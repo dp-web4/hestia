@@ -63,14 +63,89 @@ print(h.hexdigest())
 PY
 }
 watch_source_hash() { sha256_file "$WATCH_SOURCE"; }
-# A predecessor that deployed us already hashed the exact bytes it handed over, and
-# they are the bytes this process is executing. Re-deriving the baseline by reading the
-# canonical path here would instead capture whatever is on disk NOW -- which, if the path
-# moved again in the microseconds since, is a baseline for a file we never ran.
-WATCH_STARTUP_SHA256="${HESTIA_WATCH_STARTUP_SHA256:-}"
-[[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]] || \
+
+# THE BYTES THIS INTERPRETER IS READING, not the bytes at a pathname.
+#
+# Bash holds the script open on a descriptor for the life of the process and reads the
+# not-yet-parsed tail from it, so /proc/<pid>/fd/<n> is the SAME open file description
+# bash itself reads -- opening it does not re-resolve the path. Measured on this host:
+# replace the script by rename underneath a running process and this fd still hashes the
+# ORIGINAL bytes (readlink additionally reports "(deleted)"), while hashing "$0" returns
+# the impostor that never executed. That is the difference between naming what is running
+# and naming what happens to be at a name.
+#
+# The descriptor number is DISCOVERED, never assumed. Bash takes the highest FREE fd:
+# 255 normally, 254 when the parent handed us 255, 249 with 250-255 taken (all measured).
+# Hardcoding 255 does not fail loudly -- it hashes an unrelated inherited fd.
+#
+# KNOWN BLIND SPOT, pinned by a test rather than left to be discovered: a same-length
+# IN-PLACE rewrite of our own inode is followed by this fd, because it is the same inode.
+# It is invisible here and to every other spelling; a length-CHANGING in-place rewrite
+# corrupts the running parse instead. Rename-replace -- the shape maybe_self_deploy and
+# every sane deploy actually use -- is the case this closes.
+watch_own_fd_path() {
+  local want="$1" fd n target best=""
+  for fd in /proc/$$/fd/*; do
+    n="${fd##*/}"
+    case "$n" in ''|*[!0-9]*) continue ;; esac
+    target="$(readlink "$fd" 2>/dev/null || true)"
+    target="${target% (deleted)}"
+    if [ -n "$target" ] && [ "$target" = "$want" ]; then
+      if [ -z "$best" ] || [ "$n" -gt "$best" ]; then best="$n"; fi
+    fi
+  done
+  if [ -z "$best" ]; then return 1; fi
+  printf '/proc/%s/fd/%s\n' "$$" "$best"
+}
+
+# HOW the baseline was obtained, printed beside it. A bare hash on a log line has already
+# been misread as a commit sha in a published table: it is a CONTENT hash, and recovering
+# a commit from it needs a reverse lookup that only succeeds while some commit still holds
+# those exact bytes. The origin token says which question the number answers.
+#   own-fd                     -- hashed from the descriptor bash is reading (authoritative)
+#   own-fd-handover-mismatch   -- self-derived, and the predecessor's claim DISAGREED
+#   handover                   -- /proc unavailable; believed the predecessor
+#   path-reread                -- believed the pathname; a baseline for bytes we may not run
+#   unavailable                -- no baseline was ever captured
+WATCH_STARTUP_ORIGIN="unavailable"
+WATCH_STARTUP_SHA256=""
+WATCH_SELF_FD_PATH="$(watch_own_fd_path "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+if [ -n "$WATCH_SELF_FD_PATH" ]; then
+  WATCH_STARTUP_SHA256="$(sha256_file "$WATCH_SELF_FD_PATH" 2>/dev/null || true)"
+  if [[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    WATCH_STARTUP_ORIGIN="own-fd"
+  fi
+fi
+# The predecessor's claim is now a CROSS-CHECK, not the source. As the source it meant an
+# operator who exported the pair could tell a fresh watcher what it was running; `unset`
+# bounded that lie to one process but did not remove it. Self-derivation removes the need
+# to believe it at all, and keeping the comparison converts a lie -- or a snapshot that
+# moved between hash and exec -- from a silent adoption into a reportable disagreement.
+WATCH_HANDOVER_SHA256="${HESTIA_WATCH_STARTUP_SHA256:-}"
+if [ "$WATCH_STARTUP_ORIGIN" = "own-fd" ]; then
+  if [[ "$WATCH_HANDOVER_SHA256" =~ ^[0-9a-f]{64}$ ]] && \
+     [ "$WATCH_HANDOVER_SHA256" != "$WATCH_STARTUP_SHA256" ]; then
+    WATCH_STARTUP_ORIGIN="own-fd-handover-mismatch"
+  fi
+fi
+# Fall back exactly as before when /proc gives us nothing: the handover, then the path.
+if [ "$WATCH_STARTUP_ORIGIN" = "unavailable" ]; then
+  WATCH_STARTUP_SHA256="$WATCH_HANDOVER_SHA256"
+  if [[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    WATCH_STARTUP_ORIGIN="handover"
+  fi
+fi
+if [ "$WATCH_STARTUP_ORIGIN" = "unavailable" ]; then
   WATCH_STARTUP_SHA256="$(watch_source_hash 2>/dev/null || true)"
-[[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]] || WATCH_STARTUP_SHA256="unavailable"
+  if [[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    WATCH_STARTUP_ORIGIN="path-reread"
+  fi
+fi
+if ! [[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  WATCH_STARTUP_SHA256="unavailable"
+  WATCH_STARTUP_ORIGIN="unavailable"
+fi
+unset WATCH_HANDOVER_SHA256
 # Consumed. Not inherited by the fired CLI, and not inherited by a successor that did
 # not get it from us -- these two say "your predecessor verified this", and only a
 # predecessor is entitled to say it.
@@ -281,7 +356,7 @@ announce_artifact() {
   # is the level-triggered gauge that survives log rotation; it must never depend on
   # a prior one-shot alarm still being visible.
   check_artifact_drift
-  echo "[hestia-watch] ARTIFACT plugin=$PLUGIN state=$WATCH_ARTIFACT_STATE reason=$WATCH_ARTIFACT_REASON startup_sha256=$WATCH_STARTUP_SHA256 disk_sha256=$WATCH_CURRENT_SHA256 started=$WATCH_STARTED_AT"
+  echo "[hestia-watch] ARTIFACT plugin=$PLUGIN state=$WATCH_ARTIFACT_STATE reason=$WATCH_ARTIFACT_REASON startup_sha256=$WATCH_STARTUP_SHA256 startup_origin=$WATCH_STARTUP_ORIGIN disk_sha256=$WATCH_CURRENT_SHA256 started=$WATCH_STARTED_AT"
 }
 
 check_artifact_drift() {
@@ -322,9 +397,9 @@ check_artifact_drift() {
     WATCH_LAST_ALARM_KEY=""
   elif [ "$STATE:$REASON" != "$WATCH_LAST_ALARM_KEY" ]; then
     if [ "$STATE" = "drift" ]; then
-      echo "[hestia-watch] ARTIFACT DRIFT — restart required; startup_sha256=$WATCH_STARTUP_SHA256 disk_sha256=$CURRENT"
+      echo "[hestia-watch] ARTIFACT DRIFT — restart required; startup_sha256=$WATCH_STARTUP_SHA256 startup_origin=$WATCH_STARTUP_ORIGIN disk_sha256=$CURRENT"
     else
-      echo "[hestia-watch] ARTIFACT UNVERIFIABLE — reason=$REASON startup_sha256=$WATCH_STARTUP_SHA256 disk_sha256=$CURRENT"
+      echo "[hestia-watch] ARTIFACT UNVERIFIABLE — reason=$REASON startup_sha256=$WATCH_STARTUP_SHA256 startup_origin=$WATCH_STARTUP_ORIGIN disk_sha256=$CURRENT"
     fi
     WATCH_LAST_ALARM_KEY="$STATE:$REASON"
   fi
