@@ -249,6 +249,24 @@ impl StandingScopeStore {
         hex::encode(hasher.finalize())
     }
 
+    /// The reach-bearing row for one grant, shared by the digest and the divergence report.
+    ///
+    /// THIS EXISTS SO THE TWO CANNOT DISAGREE (GPT re-review of #728). They each derived
+    /// their own before: the digest hashed member, path, granted_at and expires_at, while
+    /// the report keyed only on member and path. A grant whose expiry changed therefore
+    /// moved the digest while the report stayed silent, breaking the "exact divergence"
+    /// contract on the one field that changes authority over time. Anything the digest can
+    /// distinguish, the report must be able to name.
+    fn grant_row(g: &StandingGrant) -> String {
+        format!(
+            "grant\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            g.member,
+            g.path,
+            g.granted_at,
+            g.expires_at.map(|e| e.to_string()).unwrap_or_default()
+        )
+    }
+
     /// A canonical digest of the ENTIRE authority: floor plus every per-member grant, with
     /// the fields that decide reach. `floor_digest` answers "did two members get the same
     /// society baseline"; this answers "is this projection byte-equivalent to the vault's",
@@ -259,15 +277,7 @@ impl StandingScopeStore {
             .floor
             .iter()
             .map(|f| format!("floor\u{1f}{}", f.path))
-            .chain(self.grants.iter().map(|g| {
-                format!(
-                    "grant\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
-                    g.member,
-                    g.path,
-                    g.granted_at,
-                    g.expires_at.map(|e| e.to_string()).unwrap_or_default()
-                )
-            }))
+            .chain(self.grants.iter().map(Self::grant_row))
             .collect();
         rows.sort_unstable();
         let mut hasher = Sha256::new();
@@ -296,22 +306,58 @@ impl StandingScopeStore {
                 self.generation, vault.generation
             ));
         }
-        let key = |g: &StandingGrant| format!("{}\u{1f}{}", g.member, g.path);
-        let runtime_grants: std::collections::BTreeSet<String> =
-            self.grants.iter().map(key).collect();
-        let vault_grants: std::collections::BTreeSet<String> =
-            vault.grants.iter().map(key).collect();
-        for phantom in runtime_grants.difference(&vault_grants) {
-            out.push(format!(
-                "PHANTOM grant in runtime, absent from vault: {}",
-                phantom.replace('\u{1f}', " -> ")
-            ));
+        // Identity is (member, path): that is what "the same grant" means to an operator.
+        // Every other field is a property OF that grant, and one that moved is neither a
+        // phantom nor a loss but a rewrite, which needs its own name or a reader concludes
+        // the grant was untouched.
+        fn ident(g: &StandingGrant) -> (&str, &str) {
+            (g.member.as_str(), g.path.as_str())
         }
-        for lost in vault_grants.difference(&runtime_grants) {
-            out.push(format!(
-                "LOST grant in vault, absent from runtime: {}",
-                lost.replace('\u{1f}', " -> ")
-            ));
+        let runtime_by_ident: std::collections::BTreeMap<(&str, &str), &StandingGrant> =
+            self.grants.iter().map(|g| (ident(g), g)).collect();
+        let vault_by_ident: std::collections::BTreeMap<(&str, &str), &StandingGrant> =
+            vault.grants.iter().map(|g| (ident(g), g)).collect();
+
+        for (k, g) in &runtime_by_ident {
+            match vault_by_ident.get(k) {
+                None => out.push(format!(
+                    "PHANTOM grant in runtime, absent from vault: {} -> {}",
+                    k.0, k.1
+                )),
+                Some(v) => {
+                    // REACH OVER TIME. An expiry the vault never authorised is a widening
+                    // when it is later and a silent narrowing when it is earlier. Both are
+                    // drift, and this is the field the re-review caught the report missing.
+                    if g.expires_at != v.expires_at {
+                        let show = |e: Option<u64>| {
+                            e.map(|x| x.to_string()).unwrap_or_else(|| "never".to_string())
+                        };
+                        out.push(format!(
+                            "CHANGED grant {} -> {}: expires_at runtime {} vs vault {}",
+                            k.0,
+                            k.1,
+                            show(g.expires_at),
+                            show(v.expires_at)
+                        ));
+                    }
+                    // PROVENANCE. Not reach, but a rewritten origin means this is not the
+                    // record the operator's act produced, and the digest already sees it.
+                    if g.granted_at != v.granted_at {
+                        out.push(format!(
+                            "CHANGED grant {} -> {}: granted_at runtime {} vs vault {}",
+                            k.0, k.1, g.granted_at, v.granted_at
+                        ));
+                    }
+                }
+            }
+        }
+        for k in vault_by_ident.keys() {
+            if !runtime_by_ident.contains_key(k) {
+                out.push(format!(
+                    "LOST grant in vault, absent from runtime: {} -> {}",
+                    k.0, k.1
+                ));
+            }
         }
         let runtime_floor: std::collections::BTreeSet<&str> =
             self.floor.iter().map(|f| f.path.as_str()).collect();

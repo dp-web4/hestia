@@ -17509,6 +17509,124 @@ mod standing_scope_surface_tests {
         );
     }
 
+    /// GPT re-review of #728: an expiry-only change is a reach change, and the report used to
+    /// miss it because the digest compared four fields while the report keyed on two.
+    ///
+    /// This is the arm that was asked for. A grant present in both, same member and path,
+    /// differing only in `expires_at`, must produce `matches=false` AND a directional finding
+    /// naming that grant and that field. An empty divergence beside a moved digest is the
+    /// exact contract violation.
+    #[tokio::test]
+    async fn an_expiry_only_change_is_named_not_silently_matched() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        let mut s = state.lock().await;
+        s.commit_standing_scope(|st| {
+            st.add(standing("claude-code", "/w/hestia", now, Some(now + 3600)))
+        })
+        .unwrap();
+
+        // The matching control: untouched, this must stay clean.
+        let clean = s.verify_standing_projection(now).unwrap();
+        assert!(clean.matches, "a untouched projection must verify: {:?}", clean.divergence);
+        assert!(clean.divergence.is_empty());
+        assert_eq!(clean.runtime_digest, clean.vault_digest);
+
+        // Same member, same path, same generation. Only the expiry moves, and it moves
+        // LATER, which is a widening: reach the vault never authorised.
+        s.standing_scope.grants[0].expires_at = Some(now + 86_400);
+
+        let audit = s.verify_standing_projection(now).unwrap();
+        assert!(
+            !audit.matches,
+            "an expiry-only widening must not report as matching"
+        );
+        assert_ne!(
+            audit.runtime_digest, audit.vault_digest,
+            "the digest must see it too, or the two surfaces disagree again"
+        );
+        assert!(
+            !audit.divergence.is_empty(),
+            "a moved digest with an empty divergence is the contract violation this arm exists for"
+        );
+        assert!(
+            audit.divergence.iter().any(|d| {
+                d.contains("CHANGED") && d.contains("/w/hestia") && d.contains("expires_at")
+            }),
+            "the finding must name the grant and the field: {:?}",
+            audit.divergence
+        );
+        assert_eq!(
+            audit.runtime_generation, audit.vault_generation,
+            "generation is unmoved here on purpose: an ungoverned edit does not bump it, \
+             which is why the generation alone cannot be the detector"
+        );
+    }
+
+    /// The invariant that keeps this class from coming back: whatever the digest can
+    /// distinguish, the divergence report can name. Checked across every field the digest
+    /// hashes, rather than trusting that the two implementations stay in step.
+    #[tokio::test]
+    async fn every_digest_difference_has_a_named_divergence() {
+        use crate::server::standing_scope::{FloorEntry, StandingScopeStore};
+        let now = crate::server::gate_escalation::now_secs();
+
+        let base = || {
+            let mut st = StandingScopeStore::default();
+            st.add(standing("claude-code", "/w/hestia", now, Some(now + 3600)));
+            st.floor_add(FloorEntry {
+                path: "/w/shared".into(),
+                added_at: now,
+                added_by: "operator".into(),
+                reason: "baseline".into(),
+            });
+            st
+        };
+
+        // Each mutation touches one thing the digest hashes.
+        let mutations: Vec<(&str, Box<dyn Fn(&mut StandingScopeStore)>)> = vec![
+            ("expiry", Box::new(|st: &mut StandingScopeStore| {
+                st.grants[0].expires_at = Some(now + 99_999)
+            })),
+            ("granted_at", Box::new(|st: &mut StandingScopeStore| {
+                st.grants[0].granted_at = now - 5
+            })),
+            ("member", Box::new(|st: &mut StandingScopeStore| {
+                st.grants[0].member = "kimi-code".into()
+            })),
+            ("path", Box::new(|st: &mut StandingScopeStore| {
+                st.grants[0].path = "/w/elsewhere".into()
+            })),
+            ("extra grant", Box::new(|st: &mut StandingScopeStore| {
+                st.add(standing("codex", "/w/extra", now, None))
+            })),
+            ("dropped grant", Box::new(|st: &mut StandingScopeStore| st.grants.clear())),
+            ("floor path", Box::new(|st: &mut StandingScopeStore| {
+                st.floor.clear();
+            })),
+        ];
+
+        for (name, mutate) in mutations {
+            let vault = base();
+            let mut runtime = base();
+            mutate(&mut runtime);
+            let digests_differ = runtime.authority_digest() != vault.authority_digest();
+            let divergence = runtime.divergence_from(&vault);
+            assert!(
+                digests_differ,
+                "{name}: the digest should see this change, or the test is not exercising it"
+            );
+            assert!(
+                !divergence.is_empty(),
+                "{name}: the digest moved but the divergence report said nothing"
+            );
+        }
+
+        // And the other direction: identical stores agree on both surfaces.
+        assert_eq!(base().authority_digest(), base().authority_digest());
+        assert!(base().divergence_from(&base()).is_empty());
+    }
+
     /// dp's negative control, stated verbatim in the ruling: "revoked/absent vault grants must
     /// never be recreated from stale projections".
     ///
