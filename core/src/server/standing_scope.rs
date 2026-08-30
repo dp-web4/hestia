@@ -58,6 +58,11 @@ use sha2::{Digest, Sha256};
 /// Bounded staleness is the only kind that is safe (hestia_gate_core, `AgentPolicy`).
 pub const STANDING_SNAPSHOT_TTL_SECS: u64 = 8 * 3600;
 
+/// How often the runtime projection is re-proved against the vault authority. Short enough
+/// that drift is caught inside one working session, long enough that it costs nothing: the
+/// check is one vault read and two digests.
+pub const PROJECTION_VERIFY_INTERVAL_SECS: u64 = 900;
+
 /// One standing grant: this member may reach this path (a repo root or a file), durably,
 /// until it expires or an operator revokes it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +135,52 @@ pub struct StandingScopeStore {
     pub floor: Vec<FloorEntry>,
 }
 
+/// What the daemon found where the standing authority should be, at launch.
+///
+/// The distinction exists because an absent vault document means two opposite things, and
+/// treating them alike is the #596 outage: a fresh install correctly has no grants, while a
+/// society that predates the feature has grants it is entitled to and no record of them.
+/// Serving this beside the envelope makes the second case visible instead of silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorityStatus {
+    /// The vault held a standing document; the envelope is whatever it says.
+    Loaded,
+    /// No document and no history. Empty is correct here.
+    Fresh,
+    /// No document, but this society has acted. Empty is NOT correct, and nothing in the
+    /// binary can invent the operator's intent, so the daemon reports rather than guesses.
+    MigrationRequired,
+}
+
+impl AuthorityStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthorityStatus::Loaded => "loaded",
+            AuthorityStatus::Fresh => "fresh",
+            AuthorityStatus::MigrationRequired => "migration_required",
+        }
+    }
+}
+
+/// One periodic proof that the runtime projection still equals the vault's authority.
+///
+/// dp's ruling, 2026-08-29: "on a clock, compare vault truth to every published/runtime
+/// projection, report a freshness timestamp and exact divergence ... Silence is not health."
+/// So this carries a timestamp even when it matches, because a verifier that only speaks up
+/// on failure is indistinguishable from one that stopped running.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProjectionAudit {
+    pub verified_at: u64,
+    pub matches: bool,
+    pub runtime_generation: u64,
+    pub vault_generation: u64,
+    pub runtime_digest: String,
+    pub vault_digest: String,
+    /// Empty when `matches`. Each entry names one difference and its direction.
+    pub divergence: Vec<String>,
+}
+
 /// One floor path: every member may reach this, because the society says so.
 ///
 /// It carries its own provenance for the same reason a standing grant does — a widening whose
@@ -196,6 +247,83 @@ impl StandingScopeStore {
             hasher.update(path.as_bytes());
         }
         hex::encode(hasher.finalize())
+    }
+
+    /// A canonical digest of the ENTIRE authority: floor plus every per-member grant, with
+    /// the fields that decide reach. `floor_digest` answers "did two members get the same
+    /// society baseline"; this answers "is this projection byte-equivalent to the vault's",
+    /// which is the question periodic verification asks. Order-independent and
+    /// length-prefixed for the same reasons.
+    pub fn authority_digest(&self) -> String {
+        let mut rows: Vec<String> = self
+            .floor
+            .iter()
+            .map(|f| format!("floor\u{1f}{}", f.path))
+            .chain(self.grants.iter().map(|g| {
+                format!(
+                    "grant\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                    g.member,
+                    g.path,
+                    g.granted_at,
+                    g.expires_at.map(|e| e.to_string()).unwrap_or_default()
+                )
+            }))
+            .collect();
+        rows.sort_unstable();
+        let mut hasher = Sha256::new();
+        hasher.update((self.generation).to_be_bytes());
+        for row in rows {
+            hasher.update((row.len() as u64).to_be_bytes());
+            hasher.update(row.as_bytes());
+        }
+        hex::encode(hasher.finalize())
+    }
+
+    /// Name every way `self` (the runtime projection) differs from `vault` (the authority).
+    ///
+    /// Direction matters and is not symmetric in meaning: an entry the runtime holds and the
+    /// vault does not is a PHANTOM grant, reach nothing durable backs, and it is the failure
+    /// mode dp's 2026-08-29 ruling names last ("revoked/absent vault grants must never be
+    /// recreated from stale projections"). An entry the vault holds and the runtime does not
+    /// is a LOST grant: the operator's decision is not in force. Both are reported, labelled,
+    /// and neither is silently repaired here; this function only tells the truth about the
+    /// difference.
+    pub fn divergence_from(&self, vault: &StandingScopeStore) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.generation != vault.generation {
+            out.push(format!(
+                "generation: runtime {} vs vault {}",
+                self.generation, vault.generation
+            ));
+        }
+        let key = |g: &StandingGrant| format!("{}\u{1f}{}", g.member, g.path);
+        let runtime_grants: std::collections::BTreeSet<String> =
+            self.grants.iter().map(key).collect();
+        let vault_grants: std::collections::BTreeSet<String> =
+            vault.grants.iter().map(key).collect();
+        for phantom in runtime_grants.difference(&vault_grants) {
+            out.push(format!(
+                "PHANTOM grant in runtime, absent from vault: {}",
+                phantom.replace('\u{1f}', " -> ")
+            ));
+        }
+        for lost in vault_grants.difference(&runtime_grants) {
+            out.push(format!(
+                "LOST grant in vault, absent from runtime: {}",
+                lost.replace('\u{1f}', " -> ")
+            ));
+        }
+        let runtime_floor: std::collections::BTreeSet<&str> =
+            self.floor.iter().map(|f| f.path.as_str()).collect();
+        let vault_floor: std::collections::BTreeSet<&str> =
+            vault.floor.iter().map(|f| f.path.as_str()).collect();
+        for phantom in runtime_floor.difference(&vault_floor) {
+            out.push(format!("PHANTOM floor path in runtime: {phantom}"));
+        }
+        for lost in vault_floor.difference(&runtime_floor) {
+            out.push(format!("LOST floor path, in vault only: {lost}"));
+        }
+        out
     }
 
     /// Add (or replace, keyed by path) a floor entry. Same replace-not-duplicate rule as

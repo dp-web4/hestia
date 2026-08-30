@@ -16203,6 +16203,19 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         // without learning anything about one another's personal expansions.
         "society_floor_digest": s.standing_scope.floor_digest(),
         "generation": s.standing_scope.generation,
+        // WHAT WAS FOUND WHERE THE AUTHORITY SHOULD BE (dp's ruling, 2026-08-29). A consumer
+        // reading an empty envelope cannot otherwise tell "this society has granted nothing"
+        // from "this society's grants were never migrated", and #596 is what the second one
+        // costs when it is invisible.
+        "authority_status": s.authority_status.as_str(),
+        // FRESHNESS, REPORTED EVEN WHEN IT MATCHES. `null` means no verification has run in
+        // this process yet, which is information rather than health; silence is not health.
+        "projection_verified_at": s.standing_projection_audit.as_ref().map(|a| a.verified_at),
+        "projection_matches_vault": s.standing_projection_audit.as_ref().map(|a| a.matches),
+        "projection_divergence": s.standing_projection_audit
+            .as_ref()
+            .map(|a| a.divergence.clone())
+            .unwrap_or_default(),
         "snapshot_expires_at": snapshot_expires_at,
         "lifetime": "live_grants are memory-only — they die with the daemon. standing_grants \
                      are operator-promoted, vault-persisted, and survive restart until they \
@@ -17414,6 +17427,182 @@ mod standing_scope_surface_tests {
     /// generation included — even on the hardest arm, a REPLACEMENT of an existing grant.
     /// The first cut "rolled back" by revoking the just-added row: that bumped the
     /// generation a second time and discarded the replaced grant instead of restoring it.
+    /// dp's acceptance test for #715/#596, first half: "populate governed standing grants in
+    /// the vault, delete/corrupt the published/runtime grant projection, restart, and prove it
+    /// is reconstructed byte-/semantics-equivalently before the gate activates".
+    ///
+    /// The restart is real: the second `build_state` reads the same vault file from disk with
+    /// nothing carried over in memory, which is what a daemon restart does.
+    #[tokio::test]
+    async fn cold_start_reconstructs_the_envelope_from_the_vault() {
+        let dir = TempDir::new().unwrap();
+        let vault_path = dir.path().join("v.enc");
+        let now = crate::server::gate_escalation::now_secs();
+
+        let (before_digest, before_generation) = {
+            let vault = Vault::init(vault_path.clone(), "p".into()).unwrap();
+            let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| {
+                st.add(standing("claude-code", "/w/hestia", now, None));
+                st.add(standing("kimi-code", "/w/web4", now, None));
+                st.floor_add(crate::server::standing_scope::FloorEntry {
+                    path: "/w/shared".into(),
+                    added_at: now,
+                    added_by: "operator".into(),
+                    reason: "society baseline".into(),
+                });
+            })
+            .unwrap();
+            assert_eq!(s.standing_scope.generation, 3);
+            (s.standing_scope.authority_digest(), s.standing_scope.generation)
+        };
+
+        // The restart. Nothing from the first process survives except the vault on disk.
+        let vault = Vault::open(vault_path, "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let s = state.lock().await;
+
+        assert_eq!(
+            s.standing_scope.authority_digest(),
+            before_digest,
+            "the reconstructed envelope must be semantically identical to the one committed"
+        );
+        assert_eq!(s.standing_scope.generation, before_generation);
+        assert_eq!(s.standing_scope.grants.len(), 2);
+        assert!(s.standing_scope.floor_allows("/w/shared"));
+        assert_eq!(
+            s.authority_status,
+            crate::server::standing_scope::AuthorityStatus::Loaded,
+            "a document was present, so this is neither a fresh install nor a migration"
+        );
+        // And the reconstruction proves itself against its own source.
+        let audit = s.verify_standing_projection(now).unwrap();
+        assert!(audit.matches, "divergence after a clean cold start: {:?}", audit.divergence);
+    }
+
+    /// dp's acceptance test, second half: "alter the projection without a governed vault act
+    /// and prove periodic verification detects it".
+    ///
+    /// The alteration bypasses `commit_standing_scope` deliberately, which is the only way to
+    /// produce the state being tested: drift is by definition what arrives without passing
+    /// through the governed door.
+    #[tokio::test]
+    async fn verification_detects_a_projection_altered_without_a_governed_act() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        let mut s = state.lock().await;
+        s.commit_standing_scope(|st| st.add(standing("claude-code", "/w/hestia", now, None)))
+            .unwrap();
+        assert!(s.verify_standing_projection(now).unwrap().matches);
+
+        // Ungoverned widening, straight into memory.
+        s.standing_scope.add(standing("claude-code", "/w/not-granted", now, None));
+
+        let audit = s.verify_standing_projection(now).unwrap();
+        assert!(!audit.matches, "an ungoverned widening must not verify");
+        assert_ne!(audit.runtime_generation, audit.vault_generation);
+        assert!(
+            audit.divergence.iter().any(|d| d.contains("PHANTOM") && d.contains("/w/not-granted")),
+            "the divergence must name the phantom grant and its direction: {:?}",
+            audit.divergence
+        );
+    }
+
+    /// dp's negative control, stated verbatim in the ruling: "revoked/absent vault grants must
+    /// never be recreated from stale projections".
+    ///
+    /// This is the arm that makes the verifier worth having. A verifier that only reported
+    /// LOST grants would invite a repair that resurrects revoked reach, which is a widening
+    /// dressed as a repair.
+    #[tokio::test]
+    async fn a_revoked_grant_is_never_resurrected_from_a_stale_projection() {
+        let dir = TempDir::new().unwrap();
+        let vault_path = dir.path().join("v.enc");
+        let now = crate::server::gate_escalation::now_secs();
+
+        {
+            let vault = Vault::init(vault_path.clone(), "p".into()).unwrap();
+            let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| st.add(standing("claude-code", "/w/revoked", now, None)))
+                .unwrap();
+            // The governed revocation.
+            s.commit_standing_scope(|st| {
+                st.revoke("claude-code", "/w/revoked");
+            })
+            .unwrap();
+            assert!(s.standing_scope.grants.is_empty());
+        }
+
+        // A restart cannot bring it back: the vault is the authority and it no longer says so.
+        let vault = Vault::open(vault_path, "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let mut s = state.lock().await;
+        assert!(
+            s.standing_scope.grants.is_empty(),
+            "a revoked grant came back across a restart"
+        );
+
+        // And if a stale projection claims it anyway, verification calls it a PHANTOM rather
+        // than a repair target.
+        s.standing_scope.add(standing("claude-code", "/w/revoked", now, None));
+        let audit = s.verify_standing_projection(now).unwrap();
+        assert!(!audit.matches);
+        assert!(
+            audit.divergence.iter().any(|d| d.contains("PHANTOM") && d.contains("/w/revoked")),
+            "a resurrected revoked grant must be named a phantom: {:?}",
+            audit.divergence
+        );
+        assert!(
+            !audit.divergence.iter().any(|d| d.contains("LOST")),
+            "nothing was lost here; calling it LOST would invite recreating it: {:?}",
+            audit.divergence
+        );
+    }
+
+    /// Ruling point 2: "society exists but generation is 0 because the feature arrived later
+    /// must not silently become deny-all". A fresh install and an unmigrated society both
+    /// have no document; only the history tells them apart, and the two must not report the
+    /// same status.
+    #[tokio::test]
+    async fn an_unmigrated_society_is_distinguishable_from_a_fresh_install() {
+        use crate::server::standing_scope::AuthorityStatus;
+
+        let (_dir, fresh) = test_state().await;
+        assert_eq!(
+            fresh.lock().await.authority_status,
+            AuthorityStatus::Fresh,
+            "no document and no history is a fresh install, and empty is correct"
+        );
+
+        // A society with history and no standing document: the #596 shape.
+        let dir = TempDir::new().unwrap();
+        let vault_path = dir.path().join("v.enc");
+        {
+            let vault = Vault::init(vault_path.clone(), "p".into()).unwrap();
+            let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+            let mut s = state.lock().await;
+            s.append_chain("test_act", serde_json::json!({"why": "this society has acted"}))
+                .unwrap();
+            assert!(s.standing_scope.grants.is_empty() && s.standing_scope.floor.is_empty());
+        }
+
+        let vault = Vault::open(vault_path, "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let s = state.lock().await;
+        assert_eq!(
+            s.authority_status,
+            AuthorityStatus::MigrationRequired,
+            "history plus no standing document is a migration, not an empty society"
+        );
+        assert_ne!(
+            AuthorityStatus::Fresh.as_str(),
+            AuthorityStatus::MigrationRequired.as_str(),
+            "the two must be distinguishable at the surface, not only in the type"
+        );
+    }
+
     /// `commit_standing_scope` persists a candidate before swapping it live, so
     /// unchangedness is construction, not cleanup. Failure is injected the way it happens:
     /// the vault's directory is made unwritable, so the atomic temp-file write fails.
