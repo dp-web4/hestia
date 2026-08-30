@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  hestia-deploy on macOS: the launchd counterpart of hestia-deploy.service + .timer.
+  Run on mcnugget 2026-08-27 through two real cycles (DEPLOYED 478 -> 484 -> 485); the one
+  key added since is Nice, which has not been run there.
+
+  This is a TEMPLATE. launchd has no %h, so __HOME__ and __HESTIA_BIN__ are substituted at
+  install time; see README.md, which derives __HESTIA_BIN__ from the daemon's registration
+  rather than assuming it.
+
+  Where it differs from the systemd pair, and why:
+    - StartCalendarInterval replaces OnCalendar. Same six fixed marks (00/04/08/12/16/20 at
+      :17 local), spelled out because launchd has no interval-with-phase syntax. StartInterval
+      would have been one line, but it drifts off the wall clock at every reboot, and the
+      point of the fixed mark is that anyone running a daemon-dependent test can READ the
+      schedule instead of guessing it.
+    - No Persistent= equivalent is needed: launchd already runs a calendar job whose mark
+      passed while the machine was asleep or off, at the next wake.
+    - No TimeoutStartSec= equivalent exists, and none is wanted. A cold release build is
+      minutes; launchd does not time out a running job, so the 45min systemd guard has no
+      counterpart to port.
+    - No RunAtLoad. Installing the timer is not consent to deploy this second; the README
+      tells you to kickstart one cycle deliberately, and watch it.
+    - Nice=15 for the same reason the service unit carries it: a release build at normal
+      priority pins the CPU and the daemon's gate round-trip times out, so every member on
+      the box fail-closes (deploy/build-lock/README.md, #354/#358).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.web4.hestia.deploy</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/hestia-deploy</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HESTIA_HOME</key>
+        <string>__HOME__/.hestia</string>
+        <!-- The binary the service manager actually invokes. Not always ~/.local/bin/hestia. -->
+        <key>HESTIA_BIN</key>
+        <string>__HESTIA_BIN__</string>
+        <!-- cargo first, then homebrew (git-lfs, gh, bash>=4), then the base system (git, curl). -->
+        <key>PATH</key>
+        <string>__HOME__/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- 00:17, 04:17, 08:17, 12:17, 16:17, 20:17 local. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>17</integer></dict>
+        <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>17</integer></dict>
+        <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>17</integer></dict>
+        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>17</integer></dict>
+        <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>17</integer></dict>
+        <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>17</integer></dict>
+    </array>
+
+    <key>Nice</key>
+    <integer>15</integer>
+
+    <!-- The analogue of `journalctl --user -u hestia-deploy`: the same lines the script
+         appends to ~/.hestia/deploy.log, plus cargo's tail on a build cycle. -->
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/hestia/deploy-agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/hestia/deploy-agent.log</string>
+
+    <key>ThrottleInterval</key>
+    <integer>300</integer>
+</dict>
+</plist>
