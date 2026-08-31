@@ -20,3 +20,4 @@
 hestia_gate_core.py
 hestia_gate_mechanism.py
 hestia_governance_closure.py
+hestia_shell_classifier.py
