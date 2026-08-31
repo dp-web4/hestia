@@ -326,3 +326,16 @@ jobs:
           # engine's own docstring says it was hardened against. Collapsing a
           # fork is what drives it down.
           python3 tools/scope_fork_differential_test.py --max-divergences 6
+
+      - name: Is every seat reaching for the same domain?
+        run: |
+          set -euo pipefail
+          # The collapse percentage measures the PREDICATE. This pins the DOMAIN
+          # the predicate is applied to, which every seat builds itself before
+          # the engine is ever called (#734). A gate can reach 0.0% per-seat law
+          # and still disagree with its peers about which argument is a path.
+          # Floor is the measured number, 3 of 10, so it ratchets up from
+          # reality rather than aspiring downward from a target nobody hit.
+          # Deliberately a SEPARATE step from the collapse meter above: one
+          # number failing should not hide the other behind set -e.
+          python3 tools/gate_collapse_meter.py --quiet --min-agreed-keys 3

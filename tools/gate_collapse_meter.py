@@ -186,6 +186,10 @@ def main() -> int:
                     help="ratchet: fail if the still-per-seat percentage exceeds this. "
                          "This is the number that matters; --max-forked is the one that is "
                          "beyond argument. Pin both.")
+    ap.add_argument("--min-agreed-keys", type=int, default=None,
+                    help="ratchet the OTHER half of the gate: fail if the number of path-key "
+                         "names every seat extracts falls below this. The predicate is shared; "
+                         "the domain it is applied to is not, and nothing gated it before.")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
@@ -310,6 +314,30 @@ def main() -> int:
     print(f"law-bearing sloc: {tot_law} per-seat + {shared_law} shared = {total_law}")
     print(f"STILL PER-SEAT: {pct:.1f}%   (collapsed means 0.0%, and 0 forked)")
 
+    # The percentage above measures the PREDICATE. It says nothing about the domain the
+    # predicate is applied to, and that domain is built per-seat before the engine is called
+    # (#734). A gate can score 0.0% here and still disagree with every other seat about which
+    # argument is a path. Printed unconditionally, next to the number it qualifies, so the
+    # collapse figure is never read as covering both halves.
+    agreed_n = union_n = None
+    try:
+        from path_key_vocabulary_probe import gate_key_vocabularies  # lazy: probe imports us
+        vocab = gate_key_vocabularies(root)
+        per_seat = {s: d["keys"] for s, d in vocab.items()}
+        union = set().union(*per_seat.values())
+        agreed = set.intersection(*per_seat.values())
+        agreed_n, union_n = len(agreed), len(union)
+        print(f"EXTRACTION DOMAIN: {agreed_n} of {union_n} path-key names are extracted by all "
+              f"{len(per_seat)} seats   (collapsed means agreed == union)")
+        for seat in sorted(per_seat):
+            missing = sorted(union - per_seat[seat])
+            if missing:
+                print(f"    {seat:<13} omits {len(missing):>2}: {', '.join(missing)}")
+    except Exception as exc:
+        # Loud, never silent. An extraction figure that vanishes on error would let the
+        # per-seat percentage be quoted alone again, which is the exact gap this line closes.
+        print(f"EXTRACTION DOMAIN: cannot determine ({type(exc).__name__}: {exc})")
+
     # Print the compared value on BOTH sides, always. A threshold guard that prints only its
     # verdict rots silently as the codebase grows: nobody can see it drifting toward the
     # limit until the day it crosses.
@@ -332,6 +360,20 @@ def main() -> int:
                   f"per-seat, above the pinned {args.max_pct:.1f}%. The engine is "
                   f"re-forking.", file=sys.stderr)
             failed = True
+    if args.min_agreed_keys is not None:
+        if agreed_n is None:
+            print("::error::extraction domain could not be measured, so its ratchet cannot "
+                  "pass. Treating unmeasurable as failing.", file=sys.stderr)
+            failed = True
+        else:
+            print(f"ratchet key-agree: {agreed_n} of {union_n} vs floor "
+                  f"{args.min_agreed_keys}")
+            if agreed_n < args.min_agreed_keys:
+                print(f"::error::extraction domain diverged: only {agreed_n} of {union_n} "
+                      f"path-key names are extracted by every seat, below the pinned floor of "
+                      f"{args.min_agreed_keys}. A seat is reaching for a different domain than "
+                      f"the law was written against.", file=sys.stderr)
+                failed = True
     return 1 if failed else 0
 
 
