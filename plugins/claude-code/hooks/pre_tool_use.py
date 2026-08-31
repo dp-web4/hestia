@@ -306,10 +306,21 @@ except Exception:  # noqa: BLE001 — Tier-2: the local matcher below stays in f
 # denies every call, which is the ratified posture since fail-closed stopped being optional.
 # deploy/install-members.sh points $HESTIA_HOME/shared at the verified build BEFORE it
 # installs any hook, so a hook can never be newer than the engine it imports.
-from hestia_shell_classifier import (  # noqa: E402
-    _blank_inert_heredoc_bodies,
-    _is_read_only,
-)
+# GUARDED, and the guard is the whole point. An unguarded module-level import raises
+# BEFORE main()'s handler exists, so the process dies with a traceback and exit 1 -- and
+# under this harness's PreToolUse contract ONLY exit 2 blocks. Any other non-zero is a
+# hook error the harness does not treat as a refusal, so a missing shared authority would
+# have FAILED OPEN: the precise class deleted in #745. Caught here, refused in main().
+try:
+    from hestia_shell_classifier import (  # noqa: E402
+        _blank_inert_heredoc_bodies,
+        _is_read_only,
+    )
+    _CLASSIFIER_UNAVAILABLE = None
+except Exception as _exc:  # noqa: BLE001 -- any import failure is a missing authority
+    _blank_inert_heredoc_bodies = None  # type: ignore[assignment]
+    _is_read_only = None  # type: ignore[assignment]
+    _CLASSIFIER_UNAVAILABLE = f"{type(_exc).__name__}: {_exc}"
 
 
 # Commands whose arguments and stdin are DATA, never shell code — the same
@@ -1471,6 +1482,17 @@ def emit_decision(verdict) -> int:
 
 
 def main() -> int:
+    # FIRST, before stdin is read and before any side effect: no shared authority, no tool.
+    # This dominates every other path in the hook, which is what makes the refusal a
+    # property of the decision rather than of where the failure happened to be noticed.
+    if _CLASSIFIER_UNAVAILABLE is not None:
+        sys.stderr.write(
+            "hestia: deny [no-shared-authority] - the shared shell classifier could not be "
+            f"imported ({_CLASSIFIER_UNAVAILABLE}). This seat carries no local copy by "
+            "design, so it cannot classify this command and will not guess. Check that "
+            "$HESTIA_HOME/shared is populated and current.\n")
+        return 2
+
     raw = sys.stdin.read()
     if not raw.strip():
         # Empty stdin = the harness sent no event. Not caller-controllable from
