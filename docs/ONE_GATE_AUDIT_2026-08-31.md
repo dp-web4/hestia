@@ -146,11 +146,16 @@ assignment token on its own, while a seat hook is matched per FILE -- so splitti
 token to match. That is a second live gate-self hole beside the interpreter one in item 4, found
 by making this audit's own citation reproduce itself.
 
-**6. Agreement is not correctness, and the differential is the only thing that knows.** Running
+**6. The differential grades one layer, and on that layer the seats cannot disagree.** Running
 `tools/gate_differential.py` today: **SEAT DISAGREEMENTS: none**, and **seven agreed-but-wrong**
-answers out of 18 cases - every one of them unanimous across claude-code, codex and kimi. Deduplication moves the seats toward each other. It
-does not move them toward correct. A single implementation would make all three wrong in one
-place, which is better only because it is fixable in one place.
+answers out of 18 cases. The `none` is weaker than it looks. The tool loads each seat's module and
+calls the closure classifier that resolution exposes, and for claude-code, codex and kimi that is
+the same shared bytes answering three times; it says so itself (`MEASURES: byte-identity of the
+shared closure engine as each seat's import resolves it`). **gemini exposes no classifier at all
+and could not be driven**, so the run reports `SEATS NOT MEASURED: 1 of 4` and marks the fleet
+verdict INDETERMINATE. The seven are therefore one shared predicate wrong seven times, not four
+gates agreeing. Deduplication does not move anyone toward correct; it makes a single wrong answer
+fixable in a single place, which is the whole of the claim.
 
 ## 5. What this looks like at 45 harnesses
 
@@ -231,9 +236,12 @@ categories dp named are represented:
 | needless frictions | the three MRH-layer cases, held at `none` so this instrument stays honest |
 | exploited bypasses | `write.interpreter-arg`, `write.interpreter-seat`, `write.interpreter-embedded` |
 
-Deduplication cannot close any of those seven, because the seats already agree on all of them.
-That is the argument for one gate that this audit was missing: not that four copies drift, but
-that four copies are unanimously wrong and no amount of merging them changes the answer.
+Deduplication cannot close any of those seven, and the reason is sharper than agreement: on the
+predicate layer there is already only one implementation to deduplicate. The three drivable seats
+resolve to the same shared bytes, and the fourth could not be driven. That is the argument for one
+gate this audit was missing, and it is not that four copies drift. It is that the shared law is
+wrong in seven places, merging changes none of them, and the two layers still spelled once per
+seat - loader resolution and extraction - are the ones no corpus currently grades.
 
 **One methodological note, because it cost me twice.** Two of the corpus cases were first written
 as reductions that did not reproduce the escalation they cited -- one classified `read`, one
