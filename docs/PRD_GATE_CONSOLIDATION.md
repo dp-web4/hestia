@@ -1,13 +1,6 @@
 # PRD — one gate, thin shims: consolidate the per-harness hooks onto the shared core
 
-**Status**: **IMPLEMENTED (post-execution)** — sprints A–G are built, reviewed twice by GPT (NOT-SAME),
-repaired, merged (#420 and successors) and **deployed**; the daemon has served the consolidated gate since
-2026-08-14. This document is therefore a record of an executed plan plus its open remainder, not a proposal:
-where a section still reads as future tense it is describing the remainder (§13's open criteria, the
-deployment-observation half of §7.2, and the R1/R2/R3 remainder carried by
-`docs/PRD_ROLE_SCOPE_BRIDGE.md` and `docs/PRD_ALLOWLISTS.md`), and
-carrying "proposed" at the top while the body describes execution was itself a stale truth (GPT audit,
-2026-08-14). History: dp-directed 2026-08-11; peer-reviewed by GPT (NOT-SAME) 2026-08-11 and revised (see §11); fourth pass 2026-08-11 folding kimi's cross-vendor review (notice 1929, see §12) — the step-C pilot seat has read the plan and endorsed it. Execution directed by dp 2026-08-13 (this session): 'the prd is a must … i don't want the cheap solution, i want the actual, well implemented, robust solution.' Sprints A-G tracked in-session; as-is baseline in docs/GATE_CURRENT_STATE.md (PR #397). Fifth pass 2026-08-14: nomad's codex-seat field data re-measured against the landed train (see §13) — one hazard confirmed but not exercised, one criterion still open with a measurement behind it, one half-landed in Sprint G.
+**Status**: **PARTIALLY IMPLEMENTED; convergence sprint active.** The A-G train established a shared daemon authority path and substantial shared predicate code, but it did not deliver one executed gate. The 2026-08-31 measurement found 67.5% of law-bearing code still in seat files, four forked Gemini predicates, divergent engine loaders, and untyped per-seat extraction domains. The current completion contract is [SPRINT_ONE_GATE_EXECUTED_AUTHORITY.md](SPRINT_ONE_GATE_EXECUTED_AUTHORITY.md). This PRD remains the architectural history and source of earlier acceptance criteria; any statement below that A-G completed “one gate” is superseded by the measured sprint status.
 **Author**: claude-code (CBP), 2026-08-11
 **Motivating finding**: the shared gate core (`plugins/_shared/hestia_gate_core.py`) is **built but not wired** — it says so at line 103 (*"NOT WIRED. Nothing imports this yet."*). The live gates (codex, kimi) are the **pre-hardening hand-copies**, so security fixes that already exist in the core are absent from the enforcing hooks.
 **Directive (dp)**: *"common gate whenever possible, per-harness shims call the common gate, with local adjustments only as needed for the specifics of the harness. otherwise it is not maintainable and a massive security risk … fix the procedure, not one message."*
