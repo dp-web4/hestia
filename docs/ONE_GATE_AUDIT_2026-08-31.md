@@ -207,6 +207,9 @@ alternative if not. **dp's answer, verbatim:**
 > across the variants - learned from the false positives, the vulnerabilities, the needless
 > frictions, the exploited bypasses.
 
+That ruling is written as architecture in `docs/GATE_ARCHITECTURE.md`, which is normative. This
+section records how it was reached and what it corrected in this document.
+
 Two things follow, and the second is the one that changes the work.
 
 **The alternative I offered was not an alternative.** "One authority path plus per-harness
