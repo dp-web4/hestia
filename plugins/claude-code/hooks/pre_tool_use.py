@@ -29,22 +29,17 @@ DESIGN
 
 ENV
   HESTIA_HOOK_DEBUG=1            log to ~/.hestia-claude/hook.log
-  HESTIA_PRE_FAIL_CLOSED=1       fail-CLOSED profile for governed roles:
-                                  any path that cannot get a daemon verdict
-                                  (daemon unreachable, budget exhausted,
-                                  unexpected error) DENIES the tool instead
-                                  of allowing. The legacy fallback is skipped
-                                  entirely — the daemon is the law.
-  HESTIA_PRE_NO_FALLBACK=1       disable the legacy-engine fallback
-                                  (deny-on-daemon-unreachable instead)
   HESTIA_PRE_TOTAL_BUDGET_MS     override TOTAL_BUDGET_MS
   HESTIA_ENDPOINT                override endpoint discovery
-  HESTIA_LEGACY_FALLBACK         path to the legacy web4-governance gate. Set this
-                                  when the hooks are deployed off-repo (local-fs
-                                  deployment), or the relocated gate keeps calling
-                                  a fallback that may not be where it was left.
-                                  A path that does not exist ALLOWS — see
-                                  invoke_legacy_fallback.
+
+FAIL-CLOSED IS NOT A SWITCH (dp, 2026-08-31: "there shouldn't be legacy fallback
+period, and fail closed shouldn't be optional"). Any path that cannot get a daemon
+verdict — daemon unreachable, budget exhausted, empty or unparseable event,
+unexpected error — DENIES. There is no env var that relaxes this and no legacy
+engine to fall back to. `HESTIA_PRE_FAIL_CLOSED`, `HESTIA_PRE_NO_FALLBACK` and
+`HESTIA_LEGACY_FALLBACK` are gone; a launcher still exporting them is harmless and
+has no effect. This closes GATE_BYPASS_CATALOG #2, in which an unreachable endpoint
+plus a non-existent fallback path exited 0 with no stderr at all.
 """
 
 from __future__ import annotations
@@ -53,7 +48,6 @@ import json
 import os
 import re
 import socket
-import subprocess
 import sys
 import time
 import urllib.error
@@ -101,18 +95,12 @@ MAX_POLLS = 5
 # Floor on poll sleep to avoid busy loops if daemon misbehaves.
 MIN_POLL_SLEEP_MS = 50
 
-# Path to the legacy fallback hook. Sourced from the same code we ported,
-# but kept in-place under claude-code/plugins/ for fallback robustness.
-#
-# Overridable since 2026-07-26: this was a hardcoded absolute path naming one machine's
-# workspace, sitting on the fail-OPEN profile's critical path. A machine that deploys its
-# hooks to local fs (the 9p-migration pattern) could relocate the outer gate and silently
-# leave the fallback behind — and if the path is simply wrong, `invoke_legacy_fallback`
-# returns 0, so a missing fallback ALLOWS. Wrong-path and no-policy are indistinguishable
-# at the exit code. The fallback is optional and must be configured explicitly by an
-# installer. An absent value preserves the primary gate's normal no-fallback behavior;
-# public source cannot name an operator-specific legacy checkout.
-LEGACY_FALLBACK = os.environ.get("HESTIA_LEGACY_FALLBACK", "")
+# TOMBSTONE (dp ruling, 2026-08-31). `LEGACY_FALLBACK` lived here and named an
+# operator-supplied path to the pre-port web4-governance gate. It is deleted, not
+# defaulted: an env-supplied path whose ABSENCE means ALLOW is a bypass with a
+# configuration switch on it, and it was the live half of GATE_BYPASS_CATALOG #2
+# (unreachable endpoint + missing fallback = exit 0, no stderr). Nothing replaces
+# it. No verdict now means deny, on every path.
 
 
 def debug_log(msg: str) -> None:
@@ -2393,12 +2381,6 @@ def cache_action(tool_use_id: str, action_id: str, tool_name: str) -> None:
         debug_log(f"action cache failed: {e}")
 
 
-# ---- Legacy fallback --------------------------------------------------
-
-def fail_closed() -> bool:
-    return os.environ.get("HESTIA_PRE_FAIL_CLOSED") == "1"
-
-
 def _record_plane_e(cause: str, detail: str, tool_name: str = "unknown") -> None:
     """Persist an infrastructure refusal without scoring it as member conduct."""
     try:
@@ -2468,36 +2450,6 @@ def deny_no_verdict(why: str, *, cause: str = "unknown", tool_name: str = "unkno
         _record_plane_e(cause, why, tool_name)
     debug_log(f"fail-closed deny: {why} cause={cause}")
     return 2
-
-
-def invoke_legacy_fallback(stdin_payload: str) -> int:
-    """Spawn the legacy web4-governance pre_tool_use.py with the same
-    stdin and return its exit code. Returns 0 if the legacy script
-    isn't available (fail-open), unless HESTIA_PRE_NO_FALLBACK=1 asked
-    for deny-on-daemon-unreachable."""
-    if os.environ.get("HESTIA_PRE_NO_FALLBACK") == "1":
-        # Used to fall OPEN here despite the documented deny semantics
-        # (GPT security review HST-004 / doc-code mismatch).
-        return deny_no_verdict("daemon unreachable, legacy fallback disabled")
-    if not os.path.exists(LEGACY_FALLBACK):
-        debug_log(f"legacy fallback not found at {LEGACY_FALLBACK}; allowing")
-        return 0
-    try:
-        proc = subprocess.run(
-            ["python3", LEGACY_FALLBACK],
-            input=stdin_payload,
-            capture_output=True,
-            text=True,
-            timeout=2.0,
-        )
-        # Forward legacy's stderr so Claude Code surfaces it to the user.
-        if proc.stderr:
-            sys.stderr.write(proc.stderr)
-        debug_log(f"legacy fallback exit={proc.returncode}")
-        return proc.returncode
-    except (subprocess.TimeoutExpired, OSError) as e:
-        debug_log(f"legacy fallback failed: {e}; allowing")
-        return 0
 
 
 def _fallback_self_protection(tool_name: str, tool_input: Any,
@@ -2579,16 +2531,11 @@ def main() -> int:
         # Empty stdin = the harness sent no event. Not caller-controllable from
         # inside a session, but under strict fail-closed semantics "no event" is
         # still "no verdict" → no tool (CBP relay-verify micro-seam, 2026-07-07).
-        if fail_closed():
-            return deny_no_verdict("empty hook event")
-        return 0
+        return deny_no_verdict("empty hook event")
     try:
         event = json.loads(raw)
     except json.JSONDecodeError as e:
-        if fail_closed():
-            return deny_no_verdict(f"unparseable hook event: {e}")
-        debug_log(f"bad json: {e}; allowing")
-        return 0
+        return deny_no_verdict(f"unparseable hook event: {e}")
 
     tool_name = event.get("tool_name") or "?"
     # Claude Code's own stable session id — the real per-session audit grain.
@@ -2732,7 +2679,7 @@ def main() -> int:
             sys.stderr.write(f"hestia: deny [{_v.rule}] — {_v.reason}\n")
             debug_log(f"scope deny: {_v.rule} {tool_name}")
             return 2
-    elif fail_closed():
+    else:
         # The ratified degraded mode, computed by the core rather than invented here:
         # deny writes, allow reads. Same posture kimi and codex have had since Sprint F.
         _v = _core.degraded_verdict(_ev, _CORE_PROFILE)
@@ -2752,22 +2699,16 @@ def main() -> int:
     # Daemon unavailable or didn't settle. Under the fail-closed profile the
     # daemon is the law: no verdict → no tool (GPT review HST-004; governed /
     # unattended roles must not degrade to fail-open heuristics silently).
-    if fail_closed():
-        return deny_no_verdict(
-            f"daemon path failed for {tool_name}",
-            cause=_LAST_FAILURE,
-            tool_name=tool_name,
-            record=False,  # the daemon path already wrote the plane-E row (see ask_daemon)
-        )
-    debug_log(f"daemon path failed; falling back to legacy for {tool_name}")
-    return invoke_legacy_fallback(raw)
+    return deny_no_verdict(
+        f"daemon path failed for {tool_name}",
+        cause=_LAST_FAILURE,
+        tool_name=tool_name,
+        record=False,  # the daemon path already wrote the plane-E row (see ask_daemon)
+    )
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as e:  # noqa: BLE001
-        if fail_closed():
-            sys.exit(deny_no_verdict(f"hook crashed: {type(e).__name__}: {e}"))
-        debug_log(f"top-level: {e}; allowing")
-        sys.exit(0)
+        sys.exit(deny_no_verdict(f"hook crashed: {type(e).__name__}: {e}"))
