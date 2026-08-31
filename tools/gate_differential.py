@@ -237,6 +237,17 @@ def main() -> int:
     print()
 
     seats = [s for s, _ in gates]
+
+    # A seat that could not be driven at ANY cwd contributes no verdicts, and every
+    # comparison below silently skips it. Left unsaid, "SEAT DISAGREEMENTS: none" reads
+    # as a statement about four seats when it is a statement about three -- and the seat
+    # most likely to be missing is the one whose engine does not import, which is also
+    # the one most likely to disagree. Name the denominator on the headline.
+    undriven = {s: {k: results[k].get(s, {}).get("_error", "?") for k in cwds}
+                for s in seats
+                if all("_error" in results[k].get(s, {}) for k in cwds)}
+    driven = [s for s in seats if s not in undriven]
+
     hdr = f"{'case':<26}{'expect':>8}  " + "".join(f"{s:>14}" for s in seats)
     print(hdr)
     print("-" * len(hdr))
@@ -257,13 +268,23 @@ def main() -> int:
                 cwd_splits.append((cid, s, across))
 
     print()
+    if undriven:
+        print(f"SEATS NOT MEASURED: {len(undriven)} of {len(seats)} could not be driven at ANY cwd.")
+        for s, per in undriven.items():
+            reasons = sorted({str(v) for v in per.values()})
+            print(f"  {s}: " + "; ".join(reasons))
+        print("  Every verdict below is over "
+              f"{len(driven)} seat(s) -- {', '.join(driven) or 'none'} -- not {len(seats)}.")
+        print()
+
+    cover = f"  ({len(driven)} of {len(seats)} seats driven)" if undriven else ""
     if disagreements:
-        print(f"SEAT DISAGREEMENTS: {len(disagreements)}")
+        print(f"SEAT DISAGREEMENTS: {len(disagreements)}{cover}")
         for cid, row, note in disagreements:
             print(f"  {cid}  {note}")
             print(f"      " + "  ".join(f"{s}={v}" for s, v in row.items()))
     else:
-        print("SEAT DISAGREEMENTS: none")
+        print(f"SEAT DISAGREEMENTS: none{cover}")
 
     if cwd_splits:
         print(f"\nSAME SEAT, DIFFERENT CWD, DIFFERENT ANSWER: {len(cwd_splits)}")
