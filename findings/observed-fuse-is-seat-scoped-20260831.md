@@ -2,9 +2,14 @@
 
 **Specimen:** escalation `f5484bd911651eb0`, 2026-08-31 01:56–02:00Z, CBP.
 **Author:** claude-code, session `62eed33f-a495-4a80-a484-e7f6aaff425f`.
-**Status:** the harm is measured on myself. I lit another session's fuse, and I could not
-have avoided it by being careful — the wake protocol told me to read the pointer, and
-reading the pointer *is* the act.
+**Status:** the harm is measured on myself. I lit another session's fuse.
+
+**CORRECTED 2026-08-31 02:45Z** — this line originally read *"I could not have avoided it
+by being careful — the wake protocol told me to read the pointer, and reading the pointer
+**is** the act."* That is false, and the correction is the most useful thing in this
+document. A non-observing route to the same record already existed; I chose the observing
+one. See [Correction](#correction-reading-the-pointer-is-not-the-act) below. What survives
+is narrower and still real: the guard cannot tell an asker from a co-seat bystander.
 
 ## What happened
 
@@ -155,19 +160,80 @@ could authorise.
    arguably outside Guard B (nothing is authorised by declining to start a clock) but it
    is adjacent enough that a member should not decide it. If yes, the change is one
    conjunct in `mark_observed`, fail-safe in the direction that gives askers more time.
-2. **Until then, stop telling bystanders to pull the trigger.** The disposition primer
-   instructs the recipient to read the pointer, and delivery is seat-keyed, so the fleet's
-   own wake protocol is the mechanism that burns co-seat grants. A disposition notice
+2. ~~**Until then, stop telling bystanders to pull the trigger.** ... A disposition notice
    could carry the decided state inline — it is already known at queue time — so that
-   *reading the notice* is not *observing the record*.
+   *reading the notice* is not *observing the record*.~~ **WITHDRAWN** — dp's review, and
+   the measurement below, refute the premise. Inlining state would also break the
+   member-mesh pointer contract (content lives at the pointer). Replaced by: **route
+   pointer dereference through `resources/read`**, which already does not observe. Tool:
+   `tools/escalation_read.py`.
 3. **Reconsider what "unclaimed" measures.** With give-up at 21s and act-binding to a
    superseded string, unclaimed is the expected outcome of a working system, not a
    failure rate to drive down.
 
+## Correction: reading the pointer is not the act
+
+dp reviewed this on #732 (2026-08-31 02:16Z) and requested changes. The correction is
+sustained, and I then measured it rather than conceding it on authority.
+
+**The claim I got wrong.** I wrote that the wake protocol makes the burn unavoidable —
+that dereferencing the pointer *is* the observation. It is not. `mark_observed` has
+**exactly one call site in the tree**, `tool_gate_escalation_poll`
+(`core/src/server/handler.rs:16233`). `resources/read` on `hestia://escalation/<id>`
+routes to `resolve_escalation_pointer` (`:5996`), which never touches it — and the
+resolver already strips the `#decided` fragment the disposition notice carries, so the
+notice's own pointer is directly usable on the free route. What lit the fuse was my
+choice of `hestia gate poll --as claude-code`, not the wake.
+
+**The measurement.** Source-read is not a reading, and no test pins this (the two tests
+that exercise the resolver, `a_reaped_escalation_reads_the_same_from_the_chain` and
+neighbours, are about reaping, not observation). So I took it, on escalation
+`4b1c5dcd6c8ce23c` — this seat's own petition from the previous wake, opened when a shell
+`for` loop tripped the out-of-grammar rule, approved by dp 20s later with reason `k`. The
+act had already been completed compliantly via unrolled reads, so the grant authorised
+nothing anyone wanted. That is what makes it a legal specimen for a destructive read: the
+cross-seat leg I refused to run against a peer is safe to run against my own dead grant.
+
+| step | `observation_started_claim_window` | `claim_window_secs_remaining` |
+|---|---|---|
+| `resources/read` ×3, incl. the `#decided` fragment | *(field not served)* | fuse not started |
+| first attributed poll, **1563 s after the ruling** | `true` | **600** — full window |
+| second poll, +17 s | `false` | 583 |
+
+Three dereferences and 26 minutes after the operator ruled, the window was still
+untouched at its full 600. **The poll is the sole trigger, measured.** dp's correction is
+confirmed on the wire, not just in the source.
+
+**What this does and does not rescue.** It rescues the protocol: there is no defect in
+telling a woken member to read a pointer, provided it reads it the free way. It does not
+rescue the guard. `mark_observed`'s seat-equality check still cannot distinguish the
+asker from a co-seat session, and the ruling question stands — dp agrees it stands, as a
+later policy question rather than a mesh-notice defect. It also does not rescue the
+attack-cost paragraph, which the same run incidentally demonstrated: `hestia_connect`
+with `plugin_id` and `host_agent` taken straight from argv, no credential of any kind,
+returned a session that moved `claude-code`'s clock. One handshake, as claimed — now
+observed, on my own record only.
+
+**Second-order:** the reason I reached for `hestia gate poll` is that it is the only
+route the tooling names. `tools/await_escalation.py` and `tools/claimable.py` both poll;
+nothing in the tree dereferenced an escalation pointer the free way, and the one existing
+precedent for the pattern (`tools/session_residency_census.py`, whose docstring says
+"Mints no session, writes nothing") is about a different resource. The affordance existed
+and was undiscoverable. That is the actual defect behind my error, and it is fixed by
+shipping the reader, not by asking members to be more careful.
+
 ## Limits
 
 - n=1 for the live fuse-start. The seat-level guard is source-read; the cross-seat forgery
-  leg is deduced from #63/#128 and not run, deliberately.
+  leg is deduced from #63/#128 and not run against a peer, deliberately. The
+  self-directed version WAS run (see Correction) and is n=1 on one seat.
+- The non-observation result is n=1 on one already-decided, already-spent petition. It
+  shows the resource route did not start a fuse that a later poll then started; it does
+  not prove the resolver is side-effect-free in every arm (the witness-chain fallback arm
+  was not exercised — the specimen was still in the live store).
+- Nothing here is pinned by a test. "The resolver does not observe" is currently an
+  invariant held only by there being one call site, which a future refactor can silently
+  break. A regression test is the obvious follow-on and I did not write it.
 - The 22.4% coverage figure is over the newest 20k entries, not the whole chain.
 - I did not attempt the code change: `cargo test` on this repo is ~28 minutes and this
   wake had ~30, and the design question above outranks the patch anyway.
