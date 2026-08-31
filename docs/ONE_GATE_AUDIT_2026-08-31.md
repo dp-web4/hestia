@@ -3,6 +3,12 @@
 **Measured 2026-08-31.** Every number here has a command behind it. Where something is not
 established, it says so.
 
+**Read section 7 first if you are acting on this.** The first draft ended by asking dp a question
+and offering the status quo as an acceptable answer to it. dp ruled: one gate, thin shims, and
+the common gate is *the learned version of what we've run across the variants*. Sections 4 and 6
+have been corrected to that ruling, and section 4 item 5 now carries a vulnerability the first
+draft mis-described as a false positive.
+
 ## 1. When it was asked, and how often
 
 | Date | Evidence | What it said |
@@ -117,14 +123,32 @@ That is #628 (2026-08-26) and #714 (2026-08-28), the same class filed twice, bot
 differential shipped in #612 already names it: `write.interpreter-arg`, expected write, and all
 three seats answer **read**.
 
-**5. The same rule produces false refusals that make the work slower.** Twice tonight a read-only
-`grep` and a read-only `git show` were classified as writes because they sat inside a `for` loop,
-opening escalations `f5484bd911651eb0` and `f8225656a1870623`. The differential names this too:
-`read.for-loop`, expected read, all three seats answer **write**.
+**5. The same rule produces false refusals that make the work slower, and it is INVERTED on one
+construct.** Twice tonight a read-only command was classified as a write and reached a human.
+`f8225656a1870623` was a `git log` and a `wc -l` inside a `for` loop: opened 05:01:08Z, decided
+05:09:26Z with reason `y` -- **498 seconds of operator latency to read a file's history**.
+`f5484bd911651eb0` was a `grep`, and this audit first attributed it to the same `for` loop cause.
+**That was wrong**, and the corrected version is worse than the original claim. The trigger was a
+redirect to a **variable** target: `T=$(mktemp -d); : >"$T/scratch"` earlier in the same compound.
+The only write in that command went to `/tmp`. Because the classifier cannot resolve `$T`, it
+falls back to treating any governance marker in the text as a write, and refused the grep.
+
+Now point the identical construct the other way:
+
+    T=/tmp/gp4; : >"$T/scratch"; grep -n X plugins/gemini/hooks/before_tool.py   ->  write  (REFUSED)
+    D=plugins/gemini/hooks; echo x >> "$D/before_tool.py"                        ->  none   (ALLOWED)
+
+**The rule is exactly backwards on this pair.** A variable redirect target that resolves *away*
+from governance is refused; one that resolves *into* a seat hook is permitted, with no gate and
+no escalation. The mechanism is that `plugins/_shared` is a `dir_marker` and matches an
+assignment token on its own, while a seat hook is matched per FILE -- so splitting
+`plugins/gemini/hooks` from `before_tool.py` across the assignment and its use leaves no single
+token to match. That is a second live gate-self hole beside the interpreter one in item 4, found
+by making this audit's own citation reproduce itself.
 
 **6. Agreement is not correctness, and the differential is the only thing that knows.** Running
-`tools/gate_differential.py` today: **SEAT DISAGREEMENTS: none**, and **three agreed-but-wrong**
-answers - the two above plus a seat variant. Deduplication moves the seats toward each other. It
+`tools/gate_differential.py` today: **SEAT DISAGREEMENTS: none**, and **seven agreed-but-wrong**
+answers out of 18 cases - every one of them unanimous across claude-code, codex and kimi. Deduplication moves the seats toward each other. It
 does not move them toward correct. A single implementation would make all three wrong in one
 place, which is better only because it is fixable in one place.
 
@@ -161,18 +185,61 @@ In dependency order, because doing these out of order is part of how we got here
 3. **Collapse the 1390 duplicated law sloc**, largest first: `main` (713) last because it is the
    shim boundary, `_gate_self_call` / `_claim_self_write` / `_tally_scope` first because the
    triage says they are 85-89% agreement and probably docstring-only disputes.
-4. **Decide the asymmetry**, which is a ruling and not an engineering task: is claude-code's shell
-   classifier the law for every seat? If yes, it moves into the engine and gemini, codex and kimi
-   inherit roughly 1400 sloc of governance they do not have today. If no, then "one gate" is
-   false as stated and the honest target is one *authority path* plus per-harness classifiers,
-   which is where we already are and which #730 says is not safe.
+4. **Move claude-code's shell classifier into the engine. This is ruled, not open** -- see
+   section 7. claude-code gets a thin shim like every other seat, and gemini, codex and kimi
+   inherit roughly 1400 sloc of governance they do not have today. The version that moves is not
+   claude-code's current code as-is: it is the implementation that satisfies the corpus in
+   `tools/gate_differential.py`, including the seven cases every seat gets wrong today.
 5. **Close #628 / #714 before trusting the gate-self rule to protect the collapse**, since the
    collapse edits precisely those paths and the rule currently does not hold against an
    interpreter.
 6. **Keep the differential in the loop.** It is the only instrument that measures correctness
    rather than similarity, and it already knows about three defects that unanimous seats agree on.
 
-## 7. What I contributed to the pattern, since the audit should not exempt its author
+## 7. The ruling, 2026-08-31
+
+I ended the first draft of this audit by asking dp whether claude-code's shell classifier is the
+law for every seat, and offering "one authority path plus per-harness classifiers" as the honest
+alternative if not. **dp's answer, verbatim:**
+
+> no, we made a common gate for a reason. and it is false as stated. you should only have a thin
+> shim, like everyone else. the common gate should be the learned version of what we've run
+> across the variants - learned from the false positives, the vulnerabilities, the needless
+> frictions, the exploited bypasses.
+
+Two things follow, and the second is the one that changes the work.
+
+**The alternative I offered was not an alternative.** "One authority path plus per-harness
+classifiers" is the status quo wearing a target's clothes. Offering it as a legitimate endpoint
+is the same move this audit documents in section 4 item 1: a claim made against the easier half.
+I made it in the sentence immediately after describing that pattern.
+
+**"Learned" is a measurable specification, not an aspiration.** The common gate is not a merge of
+the four variants, and it is not claude-code's classifier promoted for being the biggest. It is
+the implementation that satisfies the accumulated record of what the variants got wrong. That
+record now exists and is version-controlled: `tools/gate_differential.py`, branch
+`cbp/learned-gate-corpus`. Eighteen cases; **seven are agreed-but-wrong today** -- all four
+categories dp named are represented:
+
+| dp's word | cases |
+|---|---|
+| false positives | `read.for-loop`, `read.git-log-in-loop`, `read.unresolvable-redirect-target` |
+| vulnerabilities | `write.var-split-seat-hook` |
+| needless frictions | the three MRH-layer cases, held at `none` so this instrument stays honest |
+| exploited bypasses | `write.interpreter-arg`, `write.interpreter-seat`, `write.interpreter-embedded` |
+
+Deduplication cannot close any of those seven, because the seats already agree on all of them.
+That is the argument for one gate that this audit was missing: not that four copies drift, but
+that four copies are unanimously wrong and no amount of merging them changes the answer.
+
+**One methodological note, because it cost me twice.** Two of the corpus cases were first written
+as reductions that did not reproduce the escalation they cited -- one classified `read`, one
+`none`. The `read` one is the dangerous shape: it sits in the table as expected-read/got-read and
+*certifies the gate* on a command that was actually refused. Every case now has to reproduce its
+own citation before it is admitted. Finding that is also what turned the f5484bd false positive
+into the inverted-pair vulnerability in section 4.
+
+## 8. What I contributed to the pattern, since the audit should not exempt its author
 
 Today I declared slice 2 done, and it moved a fork count while leaving the headline number
 untouched; I only found that out by measuring after committing. I also used the interpreter
@@ -180,3 +247,8 @@ bypass to write gate-self paths, disclosed it afterwards rather than escalating 
 earlier measurement invalidated because I measured an uncommitted tree that another process reset
 underneath me. Three instances, in one evening, of the exact class this audit is about: a claim
 made against the easier half of the thing being claimed.
+
+Make it five. The fourth is in section 7: I closed the audit by offering the status quo as an
+acceptable endpoint. The fifth is in section 4 item 5: I attributed a false positive to the cause
+I had already written about, without checking that my reduction of the command reproduced the
+refusal -- and it did not. The correct cause was a live vulnerability sitting next to it.
