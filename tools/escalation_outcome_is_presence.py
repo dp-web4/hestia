@@ -46,6 +46,18 @@ OPENED = "gate_escalation_opened"
 DECIDED = "gate_escalation_decided"
 EXPIRED = "gate_escalation_expired"
 CLAIMED = "gate_escalation_claimed"
+#: TERMINAL STATES THIS DRIVER ORIGINALLY MISSED (corrected 2026-08-31, same day).
+#: The first version knew only decided/expired and scored `withdrawn` as "no terminal
+#: event at all" -- folding an asker's deliberate exit into the same bucket as a record
+#: nobody ever looked at. They are opposite things: one is a voice, one is a silence.
+WITHDRAWN = "gate_escalation_withdrawn"
+ARBITER_REFUSED = "gate_escalation_arbiter_refused"
+#: AND THE BIG ONE. `factors_present` on a `decided` row lists only the factors that were
+#: in front of the decider AT DECISION TIME. Peer factors that land afterwards are their
+#: own event class and never appear there, so a fold over `factors_present` answers
+#: "how much review informed the verdict" while LOOKING like it answers "how much review
+#: happened". Measured over this span the two differ by 6x: 32 vs 196. Counted separately.
+CORROBORATED = "gate_escalation_corroborated"
 TTL_SECS = 3600  # core/src/server/gate_escalation.rs:109 DEFAULT_TTL_SECS
 
 
@@ -71,6 +83,8 @@ def main(argv=None):
 
     chain = ChainWalker()
     opened, decided, expired, claimed = {}, {}, {}, {}
+    withdrawn, refused = {}, {}
+    corroborations = collections.defaultdict(list)
     hops = 0
     span_new = span_old = None
     kinds = collections.Counter()
@@ -82,7 +96,8 @@ def main(argv=None):
         if t:
             span_new = span_new or t
             span_old = t
-        if et not in (OPENED, DECIDED, EXPIRED, CLAIMED):
+        if et not in (OPENED, DECIDED, EXPIRED, CLAIMED, WITHDRAWN,
+                      ARBITER_REFUSED, CORROBORATED):
             continue
         kinds[et] += 1
         p = payload(entry)
@@ -91,8 +106,12 @@ def main(argv=None):
             continue
         rec = dict(p)
         rec["_at"] = t
+        if et == CORROBORATED:
+            corroborations[e].append(rec)
+            continue
         # tip-first walk: keep the OLDEST sighting of each id per kind
-        {OPENED: opened, DECIDED: decided, EXPIRED: expired, CLAIMED: claimed}[et][e] = rec
+        {OPENED: opened, DECIDED: decided, EXPIRED: expired, CLAIMED: claimed,
+         WITHDRAWN: withdrawn, ARBITER_REFUSED: refused}[et][e] = rec
 
     newest = ts(span_new) or 0.0
 
@@ -100,12 +119,13 @@ def main(argv=None):
     for e, o in opened.items():
         t0 = ts(o.get("_at"))
         d = decided.get(e)
-        x = expired.get(e)
         term, t1 = None, None
-        if d:
-            term, t1 = "decided", ts(d.get("_at"))
-        elif x:
-            term, t1 = "expired_witnessed", ts(x.get("_at"))
+        for src, label in ((d, "decided"), (withdrawn.get(e), "withdrawn"),
+                           (expired.get(e), "expired_witnessed"),
+                           (refused.get(e), "arbiter_refused")):
+            if src:
+                term, t1 = label, ts(src.get("_at"))
+                break
         rows.append({
             "escalation_id": e,
             "opened_at": o.get("_at"),
@@ -131,6 +151,25 @@ def main(argv=None):
     unruled = [r for r in mature if r["terminal"] is None]
     ruled = [r for r in mature if r["terminal"] == "decided"]
     lapsed = [r for r in mature if r["terminal"] == "expired_witnessed"]
+    pulled = [r for r in mature if r["terminal"] == "withdrawn"]
+
+    # WHEN did peer review arrive, relative to the verdict it was meant to inform?
+    c_before = c_after = c_never = 0
+    lateness = []
+    for e, cs in corroborations.items():
+        d = decided.get(e)
+        for c in cs:
+            tc = ts(c.get("_at"))
+            if not d or tc is None:
+                c_never += 1
+                continue
+            td = ts(d.get("_at"))
+            if tc <= td:
+                c_before += 1
+            else:
+                c_after += 1
+                lateness.append(tc - td)
+    lateness.sort()
 
     # The bimodality test, on RULED rows only -- the ones a peer could in principle reach.
     buckets = collections.Counter()
@@ -159,6 +198,13 @@ def main(argv=None):
         "mature": len(mature),
         "ruled": len(ruled),
         "lapsed_witnessed_expiry": len(lapsed),
+        "withdrawn_by_asker": len(pulled),
+        "corroboration_events": sum(len(v) for v in corroborations.values()),
+        "escalations_touched_by_a_peer": len(corroborations),
+        "factors_before_the_ruling": c_before,
+        "factors_AFTER_the_ruling": c_after,
+        "factors_on_never_ruled": c_never,
+        "median_lateness_secs": (lateness[len(lateness) // 2] if lateness else None),
         "unruled_no_terminal_event": len(unruled),
         "dt_buckets_for_ruled": dict(buckets),
         "ruled_claimed": sum(1 for r in ruled if r["claimed"]),
@@ -188,6 +234,7 @@ def main(argv=None):
     print()
     print(f"  ruled (decided event)       : {len(ruled)}")
     print(f"  lapsed (expired event)      : {len(lapsed)}")
+    print(f"  withdrawn by the asker      : {len(pulled)}")
     print(f"  NO terminal event at all    : {len(unruled)}")
     print()
     print("secs_into_window at decision, RULED rows only (daemon field):")
@@ -207,6 +254,15 @@ def main(argv=None):
     print(f"factor authors                  : {out['factor_authors']}")
     print(f"ruled rows with a PEER factor   : {out['ruled_with_a_peer_factor']} / {len(ruled)}")
     print(f"ruled rows ever CLAIMED         : {out['ruled_claimed']} / {len(ruled)}")
+    print()
+    print("PEER REVIEW, counted as its own event class (not via factors_present):")
+    print(f"  corroboration events          : {out['corroboration_events']}"
+          f" on {out['escalations_touched_by_a_peer']} escalations")
+    print(f"  in front of the decider       : {out['factors_before_the_ruling']}")
+    _med = out["median_lateness_secs"]
+    print(f"  landed AFTER the ruling       : {out['factors_AFTER_the_ruling']}"
+          + (f"  (median {_med:.0f}s late)" if _med is not None else ""))
+    print(f"  on escalations never ruled    : {out['factors_on_never_ruled']}")
     return 0
 
 
