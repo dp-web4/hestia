@@ -170,7 +170,7 @@ Stated so that nobody reads this document as a description of the present.
 - **The gate-self rule does not hold against an interpreter** (#628, #714, both open). It was
   bypassed on 2026-08-31 with no escalation, by a script whose argv named no governance path.
 - **False positives are live and costed**: two escalations on 2026-08-31 alone, both for
-  read-only commands. `f8225656a1870623` was a `git log` and a `wc -l` inside a `for` loop —
+  read-only commands. `f8225656a1870623` was a `git log` and a `wc -l` inside a `for` loop -
   opened 05:01:08Z, decided 05:09:26Z with reason `y`, **498 seconds of operator latency to read
   a file's history**. `f5484bd911651eb0` was a `grep`, and the first draft of this document
   attributed it to the same cause. That was wrong: there was no control-flow construct. The
