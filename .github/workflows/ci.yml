@@ -320,19 +320,20 @@ jobs:
           # engine. This number may not rise.
           #
           # --max-verbatim-forked counts copies that are character-for-character
-          # the engine's. They are real debt but cannot diverge, and they are
-          # the UNAVOIDABLE middle of a move: a seat imports the shared module
-          # from the INSTALLED path, so publishing and deleting in one release
-          # would leave installed hosts with neither until the next deploy. The
-          # 16 are claude-code's shell classifier, published by this PR and
-          # deleted in the follow-on. Pinned, not exempted -- edit one and it
-          # re-grades DIVERGENT and blows the pin above.
+          # the engine's. It is 0 and stays 0. It briefly stood at 16 to admit
+          # claude-code's shell classifier while a two-step move published it
+          # before deleting it; that transition was wrong. A move publishes and
+          # deletes in ONE act, and the deploy-order problem it was working
+          # around got fixed instead (install-members.sh now repoints
+          # $HESTIA_HOME/shared BEFORE writing any hook, so a hook can never be
+          # newer than the engine it imports). Duplicate law is not preserved to
+          # accommodate the deploy mechanism.
           #
           # --max-pct is still the number that actually matters and still
           # depends on a published vocabulary, so it is arguable -- which is a
           # reason to print it every run, not a reason to leave it unpinned.
           python3 tools/gate_collapse_meter.py \
-            --max-divergent-forked 4 --max-verbatim-forked 16 --max-pct 67.5
+            --max-divergent-forked 4 --max-verbatim-forked 0 --max-pct 52.2
 
       - name: Do the forked predicates actually disagree with the engine?
         run: |
