@@ -788,6 +788,34 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
 # than a plausible default attributing its acts to somebody else.
 
 
+def role_bridge(*, snapshot_role, identity_path):
+    """Attribution-only: the role string that witnesses and connects carry. Never used to
+    widen reach.
+
+    Resolution order, unchanged from the seat-local copies this replaces: the daemon's
+    session-resolved role (`hestia_operating_law` identity.role) wins when the snapshot
+    answered, because the alternative is a member-writable file deciding attribution. The
+    identity.json read remains ONLY as the daemon-absent fallback, where the alternative is
+    silently changing the witness grain mid-train.
+
+    `snapshot_role` and `identity_path` are REQUIRED and keyword-only, for the reason slice 1
+    established on `emit_attestation`: in the seat-local copies both were closed over from
+    module scope, so the identity a witness carried was decided by which file the function
+    happened to live in. Making them arguments is what lets one body serve every seat.
+    Keyword-only is what stops them being passed in the wrong order, since a path and a role
+    are both strings and a silent swap would attribute a witness to a filename.
+    """
+    if isinstance(snapshot_role, str) and snapshot_role.startswith("role:"):
+        return snapshot_role
+    try:
+        r = json.load(open(identity_path, encoding="utf-8")).get("role")
+        if isinstance(r, str) and r.startswith("role:"):
+            return r
+    except Exception:
+        pass
+    return "role:constellation:member"
+
+
 def emit_attestation(allows, denies, *, plugin_id, role_lct, endpoint=None):
     """Attest this gate's effective scope to the daemon, best effort.
 

@@ -178,7 +178,7 @@ READ_CLASS = _core.READ_CLASS if _core is not None else frozenset()
 # cutover: standing scope, egress, and command/path scoping are ALL decided inside the
 # core's evaluate(), from a policy snapshot fetched LIVE from the daemon (the mechanism's
 # fetch_policy_snapshot) — or by the core's ratified degraded_verdict when the daemon is
-# unreachable. The only bridge left shim-side is _role_bridge (attribution only), fed from
+# unreachable. The attribution bridge now lives in the shared engine (role_bridge), fed from
 # the snapshot when the daemon answers. READ_CLASS stays core-sourced (§7.1(1)).
 
 # ── Sprint F (§6.F): _agent_scopes deleted — standing scope now arrives inside
@@ -191,26 +191,6 @@ READ_CLASS = _core.READ_CLASS if _core is not None else frozenset()
 
 
 _SNAPSHOT_ROLE = None  # set by main() from the live daemon snapshot (identity.role)
-
-
-def _role_bridge():
-    """Attribution-only: the role string that witnesses/connects carry. Never used to widen
-    reach. Sprint F: RESOLVED from the live snapshot when the daemon answered — the
-    daemon's session-resolved role (hestia_operating_law identity.role) wins over the
-    member-writable identity.json; the file read remains ONLY as the daemon-absent
-    fallback for witness attribution, where the alternative is silently changing the
-    witness grain mid-train.
-    # SPRINT-F: replace with certified snapshot — PARTIAL: resolved when the daemon
-    # answers; the identity.json fallback stays for the unreachable case (F_NOTES.md)."""
-    if isinstance(_SNAPSHOT_ROLE, str) and _SNAPSHOT_ROLE.startswith("role:"):
-        return _SNAPSHOT_ROLE
-    try:
-        r = json.load(open(IDENTITY, encoding="utf-8")).get("role")
-        if isinstance(r, str) and r.startswith("role:"):
-            return r
-    except Exception:
-        pass
-    return "role:constellation:member"
 
 
 # ── Sprint F (§6.F): _launch_scope_bridge deleted — the per-launch cwd grant is computed
@@ -346,7 +326,7 @@ def _tally_scope(allowed: bool):
         if t["allows"] + t["denies"] >= SCOPE_ATTEST_EVERY:
             _load_mechanism().emit_attestation(
                 t["allows"], t["denies"],
-                plugin_id=HESTIA_PLUGIN_ID, role_lct=_role_bridge())
+                plugin_id=HESTIA_PLUGIN_ID, role_lct=_load_mechanism().role_bridge(snapshot_role=_SNAPSHOT_ROLE, identity_path=IDENTITY))
             t = {"allows": 0, "denies": 0}
         json.dump(t, open(_TALLY, "w"))
     except Exception:
@@ -462,7 +442,7 @@ def _gate_self_call(tool, args, host_session_id=None):
         post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, h, 0.4)
         connect_args = {"plugin_id": HESTIA_PLUGIN_ID,
                         "host_agent": HESTIA_PLUGIN_ID,
-                        "role": _role_bridge(),
+                        "role": _load_mechanism().role_bridge(snapshot_role=_SNAPSHOT_ROLE, identity_path=IDENTITY),
                         "instance_name": "gate-self"}
         if host_session_id:
             connect_args["host_session_id"] = host_session_id
@@ -496,7 +476,7 @@ def _witness_gate_self(event_type, marker, tool_name, rule=None):
                        "rule": rule,
                        "gate_path": os.path.abspath(__file__),
                        "severity": "record" if event_type == "gate_self_read" else "escalate",
-                       "role_lct": _role_bridge()}},
+                       "role_lct": _load_mechanism().role_bridge(snapshot_role=_SNAPSHOT_ROLE, identity_path=IDENTITY)}},
         host_session_id=_EVENT.get("session_id")) is not None
 
 
@@ -512,7 +492,7 @@ def _claim_self_write(marker, tool_name, attempted):
     through."""
     claim_args = {
         "plugin_id": HESTIA_PLUGIN_ID,
-        "role": _role_bridge(),
+        "role": _load_mechanism().role_bridge(snapshot_role=_SNAPSHOT_ROLE, identity_path=IDENTITY),
         "tool_name": tool_name,
         "marker": marker,
         # `reason` carries the ATTEMPTED ACT, not a rationale: an auto-opened escalation HAS no
