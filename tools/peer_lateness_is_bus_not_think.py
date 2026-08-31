@@ -100,9 +100,46 @@ def pct(v, q):
     return s[min(len(s) - 1, int(q * len(s)))]
 
 
-def load_wakes():
+#: A WAKE RECORD IS NOT CAPACITY. The watcher names the record for the instant it FIRED,
+#: before the agent runs. If the agent then dies -- out of credits, usage limit, overload
+#: -- the record exists and the member could not have filed anything. Measured rate
+#: (`dead_wakes_are_not_availability.py`): codex 39.7%, kimi 26.8%, claude 3.9% of all
+#: wakes. Those are not rare enough to ignore.
+#:
+#: DIRECTION OF THE ERROR, so the correction can be read without re-deriving it. W is the
+#: LATEST wake start <= t_factor. Dead wakes only ADD candidate starts, so including them
+#: can only move W LATER, never earlier. BUS = W - t_open is therefore OVERSTATED and
+#: THINK = t_factor - W UNDERSTATED by the published run. The correction moves latency
+#: from BUS to THINK -- i.e. AGAINST the transport remedy and IN FAVOUR of this driver's
+#: own conclusion. That is exactly the direction that obliges stating it.
+#:
+#: `--live-wakes-only` is OFF by default so the published numbers stay reproducible.
+DEAD_MARKERS = ("out of credits", "usage limit", "quota exceeded", "rate limit",
+                "overloaded")
+ECHO_DELIM = "end previous-wake-final-output"
+
+
+def wake_died(path):
+    """True if THIS wake's own output carries a failure marker.
+
+    Positional, not a plain substring test: each record embeds the PREVIOUS wake's final
+    output, so a healthy wake following a dead one contains the death message. Only the
+    text after the last delimiter was produced by this wake.
+    """
+    try:
+        with open(path, "r", errors="replace") as fh:
+            low = fh.read().lower()
+    except OSError:
+        return False
+    cut = low.rfind(ECHO_DELIM)
+    tail = low[cut + len(ECHO_DELIM):] if cut >= 0 else low
+    return any(m in tail for m in DEAD_MARKERS)
+
+
+def load_wakes(live_only=False):
     """member -> sorted list of wake-start epochs, from record FILENAMES (local tz)."""
     wakes = collections.defaultdict(list)
+    dropped = collections.Counter()
     for fn in os.listdir(WAKE_DIR):
         m = NAME_RE.match(fn)
         if not m:
@@ -110,10 +147,16 @@ def load_wakes():
         member = SEAT_TO_MEMBER.get(m.group("seat"))
         if not member:
             continue
+        if live_only and wake_died(os.path.join(WAKE_DIR, fn)):
+            dropped[member] += 1
+            continue
         dt = datetime.strptime(m.group("d") + m.group("t"), "%Y%m%d%H%M%S")
         wakes[member].append(dt.timestamp())     # naive -> local -> epoch
     for v in wakes.values():
         v.sort()
+    if live_only:
+        print("dead wakes excluded from the clock: %s"
+              % (dict(dropped) or "none"), file=sys.stderr)
     return wakes
 
 
@@ -128,9 +171,13 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--max-hops", type=int, default=60000)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--live-wakes-only", action="store_true",
+                    help="drop wakes whose own output shows the agent died "
+                         "(out of credits / usage limit / overload). OFF by "
+                         "default so the published run stays reproducible.")
     args = ap.parse_args(argv)
 
-    wakes = load_wakes()
+    wakes = load_wakes(live_only=args.live_wakes_only)
     chain = ChainWalker()
     opened, decided = {}, {}
     factors = {}
