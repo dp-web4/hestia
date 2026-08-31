@@ -374,40 +374,40 @@ fn deployment_update_status(
             Some("deployment update status has an invalid timestamp".into()),
         );
     };
-    let age = chrono::Utc::now()
+    let age_secs = chrono::Utc::now()
         .signed_duration_since(updated.with_timezone(&chrono::Utc))
-        .num_minutes();
+        .num_seconds();
     let target_note = if supervisor_target.is_empty() {
         String::new()
     } else {
         format!(" toward {supervisor_target}")
     };
     match state {
-        "requested" if (0..=420).contains(&age) => (
+        "requested" if (0..=420 * 60).contains(&age_secs) => (
             true,
             "requested".into(),
             request_id,
             Some("deployment update requested; waiting for the supervisor".into()),
         ),
-        "held" if (0..=420).contains(&age) => (
+        "held" if (0..=420 * 60).contains(&age_secs) => (
             true,
             "held".into(),
             request_id,
             Some("deployment update is queued behind an active operator hold".into()),
         ),
-        "running" if (0..=60).contains(&age) => (
+        "running" if (0..=60 * 60).contains(&age_secs) => (
             true,
             "running".into(),
             request_id,
             Some(format!("deployment supervisor is updating this installation{target_note}")),
         ),
-        "failed" if (0..=420).contains(&age) => (
+        "failed" if (0..=420 * 60).contains(&age_secs) => (
             true,
             "failed".into(),
             request_id,
             Some("last deployment update failed; the previous working deployment remains in force".into()),
         ),
-        "succeeded" if (0..=420).contains(&age) => (
+        "succeeded" if (0..=420 * 60).contains(&age_secs) => (
             true,
             "failed".into(),
             request_id,
@@ -1611,6 +1611,34 @@ mod tests {
         let current = deployment_health_from_path(Some(&manifest));
         assert_eq!(current.state, "current");
         assert_eq!(current.current_build.as_deref(), Some(running));
+    }
+
+    #[test]
+    fn deployment_update_status_projects_supervisor_states_without_inventing_success() {
+        if !(cfg!(target_os = "linux") || cfg!(target_os = "macos")) {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let manifest = dir.path().join("current-build.json");
+        std::fs::write(&manifest, r#"{"build_id":"authority-build"}"#).unwrap();
+        let status = dir.path().join("deploy-status.tsv");
+        let now = chrono::Utc::now();
+        for (wire, expected) in [("requested", "requested"), ("held", "held"), ("running", "running"), ("failed", "failed"), ("succeeded", "failed")] {
+            std::fs::write(&status, format!("{wire}\treq-1\ttarget-build\t{}\n", now.to_rfc3339())).unwrap();
+            let health = deployment_health_from_path(Some(&manifest));
+            assert_eq!(health.state, "stale");
+            assert_eq!(health.update_state, expected, "wire state {wire}");
+            assert_eq!(health.update_request_id.as_deref(), Some("req-1"));
+        }
+        std::fs::write(&status, format!("running\treq-future\ttarget-build\t{}\n", (now + chrono::Duration::seconds(30)).to_rfc3339())).unwrap();
+        let future = deployment_health_from_path(Some(&manifest));
+        assert_eq!(future.state, "stale");
+        assert_eq!(future.update_state, "failed");
+        std::fs::write(&manifest, format!(r#"{{"build_id":"{}"}}"#, env!("HESTIA_GIT_VERSION"))).unwrap();
+        let health = deployment_health_from_path(Some(&manifest));
+        assert_eq!(health.state, "current");
+        assert_eq!(health.update_state, "idle");
+        assert!(health.update_request_id.is_none());
     }
 
     #[test]

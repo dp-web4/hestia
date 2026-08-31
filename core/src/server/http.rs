@@ -620,6 +620,20 @@ fn deployment_update_authority() -> std::result::Result<(std::path::PathBuf, Str
     Ok((home.to_path_buf(), target.to_string()))
 }
 
+fn create_deployment_update_request(
+    path: &std::path::Path,
+    contents: &str,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
 fn write_deployment_update_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
     std::fs::write(&tmp, contents)?;
@@ -637,12 +651,12 @@ fn active_deployment_update(path: &std::path::Path) -> Option<(String, String)> 
         return None;
     }
     let updated = chrono::DateTime::parse_from_rfc3339(fields[3]).ok()?;
-    let age = chrono::Utc::now()
+    let age_secs = chrono::Utc::now()
         .signed_duration_since(updated.with_timezone(&chrono::Utc))
-        .num_minutes();
+        .num_seconds();
     let active = match fields[0] {
-        "running" => (0..=60).contains(&age),
-        "requested" | "held" => (0..=420).contains(&age),
+        "running" => (0..=60 * 60).contains(&age_secs),
+        "requested" | "held" => (0..=420 * 60).contains(&age_secs),
         _ => false,
     };
     active.then(|| (fields[0].to_string(), fields[1].to_string()))
@@ -784,21 +798,9 @@ async fn operator_deployment_update(
         );
     };
 
-    let requested_at = chrono::Utc::now().to_rfc3339();
-    let request_record = format!("{request_id}\n");
-    let status_record = format!("requested\t{request_id}\t\t{requested_at}\n");
-    if let Err(error) = write_deployment_update_file(&request_path, &request_record)
-        .and_then(|_| write_deployment_update_file(&status_path, &status_record))
-    {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "status": "update_unavailable",
-                "error": format!("cannot publish deployment update request: {error}"),
-            })),
-        );
-    }
-
+    // SELF-WITNESS BEFORE SIDE EFFECT. The operator middleware witnesses authorization, but
+    // this record binds the specific request id + deployment evidence. If the chain cannot
+    // accept it, there is no supervisor request file and therefore no deployment act.
     {
         let mut s = state.lock().await;
         let record = super::operator_auth::attach_operator_provenance(
@@ -812,7 +814,76 @@ async fn operator_deployment_update(
             }),
             provenance.as_ref(),
         );
-        let _ = s.append_chain("deployment_update_requested", record);
+        if let Err(error) = s.append_chain("deployment_update_request_intent", record) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "failed",
+                    "error": format!("cannot witness deployment update request: {error}"),
+                })),
+            );
+        }
+    }
+
+    let requested_at = chrono::Utc::now().to_rfc3339();
+    let request_record = format!("{request_id}\n");
+    let status_record = format!("requested\t{request_id}\t\t{requested_at}\n");
+    match create_deployment_update_request(&request_path, &request_record) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "requested",
+                    "message": "another deployment update request is already queued",
+                })),
+            );
+        }
+        Err(error) => {
+            let mut s = state.lock().await;
+            let _ = s.append_chain(
+                "deployment_update_publish_failed",
+                super::operator_auth::attach_operator_provenance(
+                    serde_json::json!({
+                        "request_id": request_id,
+                        "operator": operator,
+                        "outcome": "not-published",
+                        "error": error.to_string(),
+                    }),
+                    provenance.as_ref(),
+                ),
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "update_unavailable",
+                    "error": format!("cannot publish deployment update request: {error}"),
+                })),
+            );
+        }
+    }
+    if let Err(error) = write_deployment_update_file(&status_path, &status_record) {
+        let _ = std::fs::remove_file(&request_path);
+        let mut s = state.lock().await;
+        let _ = s.append_chain(
+            "deployment_update_publish_failed",
+            super::operator_auth::attach_operator_provenance(
+                serde_json::json!({
+                    "request_id": request_id,
+                    "operator": operator,
+                    "outcome": "not-published",
+                    "error": error.to_string(),
+                }),
+                provenance.as_ref(),
+            ),
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "failed",
+                "error": format!("cannot publish deployment update status: {error}"),
+            })),
+        );
     }
 
     let trigger_for_run = trigger.clone();
@@ -906,6 +977,30 @@ mod deployment_update_tests {
     #[test]
     fn unsupported_platform_has_no_shell_fallback() {
         assert_eq!(deployment_update_trigger_for("windows", None), None);
+    }
+
+    #[test]
+    fn deployment_update_request_file_is_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deploy-update.request");
+        create_deployment_update_request(&path, "first\n").unwrap();
+        let second = create_deployment_update_request(&path, "second\n")
+            .expect_err("a second request must not overwrite the queued request id");
+        assert_eq!(second.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "first\n");
+    }
+
+    #[test]
+    fn active_update_status_rejects_expired_and_future_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deploy-status.tsv");
+        let now = chrono::Utc::now();
+        std::fs::write(&path, format!("running\treq-now\ttarget\t{}\n", now.to_rfc3339())).unwrap();
+        assert_eq!(active_deployment_update(&path), Some(("running".into(), "req-now".into())));
+        std::fs::write(&path, format!("running\treq-old\ttarget\t{}\n", (now - chrono::Duration::minutes(61)).to_rfc3339())).unwrap();
+        assert_eq!(active_deployment_update(&path), None);
+        std::fs::write(&path, format!("running\treq-future\ttarget\t{}\n", (now + chrono::Duration::seconds(30)).to_rfc3339())).unwrap();
+        assert_eq!(active_deployment_update(&path), None);
     }
 }
 
