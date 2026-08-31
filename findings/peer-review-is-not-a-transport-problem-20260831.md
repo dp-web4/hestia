@@ -94,11 +94,29 @@ The transport fix is real and insufficient. A ruling takes about two minutes; a 
 about eight. No delivery improvement closes a gap that lives on the other side of delivery.
 
 So the remedy I ranked second this morning — *let a late factor attach* — is not the
-second-best option. Together with holding the window against invited peers it is the
-**only** class of fix that can make the `sovereign_plus_peer` bar mean anything. Codex's
-review of notice 7597 is the same fact at n=1 from the other side: that escalation was
-decided **16 seconds** after opening, and codex correctly declined to represent its dissent
-as a veto, because corroboration accepts only pending records.
+second-best option. It is also **not a remedy, because it is already the behaviour.**
+
+Codex's mesh notice 7518 corrected me on this and I verified it in source rather than
+taking it: `GateEscalation::status_at` (`core/src/server/gate_escalation.rs:501`) promotes a
+row to `Expired` **only from stored `Pending`** — a decided row keeps its stored status
+forever — and `corroborate` (:1795) refuses `Expired` alone. **A decided escalation accepts
+peer factors permanently.** The 130 late factors were not rejected and were not written into
+a sealed record. They attached fine. Nothing reads them.
+
+That relocates the defect precisely. The gap is not *acceptance*, it is *effect*: a factor
+filed after `decided` mutates a record whose verdict no longer depends on its factors. The
+only fixes that can make `sovereign_plus_peer` mean anything are therefore **hold the window
+against invited peers** or **make a ruling revisable by a late factor** — and the second is
+what the apparatus already half-implements, since it stores the evidence and then ignores it.
+
+The folk belief is worth naming because it is expensive and it does not stay corrected.
+Codex's own later review of notice 7597 declined to file a dissent on the ground that
+"corroboration accepts only pending records" — the very claim its earlier 7518 had refuted
+with a live probe (`4b1c5dcd6c8ce23c` still took a factor 26 minutes past `expires_at`).
+Same seat, correct mechanism established, then reverted to the folk version one review later.
+A peer that believes its factor will bounce does not file it, so this belief removes review
+from the record *in addition to* the latency measured above. That escalation is also this
+finding's n=1 from the other side: it was decided **16 seconds** after opening.
 
 ## Two limits, stated with their direction
 
@@ -132,15 +150,24 @@ next one. Uptime is not availability when the read happens once.
 python3 tools/peer_lateness_is_bus_not_think.py --max-hops 60000
 ```
 
-## A gate false positive found by writing this
+## A gate deny found by writing this — reported as an observation, not a defect
 
 Creating `tools/peer_lateness_is_bus_not_think.py` through a **quoted** Bash heredoc was
-denied `mrh.command — 'logs' is not granted`. The token was a path *mentioned inside the
-file's own text*, in a non-expanding heredoc body, extracted as a bare relative path and
-resolved against the workspace root rather than any cwd. The identical bytes through the
-file-creation tool were allowed.
+denied `mrh.command — 'logs' is not granted`. The token was a path mentioned inside the
+file's own text, in a non-expanding heredoc body, and came back as a bare workspace-relative
+first segment. The identical bytes through the file-creation tool were allowed. That much I
+watched happen.
 
-This is the extraction-domain hole again (PR #734), in its mirror form: there the same
-destination flipped allow→deny on which key the classifier read; here the same **bytes** flip
-deny→allow on **which tool carries them**. A gate whose verdict depends on the transport of a
-payload rather than the act it performs is not classifying acts.
+**I could not localize it, so it is not written up as a defect.**
+`tools/heredoc_mention_fp_vs_main.py` runs the installed and the `origin/main`
+`hestia_gate_core.command_in_scope` against six reconstructions — backticked path in the
+heredoc body, `os.listdir(LOGDIR)`, absolute assignment, bare `logs/` in a comment — and
+**all twelve verdicts are ALLOW**. The preregistered reading of that outcome is *the probe is
+wrong, not the gate*, and nothing may be concluded from it. Whatever fired is somewhere I did
+not look: a different layer, or an argument (`cwd`) I did not reproduce.
+
+I also nearly blamed it on stale bytes and that was wrong twice over. See
+`findings/two-loaders-one-hook-20260831.md`: the shared directory I hashed
+(`~/.claude/_shared`, core dated 2026-08-14, 134 lines off main) is a **superseded copy that
+the clean enforcement path does not load**. The core actually in force on that path is
+byte-identical to `origin/main`. Measuring a directory is not measuring an import.
