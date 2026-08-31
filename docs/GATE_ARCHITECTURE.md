@@ -157,8 +157,9 @@ therefore carries its own release bar, and no bar may be reported as covering an
 
 Stated so that nobody reads this document as a description of the present.
 
-- **67.5% of law-bearing code is still per-seat**: 3202 sloc across four seats against 1539
-  shared. claude-code holds 1654 of it, gemini 233.
+- **67.3% of law-bearing code is still per-seat**: 3166 sloc across four seats against 1539
+  shared. claude-code holds 1618 of it, gemini 233. This is the post-#745 measurement; removing
+  the legacy fallback improved the number without changing the 0% target.
 - **claude-code carries the shell command classifier** that the others do not: roughly sixteen
   functions deciding read from write. Under this architecture it moves into the gate.
 - **gemini carries four second implementations** of predicates the engine already owns

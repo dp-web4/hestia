@@ -1,7 +1,10 @@
 # One gate for all: audit of a request that is 7 weeks old and 67.5% unfinished
 
 **Measured 2026-08-31.** Every number here has a command behind it. Where something is not
-established, it says so.
+established, it says so. The table below records the pre-#745 baseline at the time of the audit.
+After #745 removed the legacy fail-open path later the same day, the same meter reports 3166
+per-seat SLOC against 1539 shared, or 67.3%. The historical 67.5% measurement remains the baseline
+for the attempt described here; `GATE_ARCHITECTURE.md` carries the current distance.
 
 **Read section 7 first if you are acting on this.** The first draft ended by asking dp a question
 and offering the status quo as an acceptable answer to it. dp ruled: one gate, thin shims, and
