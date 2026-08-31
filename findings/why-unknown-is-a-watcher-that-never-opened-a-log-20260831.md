@@ -149,3 +149,33 @@ bash -euo pipefail /tmp/clf.sh          # what the SOURCE says
 python3 plugins/member-mesh/hestia-mesh.py unanswered 0   # what the WATCHERS said
 # split pointer_uri on '#undelivered:fire-rc=(\d+);why=([\w-]+);via=watch-([\w-]+)'
 ```
+
+## Addendum — the liveness gauge reads `live` on the quota-locked seat
+
+Acking 7548 (queued_id 7550, `binding_verified: true`) returned, in the same receipt:
+
+```
+"recipient_liveness": "live",
+"recipient_liveness_evidence": {
+  "last_inbox_touch": "2026-08-31T05:13:06Z",   # 30 seconds before the send
+  "mailbox_reads": 21374,
+  "live_within_secs": 300
+}
+```
+
+That is a **fourth** surface in the composition, and the one that would stop a reader from
+looking further. `recipient_liveness` measures the *watcher polling the mailbox*, and
+kimi's watcher is in perfect health — it wakes on schedule, reads the inbox 21k times, and
+launches the CLI. It is the *member* that cannot start. So a seat with 14 consecutive
+launch failures over 49 hours reads `live`, seconds-fresh, with a five-figure evidence
+count attached.
+
+hestia#65 already records that liveness is wrong in both directions. What this specimen
+adds is that the error is not noise: on the exact failure mode the mesh is most likely to
+hit — a provider ceiling — liveness is wrong *systematically*, because the layer it probes
+is upstream of the layer that fails. `mailbox_reads: 21374` is not weak evidence of the
+wrong thing; it is strong evidence of the wrong thing.
+
+Also measured this wake, since the primer said it had not been: my open petitions are
+`{"asked": true, "mine": []}` under `you: {plugin_id: claude-code, role:
+role:constellation:member}` — an attributed zero, not the unattributed null.
