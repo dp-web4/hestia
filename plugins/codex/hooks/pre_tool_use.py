@@ -28,6 +28,11 @@ Defense-in-depth, because no single layer covers everything on Codex:
     container that exposes only granted repos is the real read-confinement fix (future).
 This gate is the shell/edit/MCP-command layer: scope + egress + society-safety, fail-closed.
 
+ENGINE AUTHORITY: runtime law is loaded only from `$HESTIA_SHARED_DIR` when explicitly set,
+otherwise from `$HESTIA_HOME/shared` (default `~/.hestia/shared`). The repository working
+tree is never an implicit runtime fallback. A missing installed engine is a fail-closed
+misdeployment, not permission to execute branch-dependent law.
+
 Three gates, in order (Sprint F: self-protection first, then the ONE decision, then society):
   1c. SELF-PROTECTION (Sprint B): a write whose DESTINATION is the governance closure is
      refused and escalated pre-daemon (a pre-existing human approval is claimed and spent —
@@ -95,11 +100,16 @@ def _load_mechanism():
 
     Raises on failure — each CALLER decides the fail posture (Gate 2 fails closed on a
     consequential act; the witness path falls back to the diagnostic log)."""
-    for cand in (os.path.join(WORKSPACE, "hestia", "plugins", "_shared"),
-                 os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                              "_shared")):
-        if os.path.isdir(cand) and cand not in sys.path:
-            sys.path.insert(0, cand)
+    shared = os.environ.get("HESTIA_SHARED_DIR") or os.path.join(
+        os.path.expanduser(os.environ.get("HESTIA_HOME", "~/.hestia")), "shared")
+    required = os.path.join(shared, "hestia_gate_mechanism.py")
+    if not os.path.isfile(required):
+        raise ImportError(
+            "installed Hestia shared engine is unavailable at "
+            f"{shared!r}; run deploy/install-members.sh"
+        )
+    if shared not in sys.path:
+        sys.path.insert(0, shared)
     import hestia_gate_mechanism
     return hestia_gate_mechanism
 
@@ -114,13 +124,10 @@ CODEX_HOME = os.path.expanduser("~/.codex")
 # it). GUARDED: this engine fails OPEN on a hook error, so a missing/broken module must
 # not disarm the layer — _CLOSURE_FLOOR is the Tier-2 fallback (deny writes touching the
 # literal floor, allow reads), per the ratified degraded-mode semantics.
-for _shared_cand in (
-    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__)))), "_shared"),
-    os.path.join(WORKSPACE, "hestia", "plugins", "_shared"),
-):
-    if os.path.isdir(_shared_cand) and _shared_cand not in sys.path:
-        sys.path.insert(0, _shared_cand)
+_SHARED_RUNTIME = os.environ.get("HESTIA_SHARED_DIR") or os.path.join(
+    os.path.expanduser(os.environ.get("HESTIA_HOME", "~/.hestia")), "shared")
+if os.path.isdir(_SHARED_RUNTIME) and _SHARED_RUNTIME not in sys.path:
+    sys.path.insert(0, _SHARED_RUNTIME)
 try:
     from hestia_governance_closure import classify as _closure_classify
 except Exception:
