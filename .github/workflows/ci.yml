@@ -310,12 +310,29 @@ jobs:
       - name: Measure how much of the gate still executes per-seat
         run: |
           set -euo pipefail
-          # Both pins, deliberately. --max-forked is beyond argument (a name the
-          # shared engine already owns, implemented a second time in a seat's
-          # gate). --max-pct is the number that actually matters and depends on
-          # a published vocabulary, so it is arguable -- which is a reason to
-          # print it every run, not a reason to leave it unpinned.
-          python3 tools/gate_collapse_meter.py --max-forked 4 --max-pct 67.5
+          # THREE pins now, because the fork count was one number over two
+          # opposite risks and that cost us a landing.
+          #
+          # --max-divergent-forked is the tight one and keeps the old meaning:
+          # a name the shared engine owns, implemented a SECOND TIME with a
+          # different body. All 4 are gemini's scope predicates, and the step
+          # below independently finds 6 inputs they answer differently from the
+          # engine. This number may not rise.
+          #
+          # --max-verbatim-forked counts copies that are character-for-character
+          # the engine's. They are real debt but cannot diverge, and they are
+          # the UNAVOIDABLE middle of a move: a seat imports the shared module
+          # from the INSTALLED path, so publishing and deleting in one release
+          # would leave installed hosts with neither until the next deploy. The
+          # 16 are claude-code's shell classifier, published by this PR and
+          # deleted in the follow-on. Pinned, not exempted -- edit one and it
+          # re-grades DIVERGENT and blows the pin above.
+          #
+          # --max-pct is still the number that actually matters and still
+          # depends on a published vocabulary, so it is arguable -- which is a
+          # reason to print it every run, not a reason to leave it unpinned.
+          python3 tools/gate_collapse_meter.py \
+            --max-divergent-forked 4 --max-verbatim-forked 16 --max-pct 67.5
 
       - name: Do the forked predicates actually disagree with the engine?
         run: |
