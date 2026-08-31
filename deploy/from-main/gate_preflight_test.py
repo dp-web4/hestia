@@ -35,6 +35,8 @@ def make_member(repo: Path, home: Path, name: str, *, registered: bool = True,
         body = "import sys; sys.stdin.read(); raise SystemExit(0)\n"
     elif outcome == "payload-deny":
         body = "import json; print(json.dumps({'permissionDecision': 'deny'}))\n"
+    elif outcome == "decision-deny":
+        body = "import json; print(json.dumps({'decision': 'deny'}))\n"
     else:
         body = "import sys; sys.stdin.read(); raise SystemExit(2)\n"
     (hooks / "pre_tool_use.py").write_text(body, encoding="utf-8")
@@ -72,6 +74,16 @@ def test_zero_exit_payload_deny_is_not_mistaken_for_an_allow():
         root = Path(raw)
         repo, home = root / "repo", root / "home"
         make_member(repo, home, "alpha", outcome="payload-deny")
+        rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+        assert not good
+        assert rows[0]["status"] == "refused"
+
+
+def test_gemini_zero_exit_decision_deny_is_not_mistaken_for_an_allow():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        repo, home = root / "repo", root / "home"
+        make_member(repo, home, "alpha", outcome="decision-deny")
         rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
         assert not good
         assert rows[0]["status"] == "refused"
@@ -129,6 +141,9 @@ def test_every_shipped_gate_declares_its_own_probe_shape():
         assert isinstance(probe.get("entry"), str), f"{expects_path}: probe has no entry"
         events = probe.get("events")
         assert isinstance(events, list) and events, f"{expects_path}: probe has no events"
+        environment = probe.get("environment") or {}
+        obsolete = {"HESTIA_PRE_FAIL_CLOSED", "HESTIA_PRE_NO_FALLBACK"} & set(environment)
+        assert not obsolete, f"{expects_path}: obsolete fail-closed switches: {sorted(obsolete)}"
         for declared in events:
             assert isinstance(declared.get("label"), str), f"{expects_path}: event has no label"
             assert isinstance(declared.get("event"), dict), f"{expects_path}: event has no payload"
@@ -138,8 +153,9 @@ if __name__ == "__main__":
     test_registered_candidate_must_allow_the_declared_probe()
     test_registered_refusal_blocks_the_set_before_installation()
     test_zero_exit_payload_deny_is_not_mistaken_for_an_allow()
+    test_gemini_zero_exit_decision_deny_is_not_mistaken_for_an_allow()
     test_unregistered_member_is_not_a_deployment_requirement()
     test_bad_registration_is_unmeasured_not_absent()
     test_workspace_is_explicit_when_a_checkout_is_nested_in_a_worktree()
     test_every_shipped_gate_declares_its_own_probe_shape()
-    print("ok: 7 gate-preflight checks")
+    print("ok: 8 gate-preflight checks")

@@ -19,9 +19,7 @@
     "gate_probe": {
       "entry": "hooks/pre_tool_use.py",
       "environment": {
-        "CLAUDECODE": "1",
-        "HESTIA_PRE_FAIL_CLOSED": "1",
-        "HESTIA_PRE_NO_FALLBACK": "1"
+        "CLAUDECODE": "1"
       },
       "events": [
         {

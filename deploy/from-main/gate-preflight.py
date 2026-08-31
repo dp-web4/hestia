@@ -86,12 +86,14 @@ def _render(value: Any, replacements: dict[str, str]) -> Any:
 
 
 def _payload_denies(stdout: str) -> bool:
-    """Gemini can encode a policy denial in JSON while exiting zero."""
+    """A harness may encode a policy denial in JSON while exiting zero."""
     try:
         value = json.loads(stdout)
     except ValueError:
         return False
-    return isinstance(value, dict) and value.get("permissionDecision") == "deny"
+    return isinstance(value, dict) and (
+        value.get("permissionDecision") == "deny" or value.get("decision") == "deny"
+    )
 
 
 def run_probes(
