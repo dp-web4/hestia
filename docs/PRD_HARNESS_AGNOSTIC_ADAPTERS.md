@@ -120,7 +120,9 @@ For newly accepted adapters:
 
 > **adapter-local law-bearing SLOC MUST equal 0.**
 
-The fleet-wide 5% release threshold and 2% convergence target in §12 are migration bars for historical adapters. They are not a policy budget for new adapters.
+The fleet-wide 5% temporary release threshold and 2% interim convergence milestone in §12 are
+migration bars for historical adapters. The architectural target is 0%. These bars are not a policy
+budget for new adapters or permission to retain local law.
 
 ### N2. Fail closed
 
@@ -760,9 +762,9 @@ For every newly Accepted adapter:
 
 Historical adapters are currently above the intended boundary. Migration is measured fleet-wide:
 
-- release threshold: **<= 5%** of total gate law-bearing SLOC may remain per-seat;
-- convergence target: **<= 2%**;
-- architectural ideal: **0%**;
+- temporary release threshold: **<= 5%** of total gate law-bearing SLOC may remain per-seat;
+- interim convergence milestone: **<= 2%**;
+- non-negotiable architectural target: **0%**;
 - no adapter may independently own a governance decision even if the aggregate percentage is below threshold.
 
 The percentage is a debt indicator, not permission to keep local law.
