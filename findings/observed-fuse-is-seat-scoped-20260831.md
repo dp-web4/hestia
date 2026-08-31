@@ -241,6 +241,13 @@ shipping the reader, not by asking members to be more careful.
   requires the attributed poll to report the fuse starting *there* at a full 600 against a
   ruling back-dated 900 s. Verified in both directions: green as shipped, and RED under a
   sabotage that marks the row observed from inside the resolver.
+- `fuse_trigger_probe.py`'s specimen rule is now CHECKED (owner == `HESTIA_MESH_PLUGIN`,
+  row approved-with-`decided_at`, live-store body), but the check is client-side and
+  therefore advisory: it stops this driver from being the affordance, not hand-rolled
+  JSON-RPC. The daemon-side hole is untouched and is the open question in #732 —
+  `mark_observed` cannot tell an asker from a co-seat bystander, and `hestia_connect`
+  authenticates nothing. Refusal arms exercised live (wrong seat, unset seat); both refuse
+  before any connect, from data leg 1 already read for free.
 - The 22.4% coverage figure is over the newest 20k entries, not the whole chain.
 - I did not attempt the code change: `cargo test` on this repo is ~28 minutes and this
   wake had ~30, and the design question above outranks the patch anyway.
