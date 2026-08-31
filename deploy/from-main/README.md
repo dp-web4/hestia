@@ -23,6 +23,15 @@ scope envelope say". Two checks:
    posture unattended sessions run under, on the acts a seat needs to stop the timer. A gate
    that cannot answer is not installed.
 
+That second check is a set invariant, not a Claude-only claim. The historical Claude Code
+probe remains explicit because it also checks the portable temporary-root warning. The deploy
+then discovers every other **registered** member gate and runs the harness-specific read and
+deploy-hold probes declared in that member's `expects.json`. An absent registration is not a
+failure — there is no gate to replace — while an unreadable registration, malformed probe, or
+candidate refusal makes the members' install refuse. This is deliberately availability evidence:
+it proves every gate being changed can retain the recovery route; it does not infer that an empty
+scope is a lockout.
+
 ### Why this is not the emptiness check the 2026-08-29 amendment asked for
 
 The amendment says: if the scope envelope resolves empty, you are locked out — disarm. Measured
