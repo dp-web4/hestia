@@ -327,7 +327,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_gate_pending_escalations",
-            "List governance-write escalations nobody has ruled on yet. Pass your session_id and each entry tells you whether YOU may rule it (NOT-SAME: never your own ask). Read-only. A peer that can rule but cannot discover has the authority and no way to learn there is anything open",
+            "List governance-write escalations nobody has ruled on yet. Pass your session_id and each entry tells you whether YOU may rule it (NOT-SAME: never your own ask). Read-only. A peer that can rule but cannot discover has the authority and no way to learn there is anything open. PENDING-ONLY, and the `mine` fold is ASKER-side: an empty answer means nothing awaits a RULING. It does NOT mean there is nothing to REVIEW — decided records stay open to `hestia_gate_escalation_corroborate` indefinitely, and this surface will never show you one. Every recorded refusal-to-file in this repo cited an empty read of it to answer a reviewer-side question it cannot answer",
         ),
         t(
             "hestia_gate_arbitrate_escalation",
@@ -335,7 +335,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t_args(
             "hestia_gate_escalation_corroborate",
-            "Add your evidence to ANOTHER member's governance-write escalation WITHOUT deciding it (NOT-SAME enforced). Your STANCE is required and explicit — 'concur' or 'dissent' — because an unstated stance used to default to concurrence and recorded one peer's dissent as agreement (#367, escalation 99417cc). A dissent must carry its argument; it is evidence surfaced to the decider, NEVER a veto — the sovereign decision stands regardless. Approval is not first-answer-wins: your factor joins the set, the operator or arbiter decides later, and the stated bar is evaluated over the whole set. A factor permits nothing by itself; it is witnessed separately so it cannot be laundered into a ruling. This schema is the WHOLE contract: arguments outside it are refused by name, not discarded",
+            "Add your evidence to ANOTHER member's governance-write escalation WITHOUT deciding it (NOT-SAME enforced). Your STANCE is required and explicit — 'concur' or 'dissent' — because an unstated stance used to default to concurrence and recorded one peer's dissent as agreement (#367, escalation 99417cc). A dissent must carry its argument; it is evidence surfaced to the decider, NEVER a veto — the sovereign decision stands regardless. Approval is not first-answer-wins: your factor joins the set, the operator or arbiter decides later, and the stated bar is evaluated over the whole set. A factor permits nothing by itself; it is witnessed separately so it cannot be laundered into a ruling. A DECIDED record STILL ACCEPTS FACTORS, and always will: `corroborate`'s only status guard refuses `Expired`, and `status_at` reaches `Expired` from `Pending` alone — approved and denied pass through unchanged, forever. The records closed to peer review are the ones that LAPSED UNDECIDED, not the ones that were ruled. Do not read `decide`'s adjacent and true `AlreadyDecided` refusal as applying here; six recorded reviews declined to file on exactly that inference. This schema is the WHOLE contract: arguments outside it are refused by name, not discarded",
             json!({
                 "type": "object",
                 // False, truthfully: the handler refuses unknown keys by name, so the

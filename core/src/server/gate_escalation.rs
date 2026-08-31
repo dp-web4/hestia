@@ -3884,6 +3884,37 @@ mod bar_factor_tests {
             .expect_err("expired is expired");
         assert_eq!(err, DecideError::Expired);
     }
+
+    #[test]
+    fn a_ruled_escalation_still_takes_evidence_long_after_its_record_horizon() {
+        // The pair above leaves a gap that six recorded reviews have now fallen into:
+        // `post_decision_participation_...` corroborates at T0+6, INSIDE the window, and
+        // `an_expired_escalation_...` expires a record that was never ruled. Neither says
+        // what happens to a DECIDED record once the clock passes `expires_at` — and every
+        // seat has guessed "it closes", declining to file on a decided row (see
+        // findings/peer-review-terminal-belief-20260829.md; codex on 4b1c5dcd6c8ce23c,
+        // 2026-08-31, "because the operator already decided, peer factors are frozen").
+        //
+        // It never closes. `status_at` reaches `Expired` from `Pending` ALONE, so
+        // corroborate's one status guard is unreachable on a ruled record, at any clock
+        // value. Asserted here at 100x the record's own lifetime, so that an edit making
+        // expiry apply to decided records fails HERE rather than silently teaching the
+        // next reviewer that its instinct was right.
+        let (mut s, id) = open_with("law_inject.py");
+        s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::OperatorSession, None, Some("ruled inside the window"), T0 + 5)
+            .expect("decided while pending");
+
+        // Well past the horizon that expires an UNDECIDED record (T0+121, above).
+        let late = T0 + 12_000;
+        assert_eq!(s.status_of(&id, late), Status::Approved, "a ruling does not lapse");
+
+        let after = s
+            .corroborate(&id, "codex", "role:constellation:member", None, true, Some("read the act; it was read-only"), late)
+            .expect("a decided record takes evidence for as long as it exists — that is the invitation");
+
+        assert_eq!(after.peer_participation().dissented, 1, "the late dissent is on the record");
+        assert_eq!(after.stored_status(), Status::Approved, "and the ruling is untouched");
+    }
 }
 
 #[cfg(test)]
