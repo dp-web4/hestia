@@ -283,75 +283,15 @@ def _tally_scope(allowed: bool):
             t = {"allows": 0, "denies": 0}
         t["allows" if allowed else "denies"] += 1
         if t["allows"] + t["denies"] >= SCOPE_ATTEST_EVERY:
-            _emit_attestation(t["allows"], t["denies"])
+            from hestia_gate_mechanism import emit_attestation
+            emit_attestation(
+                t["allows"], t["denies"],
+                plugin_id=HESTIA_PLUGIN_ID, role_lct=_role_bridge())
             t = {"allows": 0, "denies": 0}
         json.dump(t, open(_TALLY, "w"))
     except Exception:
         pass  # accounting must never change a decision
 
-
-def _emit_attestation(allows, denies):
-    import urllib.request
-    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
-
-    def post(payload, timeout, hdrs=None):
-        req = urllib.request.Request(
-            endpoint, data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json",
-                     "Accept": "application/json, text/event-stream", **(hdrs or {})})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read(), r.headers.get("mcp-session-id")
-
-    _, sid = post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                   "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                              "clientInfo": {"name": "hestia-gate-attest", "version": "1"}}}, 1.0)
-    h = {"mcp-session-id": sid} if sid else {}
-    post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, 0.4, h)
-    # `hestia_request_witness` is an ATTRIBUTED append: it refuses an unconnected caller,
-    # because what lands on the chain must carry a proven WHO and not only caller-supplied
-    # data. Connect first and pass the session, or the attestation is silently refused —
-    # which is exactly how the first cut of this failed.
-    raw, _ = post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                   "params": {"name": "hestia_connect",
-                              "arguments": {"plugin_id": HESTIA_PLUGIN_ID,
-                                            "host_agent": HESTIA_PLUGIN_ID,
-                                            # DECLARE THE ROLE ON CONNECT (dp, 2026-07-28:
-                                            # "kimi's member alias still shows unmeasured
-                                            # with over 3k actions"). This gate has always
-                                            # KNOWN its role — it writes `_role_bridge()`
-                                            # into the attestation payload below — and never
-                                            # told the daemon on connect, so the session
-                                            # defaulted to role:constellation:member and the
-                                            # attestation landed on a grain the member does
-                                            # not act under. Acts on one grain, the decisions
-                                            # governing them on another, and NEITHER can score
-                                            # conduct. The capability to declare arrived with
-                                            # the connect-echoes-role work; this is the caller
-                                            # that never started using it.
-                                            "role": _role_bridge(),
-                                            "instance_name": "gate-attest"}}}, 1.5, h)
-    sess = None
-    for line in raw.decode("utf-8", "replace").splitlines():
-        if line.startswith("data: {"):
-            try:
-                pl = json.loads(line[6:])
-                if "result" in pl:
-                    sess = json.loads(pl["result"]["content"][0]["text"]).get("sessionId")
-            except Exception:
-                pass
-    if not sess:
-        return
-    post({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-          "params": {"name": "hestia_request_witness",
-                     "arguments": {"session_id": sess,
-                                   "event_type": "scope_attestation",
-                                   "event_data": {
-                                       "plugin_id": HESTIA_PLUGIN_ID,
-                                       "role_lct": _role_bridge(),
-                                       "allows": allows,
-                                       "denies": denies,
-                                       "attested_by": "plugin-gate:" + HESTIA_PLUGIN_ID,
-                                   }}}}, 1.5, h)
 
 
 def _attempted_summary(ev, limit=400):
