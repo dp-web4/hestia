@@ -315,7 +315,7 @@ jobs:
           # gate). --max-pct is the number that actually matters and depends on
           # a published vocabulary, so it is arguable -- which is a reason to
           # print it every run, not a reason to leave it unpinned.
-          python3 tools/gate_collapse_meter.py --max-forked 4 --max-pct 69.3
+          python3 tools/gate_collapse_meter.py --max-forked 4 --max-pct 67.5
 
       - name: Do the forked predicates actually disagree with the engine?
         run: |
