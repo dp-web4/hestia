@@ -410,7 +410,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t_args(
             "hestia_member_notify",
-            "Send a witnessed, pointer-based wake notice to another LOCAL member (fractal mesh; kinds mirror hub-mesh). The notice carries NO content: post the content first, then point at it with pointer_uri — a notice without a pointer wakes the recipient with nothing to act on and is refused. Pass in_reply_to:<notice id> to bind a disposition (reply/ack/review_done) to the notice it answers. The receipt reports recipient_liveness (live/dormant/unknown) — 'unknown' means nothing on this mesh is known to deliver it, usually a fleet member addressed locally",
+            "Send a witnessed, pointer-based wake notice to another LOCAL member (fractal mesh; kinds mirror hub-mesh). The notice carries NO content: post the content first, then point at it with pointer_uri — a notice without a pointer wakes the recipient with nothing to act on and is refused. Pass in_reply_to:<notice id> to bind a disposition (reply/ack/review_done) to the notice it answers. The receipt reports recipient_liveness (live/dormant/unknown) — 'unknown' means nothing on this mesh is known to deliver it, usually a fleet member addressed locally. 'live' means the recipient's WATCHER read its mailbox recently; it does NOT mean the member can act. The watcher drains the mailbox before firing the member's CLI, so a seat that is out of credits or crashed keeps reading 'live' indefinitely (measured 2026-08-31: two seats 'live' on sub-2-minute touches with no chain act for 3.4h and 15.7h). Do not read 'live' as 'they saw it and chose not to reply'",
             json!({
                 "type": "object",
                 "additionalProperties": true,
@@ -4031,6 +4031,23 @@ const MEMBER_LIVE_WITHIN_SECS: i64 = 300;
 /// permission. Three states, all derived from one kept sighting:
 ///
 /// - `live` — mailbox read within [`MEMBER_LIVE_WITHIN_SECS`]. Watcher is up.
+///   **And that is the whole of it: `live` is the WATCHER, never the member.**
+///   `touch_inbox` is called from `drain_member`/`peek_member` keyed on
+///   `to_plugin`, and on this mesh `hestia-watch-member.sh` drains the member's
+///   inbox into a primer BEFORE firing its CLI — so the touch is written when
+///   the member runs, and identically when it never runs at all. A seat whose
+///   agent is out of credits, egress-blocked or crashed reads `live` for as
+///   long as its watcher polls. MEASURED 2026-08-31: `codex` `live` on a 78 s
+///   touch with 29,783 mailbox reads and its newest chain act 3.4 h old;
+///   `kimi-code` `live` on a 42 s touch with 21,870 reads and NO act in the
+///   15.7 h walked — both out of credits, both with 148 notices queued against
+///   them. Same day, this seat read `live` with an act 36 s old, so the split
+///   is real and not a predicate stuck on one answer
+///   (`tools/liveness_is_the_watcher_not_the_member.py`). This is the same
+///   thing hestia#65 found from the other end — liveness uncorrelated with
+///   capacity to act — restated where the state is defined rather than only
+///   where routing consumes it. For "can this member ACT?" the daemon already
+///   owns `actor_liveness`, read from the member's own chain acts.
 /// - `dormant` — seen before, not lately. Watcher down, host asleep, member
 ///   between sessions. This is the deferred-delivery case and queueing is
 ///   exactly right for it.
@@ -11021,6 +11038,27 @@ mod tests {
     /// which is why a second seat — `kimi-code`, mailbox read seconds ago — is added here as a
     /// positive control. Without it every assertion below is also satisfied by a predicate
     /// that answers "no reader" to everyone, and a blanket `false` would read as a fix.
+    ///
+    /// THAT CONTROL'S ASSUMPTION IS FALSE, and this window fix does not reach the half it
+    /// leaves behind (CBP 2026-08-31). The control reads "mailbox read seconds ago" as a seat
+    /// that COULD have read the ask. A fresh touch means only that the seat's WATCHER polled:
+    /// `hestia-watch-member.sh` drains the member's inbox into a primer before firing its CLI,
+    /// so `last_touch` stays seconds old whether or not the member ever runs. Measured on the
+    /// live mesh that day, `kimi-code` — this very control seat — carried a 42 s touch, 21,870
+    /// mailbox reads and NOT ONE chain act in the 15.7 h walked, because it was out of credits;
+    /// `codex` carried a 78 s touch, 29,783 reads and its newest act 3.4 h back. Both read
+    /// `live`, both are excluded by none of the three, both land in `absent`. This seat, live
+    /// and acting 36 s earlier, is the negative control that keeps the split honest.
+    ///
+    /// So the window closed the STALE half and left the FRESH half not merely open but MORE
+    /// confident, since a fresh touch is now affirmatively credited as a reader. The residue
+    /// is not a staleness bound — no window reaches a 42-second-old touch — it is that the
+    /// conduct question is asked of the wrong signal. `actor_liveness` (member chain acts:
+    /// `outcome`, `policy_decision`, `adjudication`, `appeal`) is written only when the member
+    /// itself runs, and `resolve_invitation` ALREADY ranks the pool by it; only the conduct
+    /// question still keys on the mailbox. Driver, two-sided:
+    /// `tools/liveness_is_the_watcher_not_the_member.py`. Not fixed here: which signal decides
+    /// published conduct evidence about a peer is a governance call, not a refactor.
     ///
     /// Before: `invited_without_reader` caught "never seen" and missed "not seen since July",
     /// so a dead mailbox was scored as a peer that declined.
