@@ -20,12 +20,43 @@ leg 2 (DESTRUCTIVE, --burn): open an attributed session and poll. If leg 1
 
 Leg 2 is the whole experiment and it consumes the thing it measures. There is no
 non-destructive version: the only way to learn whether a fuse is lit is to light
-it. So the probe refuses to run leg 2 without `--burn` AND an explicit id.
+it.
 
-CHOOSE THE SPECIMEN HONESTLY. Run leg 2 only against a petition that is:
-  * yours (the `plugin_id` on the row is your seat), AND
-  * already dead in practice -- the act was abandoned, or completed by a
-    compliant alternate route, so the grant authorises nothing anyone wants.
+THE SPECIMEN RULE IS CHECKED, NOT ASSERTED
+------------------------------------------
+The first cut of this script stated the rule in prose and then hard-coded
+`plugin_id: "claude-code"` in the connect. codex's review of #735 named both ways
+that fails, and it was right on both:
+
+  1. MISREPORT. Another seat running leg 2 against its OWN dead petition would
+     still poll as `claude-code`. `mark_observed` requires `e.plugin_id ==
+     plugin_id`, so it would refuse, the poll would answer
+     `observation_started_claim_window: false`, and this script would print
+     "fuse was ALREADY lit" -- a wrong conclusion from a correct daemon.
+  2. ATTACK. Any caller could point the driver at a LIVE `claude-code`
+     escalation and start that seat's clock. That is precisely the
+     one-handshake attack the finding documents, packaged as a convenience.
+
+So identity and ownership are now PRECONDITIONS the script checks before it
+issues a poll, from data leg 1 already read for free:
+
+  * the running seat is `HESTIA_MESH_PLUGIN` -- the same source `hestia-mesh.py`
+    requires and refuses to default. NOT argv, because an argument is just the
+    hard-coded string with extra steps.
+  * the escalation row's `plugin_id` must EQUAL that seat. A phantom seat from a
+    mistyped env var fails here too, because a phantom owns no rows.
+  * the row must be `approved` with a `decided_at`. A pending petition is one
+    somebody still wants; there is no fuse to find on it.
+  * if the pointer resolved through the witness-chain fallback (no `plugin_id`
+    in the body), ownership is UNVERIFIABLE and leg 2 refuses. That arm is
+    untested for this measurement either way.
+
+What this does NOT do: close the daemon-side hole. `mark_observed`'s seat check
+still cannot tell an asker from a co-seat bystander, and asserting a `plugin_id`
+to `hestia_connect` remains unauthenticated -- that is the open ruling question
+in #732, and no client-side check can stand in for it. These preconditions stop
+this DRIVER from being the affordance; they do not stop hand-rolled JSON-RPC.
+
 The 2026-08-31 run used `4b1c5dcd6c8ce23c`: this seat's own petition from a shell
 `for` loop that tripped the out-of-grammar rule, whose act had already been done
 via unrolled reads. Do NOT point leg 2 at a peer's live grant. That is the exact
@@ -44,12 +75,14 @@ so rather than reporting a spurious result; it is the error that made the first
 Usage
 -----
     python3 -I tools/fuse_trigger_probe.py <escalation_id>            # leg 1 only
-    python3 -I tools/fuse_trigger_probe.py <escalation_id> --burn     # both legs
+    HESTIA_MESH_PLUGIN=<your seat> \\
+      python3 -I tools/fuse_trigger_probe.py <escalation_id> --burn   # both legs
 
 Run under `python3 -I` if cwd may be /tmp: stray modules there shadow the stdlib
 and this imports `urllib.request`.
 """
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -61,7 +94,8 @@ SETTLE_SECS = 17
 
 # No environment override for the endpoint: the obvious spelling of that lookup
 # trips the seat gate's `egress.secret` substring rule, and the endpoint file is
-# the real source on every seat.
+# the real source on every seat. The identity lookup below is a different rule
+# and a different variable, and it is the one hestia-mesh.py already mandates.
 
 
 class Client:
@@ -108,6 +142,63 @@ def endpoint():
     return "http://127.0.0.1:7711/mcp"
 
 
+def running_seat():
+    """This process's member id, from the source the mesh CLI already mandates.
+
+    Deliberately NOT an argument. The bug being fixed is a hard-coded seat name;
+    accepting one on argv reintroduces it with a nicer spelling, because the
+    attack and the misreport both start with a caller naming a seat it is not.
+    """
+    return os.environ.get("HESTIA_MESH_PLUGIN", "").strip()
+
+
+def burn_preconditions(seat, esc, body):
+    """Return a refusal string, or None if leg 2 may proceed.
+
+    Every conjunct is decided from data leg 1 already fetched for free, so a
+    refusal costs nothing and never touches the record it declines to burn.
+    """
+    if not seat:
+        return (
+            "HESTIA_MESH_PLUGIN is unset, so this process cannot say which member it is.\n"
+            "  Leg 2 moves a claim deadline and the daemon records WHOSE. Refusing rather\n"
+            "  than guessing -- a guess here is how a driver becomes someone else's clock.\n"
+            "  Set it to your own member id, the same value hestia-mesh.py requires."
+        )
+    owner = body.get("plugin_id")
+    if not owner:
+        return (
+            f"the pointer for {esc} resolved without a `plugin_id`, which means the witness-\n"
+            "  chain fallback answered rather than the live store. Ownership is UNVERIFIABLE\n"
+            "  from that body, so leg 2 refuses. (That arm is also untested for this\n"
+            "  measurement -- see the finding's limits.)"
+        )
+    if owner != seat:
+        return (
+            f"escalation {esc} belongs to '{owner}', and this process is '{seat}'.\n"
+            "  Two things go wrong if leg 2 runs anyway, and codex's #735 review named both:\n"
+            f"    * MISREPORT -- mark_observed refuses a non-owner, so the poll answers\n"
+            "      observation_started_claim_window: false and this script would call that\n"
+            "      'already lit' when the fuse is untouched.\n"
+            f"    * SPENDING SOMEONE ELSE'S GRANT -- if '{owner}' still wants that approval,\n"
+            "      starting its 600s window is the co-seat burn #732 exists to describe.\n"
+            "  Run leg 2 only against a dead petition of your own."
+        )
+    status = body.get("status")
+    if status != "approved":
+        return (
+            f"escalation {esc} reads status='{status}', not 'approved'.\n"
+            "  mark_observed fires only on an approved, bar-met row, so there is no fuse here\n"
+            "  to find -- and a PENDING petition is one somebody is still waiting on."
+        )
+    if body.get("decided_at") is None:
+        return (
+            f"escalation {esc} carries no `decided_at`. The measurement is 'how long after the\n"
+            "  ruling did the window still read full', which is unanswerable without one."
+        )
+    return None
+
+
 def main(argv):
     args = [a for a in argv[1:] if not a.startswith("--")]
     burn = "--burn" in argv[1:]
@@ -126,6 +217,7 @@ def main(argv):
                           "clientInfo": {"name": "fuse-trigger-probe", "version": "1"}})
 
     print(f"== leg 1 (free): resources/read x3 on {esc} ==")
+    first_body = None
     for i, uri in enumerate([f"hestia://escalation/{esc}#decided",
                              f"hestia://escalation/{esc}",
                              f"hestia://escalation/{esc}#decided"]):
@@ -134,6 +226,8 @@ def main(argv):
         body = json.loads(contents[0]["text"]) if contents else {"_err": r}
         if "_hestia_error" in body:
             raise SystemExit(f"  read[{i}] {uri}\n  {body['_hestia_error'].get('message')}")
+        if first_body is None:
+            first_body = body
         print(f"  read[{i}] {uri} -> status={body.get('status')} "
               f"plugin_id={body.get('plugin_id')} decided_by={body.get('decided_by')}")
         if i == 0 and not burn:
@@ -146,9 +240,16 @@ def main(argv):
               "ONLY against\na petition of your own that is already dead in practice.")
         return 0
 
-    print(f"\n== leg 2 (DESTRUCTIVE): attributed poll on {esc} ==")
+    seat = running_seat()
+    refusal = burn_preconditions(seat, esc, first_body or {})
+    if refusal:
+        print(f"\n== leg 2 REFUSED ==\n  {refusal}")
+        return 2
+
+    print(f"\n== leg 2 (DESTRUCTIVE): attributed poll on {esc} as '{seat}' ==")
     conn = unwrap(c.post("tools/call", {"name": "hestia_connect", "arguments": {
-        "plugin_id": "claude-code", "host_agent": "claude-code",
+        "plugin_id": seat,
+        "host_agent": os.environ.get("HESTIA_MESH_HOST_AGENT", "").strip() or seat,
         "role": "role:constellation:member"}}))
     if "_hestia_error" in conn:
         raise SystemExit(f"  connect refused: {conn['_hestia_error'].get('message')}")
@@ -179,7 +280,9 @@ def main(argv):
     elif not first.get("observation_started_claim_window"):
         print("\nVERDICT: fuse was ALREADY lit before this poll. Either leg 1 observed "
               "(which\n         would refute the finding) or something else polled first "
-              "-- check for a\n         co-seat session before concluding the former.")
+              "-- check for a\n         co-seat session before concluding the former.\n"
+              "         Ownership was checked before this poll, so a non-owner refusal is "
+              "NOT\n         among the causes here.")
     else:
         print("\nVERDICT: fuse started here but the window was not full. Unexpected; "
               "report the\n         raw rows rather than a conclusion.")

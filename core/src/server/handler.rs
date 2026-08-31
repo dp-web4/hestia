@@ -11973,6 +11973,161 @@ mod tests {
         );
     }
 
+    /// `resources/read` ON AN ESCALATION POINTER MUST NOT START THE CLAIM FUSE.
+    ///
+    /// #735 ships `tools/escalation_read.py` and documents the RESOURCE route as the free way
+    /// to dereference a disposition notice's pointer, against the observing route
+    /// (`hestia_gate_escalation_poll`) that every other tool in the tree reached for. Until
+    /// this test, that rested on there being exactly one non-test `mark_observed` call site —
+    /// which is a TOPOLOGY, not an invariant. codex's #735 review named the hole precisely: "a
+    /// future refactor can route the resolver through observation with existing tests still
+    /// green." Nothing in the tree would have gone red. Now something does.
+    ///
+    /// BOTH HALVES ARE ASSERTED, because only the pair is falsifiable. A test that merely
+    /// checked `observed_at.is_none()` after some reads would also pass if the pointer 404'd,
+    /// if the resource door stopped dispatching, or if the escalation were never approved — so
+    /// each read is asserted to have RESOLVED THE ROW, and the attributed poll afterwards must
+    /// then report the fuse started HERE, at a full window.
+    ///
+    /// The specimen is back-dated fifteen minutes to make that sharp. On the ruling clock the
+    /// window is already SHUT (`claim_window_secs_remaining: 0` — `decided_at + 600 < now`),
+    /// and it is the poll that resurrects it to a full 600. That is the live 2026-08-31
+    /// measurement on `4b1c5dcd6c8ce23c` (three reads, then one poll +1563s after the ruling,
+    /// answering `600`) reproduced deterministically.
+    ///
+    /// SABOTAGE ARM: route `resolve_escalation_pointer` through `mark_observed` and the last
+    /// two arms red — the attributed poll answers `false` with a partial window. Route it
+    /// only on the bare URI and the `#decided` arms still catch it, which is why the fragment
+    /// spelling is here: a disposition notice's pointer carries `#decided`, and the resource
+    /// door strips the fragment before dispatch.
+    #[tokio::test]
+    async fn a_resource_read_of_an_escalation_pointer_does_not_start_the_claim_fuse() {
+        use crate::server::gate_escalation::{now_secs, APPROVAL_CLAIM_WINDOW_SECS};
+        const MARKER: &str = "policy.json";
+        const ACT: &str = "Bash -> /repo/tools/unrolled_read.sh";
+
+        let (_dir, shared) = make_shared_state();
+        let connected = tool_connect(
+            &shared,
+            &json!({ "plugin_id": "claude-code", "host_agent": "h" }),
+        )
+        .await
+        .unwrap();
+        let session = connected["sessionId"].as_str().unwrap().to_string();
+
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": session,
+                "tool_name": "Bash",
+                "marker": MARKER,
+                "act": ACT,
+                "reason": ACT,
+            }),
+        )
+        .await
+        .unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+
+        // Ruled a quarter of an hour ago and never looked at — the shape of every grant this
+        // fuse exists for, and the shape of the live specimen.
+        let ruled_at = now_secs() - 900;
+        {
+            let mut s = shared.lock().await;
+            s.gate_escalations
+                .decide(
+                    &id,
+                    true,
+                    "operator",
+                    "role:constellation:sovereign",
+                    crate::server::gate_escalation::Channel::OperatorSession,
+                    None,
+                    Some("k"),
+                    ruled_at,
+                )
+                .expect("the sovereign channel approves");
+            assert!(
+                s.gate_escalations.get(&id).unwrap().observed_at.is_none(),
+                "a ruling is not an observation: nobody has read this yet"
+            );
+        }
+
+        // THE FREE ROUTE, three times, through the door a peer actually drives — including
+        // the `#decided` fragment a disposition notice carries verbatim.
+        for uri in [
+            format!("hestia://escalation/{id}#decided"),
+            format!("hestia://escalation/{id}"),
+            format!("hestia://escalation/{id}#decided"),
+        ] {
+            let raw = read_resource_body(&shared, &uri).await.unwrap();
+            let body: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                body["escalation_id"], id,
+                "the read has to RESOLVE THE ROW or this test proves nothing: {body}"
+            );
+            assert_eq!(body["status"], "approved", "{body}");
+            assert_eq!(
+                body["source"], "live_store",
+                "the live-store arm is the one under test; the chain fallback is a different \
+                 path and is not pinned here: {body}"
+            );
+            assert!(
+                shared.lock().await.gate_escalations.get(&id).unwrap().observed_at.is_none(),
+                "`{uri}` started the claim fuse. Dereferencing a pointer is not observing a \
+                 decision — tools/escalation_read.py is documented as free on exactly this."
+            );
+        }
+
+        // The UNATTRIBUTED poll is free too, and it is the "before" reading: on the ruling
+        // clock this grant is already dead.
+        let before = tool_gate_escalation_poll(&shared, &json!({ "escalation_id": id }))
+            .await
+            .unwrap();
+        assert_eq!(
+            before["observation_started_claim_window"], false,
+            "an unproven caller cannot move anyone's clock: {before}"
+        );
+        assert_eq!(
+            before["claim_window_secs_remaining"], 0,
+            "measured from the ruling, this window shut 300s ago: {before}"
+        );
+
+        // THE OBSERVING ROUTE. This is the call that costs the grant its clock.
+        let lit = tool_gate_escalation_poll(
+            &shared,
+            &json!({ "escalation_id": id, "session_id": session }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            lit["observation_started_claim_window"], true,
+            "the poll is the sole trigger, so it must be what lights the fuse: {lit}"
+        );
+        assert_eq!(
+            lit["claim_window_secs_remaining"],
+            json!(APPROVAL_CLAIM_WINDOW_SECS),
+            "a FULL window however long ago the ruling landed — the clock is measured from \
+             the read, not the decision: {lit}"
+        );
+
+        // One-way and idempotent: a member cannot refresh its own window by polling again.
+        let again = tool_gate_escalation_poll(
+            &shared,
+            &json!({ "escalation_id": id, "session_id": session }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            again["observation_started_claim_window"], false,
+            "the first observation wins: {again}"
+        );
+        assert!(
+            shared.lock().await.gate_escalations.get(&id).unwrap().observed_at.is_some(),
+            "and the record keeps the instant it was observed"
+        );
+    }
+
     /// THE DERIVATION, with nothing on the wire to derive from.
     ///
     /// The first draft of this change wrote the caller's `host_session_id` argument straight

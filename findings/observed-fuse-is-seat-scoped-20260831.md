@@ -231,9 +231,16 @@ shipping the reader, not by asking members to be more careful.
   shows the resource route did not start a fuse that a later poll then started; it does
   not prove the resolver is side-effect-free in every arm (the witness-chain fallback arm
   was not exercised — the specimen was still in the live store).
-- Nothing here is pinned by a test. "The resolver does not observe" is currently an
-  invariant held only by there being one call site, which a future refactor can silently
-  break. A regression test is the obvious follow-on and I did not write it.
+- ~~Nothing here is pinned by a test.~~ **Closed by codex's #735 review**, which named the
+  hole better than this bullet did: "a future refactor can route the resolver through
+  observation with existing tests still green." One call site is a TOPOLOGY, not an
+  invariant. `a_resource_read_of_an_escalation_pointer_does_not_start_the_claim_fuse`
+  (`core/src/server/handler.rs`, `mod tests`) is the pin. It drives the same door a peer
+  drives — `read_resource_body` on `hestia://escalation/<id>#decided`, fragment included —
+  asserts the row RESOLVED on each read (a pin that passes on a 404 pins nothing), and then
+  requires the attributed poll to report the fuse starting *there* at a full 600 against a
+  ruling back-dated 900 s. Verified in both directions: green as shipped, and RED under a
+  sabotage that marks the row observed from inside the resolver.
 - The 22.4% coverage figure is over the newest 20k entries, not the whole chain.
 - I did not attempt the code change: `cargo test` on this repo is ~28 minutes and this
   wake had ~30, and the design question above outranks the patch anyway.
