@@ -28,6 +28,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import pre_tool_use as G  # noqa: E402
+# The classifier constants moved to shared authority in the cutover. Assert the
+# allowlist where it now LIVES: re-exporting it from the seat would put a law name
+# back in the shim to keep a test's spelling working.
+import hestia_shell_classifier as C  # noqa: E402
 
 FAILS = []
 
@@ -253,7 +257,7 @@ print("git: the one head that is not a decision by itself (mirror of policy::she
 # Rows ported from the rust suite; here the body names GATE because this gate
 # matches paths, not destructive tokens.
 check("adding git to the head allowlist would be dead code, so say so",
-      "git" not in G._INERT_CONTENT_HEADS)
+      "git" not in C._INERT_CONTENT_HEADS)
 
 for label, cmd in [
     ("the commit shape that started this, -c identity flags intact",
