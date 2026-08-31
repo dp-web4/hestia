@@ -333,7 +333,13 @@ jobs:
           # depends on a published vocabulary, so it is arguable -- which is a
           # reason to print it every run, not a reason to leave it unpinned.
           python3 tools/gate_collapse_meter.py \
-            --max-divergent-forked 4 --max-verbatim-forked 0 --max-pct 52.2
+          # 52.3, not 52.2. The cutover measured 52.2; the mandated fail-closed
+          # import guard (missing shared authority -> exit 2, proven by
+          # plugins/claude-code/tests/missing_shared_authority_blocks_test.py)
+          # added 11 law-bearing sloc to the seat and moved it to 52.3. Pinned at
+          # the MEASURED value. The alternative was writing terser refusal code to
+          # hit a round number, which is optimising the gauge instead of the thing.
+            --max-divergent-forked 4 --max-verbatim-forked 0 --max-pct 52.3
 
       - name: Do the forked predicates actually disagree with the engine?
         run: |
