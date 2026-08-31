@@ -43,6 +43,11 @@ def git(*args):
     return subprocess.run(("git", "-C", REPO) + args, capture_output=True, text=True)
 
 
+def git_bytes(*args):
+    """Read an object without newline conversion or UTF-8 assumptions."""
+    return subprocess.run(("git", "-C", REPO) + args, capture_output=True)
+
+
 def sha_bytes(b):
     return hashlib.sha256(b).hexdigest()
 
@@ -50,20 +55,23 @@ def sha_bytes(b):
 def main():
     ref = sys.argv[1] if len(sys.argv) > 1 else "origin/main"
 
-    head = git("cat-file", "-p", f"{ref}:{TRACKED}")
+    head = git_bytes("cat-file", "-p", f"{ref}:{TRACKED}")
     if head.returncode != 0:
         print(f"cannot read {ref}:{TRACKED} — fetch first?", file=sys.stderr)
         return 2
-    want = sha_bytes(head.stdout.encode())
+    want = sha_bytes(head.stdout)
 
     # Every revision of the file, newest first, so an installed copy can be dated by
     # exact match. A copy that matches nothing has been hand-edited and is reported so.
-    revs = git("log", "--format=%H", "--", TRACKED).stdout.split()
+    # The history must be the anchor's history too. Walking the checkout's HEAD here would
+    # reintroduce the exact defect this tool replaces: from a divergent worktree, a genuine
+    # main-line vintage could be mislabeled hand-edited merely because HEAD cannot reach it.
+    revs = git("log", "--format=%H", ref, "--", TRACKED).stdout.split()
     by_sha = {}
     for c in revs:
-        blob = git("cat-file", "-p", f"{c}:{TRACKED}")
+        blob = git_bytes("cat-file", "-p", f"{c}:{TRACKED}")
         if blob.returncode == 0:
-            by_sha.setdefault(sha_bytes(blob.stdout.encode()), c)
+            by_sha.setdefault(sha_bytes(blob.stdout), c)
 
     print(f"anchor {ref} = {want[:12]}  ({TRACKED})")
     behind = False
