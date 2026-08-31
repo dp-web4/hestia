@@ -107,6 +107,54 @@ T0=$(date +%s)
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG" >&2; }
 die() { log "FAIL $*"; exit 1; }
 
+
+# Operator-originated dashboard update status (#751). The dashboard never runs a second
+# deployment implementation: it drops one bounded request next to current-build.json and
+# triggers this same supervisor. The request contains only a generated id. The actual target
+# is not knowable until THIS supervisor syncs its dedicated checkout, so only this script
+# writes the target into status.
+UPDATE_REQUEST="$HESTIA_HOME/deploy-update.request"
+UPDATE_STATUS="$HESTIA_HOME/deploy-status.tsv"
+UPDATE_REQUEST_ID=""
+UPDATE_TARGET=""
+LOCKD_OWNED=0
+
+write_update_status() {
+  [ -n "$UPDATE_REQUEST_ID" ] || return 0
+  local state="$1" now tmp
+  now="$(date -u +%FT%TZ)"
+  tmp="$UPDATE_STATUS.tmp.$$"
+  printf '%s\t%s\t%s\t%s\n' "$state" "$UPDATE_REQUEST_ID" "$UPDATE_TARGET" "$now" > "$tmp"
+  mv "$tmp" "$UPDATE_STATUS"
+}
+
+finish_update_status() {
+  local rc="${1:-$?}"
+  if [ -n "$UPDATE_REQUEST_ID" ]; then
+    if [ "$rc" -eq 0 ]; then write_update_status succeeded
+    else write_update_status failed
+    fi
+  fi
+}
+
+read_update_request_id() {
+  [ -r "$UPDATE_REQUEST" ] || return 1
+  UPDATE_REQUEST_ID="$(head -n 1 "$UPDATE_REQUEST" 2>/dev/null || true)"
+  case "$UPDATE_REQUEST_ID" in
+    ''|*[!A-Za-z0-9-]*) UPDATE_REQUEST_ID=""; return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+cleanup_deploy() {
+  local rc=$?
+  if [ "$LOCKD_OWNED" = "1" ]; then
+    rm -f "$LOCKD/pid"
+    rmdir "$LOCKD" 2>/dev/null || true
+  fi
+  finish_update_status "$rc"
+}
+
 # The parenthesised `git describe` string from a version line, e.g.
 #   hestia 0.0.4 (v0.0.4-444-gdd4300c)  ->  v0.0.4-444-gdd4300c
 describe_of() { grep -oE '\([^)]+\)' | head -1 | tr -d '()'; }
@@ -541,7 +589,7 @@ LOCKD="$HESTIA_HOME/deploy.lock.d"
 take_lockd() {
   mkdir "$LOCKD" 2>/dev/null || return 1
   echo $$ >"$LOCKD/pid"
-  trap 'rm -f "$LOCKD/pid"; rmdir "$LOCKD" 2>/dev/null' EXIT
+  LOCKD_OWNED=1
 }
 if command -v flock >/dev/null 2>&1; then
   exec 9>"$HESTIA_HOME/deploy.lock"
@@ -556,11 +604,17 @@ elif ! take_lockd; then
   rm -f "$LOCKD/pid"; rmdir "$LOCKD" 2>/dev/null || true
   take_lockd || { log "SKIP another deploy holds the lock ($LOCKD)"; exit 0; }
 fi
+trap cleanup_deploy EXIT
 
 # ---- operator hold -----------------------------------------------------------------------
 if [ -e "$HOLD" ]; then
   age=$(( $(date +%s) - $(mtime_of "$HOLD") ))
   if [ "$age" -lt "$HOLD_MAX_SECS" ]; then
+    if [ "$MODE" = full ] && read_update_request_id; then
+      UPDATE_TARGET=""
+      write_update_status held
+      UPDATE_REQUEST_ID=""  # request remains queued; do not let EXIT call this success
+    fi
     log "SKIP hold present (${age}s old, expires at ${HOLD_MAX_SECS}s): $(head -c 200 "$HOLD" | tr '\n' ' ')"
     exit 0
   fi
@@ -588,6 +642,20 @@ web4_sha="$(git -C "$DEPLOY_ROOT/web4" rev-parse --short HEAD)"
 running="$(running_version)"
 ondisk="$("$BIN" --version 2>/dev/null | describe_of || true)"
 log "target=$target ($target_sha, web4 $web4_sha) running=${running:-none} ondisk=${ondisk:-none} bin=$BIN"
+
+# Claim a dashboard request only now: lock and hold have both passed, and `target` is the
+# supervisor's actual synced target rather than the old current-build authority record.
+if [ "$MODE" = full ] && [ -r "$UPDATE_REQUEST" ]; then
+  if read_update_request_id; then
+    UPDATE_TARGET="$target"
+    rm -f "$UPDATE_REQUEST"
+    write_update_status running
+    log "dashboard update request $UPDATE_REQUEST_ID claimed for $UPDATE_TARGET"
+  else
+    log "dashboard update request malformed; removing it rather than retrying forever"
+    rm -f "$UPDATE_REQUEST"
+  fi
+fi
 
 # BIN must be the file the daemon execs. Otherwise one cycle installs to a path nothing
 # launches, restarts the OLD binary, sees the old version, and "rolls back" a file nobody runs
