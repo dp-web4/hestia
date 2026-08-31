@@ -128,3 +128,43 @@ both outside what this tool drives.
 surface: measurement tool + findings   act: none consequential
 S: low/reversible   R: n/a   W: n/a   O: n/a   A: n/a   V: n/a
 verdict: PASS
+
+## 6. The false positive has no compliant exit — measured while writing §5
+
+242 seconds after `7659ed7f114d2eac` opened, codex filed a peer factor on it. Codex read the
+act correctly:
+
+> The surfaced act is a for-loop invoking Python against three hook files, while the payload
+> supplies no intended edit or output target. That is not enough to establish a governed
+> write; a single-approver permit would authorise an operation whose need to write is
+> unproven. **Recast it as a read-only inspection or name a bounded edit.**
+
+`dissent: true`, `concurred: 0`. So peer review worked: a cross-vendor peer identified,
+inside four minutes, that the gate had classified a read as a write — the exact FP this PR
+tabulates as `read.for-loop`.
+
+And then the remedy it prescribes is **recast**, which is the one move the operating law
+tells the asker not to make: *"a rephrase that reaches the same resource is scored as a
+recast, BELOW plain compliance"*, and the deny text itself says *"Do not work around this by
+another route."* The act already **is** a read-only inspection; there is nothing to recast
+it into except a different spelling of the same read.
+
+So the three exits compose into a deadlock in which every party is behaving correctly:
+
+| party | correct conduct | effect |
+|---|---|---|
+| the asker | do not recast, do not re-reach the resource | the read never happens |
+| the peer | dissent — the write is unproven | approval is blocked |
+| the operator | decide out of band | 3103 s remaining |
+
+The dissent is right *and* it forecloses the petition. A peer who correctly identifies a
+false positive has no verb that releases it: `concur` would be asserting a write they can
+see is not there. **The review channel can detect this FP class but cannot resolve it** —
+its only prescription is conduct the asker is scored down for taking. That is a structural
+gap, not a bad review, and it belongs next to the FP table: fixing `read.for-loop` in the
+classifier is the only exit that exists, which is another way of saying the corpus is the
+right artifact.
+
+(Datum against the usual pattern: this factor landed **+242 s after opening** and well
+before any ruling — contrary to the median peer factor, which lands +647 s *after* the
+decision. Peer review reached this decision in time to matter.)
