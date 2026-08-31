@@ -459,11 +459,35 @@ manifest_build_id() {
 #   ok, or skipped by explicit HESTIA_DEPLOY_HOOKS=0            -> 0
 #   refused(governed session)                                   -> 1, and the tail names the
 #      constraint: the fix is not "fix the cause" but "run from a party that is not a session"
+#   refused(FAILED(...))  [the preflight refused]               -> 1, and the tail must NOT
+#      promise a repair: see below
 #   FAILED(rc=N), skipped(no bash>=4), skipped(no installer),
 #   skipped(HESTIA_BASH not bash>=4)                            -> 1, fix the cause first
+#
+# TWO PRODUCERS SHARE THE WORD "refused" AND THEY NEED OPPOSITE ADVICE (CBP, 2026-08-31).
+# `refused(governed session)` is rc=3 from the installer and IS repaired by the next timer
+# cycle — the timer is not a session. `refused(FAILED(...))` is install_hooks refusing on a
+# preflight verdict, and the preflight sits on EVERY path into the members' install, the
+# timer's and --hooks-only's alike, so it re-runs and refuses identically forever. The glob
+# was `refused*`, written when rc=3 was the only producer; the preflight producer was added
+# later and inherited a remedy naming a cause it had not hit and a repair that cannot happen.
+# Measured, not theorised: CBP printed "the next timer cycle repairs it" on 7 consecutive
+# cycles — every one since the rule-0 auditor landed — spanning 2026-08-30T03:18:27Z to
+# 2026-08-31T03:18:26Z, while the members' surface stayed pinned at v0.0.4-516-gc991e12 and
+# the daemon walked on to -529. The whole point of this script is that a cycle ends loud and says
+# what to do; a tail that names the wrong cause is worse than silence, because it is followed.
+#
+# This is the third instance of the class this file has already fixed twice (rc=3 vs
+# FAILED(rc=N); installer-rc=0 vs ok) — and the fix each time is the same shape: stop keying
+# on a PREFIX that two causes happen to share, key on the cause.
 hooks_repair_hint() {
   case "$hooks" in
-    refused*) printf '%s' "the members' installer refuses inside a governed session (CLAUDECODE/HESTIA_ROLE set); the next timer cycle repairs it, or run hestia-deploy --hooks-only from an operator shell" ;;
+    "refused(governed session)")
+      printf '%s' "the members' installer refuses inside a governed session (CLAUDECODE/HESTIA_ROLE set); the next timer cycle repairs it, or run hestia-deploy --hooks-only from an operator shell" ;;
+    "refused(FAILED(rule-0:"*)
+      printf '%s' "the gate PREFLIGHT refused on rule 0 — an enforcing gate is registered inside a git worktree; the REFUSED line above names the registration. NO timer cycle and NO --hooks-only run repairs this: the preflight guards every path into the members' install and will refuse identically until the REGISTRATION moves out of the checkout. Check the harness settings for BOTH spellings — the hooks[].command entry and env.HESTIA_LEGACY_FALLBACK, which is a live decider whenever the daemon returns no verdict, not documentation. Moving it is an operator act by design: a governed session has no in-band route to it. HESTIA_DEPLOY_RULE0=warn keeps the seat cycling while the fix is queued" ;;
+    "refused(FAILED("*)
+      printf '%s' "the gate PREFLIGHT refused; the REFUSED line above names which check. NO timer cycle repairs a preflight verdict — it re-runs on every path into the members' install and refuses identically. Fix the cause it names, then hestia-deploy --hooks-only" ;;
     "FAILED(installer rc=0"*) printf '%s' "the installer exited 0 without writing the manifest; its own lines above say why (no member registered on this host, or DRY_RUN=1). Register a member, then hestia-deploy --hooks-only from an operator shell, or let the next timer cycle repair it" ;;
     *)        printf '%s' "fix the cause, then hestia-deploy --hooks-only (from an operator shell, or let the next timer cycle repair it)" ;;
   esac
