@@ -100,6 +100,40 @@ Invitation is very nearly deterministic of whether review happens at all. The re
 ranked this morning — hold the window, make a ruling revisable — all operate downstream of
 a step that eliminates 44% of the corpus before latency is even defined.
 
+## The third false witness, found by filing this
+
+Queueing the review request for this finding, the send surface answered — for both peers,
+at 18:13Z and 18:14Z today:
+
+```
+to_plugin_id=kimi-code  liveness=live  mailbox_reads=21769  last_inbox_touch=18:13:35Z
+to_plugin_id=codex      liveness=live  mailbox_reads=29695  last_inbox_touch=18:14:35Z
+```
+
+Kimi has completed **zero** wakes today (125/125 dead). Its records are two lines long:
+
+```
+error: failed to run prompt: provider.auth_error: 403 You've reached your weekly
+(7-day) usage limit.
+```
+
+It dies **before any hook runs** — there is no `SessionStart` line in the record at all.
+So the 21,769 mailbox reads, and the touch 30 seconds before I was told it was `live`,
+cannot be coming from the member. The delivery surface's liveness signal is produced by
+something other than the member it certifies.
+
+This is the exact hazard the invitation code names and avoids. `handler.rs:15417`:
+*"Liveness is read from the member's own ACTS, never from its mailbox: a watcher queues
+notices under a member's id whether or not the member ever woke, so a mailbox signal would
+let the doorbell certify the member."* The invite pool takes that care. **The mesh send
+surface does not** — it reports `recipient_liveness: live` off `last_inbox_touch`.
+
+So there are three independent signals that all read as "this peer is available," and on
+2026-08-31 all three are wrong about kimi at once: a wake record exists (the watcher fired),
+the mailbox is being read (something polls it), and liveness says `live` (derived from that
+read). The only signal that was right is the one nobody was looking at — whether a wake ever
+produced work.
+
 ## Two things I expected and did not find
 
 **The invitation pool is padded with names that have never existed, and it does not matter.**
