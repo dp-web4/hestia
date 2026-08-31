@@ -36,6 +36,14 @@ Both halves of that last sentence are false for this arm:
 The log is its own falsifier: the line predicting the repair is followed by six more copies of
 itself.
 
+**Why the first refusal is at 03:18 and not at 01:16.** The rule-0 auditor landed in `95e6357`
+(2026-08-29 12:46 PDT), merged as `c991e12`, and `c991e12` is what the `2026-08-30T01:16:59Z`
+cycle deployed — with `hooks=ok`. It did not refuse because the *running* script was still the
+previous one: `hestia-deploy` self-installs to `~/.local/bin`, and bash holds the script it is
+executing on an open fd, so the new bytes landed at `01:15Z` and did not decide anything until
+the next fire. The `committed → … → RESTARTED → measured` chain, one level below the daemon: a
+check can be merged, deployed and on disk and still not have run.
+
 ## 2. The defect
 
 `hooks_repair_hint()` keyed on the glob `refused*`. That was written when `refused(…)` had one
