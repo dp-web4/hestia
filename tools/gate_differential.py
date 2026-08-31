@@ -170,7 +170,11 @@ if fn is None:
         import hestia_governance_closure as hgc
         fn = hgc.classify
     except BaseException as e:
-        print(json.dumps({"_error": f"no classifier: {type(e).__name__}"})); raise SystemExit(0)
+        # The seat's module IMPORTED FINE. It simply has no closure classifier: no
+        # `_closure_classify` of its own, and nothing on the sys.path it built at import
+        # time answers to `hestia_governance_closure`. That is a fact about the SEAT, not
+        # a failure of this instrument, and the two must not read alike in the table.
+        print(json.dumps({"_error": f"NO CLOSURE GATE: module imports, exposes no classifier ({type(e).__name__})"})); raise SystemExit(0)
 
 for cid, tool, tinput in cases:
     try:
@@ -277,14 +281,32 @@ def main() -> int:
               f"{len(driven)} seat(s) -- {', '.join(driven) or 'none'} -- not {len(seats)}.")
         print()
 
+    # WHAT THIS INSTRUMENT CAN DISTINGUISH. Every driveable seat's `_closure_classify` is
+    # `from hestia_governance_closure import classify` -- the same symbol -- and the loop
+    # above hands all of them IDENTICAL arguments. So a disagreement is possible if and
+    # only if two seats' imports resolved to different BYTES. Read the verdict below as a
+    # statement about engine byte-identity, not about four gates agreeing. The two things
+    # that are genuinely per-seat are both outside this tool: the LOADER (claude-code and
+    # kimi resolve $HESTIA_HOME/shared, codex resolves the repo working tree) and the
+    # EXTRACTION domain (each seat fills paths from its own arg-key list, #734), which the
+    # corpus bypasses by passing pre-extracted tool_input.
+    print("MEASURES: byte-identity of the shared closure engine as each seat's import")
+    print("          resolves it. NOT per-seat extraction (#734) and NOT loader drift.")
+    print()
+
     cover = f"  ({len(driven)} of {len(seats)} seats driven)" if undriven else ""
     if disagreements:
         print(f"SEAT DISAGREEMENTS: {len(disagreements)}{cover}")
         for cid, row, note in disagreements:
             print(f"  {cid}  {note}")
             print(f"      " + "  ".join(f"{s}={v}" for s, v in row.items()))
+    elif undriven:
+        # Do NOT print a clean verdict over a partial denominator. "none" here reads as an
+        # all-seat result to exactly the audience the corpus is written for.
+        print(f"SEAT DISAGREEMENTS: none among the {len(driven)} seats driven "
+              f"-- INDETERMINATE for the fleet ({len(undriven)} seat(s) unmeasured)")
     else:
-        print(f"SEAT DISAGREEMENTS: none{cover}")
+        print("SEAT DISAGREEMENTS: none")
 
     if cwd_splits:
         print(f"\nSAME SEAT, DIFFERENT CWD, DIFFERENT ANSWER: {len(cwd_splits)}")
@@ -314,6 +336,18 @@ def main() -> int:
             print(f"  {cid}: expected {expect}; " + ", ".join(f"{s}={v}" for s, v in wrong.items()))
             print(f"      {note}")
 
+    # Exit status has THREE states, because "the seats agreed" and "a seat was never asked"
+    # are different claims and only one of them is a pass. Codex's review of #739 is right
+    # that folding the second into 0 hands out a four-seat green over a three-seat run.
+    #   0  every discovered seat answered, and they agreed
+    #   1  seats disagreed, or one seat split across cwds
+    #   2  INDETERMINATE: a discovered seat could not be driven at ANY cwd
+    # 2 dominates 1 rather than the other way round: an agreement count computed over an
+    # unknown denominator is not a number to act on either, so the missing seat is the
+    # first thing to fix. A caller that only tests `rc == 0` is unaffected; one that tests
+    # `rc == 1` for "disagreement" keeps its meaning.
+    if undriven:
+        return 2
     return 1 if (disagreements or cwd_splits) else 0
 
 
