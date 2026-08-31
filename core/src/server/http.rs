@@ -559,6 +559,356 @@ async fn operator_gate(
     }
 }
 
+
+/// Fixed deployment-supervisor trigger. The browser gets no command, path, unit, label,
+/// branch, or ref parameter: it can express exactly one intent, "bring the registered
+/// deployment current". Platform mechanics stay data here rather than becoming a shell
+/// string assembled from request input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeploymentUpdateTrigger {
+    program: &'static str,
+    args: Vec<String>,
+}
+
+fn deployment_update_trigger_for(os: &str, uid: Option<&str>) -> Option<DeploymentUpdateTrigger> {
+    match os {
+        "linux" => Some(DeploymentUpdateTrigger {
+            program: "systemctl",
+            // --no-block is load-bearing: hestia-deploy.service is Type=oneshot and the
+            // deployment restarts this daemon. Waiting for the oneshot from inside the daemon
+            // would make the HTTP request depend on surviving its own restart.
+            args: vec![
+                "--user".into(),
+                "--no-block".into(),
+                "start".into(),
+                "hestia-deploy.service".into(),
+            ],
+        }),
+        "macos" => uid.filter(|u| !u.is_empty()).map(|u| DeploymentUpdateTrigger {
+            program: "launchctl",
+            // No -k: if a scheduled deployment is already running, the button must not kill it.
+            args: vec![
+                "kickstart".into(),
+                format!("gui/{u}/com.web4.hestia.deploy"),
+            ],
+        }),
+        _ => None,
+    }
+}
+
+fn deployment_update_authority() -> std::result::Result<(std::path::PathBuf, String), String> {
+    let manifest_path = std::env::var_os("HESTIA_CURRENT_BUILD_FILE")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| "deployment update unavailable: HESTIA_CURRENT_BUILD_FILE is not configured".to_string())?;
+    let raw = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("deployment update unavailable: cannot read deployment authority: {e}"))?;
+    let manifest: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("deployment update unavailable: deployment authority is invalid JSON: {e}"))?;
+    let target = manifest
+        .get("build_id")
+        .or_else(|| manifest.get("git_version"))
+        .or_else(|| manifest.get("commit"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "deployment update unavailable: deployment authority has no build_id".to_string())?;
+    if target.chars().any(char::is_control) {
+        return Err("deployment update unavailable: deployment build_id contains control characters".into());
+    }
+    let home = manifest_path
+        .parent()
+        .ok_or_else(|| "deployment update unavailable: deployment authority has no parent directory".to_string())?;
+    Ok((home.to_path_buf(), target.to_string()))
+}
+
+fn write_deployment_update_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp, contents)?;
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn active_deployment_update(path: &std::path::Path) -> Option<(String, String)> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let fields: Vec<&str> = raw.trim_end().split('\t').collect();
+    if fields.len() != 4 || fields[1].is_empty() {
+        return None;
+    }
+    let updated = chrono::DateTime::parse_from_rfc3339(fields[3]).ok()?;
+    let age = chrono::Utc::now()
+        .signed_duration_since(updated.with_timezone(&chrono::Utc))
+        .num_minutes();
+    let active = match fields[0] {
+        "running" => (0..=60).contains(&age),
+        "requested" | "held" => (0..=420).contains(&age),
+        _ => false,
+    };
+    active.then(|| (fields[0].to_string(), fields[1].to_string()))
+}
+
+fn deployment_trigger_output(trigger: &DeploymentUpdateTrigger) -> std::result::Result<(), String> {
+    let output = std::process::Command::new(trigger.program)
+        .args(&trigger.args)
+        .output()
+        .map_err(|e| format!("could not start deployment supervisor: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr: String = String::from_utf8_lossy(&output.stderr)
+        .trim()
+        .chars()
+        .take(512)
+        .collect();
+    Err(if stderr.is_empty() {
+        format!("deployment supervisor trigger exited {}", output.status)
+    } else {
+        format!("deployment supervisor trigger failed: {stderr}")
+    })
+}
+
+fn current_operator_context(
+    state: &super::state::ServerState,
+    headers: &HeaderMap,
+    now: u64,
+) -> (Option<String>, Option<super::operator_auth::OperatorProvenance>) {
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let operator = bearer.and_then(|token| {
+        state
+            .operator_sessions
+            .operator(token, now, super::operator_auth::SESSION_TTL_SECS)
+            .map(str::to_string)
+    });
+    let provenance = bearer.and_then(|token| {
+        state
+            .operator_sessions
+            .provenance(token, now, super::operator_auth::SESSION_TTL_SECS)
+            .cloned()
+    });
+    (operator, provenance)
+}
+
+/// `POST /api/operator/deployment/update` - request the already-installed deployment
+/// supervisor to bring this registered deployment current.
+///
+/// This endpoint never performs the deployment transaction itself. It publishes a bounded
+/// request/status record, triggers the existing systemd/launchd supervisor, and returns before
+/// the supervisor can restart the daemon. The deployment script owns sync/build/install,
+/// preflight, lock/hold behavior, hook postconditions, and rollback exactly as it does on timer.
+async fn operator_deployment_update(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let now = super::state::unix_now();
+    let (operator, provenance) = {
+        let s = state.lock().await;
+        current_operator_context(&s, &headers, now)
+    };
+
+    let (home, authority_build) = match deployment_update_authority() {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "update_unavailable",
+                    "error": error,
+                })),
+            );
+        }
+    };
+
+    if authority_build == env!("HESTIA_GIT_VERSION") {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "current",
+                "message": "deployment is already current",
+                "running_build": env!("HESTIA_GIT_VERSION"),
+            })),
+        );
+    }
+
+    let request_path = home.join("deploy-update.request");
+    let status_path = home.join("deploy-status.tsv");
+    if let Some((status, existing_id)) = active_deployment_update(&status_path) {
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": status,
+                "request_id": existing_id,
+                "message": "a deployment update request is already active",
+            })),
+        );
+    }
+
+    let uid = if std::env::consts::OS == "macos" {
+        match std::process::Command::new("id").arg("-u").output() {
+            Ok(output) if output.status.success() => {
+                Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            }
+            Ok(output) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "status": "update_unavailable",
+                        "error": format!("cannot resolve launchd uid: {}", output.status),
+                    })),
+                );
+            }
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "status": "update_unavailable",
+                        "error": format!("cannot resolve launchd uid: {error}"),
+                    })),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let Some(trigger) = deployment_update_trigger_for(std::env::consts::OS, uid.as_deref()) else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "status": "update_unavailable",
+                "error": format!("no deployment supervisor trigger for {}", std::env::consts::OS),
+            })),
+        );
+    };
+
+    let requested_at = chrono::Utc::now().to_rfc3339();
+    let request_record = format!("{request_id}\n");
+    let status_record = format!("requested\t{request_id}\t\t{requested_at}\n");
+    if let Err(error) = write_deployment_update_file(&request_path, &request_record)
+        .and_then(|_| write_deployment_update_file(&status_path, &status_record))
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "update_unavailable",
+                "error": format!("cannot publish deployment update request: {error}"),
+            })),
+        );
+    }
+
+    {
+        let mut s = state.lock().await;
+        let record = super::operator_auth::attach_operator_provenance(
+            serde_json::json!({
+                "request_id": request_id,
+                "operator": operator,
+                "running_build": env!("HESTIA_GIT_VERSION"),
+                "authority_build": authority_build,
+                "platform": std::env::consts::OS,
+                "mechanism": "registered-deployment-supervisor",
+            }),
+            provenance.as_ref(),
+        );
+        let _ = s.append_chain("deployment_update_requested", record);
+    }
+
+    let trigger_for_run = trigger.clone();
+    let result = tokio::task::spawn_blocking(move || deployment_trigger_output(&trigger_for_run)).await;
+    let trigger_result = match result {
+        Ok(result) => result,
+        Err(error) => Err(format!("deployment supervisor trigger task failed: {error}")),
+    };
+
+    match trigger_result {
+        Ok(()) => {
+            let mut s = state.lock().await;
+            let record = super::operator_auth::attach_operator_provenance(
+                serde_json::json!({
+                    "request_id": request_id,
+                    "operator": operator,
+                    "running_build": env!("HESTIA_GIT_VERSION"),
+                    "authority_build": authority_build,
+                    "platform": std::env::consts::OS,
+                    "trigger_program": trigger.program,
+                    "trigger_args": trigger.args,
+                    "outcome": "requested",
+                }),
+                provenance.as_ref(),
+            );
+            let _ = s.append_chain("deployment_update_triggered", record);
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "requested",
+                    "request_id": request_id,
+                    "authority_build": authority_build,
+                    "message": "deployment supervisor accepted the update request",
+                })),
+            )
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&request_path);
+            let failed_at = chrono::Utc::now().to_rfc3339();
+            let _ = write_deployment_update_file(
+                &status_path,
+                &format!("failed\t{request_id}\t\t{failed_at}\n"),
+            );
+            let mut s = state.lock().await;
+            let record = super::operator_auth::attach_operator_provenance(
+                serde_json::json!({
+                    "request_id": request_id,
+                    "operator": operator,
+                    "running_build": env!("HESTIA_GIT_VERSION"),
+                    "authority_build": authority_build,
+                    "platform": std::env::consts::OS,
+                    "outcome": "trigger-failed",
+                    "error": error,
+                }),
+                provenance.as_ref(),
+            );
+            let _ = s.append_chain("deployment_update_trigger_failed", record);
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "failed",
+                    "request_id": request_id,
+                    "error": error,
+                })),
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod deployment_update_tests {
+    use super::*;
+
+    #[test]
+    fn linux_trigger_is_fixed_and_nonblocking() {
+        let trigger = deployment_update_trigger_for("linux", None).unwrap();
+        assert_eq!(trigger.program, "systemctl");
+        assert_eq!(
+            trigger.args,
+            ["--user", "--no-block", "start", "hestia-deploy.service"]
+        );
+    }
+
+    #[test]
+    fn macos_trigger_is_fixed_to_the_registered_launchd_label() {
+        let trigger = deployment_update_trigger_for("macos", Some("501")).unwrap();
+        assert_eq!(trigger.program, "launchctl");
+        assert_eq!(trigger.args, ["kickstart", "gui/501/com.web4.hestia.deploy"]);
+    }
+
+    #[test]
+    fn unsupported_platform_has_no_shell_fallback() {
+        assert_eq!(deployment_update_trigger_for("windows", None), None);
+    }
+}
+
 pub async fn serve(state: SharedState, bind: &str) -> Result<()> {
     serve_with_callback(state, bind, None).await
 }
@@ -628,6 +978,10 @@ pub async fn serve_with_callback(
         .route("/api/trust/derivation", get(trust_derivation_json))
         .route("/api/trust/graph", get(trust_graph_turtle))
         .route("/api/operator/adjudicate", post(operator_adjudicate))
+        .route(
+            "/api/operator/deployment/update",
+            post(operator_deployment_update),
+        )
         .route(
             "/api/operator/gate-escalation",
             post(operator_gate_escalation),
