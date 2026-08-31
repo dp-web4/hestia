@@ -15,9 +15,31 @@ prints it. A verdict can be sincere and wrong. A number that goes to zero cannot
 THREE MEASUREMENTS. The first two are mechanical; the third takes a judgment call and prints
 the judgment so it can be argued with rather than trusted.
 
-  1. FORKED (no judgment). A seat function whose name the shared engine already owns AND
-     whose body is a second implementation. That is the shape that lets two seats answer the
-     same question differently, so it is what CI ratchets on.
+  1. FORKED (no judgment), in two grades, because one number was hiding two opposite risks.
+     A seat function whose name the shared engine already owns AND whose body is not a
+     delegating call. The grade is decided by comparing the two SOURCE TEXTS:
+
+       DIVERGENT -- the bodies differ. Two implementations of one name, free to answer the
+       same question differently. This is the shape the ratchet exists to stop, and it is
+       the tight pin.
+
+       VERBATIM -- the seat's source is character-for-character the shared engine's. Real
+       debt (two copies to deploy, two places to edit) but provably not divergence: there is
+       no input on which they can disagree, because they are the same program.
+
+     Counting these as one number made the deploy-safe collapse of the largest seat
+     unlandable. A seat imports the shared module from the INSTALLED path, so a move must
+     publish first and delete in the follow-on release; between those merges the moved
+     functions are duplicated ON PURPOSE. Under a single pin that transient reads exactly
+     like drift, so the ratchet forbade the publish step -- while the four forks it was
+     already tolerating carried 100% of the fleet's actual divergence. The instrument would
+     again have gone red at the moment the work it measures succeeded.
+
+     This is a tightening, not an exemption. Nothing is annotated and nothing is trusted:
+     the grade is recomputed from source on every run, so the day a verbatim copy is edited
+     it becomes DIVERGENT and trips the tight pin immediately -- which the old count-only
+     ratchet would have missed entirely, since the count did not move. Reindentation also
+     reads as divergent; the comparison errs toward the strict grade.
 
   2. ADAPTER (no judgment, and NOT a fork). Same name, but the body is one delegating call
      to the shared name -- `return _core.path_in_scope(...)`. That is the collapse pattern
@@ -115,11 +137,13 @@ def shared_symbols(shared_dir: Path):
     """Every name the shared engine defines. Tests are not the engine."""
     names = set()
     files = []
+    sources: dict[str, str] = {}
     for f in sorted(shared_dir.glob(SHARED_GLOB)):
         if is_test(f):
             continue
         files.append(f)
-        tree = ast.parse(f.read_text(encoding="utf-8", errors="replace"), filename=str(f))
+        src = f.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(src, filename=str(f))
         # TOP LEVEL ONLY, and this is a correction rather than a tightening. `ast.walk`
         # collected NESTED functions too, so a private closure inside a shared function
         # became "a name the engine owns" -- and any unrelated local helper in a seat that
@@ -132,7 +156,12 @@ def shared_symbols(shared_dir: Path):
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 names.add(node.name)
-    return names, files
+                if not isinstance(node, ast.ClassDef):
+                    # First definition wins, matching `names`: if two shared modules define
+                    # the same name the engine is already inconsistent, and a seat matching
+                    # either one is not the thing this grade is claiming.
+                    sources.setdefault(node.name, ast.get_source_segment(src, node) or "")
+    return names, files, sources
 
 
 def delegates(node) -> bool:
@@ -156,6 +185,20 @@ def delegates(node) -> bool:
     return isinstance(func, ast.Attribute) and func.attr == node.name
 
 
+def is_verbatim(fn: dict, shared_sources: dict) -> bool:
+    """True when a fork's source is character-for-character the shared engine's.
+
+    Equal text cannot disagree on any input, so such a copy is duplicate law (two places to
+    deploy, two places to edit) but provably not divergence. Everything else is DIVERGENT,
+    including a copy that differs only by indentation: the grade errs strict, because the
+    cost of calling a divergent fork verbatim is an undetected second law, and the cost of
+    calling a verbatim fork divergent is one honest line of ratchet noise.
+
+    Recomputed from source on every run. There is no annotation to trust and nothing a seat
+    can assert about itself -- editing a verbatim copy re-grades it on the next CI run."""
+    return bool(fn.get("source")) and fn["source"] == shared_sources.get(fn["name"])
+
+
 def module_functions(path: Path):
     """Every function a module defines, with its own source extent and classification."""
     src = path.read_text(encoding="utf-8", errors="replace")
@@ -174,6 +217,7 @@ def module_functions(path: Path):
                 "top_level": id(node) in top,
                 "delegates": delegates(node),
                 "law_bearing": any(v in body or v in node.name.lower() for v in LAW_VOCABULARY),
+                "source": ast.get_source_segment(src, node) or "",
             })
     return out, len(lines)
 
@@ -181,7 +225,16 @@ def module_functions(path: Path):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-forked", type=int, default=None,
-                    help="ratchet: fail if the forked-function count exceeds this")
+                    help="ratchet: fail if the TOTAL forked-function count exceeds this")
+    ap.add_argument("--max-divergent-forked", type=int, default=None,
+                    help="ratchet: fail if the count of forks whose source DIFFERS from the "
+                         "shared engine's exceeds this. The tight pin: these are the forks "
+                         "that can answer a question two ways.")
+    ap.add_argument("--max-verbatim-forked", type=int, default=None,
+                    help="ratchet: fail if the count of forks that are character-for-"
+                         "character the shared engine's exceeds this. Duplicate law with a "
+                         "receipt -- a move that has published but not yet deleted. Declared "
+                         "so it is visible, and it must come back down.")
     ap.add_argument("--max-pct", type=float, default=None,
                     help="ratchet: fail if the still-per-seat percentage exceeds this. "
                          "This is the number that matters; --max-forked is the one that is "
@@ -194,7 +247,7 @@ def main() -> int:
     args = ap.parse_args()
 
     root = repo_root(Path(__file__).resolve())
-    names, shared_files = shared_symbols(root / "plugins" / "_shared")
+    names, shared_files, shared_sources = shared_symbols(root / "plugins" / "_shared")
     gates, unclassified = discover_gates(root)
 
     # A discovery that matches nothing must fail loudly. Silent zero reads as collapsed,
@@ -223,11 +276,14 @@ def main() -> int:
     print()
 
     tot_fork = tot_fork_sloc = tot_adapt = tot_law = tot_local = 0
+    tot_div = tot_verb = 0
     rows = []
     for seat, path in gates:
         fns, filelines = module_functions(path)
         same = [f for f in fns if f["name"] in names and f["top_level"]]
         fork = [f for f in same if not f["delegates"]]
+        for f in fork:
+            f["verbatim"] = is_verbatim(f, shared_sources)
         adapt = [f for f in same if f["delegates"]]
         law = [f for f in fns if f["law_bearing"]]
         local_sloc = sum(f["sloc"] for f in fns)
@@ -235,20 +291,25 @@ def main() -> int:
                      sum(f["sloc"] for f in law), local_sloc, filelines))
         tot_fork += len(fork)
         tot_fork_sloc += sum(f["sloc"] for f in fork)
+        tot_div += sum(1 for f in fork if not f["verbatim"])
+        tot_verb += sum(1 for f in fork if f["verbatim"])
         tot_adapt += len(adapt)
         tot_law += sum(f["sloc"] for f in law)
         tot_local += local_sloc
 
-    hdr = (f"{'seat':<14}{'funcs':>7}{'fork':>6}{'fork':>7}{'adapt':>7}"
+    hdr = (f"{'seat':<14}{'funcs':>7}{'diver':>6}{'verb':>6}{'fork':>7}{'adapt':>7}"
            f"{'law':>6}{'law':>7}{'local':>8}{'file':>7}")
     print(hdr)
-    print(f"{'':<14}{'':>7}{'':>6}{'sloc':>7}{'':>7}{'fns':>6}{'sloc':>7}{'sloc':>8}{'lines':>7}")
+    print(f"{'':<14}{'':>7}{'gent':>6}{'atim':>6}{'sloc':>7}{'':>7}"
+          f"{'fns':>6}{'sloc':>7}{'sloc':>8}{'lines':>7}")
     print("-" * len(hdr))
     for seat, nf, fork, adapt, nl, nls, ls, fl in rows:
-        print(f"{seat:<14}{nf:>7}{len(fork):>6}{sum(f['sloc'] for f in fork):>7}"
+        nd = sum(1 for f in fork if not f["verbatim"])
+        nv = sum(1 for f in fork if f["verbatim"])
+        print(f"{seat:<14}{nf:>7}{nd:>6}{nv:>6}{sum(f['sloc'] for f in fork):>7}"
               f"{len(adapt):>7}{nl:>6}{nls:>7}{ls:>8}{fl:>7}")
     print("-" * len(hdr))
-    print(f"{'TOTAL':<14}{'':>7}{tot_fork:>6}{tot_fork_sloc:>7}{tot_adapt:>7}"
+    print(f"{'TOTAL':<14}{'':>7}{tot_div:>6}{tot_verb:>6}{tot_fork_sloc:>7}{tot_adapt:>7}"
           f"{'':>6}{tot_law:>7}{tot_local:>8}")
     print()
 
@@ -289,9 +350,10 @@ def main() -> int:
     if not args.quiet:
         for seat, _, fork, adapt, _, _, _, _ in rows:
             if fork:
-                print(f"{seat}: FORKS names the shared engine owns (second implementations)")
+                print(f"{seat}: FORKS names the shared engine owns")
                 for f in sorted(fork, key=lambda r: -r["sloc"]):
-                    print(f"    {f['sloc']:>5} sloc  line {f['line']:>5}  {f['name']}")
+                    grade = "verbatim " if f["verbatim"] else "DIVERGENT"
+                    print(f"    {grade} {f['sloc']:>5} sloc  line {f['line']:>5}  {f['name']}")
             if adapt:
                 print(f"{seat}: adapts (delegates to the shared name -- this is the cure)")
                 for f in sorted(adapt, key=lambda r: -r["sloc"]):
@@ -309,7 +371,8 @@ def main() -> int:
     total_law = tot_law + shared_law
     pct = (100.0 * tot_law / total_law) if total_law else 0.0
 
-    print(f"COLLAPSE METER: {tot_fork} forked function(s), {tot_fork_sloc} sloc; "
+    print(f"COLLAPSE METER: {tot_fork} forked function(s) "
+          f"({tot_div} divergent, {tot_verb} verbatim), {tot_fork_sloc} sloc; "
           f"{tot_adapt} adapter(s) (not counted against the ratchet).")
     print(f"law-bearing sloc: {tot_law} per-seat + {shared_law} shared = {total_law}")
     print(f"STILL PER-SEAT: {pct:.1f}%   (collapsed means 0.0%, and 0 forked)")
@@ -347,6 +410,21 @@ def main() -> int:
         if tot_fork > args.max_forked:
             print(f"::error::gate collapse regressed: {tot_fork} forked functions exceeds "
                   f"the pinned limit of {args.max_forked}", file=sys.stderr)
+            failed = True
+    if args.max_divergent_forked is not None:
+        print(f"ratchet divergent: {tot_div} vs limit {args.max_divergent_forked}")
+        if tot_div > args.max_divergent_forked:
+            print(f"::error::gate collapse regressed: {tot_div} DIVERGENT forked functions "
+                  f"exceeds the pinned limit of {args.max_divergent_forked}. Two bodies for "
+                  f"one name can answer one question two ways.", file=sys.stderr)
+            failed = True
+    if args.max_verbatim_forked is not None:
+        print(f"ratchet verbatim : {tot_verb} vs limit {args.max_verbatim_forked}")
+        if tot_verb > args.max_verbatim_forked:
+            print(f"::error::duplicate law grew: {tot_verb} verbatim copies of shared "
+                  f"functions exceeds the pinned limit of {args.max_verbatim_forked}. A "
+                  f"published-but-not-yet-deleted move is allowed, but it is DECLARED here "
+                  f"and the follow-on release must bring this back down.", file=sys.stderr)
             failed = True
     if args.max_pct is not None:
         # Compare the number that is PRINTED, not the float behind it. The first version
