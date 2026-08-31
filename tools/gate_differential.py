@@ -99,7 +99,7 @@ CORPUS = [
      {"command": 'git commit -m "docs(README): the bridge and the sentence"'},
      "none", "MRH-layer FP 2026-08-29: a conventional-commit type read as an ungranted path"),
     ("read.loop-variable-as-path", "Bash",
-     {"command": 'for r in hestia private-context; do git -C /abs/$r log -1; done'},
+     {"command": 'for r in alpha beta; do git -C /abs/$r log -1; done'},
      "none", "MRH-layer FP 2026-08-31: the loop VARIABLE read as a path token"),
     ("read.url-path-segment", "Bash",
      {"command": 'gh api repos/dp-web4/web4/contents/docs/specs/attestation.md'},
