@@ -326,3 +326,17 @@ jobs:
           # engine's own docstring says it was hardened against. Collapsing a
           # fork is what drives it down.
           python3 tools/scope_fork_differential_test.py --max-divergences 6
+
+      - name: Does a policy predicate still have exactly one home?
+        run: |
+          set -euo pipefail
+          # Not a ratchet -- a floor, with an EMPTY allowlist. Two surfaces had
+          # written `bar_met`'s old SovereignPlusPeer rule down in their own
+          # words; when 9d3936d relaxed the rule, one was corrected 10 days
+          # later and the other spent 25 days telling the operator, in warning
+          # colour, the opposite of what the code did. Both restatements had the
+          # same syntactic shape: an `==` against a policy enum outside the
+          # module that owns the predicate. This forbids that shape. It is RED
+          # on main's dashboard.rs (2 sites) and green on the fix -- verified
+          # against the real defect, not a synthetic one.
+          python3 tools/policy_predicate_has_one_home.py
