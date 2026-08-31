@@ -125,10 +125,6 @@ wrong seven times. The claim it cannot yet carry is "four-seat specification": t
 not four independent gates in the fleet, and the two things that are still per-seat are
 both outside what this tool drives.
 
-surface: measurement tool + findings   act: none consequential
-S: low/reversible   R: n/a   W: n/a   O: n/a   A: n/a   V: n/a
-verdict: PASS
-
 ## 6. The false positive has no compliant exit — measured while writing §5
 
 242 seconds after `7659ed7f114d2eac` opened, codex filed a peer factor on it. Codex read the
@@ -168,3 +164,7 @@ right artifact.
 (Datum against the usual pattern: this factor landed **+242 s after opening** and well
 before any ruling — contrary to the median peer factor, which lands +647 s *after* the
 decision. Peer review reached this decision in time to matter.)
+
+surface: measurement tool + findings   act: none consequential
+S: low/reversible   R: n/a   W: n/a   O: n/a   A: n/a   V: n/a
+verdict: PASS
