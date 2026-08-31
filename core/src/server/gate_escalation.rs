@@ -1816,15 +1816,28 @@ pub fn act_digest_of(act: &str) -> String {
         self.by_id.insert(prior.id.clone(), prior);
     }
 
-    /// Add a peer's evidence to a PENDING escalation without deciding it.
+    /// Add a peer's evidence to an escalation without deciding it.
     ///
     /// This is the accumulation half of the constellation model: approval is not a boolean
     /// from whichever channel answered first. A peer co-signs here (NOT-SAME, enforced by the
     /// caller the same way arbitration enforces it), the operator decides later, and `bar_met`
     /// evaluates the whole set. A corroboration is NOT a decision: it permits nothing by
-    /// itself, it is witnessed separately (so it cannot be laundered into a ruling), and it
-    /// freezes the moment a decision lands — evidence after the fact would let a weak ruling
-    /// be dressed up retroactively.
+    /// itself, and it is witnessed separately, so it cannot be laundered into a ruling.
+    ///
+    /// WHAT CLOSES THIS DOOR IS EXPIRY, NOT THE RULING. `status_at` reaches `Expired` from
+    /// `Pending` ALONE, so the guard below is unreachable on a decided row: an approved or
+    /// denied escalation takes factors FOREVER, and only a lapsed-undecided one refuses.
+    /// A late factor still cannot dress up a ruling — `bar_met` is unmoved by it (see
+    /// `a_late_factor_cannot_move_the_bar_on_the_surface_where_it_could`) — so the protection
+    /// the deleted sentence claimed comes from the PREDICATE, not from refusing the peer.
+    ///
+    /// The deleted sentence said the opposite ("it freezes the moment a decision lands").
+    /// It outlived the 2026-08-06 cutover by 25 days and was filed twice (#510, and codex's
+    /// review-4732) before this fix. Between those filings a seat re-derived the false
+    /// version as fact 102 minutes after the corroboration landed, holding the correct rule
+    /// in its own notes at the time. That is why the correction belongs HERE and in the tool
+    /// description: a stale line two lines above the code beats a correct note anywhere
+    /// else, because this is where the next reader stands.
     pub fn corroborate(
         &mut self,
         id: &str,
@@ -3865,6 +3878,39 @@ mod bar_factor_tests {
         assert_eq!(after.bar_met(), before, "a late factor MUST NOT change the bar verdict");
         assert_eq!(after.peer_participation().concurred, 1, "but it is on the record");
         assert_eq!(after.stored_status(), Status::Approved, "and the ruling is untouched");
+    }
+
+    #[test]
+    fn a_late_factor_cannot_move_the_bar_on_the_surface_where_it_could() {
+        // The sibling test above uses a `law_inject.py` fixture, which `bar_for` maps to
+        // SingleApprover — where `sovereign || peer` is already true from the decider's own
+        // factor, so its before/after assertion is a tautology and stays green no matter what
+        // `corroborate` does to the factor set. The dress-up hazard lives on the OTHER arm.
+        //
+        // `witness.py` is SovereignPlusPeer. Under the shipped predicate (`any(is_sovereign)`)
+        // a late peer factor is inert here too. Under the peer conjunct that codex's
+        // review-4732 warned about restoring (`sovereign && peer`), `before` is false and
+        // `after` is true — a peer arriving AFTER the ruling would make an approval claimable
+        // that was not. This test is the arithmetic of that hazard, so the reintroduction
+        // cannot land silently.
+        let (mut s, id) = open_with("witness.py");
+        assert_eq!(s.get(&id).unwrap().bar, Bar::SovereignPlusPeer);
+        s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::OperatorSession, None, None, T0 + 5)
+            .expect("decided");
+        let before = s.get(&id).unwrap().bar_met();
+        let claimable_before = s.get(&id).unwrap().is_claimable(T0 + 6);
+
+        let after = s
+            .corroborate(&id, "kimi-code", "r", None, false, None, T0 + 7)
+            .expect("a decided row still takes evidence — expiry closes this door, not the ruling");
+
+        assert_eq!(after.bar_met(), before, "a late factor MUST NOT move the bar on a two-bar surface");
+        assert_eq!(
+            after.is_claimable(T0 + 8),
+            claimable_before,
+            "and it MUST NOT turn an unclaimable approval into a claimable one"
+        );
+        assert_eq!(after.peer_participation().concurred, 1, "but it is on the record");
     }
 
     #[test]
