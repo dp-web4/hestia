@@ -1,0 +1,113 @@
+name: gpt fix invitation note 694
+
+on:
+  push:
+    branches: [gpt/fix-invitation-note-694]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Patch and test the invitation note contract
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('core/src/server/handler.rs')
+          s = p.read_text()
+          old = '''        "invitation_note": match (esc.bar, asker_is_proven, invited.is_empty()) {
+              (Bar::SingleApprover, _, _) =>
+                  "this bar names no peer conjunct — no invitation was issued, and none was due",
+              (Bar::SovereignPlusPeer, false, _) =>
+                  "NOBODY WAS WOKEN, and not because the registry is empty. This ask arrived \\
+                   without a session_id, so its asker is a string this daemon never verified, \\
+                   and waking peers in that name would be an outward message sent on behalf of \\
+                   an identity nobody proved (#128). The peers who WOULD have been asked are \\
+                   recorded under `invitation_withheld`. Re-open with your session_id from \\
+                   hestia_connect to actually invite them; the sovereign can decide either way",
+              (Bar::SovereignPlusPeer, true, true) =>
+                  "this bar invites a peer and this box knows no admissible one to ask. The \\
+                   sovereign may still decide (#226: the two-bar invites, it does not block) — \\
+                   the record will say the peer half was never asked, not that it declined",
+              (Bar::SovereignPlusPeer, true, false) =>
+                  "peers were invited and woken. Their participation is EVIDENCE, never a veto: \\
+                   a sovereign decision stands whether they concur, dissent, or never look",
+          },'''
+          new = '''        "invitation_note": invitation_note(asker_is_proven, invited.is_empty()),'''
+          if s.count(old) != 1:
+              raise SystemExit(f'expected exactly one stale invitation_note match, found {s.count(old)}')
+          s = s.replace(old, new)
+          anchor = '''/// `hestia_request_scope` — a member asks the operator to reach ONE path outside its MRH.\n'''
+          helper = r'''/// Explain the invitation outcome from the facts that actually control it.
+///
+/// The bar does not belong in this predicate. Both bars invite admissible peers; whether an
+/// invitation is withheld is determined by asker attribution, and an empty invitation after a
+/// proven ask means the registry had nobody admissible to wake. Keeping the prose over the same
+/// two facts as `resolve_invitation` prevents an old bar interpretation from outliving policy.
+fn invitation_note(asker_is_proven: bool, invited_is_empty: bool) -> &'static str {
+    match (asker_is_proven, invited_is_empty) {
+        (false, _) =>
+            "NOBODY WAS WOKEN, and not because the registry is empty. This ask arrived \
+             without a proven session_id, so its asker is a string this daemon never verified, \
+             and waking peers in that name would be an outward message sent on behalf of an \
+             identity nobody proved (#128). The peers who WOULD have been asked are recorded \
+             under `invitation_withheld`. Re-open with your session_id from hestia_connect to \
+             actually invite them; the sovereign can decide either way",
+        (true, true) =>
+            "this ask was attributed, but this box knows no admissible peer to invite. The \
+             sovereign may still decide (#226: participation is invited, never a blocker) — \
+             the record says nobody was asked, not that a peer declined",
+        (true, false) =>
+            "peers were invited and woken. Their participation is EVIDENCE, never a veto: a \
+             sovereign decision stands whether they concur, dissent, or never look",
+    }
+}
+
+#[cfg(test)]
+mod invitation_note_contract_tests {
+    use super::invitation_note;
+
+    #[test]
+    fn unattributed_ask_names_identity_as_the_cause_and_the_remedy() {
+        for invited_is_empty in [true, false] {
+            let note = invitation_note(false, invited_is_empty);
+            assert!(note.contains("NOBODY WAS WOKEN"), "{note}");
+            assert!(note.contains("session_id"), "{note}");
+            assert!(note.contains("hestia_connect"), "{note}");
+            assert!(!note.contains("bar names no peer"), "{note}");
+        }
+    }
+
+    #[test]
+    fn attributed_ask_reports_invitation_reality_not_bar_folklore() {
+        let none = invitation_note(true, true);
+        assert!(none.contains("no admissible peer"), "{none}");
+        assert!(!none.contains("declined"), "{none}");
+
+        let sent = invitation_note(true, false);
+        assert!(sent.contains("peers were invited and woken"), "{sent}");
+        assert!(sent.contains("EVIDENCE, never a veto"), "{sent}");
+    }
+}
+
+'''
+          if s.count(anchor) != 1:
+              raise SystemExit(f'expected request-scope anchor once, found {s.count(anchor)}')
+          s = s.replace(anchor, helper + anchor)
+          p.write_text(s)
+          PY
+          cargo test --manifest-path core/Cargo.toml invitation_note_contract_tests --locked
+      - name: Commit source correction
+        run: |
+          git config user.name "gpt-sweep"
+          git config user.email "actions@users.noreply.github.com"
+          git add core/src/server/handler.rs
+          git commit -m "fix: make invitation note describe actual cause (#694)"
+          git push
