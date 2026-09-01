@@ -15733,6 +15733,58 @@ fn deliver_invitations(
     invitations
 }
 
+
+/// The remedy every escalation names — in a form that can actually be typed.
+///
+/// Both `how_to_decide` strings were written in `5e15636` (#114), BEFORE `hestia gate`
+/// existed (`gate_cli.rs` header: "That subcommand had never been written"). When the CLI
+/// shipped it deliberately asserts `hestia-cli` unless told `--as <seat>` — and `hestia-cli`
+/// matches no lineage in `arbiter::is_recognised_reasoner`, so the printed command is refused
+/// for EVERY caller: `hestia gate deny <id>` → "'hestia-cli' is not a recognised reasoning
+/// harness". Measured 2026-09-01 on escalation `4ea163f9db88ec75`, approve and deny alike.
+/// The seat hooks print this string verbatim (`To allow:  {how}` in claude/codex/kimi
+/// `pre_tool_use.py`), so the recipe every refusal handed out failed as typed; the rulings
+/// that did land added `--as` from memory, not from the text.
+///
+/// One function for both opening doors so they cannot drift again (they had: one printed
+/// `--reason` on the approve leg, the other on the deny leg). The deny leg names the ASKER
+/// because a seat retiring its own false-positive petition is the modal CLI use
+/// (`self_withdrawn`); the approve leg carries a placeholder because NOT-SAME forbids naming
+/// the asker there. The operator rules through the dashboard (`operator_session`) and does
+/// not need this line.
+fn how_to_decide(id: &str, asker: &str) -> String {
+    format!(
+        "a peer rules: hestia gate approve {id} --as <peer-seat> --reason '...' \
+         (or: hestia gate deny {id} --as <peer-seat> --reason '...'); \
+         the asker retires its own: hestia gate deny {id} --as {asker} --reason '...'. \
+         Without --as the CLI asserts 'hestia-cli', which every ruling refuses as unrecognised."
+    )
+}
+
+#[cfg(test)]
+mod how_to_decide_tests {
+    use super::how_to_decide;
+
+    /// Every `hestia gate` command in the recipe carries `--as`. The CLI's default identity
+    /// is refused by the arbiter, so a recipe without it is a dead instruction — the state
+    /// both doors were in from `5e15636` until this test (approve and deny alike, measured
+    /// 2026-09-01 on `4ea163f9db88ec75`). Pinned as a predicate over the string rather than
+    /// a golden copy, so a rewording that keeps the property passes and one that drops it
+    /// does not.
+    #[test]
+    fn every_command_in_the_recipe_carries_as() {
+        let s = how_to_decide("abc123", "claude-code");
+        let legs: Vec<&str> = s.split("hestia gate ").skip(1).collect();
+        assert!(legs.len() >= 2, "recipe names fewer than two commands: {s}");
+        for leg in &legs {
+            assert!(leg.contains("--as "), "a command without --as: hestia gate {leg}");
+            assert!(leg.contains("abc123"), "a command without the id: hestia gate {leg}");
+        }
+        assert!(s.contains("deny abc123 --as claude-code"), "deny leg must name the asker: {s}");
+        assert!(!s.contains("approve abc123 --as claude-code"), "approve leg must NOT name the asker (NOT-SAME): {s}");
+    }
+}
+
 async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::{now_secs, Bar, DEFAULT_TTL_SECS};
 
@@ -15925,10 +15977,7 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
         "invited_peers": invited,
         "invitations": invitations,
         "asker_basis": if asker_is_proven { "session" } else { "asserted" },
-        "how_to_decide": format!(
-            "hestia gate approve {id}   (or: hestia gate deny {id} --reason '...')",
-            id = esc.id
-        ),
+        "how_to_decide": how_to_decide(&esc.id, &esc.plugin_id),
         "on_timeout": "DENIED — no decision within the window is a refusal, not a retry",
         // Say plainly when nobody was asked, and WHY. Silence would read as "asked, and they
         // agreed"; the withheld case reading as the empty-registry case would be worse still —
@@ -16640,10 +16689,7 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                 "invited_peers": inv.invited,
                 "invitations": invitations,
                 "asker_basis": if asker_is_proven { "session" } else { "asserted" },
-                "how_to_decide": format!(
-                    "hestia gate approve {id} --reason '...'   (or: hestia gate deny {id})",
-                    id = esc.id
-                ),
+                "how_to_decide": how_to_decide(&esc.id, &esc.plugin_id),
                 // TELL THE ASKER HOW TO WAIT, because the notice does not reach a live seat.
                 //
                 // dp, 2026-08-27: "the escalation instructions should include the suggestion
