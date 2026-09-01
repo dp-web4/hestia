@@ -42,7 +42,8 @@
             "tool_input": {
               "command": "touch {hold}"
             }
-          }
+          },
+          "advisory": true
         }
       ]
     }

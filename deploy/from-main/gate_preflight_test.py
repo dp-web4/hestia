@@ -18,16 +18,20 @@ SPEC.loader.exec_module(gate_preflight)
 
 
 def make_member(repo: Path, home: Path, name: str, *, registered: bool = True,
-                outcome: str = "allow", reader: str = "json-hook-commands") -> None:
+                outcome: str = "allow", reader: str = "json-hook-commands",
+                advisory: bool = False) -> None:
     plugin = repo / "plugins" / name
     hooks = plugin / "hooks"
     hooks.mkdir(parents=True)
     event = {"hook_event_name": "PreToolUse", "tool_name": "Read",
              "tool_input": {"file_path": "{scratch}"}}
+    declared = {"label": "read", "event": event}
+    if advisory:
+        declared["advisory"] = True
     spec = {
         "install": {
             "registration": {"path": [f".{name}", "settings.json"], "reader": reader},
-            "gate_probe": {"entry": "hooks/pre_tool_use.py", "events": [{"label": "read", "event": event}]},
+            "gate_probe": {"entry": "hooks/pre_tool_use.py", "events": [declared]},
         }
     }
     (plugin / "expects.json").write_text(json.dumps(spec), encoding="utf-8")
@@ -67,6 +71,34 @@ def test_registered_refusal_blocks_the_set_before_installation():
         assert not good
         assert rows[0]["status"] == "refused"
         assert rows[0]["member"] == "alpha"
+
+
+def test_advisory_refusal_is_logged_and_does_not_block():
+    """#767: a probe declared advisory keeps its row and loses its veto. The SAME deny that
+    blocks above must not block here, and the row must say it was refused, not ok."""
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        repo, home = root / "repo", root / "home"
+        make_member(repo, home, "alpha", outcome="deny", advisory=True)
+        rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+        assert good, rows
+        assert rows == [{"member": "alpha", "probe": "read", "status": "advisory-refused",
+                         "reason": "candidate exited 2"}]
+
+
+def test_advisory_flag_must_be_literal_true():
+    """A truthy-but-wrong spelling ("yes", 1) must NOT demote a blocking probe."""
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        repo, home = root / "repo", root / "home"
+        make_member(repo, home, "alpha", outcome="deny")
+        spec_path = repo / "plugins" / "alpha" / "expects.json"
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        spec["install"]["gate_probe"]["events"][0]["advisory"] = "yes"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+        assert not good
+        assert rows[0]["status"] == "refused"
 
 
 def test_zero_exit_payload_deny_is_not_mistaken_for_an_allow():
@@ -152,10 +184,12 @@ def test_every_shipped_gate_declares_its_own_probe_shape():
 if __name__ == "__main__":
     test_registered_candidate_must_allow_the_declared_probe()
     test_registered_refusal_blocks_the_set_before_installation()
+    test_advisory_refusal_is_logged_and_does_not_block()
+    test_advisory_flag_must_be_literal_true()
     test_zero_exit_payload_deny_is_not_mistaken_for_an_allow()
     test_gemini_zero_exit_decision_deny_is_not_mistaken_for_an_allow()
     test_unregistered_member_is_not_a_deployment_requirement()
     test_bad_registration_is_unmeasured_not_absent()
     test_workspace_is_explicit_when_a_checkout_is_nested_in_a_worktree()
     test_every_shipped_gate_declares_its_own_probe_shape()
-    print("ok: 8 gate-preflight checks")
+    print("ok: 10 gate-preflight checks")

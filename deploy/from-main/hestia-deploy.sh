@@ -373,9 +373,20 @@ preflight_gate() {
 
   # Each probe is an act the seat MUST retain in order to undo this install. A gate that denies
   # any of them has taken the escape hatch with it.
+  #
+  # RUN FROM THE GOVERNED CHECKOUT, NOT FROM WHEREVER THE CALLER STOOD (#767, CBP 2026-09-01).
+  # The gate infers its workspace from cwd when HESTIA_WORKSPACE is unset. From `~` that is
+  # /home/<user>, and every absolute path under home that is not a granted repo then reads
+  # as "'.hestia' is not granted" -- including $HOLD. The timer unit sets no WorkingDirectory,
+  # so the timer stood in `~` and the hold probe refused on the FIRST cycle after rule 0
+  # cleared; an operator running this from `~` got the identical verdict. No real member
+  # session has /home/<user> as its workspace: sessions launch inside the repo they govern.
+  # gate-preflight.py already models that with cwd=repo; this probe now does the same, so the
+  # verdict is a property of the gate and the law, not of the caller's shell. Measured both
+  # ways against 2ce595c (rc=2 from `~`, rc=0 from the checkout, same event, same daemon).
   _probe() {  # $1 = label, $2 = event json
-    printf '%s' "$2" | env HESTIA_PRE_FAIL_CLOSED=1 CLAUDECODE=1 HESTIA_ENDPOINT="$EP" \
-      python3 "$gate" >"$tmp/out" 2>"$tmp/err"
+    printf '%s' "$2" | (cd "$DEPLOY_ROOT/hestia" && env HESTIA_PRE_FAIL_CLOSED=1 CLAUDECODE=1 \
+      HESTIA_ENDPOINT="$EP" python3 "$gate") >"$tmp/out" 2>"$tmp/err"
     rc=$?
     [ "$rc" = 0 ] && return 0
     log "WARN preflight probe '$1' -> rc=$rc: $(head -c 300 "$tmp/err" | tr '\n' ' ')"
@@ -405,8 +416,13 @@ preflight_gate() {
   esac
 
   ev='{"session_id":"hestia-deploy-preflight","tool_name":"Bash","tool_input":{"command":"touch '"$HOLD"'"}}'
-  _probe "touch the deploy hold (the in-band stop)" "$ev" || {
-    preflight="FAILED(gate refuses the hold file)"; rm -rf "$tmp"; return 0; }
+  # ADVISORY, not blocking (#767). No seat's scope law grants a member a write to
+  # $HESTIA_HOME/deploy.hold; where this probe passes it passes because the command does not
+  # mention the inferred workspace, which is a scanner blind spot, not a grant. The members'
+  # probes in expects.json carry the same flag. The row stays in the log every cycle; whether
+  # members SHOULD hold the deploy is a ruling for the law, and then this becomes blocking again.
+  _probe "touch the deploy hold (the in-band stop)" "$ev" || \
+    log "WARN advisory: the gate refuses the deploy hold (#767) -- logged, not grounds to refuse the install"
 
   # THERE WAS A THIRD PROBE HERE AND MEASURING IT KILLED IT. It wrote ~/.claude/settings.json —
   # the rule-0 remedy — on the theory that a seat which cannot re-register its own gate has lost
