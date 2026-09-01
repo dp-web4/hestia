@@ -251,6 +251,14 @@ jobs:
           python-version: "3.12"
 
       - name: Test hooks
+        # The seats resolve runtime law ONLY from an explicit HESTIA_SHARED_DIR or an
+        # installed $HESTIA_HOME/shared (#742 for codex, #747 for claude-code). A CI runner
+        # has no installed engine, and the repository checkout is deliberately NOT an
+        # implicit fallback any more -- that fallback is what let a hook execute whatever
+        # law the branch happened to carry. So the runner names the reviewed shared tree
+        # explicitly: a test fixture, chosen and visible, not an ambient path lookup.
+        env:
+          HESTIA_SHARED_DIR: ${{ github.workspace }}/plugins/_shared
         run: |
           set -euo pipefail
           # Discovery comes from tools/ci_discovery.py (mode: hooks), the same
@@ -338,8 +346,19 @@ jobs:
           # added 11 law-bearing sloc to the seat and moved it to 52.3. Pinned at
           # the MEASURED value. The alternative was writing terser refusal code to
           # hit a round number, which is optimising the gauge instead of the thing.
+          # 52.9, not 52.3. Review of #747 found the negative test did not model
+          # an ABSENT install (an existing empty dir suppressed the repo fallback),
+          # so the fallback and two unconditional working-tree resolutions were
+          # deleted and replaced by ONE installed-only loader, byte-identical to
+          # codex's (#742) plus a sys.path line both copies need. The loader is
+          # 58 sloc the meter counts as per-seat law. It cannot live in shared
+          # authority because it IS the reach to shared authority; once both
+          # seats carry one text the meter grades it a verbatim fork and this
+          # ratchet trips at --max-verbatim-forked 0. That collision is
+          # deliberate: the meter needs a loader grade, and the change to the
+          # gauge must land as its own reviewed act, not be smuggled in here.
           python3 tools/gate_collapse_meter.py \
-            --max-divergent-forked 4 --max-verbatim-forked 0 --max-pct 52.3
+            --max-divergent-forked 4 --max-verbatim-forked 0 --max-pct 52.9
 
       - name: Do the forked predicates actually disagree with the engine?
         run: |

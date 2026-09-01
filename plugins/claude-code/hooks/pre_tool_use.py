@@ -286,18 +286,88 @@ _GOVERNANCE_FILES = (
 # One fact, one name. `$HESTIA_HOME/shared` is the fleet path the installer already uses.
 _HESTIA_HOME = os.environ.get("HESTIA_HOME") or os.path.join(
     os.path.expanduser("~"), ".hestia")
-_SHARED_DIR = os.environ.get("HESTIA_SHARED_DIR") or os.path.join(_HESTIA_HOME, "shared")
-# Fallback, deliberately one-directional: if the canonical path is not populated yet, keep
-# using the legacy per-vendor directory rather than losing the closure entirely. A host
-# mid-rollout stays governed; a host that has cut over never silently reverts.
-_LEGACY_SHARED_DIR = os.path.join(os.path.dirname(os.path.dirname(_SELF_DIR)), "_shared")
-if not os.path.isdir(_SHARED_DIR) and os.path.isdir(_LEGACY_SHARED_DIR):
-    _SHARED_DIR = _LEGACY_SHARED_DIR
-if os.path.isdir(_SHARED_DIR) and _SHARED_DIR not in sys.path:
-    sys.path.insert(0, _SHARED_DIR)
+
+
+def _shared_runtime_dir():
+    return os.environ.get("HESTIA_SHARED_DIR") or os.path.join(
+        os.path.expanduser(os.environ.get("HESTIA_HOME", "~/.hestia")), "shared")
+
+
+def _load_shared_module(name):
+    """Load governing code only from the selected installed authority directory.
+
+    The Codex seat's loader (#742) plus one sys.path line, and the difference is a finding
+    against both copies, not a divergence: see the comment on that line. The loader is the
+    one piece of law-adjacent code that CANNOT itself be loaded from shared authority,
+    because it is what reaches shared authority. It is duplicated by necessity, so it must
+    not also be independently maintained: tools/installed_engine_loader_test.py drives the
+    same contract on every seat, and the two copies should converge on one text.
+
+    Three claude-code resolution paths are DELETED here, not narrowed:
+
+      - a repo `plugins/_shared` fallback taken when the installed dir was ABSENT. Review of
+        #747: the negative test used an EXISTING empty tempdir, which suppresses that
+        fallback, so the test passed while the ordinary missing-install state still loaded
+        branch-local law and denied for an unrelated reason (`gate.degraded`, never
+        `no-shared-authority`). The control did not model the state it named.
+      - `_load_mechanism()` resolved `parents[2]/_shared` UNCONDITIONALLY: the working tree,
+        with no installed path consulted at all.
+      - `_record_plane_e()` did the same.
+
+    Both of the latter inserted that directory at sys.path[0], where it could shadow the
+    installed engine for every import that ran after them, making which law answers depend
+    on call order within a single process.
+
+    A missing installed engine is a fail-closed misdeployment, not permission to execute
+    whatever law the checkout happens to be sitting on."""
+    import importlib.util
+
+    shared = _shared_runtime_dir()
+    # The SELECTED directory, and only it, goes on sys.path: shared modules import each
+    # other by bare name (hestia_gate_mechanism:541 pulls HarnessProfile from
+    # hestia_gate_core inside the standing-scope fetch). Loading by file location alone
+    # left those sibling imports unresolvable, and because they sit under try/except the
+    # symptom was not an error but a scope fetch that silently never happened
+    # (sprintF::claude-fetched-standing-scope). Same authority, one more way to reach it.
+    if os.path.isdir(shared) and shared not in sys.path:
+        sys.path.insert(0, shared)
+    required = os.path.realpath(os.path.join(shared, name + ".py"))
+    if not os.path.isfile(required):
+        raise ImportError(
+            f"installed Hestia shared module {name!r} is unavailable at {required!r}; "
+            "run deploy/install-members.sh"
+        )
+
+    cached = sys.modules.get(name)
+    if cached is not None:
+        cached_file = getattr(cached, "__file__", None)
+        if cached_file and os.path.realpath(cached_file) == required:
+            return cached
+        sys.modules.pop(name, None)
+
+    spec = importlib.util.spec_from_file_location(name, required)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot construct a loader for installed module {required!r}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
+    loaded_file = getattr(module, "__file__", None)
+    if not loaded_file or os.path.realpath(loaded_file) != required:
+        sys.modules.pop(name, None)
+        raise ImportError(
+            f"shared authority miswire: {name!r} resolved to {loaded_file!r}, "
+            f"expected {required!r}"
+        )
+    return module
+
+
 try:
-    from hestia_governance_closure import classify as _closure_classify
-except Exception:  # noqa: BLE001 — Tier-2: the local matcher below stays in force
+    _closure_classify = _load_shared_module("hestia_governance_closure").classify
+except Exception:  # noqa: BLE001 - Tier-2: the local matcher below stays in force
     _closure_classify = None
 
 # The shell read/write classifier, from the SAME installed engine directory. Deliberately
@@ -312,10 +382,9 @@ except Exception:  # noqa: BLE001 — Tier-2: the local matcher below stays in f
 # hook error the harness does not treat as a refusal, so a missing shared authority would
 # have FAILED OPEN: the precise class deleted in #745. Caught here, refused in main().
 try:
-    from hestia_shell_classifier import (  # noqa: E402
-        _blank_inert_heredoc_bodies,
-        _is_read_only,
-    )
+    _classifier = _load_shared_module("hestia_shell_classifier")
+    _blank_inert_heredoc_bodies = _classifier._blank_inert_heredoc_bodies
+    _is_read_only = _classifier._is_read_only
     _CLASSIFIER_UNAVAILABLE = None
 except Exception as _exc:  # noqa: BLE001 -- any import failure is a missing authority
     _blank_inert_heredoc_bodies = None  # type: ignore[assignment]
@@ -1260,11 +1329,7 @@ def _load_mechanism():
     """Import the shared gate mechanism module from plugins/_shared (repo and installed
     layouts both place it two levels up from this hooks dir). Raises on failure — callers
     keep their own fail posture (ask_daemon returns None → fail-closed / legacy below)."""
-    shared = Path(__file__).resolve().parents[2] / "_shared"
-    if str(shared) not in sys.path:
-        sys.path.insert(0, str(shared))
-    import hestia_gate_mechanism
-    return hestia_gate_mechanism
+    return _load_shared_module("hestia_gate_mechanism")
 
 
 def McpHttp(endpoint: str, deadline: float):
@@ -1340,10 +1405,8 @@ def cache_action(tool_use_id: str, action_id: str, tool_name: str) -> None:
 def _record_plane_e(cause: str, detail: str, tool_name: str = "unknown") -> None:
     """Persist an infrastructure refusal without scoring it as member conduct."""
     try:
-        shared = Path(__file__).resolve().parents[2] / "_shared"
-        if str(shared) not in sys.path:
-            sys.path.insert(0, str(shared))
-        from hestia_gate_core import record_gate_unavailable  # type: ignore
+        record_gate_unavailable = _load_shared_module(
+            "hestia_gate_core").record_gate_unavailable
         record_gate_unavailable(PLUGIN_ID, tool_name, cause, detail, home=str(DEFAULT_HESTIA_HOME))
     except Exception:
         pass
@@ -1575,7 +1638,7 @@ def main() -> int:
     # is the exemption surviving on the error path, the same privilege wearing an apology. If
     # the core cannot be reached this seat degrades like every other: deny writes, allow reads.
     try:
-        import hestia_gate_core as _core
+        _core = _load_shared_module("hestia_gate_core")
     except Exception as _e:  # noqa: BLE001
         sys.stderr.write(
             f"hestia: deny [gate.core_unavailable] — the shared law core could not be imported "
