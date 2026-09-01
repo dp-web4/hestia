@@ -950,6 +950,7 @@
       <nav class="view-switch" id="view-switch" aria-label="Dashboard view">
         <button type="button" class="view-chip selected" data-view="agents">agents</button>
         <button type="button" class="view-chip" data-view="hubs">hubs</button>
+        <button type="button" class="view-chip" data-view="channels">channels</button>
         <button type="button" class="view-chip" data-view="devices">devices</button>
         <button type="button" class="view-chip" data-view="govern">govern<span
           class="view-chip-badge" id="govern-chip-badge" hidden></span><span
@@ -1133,6 +1134,18 @@
       </div>
     </div>
     </div><!-- /#hubs-view -->
+
+    <!-- CHANNELS — the gateway to this entity's addressable surfaces (PRD §5.9,
+         dp 2026-09-01). Same doctrine as devices below: the slot is real and it
+         must not LOOK finished. The spec exists (two families, tiered disclosure,
+         role-mediated deepening); the machinery does not. `renderChannels` has the
+         same two legal outputs as `renderDevices`: real channel state, or an
+         explicit "not yet implemented". -->
+    <div id="channels-view" class="dash-view" hidden>
+      <div class="govern-scroll" id="channels-body">
+        <div class="empty">loading…</div>
+      </div>
+    </div>
     <!-- DEVICES — constellation management (PRD_ALLOWLISTS §6.0.3, AC-22).
          The slot is real, and it must not LOOK finished. `core/src/constellation.rs` is
          substantial and the snapshot already carries a `constellation` field, but the screen
@@ -1557,6 +1570,8 @@
     agents:  { el: 'agents-view',  autoDefault: true  },
     hubs:    { el: 'hubs-view',    autoDefault: true,
                mount: () => { if (typeof window.__hubRefresh === 'function') window.__hubRefresh(); } },
+    channels:{ el: 'channels-view', autoDefault: false,
+               mount: () => renderChannels() },
     devices: { el: 'devices-view', autoDefault: false,
                mount: () => renderDevices(lastData) },
     govern:  { el: 'govern-view',  autoDefault: false,
@@ -3176,6 +3191,38 @@
   // top; if the snapshot's `constellation` field carries anything, it is shown BELOW that
   // notice rather than instead of it, because partial data on an unbuilt screen is exactly
   // how "looks finished, shows nothing" gets built by accident.
+  // CHANNELS (PRD §5.9, dp 2026-09-01): "how the world reaches me, and how much it
+  // learns". Static and honest — unlike devices there is not even a snapshot field
+  // to show yet, so the ONLY legal output is the explicit not-implemented notice
+  // plus the spec it will implement. Never-flatter (#435/#438): an empty-looking
+  // panel here would claim "this entity has no channels" when the truth is that
+  // nobody has built the view.
+  function renderChannels() {
+    const root = $('channels-body');
+    if (!root) return;
+    root.innerHTML = `
+      <div class="devices-notice">
+        <strong>Not yet implemented.</strong> Channels is a reserved slot with a written
+        spec (PRD §5.9) and no machinery behind it yet. Nothing on this screen reads or
+        renders real channel state.
+      </div>
+      <div class="esc-note" style="margin-top:0.7rem">
+        <p style="margin:0 0 0.5rem"><strong>What this screen will be:</strong> the gateway to every
+        <em>addressable surface</em> of this entity, in two families:</p>
+        <p style="margin:0 0 0.3rem">· <strong>contact / social</strong> — Discord, Slack, Matrix,
+        Telegram, Meetup, GitHub, site, email: how the world <em>reaches</em> this entity.</p>
+        <p style="margin:0 0 0.5rem">· <strong>record</strong> — the witness log, the governance
+        record, the ledger head: how the world <em>reads</em> it. Witness-log access is itself
+        a channel, behind the same gateway and the same disclosure model.</p>
+        <p style="margin:0 0 0.3rem"><strong>Disclosure is tiered</strong>, and the tiers are depths
+        of question: <em>public</em> answers "that it exists / that an act occurred";
+        <em>member</em> answers "the address / who participated"; <em>governance</em> answers
+        "substance and outcome". Deepening is role-mediated, never a parameter — and a tier-3
+        inquiry is itself a governed, witnessed act by the asker: others can learn who did what,
+        and the asking leaves a trace.</p>
+      </div>`;
+  }
+
   function renderDevices(data) {
     const root = $('devices-body');
     if (!root) return;
@@ -4061,17 +4108,36 @@
       const r = await hubFetch('/api/hub/status', { cache: 'no-store' });
       const d = await r.json();
       const st = $('hub-state');
+      // Membership is the HUB's answer (pinned-pubkey resolve against our LCT),
+      // not a local claim — so it gets its own words per state, and an unknown
+      // stays unknown rather than defaulting to either yes or no.
+      const mem = d.membership || null;
       if (d.reachable) {
-        st.className = 'hub-state ok';
         const name = (d.hubs && d.hubs[0] && d.hubs[0].name) || 'hub';
-        st.textContent = name + ' — live';
+        if (mem && mem.state === 'member') {
+          st.className = 'hub-state ok';
+          st.textContent = name + ' — member ✓';
+        } else if (mem && mem.state === 'pinned_key_mismatch') {
+          st.className = 'hub-state err';
+          st.textContent = name + ' — hub pins a DIFFERENT key for this identity';
+        } else {
+          st.className = 'hub-state ok';
+          st.textContent = name + ' — live'
+            + (mem && mem.state === 'not_member' ? ' (not a member yet)' : '');
+        }
       } else {
         st.className = 'hub-state err';
         st.textContent = 'unreachable';
       }
+      const memNote =
+        !mem || !d.member_lct ? ''
+        : mem.state === 'member' ? ' · hub has pinned this key (verified member)'
+        : mem.state === 'not_member' ? ' · hub does not know this identity'
+        : mem.state === 'unknown' ? ' · membership unverified (' + esc(mem.detail || 'no answer') + ')'
+        : '';
       $('hub-meta').innerHTML = esc(d.url)
         + (d.member_lct
-           ? ' · member identity <b>' + short(d.member_lct) + '</b> (vault)'
+           ? ' · member identity <b>' + short(d.member_lct) + '</b> (vault)' + memNote
            : ' · no member identity yet');
       $('hub-join').hidden = false;
       $('hub-join-btn').textContent = d.member_lct ? 'join / re-sync' : 'join hub';
