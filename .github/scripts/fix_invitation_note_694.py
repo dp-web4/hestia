@@ -64,7 +64,7 @@ mod invitation_note_contract_tests {
     fn attributed_ask_reports_invitation_reality() {
         let none = invitation_note(true, true);
         assert!(none.contains("no admissible peer"), "{none}");
-        assert!(!none.contains("peer declined"), "{none}");
+        assert!(none.contains("not that a peer declined"), "{none}");
         let sent = invitation_note(true, false);
         assert!(sent.contains("peers were invited and woken"), "{sent}");
         assert!(sent.contains("EVIDENCE, never a veto"), "{sent}");
