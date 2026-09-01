@@ -239,6 +239,9 @@ def main() -> int:
                     help="ratchet: fail if the still-per-seat percentage exceeds this. "
                          "This is the number that matters; --max-forked is the one that is "
                          "beyond argument. Pin both.")
+    ap.add_argument("--max-seat-pct", action="append", default=[], metavar="SEAT=PCT",
+                    help="per-seat ceiling on local law %% (#771); repeatable; a named seat "
+                         "that is not discovered fails, since unmeasurable is not compliant")
     ap.add_argument("--min-agreed-keys", type=int, default=None,
                     help="ratchet the OTHER half of the gate: fail if the number of path-key "
                          "names every seat extracts falls below this. The predicate is shared; "
@@ -375,7 +378,18 @@ def main() -> int:
           f"({tot_div} divergent, {tot_verb} verbatim), {tot_fork_sloc} sloc; "
           f"{tot_adapt} adapter(s) (not counted against the ratchet).")
     print(f"law-bearing sloc: {tot_law} per-seat + {shared_law} shared = {total_law}")
-    print(f"STILL PER-SEAT: {pct:.1f}%   (collapsed means 0.0%, and 0 forked)")
+    # PER SEAT FIRST (#771). One fleet number is a trend, not a compliance signal: one shim
+    # adding local authority moves it for everyone, and three nearly-empty adapters can
+    # dilute one badly forked shim. The unit is the seat, and the ratio is that seat's own
+    # law against the SAME shared engine, same classifier, same grain.
+    seat_pct = {}
+    for seat, nf, fork, adapt, nl, nls, ls, fl in rows:
+        seat_pct[seat] = (100.0 * nls / (nls + shared_law)) if (nls + shared_law) else 0.0
+    print("PER-SEAT LOCAL LAW (seat law / (seat law + shared law)):")
+    for seat, v in seat_pct.items():
+        print(f"    {seat:<13} {v:>5.1f}%")
+    print(f"TREND (secondary, not a verdict) STILL PER-SEAT: {pct:.1f}%   "
+          f"(collapsed means 0.0%, and 0 forked)")
 
     # The percentage above measures the PREDICATE. It says nothing about the domain the
     # predicate is applied to, and that domain is built per-seat before the engine is called
@@ -425,6 +439,27 @@ def main() -> int:
                   f"functions exceeds the pinned limit of {args.max_verbatim_forked}. A "
                   f"published-but-not-yet-deleted move is allowed, but it is DECLARED here "
                   f"and the follow-on release must bring this back down.", file=sys.stderr)
+            failed = True
+    for bound in args.max_seat_pct or []:
+        seat, _, lim = bound.partition("=")
+        if not seat or not lim:
+            print(f"::error::bad --max-seat-pct {bound!r}; want SEAT=PCT", file=sys.stderr)
+            failed = True
+            continue
+        lim = float(lim)
+        if seat not in seat_pct:
+            # A pinned seat that is not in the tree is INDETERMINATE, and indeterminate is not
+            # a pass: a seat that vanished from discovery would otherwise read as compliant.
+            print(f"::error::--max-seat-pct names {seat!r}, which is not a discovered gate "
+                  f"({', '.join(seat_pct)}). Unmeasurable is not compliant.", file=sys.stderr)
+            failed = True
+            continue
+        shown = round(seat_pct[seat], 1)
+        print(f"ratchet seat {seat:<12}: {shown:.1f}% vs limit {lim:.1f}%")
+        if shown > lim:
+            print(f"::error::{seat} regressed: {shown:.1f}% of its law is local, above its "
+                  f"pinned {lim:.1f}%. This names the seat; the other seats' numbers are "
+                  f"unchanged by it.", file=sys.stderr)
             failed = True
     if args.max_pct is not None:
         # Compare the number that is PRINTED, not the float behind it. The first version
