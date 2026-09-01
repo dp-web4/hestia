@@ -288,55 +288,60 @@ _HESTIA_HOME = os.environ.get("HESTIA_HOME") or os.path.join(
     os.path.expanduser("~"), ".hestia")
 
 
+# THE LOADER IS THE ONE LAW-ADJACENT TEXT THAT CANNOT LIVE IN SHARED AUTHORITY, because it is
+# what reaches shared authority. So it is duplicated by necessity across seats and must not be
+# independently maintained: the two functions below are BYTE-IDENTICAL to the Codex seat's
+# (#742, head 03a0ba8), one text, not a dialect. Review of #747 (GPT, 2026-09-01) held the
+# merge on exactly the two places an earlier draft here differed from it:
+#   * `except Exception` at module init let a SystemExit(0) raised by an installed module
+#     escape before main(), ending the hook rc=0 -- an allow -- instead of the explicit
+#     no-shared-authority rc=2. The boundary is BaseException, module INITIALISATION only,
+#     re-raised as ImportError; main()'s own legitimate SystemExit stays outside it.
+#   * inserting the selected dir at sys.path[0] only when its literal string was absent left
+#     a decoy ahead of an already-present installed path. The selected dir is canonicalised,
+#     equivalent spellings removed, and it goes first every time.
+# Three claude-code resolution paths were deleted, not narrowed, on the way here: a repo
+# `plugins/_shared` fallback taken when the installed dir was ABSENT (an existing empty
+# tempdir suppressed it, so the negative test passed while branch-local law still answered);
+# and `_load_mechanism()` / `_record_plane_e()` resolving `parents[2]/_shared` unconditionally
+# at sys.path[0], measured live on build 561 as a 2026-08-14 engine answering marker-touching
+# commands with floor-less grants. A missing installed engine is a fail-closed misdeployment,
+# not permission to execute whatever law the checkout is sitting on.
+# tools/loader_binds_installed_engine_test.py drives the controls on this seat;
+# tools/installed_engine_loader_test.py (#742) drives the same shapes on Codex.
 def _shared_runtime_dir():
     return os.environ.get("HESTIA_SHARED_DIR") or os.path.join(
         os.path.expanduser(os.environ.get("HESTIA_HOME", "~/.hestia")), "shared")
 
 
 def _load_shared_module(name):
-    """Load governing code only from the selected installed authority directory.
-
-    The Codex seat's loader (#742) plus one sys.path line, and the difference is a finding
-    against both copies, not a divergence: see the comment on that line. The loader is the
-    one piece of law-adjacent code that CANNOT itself be loaded from shared authority,
-    because it is what reaches shared authority. It is duplicated by necessity, so it must
-    not also be independently maintained: tools/installed_engine_loader_test.py drives the
-    same contract on every seat, and the two copies should converge on one text.
-
-    Three claude-code resolution paths are DELETED here, not narrowed:
-
-      - a repo `plugins/_shared` fallback taken when the installed dir was ABSENT. Review of
-        #747: the negative test used an EXISTING empty tempdir, which suppresses that
-        fallback, so the test passed while the ordinary missing-install state still loaded
-        branch-local law and denied for an unrelated reason (`gate.degraded`, never
-        `no-shared-authority`). The control did not model the state it named.
-      - `_load_mechanism()` resolved `parents[2]/_shared` UNCONDITIONALLY: the working tree,
-        with no installed path consulted at all.
-      - `_record_plane_e()` did the same.
-
-    Both of the latter inserted that directory at sys.path[0], where it could shadow the
-    installed engine for every import that ran after them, making which law answers depend
-    on call order within a single process.
-
-    A missing installed engine is a fail-closed misdeployment, not permission to execute
-    whatever law the checkout happens to be sitting on."""
+    """Load governing code only from the selected installed authority directory."""
     import importlib.util
 
     shared = _shared_runtime_dir()
-    # The SELECTED directory, and only it, goes on sys.path: shared modules import each
-    # other by bare name (hestia_gate_mechanism:541 pulls HarnessProfile from
-    # hestia_gate_core inside the standing-scope fetch). Loading by file location alone
-    # left those sibling imports unresolvable, and because they sit under try/except the
-    # symptom was not an error but a scope fetch that silently never happened
-    # (sprintF::claude-fetched-standing-scope). Same authority, one more way to reach it.
-    if os.path.isdir(shared) and shared not in sys.path:
-        sys.path.insert(0, shared)
     required = os.path.realpath(os.path.join(shared, name + ".py"))
     if not os.path.isfile(required):
         raise ImportError(
             f"installed Hestia shared module {name!r} is unavailable at {required!r}; "
             "run deploy/install-members.sh"
         )
+
+    # Shared modules legitimately import one another by bare canonical name. Make only
+    # the selected authority directory available to those imports; never add a checkout
+    # fallback. Canonicalize it so a HESTIA_HOME/shared symlink and its build directory
+    # cannot occupy two precedence positions.
+    selected_dir = os.path.dirname(required)
+    selected_key = os.path.normcase(selected_dir)
+    retained = []
+    for entry in sys.path:
+        try:
+            entry_key = os.path.normcase(os.path.realpath(os.fspath(entry) or os.getcwd()))
+        except (TypeError, ValueError, OSError):
+            retained.append(entry)
+            continue
+        if entry_key != selected_key:
+            retained.append(entry)
+    sys.path[:] = [selected_dir, *retained]
 
     cached = sys.modules.get(name)
     if cached is not None:
@@ -352,9 +357,14 @@ def _load_shared_module(name):
     sys.modules[name] = module
     try:
         spec.loader.exec_module(module)
-    except Exception:
+    except BaseException as exc:
         sys.modules.pop(name, None)
-        raise
+        # This boundary is module INITIALIZATION only. Convert even SystemExit(0) into
+        # an ordinary loader failure so module-level callers reach the explicit
+        # fail-closed posture; main()'s legitimate allow/deny SystemExit remains outside.
+        raise ImportError(
+            f"installed Hestia shared module {name!r} failed to initialize"
+        ) from exc
     loaded_file = getattr(module, "__file__", None)
     if not loaded_file or os.path.realpath(loaded_file) != required:
         sys.modules.pop(name, None)
