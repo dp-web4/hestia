@@ -48,6 +48,13 @@ def check(ok: bool, msg: str) -> None:
         FAILURES.append(msg)
 
 
+def teardown_module(module=None) -> None:
+    """Under pytest each test_* returns normally after appending to FAILURES, so without
+    this the accumulator is never consumed and a red arm reads as green (ci_selfexec_test).
+    The __main__ path below asserts the same list; this is the pytest spelling of it."""
+    assert not FAILURES, FAILURES
+
+
 def stage(dst: Path, sentinel: str | None, poison: dict[str, str] | None = None) -> None:
     dst.mkdir(parents=True)
     for name in MODULES:
