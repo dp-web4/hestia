@@ -28,9 +28,9 @@ it the law. Every case is therefore run at several cwds, and a verdict that CHAN
 is reported as its own class of finding: the same act, the same seat, two answers.
 
 EXIT STATUS IS A VERDICT:
-  0  every seat agreed on every case, at every cwd
-  1  at least one disagreement (between seats, or within a seat across cwd)
-  2  could not determine (no gates discovered, or no seat could be driven)
+  0  every discovered seat answered every case at every cwd, agreed, and matched expectations
+  1  measured result is wrong (seat disagreement, cwd split, or expectation miss)
+  2  could not determine (discovery failure or any seat/case/cwd was not measured)
 """
 
 from __future__ import annotations
@@ -110,7 +110,7 @@ CORPUS = [
     # same construct hides a real write to a seat hook, and the answer is `none` -- no gate, no
     # escalation. The rule is not merely noisy, it is INVERTED on this pair: a variable target
     # resolving AWAY from governance is refused, one resolving INTO governance is allowed.
-    # Mechanism: `plugins/_shared` is a dir_marker and matches the assignment token on its own,
+    # Mechanism: `plugins/_shared` is a `dir_marker` and matches an assignment token on its own,
     # but a seat hook is matched per FILE, so splitting `plugins/gemini/hooks` from
     # `before_tool.py` across the assignment and its use leaves no single token to match.
     ("write.var-split-seat-hook", "Bash",
@@ -242,15 +242,23 @@ def main() -> int:
 
     seats = [s for s, _ in gates]
 
-    # A seat that could not be driven at ANY cwd contributes no verdicts, and every
-    # comparison below silently skips it. Left unsaid, "SEAT DISAGREEMENTS: none" reads
-    # as a statement about four seats when it is a statement about three -- and the seat
-    # most likely to be missing is the one whose engine does not import, which is also
-    # the one most likely to disagree. Name the denominator on the headline.
-    undriven = {s: {k: results[k].get(s, {}).get("_error", "?") for k in cwds}
-                for s in seats
-                if all("_error" in results[k].get(s, {}) for k in cwds)}
-    driven = [s for s in seats if s not in undriven]
+    # Any missing seat/cwd/case makes the run indeterminate. A seat that succeeds in one cwd
+    # and fails in another is exactly the loader-drift shape this instrument is supposed to
+    # expose; partial success must never be promoted to a measured seat.
+    measurement_errors = []
+    for s in seats:
+        for k in cwds:
+            r = results[k].get(s, {})
+            if "_error" in r:
+                measurement_errors.append((s, k, "seat", r["_error"]))
+                continue
+            for cid, *_ in CORPUS:
+                verdict = r.get(cid, "-")
+                if verdict == "-" or str(verdict).startswith("ERR"):
+                    measurement_errors.append((s, k, cid, verdict))
+
+    fully_driven = [s for s in seats
+                    if not any(err[0] == s for err in measurement_errors)]
 
     hdr = f"{'case':<26}{'expect':>8}  " + "".join(f"{s:>14}" for s in seats)
     print(hdr)
@@ -272,39 +280,32 @@ def main() -> int:
                 cwd_splits.append((cid, s, across))
 
     print()
-    if undriven:
-        print(f"SEATS NOT MEASURED: {len(undriven)} of {len(seats)} could not be driven at ANY cwd.")
-        for s, per in undriven.items():
-            reasons = sorted({str(v) for v in per.values()})
-            print(f"  {s}: " + "; ".join(reasons))
-        print("  Every verdict below is over "
-              f"{len(driven)} seat(s) -- {', '.join(driven) or 'none'} -- not {len(seats)}.")
+    if measurement_errors:
+        print(f"MEASUREMENT INCOMPLETE: {len(measurement_errors)} seat/cwd/case result(s) unavailable.")
+        for s, k, where, reason in measurement_errors:
+            print(f"  {s} at {k} [{where}]: {reason}")
+        print("  Fully measured seats: "
+              f"{len(fully_driven)} of {len(seats)} -- {', '.join(fully_driven) or 'none'}.")
         print()
 
-    # WHAT THIS INSTRUMENT CAN DISTINGUISH. Every driveable seat's `_closure_classify` is
-    # `from hestia_governance_closure import classify` -- the same symbol -- and the loop
-    # above hands all of them IDENTICAL arguments. So a disagreement is possible if and
-    # only if two seats' imports resolved to different BYTES. Read the verdict below as a
-    # statement about engine byte-identity, not about four gates agreeing. The two things
-    # that are genuinely per-seat are both outside this tool: the LOADER (claude-code and
-    # kimi resolve $HESTIA_HOME/shared, codex resolves the repo working tree) and the
-    # EXTRACTION domain (each seat fills paths from its own arg-key list, #734), which the
-    # corpus bypasses by passing pre-extracted tool_input.
-    print("MEASURES: byte-identity of the shared closure engine as each seat's import")
-    print("          resolves it. NOT per-seat extraction (#734) and NOT loader drift.")
+    # WHAT THIS INSTRUMENT CAN DISTINGUISH. It calls the closure classifier reached after each
+    # seat module is imported and compares the sampled verdicts. It does NOT hash the resolved
+    # module bytes, so equal outputs are sampled behavioral agreement, not proof of byte identity.
+    # It also bypasses native-event extraction by passing identical tool_input to the classifier.
+    print("MEASURES: sampled behavioral agreement of the closure classifier each seat resolves.")
+    print("          NOT byte identity, native extraction (#734/#743), or full end-to-end gate behavior.")
     print()
 
-    cover = f"  ({len(driven)} of {len(seats)} seats driven)" if undriven else ""
+    cover = (f"  ({len(fully_driven)} of {len(seats)} seats fully measured)"
+             if measurement_errors else "")
     if disagreements:
         print(f"SEAT DISAGREEMENTS: {len(disagreements)}{cover}")
         for cid, row, note in disagreements:
             print(f"  {cid}  {note}")
-            print(f"      " + "  ".join(f"{s}={v}" for s, v in row.items()))
-    elif undriven:
-        # Do NOT print a clean verdict over a partial denominator. "none" here reads as an
-        # all-seat result to exactly the audience the corpus is written for.
-        print(f"SEAT DISAGREEMENTS: none among the {len(driven)} seats driven "
-              f"-- INDETERMINATE for the fleet ({len(undriven)} seat(s) unmeasured)")
+            print("      " + "  ".join(f"{s}={v}" for s, v in row.items()))
+    elif measurement_errors:
+        print("SEAT DISAGREEMENTS: sampled seats agree where measured "
+              "-- INDETERMINATE for the fleet because measurement is incomplete")
     else:
         print("SEAT DISAGREEMENTS: none")
 
@@ -315,10 +316,8 @@ def main() -> int:
     else:
         print("SAME SEAT, DIFFERENT CWD: no splits")
 
-    # Expectation misses are reported but do NOT set exit status: this tool measures
-    # AGREEMENT between seats. Whether the agreed answer is the RIGHT answer is a separate
-    # question, and conflating them would let a uniformly wrong fleet exit 0 as "equal"
-    # while a fleet that is right in three seats and wrong in one exits the same way.
+    # Expectations are part of acceptance, not commentary. Agreement can prove only equality;
+    # a uniformly wrong fleet must fail just as surely as one divergent seat.
     print()
     misses = []
     base = results[list(cwds)[0]]
@@ -331,24 +330,18 @@ def main() -> int:
         if wrong:
             misses.append((cid, expect, wrong, note))
     if misses:
-        print(f"AGREED-BUT-WRONG / PARTIAL (not counted in exit status): {len(misses)}")
+        print(f"EXPECTATION MISSES: {len(misses)} (acceptance failure)")
         for cid, expect, wrong, note in misses:
             print(f"  {cid}: expected {expect}; " + ", ".join(f"{s}={v}" for s, v in wrong.items()))
             print(f"      {note}")
+    else:
+        print("EXPECTATION MISSES: none")
 
-    # Exit status has THREE states, because "the seats agreed" and "a seat was never asked"
-    # are different claims and only one of them is a pass. Codex's review of #739 is right
-    # that folding the second into 0 hands out a four-seat green over a three-seat run.
-    #   0  every discovered seat answered, and they agreed
-    #   1  seats disagreed, or one seat split across cwds
-    #   2  INDETERMINATE: a discovered seat could not be driven at ANY cwd
-    # 2 dominates 1 rather than the other way round: an agreement count computed over an
-    # unknown denominator is not a number to act on either, so the missing seat is the
-    # first thing to fix. A caller that only tests `rc == 0` is unaffected; one that tests
-    # `rc == 1` for "disagreement" keeps its meaning.
-    if undriven:
+    # Three-state result. Indeterminate dominates a measured failure because an acceptance
+    # decision must not be made from an incomplete denominator.
+    if measurement_errors:
         return 2
-    return 1 if (disagreements or cwd_splits) else 0
+    return 1 if (disagreements or cwd_splits or misses) else 0
 
 
 if __name__ == "__main__":
