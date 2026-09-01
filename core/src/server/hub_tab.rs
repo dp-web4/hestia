@@ -30,8 +30,11 @@ use web4_core::crypto::KeyPair;
 /// ephemeral — this is a compiled fallback, not the configuration surface. The
 /// configuration surface is the editable list ([`HubUrls`]) and the env
 /// override, both of which take precedence and neither of which needs a rebuild.
-const DEFAULT_HUB_URL: &str =
-    "https://meaning-hospital-ahead-instrumentation.trycloudflare.com";
+// The fleet mesh hub over the tailnet ("Web4 Fleet"). Purely a default: env
+// override and the operator's vault hub list both take precedence, and this
+// carries no identity — it is only where the card dials when nothing is
+// configured. (Previously the hackathon trycloudflare tunnel, long dead.)
+const DEFAULT_HUB_URL: &str = "http://hub.tail3d7929.ts.net:8770";
 
 /// The vault key under which the known-hub list is stored (config-in-vault:
 /// PRD_CONFIG_IN_VAULT). The list is not a secret, but the vault is hestia's
