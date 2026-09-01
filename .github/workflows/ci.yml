@@ -369,9 +369,15 @@ jobs:
           # decides nothing. Deployment readiness over RESIDENT bytes is the other
           # instrument (tools/installed_seat_readiness.py); CI has no installed
           # seats, so its self-test runs in the plugin-tests job instead.
+          #
+          # codex 25.0, not 23.9 (#742): the installed-only loader and its refusal
+          # path are per-seat mechanics the meter counts as law. Moved to the
+          # measured value on that head and no other seat's pin touched, which is
+          # the point of pinning per seat: the same change under the fleet gauge
+          # read as "the fleet regressed 0.1".
           python3 tools/gate_collapse_meter.py \
             --max-divergent-forked 4 --max-verbatim-forked 0 \
-            --max-seat-pct claude-code=30.1 --max-seat-pct codex=23.9 \
+            --max-seat-pct claude-code=30.1 --max-seat-pct codex=25.0 \
             --max-seat-pct gemini=9.4 --max-seat-pct kimi=21.3
 
       - name: Do the forked predicates actually disagree with the engine?
