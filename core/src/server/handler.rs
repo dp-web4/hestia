@@ -15664,10 +15664,23 @@ fn opened_payload(
         // against a member that was online the entire time.
         //
         // A refused member is BY DEFINITION talking to this daemon right now, so the refusal
-        // answers the question it just provoked: what of mine can I already spend? Same
-        // predicate `claim()` spends against, so this cannot advertise a claim that would
-        // fail. The escalation just opened is excluded — pending by construction, and
-        // listing it would read as "already approved".
+        // answers the question it just provoked: what of mine can I already spend? The
+        // escalation just opened is excluded — pending by construction, and listing it
+        // would read as "already approved".
+        //
+        // NOT the same predicate `claim()` spends against, and this CAN list a row `claim()`
+        // refuses: `claimable_for` filters on (plugin_id, digest present, claimable) —
+        // `claim()` also requires `marker` equality. Counterexample on the CBP chain,
+        // 2026-08-31 17:18:41Z: `7079b9f6d4732751` (marker `pre_tool_use.py`, approved,
+        // 289s left, digest a8899b61…) was listed on the open of `033e052edafc8620`,
+        // whose act carried the SAME digest under marker `plugins/*/hooks`. The claim
+        // missed on the marker, a second petition opened, dp approved it too, and the first
+        // burned. Read `marker` beside `act_digest`: both must match the re-issue. (The
+        // earlier text here — "so this cannot advertise a claim that would fail" — was
+        // written the day the field was added and never measured.)
+        //
+        // And until the claim door lifted this onto its RESPONSE (2026-09-01) the field was
+        // chain-only: computed "for a live seat", read by no seat.
         "decided_awaiting_claim": s
             .gate_escalations
             .claimable_for(&esc.plugin_id, crate::server::gate_escalation::now_secs())
@@ -16612,18 +16625,31 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
             // escalate, so it stated no why, and the operator otherwise rules on an id and a
             // path fragment alone.
             let inv = resolve_invitation(&mut s, &esc, asker_is_proven);
-            let entry = s.append_chain(
-                "gate_escalation_opened",
-                opened_payload(
-                    &s,
-                    &esc,
-                    &inv,
-                    asker_is_proven,
-                    answers_deny.as_deref(),
-                    "claim",
-                    DEFAULT_TTL_SECS,
-                ),
-            )?;
+            let payload = opened_payload(
+                &s,
+                &esc,
+                &inv,
+                asker_is_proven,
+                answers_deny.as_deref(),
+                "claim",
+                DEFAULT_TTL_SECS,
+            );
+            // WHAT THIS MEMBER CAN ALREADY SPEND, told to the member. `opened_payload` has
+            // computed `decided_awaiting_claim` since #366 "for a live seat" — and wrote it
+            // to the CHAIN only. The refusal this door returns is the one surface the
+            // refused member is certainly reading, and it never carried the field, so the
+            // member it was computed for was the one reader who never saw it. Measured on
+            // CBP 2026-09-01 (chain 08-29T19:15Z..09-01T15:20Z, 68 opens): 21 opened while
+            // a same-seat approval was still live; of the 39 approvals so listed, 4 were
+            // later claimed and 35 burned. One of the 35 was `db0b02256b3eb7d5`: approved,
+            // 153s left, listed on `c9af97ae9c0140bb`'s open — the same member re-issuing
+            // the same `cp` with `&& echo LANDED` appended, which is a new digest (#539).
+            // Three petitions and three operator keystrokes for one write.
+            let decided_awaiting_claim = payload
+                .get("decided_awaiting_claim")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            let entry = s.append_chain("gate_escalation_opened", payload)?;
             let invitations = deliver_invitations(&mut s, &esc, &inv.invited, &entry.hash);
             Ok(json!({
                 "claimed": false,
@@ -16632,6 +16658,7 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                 "expires_at": esc.expires_at,
                 "decide_within_secs": DEFAULT_TTL_SECS,
                 "retry_within_secs": DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS,
+                "decided_awaiting_claim": decided_awaiting_claim,
                 "witnessEntryHash": entry.hash,
                 // Told to the ASKER too, not only written to the chain — the same asymmetry
                 // #219 found, where a decider got a bare verdict while the entry beside it
@@ -16669,7 +16696,14 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                      0=claimable now, 3=approved-but-window-closed, 4=denied, 5=expired)",
                     id = esc.id
                 ),
-                "then": "RE-ISSUE the same write; it will claim the approval. The write is \
+                // "the same write" has meant "the same BYTES" since #539 keyed the claim on
+                // sha256(command text). A member that reads it as "the same intent" and
+                // appends `&& echo LANDED` to confirm the landing opens a second petition
+                // while its approved first one burns (db0b02 -> c9af97ae, 2026-09-01).
+                "then": "RE-ISSUE the write BYTE-FOR-BYTE under the same marker; it will \
+                         claim the approval. The approval is keyed on sha256(command text) \
+                         (#539): any edit, even an appended `&& echo`, is a different act \
+                         and opens a NEW petition while this one burns. The write is \
                          refused right now, and stays refused until it is retried after a \
                          human approves.",
             }))
