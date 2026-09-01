@@ -379,6 +379,26 @@ preflight_gate() {
   # fired session. The escape hatch a governed seat genuinely retains is the hold file above,
   # and an operator. Those are what this probes.
 
+  # The historical probes above exercise the Claude Code event shape. The installer may also
+  # replace Codex, Kimi, and Gemini gates, whose event vocabulary is not interchangeable with
+  # Claude's. A green Claude result therefore cannot certify the whole set. Run each OTHER
+  # registered candidate through its declared read + hold probes before installation. The
+  # declaration belongs beside the harness's install metadata; the common runner discovers
+  # actual registration and never makes an absent member a deployment requirement.
+  member_probe="$DEPLOY_ROOT/hestia/deploy/from-main/gate-preflight.py"
+  if [ ! -f "$member_probe" ]; then
+    preflight="FAILED(per-member gate probe is missing)"
+    return 0
+  fi
+  member_probe_rc=0
+  python3 "$member_probe" --repo "$DEPLOY_ROOT/hestia" --workspace "$DEPLOY_ROOT" --endpoint "$EP" \
+    --scratch "$tmp/probe" --hold "$HOLD" --exclude-member claude-code >>"$LOG" 2>&1 \
+    || member_probe_rc=$?
+  if [ "$member_probe_rc" != 0 ]; then
+    preflight="FAILED(registered candidate gate did not retain the recovery probes; rc=$member_probe_rc)"
+    return 0
+  fi
+
   rm -rf "$tmp"
   return 0
 }
