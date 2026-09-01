@@ -352,13 +352,27 @@ jobs:
           # deleted and replaced by ONE installed-only loader, BYTE-IDENTICAL to
           # codex's (#742 head 03a0ba8), asserted by the staging script, not
           # eyeballed. The loader is per-seat law the meter counts. It cannot
-          # live in shared authority because it IS the reach to shared authority;
-          # once both seats carry one text the meter grades it a verbatim fork and
-          # this ratchet trips at --max-verbatim-forked 0. That collision is
-          # deliberate: the meter needs a loader grade, and the change to the
-          # gauge must land as its own reviewed act, not be smuggled in here.
+          # live in shared authority because it IS the reach to shared authority.
+          # (An earlier version of this comment predicted the verbatim ratchet
+          # would trip when both seats carried one loader text. Wrong: that grade
+          # covers only names the SHARED ENGINE owns, and the loader is not one; a
+          # duplicated loader lands in the informational unshared-fork surface,
+          # as _load_mechanism already does. Recorded so the next reader does not
+          # inherit the prediction.)
+          #
+          # PER SEAT, NOT FLEET (#771). The fleet aggregate let one shim's added
+          # authority read as a fleet regression and let three lean adapters dilute
+          # one forked shim. Bounds are now one per discovered seat, at the MEASURED
+          # value on this head; a regression names its seat and moves no other
+          # seat's number. A pinned seat that is not discovered fails: unmeasurable
+          # is not compliant. The aggregate is still printed, labeled TREND, and
+          # decides nothing. Deployment readiness over RESIDENT bytes is the other
+          # instrument (tools/installed_seat_readiness.py); CI has no installed
+          # seats, so its self-test runs in the plugin-tests job instead.
           python3 tools/gate_collapse_meter.py \
-            --max-divergent-forked 4 --max-verbatim-forked 0 --max-pct 52.8
+            --max-divergent-forked 4 --max-verbatim-forked 0 \
+            --max-seat-pct claude-code=30.1 --max-seat-pct codex=23.9 \
+            --max-seat-pct gemini=9.4 --max-seat-pct kimi=21.3
 
       - name: Do the forked predicates actually disagree with the engine?
         run: |
