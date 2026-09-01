@@ -23,18 +23,25 @@ def write_engine(root: Path, sentinel: str) -> None:
         encoding="utf-8",
     )
     (root / "hestia_gate_mechanism.py").write_text(
-        "SENTINEL = " + repr(sentinel) + "\n", encoding="utf-8")
+        "SENTINEL = " + repr(sentinel) + "\n"
+        "def peer_core_sentinel():\n"
+        "    from hestia_gate_core import SENTINEL\n"
+        "    return SENTINEL\n",
+        encoding="utf-8",
+    )
     (root / "hestia_governance_closure.py").write_text(
         "def classify(*args, **kwargs): return None\n", encoding="utf-8")
 
 
 def load_probe(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     code = (
-        "import importlib.util; "
+        "import importlib.util, sys; "
         f"s=importlib.util.spec_from_file_location('codex_gate', {str(HOOK)!r}); "
         "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
         "print(m._core.SENTINEL); print(m._load_mechanism().SENTINEL); "
-        "print(m._closure_classify is not None)"
+        "print(m._closure_classify is not None); "
+        "sys.modules.pop('hestia_gate_core', None); "
+        "print(m._load_mechanism().peer_core_sentinel())"
     )
     return subprocess.run([sys.executable, "-I", "-c", code], env=env,
                           text=True, capture_output=True, check=False)
@@ -52,7 +59,9 @@ def test_installed_engine_wins_over_workspace_decoy() -> None:
         env.pop("HESTIA_SHARED_DIR", None)
         run = load_probe(env)
         assert run.returncode == 0, run.stderr
-        assert run.stdout.splitlines() == ["installed", "installed", "True"], run.stdout
+        assert run.stdout.splitlines() == [
+            "installed", "installed", "True", "installed"
+        ], run.stdout
 
 
 def test_explicit_shared_dir_is_the_selected_authority() -> None:
@@ -66,7 +75,9 @@ def test_explicit_shared_dir_is_the_selected_authority() -> None:
                    HESTIA_HOME=str(root / "hestia-home"))
         run = load_probe(env)
         assert run.returncode == 0, run.stderr
-        assert run.stdout.splitlines() == ["explicit", "explicit", "True"], run.stdout
+        assert run.stdout.splitlines() == [
+            "explicit", "explicit", "True", "explicit"
+        ], run.stdout
 
 
 def test_missing_install_never_falls_back_and_hook_fails_closed() -> None:
@@ -119,6 +130,33 @@ def test_preloaded_wrong_origin_modules_cannot_become_authority() -> None:
         assert lines[3] == str((installed / "hestia_governance_closure.py").resolve()), run.stdout
 
 
+def test_selected_module_baseexception_fails_closed() -> None:
+    for raised in ("SystemExit(0)", "KeyboardInterrupt()"):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            selected = root / "selected-shared"
+            workspace = root / "workspace"
+            write_engine(selected, "selected")
+            (selected / "hestia_gate_core.py").write_text(
+                f"raise {raised}\n", encoding="utf-8")
+            env = dict(os.environ, HESTIA_SHARED_DIR=str(selected),
+                       HESTIA_WORKSPACE=str(workspace), HESTIA_CODEX_GATE_MODE="enforce")
+            event = {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Read",
+                "tool_input": {"file_path": str(workspace / "ordinary.txt")},
+                "cwd": str(workspace),
+                "session_id": "installed-loader-baseexception-test",
+            }
+            run = subprocess.run([sys.executable, "-I", str(HOOK)], env=env,
+                                 input=json.dumps(event), text=True, capture_output=True,
+                                 check=False)
+            assert run.returncode == 2, (raised, run.stdout, run.stderr)
+            assert "shared gate core could not be loaded" in run.stderr, (
+                raised, run.stderr)
+            assert "Traceback" not in run.stderr, (raised, run.stderr)
+
+
 def test_no_implicit_workspace_loader_spelling_remains() -> None:
     src = HOOK.read_text(encoding="utf-8")
     assert 'os.path.join(WORKSPACE, "hestia", "plugins", "_shared")' not in src
@@ -131,5 +169,6 @@ if __name__ == "__main__":
     test_explicit_shared_dir_is_the_selected_authority()
     test_missing_install_never_falls_back_and_hook_fails_closed()
     test_preloaded_wrong_origin_modules_cannot_become_authority()
+    test_selected_module_baseexception_fails_closed()
     test_no_implicit_workspace_loader_spelling_remains()
     print("ok: Codex loader is pinned to the selected installed shared engine")
