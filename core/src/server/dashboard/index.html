@@ -4281,13 +4281,21 @@
       const row = document.createElement('div');
       row.className = 'hub-row';
       // null enrollment is UNKNOWN, not "no": an unreachable hub was never asked.
+      // Three distinct unknowns, and they are not interchangeable: we never asked
+      // (hub down), we asked and the answer was not about membership (probe_error
+      // — e.g. a 500, or the pubkey route's 404 for a mismatched hub id), or the
+      // hub answered and we simply have no reading. Each keeps the amber badge and
+      // carries its reason on hover, so none of them can read as "not a member".
       const st = h.enrolled === true ? ['enrolled','enrolled']
                : h.enrolled === false ? ['notmember','not a member']
-               : ['unknown', h.reachable ? 'unknown' : 'unreachable'];
+               : !h.reachable ? ['unknown','unreachable']
+               : h.probe_error ? ['unknown','undetermined']
+               : ['unknown','unknown'];
       const name = h.hub_name || h.label || '(unnamed hub)';
       row.innerHTML =
         '<span class="hub-name"></span>' +
-        '<span class="hub-badge ' + st[0] + '">' + st[1] + '</span>' +
+        '<span class="hub-badge ' + st[0] + '"' +
+          (h.probe_error ? ' title="' + escapeHtml(h.probe_error) + '"' : '') + '>' + st[1] + '</span>' +
         '<span class="hub-url"></span><span class="spacer"></span>';
       row.querySelector('.hub-name').textContent = name + (h.active ? ' ·  active' : '');
       row.querySelector('.hub-url').textContent = h.url;

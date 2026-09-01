@@ -229,7 +229,10 @@ async fn discover_with_timeout(
 /// admitted it. The old hubs card inferred "joined" from the local identity, which is
 /// the same class of error as reading a green health check as proof of currency. So
 /// enrollment is probed: `GET /v1/hubs/{hub}/members/{me}/pubkey` answers 200 when the
-/// hub has this LCT pinned and 404 when it does not.
+/// hub has this LCT pinned and 404 when it does not. Only those two answers set
+/// `enrolled`; any other status leaves it `null` and reports `probe_error`, because
+/// a 500 -- or the same route's 404 for a mismatched hub id -- says nothing about
+/// membership and must not be rendered as "not a member".
 ///
 /// Read-only, and every probe is bounded by `NET_TIMEOUT`; an unreachable hub reports
 /// `reachable: false` and an UNKNOWN enrollment rather than a false negative — "we could
@@ -269,7 +272,30 @@ pub async fn hub_memberships(State(state): State<SharedState>) -> impl IntoRespo
                 if let Ok(Ok(resp)) =
                     tokio::time::timeout(NET_TIMEOUT, http.get(&probe).send()).await
                 {
-                    row["enrolled"] = serde_json::json!(resp.status().is_success());
+                    // Only two answers are informative. 200 means the hub has this
+                    // LCT pinned. 404 means "no pinned pubkey" -- BUT the same route
+                    // also 404s when the hub_id in the path does not match the hub,
+                    // and that 404 says nothing about membership. Verified live: a
+                    // wrong hub id returns `hub id X does not match this hub Y`.
+                    // Anything else (500, 403, a proxy's error page) is likewise not
+                    // a statement about membership, so it stays UNKNOWN. Mapping
+                    // every non-200 to `false` would render a broken hub as a
+                    // confident "not a member" -- the failure this endpoint exists
+                    // to avoid, in the direction that misleads.
+                    let status = resp.status();
+                    if status.is_success() {
+                        row["enrolled"] = serde_json::json!(true);
+                    } else if status.as_u16() == 404 {
+                        let body = resp.text().await.unwrap_or_default();
+                        if body.contains("does not match this hub") {
+                            row["probe_error"] =
+                                serde_json::json!("hub id mismatch — enrollment not determined");
+                        } else {
+                            row["enrolled"] = serde_json::json!(false);
+                        }
+                    } else {
+                        row["probe_error"] = serde_json::json!(format!("probe HTTP {status}"));
+                    }
                 }
             }
         }
