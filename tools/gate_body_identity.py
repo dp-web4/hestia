@@ -140,7 +140,7 @@ def main() -> int:
         for u in unclassified:
             print(f"  {u}")
         return 2
-    owned, _ = shared_symbols(root / "plugins" / "_shared")
+    owned, _, _ = shared_symbols(root / "plugins" / "_shared")
 
     per_seat = {seat: gate_functions(path) for seat, path in gates}
     seats = sorted(per_seat)

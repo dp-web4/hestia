@@ -251,6 +251,14 @@ jobs:
           python-version: "3.12"
 
       - name: Test hooks
+        # The seats resolve runtime law ONLY from an explicit HESTIA_SHARED_DIR or an
+        # installed $HESTIA_HOME/shared (#742 for codex, #747 for claude-code). A CI runner
+        # has no installed engine, and the repository checkout is deliberately NOT an
+        # implicit fallback any more -- that fallback is what let a hook execute whatever
+        # law the branch happened to carry. So the runner names the reviewed shared tree
+        # explicitly: a test fixture, chosen and visible, not an ambient path lookup.
+        env:
+          HESTIA_SHARED_DIR: ${{ github.workspace }}/plugins/_shared
         run: |
           set -euo pipefail
           # Discovery comes from tools/ci_discovery.py (mode: hooks), the same
@@ -310,12 +318,47 @@ jobs:
       - name: Measure how much of the gate still executes per-seat
         run: |
           set -euo pipefail
-          # Both pins, deliberately. --max-forked is beyond argument (a name the
-          # shared engine already owns, implemented a second time in a seat's
-          # gate). --max-pct is the number that actually matters and depends on
-          # a published vocabulary, so it is arguable -- which is a reason to
-          # print it every run, not a reason to leave it unpinned.
-          python3 tools/gate_collapse_meter.py --max-forked 4 --max-pct 67.5
+          # THREE pins now, because the fork count was one number over two
+          # opposite risks and that cost us a landing.
+          #
+          # --max-divergent-forked is the tight one and keeps the old meaning:
+          # a name the shared engine owns, implemented a SECOND TIME with a
+          # different body. All 4 are gemini's scope predicates, and the step
+          # below independently finds 6 inputs they answer differently from the
+          # engine. This number may not rise.
+          #
+          # --max-verbatim-forked counts copies that are character-for-character
+          # the engine's. It is 0 and stays 0. It briefly stood at 16 to admit
+          # claude-code's shell classifier while a two-step move published it
+          # before deleting it; that transition was wrong. A move publishes and
+          # deletes in ONE act, and the deploy-order problem it was working
+          # around got fixed instead (install-members.sh now repoints
+          # $HESTIA_HOME/shared BEFORE writing any hook, so a hook can never be
+          # newer than the engine it imports). Duplicate law is not preserved to
+          # accommodate the deploy mechanism.
+          #
+          # --max-pct is still the number that actually matters and still
+          # depends on a published vocabulary, so it is arguable -- which is a
+          # reason to print it every run, not a reason to leave it unpinned.
+          # 52.3, not 52.2. The cutover measured 52.2; the mandated fail-closed
+          # import guard (missing shared authority -> exit 2, proven by
+          # plugins/claude-code/tests/missing_shared_authority_blocks_test.py)
+          # added 11 law-bearing sloc to the seat and moved it to 52.3. Pinned at
+          # the MEASURED value. The alternative was writing terser refusal code to
+          # hit a round number, which is optimising the gauge instead of the thing.
+          # 52.8, not 52.3. Review of #747 found the negative test did not model
+          # an ABSENT install (an existing empty dir suppressed the repo fallback),
+          # so the fallback and two unconditional working-tree resolutions were
+          # deleted and replaced by ONE installed-only loader, BYTE-IDENTICAL to
+          # codex's (#742 head 03a0ba8), asserted by the staging script, not
+          # eyeballed. The loader is per-seat law the meter counts. It cannot
+          # live in shared authority because it IS the reach to shared authority;
+          # once both seats carry one text the meter grades it a verbatim fork and
+          # this ratchet trips at --max-verbatim-forked 0. That collision is
+          # deliberate: the meter needs a loader grade, and the change to the
+          # gauge must land as its own reviewed act, not be smuggled in here.
+          python3 tools/gate_collapse_meter.py \
+            --max-divergent-forked 4 --max-verbatim-forked 0 --max-pct 52.8
 
       - name: Do the forked predicates actually disagree with the engine?
         run: |
