@@ -451,6 +451,29 @@ pub fn normalize_scope_path(path: &str) -> String {
     }
 }
 
+/// A `path:` scope grant MUST be stored absolute (#722). A relative grant renders in the seat's
+/// grant set — e.g. `path:home/dp/ai-workspace` with no leading slash — but can never match a
+/// resolved absolute candidate under #597 prefix containment (`_within_path_grant`/`_scope_parts`),
+/// so it is dead weight: the seat reads a workspace-wide grant it does not actually hold.
+///
+/// `normalize_scope_path` is deliberately LEXICAL and cannot safely absolutise — the daemon RECORDS
+/// the grant while the plugin gate ENFORCES it, and the two may not even share a mount (see its
+/// doc). So admission REJECTS a relative path, naming it, rather than guessing an absolute one
+/// against the daemon's own workspace (which could mint a grant for a path the seat cannot reach).
+/// This is #722 ask #1, the "refuse with a message that names the grant" arm.
+pub fn require_absolute_grant_path(path: &str) -> Result<(), String> {
+    if path.starts_with('/') {
+        Ok(())
+    } else {
+        Err(format!(
+            "scope grant path must be absolute; got '{path}'. A relative path grant renders in the \
+             grant set but can never match a resolved path under #597 prefix containment, so the \
+             seat would read a workspace-wide grant it does not hold (#722). Re-issue with a \
+             leading slash."
+        ))
+    }
+}
+
 /// A durable scope widening that failed part-way, named by WHAT IS TRUE AFTERWARDS.
 ///
 /// The variants are the point. Each says exactly what the chain holds and what the store
