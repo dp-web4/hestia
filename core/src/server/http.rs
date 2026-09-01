@@ -2712,6 +2712,14 @@ async fn scope_grant(
             })),
         );
     }
+    // #722: a relative `path:` grant can never match under #597 prefix containment — reject at the
+    // write site rather than store dead weight the seat reads as a workspace-wide grant it lacks.
+    if let Err(msg) = crate::server::state::require_absolute_grant_path(&path) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": msg})),
+        );
+    }
     let now = crate::server::gate_escalation::now_secs();
     let expires_at: Option<u64> = body
         .get("expires_in_secs")
@@ -2894,6 +2902,14 @@ async fn scope_floor_add(
         );
     }
     let path = crate::server::state::normalize_scope_path(&raw_path);
+    // #722: reject a relative path at admission — a floor grant that can never match under #597
+    // is worse than none (it reads as society-wide coverage the seats do not actually hold).
+    if let Err(msg) = crate::server::state::require_absolute_grant_path(&path) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": msg})),
+        );
+    }
     let now = crate::server::gate_escalation::now_secs();
 
     let mut s = state.lock().await;

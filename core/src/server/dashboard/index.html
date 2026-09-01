@@ -3844,9 +3844,24 @@
       err.hidden = true; ok.hidden = true;
       btn.disabled = true;
       try {
+        // #722: a scope grant path MUST be absolute — but the CLIENT must not infer WHICH
+        // absolute path the operator meant. That is the same reason `require_absolute_grant_path`
+        // refuses on the server: the recorder and the enforcer may not share a mount, so
+        // synthesizing `/` + input would mint an authority-bearing grant to a path the operator
+        // never typed. So validate and REFUSE here too, preserving the typed value, rather than
+        // guess. (GPT review of #781.)
+        const grantPath = path.value.trim();
+        if (!grantPath.startsWith('/')) {
+          err.textContent = 'absolute path required — a scope grant must start with "/". Type the '
+            + 'full absolute path; the daemon refuses a relative grant, which can never match under '
+            + 'prefix containment.';
+          err.hidden = false;
+          sync();
+          return;
+        }
         const body = {
           plugin_id: plugin.value.trim(),
-          path: path.value.trim(),
+          path: grantPath,
           reason: reason.value.trim(),
         };
         if (ttl.value) body.expires_in_secs = Number(ttl.value);

@@ -9719,6 +9719,25 @@ mod tests {
         assert_eq!(normalize_scope_path("/../../etc/shadow"), "/etc/shadow");
     }
 
+    /// #722: a relative `path:` grant is stored verbatim by the lexical normaliser (which cannot
+    /// safely absolutise — daemon records, plugin enforces, may not share a mount) and can then
+    /// never match an absolute resolved candidate under #597 prefix containment. So admission must
+    /// REJECT it. This pins both halves: the normaliser preserves the relative form (the bug's
+    /// mechanism), and `require_absolute_grant_path` refuses it, naming the grant (the fix).
+    #[test]
+    fn a_relative_scope_grant_is_refused_at_admission() {
+        use crate::server::state::{normalize_scope_path, require_absolute_grant_path};
+        // The exact Legion repro: a workspace path that lost its leading slash.
+        let relative = normalize_scope_path("home/dp/ai-workspace");
+        assert_eq!(relative, "home/dp/ai-workspace"); // lexical normaliser keeps it relative
+        let err = require_absolute_grant_path(&relative)
+            .expect_err("a relative grant that can never match must be refused at the write site");
+        // The error names the offending grant so an operator sees WHAT was refused.
+        assert!(err.contains("home/dp/ai-workspace"), "error must name the grant: {err}");
+        // The same path WITH its leading slash is admitted.
+        assert!(require_absolute_grant_path(&normalize_scope_path("/home/dp/ai-workspace")).is_ok());
+    }
+
     /// Silence refuses, here as everywhere else. An undecided request that runs out its window
     /// is `expired`, and expired grants nothing — so waiting is never a strategy.
     #[test]
