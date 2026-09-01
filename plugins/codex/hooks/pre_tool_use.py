@@ -103,6 +103,23 @@ def _load_shared_module(name):
             "run deploy/install-members.sh"
         )
 
+    # Shared modules legitimately import one another by bare canonical name. Make only
+    # the selected authority directory available to those imports; never add a checkout
+    # fallback. Canonicalize it so a HESTIA_HOME/shared symlink and its build directory
+    # cannot occupy two precedence positions.
+    selected_dir = os.path.dirname(required)
+    selected_key = os.path.normcase(selected_dir)
+    retained = []
+    for entry in sys.path:
+        try:
+            entry_key = os.path.normcase(os.path.realpath(os.fspath(entry) or os.getcwd()))
+        except (TypeError, ValueError, OSError):
+            retained.append(entry)
+            continue
+        if entry_key != selected_key:
+            retained.append(entry)
+    sys.path[:] = [selected_dir, *retained]
+
     cached = sys.modules.get(name)
     if cached is not None:
         cached_file = getattr(cached, "__file__", None)
@@ -117,9 +134,14 @@ def _load_shared_module(name):
     sys.modules[name] = module
     try:
         spec.loader.exec_module(module)
-    except Exception:
+    except BaseException as exc:
         sys.modules.pop(name, None)
-        raise
+        # This boundary is module INITIALIZATION only. Convert even SystemExit(0) into
+        # an ordinary loader failure so module-level callers reach the explicit
+        # fail-closed posture; main()'s legitimate allow/deny SystemExit remains outside.
+        raise ImportError(
+            f"installed Hestia shared module {name!r} failed to initialize"
+        ) from exc
     loaded_file = getattr(module, "__file__", None)
     if not loaded_file or os.path.realpath(loaded_file) != required:
         sys.modules.pop(name, None)
