@@ -39,6 +39,13 @@ WRITE_EVENT = {
 def run(shared_dir: str) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["HESTIA_SHARED_DIR"] = shared_dir
+    # Make a branch-local classifier discoverable through ordinary Python import lookup.
+    # The selected installed directory must still be authoritative: neither a missing path
+    # nor an empty one may silently borrow law from PYTHONPATH/the current checkout.
+    inherited_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = str(REAL_SHARED) + (
+        os.pathsep + inherited_pythonpath if inherited_pythonpath else ""
+    )
     # Point the daemon at a closed port so the run cannot depend on a live daemon. The
     # authority check under test happens before any of that matters.
     env["HESTIA_ENDPOINT"] = "http://127.0.0.1:1"
@@ -52,24 +59,41 @@ def run(shared_dir: str) -> subprocess.CompletedProcess:
     )
 
 
+def require_missing_authority_refusal(
+    failures: list[str], label: str, shared_dir: str
+) -> None:
+    got = run(shared_dir)
+    if got.returncode != 2:
+        failures.append(
+            f"{label} returned {got.returncode}, expected 2. "
+            f"Only exit 2 blocks; {got.returncode} lets the tool run. "
+            f"stderr[:200]={got.stderr[:200]!r}")
+    elif "no-shared-authority" not in got.stderr:
+        failures.append(
+            f"{label} returned exit 2 but stderr does not name the cause; a refusal "
+            f"the operator cannot diagnose is a brick. stderr[:200]={got.stderr[:200]!r}")
+
+
 def main() -> int:
     failures = []
 
-    # 1. NO shared authority -> must be a refusal, and specifically exit 2.
+    # 1. An existing but empty installed directory must fail closed.
     with tempfile.TemporaryDirectory() as empty:
-        got = run(empty)
-        if got.returncode != 2:
-            failures.append(
-                f"missing shared authority returned {got.returncode}, expected 2. "
-                f"Only exit 2 blocks; {got.returncode} lets the tool run. "
-                f"stderr[:200]={got.stderr[:200]!r}")
-        elif "no-shared-authority" not in got.stderr:
-            failures.append(
-                "exit 2 was returned but stderr does not name the cause; a refusal the "
-                f"operator cannot diagnose is a brick. stderr[:200]={got.stderr[:200]!r}")
+        require_missing_authority_refusal(
+            failures, "empty shared authority directory", empty
+        )
 
-    # 2. WITH the shared authority present the hook must NOT refuse for this reason.
-    #    Without this arm the test passes against a hook that refuses everything.
+        # 2. A path that does not exist must behave identically. This is the regression
+        #    arm for the branch-local fallback: before the repair, this exact shape silently
+        #    loaded plugins/_shared from the checkout and never reached no-shared-authority.
+        require_missing_authority_refusal(
+            failures,
+            "non-existent shared authority path",
+            str(Path(empty) / "not-created"),
+        )
+
+    # 3. WITH the explicitly reviewed shared fixture present the hook must NOT refuse for
+    #    this reason. Without this arm the test passes against a hook that refuses everything.
     got = run(str(REAL_SHARED))
     if "no-shared-authority" in got.stderr:
         failures.append(
@@ -80,7 +104,10 @@ def main() -> int:
         for f in failures:
             print(f"FAIL: {f}", file=sys.stderr)
         return 1
-    print("ok: missing shared authority blocks with exit 2, and does not fire when present")
+    print(
+        "ok: empty and non-existent shared authority block with exit 2, "
+        "and the explicit reviewed fixture does not"
+    )
     return 0
 
 

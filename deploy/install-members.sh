@@ -131,7 +131,7 @@ log ""
 # The engine swap is already atomic (build dir, verify digests, rename the symlink); this
 # ordering is what makes the whole install atomic from a hook's point of view.
 # --- THE SHARED ENGINE IS AN INSTALL ARTIFACT TOO. ----------------------------------------
-# Every hook entrypoint installed above imports its decision engine from plugins/_shared/ —
+# Every hook entrypoint installed below imports its decision engine from plugins/_shared/ —
 # and until now the ledger bound the entrypoints and ZERO bytes of the engine they call
 # (#481: current-build.json binds hook entrypoints but 0 bytes of _shared; the hooks digested
 # to installed paths while the engine executed from the mutable workspace checkout). An audit

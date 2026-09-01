@@ -317,6 +317,25 @@ def test_manifest_declares_exactly_what_the_runtime_imports():
           f"{sorted(undeclared)}")
 
 
+def test_shared_engine_activation_precedes_member_entrypoints():
+    """The cutover's ordering is a safety property, not explanatory prose.
+
+    A newly installed hook may require a module that the previous shared build did not
+    contain. The installer must therefore finish the verified engine activation before it
+    enters the member loop that writes hook entrypoints. This source-order assertion is
+    intentionally narrow: it guards the two transaction boundaries without duplicating the
+    shell implementation in the test.
+    """
+    with open(SCRIPT, encoding="utf-8") as fh:
+        source = fh.read()
+    engine_flip = source.find('python3 -c \'import os, sys; os.rename(sys.argv[1], sys.argv[2])\'')
+    member_loop = source.find('for expects in "$REPO_ROOT"/plugins/*/expects.json; do')
+    check(engine_flip >= 0, "shared-engine atomic activation was not found")
+    check(member_loop >= 0, "member entrypoint loop was not found")
+    check(0 <= engine_flip < member_loop,
+          "member hook entrypoints can be installed before the shared engine is active")
+
+
 def teardown_module(_module=None):
     """Deliver the accumulator to pytest as well as to the bare runner — see
     installer_derives_target_test.py, where a green-under-pytest that meant
@@ -331,6 +350,7 @@ if __name__ == "__main__":
     test_rerun_is_idempotent_except_timestamps()
     test_dry_run_reports_the_engine_but_writes_nothing()
     test_manifest_declares_exactly_what_the_runtime_imports()
+    test_shared_engine_activation_precedes_member_entrypoints()
     for f in FAILS:
         print("FAIL", f)
     print(f"{'FAILED' if FAILS else 'ok'}: {len(FAILS)} failure(s)")

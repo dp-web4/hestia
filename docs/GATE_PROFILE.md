@@ -2,7 +2,7 @@
 
 **Status:** Normative adapter contract, implementation-divergent · current 2026-08-31.
 The shared predicate is wired, but one executed gate is not complete: loaders and native-event
-normalization still diverge, and 67.3% of measured law-bearing code remains per-seat. Active
+normalization still diverge, and 52.3% of measured law-bearing code remains per-seat. Active
 completion plan: [SPRINT_ONE_GATE_EXECUTED_AUTHORITY.md](SPRINT_ONE_GATE_EXECUTED_AUTHORITY.md).
 **Wire authority:** [`web4-standard/core-spec/presence-protocol.md`](https://github.com/dp-web4/web4/blob/main/web4-standard/core-spec/presence-protocol.md) §§3.1–3.4 — this profile adds **client-construction requirements**, it does not change the wire protocol.
 **Thread:** `hestia-role-orchestration` · answers CBP's "ready for your gate-endpoint contract" (`cbp-to-hub-OQ1-ANSWERED-…-2026-07-09.md`)
