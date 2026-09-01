@@ -5,7 +5,7 @@
 **Started:** 2026-08-31  
 **North star:** every harness contributes only event translation, identity location, registration, and native refusal rendering. Every decision-bearing rule executes from one installed, attested shared engine over one typed normalized event.
 
-## Measured starting point
+## Measured starting point (2026-08-31 pre-sprint baseline)
 
 - 67.5% of law-bearing gate code remains in seat files.
 - Gemini still holds four forked scope predicates.
@@ -65,7 +65,7 @@ Bind binary, hook entrypoints, shared engine, adapter schema, and effective gran
 
 ## Ratchets
 
-- Seat-local law-bearing percentage: 67.5% to 0%.
+- Seat-local law-bearing percentage: 67.5% pre-sprint baseline to 0% architectural target.
 - Forked predicates: 4 to 0.
 - Wrong shared-predicate cases: 7/18 to 0.
 - Registered gates with proven installed digest: all; UNKNOWN is failure.
