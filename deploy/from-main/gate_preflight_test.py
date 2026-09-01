@@ -19,7 +19,7 @@ SPEC.loader.exec_module(gate_preflight)
 
 def make_member(repo: Path, home: Path, name: str, *, registered: bool = True,
                 outcome: str = "allow", reader: str = "json-hook-commands",
-                advisory: bool = False) -> None:
+                advisory: bool = False, body: str | None = None) -> None:
     plugin = repo / "plugins" / name
     hooks = plugin / "hooks"
     hooks.mkdir(parents=True)
@@ -35,7 +35,9 @@ def make_member(repo: Path, home: Path, name: str, *, registered: bool = True,
         }
     }
     (plugin / "expects.json").write_text(json.dumps(spec), encoding="utf-8")
-    if outcome == "allow":
+    if body is not None:
+        pass
+    elif outcome == "allow":
         body = "import sys; sys.stdin.read(); raise SystemExit(0)\n"
     elif outcome == "payload-deny":
         body = "import json; print(json.dumps({'permissionDecision': 'deny'}))\n"
@@ -84,6 +86,23 @@ def test_advisory_refusal_is_logged_and_does_not_block():
         assert good, rows
         assert rows == [{"member": "alpha", "probe": "read", "status": "advisory-refused",
                          "reason": "candidate exited 2"}]
+
+
+def test_candidate_gate_is_probed_against_the_candidate_engine():
+    """The first cycle after #747 merged probed the new gate against the still-installed
+    3-module engine; the gate refused `no-shared-authority` and the preflight blocked the
+    install that shipped the missing module. The candidate hook must see HESTIA_SHARED_DIR
+    naming the checkout's own plugins/_shared, the tree about to be installed."""
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        repo, home = root / "repo", root / "home"
+        expected = str((repo / "plugins" / "_shared").resolve())
+        body = ("import os, sys; sys.stdin.read()\n"
+                f"raise SystemExit(0 if os.environ.get('HESTIA_SHARED_DIR') == {expected!r} else 2)\n")
+        make_member(repo, home, "alpha", body=body)
+        rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+        assert good, rows
+        assert rows == [{"member": "alpha", "probe": "read", "status": "ok"}]
 
 
 def test_advisory_flag_must_be_literal_true():
@@ -186,10 +205,11 @@ if __name__ == "__main__":
     test_registered_refusal_blocks_the_set_before_installation()
     test_advisory_refusal_is_logged_and_does_not_block()
     test_advisory_flag_must_be_literal_true()
+    test_candidate_gate_is_probed_against_the_candidate_engine()
     test_zero_exit_payload_deny_is_not_mistaken_for_an_allow()
     test_gemini_zero_exit_decision_deny_is_not_mistaken_for_an_allow()
     test_unregistered_member_is_not_a_deployment_requirement()
     test_bad_registration_is_unmeasured_not_absent()
     test_workspace_is_explicit_when_a_checkout_is_nested_in_a_worktree()
     test_every_shipped_gate_declares_its_own_probe_shape()
-    print("ok: 10 gate-preflight checks")
+    print("ok: 11 gate-preflight checks")
