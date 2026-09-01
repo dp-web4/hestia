@@ -221,6 +221,80 @@ async fn discover_with_timeout(
         .map_err(|_| anyhow::anyhow!("hub discovery timed out after {:?}", NET_TIMEOUT))?
 }
 
+/// GET /api/hub/memberships — every known hub, with whether this node is ACTUALLY
+/// ENROLLED in it, asked of the hub rather than inferred locally.
+///
+/// The distinction is the point. Holding a member identity in the vault says only that
+/// this node has *an* identity; it says nothing about whether any particular hub has
+/// admitted it. The old hubs card inferred "joined" from the local identity, which is
+/// the same class of error as reading a green health check as proof of currency. So
+/// enrollment is probed: `GET /v1/hubs/{hub}/members/{me}/pubkey` answers 200 when the
+/// hub has this LCT pinned and 404 when it does not.
+///
+/// Read-only, and every probe is bounded by `NET_TIMEOUT`; an unreachable hub reports
+/// `reachable: false` and an UNKNOWN enrollment rather than a false negative — "we could
+/// not ask" must never render as "you are not a member".
+pub async fn hub_memberships(State(state): State<SharedState>) -> impl IntoResponse {
+    let (entries, active, me) = {
+        let s = state.lock().await;
+        let list = HubUrls::load(&s.vault);
+        let me = read_member_identity(&s.vault).map(|(lct, _)| lct);
+        (list.entries, list.active, me)
+    };
+
+    let http = reqwest::Client::new();
+    let mut out = Vec::new();
+    for e in entries {
+        let mut row = serde_json::json!({
+            "url": e.url,
+            "label": e.label,
+            "active": Some(&e.url) == active.as_ref(),
+            "reachable": false,
+            "hub_lct_id": serde_json::Value::Null,
+            "hub_name": serde_json::Value::Null,
+            // `null` means UNASKED/UNKNOWN, never "no". Only an answered probe sets a bool.
+            "enrolled": serde_json::Value::Null,
+        });
+        if let Ok(info) = discover_with_timeout(&e.url).await {
+            row["reachable"] = serde_json::json!(true);
+            row["hub_lct_id"] = serde_json::json!(info.hub_lct_id);
+            if let Some(h) = info.hubs.first() {
+                row["hub_name"] = serde_json::json!(h.name);
+            }
+            if let Some(me) = me {
+                let probe = format!(
+                    "{}/v1/hubs/{}/members/{}/pubkey",
+                    e.url.trim_end_matches('/'), info.hub_lct_id, me
+                );
+                if let Ok(Ok(resp)) =
+                    tokio::time::timeout(NET_TIMEOUT, http.get(&probe).send()).await
+                {
+                    row["enrolled"] = serde_json::json!(resp.status().is_success());
+                }
+            }
+        }
+        out.push(row);
+    }
+
+    Json(serde_json::json!({
+        "member_lct": me.map(|m| m.to_string()),
+        "hubs": out,
+        // Capabilities this build actually has, so the UI can render honest controls
+        // instead of buttons that silently do nothing (dp, 2026-09-01).
+        "supported": {
+            "apply": true,
+            "remove_from_list": true,
+            // No member-initiated departure exists: the hub has an operator-only
+            // /admin/api/members/:id/remove and no withdraw route or event.
+            // Tracked as a hub-side gap against PRD_HUB_V2_FEDERATED R8.2 (exit).
+            "withdraw": false,
+            // Discovery today is "paste a URL"; there is no registry to search.
+            "discover": false
+        }
+    }))
+    .into_response()
+}
+
 /// GET /api/hub/status — hub reachability + our identity state. Read-only.
 pub async fn hub_status(State(state): State<SharedState>) -> impl IntoResponse {
     let (url, url_source, identity) = {
