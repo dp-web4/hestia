@@ -86,6 +86,15 @@
   .deployment-health.stale { color: var(--warning); }
   .deployment-health.unknown { color: var(--fg-faint); }
   .deployment-health .mark { font-size: 0.9rem; font-weight: 700; }
+  .deployment-update {
+    appearance: none; border: 1px solid var(--warning); border-radius: 999px;
+    background: transparent; color: var(--warning); font: inherit; font-size: 0.68rem;
+    letter-spacing: 0.05em; text-transform: uppercase; padding: 0.2rem 0.55rem;
+    cursor: pointer;
+  }
+  .deployment-update:hover:not(:disabled) { background: color-mix(in srgb, var(--warning) 12%, transparent); }
+  .deployment-update:disabled { cursor: default; opacity: 0.7; }
+  .deployment-update.failed { border-color: var(--failure); color: var(--failure); }
 
   /* Top-level view switch (agents | hubs), in the masthead by the Hestia mark. The content
      area below is one view or the other — see the HTML note at #agents-view. A segmented
@@ -980,6 +989,7 @@
          still on the face of the nav. -->
     <div class="live">
       <span class="deployment-health unknown" id="deployment-health" title="Deployment freshness">● deployment unknown</span>
+      <button class="deployment-update" id="deployment-update" type="button" hidden>update</button>
       <span class="dot"></span>
       <span id="live-status">connecting…</span>
     </div>
@@ -2612,13 +2622,59 @@
   function renderDeployment(deployment) {
     const d = deployment || { state: 'unknown', note: 'deployment status unavailable' };
     const el = $('deployment-health');
+    const btn = $('deployment-update');
     const state = ['current', 'stale', 'unknown'].includes(d.state) ? d.state : 'unknown';
+    const updateState = d.update_state || 'idle';
     el.className = `deployment-health ${state}`;
     el.textContent = state === 'current'
       ? '● deployment current'
       : state === 'stale' ? '! deployment stale' : '● deployment unknown';
-    el.title = `${d.note || 'deployment status unavailable'}${d.running_build ? ` (running ${d.running_build})` : ''}${d.current_build ? `; current ${d.current_build}` : ''}`;
+    el.title = `${d.note || 'deployment status unavailable'}${d.running_build ? ` (running ${d.running_build})` : ''}${d.current_build ? `; current ${d.current_build}` : ''}${d.update_note ? `; ${d.update_note}` : ''}`;
+
+    if (!btn) return;
+    const active = state === 'stale' && ['requested', 'held', 'running'].includes(updateState);
+    const failed = state === 'stale' && updateState === 'failed';
+    btn.hidden = state !== 'stale' || !d.update_capable;
+    btn.disabled = active;
+    btn.classList.toggle('failed', failed);
+    btn.textContent = updateState === 'held' ? 'update held' : active ? 'updating…' : failed ? 'retry update' : 'update';
+    btn.title = active
+      ? (d.update_note || 'deployment supervisor is updating this installation')
+      : failed ? (d.update_note || 'last update failed; retry')
+      : 'bring this deployment current through the registered supervisor';
   }
+
+  (function wireDeploymentUpdate() {
+    const btn = $('deployment-update');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      btn.textContent = 'requesting…';
+      btn.classList.remove('failed');
+      try {
+        const res = await apiFetch('/api/operator/deployment/update', { method: 'POST' });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+        if (body.status === 'current') {
+          await tick();
+          return;
+        }
+        btn.textContent = 'updating…';
+        $('live-status').textContent = 'updating…';
+        // Re-read authoritative supervisor state rather than inventing a client-side success.
+        // The daemon may disappear during restart; the ordinary poll will reconnect and only
+        // deployment.state=current clears the stale badge.
+        await tick();
+      } catch (error) {
+        btn.disabled = false;
+        btn.classList.add('failed');
+        btn.textContent = 'retry update';
+        btn.title = `update request failed: ${error.message}`;
+        $('live-status').textContent = `update failed (${error.message})`;
+      }
+    });
+  })();
 
   async function fetchFailures() {
     try {
