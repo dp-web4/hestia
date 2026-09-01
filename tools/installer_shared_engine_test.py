@@ -278,6 +278,24 @@ def test_dry_run_reports_the_engine_but_writes_nothing():
               "dry run wrote the authority file")
 
 
+def test_no_registered_member_is_state_neutral():
+    """A no-member run must not change executable bytes without deployment truth.
+
+    Moving engine activation before member discovery made this path install and activate
+    the shared engine, then report "no member installed" and withhold the authority record.
+    A real registered target must be the trigger for activation.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root, home, hestia_home, env = build(tmp)
+        os.remove(os.path.join(home, ".harness", "settings.json"))
+        rc, out = run(root, env)
+        check(rc == 0, f"no-member install exited {rc}: {out}")
+        check("no member installed" in out,
+              "no-member run did not state that no deployment occurred")
+        check(not os.path.exists(hestia_home),
+              "no-member run mutated Hestia state despite withholding authority")
+
+
 def test_manifest_declares_exactly_what_the_runtime_imports():
     """The drift guard for option B, in both directions: every manifest entry
     must exist and be a runtime module (never a test), and every _shared module
@@ -328,11 +346,13 @@ def test_shared_engine_activation_precedes_member_entrypoints():
     """
     with open(SCRIPT, encoding="utf-8") as fh:
         source = fh.read()
-    engine_flip = source.find('python3 -c \'import os, sys; os.rename(sys.argv[1], sys.argv[2])\'')
     member_loop = source.find('for expects in "$REPO_ROOT"/plugins/*/expects.json; do')
-    check(engine_flip >= 0, "shared-engine atomic activation was not found")
     check(member_loop >= 0, "member entrypoint loop was not found")
-    check(0 <= engine_flip < member_loop,
+    activation_call = source.find("    activate_shared_engine\n", member_loop)
+    hook_install = source.find('      install -m 0755 "$src" "$target"', member_loop)
+    check(activation_call >= 0, "shared-engine activation call was not found in member loop")
+    check(hook_install >= 0, "member hook install was not found")
+    check(member_loop < activation_call < hook_install,
           "member hook entrypoints can be installed before the shared engine is active")
 
 
@@ -349,6 +369,7 @@ if __name__ == "__main__":
     test_removed_source_file_leaves_the_active_set()
     test_rerun_is_idempotent_except_timestamps()
     test_dry_run_reports_the_engine_but_writes_nothing()
+    test_no_registered_member_is_state_neutral()
     test_manifest_declares_exactly_what_the_runtime_imports()
     test_shared_engine_activation_precedes_member_entrypoints()
     for f in FAILS:
