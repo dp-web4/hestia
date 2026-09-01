@@ -199,6 +199,18 @@ def run_probes(
                     if completed.returncode != 0
                     else "candidate returned denial payload"
                 )
+                # ADVISORY (#767): a probe may be declared advisory when it asserts a right the
+                # law has not granted. The deploy-hold probe is one: no seat's scope admits a
+                # write to $HESTIA_HOME/deploy.hold, so from #729's first cycle every member
+                # gate refused it and the members' install was blocked fleet-wide, on a probe
+                # nobody had run against the gate before shipping it. An advisory refusal is
+                # still a row in deploy.log every cycle, so the observation is kept; it no
+                # longer decides whether hooks install. Whether members SHOULD hold the deploy
+                # is a ruling for the law, and when it lands the flag comes off.
+                if declared.get("advisory") is True:
+                    rows.append({"member": member, "probe": label,
+                                 "status": "advisory-refused", "reason": reason})
+                    continue
                 rows.append({"member": member, "probe": label, "status": "refused", "reason": reason})
                 good = False
             else:
