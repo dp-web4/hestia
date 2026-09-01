@@ -155,6 +155,7 @@ def run_hook(ws, event, endpoint):
                 "HESTIA_CODEX_IDENTITY": os.path.join(ws, "identity.json"),
                 "HESTIA_OBSERVE_DIR": os.path.join(ws, "observe"),
                 "HESTIA_CODEX_GATE_MODE": "enforce",
+                "HESTIA_SHARED_DIR": os.path.join(ws, "hestia", "plugins", "_shared"),
                 "HESTIA_ENDPOINT": endpoint})
     p = subprocess.run([sys.executable, HOOK], input=json.dumps(event),
                        capture_output=True, text=True, timeout=60,

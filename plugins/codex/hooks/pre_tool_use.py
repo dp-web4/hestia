@@ -28,6 +28,11 @@ Defense-in-depth, because no single layer covers everything on Codex:
     container that exposes only granted repos is the real read-confinement fix (future).
 This gate is the shell/edit/MCP-command layer: scope + egress + society-safety, fail-closed.
 
+ENGINE AUTHORITY: runtime law is loaded only from `$HESTIA_SHARED_DIR` when explicitly set,
+otherwise from `$HESTIA_HOME/shared` (default `~/.hestia/shared`). The repository working
+tree is never an implicit runtime fallback. A missing installed engine is a fail-closed
+misdeployment, not permission to execute branch-dependent law.
+
 Three gates, in order (Sprint F: self-protection first, then the ONE decision, then society):
   1c. SELF-PROTECTION (Sprint B): a write whose DESTINATION is the governance closure is
      refused and escalated pre-daemon (a pre-existing human approval is claimed and spent —
@@ -81,27 +86,56 @@ IDENTITY = os.path.expanduser(
     os.environ.get("HESTIA_CODEX_IDENTITY", "~/.codex/hestia-instance/identity.json"))
 
 
+def _shared_runtime_dir():
+    return os.environ.get("HESTIA_SHARED_DIR") or os.path.join(
+        os.path.expanduser(os.environ.get("HESTIA_HOME", "~/.hestia")), "shared")
+
+
+def _load_shared_module(name):
+    """Load governing code only from the selected installed authority directory."""
+    import importlib.util
+
+    shared = _shared_runtime_dir()
+    required = os.path.realpath(os.path.join(shared, name + ".py"))
+    if not os.path.isfile(required):
+        raise ImportError(
+            f"installed Hestia shared module {name!r} is unavailable at {required!r}; "
+            "run deploy/install-members.sh"
+        )
+
+    cached = sys.modules.get(name)
+    if cached is not None:
+        cached_file = getattr(cached, "__file__", None)
+        if cached_file and os.path.realpath(cached_file) == required:
+            return cached
+        sys.modules.pop(name, None)
+
+    spec = importlib.util.spec_from_file_location(name, required)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot construct a loader for installed module {required!r}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
+    loaded_file = getattr(module, "__file__", None)
+    if not loaded_file or os.path.realpath(loaded_file) != required:
+        sys.modules.pop(name, None)
+        raise ImportError(
+            f"shared authority miswire: {name!r} resolved to {loaded_file!r}, "
+            f"expected {required!r}"
+        )
+    return module
+
+
 def _load_mechanism():
-    """Import the SHARED society-safety mechanism (Sprint E — PRD §6.E, one transport).
+    """Import the installed shared society-safety mechanism.
 
-    HISTORY (why there is no subprocess here). Gate 2 used to spawn the claude-code gate as a
-    subprocess (a 2760-line cold import, from a mounted workspace) with a 2s budget under
-    codex's 3s hook clamp. Warm it answered in 194-336ms; cold 9p reads blew the budget, so codex
-    was repeatedly blocked with `no policy verdict (daemon path failed)` while the daemon was up
-    the whole time (2026-07-26, NRestarts=0). That subprocess spawn was the structural cost
-    criterion 10 (§7.4) deletes: the timeout asymmetry cannot close while any harness reaches
-    the verdict through a fork + cold interpreter start. The shared mechanism runs the same
-    connect/begin/poll protocol IN-PROCESS — the identical lean round-trip claude makes.
-
-    Raises on failure — each CALLER decides the fail posture (Gate 2 fails closed on a
-    consequential act; the witness path falls back to the diagnostic log)."""
-    for cand in (os.path.join(WORKSPACE, "hestia", "plugins", "_shared"),
-                 os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                              "_shared")):
-        if os.path.isdir(cand) and cand not in sys.path:
-            sys.path.insert(0, cand)
-    import hestia_gate_mechanism
-    return hestia_gate_mechanism
+    Explicit HESTIA_SHARED_DIR is allowed for tests/development; otherwise authority is
+    HESTIA_HOME/shared. Mutable worktrees and stale module-cache entries are not fallbacks."""
+    return _load_shared_module("hestia_gate_mechanism")
 
 
 # The agent's own home is always in scope (state, identity, config).
@@ -114,15 +148,8 @@ CODEX_HOME = os.path.expanduser("~/.codex")
 # it). GUARDED: this engine fails OPEN on a hook error, so a missing/broken module must
 # not disarm the layer — _CLOSURE_FLOOR is the Tier-2 fallback (deny writes touching the
 # literal floor, allow reads), per the ratified degraded-mode semantics.
-for _shared_cand in (
-    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__)))), "_shared"),
-    os.path.join(WORKSPACE, "hestia", "plugins", "_shared"),
-):
-    if os.path.isdir(_shared_cand) and _shared_cand not in sys.path:
-        sys.path.insert(0, _shared_cand)
 try:
-    from hestia_governance_closure import classify as _closure_classify
+    _closure_classify = _load_shared_module("hestia_governance_closure").classify
 except Exception:
     _closure_classify = None
 
@@ -151,7 +178,7 @@ _CLOSURE_FLOOR = (
 # as the explicit fail-closed deny in main() (`_core is None`), never as a module-level
 # crash. sys.path already carries _shared via the Gate-1c block above.
 try:
-    import hestia_gate_core as _core
+    _core = _load_shared_module("hestia_gate_core")
 except Exception:
     _core = None
 
