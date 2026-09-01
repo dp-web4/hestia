@@ -131,7 +131,7 @@ log ""
 # The engine swap is already atomic (build dir, verify digests, rename the symlink); this
 # ordering is what makes the whole install atomic from a hook's point of view.
 # --- THE SHARED ENGINE IS AN INSTALL ARTIFACT TOO. ----------------------------------------
-# Every hook entrypoint installed above imports its decision engine from plugins/_shared/ —
+# Every hook entrypoint installed by the loop below imports its decision engine from plugins/_shared/ —
 # and until now the ledger bound the entrypoints and ZERO bytes of the engine they call
 # (#481: current-build.json binds hook entrypoints but 0 bytes of _shared; the hooks digested
 # to installed paths while the engine executed from the mutable workspace checkout). An audit
@@ -206,59 +206,75 @@ for i in "${!engine_names[@]}"; do
 done
 shared_engine_json="$shared_engine_json]"
 
-if [ "$DRY_RUN" = "1" ]; then
-  for base in "${engine_names[@]}"; do
-    log "  would $base -> $shared_link (build $build_digest)"
-  done
-else
-  mkdir -p "$builds_dir"
-  # Staging dirs from an interrupted run are inert — nothing points at them. Sweep them.
-  for stale in "$builds_dir"/.staging.*; do
-    [ -e "$stale" ] && rm -rf "$stale"
-  done
+# ACTIVATION IS LAZY, ON THE FIRST REAL MEMBER (codex pin, codex/final-747 831d760). The
+# engine must be active before the first hook byte lands (a hook imports it at start), and
+# a box with NO registered member must not have its state mutated by a run that then says
+# "no member installed" and withholds the authority record. Engine-before-loop satisfied
+# the first by breaking the second. So: computed above, activated here, called from inside
+# the member loop immediately before the first install, once.
+engine_active=0
+activate_shared_engine() {
+  [ "$engine_active" = 1 ] && return 0
+  # Bash variables are global unless declared. The caller is mid-loop over member files
+  # with $base bound to the hook it is about to install and RECORD; this body's own loop
+  # over engine names reused the name and the first probe run ledgered hook.py as
+  # engine.py. Every name this body binds is local.
+  local base i stale staging current_target flip
+  if [ "$DRY_RUN" = "1" ]; then
+    for base in "${engine_names[@]}"; do
+      log "  would $base -> $shared_link (build $build_digest)"
+    done
+  else
+    mkdir -p "$builds_dir"
+    # Staging dirs from an interrupted run are inert — nothing points at them. Sweep them.
+    for stale in "$builds_dir"/.staging.*; do
+      [ -e "$stale" ] && rm -rf "$stale"
+    done
 
-  if [ -d "$build_dir" ]; then
-    if engine_build_ok "$build_dir"; then
-      log "  ok    build $build_digest (already staged, re-verified)"
+    if [ -d "$build_dir" ]; then
+      if engine_build_ok "$build_dir"; then
+        log "  ok    build $build_digest (already staged, re-verified)"
+      else
+        # A content-addressed directory whose bytes no longer match their address: an installed
+        # engine file was rewritten after deploy. Quarantine loudly; never silently reuse. The
+        # symlink dangles until the rebuild below lands — the honest direction for a tampered
+        # engine is to fail, not to coast on bytes the ledger no longer recognizes.
+        warn "build $build_digest FAILED re-verification — quarantining as $build_dir.corrupt.$$ and rebuilding"
+        mv "$build_dir" "$build_dir.corrupt.$$"
+      fi
+    fi
+    if [ ! -d "$build_dir" ]; then
+      staging="$builds_dir/.staging.$$"
+      mkdir -p "$staging"
+      for i in "${!engine_names[@]}"; do
+        # Imported, not executed: 0644, not the entrypoints' 0755.
+        install -m 0644 "$REPO_ROOT/plugins/_shared/${engine_names[$i]}" "$staging/${engine_names[$i]}"
+      done
+      # INVARIANT 3: prove the bytes landed — the WHOLE staged set, before it can become active.
+      engine_build_ok "$staging" || die "engine build $build_digest verify FAILED in staging; nothing was activated"
+      mv "$staging" "$build_dir"
+      log "  wrote build $build_digest (${#engine_names[@]} files, staged and verified)"
+    fi
+
+    # THE FLIP: one atomic rename of a symlink. Before it, the active engine is untouched;
+    # after it, it is exactly the verified build. There is no between.
+    if [ -e "$shared_link" ] && [ ! -L "$shared_link" ]; then
+      # A pre-symlink install left shared/ as a real directory. INVARIANT 2: preserve, then move.
+      warn "migrating legacy shared/ directory aside to $shared_link.pre-flip.bak"
+      mv "$shared_link" "$shared_link.pre-flip.bak"
+    fi
+    current_target="$(readlink "$shared_link" 2>/dev/null || true)"
+    if [ "$current_target" = "shared.builds/$build_digest" ]; then
+      log "  ok    shared -> $current_target (already current)"
     else
-      # A content-addressed directory whose bytes no longer match their address: an installed
-      # engine file was rewritten after deploy. Quarantine loudly; never silently reuse. The
-      # symlink dangles until the rebuild below lands — the honest direction for a tampered
-      # engine is to fail, not to coast on bytes the ledger no longer recognizes.
-      warn "build $build_digest FAILED re-verification — quarantining as $build_dir.corrupt.$$ and rebuilding"
-      mv "$build_dir" "$build_dir.corrupt.$$"
+      flip="$HESTIA_HOME/.shared.flip.$$"
+      ln -s "shared.builds/$build_digest" "$flip"
+      python3 -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$flip" "$shared_link"
+      log "  wrote shared -> shared.builds/$build_digest"
     fi
   fi
-  if [ ! -d "$build_dir" ]; then
-    staging="$builds_dir/.staging.$$"
-    mkdir -p "$staging"
-    for i in "${!engine_names[@]}"; do
-      # Imported, not executed: 0644, not the entrypoints' 0755.
-      install -m 0644 "$REPO_ROOT/plugins/_shared/${engine_names[$i]}" "$staging/${engine_names[$i]}"
-    done
-    # INVARIANT 3: prove the bytes landed — the WHOLE staged set, before it can become active.
-    engine_build_ok "$staging" || die "engine build $build_digest verify FAILED in staging; nothing was activated"
-    mv "$staging" "$build_dir"
-    log "  wrote build $build_digest (${#engine_names[@]} files, staged and verified)"
-  fi
-
-  # THE FLIP: one atomic rename of a symlink. Before it, the active engine is untouched;
-  # after it, it is exactly the verified build. There is no between.
-  if [ -e "$shared_link" ] && [ ! -L "$shared_link" ]; then
-    # A pre-symlink install left shared/ as a real directory. INVARIANT 2: preserve, then move.
-    warn "migrating legacy shared/ directory aside to $shared_link.pre-flip.bak"
-    mv "$shared_link" "$shared_link.pre-flip.bak"
-  fi
-  current_target="$(readlink "$shared_link" 2>/dev/null || true)"
-  if [ "$current_target" = "shared.builds/$build_digest" ]; then
-    log "  ok    shared -> $current_target (already current)"
-  else
-    flip="$HESTIA_HOME/.shared.flip.$$"
-    ln -s "shared.builds/$build_digest" "$flip"
-    python3 -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$flip" "$shared_link"
-    log "  wrote shared -> shared.builds/$build_digest"
-  fi
-fi
+  engine_active=1
+}
 
 installed_json="["
 first_entry=1
@@ -388,6 +404,9 @@ print(os.path.expanduser(p) if p else "")' "$expects")"
       warn "$member/$base: expects.json declares '$declared' but the harness invokes it from '$target_dir' — installing to the REGISTERED path. The declared value is a per-seat CLAIM this run just checked, not a fleet-wide target: layouts differ by seat, so this divergence may be structural rather than a stale string to correct"
     fi
 
+    # A registered consumer exists on this host: the engine it imports must be active (and
+    # re-verified) before its bytes are touched or confirmed current. Once per run, lazily.
+    activate_shared_engine
     src_hash="$(sha256sum "$src" | cut -d' ' -f1)"
     if [ -f "$target" ] && [ "$(sha256sum "$target" | cut -d' ' -f1)" = "$src_hash" ]; then
       log "  ok    $base (already current) -> $target_dir"

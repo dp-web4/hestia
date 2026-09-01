@@ -12,10 +12,13 @@ So this pins the polarity in both directions on synthetic modules. It deliberate
 mutate a real seat gate to test the same thing: writing to `plugins/*/hooks/` is refused by
 the gate self-access rule, correctly, and the predicate is what carries the risk anyway.
 
-The end-to-end wiring is pinned by the live tree, where both grades occur at once: gemini
-carries 4 divergent scope predicates (independently confirmed by
-`scope_fork_differential_test.py`, which finds 6 inputs they answer differently) while
-claude-code's 16 shell-classifier copies grade verbatim.
+The end-to-end wiring is pinned by the live tree: gemini carries 4 divergent scope predicates
+(independently confirmed by `scope_fork_differential_test.py`, which finds 6 inputs they
+answer differently). The verbatim grade had 16 live instances, claude-code's shell-classifier
+copies, until #747 deleted them; the live count is 0 and the CI pin is
+`--max-verbatim-forked 0`, so the polarity is now carried by the synthetic modules below
+alone. When the loader (#742/#747) lands on two seats the meter will grade it verbatim, and
+that is the ratchet working, not this test.
 """
 from __future__ import annotations
 
