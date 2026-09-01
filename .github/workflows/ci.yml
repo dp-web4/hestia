@@ -190,6 +190,10 @@ jobs:
   plugin-tests:
     name: plugin tests (python)
     runs-on: ubuntu-latest
+    env:
+      # Tests exercise the reviewed source fixture explicitly. Production hooks never infer
+      # authority from a checkout; deploy/install-members.sh selects the installed directory.
+      HESTIA_SHARED_DIR: ${{ github.workspace }}/plugins/_shared
     steps:
       - uses: actions/checkout@v4
 
@@ -243,6 +247,10 @@ jobs:
   hooks:
     name: hook tests (python)
     runs-on: ubuntu-latest
+    env:
+      # Hook tests run before installation, so bind them to the reviewed source fixture.
+      # This is test authority, not a production loader fallback.
+      HESTIA_SHARED_DIR: ${{ github.workspace }}/plugins/_shared
     steps:
       - uses: actions/checkout@v4
 

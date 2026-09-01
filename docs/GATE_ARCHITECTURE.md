@@ -153,18 +153,20 @@ therefore carries its own release bar, and no bar may be reported as covering an
 6. **New harnesses.** Adding a harness means writing an adapter and a declaration. It does not
    mean writing a gate. A PR that adds a harness carrying its own predicates does not merge.
 
-## 6. Known distance from this architecture, as of 2026-08-31
+## 6. Known distance from this architecture, after the shell-classifier cutover
 
 Stated so that nobody reads this document as a description of the present.
 
-- **67.3% of law-bearing code is still per-seat**: 3166 sloc across four seats against 1539
-  shared. claude-code holds 1618 of it, gemini 233. This is the post-#745 measurement; removing
-  the legacy fallback improved the number without changing the 0% target.
-- **claude-code carries the shell command classifier** that the others do not: roughly sixteen
-  functions deciding read from write. Under this architecture it moves into the gate.
+- **52.3% of law-bearing code is still per-seat**: 2471 sloc across four seats against 2250
+  shared. claude-code holds 918 of it, gemini 233. Extracting the learned shell classifier is
+  material progress, not completion; the target remains 0%.
+- **The learned shell classifier is now shared and claude-code consumes it**, but substantial
+  decision-bearing entrypoint, extraction, self-protection, and degraded-mode code remains in
+  seat files. The other adapters have not yet converged on one typed normalization path.
 - **gemini carries four second implementations** of predicates the engine already owns
-  (`path_in_scope`, `command_in_scope`, `launch_cwd_repo`, `_all_repos`), and issue #730 is the
-  behaviour that follows: it permits on an unreachable daemon where codex and kimi refuse.
+  (`path_in_scope`, `command_in_scope`, `launch_cwd_repo`, `_all_repos`). The apparent Gemini
+  unreachable-daemon exception in #730 was a preflight parser defect: its structured denial was
+  misread as allow. #729 repaired the instrument; it did not erase these four real forks.
 - **gemini cannot be driven by the corpus at all.** It exposes no closure classifier and resolves
   no shared engine on the `sys.path` it builds, so every predicate verdict we hold is over three
   seats and is INDETERMINATE for the fleet. The least-measured seat is the most-forked one.

@@ -44,6 +44,7 @@ plus a non-existent fallback path exited 0 with no stderr at all.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -287,12 +288,10 @@ _GOVERNANCE_FILES = (
 _HESTIA_HOME = os.environ.get("HESTIA_HOME") or os.path.join(
     os.path.expanduser("~"), ".hestia")
 _SHARED_DIR = os.environ.get("HESTIA_SHARED_DIR") or os.path.join(_HESTIA_HOME, "shared")
-# Fallback, deliberately one-directional: if the canonical path is not populated yet, keep
-# using the legacy per-vendor directory rather than losing the closure entirely. A host
-# mid-rollout stays governed; a host that has cut over never silently reverts.
-_LEGACY_SHARED_DIR = os.path.join(os.path.dirname(os.path.dirname(_SELF_DIR)), "_shared")
-if not os.path.isdir(_SHARED_DIR) and os.path.isdir(_LEGACY_SHARED_DIR):
-    _SHARED_DIR = _LEGACY_SHARED_DIR
+# Runtime authority is only the explicitly selected or installed shared directory. Falling
+# back to this checkout's ``plugins/_shared`` when installation is missing would make the
+# enforcing law depend on whichever branch happens to be checked out. A missing install is a
+# misdeployment and must reach the no-shared-authority refusal below.
 if os.path.isdir(_SHARED_DIR) and _SHARED_DIR not in sys.path:
     sys.path.insert(0, _SHARED_DIR)
 try:
@@ -311,11 +310,19 @@ except Exception:  # noqa: BLE001 — Tier-2: the local matcher below stays in f
 # under this harness's PreToolUse contract ONLY exit 2 blocks. Any other non-zero is a
 # hook error the harness does not treat as a refusal, so a missing shared authority would
 # have FAILED OPEN: the precise class deleted in #745. Caught here, refused in main().
+_CLASSIFIER_SOURCE = os.path.join(_SHARED_DIR, "hestia_shell_classifier.py")
 try:
-    from hestia_shell_classifier import (  # noqa: E402
-        _blank_inert_heredoc_bodies,
-        _is_read_only,
+    if not os.path.isfile(_CLASSIFIER_SOURCE):
+        raise ImportError(f"installed classifier is absent at {_CLASSIFIER_SOURCE}")
+    _classifier_spec = importlib.util.spec_from_file_location(
+        "_hestia_installed_shell_classifier", _CLASSIFIER_SOURCE
     )
+    if _classifier_spec is None or _classifier_spec.loader is None:
+        raise ImportError(f"cannot create loader for {_CLASSIFIER_SOURCE}")
+    _classifier_module = importlib.util.module_from_spec(_classifier_spec)
+    _classifier_spec.loader.exec_module(_classifier_module)
+    _blank_inert_heredoc_bodies = _classifier_module._blank_inert_heredoc_bodies
+    _is_read_only = _classifier_module._is_read_only
     _CLASSIFIER_UNAVAILABLE = None
 except Exception as _exc:  # noqa: BLE001 -- any import failure is a missing authority
     _blank_inert_heredoc_bodies = None  # type: ignore[assignment]
@@ -1488,7 +1495,7 @@ def main() -> int:
     if _CLASSIFIER_UNAVAILABLE is not None:
         sys.stderr.write(
             "hestia: deny [no-shared-authority] - the shared shell classifier could not be "
-            f"imported ({_CLASSIFIER_UNAVAILABLE}). This seat carries no local copy by "
+            f"loaded ({_CLASSIFIER_UNAVAILABLE}). This seat carries no local copy by "
             "design, so it cannot classify this command and will not guess. Check that "
             "$HESTIA_HOME/shared is populated and current.\n")
         return 2
