@@ -165,6 +165,16 @@ def run_probes(
         environment = dict(os.environ)
         environment.update(declared_env)
         environment.update({"HESTIA_ENDPOINT": endpoint, "HESTIA_WORKSPACE": workspace_text})
+        # THE CANDIDATE GATE IS PROBED AGAINST THE CANDIDATE ENGINE, not the installed one.
+        # Since #742/#747 a seat loads shared law only from HESTIA_SHARED_DIR or the installed
+        # $HESTIA_HOME/shared, with no fallback. The first cycle after #747 merged (CBP,
+        # 2026-09-01T16:10Z) probed the new gate against the still-installed 3-module engine,
+        # the gate correctly refused `no-shared-authority`, and the preflight read that as
+        # "gate refuses a benign read" and blocked the very install that ships the module
+        # the gate needed. Gate + stale engine is a pairing that never exists after install;
+        # gate + the reviewed tree about to be installed is the one that will. This is the
+        # explicit dev/test selection the loader allows, naming the exact tree under test.
+        environment["HESTIA_SHARED_DIR"] = str(repo / "plugins" / "_shared")
 
         for declared in events:
             if not isinstance(declared, dict):

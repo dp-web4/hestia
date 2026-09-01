@@ -384,8 +384,16 @@ preflight_gate() {
   # gate-preflight.py already models that with cwd=repo; this probe now does the same, so the
   # verdict is a property of the gate and the law, not of the caller's shell. Measured both
   # ways against 2ce595c (rc=2 from `~`, rc=0 from the checkout, same event, same daemon).
+  # AGAINST THE CANDIDATE ENGINE, not the installed one. Since #742/#747 a seat loads shared
+  # law only from HESTIA_SHARED_DIR or the installed $HESTIA_HOME/shared, no fallback. The
+  # first cycle after #747 merged (CBP 2026-09-01T16:10Z) probed the new gate against the
+  # still-installed 3-module engine; the gate correctly refused `no-shared-authority`, and
+  # this preflight read it as "gate refuses a benign read" and blocked the install that ships
+  # the module the gate needed. The pairing that exists after install is gate + the reviewed
+  # tree about to be installed, so that is the pairing probed. gate-preflight.py does the same.
   _probe() {  # $1 = label, $2 = event json
     printf '%s' "$2" | (cd "$DEPLOY_ROOT/hestia" && env HESTIA_PRE_FAIL_CLOSED=1 CLAUDECODE=1 \
+      HESTIA_SHARED_DIR="$DEPLOY_ROOT/hestia/plugins/_shared" \
       HESTIA_ENDPOINT="$EP" python3 "$gate") >"$tmp/out" 2>"$tmp/err"
     rc=$?
     [ "$rc" = 0 ] && return 0
