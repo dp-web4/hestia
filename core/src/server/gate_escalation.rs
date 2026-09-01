@@ -921,6 +921,36 @@ impl std::fmt::Display for OpenError {
     }
 }
 
+/// What `open_or_coalesce` handed back: a row it MINTED, or the row it found already asking
+/// for this exact act and handed back instead (#668).
+///
+/// Two variants rather than a flag so a door cannot forget to check — a coalesced open must
+/// NOT be witnessed as `gate_escalation_opened` (the record would show two asks for one
+/// act, which is the inflation this exists to end) and must NOT re-invite (the peers were
+/// woken by the first open; a second wake for the same ask is the bounce storm the mesh
+/// already measures).
+#[derive(Debug, Clone)]
+pub enum Opened {
+    Minted(Escalation),
+    Coalesced(Escalation),
+}
+
+impl Opened {
+    pub fn escalation(&self) -> &Escalation {
+        match self {
+            Opened::Minted(e) | Opened::Coalesced(e) => e,
+        }
+    }
+    pub fn coalesced(&self) -> bool {
+        matches!(self, Opened::Coalesced(_))
+    }
+    pub fn into_escalation(self) -> Escalation {
+        match self {
+            Opened::Minted(e) | Opened::Coalesced(e) => e,
+        }
+    }
+}
+
 #[derive(Default)]
 /// The outcome of an invitation, as a record rather than a gate.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1389,6 +1419,71 @@ impl EscalationStore {
         };
         self.by_id.insert(id, esc.clone());
         Ok(esc)
+    }
+
+    /// The PENDING row already asking for this exact act, if there is one: same seat, same
+    /// marker, same `act_digest`, and still undecided as of `now`. The oldest such row wins
+    /// so a chain of re-opens converges on ONE id rather than on whichever was minted last.
+    ///
+    /// Pending ONLY, on purpose. A row that was approved and is still claimable is the claim
+    /// door's job — `claim()` already routes a matching act to it, so a second open over a
+    /// live grant does not happen (0 of 49 re-opens in the 08-02..09-01 census). A row that
+    /// was approved and SPENT is a different fact: the act was performed once and is being
+    /// asked for again, and single-use means that is a new ask. A denied or expired row is a
+    /// refusal the member may legitimately re-petition. Only the undecided case has nothing
+    /// to distinguish the second ask from the first.
+    pub fn pending_twin(
+        &self,
+        plugin_id: &str,
+        marker: &str,
+        act_digest: &str,
+        now: u64,
+    ) -> Option<&Escalation> {
+        self.by_id
+            .values()
+            .filter(|e| {
+                e.plugin_id == plugin_id
+                    && e.marker == marker
+                    && e.act_digest.as_deref() == Some(act_digest)
+                    && e.status_at(now) == Status::Pending
+            })
+            .min_by(|a, b| a.opened_at.cmp(&b.opened_at).then_with(|| a.id.cmp(&b.id)))
+    }
+
+    /// One act, one ruling (#668).
+    ///
+    /// Measured before this existed (chain walk 2026-08-02..09-01, 120k entries, 210 opens
+    /// carrying a digest): the gate minted **1.30 ids per distinct act**, and of the 49
+    /// re-opens of an act already on file, **25 landed while the first petition was still
+    /// PENDING** — median 53 s after the prior ask, and on 2026-09-01 two byte-identical `cp` petitions 9 s
+    /// apart, each of which the operator then approved by hand. Every one of those second
+    /// ids cost a human a ruling and bought the member nothing: the first approval would
+    /// have been claimed by the same act.
+    ///
+    /// So: if a pending twin exists, hand it back instead of minting. The caller learns which
+    /// happened through `Opened` and witnesses accordingly. `open` itself is unchanged — it
+    /// stays the pure mint, and every test that pins its behaviour still pins it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_or_coalesce(
+        &mut self,
+        plugin_id: &str,
+        role: &str,
+        tool_name: &str,
+        marker: &str,
+        act: Option<&str>,
+        stated_reason: Option<&str>,
+        stated_detail: Option<&str>,
+        now: u64,
+        ttl_secs: u64,
+    ) -> Result<Opened, OpenError> {
+        if let Some(a) = act.map(str::trim).filter(|v| !v.is_empty()) {
+            let digest = Self::act_digest_of(a);
+            if let Some(twin) = self.pending_twin(plugin_id.trim(), marker.trim(), &digest, now) {
+                return Ok(Opened::Coalesced(twin.clone()));
+            }
+        }
+        self.open(plugin_id, role, tool_name, marker, act, stated_reason, stated_detail, now, ttl_secs)
+            .map(Opened::Minted)
     }
 
     /// Record which seats were INVITED to participate — the production writer the invitation
@@ -3995,5 +4090,101 @@ mod ttl_tests {
             .decide(&e.id, true, "kimi-code", "r", Channel::PeerMember, None, Some("late"),
                     T0 + DEFAULT_TTL_SECS + 1)
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod coalesce_tests {
+    //! #668: one act, one ruling. The gate re-trips on the same refused act and every trip
+    //! minted an id the operator had to rule on. These pin the ONE case that is retired —
+    //! a second ask for an act whose first ask is still undecided — and the cases that are
+    //! deliberately NOT: a different act, a different marker, a decided twin (approved,
+    //! spent, or denied), an expired twin.
+    use super::*;
+
+    const T0: u64 = 1_800_000_000;
+    const ACT: &str = "Bash: cd /tmp/wt && cp new.py plugins/claude-code/hooks/pre_tool_use.py";
+
+    fn open2(s: &mut EscalationStore, act: &str, marker: &str, at: u64) -> Opened {
+        s.open_or_coalesce("claude-code", "r", "Bash", marker, Some(act), None, None, at, 3600)
+            .expect("open")
+    }
+
+    #[test]
+    fn a_second_ask_for_a_pending_act_is_the_first_ask() {
+        let mut s = EscalationStore::default();
+        let first = open2(&mut s, ACT, "plugins/*/hooks", T0);
+        assert!(!first.coalesced());
+        // 9 seconds later, byte-identical (the 2026-09-01 specimen: 4ec27c68 / b4b410f1).
+        let second = open2(&mut s, ACT, "plugins/*/hooks", T0 + 9);
+        assert!(second.coalesced(), "the twin is pending; nothing distinguishes the asks");
+        assert_eq!(second.escalation().id, first.escalation().id);
+        assert_eq!(s.pending(T0 + 10).len(), 1, "one act, one row");
+        // A third converges on the same id, not on the second.
+        let third = open2(&mut s, ACT, "plugins/*/hooks", T0 + 40);
+        assert_eq!(third.escalation().id, first.escalation().id);
+    }
+
+    #[test]
+    fn a_different_act_or_marker_is_a_different_ask() {
+        let mut s = EscalationStore::default();
+        let first = open2(&mut s, ACT, "plugins/*/hooks", T0);
+        // The 2026-09-01 specimen again: 8791447f was 50f8d3a1's command plus
+        // `&& echo INSTALLED && git diff` — a superset, and a different digest.
+        let superset = open2(&mut s, &format!("{ACT} && echo INSTALLED"), "plugins/*/hooks", T0 + 5);
+        assert!(!superset.coalesced());
+        assert_ne!(superset.escalation().id, first.escalation().id);
+        let other_marker = open2(&mut s, ACT, "plugins/_shared", T0 + 6);
+        assert!(!other_marker.coalesced());
+        assert_eq!(s.pending(T0 + 7).len(), 3);
+    }
+
+    #[test]
+    fn a_decided_twin_does_not_coalesce_whatever_the_verdict() {
+        // Approved-and-unspent is the claim door's job; approved-and-spent is a new act;
+        // denied is a refusal the member may re-petition. None of them is "still asking".
+        for approve in [true, false] {
+            let mut s = EscalationStore::default();
+            let first = open2(&mut s, ACT, "plugins/*/hooks", T0).into_escalation();
+            s.decide(
+                &first.id, approve, "operator", "role:constellation:sovereign",
+                Channel::OperatorSession, None, Some("k"), T0 + 20,
+            )
+            .expect("decide");
+            let again = open2(&mut s, ACT, "plugins/*/hooks", T0 + 30);
+            assert!(!again.coalesced(), "approve={approve}: a ruled row is not a pending twin");
+            assert_ne!(again.escalation().id, first.id);
+        }
+    }
+
+    #[test]
+    fn an_expired_twin_does_not_coalesce() {
+        let mut s = EscalationStore::default();
+        let first = s
+            .open_or_coalesce("claude-code", "r", "Bash", "m", Some(ACT), None, None, T0, 100)
+            .unwrap()
+            .into_escalation();
+        let again = open2(&mut s, ACT, "m", T0 + 101);
+        assert!(!again.coalesced(), "the clock refused the first ask; this is a new one");
+        assert_ne!(again.escalation().id, first.id);
+    }
+
+    #[test]
+    fn another_seat_asking_for_the_same_act_is_its_own_ask() {
+        let mut s = EscalationStore::default();
+        let mine = open2(&mut s, ACT, "m", T0).into_escalation();
+        let theirs = s
+            .open_or_coalesce("kimi-code", "r", "Bash", "m", Some(ACT), None, None, T0 + 1, 3600)
+            .unwrap();
+        assert!(!theirs.coalesced(), "a grant is per seat; so is the ask");
+        assert_ne!(theirs.escalation().id, mine.id);
+    }
+
+    #[test]
+    fn an_ask_with_no_act_never_coalesces_and_still_fails_the_mint_guard() {
+        let mut s = EscalationStore::default();
+        let _ = open2(&mut s, ACT, "m", T0);
+        let r = s.open_or_coalesce("claude-code", "r", "Bash", "m", None, None, None, T0 + 1, 3600);
+        assert!(matches!(r, Err(OpenError::MissingField("act"))));
     }
 }
