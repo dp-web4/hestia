@@ -3,6 +3,7 @@ name: gpt fix invitation note 694
 on:
   push:
     branches: [gpt/fix-invitation-note-694]
+  workflow_dispatch:
 
 permissions:
   contents: write
