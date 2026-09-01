@@ -14,10 +14,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          path: hestia
           fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: dp-web4/web4
+          path: web4
       - run: python3 .github/scripts/fix_invitation_note_694.py
+        working-directory: hestia
       - run: cargo test --manifest-path core/Cargo.toml invitation_note_contract_tests --locked
+        working-directory: hestia
       - name: Commit source correction if needed
+        working-directory: hestia
         run: |
           if git diff --quiet -- core/src/server/handler.rs; then
             exit 0
