@@ -144,6 +144,18 @@
      the half nobody develops at is the half that ships broken. `dvh` rather than `vh`
      because mobile browsers shrink the visual viewport as their chrome retracts. */
   .govern-scroll { max-height: 70dvh; overflow-y: auto; }
+
+  /* Channels placeholder: readable prose, not the centred `.empty` "loading…" treatment.
+     Left-aligned, held to a sane measure, so it reads as a description of a surface rather
+     than as a status message. */
+  .placeholder-doc { max-width: 46rem; margin: 0; padding: 0.5rem 0 1rem; text-align: left;
+                     color: var(--fg-dim); line-height: 1.55; }
+  .placeholder-doc h3 { color: var(--fg); font-size: 1.05rem; margin: 0 0 0.6rem; }
+  .placeholder-doc p { margin: 0 0 0.7rem; }
+  .placeholder-doc ul { margin: 0 0 0.9rem; padding-left: 1.2rem; }
+  .placeholder-doc li { margin: 0 0 0.35rem; }
+  .placeholder-doc b { color: var(--fg); }
+  .placeholder-doc .note { font-size: 0.86rem; color: var(--fg-dim); opacity: 0.85; }
   .govern-pane-head { display: flex; align-items: baseline; gap: 0.6rem; margin-bottom: 0.5rem; }
   .govern-pane-head h2 { margin: 0; font-size: 0.95rem; }
   .policy-state { font-size: 0.72rem; color: var(--fg-dim); margin-left: auto; }
@@ -951,6 +963,7 @@
         <button type="button" class="view-chip selected" data-view="agents">agents</button>
         <button type="button" class="view-chip" data-view="hubs">hubs</button>
         <button type="button" class="view-chip" data-view="devices">devices</button>
+        <button type="button" class="view-chip" data-view="channels">channels</button>
         <button type="button" class="view-chip" data-view="govern">govern<span
           class="view-chip-badge" id="govern-chip-badge" hidden></span><span
           class="view-chip-state" id="govern-chip-state"></span></button>
@@ -1145,6 +1158,43 @@
       <!-- This view's ONE growing, scrolling region (§6.4). Direct flex child of the view. -->
       <div class="govern-scroll" id="devices-body">
         <div class="empty">loading…</div>
+      </div>
+    </div>
+
+    <!-- CHANNELS — every addressable surface of this entity (PRD §5.9, dp 2026-09-01).
+         Placeholder: the shape is decided, the surface is not built. Two families behind one
+         gateway, because an entity is REACHED through its social channels and READ through its
+         record, and both are addressable surfaces. Disclosure is tiered, and the tiers are
+         depths of question rather than per-field flags. -->
+    <div id="channels-view" class="dash-view" hidden>
+      <div class="govern-scroll" id="channels-body">
+        <div class="placeholder-doc">
+          <h3>Channels is not implemented yet.</h3>
+          <p>This is the gateway to every <b>addressable surface</b> of this entity — the ways the
+             world reaches you, and the ways it reads you. Two families, one model:</p>
+          <ul>
+            <li><b>Contact &amp; social</b> — Discord, Slack, Matrix, Telegram, Meetup, GitHub, a
+                site, an email address. Held as <i>verified references</i>, never mirrored: this is
+                not a place your Slack gets archived.</li>
+            <li><b>Record</b> — your <b>witness log</b> and governance record. Access to your own
+                record is itself a channel, on the same footing as the others.</li>
+          </ul>
+          <p><b>Disclosure will be tiered</b>, and each tier answers a deeper question:</p>
+          <ul>
+            <li><b>public</b> — <i>that it exists</i>. “This entity has a Discord.” “Acts occurred,
+                and when.”</li>
+            <li><b>member</b> — <i>the address, or who took part</i>.</li>
+            <li><b>governance</b> — <i>substance and outcome</i>: who operates a channel, its
+                verification chain and posting authority; the reason a decision went the way it did
+                and the evidence relied on.</li>
+          </ul>
+          <p>Going deeper is not a setting you flip or a parameter a caller passes — the inquiry is
+             <b>routed through a role</b> that may disclose it, and <b>asking is itself a recorded
+             act</b>. That is what keeps this transparency rather than surveillance: others can find
+             out what you did, and the asking leaves a trace too.</p>
+          <p class="note">Spec: <code>docs/PRD.md</code> §5.9 · substrate gaps tracked in #563 ·
+             society-scale twin in <code>web4/hub/docs/PRD_CHAPTER_DELIVERY.md</code> §4.5</p>
+        </div>
       </div>
     </div>
 
@@ -1559,6 +1609,9 @@
                mount: () => { if (typeof window.__hubRefresh === 'function') window.__hubRefresh(); } },
     devices: { el: 'devices-view', autoDefault: false,
                mount: () => renderDevices(lastData) },
+    // Static placeholder: no mount hook (nothing to refresh) and autoDefault false, so the
+    // dashboard never lands an operator on an unimplemented screen by itself.
+    channels: { el: 'channels-view', autoDefault: false },
     govern:  { el: 'govern-view',  autoDefault: false,
                mount: () => governMount() },
   };
