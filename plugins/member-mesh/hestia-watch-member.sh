@@ -437,8 +437,9 @@ migrate_flat_primers
 SPENT_MAX_AGE_SECS="${SPENT_MAX_AGE_SECS:-518400}"   # 6d — deliberately INSIDE the daemon's 7d inbox TTL
 SPENT_MIN_AGE_SECS="${SPENT_MIN_AGE_SECS:-21600}"    # 6h — MEMBER_UNANSWERED_DEFAULT_SECS, the fallback when the fold will not say
 
-# $1 = primer path, $2 = the `unanswered` fold, fetched once per pass. Exit 0 ONLY when
-# every notice in the primer is inside the measurable window and absent from `i_owe`.
+# $1 = primer path, $2 = the `unanswered` fold, fetched ONCE PER PRIMER (not once per
+# pass -- see retry_stale_primers). Exit 0 ONLY when every notice in the primer is inside
+# the measurable window and absent from `i_owe`.
 primer_spent() {
   python3 - "$1" "$SPENT_MAX_AGE_SECS" "$2" "$SPENT_MIN_AGE_SECS" <<'PY'
 import datetime, json, sys
@@ -478,13 +479,22 @@ PY
 # Wrapped in a function only so it can run AFTER `mesh_rpc` is defined; it is still
 # called from the startup path, in the same place, before the first poll.
 retry_stale_primers() {
-  local fold; fold="$(unanswered_now 2>/dev/null || true)"
+  local fold
   for stale in "$PRIMERS"/notice-*.json; do
     [ -e "$stale" ] || break
     echo "[hestia-watch] STALE PRIMER (undelivered notices from a failed fire): $stale"
     python3 -c "import json,sys;d=json.load(open(sys.argv[1]));[print(f\"    id={n.get('id')} {n.get('kind')} from {n.get('from_plugin')} queued={n.get('queued_at','')}: {n.get('pointer_uri','')}\") for n in d.get('notices',[])]" "$stale" 2>/dev/null || true
     [ -n "$FIRE" ] || continue
     attempts_file="$stale.attempts"
+    # The fold is re-read for EVERY primer, not once per pass. Each "$FIRE" below is
+    # synchronous and serialised on the member lock, so a pass lasts as long as the
+    # sum of its fires -- 27 minutes on CBP 2026-09-02 -- and the first wake in a pass
+    # answers debt the later primers are then judged on. Measured: notice 7927 was
+    # bound at 04:39:31Z by the pass's first fire; its own primer came up at 04:48:53Z,
+    # was judged against the 04:22:04Z fold that still owed it, and re-fired a wake
+    # whose whole output was "already answered". One RPC per retained primer is the
+    # price of judging on the debt as it stands when the verdict is given.
+    fold="$(unanswered_now 2>/dev/null || true)"
     # Before the attempt budget, not after: a discharged list should retire on the
     # first pass that can prove it, whatever the counter says.
     if primer_spent "$stale" "$fold"; then

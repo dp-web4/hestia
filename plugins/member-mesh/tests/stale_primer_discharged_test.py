@@ -46,6 +46,15 @@ launchers -- no test seam:
   4. A REFUSAL IS NOT AN EMPTY DEBT. When the `unanswered` RPC fails, the primer fires.
      `{}` and a 500 must not read as "nothing owed" -- that is the shape this corpus
      keeps finding, and here it would delete the only copy of a work list.
+  7. THE FOLD IS THE DEBT AS IT STANDS WHEN THE VERDICT IS GIVEN, NOT AT PASS START.
+     Fires are synchronous and serialised on the member lock, so a startup pass lasts
+     as long as the sum of its fires, and the first wake in the pass answers debt that
+     later primers are then judged on. Measured on CBP 2026-09-02: the watcher
+     restarted 04:22:04Z and read the fold once; the pass's first wake bound the reply
+     to notice 7927 at 04:39:31Z; 7927's own primer came up at 04:48:53Z, was judged
+     against the 04:22 fold that still owed it, and spent a wake learning it was done.
+     Two retained primers, the first fire discharging the second's notice: the second
+     must retire, not fire. Red on a once-per-pass fold.
 
 Usage: ./stale_primer_discharged_test.py     (runtime ~20s)
 """
@@ -100,6 +109,7 @@ DEBTS = []                 # rows the member genuinely still owes
 REFUSE_UNANSWERED = False
 IGNORE_FLOOR_ARG = False   # model #155: the daemon DISCARDS `older_than_secs` and defaults
 FLOORS_SEEN = []
+DISCHARGE_DIR = None       # case 7: a fire may DISCHARGE debts mid-pass by touching <id> here
 
 
 class Stub(http.server.BaseHTTPRequestHandler):
@@ -139,6 +149,11 @@ class Stub(http.server.BaseHTTPRequestHandler):
             cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=floor)
             shown = [d for d in DEBTS
                      if datetime.datetime.fromisoformat(d["queued_at"].replace("Z", "+00:00")) < cutoff]
+            if DISCHARGE_DIR:
+                # A debt the member has since answered leaves `i_owe` -- the daemon's
+                # rule. The fire under test is the one that answers it (case 7).
+                shown = [d for d in shown
+                         if not os.path.exists(os.path.join(DISCHARGE_DIR, str(d["id"])))]
             # The daemon ECHOES the floor it APPLIED, not the one it was asked for.
             # Measured against the live daemon 2026-08-06, same session, four cells:
             #   older_than_secs=0 -> 0 | omitted -> 21600 | older_than_seconds=0 -> 21600
@@ -176,7 +191,11 @@ def start_stub():
     return srv, f"http://127.0.0.1:{srv.server_address[1]}/mcp"
 
 
-def write_fire(path, log, rc=0):
+def write_fire(path, log, rc=0, discharge=(), discharge_dir=None):
+    """`discharge`: notice ids this fire ANSWERS as a side effect of running -- the
+    shape of a real wake, which takes `unanswered 0` as its work list and binds
+    replies to everything in it, not just to the primer it was woken with."""
+    touches = "".join(f'touch "{discharge_dir}/{i}"\n' for i in discharge)
     with open(path, "w") as f:
         f.write(f'''#!/usr/bin/env bash
 python3 - "$1" "{log}" <<'PY'
@@ -186,7 +205,7 @@ except Exception: d={{}}
 open(sys.argv[2],"a").write(json.dumps({{"primer":sys.argv[1],
     "ids":[n.get("id") for n in d.get("notices",[])]}})+"\\n")
 PY
-exit {rc}
+{touches}exit {rc}
 ''')
     os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
@@ -223,18 +242,21 @@ def notice(nid, age_secs, kind="reply"):
 
 
 def run_case(tmp, ep, label, planted, debts, want_ids, refuse=False, sentinel_id=99999,
-             ignore_floor_arg=False):
+             ignore_floor_arg=False, discharge_on_fire=()):
     """Run the real watcher once. The observable that says the startup stale pass has
     finished is the member's OWN fresh mail being fired -- the drain happens after that
     pass, so a sentinel in the log means every stale decision is already made. Never a
     fixed sleep: a duration is a coin flip on a loaded host."""
-    global DEBTS, REFUSE_UNANSWERED, IGNORE_FLOOR_ARG
+    global DEBTS, REFUSE_UNANSWERED, IGNORE_FLOOR_ARG, DISCHARGE_DIR
     state = os.path.join(tmp, label)
     primers = os.path.join(state, "primers", PLUGIN)
     os.makedirs(primers)
     log = os.path.join(tmp, f"{label}.log")
     fire = os.path.join(tmp, f"{label}-fire.sh")
-    write_fire(fire, log, rc=70)          # every fire REFUSES, so nothing is deleted
+    DISCHARGE_DIR = os.path.join(tmp, f"{label}-discharged")
+    os.makedirs(DISCHARGE_DIR)
+    # every fire REFUSES, so nothing is deleted
+    write_fire(fire, log, rc=70, discharge=discharge_on_fire, discharge_dir=DISCHARGE_DIR)
     for name, notices in planted.items():
         plant(primers, name, notices)
 
@@ -368,6 +390,32 @@ def main():
           "unmeasurable and fires -- absence under a floor is not an answer",
           911 in got and not os.path.exists(os.path.join(primers, "notice-YNGIGN.json.discharged")),
           f"fired ids={sorted(got)} dir={sorted(os.listdir(primers))}\n{out[-1500:]}")
+
+    # ---- 7. THE FOLD IS RE-READ PER PRIMER.
+    # Two owed notices in two retained primers. The FIRST fire answers the second's
+    # notice (a real wake works `unanswered 0`, not its primer). Glob order puts
+    # AAAAAA first, so by the time BBBBBB is judged, 801 is no longer owed. A fold read
+    # once at pass start still says 801 is owed and fires it: that wake's entire output
+    # is "already answered", and on CBP 2026-09-02 it was this seat's, notice 7927.
+    first = notice(800, 2 * 86400)
+    second = notice(801, 2 * 86400)
+    got, primers, out = run_case(
+        tmp, ep, "fold-per-primer",
+        planted={"AAAAAA": [first], "BBBBBB": [second]},
+        debts=[{"id": 800, "kind": "reply", "from_plugin": "kimi-code",
+                "to_plugin": PLUGIN, "queued_at": first["queued_at"], "drained_at": None},
+               {"id": 801, "kind": "reply", "from_plugin": "kimi-code",
+                "to_plugin": PLUGIN, "queued_at": second["queued_at"], "drained_at": None}],
+        want_ids={800}, discharge_on_fire=(801,))
+    check("7a. the first owed primer fires", 800 in got,
+          f"fired ids={sorted(got)}\n{out[-1500:]}")
+    check("7b. a notice the first fire answered is NOT re-fired by the same pass "
+          "(the fold is read when the verdict is given, not when the pass began)",
+          801 not in got, f"fired ids={sorted(got)}\n{out[-1500:]}")
+    check("7c. and its primer is RETIRED, not preserved for the next restart",
+          os.path.exists(os.path.join(primers, "notice-BBBBBB.json.discharged"))
+          and not os.path.exists(os.path.join(primers, "notice-BBBBBB.json")),
+          f"dir={sorted(os.listdir(primers))}")
 
     # ---- 4. A REFUSAL IS NOT AN EMPTY DEBT.
     got, primers, out = run_case(
