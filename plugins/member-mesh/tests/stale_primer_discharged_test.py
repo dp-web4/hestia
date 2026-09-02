@@ -46,8 +46,14 @@ launchers -- no test seam:
   4. A REFUSAL IS NOT AN EMPTY DEBT. When the `unanswered` RPC fails, the primer fires.
      `{}` and a 500 must not read as "nothing owed" -- that is the shape this corpus
      keeps finding, and here it would delete the only copy of a work list.
+  7. THE FOLD IS DATA, NOT AN ARGUMENT. The fold used to reach `primer_spent` as one
+     inline argv string, and argv has a per-string ceiling: MAX_ARG_STRLEN, 131072
+     bytes on every Linux. Measured live on CBP 2026-09-02: kimi-code's fold was
+     145,832 bytes (284 `owed_to_me` rows), execve failed E2BIG before python ran,
+     the guard could never prove discharge, and already-answered primers re-fired
+     instead of retiring. Red before the fix: the discharged primer fires.
 
-Usage: ./stale_primer_discharged_test.py     (runtime ~20s)
+Usage: ./stale_primer_discharged_test.py     (runtime ~25s)
 """
 import http.server
 import json
@@ -99,6 +105,7 @@ INBOX = {}
 DEBTS = []                 # rows the member genuinely still owes
 REFUSE_UNANSWERED = False
 IGNORE_FLOOR_ARG = False   # model #155: the daemon DISCARDS `older_than_secs` and defaults
+BIG_OWED = 0               # pad `owed_to_me` to model a fold past MAX_ARG_STRLEN
 FLOORS_SEEN = []
 
 
@@ -145,7 +152,12 @@ class Stub(http.server.BaseHTTPRequestHandler):
             #   | older_than_secs=60 -> 60.  The misspelled cell reports the fallback,
             # which is what makes the echo usable as an oracle rather than a mirror.
             # `floor` here is post-fallback for exactly that reason.
-            payload = {"i_owe": shown, "owed_to_me": [], "older_than_secs": floor}
+            owed = [{"id": 900000 + i, "kind": "reply", "from_plugin": PLUGIN,
+                     "to_plugin": "claude-code",
+                     "pointer_uri": "https://example.invalid/p#" + "x" * 400,
+                     "queued_at": ago(3600), "drained_at": None}
+                    for i in range(BIG_OWED)]
+            payload = {"i_owe": shown, "owed_to_me": owed, "older_than_secs": floor}
         else:
             payload = {}
         self._sse({"jsonrpc": "2.0", "id": body.get("id"),
@@ -223,12 +235,12 @@ def notice(nid, age_secs, kind="reply"):
 
 
 def run_case(tmp, ep, label, planted, debts, want_ids, refuse=False, sentinel_id=99999,
-             ignore_floor_arg=False):
+             ignore_floor_arg=False, big_owed=0):
     """Run the real watcher once. The observable that says the startup stale pass has
     finished is the member's OWN fresh mail being fired -- the drain happens after that
     pass, so a sentinel in the log means every stale decision is already made. Never a
     fixed sleep: a duration is a coin flip on a loaded host."""
-    global DEBTS, REFUSE_UNANSWERED, IGNORE_FLOOR_ARG
+    global DEBTS, REFUSE_UNANSWERED, IGNORE_FLOOR_ARG, BIG_OWED
     state = os.path.join(tmp, label)
     primers = os.path.join(state, "primers", PLUGIN)
     os.makedirs(primers)
@@ -241,6 +253,7 @@ def run_case(tmp, ep, label, planted, debts, want_ids, refuse=False, sentinel_id
     DEBTS = list(debts)
     REFUSE_UNANSWERED = refuse
     IGNORE_FLOOR_ARG = ignore_floor_arg
+    BIG_OWED = big_owed
     INBOX[PLUGIN] = [notice(sentinel_id, 60, kind="coordination")]
 
     env = dict(os.environ)
@@ -257,6 +270,7 @@ def run_case(tmp, ep, label, planted, debts, want_ids, refuse=False, sentinel_id
     out, _ = p.communicate()
     REFUSE_UNANSWERED = False
     IGNORE_FLOOR_ARG = False
+    BIG_OWED = 0
     got = fired_ids(log) - {sentinel_id}
     return got, primers, out
 
@@ -377,6 +391,25 @@ def main():
     check("4. when the unanswered RPC fails, the primer fires rather than being retired",
           709 in got and not os.path.exists(os.path.join(primers, "notice-REFUSE.json.discharged")),
           f"fired ids={sorted(got)} dir={sorted(os.listdir(primers))}\n{out[-1500:]}")
+
+    # ---- 7. THE FOLD IS DATA, NOT AN ARGUMENT.
+    # The stub owes nothing, so every planted notice is discharged -- but the fold
+    # carries 500 `owed_to_me` rows at ~460 bytes each, ~230KB serialized, past the
+    # 128KiB MAX_ARG_STRLEN ceiling a single argv string cannot cross. Pre-fix the
+    # execve into primer_spent's python failed E2BIG, the guard never ran, and the
+    # discharged primer re-fired -- the exact journal line measured on CBP
+    # 2026-09-02 (`line 443: /usr/bin/python3: Argument list too long`, 6x in one
+    # window, watch-kimi only, whose live fold was 145,832 bytes).
+    got, primers, out = run_case(
+        tmp, ep, "big-fold",
+        planted={"BIGFOLD": [notice(709, 2 * 86400)]},
+        debts=[], want_ids=set(), big_owed=500)
+    check("7a. a fold past MAX_ARG_STRLEN still lets a discharged primer retire",
+          got == set() and os.path.exists(os.path.join(primers, "notice-BIGFOLD.json.discharged")),
+          f"fired ids={sorted(got)} dir={sorted(os.listdir(primers))}\n{out[-1500:]}")
+    check("7b. and the exec-boundary error itself is gone from the watcher's output",
+          "Argument list too long" not in out,
+          f"tail:\n{out[-1500:]}")
 
     srv.shutdown()
     print()

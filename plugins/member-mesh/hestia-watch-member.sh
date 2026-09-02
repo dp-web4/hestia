@@ -437,14 +437,30 @@ migrate_flat_primers
 SPENT_MAX_AGE_SECS="${SPENT_MAX_AGE_SECS:-518400}"   # 6d — deliberately INSIDE the daemon's 7d inbox TTL
 SPENT_MIN_AGE_SECS="${SPENT_MIN_AGE_SECS:-21600}"    # 6h — MEMBER_UNANSWERED_DEFAULT_SECS, the fallback when the fold will not say
 
-# $1 = primer path, $2 = the `unanswered` fold, fetched once per pass. Exit 0 ONLY when
-# every notice in the primer is inside the measurable window and absent from `i_owe`.
+# $1 = primer path, $2 = PATH to a file holding the `unanswered` fold, fetched once
+# per pass. Exit 0 ONLY when every notice in the primer is inside the measurable
+# window and absent from `i_owe`.
+#
+# THE FOLD IS DATA, NOT AN ARGUMENT (2026-09-02). It used to BE $2 — the whole JSON
+# inlined into argv — and argv has a per-string ceiling the daemon's answer can
+# exceed: MAX_ARG_STRLEN, 32 pages, 131072 bytes on every Linux. Measured on CBP the
+# morning this was written: kimi-code's fold was 145,832 bytes (284 `owed_to_me`
+# rows, mostly undelivered-report replies), so execve failed E2BIG and the shell
+# printed `line 443: /usr/bin/python3: Argument list too long` — six times in one
+# journal window, one per pass; watch-claude and watch-codex zero (their folds fit).
+# The guard's every-failure-direction-fires asymmetry made it SILENT: unmeasured ->
+# fire, so discharged primers re-fired instead of retiring (notice 3594 re-fired
+# 2026-09-02, answered 2026-08-19), and the retry backlog kept the watcher inside
+# `retry_stale_primers` for hours at 15–20 min per fire — the main loop starved,
+# which is why `process_vintage.py units` reported watch-kimi vintage NOT MEASURED
+# for five consecutive wakes: no hourly ARTIFACT line ever landed. The file hand-off
+# restores "unreadable -> fire" as the ONLY way this guard abstains.
 primer_spent() {
   python3 - "$1" "$SPENT_MAX_AGE_SECS" "$2" "$SPENT_MIN_AGE_SECS" <<'PY'
 import datetime, json, sys
-primer, max_age, fold_raw, min_age = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+primer, max_age, fold_path, min_age = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
 try:
-    fold = json.loads(fold_raw)
+    fold = json.load(open(fold_path))
     notices = json.load(open(primer)).get("notices") or []
 except Exception:
     raise SystemExit(1)                     # unreadable either side -> unmeasured
@@ -478,7 +494,14 @@ PY
 # Wrapped in a function only so it can run AFTER `mesh_rpc` is defined; it is still
 # called from the startup path, in the same place, before the first poll.
 retry_stale_primers() {
-  local fold; fold="$(unanswered_now 2>/dev/null || true)"
+  # The fold crosses an exec boundary into `primer_spent`, so it goes through a file:
+  # inline as an argument it dies at MAX_ARG_STRLEN (128KiB per string) before python
+  # ever runs — see the note on `primer_spent`. A failed fetch leaves an EMPTY file,
+  # which parses as nothing and fires: the refusal-is-not-an-empty-debt direction.
+  local fold_file; fold_file="$(mktemp "${TMPDIR:-/tmp}/watch-fold.XXXXXX")" || fold_file=""
+  if [ -n "$fold_file" ]; then
+    unanswered_now > "$fold_file" 2>/dev/null || true
+  fi
   for stale in "$PRIMERS"/notice-*.json; do
     [ -e "$stale" ] || break
     echo "[hestia-watch] STALE PRIMER (undelivered notices from a failed fire): $stale"
@@ -487,7 +510,7 @@ retry_stale_primers() {
     attempts_file="$stale.attempts"
     # Before the attempt budget, not after: a discharged list should retire on the
     # first pass that can prove it, whatever the counter says.
-    if primer_spent "$stale" "$fold"; then
+    if primer_spent "$stale" "$fold_file"; then
       echo "[hestia-watch] STALE PRIMER ALREADY DISCHARGED (the daemon owes nothing for any notice in it) — retired without a fire: $stale.discharged"
       mv -f "$stale" "$stale.discharged" 2>/dev/null && rm -f "$attempts_file"
       continue
@@ -509,6 +532,7 @@ retry_stale_primers() {
       echo "[hestia-watch] stale retry failed rc=$rc (preserved, will retry): $stale"
     fi
   done
+  [ -n "$fold_file" ] && rm -f "$fold_file"
 }
 
 # The unanswered row exists (daemon-side) only if something ASKS on a cadence —
