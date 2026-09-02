@@ -402,6 +402,17 @@ jobs:
           # reads as a divergence and trips at zero.
           python3 tools/scope_fork_differential_test.py --max-divergences 0
 
+      - name: Does the scope verdict depend on where the session was parked?
+        run: |
+          # The MRH-layer differential #760 asks for. One command through the shared
+          # command_in_scope at four cells (resolved root wrong/right x event cwd at the
+          # root / in a granted repo). Pinned mode: today's cells, false positives
+          # included (7 of 14 cases; every live refusal of 2026-09-02 reproduced token
+          # for token). A regression AND a fix both move a cell off its pin, so either
+          # must update the pin in the same change. `--strict` is the acceptance for
+          # the TOOLS + FILES replacement model and is red today by design.
+          python3 tools/mrh_scope_differential.py
+
       - name: Is every seat reaching for the same domain?
         run: |
           set -euo pipefail
