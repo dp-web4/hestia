@@ -1308,8 +1308,22 @@ impl EscalationStore {
         // Housekeeping first. Without it terminal entries accumulate without bound — a member
         // may sustain MAX_PENDING opens per window, and both the live count below and
         // `pending()` are O(n) scans, so every escalation would get slower with history.
-        // kimi-code, PR #114 review: `reap` was called only from its own test. Safe to call
-        // here because `reaping_can_never_change_an_answer` proves it cannot flip a verdict.
+        // kimi-code, PR #114 review: `reap` was called only from its own test.
+        //
+        // THE JUSTIFICATION THAT USED TO SIT HERE WAS FALSE. It read: "safe to call here
+        // because `reaping_can_never_change_an_answer` proves it cannot flip a verdict". That
+        // test only ever exercised an UNDECIDED record already past its TTL, whose status is
+        // `Expired` on both sides of the reap — a tautology, not a proof. Reaping a DECIDED
+        // record flips `approved` to `expired`, which
+        // `reaping_erases_a_decided_answer_and_it_reads_as_expired` now pins.
+        //
+        // The call is still correct, for the reason that was never written down: no grant is
+        // reaped while it is still spendable. `decided_horizon` is capped at
+        // `expires_at + APPROVAL_CLAIM_WINDOW_SECS` (600) and `REAP_KEEP_SECS` is 3600, so
+        // every row survives its own last claimable instant by ~50 minutes. Permission cannot
+        // be lost here; only EVIDENCE can, and it is — an hour after TTL a decided row stops
+        // being readable and a late reviewer gets "expired" for an escalation an operator
+        // approved. The durable copy is the chain, not this table.
         self.reap(now, REAP_KEEP_SECS);
 
         let plugin_id = plugin_id.trim();
@@ -3470,14 +3484,93 @@ mod tests {
         assert_ne!(a.id, b.id, "same member, same file, same second must still differ");
     }
 
+    /// NAMED FOR ITS DOMAIN, because the domain is the whole content of the claim.
+    ///
+    /// This was `reaping_can_never_change_an_answer`, and the `open()` call site cites it BY
+    /// NAME as the proof that housekeeping is safe there. It never proved that. The only
+    /// record it exercises is an UNDECIDED one past its TTL, whose `status_of` is already
+    /// `Expired` before the reap and is `Expired` after it because an absent id also reads
+    /// `Expired`. Both arms of the equality are the same constant: the assertion cannot fail
+    /// for any value of `reap`, so it certifies nothing about reaping.
+    ///
+    /// The case it is silent on is the one that matters, and it is pinned directly below.
     #[test]
-    fn reaping_can_never_change_an_answer() {
+    fn reaping_cannot_change_an_answer_that_was_already_expired() {
         let (mut s, id) = store_with_one();
         let t = T0 + 10_000;
         let before = s.status_of(&id, t);
         s.reap(t, 60);
         assert_eq!(s.status_of(&id, t), before, "reap changed a verdict");
         assert_eq!(before, Status::Expired);
+    }
+
+    /// REAPING DOES CHANGE AN ANSWER: a DECIDED record reads `approved` until housekeeping
+    /// deletes it, and `expired` forever after.
+    ///
+    /// `status_at` decays only `Pending`, so an approved escalation stays `Approved` for as
+    /// long as the row exists — past its TTL, past its claim horizon, indefinitely. What ends
+    /// that is `reap`, which retains on `now < expires_at + keep_secs` and is BLIND to whether
+    /// the row was decided or claimed. Once the row is gone `status_of` falls through to
+    /// `unwrap_or(Status::Expired)` — the deliberate fail-closed policy for an unknown id —
+    /// and the daemon can no longer distinguish "an operator approved this" from "nobody ever
+    /// ruled".
+    ///
+    /// NO GRANT IS EVER REAPED WHILE IT IS STILL SPENDABLE, and that is the property the
+    /// `open()` call site actually needs: `decided_horizon` is bounded above by
+    /// `expires_at + APPROVAL_CLAIM_WINDOW_SECS` (600) and `REAP_KEEP_SECS` is 3600, so the
+    /// row outlives every claim it could authorise by at least 50 minutes. Permission is safe.
+    /// EVIDENCE is not: what the reap destroys is a decided row's readability, an hour after
+    /// its TTL, on a surface whose peer reviewers routinely arrive later than that.
+    ///
+    /// Measured 2026-09-02 (kimi-code, review of mesh notices 9313-9391): seven decided
+    /// escalations — five approved-and-claimed, two approved-and-lapsed — all polled back
+    /// `expired` ~6h after their decisions, and `tools/await_escalation.py` rendered every one
+    /// of them as "no decision landed in the window". Seven of seven, not five of seven: the
+    /// two lapsed grants were decided too, so the sentence is false of them as well.
+    ///
+    /// SABOTAGE, run 2026-09-02 — `reap`'s `retain` replaced by `|_, _| true`, so housekeeping
+    /// deletes nothing: this test goes RED on the final assertion, and
+    /// `reaping_cannot_change_an_answer_that_was_already_expired` stays GREEN. That is the
+    /// discriminating arm. It is also the direct measurement of #544's charge that the old
+    /// warrant was inert: a reap that has stopped working entirely does not move the test the
+    /// call site cited as its proof.
+    #[test]
+    fn reaping_erases_a_decided_answer_and_it_reads_as_expired() {
+        let (mut s, id) = store_with_one();
+        s.decide(
+            &id, true, "operator", "role:constellation:sovereign",
+            Channel::OperatorSession, None, Some("k"), T0 + 5,
+        )
+        .expect("the sovereign channel approves");
+
+        // The record's own TTL and its claim horizon are both long past here, and neither
+        // moves the answer: the row is still readable, so it still says what happened.
+        let past_the_claim_horizon = T0 + 120 + APPROVAL_CLAIM_WINDOW_SECS + 1;
+        assert_eq!(
+            s.status_of(&id, past_the_claim_horizon),
+            Status::Approved,
+            "a decided row keeps its verdict for as long as it exists",
+        );
+        assert!(
+            !s.get(&id).unwrap().is_claimable(past_the_claim_horizon),
+            "and it is unspendable well before the reap can reach it",
+        );
+
+        // One second past `expires_at + REAP_KEEP_SECS`, which is what every subsequent
+        // `open()` runs unconditionally.
+        let past_the_reap = T0 + 120 + REAP_KEEP_SECS + 1;
+        assert_eq!(
+            s.status_of(&id, past_the_reap),
+            Status::Approved,
+            "still approved right up to the moment housekeeping runs",
+        );
+        s.reap(past_the_reap, REAP_KEEP_SECS);
+        assert_eq!(
+            s.status_of(&id, past_the_reap),
+            Status::Expired,
+            "REAP CHANGED THE ANSWER — this is the case the old guard's name claimed to cover",
+        );
+        assert!(s.get(&id).is_none(), "and the evidence is gone, not merely restated");
     }
 
     #[test]
