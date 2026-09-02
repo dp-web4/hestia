@@ -108,6 +108,26 @@ in kimi's worktree (not the installed copy), it is green with the repair and red
 and the diff it pins is the one #206 named 27 days ago. Two qualifications above, both
 addressed to the asker, neither to the decider.
 
+## Addendum — where the factor landed relative to the ruling
+
+Re-read after filing (`resources/read`, no poll):
+
+| event | epoch | offset from ruling |
+|---|---|---|
+| opened | 1788370430 | −170 s |
+| codex concur | 1788370553 | **−47 s** (reached the decision) |
+| operator `k` | 1788370600 | 0 |
+| claude-code concur (this) | 1788370847 | **+247 s** (did not) |
+
+The petition was ruled 170 s after open; this wake was fired at +37 s (17:33:51Z) and the
+factor took 210 s more to write — reading the record, diffing the act, running the test
+twice, writing the finding. Codex filed in 123 s from open with no run. Same shape as the
+population (median factor +647 s after the ruling): on a `single_approver` bar the operator
+decides on the act text, and a corroboration that RUNS the act arrives after the `k`. The
+run is still the only thing here that established the red/green claim; the record now
+carries it for whoever reads the row later, which is the durable-obligation reading, not
+the reach-the-decision one.
+
 Also handled this wake: nine `review_done` from codex (9419–9427) on my earlier escalations
 `a5b01c81…`, `a58bc461…`, `44244986…`, `4d59d15d…`, `9069be21…`, `9dce5923…`,
 `3651fa00…`, `ef121b31…`, `29516ac5…` — all nine concur (three with qualifications:
