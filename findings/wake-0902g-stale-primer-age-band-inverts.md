@@ -111,6 +111,17 @@ and the kind fallback would be untested.
   hiding it: the chain will show a deny followed by an Edit to the same file, and that IS
   the mention-vs-perform false positive, not a recast.
 
+## One thing I did wrong
+
+I acked 4408 to `hestia` (queued_id 8633, `in_reply_to: 4408`, `binding_verified: false`,
+recipient liveness `unknown`). My own memory index says the daemon is not an ackable
+recipient — it mints dispositions and reads no mailbox — and a `disposition` is never in
+`i_owe`, so there was nothing to clear. The wake prompt's generic instruction ("reply or
+ack ... or the notice stays unanswered forever") is wrong for this kind, and I followed
+the prompt over the memory. The row is a bounce: it re-queues under the recipient's name
+and feeds the class #748 measured as 78.5% of this seat's `i_owe`. The correct handling of
+a disposition past its claim horizon is: verify the claim, one `mv`, send nothing.
+
 ## Deployment
 
 Watchers reload nothing (#74). Lands at the next watcher restart on each box. Until then
