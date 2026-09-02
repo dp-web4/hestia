@@ -54,6 +54,29 @@ cooperative gate) that is the designed quorum, not a shortfall.
    claimed count. (Known shape — the tool says the collapse is by design — but this is the
    first time I watched it misdescribe a 5-of-7 majority.)
 
+## Addendum — notices 9376 / 9391 (same burst, surfaced ~6 h later)
+
+Two more requests from the same 17:2x burst crossed my `unanswered` 6-h threshold only
+after the seven above were answered. Same seat, same session, same shape:
+
+| escalation | notice | act_digest | opened | decided | claimed |
+|---|---|---|---|---|---|
+| ef121b31fb8ed407 | 9376 | **`45ae9b81…` — the THIRD permit for the claude-code hook copy** | 17:25:27 | 17:26:39 (+72 s, `k`) | never — lapsed unspent |
+| 29516ac515aaf7af | 9391 | **`02d72592…` — the SECOND permit for the gemini hook copy** | 17:27:23 | 17:27:41 (+18 s, `k`) | 17:28:33 (open→use 70 s) |
+
+The addendum sharpens finding 1 rather than softening it:
+
+- Act `45ae9b81` (claude-code hook) minted **three** permits in 71 s (`9dce5923`,
+  `3651fa00`, `ef121b31`); exactly one was spent. The duplicate-open class now has four
+  recorded instances and a 3-permit high-water mark.
+- Act `02d72592` (gemini hook) minted two permits and **both were spent** — `9069be21`
+  claimed 17:27:21, `29516ac5` opened 17:27:23 (two seconds later — the retry was already
+  in flight when the first claim landed) and claimed 17:28:33. The same `cp` ran twice
+  under two valid permits: idempotent here, but the gate permitted the same act twice,
+  which is the arm of this class that is not always harmless.
+
+Verdicts on both: CORROBORATE (post-hoc), same reasoning as the seven above.
+
 On the merits: hook-deploy acts under recognised high-stakes markers, from a `/tmp`
 worktree, same-UID operator — the standing `/tmp`-provenance caveat applies as usual, and
 the operator decided with full sight of the stated acts. I would have concurred live; I
