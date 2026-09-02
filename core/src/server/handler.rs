@@ -4832,6 +4832,146 @@ pub(crate) fn ensure_disposition(
     }
 }
 
+/// The asker's lane: `<home>/dispositions/<plugin>.jsonl`.
+///
+/// A disposition row in `member_notices` is durable and addressed, and it is PULLED -- by the
+/// seat watcher, every 60s, consume-once, into a fresh session that is not the asker, cannot
+/// claim, and whose poll would light the asker's fuse (#732). The asker's own live session
+/// reads no mailbox at all after its start. So the ruling existed, was recorded, was even
+/// queued, and the only channel that ever delivered it was a human typing "approved" into the
+/// session (`observed_at` doc; `gate_cli::poll` doc; measured again 2026-09-02, three grants,
+/// two dead at zero seconds).
+///
+/// A file is the delivery the mailbox cannot be: reading it costs no round trip on a daemon
+/// that serializes every member, consumes nothing, and cannot start a claim window. A
+/// bystander session of the same seat may read the whole lane and harm no one, which is why
+/// the address rides IN the line (`for_session`) rather than being enforced by who opens the
+/// file (PRD_DISPOSITION_DELIVERY R1/R6).
+pub(crate) const DISPOSITION_LANE_DIR: &str = "dispositions";
+
+/// Text cap for member-supplied strings that ride to the asker's context window.
+const LANE_TEXT_CAP: usize = 400;
+
+fn lane_clip(v: Option<&String>) -> Option<String> {
+    v.map(|t| {
+        let t = t.trim();
+        if t.chars().count() <= LANE_TEXT_CAP {
+            t.to_string()
+        } else {
+            t.chars().take(LANE_TEXT_CAP).collect::<String>() + " [clipped]"
+        }
+    })
+    .filter(|t| !t.is_empty())
+}
+
+/// Append this ruling to the asker's lane. Warn-and-continue, exactly like `ensure_disposition`:
+/// the decision has already committed to the chain, and a failed delivery must never unmake a
+/// ruling. What it costs when it fails is what we have today -- a human relaying by hand.
+///
+/// The `render` field is composed HERE, by the gate, and the seat prints it. What was decided,
+/// whether a grant still authorises anything, when it dies and what the asker may do next are
+/// all law; a shim that composed them would be a second legal system with a nicer font
+/// (GATE_ARCHITECTURE section 2, and the SHIM_LEDGER class for the reader is refusal-channel).
+pub(crate) fn append_disposition_lane(
+    s: &super::state::ServerState,
+    esc: &super::gate_escalation::Escalation,
+    pointer: &str,
+    ruling_hash: &str,
+    now: u64,
+) {
+    use std::io::Write;
+    let dir = s.home.join(DISPOSITION_LANE_DIR);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("disposition lane dir {dir:?} unavailable ({e}) - the asker will not be told");
+        return;
+    }
+    let status = match serde_json::to_value(esc.stored_status()) {
+        Ok(Value::String(v)) => v,
+        _ => "unknown".to_string(),
+    };
+    let claimable = esc.is_claimable(now);
+    let deadline = esc.claim_deadline();
+    let deadline_utc = deadline.and_then(|d| {
+        chrono::DateTime::from_timestamp(d as i64, 0).map(|t| t.to_rfc3339())
+    });
+    // The one sentence the asker acts on. It says what is true and what may be done; it never
+    // says "hurry", because a deadline is already in the line.
+    let render = if claimable {
+        format!(
+            "{status} - escalation {id} ({act}). Decided by {by}{reason}. This grant is UNSPENT and              authorises exactly the write it was opened for, until {until}. RE-ISSUE THE SAME WRITE              to claim it (single use); anything else lets it lapse. Ruling {hash}.",
+            status = status.to_uppercase(),
+            id = esc.id,
+            act = lane_clip(esc.stated_detail.as_ref())
+                .or_else(|| lane_clip(esc.stated_reason.as_ref()))
+                .unwrap_or_else(|| format!("{} {}", esc.tool_name, esc.marker)),
+            by = esc.decided_by.as_deref().unwrap_or("an arbiter"),
+            reason = lane_clip(esc.reason.as_ref())
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default(),
+            until = deadline_utc.clone().unwrap_or_else(|| "the window on record".to_string()),
+            hash = ruling_hash,
+        )
+    } else {
+        format!(
+            "{status} - escalation {id} ({act}). Decided by {by}{reason}. Nothing is claimable:              {why}. Do not re-issue the write; if the rule itself is wrong, appeal it. Ruling {hash}.",
+            status = status.to_uppercase(),
+            id = esc.id,
+            act = lane_clip(esc.stated_detail.as_ref())
+                .or_else(|| lane_clip(esc.stated_reason.as_ref()))
+                .unwrap_or_else(|| format!("{} {}", esc.tool_name, esc.marker)),
+            by = esc.decided_by.as_deref().unwrap_or("an arbiter"),
+            reason = lane_clip(esc.reason.as_ref())
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default(),
+            why = if esc.consumed_at.is_some() {
+                "this grant was already spent".to_string()
+            } else if status == "approved" {
+                "the approval is past its claim horizon or short of its bar".to_string()
+            } else {
+                format!("the ruling is {status}")
+            },
+            hash = ruling_hash,
+        )
+    };
+    let row = json!({
+        "v": 1,
+        "written_at": now,
+        "escalation_id": esc.id,
+        "plugin_id": esc.plugin_id,
+        "for_session": esc.host_session_id,
+        "decision": status,
+        "decided_at": esc.decided_at,
+        "decided_by": esc.decided_by,
+        "decided_role": esc.decided_role,
+        "reason": lane_clip(esc.reason.as_ref()),
+        "ruling_hash": ruling_hash,
+        "pointer": pointer,
+        "claimable": claimable,
+        "consumed_at": esc.consumed_at,
+        "claim_deadline": deadline,
+        "claim_deadline_utc": deadline_utc,
+        "act_digest": esc.act_digest,
+        "attempted": lane_clip(esc.stated_detail.as_ref()),
+        "render": render,
+    });
+    let path = dir.join(format!("{}.jsonl", esc.plugin_id));
+    let line = match serde_json::to_string(&row) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("disposition lane line for {} not serialisable ({e})", esc.id);
+            return;
+        }
+    };
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut f) => {
+            if let Err(e) = writeln!(f, "{line}") {
+                tracing::warn!("disposition lane {path:?} not written ({e})");
+            }
+        }
+        Err(e) => tracing::warn!("disposition lane {path:?} not open ({e})"),
+    }
+}
+
 /// One projector pass's page bound (#480 revised review, item 4a): at most this
 /// many chain positions per pass. The page is an index walk over
 /// `chain_position`, taken on the chain store's OWN connection mutex — never
@@ -12936,6 +13076,113 @@ mod tests {
         );
     }
 
+    /// PRD_DISPOSITION_DELIVERY R1/R2/R3: the ruling reaches the ASKER, at decide time, on a
+    /// lane addressed to the asker's own live session, carrying an ABSOLUTE deadline and the
+    /// one sentence saying what may be done.
+    ///
+    /// The mechanism this replaces was a human. Measured 2026-09-02 on this seat: three
+    /// approvals, every delivery that worked was dp typing "approved" into the session, two
+    /// grants dead at zero seconds remaining. The daemon knew all three the moment it ruled.
+    ///
+    /// Drives the REAL path (`tool_gate_arbitrate_escalation`), not the lane writer directly:
+    /// a test that called the writer would pass with both call sites deleted.
+    #[tokio::test]
+    async fn the_ruling_reaches_the_askers_live_session_at_decide_time() {
+        let (dir, shared) = make_shared_state();
+        let asker = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "host_agent": "h",
+                "host_session_id": "sess-asker-42",
+            }),
+        )
+        .await
+        .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let peer = tool_connect(&shared, &json!({ "plugin_id": "codex", "host_agent": "h" }))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": asker,
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "act": "Edit -> pre_tool_use.py",
+                "detail": "add HESTIA_WORKSPACE to the gate hook line",
+            }),
+        )
+        .await
+        .unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap().to_string();
+
+        let lane = dir
+            .path()
+            .join(super::DISPOSITION_LANE_DIR)
+            .join("claude-code.jsonl");
+        assert!(!lane.exists(), "no ruling yet, so nothing to deliver");
+
+        let decided = tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "approve": true,
+                "reason": "the asker must learn this without a human relaying it",
+                "session_id": peer,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(decided["status"], "approved", "{decided}");
+
+        let body = std::fs::read_to_string(&lane)
+            .expect("the ruling must reach the asker's lane, not only the mailbox");
+        let row: Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            row["for_session"], "sess-asker-42",
+            "addressed to the ASKER's own session, so a co-seat session knows it is not theirs: {row}"
+        );
+        assert_eq!(row["decision"], "approved", "{row}");
+        assert_eq!(row["escalation_id"], esc_id, "{row}");
+        let deadline = row["claim_deadline"]
+            .as_u64()
+            .expect("an ABSOLUTE deadline, because a countdown decays in flight: {row}");
+        let decided_at = row["decided_at"].as_u64().unwrap();
+        assert_eq!(
+            deadline,
+            decided_at + crate::server::gate_escalation::APPROVAL_CLAIM_WINDOW_SECS,
+            "the deadline is the horizon the gate itself enforces: {row}"
+        );
+        assert!(
+            row["claim_deadline_utc"].as_str().unwrap().starts_with("20"),
+            "and it is legible to whoever reads it: {row}"
+        );
+
+        let render = row["render"].as_str().unwrap();
+        assert!(
+            render.contains(&esc_id) && render.to_lowercase().contains("re-issue"),
+            "the render tells the asker what it may do, composed by the GATE: {render}"
+        );
+        assert!(
+            render.contains("add HESTIA_WORKSPACE to the gate hook line"),
+            "and which act it authorises: {render}"
+        );
+        if row["claimable"].as_bool().unwrap() {
+            assert!(
+                !render.to_lowercase().contains("do not re-issue"),
+                "a live grant must not be rendered as a spent one: {render}"
+            );
+        }
+    }
+
     /// Two members with live sessions and one escalation opened by the first — the fixture
     /// every corroborate-stance test below starts from. Returns (state, escalation_id,
     /// corroborator's session_id).
@@ -17646,6 +17893,9 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
                 &pointer,
                 &entry.hash,
             );
+            // ...and the same ruling on the lane the asker's LIVE session reads, because a
+            // queued notice reaches the next wake and the asker is here now (PRD R2).
+            append_disposition_lane(&s, &decided, &pointer, &entry.hash, now);
             // The bar and whether this decision met it go to the DECIDER, not only to the
             // chain. They were recorded above and withheld here, and the asymmetry had a
             // measured cost: across the whole chain, 66 `sovereign_plus_peer` escalations

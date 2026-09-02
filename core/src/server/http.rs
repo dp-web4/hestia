@@ -4087,6 +4087,16 @@ async fn operator_gate_escalation(
                 &format!("hestia://escalation/{}#decided", esc.id),
                 &entry.hash,
             );
+            // The operator just ruled from the dashboard. The asker is a live session that
+            // reads no mailbox until it restarts, so put the ruling where it can see it now
+            // (PRD_DISPOSITION_DELIVERY R2).
+            super::handler::append_disposition_lane(
+                &s,
+                &esc,
+                &format!("hestia://escalation/{}#decided", esc.id),
+                &entry.hash,
+                now,
+            );
             // THE DECIDER SEES THE BAR — on this surface too.
             //
             // This reply used to be `{escalation_id, status, witnessEntryHash}`. #219 measured

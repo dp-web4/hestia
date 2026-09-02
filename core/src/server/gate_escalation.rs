@@ -538,6 +538,19 @@ impl Escalation {
             .map(|_| self.decided_horizon().saturating_sub(now))
     }
 
+    /// The same horizon as an ABSOLUTE epoch, for anything that leaves this process.
+    ///
+    /// A countdown is only true at the instant it is computed. Every delivery of a remaining
+    /// count -- a refusal payload, a poll reply, a queued notice -- is read later than it was
+    /// written, and #795 measured what that costs: a disposition said 47 minutes remained
+    /// while the real horizon had six and the grant was already spent. A deadline survives the
+    /// trip; a countdown decays in flight. `decided_horizon` stays private and stays the ONE
+    /// definition (PRD_DISPOSITION_DELIVERY R3) -- this is a projection of it, never a second
+    /// copy of the rule.
+    pub fn claim_deadline(&self) -> Option<u64> {
+        self.decided_at.map(|_| self.decided_horizon())
+    }
+
     /// May this approval still authorise the write it was granted for?
     ///
     /// Four conditions, all of which have to hold, and each of which is a way this could
