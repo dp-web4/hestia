@@ -39,7 +39,8 @@ Usage:
   grounds_vs_acts.py --seat kimi-code --cache-out /tmp/walk.json      # walk + report
   grounds_vs_acts.py --seat claude-code --cache-in /tmp/walk.json     # report only
 
-Exit 1 if a divergence surface is non-empty (both registers contradict), else 0.
+Exit 1 if a divergence surface is non-empty (both registers non-empty) — a review signal
+summoning adjudication, never a verdict (real false positives are a documented class).
 """
 
 from __future__ import annotations
@@ -212,7 +213,12 @@ def conduct_register(dump: dict, seat: str) -> dict:
         if not eid:
             continue
         if e["eventType"] in TERMINAL_EVENTS:
-            terminal[eid] = e          # last write wins: final terminal state
+            # The FINAL terminal state, by timestamp — never by walk order. A dump is
+            # newest-first from walk_chain but oldest-first from some caches, and an
+            # order-dependent "last write wins" classifies duplicate-terminal records
+            # backwards in one of them (codex review of #809, hold item 1).
+            if eid not in terminal or ts(e) > ts(terminal[eid]):
+                terminal[eid] = e
         elif e["eventType"] == "gate_escalation_corroborated":
             if (d.get("plugin_id") or d.get("by")) == seat:
                 factors.append(e)
@@ -273,9 +279,16 @@ def statement_register(files: list[Path]) -> list[dict]:
                 para.append(line)
             elif para:
                 blob = " ".join(x.strip() for x in para)
-                if (CUE_FACTOR.search(blob) and CUE_TERMINALITY.search(blob)
-                        and CUE_IMPOSSIBILITY.search(blob)):
-                    hits.append({"file": str(p), "line": start + 1, "text": blob[:400]})
+                fm = CUE_FACTOR.search(blob)
+                tm = CUE_TERMINALITY.search(blob)
+                im = CUE_IMPOSSIBILITY.search(blob)
+                if fm and tm and im:
+                    # Store the FULL paragraph and the matched cue terms: truncating the
+                    # text can cut off the cue, negation, or correction the adjudicator
+                    # needs (codex review of #809, hold item 2).
+                    hits.append({"file": str(p), "line": start + 1, "text": blob,
+                                 "cues": {"factor": fm.group(0), "terminality": tm.group(0),
+                                          "impossibility": im.group(0)}})
                 para = []
     return hits
 
@@ -302,8 +315,9 @@ def main() -> int:
 
     span = dump.get("span") or ["?", "?"]
     print(f"# grounds vs acts — seat: {args.seat}")
+    print(f"# corpus root: {Path(args.repo).resolve()}")  # codex review: results must name their corpus, not float ambient
     print(f"# walk: {dump.get('walked_hops')} hops, complete={dump.get('complete')}, "
-          f"span {span[0]} .. {span[1]}")
+          f"head_position={dump.get('head_position')}, span {span[0]} .. {span[1]}")
     print("# cue families (coverage bound — a claim outside this vocabulary is a miss):")
     print(f"#   factor:       {CUE_FACTOR.pattern}")
     print(f"#   terminality:  {CUE_TERMINALITY.pattern}")
@@ -325,10 +339,15 @@ def main() -> int:
     print(f"\n## statement register: {len(files)} authored records, "
           f"{len(hits)} candidate statements")
     for hit in hits:
-        print(f"  {hit['file']}:{hit['line']}: {hit['text'][:180]}")
+        c = hit["cues"]
+        print(f"  {hit['file']}:{hit['line']}: [{c['factor']} | {c['terminality']} | "
+              f"{c['impossibility']}] {hit['text'][:400]}")
 
+    # A review signal, NOT a verdict: both registers non-empty means the reader must
+    # adjudicate, and real false positives (quotation, refutation, the correction
+    # itself) prove the inference "candidates imply contradiction" is invalid.
     divergent = bool(post) and bool(hits)
-    print(f"\n## divergence: {'PRESENT — conduct contradicts stated grounds; adjudicate above' if divergent else 'none detected within coverage bounds'}")
+    print(f"\n## divergence surface: {'PRESENT — adjudication required (exit 1 is a review signal, not a verdict)' if divergent else 'none detected within coverage bounds'}")
     return 1 if divergent else 0
 
 
