@@ -1693,8 +1693,10 @@ def main() -> int:
 
     # The event, normalised the way the core expects. Paths and command come from the same
     # tool_input the closure classifier already read — one extraction, not a second opinion.
-    _paths = [tool_input[k] for k in ("file_path", "path", "notebook_path")
-              if isinstance(tool_input.get(k), str) and tool_input.get(k).strip()]
+    # Reach extraction is the ENGINE's (tool, key) table (slice 5). This is the SCOPE
+    # site only: the 3-key tuples elsewhere in this file answer a different question —
+    # which single key names a WRITE'S DESTINATION — and stay local on purpose.
+    _paths = _core.path_targets(tool_name, tool_input)
     _cmd = tool_input.get("command") if isinstance(tool_input.get("command"), str) else None
     _ev = _core.NormalizedEvent(tool=tool_name, paths=_paths, command=_cmd,
                                 cwd=event.get("cwd"), raw=event)

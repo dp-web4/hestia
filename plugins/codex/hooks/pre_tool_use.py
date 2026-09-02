@@ -260,18 +260,6 @@ def _role_bridge():
 # no such surface yet; the core-side bridge stays, declared RED in F_NOTES.md.
 
 
-def path_targets(tool_input):
-    out = []
-    if isinstance(tool_input, dict):
-        # NOTE: "pattern" (Glob/Grep) is deliberately NOT here — it is a matcher
-        # ('*.md', a regex), not a filesystem reach; the "path" key carries the
-        # location. Checking the pattern as a path false-denied every Glob whose
-        # pattern didn't look like a granted repo (Kimi live, 2026-07-23).
-        for k in ("path", "file_path", "notebook_path"):
-            v = tool_input.get(k)
-            if isinstance(v, str):
-                out.append(v)
-    return out
 
 
 def mcp_repo_target(tool_input):
@@ -691,7 +679,11 @@ def main():
             paths = apply_patch_targets(tinput)
             cmd = None
         else:
-            paths = path_targets(tinput)
+            # Reach extraction is the ENGINE's (tool, key) table (slice 5): one declared
+            # domain, so this seat cannot silently judge a different world than its peers.
+            # Runs after the `_core is None` fail-closed deny above, so the direct call is
+            # safe by ordering.
+            paths = _core.path_targets(tool, tinput)
             cmd = command_of(tinput)
         # An MCP connector call names its repository in its OWN argument; evaluate() scopes
         # that NAME (NormalizedEvent.repos) and treats the call's repo-relative `path` keys as

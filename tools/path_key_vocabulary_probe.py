@@ -163,13 +163,49 @@ def keys_from_get_literals(path: Path, anchor):
     return keys, mixed
 
 
+def engine_reach_keys(root: Path):
+    """The engine's declared (tool, key) reach table, flattened to key names (slice 5).
+
+    Read from the AST of the shipped core, never hardcoded here: a probe that carried its
+    own copy of the table would be the drift it measures. Returns None when the core does
+    not declare the table (a pre-slice-5 tree)."""
+    core = root / "plugins" / "_shared" / "hestia_gate_core.py"
+    try:
+        tree = ast.parse(core.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError):
+        return None
+    consts = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, (ast.Tuple, ast.List)):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    consts[t.id] = {e.value for e in node.value.elts
+                                    if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+    if "PATH_KEYS" not in consts or "PATTERN_REACH_TOOLS" not in consts:
+        return None
+    keys = set()
+    for name in ("PATH_KEYS", "PATH_LIST_KEYS", "GLOB_KEYS"):
+        keys |= consts.get(name, set())
+    return keys | {"pattern"}
+
+
 def gate_key_vocabularies(root: Path):
     gates, unclassified = discover_gates(root)
     if unclassified:
         raise SystemExit(f"UNCLASSIFIED hook module(s): {unclassified}")
     vocab = {}
     declared = {}
+    engine_keys = engine_reach_keys(root)
     for seat, path in gates:
+        # A seat that DELEGATES extraction consumes the engine table by construction
+        # (slice 5): its vocabulary IS the table, and re-deriving it from the seat's
+        # source would measure the delegation call, not the domain.
+        if engine_keys is not None and re.search(
+                r"_core\.path_targets\(", path.read_text(encoding="utf-8", errors="replace")):
+            declared[seat] = engine_keys
+            vocab[seat] = {"keys": {k for k in engine_keys if k not in NOT_REACH},
+                           "source": "engine reach table (delegated)", "path": path, "mixed": []}
+            continue
         keys = keys_from_path_targets(path)
         if keys is not None:
             declared[seat] = keys

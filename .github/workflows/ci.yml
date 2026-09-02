@@ -383,8 +383,8 @@ jobs:
           # lower number left only in the PR prose is not a ratchet.
           python3 tools/gate_collapse_meter.py \
             --max-divergent-forked 0 --max-verbatim-forked 0 \
-            --max-seat-pct claude-code=28.7 --max-seat-pct codex=20.7 \
-            --max-seat-pct gemini=10.7 --max-seat-pct kimi=17.1
+            --max-seat-pct claude-code=28.8 --max-seat-pct codex=20.5 \
+            --max-seat-pct gemini=10.3 --max-seat-pct kimi=16.8
 
       - name: Do the forked predicates actually disagree with the engine?
         run: |
@@ -413,4 +413,10 @@ jobs:
           # reality rather than aspiring downward from a target nobody hit.
           # Deliberately a SEPARATE step from the collapse meter above: one
           # number failing should not hide the other behind set -e.
-          python3 tools/gate_collapse_meter.py --quiet --min-agreed-keys 3
+          # 10, not 3 (slice 5): the reach domain is ONE engine table and every seat
+          # consumes it, so agreed == union by construction. This floor now guards the
+          # DELEGATION: a seat that re-declares its own key list reads as omitting
+          # whatever it forgot, and trips here. claude-code's pin moved 28.7 -> 28.8:
+          # the delegation's own comment carries law vocabulary the meter counts;
+          # codex/gemini/kimi dropped to their measured floors in the same act.
+          python3 tools/gate_collapse_meter.py --quiet --min-agreed-keys 10

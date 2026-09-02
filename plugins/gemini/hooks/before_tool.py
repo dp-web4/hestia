@@ -239,25 +239,6 @@ def _launch_grant():
     return _core.launch_cwd_repo(_CORE_PROFILE, WORKSPACE)
 
 
-def path_targets(tool_input):
-    out = []
-    if isinstance(tool_input, dict):
-        # superset of Gemini builtin file-arg names (read_file/write_file/replace/glob/...)
-        for k in ("path", "file_path", "absolute_path", "notebook_path", "pattern", "dir_path"):
-            v = tool_input.get(k)
-            if isinstance(v, str):
-                out.append(v)
-        # read_many_files takes `include`/`exclude` GLOBS, not `paths` (SOURCE-VERIFIED:
-        # tools/definitions/base-declarations.ts). Scanning only paths/file_paths skipped Gate-1b
-        # for this tool entirely - an out-of-scope `include:["../restricted-project/**"]` was ALLOWED.
-        # `paths`/`file_paths` stay as a defensive superset (other/future tools, harmless if absent).
-        for k in ("paths", "file_paths", "include", "exclude"):
-            v = tool_input.get(k)
-            if isinstance(v, str):
-                out.append(v)
-            elif isinstance(v, list):
-                out.extend(x for x in v if isinstance(x, str))
-    return out
 
 
 def command_of(tool_input):
@@ -471,13 +452,19 @@ def _gate():
     if event.get("hook_event_name") != "BeforeTool":
         sys.exit(0)  # not our event
 
+    # Slice 5: reach extraction lives in the engine, so an absent engine would return no
+    # paths and Gate-1b would silently judge nothing. That is a bypass, not a degrade —
+    # an ANOMALY deny in enforce mode, same class as an unreadable event.
+    if _core is None and MODE == "enforce":
+        anomaly("hestia: deny [gate] - shared engine unavailable (no reach extraction); failing closed.")
+
     raw_tool = event.get("tool_name")
     tool = raw_tool if isinstance(raw_tool, str) and raw_tool else "?"
     tinput = event.get("tool_input") or {}
     mcp = event.get("mcp_context") if isinstance(event.get("mcp_context"), dict) else None
     cwd = event.get("cwd") or os.environ.get("HESTIA_GEMINI_LAUNCH_CWD") or os.getcwd()
     scopes = dedupe(load_in_scope() + _launch_grant())
-    paths = path_targets(tinput)
+    paths = _core.path_targets(tool, tinput)
     cmd = command_of(tinput)
     egress = egress_targets(tinput) + mcp_egress(mcp)  # url/prompt/query + HTTP-MCP url: Gate-1a only
     mcp_args = mcp_strings(mcp)          # the MCP transport surface Gate-1 could not see (command+args+cwd)
