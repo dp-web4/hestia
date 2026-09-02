@@ -465,6 +465,54 @@ def _deny(rule: str, reason: str, innate: bool = False) -> Verdict:
 ALLOW = Verdict("allow")
 
 
+# ── The reach domain: which (tool, key) values are filesystem reach (#734's other half) ────
+# The predicate was collapsed first; the DOMAIN it runs over stayed per-seat, and the seats
+# disagreed with receipts on both sides. codex/kimi excluded `pattern` because pattern-as-path
+# false-denied every Glob whose matcher did not look like a granted repo (kimi live,
+# 2026-07-23). gemini included it because its `glob` tool's pattern IS the reach — and gemini
+# also learned that omitting `include`/`exclude` let an out-of-scope
+# `include:["../restricted-project/**"]` through Gate-1b entirely (source-verified against
+# tools/definitions/base-declarations.ts). Both were right about their own harness and the
+# census called it divergence. So the table is (tool, key)-aware: `pattern` is reach ONLY on
+# glob-shaped tools, where the matcher walks the filesystem; on a grep-shaped tool it is a
+# regex over contents and treating it as a path manufactures the 07-23 class — gemini was
+# doing exactly that to `search_file_content` until this table.
+#
+# One extraction, declared once. Seats call `path_targets(tool, tool_input)` and may not
+# re-decide which keys are paths (GATE_ARCHITECTURE §2: the (tool, key) -> value-kind mapping
+# is the gate's data, not the shim's code).
+PATH_KEYS = ("path", "file_path", "absolute_path", "notebook_path", "dir_path")
+PATH_LIST_KEYS = ("paths", "file_paths")
+GLOB_KEYS = ("include", "exclude")            # reach-bearing globs; list or str
+PATTERN_REACH_TOOLS = ("glob",)               # tools whose `pattern` walks the filesystem
+
+
+def path_targets(tool_name, tool_input):
+    """Every reach-bearing string in a tool call, by the ratified (tool, key) table above.
+
+    Returns a list of raw strings (paths and globs); scope resolution happens in
+    `path_in_scope`, which resolves relative values against the event cwd — so a traversal
+    glob like `../elsewhere/**` is judged where it lands, not by its spelling."""
+    out = []
+    if not isinstance(tool_input, dict):
+        return out
+    for k in PATH_KEYS:
+        v = tool_input.get(k)
+        if isinstance(v, str) and v.strip():
+            out.append(v)
+    for k in PATH_LIST_KEYS + GLOB_KEYS:
+        v = tool_input.get(k)
+        if isinstance(v, str) and v.strip():
+            out.append(v)
+        elif isinstance(v, list):
+            out.extend(x for x in v if isinstance(x, str) and x.strip())
+    if isinstance(tool_name, str) and tool_name.lower() in PATTERN_REACH_TOOLS:
+        v = tool_input.get("pattern")
+        if isinstance(v, str) and v.strip():
+            out.append(v)
+    return out
+
+
 # ── Workspace + scope resolution ─────────────────────────────────────────────────────────
 def detect_workspace(profile: HarnessProfile) -> str:
     """Resolve explicit install scope and otherwise fail narrow.

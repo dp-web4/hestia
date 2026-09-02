@@ -163,13 +163,114 @@ def keys_from_get_literals(path: Path, anchor):
     return keys, mixed
 
 
+def engine_reach_keys(root: Path):
+    """The engine's declared (tool, key) reach table, flattened to key names (slice 5).
+
+    Read from the AST of the shipped core, never hardcoded here: a probe that carried its
+    own copy of the table would be the drift it measures. Returns None when the core does
+    not declare the table (a pre-slice-5 tree)."""
+    core = root / "plugins" / "_shared" / "hestia_gate_core.py"
+    try:
+        tree = ast.parse(core.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError):
+        return None
+    consts = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, (ast.Tuple, ast.List)):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    consts[t.id] = {e.value for e in node.value.elts
+                                    if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+    if "PATH_KEYS" not in consts or "PATTERN_REACH_TOOLS" not in consts:
+        return None
+    keys = set()
+    for name in ("PATH_KEYS", "PATH_LIST_KEYS", "GLOB_KEYS"):
+        keys |= consts.get(name, set())
+    return keys | {"pattern"}
+
+
+def _is_engine_path_targets_call(node) -> bool:
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "path_targets"
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == "_core")
+
+
+def live_site_delegates(path: Path) -> bool:
+    """Does the seat's LIVE scope-extraction site consume the engine table?
+
+    Not "does the source mention `_core.path_targets(` somewhere" -- GPT's review of #830
+    falsified that in one move: a seat-local 3-key extractor on the real path plus one dead
+    engine call elsewhere read as fully delegated. The proof is structural, at the site
+    that feeds scope: the value bound to the paths the scope check judges must BE the engine
+    call, every seat-local `path_targets`/`_path_targets` definition is gone, and no other
+    binding of that name on the live path comes from anywhere else.
+
+    Live sites, by seat shape:
+      - a `NormalizedEvent(... paths=<expr> ...)` keyword (claude-code)
+      - an assignment `paths = <expr>` inside main() (codex, kimi, gemini)
+
+    Every such binding must CONTAIN the engine call, and every other callee in it must be a
+    pure harness-shape translator: a local function that names NO path key (codex's
+    apply_patch_targets parses file targets out of a diff body -- event shape a shim may
+    translate -- and is composed with the engine call at the site). A callee that spells a
+    key name is a second domain and reads as a re-fork, whatever it is called."""
+    src = path.read_text(encoding="utf-8", errors="replace")
+    tree = ast.parse(src)
+    local_fns = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    if any(n in local_fns for n in ("path_targets", "_path_targets")):
+        return False
+    # path is plugins/<seat>/hooks/<file>; the repo root is three levels up. A fixture
+    # outside any tree keeps the classic three names, which is enough to catch a re-fork.
+    parents = path.resolve().parents
+    root_keys = engine_reach_keys(parents[3]) if len(parents) > 3 else None
+    key_names = set(root_keys or set()) | {"file_path", "path", "notebook_path"}
+    bindings = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "NormalizedEvent":
+            for kw in node.keywords:
+                if kw.arg == "paths":
+                    bindings.append(kw.value)
+        elif isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id in ("paths", "_paths") for t in node.targets):
+                bindings.append(node.value)
+    if not bindings:
+        return False
+    for expr in bindings:
+        calls = [c for c in ast.walk(expr) if isinstance(c, ast.Call)]
+        if not any(_is_engine_path_targets_call(c) for c in calls):
+            return False                       # a binding with no engine call: re-fork
+        for c in calls:
+            if _is_engine_path_targets_call(c):
+                continue
+            name = getattr(c.func, "id", None)
+            fn = local_fns.get(name)
+            if fn is None:
+                return False                   # an unknown callee cannot be proven a translator
+            spelled = {k.value for k in ast.walk(fn)
+                       if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+            if spelled & key_names:
+                return False                   # the callee spells a path key: a second domain
+    return True
+
+
 def gate_key_vocabularies(root: Path):
     gates, unclassified = discover_gates(root)
     if unclassified:
         raise SystemExit(f"UNCLASSIFIED hook module(s): {unclassified}")
     vocab = {}
     declared = {}
+    engine_keys = engine_reach_keys(root)
     for seat, path in gates:
+        # A seat whose LIVE extraction site is the engine call consumes the engine table by
+        # construction (slice 5): its vocabulary IS the table. Proven at the site, not by a
+        # substring (see live_site_delegates). The flat key census below is a trend, not the
+        # contract: the typed (tool, key) behaviour is pinned by
+        # tools/reach_domain_contract_test.py, which can turn red where this cannot.
+        if engine_keys is not None and live_site_delegates(path):
+            declared[seat] = engine_keys
+            vocab[seat] = {"keys": {k for k in engine_keys if k not in NOT_REACH},
+                           "source": "engine reach table (delegated)", "path": path, "mixed": []}
+            continue
         keys = keys_from_path_targets(path)
         if keys is not None:
             declared[seat] = keys
