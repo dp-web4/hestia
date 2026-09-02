@@ -281,3 +281,61 @@ jobs:
             exit 1
           fi
           echo "all ${#tests[@]} passed"
+
+  # ADDITION: the ratchet under the engine collapse.
+  #
+  # The `hooks` job above runs each seat's tests FROM ITS OWN DIRECTORY, which is
+  # correct for what it tests and is also exactly why the seats drift: it proves
+  # every seat is self-consistent and compares no seat to any other. A fix that
+  # lands in one seat's file is green. Three seats, three greens, one law that
+  # differs by seat.
+  #
+  # "The seats all import the shared closure" was true and reported as done for
+  # weeks. It was never the question. The question is what fraction of
+  # LAW-BEARING code still executes per-seat, and on the day this job was added
+  # the answer was 67.7% -- with claude-code alone carrying more law-bearing
+  # SLOC (1,654) than the shared engine's law-bearing portion (1,470).
+  #
+  # This job does not require the number to fall. It requires that it not RISE.
+  # Lower the pins in the same PR that lowers the number; that edit is the
+  # progress record, and it is the thing a verdict could never be.
+  collapse-ratchet:
+    name: gate collapse ratchet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Measure how much of the gate still executes per-seat
+        run: |
+          set -euo pipefail
+          # Both pins, deliberately. --max-forked is beyond argument (a name the
+          # shared engine already owns, implemented a second time in a seat's
+          # gate). --max-pct is the number that actually matters and depends on
+          # a published vocabulary, so it is arguable -- which is a reason to
+          # print it every run, not a reason to leave it unpinned.
+          python3 tools/gate_collapse_meter.py --max-forked 4 --max-pct 67.5
+
+      - name: Do the forked predicates actually disagree with the engine?
+        run: |
+          set -euo pipefail
+          # A fork count is debt; a divergence count is exposure. This pins how
+          # many inputs the forked scope predicates answer differently from the
+          # shared engine -- currently 6, every one of them a defect class the
+          # engine's own docstring says it was hardened against. Collapsing a
+          # fork is what drives it down.
+          python3 tools/scope_fork_differential_test.py --max-divergences 6
+
+      - name: Is every seat reaching for the same domain?
+        run: |
+          set -euo pipefail
+          # The collapse percentage measures the PREDICATE. This pins the DOMAIN
+          # the predicate is applied to, which every seat builds itself before
+          # the engine is ever called (#734). A gate can reach 0.0% per-seat law
+          # and still disagree with its peers about which argument is a path.
+          # Floor is the measured number, 3 of 10, so it ratchets up from
+          # reality rather than aspiring downward from a target nobody hit.
+          # Deliberately a SEPARATE step from the collapse meter above: one
+          # number failing should not hide the other behind set -e.
+          python3 tools/gate_collapse_meter.py --quiet --min-agreed-keys 3

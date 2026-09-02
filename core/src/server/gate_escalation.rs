@@ -552,30 +552,15 @@ impl Escalation {
             && now < self.decided_horizon()
     }
 
-    /// THE ONE PLACE A BAR IS EVALUATED. `bar_met` asks it about the factors PRESENT;
-    /// `operator_alone_suffices` asks the same predicate about the factors that WOULD be
-    /// present after a lone sovereign decision. Two questions, one implementation.
-    ///
-    /// It is a function rather than two `match` arms because the second question already had
-    /// an answer written down somewhere else, and that answer went stale. `dashboard.rs`
-    /// restated the SovereignPlusPeer arm as "is there a PeerMember factor?" — correct when
-    /// it was written 2026-08-04, and inverted by `9d3936d` two days later when the peer
-    /// conjunct was dropped from `bar_met`. That commit changed this file and `handler.rs`,
-    /// listed "the dashboard" as still-open work, and shipped. Nobody looked for sentences
-    /// that had just become FALSE, because a still-open list is forward-looking and an
-    /// inverted invariant is backward-looking. The operator was told
-    /// "YOUR APPROVAL ALONE WILL NOT PERMIT THIS" — in warning colour, on the one line the
-    /// UI comment says must not be skimmed — for 25 days, about writes their approval alone
-    /// did in fact permit. Deriving the promise from the predicate is what makes the next
-    /// relaxation of a bar unable to do this again.
-    fn bar_met_over(bar: Bar, channels: impl Iterator<Item = Channel>) -> bool {
-        let (mut sovereign, mut peer) = (false, false);
-        for c in channels {
-            sovereign |= c.is_sovereign();
-            peer |= c == Channel::PeerMember;
-        }
-        match bar {
-            Bar::SingleApprover => sovereign || peer,
+    /// Does the evidence present meet the stated bar? Evaluated against the factor SET, so a
+    /// cross-vendor peer plus a sovereign decision is a different recorded quantity than
+    /// either alone — which is the whole point of having a bar at all.
+    pub fn bar_met(&self) -> bool {
+        match self.bar {
+            Bar::SingleApprover => self
+                .factors
+                .iter()
+                .any(|f| f.channel.is_sovereign() || f.channel == Channel::PeerMember),
             // TWO-BAR IS AN INVITATION TO PARTICIPATE, NOT A BLOCKER.
             //
             // dp, decision of record 2026-08-06: *"On sovereign decisions, two-bar is an
@@ -603,45 +588,8 @@ impl Escalation {
             // `OnExceeded`, D-3's `NotSameRequirement::Preferred`, and `ReadBasis`:
             // proceed with the best available, never silently, always with the deficiency
             // on the record.
-            //
-            // `peer` is deliberately still computed above and unused HERE: it is what the
-            // SingleApprover arm reads, and leaving the binding in place means restoring
-            // this conjunct is a one-word edit in the one place that decides.
-            Bar::SovereignPlusPeer => sovereign,
+            Bar::SovereignPlusPeer => self.factors.iter().any(|f| f.channel.is_sovereign()),
         }
-    }
-
-    /// Will an operator's approval, ON ITS OWN, carry this escalation over its bar?
-    ///
-    /// Asked BEFORE the decision, by the surface holding the button. Derived by running the
-    /// real predicate over the factor set this escalation would have once the decider's own
-    /// factor is appended (`decide` always appends one — see there), so the answer cannot
-    /// drift from what actually happens when the operator clicks.
-    pub fn operator_alone_suffices(&self) -> bool {
-        Self::bar_met_over(
-            self.bar,
-            self.factors
-                .iter()
-                .map(|f| f.channel)
-                .chain(std::iter::once(Channel::OperatorSession)),
-        )
-    }
-
-    /// Stated positively so a UI never has to infer a remedy from a false boolean: what is
-    /// still missing, in the operator's terms, or `None` when nothing is.
-    pub fn still_needs(&self) -> Option<&'static str> {
-        if self.operator_alone_suffices() {
-            None
-        } else {
-            Some("an independent NOT-SAME peer factor (hestia_gate_escalation_corroborate)")
-        }
-    }
-
-    /// Does the evidence present meet the stated bar? Evaluated against the factor SET, so a
-    /// cross-vendor peer plus a sovereign decision is a different recorded quantity than
-    /// either alone — which is the whole point of having a bar at all.
-    pub fn bar_met(&self) -> bool {
-        Self::bar_met_over(self.bar, self.factors.iter().map(|f| f.channel))
     }
 
     /// What the invited peers actually did — the half of the bar that survives.
@@ -1868,15 +1816,28 @@ pub fn act_digest_of(act: &str) -> String {
         self.by_id.insert(prior.id.clone(), prior);
     }
 
-    /// Add a peer's evidence to a PENDING escalation without deciding it.
+    /// Add a peer's evidence to an escalation without deciding it.
     ///
     /// This is the accumulation half of the constellation model: approval is not a boolean
     /// from whichever channel answered first. A peer co-signs here (NOT-SAME, enforced by the
     /// caller the same way arbitration enforces it), the operator decides later, and `bar_met`
     /// evaluates the whole set. A corroboration is NOT a decision: it permits nothing by
-    /// itself, it is witnessed separately (so it cannot be laundered into a ruling), and it
-    /// freezes the moment a decision lands — evidence after the fact would let a weak ruling
-    /// be dressed up retroactively.
+    /// itself, and it is witnessed separately, so it cannot be laundered into a ruling.
+    ///
+    /// WHAT CLOSES THIS DOOR IS EXPIRY, NOT THE RULING. `status_at` reaches `Expired` from
+    /// `Pending` ALONE, so the guard below is unreachable on a decided row: an approved or
+    /// denied escalation takes factors FOREVER, and only a lapsed-undecided one refuses.
+    /// A late factor still cannot dress up a ruling — `bar_met` is unmoved by it (see
+    /// `a_late_factor_cannot_move_the_bar_on_the_surface_where_it_could`) — so the protection
+    /// the deleted sentence claimed comes from the PREDICATE, not from refusing the peer.
+    ///
+    /// The deleted sentence said the opposite ("it freezes the moment a decision lands").
+    /// It outlived the 2026-08-06 cutover by 25 days and was filed twice (#510, and codex's
+    /// review-4732) before this fix. Between those filings a seat re-derived the false
+    /// version as fact 102 minutes after the corroboration landed, holding the correct rule
+    /// in its own notes at the time. That is why the correction belongs HERE and in the tool
+    /// description: a stale line two lines above the code beats a correct note anywhere
+    /// else, because this is where the next reader stands.
     pub fn corroborate(
         &mut self,
         id: &str,
@@ -3780,73 +3741,6 @@ mod bar_factor_tests {
     const T0: u64 = 1_800_000_000;
 
     #[test]
-    fn the_promise_shown_before_the_click_predicts_what_the_click_does() {
-        // THE INVARIANT THE DASHBOARD BROKE FOR 25 DAYS, PINNED AS A PROPERTY.
-        //
-        // `operator_alone_suffices()` is a PREDICTION, rendered on the approval button's own
-        // metadata line. The only thing that makes it worth showing is that it comes true.
-        // So assert exactly that, for every marker class, rather than transcribing today's
-        // bar into an expected value — a transcription is what `dashboard.rs` contained, and
-        // it kept passing review while asserting the opposite of the code it described.
-        //
-        // Sweep both bars via the markers `bar_for` actually routes.
-        for marker in ["law_inject.py", "pre_tool_use.py", "witness.py", "hestia_gate_mechanism.py"]
-        {
-            let (mut s, id) = open_with(marker);
-            let promised = s.get(&id).unwrap().operator_alone_suffices();
-            let needs = s.get(&id).unwrap().still_needs();
-            assert_eq!(
-                promised,
-                needs.is_none(),
-                "{marker}: the two operator-facing fields must never disagree with each other"
-            );
-
-            // The operator clicks approve. Nobody else has looked, and — per the wake-record
-            // and invitation findings — on this fleet nobody else usually will.
-            let e = s
-                .decide(&id, true, "dp", "role:constellation:sovereign", Channel::OperatorSession, None, Some("reviewed"), T0 + 5)
-                .expect("operator decides alone");
-
-            assert_eq!(
-                e.bar_met(),
-                promised,
-                "{marker}: told the operator `operator_alone_suffices = {promised}`, then their \
-                 lone approval produced bar_met = {}. A prediction that does not come true is \
-                 worse than no prediction: it is the panel teaching that the button is broken.",
-                e.bar_met()
-            );
-            assert_eq!(
-                e.is_claimable(T0 + 6),
-                promised,
-                "{marker}: and the write itself must follow the same promise"
-            );
-        }
-    }
-
-    #[test]
-    fn relaxing_a_bar_cannot_leave_the_operator_surface_asserting_the_old_one() {
-        // The regression test for the CAUSE, not just the symptom. Both operator-facing
-        // fields are derived from `bar_met_over`, so there is no second copy of the bar to
-        // go stale. If someone restores the peer conjunct to `SovereignPlusPeer`, this test
-        // keeps passing and the dashboard follows automatically; if someone re-introduces a
-        // hand-written copy beside it, `the_promise_...` above fails.
-        let (mut s, id) = open_with("pre_tool_use.py");
-        let e = s.get(&id).unwrap();
-        assert!(
-            e.operator_alone_suffices(),
-            "under invitation semantics (9d3936d) the sovereign conjunct decides alone"
-        );
-        assert_eq!(e.still_needs(), None, "so nothing is 'still needed' from a peer");
-
-        // And a peer factor, welcome as it is, changes neither the promise nor the verdict.
-        let e = s
-            .corroborate(&id, "kimi-code", "role:constellation:member", None, false, None, T0 + 3)
-            .expect("peer participates");
-        assert!(e.operator_alone_suffices(), "a peer arriving does not make the operator weaker");
-        assert_eq!(e.still_needs(), None);
-    }
-
-    #[test]
     fn the_bar_is_stated_at_open_and_differs_by_surface() {
         // A law renderer and the enforcement path are not the same stakes, and the record
         // must say which criterion each was judged against — inferred sufficiency is the
@@ -3859,6 +3753,7 @@ mod bar_factor_tests {
         assert_eq!(s3.get(&id3).unwrap().bar, Bar::SovereignPlusPeer);
     }
 
+    #[test]
     /// The marker is a JOIN KEY, and a member filing deliberately cannot learn it.
     ///
     /// The live failure, reproduced: a member files with its own readable string, an operator
@@ -3905,15 +3800,6 @@ mod bar_factor_tests {
         );
     }
 
-    /// DEAD FROM 2026-08-04 TO 2026-08-31, and nothing said so.
-    ///
-    /// `6266dd9` inserted `a_marker_the_gate_never_presented_...` between this function and
-    /// its `#[test]`, so the new test took the attribute and this one silently stopped being
-    /// a test. It kept compiling, kept reading like coverage, and ran zero times — including
-    /// through `9d3936d` two days later, which rewrote the very predicate it guards. The
-    /// compiler said so the whole time (`function is never used`, `duplicated attribute`) in
-    /// a build that carries 21 warnings, which is the same as not saying it.
-    #[test]
     fn a_single_approval_meets_a_single_approver_bar() {
         let (mut s, id) = open_with("law_inject.py");
         let e = s
@@ -3992,6 +3878,39 @@ mod bar_factor_tests {
         assert_eq!(after.bar_met(), before, "a late factor MUST NOT change the bar verdict");
         assert_eq!(after.peer_participation().concurred, 1, "but it is on the record");
         assert_eq!(after.stored_status(), Status::Approved, "and the ruling is untouched");
+    }
+
+    #[test]
+    fn a_late_factor_cannot_move_the_bar_on_the_surface_where_it_could() {
+        // The sibling test above uses a `law_inject.py` fixture, which `bar_for` maps to
+        // SingleApprover — where `sovereign || peer` is already true from the decider's own
+        // factor, so its before/after assertion is a tautology and stays green no matter what
+        // `corroborate` does to the factor set. The dress-up hazard lives on the OTHER arm.
+        //
+        // `witness.py` is SovereignPlusPeer. Under the shipped predicate (`any(is_sovereign)`)
+        // a late peer factor is inert here too. Under the peer conjunct that codex's
+        // review-4732 warned about restoring (`sovereign && peer`), `before` is false and
+        // `after` is true — a peer arriving AFTER the ruling would make an approval claimable
+        // that was not. This test is the arithmetic of that hazard, so the reintroduction
+        // cannot land silently.
+        let (mut s, id) = open_with("witness.py");
+        assert_eq!(s.get(&id).unwrap().bar, Bar::SovereignPlusPeer);
+        s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::OperatorSession, None, None, T0 + 5)
+            .expect("decided");
+        let before = s.get(&id).unwrap().bar_met();
+        let claimable_before = s.get(&id).unwrap().is_claimable(T0 + 6);
+
+        let after = s
+            .corroborate(&id, "kimi-code", "r", None, false, None, T0 + 7)
+            .expect("a decided row still takes evidence — expiry closes this door, not the ruling");
+
+        assert_eq!(after.bar_met(), before, "a late factor MUST NOT move the bar on a two-bar surface");
+        assert_eq!(
+            after.is_claimable(T0 + 8),
+            claimable_before,
+            "and it MUST NOT turn an unclaimable approval into a claimable one"
+        );
+        assert_eq!(after.peer_participation().concurred, 1, "but it is on the record");
     }
 
     #[test]

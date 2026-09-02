@@ -335,7 +335,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t_args(
             "hestia_gate_escalation_corroborate",
-            "Add your evidence to ANOTHER member's governance-write escalation WITHOUT deciding it (NOT-SAME enforced). Your STANCE is required and explicit — 'concur' or 'dissent' — because an unstated stance used to default to concurrence and recorded one peer's dissent as agreement (#367, escalation 99417cc). A dissent must carry its argument; it is evidence surfaced to the decider, NEVER a veto — the sovereign decision stands regardless. Approval is not first-answer-wins: your factor joins the set, the operator or arbiter decides later, and the stated bar is evaluated over the whole set. A factor permits nothing by itself; it is witnessed separately so it cannot be laundered into a ruling. This schema is the WHOLE contract: arguments outside it are refused by name, not discarded",
+            "Add your evidence to ANOTHER member's governance-write escalation WITHOUT deciding it (NOT-SAME enforced). Your STANCE is required and explicit — 'concur' or 'dissent' — because an unstated stance used to default to concurrence and recorded one peer's dissent as agreement (#367, escalation 99417cc). A dissent must carry its argument; it is evidence surfaced to the decider, NEVER a veto — the sovereign decision stands regardless. Approval is not first-answer-wins: your factor joins the set, the operator or arbiter decides later, and the stated bar is evaluated over the whole set. A factor permits nothing by itself; it is witnessed separately so it cannot be laundered into a ruling. TIMING — a DECIDED escalation STILL TAKES YOUR FACTOR. The guard here is expiry, not the ruling: an approved or denied row accepts evidence indefinitely (the ruling stands and cannot reopen, and your factor cannot change `bar_met` — what it buys is the record, which is what the invitation was for), while only a LAPSED, never-decided row refuses with `Expired`. Do not skip filing because the row already reads approved or denied; that belief is fleet-wide, false, and this sentence is here because the seats holding it each re-derived it from documentation rather than from the door. This schema is the WHOLE contract: arguments outside it are refused by name, not discarded",
             json!({
                 "type": "object",
                 // False, truthfully: the handler refuses unknown keys by name, so the
@@ -8857,12 +8857,21 @@ mod member_mesh_tests {
 
         // Fill the egress plane to its bound directly — this test is about what the
         // refusal RECORDS, not about where the bound sits (that is pinned in inbox.rs).
+        //
+        // SPREAD ACROSS PEERS. This fill used one destination ("thor"), which stopped
+        // reaching the plane's bound when MAX_EGRESS_QUEUE_PER_PEER landed: a single peer
+        // is refused at its own share (50) long before the plane (200) is full, so the
+        // loop's unwrap panicked at i=50. That is the per-peer clause doing its job. The
+        // destination was always incidental here — what is under test is the refusal's
+        // chain record — so the fill is distributed and "thor", which holds nothing, is
+        // then refused by the GLOBAL bound, exactly as before.
         {
             let s = state.lock().await;
+            let per = crate::storage::inbox::MAX_EGRESS_QUEUE_PER_PEER;
             for i in 0..crate::storage::inbox::MAX_EGRESS_QUEUE {
                 s.inbox_store
-                    .enqueue_egress("thor", "claude-code", "codex-cli", "role:r",
-                                    "reply", Some("forum/x.md#thread=t"),
+                    .enqueue_egress(&format!("peer{}", i / per), "claude-code", "codex-cli",
+                                    "role:r", "reply", Some("forum/x.md#thread=t"),
                                     &format!("h{i}"))
                     .unwrap();
             }
@@ -15637,6 +15646,13 @@ fn opened_payload(
         "gate_path": esc.gate_path,
         "host_session_id": esc.host_session_id,
         "session_id": esc.session_id,
+        // WHEN IT OPENED. Never emitted before this change: replay had `expires_at` and
+        // `ttl_secs` but not the open, so `rehydrate` dated every restored row at RESTART
+        // time — a row opened at 05:09Z carried `opened_at` 05:43:47Z, one second after the
+        // daemon came back, with its own peer factors 31 minutes OLDER than its open
+        // (kimi-code, factor on d3f643cf). Every replay test supplied the field; production
+        // never did — the fixture was the only writer of it.
+        "opened_at": esc.opened_at,
         "expires_at": esc.expires_at,
         "ttl_secs": ttl_secs,
         // Recorded so a reader is never left inferring it from silence.
@@ -17491,6 +17507,124 @@ mod standing_scope_surface_tests {
             "the divergence must name the phantom grant and its direction: {:?}",
             audit.divergence
         );
+    }
+
+    /// GPT re-review of #728: an expiry-only change is a reach change, and the report used to
+    /// miss it because the digest compared four fields while the report keyed on two.
+    ///
+    /// This is the arm that was asked for. A grant present in both, same member and path,
+    /// differing only in `expires_at`, must produce `matches=false` AND a directional finding
+    /// naming that grant and that field. An empty divergence beside a moved digest is the
+    /// exact contract violation.
+    #[tokio::test]
+    async fn an_expiry_only_change_is_named_not_silently_matched() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        let mut s = state.lock().await;
+        s.commit_standing_scope(|st| {
+            st.add(standing("claude-code", "/w/hestia", now, Some(now + 3600)))
+        })
+        .unwrap();
+
+        // The matching control: untouched, this must stay clean.
+        let clean = s.verify_standing_projection(now).unwrap();
+        assert!(clean.matches, "a untouched projection must verify: {:?}", clean.divergence);
+        assert!(clean.divergence.is_empty());
+        assert_eq!(clean.runtime_digest, clean.vault_digest);
+
+        // Same member, same path, same generation. Only the expiry moves, and it moves
+        // LATER, which is a widening: reach the vault never authorised.
+        s.standing_scope.grants[0].expires_at = Some(now + 86_400);
+
+        let audit = s.verify_standing_projection(now).unwrap();
+        assert!(
+            !audit.matches,
+            "an expiry-only widening must not report as matching"
+        );
+        assert_ne!(
+            audit.runtime_digest, audit.vault_digest,
+            "the digest must see it too, or the two surfaces disagree again"
+        );
+        assert!(
+            !audit.divergence.is_empty(),
+            "a moved digest with an empty divergence is the contract violation this arm exists for"
+        );
+        assert!(
+            audit.divergence.iter().any(|d| {
+                d.contains("CHANGED") && d.contains("/w/hestia") && d.contains("expires_at")
+            }),
+            "the finding must name the grant and the field: {:?}",
+            audit.divergence
+        );
+        assert_eq!(
+            audit.runtime_generation, audit.vault_generation,
+            "generation is unmoved here on purpose: an ungoverned edit does not bump it, \
+             which is why the generation alone cannot be the detector"
+        );
+    }
+
+    /// The invariant that keeps this class from coming back: whatever the digest can
+    /// distinguish, the divergence report can name. Checked across every field the digest
+    /// hashes, rather than trusting that the two implementations stay in step.
+    #[tokio::test]
+    async fn every_digest_difference_has_a_named_divergence() {
+        use crate::server::standing_scope::{FloorEntry, StandingScopeStore};
+        let now = crate::server::gate_escalation::now_secs();
+
+        let base = || {
+            let mut st = StandingScopeStore::default();
+            st.add(standing("claude-code", "/w/hestia", now, Some(now + 3600)));
+            st.floor_add(FloorEntry {
+                path: "/w/shared".into(),
+                added_at: now,
+                added_by: "operator".into(),
+                reason: "baseline".into(),
+            });
+            st
+        };
+
+        // Each mutation touches one thing the digest hashes.
+        let mutations: Vec<(&str, Box<dyn Fn(&mut StandingScopeStore)>)> = vec![
+            ("expiry", Box::new(|st: &mut StandingScopeStore| {
+                st.grants[0].expires_at = Some(now + 99_999)
+            })),
+            ("granted_at", Box::new(|st: &mut StandingScopeStore| {
+                st.grants[0].granted_at = now - 5
+            })),
+            ("member", Box::new(|st: &mut StandingScopeStore| {
+                st.grants[0].member = "kimi-code".into()
+            })),
+            ("path", Box::new(|st: &mut StandingScopeStore| {
+                st.grants[0].path = "/w/elsewhere".into()
+            })),
+            ("extra grant", Box::new(|st: &mut StandingScopeStore| {
+                st.add(standing("codex", "/w/extra", now, None))
+            })),
+            ("dropped grant", Box::new(|st: &mut StandingScopeStore| st.grants.clear())),
+            ("floor path", Box::new(|st: &mut StandingScopeStore| {
+                st.floor.clear();
+            })),
+        ];
+
+        for (name, mutate) in mutations {
+            let vault = base();
+            let mut runtime = base();
+            mutate(&mut runtime);
+            let digests_differ = runtime.authority_digest() != vault.authority_digest();
+            let divergence = runtime.divergence_from(&vault);
+            assert!(
+                digests_differ,
+                "{name}: the digest should see this change, or the test is not exercising it"
+            );
+            assert!(
+                !divergence.is_empty(),
+                "{name}: the digest moved but the divergence report said nothing"
+            );
+        }
+
+        // And the other direction: identical stores agree on both surfaces.
+        assert_eq!(base().authority_digest(), base().authority_digest());
+        assert!(base().divergence_from(&base()).is_empty());
     }
 
     /// dp's negative control, stated verbatim in the ruling: "revoked/absent vault grants must
