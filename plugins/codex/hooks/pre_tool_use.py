@@ -310,10 +310,10 @@ def apply_patch_targets(tool_input):
                 break
         for m in re.finditer(r'^\*\*\*\s+(?:Add|Update|Delete)\s+File:\s*(.+?)\s*$', blob, re.MULTILINE):
             out.append(m.group(1))
-        for k in ("path", "file_path"):        # explicit target keys, if present
-            v = tool_input.get(k)
-            if isinstance(v, str):
-                out.append(v)
+        # No key-based extraction here (slice 5, GPT review of #830): this is a HARNESS-SHAPE
+        # translator -- apply_patch delivers its targets inside a diff body, which is event
+        # shape a shim may translate. Which KEYS are reach is the engine's table; the call
+        # site composes the two. A key list living in here was a second seat-local domain.
     return out
 
 
@@ -676,7 +676,9 @@ def main():
             # what evaluate() scopes/egress-checks; the patch body is never scanned for
             # forbidden tokens (else a security review that mentions '.env'/'credentials' is
             # false-denied — Codex, 2026-07-23). The sandbox confines the write.
-            paths = apply_patch_targets(tinput)
+            # Patch-body targets (shape translation) PLUS the engine's key table: both
+            # reach, one owner of the key domain.
+            paths = apply_patch_targets(tinput) + _core.path_targets(tool, tinput)
             cmd = None
         else:
             # Reach extraction is the ENGINE's (tool, key) table (slice 5): one declared
