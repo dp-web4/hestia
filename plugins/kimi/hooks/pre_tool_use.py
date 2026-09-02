@@ -184,23 +184,13 @@ _SNAPSHOT_ROLE = None  # set by main() from the live daemon snapshot (identity.r
 
 
 def _role_bridge():
-    """Attribution-only: the role string that witnesses/connects carry. Never used to widen
-    reach. Sprint F: RESOLVED from the live snapshot when the daemon answered — the
-    daemon's session-resolved role (hestia_operating_law identity.role) wins over the
-    member-writable identity.json; the file read remains ONLY as the daemon-absent
-    fallback for witness attribution, where the alternative is silently changing the
-    witness grain mid-train.
-    # SPRINT-F: replace with certified snapshot — PARTIAL: resolved when the daemon
-    # answers; the identity.json fallback stays for the unreachable case (F_NOTES.md)."""
-    if isinstance(_SNAPSHOT_ROLE, str) and _SNAPSHOT_ROLE.startswith("role:"):
-        return _SNAPSHOT_ROLE
+    """Seat wrapper (slice 3): context in, one engine body decides. Never raises — the
+    fallback below is the exact string the seat-local copy ended on."""
     try:
-        r = json.load(open(IDENTITY, encoding="utf-8")).get("role")
-        if isinstance(r, str) and r.startswith("role:"):
-            return r
+        return __import__('hestia_gate_mechanism').role_bridge(
+            snapshot_role=_SNAPSHOT_ROLE, identity_path=IDENTITY)
     except Exception:
-        pass
-    return "role:constellation:member"
+        return "role:constellation:member"
 
 
 # ── Sprint F (§6.F): _launch_scope_bridge deleted — the per-launch cwd grant is computed
@@ -274,23 +264,14 @@ _TALLY = os.path.join(_TALLY_DIR, "scope-tally.json")
 
 
 def _tally_scope(allowed: bool):
-    """Count this decision; emit an attestation when the window closes."""
+    """Seat wrapper; accounting must never change a decision."""
     try:
-        os.makedirs(_TALLY_DIR, exist_ok=True)
-        try:
-            t = json.load(open(_TALLY))
-        except Exception:
-            t = {"allows": 0, "denies": 0}
-        t["allows" if allowed else "denies"] += 1
-        if t["allows"] + t["denies"] >= SCOPE_ATTEST_EVERY:
-            from hestia_gate_mechanism import emit_attestation
-            emit_attestation(
-                t["allows"], t["denies"],
-                plugin_id=HESTIA_PLUGIN_ID, role_lct=_role_bridge())
-            t = {"allows": 0, "denies": 0}
-        json.dump(t, open(_TALLY, "w"))
+        __import__('hestia_gate_mechanism').tally_scope(
+            allowed, tally_dir=_TALLY_DIR, tally_path=_TALLY,
+            attest_every=SCOPE_ATTEST_EVERY,
+            plugin_id=HESTIA_PLUGIN_ID, role_lct=_role_bridge())
     except Exception:
-        pass  # accounting must never change a decision
+        pass
 
 
 
@@ -488,151 +469,38 @@ def _fallback_touches_self(tool_input):  # Tier-2 fallback; live path is classif
 
 
 def _gate_self_call(tool, args, host_session_id=None):
-    """One short daemon round trip for a gate-self event: initialize, connect (session-bound),
-    one tools/call. Returns the unwrapped result dict, or None on ANY failure.
-
-    Never raises and stays inside a ~2.5s budget: the harness kills this hook at 5s, and a killed
-    hook yields neither exit 2 nor a JSON deny — the engine reads it as a non-blocking error and
-    runs the tool anyway. A gate-self exchange that hangs therefore fails OPEN, which is strictly
-    worse than a refusal. Callers treat None as refusal (writes) or best-effort loss (witnesses).
-
-    `host_session_id`, when the caller has one, is threaded into the connect so the gate-self
-    session this call mints joins to the per-wake session the outcome rows carry (same join the
-    main daemon path makes at the Gate 2 call below).
-    """
-    import urllib.request
-    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
-
-    def post(payload, hdrs, timeout):
-        req = urllib.request.Request(
-            endpoint, data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json",
-                     "Accept": "application/json, text/event-stream", **hdrs})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read(), r.headers.get("mcp-session-id")
-
-    def unwrap(raw):
-        """The result payload of a tools/call: structuredContent, or the content[0] text JSON —
-        and the body may be plain JSON or SSE-framed (`data: {...}` lines)."""
-        for line in raw.decode("utf-8", "replace").splitlines():
-            line = line.strip()
-            if not (line.startswith("{") or line.startswith("data: {")):
-                continue
-            try:
-                pl = json.loads(line[line.index("{"):])
-            except Exception:
-                continue
-            res = pl.get("result")
-            if not isinstance(res, dict):
-                continue
-            sc = res.get("structuredContent")
-            if isinstance(sc, dict):
-                return sc
-            content = res.get("content") or []
-            if content and isinstance(content[0], dict):
-                try:
-                    d = json.loads(content[0].get("text") or "{}")
-                    return d if isinstance(d, dict) else None
-                except Exception:
-                    return None
-        return None
-
+    """Seat wrapper for the engine's gate_self_call. None on ANY failure, including a
+    failure to reach the engine itself: this seat fails open on a crashing hook, so an
+    exception here would be strictly worse than a refused gate-self exchange."""
     try:
-        _, sid_hdr = post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                           "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                                      "clientInfo": {"name": "hestia-kimi-gate-self",
-                                                     "version": "1"}}}, {}, 0.8)
-        h = {"mcp-session-id": sid_hdr} if sid_hdr else {}
-        post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, h, 0.4)
-        connect_args = {"plugin_id": HESTIA_PLUGIN_ID,
-                        "host_agent": HESTIA_PLUGIN_ID,
-                        "role": _role_bridge(),
-                        "instance_name": "gate-self"}
-        if host_session_id:
-            connect_args["host_session_id"] = host_session_id
-        raw, _ = post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                       "params": {"name": "hestia_connect",
-                                  "arguments": connect_args}}, h, 0.8)
-        conn = unwrap(raw)
-        sess = conn.get("sessionId") if conn else None
-        if not sess:
-            return None  # an unconnected witness/claim is refused by the daemon anyway
-        args = dict(args)
-        args.setdefault("session_id", sess)
-        raw, _ = post({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                       "params": {"name": tool, "arguments": args}}, h, 0.9)
-        return unwrap(raw)
+        return __import__('hestia_gate_mechanism').gate_self_call(
+            tool, args, plugin_id=HESTIA_PLUGIN_ID, role=_role_bridge(),
+            client_name='hestia-kimi-gate-self', host_session_id=host_session_id)
     except Exception:
         return None
 
 
 def _witness_gate_self(event_type, marker, tool_name, rule=None):
-    """Record a governance-surface event as its OWN class — `gate_self_read` for a permitted
-    read, `gate_self_access` (appealable) for a refused write. The two stay distinct so an alert
-    on the refusal keeps its meaning. Best effort: a failed record never changes the decision —
-    the daemon's health is not a precondition for reading one's own law, and the deny already
-    happened locally."""
-    return _gate_self_call("hestia_request_witness", {
-        "event_type": event_type,
-        "event_data": {"plugin_id": HESTIA_PLUGIN_ID,
-                       "tool_name": tool_name,
-                       "marker": marker,
-                       "rule": rule,
-                       "gate_path": os.path.abspath(__file__),
-                       "severity": "record" if event_type == "gate_self_read" else "escalate",
-                       "role_lct": _role_bridge()}},
-        host_session_id=_EVENT.get("session_id")) is not None
+    """Seat wrapper; a failed record never changes the decision."""
+    try:
+        return __import__('hestia_gate_mechanism').witness_gate_self(
+            event_type, marker, tool_name, rule,
+            plugin_id=HESTIA_PLUGIN_ID, role=_role_bridge(),
+            gate_path=os.path.abspath(__file__), client_name='hestia-kimi-gate-self',
+            host_session_id=_EVENT.get("session_id"))
+    except Exception:
+        return False
 
 
 def _claim_self_write(marker, tool_name, attempted):
-    """Ask ONCE whether a human has already approved this exact (member, marker) write.
-    Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
-
-    Mirrored from the claude gate's request_self_write: never waits. The first attempt is refused
-    and the refusal opens an escalation; a human decides out of band; the member RE-ISSUES the
-    write and the second attempt claims the approval. Every failure — unreachable, malformed, a
-    daemon with no escalation channel — is a refusal: a daemon that cannot answer must not be a
-    way to get a governance write through."""
-    claim_args = {
-        "plugin_id": HESTIA_PLUGIN_ID,
-        "role": _role_bridge(),
-        "tool_name": tool_name,
-        "marker": marker,
-        # `reason` carries the ATTEMPTED ACT, not a rationale: an auto-opened escalation HAS no
-        # stated why — the member did not choose to escalate; the gate opened it on a refused
-        # write. Presenting the act as though it were a rationale would look like the member had
-        # explained itself. A member that wants to state a why opens the escalation itself.
-        "reason": attempted or f"{tool_name} -> {marker}",
-        "detail": ("Auto-opened by the gate on a refused write; the member stated no rationale "
-                   "because it did not choose to escalate. Approving authorises this one write."),
-    }
-    # The claimed-row join key (reply-2005/reply-2006, 2026-08-12): of the three session-id
-    # namespaces in a claim window, only the per-wake host session appears on the outcome rows
-    # an auditor joins from — the gate-self connect session above joins only to gate witnesses.
-    # Sent only when in hand: the daemon writes explicit null, and a fabricated placeholder
-    # would be a lie in the exact record used to argue about who authorised what.
-    host_session_id = _EVENT.get("session_id")
-    if host_session_id:
-        claim_args["host_session_id"] = host_session_id
-    r = _gate_self_call("hestia_gate_escalation_claim", claim_args,
-                        host_session_id=host_session_id)
-    if not isinstance(r, dict):
+    """Seat wrapper; every failure is a refusal, spelled the way the local copy spelled it."""
+    try:
+        return __import__('hestia_gate_mechanism').claim_self_write(
+            marker, tool_name, attempted,
+            plugin_id=HESTIA_PLUGIN_ID, role=_role_bridge(),
+            client_name='hestia-kimi-gate-self', host_session_id=_EVENT.get("session_id"))
+    except Exception:
         return "unreachable", "no answer from the daemon — refused", None, None
-    # BOTH flags, and the daemon owns both — two places deciding what "approved" means is how
-    # they come to disagree, so the hook re-derives nothing.
-    if r.get("claimed") is True and r.get("permits_write") is True:
-        who = r.get("decided_by") or "a human"
-        via = r.get("decided_via") or "unknown-channel"
-        return ("approved",
-                f"claimed an approval from {who} via {via} (single use, now spent)", None, None)
-    esc_id = r.get("escalation_id")
-    if not esc_id:
-        # An old daemon answers {} to a tool it does not know — which must not permit a write by
-        # failing to understand the question, but also cannot open an escalation. Say which.
-        why = r.get("error") or "this daemon has no escalation channel (is it upgraded?)"
-        return "no-channel", f"refused, and NO escalation was opened — {why}", None, None
-    return ("escalated", "refused; escalation opened for out-of-band decision",
-            esc_id, r.get("how_to_decide") or f"hestia gate approve {esc_id}")
 
 
 def _fail_closed_internal_error(event, exc):

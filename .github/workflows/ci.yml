@@ -375,10 +375,16 @@ jobs:
           # measured value on that head and no other seat's pin touched, which is
           # the point of pinning per seat: the same change under the fleet gauge
           # read as "the fleet regressed 0.1".
+          #
+          # Slice 3 (#796) moved the five codex/kimi gate-self bodies into the
+          # shared mechanism. Codex and kimi lose the duplicated bodies; the
+          # shared-law denominator grows for every seat, so all four measured
+          # percentages fall. Pin the exact post-move values in the same PR: a
+          # lower number left only in the PR prose is not a ratchet.
           python3 tools/gate_collapse_meter.py \
             --max-divergent-forked 4 --max-verbatim-forked 0 \
-            --max-seat-pct claude-code=30.1 --max-seat-pct codex=25.0 \
-            --max-seat-pct gemini=9.4 --max-seat-pct kimi=21.3
+            --max-seat-pct claude-code=28.7 --max-seat-pct codex=20.7 \
+            --max-seat-pct gemini=8.8 --max-seat-pct kimi=17.1
 
       - name: Do the forked predicates actually disagree with the engine?
         run: |
