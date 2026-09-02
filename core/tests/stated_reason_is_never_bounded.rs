@@ -109,6 +109,7 @@ fn the_store_keeps_an_overlong_credential_shaped_reason_verbatim() {
             "role:constellation:member",
             "Bash",
             "stated_reason_bound_probe",
+            None,
             // #539: the act is its own field. This suite probes whether `stated_reason` is
             // BOUNDED, so the act is a short constant and the reason carries the payload —
             // exactly the separation the two fields now have.

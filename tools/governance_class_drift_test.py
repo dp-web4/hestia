@@ -505,11 +505,18 @@ def audit(matcher_text=None, bar_text=None, declared=DECLARED):
                 "handed to it.")
 
     # --- F. the marker tuple's directory elements.
-    # The escalation carries the MATCHED MARKER, not the act's path, and a marker
-    # that names no file cannot match a bar testing for filenames -- so every
-    # directory element in that tuple routes to the single-approver branch by
-    # construction, however precisely the bar is written. Pinned so a new one is a
-    # reviewed diff rather than a widening nobody sees.
+    # The escalation carries the MATCHED MARKER, not the act's path. Until #810 the
+    # bar was priced from that marker, and a marker naming no file could not match a
+    # bar testing for filenames -- every directory element routed to the
+    # single-approver branch by construction, however precisely the bar was written.
+    # #810 ended that: the escalation now carries the act's RESOLVED TARGET alongside
+    # the marker and the bar prices from the target when present (`bar_basis`,
+    # gate_escalation.rs), so the directory element no longer decides the price on
+    # its own. What is still true, and still pinned here so a new one is a reviewed
+    # diff rather than a widening nobody sees: the directory marker is what the
+    # record shows as the REASON, it is the claim join key, and it is what prices
+    # the bar for any opener that carries no target (every pre-#810 row, and any
+    # hook too old to send one).
     #
     # PIN MOVED 2 -> 4 (PR #275, reviewed in shared-context forum "Two reds in a
     # queue of ten", 2026-08-07): the two installer markers
@@ -538,14 +545,16 @@ def audit(matcher_text=None, bar_text=None, declared=DECLARED):
         out.append("")
         out.append(f"marker tuple: {len(lits) + computed} elements "
                    f"({computed} computed from __file__, {len(lits)} literal); "
-                   f"{len(dir_lits)} literal element(s) name no governed file and "
-                   f"therefore price at one approver whatever the bar says")
+                   f"{len(dir_lits)} literal element(s) name no governed file -- "
+                   f"since #810 the act's resolved target, not these, prices the bar "
+                   f"when the opener carries one")
         if len(dir_lits) != 4 or computed != 2:
             bad(f"the marker tuple's shape moved (expected 2 computed + 4 literal "
                 f"directory elements, measured {computed} computed + "
-                f"{len(dir_lits)} literal). Every directory element is an act that "
-                f"cannot reach the two-factor bar; adding one widens the weak set "
-                f"and nothing else in the repo would say so.")
+                f"{len(dir_lits)} literal). Every directory element is an act whose "
+                f"marker carries no filename; adding one widens the set that NEEDS "
+                f"the resolved-target pricing (#810) and nothing else in the repo "
+                f"would say so.")
 
     if awaiting:
         out.append("")

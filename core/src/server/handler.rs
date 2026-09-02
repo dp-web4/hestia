@@ -323,7 +323,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_gate_escalation_open",
-            "Ask a HUMAN to approve a write to the governance surface (gate, witness, law_inject, the registration). Stage 2 of dp's 2026-07-29 ruling: the gate refuses these writes, and this is the channel that un-refuses a legitimate one. Returns an escalation_id and a deadline; NO DECISION WITHIN THE WINDOW IS A DENY, not a retry. Witnessed on open. Assurance A1: the operator shares this UID, so approval is tamper-EVIDENT, not tamper-proof. PASS answers_deny = the chain hash of the deny you are escalating (hestia_witness_decision returns it as witnessEntryHash): without it the escalation is witnessed but UNLINKED, and unlinked escalations cannot be credited as conduct — escalating instead of routing around is the top of the Temperament scale (1.0 on approval), and the link is what makes it readable. It is never inferred from timing. PASS act = the exact write you intend to perform, e.g. 'Edit -> plugins/<seat>/hooks/<file>'. REQUIRED: the approval is bound to this string (#539), and you must re-issue the SAME string to claim it. `reason` is your rationale and is NOT the act — an approval bound to a rationale can never be claimed, so an open without `act` is refused rather than granted-and-unspendable",
+            "Ask a HUMAN to approve a write to the governance surface (gate, witness, law_inject, the registration). Stage 2 of dp's 2026-07-29 ruling: the gate refuses these writes, and this is the channel that un-refuses a legitimate one. Returns an escalation_id and a deadline; NO DECISION WITHIN THE WINDOW IS A DENY, not a retry. Witnessed on open. Assurance A1: the operator shares this UID, so approval is tamper-EVIDENT, not tamper-proof. PASS answers_deny = the chain hash of the deny you are escalating (hestia_witness_decision returns it as witnessEntryHash): without it the escalation is witnessed but UNLINKED, and unlinked escalations cannot be credited as conduct — escalating instead of routing around is the top of the Temperament scale (1.0 on approval), and the link is what makes it readable. It is never inferred from timing. PASS act = the exact write you intend to perform, e.g. 'Edit -> plugins/<seat>/hooks/<file>'. REQUIRED: the approval is bound to this string (#539), and you must re-issue the SAME string to claim it. `reason` is your rationale and is NOT the act — an approval bound to a rationale can never be claimed, so an open without `act` is refused rather than granted-and-unspendable. PASS resolved_target = the exact path your write would reach, when you know it: the bar is priced from it when present, and a marker that names only a DIRECTORY can never reach the two-factor bar while the target can (#810)",
         ),
         t(
             "hestia_gate_pending_escalations",
@@ -371,7 +371,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_gate_escalation_claim",
-            "Claim a human's approval for a write to the governance surface, or open an escalation and REFUSE. One round trip, because a hook that outlives its harness timeout is killed and the tool then runs ANYWAY — so nothing waits in-hook. Either an approval already exists for this exact (member, file) and is spent here (single use), or the write is refused now and a human decides out of band; re-issue the write to use the approval",
+            "Claim a human's approval for a write to the governance surface, or open an escalation and REFUSE. One round trip, because a hook that outlives its harness timeout is killed and the tool then runs ANYWAY — so nothing waits in-hook. Either an approval already exists for this exact (member, file) and is spent here (single use), or the write is refused now and a human decides out of band; re-issue the write to use the approval. Pass resolved_target = the concrete path the write would reach when the gate's classifier holds it: the bar is priced from it when present, and a marker naming only a directory cannot reach the two-factor bar while the target can (#810)",
         ),
         t(
             "hestia_gate_escalation_poll",
@@ -10833,6 +10833,89 @@ mod tests {
         );
     }
 
+    /// #810 ON THE DOOR THE HOOK ACTUALLY CALLS: a governance write whose marker names
+    /// only a DIRECTORY must still reach the two-factor bar, because the hook now sends
+    /// the act's resolved target and the bar is priced from it. Asserts on the CHAIN
+    /// ENTRY, not the response — the chain is what replay reads and what a census counts.
+    ///
+    /// The pre-repair behaviour this inverts was measured, not hypothetical: 166
+    /// strong-named hook writes priced `single_approver` in 27 days
+    /// (findings/marker-bar-probe-dead-27-days-after-206-20260902.md), because the
+    /// classifier held the target and the claim call never sent it.
+    #[tokio::test]
+    async fn the_claim_door_prices_the_bar_from_the_resolved_target() {
+        let (_dir, shared) = make_shared_state();
+        tool_connect(&shared, &json!({ "plugin_id": "kimi-code", "host_agent": "h" }))
+            .await
+            .unwrap();
+
+        // The shape the closure emits for an in-tree hook write: a DIRECTORY marker,
+        // with the concrete path as the resource.
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "tool_name": "Edit",
+                "marker": "plugins/*/hooks",
+                "resolved_target": "/wt/plugins/kimi/hooks/pre_tool_use.py",
+                "reason": "Edit -> plugins/kimi/hooks/pre_tool_use.py",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed["claimed"], false, "nothing to claim — this opens: {claimed}");
+        assert_eq!(
+            claimed["bar"], "sovereign_plus_peer",
+            "the directory marker must not hide the filename the target carries: {claimed}"
+        );
+
+        let s = shared.lock().await;
+        let opened = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened")
+            .expect("the refusal must be witnessed");
+        let d = &opened.event_data;
+        assert_eq!(
+            d["resolved_target"], "/wt/plugins/kimi/hooks/pre_tool_use.py",
+            "the chain entry carries the act's resolved target alongside the marker: {d}"
+        );
+        assert_eq!(d["marker"], "plugins/*/hooks", "the marker stays, for provenance: {d}");
+        assert_eq!(d["bar"], "sovereign_plus_peer", "and the bar was priced from the target: {d}");
+
+        // VERSION SKEW HOLDS: an old hook sends no resolved_target and the same marker
+        // prices exactly as it did before this change.
+        drop(s);
+        let legacy = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "tool_name": "Edit",
+                "marker": "plugins/claude-code/hooks",
+                "reason": "Edit -> plugins/claude-code/hooks/witness.py",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(legacy["claimed"], false, "{legacy}");
+        assert_eq!(
+            legacy["bar"], "single_approver",
+            "no target recorded -> the marker decides, unchanged from before #810: {legacy}"
+        );
+        let s = shared.lock().await;
+        let opened = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened"
+                && e.event_data["marker"] == "plugins/claude-code/hooks")
+            .expect("the second refusal is witnessed too");
+        assert!(
+            opened.event_data["resolved_target"].is_null(),
+            "explicit null, not a missing key a census cannot read: {}",
+            opened.event_data
+        );
+    }
+
     /// THE MEASURED HARM, as a regression: probe residue evicting a live peer from the cap.
     ///
     /// `plugin_id` is caller-supplied at connect, so `member_registry` holds every probe that
@@ -15620,6 +15703,13 @@ fn opened_payload(
         "role": esc.role,
         "tool_name": esc.tool_name,
         "marker": esc.marker,
+        // THE ACT'S RESOLVED TARGET (#810), alongside the marker — the marker is which
+        // rule fired, this is what the write would reach, and the bar above was priced
+        // from it when present. Explicit null when the opener carried none (every entry
+        // before this field, and any hook too old to send it): a missing key and an
+        // absent value must not be the same row to a census. Replay restores it
+        // (`rehydrate`), so a restart cannot silently reprice the row.
+        "resolved_target": esc.resolved_target,
         // The asker's own account of WHY, when it had one. The open door never emitted these
         // and the claim door always did; both do now. An auto-opened escalation carries the
         // ATTEMPTED ACT here, not a rationale, because the member did not choose to escalate.
@@ -15812,6 +15902,16 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // struct field's doc). A member-initiated open through a plain session usually
     // supplies nothing, and null is the explicit record of that.
     let gate_path = optional_string(args, "gate_path");
+    // THE ACT'S RESOLVED TARGET (#810). The marker is which rule fired; this is what the
+    // write would REACH. The gate's classifier holds it at decision time (the closure
+    // verdict's `resource`, the triple's second element) and until this field it was
+    // dropped at the door — and the bar was priced from the marker alone, which for a
+    // directory marker carries no filename at all, so the two-factor bar was unreachable
+    // for exactly the in-tree paths it exists for. Optional: old hooks send nothing, and
+    // absent prices from the marker, exactly as before. Caller-asserted, like `marker` —
+    // and safe to take on those terms, because a fabricated target can only RAISE the
+    // bar on the asker's own escalation, never lower it.
+    let resolved_target = optional_string(args, "resolved_target");
     let now = now_secs();
 
     let mut s = state.lock().await;
@@ -15837,6 +15937,8 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     let esc = match s
         .gate_escalations
         .open(&plugin_id, &role, &tool_name, &marker,
+              // The act's resolved target (#810) — prices the bar when present.
+              resolved_target.as_deref(),
               // The act, from its own field. No fallback to `reason` on this door.
               act.as_deref(),
               stated_reason.as_deref(), stated_detail.as_deref(), now, DEFAULT_TTL_SECS)
@@ -16406,6 +16508,13 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // as exactly that (the struct field's doc carries the caveat). The hook passes
     // its own realpath; an old hook passes nothing, and null is the explicit record.
     let gate_path = optional_string(args, "gate_path");
+    // THE ACT'S RESOLVED TARGET (#810) — the same field the open door takes, on the
+    // door the gate hook actually calls. This is the door where the defect lived: the
+    // hook's classifier holds the concrete target (the closure verdict's `resource`)
+    // at refusal time and the claim call never sent it, so the auto-opened escalation
+    // priced its bar from a marker that — for a directory marker — names no file.
+    // Optional; absent prices from the marker, exactly as before.
+    let resolved_target = optional_string(args, "resolved_target");
     // WHO is asking, provable. Accepted here for the same reason `tool_gate_escalation_open`
     // accepts it (#128: `eligibility` otherwise compares an ASSERTION against an IDENTITY),
     // and because the invitation half cannot issue without it — an invitation is an outward
@@ -16588,6 +16697,8 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     match s
         .gate_escalations
         .open(&plugin_id, &role, &tool_name, &marker,
+              // The act's resolved target (#810) — prices the bar when present.
+              resolved_target.as_deref(),
               // The gate hook composes `reason` AS the act, and has always done so, so it is
               // the act here. `act` still wins if a caller sends both.
               attempted_act.as_deref(),
@@ -18026,6 +18137,7 @@ mod disposition_durability_tests {
                 "",
                 "policy_edit",
                 "policy.json",
+                None,
                 // #539: the act is its own field. This synthetic opener names the act it is
                 // about to perform; `stated_reason` stays the rationale.
                 Some("policy_edit -> policy.json"),
@@ -18746,7 +18858,7 @@ mod disposition_durability_tests {
             let opened_at = real_now - 3 * 3600;
             let esc = s
                 .gate_escalations
-                .open("kimi-code", "", "policy_edit", "policy.json", Some("Edit -> act"), None, None, opened_at, 3600)
+                .open("kimi-code", "", "policy_edit", "policy.json", None, Some("Edit -> act"), None, None, opened_at, 3600)
                 .unwrap();
             let id = esc.id.clone();
             s.gate_escalations

@@ -44,7 +44,7 @@ fn opened_and_approved(decided_at: u64) -> (EscalationStore, String) {
     let mut s = EscalationStore::default();
     let e = s
         .open(SEAT, "role:constellation:member", "Edit", "law_inject.py",
-              Some(ACT), None, None, T0, DEFAULT_TTL_SECS)
+              None, Some(ACT), None, None, T0, DEFAULT_TTL_SECS)
         .expect("open");
     let id = e.id.clone();
     s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::LocalCli,
@@ -149,7 +149,7 @@ fn polling_a_pending_petition_does_not_start_the_fuse() {
     let mut s = EscalationStore::default();
     let e = s
         .open(SEAT, "role:constellation:member", "Edit", "law_inject.py",
-              Some(ACT), None, None, T0, DEFAULT_TTL_SECS)
+              None, Some(ACT), None, None, T0, DEFAULT_TTL_SECS)
         .expect("open");
     let id = e.id.clone();
 
@@ -189,7 +189,7 @@ fn observing_a_denial_records_nothing() {
     let mut s = EscalationStore::default();
     let e = s
         .open(SEAT, "role:constellation:member", "Edit", "law_inject.py",
-              Some(ACT), None, None, T0, DEFAULT_TTL_SECS)
+              None, Some(ACT), None, None, T0, DEFAULT_TTL_SECS)
         .expect("open");
     let id = e.id.clone();
     s.decide(&id, false, "dp", "role:constellation:sovereign", Channel::LocalCli,
@@ -201,7 +201,7 @@ fn observing_a_denial_records_nothing() {
     // about the verdict and not about a store that refuses every observation.
     let mut ok = EscalationStore::default();
     let g = ok.open(SEAT, "role:constellation:member", "Edit", "law_inject.py",
-                    Some(ACT), None, None, T0, DEFAULT_TTL_SECS).expect("open");
+                    None, Some(ACT), None, None, T0, DEFAULT_TTL_SECS).expect("open");
     ok.decide(&g.id, true, "dp", "role:constellation:sovereign", Channel::LocalCli,
               None, Some("ok"), T0 + 10).expect("decide");
     assert!(ok.mark_observed(&g.id, SEAT, T0 + 20), "positive control: an approval records");
