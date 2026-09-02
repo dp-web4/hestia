@@ -436,14 +436,50 @@ migrate_flat_primers
 # or echo > 0 all fall back to the conservative 6h band unchanged.
 SPENT_MAX_AGE_SECS="${SPENT_MAX_AGE_SECS:-518400}"   # 6d — deliberately INSIDE the daemon's 7d inbox TTL
 SPENT_MIN_AGE_SECS="${SPENT_MIN_AGE_SECS:-21600}"    # 6h — MEMBER_UNANSWERED_DEFAULT_SECS, the fallback when the fold will not say
+INBOX_TTL_SECS="${INBOX_TTL_SECS:-604800}"           # 7d — core/src/storage/inbox.rs INBOX_TTL_SECS: past this the daemon has DELETED the row
+
+# TWO MORE VERDICTS THE AGE BAND ALONE GETS WRONG (2026-09-02, notice 4408).
+#
+# The band above was written for notices the fold can COUNT. `hestia_member_unanswered`
+# echoes which kinds those are (`kinds_counted`, the daemon's MEMBER_KINDS_AWAIT_RESPONSE
+# — `review_request` and `reply` today), and it counts nothing else: a `disposition`, an
+# `ack`, a `review_done`, a `coordination` or a `handoff` can NEVER appear in `i_owe`, at
+# any age. For those kinds absence from the fold is structural — not "answered", not
+# "pruned" — so the band has nothing to say and must not be consulted. It was: the
+# ">6d -> unmeasured -> fire" rule ran first and never asked the kind. Measured on CBP:
+# notice 4408, the daemon's own `disposition` for `27a25b66e7fe22d0` (a grant CLAIMED
+# 41s after approval on 08-24, cited in handler.rs as the payload that motivated #611),
+# re-fired this seat 8.4 DAYS later as attempt 2 of 3; the wake it woke found nothing
+# to do. 16 of the 84 primers retained on this seat that morning held ONLY such kinds,
+# 13 of them past the ceiling, 32 fires queued for mail no surface counts as owed. The
+# kind list is read from the fold's echo, never named here (#201's rule: the daemon's
+# constant stays the single definition); an older daemon that does not echo it gets
+# the previous verdict unchanged.
+#
+# And the ceiling itself inverts past the daemon's TTL. `SPENT_MAX_AGE_SECS` fires
+# anything older than 6d because "absence means pruned, not answered" — true, and the
+# conclusion drawn from it was backwards. Past INBOX_TTL_SECS the daemon has DELETED
+# the row: it can never re-enter `i_owe`, a binding to its id is accepted but
+# unverified (KINDS.md), and the escalation a `review_request` points at was reaped
+# from the live store within hours of settling. There is no work a fire can recover,
+# because the ledger has already written the obligation off. Retention exists to
+# recover OWED work; a primer whose every notice is either never-owed or pruned is
+# retired as `.expired` — a distinct suffix, so the record says which door closed it.
+# Between the ceiling and the TTL (6d..7d) the old verdict stands: unmeasured, fire.
+# Measured the same morning across three seats: 205 retained primers older than 6d,
+# 242 fires still budgeted for them, 207 of those for notices already past the TTL.
 
 # $1 = primer path, $2 = the `unanswered` fold, fetched ONCE PER PRIMER (not once per
-# pass -- see retry_stale_primers). Exit 0 ONLY when every notice in the primer is inside
-# the measurable window and absent from `i_owe`.
+# pass -- see retry_stale_primers). Exit 0 ONLY when every notice in the primer is either
+# of a kind the fold never counts, or inside the measurable window and absent from
+# `i_owe`. Exit 2 when the same holds except that at least one COUNTED notice is past
+# the daemon's inbox TTL (its row is pruned; nothing can owe it again). Exit 1 otherwise:
+# unmeasured, fire.
 primer_spent() {
-  python3 - "$1" "$SPENT_MAX_AGE_SECS" "$2" "$SPENT_MIN_AGE_SECS" <<'PY'
+  python3 - "$1" "$SPENT_MAX_AGE_SECS" "$2" "$SPENT_MIN_AGE_SECS" "$INBOX_TTL_SECS" <<'PY'
 import datetime, json, sys
 primer, max_age, fold_raw, min_age = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+inbox_ttl = int(sys.argv[5])
 try:
     fold = json.loads(fold_raw)
     notices = json.load(open(primer)).get("notices") or []
@@ -461,18 +497,32 @@ applied = fold.get("older_than_secs")
 if isinstance(applied, int) and not isinstance(applied, bool) and 0 <= applied < min_age:
     min_age = applied                       # the fold covers this band; trust it that far
 owed = {n.get("id") for n in fold["i_owe"] if isinstance(n, dict)}
+# The kinds the fold counts, in the fold's own words. None when the daemon predates the
+# echo, and then every kind is judged by age as before.
+counted = fold.get("kinds_counted")
+counted = {k for k in counted if isinstance(k, str)} if isinstance(counted, list) else None
 now = datetime.datetime.now(datetime.timezone.utc)
+expired = False
 for n in notices:
     if n.get("id") is None or n.get("id") in owed:
-        raise SystemExit(1)
+        raise SystemExit(1)                 # owed (or unidentifiable) -> fire, whatever its age
+    if counted is not None:
+        kind = n.get("kind")
+        if not isinstance(kind, str):
+            raise SystemExit(1)             # a notice with no kind is not judgeable
+        if kind not in counted:
+            continue                        # never owed at any age: absence is structural
     try:
         q = datetime.datetime.fromisoformat(str(n.get("queued_at", "")).replace("Z", "+00:00"))
     except ValueError:
         raise SystemExit(1)
     age = (now - q).total_seconds()
+    if age > inbox_ttl:
+        expired = True                      # the daemon deleted the row; no fire recovers it
+        continue
     if age > max_age or age < min_age:
         raise SystemExit(1)
-raise SystemExit(0)
+raise SystemExit(2 if expired else 0)
 PY
 }
 
@@ -497,9 +547,14 @@ retry_stale_primers() {
     fold="$(unanswered_now 2>/dev/null || true)"
     # Before the attempt budget, not after: a discharged list should retire on the
     # first pass that can prove it, whatever the counter says.
-    if primer_spent "$stale" "$fold"; then
+    spent=0; primer_spent "$stale" "$fold" || spent=$?
+    if [ "$spent" -eq 0 ]; then
       echo "[hestia-watch] STALE PRIMER ALREADY DISCHARGED (the daemon owes nothing for any notice in it) — retired without a fire: $stale.discharged"
       mv -f "$stale" "$stale.discharged" 2>/dev/null && rm -f "$attempts_file"
+      continue
+    elif [ "$spent" -eq 2 ]; then
+      echo "[hestia-watch] STALE PRIMER PAST THE INBOX TTL (every notice in it is never-owed or older than ${INBOX_TTL_SECS}s — the daemon has pruned the row, nothing in it can be owed again) — retired without a fire: $stale.expired"
+      mv -f "$stale" "$stale.expired" 2>/dev/null && rm -f "$attempts_file"
       continue
     fi
     attempts="$(cat "$attempts_file" 2>/dev/null || echo 0)"
