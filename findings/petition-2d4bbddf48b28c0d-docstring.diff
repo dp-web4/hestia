@@ -1,0 +1,41 @@
+--- a/plugins/_shared/test_gate_core.py
++++ b/plugins/_shared/test_gate_core.py
+@@ -566,22 +566,28 @@
+ 
+ 
+ def test_the_core_is_not_the_only_copy_of_the_scope_rule():
+-    """How far does a fix to this file actually reach? Today: one enforcing copy in five.
++    """How far does a fix to this file actually reach? After slice 4: one enforcing copy
++    remains outside the core, kimi's, and `KNOWN_DUPLICATE_OWNERS` below is the live count.
++    (As frozen 2026-08-05 it was one enforcing copy in five; the paragraphs that follow keep
++    that history because the guard's blind spot has not changed, only its population.)
+ 
+     `test_shims_contain_no_policy` above is the guard meant to hold the line that policy lives
+     only here. It globs `shim_*.py` inside `_shared/`, and there are none — so it prints
+-    "0 shims present — NOTHING CHECKED" and returns green. Its blind fraction is TOTAL: the
+-    four un-consolidated copies are real per-harness hook files, which that glob cannot match.
++    "0 shims present — NOTHING CHECKED" and returns green. Its blind fraction is TOTAL: an
++    un-consolidated copy is a real per-harness hook file, which that glob cannot match.
+     A guard whose population is empty reports "clean" and "I inspected nothing" in one word.
+ 
+-    Those copies are DRIFTED, not merely duplicated — they carry defects this file already
+-    fixed. The kimi and gemini hooks still gate temp on `startswith(("/tmp", "/var/tmp"))`,
+-    the prefix-not-boundary bug codex found in #169 and `_under_temp_root` fixed here, so
+-    `/tmp-other/x` is granted unconditionally there. The gemini copy does not normalise at
+-    all, and falls back to reading a first segment off paths OUTSIDE the workspace.
++    The copies were DRIFTED, not merely duplicated — they carried defects this file had
++    already fixed. As of 2026-08-05 the kimi and gemini hooks still gated temp on
++    `startswith(("/tmp", "/var/tmp"))`, the prefix-not-boundary bug codex found in #169 and
++    `_under_temp_root` fixed here, so `/tmp-other/x` was granted unconditionally there; the
++    gemini copy did not normalise at all and fell back to reading a first segment off paths
++    OUTSIDE the workspace. Slice 4 deleted the gemini copy (its scope predicates now delegate
++    into the core, fail-closed); codex's went in Sprints F and G. Only kimi's thin adapter pair
++    is still counted, and the temp-prefix defect lives there until it, too, delegates.
+ 
+-    This test does not assert the copies are correct — they are not, and rewriting four
+-    harnesses' gates is not one member's call. It asserts the INVENTORY, so the divergence is
++    This test does not assert the remaining copy is correct — rewriting another harness's gate
++    is not one member's call. It asserts the INVENTORY, so the divergence is
+     a number in CI rather than something the next sweep rediscovers. It fails in both
+     directions on purpose: a new entry means the policy was forked again; a missing one means
+     consolidation advanced and this list owes an update.

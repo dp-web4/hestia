@@ -94,21 +94,42 @@ def collect(ids: Optional[set], max_entries: int = 20000) -> Dict[str, Dict[str,
         if not eid or (ids is not None and eid[:8] not in ids and eid not in ids):
             continue
         row = rows.setdefault(eid, {"id": eid})
-        at = _epoch(entry.get("timestamp") or "")
-        if etype.endswith("_opened"):
-            row["opened_at"] = at
-            row["expires_at"] = data.get("expires_at")
-            row["ttl_secs"] = data.get("ttl_secs")
-            row["bar"] = data.get("bar")
-            row["marker"] = data.get("marker")
-            row["plugin_id"] = data.get("plugin_id")
-        elif etype.endswith("_decided"):
-            row["decided_at"] = at
-            row["status"] = data.get("status") or data.get("decision")
-            row["bar_met"] = data.get("bar_met")
-        elif etype.endswith("_claimed"):
-            row["consumed_at"] = at
+        fold_event(row, etype, data, _epoch(entry.get("timestamp") or ""))
     return rows
+
+
+def fold_event(row: Dict[str, Any], etype: str, data: Dict[str, Any], at: Optional[int]) -> None:
+    """Fold ONE chain event into its escalation's row. Factored out so the fold is testable
+    without a daemon.
+
+    `_withdrawn` and `_expired` are terminal too. Until 2026-09-02 only `_decided` set
+    `status`, so a self-withdrawn row (534ea5a4bff742aa, chain event
+    `gate_escalation_withdrawn`, `decided_via: self_withdrawn`) read here as
+    `status=undecided` — the right verdict (NO) for the wrong reason, and a wrong reason
+    that invites a reader to think the petition still awaits a ruling. A withdrawn petition
+    also REVIVES on daemon restart (#710), so "undecided" and "withdrawn" are not
+    interchangeable to anyone deciding whether to re-issue.
+    """
+    if etype.endswith("_opened"):
+        row["opened_at"] = at
+        row["expires_at"] = data.get("expires_at")
+        row["ttl_secs"] = data.get("ttl_secs")
+        row["bar"] = data.get("bar")
+        row["marker"] = data.get("marker")
+        row["plugin_id"] = data.get("plugin_id")
+    elif etype.endswith("_decided"):
+        row["decided_at"] = at
+        row["status"] = data.get("status") or data.get("decision")
+        row["bar_met"] = data.get("bar_met")
+    elif etype.endswith("_withdrawn"):
+        row["decided_at"] = at
+        row["status"] = "withdrawn"
+        row["bar_met"] = data.get("bar_met")
+        row["decided_via"] = data.get("decided_via")
+    elif etype.endswith("_expired"):
+        row["status"] = "expired"
+    elif etype.endswith("_claimed"):
+        row["consumed_at"] = at
 
 
 def horizon(row: Dict[str, Any]) -> Optional[int]:

@@ -107,6 +107,32 @@ def test_bar_not_met_is_still_reported():
     check("bar conjunct named", "bar not met" in v, v)
 
 
+def test_a_withdrawn_event_names_its_status_not_undecided():
+    """534ea5a4bff742aa (2026-09-02): the chain carries `gate_escalation_withdrawn`, no
+    `_decided`. Before the fold learned the event, this row read `status=undecided`."""
+    row = _opened()
+    cl.fold_event(row, "gate_escalation_withdrawn",
+                  {"decided_via": "self_withdrawn", "bar_met": False}, T0 + 16)
+    check("status folded", row.get("status") == "withdrawn", f"row={row}")
+    v = cl.verdict(row, T0 + 30)
+    check("verdict names withdrawn", v == "NO — status=withdrawn", f"verdict={v!r}")
+
+
+def test_an_expired_event_names_its_status_not_undecided():
+    row = _opened()
+    cl.fold_event(row, "gate_escalation_expired", {}, T0 + 3600)
+    v = cl.verdict(row, T0 + 3601)
+    check("verdict names expired", v == "NO — status=expired", f"verdict={v!r}")
+
+
+def test_fold_event_is_what_collect_uses_for_decided_rows():
+    row = _opened()
+    cl.fold_event(row, "gate_escalation_decided", {"status": "approved", "bar_met": True}, T0 + 20)
+    cl.fold_event(row, "gate_escalation_claimed", {}, T0 + 40)
+    check("decided folded", row.get("decided_at") == T0 + 20 and row.get("status") == "approved", f"row={row}")
+    check("claimed folded", row.get("consumed_at") == T0 + 40, f"row={row}")
+
+
 def test_a_consumed_row_reads_consumed_even_with_no_open_or_decide():
     """The one live row (620407c5) whose `_opened` fell outside the chain window: it is
     known ONLY through its `_claimed` event. Consumed must be checked before status, or
@@ -134,6 +160,9 @@ TESTS = [
     test_an_approved_row_dies_at_the_grant_anchor_not_the_ttl,
     test_a_denied_row_names_its_status,
     test_bar_not_met_is_still_reported,
+    test_a_withdrawn_event_names_its_status_not_undecided,
+    test_an_expired_event_names_its_status_not_undecided,
+    test_fold_event_is_what_collect_uses_for_decided_rows,
     test_a_consumed_row_reads_consumed_even_with_no_open_or_decide,
 ]
 
