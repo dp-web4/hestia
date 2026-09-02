@@ -44,17 +44,27 @@ sys.path.insert(0, str(ROOT / "plugins" / "_shared"))
 import hestia_gate_core as core          # noqa: E402
 
 GATE = ROOT / "plugins" / "gemini" / "hooks" / "before_tool.py"
-LIFT = {"path_in_scope", "command_in_scope", "_all_repos"}
+# POST-COLLAPSE, THIS IS A WIRING PIN, NOT A DIVERGENCE METER. The gemini forks this file
+# was written against (path_in_scope, command_in_scope, _all_repos, all measured strictly
+# fail-open: 6 of 12 rows SEAT GRANTS WHAT THE ENGINE DENIES) were deleted and replaced by
+# _scope_path/_scope_command, thin fail-closed delegates into hestia_gate_core. The rows
+# below now prove the seat's lifted predicate REACHES the hardened engine and returns its
+# pinned answers -- the property that goes red if anyone re-forks. The engine-answer check
+# stays primary: agreement between two implementations is still not evidence either is right.
+LIFT = {"_scope_path", "_scope_command"}
 
 
-def lift(path: Path, workspace: str, home: str) -> dict:
+def lift(path: Path, workspace: str, home: str, core_mod, profile) -> dict:
     """Pull the predicates out of the seat module without importing it.
 
     Importing would run the module's top level -- env reads, config loads, and on some seats
-    a daemon probe. The predicates are what is on trial; the module's startup is not."""
+    a daemon probe. The predicates are what is on trial; the module's startup is not.
+    The delegates close over `_core` and `_CORE_PROFILE` at module scope; the namespace
+    supplies both, bound to the same engine the expected answers are pinned against."""
     src = path.read_text(encoding="utf-8", errors="replace")
     lines = src.splitlines()
-    ns = {"os": os, "re": re, "WORKSPACE": workspace, "GEMINI_HOME": home}
+    ns = {"os": os, "re": re, "WORKSPACE": workspace, "GEMINI_HOME": home,
+          "_core": core_mod, "_CORE_PROFILE": profile}
     found = []
     for node in ast.walk(ast.parse(src)):
         if isinstance(node, ast.FunctionDef) and node.name in LIFT:
@@ -113,13 +123,13 @@ def main() -> int:
     ws = "/synthetic-workspace"
     home = "/synthetic-member-home"
     scopes = ("granted",)
-    seat = lift(GATE, ws, home)
     profile = core.HarnessProfile(
         member_id="gemini",
         identity_path=home + "/identity.json",
         home_markers=(home,),
         launch_cwd_env="HESTIA_GEMINI_LAUNCH_CWD",
     )
+    seat = lift(GATE, ws, home, core, profile)
 
     print(f"gate under test : {GATE.relative_to(ROOT)}")
     print(f"predicates      : {', '.join(sorted(LIFT))}")
@@ -131,7 +141,7 @@ def main() -> int:
     diverged, engine_wrong = [], []
     for label, path, expect, why in cases(ws, home):
         e = core.path_in_scope(path, scopes, ws, profile, cwd=ws)
-        s_ = seat["path_in_scope"](path, scopes)
+        s_ = seat["_scope_path"](path, scopes)
         if e != expect:
             engine_wrong.append((label, path, expect, e))
         if e != s_:
