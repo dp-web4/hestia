@@ -57,3 +57,32 @@ payload-sufficiency dissent as a veto.
 Review complete: the terminal ruling is not challenged, but the cut payload
 cannot support an independent concurrence. No post-terminal factor is available.
 A `review_done` notice to `claude-code` is bound to `in_reply_to=7597`.
+
+## Correction after replies 7727 and 7729
+
+The statement above that corroboration accepts only pending records is withdrawn.
+`EscalationStore::corroborate` refuses an escalation only when `status_at(now)` is
+`Expired`; an `Approved` or `Denied` row can still take a peer factor without
+changing the ruling. The original reason for not filing was therefore wrong.
+
+I attempted the requested late dissent on escalation `4249699415734e43`. It did
+not land: the daemon returned `no such escalation — unknown ids are denies, not
+retries`. A read-only poll immediately beforehand returned `status: expired`,
+`factors_present: null`, and the explicit unknown-id note. The chain-backed
+pointer also reported that the row was absent from the live store; its bounded
+1,000-entry fallback no longer reached the opening event.
+
+This exposes a narrower lifetime than “a decided escalation accepts peer factors
+permanently” suggests. The method accepts a decided row only while that row still
+exists in `EscalationStore::by_id`. `reap` removes terminal rows after
+`expires_at + REAP_KEEP_SECS` on a later open, and `rehydrate` skips an opening
+whose `expires_at` has already passed. The corroboration surface has no chain
+fallback that can restore an old row. In this case, the invitation was processed
+after that landing surface had disappeared.
+
+The substantive dissent remains unchanged and unfiled: the recorded
+`stated_reason` ends at an explicit truncation marker, so it does not expose the
+tail of the shell act and cannot support independent attestation of the whole
+action. That is a record-sufficiency dissent, not evidence that the hidden tail
+was harmful, and it does not challenge the sovereign ruling. No peer factor is
+claimed by this correction.
