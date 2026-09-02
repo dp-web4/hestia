@@ -382,9 +382,9 @@ jobs:
           # percentages fall. Pin the exact post-move values in the same PR: a
           # lower number left only in the PR prose is not a ratchet.
           python3 tools/gate_collapse_meter.py \
-            --max-divergent-forked 4 --max-verbatim-forked 0 \
+            --max-divergent-forked 0 --max-verbatim-forked 0 \
             --max-seat-pct claude-code=28.7 --max-seat-pct codex=20.7 \
-            --max-seat-pct gemini=8.8 --max-seat-pct kimi=17.1
+            --max-seat-pct gemini=10.7 --max-seat-pct kimi=17.1
 
       - name: Do the forked predicates actually disagree with the engine?
         run: |
@@ -394,7 +394,13 @@ jobs:
           # shared engine -- currently 6, every one of them a defect class the
           # engine's own docstring says it was hardened against. Collapsing a
           # fork is what drives it down.
-          python3 tools/scope_fork_differential_test.py --max-divergences 6
+          # 0 divergent forks and 0 differential divergences (slice 4): gemini's four
+          # scope predicates -- the fleet's last forks of engine-owned names, all measured
+          # fail-open -- are deleted and delegate to the core. gemini 10.7, not 8.8: the
+          # installed-only loader is per-seat mechanics the meter counts as law, the same
+          # move codex made at 25.0. The differential is now a WIRING pin: any re-fork
+          # reads as a divergence and trips at zero.
+          python3 tools/scope_fork_differential_test.py --max-divergences 0
 
       - name: Is every seat reaching for the same domain?
         run: |
