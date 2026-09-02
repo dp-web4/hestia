@@ -122,6 +122,12 @@ C fire on the bookkeeping it was written to permit. The scope is hooks: the
 gates are what read an identity to decide. `entity` was additionally checked
 against the whole tree by hand -- no reader anywhere, decider or not.
 
+One reviewed interprocedural seam is included: when a hook passes its concrete
+identity path to the shared `role_bridge`, the walk summarizes the shared
+callee's actual identity-field reads and joins them at that call site. Both
+halves are required. The callee body alone is unreachable law; the call shape
+alone is a name that can survive after the body stops reading the field.
+
 DISCOVERY, not a list -- for the same reason `ci_discovery` discovers: a check
 that hard-codes the set of identity files cannot see the one somebody adds.
 Artifacts and hooks both come from `git ls-files`.
@@ -257,12 +263,17 @@ def embedded_python(shell_src: str):
         yield body, ["-"] + argv
 
 
-def identity_field_access(src: str, argv=None):
+def identity_field_access(src: str, argv=None, *, identity_params=(), call_summaries=None):
     """(reads, writes) as dotted field paths off the identity object."""
     tree = ast.parse(src)
     argv = argv or []
-    consts = {}            # name -> string value, for path resolution
+    # A shared function may receive the identity path as a parameter rather than
+    # spelling a concrete identity.json path in its own body.  Seeding only the
+    # explicitly declared path parameters lets the existing taint walk summarize
+    # that function without treating every arbitrary string parameter as identity.
+    consts = {name: f"/synthetic/{name}.identity.json" for name in identity_params}
     tainted = {}           # name -> path tuple into the identity object
+    call_summaries = call_summaries or {}
 
     def const_str(node):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -384,22 +395,46 @@ def identity_field_access(src: str, argv=None):
                 p = resolve(node)
                 if p:
                     reads.add(".".join(p))
-    # THE SEAM RULE (slice 3, PR #796). The collapse moved the identity role read into the
-    # shared engine: `role_bridge(*, snapshot_role, identity_path)` reads `role` from the
-    # file it is handed -- that is its contract, and the engine body is in the walk. But the
-    # read no longer lexically names identity.json (the path arrives as a parameter), so the
-    # taint walk cannot resolve it, and property B reported `role` as "declared core -- and
-    # nothing reads it" the moment the reader was deduplicated. A call to role_bridge that
-    # binds identity_path IS the decider exercising the field: record it as a read of `role`
-    # at the CALL SITE, so B still goes red if the seats stop consulting the bridge. Pinned
-    # by E6 below, in both directions.
+    # INTERPROCEDURAL SEAM (slice 3, PR #796). A call counts only when BOTH halves exist:
+    # the selected shared function's body was summarized as reading an identity field, and
+    # this call binds that function's path parameter to an identity.json-shaped value. A
+    # function name or keyword alone proves neither. E6 pins the callee-loss, call-loss and
+    # wrong-path negative controls so a stubbed role_bridge cannot leave property B green.
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             f = node.func
             fname = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
-            if fname == "role_bridge" and any(k.arg == "identity_path" for k in node.keywords):
-                reads.add("role")
+            summary = call_summaries.get(fname)
+            if not summary:
+                continue
+            path_arg = next((k.value for k in node.keywords
+                             if k.arg == summary["identity_param"]), None)
+            if path_arg is not None and names_an_identity(path_arg):
+                reads.update(summary["reads"])
     return reads, writes
+
+
+def shared_identity_call_summaries():
+    """Identity-field summaries for reviewed shared call seams.
+
+    The shared mechanism is not a sixth member and is not itself added to the
+    per-member census.  Its body supplies a callee summary; the consuming seat's
+    call site supplies reachability and the concrete identity path.
+    """
+    path = REPO / "plugins" / "_shared" / "hestia_gate_mechanism.py"
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeError):
+        return {}
+    bridge = next((node for node in tree.body
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and node.name == "role_bridge"), None)
+    if bridge is None:
+        return {}
+    reads, _ = identity_field_access(
+        ast.unparse(bridge), identity_params={"identity_path"})
+    return ({"role_bridge": {"identity_param": "identity_path", "reads": reads}}
+            if reads else {})
 
 
 def is_decider(src: str) -> bool:
@@ -446,18 +481,9 @@ def is_decider(src: str) -> bool:
 
 
 def hook_sources():
-    """Every hook this repo ships, as (relpath, member, python_source, argv).
-
-    PLUS the shared engine (slice 3, PR #796): the collapse moves law OUT of seat hooks and
-    into plugins/_shared, readers included -- role_bridge's identity.json role read now lives
-    in hestia_gate_mechanism, and a walk scoped to hooks alone reported `role` as "declared
-    core -- and nothing reads it" the moment the reader was deduplicated. The field is still
-    read and still keys attribution/scope; the measurement follows the law to where it lives.
-    Tests beside the engine are not the engine and stay out of the walk."""
+    """Every hook this repo ships, as (relpath, member, python_source, argv)."""
     out = []
-    shared = [p for p in tracked("plugins/_shared/hestia_*.py")
-              if not p.name.endswith("_test.py") and not p.name.startswith("test_")]
-    for p in tracked("plugins/*/hooks/*") + tracked("plugins/*/*/*/*/hooks/*") + shared:
+    for p in tracked("plugins/*/hooks/*") + tracked("plugins/*/*/*/*/hooks/*"):
         rel = p.relative_to(REPO).as_posix()
         member = rel.split("/")[1]
         if rel.startswith("plugins/codex/marketplace/"):
@@ -484,9 +510,11 @@ def access_map():
     bookkeeping field is not an enforcement of it.
     """
     per_member, per_file = {}, {}
+    call_summaries = shared_identity_call_summaries()
     for rel, member, src, argv, decides in hook_sources():
         try:
-            reads, writes = identity_field_access(src, argv) if src else (set(), set())
+            reads, writes = (identity_field_access(
+                src, argv, call_summaries=call_summaries) if src else (set(), set()))
         except SyntaxError:
             continue
         per_file[rel] = (reads, writes, decides)
@@ -631,17 +659,41 @@ def prop_e_selftest():
     if "role" not in split:
         failures.append("E5: D passes vacuously when a core field has no carrier")
 
-    # E6: the seam rule, both directions. A call binding identity_path to the bridge is the
-    # decider exercising `role` (the engine body reads it from that file by contract); a
-    # bridge call WITHOUT identity_path is not evidence of the read and must not count.
-    src = ("m.role_bridge(snapshot_role=s, identity_path=IDENTITY)\n")
-    reads, _ = identity_field_access(src)
+    # E6: the interprocedural seam, both halves and their negative controls. The callee must
+    # really read role through its declared identity parameter; the caller must really bind
+    # that parameter to an identity-shaped path. A same-named stub or unrelated path cannot
+    # keep property B green.
+    bridge = ("def role_bridge(*, snapshot_role, identity_path):\n"
+              "    return json.load(open(identity_path)).get('role')\n")
+    bridge_reads, _ = identity_field_access(
+        bridge, identity_params={"identity_path"})
+    summary = {"role_bridge": {"identity_param": "identity_path",
+                                "reads": bridge_reads}}
+    src = ("IDENTITY = '/tmp/identity.json'\n"
+           "m.role_bridge(snapshot_role=s, identity_path=IDENTITY)\n")
+    reads, _ = identity_field_access(src, call_summaries=summary)
     if "role" not in reads:
-        failures.append("E6: role_bridge(identity_path=...) call site not seen as a role read")
-    src = ("m.role_bridge(snapshot_role=s)\n")
-    reads, _ = identity_field_access(src)
+        failures.append("E6: real role_bridge read + identity-bound call not joined")
+    broken_bridge = ("def role_bridge(*, snapshot_role, identity_path):\n"
+                     "    return 'role:constellation:member'\n")
+    broken_reads, _ = identity_field_access(
+        broken_bridge, identity_params={"identity_path"})
+    broken_summary = ({"role_bridge": {"identity_param": "identity_path",
+                                        "reads": broken_reads}}
+                      if broken_reads else {})
+    reads, _ = identity_field_access(src, call_summaries=broken_summary)
     if "role" in reads:
-        failures.append("E6: a bridge call WITHOUT identity_path counted as a read (rule too broad)")
+        failures.append("E6: a role_bridge body that reads no role satisfied B")
+    src = ("IDENTITY = '/tmp/identity.json'\n"
+           "m.role_bridge(snapshot_role=s)\n")
+    reads, _ = identity_field_access(src, call_summaries=summary)
+    if "role" in reads:
+        failures.append("E6: a bridge call without identity_path counted as a read")
+    src = ("OTHER = '/tmp/ordinary.txt'\n"
+           "m.role_bridge(snapshot_role=s, identity_path=OTHER)\n")
+    reads, _ = identity_field_access(src, call_summaries=summary)
+    if "role" in reads:
+        failures.append("E6: a non-identity path counted as an identity read")
 
     return failures
 
