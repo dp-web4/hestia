@@ -128,6 +128,42 @@ run is still the only thing here that established the red/green claim; the recor
 carries it for whoever reads the row later, which is the durable-obligation reading, not
 the reach-the-decision one.
 
+## Addendum 2 — the act RAN, and the petition was a lapse-then-reissue (asker transcript)
+
+At 17:43:03Z the worktree's test file became byte-identical to the staged `/tmp` copy
+(`cmp` clean, mtime 17:43:03Z). Against the `k` at 17:36:40Z that is **+383 s**: a claim at
+about +143 s, then the act's own `sleep 240`, then the write. My factor (+247 s) landed
+INSIDE the claimed-but-unwritten interval Qualification 2 predicted.
+
+Kimi's transcript (`~/.kimi-code/sessions/wd_ai-agents_…/session_66215da4…/agents/agent-0/wire.jsonl`)
+answers the two open questions:
+
+- **Why this petition exists.** It is the SECOND petition for the same bytes.
+  `94c20f097d5d0dfa` (identical act, same digest) was approved 17:08:43Z, kimi's first
+  re-issue hit a daemon flap ("Daemon down again … the claim windows are ticking"), and the
+  second re-issue found the grant EXPIRED, so the hook minted `dc1315dbf755bad4`. Kimi's own
+  diagnosis, verbatim in shape: "the test-file approval died in its claim window during a
+  daemon flap — a fresh escalation now awaits dp." So beside recast / abandonment /
+  supersession this is a fourth face of "approved, unclaimed": **lapse-then-reissue**, and it
+  is chain-visible — two petition ids sharing one `act_digest`, the first `approved` with no
+  claim, the second claimed. Kimi also noted its polls were what armed the fuses
+  ("first observation wins"), which is #732's mechanism from the asker's side.
+- **The staggered sleeps.** Kimi's four #810 hook writes carried `sleep 180`, `240`, `280`,
+  `240` (kimi shim, codex shim, claude shim, test). No rationale appears in the transcript;
+  the same `sleep 240;` prefix is kimi's habitual CI-wait idiom in three earlier sessions
+  (`sleep 240; … gh pr view N --json statusCheckRollup`). Untested, not refuted: the stagger
+  looks like an attempt to serialise four claims through one daemon, carried over from the
+  CI idiom. The cost is real either way: the digest binds the sleep, so every re-issue pays
+  it, and a peer reading the chain sees "claimed" minutes before the file changes.
+
+Sibling petitions from the same batch, read through `resources/read`: `f0745d1237a3d432`
+(kimi shim, `sleep 180`) approved and lapsed unspent; `c168366e0578becf` is its recast with
+`&& echo KIMI_LANDED` appended — approved and claimed, the 09-01 "same bytes" lesson again;
+`5b19f2430703c24a` is a double-prefixed recast (`sleep 90; cd … && sleep 180; cd … && cp …`)
+that kimi **self-denied** at 17:14:41Z; `6faee69a33d73523` is the RETROACTIVE petition for
+the mechanism write that had already landed (the heredoc-apostrophe specimen). One batch of
+five files produced eight petitions.
+
 Also handled this wake: nine `review_done` from codex (9419–9427) on my earlier escalations
 `a5b01c81…`, `a58bc461…`, `44244986…`, `4d59d15d…`, `9069be21…`, `9dce5923…`,
 `3651fa00…`, `ef121b31…`, `29516ac5…` — all nine concur (three with qualifications:
