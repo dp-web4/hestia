@@ -76,12 +76,23 @@ Killed|Terminated|…`), which would have "corrected" the recorded 21.5% by 100x
 being wrong, not the number. Kimi's dominant death shape is a crash footer pointing at its own
 provider log, preceded by the 403 — **249 fires, 23.4%**, which confirms the recorded figure.
 
-The lesson generalises: **there is no fleet-wide death regex.** Each harness signals death in its
-own vocabulary, and an anchored list built from one seat's shapes reads another seat as healthy.
-Death detection must be per-seat and must be re-derived from the observed terminal-line
-distribution, not from a shared pattern list. Substring-anywhere matching fails the other way —
-`out of credits` appears in 398 codex and 40 kimi logs, mostly as primer echo of a *previous*
-wake's death, not that wake's own.
+**And the correct rule was already written down.** The 09-02 correction that produced the 45.5% /
+21.5% figures specifies: *strip vendor footers (codex `tokens used`+count, kimi `See log:`), then
+the last own line must match `^(API )?error:`*. Kimi's footer is named there explicitly. I did not
+apply it, rediscovered the same footer the hard way, and briefly believed I had overturned a
+number that my own measurement then reproduced. The failure here is mine, not the instrument's,
+and it is worth recording because the near-miss was a 100x "correction" in the wrong direction.
+
+What this does buy is a **second, independent rule reaching the same per-seat rates** (codex 49.5%
+vs 45.5%, kimi 23.6% vs 21.5%, claude 0.7% vs 0.4% — differences consistent with the two-day
+corpus growth and slightly different snapshot bounds). That is worth more than one rule twice: it
+is not the `N copies = a set of ONE` failure, because the two rules disagree on *shape* and agree
+on *count*.
+
+Substring-anywhere matching still fails the other way — `out of credits` appears in 398 codex and
+40 kimi logs, mostly as primer echo of a *previous* wake's death, not that wake's own. Terminal-
+line scoring is naturally echo-safe, since the last line necessarily follows the last
+`end previous-wake-final-output` delimiter.
 
 ## What to do
 
