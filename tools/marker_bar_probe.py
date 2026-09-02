@@ -1,60 +1,66 @@
 #!/usr/bin/env python3
-"""Which marker does the gate hand an escalation, and can the strong bar see it?
+"""Which string prices the bar for a governance-surface act — and does the act's
+own resolved target carry what the bar needs to see?
 
 WHY THIS EXISTS. The escalation `marker` is not the path the act touches. It is
-whichever element of the matcher's own marker tuple matched first -- the matcher's
-docstring says so outright ("Return the matched marker"). The Rust side then chooses
-the approval bar by testing THAT STRING for three governance filenames
-(`bar_for()`, core/src/server/gate_escalation.rs). Three of the four marker-tuple
-elements are DIRECTORIES and contain no filename at all. When one of those matches
-first, the bar test finds nothing to match and falls to the single-approver bar --
-for an act on the governance surface.
+whichever element of the matcher's marker tuple matched first -- the matcher says
+so outright. The Rust side chose the approval bar by testing THAT STRING for four
+governance filenames (`bar_for()`, core/src/server/gate_escalation.rs), and most
+of the marker-tuple elements are DIRECTORIES with no filename in them. When one of
+those matched first, the bar test found nothing to match and fell to the
+single-approver bar -- for an act on the governance surface. Measured between
+#206 merging and #810 being filed: 166 strong-named hook writes priced weak in 27
+days (findings/marker-bar-probe-dead-27-days-after-206-20260902.md).
 
-The consequence is an inversion: the wider the act, the weaker the bar. A wildcard
-over the whole installed hooks directory matches the directory element and gets one
-approver; naming a single file exactly matches the file element and gets
-sovereign-plus-peer.
+THE REPAIR (#810, the one #206 named): the escalation carries the act's RESOLVED
+TARGET alongside the matched marker, and the bar is priced from the target when
+the record carries one, from the marker when it does not. The matcher's triple
+(and the closure verdict) have carried that target all along -- it was computed
+and dropped at the door. This probe's question is therefore not "does the marker
+name a file" but the end-to-end one:
 
-WHAT THIS DOES NOT DO. It does not route a tool call, so it mints no escalation, no
-deny, and no conduct record for anyone -- unlike `gate-probe.py`, which drives the
-real gate end-to-end and must exonerate the ding it causes. This one imports the
-enforcing copy and calls `_touches_self` directly. It is safe to run repeatedly and
-needs no cleanup.
+    the matcher emits (marker, resource) -- does the string the bar is priced
+    from still carry the strong-bar filename the RESOURCE carried?
 
-THE BRIDGE TO THE BAR IS ONE-SIDED, DELIBERATELY. This is Python; `bar_for` is Rust,
-and transcribing its three literals here would both duplicate a pinned list and make
-this file unwritable (the gate scans proposed content for exactly those strings). So
-the test is on the weaker, derivable predicate:
+WHICH RULE IS IN FORCE IS READ FROM THE PRICING SITE, not assumed. The repair's
+wiring is `effective_bar(marker, resolved_target)` in gate_escalation.rs -- the
+STRONGER of the two inputs' bars (a max, so the caller-asserted target can never
+lower the bar the marker derived); its absence means the legacy marker-only rule.
+That is what makes this probe RED against pre-repair code and GREEN after it, with
+no edit to this file in between.
 
-    marker contains NO governance filename  =>  `bar_for`, which looks for a strict
-    SUBSET of those filenames, cannot match either  =>  single approver. Airtight.
+WHAT THIS DOES NOT DO. It does not route a tool call, so it mints no escalation,
+no deny, and no conduct record for anyone -- unlike `gate-probe.py`, which drives
+the real gate end-to-end and must exonerate the ding it causes. This one imports
+the enforcing matcher copy and calls it in-process. It is safe to run repeatedly
+and needs no cleanup.
 
-    marker contains SOME governance filename  =>  `bar_for` may still miss it, since
-    it checks only three of the seven. Reported as "maybe strong", never as proof.
+WHAT IT DOES NOT COUNT, and why the exit code is honest about it. Two classes of
+governance act stay off the exit code deliberately, because neither is the defect
+this probe exists to catch:
 
-THAT SECOND ROW IS NOW DECIDED, and the answer changes the headline. The one-sided
-version was not a limit of the evidence -- it was a limit of where the probe was
-willing to look. `bar_for`'s three literals live in the Rust source in this same
-repo, so they can be READ at runtime instead of transcribed. Reading them keeps the
-constraint that motivated the one-sidedness (no such literal appears in this file)
-while removing the blind spot it caused.
+  * an act whose resolved target names a governed file the BAR never tests (the
+    drift table below -- a bar-coverage gap, repairable only by widening
+    `bar_for`, which #206 explicitly ruled out of this repair), and
+  * an act that carries no governed filename ANYWHERE (a wildcard over a hooks
+    directory) -- a filename-keyed bar has nothing to price from, however the
+    escalation is shaped.
 
-What it found: of the governance names the matcher protects, the bar tests only a
-subset, and one of the names it does NOT test is the shared policy core -- the file
-the matcher's own comment says is to BECOME the single gate for all five harnesses.
-So a `maybe strong` row was in fact a weak one, and the count of acts that cannot
-reach the strong bar was under-reported by one. A one-sided instrument does not
-report a bound; it gets read as a point ([[one-sided-refutability]]).
+Both are printed, both are real, and neither is "the pipeline had the filename
+and dropped it". That last class -- the information existed and the pricing never
+saw it -- is the one that drives the exit code.
 
-One name reaches the strong bar by SUBSTRING ACCIDENT rather than by design (its
-basename ends with another governed basename), so renaming that file would silently
-demote it. The drift table below states each name's class as derived, so a future
-addition to either list shows up as an unclassified row instead of a silence.
+THE TRIPLE, and the 26 days. 5.2 (2026-08-07, two days after #206 merged) made
+the matcher return (marker, resource, key); this probe kept reading a bare string
+and crashed at its print loop until the triple unpack landed (PR #808). A crashed
+acceptance test reads as no news: RED for ~36 hours, then absent for 26 days, in
+no CI job. The unpack below handles both shapes so the probe cannot die that
+death again silently -- an unexpected shape is now a row, not a traceback.
 
-NO LITERAL MARKER PATH OR GOVERNANCE FILENAME APPEARS IN THIS SOURCE. Every one is
-derived from the imported module's own constants, or read from the bar's own source.
-That is not a style choice -- a literal would make this file refused by the gate it
-measures.
+NO LITERAL MARKER PATH OR GOVERNANCE FILENAME APPEARS IN THIS SOURCE. Every one
+is derived from the imported module's own constants, or read from the bar's own
+source. That is not a style choice -- a literal would make this file refused by
+the gate it measures.
 
 Run: python3 tools/marker_bar_probe.py
 """
@@ -81,22 +87,28 @@ CORE = [f for f in GOV if f.startswith("hestia_")][0]
 
 
 # ---------------------------------------------------------------------------
-# THE BAR'S OWN LIST, READ FROM THE BAR'S OWN SOURCE
+# THE BAR'S OWN LIST, AND THE PRICING RULE, READ FROM THE BAR'S OWN SOURCE
 # ---------------------------------------------------------------------------
-# Transcribing these three would duplicate a pinned list AND make this file
-# unwritable, which is why the first cut of this probe declined to test them at all.
-# Reading them costs neither: the strings never appear here, only in the Rust file
-# that already owns them. If that file moves or the function is rewritten, we say so
-# and fall back to the one-sided verdicts rather than guessing.
+# Transcribing the bar's literals would duplicate a pinned list AND make this
+# file unwritable, which is why the first cut of this probe declined to test them
+# at all. Reading them costs neither: the strings never appear here, only in the
+# Rust file that already owns them. If that file moves or the function is
+# rewritten, we say so and fall back to the one-sided verdicts rather than
+# guessing.
 BAR_SRC = os.path.join(REPO, "core", "src", "server", "gate_escalation.rs")
 
 
-def _bar_names(path):
-    """The filenames `bar_for` routes to the two-factor bar, or None if unreadable."""
+def _bar_source(path):
     try:
         with open(path, encoding="utf-8") as fh:
-            src = fh.read()
+            return fh.read()
     except OSError:
+        return None
+
+
+def _bar_names(src):
+    """The filenames `bar_for` routes to the two-factor bar, or None if unreadable."""
+    if src is None:
         return None
     start = src.find("pub fn bar_for")
     if start < 0:
@@ -109,7 +121,29 @@ def _bar_names(path):
     return names or None
 
 
-STRONG = _bar_names(BAR_SRC)
+def _bar_rule(src):
+    """Which string the bar is priced from, as wired at the pricing site.
+
+    "resolved-target" -- the #810 repair is in the tree: the pricing is
+    `effective_bar(marker, resolved_target)`, the STRONGER of the two inputs'
+    bars (review hold 1 on PR #812 made it a max, not a replacement: a
+    fabricated target can strengthen the bar, never weaken it).
+    "marker-only" -- the pre-#810 wiring: the bar sees the marker and nothing
+    else, so a directory marker prices weak whatever the act touched.
+    None -- the source is unreadable; verdicts stay one-sided.
+    """
+    if src is None:
+        return None
+    if re.search(r"effective_bar\(\s*&?marker", src):
+        return "resolved-target"
+    if "pub fn bar_for" in src:
+        return "marker-only"
+    return None
+
+
+BAR_SRC_TEXT = _bar_source(BAR_SRC)
+STRONG = _bar_names(BAR_SRC_TEXT)
+RULE = _bar_rule(BAR_SRC_TEXT)
 
 dirs_in_tuple = sum(1 for m in G._SELF_MARKERS if not any(f in m for f in GOV))
 print(f"imported from : {G.__file__}")
@@ -121,6 +155,7 @@ if STRONG is None:
 else:
     print(f"bar source    : {len(STRONG)} of {len(GOV)} governed names route to the "
           f"two-factor bar")
+print(f"pricing rule  : {RULE or 'UNKNOWN'} (read from the pricing site, not assumed)")
 print()
 
 tilde_dir = "~" + INSTALLED_DIR[len(HOME):]
@@ -148,27 +183,59 @@ CASES = [
 
 rows = []
 for name, tool, inp in CASES:
-    marker = G._touches_self(tool, inp)
-    named = [f for f in GOV if marker and f in marker]
+    hit = G._touches_self(tool, inp)
+    # The matcher has returned (marker, resource, key) since 5.2; before that, a
+    # bare marker. Read both -- and treat any OTHER shape as a finding, not a
+    # traceback: the last time this probe assumed a shape it died for 26 days.
+    if isinstance(hit, tuple):
+        marker = hit[0] if hit else None
+        resource = hit[1] if len(hit) > 1 else None
+    else:
+        marker, resource = hit, None
+    if not isinstance(marker, str) and marker is not None:
+        rows.append((name, repr(marker), "UNEXPECTED MATCHER SHAPE", True,
+                     "the probe cannot price this -- read it, do not crash", resource))
+        continue
+
+    # The bar each input prices at, under the in-force rule. Post-#810 the rule is
+    # a MAX (review hold 1 on PR #812): strong if EITHER the marker or the target
+    # carries a strong-bar name; the target can only strengthen, never weaken.
+    in_marker = bool(STRONG and marker) and any(f in marker for f in STRONG)
+    in_target = [f for f in (STRONG or []) if resource and f in resource]
+    priced_strong = STRONG is not None and (
+        in_marker or (RULE == "resolved-target" and bool(in_target)))
+
     if marker is None:
         verdict, weak, why = "NOT MATCHED AT ALL", False, ""
-    elif not named:
-        # No governed filename in the marker, so a bar testing for filenames cannot
-        # match whatever subset it tests. True regardless of STRONG.
-        verdict, weak, why = "single approver (PROVEN)", True, "NAMES A DIRECTORY, NOT A FILE"
-    elif STRONG is None:
-        verdict, weak, why = "maybe strong", False, ""
-    elif any(s in marker for s in STRONG):
-        verdict, weak, why = "sovereign+peer (PROVEN)", False, ""
-    else:
+    elif priced_strong:
+        via = "target" if in_target and not in_marker else "marker"
+        verdict, weak, why = f"sovereign+peer (PROVEN, via {via})", False, ""
+    elif in_target:
+        # THE #810 DEFECT, LIVE: the act's own resolved target names a strong-bar
+        # file, and the pricing rule in force never looks at it. This row -- not
+        # the two classes below -- is what the exit code counts.
         verdict, weak, why = ("single approver (PROVEN)", True,
-                              "GOVERNED NAME THE BAR DOES NOT TEST")
-    rows.append((name, marker, verdict, weak, why))
+                              "TARGET NAMES THE FILE; THE PRICING NEVER SEES IT")
+    elif any(f in (resource or "") for f in GOV) or any(f in marker for f in GOV):
+        # A governed file whose name the bar never tests: a bar-coverage gap,
+        # reported in the drift table below. #206 ruled widening `bar_for` OUT of
+        # this repair, so this class cannot count against it.
+        verdict, weak, why = ("single approver", False,
+                              "GOVERNED NAME THE BAR DOES NOT TEST (see the drift table)")
+    else:
+        # No governed filename anywhere in what the matcher emits (a wildcard over
+        # a hooks directory). A filename-keyed bar has nothing to price from here,
+        # however the escalation is shaped -- a real gap, NOT this defect.
+        verdict, weak, why = ("single approver", False,
+                              "NO GOVERNED FILENAME IN THE ACT AT ALL")
+    rows.append((name, marker, verdict, weak, why, resource))
 
 w = max(len(r[0]) for r in rows)
 weak_count = 0
-for name, marker, verdict, weak, why in rows:
+for name, marker, verdict, weak, why, resource in rows:
     shown = marker if marker else "-"
+    if resource and resource != marker:
+        shown += f"   (target: {resource})"
     if why:
         shown += f"   <-- {why}"
     if weak:
@@ -177,8 +244,15 @@ for name, marker, verdict, weak, why in rows:
     print(f"{'':<{w}}      marker: {shown}")
 
 print()
-print(f"{weak_count} of {len(rows)} acts on the governance surface cannot reach the "
-      f"two-factor bar.")
+if weak_count:
+    print(f"{weak_count} of {len(rows)} acts carry the strong-bar filename in their "
+          f"resolved target and are priced from a string that lacks it.")
+    print("The escalation drops the target at the door; #810's repair (carry it,"
+          " price from it) is what turns this probe green.")
+else:
+    print(f"0 of {len(rows)} acts lose a strong-bar filename between the matcher "
+          f"and the pricing. Every act whose resolved target names a strong-bar "
+          f"file prices the two-factor bar.")
 
 if STRONG is not None:
     # Every governed name, classified. An unclassified row here is the drift this
@@ -201,8 +275,10 @@ if STRONG is not None:
         print()
         print(f"{len(unreachable)} of {len(GOV)} governed names can never reach the "
               f"two-factor bar, however")
-        print("precisely the marker resolves. Making the marker resolution-aware "
-              "does not reach them.")
+        print("precisely the target resolves. Carrying the resolved target (#810) "
+              "does not reach them;")
+        print("only widening the bar's list would, and #206 ruled that out of the "
+              "repair.")
         print()
         print("This table reports REACHABILITY, not intent. The bar's doc comment "
               "classes one of")

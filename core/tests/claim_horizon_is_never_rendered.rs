@@ -169,6 +169,7 @@ fn opened(ttl: u64) -> (EscalationStore, String) {
             "role:constellation:member",
             "Edit",
             "law_inject.py",
+            None,
             // #539: the act is bound at open and must be re-stated at claim. This suite is
             // about the HORIZON, so both ends name the same act deliberately — otherwise the
             // act mismatch would refuse the claim and the horizon would stop being the thing

@@ -381,10 +381,17 @@ jobs:
           # shared-law denominator grows for every seat, so all four measured
           # percentages fall. Pin the exact post-move values in the same PR: a
           # lower number left only in the PR prose is not a ratchet.
+          #
+          # #812 (#810's producer half) ADDS law per seat: each gate shim now
+          # threads the act's resolved target to the escalation claim so the
+          # daemon can price the bar from it. claude-code 28.7 -> 29.1, codex
+          # 20.7 -> 20.9, kimi 17.1 -> 17.3 — pinned at the MEASURED values on
+          # this head, per the standing convention: the alternative is writing
+          # terser gate code to fit a gauge, which is optimising the gauge.
           python3 tools/gate_collapse_meter.py \
             --max-divergent-forked 0 --max-verbatim-forked 0 \
-            --max-seat-pct claude-code=28.7 --max-seat-pct codex=20.7 \
-            --max-seat-pct gemini=10.7 --max-seat-pct kimi=17.1
+            --max-seat-pct claude-code=29.1 --max-seat-pct codex=20.9 \
+            --max-seat-pct gemini=10.7 --max-seat-pct kimi=17.3
 
       - name: Do the forked predicates actually disagree with the engine?
         run: |

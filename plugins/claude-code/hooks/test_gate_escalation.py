@@ -52,6 +52,9 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 class _Stub(BaseHTTPRequestHandler):
     payload: dict = {}
     stall_s: float = 0.0
+    # #810: the last tools/call's ARGUMENTS, so a test can assert what the claim
+    # carried — the request, not the response.
+    last_request: dict = {}
 
     def log_message(self, *_a):
         pass
@@ -62,6 +65,7 @@ class _Stub(BaseHTTPRequestHandler):
             req = json.loads(body or b"{}")
         except ValueError:
             req = {}
+        _Stub.last_request = (req.get("params") or {}).get("arguments") or {}
         if self.stall_s:
             time.sleep(self.stall_s)  # accepts the connection, never answers in time
         out = json.dumps({
@@ -323,6 +327,20 @@ try:
         msg = buf.getvalue()
         check("the escalation record names the resource, not the rule",
               "/x/hooks/pre_tool_use.py" in msg, msg[:200])
+        # #810: the claim carries the act's resolved target when the caller has one —
+        # the daemon prices the bar from it (max with the marker's bar).
+        ptu.request_self_write("plugins/claude-code/hooks", "Write",
+                               resource="/x/hooks/pre_tool_use.py", key="file_path",
+                               resolved_target="/x/hooks/pre_tool_use.py")
+        check("the claim carries the resolved target for bar pricing",
+              _Stub.last_request.get("resolved_target") == "/x/hooks/pre_tool_use.py",
+              repr(_Stub.last_request)[:200])
+        # And with no target supplied the key is absent — old callers change nothing.
+        ptu.request_self_write("plugins/claude-code/hooks", "Write",
+                               resource="/x/hooks/pre_tool_use.py", key="file_path")
+        check("no target supplied, no resolved_target key on the wire",
+              "resolved_target" not in _Stub.last_request,
+              repr(_Stub.last_request)[:200])
     except TypeError as e:
         check("the escalation record names the resource, not the rule", False, str(e))
     finally:

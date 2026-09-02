@@ -208,7 +208,7 @@ pub enum Channel {
 /// so a met bar is *stated sufficiency*, not proof. What it changes is that a reader can now
 /// see the criterion, the factors present, and whether they met it — the mismatch becomes a
 /// recorded fact instead of an implicit one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Bar {
     /// One decision from a sovereign channel (operator session / operator CLI) OR a NOT-SAME
@@ -218,6 +218,11 @@ pub enum Bar {
     /// silent compromise is the whole model.
     SovereignPlusPeer,
 }
+// The DECLARATION ORDER above is the strength order (SingleApprover < SovereignPlusPeer) and
+// `effective_bar`'s max-semantics reads it — a reorder is a policy change, not a style edit.
+// Deserialize exists so replay can restore the RECORDED criterion (review hold 2, PR #812);
+// the only parser of chain values is `rehydrate`, which falls back to recomputing when the
+// key is absent or unreadable.
 
 /// The bar a governance file's write must clear. This is POLICY, stated in one place so a
 /// change is a reviewed diff — and copied onto every escalation at open, so the record
@@ -231,6 +236,13 @@ pub enum Bar {
 /// which makes enforcement-path writes wait rather than proceed under a weaker bar. That is
 /// the honest state, and it is visible here rather than implicit. If that is the wrong
 /// trade, this is the one line to change.
+///
+/// WHAT THIS IS FED changed with #810 — see `effective_bar`. Until then it was fed the
+/// escalation's `marker`, which is whichever element of the gate's marker tuple matched
+/// first; most of those elements name DIRECTORIES, so the strong-bar test below could
+/// never match them and an Edit to an in-tree hook file priced at one approver. The list
+/// itself is deliberately NOT widened here (#206 ruled that out): the repair carried the
+/// act's resolved target to this function, it did not add names.
 pub fn bar_for(marker: &str) -> Bar {
     if marker.contains("pre_tool_use.py")
         || marker.contains("post_tool_use.py")
@@ -245,6 +257,34 @@ pub fn bar_for(marker: &str) -> Bar {
         Bar::SovereignPlusPeer
     } else {
         Bar::SingleApprover
+    }
+}
+
+/// The bar an escalation prices at (#810, monotonic per review hold 1 on PR #812):
+/// `max(bar_for(marker), bar_for(resolved_target))` — the act's RESOLVED TARGET may
+/// STRENGTHEN the marker-derived bar, never weaken it.
+///
+/// The marker is the reason (which rule fired), the target is the act (what the write
+/// reaches) — and the marker tuple is ordered first-match-wins with most elements naming
+/// directories, so a marker-only bar was unpriceable-strong for exactly the in-tree paths
+/// the strong bar exists for (166 strong-named hook writes priced weak in the 27 days
+/// between #206 naming this repair and it landing; the acceptance probe is
+/// `tools/marker_bar_probe.py`). The target carries the filename, so `bar_for` can see it.
+///
+/// Why MAX and not replacement: the target is caller-asserted, and a first cut that priced
+/// from the target ALONE let a fabricated target lower a bar the marker had priced strong
+/// (marker naming the gate + target "/tmp/ordinary.txt" ⇒ single approver). With the max,
+/// the target can only add information: the strong arm of either input decides.
+///
+/// ONE derivation, called by both `open` and `rehydrate`, so live pricing and replay can
+/// never disagree. A target that is absent, empty, or all whitespace contributes nothing
+/// — the marker decides, which is also what every pre-#810 row does: the field is absent
+/// there, and absent prices exactly as it was priced live.
+pub fn effective_bar(marker: &str, resolved_target: Option<&str>) -> Bar {
+    let marker_bar = bar_for(marker);
+    match resolved_target.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => marker_bar.max(bar_for(t)),
+        None => marker_bar,
     }
 }
 
@@ -370,6 +410,29 @@ pub struct Escalation {
     pub tool_name: String,
     /// Which governance file the write would reach.
     pub marker: String,
+    /// The act's RESOLVED TARGET, carried ALONGSIDE the marker (#810) — the concrete
+    /// path (or write-position argument) the gate's classifier matched, where `marker`
+    /// is only the tuple element that fired. The tuple is ordered first-match-wins and
+    /// most of its elements name DIRECTORIES, so for most governance-surface acts the
+    /// marker carries no filename and a bar testing it for filenames could never match:
+    /// 166 strong-named hook writes priced `single_approver` in the 27 days between
+    /// #206 naming this repair and it landing (the acceptance probe is
+    /// `tools/marker_bar_probe.py`). The marker stays as the claim join key and the
+    /// provenance of the refusal; the target joins the pricing (`effective_bar`).
+    ///
+    /// CALLER-ASSERTED, like `marker` itself (A1, HST-005): the hook self-reports it
+    /// and the daemon has nothing to check it against. The failure direction is
+    /// STRUCTURALLY bounded by what it feeds: `effective_bar` prices
+    /// `max(bar_for(marker), bar_for(target))`, so a fabricated target can only make
+    /// the bar STRONGER for the asking member's own escalation, never weaker
+    /// (review hold 1 on PR #812 — the first cut replaced the marker as pricing
+    /// input, and a fabricated target could lower it).
+    ///
+    /// `None` on rows opened before the field existed — over 211k chain entries lack
+    /// it — and replay treats absent as absent (never a failure), pricing those from
+    /// the marker exactly as they were priced live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_target: Option<String>,
     /// WHY the member says it needs this, in its own words. Caller-asserted like everything
     /// else here, and worth exactly what a self-declaration is worth — which is more than
     /// nothing, because it is the only account of intent the decider gets.
@@ -484,9 +547,12 @@ pub struct Escalation {
     /// that was refused, not a standing permit on the governance surface. Without this, one
     /// approval would license every subsequent edit until the daemon restarted.
     pub consumed_at: Option<u64>,
-    /// The stated bar this escalation must clear — copied from `bar_for(marker)` at open, so
-    /// the record carries the criterion in force at the time. See Bar's doc: this is what
-    /// makes "sufficient for this context" auditable.
+    /// The stated bar this escalation must clear — copied from policy at open
+    /// (`effective_bar(marker, resolved_target)`: the stronger of the marker-derived
+    /// bar and the target-derived bar, #810), so the record carries the
+    /// criterion in force at the time. See Bar's doc: this is what
+    /// makes "sufficient for this context" auditable. Replay RESTORES this value
+    /// rather than recomputing it (review hold 2 on PR #812).
     pub bar: Bar,
     /// The evidence present, in arrival order. `decide` always appends the decider's factor;
     /// `corroborate` can add a peer factor while Pending. The bar is evaluated against this
@@ -1050,6 +1116,10 @@ impl EscalationStore {
                     if expires_at <= now {
                         continue;
                     }
+                    // #810: the act's resolved target, when the entry carries one (every
+                    // entry written before the field existed does not — Option, and the
+                    // bar recomputation below prices those from the marker, unchanged).
+                    let resolved_target = s(d, "resolved_target");
                     self.by_id.insert(
                         id.clone(),
                         Escalation {
@@ -1124,9 +1194,6 @@ impl EscalationStore {
                                 .unwrap_or_default(),
                             role: s(d, "role").unwrap_or_default(),
                             tool_name: s(d, "tool_name").unwrap_or_default(),
-                            // Recomputed from the marker rather than read from the entry: the
-                            // claim path's `opened` event does not carry `bar`, and a default
-                            // would silently lower the criterion an escalation is judged against.
                             // Restored from the entry, so a restart keeps the binding.
                             // Absent on legacy rows opened before #539 -> None -> unspendable.
                             act_digest: s(d, "act_digest"),
@@ -1139,8 +1206,25 @@ impl EscalationStore {
                             gate_path: s(d, "gate_path"),
                             host_session_id: s(d, "host_session_id"),
                             session_id: s(d, "session_id"),
-                            bar: bar_for(&marker),
+                            // The RECORDED criterion wins (review hold 2, PR #812): the
+                            // opened entry has carried `bar` since the payload unification,
+                            // and recomputing under a LATER `bar_for` would silently reprice
+                            // an already-open escalation across a restart — the code claimed
+                            // criterion-frozen-at-open while replay reconstructed from current
+                            // policy, a pre-existing contradiction this repairs. Recompute
+                            // (from the same basis the open used, #810) only for rows written
+                            // before the field existed, and for a bar value that does not
+                            // parse — an unreadable criterion is no criterion, and the
+                            // recompute is the honest fallback rather than a fabricated one.
+                            bar: d
+                                .get("bar")
+                                .and_then(|v| serde_json::from_value::<Bar>(v.clone()).ok())
+                                .unwrap_or_else(|| effective_bar(&marker, resolved_target.as_deref())),
                             marker,
+                            // The act's resolved target (#810), restored with the row.
+                            // Absent on every entry written before the field existed —
+                            // Option, never a replay failure.
+                            resolved_target,
                             // The open time is the ENTRY's time, not the restart's. The
                             // payload carries it as of this change; rows written before
                             // it never did, and for those the chain entry's own append
@@ -1293,6 +1377,7 @@ impl EscalationStore {
         role: &str,
         tool_name: &str,
         marker: &str,
+        resolved_target: Option<&str>,
         act: Option<&str>,
         stated_reason: Option<&str>,
         stated_detail: Option<&str>,
@@ -1346,6 +1431,15 @@ impl EscalationStore {
         h.update(marker.as_bytes());
         let id: String = h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect();
 
+        // The act's resolved target (#810), trimmed like its siblings; empty is absent.
+        let resolved_target = resolved_target.map(str::trim).filter(|v| !v.is_empty());
+        // The bar is stated AT OPEN and copied from policy, so the record carries the
+        // criterion in force at the time — a later tightening of `bar_for` must not
+        // rewrite what this escalation was judged against (and replay RESTORES this
+        // value rather than recomputing it — review hold 2, PR #812). Monotonic over
+        // the marker's own bar: the target can strengthen it, never weaken it (hold 1).
+        let bar = effective_bar(marker, resolved_target);
+
         let esc = Escalation {
             id: id.clone(),
             invited_peers: Vec::new(),
@@ -1362,6 +1456,7 @@ impl EscalationStore {
             role: role.trim().to_string(),
             tool_name: tool_name.to_string(),
             marker: marker.to_string(),
+            resolved_target: resolved_target.map(str::to_string),
             stated_reason: stated_reason.map(str::to_string).filter(|v| !v.trim().is_empty()),
             stated_detail: stated_detail.map(str::to_string).filter(|v| !v.trim().is_empty()),
             // Seat keys are recorded by `record_seat_keys` after the handler
@@ -1381,10 +1476,7 @@ impl EscalationStore {
             independence: None,
             observed_at: None,
             consumed_at: None,
-            // The bar is stated AT OPEN and copied from policy, so the record carries the
-            // criterion in force at the time — a later tightening of `bar_for` must not
-            // rewrite what this escalation was judged against.
-            bar: bar_for(marker),
+            bar,
             factors: Vec::new(),
         };
         self.by_id.insert(id, esc.clone());
@@ -2018,6 +2110,93 @@ mod tests {
         assert_eq!(pending, vec!["legacy", "current"]);
     }
 
+    /// #810: replay must price a row from its recorded resolved target — the same basis
+    /// the live open used — and must NOT reprice the legacy population. A restart that
+    /// lowered a strong-priced row to weak would silently re-open under one approver what
+    /// was filed under two; a restart that raised legacy rows would rewrite history.
+    /// Both directions are the same requirement: replay restores the pricing, it does
+    /// not revisit it.
+    #[test]
+    fn replay_prices_from_the_resolved_target_and_leaves_legacy_rows_as_they_were() {
+        let opened = |id: &str, target: Option<&str>| {
+            let mut data = serde_json::json!({
+                "escalation_id": id, "plugin_id": "claude-code",
+                "role": "role:constellation:member", "tool_name": "Edit",
+                // The directory marker the closure emits for an in-tree hook path.
+                "marker": "plugins/*/hooks",
+                "opened_at": T0, "expires_at": T0 + 3600,
+            });
+            if let Some(t) = target {
+                data["resolved_target"] = serde_json::Value::String(t.to_string());
+            }
+            chain_entry("gate_escalation_opened", data)
+        };
+        let target = "/wt/plugins/kimi/hooks/pre_tool_use.py";
+        let mut s = EscalationStore::default();
+        // A post-#810 row (target carried) beside a pre-#810 row (no such key — the
+        // entire 211k-entry population the field was added over).
+        assert_eq!(
+            s.rehydrate(&[opened("new1", Some(target)), opened("old1", None)], T0 + 20),
+            2
+        );
+        let new = s.by_id.get("new1").expect("restored");
+        assert_eq!(
+            new.bar,
+            Bar::SovereignPlusPeer,
+            "replay must restore the strong bar the live open priced from the target"
+        );
+        assert_eq!(new.resolved_target.as_deref(), Some(target));
+        let old = s.by_id.get("old1").expect("restored");
+        assert_eq!(old.resolved_target, None, "absent restores absent, never fails");
+        assert_eq!(
+            old.bar,
+            Bar::SingleApprover,
+            "a legacy row replays marker-priced, exactly as it was priced live"
+        );
+    }
+
+    /// Review hold 2 on PR #812: the opened entry has carried the criterion in force
+    /// since #241's payload unification ("the record carries the criterion in force at
+    /// the time"), but `rehydrate` RECOMPUTED the bar from the marker — so a later
+    /// `bar_for` change would silently reprice an already-open escalation across a
+    /// restart, and the record's own claim was false on exactly the path that makes it
+    /// durable. Replay must restore the RECORDED bar; recomputing is the backward-compat
+    /// fallback for rows written before the field existed.
+    #[test]
+    fn replay_restores_the_recorded_bar_not_todays_policy() {
+        let opened = |id: &str, bar: Option<&str>| {
+            let mut data = serde_json::json!({
+                "escalation_id": id, "plugin_id": "claude-code",
+                "role": "role:constellation:member", "tool_name": "Edit",
+                // A marker that CURRENT policy prices strong...
+                "marker": "pre_tool_use.py",
+                "opened_at": T0, "expires_at": T0 + 3600,
+            });
+            if let Some(b) = bar {
+                data["bar"] = serde_json::Value::String(b.to_string());
+            }
+            chain_entry("gate_escalation_opened", data)
+        };
+        let mut s = EscalationStore::default();
+        // ...while the RECORD says this row was opened under single_approver. The
+        // divergence stands in for any future bar_for change: replay must not reprice.
+        assert_eq!(s.rehydrate(&[opened("rec1", Some("single_approver"))], T0 + 20), 1);
+        assert_eq!(
+            s.by_id.get("rec1").unwrap().bar,
+            Bar::SingleApprover,
+            "the record carries the criterion in force at the time — replay restores it, \
+             it does not revisit it under today's policy"
+        );
+        // The fallback: a row written before `bar` was emitted recomputes from the
+        // current basis — the only thing an absent criterion can honestly do.
+        assert_eq!(s.rehydrate(&[opened("leg1", None)], T0 + 20), 1);
+        assert_eq!(
+            s.by_id.get("leg1").unwrap().bar,
+            Bar::SovereignPlusPeer,
+            "absent `bar` recomputes — the legacy behaviour, unchanged"
+        );
+    }
+
     /// Replay must restore a human's ruling AND must never re-arm one that was already spent.
     ///
     /// The second half is the dangerous direction: if a restart resurrected consumed approvals,
@@ -2334,7 +2513,7 @@ mod tests {
 
         // And the live path: `open` defaults to Asserted until the handler records the proof.
         let mut s3 = EscalationStore::default();
-        let e = s3.open("codex", "r", "Edit", "pre_tool_use.py", Some(TEST_ACT), None, None, T0, 120).unwrap();
+        let e = s3.open("codex", "r", "Edit", "pre_tool_use.py", None, Some(TEST_ACT), None, None, T0, 120).unwrap();
         assert_eq!(e.asker_basis, crate::arbiter::AskerBasis::Asserted);
         assert!(s3.record_asker_basis(&e.id, crate::arbiter::AskerBasis::Session));
         assert_eq!(s3.get(&e.id).map(|e| e.asker_basis), Some(crate::arbiter::AskerBasis::Session));
@@ -2491,7 +2670,7 @@ mod tests {
     fn store_with_one_simple_marker() -> (EscalationStore, String) {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "role:constellation:member", "Edit", "law_inject.py", Some(TEST_ACT), None, None, T0, 120)
+            .open("claude-code", "role:constellation:member", "Edit", "law_inject.py", None, Some(TEST_ACT), None, None, T0, 120)
             .expect("open");
         (s, e.id)
     }
@@ -2499,7 +2678,7 @@ mod tests {
     fn store_with_one() -> (EscalationStore, String) {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "role:constellation:member", "Edit", "pre_tool_use.py", Some(TEST_ACT), None, None, T0, 120)
+            .open("claude-code", "role:constellation:member", "Edit", "pre_tool_use.py", None, Some(TEST_ACT), None, None, T0, 120)
             .expect("open");
         (s, e.id)
     }
@@ -2665,7 +2844,7 @@ mod tests {
 
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "r", "Edit", "pre_tool_use.py", Some(APPROVED), Some(APPROVED), None,
+            .open("claude-code", "r", "Edit", "pre_tool_use.py", None, Some(APPROVED), Some(APPROVED), None,
                   T0, DEFAULT_TTL_SECS)
             .unwrap();
         s.decide(&e.id, true, "operator", "role:constellation:sovereign",
@@ -2705,7 +2884,7 @@ mod tests {
         let mut s = EscalationStore::default();
         // A member stating only a why — the exact shape the member door documents.
         let err = s
-            .open("claude-code", "r", "Edit", "pre_tool_use.py",
+            .open("claude-code", "r", "Edit", "pre_tool_use.py", None,
                   None, Some("I need to close the newline bypass"), None, T0, DEFAULT_TTL_SECS)
             .unwrap_err();
         assert_eq!(
@@ -2716,7 +2895,7 @@ mod tests {
 
         // With the act stated, the same open succeeds and the permit is spendable.
         let e = s
-            .open("claude-code", "r", "Edit", "pre_tool_use.py",
+            .open("claude-code", "r", "Edit", "pre_tool_use.py", None,
                   Some(TEST_ACT), Some("I need to close the newline bypass"), None,
                   T0, DEFAULT_TTL_SECS)
             .unwrap();
@@ -2734,7 +2913,7 @@ mod tests {
     fn an_approval_naming_no_act_cannot_be_spent() {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "r", "Edit", "pre_tool_use.py", Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
+            .open("claude-code", "r", "Edit", "pre_tool_use.py", None, Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         s.decide(&e.id, true, "operator", "role:constellation:sovereign",
                  Channel::OperatorSession, None, Some("approved"), T0 + 5)
@@ -2760,7 +2939,7 @@ mod tests {
         // This test is the arithmetic of that ruling: it FAILS on the old semantics.
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         let id = e.id.clone();
         assert_eq!(s.get(&id).unwrap().bar, Bar::SovereignPlusPeer);
@@ -2834,7 +3013,7 @@ mod tests {
         // LIVE: open, invite, record — exactly what `open_escalation` does.
         let mut live = EscalationStore::default();
         let e = live
-            .open("claude-code", "r", "Edit", "m.py", Some("Edit -> m.py"), None, None, T0, 3600)
+            .open("claude-code", "r", "Edit", "m.py", None, Some("Edit -> m.py"), None, None, T0, 3600)
             .unwrap();
         live.invite(&e.id, invited.clone());
         assert!(live.record_invitee_readers(&e.id, &evidence));
@@ -2872,7 +3051,7 @@ mod tests {
     fn an_unreadable_mailbox_is_neither_absent_nor_readerless() {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some("Bash -> the seat gate script"), None, None, T0, DEFAULT_TTL_SECS)
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, Some("Bash -> the seat gate script"), None, None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         let mut e = s.get(&e.id).unwrap().clone();
         e.invited_peers = vec![
@@ -2921,7 +3100,7 @@ mod tests {
     fn a_late_readers_answer_cannot_hide_a_readable_peers_absence() {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         let id = e.id.clone();
         s.invite(&id, vec!["late-reader".into(), "readable-but-absent".into()]);
@@ -3001,7 +3180,7 @@ mod tests {
 
         // Bound to an act — spendable, so it belongs in the listing.
         let bound = s
-            .open("claude-code", "r", "Bash", "m-bound", Some("Bash -> probe"), None, None,
+            .open("claude-code", "r", "Bash", "m-bound", None, Some("Bash -> probe"), None, None,
                   T0, DEFAULT_TTL_SECS)
             .unwrap();
         let bound_id = bound.id.clone();
@@ -3042,7 +3221,7 @@ mod tests {
         let mut s = EscalationStore::default();
 
         let a = s
-            .open("claude-code", "r", "Bash", "marker-a",
+            .open("claude-code", "r", "Bash", "marker-a", None,
                   Some("Bash -> marker-a"), None, None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         let aid = a.id.clone();
@@ -3051,12 +3230,12 @@ mod tests {
             .unwrap();
 
         let b = s
-            .open("claude-code", "r", "Bash", "marker-b",
+            .open("claude-code", "r", "Bash", "marker-b", None,
                   Some("Bash -> marker-b"), None, None, T0, DEFAULT_TTL_SECS)
             .unwrap();
 
         let c = s
-            .open("kimi-code", "r", "Bash", "marker-c",
+            .open("kimi-code", "r", "Bash", "marker-c", None,
                   Some("Bash -> marker-c"), None, None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         let cid = c.id.clone();
@@ -3085,7 +3264,7 @@ mod tests {
     fn one_answer_serves_both_deciding_surfaces() {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         let id = e.id.clone();
         let decided = s
@@ -3132,7 +3311,7 @@ mod tests {
     fn permits_write_tracks_the_two_conjuncts_that_move() {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         let id = e.id.clone();
         let decided = s
@@ -3215,7 +3394,7 @@ mod tests {
     fn an_approval_that_meets_no_bar_reports_that_it_permits_nothing() {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         let id = e.id.clone();
         s.decide(&id, true, "operator", "role:constellation:sovereign",
@@ -3258,7 +3437,7 @@ mod tests {
     fn an_uninvited_peer_reads_as_uninvited_not_as_agreement() {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         assert!(
             e.invited_peers.is_empty(),
@@ -3333,7 +3512,7 @@ mod tests {
         // blocker again by the back door.
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", None, Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
             .unwrap();
         let id = e.id.clone();
         s.decide(&id, true, "operator", "role:constellation:sovereign",
@@ -3431,15 +3610,15 @@ mod tests {
     fn required_fields_are_required() {
         let mut s = EscalationStore::default();
         assert_eq!(
-            s.open("", "r", "Edit", "gate.py", Some(TEST_ACT), None, None, T0, 120).unwrap_err(),
+            s.open("", "r", "Edit", "gate.py", None, Some(TEST_ACT), None, None, T0, 120).unwrap_err(),
             OpenError::MissingField("plugin_id")
         );
         assert_eq!(
-            s.open("claude-code", "r", "", "gate.py", Some(TEST_ACT), None, None, T0, 120).unwrap_err(),
+            s.open("claude-code", "r", "", "gate.py", None, Some(TEST_ACT), None, None, T0, 120).unwrap_err(),
             OpenError::MissingField("tool_name")
         );
         assert_eq!(
-            s.open("claude-code", "r", "Edit", "   ", Some(TEST_ACT), None, None, T0, 120).unwrap_err(),
+            s.open("claude-code", "r", "Edit", "   ", None, Some(TEST_ACT), None, None, T0, 120).unwrap_err(),
             OpenError::MissingField("marker")
         );
     }
@@ -3448,25 +3627,25 @@ mod tests {
     fn a_flood_is_refused_and_expired_entries_do_not_hold_the_quota() {
         let mut s = EscalationStore::default();
         for i in 0..MAX_PENDING {
-            s.open("claude-code", "r", "Edit", &format!("f{i}.py"), Some(TEST_ACT), None, None, T0, 120)
+            s.open("claude-code", "r", "Edit", &format!("f{i}.py"), None, Some(TEST_ACT), None, None, T0, 120)
                 .expect("under the cap");
         }
         assert_eq!(
-            s.open("claude-code", "r", "Edit", "one-too-many.py", Some(TEST_ACT), None, None, T0, 120)
+            s.open("claude-code", "r", "Edit", "one-too-many.py", None, Some(TEST_ACT), None, None, T0, 120)
                 .unwrap_err(),
             OpenError::TooManyPending(MAX_PENDING)
         );
         // Once they lapse, the quota frees — otherwise a member's own timeouts would lock it out
         // of ever escalating again, which is a deny with no decision behind it.
-        s.open("claude-code", "r", "Edit", "later.py", Some(TEST_ACT), None, None, T0 + 121, 120)
+        s.open("claude-code", "r", "Edit", "later.py", None, Some(TEST_ACT), None, None, T0 + 121, 120)
             .expect("expired entries must not hold the quota");
     }
 
     #[test]
     fn ids_are_distinct_within_the_same_second() {
         let mut s = EscalationStore::default();
-        let a = s.open("claude-code", "r", "Edit", "gate.py", Some(TEST_ACT), None, None, T0, 120).unwrap();
-        let b = s.open("claude-code", "r", "Edit", "gate.py", Some(TEST_ACT), None, None, T0, 120).unwrap();
+        let a = s.open("claude-code", "r", "Edit", "gate.py", None, Some(TEST_ACT), None, None, T0, 120).unwrap();
+        let b = s.open("claude-code", "r", "Edit", "gate.py", None, Some(TEST_ACT), None, None, T0, 120).unwrap();
         assert_ne!(a.id, b.id, "same member, same file, same second must still differ");
     }
 
@@ -3606,7 +3785,7 @@ mod tests {
         let old_ceiling = T0 + DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS;
         for grant in [T0, T0 + 1, T0 + 90, T0 + 119] {
             let mut s = EscalationStore::default();
-            let e = s.open("claude-code", "r", "Edit", "gate.py", Some(TEST_ACT), None, None, T0, ttl).unwrap();
+            let e = s.open("claude-code", "r", "Edit", "gate.py", None, Some(TEST_ACT), None, None, T0, ttl).unwrap();
             s.decide(&e.id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), grant).unwrap();
             let esc = s.get(&e.id).unwrap();
             assert!(
@@ -3622,7 +3801,7 @@ mod tests {
         // The synthesised grant, directly: bounded by the record, not by the timestamp
         // the replay invented.
         let mut s = EscalationStore::default();
-        let e = s.open("claude-code", "r", "Edit", "gate.py", Some(TEST_ACT), None, None, T0, ttl).unwrap();
+        let e = s.open("claude-code", "r", "Edit", "gate.py", None, Some(TEST_ACT), None, None, T0, ttl).unwrap();
         s.decide(&e.id, true, "dp", "role:constellation:sovereign", Channel::LocalCli, None, Some("ok"), T0 + 1).unwrap();
         let mut esc = s.get(&e.id).unwrap().clone();
         esc.decided_at = Some(T0 + 1_000_000);
@@ -3701,11 +3880,11 @@ mod tests {
     fn open_reaps_so_terminal_entries_cannot_accumulate_without_bound() {
         let mut s = EscalationStore::default();
         for i in 0..10 {
-            s.open("claude-code", "r", "Edit", &format!("f{i}.py"), Some(TEST_ACT), None, None, T0, 120).unwrap();
+            s.open("claude-code", "r", "Edit", &format!("f{i}.py"), None, Some(TEST_ACT), None, None, T0, 120).unwrap();
         }
         assert_eq!(s.len(), 10);
         // Long after they lapsed, one more open sweeps them.
-        s.open("claude-code", "r", "Edit", "later.py", Some(TEST_ACT), None, None, T0 + DEFAULT_TTL_SECS + REAP_KEEP_SECS + 1, 120)
+        s.open("claude-code", "r", "Edit", "later.py", None, Some(TEST_ACT), None, None, T0 + DEFAULT_TTL_SECS + REAP_KEEP_SECS + 1, 120)
             .unwrap();
         assert_eq!(s.len(), 1, "reap must run on open, not only in its own test");
     }
@@ -3713,8 +3892,8 @@ mod tests {
     #[test]
     fn pending_lists_oldest_first_and_hides_the_expired() {
         let mut s = EscalationStore::default();
-        let old = s.open("claude-code", "r", "Edit", "a.py", Some(TEST_ACT), None, None, T0, 120).unwrap();
-        let new = s.open("kimi-code", "r", "Write", "b.py", Some(TEST_ACT), None, None, T0 + 30, 120).unwrap();
+        let old = s.open("claude-code", "r", "Edit", "a.py", None, Some(TEST_ACT), None, None, T0, 120).unwrap();
+        let new = s.open("kimi-code", "r", "Write", "b.py", None, Some(TEST_ACT), None, None, T0 + 30, 120).unwrap();
         let ids: Vec<&str> = s.pending(T0 + 31).iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, vec![old.id.as_str(), new.id.as_str()]);
         // `old` lapses first; the list must stop offering it as decidable.
@@ -3731,9 +3910,13 @@ mod bar_factor_tests {
     use super::*;
 
     fn open_with(marker: &str) -> (EscalationStore, String) {
+        open_with_target(marker, None)
+    }
+
+    fn open_with_target(marker: &str, resolved_target: Option<&str>) -> (EscalationStore, String) {
         let mut s = EscalationStore::default();
         let e = s
-            .open("claude-code", "role:constellation:member", "Edit", marker, Some("Edit -> act"), None, None, T0, 120)
+            .open("claude-code", "role:constellation:member", "Edit", marker, resolved_target, Some("Edit -> act"), None, None, T0, 120)
             .expect("open");
         (s, e.id)
     }
@@ -3751,6 +3934,78 @@ mod bar_factor_tests {
         assert_eq!(s2.get(&id2).unwrap().bar, Bar::SovereignPlusPeer);
         let (s3, id3) = open_with("witness.py");
         assert_eq!(s3.get(&id3).unwrap().bar, Bar::SovereignPlusPeer);
+    }
+
+    #[test]
+    fn an_in_tree_hook_write_prices_the_strong_bar() {
+        // #810, the acceptance #206 named and nobody wrote for 27 days. The matcher's
+        // marker tuple is ordered first-match-wins and most of its elements name
+        // DIRECTORIES, so an Edit to an in-tree hook file arrives with a marker that
+        // carries no filename — and a bar testing the marker for filenames cannot match.
+        // The escalation carries the act's RESOLVED TARGET alongside the marker, and the
+        // bar is priced from it when present. This test was RED against the pre-repair
+        // code (marker-only pricing: SingleApprover where the target names the gate).
+        //
+        // The marker shape below is the one the closure actually emits for an in-tree
+        // hook path (findings/marker-bar-probe-dead-27-days-after-206-20260902.md:
+        // every in-tree path priced weak under it).
+        let target = "/wt/plugins/kimi/hooks/pre_tool_use.py";
+        let (s, id) = open_with_target("plugins/*/hooks", Some(target));
+        let esc = s.get(&id).unwrap();
+        assert_eq!(
+            esc.bar,
+            Bar::SovereignPlusPeer,
+            "an in-tree hook write whose marker names only a directory must still reach \
+             the two-factor bar: the act's resolved target carries the filename"
+        );
+        // The record carries BOTH: the marker for provenance and the claim join key,
+        // the target as what priced the bar.
+        assert_eq!(esc.marker, "plugins/*/hooks");
+        assert_eq!(esc.resolved_target.as_deref(), Some(target));
+
+        // THE FALLBACK IS THE OLD BEHAVIOUR, bit for bit: no target recorded, the
+        // marker decides, a directory marker prices weak. Version skew (an old hook
+        // against a new daemon) must not change any pricing.
+        let (s2, id2) = open_with_target("plugins/*/hooks", None);
+        assert_eq!(s2.get(&id2).unwrap().bar, Bar::SingleApprover);
+        // An empty or whitespace target is NO target — the marker decides.
+        let (s3, id3) = open_with_target("plugins/*/hooks", Some("   "));
+        assert_eq!(s3.get(&id3).unwrap().bar, Bar::SingleApprover);
+        assert_eq!(s3.get(&id3).unwrap().resolved_target, None);
+        // And a target that names no governed file changes nothing either — the bar's
+        // list is NOT widened by this repair (#206: the repair is carrying the target,
+        // not adding names).
+        let (s4, id4) = open_with_target("plugins/*/hooks", Some("/wt/plugins/kimi/hooks/README.md"));
+        assert_eq!(s4.get(&id4).unwrap().bar, Bar::SingleApprover);
+    }
+
+    #[test]
+    fn the_resolved_target_can_strengthen_but_never_weaken_the_bar() {
+        // Review hold 1 on PR #812: as first shipped, the target REPLACED the marker as
+        // the pricing input, so a fabricated target could LOWER a bar the marker alone
+        // priced strong — marker "pre_tool_use.py" plus target "/tmp/ordinary.txt" priced
+        // SingleApprover. The invariant, pinned on all four arms: the target may
+        // STRENGTHEN the marker-derived bar, never weaken it.
+
+        // Weak marker + strong target ⇒ STRONG. This is the #810 repair itself.
+        let (s1, id1) = open_with_target("plugins/*/hooks", Some("/wt/plugins/kimi/hooks/pre_tool_use.py"));
+        assert_eq!(s1.get(&id1).unwrap().bar, Bar::SovereignPlusPeer,
+                   "the repair: the target carries the filename the marker lacks");
+
+        // STRONG marker + weak/fabricated target ⇒ STILL STRONG. The arm that was wrong.
+        let (s2, id2) = open_with_target("pre_tool_use.py", Some("/tmp/ordinary.txt"));
+        assert_eq!(s2.get(&id2).unwrap().bar, Bar::SovereignPlusPeer,
+                   "a fabricated or ordinary target must never LOWER the marker-derived bar");
+
+        // Weak + weak ⇒ weak. No information, no strong bar.
+        let (s3, id3) = open_with_target("plugins/*/hooks", Some("/tmp/ordinary.txt"));
+        assert_eq!(s3.get(&id3).unwrap().bar, Bar::SingleApprover);
+
+        // Target absent or empty ⇒ the marker decides, exactly.
+        let (s4, id4) = open_with_target("plugins/*/hooks", None);
+        assert_eq!(s4.get(&id4).unwrap().bar, Bar::SingleApprover);
+        let (s5, id5) = open_with_target("pre_tool_use.py", Some("   "));
+        assert_eq!(s5.get(&id5).unwrap().bar, Bar::SovereignPlusPeer);
     }
 
     #[test]
@@ -3784,7 +4039,7 @@ mod bar_factor_tests {
 
         // THE FAILURE: file under the readable marker, approve it, watch the gate find nothing.
         let esc = s
-            .open("m", "r", "Edit", readable, Some("Edit -> readable"), Some("a stated reason"), None, T0, 3600)
+            .open("m", "r", "Edit", readable, None, Some("Edit -> readable"), Some("a stated reason"), None, T0, 3600)
             .expect("open");
         let id = esc.id.clone();
         let decided = s
@@ -3944,7 +4199,7 @@ mod ttl_tests {
         // a mesh notice, on its own schedule, can still rule when it gets there. Two minutes
         // could not, and that is how escalation 8bb08a85 expired unruled on 2026-07-30.
         let mut s = EscalationStore::default();
-        let e = s.open("claude-code", "r", "Edit", "gate.py", Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS).unwrap();
+        let e = s.open("claude-code", "r", "Edit", "gate.py", None, Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS).unwrap();
         let ten_minutes_later = T0 + 600;
         assert_eq!(
             s.status_of(&e.id, ten_minutes_later),
@@ -3964,7 +4219,7 @@ mod ttl_tests {
         // time buys a chance of an answer and grants nothing in the meantime. If this ever
         // fails, the generosity became a hole.
         let mut s = EscalationStore::default();
-        let e = s.open("claude-code", "r", "Edit", "gate.py", Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS).unwrap();
+        let e = s.open("claude-code", "r", "Edit", "gate.py", None, Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS).unwrap();
         for t in [T0 + 1, T0 + 600, T0 + 3599] {
             assert_eq!(s.status_of(&e.id, t), Status::Pending);
             assert!(!s.status_of(&e.id, t).permits_write(), "pending permitted a write at {t}");
@@ -3989,7 +4244,7 @@ mod ttl_tests {
         // Generous is not unbounded. An ask nobody ever answers must still go stale, or the
         // store accumulates open grants forever and 'pending' stops meaning anything.
         let mut s = EscalationStore::default();
-        let e = s.open("claude-code", "r", "Edit", "gate.py", Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS).unwrap();
+        let e = s.open("claude-code", "r", "Edit", "gate.py", None, Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS).unwrap();
         assert_eq!(s.status_of(&e.id, T0 + DEFAULT_TTL_SECS), Status::Expired);
         assert!(s
             .decide(&e.id, true, "kimi-code", "r", Channel::PeerMember, None, Some("late"),

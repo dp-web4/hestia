@@ -460,13 +460,18 @@ def _witness_gate_self(event_type, marker, tool_name, rule=None):
         return False
 
 
-def _claim_self_write(marker, tool_name, attempted):
-    """Seat wrapper; every failure is a refusal, spelled the way the local copy spelled it."""
+def _claim_self_write(marker, tool_name, attempted, resolved_target=None):
+    """Seat wrapper; every failure is a refusal, spelled the way the local copy spelled it.
+
+    `resolved_target` (#810) is the act's concrete target — the closure verdict's
+    resource on the live path. The daemon prices the escalation's bar from it (max
+    with the marker-derived bar, so it can only strengthen)."""
     try:
         return _load_mechanism().claim_self_write(
             marker, tool_name, attempted,
             plugin_id=HESTIA_PLUGIN_ID, role=_role_bridge(),
-            client_name='hestia-codex-gate-self', host_session_id=_EVENT.get("session_id"))
+            client_name='hestia-codex-gate-self', host_session_id=_EVENT.get("session_id"),
+            resolved_target=resolved_target)
     except Exception:
         return "unreachable", "no answer from the daemon — refused", None, None
 
@@ -714,6 +719,7 @@ def main():
         self_hit = None
         self_is_read = False
         self_rule = None
+        self_target = None  # #810: the act's resolved target, when the closure holds it
         if _closure_classify is not None:
             if tool == "apply_patch":
                 # CALL-SITE ADAPTATION (the module stays codex-agnostic): apply_patch's
@@ -742,6 +748,10 @@ def main():
                             _cv.resource or _cv.marker or _cv.rule)
                 self_is_read = _cv.classification == "read"
                 self_rule = _cv.rule
+                # #810: the closure's resource is a parsed write-position target (a
+                # path, never payload text); the daemon prices the bar from it. The
+                # floor fallback below holds only a marker constant — nothing to send.
+                self_target = _cv.resource
         else:
             # Tier-2 degraded mode (ratified deny-writes-allow-reads): the classifier
             # failed to import — the literal floor decides, and the SAME lifecycle below
@@ -766,7 +776,8 @@ def main():
                 _witness_gate_self("gate_self_read", self_marker, tool, rule=self_rule)
             else:
                 verdict, detail, esc_id, how = _claim_self_write(
-                    self_marker, tool, _attempted_summary(_EVENT))
+                    self_marker, tool, _attempted_summary(_EVENT),
+                    resolved_target=self_target)
                 if verdict != "approved":
                     _witness_gate_self("gate_self_access", self_marker, tool, rule=self_rule)
                     esc = (f" Escalation {esc_id} is open — a human decides out of band ({how}); "
