@@ -208,7 +208,7 @@ pub enum Channel {
 /// so a met bar is *stated sufficiency*, not proof. What it changes is that a reader can now
 /// see the criterion, the factors present, and whether they met it — the mismatch becomes a
 /// recorded fact instead of an implicit one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Bar {
     /// One decision from a sovereign channel (operator session / operator CLI) OR a NOT-SAME
@@ -218,6 +218,11 @@ pub enum Bar {
     /// silent compromise is the whole model.
     SovereignPlusPeer,
 }
+// The DECLARATION ORDER above is the strength order (SingleApprover < SovereignPlusPeer) and
+// `effective_bar`'s max-semantics reads it — a reorder is a policy change, not a style edit.
+// Deserialize exists so replay can restore the RECORDED criterion (review hold 2, PR #812);
+// the only parser of chain values is `rehydrate`, which falls back to recomputing when the
+// key is absent or unreadable.
 
 /// The bar a governance file's write must clear. This is POLICY, stated in one place so a
 /// change is a reviewed diff — and copied onto every escalation at open, so the record
@@ -232,7 +237,7 @@ pub enum Bar {
 /// the honest state, and it is visible here rather than implicit. If that is the wrong
 /// trade, this is the one line to change.
 ///
-/// WHAT THIS IS FED changed with #810 — see `bar_basis`. Until then it was fed the
+/// WHAT THIS IS FED changed with #810 — see `effective_bar`. Until then it was fed the
 /// escalation's `marker`, which is whichever element of the gate's marker tuple matched
 /// first; most of those elements name DIRECTORIES, so the strong-bar test below could
 /// never match them and an Edit to an in-tree hook file priced at one approver. The list
@@ -255,8 +260,9 @@ pub fn bar_for(marker: &str) -> Bar {
     }
 }
 
-/// Which string prices the bar (#810): the act's RESOLVED TARGET when the escalation
-/// carries one, else the matched marker.
+/// The bar an escalation prices at (#810, monotonic per review hold 1 on PR #812):
+/// `max(bar_for(marker), bar_for(resolved_target))` — the act's RESOLVED TARGET may
+/// STRENGTHEN the marker-derived bar, never weaken it.
 ///
 /// The marker is the reason (which rule fired), the target is the act (what the write
 /// reaches) — and the marker tuple is ordered first-match-wins with most elements naming
@@ -265,14 +271,20 @@ pub fn bar_for(marker: &str) -> Bar {
 /// between #206 naming this repair and it landing; the acceptance probe is
 /// `tools/marker_bar_probe.py`). The target carries the filename, so `bar_for` can see it.
 ///
+/// Why MAX and not replacement: the target is caller-asserted, and a first cut that priced
+/// from the target ALONE let a fabricated target lower a bar the marker had priced strong
+/// (marker naming the gate + target "/tmp/ordinary.txt" ⇒ single approver). With the max,
+/// the target can only add information: the strong arm of either input decides.
+///
 /// ONE derivation, called by both `open` and `rehydrate`, so live pricing and replay can
-/// never disagree about which string decided. A target that is empty or all whitespace is
-/// no target — the marker decides, which is also what every pre-#810 row does on replay:
-/// the field is absent there, and absent prices exactly as it was priced live.
-pub fn bar_basis<'a>(resolved_target: Option<&'a str>, marker: &'a str) -> &'a str {
-    match resolved_target {
-        Some(t) if !t.trim().is_empty() => t,
-        _ => marker,
+/// never disagree. A target that is absent, empty, or all whitespace contributes nothing
+/// — the marker decides, which is also what every pre-#810 row does: the field is absent
+/// there, and absent prices exactly as it was priced live.
+pub fn effective_bar(marker: &str, resolved_target: Option<&str>) -> Bar {
+    let marker_bar = bar_for(marker);
+    match resolved_target.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => marker_bar.max(bar_for(t)),
+        None => marker_bar,
     }
 }
 
@@ -406,13 +418,15 @@ pub struct Escalation {
     /// 166 strong-named hook writes priced `single_approver` in the 27 days between
     /// #206 naming this repair and it landing (the acceptance probe is
     /// `tools/marker_bar_probe.py`). The marker stays as the claim join key and the
-    /// provenance of the refusal; the target is what prices the bar (`bar_basis`).
+    /// provenance of the refusal; the target joins the pricing (`effective_bar`).
     ///
     /// CALLER-ASSERTED, like `marker` itself (A1, HST-005): the hook self-reports it
     /// and the daemon has nothing to check it against. The failure direction is
-    /// bounded by what it feeds — it can only make the bar STRONGER for the asking
-    /// member's own escalation, never weaker, and a fabricated target buys the asker
-    /// a harder approval, not an easier one.
+    /// STRUCTURALLY bounded by what it feeds: `effective_bar` prices
+    /// `max(bar_for(marker), bar_for(target))`, so a fabricated target can only make
+    /// the bar STRONGER for the asking member's own escalation, never weaker
+    /// (review hold 1 on PR #812 — the first cut replaced the marker as pricing
+    /// input, and a fabricated target could lower it).
     ///
     /// `None` on rows opened before the field existed — over 211k chain entries lack
     /// it — and replay treats absent as absent (never a failure), pricing those from
@@ -534,10 +548,11 @@ pub struct Escalation {
     /// approval would license every subsequent edit until the daemon restarted.
     pub consumed_at: Option<u64>,
     /// The stated bar this escalation must clear — copied from policy at open
-    /// (`bar_for(bar_basis(resolved_target, marker))` — the act's resolved target when
-    /// the record carries one, else the marker, #810), so the record carries the
+    /// (`effective_bar(marker, resolved_target)`: the stronger of the marker-derived
+    /// bar and the target-derived bar, #810), so the record carries the
     /// criterion in force at the time. See Bar's doc: this is what
-    /// makes "sufficient for this context" auditable.
+    /// makes "sufficient for this context" auditable. Replay RESTORES this value
+    /// rather than recomputing it (review hold 2 on PR #812).
     pub bar: Bar,
     /// The evidence present, in arrival order. `decide` always appends the decider's factor;
     /// `corroborate` can add a peer factor while Pending. The bar is evaluated against this
@@ -1191,15 +1206,20 @@ impl EscalationStore {
                             gate_path: s(d, "gate_path"),
                             host_session_id: s(d, "host_session_id"),
                             session_id: s(d, "session_id"),
-                            // Recomputed rather than read from the entry: the claim path's
-                            // `opened` event does not carry `bar`, and a default would
-                            // silently lower the criterion an escalation is judged against.
-                            // Recomputed from the SAME basis the open used (#810): the entry's
-                            // resolved target when it carries one, else the marker — one
-                            // derivation (`bar_basis`), so replay cannot reprice a row the
-                            // live open priced differently. A pre-#810 entry has no target
-                            // key and replays marker-priced, exactly as it was priced live.
-                            bar: bar_for(bar_basis(resolved_target.as_deref(), &marker)),
+                            // The RECORDED criterion wins (review hold 2, PR #812): the
+                            // opened entry has carried `bar` since the payload unification,
+                            // and recomputing under a LATER `bar_for` would silently reprice
+                            // an already-open escalation across a restart — the code claimed
+                            // criterion-frozen-at-open while replay reconstructed from current
+                            // policy, a pre-existing contradiction this repairs. Recompute
+                            // (from the same basis the open used, #810) only for rows written
+                            // before the field existed, and for a bar value that does not
+                            // parse — an unreadable criterion is no criterion, and the
+                            // recompute is the honest fallback rather than a fabricated one.
+                            bar: d
+                                .get("bar")
+                                .and_then(|v| serde_json::from_value::<Bar>(v.clone()).ok())
+                                .unwrap_or_else(|| effective_bar(&marker, resolved_target.as_deref())),
                             marker,
                             // The act's resolved target (#810), restored with the row.
                             // Absent on every entry written before the field existed —
@@ -1415,10 +1435,10 @@ impl EscalationStore {
         let resolved_target = resolved_target.map(str::trim).filter(|v| !v.is_empty());
         // The bar is stated AT OPEN and copied from policy, so the record carries the
         // criterion in force at the time — a later tightening of `bar_for` must not
-        // rewrite what this escalation was judged against. Priced from the act's resolved
-        // target when the opener carried one: the marker may name only a directory, and a
-        // directory priced weak whatever the act touched (#810).
-        let bar = bar_for(bar_basis(resolved_target, marker));
+        // rewrite what this escalation was judged against (and replay RESTORES this
+        // value rather than recomputing it — review hold 2, PR #812). Monotonic over
+        // the marker's own bar: the target can strengthen it, never weaken it (hold 1).
+        let bar = effective_bar(marker, resolved_target);
 
         let esc = Escalation {
             id: id.clone(),
@@ -2132,6 +2152,48 @@ mod tests {
             old.bar,
             Bar::SingleApprover,
             "a legacy row replays marker-priced, exactly as it was priced live"
+        );
+    }
+
+    /// Review hold 2 on PR #812: the opened entry has carried the criterion in force
+    /// since #241's payload unification ("the record carries the criterion in force at
+    /// the time"), but `rehydrate` RECOMPUTED the bar from the marker — so a later
+    /// `bar_for` change would silently reprice an already-open escalation across a
+    /// restart, and the record's own claim was false on exactly the path that makes it
+    /// durable. Replay must restore the RECORDED bar; recomputing is the backward-compat
+    /// fallback for rows written before the field existed.
+    #[test]
+    fn replay_restores_the_recorded_bar_not_todays_policy() {
+        let opened = |id: &str, bar: Option<&str>| {
+            let mut data = serde_json::json!({
+                "escalation_id": id, "plugin_id": "claude-code",
+                "role": "role:constellation:member", "tool_name": "Edit",
+                // A marker that CURRENT policy prices strong...
+                "marker": "pre_tool_use.py",
+                "opened_at": T0, "expires_at": T0 + 3600,
+            });
+            if let Some(b) = bar {
+                data["bar"] = serde_json::Value::String(b.to_string());
+            }
+            chain_entry("gate_escalation_opened", data)
+        };
+        let mut s = EscalationStore::default();
+        // ...while the RECORD says this row was opened under single_approver. The
+        // divergence stands in for any future bar_for change: replay must not reprice.
+        assert_eq!(s.rehydrate(&[opened("rec1", Some("single_approver"))], T0 + 20), 1);
+        assert_eq!(
+            s.by_id.get("rec1").unwrap().bar,
+            Bar::SingleApprover,
+            "the record carries the criterion in force at the time — replay restores it, \
+             it does not revisit it under today's policy"
+        );
+        // The fallback: a row written before `bar` was emitted recomputes from the
+        // current basis — the only thing an absent criterion can honestly do.
+        assert_eq!(s.rehydrate(&[opened("leg1", None)], T0 + 20), 1);
+        assert_eq!(
+            s.by_id.get("leg1").unwrap().bar,
+            Bar::SovereignPlusPeer,
+            "absent `bar` recomputes — the legacy behaviour, unchanged"
         );
     }
 
@@ -3915,6 +3977,35 @@ mod bar_factor_tests {
         // not adding names).
         let (s4, id4) = open_with_target("plugins/*/hooks", Some("/wt/plugins/kimi/hooks/README.md"));
         assert_eq!(s4.get(&id4).unwrap().bar, Bar::SingleApprover);
+    }
+
+    #[test]
+    fn the_resolved_target_can_strengthen_but_never_weaken_the_bar() {
+        // Review hold 1 on PR #812: as first shipped, the target REPLACED the marker as
+        // the pricing input, so a fabricated target could LOWER a bar the marker alone
+        // priced strong — marker "pre_tool_use.py" plus target "/tmp/ordinary.txt" priced
+        // SingleApprover. The invariant, pinned on all four arms: the target may
+        // STRENGTHEN the marker-derived bar, never weaken it.
+
+        // Weak marker + strong target ⇒ STRONG. This is the #810 repair itself.
+        let (s1, id1) = open_with_target("plugins/*/hooks", Some("/wt/plugins/kimi/hooks/pre_tool_use.py"));
+        assert_eq!(s1.get(&id1).unwrap().bar, Bar::SovereignPlusPeer,
+                   "the repair: the target carries the filename the marker lacks");
+
+        // STRONG marker + weak/fabricated target ⇒ STILL STRONG. The arm that was wrong.
+        let (s2, id2) = open_with_target("pre_tool_use.py", Some("/tmp/ordinary.txt"));
+        assert_eq!(s2.get(&id2).unwrap().bar, Bar::SovereignPlusPeer,
+                   "a fabricated or ordinary target must never LOWER the marker-derived bar");
+
+        // Weak + weak ⇒ weak. No information, no strong bar.
+        let (s3, id3) = open_with_target("plugins/*/hooks", Some("/tmp/ordinary.txt"));
+        assert_eq!(s3.get(&id3).unwrap().bar, Bar::SingleApprover);
+
+        // Target absent or empty ⇒ the marker decides, exactly.
+        let (s4, id4) = open_with_target("plugins/*/hooks", None);
+        assert_eq!(s4.get(&id4).unwrap().bar, Bar::SingleApprover);
+        let (s5, id5) = open_with_target("pre_tool_use.py", Some("   "));
+        assert_eq!(s5.get(&id5).unwrap().bar, Bar::SovereignPlusPeer);
     }
 
     #[test]

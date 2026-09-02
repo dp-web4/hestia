@@ -510,11 +510,12 @@ def audit(matcher_text=None, bar_text=None, declared=DECLARED):
     # bar testing for filenames -- every directory element routed to the
     # single-approver branch by construction, however precisely the bar was written.
     # #810 ended that: the escalation now carries the act's RESOLVED TARGET alongside
-    # the marker and the bar prices from the target when present (`bar_basis`,
-    # gate_escalation.rs), so the directory element no longer decides the price on
+    # the marker and the bar prices the STRONGER of the two inputs (`effective_bar`,
+    # gate_escalation.rs -- a max, so the caller-asserted target can never lower the
+    # marker's own bar), so the directory element no longer decides the price on
     # its own. What is still true, and still pinned here so a new one is a reviewed
     # diff rather than a widening nobody sees: the directory marker is what the
-    # record shows as the REASON, it is the claim join key, and it is what prices
+    # record shows as the REASON, it is the claim join key, and it alone prices
     # the bar for any opener that carries no target (every pre-#810 row, and any
     # hook too old to send one).
     #

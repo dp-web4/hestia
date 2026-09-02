@@ -23,9 +23,11 @@ name a file" but the end-to-end one:
     from still carry the strong-bar filename the RESOURCE carried?
 
 WHICH RULE IS IN FORCE IS READ FROM THE PRICING SITE, not assumed. The repair's
-wiring is `bar_for(bar_basis(...))` in gate_escalation.rs; its absence means the
-legacy marker-only rule. That is what makes this probe RED against pre-repair
-code and GREEN after it, with no edit to this file in between.
+wiring is `effective_bar(marker, resolved_target)` in gate_escalation.rs -- the
+STRONGER of the two inputs' bars (a max, so the caller-asserted target can never
+lower the bar the marker derived); its absence means the legacy marker-only rule.
+That is what makes this probe RED against pre-repair code and GREEN after it, with
+no edit to this file in between.
 
 WHAT THIS DOES NOT DO. It does not route a tool call, so it mints no escalation,
 no deny, and no conduct record for anyone -- unlike `gate-probe.py`, which drives
@@ -122,16 +124,17 @@ def _bar_names(src):
 def _bar_rule(src):
     """Which string the bar is priced from, as wired at the pricing site.
 
-    "resolved-target" -- the #810 repair is in the tree: `bar_for` is fed
-    `bar_basis(resolved_target, marker)`, so the act's target prices the bar
-    when the record carries one.
+    "resolved-target" -- the #810 repair is in the tree: the pricing is
+    `effective_bar(marker, resolved_target)`, the STRONGER of the two inputs'
+    bars (review hold 1 on PR #812 made it a max, not a replacement: a
+    fabricated target can strengthen the bar, never weaken it).
     "marker-only" -- the pre-#810 wiring: the bar sees the marker and nothing
     else, so a directory marker prices weak whatever the act touched.
     None -- the source is unreadable; verdicts stay one-sided.
     """
     if src is None:
         return None
-    if re.search(r"bar_for\(\s*bar_basis\(", src):
+    if re.search(r"effective_bar\(\s*&?marker", src):
         return "resolved-target"
     if "pub fn bar_for" in src:
         return "marker-only"
@@ -194,15 +197,18 @@ for name, tool, inp in CASES:
                      "the probe cannot price this -- read it, do not crash", resource))
         continue
 
-    # The string the bar is priced from, under the in-force rule.
-    basis = (resource or marker) if RULE == "resolved-target" else marker
+    # The bar each input prices at, under the in-force rule. Post-#810 the rule is
+    # a MAX (review hold 1 on PR #812): strong if EITHER the marker or the target
+    # carries a strong-bar name; the target can only strengthen, never weaken.
+    in_marker = bool(STRONG and marker) and any(f in marker for f in STRONG)
     in_target = [f for f in (STRONG or []) if resource and f in resource]
-    priced_strong = STRONG is not None and basis and any(f in basis for f in STRONG)
+    priced_strong = STRONG is not None and (
+        in_marker or (RULE == "resolved-target" and bool(in_target)))
 
     if marker is None:
         verdict, weak, why = "NOT MATCHED AT ALL", False, ""
     elif priced_strong:
-        via = "target" if in_target and not any(f in marker for f in STRONG) else "marker"
+        via = "target" if in_target and not in_marker else "marker"
         verdict, weak, why = f"sovereign+peer (PROVEN, via {via})", False, ""
     elif in_target:
         # THE #810 DEFECT, LIVE: the act's own resolved target names a strong-bar
