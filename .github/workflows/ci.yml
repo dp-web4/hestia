@@ -383,7 +383,7 @@ jobs:
           # lower number left only in the PR prose is not a ratchet.
           python3 tools/gate_collapse_meter.py \
             --max-divergent-forked 0 --max-verbatim-forked 0 \
-            --max-seat-pct claude-code=28.8 --max-seat-pct codex=20.5 \
+            --max-seat-pct claude-code=28.8 --max-seat-pct codex=20.6 \
             --max-seat-pct gemini=10.3 --max-seat-pct kimi=16.8
 
       - name: Do the forked predicates actually disagree with the engine?
@@ -422,6 +422,10 @@ jobs:
           # plugin-tests job: typed behaviour with a sabotage self-check, the live
           # extraction site proven by AST, and behaviour through every seat under a
           # stub daemon. claude-code's pin moved 28.7 -> 28.8 (the delegation's own
-          # comment carries law vocabulary the meter counts); codex/gemini/kimi
-          # dropped to their measured floors in the same act.
+          # comment carries law vocabulary the meter counts); gemini/kimi dropped to
+          # their measured floors in the same act. codex 20.6, not 20.5: the review
+          # repair composed apply_patch's shape translator with the engine call at the
+          # call site and said so in two comment lines inside main(), which the meter
+          # counts as law sloc. Pinned at the measured value rather than trimming a
+          # comment to move a gauge.
           python3 tools/gate_collapse_meter.py --quiet --min-agreed-keys 10
