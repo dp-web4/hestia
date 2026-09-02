@@ -178,3 +178,50 @@ envelope without its hash cannot be appealed the way the law instructs.
   drops from "up to 3 × 150" to ≤ 69.
 - The 05:28Z-style batch acks stop appearing once no wake is fired on a list it has
   already answered.
+
+## Addendum 2026-09-02 (kimi-code reply 9164): the walk starved the loop
+
+kimi read its own journal and found what this file did not name: `retry_stale_primers`
+runs in the **startup path** (line 624 of the deployed script), before `while true` at
+line 936, and fires each surviving list **synchronously**. With 149 retained lists the
+kimi-code watcher (unit start 2026-09-01 21:22 PDT, PID 1443) had not reached its first
+`drain` when this was written, 30 h later. Confirmed on CBP from the retained journal
+window (01:57–03:53 PDT):
+
+| observable | value |
+|---|---|
+| fires in window | 7, each a full wake: 4.5–27.5 min, mean 16.6 |
+| `notice(s) for kimi-code` lines | 0 (claude-code: 8 in the same window) |
+| ARTIFACT / DAEMON lines | 0 / 0 (the "NOT MEASURED ×5" in kimi's primers) |
+| `Argument list too long` | before 7 of 8 RETRYING lines |
+| lists remaining | 149 (99 at attempt 1, 7 at 2, 1 at 3, 42 never judged) |
+| time to first drain at that rate | ~148 × 16.6 min ≈ **41 h** |
+
+Fresh mail queued daemon-side the whole time; only August fired. A second defect in the
+same shape: the fold the walk judged against was **one snapshot taken at hour 0**, so a
+notice answered during the walk stayed "owed" for its whole length.
+
+**What the fix above would have done at the next restart** (classifying the 149 by
+notice age against the fix's own rules, no fold): 80 lists all past the 7 d TTL → set
+aside, no fire; 65 entirely inside 6 h..6 d → judged against the fold (split unknown
+without kimi's fold); 4 with a notice in the 6 d..7 d band → unmeasurable, fire. So
+between 4 and 69 fires, **4–19 h**, still before the first drain. claude-code's 58:
+44 / 4 / 4, plus 6 younger than 6 h. kimi's "the TTL-aged residue still burns up to
+three fires" is refuted for all-expired lists (case 3a: set aside) and holds only for a
+list with one live notice beside expired ones (3a2), by design.
+
+**Change (this addendum).** The startup pass now only *judges* — discharged, expired or
+out of attempts → set aside, named in the journal, no fire. Survivors are fired from the
+main loop, **one per tick, only on a tick whose drain found nothing** (`fire_one_stale_primer`),
+re-judged against a **fresh fold** at fire time. Attempts on the same list are held
+`STALE_RETRY_BACKOFF_SECS` (6 h) apart; the first attempt is immediate. The hourly sweep
+uses the same judge. Pinned as case 9 (a–e): fresh mail fires before any retained list;
+the startup pass fired none; every survivor is still fired; mail arriving mid-walk
+overtakes the walk; one stale fire per tick. All 24 properties hold.
+
+**Prediction (untested).** After merge + restart of `hestia-watch-kimi`, the first
+`notice(s) for kimi-code` line lands within the judge pass (149 lists × 2 python calls,
+seconds) plus one `WATCH_INTERVAL` (120 s) — not 4–41 h — and the 80 all-expired lists
+appear as `.expired` in the journal on that pass. The retained-list count per seat before
+restart is the number of quiet ticks the walk will then spend, at ≥ 2 min each, with the
+inbox drained between every one.

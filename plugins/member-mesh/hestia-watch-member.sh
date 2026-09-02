@@ -543,33 +543,95 @@ fold_to_file() {
 
 # Wrapped in a function only so it can run AFTER `mesh_rpc` is defined; it is still
 # called from the startup path, in the same place, before the first poll.
+# THE WALK YIELDS TO THE LOOP (kimi-code, reply 9164, 2026-09-02). This pass used to
+# FIRE every surviving list, synchronously, before the main loop below ever ran. Each
+# fire is a full wake (kimi-code on CBP: 4.5-27.5 min, mean 16.6), and the kimi-code
+# watcher restarted on 2026-09-01 21:22 PDT with 149 retained lists: at that rate the
+# first `drain` was ~41 hours away. Measured in its journal the next day: zero
+# "notice(s) for kimi-code" lines, zero ARTIFACT, zero DAEMON, eight consecutive
+# "RETRYING stale primer" -- fresh mail queued daemon-side while the watcher re-delivered
+# August. The fold it judged against was also a single snapshot from hour 0.
+#
+# So the startup pass now only JUDGES: set aside what is discharged, expired or out of
+# attempts (no fire, cheap, every list named in the journal). What survives is fired
+# from the main loop, ONE per tick, and only on a tick whose drain found no fresh mail
+# -- the member's own inbox always goes first. Between attempts on the same list the
+# loop waits `STALE_RETRY_BACKOFF_SECS` (6h): the old cadence was "once per restart",
+# which was days, and a member out of credits for a night would otherwise burn all
+# three attempts in six minutes. The FIRST attempt is not held back -- a retained list
+# whose launcher merely timed out is retried on the next quiet tick, and if the session
+# inside did the work, the judge (re-run against a FRESH fold at fire time) retires it
+# instead.
+STALE_RETRY_BACKOFF_SECS="${STALE_RETRY_BACKOFF_SECS:-21600}"
+
+# judge_stale_primer <primer> <fold_file>: 0 = set aside (never to be fired), 1 = live.
+judge_stale_primer() {
+  local stale="$1" fold_file="$2" attempts_file="$1.attempts" attempts
+  # Before the attempt budget, not after: a discharged list should retire on the
+  # first pass that can prove it, whatever the counter says.
+  if [ -n "$fold_file" ] && primer_spent "$stale" "$fold_file"; then
+    echo "[hestia-watch] STALE PRIMER ALREADY DISCHARGED (the daemon owes nothing for any notice in it) — retired without a fire: $stale.discharged"
+    mv -f "$stale" "$stale.discharged" 2>/dev/null && rm -f "$attempts_file"
+    return 0
+  fi
+  if primer_expired "$stale"; then
+    echo "[hestia-watch] STALE PRIMER EXPIRED (every notice is past the daemon's ${EXPIRED_AGE_SECS}s inbox TTL: pruned, unbindable, owed to nobody) — set aside without a fire; the ids above are the only record, read them by hand if the work still matters: $stale.expired"
+    mv -f "$stale" "$stale.expired" 2>/dev/null && rm -f "$attempts_file"
+    return 0
+  fi
+  attempts="$(cat "$attempts_file" 2>/dev/null || echo 0)"
+  [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
+  if [ "$attempts" -ge "$STALE_MAX_ATTEMPTS" ]; then
+    echo "[hestia-watch] STALE PRIMER exhausted ($attempts/$STALE_MAX_ATTEMPTS) — set aside: $stale.exhausted"
+    mv -f "$stale" "$stale.exhausted" 2>/dev/null && rm -f "$attempts_file"
+    return 0
+  fi
+  return 1
+}
+
+# The startup pass: name every retained list in the journal and judge it. Fires nothing.
 retry_stale_primers() {
-  local fold_file; fold_file="$(fold_to_file || true)"
+  local fold_file live=0
+  ls "$PRIMERS"/notice-*.json >/dev/null 2>&1 || return 0
+  fold_file="$(fold_to_file || true)"
   for stale in "$PRIMERS"/notice-*.json; do
     [ -e "$stale" ] || break
     echo "[hestia-watch] STALE PRIMER (undelivered notices from a failed fire): $stale"
     python3 -c "import json,sys;d=json.load(open(sys.argv[1]));[print(f\"    id={n.get('id')} {n.get('kind')} from {n.get('from_plugin')} queued={n.get('queued_at','')}: {n.get('pointer_uri','')}\") for n in d.get('notices',[])]" "$stale" 2>/dev/null || true
     [ -n "$FIRE" ] || continue
+    judge_stale_primer "$stale" "$fold_file" || live=$((live + 1))
+  done
+  [ -n "$fold_file" ] && rm -f "$fold_file"
+  [ "$live" -gt 0 ] && echo "[hestia-watch] $live retained primer(s) survive the judge; the loop will fire them one per quiet tick, the inbox first"
+  return 0
+}
+
+# stale_primer_due <primer>: the first attempt is immediate; later ones wait the backoff
+# measured from the previous attempt (the `.attempts` file's mtime).
+stale_primer_due() {
+  local attempts_file="$1.attempts" last now
+  [ -e "$attempts_file" ] || return 0
+  last="$(stat -c %Y "$attempts_file" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  [ $((now - last)) -ge "$STALE_RETRY_BACKOFF_SECS" ]
+}
+
+# One quiet tick, one retained list: re-judged against a fresh fold, then fired.
+fire_one_stale_primer() {
+  local fold_file attempts_file attempts rc
+  ls "$PRIMERS"/notice-*.json >/dev/null 2>&1 || return 0
+  for stale in "$PRIMERS"/notice-*.json; do
+    [ -e "$stale" ] || break
+    stale_primer_due "$stale" || continue
+    fold_file="$(fold_to_file || true)"
+    if judge_stale_primer "$stale" "$fold_file"; then
+      [ -n "$fold_file" ] && rm -f "$fold_file"
+      continue                              # set aside; look for the next one
+    fi
+    [ -n "$fold_file" ] && rm -f "$fold_file"
     attempts_file="$stale.attempts"
-    # Before the attempt budget, not after: a discharged list should retire on the
-    # first pass that can prove it, whatever the counter says.
-    if [ -n "$fold_file" ] && primer_spent "$stale" "$fold_file"; then
-      echo "[hestia-watch] STALE PRIMER ALREADY DISCHARGED (the daemon owes nothing for any notice in it) — retired without a fire: $stale.discharged"
-      mv -f "$stale" "$stale.discharged" 2>/dev/null && rm -f "$attempts_file"
-      continue
-    fi
-    if primer_expired "$stale"; then
-      echo "[hestia-watch] STALE PRIMER EXPIRED (every notice is past the daemon's ${EXPIRED_AGE_SECS}s inbox TTL: pruned, unbindable, owed to nobody) — set aside without a fire; the ids above are the only record, read them by hand if the work still matters: $stale.expired"
-      mv -f "$stale" "$stale.expired" 2>/dev/null && rm -f "$attempts_file"
-      continue
-    fi
     attempts="$(cat "$attempts_file" 2>/dev/null || echo 0)"
     [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
-    if [ "$attempts" -ge "$STALE_MAX_ATTEMPTS" ]; then
-      echo "[hestia-watch] STALE PRIMER exhausted ($attempts/$STALE_MAX_ATTEMPTS) — set aside: $stale.exhausted"
-      mv -f "$stale" "$stale.exhausted" 2>/dev/null && rm -f "$attempts_file"
-      continue
-    fi
     echo $((attempts + 1)) > "$attempts_file"
     echo "[hestia-watch] RETRYING stale primer (attempt $((attempts + 1))/$STALE_MAX_ATTEMPTS): $stale"
     if "$FIRE" "$stale"; then
@@ -577,22 +639,23 @@ retry_stale_primers() {
       echo "[hestia-watch] stale primer DELIVERED on retry: $stale"
     else
       rc=$?
-      echo "[hestia-watch] stale retry failed rc=$rc (preserved, will retry): $stale"
+      echo "[hestia-watch] stale retry failed rc=$rc (preserved, will retry after ${STALE_RETRY_BACKOFF_SECS}s): $stale"
     fi
+    return 0                                # one fire per tick
   done
-  [ -n "$fold_file" ] && rm -f "$fold_file"
   return 0
 }
 
-# JUDGE INSIDE THE WINDOW (2026-09-02). The pass above runs at startup only, and a
+# JUDGE INSIDE THE WINDOW (2026-09-02). The startup pass judges once, and a
 # watcher restarts rarely: the kimi-code watcher on CBP ran 2026-08-20 -> 09-01 without
 # one. Every primer retained in between was first judged after the 6d judging window
 # had closed, so `primer_spent` could only say "unmeasured" and the pass fired all of
 # them — 45 of the 57 claude-code retained primers were in that state the day this was
 # written, 3 were provably discharged, 9 owed. This sweep asks the same question on a
-# cadence and does the ONE thing that is safe on a cadence: retire what the daemon says
-# is discharged. It never fires — a retry on a cadence would spend the attempt budget
-# in three hours on a genuinely-owed list, and firing is the startup pass's job.
+# cadence and does the ONE thing that is safe on a cadence: set aside what the daemon says
+# is discharged (and, since the walk moved into the loop, what is expired or out of
+# attempts — the same judge). It never fires: firing is the loop's job, one list per
+# quiet tick, held to `STALE_RETRY_BACKOFF_SECS` between attempts on the same list.
 # `DISCHARGE_SWEEP_EVERY` is its own knob only so the test can turn it.
 DISCHARGE_SWEEP_EVERY="${DISCHARGE_SWEEP_EVERY:-3600}"
 
@@ -603,14 +666,10 @@ retire_discharged_primers() {
   [ -n "$fold_file" ] || return 0
   for stale in "$PRIMERS"/notice-*.json; do
     [ -e "$stale" ] || break
-    if primer_spent "$stale" "$fold_file"; then
-      echo "[hestia-watch] RETAINED PRIMER DISCHARGED (the daemon owes nothing for any notice in it) — retired without a fire: $stale.discharged"
-      mv -f "$stale" "$stale.discharged" 2>/dev/null && rm -f "$stale.attempts"
-      n=$((n + 1))
-    fi
+    judge_stale_primer "$stale" "$fold_file" && n=$((n + 1))
   done
   rm -f "$fold_file"
-  [ "$n" -gt 0 ] && echo "[hestia-watch] discharge sweep retired $n retained primer(s)"
+  [ "$n" -gt 0 ] && echo "[hestia-watch] discharge sweep set aside $n retained primer(s)"
   return 0
 }
 
@@ -1103,6 +1162,10 @@ json.dump(d,sys.stdout)
     else
       python3 -c "import json;d=json.load(open('$PRIMER'));[print(f\"  {n['kind']} from {n['from_plugin']}: {n.get('pointer_uri','')}\") for n in d['notices']]"
     fi
+  elif [ -n "$FIRE" ]; then
+    # No fresh mail this tick: spend it on ONE retained list, if any is due. The inbox
+    # was drained first, so a member with new work never waits behind old work.
+    fire_one_stale_primer
   fi
   sleep "$IVL"
 done

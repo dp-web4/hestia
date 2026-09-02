@@ -52,6 +52,11 @@ launchers -- no test seam:
   4. A REFUSAL IS NOT AN EMPTY DEBT. When the `unanswered` RPC fails, the primer fires.
      `{}` and a 500 must not read as "nothing owed" -- that is the shape this corpus
      keeps finding, and here it would delete the only copy of a work list.
+  9. THE WALK YIELDS TO THE LOOP (kimi-code, reply 9164, 2026-09-02). The startup pass
+     fires nothing; surviving lists are fired from the main loop, one per tick, only on
+     a tick whose drain found no fresh mail. The kimi-code watcher on CBP restarted with
+     149 retained lists and, at a full wake per list, had not reached its first drain
+     in the 30 hours before this was written. Red before the fix.
 
 Usage: ./stale_primer_discharged_test.py     (runtime ~20s)
 """
@@ -237,12 +242,30 @@ def notice(nid, age_secs, kind="reply"):
             "queued_at": ago(age_secs), "in_reply_to": None}
 
 
+def decided(primers, planted, log):
+    """Every planted list has been judged: set aside (renamed away), or fired at least
+    once (its `.attempts` file exists and the fire log carries its path)."""
+    logged = {f["primer"] for f in fired(log)}
+    for name in planted:
+        path = os.path.join(primers, f"notice-{name}.json")
+        if not os.path.exists(path):
+            continue
+        if os.path.exists(path + ".attempts") and path in logged:
+            continue
+        return False
+    return True
+
+
 def run_case(tmp, ep, label, planted, debts, want_ids, refuse=False, sentinel_id=99999,
-             ignore_floor_arg=False, pad_owed=0, sweep_every=None, then=None):
-    """Run the real watcher once. The observable that says the startup stale pass has
-    finished is the member's OWN fresh mail being fired -- the drain happens after that
-    pass, so a sentinel in the log means every stale decision is already made. Never a
-    fixed sleep: a duration is a coin flip on a loaded host."""
+             ignore_floor_arg=False, pad_owed=0, sweep_every=None, then=None,
+             on_first_stale=None, also_wait_for=()):
+    """Run the real watcher once. Two observables, never a fixed sleep (a duration is a
+    coin flip on a loaded host): the member's OWN fresh mail (the sentinel) being fired
+    says the loop is running; every planted list being judged -- set aside, or fired
+    once from the loop -- says every stale decision is made. Until 2026-09-02 the walk
+    fired BEFORE the first drain, so the sentinel alone was the second observable too.
+    `on_first_stale(primers)` runs once, as soon as any planted list has been fired;
+    `also_wait_for` are extra ids that must be in the log before the run is over."""
     global DEBTS, REFUSE_UNANSWERED, IGNORE_FLOOR_ARG, PAD_OWED_TO_ME
     PAD_OWED_TO_ME = pad_owed
     state = os.path.join(tmp, label)
@@ -266,13 +289,23 @@ def run_case(tmp, ep, label, planted, debts, want_ids, refuse=False, sentinel_id
     p = subprocess.Popen([WATCHER, PLUGIN, f"{PLUGIN}-watch", fire],
                          env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     deadline = time.time() + 60
-    while time.time() < deadline and sentinel_id not in fired_ids(log):
+    hooked = False
+    while time.time() < deadline:
         if p.poll() is not None:
+            break
+        ids = fired_ids(log)
+        if on_first_stale is not None and not hooked and any(
+                f["primer"] != "" and os.path.basename(f["primer"])[7:13] in planted
+                for f in fired(log)):
+            on_first_stale(primers)
+            hooked = True
+        if (sentinel_id in ids and decided(primers, planted, log)
+                and set(also_wait_for) <= ids and (on_first_stale is None or hooked)):
             break
         time.sleep(0.2)
     if then is not None and p.poll() is None:
-        # Case 8: the startup pass is over (the sentinel fired). Change the world, then
-        # wait for the watcher's own cadence to notice -- never a fixed sleep.
+        # Case 8: every stale decision is made (the owed list fired once, from the loop).
+        # Change the world, then wait for the watcher's own cadence to notice.
         then(primers)
         deadline = time.time() + 30
         while time.time() < deadline and not os.path.exists(
@@ -483,14 +516,60 @@ def main():
         tmp, ep, "swept",
         planted={"SWEEPD": [owed8]},
         debts=[debt8], want_ids={940}, sweep_every=1, then=pay)
-    check("8a. an owed primer fires at startup and is preserved", 940 in got, f"{out[-1500:]}")
+    check("8a. an owed primer fires once, from the loop, and is preserved", 940 in got, f"{out[-1500:]}")
     check("8b. once the debt is paid, the cadence sweep retires it without a restart",
           os.path.exists(os.path.join(primers, "notice-SWEEPD.json.discharged"))
           and not os.path.exists(os.path.join(primers, "notice-SWEEPD.json")),
           f"dir={sorted(os.listdir(primers))}\n{out[-1500:]}")
-    check("8c. and the sweep never fires: exactly one fire of 940, the startup one",
+    check("8c. and the sweep never fires: exactly one fire of 940 (the loop's; a second "
+          "attempt waits STALE_RETRY_BACKOFF_SECS)",
           sum(1 for f in fired(os.path.join(tmp, "swept.log")) if 940 in f["ids"]) == 1,
           f"{fired(os.path.join(tmp, 'swept.log'))}")
+
+    # ---- 9. THE WALK YIELDS TO THE LOOP.
+    # Four owed lists retained at startup, one fresh notice waiting in the inbox, and a
+    # second fresh notice that arrives while the walk is in progress. Before the fix the
+    # watcher fired all four lists before its first drain; the first fresh notice waited
+    # behind them and the second was never seen until the walk was over. Now: the fresh
+    # notice fires FIRST, then one list per tick with a drain between each -- so the
+    # late notice overtakes the rest of the walk.
+    owed9 = {name: [notice(nid, 2 * 86400)] for name, nid in
+             (("WALK01", 950), ("WALK02", 951), ("WALK03", 952), ("WALK04", 953))}
+    debts9 = [{"id": n["id"], "kind": "reply", "from_plugin": "kimi-code",
+               "to_plugin": PLUGIN, "queued_at": n["queued_at"], "drained_at": None}
+              for lst in owed9.values() for n in lst]
+    LATE = 99998
+
+    def late_mail(primers):
+        INBOX[PLUGIN] = [notice(LATE, 30, kind="coordination")]
+
+    got, primers, out = run_case(
+        tmp, ep, "yields",
+        planted=owed9, debts=debts9, want_ids={950, 951, 952, 953},
+        on_first_stale=late_mail, also_wait_for=(LATE,))
+    got -= {LATE}
+    log9 = fired(os.path.join(tmp, "yields.log"))
+    order = [f["ids"][0] for f in log9 if f["ids"]]
+    check("9a. the member's own fresh mail fires BEFORE any retained list (the walk no "
+          "longer runs ahead of the first drain)",
+          order and order[0] == 99999,
+          f"fire order={order}\n{out[-2000:]}")
+    check("9b. the startup pass judged every list and fired none of them",
+          "4 retained primer(s) survive the judge" in out
+          and out.find("RETRYING stale primer") > out.find("notice(s) for"),
+          out[-2000:])
+    check("9c. every surviving list is still fired -- the loop works through the walk",
+          {950, 951, 952, 953} <= got, f"fired ids={sorted(got)}\n{out[-2000:]}")
+    last_stale = max((i for i, x in enumerate(order) if x in {950, 951, 952, 953}), default=-1)
+    check("9d. fresh mail that arrives mid-walk overtakes the rest of the walk "
+          "(a drain between every stale fire)",
+          LATE in order and order.index(LATE) < last_stale,
+          f"fire order={order}\n{out[-2000:]}")
+    check("9e. one retained list per tick: no two stale fires without a drain between "
+          "them (every stale fire is preceded by the loop's own inbox poll)",
+          out.count("RETRYING stale primer") == 4
+          and all(i == 0 or order[i - 1] != order[i] for i in range(len(order))),
+          f"fire order={order}\n{out[-2000:]}")
 
     srv.shutdown()
     print()
