@@ -73,6 +73,23 @@ Conduct evidence MUST resolve to witnessed records and carry enough information 
 
 Cached or projected data is acceleration only; it MUST preserve references back to canonical evidence.
 
+### 3.4 Actor and subject attribution are event-schema-specific
+
+A consistency axis MUST define how actor, subject, beneficiary, owner, filer, decider, witness, and other relevant parties are attributed for **each source event type it consumes**. Those roles are not interchangeable merely because two event schemas reuse a generic-looking field name.
+
+The #811/#822 correction to PR #809 is the canonical counterexample. On `gate_escalation_corroborated`, `plugin_id` names the **petition owner**, while `corroborated_by` names the participant who actually filed the factor. Keying conduct on `plugin_id` therefore measured "peer factors on my petitions" and mislabeled them as "my factors." The instrument looked internally coherent until the event schema was checked against the question it claimed to answer.
+
+Requirements:
+
+- every axis declares an attribution map/predicate for every event type it consumes;
+- attribution comes from the field whose schema semantics actually name that role, not from a preferred generic key;
+- a missing explicit actor field MUST become `unattributable` / unknown evidence rather than falling back to a field with different semantics;
+- subject and actor MUST remain separate when the act is performed **about/on behalf of** another entity;
+- fixtures SHOULD deliberately make distinct roles carry distinct identities so accidental equality cannot hide a conflation;
+- any schema/version change that alters attribution semantics invalidates the affected evidence cache and detector version.
+
+A detector that cannot say **whose act this is, by the event's own contract**, may surface the record for review but MUST NOT attribute conduct or create a reputation-bearing case from it.
+
 ## 4. Consistency case
 
 A detector MAY create a durable `ConsistencyCase` when both sides of an axis expose a divergence surface.
@@ -238,7 +255,8 @@ Before this PRD is considered implemented:
 7. An adjudicated case can emit an R7 observation only through society law.
 8. The resulting role-context reputation can be traced back to the adjudication and source evidence.
 9. Corrections supersede active propositions/cases without deleting history.
-10. A second materially different consistency axis validates the generic case schema before it is frozen.
+10. An attribution fixture with distinct petition owner / factor filer / subject proves the axis attributes conduct to the schema-defined actor and does not fall back when that actor field is absent.
+11. A second materially different consistency axis validates the generic case schema before it is frozen.
 
 ## 11. Relationship to PR #809
 
