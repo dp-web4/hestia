@@ -414,9 +414,14 @@ jobs:
           # Deliberately a SEPARATE step from the collapse meter above: one
           # number failing should not hide the other behind set -e.
           # 10, not 3 (slice 5): the reach domain is ONE engine table and every seat
-          # consumes it, so agreed == union by construction. This floor now guards the
-          # DELEGATION: a seat that re-declares its own key list reads as omitting
-          # whatever it forgot, and trips here. claude-code's pin moved 28.7 -> 28.8:
-          # the delegation's own comment carries law vocabulary the meter counts;
-          # codex/gemini/kimi dropped to their measured floors in the same act.
+          # consumes it, so agreed == union by construction. This flat key census is a
+          # TREND, not the contract: it cannot see the (tool, key) typing (delete "glob"
+          # from PATTERN_REACH_TOOLS and it stays 10/10), and a substring delegation
+          # check blessed a re-forked live site (GPT review of #830, both falsified).
+          # The contract is pinned by tools/reach_domain_contract_test.py in the
+          # plugin-tests job: typed behaviour with a sabotage self-check, the live
+          # extraction site proven by AST, and behaviour through every seat under a
+          # stub daemon. claude-code's pin moved 28.7 -> 28.8 (the delegation's own
+          # comment carries law vocabulary the meter counts); codex/gemini/kimi
+          # dropped to their measured floors in the same act.
           python3 tools/gate_collapse_meter.py --quiet --min-agreed-keys 10
