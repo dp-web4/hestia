@@ -172,10 +172,15 @@ def engine_reach_keys(root: Path):
     return engine_reach_keys_from_core(root / "plugins" / "_shared" / "hestia_gate_core.py")
 
 
-def engine_reach_keys_from_core(core: Path):
-    """The same table read from ONE core file: the tree's, or the resident engine under
-    $HESTIA_HOME/shared. The readiness instrument measures installed bytes and must not be
-    handed the source tree's table in their place."""
+REACH_TABLE_NAMES = ("PATH_KEYS", "PATH_LIST_KEYS", "GLOB_KEYS", "PATTERN_REACH_TOOLS")
+
+
+def engine_reach_table_from_core(core: Path):
+    """The TYPED table read from ONE core file: the tree's, or the resident engine under
+    $HESTIA_HOME/shared. {name: set(str)} for the four declarations, or None when the core
+    does not declare PATH_KEYS and PATTERN_REACH_TOOLS as tuple/list literals (a pre-slice-5
+    tree, or a spelling this reader cannot see). The readiness instrument measures installed
+    bytes and must not be handed the source tree's table in their place."""
     try:
         tree = ast.parse(core.read_text(encoding="utf-8", errors="replace"))
     except (OSError, SyntaxError):
@@ -189,10 +194,25 @@ def engine_reach_keys_from_core(core: Path):
                                     if isinstance(e, ast.Constant) and isinstance(e.value, str)}
     if "PATH_KEYS" not in consts or "PATTERN_REACH_TOOLS" not in consts:
         return None
-    keys = set()
-    for name in ("PATH_KEYS", "PATH_LIST_KEYS", "GLOB_KEYS"):
-        keys |= consts.get(name, set())
-    return keys | {"pattern"}
+    return {name: set(consts.get(name, set())) for name in REACH_TABLE_NAMES}
+
+
+def active_reach_keys(table) -> set:
+    """The key names that are reach under a typed table. `pattern` is a reach key only while
+    some tool is declared to walk the filesystem with it. GPT's review of #837: the flat
+    union added `pattern` whenever the declaration merely EXISTED, so a resident engine with
+    `PATTERN_REACH_TOOLS = ()` -- valid AST, the Glob semantic deleted -- still read as the
+    full table. The same blindness #830 killed in the census, one reader over."""
+    keys = set(table["PATH_KEYS"]) | set(table["PATH_LIST_KEYS"]) | set(table["GLOB_KEYS"])
+    if table["PATTERN_REACH_TOOLS"]:
+        keys.add("pattern")
+    return keys
+
+
+def engine_reach_keys_from_core(core: Path):
+    """Active reach key names of one core file (see active_reach_keys), or None."""
+    table = engine_reach_table_from_core(core)
+    return None if table is None else active_reach_keys(table)
 
 
 def _is_engine_path_targets_call(node) -> bool:

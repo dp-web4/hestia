@@ -20,6 +20,9 @@ Then it sabotages the installation one way at a time and asserts the row says so
   9. empty domain          -> when no resident gate declares OR delegates a key the column is
                               a measurement gap, INDETERMINATE; the 2026-09-02 deploy of slice 5
                               graded all four seats PASS on `0/0` under the old fallback
+ 10. Glob semantic deleted  -> a resident core with `PATTERN_REACH_TOOLS = ()` (valid AST) reads
+                              N-1 keys with `pattern` absent and the table line says so; the
+                              flat reader (GPT, #837 review) kept it at N/N
 
 The verdict column is not asserted as PASS for every seat on the real tree; this test
 asserts the instrument, not the fleet.
@@ -241,6 +244,30 @@ def test_empty_domain_is_indeterminate_not_pass() -> None:
         check(rc == 1, "[9] an unmeasurable domain is not a pass")
 
 
+def test_pattern_reach_off_is_visible() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        home, hestia = install(Path(raw))
+        _, base = run(hestia, "--report-only")
+        n = by_seat(base)["claude-code"]["extraction"][0]
+        check(base["trend"]["reach_table"]["PATTERN_REACH_TOOLS"] == ["glob"]
+              and "pattern" in by_seat(base)["claude-code"]["extraction_keys"],
+              "[10] faithful install: pattern-reach tools = glob, pattern is a key")
+        core = hestia / "shared" / "hestia_gate_core.py"
+        src = core.read_text(encoding="utf-8")
+        assert 'PATTERN_REACH_TOOLS = ("glob",)' in src
+        core.write_text(src.replace('PATTERN_REACH_TOOLS = ("glob",)', "PATTERN_REACH_TOOLS = ()", 1),
+                        encoding="utf-8")
+        reledger(hestia)
+        rc, data = run(hestia, "--report-only")
+        rows = by_seat(data)
+        check(data["trend"].get("reach_table", {}).get("PATTERN_REACH_TOOLS") == [],
+              f"[10] the resident table on the output shows no pattern-reach tool: {data['trend'].get('reach_table')}")
+        for s in GATES:
+            r = rows.get(s, {})
+            check(tuple(r.get("extraction") or ()) == (n - 1, n - 1) and "pattern" not in r.get("extraction_keys", ["pattern"]),
+                  f"[10] {s}: {r.get('extraction')} keys={r.get('extraction_keys')} (was {n}/{n} with pattern)")
+
+
 def test_no_ledger_is_indeterminate() -> None:
     with tempfile.TemporaryDirectory() as raw:
         hestia = Path(raw) / "empty"
@@ -259,6 +286,7 @@ if __name__ == "__main__":
     test_delegated_extraction_reads_resident_engine_table()
     test_delegating_seat_over_tableless_engine_is_indeterminate()
     test_empty_domain_is_indeterminate_not_pass()
+    test_pattern_reach_off_is_visible()
     if FAILURES:
         print(f"FAILED: {len(FAILURES)}", file=sys.stderr)
         sys.exit(1)

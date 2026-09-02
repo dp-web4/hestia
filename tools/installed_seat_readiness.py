@@ -46,8 +46,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import gate_collapse_meter as meter  # noqa: E402
 from path_key_vocabulary_probe import (  # noqa: E402
-    NOT_REACH, engine_reach_keys_from_core, keys_from_get_literals, keys_from_path_targets,
-    live_site_delegates)
+    NOT_REACH, REACH_TABLE_NAMES, active_reach_keys, engine_reach_table_from_core,
+    keys_from_get_literals, keys_from_path_targets, live_site_delegates)
 
 GATE_BASENAMES = set(meter.GATE_BASENAMES)
 
@@ -229,7 +229,11 @@ def measure(ledger_path: Path, hestia_home: Path, max_local: dict, max_forks: di
     for e in ledger.get("shared_engine") or []:
         if e.get("file") == "hestia_gate_core.py" and e.get("path"):
             core = Path(e["path"])
-    engine_keys = engine_reach_keys_from_core(core)
+    # The TYPED table, so `pattern` counts only while a tool is declared to walk with it; the
+    # table itself rides on the output so a semantic change in the resident engine (the Glob
+    # reach deleted, AST still valid) is visible as a changed row, not a flat N/N.
+    engine_table = engine_reach_table_from_core(core)
+    engine_keys = None if engine_table is None else active_reach_keys(engine_table)
     declared, sources = {}, {}
     for row in rows:
         p = row.get("resident_path")
@@ -267,7 +271,10 @@ def measure(ledger_path: Path, hestia_home: Path, max_local: dict, max_forks: di
         row["extraction_source"] = sources.get(seat)
         if seat in vocab:
             row["extraction"] = (len(vocab[seat]), len(union))
+            row["extraction_keys"] = sorted(vocab[seat])
             row["extraction_missing"] = sorted(union - vocab[seat])
+    reach_table = (None if engine_table is None
+                   else {name: sorted(engine_table[name]) for name in REACH_TABLE_NAMES})
 
     # --- verdicts
     for row in rows:
@@ -305,7 +312,7 @@ def measure(ledger_path: Path, hestia_home: Path, max_local: dict, max_forks: di
     trend = {"fleet_local_law": fleet_local, "shared_law": shared_law,
              "fleet_pct": (100.0 * fleet_local / (fleet_local + shared_law)) if (fleet_local + shared_law) else 0.0,
              "build_id": ledger.get("build_id"), "installed_at": ledger.get("installed_at_iso"),
-             "engine_ok": engine_ok}
+             "engine_ok": engine_ok, "reach_table": reach_table, "resident_core": str(core)}
     return rows, trend
 
 
@@ -323,6 +330,13 @@ def render(rows: list[dict], trend: dict) -> None:
                   f"{(f'{ex[0]}/{ex[1]} {src}' if ex else '?'):<11}{r['loader_verdict']:<11}{r['verdict']}")
         for reason in r["reasons"]:
             print(f"{'':<13}- {reason}")
+    t = trend.get("reach_table")
+    if t is None:
+        print("RESIDENT REACH TABLE: none declared (delegating seats cannot be measured)")
+    else:
+        prt = ",".join(t["PATTERN_REACH_TOOLS"]) or "NONE (pattern is not a reach key on this engine)"
+        print(f"RESIDENT REACH TABLE: path={len(t['PATH_KEYS'])} list={len(t['PATH_LIST_KEYS'])} "
+              f"glob={len(t['GLOB_KEYS'])} pattern-reach-tools={prt}")
     print(f"TREND (secondary, not a verdict): fleet {trend['fleet_pct']:.1f}% of law-bearing sloc is per-seat "
           f"({trend['fleet_local_law']} per-seat + {trend['shared_law']} shared)")
 
