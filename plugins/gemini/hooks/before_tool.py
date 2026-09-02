@@ -109,9 +109,96 @@ with contextlib.redirect_stdout(sys.stderr):
     except Exception:
         _shared_check_paths = None
 
+# ── The shared engine, through the installed-only loader ─────────────────────────────────
+# BYTE-IDENTICAL to the codex/claude loader (#742/#747; asserted by the staging script, not
+# eyeballed): the loader is the one law-adjacent text that cannot itself be loaded from
+# shared authority. Gemini was the last seat without it, and its four private scope
+# predicates measured strictly FAIL-OPEN against the engine (scope_fork_differential_test,
+# 6 of 12 inputs SEAT GRANTS WHAT THE ENGINE DENIES: substring-home x2 [fleet-review
+# blocker 8], startswith-temp-root x2 [#169], lexical traversal x2 [#940 B5]). Loaded under
+# the same stdout redirect as path_scope above: fd 1 is the verdict channel, and a stray
+# byte printed by a module would shadow a deny payload into an allow.
+def _shared_runtime_dir():
+    return os.environ.get("HESTIA_SHARED_DIR") or os.path.join(
+        os.path.expanduser(os.environ.get("HESTIA_HOME", "~/.hestia")), "shared")
+
+
+def _load_shared_module(name):
+    """Load governing code only from the selected installed authority directory."""
+    import importlib.util
+
+    shared = _shared_runtime_dir()
+    required = os.path.realpath(os.path.join(shared, name + ".py"))
+    if not os.path.isfile(required):
+        raise ImportError(
+            f"installed Hestia shared module {name!r} is unavailable at {required!r}; "
+            "run deploy/install-members.sh"
+        )
+
+    # Shared modules legitimately import one another by bare canonical name. Make only
+    # the selected authority directory available to those imports; never add a checkout
+    # fallback. Canonicalize it so a HESTIA_HOME/shared symlink and its build directory
+    # cannot occupy two precedence positions.
+    selected_dir = os.path.dirname(required)
+    selected_key = os.path.normcase(selected_dir)
+    retained = []
+    for entry in sys.path:
+        try:
+            entry_key = os.path.normcase(os.path.realpath(os.fspath(entry) or os.getcwd()))
+        except (TypeError, ValueError, OSError):
+            retained.append(entry)
+            continue
+        if entry_key != selected_key:
+            retained.append(entry)
+    sys.path[:] = [selected_dir, *retained]
+
+    cached = sys.modules.get(name)
+    if cached is not None:
+        cached_file = getattr(cached, "__file__", None)
+        if cached_file and os.path.realpath(cached_file) == required:
+            return cached
+        sys.modules.pop(name, None)
+
+    spec = importlib.util.spec_from_file_location(name, required)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot construct a loader for installed module {required!r}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        sys.modules.pop(name, None)
+        # This boundary is module INITIALIZATION only. Convert even SystemExit(0) into
+        # an ordinary loader failure so module-level callers reach the explicit
+        # fail-closed posture; main()'s legitimate allow/deny SystemExit remains outside.
+        raise ImportError(
+            f"installed Hestia shared module {name!r} failed to initialize"
+        ) from exc
+    loaded_file = getattr(module, "__file__", None)
+    if not loaded_file or os.path.realpath(loaded_file) != required:
+        sys.modules.pop(name, None)
+        raise ImportError(
+            f"shared authority miswire: {name!r} resolved to {loaded_file!r}, "
+            f"expected {required!r}"
+        )
+    return module
+
+
+with contextlib.redirect_stdout(sys.stderr):
+    try:
+        _core = _load_shared_module("hestia_gate_core")
+    except Exception:
+        _core = None
+
 WORKSPACE = os.environ.get("HESTIA_WORKSPACE") or os.getcwd()
 IDENTITY = os.path.expanduser(
     os.environ.get("HESTIA_GEMINI_IDENTITY", "~/.gemini/hestia-instance/identity.json"))
+_CORE_PROFILE = (_core.HarnessProfile(
+    member_id="gemini",
+    identity_path=IDENTITY,
+    home_markers=("~/.gemini",),
+    launch_cwd_env="HESTIA_GEMINI_LAUNCH_CWD",
+) if _core is not None else None)
 CLAUDE_PRE = os.environ.get(
     "HESTIA_SOCIETY_GATE",
     os.path.join(WORKSPACE, "hestia/plugins/claude-code/hooks/pre_tool_use.py"))
@@ -144,16 +231,12 @@ def load_in_scope():
     return []
 
 
-def launch_cwd_repo():
-    """The repo Gemini is launched in is always in scope - a per-launch dynamic grant on top of the
-    static allowlist, so a task-specific launch dir is reachable for that session without widening
-    the standing grant."""
-    cwd = (os.environ.get("HESTIA_GEMINI_LAUNCH_CWD") or os.getcwd()).replace("\\", "/")
-    if WORKSPACE in cwd:
-        rest = cwd.split(WORKSPACE, 1)[1].lstrip("/")
-        seg = rest.split("/", 1)[0] if rest else ""
-        return [seg] if seg else []
-    return []
+def _launch_grant():
+    """Engine's launch-grant rule; the local copy judged WORKSPACE by SUBSTRING.
+    Engine absent: no dynamic grant, the tighter direction."""
+    if _core is None or _CORE_PROFILE is None:
+        return []
+    return _core.launch_cwd_repo(_CORE_PROFILE, WORKSPACE)
 
 
 def path_targets(tool_input):
@@ -307,45 +390,25 @@ def to_claude_lineage(event, tool, tinput, mcp):
     return out
 
 
-def _all_repos():
-    try:
-        return [d for d in os.listdir(WORKSPACE)
-                if os.path.isdir(os.path.join(WORKSPACE, d)) and not d.startswith(".")]
-    except Exception:
-        return []
 
 
-def path_in_scope(path, scopes):
-    """A file path is in-scope if it's the agent's home, /tmp, or under a granted repo."""
-    p = path.replace("\\", "/")
-    low = p.lower()
-    if GEMINI_HOME.lower() in low or "~/.gemini" in low:
-        return True
-    if p.startswith(("/tmp", "/var/tmp")):
-        return True
-    if WORKSPACE in p:
-        rest = p.split(WORKSPACE, 1)[1].lstrip("/")
-    else:
-        rest = p.lstrip("./")
-    seg = rest.split("/", 1)[0] if rest else ""
-    if seg == "":
-        return False           # bare workspace root (the glob-the-root antipattern) -> out of scope
-    return seg in scopes
+def _scope_path(path, scopes):
+    """Engine's path predicate (normalise first, containment at the boundary). This is the
+    FALLBACK arm behind path_scope's realpath containment, and the fallback is exactly where
+    the fail-opens lived: it only runs on a partial checkout, the least-reviewed state.
+    Engine absent: out of scope -- Gate-1b's fail-closed direction."""
+    if _core is None or _CORE_PROFILE is None:
+        return False
+    return _core.path_in_scope(path, scopes, WORKSPACE, _CORE_PROFILE, cwd=os.getcwd())
 
 
-def command_in_scope(cmd, scopes):
-    """A shell command is out of scope if it names an out-of-scope repo, or globs the workspace root
-    without narrowing to a granted repo. (Relative-recursive traversal from a broad cwd escapes
-    string-parsing - launch Gemini in the specific task repo, not the workspace root.)"""
-    oos = [r for r in _all_repos() if r not in scopes]
-    for repo in oos:
-        if re.search(rf"""(^|[\s/=:"'(]){re.escape(repo)}(/|[\s"')]|$)""", cmd):
-            return False
-    if WORKSPACE in cmd:
-        after = cmd.split(WORKSPACE, 1)[1]
-        if not any(after.lstrip("/").startswith(s) for s in scopes):
-            return False
-    return True
+def _scope_command(cmd, scopes):
+    """Engine's command predicate; the local copy consulted a lexical repo list and judged
+    the workspace by substring. Engine absent: out of scope, fail closed."""
+    if _core is None:
+        return False
+    ok, _tok = _core.command_in_scope(cmd, scopes, WORKSPACE, cwd=os.getcwd())
+    return ok
 
 
 # Rollout mode: DENY-TIGHT by default - a foreign agent starts enforced and RELAXES as role-scoped
@@ -413,7 +476,7 @@ def _gate():
     tinput = event.get("tool_input") or {}
     mcp = event.get("mcp_context") if isinstance(event.get("mcp_context"), dict) else None
     cwd = event.get("cwd") or os.environ.get("HESTIA_GEMINI_LAUNCH_CWD") or os.getcwd()
-    scopes = dedupe(load_in_scope() + launch_cwd_repo())
+    scopes = dedupe(load_in_scope() + _launch_grant())
     paths = path_targets(tinput)
     cmd = command_of(tinput)
     egress = egress_targets(tinput) + mcp_egress(mcp)  # url/prompt/query + HTTP-MCP url: Gate-1a only
@@ -440,13 +503,13 @@ def _gate():
                      "Adjust to work within scope, or if legitimately needed, request it (request_scope).")
         else:
             for p in paths:
-                if not path_in_scope(p, scopes):
+                if not _scope_path(p, scopes):
                     deny(f"'{tool}' targets '{p[:60]}' outside your granted scope ({'+'.join(scopes)})",
                          "Adjust to work within scope, or if legitimately needed, request it (request_scope).")
     # Command-scope covers the shell command AND the MCP transport (its command + args are a real
     # exec surface: an oos root handed to a filesystem server is an oos read the file gates never see).
     for c in ([cmd] if cmd is not None else []) + mcp_args:
-        if not command_in_scope(c, scopes):
+        if not _scope_command(c, scopes):
             where = "command" if c == cmd else "mcp_context argument"
             deny(f"'{tool}' {where} reaches outside your granted scope ({'+'.join(scopes)})",
                  "Scope it to a granted repo, or if legitimately needed, request it (request_scope).")
