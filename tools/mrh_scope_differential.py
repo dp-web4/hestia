@@ -61,11 +61,11 @@ def build_fixture(base: Path) -> dict:
     right = wrong / "ai-agents"
     for d in ("python", "exec", "misc", "archive", "ye"):
         (wrong / d).mkdir(parents=True)
-    for d in ("hestia/tools", "hestia/.github/workflows", "private-context", "docs", "scripts"):
+    for d in ("hestia/tools", "hestia/.github/workflows", "sibling-repo", "docs", "scripts"):
         (right / d).mkdir(parents=True)
     (right / "hestia" / "README.md").write_text("x\n")
     (right / "hestia" / ".github" / "workflows" / "ci.yml").write_text("x\n")
-    (right / "private-context" / "notes.md").write_text("x\n")
+    (right / "sibling-repo" / "notes.md").write_text("x\n")
     os.symlink(".", right / "ai-agents")        # the stray self-link measured on CBP (2025-11-21)
     return {"wrong": str(wrong), "right": str(right), "hestia": str(right / "hestia"),
             "grants": [f"path:{right / 'hestia'}", f"path:{right / 'docs'}"]}
@@ -87,8 +87,8 @@ def cases(fx: dict) -> list:
         ("ctl.interpreter-head", f"cd {H} && python3 tools/meter.py", ALLOW),
         ("ctl.granted-absolute-read", f"cat {H}/README.md", ALLOW),
         ("ctl.granted-relative-read", "cat tools/meter.py", None),        # meaning depends on cwd by design
-        ("ctl.ungranted-sibling-repo", f"cat {R}/private-context/notes.md", DENY),
-        ("ctl.traversal-out-of-grant", f"cat {H}/../private-context/notes.md", DENY),
+        ("ctl.ungranted-sibling-repo", f"cat {R}/sibling-repo/notes.md", DENY),
+        ("ctl.traversal-out-of-grant", f"cat {H}/../sibling-repo/notes.md", DENY),
     ]
 
 
@@ -143,12 +143,12 @@ PINS = {
     ('ctl.interpreter-head', 'right', 'root'): ('allow', None),
     ('ctl.interpreter-head', 'wrong', 'repo'): ('allow', None),
     ('ctl.interpreter-head', 'wrong', 'root'): ('allow', None),
-    ('ctl.traversal-out-of-grant', 'right', 'repo'): ('deny', 'private-context'),
-    ('ctl.traversal-out-of-grant', 'right', 'root'): ('deny', 'private-context'),
+    ('ctl.traversal-out-of-grant', 'right', 'repo'): ('deny', 'sibling-repo'),
+    ('ctl.traversal-out-of-grant', 'right', 'root'): ('deny', 'sibling-repo'),
     ('ctl.traversal-out-of-grant', 'wrong', 'repo'): ('deny', 'ai-agents'),
     ('ctl.traversal-out-of-grant', 'wrong', 'root'): ('deny', 'ai-agents'),
-    ('ctl.ungranted-sibling-repo', 'right', 'repo'): ('deny', 'private-context'),
-    ('ctl.ungranted-sibling-repo', 'right', 'root'): ('deny', 'private-context'),
+    ('ctl.ungranted-sibling-repo', 'right', 'repo'): ('deny', 'sibling-repo'),
+    ('ctl.ungranted-sibling-repo', 'right', 'root'): ('deny', 'sibling-repo'),
     ('ctl.ungranted-sibling-repo', 'wrong', 'repo'): ('deny', 'ai-agents'),
     ('ctl.ungranted-sibling-repo', 'wrong', 'root'): ('deny', 'ai-agents'),
 }
