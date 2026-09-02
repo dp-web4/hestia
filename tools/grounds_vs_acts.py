@@ -207,6 +207,7 @@ def conduct_register(dump: dict, seat: str) -> dict:
     """Classify the seat's corroboration factors against terminality."""
     terminal: dict[str, dict] = {}
     factors = []
+    unattributable = []
     for e in dump["events"]:
         d = e.get("eventData") or {}
         eid = d.get("escalation_id")
@@ -220,8 +221,16 @@ def conduct_register(dump: dict, seat: str) -> dict:
             if eid not in terminal or ts(e) > ts(terminal[eid]):
                 terminal[eid] = e
         elif e["eventType"] == "gate_escalation_corroborated":
-            if (d.get("plugin_id") or d.get("by")) == seat:
+            # THE FILER, not the owner (#811): on a corroborated event `plugin_id` names the
+            # PETITION OWNER; `corroborated_by` names who filed the factor. The two agree on
+            # 0 of 295 events in the full-chain dump, so owner-keying reported "peers'
+            # factors on my petitions" as the seat's own conduct. No plugin_id fallback on
+            # purpose -- falling back would silently reintroduce the wrong population when
+            # the field is absent; an event with no corroborated_by is counted and named.
+            if d.get("corroborated_by") == seat:
                 factors.append(e)
+            elif "corroborated_by" not in d:
+                unattributable.append(e)
     pre, post, no_terminal = [], [], []
     for e in factors:
         d = e["eventData"]
@@ -239,7 +248,8 @@ def conduct_register(dump: dict, seat: str) -> dict:
             row["dt_after_terminal_s"] = round(dt, 1)
             (pre if dt <= 0 else post).append(row)
     return {"seat": seat, "factors": len(factors), "pre": pre,
-            "post": post, "no_terminal_in_window": no_terminal}
+            "post": post, "no_terminal_in_window": no_terminal,
+            "unattributable": len(unattributable)}
 
 
 def authored_files(repo: Path, seat: str) -> list[Path]:
@@ -325,6 +335,9 @@ def main() -> int:
 
     conduct = conduct_register(dump, args.seat)
     post = conduct["post"]
+    if conduct.get("unattributable"):
+        print(f"\n## NOTE: {conduct['unattributable']} corroborated event(s) carry no "
+              f"corroborated_by and are counted for no seat")
     print(f"\n## conduct register: {conduct['factors']} factors — "
           f"{len(conduct['pre'])} pre-terminal, {len(post)} post-terminal, "
           f"{len(conduct['no_terminal_in_window'])} no-terminal-in-window")

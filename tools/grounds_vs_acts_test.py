@@ -27,13 +27,13 @@ def test_conduct_register_classifies_against_terminality() -> None:
         esc_event("gate_escalation_opened", "aaa", "2026-08-20T00:00:00Z"),
         esc_event("gate_escalation_decided", "aaa", "2026-08-20T00:01:00Z", status="approved"),
         esc_event("gate_escalation_corroborated", "aaa", "2026-08-20T00:00:30Z",
-                  plugin_id="kimi-code", stance="concur"),
+                  corroborated_by="kimi-code", plugin_id="owner-seat", stance="concur"),
         esc_event("gate_escalation_corroborated", "aaa", "2026-08-20T00:05:00Z",
-                  plugin_id="kimi-code", stance="concur"),
+                  corroborated_by="kimi-code", plugin_id="owner-seat", stance="concur"),
         esc_event("gate_escalation_corroborated", "aaa", "2026-08-20T00:04:00Z",
-                  plugin_id="codex", stance="dissent"),
+                  corroborated_by="codex", plugin_id="owner-seat", stance="dissent"),
         esc_event("gate_escalation_corroborated", "bbb", "2026-08-20T00:02:00Z",
-                  plugin_id="kimi-code", stance="concur"),
+                  corroborated_by="kimi-code", plugin_id="owner-seat", stance="concur"),
     ]}
     reg = GVA.conduct_register(dump, "kimi-code")
     assert reg["factors"] == 3, reg                       # codex factor excluded
@@ -91,7 +91,7 @@ def test_duplicate_terminal_records_select_the_final_state_in_either_order() -> 
     older = esc_event("gate_escalation_decided", "dup", "2026-08-20T00:01:00Z", status="denied")
     newer = esc_event("gate_escalation_withdrawn", "dup", "2026-08-20T00:10:00Z", status="denied")
     factor = esc_event("gate_escalation_corroborated", "dup", "2026-08-20T00:05:00Z",
-                       plugin_id="kimi-code", stance="concur")
+                       corroborated_by="kimi-code", plugin_id="owner-seat", stance="concur")
     for events in ([older, factor, newer], [newer, factor, older]):   # both walk orders
         reg = GVA.conduct_register({"events": events}, "kimi-code")
         assert len(reg["pre"]) == 1 and not reg["post"], (events, reg)
@@ -123,7 +123,7 @@ def test_report_language_is_a_review_signal_not_a_verdict() -> None:
             "events": [
                 esc_event("gate_escalation_decided", "e1", "2026-08-20T00:01:00Z", status="approved"),
                 esc_event("gate_escalation_corroborated", "e1", "2026-08-20T00:05:00Z",
-                          plugin_id="kimi-code", stance="concur"),
+                          corroborated_by="kimi-code", plugin_id="owner-seat", stance="concur"),
             ]}
     with tempfile.TemporaryDirectory() as raw:
         cache = Path(raw) / "walk.json"
