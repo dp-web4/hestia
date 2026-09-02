@@ -384,6 +384,21 @@ def identity_field_access(src: str, argv=None):
                 p = resolve(node)
                 if p:
                     reads.add(".".join(p))
+    # THE SEAM RULE (slice 3, PR #796). The collapse moved the identity role read into the
+    # shared engine: `role_bridge(*, snapshot_role, identity_path)` reads `role` from the
+    # file it is handed -- that is its contract, and the engine body is in the walk. But the
+    # read no longer lexically names identity.json (the path arrives as a parameter), so the
+    # taint walk cannot resolve it, and property B reported `role` as "declared core -- and
+    # nothing reads it" the moment the reader was deduplicated. A call to role_bridge that
+    # binds identity_path IS the decider exercising the field: record it as a read of `role`
+    # at the CALL SITE, so B still goes red if the seats stop consulting the bridge. Pinned
+    # by E6 below, in both directions.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            f = node.func
+            fname = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+            if fname == "role_bridge" and any(k.arg == "identity_path" for k in node.keywords):
+                reads.add("role")
     return reads, writes
 
 
@@ -431,9 +446,18 @@ def is_decider(src: str) -> bool:
 
 
 def hook_sources():
-    """Every hook this repo ships, as (relpath, member, python_source, argv)."""
+    """Every hook this repo ships, as (relpath, member, python_source, argv).
+
+    PLUS the shared engine (slice 3, PR #796): the collapse moves law OUT of seat hooks and
+    into plugins/_shared, readers included -- role_bridge's identity.json role read now lives
+    in hestia_gate_mechanism, and a walk scoped to hooks alone reported `role` as "declared
+    core -- and nothing reads it" the moment the reader was deduplicated. The field is still
+    read and still keys attribution/scope; the measurement follows the law to where it lives.
+    Tests beside the engine are not the engine and stay out of the walk."""
     out = []
-    for p in tracked("plugins/*/hooks/*") + tracked("plugins/*/*/*/*/hooks/*"):
+    shared = [p for p in tracked("plugins/_shared/hestia_*.py")
+              if not p.name.endswith("_test.py") and not p.name.startswith("test_")]
+    for p in tracked("plugins/*/hooks/*") + tracked("plugins/*/*/*/*/hooks/*") + shared:
         rel = p.relative_to(REPO).as_posix()
         member = rel.split("/")[1]
         if rel.startswith("plugins/codex/marketplace/"):
@@ -606,6 +630,18 @@ def prop_e_selftest():
     split = prop_d_provenance({}, {"plugins/a/instance/identity.seed.json": {"entity": "a"}})
     if "role" not in split:
         failures.append("E5: D passes vacuously when a core field has no carrier")
+
+    # E6: the seam rule, both directions. A call binding identity_path to the bridge is the
+    # decider exercising `role` (the engine body reads it from that file by contract); a
+    # bridge call WITHOUT identity_path is not evidence of the read and must not count.
+    src = ("m.role_bridge(snapshot_role=s, identity_path=IDENTITY)\n")
+    reads, _ = identity_field_access(src)
+    if "role" not in reads:
+        failures.append("E6: role_bridge(identity_path=...) call site not seen as a role read")
+    src = ("m.role_bridge(snapshot_role=s)\n")
+    reads, _ = identity_field_access(src)
+    if "role" in reads:
+        failures.append("E6: a bridge call WITHOUT identity_path counted as a read (rule too broad)")
 
     return failures
 
