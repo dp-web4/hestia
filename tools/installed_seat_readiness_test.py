@@ -13,10 +13,19 @@ Then it sabotages the installation one way at a time and asserts the row says so
   4. missing resident      -> that seat INDETERMINATE, never dropped from the table
   5. per-seat bound        -> a bound on one seat fails THAT seat and moves no other row
   6. no ledger             -> rc 3, INDETERMINATE, not a pass
+  7. delegated extraction  -> every seat's column is the RESIDENT engine's table, N/N `engine`,
+                              N > 0, and N is read from the staged build's core (not the tree)
+  8. engine without table  -> a delegating seat over a resident core that declares no reach
+                              table is INDETERMINATE by name, not PASS and not 0/0
+  9. empty domain          -> when no resident gate declares OR delegates a key the column is
+                              a measurement gap, INDETERMINATE; the 2026-09-02 deploy of slice 5
+                              graded all four seats PASS on `0/0` under the old fallback
+ 10. Glob semantic deleted  -> a resident core with `PATTERN_REACH_TOOLS = ()` (valid AST) reads
+                              N-1 keys with `pattern` absent and the table line says so; the
+                              flat reader (GPT, #837 review) kept it at N/N
 
-The verdict column is not asserted as PASS for every seat: on the real tree gemini carries
-four divergent scope forks and three seats extract 3/10 path keys, and this test does not
-get to pretend otherwise. It asserts the instrument, not the fleet.
+The verdict column is not asserted as PASS for every seat on the real tree; this test
+asserts the instrument, not the fleet.
 """
 from __future__ import annotations
 
@@ -169,6 +178,96 @@ def test_per_seat_bound_names_one_seat() -> None:
                   f"[5] {s} measured value and reasons unchanged by claude-code's bound")
 
 
+def reledger(hestia: Path) -> None:
+    """Re-sign the ledger over the CURRENT resident bytes, so a deliberate edit to a resident
+    file tests the column under edit rather than the MISWIRED row."""
+    ledger = json.loads((hestia / "current-build.json").read_text(encoding="utf-8"))
+    for m in ledger["members"]:
+        for f in m["files"]:
+            f["sha256"] = sha(Path(f["path"]))
+    for e in ledger["shared_engine"]:
+        e["sha256"] = sha(Path(e["path"]))
+    (hestia / "current-build.json").write_text(json.dumps(ledger), encoding="utf-8")
+
+
+def test_delegated_extraction_reads_resident_engine_table() -> None:
+    sys.path.insert(0, str(REPO / "tools"))
+    from path_key_vocabulary_probe import engine_reach_keys_from_core
+    with tempfile.TemporaryDirectory() as raw:
+        home, hestia = install(Path(raw))
+        n = len(engine_reach_keys_from_core(hestia / "shared" / "hestia_gate_core.py") or ())
+        check(n > 0, f"[7] the staged build's core declares a reach table ({n} keys)")
+        rc, data = run(hestia, "--report-only")
+        rows = by_seat(data)
+        for s in GATES:
+            r = rows.get(s, {})
+            check(r.get("extraction_source") == "engine" and tuple(r.get("extraction") or ()) == (n, n),
+                  f"[7] {s}: extraction {r.get('extraction')} {r.get('extraction_source')} == ({n}, {n}) engine")
+
+
+def test_delegating_seat_over_tableless_engine_is_indeterminate() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        home, hestia = install(Path(raw))
+        core = hestia / "shared" / "hestia_gate_core.py"
+        src = core.read_text(encoding="utf-8")
+        assert 'PATTERN_REACH_TOOLS = ("glob",)' in src
+        # the same value, spelled so the AST reader sees no tuple literal: the table is gone
+        core.write_text(src.replace('PATTERN_REACH_TOOLS = ("glob",)', 'PATTERN_REACH_TOOLS = tuple(["glob"])', 1),
+                        encoding="utf-8")
+        reledger(hestia)
+        rc, data = run(hestia)
+        rows = by_seat(data)
+        for s in GATES:
+            r = rows.get(s, {})
+            check(r.get("verdict") == "INDETERMINATE" and any("no reach table" in x for x in r.get("reasons", [])),
+                  f"[8] {s}: {r.get('verdict')} {r.get('reasons')}")
+        check(rc == 1, "[8] INDETERMINATE is not a pass")
+
+
+def test_empty_domain_is_indeterminate_not_pass() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        home, hestia = install(Path(raw))
+        for seat, rel in GATES.items():
+            dest = home / f".{seat}" / "hooks" / Path(rel).name
+            if dest.is_file():
+                # a gate that neither declares a list nor delegates: no reach key anywhere
+                dest.write_text("import sys\n\ndef main():\n    return 0\n\nif __name__ == '__main__':\n"
+                                "    sys.exit(main())\n", encoding="utf-8")
+        reledger(hestia)
+        rc, data = run(hestia)
+        rows = by_seat(data)
+        for s in GATES:
+            r = rows.get(s, {})
+            check(tuple(r.get("extraction") or ()) == (0, 0), f"[9] {s}: the column reads 0/0 ({r.get('extraction')})")
+            check(r.get("verdict") != "PASS" and any("unmeasurable" in x for x in r.get("reasons", [])),
+                  f"[9] {s}: 0/0 is not PASS: {r.get('verdict')} {r.get('reasons')}")
+        check(rc == 1, "[9] an unmeasurable domain is not a pass")
+
+
+def test_pattern_reach_off_is_visible() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        home, hestia = install(Path(raw))
+        _, base = run(hestia, "--report-only")
+        n = by_seat(base)["claude-code"]["extraction"][0]
+        check(base["trend"]["reach_table"]["PATTERN_REACH_TOOLS"] == ["glob"]
+              and "pattern" in by_seat(base)["claude-code"]["extraction_keys"],
+              "[10] faithful install: pattern-reach tools = glob, pattern is a key")
+        core = hestia / "shared" / "hestia_gate_core.py"
+        src = core.read_text(encoding="utf-8")
+        assert 'PATTERN_REACH_TOOLS = ("glob",)' in src
+        core.write_text(src.replace('PATTERN_REACH_TOOLS = ("glob",)', "PATTERN_REACH_TOOLS = ()", 1),
+                        encoding="utf-8")
+        reledger(hestia)
+        rc, data = run(hestia, "--report-only")
+        rows = by_seat(data)
+        check(data["trend"].get("reach_table", {}).get("PATTERN_REACH_TOOLS") == [],
+              f"[10] the resident table on the output shows no pattern-reach tool: {data['trend'].get('reach_table')}")
+        for s in GATES:
+            r = rows.get(s, {})
+            check(tuple(r.get("extraction") or ()) == (n - 1, n - 1) and "pattern" not in r.get("extraction_keys", ["pattern"]),
+                  f"[10] {s}: {r.get('extraction')} keys={r.get('extraction_keys')} (was {n}/{n} with pattern)")
+
+
 def test_no_ledger_is_indeterminate() -> None:
     with tempfile.TemporaryDirectory() as raw:
         hestia = Path(raw) / "empty"
@@ -184,6 +283,10 @@ if __name__ == "__main__":
     test_missing_resident_is_indeterminate_not_omitted()
     test_per_seat_bound_names_one_seat()
     test_no_ledger_is_indeterminate()
+    test_delegated_extraction_reads_resident_engine_table()
+    test_delegating_seat_over_tableless_engine_is_indeterminate()
+    test_empty_domain_is_indeterminate_not_pass()
+    test_pattern_reach_off_is_visible()
     if FAILURES:
         print(f"FAILED: {len(FAILURES)}", file=sys.stderr)
         sys.exit(1)

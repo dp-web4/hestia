@@ -14,7 +14,10 @@ names, measures the RESIDENT files:
   local%      law-bearing sloc in the resident gate / (that + law-bearing sloc in the resident
               engine), same classifier and grain as the source meter
   forks       resident gate functions that re-implement a name the resident engine owns
-  extraction  path-key names this resident gate extracts / the union across resident gates
+  extraction  path-key names this resident gate extracts / the union across resident gates.
+              `eng`: the gate's live scope site delegates to the RESIDENT engine's (tool, key)
+              reach table (slice 5), read from the installed core; `loc`/`lit`: a list the
+              gate still declares itself. An empty domain is INDETERMINATE, never 0/0 PASS.
   loader      where the resident gate's shared-module imports ACTUALLY resolved when the
               hook was executed under the installed HESTIA_HOME: installed / worktree / other
               / unresolved. A worktree is FAIL: mutable, un-ratified authority.
@@ -43,7 +46,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import gate_collapse_meter as meter  # noqa: E402
 from path_key_vocabulary_probe import (  # noqa: E402
-    NOT_REACH, keys_from_get_literals, keys_from_path_targets)
+    NOT_REACH, REACH_TABLE_NAMES, active_reach_keys, engine_reach_table_from_core,
+    keys_from_get_literals, keys_from_path_targets, live_site_delegates)
 
 GATE_BASENAMES = set(meter.GATE_BASENAMES)
 
@@ -215,31 +219,62 @@ def measure(ledger_path: Path, hestia_home: Path, max_local: dict, max_forks: di
             row["loader_verdict"] = "partial" if "installed" in kinds else "unresolved"
         rows.append(row)
 
-    # --- extraction domain over RESIDENT gates, anchored like the source probe
-    declared = {}
+    # --- extraction domain over RESIDENT gates. A seat whose live scope site delegates to
+    # the engine (slice 5) extracts exactly the RESIDENT engine's table, read from the
+    # installed core and never from the source tree; a seat still declaring its own list is
+    # read as before. After slice 5 no gate declares a local list, and the old fallback
+    # yielded no keys for anyone: 0/0 graded every seat PASS on an empty column. An empty
+    # domain is a measurement gap, INDETERMINATE.
+    core = installed_shared / "hestia_gate_core.py"
+    for e in ledger.get("shared_engine") or []:
+        if e.get("file") == "hestia_gate_core.py" and e.get("path"):
+            core = Path(e["path"])
+    # The TYPED table, so `pattern` counts only while a tool is declared to walk with it; the
+    # table itself rides on the output so a semantic change in the resident engine (the Glob
+    # reach deleted, AST still valid) is visible as a changed row, not a flat N/N.
+    engine_table = engine_reach_table_from_core(core)
+    engine_keys = None if engine_table is None else active_reach_keys(engine_table)
+    declared, sources = {}, {}
     for row in rows:
         p = row.get("resident_path")
         if not p or row.get("resident_sha") is None:
             continue
+        if live_site_delegates(Path(p)):
+            sources[row["seat"]] = "engine"
+            if engine_keys is not None:
+                declared[row["seat"]] = set(engine_keys)
+            continue
         k = keys_from_path_targets(Path(p))
         if k is not None:
             declared[row["seat"]] = k
+            sources[row["seat"]] = "local"
     anchor = set.intersection(*declared.values()) if declared else set()
     vocab = {}
     for row in rows:
         p = row.get("resident_path")
         if not p or row.get("resident_sha") is None:
             continue
-        if row["seat"] in declared:
-            keys = declared[row["seat"]]
+        seat = row["seat"]
+        if seat in declared:
+            keys = declared[seat]
+        elif sources.get(seat) == "engine":
+            row["extraction_error"] = ("delegates reach extraction to a resident engine that declares "
+                                       f"no reach table ({core})")
+            continue
         else:
             keys, _mixed = keys_from_get_literals(Path(p), anchor)
-        vocab[row["seat"]] = {k for k in keys if k not in NOT_REACH}
+            sources[seat] = "literals"
+        vocab[seat] = {k for k in keys if k not in NOT_REACH}
     union = set.union(*vocab.values()) if vocab else set()
     for row in rows:
-        if row["seat"] in vocab:
-            row["extraction"] = (len(vocab[row["seat"]]), len(union))
-            row["extraction_missing"] = sorted(union - vocab[row["seat"]])
+        seat = row["seat"]
+        row["extraction_source"] = sources.get(seat)
+        if seat in vocab:
+            row["extraction"] = (len(vocab[seat]), len(union))
+            row["extraction_keys"] = sorted(vocab[seat])
+            row["extraction_missing"] = sorted(union - vocab[seat])
+    reach_table = (None if engine_table is None
+                   else {name: sorted(engine_table[name]) for name in REACH_TABLE_NAMES})
 
     # --- verdicts
     for row in rows:
@@ -256,19 +291,28 @@ def measure(ledger_path: Path, hestia_home: Path, max_local: dict, max_forks: di
         lim = max_local.get(row["seat"])
         if lim is not None and round(row["local_pct"], 1) > lim:
             row["reasons"].append(f"local law {row['local_pct']:.1f}% > per-seat bound {lim:.1f}%")
-        if row.get("extraction") and row["extraction"][0] < row["extraction"][1]:
+        gaps = []    # measurement gaps: INDETERMINATE unless a hard reason also stands
+        if row.get("extraction_error"):
+            gaps.append(row["extraction_error"])
+        elif row.get("extraction") and row["extraction"][1] == 0:
+            gaps.append("extraction domain unmeasurable: no resident gate declares or delegates any reach key")
+        elif row.get("extraction") and row["extraction"][0] < row["extraction"][1]:
             row["reasons"].append(f"extracts {row['extraction'][0]}/{row['extraction'][1]} path keys; "
                                   f"omits {', '.join(row['extraction_missing'])}")
         if lv in ("unresolved", "partial", "error") and not row["reasons"][:-1]:
             row["verdict"] = "INDETERMINATE"
         else:
             row["verdict"] = "FAIL" if row["reasons"] else "PASS"
+        if gaps:
+            row["reasons"].extend(gaps)
+            if row["verdict"] == "PASS":
+                row["verdict"] = "INDETERMINATE"
 
     fleet_local = sum(r.get("local_law", 0) for r in rows)
     trend = {"fleet_local_law": fleet_local, "shared_law": shared_law,
              "fleet_pct": (100.0 * fleet_local / (fleet_local + shared_law)) if (fleet_local + shared_law) else 0.0,
              "build_id": ledger.get("build_id"), "installed_at": ledger.get("installed_at_iso"),
-             "engine_ok": engine_ok}
+             "engine_ok": engine_ok, "reach_table": reach_table, "resident_core": str(core)}
     return rows, trend
 
 
@@ -280,11 +324,19 @@ def render(rows: list[dict], trend: dict) -> None:
             print(f"{r['seat']:<13}{'MISSING':<10}{'':<8}{'':>7}{'':>6}  {'':<11}{'':<11}{r['verdict']}")
         else:
             ex = r.get("extraction")
+            src = {"engine": "eng", "local": "loc", "literals": "lit"}.get(r.get("extraction_source"), "?")
             print(f"{r['seat']:<13}{r['resident_sha'][:8] + ('' if r['resident_match'] else '!'):<10}"
                   f"{'ok' if trend['engine_ok'] else 'MISW':<8}{r['local_pct']:>7.1f}{r['forks']:>6}  "
-                  f"{(f'{ex[0]}/{ex[1]}' if ex else '?'):<11}{r['loader_verdict']:<11}{r['verdict']}")
+                  f"{(f'{ex[0]}/{ex[1]} {src}' if ex else '?'):<11}{r['loader_verdict']:<11}{r['verdict']}")
         for reason in r["reasons"]:
             print(f"{'':<13}- {reason}")
+    t = trend.get("reach_table")
+    if t is None:
+        print("RESIDENT REACH TABLE: none declared (delegating seats cannot be measured)")
+    else:
+        prt = ",".join(t["PATTERN_REACH_TOOLS"]) or "NONE (pattern is not a reach key on this engine)"
+        print(f"RESIDENT REACH TABLE: path={len(t['PATH_KEYS'])} list={len(t['PATH_LIST_KEYS'])} "
+              f"glob={len(t['GLOB_KEYS'])} pattern-reach-tools={prt}")
     print(f"TREND (secondary, not a verdict): fleet {trend['fleet_pct']:.1f}% of law-bearing sloc is per-seat "
           f"({trend['fleet_local_law']} per-seat + {trend['shared_law']} shared)")
 
