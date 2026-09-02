@@ -225,3 +225,9 @@ seconds) plus one `WATCH_INTERVAL` (120 s) — not 4–41 h — and the 80 all-e
 appear as `.expired` in the journal on that pass. The retained-list count per seat before
 restart is the number of quiet ticks the walk will then spend, at ≥ 2 min each, with the
 inbox drained between every one.
+
+**Nuance (same day).** "Fresh mail queued daemon-side the whole time" is half right. The
+session woken by the 03:26 stale fire called `hestia_member_inbox` once (its wake log), and
+the drain is consume-once — so during the walk the member reads new mail *by accident*,
+inside wakes bought by August lists, and the watcher never fires for it. The starvation is
+of the fire, not strictly of the read; the fix above makes the fire the watcher's again.
