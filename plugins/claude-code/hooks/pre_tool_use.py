@@ -1175,12 +1175,22 @@ def _connect_session(client: "McpHttp", host_session_id: Optional[str]) -> Optio
 def request_self_write(marker: str, tool_name: str, attempted: str = "",
                        resource: Optional[str] = None, key: Optional[str] = None,
                        dest: Optional[str] = None,
-                       host_session_id: Optional[str] = None) -> Tuple[str, str]:
+                       host_session_id: Optional[str] = None,
+                       resolved_target: Optional[str] = None) -> Tuple[str, str]:
     """One round trip. Returns (verdict, detail); only 'approved' permits the write.
 
     `marker` is what the daemon keys the approval on and is NOT the human-facing
     destination: `resource`/`key`/`dest` describe the attempted ACT for the record
     (5.2, notice 1474 §2) — see `_describe_hit`.
+
+    `resolved_target` (#810) is the same act's target as the daemon prices the bar
+    from (max with the marker-derived bar, so it can only strengthen): sent as its
+    own field, because the marker may name only a DIRECTORY and a bar testing a
+    directory for filenames can never reach the two-factor arm — the defect 166
+    hook writes were priced weak under between #206 and this repair. The callers
+    pass it only from the closure verdict's `resource` (a parsed write-position
+    target, never payload text) or from a PATH-key match; a TEXT-key match's report
+    is raw command text and stays off the chain.
 
     THIS FUNCTION NEVER WAITS, and that is the whole design. The harness kills this hook at 5
     seconds, and a killed hook yields neither `exit 2` nor a JSON deny -- Claude Code reads
@@ -1223,6 +1233,15 @@ def request_self_write(marker: str, tool_name: str, attempted: str = "",
                 "because it did not choose to escalate. Approving authorises this one write."
             ),
         }
+        # #810: the act's resolved target — the daemon prices the escalation's bar
+        # from it (max with the marker-derived bar, so it can only strengthen).
+        # Scrubbed and tail-capped by the same discipline as the summary above: the
+        # governed filename sits at the END of a path, so a cap must cut the head,
+        # never the tail.
+        if resolved_target:
+            _rt = " ".join(str(resolved_target).split())
+            if _rt and not _credential_shaped(_rt):
+                claim_args["resolved_target"] = _rt[-400:]
         # WHO is asking, provable — see `_connect_session`. Absent on any failure:
         # the claim accepts its absence and records `asker_basis: "asserted"`.
         sid = _connect_session(client, host_session_id)
@@ -1520,6 +1539,10 @@ def _fallback_self_protection(tool_name: str, tool_input: Any,
                 _self_marker, tool_name, _attempted_summary(tool_name, tool_input),
                 resource=_self_resource, key=_self_key, dest=_self_dest,
                 host_session_id=host_session_id,
+                # #810: a PATH-key match's resource is the destination path — safe to
+                # carry. A TEXT-key match's report is raw command text and stays off
+                # the chain; degraded mode prices from the marker, as before #810.
+                resolved_target=_self_resource if _self_key in _PATH_KEYS else None,
             )
             if verdict != "approved":
                 debug_log(f"gate-self-write {verdict}: {detail}")
@@ -1603,6 +1626,7 @@ def main() -> int:
                 _attempted_summary(tool_name, tool_input),
                 resource=_cv.resource, key=_cv.rule,
                 host_session_id=host_session_id,
+                resolved_target=_cv.resource,
             )
             if verdict != "approved":
                 debug_log(f"gate-self-write {verdict}: {detail}")

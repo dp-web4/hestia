@@ -492,13 +492,18 @@ def _witness_gate_self(event_type, marker, tool_name, rule=None):
         return False
 
 
-def _claim_self_write(marker, tool_name, attempted):
-    """Seat wrapper; every failure is a refusal, spelled the way the local copy spelled it."""
+def _claim_self_write(marker, tool_name, attempted, resolved_target=None):
+    """Seat wrapper; every failure is a refusal, spelled the way the local copy spelled it.
+
+    `resolved_target` (#810) is the act's concrete target — the closure verdict's
+    resource on the live path. The daemon prices the escalation's bar from it (max
+    with the marker-derived bar, so it can only strengthen)."""
     try:
         return __import__('hestia_gate_mechanism').claim_self_write(
             marker, tool_name, attempted,
             plugin_id=HESTIA_PLUGIN_ID, role=_role_bridge(),
-            client_name='hestia-kimi-gate-self', host_session_id=_EVENT.get("session_id"))
+            client_name='hestia-kimi-gate-self', host_session_id=_EVENT.get("session_id"),
+            resolved_target=resolved_target)
     except Exception:
         return "unreachable", "no answer from the daemon — refused", None, None
 
@@ -599,12 +604,19 @@ def main():
         # position keyed, accessor-agnostic — the raw text-match bridge and its disclosed
         # marker-in-command FP retire with it); this shim only renders and escalates.
         self_rule = None
+        self_target = None  # #810: the act's resolved target, when the closure holds it
         if _closure_classify is not None:
             _cv = _closure_classify(tool, tinput, cwd=event.get("cwd"))
             self_hit = ((_cv.marker or _cv.rule, _cv.resource or _cv.marker or _cv.rule)
                         if _cv.classification in ("read", "write") else None)
             self_is_read = _cv.classification == "read"
             self_rule = _cv.rule
+            # The closure's resource is a parsed WRITE-POSITION target — a path, never
+            # payload text — so it is safe to carry onto the escalation record, where
+            # the daemon prices the bar from it (#810). The Tier-2 fallback below can
+            # hold raw command text in the same slot; that stays off the chain, and
+            # degraded mode prices from the marker, exactly as before #810.
+            self_target = _cv.resource
         else:
             # Tier-2 degraded mode (ratified): import failed — the pre-B local predicate
             # decides, unchanged. The layer must not silently vanish with the import.
@@ -619,7 +631,8 @@ def main():
                 _witness_gate_self("gate_self_read", self_marker, tool, rule=self_rule)
             else:
                 verdict, detail, esc_id, how = _claim_self_write(
-                    self_marker, tool, _attempted_summary(_EVENT))
+                    self_marker, tool, _attempted_summary(_EVENT),
+                    resolved_target=self_target)
                 if verdict != "approved":
                     _witness_gate_self("gate_self_access", self_marker, tool, rule=self_rule)
                     _tally_scope(False)   # a refused reach still closes part of the window

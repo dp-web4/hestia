@@ -986,7 +986,8 @@ def witness_gate_self(event_type, marker, tool_name, rule=None, *,
 
 
 def claim_self_write(marker, tool_name, attempted, *,
-                     plugin_id, role, client_name, host_session_id=None):
+                     plugin_id, role, client_name, host_session_id=None,
+                     resolved_target=None):
     """Ask ONCE whether a human has already approved this exact (member, marker) write.
     Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
 
@@ -994,7 +995,13 @@ def claim_self_write(marker, tool_name, attempted, *,
     decides out of band; the member RE-ISSUES the write and the second attempt claims the
     approval. Every failure — unreachable, malformed, a daemon with no escalation channel —
     is a refusal: a daemon that cannot answer must not be a way to get a governance write
-    through."""
+    through.
+
+    `resolved_target` (#810) is the act's concrete target — on the live path the closure
+    verdict's `resource`, a parsed WRITE-POSITION argument, never payload text. The daemon
+    prices the escalation's bar from it (max with the marker-derived bar, so it can only
+    strengthen). Old daemons ignore the unknown key; old callers omit it and price from
+    the marker, exactly as before."""
     claim_args = {
         "plugin_id": plugin_id,
         "role": role,
@@ -1015,6 +1022,13 @@ def claim_self_write(marker, tool_name, attempted, *,
     # would be a lie in the exact record used to argue about who authorised what.
     if host_session_id:
         claim_args["host_session_id"] = host_session_id
+    # #810: the act's resolved target, when the shim carries one — the daemon prices the
+    # escalation's bar from it. Tail-capped: the governed filename sits at the END of a
+    # path, so a cap must cut the head, never the tail.
+    if resolved_target:
+        rt = " ".join(str(resolved_target).split())
+        if rt:
+            claim_args["resolved_target"] = rt[-400:]
     r = gate_self_call("hestia_gate_escalation_claim", claim_args,
                        plugin_id=plugin_id, role=role, client_name=client_name,
                        host_session_id=host_session_id)
