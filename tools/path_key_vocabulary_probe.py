@@ -169,7 +169,13 @@ def engine_reach_keys(root: Path):
     Read from the AST of the shipped core, never hardcoded here: a probe that carried its
     own copy of the table would be the drift it measures. Returns None when the core does
     not declare the table (a pre-slice-5 tree)."""
-    core = root / "plugins" / "_shared" / "hestia_gate_core.py"
+    return engine_reach_keys_from_core(root / "plugins" / "_shared" / "hestia_gate_core.py")
+
+
+def engine_reach_keys_from_core(core: Path):
+    """The same table read from ONE core file: the tree's, or the resident engine under
+    $HESTIA_HOME/shared. The readiness instrument measures installed bytes and must not be
+    handed the source tree's table in their place."""
     try:
         tree = ast.parse(core.read_text(encoding="utf-8", errors="replace"))
     except (OSError, SyntaxError):
