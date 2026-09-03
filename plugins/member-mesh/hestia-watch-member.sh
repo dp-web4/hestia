@@ -961,12 +961,29 @@ while true; do
     PET=$(open_petitions 2>/dev/null \
           | timeout 5 python3 "$WATCH_DIR/open-petitions.py" fold "$PLUGIN" \
           2>/dev/null || echo '{"asked":false,"mine":[]}')
-    printf '%s' "$OUT" | UN="$UN" PET="$PET" FOR_PLUGIN="$PLUGIN" python3 -c '
+    # THE FOLD TRAVELS BY FILE, NOT BY ENVIRONMENT (E2BIG, 2026-09-03).
+    # `UN` is an unbounded RPC result and a single environment string is capped at
+    # MAX_ARG_STRLEN (32 pages = 128KiB). Measured on CBP the day this was written the
+    # fold was 362,244 B -- 2.76x the cap -- so `execve` failed E2BIG, this interpreter
+    # NEVER STARTED, and `|| echo "$OUT"` wrote the raw drain. That silently deleted
+    # `unanswered`, `open_petitions` AND `for_plugin` from ~96% of primers for 15 days.
+    # `for_plugin` was stamped below the fold specifically to survive a failing fold;
+    # source order buys nothing when the process dies before its first bytecode. The
+    # payload grows monotonically (`owed_to_me` rows to never-draining roster ids, #541)
+    # and has no shrink path, so a cap is not a fix -- the channel is.
+    UN_FILE="$(mktemp "${TMPDIR:-/tmp}/hestia-unanswered.XXXXXX")" || UN_FILE=""
+    [ -n "$UN_FILE" ] && chmod 600 "$UN_FILE" && printf '%s' "$UN" > "$UN_FILE"
+    printf '%s' "$OUT" | UN_FILE="$UN_FILE" PET="$PET" FOR_PLUGIN="$PLUGIN" python3 -c '
 import json,os,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
-try: u=json.loads(os.environ.get("UN") or "{}")
+try: u=json.load(open(os.environ.get("UN_FILE") or "/dev/null"))
 except Exception: u={}
+# TYPE, not truthiness. `or "{}"` catches "" but not `null`, and mesh_rpc prints
+# `null` whenever the SSE body carries no data line (rpc() returns None). That
+# parses fine and then dies on `.get` -- an exit-0 failure the `|| echo '{}'`
+# guard upstream cannot see. Degrade to an empty fold; never take the process down.
+if not isinstance(u, dict): u={}
 d["unanswered"]={k:u.get(k,[]) for k in ("i_owe","owed_to_me")}
 try: d["open_petitions"]=json.loads(os.environ.get("PET") or "")
 except Exception: d["open_petitions"]={"asked":False,"mine":[]}
@@ -980,6 +997,7 @@ except Exception: d["open_petitions"]={"asked":False,"mine":[]}
 d["for_plugin"]=os.environ["FOR_PLUGIN"]
 json.dump(d,sys.stdout)
 ' > "$PRIMER" 2>/dev/null || echo "$OUT" > "$PRIMER"
+    [ -n "$UN_FILE" ] && rm -f "$UN_FILE"
     echo "[hestia-watch] $N notice(s) for $PLUGIN -> $PRIMER"
     if [ -n "$FIRE" ]; then
       # Success: primer is spent, remove it. Failure: KEEP it — the drain was
