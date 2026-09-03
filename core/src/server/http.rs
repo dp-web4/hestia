@@ -463,7 +463,7 @@ fn bad_operator_session(reason: &str) -> (StatusCode, Json<serde_json::Value>) {
 /// is self-witnessed (A). Reachability alone never admits.
 async fn operator_gate(
     State(state): State<SharedState>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use super::operator_auth::{AuthzOutcome, Stakes, gate_session_request};
@@ -530,16 +530,43 @@ async fn operator_gate(
 
     // Self-witness the authorization decision (A) for consequential acts (skip the
     // low-stakes read flood).
+    let mut gate_entry_hash = None;
     if !matches!(stakes, Stakes::LowReversible) {
         let mut s = state.lock().await;
-        let _ = s.append_chain(
-            "operator_gate",
-            super::operator_auth::attach_operator_provenance(
-                outcome.evidence_record(&format!("{method} {path}")),
-                provenance.as_ref(),
-            ),
-        );
+        // The hash was already computed and then dropped. `policy_edit` — law amendment,
+        // the highest-consequence act class here — was one of two chain families out of 39
+        // naming no author, because this middleware proves the operator, writes it into its
+        // OWN row, and discards it one stack frame from the act (forum 2662/2664/2666).
+        gate_entry_hash = s
+            .append_chain(
+                "operator_gate",
+                super::operator_auth::attach_operator_provenance(
+                    outcome.evidence_record(&format!("{method} {path}")),
+                    provenance.as_ref(),
+                ),
+            )
+            .ok()
+            .map(|e| e.hash);
     }
+
+    // Carry the authorization across the one boundary that separates the gate from the act.
+    //
+    // `gate_entry_hash` is the load-bearing half, not `provenance`. Without it an act row
+    // and its authorizing gate row are joinable only by POSITION — they land adjacent —
+    // and a positional join is not a reference: nothing in either row commits to the pair,
+    // so the join's width is chosen by the reader and concurrent traffic silently breaks
+    // it. Measured over the eight most recent `policy_edit` rows on this seat: at strict
+    // position-1 the gate row is the neighbour for 5 of 8. The other three are separated by
+    // an interleaved `outcome`, a `gate_escalation_opened`, and another `policy_edit`.
+    //
+    // Inserted for EVERY outcome, not only `Authorized`: the extension is the gate's
+    // statement about this request, and an act that somehow runs unauthorized should carry
+    // a row saying so rather than a row saying nothing.
+    req.extensions_mut()
+        .insert(super::operator_auth::GateWitness {
+            provenance,
+            gate_entry_hash,
+        });
 
     match outcome {
         AuthzOutcome::Authorized { .. } => next.run(req).await,
@@ -3266,8 +3293,29 @@ async fn scope_standing_revoke(
     )
 }
 
+/// Stamp an act record with the authorization that admitted it.
+///
+/// The act row must NAME its authorization, not sit next to it. `policy_edit` is the
+/// law-amendment class; a row that records the change and not the authorizer leaves the
+/// join to a reader who has to guess how wide a window to look in. See the note in
+/// `operator_gate` for the 5-of-8 adjacency measurement.
+///
+/// `None` is a real state and stamps nothing: a route reachable without the gate (or a
+/// dev-override) must produce an unstamped row rather than a row that claims an
+/// authorization it never had.
+fn stamp_gate(
+    record: serde_json::Value,
+    gate: &Option<axum::Extension<super::operator_auth::GateWitness>>,
+) -> serde_json::Value {
+    match gate {
+        Some(axum::Extension(witness)) => witness.stamp(record),
+        None => record,
+    }
+}
+
 async fn policy_set_preset(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let preset = body
@@ -3287,7 +3335,10 @@ async fn policy_set_preset(
             s.reload_policy();
             let _ = s.append_chain(
                 "policy_edit",
-                serde_json::json!({"change": "preset", "preset": preset}),
+                stamp_gate(
+                    serde_json::json!({"change": "preset", "preset": preset}),
+                    &gate,
+                ),
             );
             (
                 StatusCode::OK,
@@ -3314,6 +3365,7 @@ struct OverrideBody {
 /// state (the "edit specifically" path for built-in rules).
 async fn policy_set_override(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Json(body): Json<OverrideBody>,
 ) -> impl IntoResponse {
     let decision = match body.decision.as_deref() {
@@ -3338,10 +3390,13 @@ async fn policy_set_override(
             s.reload_policy();
             let _ = s.append_chain(
                 "policy_edit",
+                stamp_gate(
                 serde_json::json!({
                     "change": "override", "rule_id": body.rule_id,
                     "decision": body.decision, "enabled": body.enabled,
                 }),
+                &gate,
+                ),
             );
             (
                 StatusCode::OK,
@@ -3358,6 +3413,7 @@ async fn policy_set_override(
 /// `DELETE /api/policy/override/{rule_id}` — revert a preset rule to its default.
 async fn policy_clear_override(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Path(rule_id): Path<String>,
 ) -> impl IntoResponse {
     let mut s = state.lock().await;
@@ -3366,7 +3422,10 @@ async fn policy_clear_override(
             s.reload_policy();
             let _ = s.append_chain(
                 "policy_edit",
-                serde_json::json!({"change": "clear_override", "rule_id": rule_id}),
+                stamp_gate(
+                    serde_json::json!({"change": "clear_override", "rule_id": rule_id}),
+                    &gate,
+                ),
             );
             (
                 StatusCode::OK,
@@ -3385,6 +3444,7 @@ async fn policy_clear_override(
 /// "edit by category or specifically" path).
 async fn policy_upsert_rule(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Json(rule): Json<crate::policy::PolicyRule>,
 ) -> impl IntoResponse {
     if rule.id.trim().is_empty() || rule.name.trim().is_empty() {
@@ -3400,7 +3460,10 @@ async fn policy_upsert_rule(
             s.reload_policy();
             let _ = s.append_chain(
                 "policy_edit",
-                serde_json::json!({"change": "upsert_rule", "rule_id": rule_id}),
+                stamp_gate(
+                    serde_json::json!({"change": "upsert_rule", "rule_id": rule_id}),
+                    &gate,
+                ),
             );
             (
                 StatusCode::OK,
@@ -3417,13 +3480,20 @@ async fn policy_upsert_rule(
 /// `DELETE /api/policy/rule/{rule_id}` — remove a custom rule.
 async fn policy_delete_rule(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Path(rule_id): Path<String>,
 ) -> impl IntoResponse {
     let mut s = state.lock().await;
     match s.vault.remove_custom_rule(&rule_id) {
         Ok(removed) => {
             s.reload_policy();
-            let _ = s.append_chain("policy_edit", serde_json::json!({"change": "delete_rule", "rule_id": rule_id, "removed": removed}));
+            let _ = s.append_chain(
+                "policy_edit",
+                stamp_gate(
+                    serde_json::json!({"change": "delete_rule", "rule_id": rule_id, "removed": removed}),
+                    &gate,
+                ),
+            );
             (
                 StatusCode::OK,
                 Json(serde_json::json!({"ok": true, "removed": removed})),
