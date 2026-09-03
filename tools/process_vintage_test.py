@@ -16,11 +16,29 @@ matched a 48681-byte blob at `8af9a76` whose content sha256 was completely diffe
 Keying the commit lookup on size produces a confident WRONG commit id, which is worse
 than no answer. `git_versions` is keyed on sha256 and this pins that.
 
+ADDED 2026-09-03, and it is the one that matters most, because this file WAS GREEN while
+the tool could not read a single line a current watcher emits. `REAL_LINE` below is
+captioned "verbatim from the CBP journal 2026-08-26" and it is — the capture discipline
+was followed and dated. But #637 inserted `startup_origin=` into the emitted line on
+2026-08-29, three days before this suite landed, so the verbatim capture was ALREADY a
+snapshot of a wire that no longer existed. Provenance is not freshness: a fixture with a
+capture date is a fixture with an expiry date that nothing enforces.
+
+So `test_the_reader_handles_every_key_the_emitter_writes` does not test a capture at all.
+It reads the ARTIFACT echo out of `plugins/member-mesh/hestia-watch-member.sh` in THIS
+checkout and requires the reader to account for every `k=` in it. That guard is red in
+the CI run of the commit that inserts a field, needs no journal, and cannot go stale,
+because its fixture IS the emitter. `REAL_LINE_POST_637` keeps a dated capture too — one
+fixture per format actually present in a live journal window (measured today: 13 of 19
+lines carry the field, 6 do not, because a stale watcher and a current one were both
+running).
+
 Run: python3 tools/process_vintage_test.py   (or via pytest)
 """
 import importlib.util
 import io
 import os
+import re
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -33,12 +51,27 @@ _spec.loader.exec_module(pv)
 A = "a" * 64
 B = "b" * 64
 
-# The real line, verbatim from the CBP journal 2026-08-26T01:47:26-07:00.
+# The real line, verbatim from the CBP journal 2026-08-26T01:47:26-07:00 — emitter
+# PRE-#637, so it carries no `startup_origin`. Still a live shape: a watcher started
+# before 2026-08-29 emits exactly this, and reading a STALE watcher is the whole point of
+# the tool, so this fixture must keep parsing forever.
 REAL_LINE = ("Aug 26 01:47:26 cbp hestia-watch-member.sh[1524325]: [hestia-watch] "
              "ARTIFACT plugin=claude-code state=drift reason=differs-from-startup "
              "startup_sha256=489c0076aa0b3fd5e1b20e69708057bcdb5553fab29b233dc2a23623"
              "ac92f118 disk_sha256=a7dde01ae611d141ba9c8b83bc163bed2f167b9ee1487f3774"
              "9bef0d06151804")
+
+# The real line, verbatim from the CBP journal 2026-09-03T01:08:39-07:00 — emitter
+# POST-#637 (`startup_origin=own-fd` sits BETWEEN the two sha fields, which is exactly
+# where the original adjacency regex required them to touch). Every watcher on CBP was
+# emitting this shape, hourly, while this suite reported 15/15.
+REAL_LINE_POST_637 = (
+    "2026-09-03T01:08:39-07:00 cbp hestia-watch-member.sh[1253]: [hestia-watch] "
+    "ARTIFACT plugin=claude-code state=ok reason=matches-startup "
+    "startup_sha256=36cf220fac1a65ef82f9f2fefc5ade4d898c6f314fb08d8b65acd74c2da58083 "
+    "startup_origin=own-fd "
+    "disk_sha256=36cf220fac1a65ef82f9f2fefc5ade4d898c6f314fb08d8b65acd74c2da58083 "
+    "started=2026-09-03T08:08:39Z")
 
 
 def check(name, cond, detail=""):
@@ -53,6 +86,64 @@ def test_parses_the_real_journal_line():
     check("state", got["state"] == "drift", got)
     check("startup", got["startup"].startswith("489c0076"), got)
     check("disk", got["disk"].startswith("a7dde01a"), got)
+
+
+def test_parses_the_post_637_journal_line():
+    """THE regression. Red against the adjacency regex this file shipped with."""
+    got = pv.parse_artifact(REAL_LINE_POST_637)
+    check("parse", got is not None, "a line every current watcher emits must parse")
+    check("readable", got["missing"] == (),
+          f"required keys absent: {got['missing']}")
+    check("startup", got["startup"].startswith("36cf220f"), got)
+    check("disk", got["disk"].startswith("36cf220f"), got)
+    check("origin", got.get("startup_origin") == "own-fd", got)
+    # and the inserted field must not be reported as a surprise
+    check("known", got["unknown"] == (), f"unexpected keys: {got['unknown']}")
+
+
+def test_the_reader_handles_every_key_the_emitter_writes():
+    """The fixture IS the emitter, so this guard cannot go stale.
+
+    Reads the ARTIFACT level echo out of the watcher script in THIS checkout. If someone
+    inserts, renames or removes a field, this is red in that commit's own CI run — which
+    is the round trip that #637 did not have to make.
+    """
+    emitter = os.path.join(os.path.dirname(_HERE), pv.WATCH_PATH)
+    check("emitter present", os.path.exists(emitter), emitter)
+    with open(emitter, encoding="utf-8") as fh:
+        echoes = [l for l in fh if "ARTIFACT plugin=" in l]
+    check("echo found", len(echoes) == 1,
+          f"expected exactly one ARTIFACT level echo, found {len(echoes)}")
+    emitted = tuple(m.group("k") for m in pv._KV_RE.finditer(echoes[0]))
+    for k in pv.REQUIRED_ARTIFACT_KEYS:
+        check("required emitted", k in emitted,
+              f"the reader requires {k} and the emitter no longer writes it: {emitted}")
+    for k in emitted:
+        check("emitted known", k in pv.KNOWN_ARTIFACT_KEYS,
+              f"the emitter writes {k} and the reader does not account for it — add it "
+              f"to KNOWN_ARTIFACT_KEYS (or REQUIRED_ARTIFACT_KEYS) in process_vintage.py")
+    # The whole line must round-trip through the reader once its $VARs are filled in.
+    filled = re.sub(r"\$[A-Za-z_][A-Za-z0-9_]*", "x", echoes[0])
+    got = pv.parse_artifact(filled)
+    check("emitter line parses", got is not None and got["missing"] == (),
+          f"the emitter's own line does not parse: {got}")
+
+
+def test_an_unparseable_artifact_line_is_not_an_absent_one():
+    """The defect that hid the defect: both states printed the same reassurance.
+
+    An ARTIFACT line whose required keys the reader cannot find must come back as a
+    dict with `missing` set — a READER defect — not as None. None means "no such line",
+    whose documented remedy is to wait, and waiting can never fix a shape mismatch.
+    """
+    mangled = REAL_LINE_POST_637.replace("disk_sha256=", "disk_sha256_v2=")
+    got = pv.parse_artifact(mangled)
+    check("still recognised", got is not None,
+          "an ARTIFACT line with a renamed field is still an ARTIFACT line, not absence")
+    check("named", "disk_sha256" in got["missing"], got["missing"])
+    check("surprise named", "disk_sha256_v2" in got["unknown"], got["unknown"])
+    # and the readable line is not mistaken for the broken one
+    check("clean is clean", pv.parse_artifact(REAL_LINE_POST_637)["missing"] == ())
 
 
 def test_a_non_artifact_line_is_not_half_parsed():
@@ -263,6 +354,9 @@ def test_every_fd_input_combination_has_its_own_verdict():
 
 TESTS = [
     test_parses_the_real_journal_line,
+    test_parses_the_post_637_journal_line,
+    test_the_reader_handles_every_key_the_emitter_writes,
+    test_an_unparseable_artifact_line_is_not_an_absent_one,
     test_a_non_artifact_line_is_not_half_parsed,
     test_unverifiable_is_not_ok,
     test_drift_and_ok_match_the_shell_guard,

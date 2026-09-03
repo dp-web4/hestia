@@ -76,24 +76,63 @@ import sys
 # The LEVEL line, not the edge alarm. The edge fires once and is gone with the journal's
 # retention window; a process older than that window has no edge left to read, which is
 # how a 20-day drift stayed invisible while being correctly detected the whole time.
-ARTIFACT_RE = re.compile(
-    r"ARTIFACT\s+plugin=(?P<plugin>\S+)\s+state=(?P<state>\S+)\s+"
-    r"reason=(?P<reason>\S+)\s+startup_sha256=(?P<startup>\S+)\s+"
-    r"disk_sha256=(?P<disk>\S+)")
+#
+# PARSE BY KEY, NEVER BY ADJACENCY. The first version of this file matched the fields
+# positionally — `startup_sha256=(\S+)\s+disk_sha256=` — and #637 had already inserted
+# `startup_origin=` BETWEEN those two on 2026-08-29, three days before this file landed.
+# Every line a current watcher emits therefore failed to match, and `cmd_units` reported
+# the miss as "this invocation has emitted no ARTIFACT level line yet — wait for the next
+# one". The line was already there, hourly, and no amount of waiting would ever parse it.
+#
+# It is the SAME defect this file already names one function down, in `unit_state`: a
+# positional read of an extensible field list, where inserting a field silently shifts
+# every later answer. The watcher's line is a k=v bag by construction, so read it as one:
+# a new field is then additive, and a REMOVED required field is loud.
+ARTIFACT_HEAD_RE = re.compile(r"ARTIFACT\s+plugin=\S+")
+_KV_RE = re.compile(r"\b(?P<k>[a-z_][a-z0-9_]*)=(?P<v>\S+)")
+
+# What the reader needs. Absence of any of these on an ARTIFACT line is a READER/EMITTER
+# contract break, reported as such — never as "no line".
+REQUIRED_ARTIFACT_KEYS = ("plugin", "state", "reason", "startup_sha256", "disk_sha256")
+
+# Every key the emitter is known to write, required or not. `tools/process_vintage_test.py`
+# pins this set against the echo in WATCH_PATH itself, so the next field insertion turns
+# THIS repo's CI red at the commit that inserts it — rather than in a journal three days
+# later that only a stale watcher can still satisfy.
+KNOWN_ARTIFACT_KEYS = REQUIRED_ARTIFACT_KEYS + ("startup_origin", "started")
 
 WATCHER_UNITS = ("hestia-watch-claude", "hestia-watch-codex", "hestia-watch-kimi")
 WATCH_PATH = "plugins/member-mesh/hestia-watch-member.sh"
 
 
 def parse_artifact(line):
-    """Pull the startup/disk pair out of one ARTIFACT level line. None if not one.
+    """Pull the fields out of one ARTIFACT level line. None if it is not one at all.
+
+    THREE outcomes, because two of them were previously one:
+
+      * `None`                     — not an ARTIFACT level line. Say nothing about it.
+      * dict, `missing` empty      — parsed. `startup`/`disk` are the pair `classify`
+        wants.
+      * dict, `missing` non-empty  — it IS an ARTIFACT line and the reader could not read
+        it. That is a defect in this file or a change in the emitter, and it is NOT the
+        same state as a line that was never emitted. Collapsing the two is what hid the
+        #637 field insertion for the whole life of this tool.
 
     Returns the raw strings; validation is `classify`'s job, because "this field is not
     a sha" is a state the watcher reports deliberately (`unverifiable`) and collapsing
     it into a parse failure would hide it.
     """
-    m = ARTIFACT_RE.search(line or "")
-    return m.groupdict() if m else None
+    if not ARTIFACT_HEAD_RE.search(line or ""):
+        return None
+    kv = {m.group("k"): m.group("v") for m in _KV_RE.finditer(line)}
+    out = dict(kv)
+    out["missing"] = tuple(k for k in REQUIRED_ARTIFACT_KEYS if k not in kv)
+    out["unknown"] = tuple(sorted(k for k in kv if k not in KNOWN_ARTIFACT_KEYS))
+    # Short aliases the rest of the file reads. Present as None when absent, so a caller
+    # that ignores `missing` crashes visibly rather than getting a plausible answer.
+    out["startup"] = kv.get("startup_sha256")
+    out["disk"] = kv.get("disk_sha256")
+    return out
 
 
 def classify(startup, disk):
@@ -238,10 +277,31 @@ def cmd_units(repo):
             continue
         log, bound = invocation_log(unit, st.get("InvocationID"))
         art = None
+        unreadable = None
         for line in log.splitlines():
             parsed = parse_artifact(line)
-            if parsed:
-                art = parsed       # keep the LAST — the level line, hourly
+            if not parsed:
+                continue
+            if parsed["missing"]:
+                # An ARTIFACT line this reader cannot read. Keep it: it is the evidence
+                # that the emitter and this file have diverged, and it must NOT be
+                # reported as an absent line.
+                unreadable = (parsed, line)
+                continue
+            art = parsed           # keep the LAST readable one — the level line, hourly
+        if not art and unreadable:
+            parsed, line = unreadable
+            print(f"{unit}: READER DEFECT — vintage NOT MEASURED. {len(log.splitlines())} "
+                  f"journal line(s) include an ARTIFACT level line that this tool cannot "
+                  f"parse: required key(s) {', '.join(parsed['missing'])} absent"
+                  + (f"; unrecognised key(s) present: {', '.join(parsed['unknown'])}"
+                     if parsed["unknown"] else "") + ".")
+            print(f"    Waiting will NOT fix this — the line is already here and every "
+                  f"future one will have the same shape. Fix the reader "
+                  f"(REQUIRED_ARTIFACT_KEYS / KNOWN_ARTIFACT_KEYS in this file) or the "
+                  f"emitter ({WATCH_PATH}).")
+            print(f"    offending line: {line.strip()[:300]}\n")
+            continue
         if not art:
             if bound:
                 print(f"{unit}: active as pid {st.get('MainPID') or '?'} but THIS "
@@ -261,6 +321,12 @@ def cmd_units(repo):
                  else "matches NO commit — an uncommitted working-tree state")
         print(f"{unit}  [{state}: {reason}]")
         print(f"    in force: {where}")
+        # #637 added this: a baseline read from the process's OWN fd is first-hand; one
+        # received by handover is hearsay about a hash. Report which, or say it is absent
+        # — a pre-#637 watcher emits no such field, and that itself dates the watcher.
+        origin = art.get("startup_origin")
+        print(f"    baseline: {origin}" if origin else
+              "    baseline: no startup_origin field — this watcher predates #637")
         if state == "drift":
             since = _run(["git", "-C", repo, "log", "--oneline",
                           f"{got[0]}..origin/main", "--", WATCH_PATH]) if got else ""
