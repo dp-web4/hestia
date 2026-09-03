@@ -36,16 +36,35 @@ launchers -- no test seam:
   1. DISCHARGED IS NOT RE-FIRED. A retained primer whose every notice is absent from
      `i_owe` is retired to `.discharged` without spending a wake. Red before the fix.
   2. STILL-OWED IS STILL FIRED. The guard must not eat the case the retry exists for.
-  3. UNMEASURED IS FIRED, BOTH EDGES. Absence from the fold means nothing outside the
-     window where the fold is complete: past the daemon's 7d prune, absence means
-     "pruned"; below the 6h default floor, absence means "hidden by the floor". Both
-     fire. The young edge is the dangerous one -- the stub honours `older_than_secs`
-     exactly as the daemon does, so this case is red if the guard ever trusts the
-     floor, whether because the argument was misspelled (#155 discards it into a
-     success) or because someone deleted the min-age check as redundant.
+  3. THE TWO EDGES OF THE BAND ARE NOT SYMMETRIC. Below the 6h default floor, absence
+     means "hidden by the floor": FIRE. The young edge is the dangerous one -- the stub
+     honours `older_than_secs` exactly as the daemon does, so this case is red if the
+     guard ever trusts the floor, whether because the argument was misspelled (#155
+     discards it into a success) or because someone deleted the min-age check as
+     redundant. Past the daemon's 7d prune, absence means "pruned" -- and (REVERSED
+     2026-09-02, was "unmeasured, fire") pruned is measured and gone: retired as
+     `.expired`, no fire. See 9.
+  8. A KIND THE FOLD NEVER COUNTS IS SPENT AT ANY AGE. The fold echoes `kinds_counted`;
+     a `disposition`/`ack`/`review_done`/`coordination`/`handoff` can never be in
+     `i_owe`, so neither band edge has standing over it. Notice 4408 (the daemon's own
+     disposition, its grant claimed 41s after approval on 08-24) re-fired this seat
+     8.4 days later as attempt 2/3 because the age rule ran before the kind was asked.
+     Without the echo (an older daemon) the old age rule stands. Red before the fix.
+  9. PAST THE INBOX TTL THE ROW IS PRUNED AND NO FIRE RECOVERS IT. `.expired`, distinct
+     from `.discharged`. Between the 6d ceiling and the 7d TTL the old verdict stands
+     (fire); a row the fold still owes fires at any age (owed wins). Red before the fix.
   4. A REFUSAL IS NOT AN EMPTY DEBT. When the `unanswered` RPC fails, the primer fires.
      `{}` and a 500 must not read as "nothing owed" -- that is the shape this corpus
      keeps finding, and here it would delete the only copy of a work list.
+  7. THE FOLD IS THE DEBT AS IT STANDS WHEN THE VERDICT IS GIVEN, NOT AT PASS START.
+     Fires are synchronous and serialised on the member lock, so a startup pass lasts
+     as long as the sum of its fires, and the first wake in the pass answers debt that
+     later primers are then judged on. Measured on CBP 2026-09-02: the watcher
+     restarted 04:22:04Z and read the fold once; the pass's first wake bound the reply
+     to notice 7927 at 04:39:31Z; 7927's own primer came up at 04:48:53Z, was judged
+     against the 04:22 fold that still owed it, and spent a wake learning it was done.
+     Two retained primers, the first fire discharging the second's notice: the second
+     must retire, not fire. Red on a once-per-pass fold.
 
 Usage: ./stale_primer_discharged_test.py     (runtime ~20s)
 """
@@ -99,7 +118,10 @@ INBOX = {}
 DEBTS = []                 # rows the member genuinely still owes
 REFUSE_UNANSWERED = False
 IGNORE_FLOOR_ARG = False   # model #155: the daemon DISCARDS `older_than_secs` and defaults
+OMIT_KINDS_COUNTED = False # model a daemon older than the `kinds_counted` echo (case 8b)
+KINDS_COUNTED = ["review_request", "reply"]   # MEMBER_KINDS_AWAIT_RESPONSE, handler.rs
 FLOORS_SEEN = []
+DISCHARGE_DIR = None       # case 7: a fire may DISCHARGE debts mid-pass by touching <id> here
 
 
 class Stub(http.server.BaseHTTPRequestHandler):
@@ -139,6 +161,11 @@ class Stub(http.server.BaseHTTPRequestHandler):
             cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=floor)
             shown = [d for d in DEBTS
                      if datetime.datetime.fromisoformat(d["queued_at"].replace("Z", "+00:00")) < cutoff]
+            if DISCHARGE_DIR:
+                # A debt the member has since answered leaves `i_owe` -- the daemon's
+                # rule. The fire under test is the one that answers it (case 7).
+                shown = [d for d in shown
+                         if not os.path.exists(os.path.join(DISCHARGE_DIR, str(d["id"])))]
             # The daemon ECHOES the floor it APPLIED, not the one it was asked for.
             # Measured against the live daemon 2026-08-06, same session, four cells:
             #   older_than_secs=0 -> 0 | omitted -> 21600 | older_than_seconds=0 -> 21600
@@ -146,6 +173,8 @@ class Stub(http.server.BaseHTTPRequestHandler):
             # which is what makes the echo usable as an oracle rather than a mirror.
             # `floor` here is post-fallback for exactly that reason.
             payload = {"i_owe": shown, "owed_to_me": [], "older_than_secs": floor}
+            if not OMIT_KINDS_COUNTED:
+                payload["kinds_counted"] = list(KINDS_COUNTED)
         else:
             payload = {}
         self._sse({"jsonrpc": "2.0", "id": body.get("id"),
@@ -176,7 +205,11 @@ def start_stub():
     return srv, f"http://127.0.0.1:{srv.server_address[1]}/mcp"
 
 
-def write_fire(path, log, rc=0):
+def write_fire(path, log, rc=0, discharge=(), discharge_dir=None):
+    """`discharge`: notice ids this fire ANSWERS as a side effect of running -- the
+    shape of a real wake, which takes `unanswered 0` as its work list and binds
+    replies to everything in it, not just to the primer it was woken with."""
+    touches = "".join(f'touch "{discharge_dir}/{i}"\n' for i in discharge)
     with open(path, "w") as f:
         f.write(f'''#!/usr/bin/env bash
 python3 - "$1" "{log}" <<'PY'
@@ -186,7 +219,7 @@ except Exception: d={{}}
 open(sys.argv[2],"a").write(json.dumps({{"primer":sys.argv[1],
     "ids":[n.get("id") for n in d.get("notices",[])]}})+"\\n")
 PY
-exit {rc}
+{touches}exit {rc}
 ''')
     os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
@@ -223,24 +256,28 @@ def notice(nid, age_secs, kind="reply"):
 
 
 def run_case(tmp, ep, label, planted, debts, want_ids, refuse=False, sentinel_id=99999,
-             ignore_floor_arg=False):
+             ignore_floor_arg=False, discharge_on_fire=(), omit_kinds_counted=False):
     """Run the real watcher once. The observable that says the startup stale pass has
     finished is the member's OWN fresh mail being fired -- the drain happens after that
     pass, so a sentinel in the log means every stale decision is already made. Never a
     fixed sleep: a duration is a coin flip on a loaded host."""
-    global DEBTS, REFUSE_UNANSWERED, IGNORE_FLOOR_ARG
+    global DEBTS, REFUSE_UNANSWERED, IGNORE_FLOOR_ARG, DISCHARGE_DIR, OMIT_KINDS_COUNTED
     state = os.path.join(tmp, label)
     primers = os.path.join(state, "primers", PLUGIN)
     os.makedirs(primers)
     log = os.path.join(tmp, f"{label}.log")
     fire = os.path.join(tmp, f"{label}-fire.sh")
-    write_fire(fire, log, rc=70)          # every fire REFUSES, so nothing is deleted
+    DISCHARGE_DIR = os.path.join(tmp, f"{label}-discharged")
+    os.makedirs(DISCHARGE_DIR)
+    # every fire REFUSES, so nothing is deleted
+    write_fire(fire, log, rc=70, discharge=discharge_on_fire, discharge_dir=DISCHARGE_DIR)
     for name, notices in planted.items():
         plant(primers, name, notices)
 
     DEBTS = list(debts)
     REFUSE_UNANSWERED = refuse
     IGNORE_FLOOR_ARG = ignore_floor_arg
+    OMIT_KINDS_COUNTED = omit_kinds_counted
     INBOX[PLUGIN] = [notice(sentinel_id, 60, kind="coordination")]
 
     env = dict(os.environ)
@@ -257,6 +294,7 @@ def run_case(tmp, ep, label, planted, debts, want_ids, refuse=False, sentinel_id
     out, _ = p.communicate()
     REFUSE_UNANSWERED = False
     IGNORE_FLOOR_ARG = False
+    OMIT_KINDS_COUNTED = False
     got = fired_ids(log) - {sentinel_id}
     return got, primers, out
 
@@ -294,20 +332,31 @@ def main():
           os.path.exists(os.path.join(primers, "notice-BBBBBB.json")),
           f"dir={sorted(os.listdir(primers))}")
 
-    # ---- 3. UNMEASURED IS FIRED, BOTH EDGES.
-    # 30d: past the daemon's 7d prune -- absent because pruned, not because answered.
+    # ---- 3. THE TWO EDGES OF THE BAND, AND THEY ARE NOT SYMMETRIC.
     # 30min: below the default floor -- absent because the floor hides it. The stub
     # applies the floor for real, so if the guard leans on the fold here it retires a
-    # notice that IS owed, which is the one unrecoverable error in this design.
+    # notice that IS owed, which is the one unrecoverable error in this design. FIRE.
+    # 30d: past the daemon's 7d prune -- absent because pruned, not because answered.
+    # 3a used to pin "unmeasured, so it fires" for this edge too (2026-08-05). REVERSED
+    # 2026-09-02: pruned is not unmeasured, it is MEASURED AND GONE. The daemon deleted
+    # the row, so it can never re-enter `i_owe`; a binding to it is accepted but
+    # unverified; the escalation a review_request points at was reaped days ago. A fire
+    # here recovers nothing the ledger still tracks. The primer is retired as `.expired`
+    # -- kept on disk, distinct from `.discharged`, one `mv` from revival by a human --
+    # and the wake is withheld. 207 of the 242 fires budgeted for >6d primers across
+    # three seats that morning were for this edge. The 6d..7d gap keeps the old verdict
+    # (9b): unmeasured, fire.
     young = notice(901, 1800)
     got, primers, out = run_case(
         tmp, ep, "unmeasured",
         planted={"OLDOLD": [notice(330, 30 * 86400)], "YOUNGY": [young]},
         debts=[{"id": 901, "kind": "reply", "from_plugin": "kimi-code",
                 "to_plugin": PLUGIN, "queued_at": young["queued_at"], "drained_at": None}],
-        want_ids={330, 901})
-    check("3a. a notice past the inbox TTL is unmeasured, so it fires", 330 in got,
-          f"fired ids={sorted(got)}\n{out[-1500:]}")
+        want_ids={901})
+    check("3a. a notice past the inbox TTL is pruned, not unmeasured: retired as .expired, "
+          "no fire (REVERSES the 08-05 pin; see 9a-9c for the edges of the new rule)",
+          330 not in got and os.path.exists(os.path.join(primers, "notice-OLDOLD.json.expired")),
+          f"fired ids={sorted(got)} dir={sorted(os.listdir(primers))}\n{out[-1500:]}")
     check("3b. a notice younger than the default floor is unmeasured, so it fires "
           "(it is genuinely owed and the floor hides it)", 901 in got,
           f"fired ids={sorted(got)}\n{out[-1500:]}")
@@ -367,6 +416,100 @@ def main():
     check("6. when the fold admits it applied the 6h default, a young notice is "
           "unmeasurable and fires -- absence under a floor is not an answer",
           911 in got and not os.path.exists(os.path.join(primers, "notice-YNGIGN.json.discharged")),
+          f"fired ids={sorted(got)} dir={sorted(os.listdir(primers))}\n{out[-1500:]}")
+
+    # ---- 7. THE FOLD IS RE-READ PER PRIMER.
+    # Two owed notices in two retained primers. The FIRST fire answers the second's
+    # notice (a real wake works `unanswered 0`, not its primer). Glob order puts
+    # AAAAAA first, so by the time BBBBBB is judged, 801 is no longer owed. A fold read
+    # once at pass start still says 801 is owed and fires it: that wake's entire output
+    # is "already answered", and on CBP 2026-09-02 it was this seat's, notice 7927.
+    first = notice(800, 2 * 86400)
+    second = notice(801, 2 * 86400)
+    got, primers, out = run_case(
+        tmp, ep, "fold-per-primer",
+        planted={"AAAAAA": [first], "BBBBBB": [second]},
+        debts=[{"id": 800, "kind": "reply", "from_plugin": "kimi-code",
+                "to_plugin": PLUGIN, "queued_at": first["queued_at"], "drained_at": None},
+               {"id": 801, "kind": "reply", "from_plugin": "kimi-code",
+                "to_plugin": PLUGIN, "queued_at": second["queued_at"], "drained_at": None}],
+        want_ids={800}, discharge_on_fire=(801,))
+    check("7a. the first owed primer fires", 800 in got,
+          f"fired ids={sorted(got)}\n{out[-1500:]}")
+    check("7b. a notice the first fire answered is NOT re-fired by the same pass "
+          "(the fold is read when the verdict is given, not when the pass began)",
+          801 not in got, f"fired ids={sorted(got)}\n{out[-1500:]}")
+    check("7c. and its primer is RETIRED, not preserved for the next restart",
+          os.path.exists(os.path.join(primers, "notice-BBBBBB.json.discharged"))
+          and not os.path.exists(os.path.join(primers, "notice-BBBBBB.json")),
+          f"dir={sorted(os.listdir(primers))}")
+
+    # ---- 8. A KIND THE FOLD NEVER COUNTS IS SPENT AT ANY AGE.
+    # Notice 4408: the daemon's own `disposition` for an escalation whose grant was
+    # claimed 41s after approval on 2026-08-24. Its first fire died (0-byte log); the
+    # primer was retained; 8.4 days later it re-fired this seat as attempt 2 of 3,
+    # because ">6d -> unmeasured -> fire" ran before anyone asked what kind it was. A
+    # `disposition` cannot appear in `i_owe` at ANY age -- the fold says so itself in
+    # `kinds_counted` -- so absence is structural and the age band has no standing.
+    got, primers, out = run_case(
+        tmp, ep, "dispo-old",
+        planted={"DISPO8": [notice(4408, int(8.4 * 86400), kind="disposition")]},
+        debts=[], want_ids=set())
+    check("8a. a never-counted kind older than the 6d ceiling is retired without a fire",
+          got == set() and os.path.exists(os.path.join(primers, "notice-DISPO8.json.discharged")),
+          f"fired ids={sorted(got)} dir={sorted(os.listdir(primers))}\n{out[-1500:]}")
+    # 8b. The kind list comes from the FOLD, never from this script. A daemon that does
+    # not echo `kinds_counted` gets the old verdict: kind-blind, age-gated, fire. Placed
+    # in the 6d..7d gap so the TTL rule (9) cannot answer for it; the same primer with
+    # the echo present is 8a's case and retires.
+    got, primers, out = run_case(
+        tmp, ep, "dispo-old-noecho",
+        planted={"DISPON": [notice(4409, int(6.5 * 86400), kind="disposition")]},
+        debts=[], want_ids={4409}, omit_kinds_counted=True)
+    check("8b. without the fold's `kinds_counted` echo the old age rule stands and it fires",
+          4409 in got, f"fired ids={sorted(got)}\n{out[-1500:]}")
+    # 8c. And the 6h floor has no standing either: a floor hides OWED rows, and a kind
+    # that can never be owed has none to hide. Same #155 stub as case 6.
+    got, primers, out = run_case(
+        tmp, ep, "dispo-young-floor-ignored",
+        planted={"DISPOY": [notice(4410, 1800, kind="disposition")]},
+        debts=[], want_ids=set(), ignore_floor_arg=True)
+    check("8c. a never-counted kind under an admitted 6h floor is still retired",
+          got == set() and os.path.exists(os.path.join(primers, "notice-DISPOY.json.discharged")),
+          f"fired ids={sorted(got)} dir={sorted(os.listdir(primers))}\n{out[-1500:]}")
+
+    # ---- 9. PAST THE DAEMON'S INBOX TTL THE ROW IS PRUNED; NO FIRE RECOVERS IT.
+    # The ceiling fired anything older than 6d on the grounds that absence means
+    # "pruned, not answered". Past INBOX_TTL_SECS (7d, core/src/storage/inbox.rs) that
+    # is exactly the point: the daemon has deleted the row, it can never re-enter
+    # `i_owe`, and the mesh has written the obligation off. Retired as `.expired`,
+    # a distinct suffix from `.discharged`, so the record says which door closed it.
+    got, primers, out = run_case(
+        tmp, ep, "reply-past-ttl",
+        planted={"OLDRPL": [notice(920, 8 * 86400)]},
+        debts=[], want_ids=set())
+    check("9a. a counted kind past the inbox TTL is retired as .expired without a fire",
+          got == set() and os.path.exists(os.path.join(primers, "notice-OLDRPL.json.expired"))
+          and not os.path.exists(os.path.join(primers, "notice-OLDRPL.json.discharged")),
+          f"fired ids={sorted(got)} dir={sorted(os.listdir(primers))}\n{out[-1500:]}")
+    # 9b. Between the ceiling and the TTL the old verdict stands: unmeasured, fire.
+    got, primers, out = run_case(
+        tmp, ep, "reply-6d-to-7d",
+        planted={"MIDRPL": [notice(921, int(6.5 * 86400))]},
+        debts=[], want_ids={921})
+    check("9b. a counted kind between the 6d ceiling and the 7d TTL still fires",
+          921 in got, f"fired ids={sorted(got)}\n{out[-1500:]}")
+    # 9c. A row the fold STILL OWES past the TTL contradicts the TTL; the owed check
+    # runs first and wins. Every failure direction fires.
+    old = notice(922, 8 * 86400)
+    got, primers, out = run_case(
+        tmp, ep, "reply-past-ttl-but-owed",
+        planted={"OWDRPL": [old]},
+        debts=[{"id": 922, "kind": "reply", "from_plugin": "kimi-code",
+                "to_plugin": PLUGIN, "queued_at": old["queued_at"], "drained_at": None}],
+        want_ids={922})
+    check("9c. a notice the fold still owes fires even past the TTL (owed wins over age)",
+          922 in got and not os.path.exists(os.path.join(primers, "notice-OWDRPL.json.expired")),
           f"fired ids={sorted(got)} dir={sorted(os.listdir(primers))}\n{out[-1500:]}")
 
     # ---- 4. A REFUSAL IS NOT AN EMPTY DEBT.
