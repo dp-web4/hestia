@@ -4847,6 +4847,13 @@ pub(crate) fn ensure_disposition(
 /// bystander session of the same seat may read the whole lane and harm no one, which is why
 /// the address rides IN the line (`for_session`) rather than being enforced by who opens the
 /// file (PRD_DISPOSITION_DELIVERY R1/R6).
+///
+/// `for_session` is the asker's `host_session_id`, and what that is worth is worth stating
+/// exactly: it is a caller-supplied label, copied onto the escalation from a PROVEN session at
+/// open (`record_seat_keys`), never read from the arguments at claim time. So the session it
+/// names was proven; the string itself is a reuse key and never an authorisation discriminator
+/// (`state::Session`, guard B). It is being used here only to ROUTE a rendering, which is the
+/// weakest thing it could be used for, and nothing downstream may treat a match as authority.
 pub(crate) const DISPOSITION_LANE_DIR: &str = "dispositions";
 
 /// Text cap for member-supplied strings that ride to the asker's context window.
@@ -4864,15 +4871,24 @@ fn lane_clip(v: Option<&String>) -> Option<String> {
     .filter(|t| !t.is_empty())
 }
 
-/// Append this ruling to the asker's lane. Warn-and-continue, exactly like `ensure_disposition`:
-/// the decision has already committed to the chain, and a failed delivery must never unmake a
-/// ruling. What it costs when it fails is what we have today -- a human relaying by hand.
+/// Put this ruling on the asker's lane, idempotently, keyed by the ruling hash.
+///
+/// Warn-and-continue at the ruling site, exactly like `ensure_disposition`: the decision has
+/// already committed to the chain, and a failed projection must never unmake a ruling. But it
+/// must not be warn-and-FORGET either (PRD #845 R2): the chain is the evidence and the lane is
+/// a projection of it, so a line that failed to land is re-derived by the projector on its next
+/// pass. That is why this checks for the ruling hash before appending -- the repair path and
+/// the ruling path call the same function, and calling it twice writes one line.
+///
+/// The repair window is the row's lifetime. Once an escalation is reaped there is no row to
+/// render from (#867: a later `open()` reaps, not only a restart), and nothing claimable is
+/// lost by that, because the claim horizon is far shorter than the reap window.
 ///
 /// The `render` field is composed HERE, by the gate, and the seat prints it. What was decided,
 /// whether a grant still authorises anything, when it dies and what the asker may do next are
 /// all law; a shim that composed them would be a second legal system with a nicer font
 /// (GATE_ARCHITECTURE section 2, and the SHIM_LEDGER class for the reader is refusal-channel).
-pub(crate) fn append_disposition_lane(
+pub(crate) fn ensure_disposition_lane(
     s: &super::state::ServerState,
     esc: &super::gate_escalation::Escalation,
     pointer: &str,
@@ -4899,7 +4915,7 @@ pub(crate) fn append_disposition_lane(
     // accident into a new outward artifact, which is the debt #845 exists to retire. So it
     // ships named and versioned, and a reader looking for the canonical deadline finds no
     // field to mistake for it (GPT review of #849).
-    let horizon = esc.claim_deadline();
+    let horizon = esc.pre_migration_horizon();
     let utc = |t: u64| chrono::DateTime::from_timestamp(t as i64, 0).map(|d| d.to_rfc3339());
     let horizon_utc = horizon.and_then(utc);
     let act = lane_clip(esc.stated_detail.as_ref())
@@ -4914,8 +4930,11 @@ pub(crate) fn append_disposition_lane(
             "{status} - escalation {id} ({act}). Decided by {by}{why}. This grant is UNSPENT and \
 authorises exactly the write it was opened for. Under TODAY'S policy it stops authorising at \
 {until}, a horizon anchored on the ruling rather than on your receipt of it (#845, #850). \
-RE-ISSUE THE SAME WRITE to claim it: byte-identical, because the act digest covers the whole \
-command, and single use. Anything else lets it lapse. Ruling {hash}.",
+RE-ISSUE THE SAME WRITE to claim it, single use. Match what you stated: the binding is a \
+digest over a BOUNDED SUMMARY of the act, not over its bytes (#539 measures the classes: a \
+220-character command prefix, a 140-character path tail, and a redaction keyed on length), so a \
+difference inside that summary claims nothing and a difference beyond it may still claim. \
+Anything else lets this lapse. Ruling {hash}.",
             status = status.to_uppercase(),
             id = esc.id,
             until = horizon_utc
@@ -4970,6 +4989,13 @@ store-only and resets on replay (#850). NOT the canonical delivery-started deadl
         "render": render,
     });
     let path = dir.join(format!("{}.jsonl", esc.plugin_id));
+    // Idempotent by ruling hash: the ruling site and the projector's repair pass both call
+    // this, and a ruling that is delivered twice is a ruling the asker cannot trust.
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        if existing.lines().any(|l| l.contains(ruling_hash)) {
+            return;
+        }
+    }
     let line = match serde_json::to_string(&row) {
         Ok(l) => l,
         Err(e) => {
@@ -13198,9 +13224,18 @@ mod tests {
             render.contains(&esc_id) && render.to_lowercase().contains("re-issue"),
             "the render tells the asker what it may do, composed by the GATE: {render}"
         );
+        // What the binding IS, stated as narrowly as it is true. `act_digest_of` hashes a
+        // summary the seat already normalised, and that normalisation is lossy in three
+        // measured ways (#539: a 220-char command prefix, a 140-char path tail, a redaction
+        // keyed on length). A render promising "byte-identical, because the digest covers the
+        // whole command" would be false in the direction that costs an asker its grant.
         assert!(
-            render.contains("byte-identical"),
-            "and how, since an act digest covers the whole command and a near-miss claims              nothing (measured 2026-09-02, an appended `&& ls -l` lost a live grant): {render}"
+            render.contains("BOUNDED SUMMARY") && render.contains("#539"),
+            "the render says what the binding covers, and cites what measured it: {render}"
+        );
+        assert!(
+            !render.to_lowercase().contains("whole command"),
+            "and never promises binding over the whole command: {render}"
         );
         assert!(
             render.contains("add HESTIA_WORKSPACE to the gate hook line"),
@@ -18001,7 +18036,7 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
             );
             // ...and the same ruling on the lane the asker's LIVE session reads, because a
             // queued notice reaches the next wake and the asker is here now (PRD R2).
-            append_disposition_lane(&s, &decided, &pointer, &entry.hash, now);
+            ensure_disposition_lane(&s, &decided, &pointer, &entry.hash, now);
             // The bar and whether this decision met it go to the DECIDER, not only to the
             // chain. They were recorded above and withheld here, and the asymmetry had a
             // measured cost: across the whole chain, 66 `sovereign_plus_peer` escalations

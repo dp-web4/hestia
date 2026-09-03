@@ -538,7 +538,13 @@ impl Escalation {
             .map(|_| self.decided_horizon().saturating_sub(now))
     }
 
-    /// The same horizon as an ABSOLUTE epoch, for anything that leaves this process.
+    /// Today's horizon as an ABSOLUTE epoch, for anything that leaves this process.
+    ///
+    /// NOT named `claim_deadline`, and the name is the point: the canonical, delivery-started
+    /// deadline begins at a witnessed receipt (PRD #845 R5) and does not exist yet. A method
+    /// called `claim_deadline` returning `observed_at.or(decided_at) + window` would put the
+    /// pre-migration model behind a canonical name, and every caller would inherit it as the
+    /// deadline rather than as the projection it is.
     ///
     /// A countdown is only true at the instant it is computed. Every delivery of a remaining
     /// count -- a refusal payload, a poll reply, a queued notice -- is read later than it was
@@ -547,7 +553,7 @@ impl Escalation {
     /// trip; a countdown decays in flight. `decided_horizon` stays private and stays the ONE
     /// definition (PRD_DISPOSITION_DELIVERY R3) -- this is a projection of it, never a second
     /// copy of the rule.
-    pub fn claim_deadline(&self) -> Option<u64> {
+    pub fn pre_migration_horizon(&self) -> Option<u64> {
         self.decided_at.map(|_| self.decided_horizon())
     }
 

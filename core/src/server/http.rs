@@ -4090,7 +4090,7 @@ async fn operator_gate_escalation(
             // The operator just ruled from the dashboard. The asker is a live session that
             // reads no mailbox until it restarts, so put the ruling where it can see it now
             // (PRD_DISPOSITION_DELIVERY R2).
-            super::handler::append_disposition_lane(
+            super::handler::ensure_disposition_lane(
                 &s,
                 &esc,
                 &format!("hestia://escalation/{}#decided", esc.id),
