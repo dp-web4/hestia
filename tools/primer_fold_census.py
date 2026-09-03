@@ -36,6 +36,32 @@ import sys
 
 PRIMERS = os.path.expanduser("~/.claude/hestia-mesh-primers")
 
+# The retry store the watcher re-fires from.  A primer that was composed days
+# ago and re-delivered today lands in PRIMERS with TODAY's mtime, so dating the
+# series by `getmtime` there attributes an old file's shape to the sweep day.
+# The `.attempts` sibling here is the re-fire marker, and this copy's mtime is
+# the real composition time.  Measured 2026-09-03 on the claude seat: 47 of 67
+# shared files carry the marker and 66 re-fired inside three minutes on 08-31 --
+# the day this census previously cited as its strongest bimodality evidence.
+RETRY = os.path.expanduser("~/.local/state/hestia-mesh/primers/claude-code")
+
+
+def refires():
+    """basename -> composition mtime, for primers the retry sweep re-delivered."""
+    out = {}
+    try:
+        names = os.listdir(RETRY)
+    except OSError:
+        return out
+    for n in names:
+        if not n.endswith(".attempts"):
+            continue
+        base = n[: -len(".attempts")]
+        src = os.path.join(RETRY, base)
+        if os.path.exists(src):
+            out[base] = os.path.getmtime(src)
+    return out
+
 # The composition fallback is `echo "$OUT"`, the raw drain result. Its key set is
 # fixed, so a primer's shape says WHICH failure produced it — no process
 # archaeology needed, and none is possible after the fact anyway.
@@ -76,7 +102,8 @@ def producer(d):
     return "pre-for_plugin (< 07-31)"
 
 
-def census(since):
+def census(since, exclude_refires=True):
+    seen = refires()
     tot = collections.Counter()
     fold_bytes = collections.defaultdict(list)
     state = collections.defaultdict(collections.Counter)
@@ -87,7 +114,16 @@ def census(since):
             d = json.load(open(f))
         except Exception:
             continue
-        day = datetime.datetime.utcfromtimestamp(os.path.getmtime(f)).strftime("%m-%d")
+        base = os.path.basename(f)
+        if base in seen:
+            # Re-delivered, not composed today.  Either drop it or date it by
+            # the retry copy -- never by this copy's mtime.
+            if exclude_refires:
+                continue
+            mtime = seen[base]
+        else:
+            mtime = os.path.getmtime(f)
+        day = datetime.datetime.utcfromtimestamp(mtime).strftime("%m-%d")
         tot[day] += 1
         state[day][classify(d)] += 1
         prod[producer(d)] += 1
@@ -175,11 +211,14 @@ def tail(n=30):
     has no shrink path, so once IT alone exceeds the cap the fold cannot compose
     again. Any later primer carrying a non-empty `unanswered` refutes that.
     """
+    seen = refires()
     rows = []
     for f in glob.glob(os.path.join(PRIMERS, "*.json")):
         try:
             d = json.load(open(f))
         except Exception:
+            continue
+        if os.path.basename(f) in seen:
             continue
         s = classify(d)
         u = d.get("unanswered")

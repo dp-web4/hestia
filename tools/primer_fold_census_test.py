@@ -76,6 +76,87 @@ with tempfile.TemporaryDirectory() as td:
     m.PRIMERS = td
     m.census("01-01")  # must not raise on a directory it has never seen
 
+# --- (3) a re-delivered primer is dated by COMPOSITION, not by the sweep ------
+# The retry store re-fires primers composed days earlier; each lands in the
+# primary store with today's mtime. Dating the series there attributes an old
+# file's shape to the sweep day -- which is what inflated 08-31 from 23% to 48%
+# in the published table. The arm below is red against that dating.
+import contextlib  # noqa: E402
+import datetime  # noqa: E402
+import io  # noqa: E402
+import time  # noqa: E402
+
+import calendar  # noqa: E402
+
+SWEEP = calendar.timegm(time.strptime("2026-08-31T21:59Z", "%Y-%m-%dT%H:%MZ"))
+BORN = calendar.timegm(time.strptime("2026-08-16T02:17Z", "%Y-%m-%dT%H:%MZ"))
+# Label them the way the tool does, so the arms pin the BEHAVIOUR and not this
+# box's timezone.
+D_SWEEP = datetime.datetime.utcfromtimestamp(SWEEP).strftime("%m-%d")
+D_BORN = datetime.datetime.utcfromtimestamp(BORN).strftime("%m-%d")
+
+
+def _rows(out):
+    """day -> (n, C_ships) parsed from the census table."""
+    got = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 7 and len(f[0]) == 5 and f[0][2] == "-" and f[0][:2].isdigit():
+            got[f[0]] = (int(f[1]), int(f[5]))
+    return got
+
+
+def _census(**kw):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        m.census("01-01", **kw)
+    return _rows(buf.getvalue())
+
+
+with tempfile.TemporaryDirectory() as prim, tempfile.TemporaryDirectory() as retry:
+    # one primer genuinely composed on the sweep day, one re-delivered that day
+    for name, born in (("notice-native.json", SWEEP), ("notice-old.json", BORN)):
+        path = os.path.join(prim, name)
+        json.dump(ships, open(path, "w"))
+        # BOTH sit in the primary store with the sweep day's mtime -- that is
+        # exactly what the re-fire does, and why the primary mtime cannot be trusted.
+        os.utime(path, (SWEEP, SWEEP))
+    src = os.path.join(retry, "notice-old.json")
+    json.dump(ships, open(src, "w"))
+    os.utime(src, (BORN, BORN))
+    open(os.path.join(retry, "notice-old.json.attempts"), "w").write("3\n")
+
+    m.PRIMERS, m.RETRY = prim, retry
+    seen = m.refires()
+    check("the .attempts sibling identifies the re-delivered primer",
+          set(seen) == {"notice-old.json"}, sorted(seen))
+    check("its composition time comes from the retry copy, not the primary copy",
+          abs(seen["notice-old.json"] - BORN) < 2, seen)
+
+    dropped = _census()
+    check("re-fires excluded: the sweep day counts only what was composed then",
+          dropped.get(D_SWEEP, (0, 0))[0] == 1, dropped)
+    check("re-fires excluded: the old primer is not credited to any day",
+          D_BORN not in dropped, dropped)
+
+    redated = _census(exclude_refires=False)
+    check("re-fires re-dated: the sweep day still counts only its own primer",
+          redated.get(D_SWEEP, (0, 0))[0] == 1, redated)
+    check("re-fires re-dated: the old primer lands on its COMPOSITION day",
+          redated.get(D_BORN, (0, 0))[0] == 1, redated)
+
+    # SABOTAGE ARM: restore the published dating (primary-store mtime, no
+    # re-fire awareness) and confirm both arms above go red. A guard that is
+    # green under the defect it names is not a guard.
+    _real = m.refires
+    m.refires = lambda: {}
+    sabotaged = _census(exclude_refires=False)
+    m.refires = _real
+    check("SABOTAGE: dating by primary mtime inflates the sweep day to 2",
+          sabotaged.get(D_SWEEP, (0, 0))[0] == 2, sabotaged)
+    check("SABOTAGE: and erases the composition day entirely",
+          D_BORN not in sabotaged, sabotaged)
+
 # --- the cap is measured, and it is the per-string one ------------------------
 n = m.cap()
 page = os.sysconf("SC_PAGESIZE")
