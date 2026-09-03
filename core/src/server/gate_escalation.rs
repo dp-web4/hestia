@@ -2108,6 +2108,14 @@ pub fn act_digest_of(act: &str) -> String {
 
     /// Everything a human needs to decide, live as of `now`, oldest first so the one about to
     /// expire is at the top.
+    /// Every escalation the store still holds, for a projection that must re-derive from
+    /// ROWS rather than from the chain. Reaping bounds it (#867: a later `open()` reaps, not
+    /// only a restart), and nothing claimable is lost by that bound: the claim horizon is far
+    /// shorter than the reap window, so a row old enough to be gone authorises nothing.
+    pub fn rows(&self) -> impl Iterator<Item = &Escalation> {
+        self.by_id.values()
+    }
+
     pub fn pending(&self, now: u64) -> Vec<&Escalation> {
         let mut v: Vec<&Escalation> = self
             .by_id

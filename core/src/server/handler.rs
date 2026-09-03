@@ -4894,12 +4894,12 @@ pub(crate) fn ensure_disposition_lane(
     pointer: &str,
     ruling_hash: &str,
     now: u64,
-) {
+) -> bool {
     use std::io::Write;
     let dir = s.home.join(DISPOSITION_LANE_DIR);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("disposition lane dir {dir:?} unavailable ({e}) - the asker will not be told");
-        return;
+        return false;
     }
     let status = match serde_json::to_value(esc.stored_status()) {
         Ok(Value::String(v)) => v,
@@ -4989,28 +4989,82 @@ store-only and resets on replay (#850). NOT the canonical delivery-started deadl
         "render": render,
     });
     let path = dir.join(format!("{}.jsonl", esc.plugin_id));
-    // Idempotent by ruling hash: the ruling site and the projector's repair pass both call
-    // this, and a ruling that is delivered twice is a ruling the asker cannot trust.
+    // Idempotent by ESCALATION, not by ruling hash. The ruling site knows the chain entry's
+    // hash; the repair pass has only the row, and #867 says the row may be gone before the
+    // chain page is walked. Keying on the escalation id lets both callers converge on one
+    // line, and a ruling delivered twice is a ruling the asker cannot trust.
+    let marker = format!("\"escalation_id\":\"{}\"", esc.id);
     if let Ok(existing) = std::fs::read_to_string(&path) {
-        if existing.lines().any(|l| l.contains(ruling_hash)) {
-            return;
+        if existing.lines().any(|l| l.replace(' ', "").contains(&marker)) {
+            return false;
         }
     }
     let line = match serde_json::to_string(&row) {
         Ok(l) => l,
         Err(e) => {
             tracing::warn!("disposition lane line for {} not serialisable ({e})", esc.id);
-            return;
+            return false;
         }
     };
     match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        Ok(mut f) => {
-            if let Err(e) = writeln!(f, "{line}") {
-                tracing::warn!("disposition lane {path:?} not written ({e})");
-            }
-        }
+        Ok(mut f) => match writeln!(f, "{line}") {
+            Ok(()) => return true,
+            Err(e) => tracing::warn!("disposition lane {path:?} not written ({e})"),
+        },
         Err(e) => tracing::warn!("disposition lane {path:?} not open ({e})"),
     }
+    false
+}
+
+/// Re-derive any lane line a ruling site failed to write. THE REPAIR, not prose about one.
+///
+/// PRD #845 R2 stopped promising that the chain entry and the lane line commit together,
+/// because they are different stores and that promise would be a lie the first time a
+/// filesystem write failed after a committed ruling. What replaces atomicity is this: the
+/// ruling is on the chain, the lane is a projection of it, and a projection that did not land
+/// is rewritten on the next pass. `ensure_disposition_lane` is idempotent by escalation, so
+/// the ruling site and this pass converge on one line and calling both writes once.
+///
+/// Bounded by reaping, deliberately and visibly: a row the store no longer holds cannot be
+/// repaired from here. That costs nothing claimable, because the claim horizon is far shorter
+/// than the reap window, and a caller that needs the ruling after reap has the chain.
+/// The disposition worker's state-side pass, named so a test can hold it.
+///
+/// The worker body is a `tokio::spawn` loop that no test drives, so anything written only
+/// inside it is verified by reading rather than by running. That is how the first cut of this
+/// PR shipped a repair the diff did not contain: the arm exercised the repair FUNCTION and
+/// stayed green with the call site deleted. Both effects of a pass now live behind one name,
+/// and the untested remainder is a single call in the loop rather than the logic itself.
+///
+/// Returns (lapses recorded, lane projections repaired).
+pub(crate) fn disposition_worker_pass(
+    s: &mut super::state::ServerState,
+    now: u64,
+) -> (usize, usize) {
+    let lapsed = record_newly_lapsed(s, now);
+    let repaired = repair_disposition_lanes(s, now);
+    (lapsed, repaired)
+}
+
+pub(crate) fn repair_disposition_lanes(s: &super::state::ServerState, now: u64) -> usize {
+    let repairs: Vec<(String, String)> = s
+        .gate_escalations
+        .rows()
+        .filter(|e| e.decided_at.is_some())
+        .map(|e| (e.id.clone(), format!("hestia://escalation/{}#decided", e.id)))
+        .collect();
+    let mut wrote = 0usize;
+    for (id, pointer) in repairs {
+        if let Some(esc) = s.gate_escalations.get(&id) {
+            if ensure_disposition_lane(s, esc, &pointer, "", now) {
+                wrote += 1;
+            }
+        }
+    }
+    if wrote > 0 {
+        tracing::info!(repaired = wrote, "disposition lanes: rulings whose projection had not landed");
+    }
+    wrote
 }
 
 /// One projector pass's page bound (#480 revised review, item 4a): at most this
@@ -13251,6 +13305,89 @@ mod tests {
         );
     }
 
+    /// A ruling whose lane projection did not land is rewritten by the repair pass.
+    ///
+    /// This arm exists because the review of #849 caught the PR describing a repair that the
+    /// diff did not contain: the ruling sites wrote the lane, nothing re-derived it, and the
+    /// prose said the projector would. Deleting the lane after a real ruling is the closest
+    /// honest model of a filesystem write that failed after the chain entry committed.
+    #[tokio::test]
+    async fn a_ruling_whose_lane_write_failed_is_repaired() {
+        let (dir, shared) = make_shared_state();
+        let asker = tool_connect(
+            &shared,
+            &json!({"plugin_id": "claude-code", "host_agent": "h", "host_session_id": "sess-repair-1"}),
+        )
+        .await
+        .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let peer = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h"}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": asker,
+                "tool_name": "Edit",
+                "marker": "hestia_gate_core.py",
+                "act": "Edit -> hestia_gate_core.py",
+            }),
+        )
+        .await
+        .unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap().to_string();
+        tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "approve": true,
+                "reason": "ruled, and then the projection is lost",
+                "session_id": peer,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let lane = dir
+            .path()
+            .join(super::DISPOSITION_LANE_DIR)
+            .join("claude-code.jsonl");
+        assert!(lane.is_file(), "the ruling site wrote it");
+        std::fs::remove_file(&lane).unwrap();
+
+        // THE WORKER'S PASS, not the repair function alone. Calling the function directly
+        // would leave this arm green with the worker's call site deleted, which is exactly how
+        // the previous cut shipped a repair that existed only in prose.
+        let now = crate::server::gate_escalation::now_secs();
+        let repaired = {
+            let mut s = shared.lock().await;
+            super::disposition_worker_pass(&mut s, now).1
+        };
+        assert!(repaired >= 1, "the lost projection is rewritten, not forgotten");
+        let body = std::fs::read_to_string(&lane).expect("the lane is back");
+        let row: Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(row["escalation_id"], esc_id, "and it is the same ruling: {row}");
+        assert_eq!(row["for_session"], "sess-repair-1", "still addressed to the asker: {row}");
+
+        // Idempotent: a second pass must not deliver the same ruling twice.
+        let again = {
+            let mut s = shared.lock().await;
+            super::disposition_worker_pass(&mut s, now).1
+        };
+        assert_eq!(again, 0, "a repaired lane is not repaired again");
+        assert_eq!(
+            std::fs::read_to_string(&lane).unwrap().lines().count(),
+            1,
+            "one ruling, one line"
+        );
+    }
+
     /// The other half of the same mechanism: a ruling that does NOT authorise anything must not
     /// read like one that does.
     ///
@@ -18036,7 +18173,7 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
             );
             // ...and the same ruling on the lane the asker's LIVE session reads, because a
             // queued notice reaches the next wake and the asker is here now (PRD R2).
-            ensure_disposition_lane(&s, &decided, &pointer, &entry.hash, now);
+            let _ = ensure_disposition_lane(&s, &decided, &pointer, &entry.hash, now);
             // The bar and whether this decision met it go to the DECIDER, not only to the
             // chain. They were recorded above and withheld here, and the asymmetry had a
             // measured cost: across the whole chain, 66 `sovereign_plus_peer` escalations
