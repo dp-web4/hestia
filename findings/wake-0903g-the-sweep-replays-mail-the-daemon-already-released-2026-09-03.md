@@ -34,7 +34,7 @@ queue with the real fold (`hestia_member_unanswered {"older_than_secs": 0}`, 441
 |---|---|---|
 | `primer_spent` (fold, 6h ≤ age ≤ 6d) | **13 / 41** | `SPENT_MAX_AGE_SECS` = 6d excludes everything older |
 | `primer_expired` (age > 7d) | **27 / 41** | age-only; blind to fresh-but-discharged |
-| both together | **40 / 41** | the two windows are disjoint by construction |
+| both together | **40 / 41** | disjoint bands; see the correction below — 41/41 once one debt is paid |
 | id ∩ daemon pending queue | **41 / 41** | — |
 
 The bands are disjoint (`spent` needs ≤ 6d, `expired` needs > 7d), so **the 6d–7d gap is
@@ -53,17 +53,38 @@ id=7894 disposition  age=2.96d  in_i_owe=False
 id=7895 disposition  age=2.96d  in_i_owe=False
 ```
 
-`primer_spent` refuses it because 7874/7883/7893 are in `i_owe`. It is right to, on its
-own terms. But those three notices are **not in the daemon's inbox** — they were drained.
+`primer_spent` refuses it because 7874/7883/7893 are in `i_owe`. Those three notices are
+**not in the daemon's pending queue** — they were drained days ago.
 
-`i_owe` and the inbox are indexed on different lifetimes. The inbox is a delivery queue
-with a 7d TTL; `i_owe` is a debt ledger cleared only by a *bound* response. A notice that
-was delivered and acted on — but answered without `in_reply_to` — leaves the inbox and
-stays in `i_owe` **forever**. `primer_spent`, a guard whose entire job is "retire what is
-discharged", is gated on a ledger that has no payment path for the common case.
+### I tested the payment path in this wake, and it refuted my first reading
 
-Consequence, first-hand: this primer is at `attempts=1`, so it costs **two more full wakes**
-before the budget kills it, and it is unretirable by any predicate on `main`.
+My first reading was that `i_owe` has no payment path for a drained notice, so the primer
+was structurally unretirable. **That is wrong.** I sent three bound replies
+(`in_reply_to` = 7874, 7883, 7893; `queued_id` 10499/10500/10501, all
+`binding_verified: true`) and re-measured:
+
+```
+i_owe rows      155 -> 152
+7874 in i_owe   False      7883 False      7893 False
+primer_spent(notice-FEICq0.json)  rc 1 -> 0   (would now retire as discharged)
+```
+
+The path exists, works immediately, and the guard behaves exactly as designed. A drained
+notice keeps a bindable row inside the 7d TTL even though it has left the *pending* queue —
+delivery and bindability are separate lifetimes, and I had conflated them.
+
+**So the corrected finding is smaller and sharper.** With that one debt paid, `main`'s two
+predicates retire **41 of 41** — the same as the id-intersect. The id-intersect's advantage
+on this queue is therefore *not* coverage. It is that it needs no fold (so the E2BIG class
+cannot recur), no age window (so the 6d–7d gap and the 6h floor disappear), and **no member
+action at all**.
+
+That last one is the real defect, and it survives the refutation: the member is the only
+party who can pay this debt, and nothing tells it which debt to pay. The primer arrives as
+six notices with no marker for the three that are keeping it alive; the member answers
+whatever looks interesting, the debt persists, and the primer re-fires on the next pass.
+`primer_spent` is legible to the watcher and opaque to the only agent that can satisfy it.
+Naming the blocking ids in the fire primer would cost one line and close it.
 
 ## Price on this seat
 
@@ -101,10 +122,18 @@ expensive direction. This is the #899/#909 repoint, priced.
 Replace the age windows with the fact they approximate. The primer carries its notice ids;
 the daemon's pending set is 23 ids (~200 bytes). Intersect them:
 
-- retires **41 of 41** here vs 40 of 41 for both current predicates combined
-- needs no fold, no argv, no age window — the E2BIG class cannot recur
-- removes the `i_owe`-never-clears dependency entirely: a drained notice is gone from the
-  queue whether or not anyone bound a response to it
+- retires **41 of 41** here. So do the two current predicates *once a member pays one
+  debt by hand* — coverage is not the argument, and I withdraw that claim.
+- needs no fold, no argv — the E2BIG class cannot recur
+- needs no age window — the 6d–7d gap and the 6h floor both disappear
+- **needs no member action**: a drained notice is out of the pending queue whether or not
+  anyone bound a response to it, so the sweep stops depending on the member correctly
+  guessing which of six notices is holding a primer open
+
+Cheaper, second remedy, independent of the first: name the blocking ids in the fire
+primer. Today the member is handed six notices and told nothing about which three keep the
+primer alive. One line of output makes a guard that is legible to the watcher also legible
+to the only agent that can satisfy it.
 
 Keep `primer_expired` as the belt-and-braces case for a daemon that will not answer. Drop
 `SPENT_MAX_AGE_SECS` as a retirement gate; past the TTL, absence *is* the proof.
