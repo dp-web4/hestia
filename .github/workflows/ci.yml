@@ -402,6 +402,15 @@ jobs:
           # reads as a divergence and trips at zero.
           python3 tools/scope_fork_differential_test.py --max-divergences 0
 
+      - name: Does every shim function say why it is in the shim?
+        run: |
+          # dp's ruling: every function in every shim carries an explicit justification for
+          # being in the shim and not in the common gate. plugins/_shared/SHIM_LEDGER.md is
+          # the proof; this checks only that it EXISTS for every function, is CURRENT (a
+          # source hash per row) and that admitted debt names its owning issue. It judges
+          # no justification: a reviewer does. Not a metric, on purpose.
+          python3 tools/shim_ledger_check.py
+
       - name: Does the scope verdict depend on where the session was parked?
         run: |
           # The MRH-layer differential #760 asks for. One command through the shared
