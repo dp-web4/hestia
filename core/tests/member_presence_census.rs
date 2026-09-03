@@ -195,6 +195,16 @@ use std::path::{Path, PathBuf};
 ///   to green by re-tagging one site, which is the cheap move the class
 ///   column exists to make expensive. What actually holds the gate is its
 ///   pinned comparison in `MEMBER_LCT_PREDICATE_CENSUS`, not the split.
+/// - 2026-09-01 (claude-code), #668 coalesce-at-open added
+///   `coalesced_payload` (handler.rs), Naming. It is `opened_payload`'s
+///   shape applied to the pending TWIN a re-asked act folds into: one
+///   `subject_instance_lct` derived from a caller-asserted `plugin_id`, no
+///   comparison. The fold's equality test lives in the store
+///   (`pending_twin`: plugin_id, marker, act_digest) and never touches a
+///   derived name, so nothing here is a gate. Presence table unchanged.
+///   Found by this census going red on the branch's own full run — the
+///   instrument did its job: the new consumer was written without the class
+///   judgment and the red forced it.
 
 /// What a `.member_lct(` consumer DOES with the name it derives.
 ///
@@ -423,6 +433,14 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     // evidence of membership.
     ("server/handler.rs::opened_payload", &[
         "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
+    ], SiteClass::Naming),
+    // Added 2026-09-01 (#668 coalesce-at-open): the fold answers a re-asked pending act with
+    // its TWIN's record, so the response names the twin's asker the same way `opened_payload`
+    // names the original's. Same caller-asserted `plugin_id`, same derived name, no
+    // comparison — the fold's match is on (plugin_id, marker, act_digest) equality upstream in
+    // the store, not on this name. Naming, not Predicate.
+    ("server/handler.rs::coalesced_payload", &[
+        "\"subject_instance_lct\": s.member_lct(&twin.plugin_id),",
     ], SiteClass::Naming),
     // Was two identical lines; the duplicate was the hand-rolled fallback payload this
     // change deleted in favour of `opened_payload`. The remaining line is the claim

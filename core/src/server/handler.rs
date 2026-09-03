@@ -323,7 +323,8 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_gate_escalation_open",
-            "Ask a HUMAN to approve a write to the governance surface (gate, witness, law_inject, the registration). Stage 2 of dp's 2026-07-29 ruling: the gate refuses these writes, and this is the channel that un-refuses a legitimate one. Returns an escalation_id and a deadline; NO DECISION WITHIN THE WINDOW IS A DENY, not a retry. Witnessed on open. Assurance A1: the operator shares this UID, so approval is tamper-EVIDENT, not tamper-proof. PASS answers_deny = the chain hash of the deny you are escalating (hestia_witness_decision returns it as witnessEntryHash): without it the escalation is witnessed but UNLINKED, and unlinked escalations cannot be credited as conduct — escalating instead of routing around is the top of the Temperament scale (1.0 on approval), and the link is what makes it readable. It is never inferred from timing. PASS act = the exact write you intend to perform, e.g. 'Edit -> plugins/<seat>/hooks/<file>'. REQUIRED: the approval is bound to this string (#539), and you must re-issue the SAME string to claim it. `reason` is your rationale and is NOT the act — an approval bound to a rationale can never be claimed, so an open without `act` is refused rather than granted-and-unspendable",
+            "Ask a HUMAN to approve a write to the governance surface (gate, witness, law_inject, the registration). Stage 2 of dp's 2026-07-29 ruling: the gate refuses these writes, and this is the channel that un-refuses a legitimate one. Returns an escalation_id and a deadline; NO DECISION WITHIN THE WINDOW IS A DENY, not a retry. Witnessed on open. Assurance A1: the operator shares this UID, so approval is tamper-EVIDENT, not tamper-proof. PASS answers_deny = the chain hash of the deny you are escalating (hestia_witness_decision returns it as witnessEntryHash): without it the escalation is witnessed but UNLINKED, and unlinked escalations cannot be credited as conduct — escalating instead of routing around is the top of the Temperament scale (1.0 on approval), and the link is what makes it readable. It is never inferred from timing. PASS act = the exact write you intend to perform, e.g. 'Edit -> plugins/<seat>/hooks/<file>'. REQUIRED: the approval is bound to this string (#539), and you must re-issue the SAME string to claim it. `reason` is your rationale and is NOT the act — an approval bound to a rationale can never be claimed, so an open without `act` is refused rather than granted-and-unspendable. ONE ACT, ONE RULING (#668): if this exact act is already \
+             pending from you, you get THAT escalation_id back with `coalesced: true` and nothing new is minted",
         ),
         t(
             "hestia_gate_pending_escalations",
@@ -371,7 +372,9 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_gate_escalation_claim",
-            "Claim a human's approval for a write to the governance surface, or open an escalation and REFUSE. One round trip, because a hook that outlives its harness timeout is killed and the tool then runs ANYWAY — so nothing waits in-hook. Either an approval already exists for this exact (member, file) and is spent here (single use), or the write is refused now and a human decides out of band; re-issue the write to use the approval",
+            "Claim a human's approval for a write to the governance surface, or open an escalation and REFUSE. One round trip, because a hook that outlives its harness timeout is killed and the tool then runs ANYWAY — so nothing waits in-hook. Either an approval already exists for this exact (member, file) and is spent here (single use), or the write is refused now and a human decides out of band; re-issue the write to use the approval. ONE ACT, ONE RULING (#668): if this exact act is \
+             already pending from you, the answer carries THAT escalation_id with `coalesced: true` \
+             — no second petition is minted and no peer is woken again; wait on the id you are given",
         ),
         t(
             "hestia_gate_escalation_poll",
@@ -10453,6 +10456,102 @@ mod tests {
         );
     }
 
+
+    /// #668, ONE ACT ONE RULING, through the door the gate hook actually calls. The hook
+    /// re-trips on the same refused act (25 of 49 same-digest re-opens in the 08-02..09-01
+    /// census arrived while the first ask was still pending; on 2026-09-01, 4ec27c68 and
+    /// b4b410f1 were the same `cp` 9 s apart and the operator ruled on both). A second ask
+    /// for a pending act must come back as the FIRST id, witness a fold rather than a second
+    /// open, wake nobody again, and still refuse the write.
+    #[tokio::test]
+    async fn a_hook_that_retrips_on_a_pending_act_gets_the_same_id_and_no_second_open() {
+        let (_dir, shared) = make_shared_state();
+        let out = tool_connect(&shared, &json!({ "plugin_id": "claude-code", "host_agent": "h" }))
+            .await
+            .unwrap();
+        let sid = out["sessionId"].as_str().expect("a session").to_string();
+        let ask = |reason: &'static str| {
+            let shared = shared.clone();
+            let sid = sid.clone();
+            async move {
+                tool_gate_escalation_claim(
+                    &shared,
+                    &json!({
+                        "plugin_id": "claude-code",
+                        "tool_name": "Bash",
+                        "marker": "plugins/*/hooks",
+                        "reason": reason,
+                        "session_id": sid,
+                    }),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        const ACT: &str =
+            "Bash: cd /tmp/wt-collapse && cp new.py plugins/claude-code/hooks/pre_tool_use.py";
+
+        let first = ask(ACT).await;
+        assert_eq!(first["claimed"], false);
+        assert_eq!(first["permits_write"], false);
+        assert!(first.get("coalesced").is_none(), "a fresh ask is not a fold: {first}");
+        let id = first["escalation_id"].as_str().expect("an id").to_string();
+
+        let second = ask(ACT).await;
+        assert_eq!(second["coalesced"], true, "{second}");
+        assert_eq!(second["escalation_id"], id, "the id already waiting, not a new one");
+        assert_eq!(second["permits_write"], false, "still refused; the ruling is still pending");
+        assert_eq!(second["claimed"], false);
+        assert!(
+            second["invitations"].as_array().map(Vec::is_empty).unwrap_or(false),
+            "nobody is woken twice for one ask: {second}"
+        );
+        // The keys a pre-#668 hook reads off a refusal are all still there.
+        for key in ["how_to_decide", "retry_within_secs", "expires_at", "witnessEntryHash"] {
+            assert!(!second[key].is_null(), "hook-read key `{key}` missing: {second}");
+        }
+        assert!(second["how_to_decide"].as_str().unwrap().contains(&id));
+
+        // A superset of the command is a different act (8791447f vs 50f8d3a1, same day).
+        let superset = ask(
+            "Bash: cd /tmp/wt-collapse && cp new.py plugins/claude-code/hooks/pre_tool_use.py \
+             && echo INSTALLED",
+        )
+        .await;
+        assert!(superset.get("coalesced").is_none(), "{superset}");
+        assert_ne!(superset["escalation_id"], id);
+
+        let s = shared.lock().await;
+        let now = crate::server::gate_escalation::now_secs();
+        assert_eq!(s.gate_escalations.pending(now).len(), 2, "two acts, two rows — not three");
+        let chain = s.recent_chain(200);
+        let opened: Vec<_> = chain
+            .iter()
+            .filter(|e| {
+                e.event_type == "gate_escalation_opened" && e.event_data["escalation_id"] == id
+            })
+            .collect();
+        assert_eq!(opened.len(), 1, "one act, ONE `gate_escalation_opened`");
+        let folded: Vec<_> = chain
+            .iter()
+            .filter(|e| e.event_type == "gate_escalation_coalesced")
+            .collect();
+        assert_eq!(folded.len(), 1, "the fold is witnessed, once");
+        let f = &folded[0].event_data;
+        assert_eq!(f["escalation_id"], id);
+        assert_eq!(f["opened_via"], "claim");
+        assert_eq!(f["plugin_id"], "claude-code");
+        assert_eq!(
+            f["act_digest"], opened[0].event_data["act_digest"],
+            "the fold names the digest it folded into, so a reader can join without trusting the id"
+        );
+        assert_eq!(second["witnessEntryHash"], folded[0].hash);
+        // The operator's ledger: still ONE row for this act, marked as re-asked once.
+        let rows = crate::server::governance_ledger::project(&chain, now);
+        let mine: Vec<_> = rows.iter().filter(|r| r.opened_hash == opened[0].hash).collect();
+        assert_eq!(mine.len(), 1, "the ledger must not re-create the inflation: {rows:?}");
+        assert_eq!(mine[0].coalesced, 1);
+    }
     /// THE MISSING DIRECTION.
     ///
     /// `governance_ledger::tests::every_declared_governance_event_is_actually_projected` walks
@@ -15619,6 +15718,89 @@ fn resolve_invitation(
     OpenedInvitation { invited, evidence, withheld, passed_over }
 }
 
+/// The `gate_escalation_coalesced` payload (#668): a second ask for an act whose first ask
+/// is still pending was folded into that first ask instead of minting a new id.
+///
+/// Witnessed, not silent. A coalesce that left no entry would make the suppressed mint
+/// invisible — the census that found the 1.30x inflation could no longer measure what this
+/// removed, and "the operator's load fell" would be an inference from an absence. The
+/// entry annotates the open row (the ledger counts it on that row) and carries the digest so a
+/// reader can join it to the `gate_escalation_opened` it folded into without trusting the id.
+fn coalesced_payload(
+    s: &super::state::ServerState,
+    twin: &crate::server::gate_escalation::Escalation,
+    opened_via: &'static str,
+    now: u64,
+) -> Value {
+    json!({
+        "escalation_id": twin.id,
+        "plugin_id": twin.plugin_id,
+        "subject_instance_lct": s.member_lct(&twin.plugin_id),
+        "tool_name": twin.tool_name,
+        "marker": twin.marker,
+        "act_digest": twin.act_digest,
+        // WHICH DOOR asked again — same discriminator `opened_payload` carries.
+        "opened_via": opened_via,
+        "first_opened_at": twin.opened_at,
+        "secs_since_first_open": now.saturating_sub(twin.opened_at),
+        "expires_at": twin.expires_at,
+        "bar": twin.bar,
+        // Not re-invited. These peers were woken by the first open; naming them here says
+        // who is already looking, not that anyone was woken again.
+        "invited_peers": twin.invited_peers,
+    })
+}
+
+/// What the asker is told when its ask was folded into a pending twin. Keeps every key the
+/// gate hooks read off a refused claim (`escalation_id`, `permits_write`, `expires_at`,
+/// `witnessEntryHash`) so a hook that predates #668 renders this exactly as it renders a
+/// fresh refusal — which it is: the write is still refused, the ruling is still pending, and
+/// the only thing that changed is that the operator will be asked ONCE.
+fn coalesced_response(
+    twin: &crate::server::gate_escalation::Escalation,
+    entry_hash: &str,
+    now: u64,
+) -> Value {
+    use crate::server::gate_escalation::APPROVAL_CLAIM_WINDOW_SECS;
+    let remaining = twin.expires_at.saturating_sub(now);
+    json!({
+        "claimed": false,
+        "permits_write": false,
+        "coalesced": true,
+        "escalation_id": twin.id,
+        "status": twin.stored_status(),
+        "bar": twin.bar,
+        "expires_at": twin.expires_at,
+        "decide_within_secs": remaining,
+        "retry_within_secs": remaining + APPROVAL_CLAIM_WINDOW_SECS,
+        "witnessEntryHash": entry_hash,
+        "invited_peers": twin.invited_peers,
+        // Nothing was sent: the invitation went out with the first open.
+        "invitations": [],
+        "coalesce_note": format!(
+            "this exact act is ALREADY pending as {id}, opened {secs}s ago — no second petition \
+             was minted and no peer was woken again. One ruling covers this ask; when it lands, \
+             re-issue the same write and it will claim it (#668).",
+            id = twin.id,
+            secs = now.saturating_sub(twin.opened_at),
+        ),
+        "how_to_decide": format!(
+            "hestia gate approve {id} --reason '...'   (or: hestia gate deny {id})",
+            id = twin.id
+        ),
+        "how_to_wait": format!(
+            "python3 tools/await_escalation.py {id} --session <your session_id>   \
+             (run it in the BACKGROUND — it exits when decided; \
+             0=claimable now, 3=approved-but-window-closed, 4=denied, 5=expired)",
+            id = twin.id
+        ),
+        "then": "RE-ISSUE the same write; it will claim the approval. The write is \
+                 refused right now, and stays refused until it is retried after a \
+                 human approves.",
+        "on_timeout": "DENIED — no decision within the window is a refusal, not a retry",
+    })
+}
+
 /// The `gate_escalation_opened` payload, written identically by both doors.
 ///
 /// One shape, every key always present. A census over payload KEYS cannot read a field that is
@@ -15878,14 +16060,14 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     }
     let asker_is_proven = proven_asker.is_some();
     let proven_session_uuid = proven_asker.as_ref().and_then(|who| who.session_uuid);
-    let esc = match s
+    let opened = match s
         .gate_escalations
-        .open(&plugin_id, &role, &tool_name, &marker,
+        .open_or_coalesce(&plugin_id, &role, &tool_name, &marker,
               // The act, from its own field. No fallback to `reason` on this door.
               act.as_deref(),
               stated_reason.as_deref(), stated_detail.as_deref(), now, DEFAULT_TTL_SECS)
     {
-        Ok(e) => e,
+        Ok(o) => o,
         // A refusal to OPEN is itself a deny of the write, so it is witnessed rather than
         // returned as a bare error the caller might log and forget.
         Err(e) => {
@@ -15901,6 +16083,17 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
             return Err(anyhow::anyhow!("{e}"));
         }
     };
+    // ONE ACT, ONE RULING (#668). The exact act is already pending under another id from
+    // this seat: witness the fold, tell the asker which id to wait on, and mint nothing —
+    // no second `gate_escalation_opened`, no second wake for the peers.
+    if let crate::server::gate_escalation::Opened::Coalesced(twin) = &opened {
+        let entry = s.append_chain(
+            "gate_escalation_coalesced",
+            coalesced_payload(&s, twin, "open", now),
+        )?;
+        return Ok(coalesced_response(twin, &entry.hash, now));
+    }
+    let esc = opened.into_escalation();
     // THE SEAT KEYS (#542), recorded before the witness so the entry records what
     // exists rather than what this call intends (the `invite` ordering rule, one
     // field group over). The two session keys are DERIVED from the proven session
@@ -16663,13 +16856,25 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // the paperwork attached to a refusal that already happened.
     match s
         .gate_escalations
-        .open(&plugin_id, &role, &tool_name, &marker,
+        .open_or_coalesce(&plugin_id, &role, &tool_name, &marker,
               // The gate hook composes `reason` AS the act, and has always done so, so it is
               // the act here. `act` still wins if a caller sends both.
               attempted_act.as_deref(),
               stated_reason.as_deref(), stated_detail.as_deref(), now, DEFAULT_TTL_SECS)
     {
-        Ok(esc) => {
+        // ONE ACT, ONE RULING (#668). This is the door the gate hook calls, and the hook
+        // re-trips on the same refused act — 25 of 49 same-digest re-opens in the
+        // 08-02..09-01 census arrived while the first ask was still pending, median 53 s
+        // after the prior ask, each costing the operator a ruling that bought nothing. Fold, witness,
+        // and answer with the id that is already waiting.
+        Ok(crate::server::gate_escalation::Opened::Coalesced(twin)) => {
+            let entry = s.append_chain(
+                "gate_escalation_coalesced",
+                coalesced_payload(&s, &twin, "claim", now),
+            )?;
+            Ok(coalesced_response(&twin, &entry.hash, now))
+        }
+        Ok(crate::server::gate_escalation::Opened::Minted(esc)) => {
             // THE SEAT KEYS (#542), same write as the member door: the two session
             // keys DERIVED from the proven session (never the arguments — the
             // doctrine the claimed row's host_session_id follows, ten lines up),
