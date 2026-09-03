@@ -11587,6 +11587,123 @@ mod tests {
             .event_data
     }
 
+    /// The claim door's REFUSAL RESPONSE carries `decided_awaiting_claim`, and it is the
+    /// same list `opened_payload` writes to the chain. Measured 2026-09-01 (`db0b02` →
+    /// `c9af97ae`, finding `three-petitions-one-cp-the-daemon-knew-20260901.md`): the field
+    /// had been computed FOR the live seat since #366 and delivered only to the ledger, so
+    /// the one reader it was computed for never saw it. A chain-side assertion would have
+    /// passed the whole time. This one reads the RESPONSE — kimi-code's second pin on #773
+    /// (notice 9225): "the chain-vs-response asymmetry cannot silently regress."
+    ///
+    /// ASSERTS ON THE RESPONSE, then on response == chain, so a later edit that lifts the
+    /// field off the response (or renders a different list there) fails here and not in a
+    /// census months later.
+    #[tokio::test]
+    async fn the_refusal_response_tells_the_member_what_it_can_already_spend() {
+        let (_dir, shared) = make_shared_state();
+        let r = tool_connect(&shared, &json!({ "plugin_id": "kimi-code", "host_agent": "h" }))
+            .await
+            .unwrap();
+        let session = r["sessionId"].as_str().unwrap().to_string();
+
+        // First refusal: nothing decided yet, so the key must be PRESENT and EMPTY. An
+        // absent key and an empty list are the same row to a census, and a hook that
+        // renders "nothing of yours to spend" has to be able to tell them apart.
+        let first = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": session,
+                "tool_name": "Edit",
+                "marker": "KINDS.md",
+                "reason": "Edit -> KINDS.md",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first["claimed"], false, "precondition — the open fallback: {first}");
+        assert_eq!(
+            first["decided_awaiting_claim"],
+            json!([]),
+            "present and empty before any approval exists: {first}"
+        );
+        let approved_id = first["escalation_id"].as_str().unwrap().to_string();
+
+        // The sovereign approves it out of band — the `k`.
+        {
+            let mut s = shared.lock().await;
+            s.gate_escalations
+                .decide(
+                    &approved_id,
+                    true,
+                    "operator",
+                    "role:constellation:sovereign",
+                    crate::server::gate_escalation::Channel::OperatorSession,
+                    None,
+                    None,
+                    crate::server::gate_escalation::now_secs(),
+                )
+                .expect("the sovereign channel decides");
+        }
+
+        // The member re-issues with `&& echo LANDED` appended — a different digest (#539) —
+        // under the same marker. Refused, a second petition opens, and THIS response is the
+        // one surface the refused member is certainly reading.
+        let second = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": session,
+                "tool_name": "Edit",
+                "marker": "KINDS.md",
+                "reason": "Edit -> KINDS.md && echo LANDED",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["claimed"], false, "a different digest does not spend: {second}");
+        let second_id = second["escalation_id"].as_str().unwrap().to_string();
+        assert_ne!(second_id, approved_id, "a fresh petition, not the approved one: {second}");
+
+        let listed = second["decided_awaiting_claim"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the refusal must carry the listing: {second}"));
+        assert_eq!(
+            listed.len(),
+            1,
+            "exactly the live approval — not the petition just opened, which is pending by \
+             construction and would read as `already approved`: {second}"
+        );
+        let row = &listed[0];
+        assert_eq!(row["escalation_id"], approved_id.as_str(), "{row}");
+        assert_eq!(
+            row["marker"], "KINDS.md",
+            "the marker the approval is spendable under — `claim()` matches on it, the \
+             listing does not (7079b9f6 → 033e052e): {row}"
+        );
+        assert!(row["act_digest"].is_string(), "WHICH act it authorises: {row}");
+        assert!(
+            row["claim_window_secs_remaining"].as_u64().unwrap_or(0) > 0,
+            "the CLAIM clock, still open: {row}"
+        );
+
+        // And it is the SAME list the chain got — the ledger and the refused member must
+        // not be able to drift apart again.
+        let s = shared.lock().await;
+        let opened = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| {
+                e.event_type == "gate_escalation_opened"
+                    && e.event_data["escalation_id"] == second_id.as_str()
+            })
+            .expect("the second open must be witnessed");
+        assert_eq!(
+            opened.event_data["decided_awaiting_claim"], second["decided_awaiting_claim"],
+            "the ledger and the refused member read the same listing"
+        );
+    }
+
     /// A claimed approval must carry the join to the act that consumed it. Until
     /// 2026-08-12 the claimed row was built entirely from STORED escalation fields: the
     /// attempted act (arriving as `reason`, by the hook's documented design) and the
@@ -15909,10 +16026,23 @@ fn opened_payload(
         // against a member that was online the entire time.
         //
         // A refused member is BY DEFINITION talking to this daemon right now, so the refusal
-        // answers the question it just provoked: what of mine can I already spend? Same
-        // predicate `claim()` spends against, so this cannot advertise a claim that would
-        // fail. The escalation just opened is excluded — pending by construction, and
-        // listing it would read as "already approved".
+        // answers the question it just provoked: what of mine can I already spend? The
+        // escalation just opened is excluded — pending by construction, and listing it
+        // would read as "already approved".
+        //
+        // NOT the same predicate `claim()` spends against, and this CAN list a row `claim()`
+        // refuses: `claimable_for` filters on (plugin_id, digest present, claimable) —
+        // `claim()` also requires `marker` equality. Counterexample on the CBP chain,
+        // 2026-08-31 17:18:41Z: `7079b9f6d4732751` (marker `pre_tool_use.py`, approved,
+        // 289s left, digest a8899b61…) was listed on the open of `033e052edafc8620`,
+        // whose act carried the SAME digest under marker `plugins/*/hooks`. The claim
+        // missed on the marker, a second petition opened, dp approved it too, and the first
+        // burned. Read `marker` beside `act_digest`: both must match the re-issue. (The
+        // earlier text here — "so this cannot advertise a claim that would fail" — was
+        // written the day the field was added and never measured.)
+        //
+        // And until the claim door lifted this onto its RESPONSE (2026-09-01) the field was
+        // chain-only: computed "for a live seat", read by no seat.
         "decided_awaiting_claim": s
             .gate_escalations
             .claimable_for(&esc.plugin_id, crate::server::gate_escalation::now_secs())
@@ -16961,18 +17091,31 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
             // escalate, so it stated no why, and the operator otherwise rules on an id and a
             // path fragment alone.
             let inv = resolve_invitation(&mut s, &esc, asker_is_proven);
-            let entry = s.append_chain(
-                "gate_escalation_opened",
-                opened_payload(
-                    &s,
-                    &esc,
-                    &inv,
-                    asker_is_proven,
-                    answers_deny.as_deref(),
-                    "claim",
-                    DEFAULT_TTL_SECS,
-                ),
-            )?;
+            let payload = opened_payload(
+                &s,
+                &esc,
+                &inv,
+                asker_is_proven,
+                answers_deny.as_deref(),
+                "claim",
+                DEFAULT_TTL_SECS,
+            );
+            // WHAT THIS MEMBER CAN ALREADY SPEND, told to the member. `opened_payload` has
+            // computed `decided_awaiting_claim` since #366 "for a live seat" — and wrote it
+            // to the CHAIN only. The refusal this door returns is the one surface the
+            // refused member is certainly reading, and it never carried the field, so the
+            // member it was computed for was the one reader who never saw it. Measured on
+            // CBP 2026-09-01 (chain 08-29T19:15Z..09-01T15:20Z, 68 opens): 21 opened while
+            // a same-seat approval was still live; of the 39 approvals so listed, 4 were
+            // later claimed and 35 burned. One of the 35 was `db0b02256b3eb7d5`: approved,
+            // 153s left, listed on `c9af97ae9c0140bb`'s open — the same member re-issuing
+            // the same `cp` with `&& echo LANDED` appended, which is a new digest (#539).
+            // Three petitions and three operator keystrokes for one write.
+            let decided_awaiting_claim = payload
+                .get("decided_awaiting_claim")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            let entry = s.append_chain("gate_escalation_opened", payload)?;
             let invitations = deliver_invitations(&mut s, &esc, &inv.invited, &entry.hash);
             Ok(json!({
                 "claimed": false,
@@ -16981,6 +17124,7 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                 "expires_at": esc.expires_at,
                 "decide_within_secs": DEFAULT_TTL_SECS,
                 "retry_within_secs": DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS,
+                "decided_awaiting_claim": decided_awaiting_claim,
                 "witnessEntryHash": entry.hash,
                 // Told to the ASKER too, not only written to the chain — the same asymmetry
                 // #219 found, where a decider got a bare verdict while the entry beside it
@@ -17015,7 +17159,14 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                      0=claimable now, 3=approved-but-window-closed, 4=denied, 5=expired)",
                     id = esc.id
                 ),
-                "then": "RE-ISSUE the same write; it will claim the approval. The write is \
+                // "the same write" has meant "the same BYTES" since #539 keyed the claim on
+                // sha256(command text). A member that reads it as "the same intent" and
+                // appends `&& echo LANDED` to confirm the landing opens a second petition
+                // while its approved first one burns (db0b02 -> c9af97ae, 2026-09-01).
+                "then": "RE-ISSUE the write BYTE-FOR-BYTE under the same marker; it will \
+                         claim the approval. The approval is keyed on sha256(command text) \
+                         (#539): any edit, even an appended `&& echo`, is a different act \
+                         and opens a NEW petition while this one burns. The write is \
                          refused right now, and stays refused until it is retried after a \
                          human approves.",
             }))

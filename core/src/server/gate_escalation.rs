@@ -1733,6 +1733,12 @@ impl EscalationStore {
                 // rule made the older promise false. Which act each approval is bound to is
                 // rendered by the caller, so a member can tell WHICH write it authorises rather
                 // than assuming any write qualifies.
+                //
+                // `marker` is deliberately NOT a conjunct here: this is a per-member listing
+                // ACROSS markers. Which means a row in this list is spendable only under its
+                // own `marker`, and a caller that re-issues the same bytes under a different
+                // marker spelling gets a fresh petition, not the claim (measured: 7079b9f6 →
+                // 033e052e, 2026-08-31; see `opened_payload`). Render `marker` with every row.
                 e.plugin_id == plugin_id && e.act_digest.is_some() && e.is_claimable(now)
             })
             .collect();
