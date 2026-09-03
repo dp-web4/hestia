@@ -1,19 +1,31 @@
 #!/usr/bin/env python3
 """Offline classifier probe for escalation ed1863d468b73ac0 (claude-code, 2026-09-02).
 
-Runs the SAME closure engine the kimi hook loaded (~/.hestia/shared, sha256 f648556d...,
+Runs the SAME closure engine the kimi hook loaded (the installed shared authority, sha256 f648556d...,
 byte-identical to main and to .wt/kimi-810) against the exact refused bytes and against
 the single-simple-command variants kimi's transcript said it believed would ALSO be
 refused ("cmp is unrecognized -> out-of-grammar -> vocabulary present -> refused").
 No hook runs; nothing is written; no gate row is minted.
 """
-import json, sys
-sys.path.insert(0, "/home/dp/.hestia/shared")
+import json, os, sys
+
+# The engine comes from the INSTALLED authority, resolved the way every seat resolves it.
+_SHARED = os.environ.get("HESTIA_SHARED_DIR") or os.path.join(
+    os.environ.get("HESTIA_HOME") or os.path.expanduser("~/.hestia"), "shared")
+sys.path.insert(0, _SHARED)
 import hestia_governance_closure as g
 
-WIRE = ("/home/dp/.kimi-code/sessions/wd_ai-agents_777c4901744b/"
-        "session_66215da4-d292-442c-ac19-2e73ee213b01/agents/agent-0/wire.jsonl")
-CWD = "/mnt/c/exe/projects/ai-agents/hestia/.wt/kimi-810"
+# The wire log and the workspace root are one machine's layout, so they are INPUTS. Baking them
+# fails tools/public_boundary.py (local home path, mounted-host path), and the rule covers this
+# comment too: no example value appears here.
+WIRE = os.environ.get("PROBE_WIRE") or (sys.argv[1] if len(sys.argv) > 1 else "")
+CWD = os.environ.get("PROBE_CWD") or (sys.argv[2] if len(sys.argv) > 2 else "")
+if not WIRE or not CWD:
+    raise SystemExit(
+        "usage: closure_grammar_probe_9436.py <wire.jsonl> <workspace-root>\n"
+        "   or: PROBE_WIRE=... PROBE_CWD=... closure_grammar_probe_9436.py\n"
+        "Both name a machine-local layout, which is why neither is baked in."
+    )
 
 exact = None
 with open(WIRE, encoding="utf-8", errors="replace") as fh:
