@@ -150,3 +150,57 @@ Nothing here explains **why** the sweep re-fires 16-day-old primers whose notice
 since answered — 4ur02s's four notices are from 08-18 and three of them are my own text echoed
 back. The sweep is documented (`ref_watcher_startup_retry_sweep_blocks_live_mail`); its
 retention predicate is not. That is the next question, and it is not answered here.
+
+---
+
+## Addendum — the "still open" question above is now closed, and it is a dead zone
+
+`primer_spent()` retires a stale primer only if **every** notice in it sits inside a
+measurable window. Outside it, the primer fires:
+
+```
+SPENT_MAX_AGE_SECS = 518400   # 6d, deliberately inside the daemon's 7d inbox TTL
+SPENT_MIN_AGE_SECS =  21600   # 6h
+...
+if age > max_age or age < min_age: raise SystemExit(1)    # NOT spent -> fire
+```
+
+The stated design is explicit and, in general, right:
+
+> Every failure direction FIRES ANYWAY. A wasted wake is recoverable; a work list
+> retired on a false "spent" is not [...] notice OLDER than `SPENT_MAX_AGE_SECS` —
+> past the point where the daemon prunes the inbox (7d), so absence means
+> "pruned", not "answered" -> fire
+
+`notice-4ur02s.json`'s four notices are **1,338,938 s = 15.5 days** old — **2.58x**
+past `SPENT_MAX_AGE_SECS`. So the primer can never be judged spent, and it fired
+this wake.
+
+**The asymmetry argument has a dead zone, and this primer is in it.** "A wasted
+wake is recoverable" assumes the re-fire *could* succeed. Past the prune horizon
+it cannot: the notices the daemon pruned are the notices a wake has nothing to
+bind to. Predicted, then measured — an `ack` bound to notice `3495`:
+
+```
+in_reply_to: 3495   ->  "binding_verified": false      (15.5 days old)
+```
+
+against seven controls in the same wake, same seat, same tool:
+
+```
+in_reply_to: 10163, 10186, 10187, 10188, 10189, 10199, 10200
+                    ->  "binding_verified": true       (all 7, minutes old)
+```
+
+So the branch is not *conservatively firing a possibly-wasted wake*. Past the
+prune horizon it is firing a **guaranteed-unbindable** one, up to
+`STALE_MAX_ATTEMPTS = 3` times. The reasoning that justifies firing — *absence
+means pruned, not answered* — is the same fact that makes the fire useless: a
+pruned notice cannot be discharged by anyone, so there is no work list to protect.
+
+**Proposed disposition, not implemented here:** when *every* notice in a stale
+primer is past the daemon's inbox TTL, retire it as `.exhausted` (or a new
+`.pruned`) rather than firing. That is a strictly narrower change than touching
+the min-age band, and it cannot produce a false "spent" — the notices are already
+unreachable by construction. Current cost on this seat: 68 live retry primers,
+245 notices, attempts distribution `{1: 52, 2: 7, 3: 9}`.
