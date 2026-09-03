@@ -1413,7 +1413,7 @@ fn cmd_lct_publish(home: &std::path::Path, send: bool) -> AnyResult<()> {
     }
     let conn = conn_snapshot.expect("send path always has a connection");
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let hub_id = conn.hub_lct_id;
 
     println!(
@@ -1874,7 +1874,7 @@ fn cmd_profile_push(home: &std::path::Path, target: &str) -> AnyResult<()> {
     let hub_id = conn.hub_lct_id;
     let our_lct = conn.our_lct_id;
     let url = conn.url.clone();
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
 
     println!("Pushing {} field(s) to {} ...", fields.len(), url);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
@@ -1913,14 +1913,9 @@ fn cmd_profile_push(home: &std::path::Path, target: &str) -> AnyResult<()> {
 }
 
 /// Resolve a possibly-relative rest endpoint against the connection base URL.
-fn abs_rest(base_url: &str, rest: &str) -> String {
-    if rest.starts_with("http://") || rest.starts_with("https://") {
-        rest.to_string()
-    } else if rest.is_empty() {
-        format!("{}/v1", base_url.trim_end_matches('/'))
-    } else {
-        format!("{}{}", base_url.trim_end_matches('/'), rest)
-    }
+fn abs_rest(base_url: &str, rest: &str) -> AnyResult<String> {
+    let advertised = if rest.is_empty() { "/v1" } else { rest };
+    hestia::hub::confined_hub_endpoint(base_url, advertised)
 }
 
 /// Resolve the hub connection to operate on (sole connection, or by url/uuid).
@@ -1953,7 +1948,7 @@ fn cmd_hub_pair_request(
     let store = HubStore::load(&vault)?;
     let conn = pick_connection(&store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -2001,7 +1996,7 @@ fn cmd_hub_pair_confirm(
     let store = HubStore::load(&vault)?;
     let conn = pick_connection(&store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -2070,7 +2065,7 @@ fn cmd_hub_pair_revoke(
     let store = HubStore::load(&vault)?;
     let conn = pick_connection(&store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -2131,7 +2126,7 @@ fn cmd_hub_send_secret(
     let store = HubStore::load(&vault)?;
     let conn = pick_connection(&store, target)?;
     let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint)?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 

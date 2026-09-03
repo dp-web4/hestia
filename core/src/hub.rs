@@ -14,6 +14,87 @@ use uuid::Uuid;
 use web4_core::crypto::{KeyPair, PublicKey};
 use web4_core::pair_channel::{self, Sealed};
 
+/// Parse and canonicalise the operator-approved origin of a Hub.
+///
+/// A Hub selection is an origin grant, not an arbitrary URL grant.  Paths,
+/// credentials, queries, and fragments would make later endpoint resolution
+/// ambiguous, so they are refused at the boundary instead of being silently
+/// discarded.  `url`'s origin serialisation supplies lower-cased/IDNA host
+/// canonicalisation and preserves a non-default explicit port.
+pub fn canonical_hub_origin(raw: &str) -> Result<String> {
+    let value = raw.trim();
+    let parsed = reqwest::Url::parse(value)
+        .with_context(|| format!("parsing Hub origin {value:?}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("Hub origin scheme must be http or https");
+    }
+    if parsed.host().is_none() {
+        anyhow::bail!("Hub origin must include a host");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("Hub origin must not contain user-info");
+    }
+    if parsed.path() != "/" {
+        anyhow::bail!("Hub origin must not contain a path");
+    }
+    if parsed.query().is_some() {
+        anyhow::bail!("Hub origin must not contain a query");
+    }
+    if parsed.fragment().is_some() {
+        anyhow::bail!("Hub origin must not contain a fragment");
+    }
+    Ok(parsed.origin().ascii_serialization())
+}
+
+fn same_origin(left: &reqwest::Url, right: &reqwest::Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host() == right.host()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+/// Resolve a discovery-advertised REST endpoint without widening the approved
+/// origin.  Relative and absolute-same-origin endpoints are accepted;
+/// scheme-relative, absolute-cross-origin, credentialed, queried, and
+/// fragmented endpoints are refused.
+pub fn confined_hub_endpoint(base_origin: &str, advertised: &str) -> Result<String> {
+    let origin = canonical_hub_origin(base_origin)?;
+    let base = reqwest::Url::parse(&format!("{origin}/"))
+        .context("parsing canonical Hub origin")?;
+    let candidate = if advertised.trim().is_empty() {
+        base.clone()
+    } else {
+        base.join(advertised.trim())
+            .with_context(|| format!("resolving Hub endpoint {advertised:?}"))?
+    };
+    if !candidate.username().is_empty() || candidate.password().is_some() {
+        anyhow::bail!("Hub endpoint must not contain user-info");
+    }
+    if candidate.query().is_some() {
+        anyhow::bail!("Hub endpoint must not contain a query");
+    }
+    if candidate.fragment().is_some() {
+        anyhow::bail!("Hub endpoint must not contain a fragment");
+    }
+    if !same_origin(&base, &candidate) {
+        anyhow::bail!(
+            "Hub discovery endpoint changed origin from {} to {}",
+            base.origin().ascii_serialization(),
+            candidate.origin().ascii_serialization()
+        );
+    }
+    Ok(candidate.as_str().trim_end_matches('/').to_string())
+}
+
+/// Hub HTTP never follows redirects.  A selected origin cannot delegate its
+/// egress authority through a 3xx response; callers surface the redirect as the
+/// upstream result and require a separately selected origin for any new peer.
+pub fn no_redirect_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("static no-redirect HTTP client configuration must build")
+}
+
 /// Hub discovery metadata from `/.well-known/web4-hub.json`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HubInfo {
@@ -353,16 +434,14 @@ pub struct HubClient {
 impl HubClient {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: no_redirect_http_client(),
         }
     }
 
     /// Discover hub metadata from well-known URL.
     pub async fn discover(&self, base_url: &str) -> Result<HubInfo> {
-        let url = format!(
-            "{}/.well-known/web4-hub.json",
-            base_url.trim_end_matches('/')
-        );
+        let origin = canonical_hub_origin(base_url)?;
+        let url = format!("{origin}/.well-known/web4-hub.json");
         let resp = self
             .http
             .get(&url)
@@ -1325,6 +1404,59 @@ fn channel_inner_request(tool: &str, args: serde_json::Value) -> serde_json::Val
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hub_origin_is_structural_and_canonical() {
+        assert_eq!(
+            canonical_hub_origin("  HTTPS://EXAMPLE.COM:443/  ").unwrap(),
+            "https://example.com"
+        );
+        assert_eq!(
+            canonical_hub_origin("http://127.0.0.1:7711").unwrap(),
+            "http://127.0.0.1:7711"
+        );
+
+        for invalid in [
+            "https://",
+            "https://?",
+            "ftp://example.com",
+            "https://user@example.com",
+            "https://example.com/path",
+            "https://example.com/?q=1",
+            "https://example.com/#fragment",
+        ] {
+            assert!(
+                canonical_hub_origin(invalid).is_err(),
+                "accepted ambiguous/non-origin value {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_endpoint_cannot_delegate_the_selected_origin() {
+        assert_eq!(
+            confined_hub_endpoint("https://hub.example", "/v1/").unwrap(),
+            "https://hub.example/v1"
+        );
+        assert_eq!(
+            confined_hub_endpoint("https://hub.example", "https://hub.example/v1").unwrap(),
+            "https://hub.example/v1"
+        );
+        assert!(confined_hub_endpoint(
+            "https://hub.example",
+            "https://127.0.0.1:7711/v1"
+        )
+        .is_err());
+        assert!(confined_hub_endpoint("https://hub.example", "//evil.example/v1").is_err());
+        assert!(confined_hub_endpoint("https://hub.example", "/v1?next=evil").is_err());
+
+        // A local Hub remains valid when the operator selected that exact
+        // origin; the remote-to-loopback delegation above is what is refused.
+        assert_eq!(
+            confined_hub_endpoint("http://127.0.0.1:7711", "/v1").unwrap(),
+            "http://127.0.0.1:7711/v1"
+        );
+    }
     use web4_core::crypto::KeyPair;
 
     // [retired 2026-07-20] sealed_secret_roundtrips_e2e_and_fails_closed tested the
