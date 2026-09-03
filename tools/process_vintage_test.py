@@ -261,6 +261,142 @@ def test_every_fd_input_combination_has_its_own_verdict():
           got)
 
 
+
+# --- 2026-09-03: the producer moved and this reader did not notice for a day ---------
+#
+# #634 shipped the reader on 2026-09-02 with the two hash fields matched ADJACENT.
+# #636 merged the same day and inserted `startup_origin=` between them. Every arm above
+# stayed green — REAL_LINE is a real journal line captured on 2026-08-26, and a fixture
+# pinned to a capture date cannot see a producer that moved after it. Measured on CBP
+# 2026-09-03: all three watcher units reported `vintage NOT MEASURED`, in the reassuring
+# spelling ("wait for the next level line"), while the level line sat in the journal of
+# the bound invocation. The primer banner names this tool as the disambiguator for which
+# producer wrote a stale primer, so the fleet's one instruction for that question was
+# answering nobody.
+
+# Verbatim, CBP journal 2026-09-03T01:08:39-07:00, invocation 42020ab38d724378.
+LIVE_LINE_0903 = (
+    "Sep 03 01:08:39 cbp hestia-watch-member.sh[1253]: [hestia-watch] ARTIFACT "
+    "plugin=claude-code state=ok reason=matches-startup "
+    "startup_sha256=36cf220fac1a65ef82f9f2fefc5ade4d898c6f314fb08d8b65acd74c2da58083 "
+    "startup_origin=own-fd "
+    "disk_sha256=36cf220fac1a65ef82f9f2fefc5ade4d898c6f314fb08d8b65acd74c2da58083 "
+    "started=2026-09-03T08:08:39Z")
+
+# REAL_LINE's hashes (so VERSIONS still resolves the commit) in the live field ORDER.
+LIVE_SHAPED_REAL = REAL_LINE.replace(
+    f"startup_sha256={STARTUP} disk_sha256=",
+    f"startup_sha256={STARTUP} startup_origin=own-fd disk_sha256=")
+
+
+def test_a_field_inserted_between_the_two_hashes_still_parses():
+    """RED before the fix: the adjacency requirement made this line unreadable."""
+    check("the fixture really is the new shape",
+          "startup_origin=own-fd" in LIVE_SHAPED_REAL, LIVE_SHAPED_REAL)
+    got = pv.parse_artifact(LIVE_LINE_0903)
+    check("parse", got is not None, "the LIVE line must parse")
+    check("nothing missing", got["missing"] == [], got)
+    check("startup", got["startup"].startswith("36cf220f"), got)
+    check("disk", got["disk"].startswith("36cf220f"), got)
+    check("state", got["state"] == "ok", got)
+
+
+def test_fields_are_read_by_name_not_by_position():
+    """The general form of the defect. Order is the producer's business, not ours."""
+    scrambled = ("[hestia-watch] ARTIFACT plugin=kimi-code "
+                 f"disk_sha256={B} started=2026-09-03T08:08:39Z reason=matches-startup "
+                 f"startup_origin=journal state=ok startup_sha256={A}")
+    got = pv.parse_artifact(scrambled)
+    check("parse", got is not None, scrambled)
+    check("nothing missing", got["missing"] == [], got)
+    check("startup", got["startup"] == A, got)
+    check("disk", got["disk"] == B, got)
+    check("reason", got["reason"] == "matches-startup", got)
+
+
+def test_a_level_line_missing_a_field_is_loud_not_silent():
+    """The half of the fix that keeps the NEXT rename from costing another day.
+
+    A line that carries the anchor but not a field this reader needs is a fact about
+    the READER. Returning None for it — what #634 did — is indistinguishable from "the
+    watcher has not reported yet", and that is the sentence the tool printed for a day.
+    """
+    truncated = ("[hestia-watch] ARTIFACT plugin=claude-code state=ok "
+                 f"reason=matches-startup startup_sha256={A} started=2026-09-03T08:08Z")
+    got = pv.parse_artifact(truncated)
+    check("not silent", got is not None,
+          "a level line missing a field must not read as 'no level line'")
+    check("names what is missing", got["missing"] == ["disk_sha256"], got)
+    check("keeps what it did read", got["startup"] == A, got)
+    # and the distinction survives: a line with no anchor is still None
+    check("no anchor is still None",
+          pv.parse_artifact("[hestia-watch] DAEMON DRIFT — running=v0.0.4") is None)
+
+
+def test_cmd_units_blames_the_reader_not_the_restart():
+    """RED before the fix twice over: pre-fix `cmd_units` printed the wait-for-the-next
+    -line sentence for this input, which is the false reassurance itself."""
+    truncated = ("[hestia-watch] ARTIFACT plugin=claude-code state=ok "
+                 f"reason=matches-startup startup_sha256={A} started=2026-09-03T08:08Z")
+    out, _ = run_units({"hestia-watch-claude": {
+        "state": "active", "invocation": "NEWINV", "inv_log": truncated}})
+    check("says the reader is stale", "UNREADABLE" in out, out)
+    check("names the missing field", "disk_sha256" in out, out)
+    check("does NOT reassure",
+          "wait for the next level line" not in out, out)
+    check("claims no vintage", "a8dccda" not in out, out)
+
+
+def test_the_live_shape_reaches_a_verdict_end_to_end():
+    """The positive control for the arm above: the new order must still MEASURE."""
+    out, _ = run_units({"hestia-watch-claude": {
+        "state": "active", "invocation": "NEWINV", "inv_log": LIVE_SHAPED_REAL}})
+    check("measured", "NOT MEASURED" not in out, out)
+    check("names the commit in force", "a8dccda" in out, out)
+    check("not blamed on the reader", "UNREADABLE" not in out, out)
+
+
+def test_the_edge_alarms_are_never_read_as_a_level_line():
+    """#636 added two more ARTIFACT spellings. An edge alarm read as a level line
+    would date the process from a one-shot event that the journal window then drops."""
+    for line in (
+        f"[hestia-watch] ARTIFACT DRIFT — restart required; startup_sha256={A} "
+        f"startup_origin=own-fd disk_sha256={B}",
+        f"[hestia-watch] ARTIFACT UNVERIFIABLE — reason=disk-hash-unavailable "
+        f"startup_sha256={A} startup_origin=own-fd disk_sha256=unavailable",
+        f"[hestia-watch] ARTIFACT DEPLOY plugin=claude-code — exec into merged bytes; "
+        f"was={A} now={B} ref=origin/main:x snapshot={A}",
+        "[hestia-watch] ARTIFACT DRIFT held — deploy declined",
+    ):
+        check("edge is not level", pv.parse_artifact(line) is None, line)
+
+
+def test_the_watcher_still_emits_every_field_this_tool_reads():
+    """THE regression guard, and the only one here that is not a copy of the past.
+
+    Every other arm feeds this tool a string some human transcribed. That is exactly
+    how the defect survived: the transcription was accurate on the day it was taken and
+    the producer moved the next day. This arm reads the PRODUCER — the level-line echo
+    in the watcher itself — and fails the moment a field this reader requires stops
+    being emitted, with no journal, no running unit and no capture involved.
+    """
+    repo = os.path.dirname(_HERE)
+    watcher = os.path.join(repo, pv.WATCH_PATH)
+    check("the producer is where we think", os.path.exists(watcher), watcher)
+    emit = [ln for ln in io.open(watcher, encoding="utf-8").read().splitlines()
+            if "[hestia-watch] ARTIFACT plugin=" in ln]
+    check("exactly one level-line emit site", len(emit) == 1,
+          f"{len(emit)} sites — if the watcher grew a second, this tool reads the "
+          f"LAST match in a journal and the arms above no longer pin which one")
+    for wire in pv.ARTIFACT_FIELDS:
+        check(f"watcher still emits {wire}", f"{wire}=" in emit[0],
+              f"the watcher's level line no longer carries {wire}=; this tool reads it. "
+              f"emit site: {emit[0].strip()[:200]}")
+    # and the anchor this tool keys on is verbatim in the producer
+    check("anchor is verbatim in the producer",
+          "[hestia-watch] ARTIFACT plugin=" in emit[0], emit[0])
+
+
 TESTS = [
     test_parses_the_real_journal_line,
     test_a_non_artifact_line_is_not_half_parsed,
@@ -277,6 +413,13 @@ TESTS = [
     test_the_journal_query_is_bound_to_the_invocation_not_the_unit,
     test_an_unbindable_unit_is_labelled_rather_than_silently_unit_wide,
     test_an_active_unit_with_a_fresh_level_line_still_reports_its_vintage,
+    test_a_field_inserted_between_the_two_hashes_still_parses,
+    test_fields_are_read_by_name_not_by_position,
+    test_a_level_line_missing_a_field_is_loud_not_silent,
+    test_cmd_units_blames_the_reader_not_the_restart,
+    test_the_live_shape_reaches_a_verdict_end_to_end,
+    test_the_edge_alarms_are_never_read_as_a_level_line,
+    test_the_watcher_still_emits_every_field_this_tool_reads,
 ]
 
 
