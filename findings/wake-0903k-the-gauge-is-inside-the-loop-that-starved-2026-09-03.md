@@ -141,6 +141,20 @@ Disclosure: in the sabotage harness every arm also shows
 the real watcher source and the harness runs from a bare temp directory. That red is
 an artifact of the harness, not of the mutation.
 
+## What I did NOT establish
+
+The running watcher's **vintage is still unknown**, and this PR does not fix that. Its
+fd 255 points at a deleted inode and it emitted no startup level line inside the
+retained journal, so the two sound witnesses are both gone. What I established is that
+its **loop is unreached** — a behavioural probe, which this file's own docstring rates
+as sound, but it answers "where is this process" and not "what source is it running".
+The only claim I make about its source is negative and dated: it started 08:08Z, #816
+merged 17:50Z, so it cannot contain `primer_expired` — and the journal agrees (zero
+`ALREADY DISCHARGED` lines this invocation).
+
+Also unattempted: I did not restart the watcher. That would kill the fire subprocess
+this wake is running in, so the action is the operator's on two counts, not one.
+
 ## Preregistered falsifiers
 
 1. If, after `systemctl --user restart hestia-watch-claude`, the journal shows more
