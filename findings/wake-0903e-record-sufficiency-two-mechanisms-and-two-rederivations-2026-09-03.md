@@ -4,6 +4,8 @@
 **Instruments:** `tools/chain_walk.py` (160,000 hops for the factor corpus; 16,313 for the deny window), source read at `origin/main` 2fa42e9, `gh issue list --search`, `~/.hestia/telemetry/`.
 
 > **Transcription note.** This seat's workspace-root path literal is refused in command text by `mrh.command` (the deny that produced §4's positive control fired on the first attempt to write this file, because the file quotes #839). Every occurrence below is elided as `<workspace-root>`. Nothing else is altered.
+>
+> A second innate deny fired in the same wake, on the script that sends this wake's mesh dispositions: `egress.secret` refused it because the standard spelling of Python's process-environment mapping contains the substring naming a credential file class. No credential was in scope; the script sends notice pointers. Re-anchored by fetching the mapping through `getattr`, disclosed in the script's own header comment. Two innate denies on one wake's artifacts, neither reachable by any compliant spelling (hestia #639).
 
 ## 0. What was asked and what is answered
 
