@@ -29,9 +29,30 @@ Issue #916 found a concrete failure shape:
 
 A raw `deny rows by seat` query therefore produced the opposite of the useful conclusion: the seat with no witnessed Hestia gate denials looked best covered.
 
-The follow-up measurement sharpened the finding rather than weakening it. The two layers are already structurally distinguishable: Hestia gate rows carry `adjudicator`, while harness-preset rows do not. The defect is that consumers collapse them. A second attribution defect exists one field deeper: harness-preset rows populate `rule_id`, while measured Hestia gate rows carry the rule only inside `reason`, leaving `rule_id` empty.
+The follow-up measurement sharpened the finding rather than weakening it. The two layers are already structurally distinguishable: Hestia gate rows carry `adjudicator`, while harness-preset rows do not. The discriminator was perfect in the measured window: 163/163 gate rows had `adjudicator`; 203/203 preset rows did not. The defect is that consumers collapse them. A second attribution defect exists one field deeper: harness-preset rows populate `rule_id` (203/203), while measured Hestia gate rows carry the rule only inside `reason`, leaving `rule_id` empty (0/163).
 
 This PRD generalizes the lesson rather than hard-coding that one incident.
+
+### 2.1 The absence-slot rule
+
+A missing signal is comparatively safe when it still **looks missing**. A missing file, an explicit `unknown`, or an expected record marked absent invites investigation.
+
+The more dangerous failure is a **decoy**: the expected signal is missing, but its observational slot is occupied by a well-formed value from another producer or another state. The absence renders as affirmative evidence.
+
+> **An absence becomes dangerous when something else is allowed to occupy its slot.**
+
+The denial-count incident is one instance: unrelated harness refusals occupied the apparent slot for Hestia refusals. The fallback-spool denominator trap is another shape: a self-selected failure population returns a perfectly correct percentage for a different denominator. Governance outcomes have the same risk whenever `unknown`, `expired`, `unruled`, `denied`, `not-applicable`, or other distinct states collapse to the same observed value.
+
+Therefore:
+
+- `unknown` MUST NOT render as `denied` or `allowed`;
+- `expired without ruling` MUST NOT render as a ruled outcome;
+- `unsupported` MUST NOT render as zero events;
+- `unwitnessed` MUST NOT render as witnessed merely because adjacent control emitted a similar record;
+- query surfaces MUST expose the producer, denominator, and state semantics needed to distinguish these cases;
+- a projection that cannot distinguish these states MUST return `unknown` / `ambiguous`, not choose a convenient terminal value.
+
+This is not merely a UI requirement. It is an evidence-schema invariant: **absence must preserve its shape through storage, projection, API, CLI, and dashboard layers.**
 
 ---
 
@@ -186,14 +207,17 @@ Dashboards and APIs that summarize governance MUST:
 
 - separate records by enforcement authority/layer before aggregating;
 - expose `expected vs observed` coverage where an expectation exists;
-- display `unsupported`, `unknown`, `pending`, and `failed` distinctly;
+- display `unsupported`, `unknown`, `pending`, `failed`, `expired`, and `unruled` distinctly where those states exist;
 - make rule attribution completeness visible;
 - expose coverage/conformance by seat and version;
-- avoid ranking seats by raw deny count as a proxy for governance health.
+- avoid ranking seats by raw deny count as a proxy for governance health;
+- preserve denominator provenance for percentages and rates.
 
 A view may still show total denials, but it MUST NOT label that number as Hestia governance denials unless the filter actually selects Hestia governance authority.
 
 If a denominator is conditional by construction — for example, a file containing only failed deliveries — the UI and API MUST label that fact rather than presenting a percentage that can be mistaken for fleet-wide rate.
+
+A projection MUST NOT map missing/unknown outcomes into a terminal outcome merely to make the schema easier to consume. If legacy compatibility requires a collapsed field, a separate explicit state/quality field MUST make the loss visible and new consumers MUST use the typed state.
 
 ---
 
@@ -233,6 +257,8 @@ This PRD is not implemented until all of the following are true:
 8. A delivery-failure percentage has an explicit decision denominator independent of the failure spool.
 9. Cross-harness fixtures prove the same governed event family carries equivalent authority, rule, action identity, and witness semantics across supported seats.
 10. Synthetic canary events cannot affect participant reputation or be mistaken for ordinary member conduct.
+11. `unknown`, `unruled`, `expired`, `unsupported`, and explicit terminal outcomes remain distinguishable end to end; no missing state silently renders as `allow` or `deny`.
+12. A test injects a well-formed adjacent-control record into the same seat/window as a missing Hestia record and proves that coverage still fails rather than appearing healthy.
 
 ---
 
@@ -245,7 +271,7 @@ The order matters because later observability should not normalize a broken reco
 3. **Define the coverage contract:** seat × version × family × enforcement layer.
 4. **Add durable receipt/reconciliation:** make pending and failed delivery first-class.
 5. **Add the canary:** prove the path end to end, not merely that components are alive.
-6. **Change operator projections:** report authority-aware expected-vs-observed coverage and denominator provenance.
+6. **Change operator projections:** report authority-aware expected-vs-observed coverage, denominator provenance, and non-collapsed unknown states.
 7. **Gate release claims on conformance:** a seat/version with no passing canary is `unknown` or `unsupported`, never implicitly healthy.
 
 ---
@@ -258,4 +284,4 @@ The stronger reusable principle is therefore:
 
 > **A governance evidence trail must carry provenance for its own coverage.**
 
-Identity, law, decision, enforcement, witness, and reconciliation are distinct claims. Hestia may compose them, but it must not collapse them. A relying party can then decide whether that evidence is sufficient for the stakes of the act without trusting a dashboard's aggregate count or Hestia's assertion that the path was active.
+Identity, law, decision, enforcement, witness, reconciliation, and absence are distinct claims. Hestia may compose them, but it must not collapse them. A relying party can then decide whether that evidence is sufficient for the stakes of the act without trusting a dashboard's aggregate count or Hestia's assertion that the path was active.
