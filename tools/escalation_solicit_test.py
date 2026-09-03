@@ -5,6 +5,8 @@ The network half of `escalation_solicit.py` is a shell; the judgement is one pur
 this pins the judgement. Arms, in the order they matter:
 
   1. denied            -> NOBODY, reason names shopping. The arm the tool exists to fail on.
+  2a. env cannot unlock -> the prior ruling arrives as a validated PARAMETER, never from the
+                          ambient environment, and an unrecognised value is not evidence
   2. reaped/expired    -> INDETERMINATE, never a fresh petition. #867: a reaped row polls as
                           synthetic `expired` whether it was ruled or not, and whether that
                           ruling was approve or DENY, so "open a fresh petition if the act still
@@ -27,7 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from escalation_solicit import (ASK, INDETERMINATE, NOBODY,  # noqa: E402
-                                resolve_peers, solicitation_verdict)
+                                resolve_peers, resolve_prior_ruling, solicitation_verdict)
 
 FAILURES: list[str] = []
 PEERS = ["codex", "kimi-code", "gemini-cli"]
@@ -50,14 +52,6 @@ def row(**kw) -> dict:
     return base
 
 
-def with_resolver(value):
-    """Set or clear the resolved prior ruling for one call."""
-    prev = os.environ.get("_RESOLVED_PRIOR_RULING")
-    if value is None:
-        os.environ.pop("_RESOLVED_PRIOR_RULING", None)
-    else:
-        os.environ["_RESOLVED_PRIOR_RULING"] = value
-    return prev
 
 
 def test_a_deny_is_never_re_solicited() -> None:
@@ -67,7 +61,6 @@ def test_a_deny_is_never_re_solicited() -> None:
 
 
 def test_a_reaped_row_is_indeterminate_not_a_fresh_petition() -> None:
-    with_resolver(None)
     for status in ("expired", "unknown", ""):
         state, who, reason = solicitation_verdict(row(status=status), PEERS)
         check(state == INDETERMINATE and who == [],
@@ -76,17 +69,43 @@ def test_a_reaped_row_is_indeterminate_not_a_fresh_petition() -> None:
               f"[2] and it names the eviction and the route: {reason[:110]}")
         check("fresh petition" not in reason.split("Resolve")[0],
               "[2] and never recommends a fresh petition on an unresolved status")
+    state, who, reason = solicitation_verdict(row(status="expired"), PEERS, prior_ruling="denied")
+    check(state == NOBODY and "appeal" in reason,
+          f"[2] canonical evidence of a DENY keeps it shut: {state} {reason[:80]}")
+    state, who, _ = solicitation_verdict(row(status="expired"), PEERS, prior_ruling="undecided")
+    check(state == ASK and who == PEERS,
+          f"[2] only a resolved UNDECIDED unlocks an ask: {state} {who}")
+
+
+def test_the_environment_cannot_unlock_an_ask() -> None:
+    """GPT's review of #866: the prior ruling used to arrive through an env var, so anyone who
+    could set `_RESOLVED_PRIOR_RULING=undecided` could reopen a reaped DENY without evidence.
+    Ambient state that unlocks an ask is a deny anyone can reopen by exporting a word."""
+    prev = {k: os.environ.get(k) for k in ("_RESOLVED_PRIOR_RULING", "HESTIA_RULING_RESOLVER")}
     try:
-        with_resolver("denied")
-        state, who, reason = solicitation_verdict(row(status="expired"), PEERS)
-        check(state == NOBODY and "appeal" in reason,
-              f"[2] a resolver saying DENY keeps it shut: {state} {reason[:80]}")
-        with_resolver("undecided")
+        os.environ["_RESOLVED_PRIOR_RULING"] = "undecided"
         state, who, _ = solicitation_verdict(row(status="expired"), PEERS)
-        check(state == ASK and who == PEERS,
-              f"[2] only a resolved UNDECIDED unlocks an ask: {state} {who}")
+        check(state == INDETERMINATE and who == [],
+              f"[2a] an env var no longer speaks for the chain: {state} {who}")
+        for bogus in ("APPROVED-ish", "yes", "", "undecided\nand more"):
+            state, _, _ = solicitation_verdict(row(status="expired"), PEERS, prior_ruling=bogus)
+            check(state == INDETERMINATE,
+                  f"[2a] an unrecognised ruling {bogus!r} is not evidence: {state}")
+        os.environ.pop("HESTIA_RULING_RESOLVER", None)
+        check(resolve_prior_ruling("deadbeef") is None,
+              "[2a] with no resolver configured the question stays unresolved")
+        os.environ["HESTIA_RULING_RESOLVER"] = "/bin/false"
+        check(resolve_prior_ruling("deadbeef") is None,
+              "[2a] a resolver that fails leaves it unresolved rather than askable")
+        os.environ["HESTIA_RULING_RESOLVER"] = "/bin/echo"
+        check(resolve_prior_ruling("deadbeef") is None,
+              "[2a] and a resolver answering something else is discarded")
     finally:
-        with_resolver(None)
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def test_absent_bar_is_not_peer_authority() -> None:
@@ -147,6 +166,7 @@ def test_the_asker_is_never_asked() -> None:
 if __name__ == "__main__":
     test_a_deny_is_never_re_solicited()
     test_a_reaped_row_is_indeterminate_not_a_fresh_petition()
+    test_the_environment_cannot_unlock_an_ask()
     test_absent_bar_is_not_peer_authority()
     test_two_factor_bar_is_not_a_peer_matter()
     test_single_approver_asks_the_roster()

@@ -22,7 +22,11 @@ is the one that matters. Every place this tool cannot establish a fact, it stops
     chain evidence the answer is INDETERMINATE, and the missing surface is named rather than
     guessed around: a resolver that distinguishes ruled-and-evicted from lapsed-undecided.
     `HESTIA_RULING_RESOLVER` may supply one (a command taking an escalation id and printing
-    `approved`, `denied`, or `undecided`); absent it, nobody is asked.
+    exactly `approved`, `denied` or `undecided`). Its answer is passed IN, validated, and never
+    read from the ambient environment: an env var consulted inside the verdict would mean any
+    caller could export `undecided` and reopen a reaped deny without evidence, which is the
+    shopping this tool exists to refuse, reached by setting a variable. Anything the resolver
+    prints other than those three words is discarded as unresolved.
   - the peer roster comes from the roster substrate (`HESTIA_PEERS`, else the workspace's
     agent registry). A baked list is one seat's view of the fleet wearing a general name, and
     it silently excluded claude-code from ever being a peer. No roster means no solicitation.
@@ -64,8 +68,18 @@ def resolve_peers(me: str, workspace: str | None) -> tuple[list[str], str]:
                 "A baked list would be one seat's view of the fleet wearing a general name")
 
 
-def solicitation_verdict(row: dict, peers: list[str], me: str = "claude-code"):
-    """(state, recipients, reason). Pure, so the judgement is testable without a daemon."""
+RULINGS = ("approved", "denied", "undecided")
+
+
+def solicitation_verdict(row: dict, peers: list[str], me: str = "claude-code",
+                         prior_ruling: str | None = None):
+    """(state, recipients, reason). Pure, so the judgement is testable without a daemon.
+
+    `prior_ruling` is canonical evidence about a reaped row, supplied by the caller and
+    validated here. It is a parameter and not an environment lookup on purpose: ambient state
+    that unlocks an ask is a deny anyone can reopen by exporting a word."""
+    if prior_ruling is not None and prior_ruling not in RULINGS:
+        prior_ruling = None
     status = (row.get("status") or "").lower()
     bar = (row.get("bar") or "").lower()
 
@@ -79,7 +93,7 @@ def solicitation_verdict(row: dict, peers: list[str], me: str = "claude-code"):
     if row.get("consumed_at"):
         return NOBODY, [], "already spent: nothing left to authorise"
     if status in ("expired", "unknown", ""):
-        ruling = (os.environ.get("_RESOLVED_PRIOR_RULING") or "").lower()
+        ruling = (prior_ruling or "").lower()
         if ruling == "denied":
             return NOBODY, [], "reaped, and the canonical ruling was DENY: appeal, never re-ask"
         if ruling == "approved":
@@ -115,16 +129,23 @@ def poll(escalation_id: str) -> dict:
     return json.loads(out[start:])
 
 
-def resolve_prior_ruling(escalation_id: str) -> None:
-    """Ask the configured resolver what the chain says, if one is configured."""
+def resolve_prior_ruling(escalation_id: str) -> str | None:
+    """Ask the configured resolver what the chain says. Returns one of RULINGS, or None.
+
+    The answer is RETURNED, never stashed in the environment, and anything outside the three
+    accepted words is None. A resolver that errors, times out, or answers something else leaves
+    the question unresolved, which keeps the escalation INDETERMINATE rather than askable."""
     cmd = os.environ.get("HESTIA_RULING_RESOLVER")
     if not cmd:
-        return
+        return None
     try:
         r = subprocess.run([cmd, escalation_id], capture_output=True, text=True, timeout=120)
-        os.environ["_RESOLVED_PRIOR_RULING"] = (r.stdout or "").strip().splitlines()[-1].strip()
+        if r.returncode != 0:
+            return None
+        answer = (r.stdout or "").strip().splitlines()[-1].strip().lower()
+        return answer if answer in RULINGS else None
     except Exception:
-        pass
+        return None
 
 
 def mesh_cli(me: str) -> str | None:
@@ -156,12 +177,13 @@ def main() -> int:
     args = ap.parse_args()
 
     row = poll(args.escalation_id)
-    resolve_prior_ruling(args.escalation_id)
+    prior = resolve_prior_ruling(args.escalation_id)
     peers, roster_note = resolve_peers(args.me, args.workspace)
-    state, recipients, reason = solicitation_verdict(row, peers, args.me)
+    state, recipients, reason = solicitation_verdict(row, peers, args.me, prior)
 
     print(f"escalation {args.escalation_id}: status={row.get('status')} bar={row.get('bar')}")
     print(f"  roster: {roster_note}")
+    print(f"  prior ruling: {prior or 'unresolved (no resolver, or an answer outside approved/denied/undecided)'}")
     print(f"  {state.upper()}: {reason}")
     if state != ASK:
         return 2 if state == INDETERMINATE else 0
