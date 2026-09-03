@@ -141,3 +141,58 @@ likely to be merged while a seat is stuck on the mesh are mesh fixes.
 The instrument that would have caught this needed no new code and no deploy: it is one
 tree's reflog, joined to one file's history on `main`.  It was available for the whole
 eight days.
+
+---
+
+## Addendum — the drift alarm's reference is the parked tree, so it points backwards
+
+While measuring the above I caught the watcher saying it in its own words. From the
+codex watcher's journal, this wake:
+
+```
+[hestia-watch] DAEMON DRIFT — direction unresolved — compare the two strings before acting;
+               running=v0.0.4-653-g0dca712 source=v0.0.4-638-g3771b19 reason=differs-from-source
+```
+
+`0dca712` is the **deployed** daemon — the checkout `hestia-deploy.timer` maintains, which
+contains `f011d0e`/#816.  `3771b19` is the shared developer worktree, sitting on a feature
+branch.  The alarm is reporting the correctly-deployed daemon as drifted *from a developer's
+working branch*.
+
+The mechanism is two lines of `hestia-watch-member.sh`:
+
+```sh
+202: WATCH_REPO_ROOT="$(cd "$(dirname "$WATCH_SOURCE")/../.." && pwd)"
+267: WATCH_DAEMON_SOURCE_RAW="$(git -C "$WATCH_REPO_ROOT" describe --tags --always --dirty)"
+```
+
+`WATCH_SOURCE` is the watcher script itself, so `WATCH_REPO_ROOT` is *the tree the watcher
+was launched from*.  The drift reference is therefore not `origin/main`, not a tag, and not
+the deploy checkout — it is whatever branch the shared tree is on right now.
+
+Three consequences, in increasing order of seriousness:
+
+1. **It is noisy by construction.**  By the measurement above, that tree's HEAD is off
+   `origin/main` 94.0% of the last 7 days and 79.9% of the last 30.  So for most of the
+   time the alarm's reference is a feature branch and `differs-from-source` is the
+   expected state, not an alert.
+
+2. **`direction unresolved` is the normal answer, not a rare one.**  `drift_direction`
+   can only speak when one commit is an ancestor of the other.  A deployed main-line
+   commit and a developer's feature branch are neither, so the alarm degrades to
+   "compare the two strings before acting" exactly when it is asked.
+
+3. **The polarity is inverted for the case that matters.**  Today the alarm fires because
+   the deployed daemon is *ahead* of the reference.  Anything that treats
+   `differs-from-source` as "the daemon is stale" would push the daemon backwards onto a
+   feature branch.  Nothing does that today; the alarm only prints.  But it is one
+   automation away, and #636 already gave this alarm a "recovery" path.
+
+This is the same root as #909 — a developer worktree is being used as a deployment
+artifact — showing up on the *reading* side rather than the executing side.  #909 says
+that tree decides what runs; this says it also decides what "current" means.
+
+**Falsifier:** if `HESTIA_WATCH_SOURCE` is set in the units to point at a release
+checkout, `WATCH_REPO_ROOT` follows it and the reference becomes correct.  The three
+installed units do not set it (line 152 explicitly `unset`s it before re-exec).  Anyone
+who can show a unit that sets it refutes the "94% of the time" claim for that seat.
