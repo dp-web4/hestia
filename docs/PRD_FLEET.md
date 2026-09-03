@@ -1,4 +1,10 @@
-# PRD — The Fleet: hestia as control plane, harness, and gateway
+# PRD — The Fleet: hestia as an agnostic control plane, and a gateway
+
+> **AMENDED 2026-09-03 (dp).** The title said *harness* and §4.3 built one. That is withdrawn:
+> **hestia is an agnostic control plane; the harness is SAGE.** The reasoning, what survives of
+> §4.3, and what replaces it are in §4.3a. Nothing else in this document is affected: the
+> session model, authenticated connect, the control plane, channels, roles and the economics
+> all describe a plane that governs harnesses, and they read better once it does not own one.
 
 **Status:** proposed — design PRD, for review
 **Owner:** dp. **Author of record:** Legion (interactive session with dp, 2026-08-23), from a four-track study: architecture map, PRD-corpus digest, SAGE gateway study, external research.
@@ -99,7 +105,77 @@ Session **creation** is a witnessed act (`session_launched`: role, scope digest,
 
 Fail-closed grammar (from `PRD_CONFIG_IN_VAULT`): unauthenticated connect for a registered-strong member **denies naming the cause**; an unknown principal may connect only into the *receptionist* posture (§6.3). No "latest session," no anonymous fallback.
 
-### 4.3 The native loop — hestia as harness
+### 4.3a AMENDMENT: the native loop is not hestia's (dp, 2026-09-03)
+
+dp: *"our prds point at hestia eventually becoming a harness. i now think that's wrong. hestia
+is an agnostic control plane. sage is our harness, and we should look for tighter/stronger
+integration of sage-hestia that would be a superset of most existing harnesses."*
+
+**Why the original was wrong, in this corpus's own terms.** A control plane that ships a harness
+stops being agnostic, because its own loop becomes the one it can most easily govern, and the law
+drifts toward whatever that loop happens to do. This repository has already ratified that failure
+shape one layer down: `GATE_ARCHITECTURE` §3 records that the cause of the whole gate recurrence
+was claude-code authoring the law and exempting itself, and states that *the author of the law
+being outside it is the failure this clause forbids*. A hestia-owned harness is that same shape at
+the harness layer, and it would arrive with the law already written by the one participant that
+cannot be an outside party to it.
+
+**The shims are permanent, not scaffolding.** The fleet runs Claude Code, codex, kimi and gemini,
+and a control plane exists to govern harnesses it did not write. `GATE_ARCHITECTURE`'s one-gate
+architecture is therefore the steady state rather than a migration, and every seat that is not
+SAGE stays a shim over the common gate.
+
+**What the adapter boundary actually costs, measured rather than argued.** Every hard defect of
+2026-09-02/03 is a consequence of governing a foreign harness through hook points it never
+designed for us, and none of them is a hestia design error:
+
+| defect | the adapter boundary underneath it |
+|---|---|
+| a ruling reaches nobody until a human relays it (#845, #849) | the harness offers no channel to tell a running session anything |
+| an absent member's mail is drained into an unreadable pile (#893) | the only wake available is spawning a fresh CLI process |
+| config lives in editable plaintext a member may not repair (#898) | the harness owns its own config format and location |
+| a crashing hook fails OPEN on two engines (`GATE_PROFILE` §0) | the harness decides what a hook's failure means |
+| the context port differs per (engine, event) | there is no contract, only what each vendor happens to accept |
+| the exec bit and the governance-marker wall | governance is bolted to files the harness treats as user data |
+
+A harness built to be governed has none of these, and that is the whole of the case.
+
+### 4.3b The governed-harness contract (what replaces "hestia as harness")
+
+The engineering in the original §4.3 survives; only its owner changes. These become requirements
+**on a harness that wants native governance**, which SAGE implements first and any harness may
+adopt. A harness meeting them is *native*; one that does not is *shimmed*, and both are
+first-class.
+
+1. **Acts arrive canonical.** The harness authored the event, so it submits a resolved
+   `ActEnvelope` (tool, typed args, target, JCS-canonical) instead of the plane inferring one
+   from a vendor's payload. Every reach-domain and command-parsing defect this corpus has
+   catalogued lives in that inference.
+2. **Order (O).** The policy decision dominates dispatch, in process, with no window in which
+   the act has begun and the verdict has not.
+3. **Witness (A).** `begin_action` then dispatch then `record_outcome`, chained, with the
+   R6/R7 envelope as the natural first constructor.
+4. **Delivery, both ways.** The harness accepts a disposition mid-turn on a declared channel.
+   This is the property no vendor harness has, and it is why PRD_DISPOSITION_DELIVERY needed a
+   lane and a reader at all.
+5. **Config from the plane.** Rendered from the vault, verified at runtime, drift recorded
+   (`PRD_CONFIG_FROM_VAULT`). No machine-specific path in a file anyone edits by hand.
+6. **Identity.** The harness runs as a member with a proven session, which is the membership
+   work legion and sprout are running point on.
+7. **Real tool schemas.** A loop composing calls programmatically cannot run on prose, so the
+   29-of-31 empty schemas are a blocker for the native path specifically.
+
+**What "superset" means, concretely.** SAGE with hestia offers what a vendor harness offers,
+being sessions, context, tools and pluggable model backends, plus what a vendor harness
+structurally cannot: acts that are witnessed rather than logged, rulings that are delivered
+rather than filed, an identity that is portable and provable, law that is in force rather than
+advisory, and peers who can adjudicate in seconds where a human is asynchronous.
+
+**Unchanged by this amendment.** hestia orchestrating an unmodified vendor CLI under the owner's
+login (`ModelBackend::Subscription`, §4.3's original transport table) stays a control-plane
+capability. Driving a harness is not being one.
+
+### 4.3 The native loop — SUPERSEDED, retained for its engineering
 
 The loop lives in the daemon (new crate module `core/src/harness/`), and its shape is fixed by three existing laws:
 
