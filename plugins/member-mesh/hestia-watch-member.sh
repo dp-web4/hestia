@@ -963,14 +963,18 @@ while true; do
           2>/dev/null || echo '{"asked":false,"mine":[]}')
     # THE FOLD TRAVELS BY FILE, NOT BY ENVIRONMENT (E2BIG, 2026-09-03).
     # `UN` is an unbounded RPC result and a single environment string is capped at
-    # MAX_ARG_STRLEN (32 pages = 128KiB). Measured on CBP the day this was written the
-    # fold was 362,244 B -- 2.76x the cap -- so `execve` failed E2BIG, this interpreter
-    # NEVER STARTED, and `|| echo "$OUT"` wrote the raw drain. That silently deleted
-    # `unanswered`, `open_petitions` AND `for_plugin` from ~96% of primers for 15 days.
-    # `for_plugin` was stamped below the fold specifically to survive a failing fold;
-    # source order buys nothing when the process dies before its first bytecode. The
-    # payload grows monotonically (`owed_to_me` rows to never-draining roster ids, #541)
-    # and has no shrink path, so a cap is not a fix -- the channel is.
+    # MAX_ARG_STRLEN -- measured on this box at 131,072 B for the whole `NAME=value`
+    # string, 32 pages, via `tools/primer_fold_census.py cap`. Measured on CBP the day
+    # this was written the fold was 362,244 B -- 2.76x the cap -- so `execve` failed
+    # E2BIG, this interpreter NEVER STARTED, and `|| echo "$OUT"` wrote the raw drain.
+    # That silently deleted `unanswered`, `open_petitions` AND `for_plugin` from 74.6%
+    # of primers on this seat over the following 15 days -- a rate that is not the
+    # finding, because this is a threshold and the daily series is bimodal (days at 0%
+    # and days at 100%; `primer_fold_census.py census`). What makes it permanent rather
+    # than oscillating: the payload is a monotone FLOOR of `owed_to_me` rows addressed
+    # to roster ids that never drain (#541) plus a live component that does drain away.
+    # The floor alone is now ~1.9x the cap, and it has no shrink path -- so a cap on the
+    # fold is not a fix, the channel is.
     UN_FILE="$(mktemp "${TMPDIR:-/tmp}/hestia-unanswered.XXXXXX")" || UN_FILE=""
     [ -n "$UN_FILE" ] && chmod 600 "$UN_FILE" && printf '%s' "$UN" > "$UN_FILE"
     printf '%s' "$OUT" | UN_FILE="$UN_FILE" PET="$PET" FOR_PLUGIN="$PLUGIN" python3 -c '
