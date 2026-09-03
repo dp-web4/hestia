@@ -1,7 +1,7 @@
 # Hestia — Product Requirements Document
 
-**Status**: draft v5 (current-source reconciliation at `9a6a5c2`; requirements remain normative, implementation status is evidence-ranked below) · **Date**: 2026-08-08 · **Owner**: dp
-**Companions**: `STATUS_AUDIT_2026-08-08.md` (current evidence) · `PRD_GOVERNANCE.md` (the governance design) · `ARCHITECTURE.md` (how it works) · `APP_BUILD_PLAN.md` (app implementation and release state) · `PROTOCOL.md` (the wire) · this doc is the *what & why*.
+**Status**: draft v5 (requirements are normative; current implementation evidence is generated from `readiness_status.json`) · **Date**: 2026-09-01 · **Owner**: dp
+**Companions**: `STATUS_AUDIT_CURRENT.md` (current evidence, generated) · `STATUS_AUDIT_2026-08-08.md` (historical snapshot) · `PRD_GOVERNANCE.md` (the governance design) · `ARCHITECTURE.md` (how it works) · `APP_BUILD_PLAN.md` (app implementation and release state) · `PROTOCOL.md` (the wire) · this doc is the *what & why*.
 
 ---
 
@@ -12,17 +12,17 @@ They must not be mistaken for current source status. Status claims use this ladd
 
 `source → merged → installed → restarted → live → observed → publicly released`
 
-One rung never proves the next. The 2026-08-08 snapshot is:
+One rung never proves the next. The current matrix lives in `STATUS_AUDIT_CURRENT.md` and is
+rendered deterministically from `readiness_status.json`. It keeps the rung separate from the
+assessment: a live failure or a public but incomplete artifact is high-rung evidence and still a
+failed requirement. The 2026-08-08 prose snapshot remains preserved as historical evidence; it is
+not current status.
 
-- **Current source and reference daemon:** `origin/main` and the running reference daemon both
-  identify `9a6a5c2`; the supervisor manifest names the same full build id.
-- **Harness parity:** not fully re-proven by that daemon match. The shared gate core remains unwired.
-- **Public daemon:** still `v0.0.3`, 324 `core/` commits behind this source baseline.
-- **Public app:** still `app-v0.1.2`, Android APK only. No desktop app artifact is public.
-- **User evidence:** no clean-machine nontechnical cold run, owner-seat correct-deny transcript, or
-  second-device constellation run yet.
-
-The reproducible matrix and issue dispositions live in `STATUS_AUDIT_2026-08-08.md`.
+As of the 2026-09-01 reconciliation: a newer daemon (`v0.0.4`) is public, the public app remains
+`app-v0.1.2` and Android-only, no current clean-machine nontechnical cold run or real second-device
+constellation receipt exists, and gate consolidation remains source-level work rather than one
+attested resident authority. Consult the generated matrix for exact baselines, blockers, candidate
+PRs, and UNKNOWN fields.
 
 ## 1. One-line
 
@@ -272,7 +272,11 @@ OAuth on-behalf-of token, the local session is a courier and the consumer is rem
 - **Every surface carries its RWOA self-audit** (`CLAUDE.md`) in its commit; a consequential surface that can't pass at its stakes is fixed or escalated before shipping. **A per-commit audit regime is structurally blind to defects that live between two audited commits** — see §11.
 - **The reconciliation for the user:** the safe path is the default and the easy one; the secure choice is never the one that breaks their workflow.
 
-## 8. Current workstreams mapped to the PRD
+## 8. Historical workstream record (2026-08-08)
+
+The detailed findings below are retained because corrections and reversals are part of the product
+evidence. They are **not current status**. `STATUS_AUDIT_CURRENT.md`, generated from
+`readiness_status.json`, is the current requirement-to-evidence-to-issue map.
 
 - **Session-coordinator (§5.7):** read side shipped (`session/own` fail-closed, `session/siblings` + redaction, connect-idempotency), all RWOA-audited; write side (work-claims + `repo-worktree` + reaper + CLI seam) next.
 - **Vault default containment (§5.5) — landed in source; migration remains.** New attributed writes

@@ -1,0 +1,350 @@
+{
+  "schema_version": 1,
+  "repository": "dp-web4/hestia",
+  "as_of": "2026-09-01",
+  "baseline": "505b300af447a2d2ba407d376a6213b7512a64c2",
+  "baseline_note": "Prepared on the reviewed one-gate integration train; replace with the exact origin/main commit after that train merges.",
+  "public_artifacts": {
+    "daemon": "v0.0.4 (2026-08-11; macOS arm64 and Linux arm64/x86_64 CLI archives with SHA-256 sidecars)",
+    "app": "app-v0.1.2 (2026-06-13; Android universal APK only)"
+  },
+  "rows": [
+    {
+      "id": "5.1",
+      "capability": "Install and onboard",
+      "assessment": "failed",
+      "highest_evidence_rung": "publicly released",
+      "rung_basis": "A daemon CLI is public, but no current public artifact has passed the PRD's nontechnical cold-run acceptance path.",
+      "evidence": [
+        {
+          "kind": "release",
+          "ref": "https://github.com/dp-web4/hestia/releases/tag/v0.0.4",
+          "claim": "The current public daemon release provides three Unix CLI archives and checksums; it provides no Windows artifact or desktop app."
+        },
+        {
+          "kind": "source",
+          "ref": "core/src/cli.rs",
+          "claim": "The init surface exists and has an AI-owned identity mode, while its user-facing contract still describes initialization as an empty vault rather than a guided owner onboarding."
+        },
+        {
+          "kind": "historical run",
+          "ref": "docs/PRD.md#9-success-criteria",
+          "claim": "Criterion 1a contains a cold release run against v0.0.3 that stopped because join/add-device were absent; it has not been rerun against v0.0.4."
+        }
+      ],
+      "blocker_issues": [315, 327, 342, 494, 520, 716],
+      "related_issues": [],
+      "active_prs": [636],
+      "gap_types": ["product functionality", "deployment truth", "UX", "evidence-only"],
+      "unknowns": [
+        "Whether an uncontaminated nontechnical user can install v0.0.4 and complete onboarding without builder help.",
+        "Whether a current-source desktop bundle can be produced and installed on each promised platform."
+      ]
+    },
+    {
+      "id": "5.2",
+      "capability": "Find and connect hubs",
+      "assessment": "partial",
+      "highest_evidence_rung": "source",
+      "rung_basis": "Connect, join, pair, notification, and sealed-secret paths exist in source; the current public newcomer path has no end-to-end receipt.",
+      "evidence": [
+        {
+          "kind": "source",
+          "ref": "core/src/hub.rs",
+          "claim": "Hub discovery, connection state, join, pairing, notifications, and sealed peer-message mechanics are implemented and unit tested in the core."
+        },
+        {
+          "kind": "CLI contract",
+          "ref": "core/src/cli.rs",
+          "claim": "The CLI exposes hub connect/join, member-key selection, pairing, notification, and secret-send/receive operations."
+        }
+      ],
+      "blocker_issues": [351, 563],
+      "related_issues": [],
+      "active_prs": [572],
+      "gap_types": ["product functionality", "security/governance correctness", "UX", "evidence-only"],
+      "unknowns": [
+        "No preserved clean-device receipt demonstrates discovery through join and first useful interaction against the intended public hub.",
+        "No current artifact-to-hub compatibility run is recorded."
+      ]
+    },
+    {
+      "id": "5.3",
+      "capability": "Manage local orchestrators",
+      "assessment": "partial",
+      "highest_evidence_rung": "source",
+      "rung_basis": "Four adapters are present and source-tested, but the reviewed train still leaves 52.3% of gate law per-seat and does not prove resident execution parity.",
+      "evidence": [
+        {
+          "kind": "ratchet",
+          "ref": "tools/gate_collapse_meter.py",
+          "claim": "At this baseline the meter reports 2,471 per-seat law-bearing SLOC plus 2,250 shared, 52.3% still per-seat, four divergent Gemini forks, and only 3 of 10 extraction keys common to every seat."
+        },
+        {
+          "kind": "test",
+          "ref": "tools/installed_engine_loader_test.py",
+          "claim": "The Codex adapter is pinned to the installed shared engine and fails closed when that authority is absent."
+        },
+        {
+          "kind": "deployment boundary",
+          "ref": "docs/PRD_HARNESS_AGNOSTIC_ADAPTERS.md",
+          "claim": "The accepted architecture is zero adapter-local law and external verification of the actual resident hook closure; current adapters have not reached that acceptance state."
+        }
+      ],
+      "blocker_issues": [225, 481, 586, 632, 647, 670, 695, 716, 741],
+      "related_issues": [],
+      "active_prs": [626, 733],
+      "gap_types": ["security/governance correctness", "deployment truth", "evidence-only"],
+      "unknowns": [
+        "Whether every registered harness currently executes the source-reviewed adapter and shared-engine bytes.",
+        "Whether each harness blocks within its real timeout budget under daemon failure and load."
+      ]
+    },
+    {
+      "id": "5.4",
+      "capability": "Build a device constellation",
+      "assessment": "partial",
+      "highest_evidence_rung": "source",
+      "rung_basis": "The source contains local and remote-device enrollment, revocation, challenge, co-sign, and presentation flows; a real second-device run is not recorded.",
+      "evidence": [
+        {
+          "kind": "source and tests",
+          "ref": "core/src/constellation.rs",
+          "claim": "Constellation state, proofs, enrolled-device verification, revocation, challenge freshness, and assurance derivation are implemented with unit coverage."
+        },
+        {
+          "kind": "CLI contract",
+          "ref": "core/src/cli.rs",
+          "claim": "The CLI exposes add-remote, enroll, revoke, present, owner consent, and remote co-sign service operations."
+        }
+      ],
+      "blocker_issues": [351],
+      "related_issues": [563],
+      "active_prs": [572],
+      "gap_types": ["product functionality", "UX", "evidence-only"],
+      "unknowns": [
+        "No durable two-device run proves pairing, consent, remote co-sign, assurance resolution, and revocation across restart.",
+        "No nontechnical app flow for device pairing has been demonstrated."
+      ]
+    },
+    {
+      "id": "5.5",
+      "capability": "Vault",
+      "assessment": "partial",
+      "highest_evidence_rung": "source",
+      "rung_basis": "New-entry containment and witnessed reads exist in source; issuance-bound release/presentation projections and safe process-secret handling remain open.",
+      "evidence": [
+        {
+          "kind": "source",
+          "ref": "core/src/vault/entry.rs",
+          "claim": "Vault entries carry consumer containment and exposure state."
+        },
+        {
+          "kind": "source",
+          "ref": "core/src/vault/rules.rs",
+          "claim": "Rule types exist, but the PRD's recipient-dependent released-view projection is not yet the complete enforced model."
+        },
+        {
+          "kind": "boundary tests",
+          "ref": "app/src-tauri/tests/identity_vault_guard.rs",
+          "claim": "The app test surface pins identity/vault boundary behavior at source level."
+        }
+      ],
+      "blocker_issues": [356, 581],
+      "related_issues": [],
+      "active_prs": [],
+      "gap_types": ["product functionality", "security/governance correctness", "deployment truth", "evidence-only"],
+      "unknowns": [
+        "No full replay suite demonstrates release, presentation, and custody against transport-authenticated recipient identity.",
+        "Legacy-entry migration and both-axis backfill have no completed artifact."
+      ]
+    },
+    {
+      "id": "5.6",
+      "capability": "Governance and conscience",
+      "assessment": "failed",
+      "highest_evidence_rung": "observed",
+      "rung_basis": "Consequential paths are governed and heavily witnessed, but live evidence records missing denials, portable or prematurely spent approvals, parser bypasses, and unreachable remedies.",
+      "evidence": [
+        {
+          "kind": "source test",
+          "ref": "core/tests/appeal_floor_window.rs",
+          "claim": "The source pins appeal-window behavior, but the issue record shows the full denial-to-appeal-to-effect loop is not closed."
+        },
+        {
+          "kind": "differential",
+          "ref": "tools/gate_differential.py",
+          "claim": "The shared closure corpus is explicitly indeterminate with an undrivable seat and contains seven agreed-but-wrong or partial cases."
+        },
+        {
+          "kind": "observed failures",
+          "ref": "https://github.com/dp-web4/hestia/issues/393",
+          "claim": "The live issue corpus demonstrates both false refusals that manufacture route-arounds and interpreter/indirection writes the text classifier misses."
+        }
+      ],
+      "blocker_issues": [225, 389, 393, 481, 491, 529, 539, 595, 600, 601, 628, 631, 669, 670, 680, 685, 686, 695, 714, 741, 756],
+      "related_issues": [242, 260, 261, 264, 301, 434, 509, 533, 537, 610, 616, 617, 622, 625, 639, 655, 658, 660, 661, 674, 676, 687],
+      "active_prs": [599, 613, 626, 704, 733, 735, 736, 750, 753],
+      "gap_types": ["security/governance correctness", "deployment truth", "UX", "evidence-only"],
+      "unknowns": [
+        "There is no current fleet-wide acceptance matrix proving one canonical act, one attributed appellant, one terminal appeal state, and verbatim re-evaluation.",
+        "The false-negative rate remains unknowable where first-stage denials do not produce chain rows."
+      ]
+    },
+    {
+      "id": "5.7",
+      "capability": "Session coordination",
+      "assessment": "partial",
+      "highest_evidence_rung": "observed",
+      "rung_basis": "Session visibility and mesh delivery operate in the fleet, while work claiming, lifecycle cleanup, and reliable disposition delivery remain incomplete or contradicted by observations.",
+      "evidence": [
+        {
+          "kind": "source and tests",
+          "ref": "core/src/server/handler.rs",
+          "claim": "Session own/siblings resources exist with bearer redaction and attribution tests."
+        },
+        {
+          "kind": "observed delivery",
+          "ref": "https://github.com/dp-web4/hestia/issues/523",
+          "claim": "Mesh sends can commit before the client timeout and then be retried as duplicates."
+        },
+        {
+          "kind": "observed lifecycle",
+          "ref": "https://github.com/dp-web4/hestia/issues/320",
+          "claim": "Session insertion has no corresponding remover, so reconnect churn accumulates state."
+        }
+      ],
+      "blocker_issues": [320, 361, 366, 523, 601, 603, 685],
+      "related_issues": [434, 510, 513, 519, 536, 551, 645, 668, 707, 732],
+      "active_prs": [649, 735, 736, 748, 750, 755],
+      "gap_types": ["product functionality", "security/governance correctness", "deployment truth", "UX", "evidence-only"],
+      "unknowns": [
+        "No end-to-end work-claim and shared-worktree contract is accepted across all seats.",
+        "No current delivery SLO proves that a routed request reaches a capable reader before its decision window closes."
+      ]
+    },
+    {
+      "id": "5.8",
+      "capability": "Trust and identity",
+      "assessment": "partial",
+      "highest_evidence_rung": "source",
+      "rung_basis": "LCT, witness, role, profile, and trust stores exist, but signed witness coordinates and subject-indexed trust derivation remain open.",
+      "evidence": [
+        {
+          "kind": "source",
+          "ref": "core/src/witness.rs",
+          "claim": "Witness records and chain operations are implemented."
+        },
+        {
+          "kind": "source",
+          "ref": "core/src/storage/trust.rs",
+          "claim": "Trust state is durable, but current derivation lacks an indexed per-member evidence read."
+        },
+        {
+          "kind": "source",
+          "ref": "core/src/lct_publish.rs",
+          "claim": "LCT publication mechanics exist; complete public interoperability and signed-chain hardening are not demonstrated."
+        }
+      ],
+      "blocker_issues": [339, 578, 580],
+      "related_issues": [328, 689],
+      "active_prs": [572],
+      "gap_types": ["product functionality", "security/governance correctness", "evidence-only"],
+      "unknowns": [
+        "No cross-implementation public verification transcript covers the current identity, witness, role, and reputation chain.",
+        "No accepted derivation proves that each trust score is computed from complete subject-specific evidence."
+      ]
+    },
+    {
+      "id": "non-functional",
+      "capability": "Non-functional requirements",
+      "assessment": "failed",
+      "highest_evidence_rung": "observed",
+      "rung_basis": "The system runs continuously, but measured memory growth, cold-connect latency, bounded-history gaps, and adapter timeout behavior miss robustness and latency requirements.",
+      "evidence": [
+        {
+          "kind": "observed performance",
+          "ref": "https://github.com/dp-web4/hestia/issues/354",
+          "claim": "Resident memory growth was observed to drive swap pressure and gate timeouts."
+        },
+        {
+          "kind": "observed latency",
+          "ref": "https://github.com/dp-web4/hestia/issues/423",
+          "claim": "Cold first-connect latency was measured at 5.7 seconds on the cited build."
+        },
+        {
+          "kind": "source constraint",
+          "ref": "https://github.com/dp-web4/hestia/issues/488",
+          "claim": "Routine chain cognition still needs indexed time floors, capped cursors, and explicit deep reads."
+        }
+      ],
+      "blocker_issues": [225, 342, 354, 423, 592, 647, 691],
+      "related_issues": [304, 434, 488, 497, 629],
+      "active_prs": [634, 692],
+      "gap_types": ["product functionality", "deployment truth", "evidence-only"],
+      "unknowns": [
+        "No current release report records binary size, steady-state RSS, cold/warm latency, and multi-day durability on each promised class of device.",
+        "No full live app/daemon contract run is part of CI."
+      ]
+    },
+    {
+      "id": "public-release",
+      "capability": "Public release and distribution",
+      "assessment": "failed",
+      "highest_evidence_rung": "publicly released",
+      "rung_basis": "Public daemon and Android artifacts exist, but they are not a current, matched, cross-platform product set and lack the PRD's newcomer evidence.",
+      "evidence": [
+        {
+          "kind": "release",
+          "ref": "https://github.com/dp-web4/hestia/releases/tag/v0.0.4",
+          "claim": "v0.0.4 is public with macOS arm64 and Linux arm64/x86_64 CLI archives plus checksums."
+        },
+        {
+          "kind": "release",
+          "ref": "https://github.com/dp-web4/hestia/releases/tag/app-v0.1.2",
+          "claim": "The newest public app is an older Android-only APK."
+        },
+        {
+          "kind": "source boundary",
+          "ref": "tools/public_boundary_test.py",
+          "claim": "The repository pins its public/private source boundary, but that is not an artifact compatibility or installation test."
+        }
+      ],
+      "blocker_issues": [315, 327, 342, 438, 481, 494, 520, 606, 607, 632, 654, 691, 716],
+      "related_issues": [],
+      "active_prs": [607, 634, 636],
+      "gap_types": ["product functionality", "deployment truth", "UX", "evidence-only"],
+      "unknowns": [
+        "No signed, version-matched desktop app and daemon set is public.",
+        "No clean-machine public install and hub-join transcript exists for the current release set."
+      ]
+    },
+    {
+      "id": "demo-target",
+      "capability": "Public hub demo target",
+      "assessment": "unknown",
+      "highest_evidence_rung": "source",
+      "rung_basis": "Hestia contains the client-side source needed for the intended hub flow; no current continuous public rehearsal receipt is stored here.",
+      "evidence": [
+        {
+          "kind": "source",
+          "ref": "core/src/hub.rs",
+          "claim": "The Hestia side can discover, join, pair, notify, exchange sealed payloads, and participate in constellation flows."
+        },
+        {
+          "kind": "historical audit",
+          "ref": "docs/STATUS_AUDIT_2026-08-08.md#demo-target-reconciliation",
+          "claim": "The prior audit defined the missing six-step public rehearsal; no newer durable receipt supersedes it in this repository."
+        }
+      ],
+      "blocker_issues": [351, 494, 716],
+      "related_issues": [563],
+      "active_prs": [572],
+      "gap_types": ["product functionality", "deployment truth", "UX", "evidence-only"],
+      "unknowns": [
+        "Whether the intended public hub is running a client-compatible build now.",
+        "Whether a new user can acquire Hestia, join, advertise presence, interact, and verify the resulting evidence in one uninterrupted run."
+      ]
+    }
+  ]
+}
