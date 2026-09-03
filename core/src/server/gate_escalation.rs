@@ -653,6 +653,27 @@ impl Escalation {
         // Three exclusions, not two. A seat whose reading FAILED is not silent-after-seeing:
         // nobody knows whether it saw. Counting it in `absent` is the defect this closes —
         // an unreadable store became affirmative conduct evidence about a peer.
+        //
+        // ALL THREE ARE KEYED ON THE MAILBOX, AND THE MAILBOX IS THE WATCHER (CBP 2026-08-31,
+        // measured). `member_inbox_touch` is written by `touch_inbox` from `drain_member` on
+        // whoever DRAINS the box; the mesh watcher drains into a primer before firing the
+        // member's CLI, so a seat whose agent never runs keeps a touch seconds old and reads
+        // `live`. It is therefore in neither `invited_without_reader` (it has a row, and a
+        // fresh one, so the TTL window does not catch it) nor `invited_reader_unknown` (the
+        // read succeeded), and it falls straight through into `absent` — published as a peer
+        // that saw the ask and declined, which is the ONE distinction this function exists to
+        // make. On the live mesh that day both real peers were in exactly this state: `codex`
+        // (78 s touch, 29,783 reads, newest act 3.4 h old) and `kimi-code` (42 s touch, 21,870
+        // reads, no act in 15.7 h), both out of credits, 148 notices queued against them,
+        // while this seat was live with an act 36 s old.
+        //
+        // The signal that answers the conduct question is `actor_liveness` — the member's own
+        // chain acts, which no watcher can write — and `resolve_invitation` already ranks the
+        // invitation pool by it. Deliberately NOT changed here: whether `absent` should key on
+        // acts rather than the mailbox decides what conduct evidence the daemon publishes
+        // about a peer, which is dp's call. Until it is made, read `absent` as "did not
+        // answer", never as "declined". Driver:
+        // `tools/liveness_is_the_watcher_not_the_member.py`.
         let reader_unknown = self
             .invited_peers
             .iter()
