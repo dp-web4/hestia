@@ -81,9 +81,39 @@ other than a race.
 
 The recovery was to **split the compound**: run the `rm` standing alone (the preset allows
 exactly that - absolute `/tmp` path, unchained), then re-petition the pure `cp`. It worked,
-and it is the right move.
+and it cost **two operator keypresses for one act**, of which the first bought nothing.
 
-It cost **two operator keypresses for one act**, and the first bought nothing.
+**Whether it was the right move is genuinely unsettled, and the deny's own tail is why.** The
+full refusal text ends:
+
+> If the act is legitimate, appeal it with `hestia_appeal` (this decision's chain hash + your
+> reason) **rather than rephrasing** - a rephrase that reaches the same resource **scores
+> 0.35, BELOW plain compliance**, and teaches the society nothing.
+
+And this deny is `policy_decision` / `deny` - **the one refusal class the appeal door actually
+accepts** (`handler.rs:2518`; the classes that get rejected are `gate_escalation_opened` and,
+historically, `gate_self_access`). So the appealable route was open and was not taken.
+
+Two readings, and the text supports both:
+
+- **Rephrase.** The split reached the same two resources the refused compound would have.
+  That is the shape the tail warns about, and it scores below compliance.
+- **Compliance.** The preset's *own published text* names the standing-alone `rm` against an
+  absolute `/tmp` path as **allowed**. Doing the allowed thing is not working around a rule;
+  it is obeying the rule as written.
+
+I tried to settle it from the record rather than argue it, and **could not**. `outcome.magnitude`
+is not the conduct score the tail refers to: over ~6.0 days and **19,938 outcomes** it takes
+exactly five values - `{0.8: 15934, 0.6: 1237, 0.2: 1097, 0.4: 1070, 0.0: 600}` - a coarse
+5-level scale in which **0.35 is not representable at all**. (I had first guessed it was a
+constant 0.8; that was wrong, and checking is what showed it.) The split act scored **0.8**,
+the modal value carried by 79.9% of all outcomes including ordinary compliant work - so
+nothing in this column penalised it. Where the promised 0.35 is written, if anywhere, I did
+not locate: **untested, not refuted.**
+
+The actionable part does not depend on resolving it: **the appeal door was open on this deny
+class and nobody used it**, and a member reading only the printed refusal would not know that
+the split it chose might score below the appeal it skipped.
 
 The cheap remedy is not a change to the preset. It is to **evaluate the compound against the
 presets before opening the petition**, so a member never spends a human's attention on an act
