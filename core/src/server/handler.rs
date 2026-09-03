@@ -99,6 +99,7 @@ impl ServerHandler for HestiaServer {
                 tool_gate_escalation_corroborate(&self.state, &args).await
             }
             "hestia_gate_pending_escalations" => tool_gate_pending_escalations(&self.state, &args).await,
+            "hestia_gate_escalation_claimable" => tool_gate_escalation_claimable(&self.state, &args).await,
             "hestia_gate_arbitrate_escalation" => tool_gate_arbitrate_escalation(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
             "hestia_query_policy" => tool_query_policy(&self.state, &args).await,
@@ -329,6 +330,10 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_gate_pending_escalations",
             "List governance-write escalations nobody has ruled on yet. Pass your session_id and each entry tells you whether YOU may rule it (NOT-SAME: never your own ask). Read-only. A peer that can rule but cannot discover has the authority and no way to learn there is anything open",
+        ),
+        t(
+            "hestia_gate_escalation_claimable",
+            "What approvals YOU can spend RIGHT NOW, newest decision first. REQUIRES a proven session_id from hestia_connect: this reports your OWN permissions, so a caller-supplied plugin_id is refused rather than trusted (it would let one member enumerate another's grants). Ask this after any deny, and again whenever you suspect a decision landed: an approval dies APPROVAL_CLAIM_WINDOW_SECS (600) after the DECISION, not after the open, and a live seat is never woken, so the notice announcing your grant waits for a wake that never comes while the window closes against a member that was online the whole time. Each entry carries act_digest — the exact act the approval is bound to (#539), which you must re-issue verbatim — and claim_window_secs_remaining, the CLAIM clock rather than the record clock. Read-only, and the same predicate hestia_gate_escalation_claim spends against, so it can never advertise a claim that would fail. An empty list is a real answer: you hold nothing spendable",
         ),
         t(
             "hestia_gate_arbitrate_escalation",
@@ -17368,6 +17373,117 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
 // What it buys is that something which is not the asker looked, and that the record says how
 // different that something was (cross-vendor beats cross-member). Anyone reading this as a
 // security boundary is reading it wrong, and the `assurance` field says so on every entry.
+
+/// THE ASKER'S HALF of the deny → decide-out-of-band → re-issue loop.
+///
+/// WHY THIS EXISTS. `claimable_for` — the only function that answers "what may I spend right
+/// now" — had exactly ONE production caller before this one: the refusal reply's
+/// `decided_awaiting_claim` field. So the answer reached a member only as a SIDE EFFECT of
+/// being refused again. A member whose grant landed while it sat idle could not ask; it had
+/// to provoke a second refusal to be told about the first approval, and the 600s window ran
+/// the whole time.
+///
+/// The push half already exists and does not arrive: the disposition projector mints a mesh
+/// notice on decision, but delivery is a WAKE, and a LIVE seat is never woken because it is
+/// already running (`claimable_for`'s own doc, #366). Measured 2026-08-23/24 on CBP: four
+/// escalations opened, four approved by the operator, ZERO notifications received, exactly
+/// one claimed — and that one only because dp mentioned it in conversation while the window
+/// happened to still be open. Reproduced 2026-08-25 on `74195558206f22ca`: approved by the
+/// operator, `bar_met: true`, and `claim_window_secs_remaining: 0` by the time its asker
+/// thought to look. The information was never missing. Nothing delivered it, and nothing
+/// could be asked for it.
+///
+/// A PULL surface needs no wake, and the member is by definition talking to this daemon at
+/// the moment it wants to know.
+///
+/// Read-only and deliberately unwitnessed, for the same reason `hestia_scope_status` is:
+/// reading your own permissions is not an act. It lists ONLY what the PROVEN caller may spend
+/// -- see the identity block below for why an earlier draft's `asserted` fallback made that
+/// sentence false, and why "the label was honest" was not a defence.
+async fn tool_gate_escalation_claimable(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::server::gate_escalation::now_secs;
+
+    let session_id_arg = optional_session_id(args);
+    let now = now_secs();
+    let s = state.lock().await;
+
+    // Identity, proven where possible. `plugin_id` is caller-supplied across this API at A1,
+    // so accepting it is consistent — but a resolved session OUTRANKS the assertion rather
+    // than merely joining it, and the basis is reported. A member reading its own grants
+    // under `asserted` should know that is what it did.
+    let caller = resolve_attributed_caller(&s, session_id_arg.as_deref());
+    // A PROVEN SESSION IS REQUIRED, and the first cut of this got it wrong (GPT/Nova review).
+    //
+    // That version fell back to a caller-supplied `plugin_id` when the session did not resolve
+    // and labelled the result `asker_basis: "asserted"`. The reasoning was that an honest label
+    // makes the evidence honest — and it does. What it does not do is make the SURFACE honest:
+    // the tool advertises "what approvals YOU can spend" and the doc claimed it "lists ONLY what
+    // the caller may spend", while the asserted arm let an unauthenticated caller ENUMERATE
+    // ANOTHER MEMBER'S claimable approvals by naming that member. Labelling a disclosure does
+    // not stop it being one, and the doc's excuse — "discloses nothing a member could not learn
+    // by being refused" — was simply false: your own refusal never tells you what a PEER holds.
+    //
+    // This surface exists precisely BECAUSE the member is already talking to this daemon, so
+    // requiring the live session costs it nothing and removes an identity-laundering seam.
+    // Same null-state discipline as before: unresolved identity is an ERROR, never an empty
+    // list, because "I do not know who you are" and "you hold nothing" are different answers.
+    let plugin_id = match caller.as_ref() {
+        Some(c) => c.plugin_id.clone(),
+        None => {
+            return Err(anyhow::anyhow!(
+                "cannot determine who is asking: this surface reports YOUR OWN claimable \
+                 approvals and therefore requires a PROVEN session_id (from hestia_connect). \
+                 A caller-supplied plugin_id is not accepted here: it would let one member \
+                 enumerate another's grants. Note that an empty list is a real answer and this \
+                 is not it — 'I do not know who you are' is a different fact from 'you hold \
+                 nothing spendable'"
+            ))
+        }
+    };
+    let basis = "session";
+
+    let items: Vec<Value> = s
+        .gate_escalations
+        .claimable_for(&plugin_id, now)
+        .iter()
+        .map(|c| {
+            json!({
+                "escalation_id": c.id,
+                "marker": c.marker,
+                // WITHOUT THIS THE LIST IS A TRAP. Since #539 `claim()` matches on the act
+                // digest and treats a missing one as no match, so "you hold an approval" is
+                // actionable only alongside "for exactly this act". A member told the former
+                // re-issues a DIFFERENT write, is refused, and reads that refusal as the
+                // approval having lapsed — concluding the window is broken when the binding
+                // is what refused.
+                "act_digest": c.act_digest,
+                "decided_by": c.decided_by,
+                "decided_at": c.decided_at,
+                // The CLAIM clock, never the record clock. Measured 2026-08-08: three
+                // permits reported ~1500s of record life while ~24 minutes past their grant
+                // horizon. That is how a dead permit publishes as live.
+                "claim_window_secs_remaining": c.claim_window_secs_remaining(now),
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "plugin_id": plugin_id,
+        "asker_basis": basis,
+        "claimable": items,
+        // State the anchor, not a countdown from now. The window opens at the DECISION and
+        // is not determinable when the escalation is opened, which is why the open path's
+        // single `retry_within_secs` number is a supremum presented as a point
+        // (`core/tests/claim_horizon_is_never_rendered.rs`, PINs 1 and 2). A rule the member
+        // can apply beats a number that is wrong in every history.
+        "claim_window_secs": crate::server::gate_escalation::APPROVAL_CLAIM_WINDOW_SECS,
+        "claim_window_anchor": "decided_at",
+        "note": "Re-issue the act named by act_digest VERBATIM to spend an approval; the \
+                 claim is single-use. An empty list means you hold nothing spendable right \
+                 now, which is not the same as never having been approved: a grant that \
+                 passed its horizon is gone and will not reappear here.",
+    }))
+}
 
 async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> ToolResult {
     use crate::arbiter::{eligibility, AppealParties, Eligibility};
