@@ -15,7 +15,10 @@ it can fail:
                                  seat seeking past a new file's end and going silent forever
   6. malformed line, missing  -> skipped; the good line beside it is still delivered
      `render`
-  7. corrupt cursor           -> delivers from the start rather than crashing the session
+  7. corrupt cursor           -> delivers rather than crashing the session, with the cursor
+                                 path DERIVED from the hook: the hand-spelled path in the first
+                                 cut kept passing after the cursor moved per session, because
+                                 it corrupted a file nothing reads
   8. runaway lane (60 lines)  -> at most MAX_LINES rendered, and still valid JSON out
   9. BYSTANDER FIRST           -> a co-seat session fires before the asker: it renders nothing
                                  AND the asker is still delivered. This is #851, which the
@@ -34,6 +37,7 @@ one session's read cannot cost another its mail.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -166,10 +170,36 @@ def test_malformed_lines_are_skipped() -> None:
               f"[6] garbage lines are skipped, the good one is delivered: {str(ctx)[:160]}")
 
 
+def cursor_file(seat, session=SESSION) -> Path:
+    """The cursor path the HOOK itself would use, asked of the hook.
+
+    Arm 7 used to spell `disposition-cursor.json` by hand. When the cursor moved to one file
+    per session (#851) the arm kept passing, because it corrupted a file nothing reads: a test
+    that spells a path the implementation owns drifts from it exactly once, silently, and then
+    guards nothing. Deriving it means the arm cannot go vacuous that way again."""
+    prev = os.environ.get("HESTIA_SEAT_STATE")
+    os.environ["HESTIA_SEAT_STATE"] = str(seat.state)
+    try:
+        spec = importlib.util.spec_from_file_location("deliverer_paths", TOOL)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return Path(mod.cursor_path(session))
+    finally:
+        if prev is None:
+            os.environ.pop("HESTIA_SEAT_STATE", None)
+        else:
+            os.environ["HESTIA_SEAT_STATE"] = prev
+
+
 def test_corrupt_cursor_still_delivers() -> None:
     with tempfile.TemporaryDirectory() as raw:
         seat = Seat(raw)
-        (seat.state / "disposition-cursor.json").write_text("<<<not json>>>", encoding="utf-8")
+        seat.write(line("APPROVED first, to make the cursor real"))
+        seat.context()
+        path = cursor_file(seat)
+        # This is only a test of corruption if the file it corrupts is the live one.
+        check(path.is_file(), f"[7] the hook's own cursor path exists after a delivery: {path}")
+        path.write_text("<<<not json>>>", encoding="utf-8")
         seat.write(line("APPROVED despite the cursor"))
         rc, ctx = seat.context()
         check(rc == 0 and bool(ctx) and "despite the cursor" in (ctx.get("additionalContext") or ""),
