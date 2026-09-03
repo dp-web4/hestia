@@ -39,6 +39,19 @@
 //! the same posture `member_registry::ensure_member` already takes for custodial
 //! members); an operator pre-pin command is the follow-up, not this change.
 //!
+//! **Every refusal is witnessed (cbp review on #907, 2026-09-03).** A refused
+//! proof leaves state bit-identical apart from the burnt nonce — and until that
+//! review it left the *event* bit-identical too: seven refusal codes, each
+//! rendered only as an error envelope handed to the party that just failed the
+//! check. The one that matters most, `connect_pop_principal_mismatch`, is the
+//! label-squat attempt the pin exists to stop, and its only record was the
+//! response delivered to the squatter. So the handler appends a
+//! `connect_refused` chain entry carrying `(code, plugin_id, claimed_lct_id,
+//! pinned_lct_id)` BEFORE returning any refusal, and the envelope carries the
+//! entry hash so a reader can join the two without trusting the caller's copy.
+//! Absence must be witnessed by someone other than the absent party: the
+//! refused caller is not that someone.
+//!
 //! **What this does NOT do.** It does not authenticate hooked/custodial seats
 //! (§4.2 class 1) or paired channels (class 3), and it does not make hestia A2.
 //! An unpinned label still connects asserted, exactly as before — the
@@ -149,6 +162,13 @@ pub struct VerifiedPrincipal {
 pub struct PopRefusal {
     pub code: &'static str,
     pub message: String,
+    /// The canonical id the proof claimed, when the proof got far enough to
+    /// name one. This is what the durable row is FOR: a `principal_mismatch`
+    /// with no claimed id would witness that a squat happened but not who
+    /// tried it.
+    pub claimed_lct_id: Option<String>,
+    /// The id the label is pinned to, when a pin was involved in the refusal.
+    pub pinned_lct_id: Option<String>,
 }
 
 impl PopRefusal {
@@ -156,7 +176,19 @@ impl PopRefusal {
         Self {
             code,
             message: message.into(),
+            claimed_lct_id: None,
+            pinned_lct_id: None,
         }
+    }
+
+    fn claiming(mut self, lct_id: impl Into<String>) -> Self {
+        self.claimed_lct_id = Some(lct_id.into());
+        self
+    }
+
+    fn pinned(mut self, lct_id: impl Into<String>) -> Self {
+        self.pinned_lct_id = Some(lct_id.into());
+        self
     }
 }
 
@@ -191,9 +223,11 @@ pub fn verify_proof(
         ));
     }
     let lct_id = field(proof, "lct_id")?;
-    let public_key_hex = field(proof, "public_key")?;
-    let nonce = field(proof, "challenge_nonce")?;
-    let signature_hex = field(proof, "signature")?;
+    // From here every refusal names the id the caller claimed: the durable row
+    // must say WHO was refused, not only that someone was.
+    let public_key_hex = field(proof, "public_key").map_err(|r| r.claiming(lct_id))?;
+    let nonce = field(proof, "challenge_nonce").map_err(|r| r.claiming(lct_id))?;
+    let signature_hex = field(proof, "signature").map_err(|r| r.claiming(lct_id))?;
 
     // Nonce first, so a malformed key or signature still burns the challenge.
     let bound_id = store.consume(nonce, now, ttl_secs).ok_or_else(|| {
@@ -202,6 +236,7 @@ pub fn verify_proof(
             "challenge_nonce was never issued, has expired, or was already redeemed \
              — request a fresh one with hestia_connect_challenge",
         )
+        .claiming(lct_id)
     })?;
     if bound_id != lct_id {
         return Err(PopRefusal::new(
@@ -210,7 +245,8 @@ pub fn verify_proof(
                 "challenge was issued for {bound_id} but the proof claims {lct_id}; \
                  a challenge binds to the id it was requested for"
             ),
-        ));
+        )
+        .claiming(lct_id));
     }
 
     let pk_bytes: [u8; 32] = hex::decode(public_key_hex)
@@ -221,12 +257,14 @@ pub fn verify_proof(
                 "hestia.connect_pop_malformed",
                 "proof.public_key must be 32 bytes of hex (Ed25519 verifying key)",
             )
+            .claiming(lct_id)
         })?;
     let public_key = PublicKey::from_bytes(&pk_bytes).map_err(|e| {
         PopRefusal::new(
             "hestia.connect_pop_malformed",
             format!("proof.public_key is not a valid Ed25519 key: {e}"),
         )
+        .claiming(lct_id)
     })?;
 
     // Identity is derived, not assigned: the claimed id must be THIS key's id.
@@ -238,7 +276,8 @@ pub fn verify_proof(
                 "the presented key derives to {derived}, not the claimed {lct_id}; \
                  an id is sha256 of its binding key and cannot be claimed under another"
             ),
-        ));
+        )
+        .claiming(lct_id));
     }
 
     let sig_bytes: [u8; 64] = hex::decode(signature_hex)
@@ -249,6 +288,7 @@ pub fn verify_proof(
                 "hestia.connect_pop_malformed",
                 "proof.signature must be 64 bytes of hex (Ed25519 signature)",
             )
+            .claiming(lct_id)
         })?;
     let message = pop_message(lct_id, nonce);
     public_key
@@ -261,6 +301,7 @@ pub fn verify_proof(
                      under the presented key"
                 ),
             )
+            .claiming(lct_id)
         })?;
 
     Ok(VerifiedPrincipal {
@@ -304,7 +345,9 @@ pub fn check_pin(pins: &PopPins, plugin_id: &str, verified: Option<&VerifiedPrin
                  a strongly enrolled label does not change principals by asserting a new key",
                 v.lct_id
             ),
-        )),
+        )
+        .claiming(v.lct_id.clone())
+        .pinned(pinned.clone())),
         (Some(pinned), None) => PinCheck::Refused(PopRefusal::new(
             "hestia.connect_pop_required",
             format!(
@@ -312,14 +355,38 @@ pub fn check_pin(pins: &PopPins, plugin_id: &str, verified: Option<&VerifiedPrin
                  (hestia_connect_challenge, then hestia_connect with `proof`); an asserted connect \
                  under a strongly enrolled label is refused, never silently downgraded"
             ),
-        )),
+        )
+        .pinned(pinned.clone())),
     }
 }
 
-/// The JSON a refusal is rendered as (the `hestia_error_envelope` shape lives
-/// in the handler; this is just the `details`).
-pub fn refusal_details(r: &PopRefusal, plugin_id: &str) -> Value {
-    json!({ "plugin_id": plugin_id, "cause": r.code })
+/// The durable form of a refusal: the `event_data` of the `connect_refused`
+/// chain entry. Written by the daemon, outside the refused caller — the
+/// witness the envelope alone is not. `ts` and the signer come from the chain
+/// entry itself.
+pub const CONNECT_REFUSED_EVENT: &str = "connect_refused";
+
+pub fn refusal_row(r: &PopRefusal, plugin_id: &str) -> Value {
+    json!({
+        "code": r.code,
+        "plugin_id": plugin_id,
+        "claimed_lct_id": r.claimed_lct_id,
+        "pinned_lct_id": r.pinned_lct_id,
+    })
+}
+
+/// The JSON a refusal is rendered as to the caller (the `hestia_error_envelope`
+/// shape lives in the handler; this is just the `details`). `refusal_entry_hash`
+/// joins the reply to the chain row so a third party can verify the refusal
+/// happened without trusting the refused party's copy of this envelope.
+pub fn refusal_details(r: &PopRefusal, plugin_id: &str, refusal_entry_hash: &str) -> Value {
+    json!({
+        "plugin_id": plugin_id,
+        "cause": r.code,
+        "claimed_lct_id": r.claimed_lct_id,
+        "pinned_lct_id": r.pinned_lct_id,
+        "refusalEntryHash": refusal_entry_hash,
+    })
 }
 
 #[cfg(test)]

@@ -634,21 +634,37 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     // refused proof leaves state bit-identical (apart from the burnt nonce, which
     // is the point). See `server::connect_pop` for the shape and the reasoning.
     use crate::server::connect_pop::{
-        CONNECT_POP_TTL_SECS, IdentityBasis, PinCheck, check_pin, refusal_details, verify_proof,
+        CONNECT_POP_TTL_SECS, CONNECT_REFUSED_EVENT, IdentityBasis, PinCheck, PopRefusal,
+        check_pin, refusal_details, refusal_row, verify_proof,
     };
+    // Every refusal below is WITNESSED before it is returned (cbp review on
+    // #907): a `connect_refused` chain entry written by the daemon, not by the
+    // refused caller. Without it the seven refusal codes existed only as an
+    // envelope handed to the party that failed the check — and for
+    // `connect_pop_principal_mismatch`, the label-squat the pin exists to stop,
+    // the squatter was the sole witness. The append uses `?` on purpose: a
+    // refusal the daemon cannot record is an error, not a quieter refusal.
+    // Cheap under flood by construction — at most one row per connect that
+    // produced no session, and a connect already costs a nonce mint.
+    fn witness_refusal(
+        s: &mut super::state::ServerState,
+        r: &PopRefusal,
+        plugin_id: &str,
+    ) -> anyhow::Result<Value> {
+        let entry = s.append_chain(CONNECT_REFUSED_EVENT, refusal_row(r, plugin_id))?;
+        Ok(hestia_error_envelope(
+            r.code,
+            &r.message,
+            Some(refusal_details(r, plugin_id, &entry.hash)),
+        ))
+    }
     let now = Utc::now().timestamp().max(0) as u64;
     s.pop_challenges.gc(now, CONNECT_POP_TTL_SECS);
     let verified = match proof.as_ref() {
         None => None,
         Some(p) => match verify_proof(&mut s.pop_challenges, p, now, CONNECT_POP_TTL_SECS) {
             Ok(v) => Some(v),
-            Err(r) => {
-                return Ok(hestia_error_envelope(
-                    r.code,
-                    &r.message,
-                    Some(refusal_details(&r, &plugin_id)),
-                ));
-            }
+            Err(r) => return witness_refusal(&mut s, &r, &plugin_id),
         },
     };
     let (identity_basis, principal_lct_id, pin_first_sight) =
@@ -657,13 +673,7 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
             PinCheck::Proven { lct_id, first_sight } => {
                 (IdentityBasis::ProofOfPossession, Some(lct_id), first_sight)
             }
-            PinCheck::Refused(r) => {
-                return Ok(hestia_error_envelope(
-                    r.code,
-                    &r.message,
-                    Some(refusal_details(&r, &plugin_id)),
-                ));
-            }
+            PinCheck::Refused(r) => return witness_refusal(&mut s, &r, &plugin_id),
         };
 
     // Connect idempotency (HUB ruling 2026-07-24): the claude-code hook connects on EVERY tool call
@@ -687,6 +697,21 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
             // to a proven session is fine — the pin check above already admitted it
             // (unpinned label) and reuse changes nothing.
             if principal_lct_id.is_some() && existing.principal_lct_id != principal_lct_id {
+                // Witnessed like the other refusals: a proven principal was turned
+                // away from a session it did not mint. The `pinned_lct_id` slot
+                // carries the session's minted principal here — the thing the
+                // proof failed to match.
+                let existing_principal = existing.principal_lct_id.clone();
+                let entry = s.append_chain(
+                    CONNECT_REFUSED_EVENT,
+                    json!({
+                        "code": "hestia.connect_pop_session_basis_mismatch",
+                        "plugin_id": plugin_id,
+                        "claimed_lct_id": principal_lct_id,
+                        "pinned_lct_id": existing_principal,
+                        "host_session_id": hsid,
+                    }),
+                )?;
                 return Ok(hestia_error_envelope(
                     "hestia.connect_pop_session_basis_mismatch",
                     "a live session under this host_session_id was minted for a different \
@@ -694,8 +719,9 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
                      connect under a fresh host_session_id",
                     Some(json!({
                         "plugin_id": plugin_id,
-                        "existing_principal_lct_id": existing.principal_lct_id,
+                        "existing_principal_lct_id": existing_principal,
                         "proven_principal_lct_id": principal_lct_id,
+                        "refusalEntryHash": entry.hash,
                     })),
                 ));
             }
@@ -20132,4 +20158,152 @@ mod connect_pop_tests {
         let r = tool_connect_challenge(&state, &json!({"lct_id": "lct:web4:member:abc"})).await.unwrap();
         assert_eq!(r["_hestia_error"]["code"], "hestia.connect_pop_malformed", "{r}");
     }
+
+    // ---- every refusal is witnessed (cbp review on #907, 2026-09-03) ----
+    // "a good lock on a door with no bell": before these, all seven refusal
+    // codes existed only as an envelope handed to the refused caller.
+
+    fn refused_rows(s: &super::super::state::ServerState) -> Vec<Value> {
+        s.recent_chain(50)
+            .iter()
+            .filter(|e| e.event_type == "connect_refused")
+            .map(|e| e.event_data.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_label_squat_is_witnessed_on_the_chain_by_the_daemon_not_the_squatter() {
+        let (_dir, state) = test_state().await;
+        let (kp, id) = being();
+        let p = proof(&state, &kp, &id).await;
+        tool_connect(&state, &json!({"plugin_id": "being", "host_agent": "sage", "proof": p}))
+            .await.unwrap();
+        assert!(refused_rows(&*state.lock().await).is_empty(),
+            "a successful connect must not leave a refusal row");
+
+        // The squat: a different key, correctly proven for ITS id, under the pinned label.
+        let (kp2, id2) = being();
+        let p2 = proof(&state, &kp2, &id2).await;
+        let r = tool_connect(&state, &json!({"plugin_id": "being", "host_agent": "x", "proof": p2}))
+            .await.unwrap();
+        assert_eq!(r["_hestia_error"]["code"], "hestia.connect_pop_principal_mismatch", "{r}");
+        let hash = r["_hestia_error"]["data"]["refusalEntryHash"].as_str()
+            .expect("the envelope must carry the chain entry hash so the two can be joined");
+
+        let s = state.lock().await;
+        let chain = s.recent_chain(50);
+        let e = chain.iter().find(|e| e.event_type == "connect_refused")
+            .expect("the label squat left NO trace on the chain");
+        assert_eq!(e.hash, hash, "envelope hash and chain entry disagree");
+        // The row says WHO: the squatter's id and the id the label is pinned to.
+        assert_eq!(e.event_data["code"], "hestia.connect_pop_principal_mismatch");
+        assert_eq!(e.event_data["plugin_id"], "being");
+        assert_eq!(e.event_data["claimed_lct_id"], json!(id2));
+        assert_eq!(e.event_data["pinned_lct_id"], json!(id));
+        // And it is signed by the daemon's sovereign, not by anyone who asked.
+        assert_eq!(e.signer_lct, s.sovereign_lct);
+        // The refusal minted nothing else — the witness row is the only residue.
+        assert_eq!(s.sessions.len(), 1);
+        assert_eq!(s.pop_pins.get("being"), Some(&id));
+    }
+
+    #[tokio::test]
+    async fn an_asserted_connect_to_a_pinned_label_leaves_a_row_naming_the_pin() {
+        let (_dir, state) = test_state().await;
+        let (kp, id) = being();
+        let p = proof(&state, &kp, &id).await;
+        tool_connect(&state, &json!({"plugin_id": "being", "host_agent": "sage", "proof": p}))
+            .await.unwrap();
+        let r = tool_connect(&state, &json!({"plugin_id": "being", "host_agent": "x"}))
+            .await.unwrap();
+        assert_eq!(r["_hestia_error"]["code"], "hestia.connect_pop_required", "{r}");
+        let rows = refused_rows(&*state.lock().await);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["code"], "hestia.connect_pop_required");
+        assert_eq!(rows[0]["claimed_lct_id"], Value::Null, "no proof, so nothing was claimed");
+        assert_eq!(rows[0]["pinned_lct_id"], json!(id));
+    }
+
+    #[tokio::test]
+    async fn every_proof_refusal_is_witnessed_with_the_claimed_id() {
+        let (_dir, state) = test_state().await;
+        let (kp, id) = being();
+
+        // bad signature
+        let mut p = proof(&state, &kp, &id).await;
+        p["signature"] = json!(KeyPair::generate().sign(b"nope").to_hex());
+        let r = tool_connect(&state, &json!({"plugin_id": "b", "host_agent": "x", "proof": p}))
+            .await.unwrap();
+        assert_eq!(r["_hestia_error"]["code"], "hestia.connect_pop_bad_signature", "{r}");
+
+        // replayed nonce (already burnt above)
+        let mut p = proof(&state, &kp, &id).await;
+        let burnt = p["challenge_nonce"].clone();
+        tool_connect(&state, &json!({"plugin_id": "b", "host_agent": "x", "proof": p.clone()}))
+            .await.unwrap();
+        p["challenge_nonce"] = burnt;
+        let r = tool_connect(&state, &json!({"plugin_id": "b", "host_agent": "x", "proof": p}))
+            .await.unwrap();
+        assert_eq!(r["_hestia_error"]["code"], "hestia.connect_pop_challenge_invalid", "{r}");
+
+        // key mismatch: claim id, present a different key, signed by that key
+        let (kp3, _) = being();
+        let ch = tool_connect_challenge(&state, &json!({"lct_id": id})).await.unwrap();
+        let nonce = ch["challengeNonce"].as_str().unwrap().to_string();
+        let sig = kp3.sign(&pop_message(&id, &nonce));
+        let p = json!({"lct_id": id, "public_key": kp3.verifying_key().to_hex(),
+                       "challenge_nonce": nonce, "signature": sig.to_hex()});
+        let r = tool_connect(&state, &json!({"plugin_id": "b", "host_agent": "x", "proof": p}))
+            .await.unwrap();
+        assert_eq!(r["_hestia_error"]["code"], "hestia.connect_pop_key_mismatch", "{r}");
+
+        // malformed after the id was named (a live nonce, so the malformed key
+        // check is the one that fires — the nonce is consumed first by design)
+        let mut p = proof(&state, &kp, &id).await;
+        p["public_key"] = json!("zz");
+        let r = tool_connect(&state, &json!({"plugin_id": "b", "host_agent": "x", "proof": p}))
+            .await.unwrap();
+        assert_eq!(r["_hestia_error"]["code"], "hestia.connect_pop_malformed", "{r}");
+
+        let rows = refused_rows(&*state.lock().await);
+        // recent_chain is newest-first; the set is the claim, not the order.
+        let mut codes: Vec<&str> = rows.iter().map(|r| r["code"].as_str().unwrap()).collect();
+        codes.sort_unstable();
+        assert_eq!(codes, vec![
+            "hestia.connect_pop_bad_signature",
+            "hestia.connect_pop_challenge_invalid",
+            "hestia.connect_pop_key_mismatch",
+            "hestia.connect_pop_malformed",
+        ], "{rows:?}");
+        for row in &rows {
+            assert_eq!(row["claimed_lct_id"], json!(id), "every refusal names who was refused: {row}");
+            assert_eq!(row["plugin_id"], "b");
+        }
+        for row in &rows {
+            assert!(row["pinned_lct_id"].is_null(), "no pin was involved: {row}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_guard_a_basis_mismatch_is_witnessed_too() {
+        let (_dir, state) = test_state().await;
+        // An asserted session under a host_session_id...
+        tool_connect(&state, &json!({"plugin_id": "cc", "host_agent": "x", "host_session_id": "H"}))
+            .await.unwrap();
+        // ...then a proven connect tries to reuse it.
+        let (kp, id) = being();
+        let p = proof(&state, &kp, &id).await;
+        let r = tool_connect(&state, &json!({
+            "plugin_id": "cc", "host_agent": "x", "host_session_id": "H", "proof": p
+        })).await.unwrap();
+        assert_eq!(r["_hestia_error"]["code"], "hestia.connect_pop_session_basis_mismatch", "{r}");
+        let hash = r["_hestia_error"]["data"]["refusalEntryHash"].as_str().unwrap();
+        let s = state.lock().await;
+        let e = s.recent_chain(50).into_iter().find(|e| e.hash == hash)
+            .expect("basis-mismatch refusal left no chain entry");
+        assert_eq!(e.event_type, "connect_refused");
+        assert_eq!(e.event_data["claimed_lct_id"], json!(id));
+        assert_eq!(e.event_data["host_session_id"], "H");
+    }
+
 }
