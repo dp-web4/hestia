@@ -11243,6 +11243,12 @@ mod tests {
     /// inert-warrant shape (`gate_escalation.rs` "safe because
     /// `reaping_can_never_change_an_answer` proves...", green under BOTH sabotage arms, #544):
     /// a citation does not go red when the test it cites is deleted. An assertion does.
+    /// (That warrant was worse than inert — it was FALSE, and it stood for the 13 days between
+    /// #544 naming it here and its repair on 2026-09-02. Reaping a DECIDED row does flip the
+    /// answer; the cited test only ever covered rows that read `Expired` on both sides. The
+    /// call site now states the property it actually relies on and
+    /// `reaping_erases_a_decided_answer_and_it_reads_as_expired` pins the case it did not.
+    /// Naming a bad warrant is not removing it — which is the sharper form of this lesson.)
     #[tokio::test]
     async fn a_never_drained_seat_stamps_false_on_both_readings() {
         let (_dir, shared) = make_shared_state();

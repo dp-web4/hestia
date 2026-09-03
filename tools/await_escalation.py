@@ -35,6 +35,23 @@ EXIT CODES, chosen so a caller can branch without parsing anything:
    5  expired / unknown id (the daemon reports these identically by design)
    2  could not determine: daemon unreachable, malformed answer, or an unclassifiable state
    1  usage error
+
+FAIL-CLOSED IS NOT A LICENCE TO NARRATE. Exit 5 stays a deny, and it is right that it does:
+`status_of` answers `expired` for an id it holds no row for, so a dropped store can never
+leave a caller waiting on a permission it will not get. What this program used to do on top
+of that was print "no decision landed in the window" -- an assertion about HISTORY, which the
+daemon never made and cannot support. `reap()` deletes DECIDED rows on the same clock as
+lapsed ones (`expires_at + 3600`, run inside every `open()`), so an hour past TTL an approved,
+claimed, fully-spent grant reads exactly like a petition nobody ruled. Measured 2026-09-02 by
+kimi-code across mesh notices 9313-9391: seven decided escalations -- five approved-and-
+claimed, two approved-and-lapsed -- all rendered here as "no decision landed". Seven of seven.
+
+The payload does carry a discriminator, and it is not the status: `bar` is `null` exactly when
+the daemon holds NO ROW (reaped, or never existed) and non-null when a real pending row lapsed
+undecided. So the two cases are now told apart and only the second one gets the sentence that
+is true of it. This is hestia#544's shape in a third consumer -- that issue carved the poll
+out as "deliberate and right", which holds for the VERDICT and not for the prose beside it.
+The deciding tools' half of #544 (a chain fallback for arbitrate/corroborate) is still open.
 """
 
 from __future__ import annotations
@@ -98,6 +115,51 @@ class Mcp:
         return d
 
 
+def classify_terminal(escalation_id: str, d: dict) -> tuple[int, str, bool]:
+    """Turn one terminal poll payload into (exit code, message, print-to-stderr).
+
+    PULLED OUT OF `main` SO THE SENTENCES CAN BE TESTED. The defect this file most recently
+    carried was not a wrong exit code -- exit 5 was right every time -- it was a wrong
+    SENTENCE printed beside a right code, and nothing could reach it without a live daemon and
+    a reaped id. A pure function over the payload is testable from a dict; see
+    `await_escalation_test.py`.
+    """
+    status = str(d.get("status", "")).lower()
+    left = d.get("claim_window_secs_remaining")
+
+    if status == "approved":
+        # BOTH conjuncts, because the daemon owns both and a member that re-derives
+        # them gets a different answer than the claim path will.
+        if d.get("permits_write") is True and isinstance(left, (int, float)) and left > 0:
+            return (0, f"{escalation_id}: APPROVED — claimable for {int(left)}s. "
+                       f"Re-issue the act VERBATIM now.", False)
+        # `consumed_at` is THE discriminator between the two ways a grant stops being
+        # claimable, and the daemon publishes it precisely so a reader does not have to
+        # substring-match prose. Spent and lapsed are different facts about the same code.
+        spent = d.get("consumed_at")
+        why = (f"already CLAIMED at {spent} — it was spent, not lost" if spent
+               else "the window LAPSED unspent")
+        return (3, f"{escalation_id}: approved but NOT claimable ({why}; "
+                   f"permits_write={d.get('permits_write')}, window={left}). "
+                   f"The grant is dead; re-escalate rather than retrying.", True)
+
+    if status == "denied":
+        return (4, f"{escalation_id}: DENIED. {d.get('reason') or ''}".rstrip(), False)
+
+    # `bar` is the row's own field, so `None` means the daemon holds NO ROW at all — reaped
+    # or never-existed, which is not the same fact as "nobody ruled it". Only a row that is
+    # still present can honestly be reported as having gone undecided.
+    if d.get("bar") is None:
+        return (5, f"{escalation_id}: {status} — this daemon holds NO ROW for that id. It was "
+                   f"either reaped (decided rows are deleted on the same clock as lapsed ones, "
+                   f"~1h past TTL) or never existed. Whether anyone ruled it is NOT knowable "
+                   f"from here — read the chain (`gate_escalation_decided` / "
+                   f"`gate_escalation_opened` entries naming the id).", True)
+
+    return (5, f"{escalation_id}: {status} — the row is still present and undecided, so no "
+               f"decision landed in the window.", True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("escalation_id")
@@ -148,24 +210,9 @@ def main() -> int:
             print(f"{args.escalation_id}: observed — the claim window now runs from this moment")
 
         if status in TERMINAL:
-            left = d.get("claim_window_secs_remaining")
-            if status == "approved":
-                # BOTH conjuncts, because the daemon owns both and a member that re-derives
-                # them gets a different answer than the claim path will.
-                if d.get("permits_write") is True and isinstance(left, (int, float)) and left > 0:
-                    print(f"{args.escalation_id}: APPROVED — claimable for {int(left)}s. "
-                          f"Re-issue the act VERBATIM now.")
-                    return 0
-                print(f"{args.escalation_id}: approved but NOT claimable "
-                      f"(permits_write={d.get('permits_write')}, window={left}). "
-                      f"The grant is dead; re-escalate rather than retrying.", file=sys.stderr)
-                return 3
-            if status == "denied":
-                print(f"{args.escalation_id}: DENIED. {d.get('reason') or ''}".rstrip())
-                return 4
-            print(f"{args.escalation_id}: {status} — no decision landed in the window.",
-                  file=sys.stderr)
-            return 5
+            code, message, to_stderr = classify_terminal(args.escalation_id, d)
+            print(message, file=sys.stderr if to_stderr else sys.stdout)
+            return code
 
         if deadline is not None and time.monotonic() > deadline:
             print(f"{args.escalation_id}: still '{status}' after {args.max_wait:.0f}s — "
