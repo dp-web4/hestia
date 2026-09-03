@@ -397,6 +397,137 @@ def test_the_watcher_still_emits_every_field_this_tool_reads():
           "[hestia-watch] ARTIFACT plugin=" in emit[0], emit[0])
 
 
+# ---------------------------------------------------------------------------
+# The starvation arms. Measured on CBP 2026-09-03: with #880's parser fix merged,
+# the one ACTIVE watcher on the box still reported `vintage NOT MEASURED`, and the
+# reason it printed — "wait for the next level line" — was false. `announce_artifact`
+# is inside the main loop; `retry_stale_primers` runs BEFORE that loop and fires one
+# full synchronous wake per retained primer. With 46 retained, the loop is hours away.
+# "Not due yet" and "unreachable by construction" are opposite verdicts about the
+# subject, and the tool printed the reassuring one for both.
+# ---------------------------------------------------------------------------
+
+def _sweep_log(marks, first="2026-09-03T10:15:30-0700",
+               last="2026-09-03T13:02:14-0700", extra=()):
+    lines = [f"{first} cbp hestia-watch-member.sh[1253]: {marks[0]}"]
+    lines.extend(extra)
+    lines.append(f"{last} cbp hestia-watch-member.sh[1253]: {marks[-1]}")
+    return "\n".join(lines) + "\n"
+
+
+SWEEP_ANNOUNCE = ("[hestia-watch] STALE PRIMER (undelivered notices from a failed "
+                  "fire): /primers/claude-code/notice-AAAAAA.json")
+RETRY_ANNOUNCE = ("[hestia-watch] RETRYING stale primer (attempt 2/3): "
+                  "/primers/claude-code/notice-MMMMMM.json")
+
+
+def test_a_starved_invocation_is_not_told_to_wait_for_a_line_it_cannot_reach():
+    """The load-bearing arm. Sweep announcements spanning longer than one gauge
+    period with ZERO main-loop announcements means the loop was never entered."""
+    log = _sweep_log((SWEEP_ANNOUNCE, RETRY_ANNOUNCE))
+    out, _ = run_units({"hestia-watch-claude": {
+        "state": "active", "invocation": "INV", "inv_log": log}})
+    check("still refuses a vintage", "NOT MEASURED" in out, out)
+    check("names starvation", "STARVED" in out, out)
+    check("contradicts the old reassurance", "unreachable" in out, out)
+    check("does NOT tell the operator to wait",
+          "wait for the next level line" not in out, out)
+    check("names the collateral outage", "maybe_self_deploy" in out, out)
+    check("span is a floor, not a claim", "at least 2h46m" in out, out)
+
+
+def test_one_main_loop_line_is_decisive_against_starvation():
+    """The sabotage arm for the arm above: the SAME sweep journal, plus a single
+    DAEMON line, must flip the verdict. If it does not, the check is keying on the
+    sweep lines alone and would call every busy watcher starved."""
+    reached = ("2026-09-03T11:00:00-0700 cbp hestia-watch-member.sh[1253]: "
+               "[hestia-watch] DAEMON state=ok reason=matches running=yes source=x")
+    log = _sweep_log((SWEEP_ANNOUNCE, RETRY_ANNOUNCE), extra=[reached])
+    out, _ = run_units({"hestia-watch-claude": {
+        "state": "active", "invocation": "INV", "inv_log": log}})
+    check("does not claim starvation", "STARVED" not in out, out)
+    check("keeps the honest fallback", "wait for the next level line" in out, out)
+
+
+def test_a_sweep_shorter_than_one_gauge_period_is_not_starvation():
+    """A restart that swept two primers in ten minutes has told us nothing yet. The
+    threshold is one gauge period because that is when a level line became overdue."""
+    log = _sweep_log((SWEEP_ANNOUNCE, RETRY_ANNOUNCE),
+                     first="2026-09-03T10:15:30-0700",
+                     last="2026-09-03T10:25:30-0700")
+    out, _ = run_units({"hestia-watch-claude": {
+        "state": "active", "invocation": "INV", "inv_log": log}})
+    check("does not claim starvation", "STARVED" not in out, out)
+
+
+def test_the_sweep_position_is_the_index_of_the_primer_in_the_pending_list():
+    """Arithmetic only — this arm STUBS `list_primers`, so it cannot see the order
+    that function actually produces. Renamed after a sabotage run: reversing the real
+    sort left it green, which is the whole inert-probe failure this corpus keeps
+    re-finding. `test_list_primers_yields_the_collation_bash_globs_in` is the arm that
+    pins the order; this one pins that position/remaining are computed off it."""
+    listing = ["/primers/claude-code/notice-AAAAAA.json",
+               "/primers/claude-code/notice-MMMMMM.json",
+               "/primers/claude-code/notice-ZZZZZZ.json"]
+    real = pv.list_primers
+    try:
+        pv.list_primers = lambda d: listing
+        out, _ = run_units({"hestia-watch-claude": {
+            "state": "active", "invocation": "INV",
+            "inv_log": _sweep_log((SWEEP_ANNOUNCE, RETRY_ANNOUNCE))}})
+    finally:
+        pv.list_primers = real
+    check("position is the index of the primer being retried",
+          "Sweep position 2 of 3" in out, out)
+    check("remaining is what is left AFTER it", "1 primer(s) still to fire" in out, out)
+
+
+def test_list_primers_yields_the_collation_bash_globs_in():
+    """The arm the stubbed one cannot be. The watcher's `for stale in
+    "$PRIMERS"/notice-*.json` expands under the unit's collation, and no LANG is set
+    by the unit, so it is C: byte order, uppercase before lowercase. Sorting any other
+    way reports a position that is not the sweep's position — and the operator reads
+    'how many still to fire' off it."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        names = ["notice-aaaaaa.json", "notice-MMMMMM.json", "notice-AAAAAA.json",
+                 "notice-ZZZZZZ.json", "notice-SpjwIu.json.discharged"]
+        for n in names:
+            open(os.path.join(d, n), "w").close()
+        got = [os.path.basename(x) for x in pv.list_primers(d)]
+    check("C collation: uppercase before lowercase, byte order within",
+          got == ["notice-AAAAAA.json", "notice-MMMMMM.json", "notice-ZZZZZZ.json",
+                  "notice-aaaaaa.json"], got)
+    check("retired primers are not in the sweep list",
+          not any(x.endswith(".discharged") for x in got), got)
+
+def test_the_gauge_period_is_read_from_the_producer_not_assumed():
+    """#880's lesson applied to the second constant in this file: the watcher moved
+    and the reader did not. A period hard-coded here would go wrong silently the day
+    someone tunes UNANSWERED_EVERY, in the direction of calling a healthy watcher
+    starved."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as repo:
+        src = os.path.join(repo, pv.WATCH_PATH)
+        os.makedirs(os.path.dirname(src))
+        with open(src, "w") as fh:
+            fh.write('UNANSWERED_EVERY="${UNANSWERED_EVERY:-14400}"   # cadence\n')
+        check("reads the watcher", pv.gauge_period(repo) == (14400, "watcher source"),
+              pv.gauge_period(repo))
+    check("says so when it could not", pv.gauge_period("/nonexistent")
+          == (pv.GAUGE_PERIOD_DEFAULT, "fallback default"),
+          pv.gauge_period("/nonexistent"))
+
+
+def test_a_sweep_spanning_midnight_is_not_a_negative_span():
+    """Seconds-of-day alone would make a 2-hour span across midnight read as -79200,
+    which compares BELOW the gauge period and silently un-detects the starvation of
+    exactly the long-running sweeps this is for."""
+    span = pv.journal_span([
+        "2026-09-03T23:30:00-0700 x", "2026-09-04T01:30:00-0700 x"])
+    check("crosses the day boundary", span == 7200, span)
+
+
 TESTS = [
     test_parses_the_real_journal_line,
     test_a_non_artifact_line_is_not_half_parsed,
@@ -420,6 +551,13 @@ TESTS = [
     test_the_live_shape_reaches_a_verdict_end_to_end,
     test_the_edge_alarms_are_never_read_as_a_level_line,
     test_the_watcher_still_emits_every_field_this_tool_reads,
+    test_a_starved_invocation_is_not_told_to_wait_for_a_line_it_cannot_reach,
+    test_one_main_loop_line_is_decisive_against_starvation,
+    test_a_sweep_shorter_than_one_gauge_period_is_not_starvation,
+    test_the_sweep_position_is_the_index_of_the_primer_in_the_pending_list,
+    test_list_primers_yields_the_collation_bash_globs_in,
+    test_the_gauge_period_is_read_from_the_producer_not_assumed,
+    test_a_sweep_spanning_midnight_is_not_a_negative_span,
 ]
 
 
