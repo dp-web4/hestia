@@ -61,9 +61,55 @@ def vintage_hint(present=None):
         present = os.path.exists(os.path.join(_REPO_ROOT, VINTAGE_TOOL))
     if present:
         return "`%s units` is what tells them apart. " % VINTAGE_TOOL
-    return ("the tool that would tell them apart (`%s`) is not on this box, so "
-            "this primer cannot discriminate them — do not spend the wake "
-            "looking for it. " % VINTAGE_TOOL)
+    return ("The tool that would date the RUNNING watcher (`%s`) is not on this "
+            "box — do not spend the wake looking for it. " % VINTAGE_TOOL)
+
+
+# The raw drain response, which is what `... || echo "$OUT" > "$PRIMER"` writes
+# when the composition step fails. `evicted` was added later than the rest, so an
+# older raw drain is the same shape minus that key — subset, not equality.
+_DRAIN_KEYS = frozenset(("evicted", "notices", "peeked", "total"))
+# Keys only a COMPOSED primer can carry: the composer is the only writer of
+# either. `for_plugin` landed 07-31 (3fc5088), `unanswered` before it.
+_COMPOSED_KEYS = frozenset(("unanswered", "for_plugin"))
+
+
+def producer_from_keys(keys):
+    """What this primer's KEY SET says about the process that wrote it.
+
+    A different question from `vintage_hint`, and worth saying out loud because
+    the block above runs them together: the key set dates the PRODUCER OF THIS
+    ARTIFACT, which is on disk and free; `process_vintage.py` dates the WATCHER
+    RUNNING NOW, which is neither. Codex's counterexamples on #634 are exactly
+    the gap between those two — a current watcher re-fires a primer an old one
+    wrote — so answering the artifact question does not answer the process one,
+    and neither substitutes for the other.
+
+    Returns None on a shape this cannot read. Saying nothing is the point: the
+    branch this lives in exists to stop absence being read as a verdict, and a
+    renderer that guesses commits that error one layer down.
+    """
+    keys = set(keys or ())
+    if keys & _COMPOSED_KEYS:
+        # The composer RAN — it is the only writer of these — and still emitted no
+        # `open_petitions`. That is not a fallback and not a failed read: it dates
+        # the writer to after the debt fold and before the petitions fold
+        # (`ced61ba`, 08-19). This is the one arm the artifact settles on its own.
+        return ("This primer carries the debt fold, which only the composer "
+                "writes, so composition SUCCEEDED and still produced no key: its "
+                "producer predates the petitions fold (2026-08-19), whatever is "
+                "running now. ")
+    if keys <= _DRAIN_KEYS and {"notices", "total"} <= keys:
+        # The raw drain response, verbatim. Two producers write exactly this and
+        # the artifact cannot separate them: the composition fallback of a current
+        # watcher, and a watcher old enough never to have composed at all. Name
+        # both; a restart fixes the second and does nothing for the first.
+        return ("This primer is the raw drain response and nothing else, so no "
+                "composer output reached it — either the composition fallback "
+                "fired (see #858, the fold exceeds the exec argument limit) or "
+                "this producer never folded at all. The artifact does not "
+                "separate those two. ")
+    return None
 
 # What survives into the primer. `stated_reason` is the SEAT HOOK's truncation of
 # the refused command, not the daemon's — the daemon stores whatever it is handed,
@@ -171,8 +217,8 @@ def render(f):
             return ("Open petitions: NOT MEASURED this wake — this primer carries no "
                     "`open_petitions` key, so the read was never attempted for it. "
                     "That dates the primer's PRODUCER (a watcher without the fold, or "
-                    "a composition fallback), not necessarily the watcher running now; "
-                    + vintage_hint() +
+                    "a composition fallback), not necessarily the watcher running now. "
+                    + (producer_from_keys(f.get("_keys")) or "") + vintage_hint() +
                     "This is not evidence that you hold none. " + SELF_SERVE)
         return ("Open petitions: NOT MEASURED this wake (the pending-escalations "
                 "read failed) — this is not evidence that you hold none. " + SELF_SERVE)
@@ -232,7 +278,11 @@ def main(argv):
             # read — and only this line can still tell them apart. `render` gets a
             # dict either way, so the discriminator has to be carried, not inferred.
             if "open_petitions" not in d:
-                f = dict(f, _absent=True)
+                # Carry the primer's KEY SET, not just the absence flag. The
+                # renderer is handed the fold, and the fold is precisely the thing
+                # that is missing here — the evidence that dates the producer is in
+                # the envelope, one level up, and is lost unless it is passed down.
+                f = dict(f, _absent=True, _keys=sorted(d))
         except Exception:
             return 0
         block = render(f)

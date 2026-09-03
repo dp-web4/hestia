@@ -227,6 +227,55 @@ with tempfile.TemporaryDirectory() as tmp:
           == os.path.exists(os.path.join(op._REPO_ROOT, op.VINTAGE_TOOL)),
           repr(out_absent))
 
+    # B1c2: having removed a prescription the reader cannot run, do not leave the
+    # reader with nothing. The block names two producers; the primer's own KEY SET
+    # settles one of them for free, and the renderer was throwing that evidence
+    # away — `render` is handed the FOLD, and the fold is the thing that is
+    # missing, so the envelope has to be passed down deliberately.
+    #
+    # The two questions are NOT the same and the block ran them together: the key
+    # set dates the PRODUCER OF THIS ARTIFACT; `process_vintage.py` dates the
+    # WATCHER RUNNING NOW. Codex's #634 counterexamples live exactly in that gap.
+    composed = os.path.join(tmp, "primer-composed-old.json")
+    with open(composed, "w") as fh:
+        # The composer RAN — only it writes `unanswered`/`for_plugin` — and still
+        # emitted no `open_petitions`. Nothing else can produce this shape.
+        json.dump({"evicted": 0, "notices": [], "peeked": False, "total": 1,
+                   "for_plugin": "claude-code",
+                   "unanswered": {"i_owe": [], "owed_to_me": []}}, fh)
+    out_composed = subprocess.run([sys.executable, HELPER, "render", composed],
+                                  capture_output=True, text=True).stdout
+    check("B1c2 a composed primer with no petitions fold DATES ITS PRODUCER",
+          "composition SUCCEEDED" in out_composed
+          and "predates the petitions fold" in out_composed, repr(out_composed))
+
+    drain = os.path.join(tmp, "primer-raw-drain.json")
+    with open(drain, "w") as fh:
+        json.dump({"evicted": 0, "notices": [], "peeked": False, "total": 1}, fh)
+    out_drain = subprocess.run([sys.executable, HELPER, "render", drain],
+                               capture_output=True, text=True).stdout
+    check("B1c2 the raw-drain shape is reported as raw drain",
+          "raw drain response" in out_drain, repr(out_drain))
+    # The honest half. Two producers write byte-identical raw drains — a current
+    # watcher's composition fallback, and a watcher that never folded — and a
+    # restart fixes only the second. Claiming either one here would be the same
+    # overclaim-from-absence B1c exists to stop.
+    check("B1c2 the raw-drain arm does NOT pick between its two producers",
+          "does not separate those two" in out_drain
+          and "composition SUCCEEDED" not in out_drain, repr(out_drain))
+    check("B1c2 the two shapes get DIFFERENT verdicts",
+          ("raw drain response" in out_drain)
+          and ("raw drain response" not in out_composed), repr(out_composed))
+    # An unreadable shape must produce no verdict at all. `{"notices": []}` (the
+    # B1b fixture) is neither a full drain nor a composed primer.
+    check("B1c2 an unrecognised shape yields NO producer claim",
+          op.producer_from_keys(["notices"]) is None
+          and op.producer_from_keys([]) is None
+          and op.producer_from_keys(None) is None,
+          repr(op.producer_from_keys(["notices"])))
+    check("B1c2 the older 3-key drain (no `evicted`) is still a drain",
+          op.producer_from_keys(["notices", "peeked", "total"]) is not None)
+
     # B1d: a diagnosis is not a remedy. Both not-measured arms named the CAUSE
     # and stopped, and the only action either ever named was a watcher restart —
     # which is the one action a woken member structurally cannot take, because
