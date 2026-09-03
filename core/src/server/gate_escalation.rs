@@ -987,6 +987,24 @@ impl std::fmt::Display for OpenError {
                 "{n} escalations already pending (max {MAX_PENDING}) — refusing rather than \
                  evicting, because evicting the oldest lets a flood erase a pending decision"
             ),
+            OpenError::MissingField(name) if *name == "act" => {
+                // NAMING THE FIELD IS NOT ENOUGH — say where to GET it.
+                //
+                // The act string is derived by the gate and truncated, so a member that
+                // retypes its own command produces a DIFFERENT string. `claim` matches on the
+                // digest of that string, so a re-typed act trades this refusal for an
+                // approval that can never be spent — the same unspendable-permit loop the
+                // mint-site guard exists to close, reached by the other door. A refusal that
+                // sends the reader off to compose the value themselves is a refusal that
+                // manufactures the failure it just prevented.
+                write!(
+                    f,
+                    "'act' is required — an unattributable escalation is not actionable. \
+                     Copy it VERBATIM from the deny text that refused the write ('would \
+                     WRITE to ...'); it is derived and truncated by the gate, so a retyped \
+                     act yields a different digest and an approval `claim` can never spend"
+                )
+            }
             OpenError::MissingField(name) => {
                 write!(f, "'{name}' is required — an unattributable escalation is not actionable")
             }
