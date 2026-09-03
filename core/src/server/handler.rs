@@ -4890,43 +4890,49 @@ pub(crate) fn append_disposition_lane(
         _ => "unknown".to_string(),
     };
     let claimable = esc.is_claimable(now);
-    let deadline = esc.claim_deadline();
-    let deadline_utc = deadline.and_then(|d| {
-        chrono::DateTime::from_timestamp(d as i64, 0).map(|t| t.to_rfc3339())
-    });
-    // The one sentence the asker acts on. It says what is true and what may be done; it never
-    // says "hurry", because a deadline is already in the line.
+    // NOT `claim_deadline`. The canonical, delivery-started deadline does not exist yet: it
+    // begins at a witnessed receipt, and receipt has no event (PRD R5/R8, the next slice).
+    // What this horizon IS today is `observed_at.or(decided_at) + window`, and #850 measured
+    // what `observed_at` is: store-only, absent from the chain, unreconstructible by an
+    // offline reader, reset to None on replay, and silently not set by the default CLI
+    // identity. Exporting that as `claim_deadline` would freeze a current implementation
+    // accident into a new outward artifact, which is the debt #845 exists to retire. So it
+    // ships named and versioned, and a reader looking for the canonical deadline finds no
+    // field to mistake for it (GPT review of #849).
+    let horizon = esc.claim_deadline();
+    let utc = |t: u64| chrono::DateTime::from_timestamp(t as i64, 0).map(|d| d.to_rfc3339());
+    let horizon_utc = horizon.and_then(utc);
+    let act = lane_clip(esc.stated_detail.as_ref())
+        .or_else(|| lane_clip(esc.stated_reason.as_ref()))
+        .unwrap_or_else(|| format!("{} {}", esc.tool_name, esc.marker));
+    let by = esc.decided_by.as_deref().unwrap_or("an arbiter").to_string();
+    let why = lane_clip(esc.reason.as_ref())
+        .map(|r| format!(" ({r})"))
+        .unwrap_or_default();
     let render = if claimable {
         format!(
-            "{status} - escalation {id} ({act}). Decided by {by}{reason}. This grant is UNSPENT and              authorises exactly the write it was opened for, until {until}. RE-ISSUE THE SAME WRITE              to claim it (single use); anything else lets it lapse. Ruling {hash}.",
+            "{status} - escalation {id} ({act}). Decided by {by}{why}. This grant is UNSPENT and \
+authorises exactly the write it was opened for. Under TODAY'S policy it stops authorising at \
+{until}, a horizon anchored on the ruling rather than on your receipt of it (#845, #850). \
+RE-ISSUE THE SAME WRITE to claim it: byte-identical, because the act digest covers the whole \
+command, and single use. Anything else lets it lapse. Ruling {hash}.",
             status = status.to_uppercase(),
             id = esc.id,
-            act = lane_clip(esc.stated_detail.as_ref())
-                .or_else(|| lane_clip(esc.stated_reason.as_ref()))
-                .unwrap_or_else(|| format!("{} {}", esc.tool_name, esc.marker)),
-            by = esc.decided_by.as_deref().unwrap_or("an arbiter"),
-            reason = lane_clip(esc.reason.as_ref())
-                .map(|r| format!(" ({r})"))
-                .unwrap_or_default(),
-            until = deadline_utc.clone().unwrap_or_else(|| "the window on record".to_string()),
+            until = horizon_utc
+                .clone()
+                .unwrap_or_else(|| "the horizon on record".to_string()),
             hash = ruling_hash,
         )
     } else {
         format!(
-            "{status} - escalation {id} ({act}). Decided by {by}{reason}. Nothing is claimable:              {why}. Do not re-issue the write; if the rule itself is wrong, appeal it. Ruling {hash}.",
+            "{status} - escalation {id} ({act}). Decided by {by}{why}. Nothing is claimable: \
+{blocked}. Do not re-issue the write; if the rule itself is wrong, appeal it. Ruling {hash}.",
             status = status.to_uppercase(),
             id = esc.id,
-            act = lane_clip(esc.stated_detail.as_ref())
-                .or_else(|| lane_clip(esc.stated_reason.as_ref()))
-                .unwrap_or_else(|| format!("{} {}", esc.tool_name, esc.marker)),
-            by = esc.decided_by.as_deref().unwrap_or("an arbiter"),
-            reason = lane_clip(esc.reason.as_ref())
-                .map(|r| format!(" ({r})"))
-                .unwrap_or_default(),
-            why = if esc.consumed_at.is_some() {
+            blocked = if esc.consumed_at.is_some() {
                 "this grant was already spent".to_string()
             } else if status == "approved" {
-                "the approval is past its claim horizon or short of its bar".to_string()
+                "the approval is past its horizon or short of its bar".to_string()
             } else {
                 format!("the ruling is {status}")
             },
@@ -4948,8 +4954,17 @@ pub(crate) fn append_disposition_lane(
         "pointer": pointer,
         "claimable": claimable,
         "consumed_at": esc.consumed_at,
-        "claim_deadline": deadline,
-        "claim_deadline_utc": deadline_utc,
+        // The canonical deadline is ABSENT, not null-by-accident: it is not derivable before a
+        // witnessed receipt exists. What is here is today's horizon, named as the projection
+        // it is, so no reader can mistake one for the other.
+        "pre_migration_horizon": horizon,
+        "pre_migration_horizon_utc": horizon_utc,
+        "pre_migration_horizon_basis": if esc.observed_at.is_some() { "observed_at" } else { "decided_at" },
+        "pre_migration_horizon_model":
+            "min(observed_at or decided_at, expires_at) + APPROVAL_CLAIM_WINDOW_SECS; observation is \
+store-only and resets on replay (#850). NOT the canonical delivery-started deadline (#845 R5).",
+        "expires_at": esc.expires_at,
+        "expires_at_utc": utc(esc.expires_at),
         "act_digest": esc.act_digest,
         "attempted": lane_clip(esc.stated_detail.as_ref()),
         "render": render,
@@ -13115,8 +13130,8 @@ mod tests {
                 "plugin_id": "claude-code",
                 "session_id": asker,
                 "tool_name": "Edit",
-                "marker": "pre_tool_use.py",
-                "act": "Edit -> pre_tool_use.py",
+                "marker": "hestia_gate_core.py",
+                "act": "Edit -> hestia_gate_core.py",
                 "detail": "add HESTIA_WORKSPACE to the gate hook line",
             }),
         )
@@ -13152,18 +13167,30 @@ mod tests {
         );
         assert_eq!(row["decision"], "approved", "{row}");
         assert_eq!(row["escalation_id"], esc_id, "{row}");
-        let deadline = row["claim_deadline"]
+        // The canonical delivery-started deadline is NOT exported, because it does not exist
+        // until a witnessed receipt does (#845 R5, GPT review of #849). A reader must find no
+        // field it could mistake for one; today's horizon ships named as the projection it is.
+        assert!(
+            row.get("claim_deadline").is_none() && row.get("claim_deadline_utc").is_none(),
+            "no field may impersonate the canonical deadline: {row}"
+        );
+        let horizon = row["pre_migration_horizon"]
             .as_u64()
-            .expect("an ABSOLUTE deadline, because a countdown decays in flight: {row}");
+            .expect("today's horizon, absolute, because a countdown decays in flight");
         let decided_at = row["decided_at"].as_u64().unwrap();
         assert_eq!(
-            deadline,
+            horizon,
             decided_at + crate::server::gate_escalation::APPROVAL_CLAIM_WINDOW_SECS,
-            "the deadline is the horizon the gate itself enforces: {row}"
+            "the horizon is the one the gate itself enforces today: {row}"
+        );
+        assert_eq!(
+            row["pre_migration_horizon_basis"], "decided_at",
+            "and it names what it is anchored on, since observation is store-only (#850): {row}"
         );
         assert!(
-            row["claim_deadline_utc"].as_str().unwrap().starts_with("20"),
-            "and it is legible to whoever reads it: {row}"
+            row["pre_migration_horizon_utc"].as_str().unwrap().starts_with("20")
+                && row["expires_at_utc"].as_str().unwrap().starts_with("20"),
+            "both instants are legible to whoever reads them: {row}"
         );
 
         let render = row["render"].as_str().unwrap();
@@ -13172,15 +13199,94 @@ mod tests {
             "the render tells the asker what it may do, composed by the GATE: {render}"
         );
         assert!(
+            render.contains("byte-identical"),
+            "and how, since an act digest covers the whole command and a near-miss claims              nothing (measured 2026-09-02, an appended `&& ls -l` lost a live grant): {render}"
+        );
+        assert!(
             render.contains("add HESTIA_WORKSPACE to the gate hook line"),
             "and which act it authorises: {render}"
         );
-        if row["claimable"].as_bool().unwrap() {
-            assert!(
-                !render.to_lowercase().contains("do not re-issue"),
-                "a live grant must not be rendered as a spent one: {render}"
-            );
-        }
+        assert_eq!(
+            row["claimable"], true,
+            "a single-approver bar is MET by one peer, so this grant is live: {row}"
+        );
+        assert!(
+            !render.to_lowercase().contains("do not re-issue"),
+            "and a live grant must never be rendered as a spent one: {render}"
+        );
+    }
+
+    /// The other half of the same mechanism: a ruling that does NOT authorise anything must not
+    /// read like one that does.
+    ///
+    /// `pre_tool_use.py` draws `Bar::SovereignPlusPeer` (`bar_for`), which one peer does not meet
+    /// — approved, recorded, and claimable by nobody. The first cut of the arm above asserted the
+    /// claimable wording inside `if row["claimable"]`, opened exactly this marker, and therefore
+    /// never ran the branch it existed to check. The bar is the variable, so it is the axis.
+    #[tokio::test]
+    async fn a_ruling_short_of_its_bar_is_not_rendered_as_a_grant() {
+        let (dir, shared) = make_shared_state();
+        let asker = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "host_agent": "h",
+                "host_session_id": "sess-asker-77",
+            }),
+        )
+        .await
+        .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let peer = tool_connect(&shared, &json!({ "plugin_id": "codex", "host_agent": "h" }))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": asker,
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "act": "Edit -> pre_tool_use.py",
+            }),
+        )
+        .await
+        .unwrap();
+        tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({
+                "escalation_id": opened["escalation_id"].as_str().unwrap(),
+                "approve": true,
+                "reason": "one peer, on a two-factor marker",
+                "session_id": peer,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let body = std::fs::read_to_string(
+            dir.path()
+                .join(super::DISPOSITION_LANE_DIR)
+                .join("claude-code.jsonl"),
+        )
+        .expect("a ruling short of its bar is still a ruling, and still reaches the asker");
+        let row: Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(row["decision"], "approved", "{row}");
+        assert_eq!(
+            row["claimable"], false,
+            "approved is not the same fact as claimable: {row}"
+        );
+        let render = row["render"].as_str().unwrap();
+        assert!(
+            render.to_lowercase().contains("do not re-issue")
+                && !render.contains("RE-ISSUE THE SAME WRITE"),
+            "the asker must not be told to spend a grant that authorises nothing: {render}"
+        );
     }
 
     /// Two members with live sessions and one escalation opened by the first — the fixture

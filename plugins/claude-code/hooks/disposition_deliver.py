@@ -8,20 +8,36 @@ WHAT THIS IS NOT.  It is not a gate: it decides nothing, refuses nothing, and ca
 tool call.  It renders one line the DAEMON composed, on the one channel this harness reads
 mid-turn (`hookSpecificOutput.additionalContext`, accepted on PreToolUse, PostToolUse and
 UserPromptSubmit).  SHIM_LEDGER class: refusal-channel.  Every judgement -- what was decided,
-whether a grant is still claimable, when it dies, what the asker may do -- is the daemon's,
-carried verbatim in the lane line's `render` field.
+whether a grant still authorises anything, until when, and what the asker may do -- is the
+daemon's, carried verbatim in the lane line's `render` field.
 
-WHY A FILE AND NOT A POLL.  A poll would cost a daemon round trip on every tool call, and the
-daemon serializes all members.  Worse, `mark_observed` starts the asker's claim fuse: a hook
-that polled on every call would light the fuse before the model could read the answer (#732).
-Reading a file consumes nothing and burns nothing, so a bystander session reading its seat's
-lane cannot harm the asker (PRD R6).
+IT IS ALSO NOT PROOF OF RECEIPT.  Rendering is availability, not an acknowledgement: nothing
+here is witnessed, so no clock may start from it.  The ACK that makes receipt a fact is the
+next slice (#845 R5/R8).  Until it exists, "delivered" in this file means "put in front of the
+model", and the daemon's horizon stays anchored where it always was.
 
-THE LANE.  `$HESTIA_HOME/dispositions/<plugin>.jsonl`, append-only, written by the daemon in
-the same transaction that appends the chain entry.  Each line carries `for_session` -- the
-asker's `host_session_id`, which is this harness's own `session_id` (the gate hook sends it on
-connect).  A line addressed to another session of the same seat is skipped, not rendered: two
-sessions of one member are two askers.
+WHY A FILE AND NOT A POLL.  A poll costs a round trip on a daemon that serializes every member,
+and `mark_observed` starts the asker's claim fuse: a hook that polled on every call would light
+the fuse before the model could read the answer (#732).  Reading a file consumes nothing and
+burns nothing.
+
+THE CURSOR IS PER SESSION, AND THAT IS THE WHOLE CORRECTION (#851).  The first cut kept one
+cursor per SEAT and advanced it over lines addressed to other sessions, which meant a co-seat
+session -- one of the mesh wakes that exist BECAUSE delivery is broken -- silently destroyed a
+ruling it rendered to nobody.  Measured: 48 claude-seat wakes on 2026-09-02, and for 48.4% of
+that span a fresh co-seat session starts within one claim window.  `tools/disposition_deliver_
+bystander_probe.py` runs the sequence (bystander first, asker second) and the fix on the same
+sequence.  One cursor per (seat, session): a session advances only its own, so no session can
+consume another's mail, and no read is destructive to anyone else.
+
+A SESSION'S FIRST SIGHT READS THE WHOLE LANE BUT DELIVERS ONLY WHAT NAMES IT.  Two failures
+sit on either side of this rule.  Start a first-sight cursor at offset 0 and deliver
+everything, and each new session inherits the backlog of every unaddressed line ever written.
+Start it at end-of-lane instead, and an asker whose ruling landed before its first hook event
+never learns of it -- measured against the bystander probe, which writes the ruling first and
+fires afterwards: every arm read `delivered=False`.  So first sight scans from the start and
+renders only lines whose `for_session` IS this session; unaddressed lines are delivered from
+the second sight on, when "I was here already" is true.
 
 FAILURE POSTURE.  Silence.  Any error -- no lane, unreadable cursor, malformed line, missing
 field -- exits 0 with no output.  A delivery mechanism that could break a session would be
@@ -31,68 +47,97 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+import time
 
 PLUGIN_ID = os.environ.get("HESTIA_PLUGIN_ID") or "claude-code"
 HESTIA_HOME = os.environ.get("HESTIA_HOME") or os.path.expanduser("~/.hestia")
 LANE = os.path.join(HESTIA_HOME, "dispositions", PLUGIN_ID + ".jsonl")
 STATE_DIR = os.environ.get("HESTIA_SEAT_STATE") or os.path.expanduser("~/.hestia-claude")
-CURSOR = os.path.join(STATE_DIR, "disposition-cursor.json")
-MAX_RENDER = 4000          # one delivery is a paragraph, never a transcript
-MAX_LINES = 20             # a backlog is delivered, but a runaway lane is not a context bomb
+CURSOR_DIR = os.path.join(STATE_DIR, "disposition-cursors")
+MAX_RENDER = 4000            # one delivery is a paragraph, never a transcript
+MAX_LINES = 20               # a backlog is delivered; a runaway lane is not a context bomb
+CURSOR_TTL_SECS = 7 * 86400  # a cursor outlives its session by a week, then it is litter
+SAFE_SESSION = re.compile(r"[^A-Za-z0-9_.-]")
 
 
-def _read_cursor() -> dict:
+def cursor_path(session_id: str) -> str:
+    """One cursor per (seat, session). The session id is a path segment, so it is sanitised:
+    a session id is caller-supplied text and must never select a file outside this dir."""
+    name = SAFE_SESSION.sub("_", session_id)[:120] or "no-session"
+    return os.path.join(CURSOR_DIR, name + ".json")
+
+
+def reap_cursors(now: float) -> None:
+    """Sessions end without saying so, and their cursors would accumulate forever."""
     try:
-        with open(CURSOR, "r", encoding="utf-8") as fh:
+        for name in os.listdir(CURSOR_DIR):
+            p = os.path.join(CURSOR_DIR, name)
+            try:
+                if now - os.stat(p).st_mtime > CURSOR_TTL_SECS:
+                    os.remove(p)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def read_cursor(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
             c = json.load(fh)
         return c if isinstance(c, dict) else {}
     except Exception:
         return {}
 
 
-def _write_cursor(offset: int, inode: int) -> None:
-    """Best effort, atomic. A lost cursor re-delivers; a corrupt one delivers nothing."""
+def write_cursor(path: str, offset: int, inode: int) -> None:
+    """Best effort, atomic. A lost cursor re-delivers to ONE session; a corrupt one is ignored."""
     try:
-        os.makedirs(STATE_DIR, exist_ok=True)
-        tmp = CURSOR + ".tmp"
+        os.makedirs(CURSOR_DIR, exist_ok=True)
+        tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump({"offset": offset, "inode": inode}, fh)
-        os.replace(tmp, CURSOR)
+        os.replace(tmp, path)
     except Exception:
         pass
 
 
 def unread_lines(lane: str, cursor: dict):
-    """New bytes since the cursor, plus the offset to record. ([], None) when there is nothing.
+    """(lines, (offset, inode) to record, first_sight) for THIS session.
 
-    Keyed on the inode as well as the offset: a rotated or truncated lane resets to 0 rather
-    than seeking past the end of a new file and delivering nothing forever."""
+    A session with no cursor for this lane reads it whole and is told so: `first_sight` is what
+    lets the caller render only what NAMES this session, rather than either the whole backlog or
+    nothing at all. Keyed on the inode as well as the offset, so a rotated or truncated lane
+    starts over rather than seeking past a new file's end forever."""
     try:
         st = os.stat(lane)
     except OSError:
-        return [], None
-    offset = cursor.get("offset") or 0
-    if cursor.get("inode") != st.st_ino or offset > st.st_size:
-        offset = 0
+        return [], None, False
+    first_sight = "offset" not in cursor or cursor.get("inode") != st.st_ino
+    offset = 0 if first_sight else (cursor.get("offset") or 0)
+    if offset > st.st_size:                     # truncated under us: start over
+        offset, first_sight = 0, True
     if offset == st.st_size:
-        return [], None
+        return [], None, first_sight
     try:
         with open(lane, "r", encoding="utf-8", errors="replace") as fh:
             fh.seek(offset)
             payload = fh.read()
             end = fh.tell()
     except OSError:
-        return [], None
-    return [ln for ln in payload.splitlines() if ln.strip()], (end, st.st_ino)
+        return [], None, first_sight
+    return ([ln for ln in payload.splitlines() if ln.strip()], (end, st.st_ino), first_sight)
 
 
-def deliverable(lines, session_id: str):
+def deliverable(lines, session_id: str, first_sight: bool = False):
     """The lines addressed to THIS asker, rendered by the daemon.
 
-    `for_session` absent means the daemon could not prove the asker's session (asker_basis
+    `for_session` absent means the daemon could not prove the asker's session (`asker_basis`
     asserted): those are delivered to any session of the seat, because the alternative is not
-    delivering a ruling at all. `for_session` present and different is another asker's mail."""
+    delivering a ruling at all. `for_session` present and different is another asker's mail,
+    and skipping it costs that asker nothing now that the cursor is its own."""
     out = []
     for raw in lines[-MAX_LINES:]:
         try:
@@ -104,6 +149,8 @@ def deliverable(lines, session_id: str):
         want = row.get("for_session")
         if want and session_id and want != session_id:
             continue
+        if first_sight and not (want and session_id and want == session_id):
+            continue      # predates this session and does not name it: not ours to render
         text = row.get("render")
         if isinstance(text, str) and text.strip():
             out.append(text.strip()[:MAX_RENDER])
@@ -117,14 +164,16 @@ def main() -> int:
         return 0
     hook_event = event.get("hook_event_name") or "PreToolUse"
     session_id = event.get("session_id") or ""
-    cursor = _read_cursor()
-    lines, advance = unread_lines(LANE, cursor)
-    if not lines or advance is None:
+    path = cursor_path(session_id)
+    reap_cursors(time.time())
+    lines, advance, first_sight = unread_lines(LANE, read_cursor(path))
+    if advance is not None:
+        # This session's own position only. No other session's delivery is affected by it,
+        # which is the property #851 falsified in the first cut.
+        write_cursor(path, advance[0], advance[1])
+    if not lines:
         return 0
-    texts = deliverable(lines, session_id)
-    # The cursor advances over lines addressed to another session too: they were read, and
-    # re-reading them on every event would deliver another asker's mail forever.
-    _write_cursor(advance[0], advance[1])
+    texts = deliverable(lines, session_id, first_sight)
     if not texts:
         return 0
     body = ("hestia: governance disposition (the daemon ruled; this is the ruling, not a gate)\n\n"

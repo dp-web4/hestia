@@ -17,9 +17,20 @@ it can fail:
      `render`
   7. corrupt cursor           -> delivers from the start rather than crashing the session
   8. runaway lane (60 lines)  -> at most MAX_LINES rendered, and still valid JSON out
+  9. BYSTANDER FIRST           -> a co-seat session fires before the asker: it renders nothing
+                                 AND the asker is still delivered. This is #851, which the
+                                 first cut of this file failed while every arm above stayed
+                                 green: one seat-wide cursor, advanced past a line addressed
+                                 to another session, destroyed a ruling it showed to nobody.
+                                 Arm 3 could not catch it -- it fires ONE session and asserts
+                                 silence, which is true of the correct hook and the broken one
+                                 alike. The order is the axis, so the order is the test.
+ 10. first sight               -> a session that has never read the lane renders what NAMES it
+                                 (its ruling may predate its first hook event) and does not
+                                 inherit unaddressed backlog written before it existed
 
-Arm 2 is the one that matters: it is the whole mechanism. It is witnessed by arm 4, which
-proves the delivery is not simply "print the lane every time".
+Arm 2 is the whole mechanism; arm 4 proves it is not "print the lane every time"; arm 9 proves
+one session's read cannot cost another its mail.
 """
 from __future__ import annotations
 
@@ -176,6 +187,43 @@ def test_runaway_lane_is_bounded() -> None:
         check("number 59" in body, "[8] and the bound keeps the NEWEST rulings")
 
 
+def test_bystander_first_does_not_eat_the_askers_ruling() -> None:
+    """#851, measured live: the sessions that exist BECAUSE delivery is broken were breaking it.
+
+    48 claude-seat wakes on 2026-09-02, median gap 938 s; for 48.4% of that span a fresh
+    co-seat session starts within one claim window, and each fires PreToolUse on its first
+    tool call. With a seat-wide cursor, whichever fires first consumes the line."""
+    with tempfile.TemporaryDirectory() as raw:
+        seat = Seat(raw)
+        seat.write(line("APPROVED for the asker alone"))
+        rc_b, bystander = seat.context(session=OTHER)
+        check(rc_b == 0 and bystander is None,
+              f"[9] the bystander renders nothing: {str(bystander)[:120]}")
+        rc_a, asker = seat.context(session=SESSION)
+        check(rc_a == 0 and bool(asker)
+              and "for the asker alone" in (asker.get("additionalContext") or ""),
+              f"[9] and the asker is STILL delivered after it: {str(asker)[:160]}")
+        _, again = seat.context(session=OTHER)
+        check(again is None, "[9] the bystander's second look is still silent")
+
+
+def test_first_sight_takes_what_names_it_and_no_backlog() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        seat = Seat(raw)
+        seat.write(line("UNADDRESSED backlog from before this session", for_session=None),
+                   line("APPROVED and addressed to this session"))
+        rc, ctx = seat.context()
+        body = (ctx or {}).get("additionalContext") or ""
+        check(rc == 0 and "addressed to this session" in body,
+              f"[10] first sight delivers what names this session: {body[:160]}")
+        check("UNADDRESSED backlog" not in body,
+              "[10] and not the backlog that predates it")
+        seat.write(line("UNADDRESSED after this session was reading", for_session=None))
+        _, later = seat.context()
+        check(bool(later) and "after this session was reading" in (later.get("additionalContext") or ""),
+              "[10] an unaddressed line written LATER is delivered, because now it may be ours")
+
+
 if __name__ == "__main__":
     test_no_lane_is_silence()
     test_the_askers_line_is_delivered()
@@ -185,6 +233,8 @@ if __name__ == "__main__":
     test_malformed_lines_are_skipped()
     test_corrupt_cursor_still_delivers()
     test_runaway_lane_is_bounded()
+    test_bystander_first_does_not_eat_the_askers_ruling()
+    test_first_sight_takes_what_names_it_and_no_backlog()
     if FAILURES:
         print(f"FAILED: {len(FAILURES)}", file=sys.stderr)
         sys.exit(1)
