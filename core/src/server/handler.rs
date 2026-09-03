@@ -644,8 +644,15 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     // `connect_pop_principal_mismatch`, the label-squat the pin exists to stop,
     // the squatter was the sole witness. The append uses `?` on purpose: a
     // refusal the daemon cannot record is an error, not a quieter refusal.
-    // Cheap under flood by construction — at most one row per connect that
-    // produced no session, and a connect already costs a nonce mint.
+    // Bound under flood: at most one row per connect that produced no session,
+    // and nothing else limits it. The nonce is NOT the limiter (cbp review on
+    // #907): `connect_pop_required` and `connect_pop_principal_mismatch` are
+    // reached from `check_pin` with `proof: None` — `verify_proof` never runs
+    // and no nonce is minted — so a bare `hestia_connect` naming a pinned label
+    // appends one row per attempt with no challenge round-trip. That is on
+    // purpose: collapsing repeats would let a squatter hide inside the noise of
+    // its own flood, and for this row the flood IS the signal. Do not cite this
+    // comment as evidence that some other refusal may append cheaply.
     fn witness_refusal(
         s: &mut super::state::ServerState,
         r: &PopRefusal,
@@ -20265,6 +20272,20 @@ mod connect_pop_tests {
             .await.unwrap();
         assert_eq!(r["_hestia_error"]["code"], "hestia.connect_pop_malformed", "{r}");
 
+        // challenge minted for a DIFFERENT id, presented under `id` and signed
+        // by `id`'s key (cbp review on #907: witnessed structurally, asserted
+        // nowhere at this level — the one code a reader of the sorted list
+        // below would otherwise believe was not a refusal that reaches here)
+        let (_kp_other, other) = being();
+        let ch = tool_connect_challenge(&state, &json!({"lct_id": other})).await.unwrap();
+        let nonce = ch["challengeNonce"].as_str().unwrap().to_string();
+        let sig = kp.sign(&pop_message(&id, &nonce));
+        let p = json!({"lct_id": id, "public_key": kp.verifying_key().to_hex(),
+                       "challenge_nonce": nonce, "signature": sig.to_hex()});
+        let r = tool_connect(&state, &json!({"plugin_id": "b", "host_agent": "x", "proof": p}))
+            .await.unwrap();
+        assert_eq!(r["_hestia_error"]["code"], "hestia.connect_pop_challenge_principal_mismatch", "{r}");
+
         let rows = refused_rows(&*state.lock().await);
         // recent_chain is newest-first; the set is the claim, not the order.
         let mut codes: Vec<&str> = rows.iter().map(|r| r["code"].as_str().unwrap()).collect();
@@ -20272,6 +20293,7 @@ mod connect_pop_tests {
         assert_eq!(codes, vec![
             "hestia.connect_pop_bad_signature",
             "hestia.connect_pop_challenge_invalid",
+            "hestia.connect_pop_challenge_principal_mismatch",
             "hestia.connect_pop_key_mismatch",
             "hestia.connect_pop_malformed",
         ], "{rows:?}");
