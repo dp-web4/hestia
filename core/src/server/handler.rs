@@ -83,6 +83,7 @@ impl ServerHandler for HestiaServer {
 
         let dispatch = match name.as_str() {
             "hestia_connect" => tool_connect(&self.state, &args).await,
+            "hestia_connect_challenge" => tool_connect_challenge(&self.state, &args).await,
             "hestia_begin_action" => tool_begin_action(&self.state, &args).await,
             "hestia_record_outcome" => tool_record_outcome(&self.state, &args).await,
             "hestia_record_reversal" => tool_record_reversal(&self.state, &args).await,
@@ -286,7 +287,29 @@ fn hestia_tools() -> Vec<Tool> {
     vec![
         t(
             "hestia_connect",
-            "Establish a plugin session and receive a Soft LCT",
+            "Establish a plugin session and receive a Soft LCT. Optional `proof` \
+             { lct_id, public_key, challenge_nonce, signature } (from \
+             hestia_connect_challenge) makes the session PROOF-OF-POSSESSION attributed \
+             to that canonical id (PRD_FLEET §4.2 class 2); a plugin_id that has ever \
+             connected with a proof is pinned to it and refuses asserted connects thereafter",
+        ),
+        t_args(
+            "hestia_connect_challenge",
+            "Mint a single-use, 120s nonce bound to the canonical lct_id you will prove at \
+             hestia_connect. Sign the returned `message` bytes (exactly, no reconstruction \
+             needed) with the Ed25519 key that id derives from, then pass \
+             { lct_id, public_key (hex32), challenge_nonce, signature (hex64) } as `proof`",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["lct_id"],
+                "properties": {
+                    "lct_id": {
+                        "type": "string",
+                        "description": "canonical id, lct:web4:mb32:b… = sha256 of the binding public key"
+                    }
+                }
+            }),
         ),
         t("hestia_begin_action", "Begin tracking an R6/R7 action"),
         t(
@@ -600,8 +623,48 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
         .get("synthetic")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // §4.2 class 2: an optional proof of possession. Parsed here, VERIFIED below
+    // under the lock, and decided before any side effect (O).
+    let proof = args.get("proof").cloned();
 
     let mut s = state.lock().await;
+
+    // PROOF-OF-POSSESSION + PINS — the identity decision, made before the reuse
+    // lookup, the synthetic persist, the member mint and the session insert, so a
+    // refused proof leaves state bit-identical (apart from the burnt nonce, which
+    // is the point). See `server::connect_pop` for the shape and the reasoning.
+    use crate::server::connect_pop::{
+        CONNECT_POP_TTL_SECS, IdentityBasis, PinCheck, check_pin, refusal_details, verify_proof,
+    };
+    let now = Utc::now().timestamp().max(0) as u64;
+    s.pop_challenges.gc(now, CONNECT_POP_TTL_SECS);
+    let verified = match proof.as_ref() {
+        None => None,
+        Some(p) => match verify_proof(&mut s.pop_challenges, p, now, CONNECT_POP_TTL_SECS) {
+            Ok(v) => Some(v),
+            Err(r) => {
+                return Ok(hestia_error_envelope(
+                    r.code,
+                    &r.message,
+                    Some(refusal_details(&r, &plugin_id)),
+                ));
+            }
+        },
+    };
+    let (identity_basis, principal_lct_id, pin_first_sight) =
+        match check_pin(&s.pop_pins, &plugin_id, verified.as_ref()) {
+            PinCheck::Unpinned => (IdentityBasis::Asserted, None, false),
+            PinCheck::Proven { lct_id, first_sight } => {
+                (IdentityBasis::ProofOfPossession, Some(lct_id), first_sight)
+            }
+            PinCheck::Refused(r) => {
+                return Ok(hestia_error_envelope(
+                    r.code,
+                    &r.message,
+                    Some(refusal_details(&r, &plugin_id)),
+                ));
+            }
+        };
 
     // Connect idempotency (HUB ruling 2026-07-24): the claude-code hook connects on EVERY tool call
     // (fresh MCP connection per hook subprocess), so without this each tool call mints a distinct
@@ -618,6 +681,24 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
             .values_mut()
             .find(|sess| sess.host_session_id.as_deref() == Some(hsid))
         {
+            // A proven connect may not be answered with a session minted under a
+            // different principal (or none): Guard A keeps the MINTED basis, so the
+            // only honest answer is a refusal that names it. An asserted reconnect
+            // to a proven session is fine — the pin check above already admitted it
+            // (unpinned label) and reuse changes nothing.
+            if principal_lct_id.is_some() && existing.principal_lct_id != principal_lct_id {
+                return Ok(hestia_error_envelope(
+                    "hestia.connect_pop_session_basis_mismatch",
+                    "a live session under this host_session_id was minted for a different \
+                     principal (or none); Guard A reuse never re-attributes a session — \
+                     connect under a fresh host_session_id",
+                    Some(json!({
+                        "plugin_id": plugin_id,
+                        "existing_principal_lct_id": existing.principal_lct_id,
+                        "proven_principal_lct_id": principal_lct_id,
+                    })),
+                ));
+            }
             existing.connected_at = Utc::now(); // Guard A: liveness only — no other field mutates
             // Guard A means a reused session keeps the role it was MINTED with — this
             // call's `role` argument is ignored outright. Report against the role the
@@ -631,6 +712,8 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
                 "constellationRole": existing.constellation_role,
                 "roleDeclarationHonored": honored,
                 "roleBasis": existing.role_basis,
+                "identityBasis": existing.identity_basis.as_str(),
+                "principalLctId": existing.principal_lct_id,
                 "gateCapabilityReportAccepted": gate_capability_report_accepted,
                 "protocolVersion": 1,
                 "reused": true,
@@ -660,7 +743,36 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
         soft_lct: soft_lct.clone(),
         connected_at: Utc::now(),
         host_session_id,
+        identity_basis,
+        principal_lct_id: principal_lct_id.clone(),
     };
+    // First proof for this label PINS it, durably, before the session exists. Fail-
+    // CLOSED like the synthetic exclusion below and for the same reason: a proven
+    // session admitted on an unpersisted pin would come back after a restart as a
+    // label anyone can assert — the silent downgrade #824 forbids.
+    if pin_first_sight {
+        if let Some(id) = principal_lct_id.as_deref() {
+            s.pop_pins.insert(plugin_id.clone(), id.to_string());
+            let super::state::ServerState { vault, pop_pins, .. } = &mut *s;
+            if let Err(e) = crate::vault::save_doc(
+                vault,
+                crate::server::connect_pop::POP_PINS_NAMESPACE,
+                crate::server::connect_pop::POP_PINS_DOC,
+                crate::server::connect_pop::POP_PINS_LEGACY_FILE,
+                pop_pins,
+            ) {
+                s.pop_pins.remove(&plugin_id);
+                return Ok(hestia_error_envelope(
+                    "hestia.internal_error",
+                    &format!(
+                        "refusing connect: could not persist the proof-of-possession pin for \
+                         '{plugin_id}' → {id} (fail-closed): {e}"
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
     // Fail-closed synthetic declaration: a client that declares itself synthetic
     // must have that exclusion durably PERSISTED before we admit it — otherwise a
     // restart loses the exclusion and mints durable member labels for a test
@@ -689,7 +801,10 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     // just isn't published yet; it must never block a connect (presence is not a
     // safety gate, unlike the synthetic exclusion above). Not per-connect work in
     // steady state: the in-memory registry short-circuits an already-known member.
-    if !synthetic {
+    // A PROVEN principal already has an LCT — its own, the one its id derives
+    // from. Minting a custodial one beside it would be the "hidden second
+    // identity system" #824 forbids, so the mint is asserted-members only.
+    if !synthetic && principal_lct_id.is_none() {
         let sovereign_anchor = s.sovereign_lct.clone();
         let sovereign_id = s.sovereign.lct_id();
         let is_syn = s.is_synthetic(&plugin_id);
@@ -739,8 +854,43 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
         "constellationRole": constellation_role,
         "roleDeclarationHonored": role_declaration_honored,
         "roleBasis": role_basis,
+        "identityBasis": identity_basis.as_str(),
+        "principalLctId": principal_lct_id,
         "gateCapabilityReportAccepted": gate_capability_report_accepted,
         "protocolVersion": 1,
+    }))
+}
+
+/// Step 1 of proof-of-possession at connect (PRD_FLEET §4.2 class 2). Mints a
+/// single-use nonce bound to the claimed canonical id and returns the exact
+/// bytes to sign. Minting is not a consequential act: an unredeemed challenge
+/// grants nothing and expires; the store is gc'd on every mint so an attacker
+/// spraying challenges bounds nothing but their own TTL window.
+async fn tool_connect_challenge(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::server::connect_pop::{CONNECT_POP_DOMAIN, CONNECT_POP_TTL_SECS, pop_message};
+    let lct_id = require_string(args, "lct_id")?;
+    if !lct_id.starts_with("lct:web4:mb32:") {
+        return Ok(hestia_error_envelope(
+            "hestia.connect_pop_malformed",
+            "lct_id must be a canonical `lct:web4:mb32:…` id (sha256 of the binding key); \
+             legacy `lct:web4:member:` labels are custodial and prove nothing",
+            Some(json!({ "lct_id": lct_id })),
+        ));
+    }
+    let now = Utc::now().timestamp().max(0) as u64;
+    let mut s = state.lock().await;
+    s.pop_challenges.gc(now, CONNECT_POP_TTL_SECS);
+    let nonce = s.pop_challenges.issue(&lct_id, now);
+    let message = pop_message(&lct_id, &nonce);
+    Ok(json!({
+        "lctId": lct_id,
+        "challengeNonce": nonce,
+        "domain": CONNECT_POP_DOMAIN,
+        "ttlSecs": CONNECT_POP_TTL_SECS,
+        // The bytes to sign, verbatim (UTF-8). A client signs THIS; it does not
+        // reconstruct it. Shown also as hex so a binary-clean client can be sure.
+        "message": String::from_utf8_lossy(&message),
+        "messageHex": hex::encode(&message),
     }))
 }
 
@@ -816,7 +966,7 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
         }
     };
 
-    let (plugin_id, role_lct, role_basis) = s
+    let (plugin_id, role_lct, role_basis, identity_basis, principal_lct_id) = s
         .sessions
         .get(&action.session_id)
         .map(|sess| {
@@ -824,12 +974,16 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
                 sess.plugin_id.clone(),
                 sess.constellation_role.clone(),
                 sess.role_basis.clone(),
+                sess.identity_basis,
+                sess.principal_lct_id.clone(),
             )
         })
         .unwrap_or_else(|| {
             (
                 "anonymous".to_string(),
                 crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string(),
+                None,
+                crate::server::connect_pop::IdentityBasis::Asserted,
                 None,
             )
         });
@@ -839,7 +993,12 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
     // per-session, not smeared onto plugin_id. `role_basis` rides alongside so a
     // role that was only PROVISIONALLY established reads as such; the normalized
     // `role_lct` alone cannot carry that distinction.
-    let instance_lct = s.member_lct(&plugin_id);
+    // A PROVEN session's acts attribute to the principal's own canonical id;
+    // an asserted one keeps the label-derived custodial `member_lct`. Which of
+    // the two it was rides alongside as `identity_basis` (#824: every witnessed
+    // act names the identity basis used), so the chain never reads an assertion
+    // as a proof.
+    let instance_lct = principal_lct_id.or_else(|| s.member_lct(&plugin_id));
 
     // The witness hook's own clock at act time (#696). append-lag =
     // chain ts - client_ts turns "the referee was slow" from a reconstruction
@@ -858,6 +1017,7 @@ async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
             "instance_lct": instance_lct,
             "role_lct": role_lct,
             "role_basis": role_basis,
+            "identity_basis": identity_basis.as_str(),
             "session_id": action.session_id,
             "host_session_id": action.host_session_id,
             "intent": action.intent,
@@ -8085,6 +8245,8 @@ mod inbox_tests {
                 soft_lct: format!("lct:test:{plugin_id}"),
                 connected_at: chrono::Utc::now(),
                 host_session_id: None,
+                identity_basis: crate::server::connect_pop::IdentityBasis::Asserted,
+                principal_lct_id: None,
             },
         );
         sid
@@ -8265,6 +8427,8 @@ mod inbox_tests {
                     soft_lct: "lct:test".into(),
                     connected_at: chrono::Utc::now(),
                     host_session_id: None,
+                identity_basis: crate::server::connect_pop::IdentityBasis::Asserted,
+                principal_lct_id: None,
                 },
             );
         }
@@ -9842,6 +10006,8 @@ mod tests {
                 soft_lct: "lct:test".into(),
                 connected_at: Utc::now(),
                 host_session_id: None,
+                identity_basis: crate::server::connect_pop::IdentityBasis::Asserted,
+                principal_lct_id: None,
             },
         );
         sid
@@ -13543,6 +13709,8 @@ mod open_appeals_tests {
                     soft_lct: format!("lct:{m}"),
                     connected_at: Utc::now(),
                     host_session_id: None,
+                identity_basis: crate::server::connect_pop::IdentityBasis::Asserted,
+                principal_lct_id: None,
                 },
             );
             ids.push(sid);
@@ -14156,6 +14324,8 @@ mod appeal_tests {
                 soft_lct: format!("lct:test:{plugin_id}"),
                 connected_at: chrono::Utc::now(),
                 host_session_id: None,
+                identity_basis: crate::server::connect_pop::IdentityBasis::Asserted,
+                principal_lct_id: None,
             },
         );
         sid
@@ -15345,6 +15515,8 @@ mod vault_hst001_tests {
             soft_lct: format!("lct:test:{plugin_id}"),
             connected_at: chrono::Utc::now(),
             host_session_id: None,
+                identity_basis: crate::server::connect_pop::IdentityBasis::Asserted,
+                principal_lct_id: None,
         });
         sid
     }
@@ -19736,5 +19908,228 @@ mod disposition_durability_tests {
             note.chain_hash, withdrawn_entry.hash,
             "the obligation anchors to the terminal entry, not to a notice-side entry"
         );
+    }
+}
+
+/// Proof-of-possession at connect (PRD_FLEET §4.2 class 2, #824 / #832) —
+/// the handler-level half. The verification arithmetic (replay, expiry, wrong
+/// key, bad signature, challenge/principal binding) is proven in
+/// `connect_pop::tests`; these prove the DOOR honours it: attribution, pins,
+/// persistence across a rebuild, Guard A, and the chain entry.
+#[cfg(test)]
+mod connect_pop_tests {
+    use super::*;
+    use crate::server::connect_pop::pop_message;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+    use web4_core::{KeyPair, derive_lct_id};
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    fn being() -> (KeyPair, String) {
+        let kp = KeyPair::generate();
+        let id = derive_lct_id(&kp.verifying_key());
+        (kp, id)
+    }
+
+    /// Step 1 + client-side signing, as `being_gate_client.py` will do it.
+    async fn proof(state: &SharedState, kp: &KeyPair, id: &str) -> Value {
+        let ch = tool_connect_challenge(state, &json!({"lct_id": id})).await.unwrap();
+        assert_eq!(ch["domain"], "web4:hestia:connect:v1");
+        let nonce = ch["challengeNonce"].as_str().unwrap().to_string();
+        // The daemon hands over the bytes; the client signs them verbatim.
+        let message = ch["message"].as_str().unwrap().as_bytes().to_vec();
+        assert_eq!(message, pop_message(id, &nonce), "message is the documented three lines");
+        let sig = kp.sign(&message);
+        json!({
+            "lct_id": id,
+            "public_key": kp.verifying_key().to_hex(),
+            "challenge_nonce": nonce,
+            "signature": sig.to_hex(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_proven_connect_is_attributed_to_the_principal_not_the_label() {
+        let (_dir, state) = test_state().await;
+        let (kp, id) = being();
+        let p = proof(&state, &kp, &id).await;
+        let r = tool_connect(&state, &json!({
+            "plugin_id": "sprout-being", "host_agent": "sage", "proof": p
+        })).await.unwrap();
+        assert!(r.get("_hestia_error").is_none(), "{r}");
+        assert_eq!(r["identityBasis"], "proof_of_possession");
+        assert_eq!(r["principalLctId"], json!(id));
+        let s = state.lock().await;
+        assert_eq!(s.pop_pins.get("sprout-being"), Some(&id), "first proof pins the label");
+        assert!(
+            s.member_registry.get("sprout-being").is_none(),
+            "a proven principal is NOT minted a custodial LCT beside its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_asserted_connect_for_an_unpinned_label_is_unchanged() {
+        let (_dir, state) = test_state().await;
+        let r = tool_connect(&state, &json!({"plugin_id": "claude-code", "host_agent": "t"}))
+            .await.unwrap();
+        assert!(r.get("_hestia_error").is_none(), "{r}");
+        assert_eq!(r["identityBasis"], "asserted");
+        assert_eq!(r["principalLctId"], Value::Null);
+        assert!(state.lock().await.member_registry.get("claude-code").is_some(),
+            "asserted members still get the custodial mint");
+    }
+
+    #[tokio::test]
+    async fn a_pinned_label_refuses_an_asserted_connect_and_a_different_key() {
+        let (_dir, state) = test_state().await;
+        let (kp, id) = being();
+        let p = proof(&state, &kp, &id).await;
+        tool_connect(&state, &json!({"plugin_id": "being", "host_agent": "sage", "proof": p}))
+            .await.unwrap();
+
+        // Squat by label: no proof.
+        let r = tool_connect(&state, &json!({"plugin_id": "being", "host_agent": "x"}))
+            .await.unwrap();
+        assert_eq!(r["_hestia_error"]["code"], "hestia.connect_pop_required", "{r}");
+
+        // Squat by a different key, correctly proven for ITS id.
+        let (kp2, id2) = being();
+        let p2 = proof(&state, &kp2, &id2).await;
+        let r = tool_connect(&state, &json!({"plugin_id": "being", "host_agent": "x", "proof": p2}))
+            .await.unwrap();
+        assert_eq!(r["_hestia_error"]["code"], "hestia.connect_pop_principal_mismatch", "{r}");
+
+        // Neither refusal minted a session (O: refused connects leave no residue).
+        assert_eq!(state.lock().await.sessions.len(), 1);
+
+        // The pinned principal reconnects fine with a fresh challenge.
+        let p3 = proof(&state, &kp, &id).await;
+        let r = tool_connect(&state, &json!({"plugin_id": "being", "host_agent": "sage", "proof": p3}))
+            .await.unwrap();
+        assert_eq!(r["identityBasis"], "proof_of_possession", "{r}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_proof_burns_the_challenge_and_mints_nothing() {
+        let (_dir, state) = test_state().await;
+        let (kp, id) = being();
+        let mut p = proof(&state, &kp, &id).await;
+        let (attacker, _) = being();
+        p["public_key"] = json!(attacker.verifying_key().to_hex());
+        p["signature"] = json!(attacker.sign(&pop_message(&id, p["challenge_nonce"].as_str().unwrap())).to_hex());
+        let r = tool_connect(&state, &json!({"plugin_id": "being", "host_agent": "x", "proof": p.clone()}))
+            .await.unwrap();
+        assert_eq!(r["_hestia_error"]["code"], "hestia.connect_pop_key_mismatch", "{r}");
+        // Replaying the (now burnt) nonce, even with the RIGHT key, fails.
+        p["public_key"] = json!(kp.verifying_key().to_hex());
+        p["signature"] = json!(kp.sign(&pop_message(&id, p["challenge_nonce"].as_str().unwrap())).to_hex());
+        let r = tool_connect(&state, &json!({"plugin_id": "being", "host_agent": "x", "proof": p}))
+            .await.unwrap();
+        assert_eq!(r["_hestia_error"]["code"], "hestia.connect_pop_challenge_invalid", "{r}");
+        let s = state.lock().await;
+        assert!(s.sessions.is_empty());
+        assert!(s.pop_pins.is_empty(), "a refused proof pins nothing");
+    }
+
+    #[tokio::test]
+    async fn pins_survive_a_daemon_restart() {
+        let dir = TempDir::new().unwrap();
+        let (kp, id) = being();
+        {
+            let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+            let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+            let p = proof(&state, &kp, &id).await;
+            let r = tool_connect(&state, &json!({"plugin_id": "being", "host_agent": "sage", "proof": p}))
+                .await.unwrap();
+            assert_eq!(r["identityBasis"], "proof_of_possession", "{r}");
+        }
+        // "Restart": rebuild state from the same vault.
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        assert_eq!(state.lock().await.pop_pins.get("being"), Some(&id));
+        let r = tool_connect(&state, &json!({"plugin_id": "being", "host_agent": "x"}))
+            .await.unwrap();
+        assert_eq!(r["_hestia_error"]["code"], "hestia.connect_pop_required",
+            "a strongly enrolled label does not downgrade across a restart: {r}");
+    }
+
+    #[tokio::test]
+    async fn guard_a_reuse_keeps_the_minted_basis_and_refuses_reattribution() {
+        let (_dir, state) = test_state().await;
+        let (kp, id) = being();
+        let p = proof(&state, &kp, &id).await;
+        let r = tool_connect(&state, &json!({
+            "plugin_id": "being", "host_agent": "sage", "proof": p, "host_session_id": "h1"
+        })).await.unwrap();
+        let sid = r["sessionId"].clone();
+        // Reconnect with a fresh proof and the same host session: reused, same basis.
+        let p2 = proof(&state, &kp, &id).await;
+        let r = tool_connect(&state, &json!({
+            "plugin_id": "being", "host_agent": "sage", "proof": p2, "host_session_id": "h1"
+        })).await.unwrap();
+        assert_eq!(r["reused"], true, "{r}");
+        assert_eq!(r["sessionId"], sid);
+        assert_eq!(r["identityBasis"], "proof_of_possession");
+        assert_eq!(r["principalLctId"], json!(id));
+
+        // An ASSERTED session under h2, then a proven connect naming h2: Guard A may
+        // not hand the proven caller an asserted session, and may not re-attribute it.
+        tool_connect(&state, &json!({"plugin_id": "claude-code", "host_agent": "t", "host_session_id": "h2"}))
+            .await.unwrap();
+        let (kp3, id3) = being();
+        let p3 = proof(&state, &kp3, &id3).await;
+        let r = tool_connect(&state, &json!({
+            "plugin_id": "other", "host_agent": "sage", "proof": p3, "host_session_id": "h2"
+        })).await.unwrap();
+        assert_eq!(r["_hestia_error"]["code"], "hestia.connect_pop_session_basis_mismatch", "{r}");
+    }
+
+    #[tokio::test]
+    async fn the_outcome_entry_names_the_principal_and_the_basis() {
+        let (_dir, state) = test_state().await;
+        let (kp, id) = being();
+        let p = proof(&state, &kp, &id).await;
+        let sid = tool_connect(&state, &json!({"plugin_id": "being", "host_agent": "sage", "proof": p}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let begin = tool_begin_action(&state, &json!({
+            "tool_name": "hestia_member_notify", "target": "cbp", "session_id": sid, "intent": "ping"
+        })).await.unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        tool_record_outcome(&state, &json!({"action_id": aid, "success": true, "magnitude": 0.1}))
+            .await.unwrap();
+        let s = state.lock().await;
+        let last = s.chain_store.read_recent(1).unwrap().pop().expect("an outcome entry");
+        let payload: Value = last.event_data.clone();
+        assert_eq!(payload["identity_basis"], "proof_of_possession", "{payload}");
+        assert_eq!(payload["instance_lct"], json!(id), "attributed to the principal's own id");
+
+        // And an asserted session's entry says so, keeping the custodial label.
+        drop(s);
+        let sid = tool_connect(&state, &json!({"plugin_id": "claude-code", "host_agent": "t"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let begin = tool_begin_action(&state, &json!({
+            "tool_name": "Bash", "target": "ls", "session_id": sid, "intent": "list"
+        })).await.unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        tool_record_outcome(&state, &json!({"action_id": aid, "success": true, "magnitude": 0.1}))
+            .await.unwrap();
+        let s = state.lock().await;
+        let last = s.chain_store.read_recent(1).unwrap().pop().unwrap();
+        let payload: Value = last.event_data.clone();
+        assert_eq!(payload["identity_basis"], "asserted");
+        assert_eq!(payload["instance_lct"], json!(s.member_lct("claude-code")));
+    }
+
+    #[tokio::test]
+    async fn a_challenge_for_a_custodial_label_is_refused_by_name() {
+        let (_dir, state) = test_state().await;
+        let r = tool_connect_challenge(&state, &json!({"lct_id": "lct:web4:member:abc"})).await.unwrap();
+        assert_eq!(r["_hestia_error"]["code"], "hestia.connect_pop_malformed", "{r}");
     }
 }

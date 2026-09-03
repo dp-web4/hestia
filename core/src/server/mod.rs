@@ -10,6 +10,7 @@ pub mod governance_ledger;
 mod handler;
 mod http;
 mod hub_tab;
+pub mod connect_pop;
 pub mod operator_auth;
 mod public_identity;
 pub mod standing_scope;
