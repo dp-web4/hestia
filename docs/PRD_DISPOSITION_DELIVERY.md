@@ -31,7 +31,9 @@ What exists, read from the tree:
 
 ## 2. Model
 
-An escalation has an **asker**: the (member, session, act) that was refused. The seat is where the asker lives, not who it is. A disposition is **delivered** when the asker's own runtime has received (decision, claim state, absolute claim deadline, act digest, what to do) on a port that runtime actually reads. Until then the disposition is filed.
+An escalation has an **asker**: the (member, session, act) that was refused. The seat is where the asker lives, not who it is.
+
+Three states, and they are three different objects. **Filed**: the ruling is on the chain. **Available**: a durable, addressed obligation exists on a lane the asker's runtime can read without asking. **Received**: the asker's own runtime has acknowledged it, and that acknowledgement is evidence. Only the third is delivery, and only the third may start a clock. The distinction is not pedantry: #851 measured a reader that made a ruling available and then destroyed it, rendering it to nobody. The row existed; delivery did not happen.
 
 Three asker states, three ports, one content:
 
@@ -49,17 +51,37 @@ The content is the gate's, composed once by the daemon. The hook renders it on t
 
 **R2. Push at decide time.** `decide`, `expire`, `withdraw` and `claim` each append to the lane in the same transaction that appends the chain entry; the chain entry is finality (#480) and the lane line carries its hash. No worker, no interval, no polling by the asker.
 
-**R3. One content, absolute.** A lane line carries: `escalation_id`, `decision`, `decided_at`, `decided_by`, `ruling_hash`, `claimable` (bool), `consumed_at`, `claim_deadline` (absolute epoch, derived from the same horizon `is_claimable` uses), `act_digest` and the bounded `attempted` summary, and `then`: the one sentence saying re-issue the same write, or that nothing is left to do. No relative seconds. The 4200 supremum is retired from the refusal text; the refusal names the lane and the deadline rule instead.
+**R3. One content, absolute, and no field that impersonates a deadline it cannot yet know.** A lane line carries `escalation_id`, `decision`, `decided_at`, `decided_by`, `ruling_hash`, `claimable`, `consumed_at`, `expires_at`, `act_digest`, the bounded `attempted` summary, and the one sentence saying what may be done. Every instant is absolute; no relative seconds anywhere. The 4200 supremum is retired from the refusal text.
+
+The **canonical claim deadline is derived from receipt** (R5) and therefore does not exist at ruling time. A lane line must not carry one. What it may carry is today's horizon, named and versioned as the projection it is (`pre_migration_horizon`, with its `basis` and its `model` spelled out in the row), because `observed_at` is store-only, absent from the chain, unreconstructible by an offline reader, reset on replay, and silently not set by the default CLI identity (#850). Exporting that as `claim_deadline` would freeze a current implementation accident into a new outward artifact, and every later reader would inherit it as compatibility debt. The sentence the asker reads says the same in words: the horizon is anchored on the ruling, not on their receipt of it.
+
+A re-issue must be **byte-identical**: the act digest covers the whole command text. The sentence says so, because a near-miss claims nothing and looks like a plain deny (measured 2026-09-02: an appended `&& ls -l` lost a live grant).
 
 **R4. Seat delivery, live.** Each seat's gate hook, on every PreToolUse, PostToolUse and UserPromptSubmit event, reads its own lane (a `stat` on one file; a read only when the size changed since the last event, cursor kept in the seat's state dir) and renders any unread line on the seat's context port. Port by engine is a measured property of the (engine, event) pair (`hook_context_contract_report.py`), not a fleet assumption: claude via `hookSpecificOutput.additionalContext`; gemini via stderr on the next decision; codex and kimi per the contract report, and where no port exists the next gate response carries the line in its text. The rendering is verbatim daemon content plus the seat's channel framing.
 
-**R5. The clock starts at delivery.** `observed_at` is set when the asker's own session reads the line (the seat hook reports the cursor advance with its proven session) or polls with its proven session. A poll from any other session, including a wake fired for the same `plugin_id`, does not start the window (#732). Windows are reported as absolute deadlines everywhere they are reported.
+**The cursor is per (seat, session), and a read is never destructive to another session.** One cursor per seat is a defect, not an optimisation: a co-seat session advances it past a line addressed to the asker and the ruling is destroyed unrendered (#851, measured; the bystanders are the mesh wakes that exist because delivery is broken). A session's first sight of a lane reads it whole and renders only lines that NAME that session; unaddressed lines are delivered from the second sight onward. Starting a first sight at end-of-lane is also wrong, and was measured wrong: a ruling can land before the asker's next hook event, and then it is never seen.
+
+**R4a. Registration is an operator act, and it is a deployment prerequisite.** The installer ships only files a member declares AND the host registers, and the registration file is a governance marker, so a governed member cannot write it. Every seat therefore needs one operator act before any seat hook can ship: declare the file in the member's manifest (the member may do this), then register it in the host's hook configuration (only the operator may). This PRD previously assigned the port to "each seat's hook" and never named that act, which made the whole of R4 depend on an implicit human keystroke (#851). A seat whose reader is unregistered is INDETERMINATE for delivery, not compliant and not failing.
+
+**R5. The clock starts at a witnessed receipt, and the legacy anchor is migrated away, not extended.** The canonical claim horizon is `receipt + window`, where receipt is the acknowledgement of R8: attributable to the asker's own proven session, on the chain, reconstructible by an offline reader and by a restart. Only then is an absolute deadline derivable, and only then may a lane line carry one.
+
+Today's anchor is `observed_at`, and #850 measured what it is: store-only, off-chain, unreconstructible, reset to `None` on replay, and not set at all by the default CLI identity. It is not a smaller version of the target; it is a different thing. The migration is explicit and has three steps, in this order:
+
+1. lanes stop exporting a canonical deadline and name today's horizon as a pre-migration projection (R3);
+2. the receipt event lands, and the horizon is computed from it when one exists, falling back to `observed_at` only for escalations opened before the event existed;
+3. `observed_at` stops being an anchor at all and remains, if it remains, as a diagnostic.
+
+A poll from any session other than the asker's must never start the window, in any of the three states (#732).
 
 **R6. Bystanders neither consume nor burn.** The watcher's consuming drain skips notices whose `for_session` names a session with a live lease; a lease is the daemon's own knowledge of the MCP session (`hestia_connect`, heartbeat), never an inbox touch. When the lease is dead the watcher takes the notice and the fired session is told, in the primer, that it is a relay: read `claimable` from the line, never poll, never re-issue on the asker's behalf, and say in one mesh reply where the asker can find the lane.
 
+**R7a. A grant is claimed last, after every other rule has agreed.** A claim spent on a call that another rule then refuses is an operator decision spent on nothing, and the asker's only compliant move (re-issue byte-identically) is what triggers it (#863, measured: the gate-self layer claimed, then the safety preset denied the same call). Either the claim is the last act before the effect, or it is a reservation that is released when the call does not proceed (#825's `reserved` -> `spent` -> `lapsed`).
+
 **R7. The asker acts; the hook does not.** Delivery tells the model what was decided and what it can do. The re-issue is the model's act, gated as any act; the claim happens on the re-issue as today. A hook that performed the write on approval would be a shim performing an act, and the reasoner would be out of the loop.
 
-**R8. Delivery is recorded.** The cursor advance from the asker's session is witnessed as `gate_escalation_delivered` with `escalation_id`, `session`, `port`, `delivered_at`. An approval that expires with no delivered event is a **delivery failure**, its own class in the lapse record, never folded into the asker's conduct.
+**R8. Receipt is an explicit, idempotent acknowledgement, and the obligation is append-only.** The seat acknowledges by escalation id, attributed to the asker's proven session; the daemon records `gate_escalation_delivered` (`escalation_id`, `session`, `port`, `delivered_at`) on the chain, and a repeat of the same ACK changes nothing. Consume-on-read is the wrong primitive and is not adopted: it is what made the mesh drain destructive, and #851 is the same defect one layer down. A local cursor is an optimisation for "what have I already rendered", never the record of what was received.
+
+An approval that expires with no delivery event, while the asker's session was live, is a **delivery failure**: its own class in the lapse record, never folded into the asker's conduct. Restart and replay must reconstruct both undelivered obligations and prior valid receipts, since neither may depend on a file in a seat's state directory.
 
 ## 4. Non-goals
 
@@ -75,7 +97,9 @@ An instrument, `tools/disposition_delivery_probe.py`, against the stub daemon an
 2. Fire one PreToolUse event in the asker's session: the hook's output carries the line's content on the engine's measured port, and `gate_escalation_delivered` is on the chain with that session.
 3. Drain as the watcher while the lease is live: the notice is not consumed and `observed_at` is unset. Kill the lease; drain again: consumed, and the primer says relay.
 4. Poll from a second session of the same `plugin_id`: `observed_at` stays unset.
-5. Grep the tree: no `retry_within_secs`, no `4200`, no relative window in any refusal text.
+5. Grep the tree: no `retry_within_secs`, no `4200`, no relative window in any refusal text, and no `claim_deadline` on any lane line until R5 step 2 lands.
+5a. **Bystander first**: a co-seat session fires before the asker on the same lane. It renders nothing, and the asker is still delivered afterwards. This sequence is a required regression arm for every seat reader (#851), and it is the arm a single-session test cannot replace.
+5b. **Restart**: kill and restart the daemon between ruling and receipt. The obligation is still there, and a prior receipt is still evidence.
 6. Live, one week, all four seats: approvals that expired unclaimed while the asker's lease was live equals zero; every lapse carries either `delivered_at` or the delivery-failure class.
 
 ## 6. Ownership
@@ -86,7 +110,8 @@ An instrument, `tools/disposition_delivery_probe.py`, against the stub daemon an
 | watcher skip-on-live-lease, relay primer | `plugins/member-mesh` | consume-once stays; the address decides who may consume |
 | per-seat delivery port | each seat's hook, class refusal-channel | renders, composes nothing; port pinned by the contract report |
 | retiring 4200 and `how_to_wait` | daemon refusal payload, seat hooks | the lane replaces both |
-| instrument | `tools/` | CI arms 1 through 5; arm 6 is the live acceptance |
+| per-seat registration of the reader | the OPERATOR, once per seat | R4a; a member cannot write its host's hook configuration, and no amount of member-side work substitutes |
+| instrument | `tools/` | CI arms 1 through 5b; arm 6 is the live acceptance |
 
 ## 7. Why this and not a longer window
 
