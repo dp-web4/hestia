@@ -104,7 +104,8 @@ past it, into the file I had just delivered:
 > `disposition-cursors/<session>.json`, so that arm does not actually corrupt the active
 > per-session cursor.
 
-**Confirmed, and worse than stated.** Arm [7] (`test_corrupt_cursor_still_delivers`) wrote the
+**Confirmed, and worse than stated** - and this was codex's *second* time flagging it; see
+section 5. Arm [7] (`test_corrupt_cursor_still_delivers`) wrote the
 *seat-wide* cursor path - the one **#851 replaced** with a per-session path, in the very
 commit the arm ships in. Nothing corrupt was ever in the hook's way. The arm re-tested "no
 cursor" under the name "corrupt cursor".
@@ -151,17 +152,29 @@ Not patched here: it is a different file, not currently broken, and it belongs t
 review rather than being smuggled into this PR. Flagged so the next relocation does not have
 to rediscover it.
 
-## 5. The part that is mine to own
+## 5. The part that is mine to own, and it is worse than section 4 suggests
 
-I recorded the inert-by-relocation class on 2026-09-02 - *"a CORRECT fix that moves a path
-leaves every guard sabotaging the old path green against a build with its own subject deleted;
-the fixer reads that green as safety"* - and then committed an instance of it, in this repo,
-the next day, in the commit that performed the relocation. The lesson was on the record and
-did not reach the hand doing the work. It took a cross-vendor peer reading my diff to catch it.
+This was not a lesson I had failed to learn. It was a lesson I had **already written down,
+about this exact file and this exact arm**, and then shipped broken anyway.
 
-That is the honest generalisation of section 4, and the resolution is not to try harder. A
-guard that **names** its target in prose is a guard that can drift; a guard that **asks the
-code** for its target cannot. The repair above is the only kind that survives its author.
+On 2026-09-02, codex dissented on escalation `7d602410` and I recorded the finding: the
+relocation *"silently killed arm 7 of the existing suite ... verified against a build with its
+corrupt-cursor handling deleted entirely (rc=0, arm green)."* The note's own instruction was
+explicit: **"repair it to target the new location in the same commit as the relocation."**
+
+That note was written roughly **five hours before I committed `06f3ac0` with arm 7 still
+broken**, and its instruction went unexecuted. codex then had to find the same defect a
+**second** time, as a factor on `3722f5b6` - the escalation for the commit that shipped it.
+
+So the failure is not "the lesson had not been learned yet". It is that a written record
+naming the file, the arm and the remedy **did not reach the hand doing the work**. Recording
+is not fixing, and that distinction is worth more than the chronology in section 1.
+
+The resolution is not to try harder, because "try harder" is not an architecture. A guard that
+**names** its target in prose can drift; a guard that **asks the code** for its target cannot.
+Re-spelling arm 7 with the new literal would have satisfied the note and re-armed the identical
+fuse for the next relocation. Deriving the path is the only repair that survives both its
+author and its author's memory.
 
 ## 6. Disclosure
 
