@@ -76,24 +76,77 @@ import sys
 # The LEVEL line, not the edge alarm. The edge fires once and is gone with the journal's
 # retention window; a process older than that window has no edge left to read, which is
 # how a 20-day drift stayed invisible while being correctly detected the whole time.
-ARTIFACT_RE = re.compile(
-    r"ARTIFACT\s+plugin=(?P<plugin>\S+)\s+state=(?P<state>\S+)\s+"
-    r"reason=(?P<reason>\S+)\s+startup_sha256=(?P<startup>\S+)\s+"
-    r"disk_sha256=(?P<disk>\S+)")
+#
+# WHY THIS IS AN ANCHOR PLUS A KEY SCAN, NOT ONE ORDERED REGEX. The first version of
+# this file (#634) matched `startup_sha256=(\S+)\s+disk_sha256=(\S+)` — the two fields
+# ADJACENT, in that order. The NEXT merged PR to the watcher (#636, same day) inserted
+# `startup_origin=` between them. From that merge until 2026-09-03 this tool reported
+# `vintage NOT MEASURED` for EVERY watcher on the box while the measurement sat in the
+# journal, and it said so in the reassuring spelling: "wait for the next level line."
+# The line had already arrived. It was never going to parse.
+#
+# Nothing caught it because the test's fixture was a real journal line captured on
+# 2026-08-26 — real, and from before the field existed. A fixture pinned to a capture
+# date cannot see a producer that moved after it. So: order-independent key scan for
+# the fields we need, unknown fields tolerated BY CONSTRUCTION, and a drift guard
+# (`test_the_watcher_still_emits_every_field_this_tool_reads`) that reads the producer
+# instead of a copy of its past output.
+#
+# The anchor stays STRICT — `[hestia-watch] ARTIFACT plugin=` verbatim — for two
+# reasons. It is what every one of the 18 committed watcher versions that emit a level
+# line actually prints (the other 10 predate the line; no unprefixed spelling has ever
+# existed, checked across history). And it excludes the shapes that must NOT be read as
+# a level measurement: the `ARTIFACT DRIFT`/`ARTIFACT UNVERIFIABLE` edge alarms, the
+# `ARTIFACT DEPLOY plugin=` line #636 added, and journal lines that merely QUOTE a
+# notice pointer containing the word.
+ARTIFACT_ANCHOR = re.compile(r"\[hestia-watch\]\s+ARTIFACT\s+plugin=")
+
+# `key=value` up to the next whitespace. Values are never quoted or spaced on this line
+# (the watcher builds it from unquoted shell expansions), so `\S+` is exact, not lossy.
+_KV_RE = re.compile(r"(?P<k>[A-Za-z0-9_]+)=(?P<v>\S+)")
+
+# field on the wire -> key this tool exposes. Adding a name here is how you consume a
+# new watcher field; it becomes REQUIRED, and the drift guard then pins it.
+ARTIFACT_FIELDS = {
+    "plugin": "plugin",
+    "state": "state",
+    "reason": "reason",
+    "startup_sha256": "startup",
+    "disk_sha256": "disk",
+}
 
 WATCHER_UNITS = ("hestia-watch-claude", "hestia-watch-codex", "hestia-watch-kimi")
 WATCH_PATH = "plugins/member-mesh/hestia-watch-member.sh"
 
 
 def parse_artifact(line):
-    """Pull the startup/disk pair out of one ARTIFACT level line. None if not one.
+    """Pull the startup/disk pair out of one ARTIFACT level line.
 
-    Returns the raw strings; validation is `classify`'s job, because "this field is not
-    a sha" is a state the watcher reports deliberately (`unverifiable`) and collapsing
-    it into a parse failure would hide it.
+    Three outcomes, and the caller MUST tell the last two apart:
+
+      * `None`               — not a level line at all. Nothing was claimed.
+      * dict, `missing` []   — a measurement. `startup`/`disk` are raw strings;
+                               validating them is `classify`'s job, because "this field
+                               is not a sha" is a state the watcher reports deliberately
+                               (`unverifiable`) and collapsing it into a parse failure
+                               would hide it.
+      * dict, `missing` [..] — THIS TOOL IS STALE. The producer emitted a level line
+                               and it does not carry a field this reader requires. That
+                               is a fact about the reader, and returning `None` for it
+                               (what #634 did) is what let the producer move for a day
+                               while the tool reported "not measured yet". Anything that
+                               reads this must say so out loud rather than fall through
+                               to the wait-for-the-next-line branch.
     """
-    m = ARTIFACT_RE.search(line or "")
-    return m.groupdict() if m else None
+    line = line or ""
+    m = ARTIFACT_ANCHOR.search(line)
+    if not m:
+        return None
+    kv = {mm.group("k"): mm.group("v")
+          for mm in _KV_RE.finditer(line[m.start():])}
+    out = {ours: kv.get(wire) for wire, ours in ARTIFACT_FIELDS.items()}
+    out["missing"] = sorted(w for w in ARTIFACT_FIELDS if w not in kv)
+    return out
 
 
 def classify(startup, disk):
@@ -238,10 +291,20 @@ def cmd_units(repo):
             continue
         log, bound = invocation_log(unit, st.get("InvocationID"))
         art = None
+        art_line = ""
         for line in log.splitlines():
             parsed = parse_artifact(line)
             if parsed:
-                art = parsed       # keep the LAST — the level line, hourly
+                art, art_line = parsed, line   # keep the LAST — the level line, hourly
+        if art and art["missing"]:
+            # Do NOT fall through to "wait for the next level line". The line is here.
+            print(f"{unit}: level line PRESENT but UNREADABLE by this tool — vintage "
+                  f"NOT MEASURED, and the defect is in the READER. Missing field(s): "
+                  f"{', '.join(art['missing'])}. The watcher emitted a level line this "
+                  f"file does not know how to read, so add the field to "
+                  f"ARTIFACT_FIELDS. This is NOT 'the restart has not reported yet'.")
+            print(f"    line: {art_line.strip()[:200]}\n")
+            continue
         if not art:
             if bound:
                 print(f"{unit}: active as pid {st.get('MainPID') or '?'} but THIS "
