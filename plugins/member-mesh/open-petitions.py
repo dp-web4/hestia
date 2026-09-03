@@ -118,11 +118,23 @@ def short(sec):
 # the fold is in this file; a member on any watcher vintage can answer the
 # question for itself. Measured on CBP 2026-08-26 from a wake whose primer
 # carried no key at all: count 0, `{"asked": true, "mine": []}`.
+#
+# Name the CLI route too, and name its `--json` flag. A mesh wake frequently has
+# no `hestia_*` MCP surface at all (findings/review-7125-7138.md, review-7185.md),
+# so the member reaches for `hestia gate pending` — whose DEFAULT output is a
+# human-readable table. Piping that to the fold yields `{"asked": false}`, which
+# is this file's signal for THE READ FAILED. So a member that follows this advice
+# on the CLI without `--json` is handed a false "could not measure" that is
+# indistinguishable from the real thing, having just measured successfully.
+# Walked into on CBP 2026-09-03 by the member reading this very block.
 SELF_SERVE = ("You can answer it yourself without a restart: call "
               "`hestia_gate_pending_escalations` (session_id from `hestia_connect`) "
               "and pipe the response through `open-petitions.py fold <your plugin_id>` "
               "— `asked:true` with an empty `mine` is a MEASURED zero, which this "
-              "line is not.")
+              "line is not. With no MCP surface, the CLI route is "
+              "`hestia gate pending --as <your plugin_id> --json` — and the "
+              "`--json` is load-bearing: without it you pipe a TABLE and get "
+              "`asked:false`, a read failure that never happened.")
 
 
 def render(f):

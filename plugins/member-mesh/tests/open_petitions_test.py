@@ -245,6 +245,25 @@ with tempfile.TemporaryDirectory() as tmp:
               "without a restart" in block, repr(block))
         check(f"B1d {label} says what a MEASURED zero looks like",
               "asked:true" in block and "mine" in block, repr(block))
+        # B1e: a mesh wake often has no `hestia_*` MCP surface at all, so the
+        # member reaches for the CLI. `hestia gate pending` DEFAULTS to a
+        # human-readable table; piping that to the fold returns `asked:false`,
+        # which this file publishes as THE READ FAILED. The member is handed a
+        # false "could not measure" immediately after measuring successfully —
+        # the same shape as prescribing an absent tool, one route over.
+        check(f"B1e {label} names the CLI route for a wake with no MCP surface",
+              "hestia gate pending" in block, repr(block))
+        check(f"B1e {label} says --json is load-bearing, not optional",
+              "--json" in block and "TABLE" in block, repr(block))
+
+    # B1e-referent: same discipline as B1c — do not let the advice name a flag
+    # that does not exist. Pinned against the flag's DEFINITION rather than the
+    # built binary, so this is checkable in a tree that has not been compiled.
+    cli_rs = os.path.join(os.path.dirname(os.path.dirname(MESH)), "core", "src", "cli.rs")
+    if os.path.exists(cli_rs):
+        cli_src = open(cli_rs, encoding="utf-8", errors="replace").read()
+        check("B1e the --json flag the block prescribes is actually defined",
+              "piped to a fold" in cli_src, cli_rs)
 
     # B2: measured-and-empty is silence. A block that fires every wake stops
     # being read, and holding nothing is the common case.
