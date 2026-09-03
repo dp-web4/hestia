@@ -1379,30 +1379,19 @@ impl ServerState {
                             // mechanism works, four writes landed on approvals last night — but
                             // an operator cannot tell a working control from a broken one when
                             // the surface withholds the discriminator.
-                            "operator_alone_suffices": match e.bar {
-                                crate::server::gate_escalation::Bar::SingleApprover => true,
-                                crate::server::gate_escalation::Bar::SovereignPlusPeer => e
-                                    .factors
-                                    .iter()
-                                    .any(|f| {
-                                        f.channel
-                                            == crate::server::gate_escalation::Channel::PeerMember
-                                    }),
-                            },
+                            //
+                            // DERIVED, NOT RESTATED. This arm used to carry its own copy of
+                            // the bar logic ("is there a PeerMember factor?"). It was right
+                            // on 2026-08-04 and wrong from 2026-08-06, when `9d3936d` made
+                            // the peer conjunct evidence rather than a gate and changed
+                            // `bar_met` without changing the sentence describing it. The
+                            // panel built to stop an operator being misled about their own
+                            // approval then misled them, in warning colour, for 25 days.
+                            // Both fields now come from the predicate itself.
+                            "operator_alone_suffices": e.operator_alone_suffices(),
                             // Stated positively so the UI never has to infer the remedy from a
                             // false boolean: what is still missing, in the operator's terms.
-                            "still_needs": match e.bar {
-                                crate::server::gate_escalation::Bar::SovereignPlusPeer
-                                    if !e.factors.iter().any(|f| {
-                                        f.channel
-                                            == crate::server::gate_escalation::Channel::PeerMember
-                                    }) =>
-                                {
-                                    Some("an independent NOT-SAME peer factor \
-                                          (hestia_gate_escalation_corroborate)")
-                                }
-                                _ => None,
-                            },
+                            "still_needs": e.still_needs(),
                         })
                     })
                     .collect()
