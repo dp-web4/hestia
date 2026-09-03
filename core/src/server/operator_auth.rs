@@ -359,6 +359,53 @@ pub fn attach_operator_provenance(
     record
 }
 
+/// The authorization the middleware already proved, carried across the one function
+/// boundary that separates the gate from the act.
+///
+/// Why this exists (chain forensics, 2026-08-16, forum 2662/2664/2666). `policy_edit` —
+/// law amendment, the highest-consequence act class here — was one of exactly two of 39
+/// chain families naming no author at all, because the middleware resolves the operator,
+/// writes it into its OWN `operator_gate` row, and then drops it before the handler runs.
+/// The author was proven and then discarded one stack frame from the act.
+///
+/// Two things travel, and the second is the load-bearing one:
+///
+///   * `provenance` — WHO. Formatted by [`attach_operator_provenance`], the same shape the
+///     gate row already carries. Nothing new is proved; a proof already in hand is kept.
+///   * `gate_entry_hash` — WHICH authorization. Without it, an act row and its authorizing
+///     gate row are joinable only by POSITION (they land adjacent), and a positional join
+///     is not a reference: nothing in either row commits to the pair, so the join's width
+///     is chosen by the reader and concurrent traffic silently breaks it. Measured on this
+///     seat over the eight most recent `policy_edit` rows: at strict position−1 the gate
+///     row is the neighbour for 5 of 8; the other three are separated by an interleaved
+///     `outcome`, a `gate_escalation_opened`, and another `policy_edit`. Widen the window
+///     to ±3 and all 8 "recover" — the rate is a property of the analyst's parameter, not
+///     of the record. Writing the hash IN the act row replaces that curve with a pointer,
+///     and because `compute_hash` covers `event_data` whole, the pointer is hash-committed.
+///
+/// This is the asserted-beside-proven pattern (`gate_escalation_refused`) with the asserted
+/// half absent by construction: on this path the daemon writes what it itself proved.
+#[derive(Clone, Debug, Default)]
+pub struct GateWitness {
+    pub provenance: Option<OperatorProvenance>,
+    pub gate_entry_hash: Option<String>,
+}
+
+impl GateWitness {
+    /// Stamp an act record with the authorization that admitted it. Absent provenance and
+    /// absent hash each leave the record untouched rather than writing a null: a reader
+    /// must be able to tell "no operator session" from "operator unrecorded", and an empty
+    /// string in an author field is the failure that reads as an answer.
+    pub fn stamp(&self, record: serde_json::Value) -> serde_json::Value {
+        let mut record = attach_operator_provenance(record, self.provenance.as_ref());
+        if let (Some(object), Some(hash)) = (record.as_object_mut(), self.gate_entry_hash.as_ref())
+        {
+            object.insert("authorized_by_gate".into(), json!(hash));
+        }
+        record
+    }
+}
+
 /// Request-level gate (clause O, at the middleware). Given the operator resolved
 /// from the request's session (if any) and the act's stakes, decide. Reuses the
 /// gradient [`authorize`]: a session is exactly ONE signer, so reversible acts

@@ -278,6 +278,24 @@ def test_dry_run_reports_the_engine_but_writes_nothing():
               "dry run wrote the authority file")
 
 
+def test_no_registered_member_is_state_neutral():
+    """A no-member run must not change executable bytes without deployment truth.
+
+    Moving engine activation before member discovery made this path install and activate
+    the shared engine, then report "no member installed" and withhold the authority record.
+    A real registered target must be the trigger for activation.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root, home, hestia_home, env = build(tmp)
+        os.remove(os.path.join(home, ".harness", "settings.json"))
+        rc, out = run(root, env)
+        check(rc == 0, f"no-member install exited {rc}: {out}")
+        check("no member installed" in out,
+              "no-member run did not state that no deployment occurred")
+        check(not os.path.exists(hestia_home),
+              "no-member run mutated Hestia state despite withholding authority")
+
+
 def test_manifest_declares_exactly_what_the_runtime_imports():
     """The drift guard for option B, in both directions: every manifest entry
     must exist and be a runtime module (never a test), and every _shared module
@@ -317,6 +335,27 @@ def test_manifest_declares_exactly_what_the_runtime_imports():
           f"{sorted(undeclared)}")
 
 
+def test_shared_engine_activation_precedes_member_entrypoints():
+    """The cutover's ordering is a safety property, not explanatory prose.
+
+    A newly installed hook may require a module that the previous shared build did not
+    contain. The installer must therefore finish the verified engine activation before it
+    enters the member loop that writes hook entrypoints. This source-order assertion is
+    intentionally narrow: it guards the two transaction boundaries without duplicating the
+    shell implementation in the test.
+    """
+    with open(SCRIPT, encoding="utf-8") as fh:
+        source = fh.read()
+    member_loop = source.find('for expects in "$REPO_ROOT"/plugins/*/expects.json; do')
+    check(member_loop >= 0, "member entrypoint loop was not found")
+    activation_call = source.find("    activate_shared_engine\n", member_loop)
+    hook_install = source.find('      install -m 0755 "$src" "$target"', member_loop)
+    check(activation_call >= 0, "shared-engine activation call was not found in member loop")
+    check(hook_install >= 0, "member hook install was not found")
+    check(member_loop < activation_call < hook_install,
+          "member hook entrypoints can be installed before the shared engine is active")
+
+
 def teardown_module(_module=None):
     """Deliver the accumulator to pytest as well as to the bare runner — see
     installer_derives_target_test.py, where a green-under-pytest that meant
@@ -330,7 +369,9 @@ if __name__ == "__main__":
     test_removed_source_file_leaves_the_active_set()
     test_rerun_is_idempotent_except_timestamps()
     test_dry_run_reports_the_engine_but_writes_nothing()
+    test_no_registered_member_is_state_neutral()
     test_manifest_declares_exactly_what_the_runtime_imports()
+    test_shared_engine_activation_precedes_member_entrypoints()
     for f in FAILS:
         print("FAIL", f)
     print(f"{'FAILED' if FAILS else 'ok'}: {len(FAILS)} failure(s)")

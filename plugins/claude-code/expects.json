@@ -15,7 +15,37 @@
       "hooks/pre_tool_use.py",
       "hooks/witness.py",
       "hooks/law_inject.py"
-    ]
+    ],
+    "gate_probe": {
+      "entry": "hooks/pre_tool_use.py",
+      "environment": {
+        "CLAUDECODE": "1"
+      },
+      "events": [
+        {
+          "label": "read recovery scratch",
+          "event": {
+            "hook_event_name": "PreToolUse",
+            "session_id": "hestia-deploy-preflight",
+            "tool_name": "Read",
+            "tool_input": {
+              "file_path": "{scratch}"
+            }
+          }
+        },
+        {
+          "label": "evaluate deploy hold",
+          "event": {
+            "hook_event_name": "PreToolUse",
+            "session_id": "hestia-deploy-preflight",
+            "tool_name": "Bash",
+            "tool_input": {
+              "command": "touch {hold}"
+            }
+          }
+        }
+      ]
+    }
   },
   "observe": [
     "PostToolUse"

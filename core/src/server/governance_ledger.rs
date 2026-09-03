@@ -64,6 +64,11 @@ pub const GOVERNANCE_EVENTS: &[&str] = &[
     "gate_escalation_decided",
     "gate_escalation_claimed",
     "gate_escalation_corroborated",
+    // A second ask for an act whose first ask was still pending, handed back the first id
+    // instead of a fresh one (#668). Annotates the open row: the operator ledger should show
+    // that an ask was re-asked — that is the load the coalescing removed — without a second
+    // row that would re-create, in the ledger, the inflation the event exists to end.
+    "gate_escalation_coalesced",
     "gate_escalation_refused",
     "gate_escalation_arbiter_refused",
     // The two TERMINAL states that are not decisions. Both were produced by `handler.rs` and
@@ -120,6 +125,10 @@ pub const GOVERNANCE_EVENTS: &[&str] = &[
     "vault_set",
     "vault_get",
 ];
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
 
 pub fn is_governance_event(event_type: &str) -> bool {
     GOVERNANCE_EVENTS.contains(&event_type)
@@ -227,6 +236,10 @@ pub struct LedgerRow {
     /// different fact from one that was used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claimed_at: Option<String>,
+    /// How many further asks for this same act arrived while it was still pending and were
+    /// folded into this row rather than minted (#668). Zero is omitted: it is the normal case.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub coalesced: u32,
     /// The chain entry this row opened at, and the one that decided it. Both, so an operator can
     /// go from the ledger to the witnessed evidence without a search.
     pub opened_hash: String,
@@ -338,6 +351,7 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                     secs_remaining: None,
                     corroborations: Vec::new(),
                     claimed_at: None,
+                    coalesced: 0,
                     opened_hash: e.hash.clone(),
                     decided_hash: None,
                     chain_position: e.chain_position,
@@ -369,6 +383,7 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                     secs_remaining: None,
                     corroborations: Vec::new(),
                     claimed_at: None,
+                    coalesced: 0,
                     opened_hash: e.hash.clone(),
                     decided_hash: None,
                     chain_position: e.chain_position,
@@ -429,6 +444,7 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                         secs_remaining: None,
                         corroborations: Vec::new(),
                         claimed_at: None,
+                    coalesced: 0,
                         opened_hash: e.hash.clone(),
                         decided_hash: Some(e.hash.clone()),
                         chain_position: e.chain_position,
@@ -442,6 +458,13 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                 if let Some(id) = s(d, "escalation_id") {
                     if let Some(row) = keyed.get_mut(&id) {
                         row.claimed_at = Some(ts);
+                    }
+                }
+            }
+            "gate_escalation_coalesced" => {
+                if let Some(id) = s(d, "escalation_id") {
+                    if let Some(row) = keyed.get_mut(&id) {
+                        row.coalesced += 1;
                     }
                 }
             }
@@ -640,6 +663,7 @@ fn one_shot(
         secs_remaining: None,
         corroborations: Vec::new(),
         claimed_at: None,
+                    coalesced: 0,
         opened_hash: e.hash.clone(),
         decided_hash: None,
         chain_position: e.chain_position,
@@ -753,6 +777,21 @@ mod tests {
         assert_eq!(rows[0].decided_via.as_deref(), Some("operator_session"));
         assert_eq!(rows[0].opened_hash, "hash1");
         assert_eq!(rows[0].decided_hash.as_deref(), Some("hash2"));
+    }
+
+    /// #668: a second ask for a still-pending act is folded into the first. The ledger counts
+    /// the fold ON the open row and adds no row — a second row here would re-create, for the
+    /// operator, exactly the inflation the fold removed.
+    #[test]
+    fn a_coalesced_ask_counts_on_its_open_row_and_adds_no_row() {
+        let fold = |pos: u64, secs: u64| {
+            entry(pos, secs, "gate_escalation_coalesced",
+                  serde_json::json!({ "escalation_id": "abc", "plugin_id": "p", "opened_via": "claim" }))
+        };
+        let rows = project(&[opened(1, "abc", 0), fold(2, 9), fold(3, 40)], T0 + 60);
+        assert_eq!(rows.len(), 1, "one act, one row: {rows:?}");
+        assert_eq!(rows[0].coalesced, 2);
+        assert_eq!(rows[0].status, LedgerStatus::Open, "a fold decides nothing");
     }
 
     /// A decision cannot expire out from under itself: once ruled, the clock is irrelevant.
@@ -1005,7 +1044,8 @@ mod tests {
 
     /// Events that annotate an existing row rather than creating one. They are governance events —
     /// the ledger must read them — but a claim with no ask in the window is not itself a row.
-    const ANNOTATION_ONLY: &[&str] = &["gate_escalation_claimed", "gate_escalation_corroborated"];
+    const ANNOTATION_ONLY: &[&str] =
+        &["gate_escalation_claimed", "gate_escalation_corroborated", "gate_escalation_coalesced"];
 
     #[test]
     fn every_declared_governance_event_is_actually_projected() {

@@ -35,6 +35,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MESH = os.path.dirname(HERE)
 HELPER = os.path.join(MESH, "open-petitions.py")
 
+# Every other arm drives the helper as a SUBPROCESS, which is right: that is how
+# the watcher runs it. But one property — "the tool is prescribed only when it
+# resolves" — has two arms and the box can only ever be in one of them, so the
+# absent/present arm has to be injected. Loading by path because the filename
+# carries a hyphen and is not importable by name.
+import importlib.util
+_spec = importlib.util.spec_from_file_location("open_petitions_helper", HELPER)
+op = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(op)
+
 failures = []
 
 
@@ -194,8 +204,77 @@ with tempfile.TemporaryDirectory() as tmp:
     check("B1c key-absent names BOTH admissible producers",
           "without the fold" in out_absent and "composition fallback" in out_absent,
           repr(out_absent))
-    check("B1c key-absent points at the tool that DOES discriminate them",
-          "process_vintage.py units" in out_absent, repr(out_absent))
+    # B1c-referent: the old form of this check was
+    #     check("... points at the tool that DOES discriminate them",
+    #           "process_vintage.py units" in out_absent)
+    # and it was green for a week on a box where that tool does not exist and
+    # never has. `tools/process_vintage.py` is PR #634 — opened 2026-08-26,
+    # still open — while the sentence naming it merged the same day (#642). An
+    # existence pin over a CONSTANT certifies that the renderer can print a
+    # string; it says nothing about whether the reader can run what it names.
+    # So pin the RESOLUTION, and drive both arms explicitly: the local box can
+    # only ever witness one of them, and a test that sees one arm pins the box
+    # rather than the behaviour.
+    check("B1c prescribes the tool ONLY when the tool resolves",
+          "`%s units` is what tells them apart." % op.VINTAGE_TOOL
+          in op.vintage_hint(present=True), repr(op.vintage_hint(present=True)))
+    check("B1c says so, and does not prescribe, when the tool is ABSENT",
+          "is not on this box" in op.vintage_hint(present=False)
+          and "units` is what tells them apart" not in op.vintage_hint(present=False),
+          repr(op.vintage_hint(present=False)))
+    check("B1c the rendered arm agrees with what is actually on THIS box",
+          (("%s units" % op.VINTAGE_TOOL) in out_absent)
+          == os.path.exists(os.path.join(op._REPO_ROOT, op.VINTAGE_TOOL)),
+          repr(out_absent))
+
+    # B1c2: having removed a prescription the reader cannot run, do not leave the
+    # reader with nothing. The block names two producers; the primer's own KEY SET
+    # settles one of them for free, and the renderer was throwing that evidence
+    # away — `render` is handed the FOLD, and the fold is the thing that is
+    # missing, so the envelope has to be passed down deliberately.
+    #
+    # The two questions are NOT the same and the block ran them together: the key
+    # set dates the PRODUCER OF THIS ARTIFACT; `process_vintage.py` dates the
+    # WATCHER RUNNING NOW. Codex's #634 counterexamples live exactly in that gap.
+    composed = os.path.join(tmp, "primer-composed-old.json")
+    with open(composed, "w") as fh:
+        # The composer RAN — only it writes `unanswered`/`for_plugin` — and still
+        # emitted no `open_petitions`. Nothing else can produce this shape.
+        json.dump({"evicted": 0, "notices": [], "peeked": False, "total": 1,
+                   "for_plugin": "claude-code",
+                   "unanswered": {"i_owe": [], "owed_to_me": []}}, fh)
+    out_composed = subprocess.run([sys.executable, HELPER, "render", composed],
+                                  capture_output=True, text=True).stdout
+    check("B1c2 a composed primer with no petitions fold DATES ITS PRODUCER",
+          "composition SUCCEEDED" in out_composed
+          and "predates the petitions fold" in out_composed, repr(out_composed))
+
+    drain = os.path.join(tmp, "primer-raw-drain.json")
+    with open(drain, "w") as fh:
+        json.dump({"evicted": 0, "notices": [], "peeked": False, "total": 1}, fh)
+    out_drain = subprocess.run([sys.executable, HELPER, "render", drain],
+                               capture_output=True, text=True).stdout
+    check("B1c2 the raw-drain shape is reported as raw drain",
+          "raw drain response" in out_drain, repr(out_drain))
+    # The honest half. Two producers write byte-identical raw drains — a current
+    # watcher's composition fallback, and a watcher that never folded — and a
+    # restart fixes only the second. Claiming either one here would be the same
+    # overclaim-from-absence B1c exists to stop.
+    check("B1c2 the raw-drain arm does NOT pick between its two producers",
+          "does not separate those two" in out_drain
+          and "composition SUCCEEDED" not in out_drain, repr(out_drain))
+    check("B1c2 the two shapes get DIFFERENT verdicts",
+          ("raw drain response" in out_drain)
+          and ("raw drain response" not in out_composed), repr(out_composed))
+    # An unreadable shape must produce no verdict at all. `{"notices": []}` (the
+    # B1b fixture) is neither a full drain nor a composed primer.
+    check("B1c2 an unrecognised shape yields NO producer claim",
+          op.producer_from_keys(["notices"]) is None
+          and op.producer_from_keys([]) is None
+          and op.producer_from_keys(None) is None,
+          repr(op.producer_from_keys(["notices"])))
+    check("B1c2 the older 3-key drain (no `evicted`) is still a drain",
+          op.producer_from_keys(["notices", "peeked", "total"]) is not None)
 
     # B1d: a diagnosis is not a remedy. Both not-measured arms named the CAUSE
     # and stopped, and the only action either ever named was a watcher restart —
@@ -215,6 +294,25 @@ with tempfile.TemporaryDirectory() as tmp:
               "without a restart" in block, repr(block))
         check(f"B1d {label} says what a MEASURED zero looks like",
               "asked:true" in block and "mine" in block, repr(block))
+        # B1e: a mesh wake often has no `hestia_*` MCP surface at all, so the
+        # member reaches for the CLI. `hestia gate pending` DEFAULTS to a
+        # human-readable table; piping that to the fold returns `asked:false`,
+        # which this file publishes as THE READ FAILED. The member is handed a
+        # false "could not measure" immediately after measuring successfully —
+        # the same shape as prescribing an absent tool, one route over.
+        check(f"B1e {label} names the CLI route for a wake with no MCP surface",
+              "hestia gate pending" in block, repr(block))
+        check(f"B1e {label} says --json is load-bearing, not optional",
+              "--json" in block and "TABLE" in block, repr(block))
+
+    # B1e-referent: same discipline as B1c — do not let the advice name a flag
+    # that does not exist. Pinned against the flag's DEFINITION rather than the
+    # built binary, so this is checkable in a tree that has not been compiled.
+    cli_rs = os.path.join(os.path.dirname(os.path.dirname(MESH)), "core", "src", "cli.rs")
+    if os.path.exists(cli_rs):
+        cli_src = open(cli_rs, encoding="utf-8", errors="replace").read()
+        check("B1e the --json flag the block prescribes is actually defined",
+              "piped to a fold" in cli_src, cli_rs)
 
     # B2: measured-and-empty is silence. A block that fires every wake stops
     # being read, and holding nothing is the common case.

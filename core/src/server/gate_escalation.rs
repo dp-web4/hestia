@@ -552,15 +552,30 @@ impl Escalation {
             && now < self.decided_horizon()
     }
 
-    /// Does the evidence present meet the stated bar? Evaluated against the factor SET, so a
-    /// cross-vendor peer plus a sovereign decision is a different recorded quantity than
-    /// either alone — which is the whole point of having a bar at all.
-    pub fn bar_met(&self) -> bool {
-        match self.bar {
-            Bar::SingleApprover => self
-                .factors
-                .iter()
-                .any(|f| f.channel.is_sovereign() || f.channel == Channel::PeerMember),
+    /// THE ONE PLACE A BAR IS EVALUATED. `bar_met` asks it about the factors PRESENT;
+    /// `operator_alone_suffices` asks the same predicate about the factors that WOULD be
+    /// present after a lone sovereign decision. Two questions, one implementation.
+    ///
+    /// It is a function rather than two `match` arms because the second question already had
+    /// an answer written down somewhere else, and that answer went stale. `dashboard.rs`
+    /// restated the SovereignPlusPeer arm as "is there a PeerMember factor?" — correct when
+    /// it was written 2026-08-04, and inverted by `9d3936d` two days later when the peer
+    /// conjunct was dropped from `bar_met`. That commit changed this file and `handler.rs`,
+    /// listed "the dashboard" as still-open work, and shipped. Nobody looked for sentences
+    /// that had just become FALSE, because a still-open list is forward-looking and an
+    /// inverted invariant is backward-looking. The operator was told
+    /// "YOUR APPROVAL ALONE WILL NOT PERMIT THIS" — in warning colour, on the one line the
+    /// UI comment says must not be skimmed — for 25 days, about writes their approval alone
+    /// did in fact permit. Deriving the promise from the predicate is what makes the next
+    /// relaxation of a bar unable to do this again.
+    fn bar_met_over(bar: Bar, channels: impl Iterator<Item = Channel>) -> bool {
+        let (mut sovereign, mut peer) = (false, false);
+        for c in channels {
+            sovereign |= c.is_sovereign();
+            peer |= c == Channel::PeerMember;
+        }
+        match bar {
+            Bar::SingleApprover => sovereign || peer,
             // TWO-BAR IS AN INVITATION TO PARTICIPATE, NOT A BLOCKER.
             //
             // dp, decision of record 2026-08-06: *"On sovereign decisions, two-bar is an
@@ -588,8 +603,45 @@ impl Escalation {
             // `OnExceeded`, D-3's `NotSameRequirement::Preferred`, and `ReadBasis`:
             // proceed with the best available, never silently, always with the deficiency
             // on the record.
-            Bar::SovereignPlusPeer => self.factors.iter().any(|f| f.channel.is_sovereign()),
+            //
+            // `peer` is deliberately still computed above and unused HERE: it is what the
+            // SingleApprover arm reads, and leaving the binding in place means restoring
+            // this conjunct is a one-word edit in the one place that decides.
+            Bar::SovereignPlusPeer => sovereign,
         }
+    }
+
+    /// Will an operator's approval, ON ITS OWN, carry this escalation over its bar?
+    ///
+    /// Asked BEFORE the decision, by the surface holding the button. Derived by running the
+    /// real predicate over the factor set this escalation would have once the decider's own
+    /// factor is appended (`decide` always appends one — see there), so the answer cannot
+    /// drift from what actually happens when the operator clicks.
+    pub fn operator_alone_suffices(&self) -> bool {
+        Self::bar_met_over(
+            self.bar,
+            self.factors
+                .iter()
+                .map(|f| f.channel)
+                .chain(std::iter::once(Channel::OperatorSession)),
+        )
+    }
+
+    /// Stated positively so a UI never has to infer a remedy from a false boolean: what is
+    /// still missing, in the operator's terms, or `None` when nothing is.
+    pub fn still_needs(&self) -> Option<&'static str> {
+        if self.operator_alone_suffices() {
+            None
+        } else {
+            Some("an independent NOT-SAME peer factor (hestia_gate_escalation_corroborate)")
+        }
+    }
+
+    /// Does the evidence present meet the stated bar? Evaluated against the factor SET, so a
+    /// cross-vendor peer plus a sovereign decision is a different recorded quantity than
+    /// either alone — which is the whole point of having a bar at all.
+    pub fn bar_met(&self) -> bool {
+        Self::bar_met_over(self.bar, self.factors.iter().map(|f| f.channel))
     }
 
     /// What the invited peers actually did — the half of the bar that survives.
@@ -653,6 +705,27 @@ impl Escalation {
         // Three exclusions, not two. A seat whose reading FAILED is not silent-after-seeing:
         // nobody knows whether it saw. Counting it in `absent` is the defect this closes —
         // an unreadable store became affirmative conduct evidence about a peer.
+        //
+        // ALL THREE ARE KEYED ON THE MAILBOX, AND THE MAILBOX IS THE WATCHER (CBP 2026-08-31,
+        // measured). `member_inbox_touch` is written by `touch_inbox` from `drain_member` on
+        // whoever DRAINS the box; the mesh watcher drains into a primer before firing the
+        // member's CLI, so a seat whose agent never runs keeps a touch seconds old and reads
+        // `live`. It is therefore in neither `invited_without_reader` (it has a row, and a
+        // fresh one, so the TTL window does not catch it) nor `invited_reader_unknown` (the
+        // read succeeded), and it falls straight through into `absent` — published as a peer
+        // that saw the ask and declined, which is the ONE distinction this function exists to
+        // make. On the live mesh that day both real peers were in exactly this state: `codex`
+        // (78 s touch, 29,783 reads, newest act 3.4 h old) and `kimi-code` (42 s touch, 21,870
+        // reads, no act in 15.7 h), both out of credits, 148 notices queued against them,
+        // while this seat was live with an act 36 s old.
+        //
+        // The signal that answers the conduct question is `actor_liveness` — the member's own
+        // chain acts, which no watcher can write — and `resolve_invitation` already ranks the
+        // invitation pool by it. Deliberately NOT changed here: whether `absent` should key on
+        // acts rather than the mailbox decides what conduct evidence the daemon publishes
+        // about a peer, which is dp's call. Until it is made, read `absent` as "did not
+        // answer", never as "declined". Driver:
+        // `tools/liveness_is_the_watcher_not_the_member.py`.
         let reader_unknown = self
             .invited_peers
             .iter()
@@ -917,6 +990,36 @@ impl std::fmt::Display for OpenError {
             OpenError::MissingField(name) => {
                 write!(f, "'{name}' is required — an unattributable escalation is not actionable")
             }
+        }
+    }
+}
+
+/// What `open_or_coalesce` handed back: a row it MINTED, or the row it found already asking
+/// for this exact act and handed back instead (#668).
+///
+/// Two variants rather than a flag so a door cannot forget to check — a coalesced open must
+/// NOT be witnessed as `gate_escalation_opened` (the record would show two asks for one
+/// act, which is the inflation this exists to end) and must NOT re-invite (the peers were
+/// woken by the first open; a second wake for the same ask is the bounce storm the mesh
+/// already measures).
+#[derive(Debug, Clone)]
+pub enum Opened {
+    Minted(Escalation),
+    Coalesced(Escalation),
+}
+
+impl Opened {
+    pub fn escalation(&self) -> &Escalation {
+        match self {
+            Opened::Minted(e) | Opened::Coalesced(e) => e,
+        }
+    }
+    pub fn coalesced(&self) -> bool {
+        matches!(self, Opened::Coalesced(_))
+    }
+    pub fn into_escalation(self) -> Escalation {
+        match self {
+            Opened::Minted(e) | Opened::Coalesced(e) => e,
         }
     }
 }
@@ -1308,8 +1411,22 @@ impl EscalationStore {
         // Housekeeping first. Without it terminal entries accumulate without bound — a member
         // may sustain MAX_PENDING opens per window, and both the live count below and
         // `pending()` are O(n) scans, so every escalation would get slower with history.
-        // kimi-code, PR #114 review: `reap` was called only from its own test. Safe to call
-        // here because `reaping_can_never_change_an_answer` proves it cannot flip a verdict.
+        // kimi-code, PR #114 review: `reap` was called only from its own test.
+        //
+        // THE JUSTIFICATION THAT USED TO SIT HERE WAS FALSE. It read: "safe to call here
+        // because `reaping_can_never_change_an_answer` proves it cannot flip a verdict". That
+        // test only ever exercised an UNDECIDED record already past its TTL, whose status is
+        // `Expired` on both sides of the reap — a tautology, not a proof. Reaping a DECIDED
+        // record flips `approved` to `expired`, which
+        // `reaping_erases_a_decided_answer_and_it_reads_as_expired` now pins.
+        //
+        // The call is still correct, for the reason that was never written down: no grant is
+        // reaped while it is still spendable. `decided_horizon` is capped at
+        // `expires_at + APPROVAL_CLAIM_WINDOW_SECS` (600) and `REAP_KEEP_SECS` is 3600, so
+        // every row survives its own last claimable instant by ~50 minutes. Permission cannot
+        // be lost here; only EVIDENCE can, and it is — an hour after TTL a decided row stops
+        // being readable and a late reviewer gets "expired" for an escalation an operator
+        // approved. The durable copy is the chain, not this table.
         self.reap(now, REAP_KEEP_SECS);
 
         let plugin_id = plugin_id.trim();
@@ -1389,6 +1506,71 @@ impl EscalationStore {
         };
         self.by_id.insert(id, esc.clone());
         Ok(esc)
+    }
+
+    /// The PENDING row already asking for this exact act, if there is one: same seat, same
+    /// marker, same `act_digest`, and still undecided as of `now`. The oldest such row wins
+    /// so a chain of re-opens converges on ONE id rather than on whichever was minted last.
+    ///
+    /// Pending ONLY, on purpose. A row that was approved and is still claimable is the claim
+    /// door's job — `claim()` already routes a matching act to it, so a second open over a
+    /// live grant does not happen (0 of 49 re-opens in the 08-02..09-01 census). A row that
+    /// was approved and SPENT is a different fact: the act was performed once and is being
+    /// asked for again, and single-use means that is a new ask. A denied or expired row is a
+    /// refusal the member may legitimately re-petition. Only the undecided case has nothing
+    /// to distinguish the second ask from the first.
+    pub fn pending_twin(
+        &self,
+        plugin_id: &str,
+        marker: &str,
+        act_digest: &str,
+        now: u64,
+    ) -> Option<&Escalation> {
+        self.by_id
+            .values()
+            .filter(|e| {
+                e.plugin_id == plugin_id
+                    && e.marker == marker
+                    && e.act_digest.as_deref() == Some(act_digest)
+                    && e.status_at(now) == Status::Pending
+            })
+            .min_by(|a, b| a.opened_at.cmp(&b.opened_at).then_with(|| a.id.cmp(&b.id)))
+    }
+
+    /// One act, one ruling (#668).
+    ///
+    /// Measured before this existed (chain walk 2026-08-02..09-01, 120k entries, 210 opens
+    /// carrying a digest): the gate minted **1.30 ids per distinct act**, and of the 49
+    /// re-opens of an act already on file, **25 landed while the first petition was still
+    /// PENDING** — median 53 s after the prior ask, and on 2026-09-01 two byte-identical `cp` petitions 9 s
+    /// apart, each of which the operator then approved by hand. Every one of those second
+    /// ids cost a human a ruling and bought the member nothing: the first approval would
+    /// have been claimed by the same act.
+    ///
+    /// So: if a pending twin exists, hand it back instead of minting. The caller learns which
+    /// happened through `Opened` and witnesses accordingly. `open` itself is unchanged — it
+    /// stays the pure mint, and every test that pins its behaviour still pins it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_or_coalesce(
+        &mut self,
+        plugin_id: &str,
+        role: &str,
+        tool_name: &str,
+        marker: &str,
+        act: Option<&str>,
+        stated_reason: Option<&str>,
+        stated_detail: Option<&str>,
+        now: u64,
+        ttl_secs: u64,
+    ) -> Result<Opened, OpenError> {
+        if let Some(a) = act.map(str::trim).filter(|v| !v.is_empty()) {
+            let digest = Self::act_digest_of(a);
+            if let Some(twin) = self.pending_twin(plugin_id.trim(), marker.trim(), &digest, now) {
+                return Ok(Opened::Coalesced(twin.clone()));
+            }
+        }
+        self.open(plugin_id, role, tool_name, marker, act, stated_reason, stated_detail, now, ttl_secs)
+            .map(Opened::Minted)
     }
 
     /// Record which seats were INVITED to participate — the production writer the invitation
@@ -1498,9 +1680,26 @@ impl EscalationStore {
             // and bar-met is exactly "this record could become claimable" minus the clock,
             // which is the clause being computed — using `is_claimable` here would ask the
             // horizon about itself.
+            //
+            // AND NOT ALREADY SPENT. The clause above says "could become claimable minus the
+            // clock", and a claimed record cannot become claimable at any clock: `claim()`
+            // sets `consumed_at`, `is_claimable` refuses on it, and nothing clears it. Yet
+            // the four conjuncts here did not read it, so the asker seat's first attributed
+            // poll AFTER its own claim stamped `observed_at`, `decided_horizon()` moved to
+            // now+600, and the poll published `observation_started_claim_window: true`
+            // beside a fresh countdown on a permit that had permitted nothing for two
+            // minutes. Measured live 2026-09-01 06:10:39Z on `cd0f8128ee32c02f`: consumed
+            // 06:08:14Z, polled `--as claude-code` → `true`, 600s; 45s later `false`, 555s.
+            // `permits_write` stayed `false` throughout — the enforcement was never wrong,
+            // only the account of it. But "the poll started your window" is exactly the
+            // sentence an asker would act on, and it was said about a window that could
+            // not exist. Observation, like the clock it starts, is about a claimable future;
+            // a spent record has none. (Sibling of the #667 revival — that was an UNSPENT
+            // grant re-armed for real; this is a SPENT one re-armed on paper.)
             Some(e)
                 if e.plugin_id == plugin_id
                     && e.observed_at.is_none()
+                    && e.consumed_at.is_none()
                     && e.status == Status::Approved
                     && e.bar_met() =>
             {
@@ -1534,6 +1733,12 @@ impl EscalationStore {
                 // rule made the older promise false. Which act each approval is bound to is
                 // rendered by the caller, so a member can tell WHICH write it authorises rather
                 // than assuming any write qualifies.
+                //
+                // `marker` is deliberately NOT a conjunct here: this is a per-member listing
+                // ACROSS markers. Which means a row in this list is spendable only under its
+                // own `marker`, and a caller that re-issues the same bytes under a different
+                // marker spelling gets a fresh petition, not the claim (measured: 7079b9f6 →
+                // 033e052e, 2026-08-31; see `opened_payload`). Render `marker` with every row.
                 e.plugin_id == plugin_id && e.act_digest.is_some() && e.is_claimable(now)
             })
             .collect();
@@ -1816,15 +2021,28 @@ pub fn act_digest_of(act: &str) -> String {
         self.by_id.insert(prior.id.clone(), prior);
     }
 
-    /// Add a peer's evidence to a PENDING escalation without deciding it.
+    /// Add a peer's evidence to an escalation without deciding it.
     ///
     /// This is the accumulation half of the constellation model: approval is not a boolean
     /// from whichever channel answered first. A peer co-signs here (NOT-SAME, enforced by the
     /// caller the same way arbitration enforces it), the operator decides later, and `bar_met`
     /// evaluates the whole set. A corroboration is NOT a decision: it permits nothing by
-    /// itself, it is witnessed separately (so it cannot be laundered into a ruling), and it
-    /// freezes the moment a decision lands — evidence after the fact would let a weak ruling
-    /// be dressed up retroactively.
+    /// itself, and it is witnessed separately, so it cannot be laundered into a ruling.
+    ///
+    /// WHAT CLOSES THIS DOOR IS EXPIRY, NOT THE RULING. `status_at` reaches `Expired` from
+    /// `Pending` ALONE, so the guard below is unreachable on a decided row: an approved or
+    /// denied escalation takes factors FOREVER, and only a lapsed-undecided one refuses.
+    /// A late factor still cannot dress up a ruling — `bar_met` is unmoved by it (see
+    /// `a_late_factor_cannot_move_the_bar_on_the_surface_where_it_could`) — so the protection
+    /// the deleted sentence claimed comes from the PREDICATE, not from refusing the peer.
+    ///
+    /// The deleted sentence said the opposite ("it freezes the moment a decision lands").
+    /// It outlived the 2026-08-06 cutover by 25 days and was filed twice (#510, and codex's
+    /// review-4732) before this fix. Between those filings a seat re-derived the false
+    /// version as fact 102 minutes after the corroboration landed, holding the correct rule
+    /// in its own notes at the time. That is why the correction belongs HERE and in the tool
+    /// description: a stale line two lines above the code beats a correct note anywhere
+    /// else, because this is where the next reader stands.
     pub fn corroborate(
         &mut self,
         id: &str,
@@ -3189,6 +3407,61 @@ mod tests {
         }
     }
 
+    /// Observation must not re-arm a SPENT permit. `mark_observed` read four conjuncts and
+    /// `is_claimable` reads four, and they were not the same four: observation never read
+    /// `consumed_at`, so the asker seat's first attributed poll AFTER its own claim stamped
+    /// `observed_at`, moved `decided_horizon()` to now+600 and answered
+    /// `observation_started_claim_window: true` with a fresh countdown about a permit that
+    /// could never be claimed again (live on `cd0f8128ee32c02f`, 2026-09-01 06:10Z).
+    ///
+    /// This is ALSO the first test in the tree to call `mark_observed` at all — the #667
+    /// fuse shipped with its behaviour asserted only in prose. Sabotage arm: drop the
+    /// `consumed_at.is_none()` conjunct and the first assertion goes red.
+    #[test]
+    fn observation_does_not_revive_a_spent_permit() {
+        let mut s = EscalationStore::default();
+        let e = s
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        let id = e.id.clone();
+        s.decide(&id, true, "operator", "role:constellation:sovereign",
+                 Channel::OperatorSession, None, Some("k"), T0 + 5)
+            .unwrap();
+        let claimed = s
+            .claim("claude-code", "pre_tool_use.py", Some(TEST_ACT), T0 + 70)
+            .expect("claimable at T0+70");
+        assert_eq!(claimed.consumed_at, Some(T0 + 70));
+
+        // The asker seat polls its own row two minutes after spending it.
+        let observed = s.mark_observed(&id, "claude-code", T0 + 190);
+        assert!(!observed, "a spent permit has no claimable future to observe");
+        let e = s.get(&id).unwrap();
+        assert_eq!(e.observed_at, None, "and the record must not carry a stamp for it");
+        assert_eq!(
+            e.claim_window_secs_remaining(T0 + 190),
+            Some(APPROVAL_CLAIM_WINDOW_SECS - 185),
+            "the countdown stays anchored at the GRANT, not restarted at the poll: {:?}",
+            e.decision_reply(T0 + 190)
+        );
+        assert!(!e.is_claimable(T0 + 190));
+
+        // Control: the same poll on an UNSPENT sibling does start the fuse (the #667 contract).
+        let u = s
+            .open("claude-code", "r", "Bash", "other_marker.py", Some("Edit -> /repo/other.rs"), None, None, T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        let uid = u.id.clone();
+        s.decide(&uid, true, "operator", "role:constellation:sovereign",
+                 Channel::OperatorSession, None, Some("k"), T0 + 5)
+            .unwrap();
+        assert!(s.mark_observed(&uid, "claude-code", T0 + 190), "unspent: observation arms the fuse");
+        assert_eq!(s.get(&uid).unwrap().observed_at, Some(T0 + 190));
+        assert_eq!(
+            s.get(&uid).unwrap().claim_window_secs_remaining(T0 + 190),
+            Some(APPROVAL_CLAIM_WINDOW_SECS),
+            "the unspent control's window restarts at the poll"
+        );
+    }
+
     /// An approval short of the bar must say it permits nothing — the class #219 found, kept
     /// under test after #226 narrowed it.
     ///
@@ -3457,14 +3730,93 @@ mod tests {
         assert_ne!(a.id, b.id, "same member, same file, same second must still differ");
     }
 
+    /// NAMED FOR ITS DOMAIN, because the domain is the whole content of the claim.
+    ///
+    /// This was `reaping_can_never_change_an_answer`, and the `open()` call site cites it BY
+    /// NAME as the proof that housekeeping is safe there. It never proved that. The only
+    /// record it exercises is an UNDECIDED one past its TTL, whose `status_of` is already
+    /// `Expired` before the reap and is `Expired` after it because an absent id also reads
+    /// `Expired`. Both arms of the equality are the same constant: the assertion cannot fail
+    /// for any value of `reap`, so it certifies nothing about reaping.
+    ///
+    /// The case it is silent on is the one that matters, and it is pinned directly below.
     #[test]
-    fn reaping_can_never_change_an_answer() {
+    fn reaping_cannot_change_an_answer_that_was_already_expired() {
         let (mut s, id) = store_with_one();
         let t = T0 + 10_000;
         let before = s.status_of(&id, t);
         s.reap(t, 60);
         assert_eq!(s.status_of(&id, t), before, "reap changed a verdict");
         assert_eq!(before, Status::Expired);
+    }
+
+    /// REAPING DOES CHANGE AN ANSWER: a DECIDED record reads `approved` until housekeeping
+    /// deletes it, and `expired` forever after.
+    ///
+    /// `status_at` decays only `Pending`, so an approved escalation stays `Approved` for as
+    /// long as the row exists — past its TTL, past its claim horizon, indefinitely. What ends
+    /// that is `reap`, which retains on `now < expires_at + keep_secs` and is BLIND to whether
+    /// the row was decided or claimed. Once the row is gone `status_of` falls through to
+    /// `unwrap_or(Status::Expired)` — the deliberate fail-closed policy for an unknown id —
+    /// and the daemon can no longer distinguish "an operator approved this" from "nobody ever
+    /// ruled".
+    ///
+    /// NO GRANT IS EVER REAPED WHILE IT IS STILL SPENDABLE, and that is the property the
+    /// `open()` call site actually needs: `decided_horizon` is bounded above by
+    /// `expires_at + APPROVAL_CLAIM_WINDOW_SECS` (600) and `REAP_KEEP_SECS` is 3600, so the
+    /// row outlives every claim it could authorise by at least 50 minutes. Permission is safe.
+    /// EVIDENCE is not: what the reap destroys is a decided row's readability, an hour after
+    /// its TTL, on a surface whose peer reviewers routinely arrive later than that.
+    ///
+    /// Measured 2026-09-02 (kimi-code, review of mesh notices 9313-9391): seven decided
+    /// escalations — five approved-and-claimed, two approved-and-lapsed — all polled back
+    /// `expired` ~6h after their decisions, and `tools/await_escalation.py` rendered every one
+    /// of them as "no decision landed in the window". Seven of seven, not five of seven: the
+    /// two lapsed grants were decided too, so the sentence is false of them as well.
+    ///
+    /// SABOTAGE, run 2026-09-02 — `reap`'s `retain` replaced by `|_, _| true`, so housekeeping
+    /// deletes nothing: this test goes RED on the final assertion, and
+    /// `reaping_cannot_change_an_answer_that_was_already_expired` stays GREEN. That is the
+    /// discriminating arm. It is also the direct measurement of #544's charge that the old
+    /// warrant was inert: a reap that has stopped working entirely does not move the test the
+    /// call site cited as its proof.
+    #[test]
+    fn reaping_erases_a_decided_answer_and_it_reads_as_expired() {
+        let (mut s, id) = store_with_one();
+        s.decide(
+            &id, true, "operator", "role:constellation:sovereign",
+            Channel::OperatorSession, None, Some("k"), T0 + 5,
+        )
+        .expect("the sovereign channel approves");
+
+        // The record's own TTL and its claim horizon are both long past here, and neither
+        // moves the answer: the row is still readable, so it still says what happened.
+        let past_the_claim_horizon = T0 + 120 + APPROVAL_CLAIM_WINDOW_SECS + 1;
+        assert_eq!(
+            s.status_of(&id, past_the_claim_horizon),
+            Status::Approved,
+            "a decided row keeps its verdict for as long as it exists",
+        );
+        assert!(
+            !s.get(&id).unwrap().is_claimable(past_the_claim_horizon),
+            "and it is unspendable well before the reap can reach it",
+        );
+
+        // One second past `expires_at + REAP_KEEP_SECS`, which is what every subsequent
+        // `open()` runs unconditionally.
+        let past_the_reap = T0 + 120 + REAP_KEEP_SECS + 1;
+        assert_eq!(
+            s.status_of(&id, past_the_reap),
+            Status::Approved,
+            "still approved right up to the moment housekeeping runs",
+        );
+        s.reap(past_the_reap, REAP_KEEP_SECS);
+        assert_eq!(
+            s.status_of(&id, past_the_reap),
+            Status::Expired,
+            "REAP CHANGED THE ANSWER — this is the case the old guard's name claimed to cover",
+        );
+        assert!(s.get(&id).is_none(), "and the evidence is gone, not merely restated");
     }
 
     #[test]
@@ -3728,6 +4080,73 @@ mod bar_factor_tests {
     const T0: u64 = 1_800_000_000;
 
     #[test]
+    fn the_promise_shown_before_the_click_predicts_what_the_click_does() {
+        // THE INVARIANT THE DASHBOARD BROKE FOR 25 DAYS, PINNED AS A PROPERTY.
+        //
+        // `operator_alone_suffices()` is a PREDICTION, rendered on the approval button's own
+        // metadata line. The only thing that makes it worth showing is that it comes true.
+        // So assert exactly that, for every marker class, rather than transcribing today's
+        // bar into an expected value — a transcription is what `dashboard.rs` contained, and
+        // it kept passing review while asserting the opposite of the code it described.
+        //
+        // Sweep both bars via the markers `bar_for` actually routes.
+        for marker in ["law_inject.py", "pre_tool_use.py", "witness.py", "hestia_gate_mechanism.py"]
+        {
+            let (mut s, id) = open_with(marker);
+            let promised = s.get(&id).unwrap().operator_alone_suffices();
+            let needs = s.get(&id).unwrap().still_needs();
+            assert_eq!(
+                promised,
+                needs.is_none(),
+                "{marker}: the two operator-facing fields must never disagree with each other"
+            );
+
+            // The operator clicks approve. Nobody else has looked, and — per the wake-record
+            // and invitation findings — on this fleet nobody else usually will.
+            let e = s
+                .decide(&id, true, "dp", "role:constellation:sovereign", Channel::OperatorSession, None, Some("reviewed"), T0 + 5)
+                .expect("operator decides alone");
+
+            assert_eq!(
+                e.bar_met(),
+                promised,
+                "{marker}: told the operator `operator_alone_suffices = {promised}`, then their \
+                 lone approval produced bar_met = {}. A prediction that does not come true is \
+                 worse than no prediction: it is the panel teaching that the button is broken.",
+                e.bar_met()
+            );
+            assert_eq!(
+                e.is_claimable(T0 + 6),
+                promised,
+                "{marker}: and the write itself must follow the same promise"
+            );
+        }
+    }
+
+    #[test]
+    fn relaxing_a_bar_cannot_leave_the_operator_surface_asserting_the_old_one() {
+        // The regression test for the CAUSE, not just the symptom. Both operator-facing
+        // fields are derived from `bar_met_over`, so there is no second copy of the bar to
+        // go stale. If someone restores the peer conjunct to `SovereignPlusPeer`, this test
+        // keeps passing and the dashboard follows automatically; if someone re-introduces a
+        // hand-written copy beside it, `the_promise_...` above fails.
+        let (mut s, id) = open_with("pre_tool_use.py");
+        let e = s.get(&id).unwrap();
+        assert!(
+            e.operator_alone_suffices(),
+            "under invitation semantics (9d3936d) the sovereign conjunct decides alone"
+        );
+        assert_eq!(e.still_needs(), None, "so nothing is 'still needed' from a peer");
+
+        // And a peer factor, welcome as it is, changes neither the promise nor the verdict.
+        let e = s
+            .corroborate(&id, "kimi-code", "role:constellation:member", None, false, None, T0 + 3)
+            .expect("peer participates");
+        assert!(e.operator_alone_suffices(), "a peer arriving does not make the operator weaker");
+        assert_eq!(e.still_needs(), None);
+    }
+
+    #[test]
     fn the_bar_is_stated_at_open_and_differs_by_surface() {
         // A law renderer and the enforcement path are not the same stakes, and the record
         // must say which criterion each was judged against — inferred sufficiency is the
@@ -3740,7 +4159,6 @@ mod bar_factor_tests {
         assert_eq!(s3.get(&id3).unwrap().bar, Bar::SovereignPlusPeer);
     }
 
-    #[test]
     /// The marker is a JOIN KEY, and a member filing deliberately cannot learn it.
     ///
     /// The live failure, reproduced: a member files with its own readable string, an operator
@@ -3787,6 +4205,15 @@ mod bar_factor_tests {
         );
     }
 
+    /// DEAD FROM 2026-08-04 TO 2026-08-31, and nothing said so.
+    ///
+    /// `6266dd9` inserted `a_marker_the_gate_never_presented_...` between this function and
+    /// its `#[test]`, so the new test took the attribute and this one silently stopped being
+    /// a test. It kept compiling, kept reading like coverage, and ran zero times — including
+    /// through `9d3936d` two days later, which rewrote the very predicate it guards. The
+    /// compiler said so the whole time (`function is never used`, `duplicated attribute`) in
+    /// a build that carries 21 warnings, which is the same as not saying it.
+    #[test]
     fn a_single_approval_meets_a_single_approver_bar() {
         let (mut s, id) = open_with("law_inject.py");
         let e = s
@@ -3865,6 +4292,39 @@ mod bar_factor_tests {
         assert_eq!(after.bar_met(), before, "a late factor MUST NOT change the bar verdict");
         assert_eq!(after.peer_participation().concurred, 1, "but it is on the record");
         assert_eq!(after.stored_status(), Status::Approved, "and the ruling is untouched");
+    }
+
+    #[test]
+    fn a_late_factor_cannot_move_the_bar_on_the_surface_where_it_could() {
+        // The sibling test above uses a `law_inject.py` fixture, which `bar_for` maps to
+        // SingleApprover — where `sovereign || peer` is already true from the decider's own
+        // factor, so its before/after assertion is a tautology and stays green no matter what
+        // `corroborate` does to the factor set. The dress-up hazard lives on the OTHER arm.
+        //
+        // `witness.py` is SovereignPlusPeer. Under the shipped predicate (`any(is_sovereign)`)
+        // a late peer factor is inert here too. Under the peer conjunct that codex's
+        // review-4732 warned about restoring (`sovereign && peer`), `before` is false and
+        // `after` is true — a peer arriving AFTER the ruling would make an approval claimable
+        // that was not. This test is the arithmetic of that hazard, so the reintroduction
+        // cannot land silently.
+        let (mut s, id) = open_with("witness.py");
+        assert_eq!(s.get(&id).unwrap().bar, Bar::SovereignPlusPeer);
+        s.decide(&id, true, "dp", "role:constellation:sovereign", Channel::OperatorSession, None, None, T0 + 5)
+            .expect("decided");
+        let before = s.get(&id).unwrap().bar_met();
+        let claimable_before = s.get(&id).unwrap().is_claimable(T0 + 6);
+
+        let after = s
+            .corroborate(&id, "kimi-code", "r", None, false, None, T0 + 7)
+            .expect("a decided row still takes evidence — expiry closes this door, not the ruling");
+
+        assert_eq!(after.bar_met(), before, "a late factor MUST NOT move the bar on a two-bar surface");
+        assert_eq!(
+            after.is_claimable(T0 + 8),
+            claimable_before,
+            "and it MUST NOT turn an unclaimable approval into a claimable one"
+        );
+        assert_eq!(after.peer_participation().concurred, 1, "but it is on the record");
     }
 
     #[test]
@@ -3949,5 +4409,101 @@ mod ttl_tests {
             .decide(&e.id, true, "kimi-code", "r", Channel::PeerMember, None, Some("late"),
                     T0 + DEFAULT_TTL_SECS + 1)
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod coalesce_tests {
+    //! #668: one act, one ruling. The gate re-trips on the same refused act and every trip
+    //! minted an id the operator had to rule on. These pin the ONE case that is retired —
+    //! a second ask for an act whose first ask is still undecided — and the cases that are
+    //! deliberately NOT: a different act, a different marker, a decided twin (approved,
+    //! spent, or denied), an expired twin.
+    use super::*;
+
+    const T0: u64 = 1_800_000_000;
+    const ACT: &str = "Bash: cd /tmp/wt && cp new.py plugins/claude-code/hooks/pre_tool_use.py";
+
+    fn open2(s: &mut EscalationStore, act: &str, marker: &str, at: u64) -> Opened {
+        s.open_or_coalesce("claude-code", "r", "Bash", marker, Some(act), None, None, at, 3600)
+            .expect("open")
+    }
+
+    #[test]
+    fn a_second_ask_for_a_pending_act_is_the_first_ask() {
+        let mut s = EscalationStore::default();
+        let first = open2(&mut s, ACT, "plugins/*/hooks", T0);
+        assert!(!first.coalesced());
+        // 9 seconds later, byte-identical (the 2026-09-01 specimen: 4ec27c68 / b4b410f1).
+        let second = open2(&mut s, ACT, "plugins/*/hooks", T0 + 9);
+        assert!(second.coalesced(), "the twin is pending; nothing distinguishes the asks");
+        assert_eq!(second.escalation().id, first.escalation().id);
+        assert_eq!(s.pending(T0 + 10).len(), 1, "one act, one row");
+        // A third converges on the same id, not on the second.
+        let third = open2(&mut s, ACT, "plugins/*/hooks", T0 + 40);
+        assert_eq!(third.escalation().id, first.escalation().id);
+    }
+
+    #[test]
+    fn a_different_act_or_marker_is_a_different_ask() {
+        let mut s = EscalationStore::default();
+        let first = open2(&mut s, ACT, "plugins/*/hooks", T0);
+        // The 2026-09-01 specimen again: 8791447f was 50f8d3a1's command plus
+        // `&& echo INSTALLED && git diff` — a superset, and a different digest.
+        let superset = open2(&mut s, &format!("{ACT} && echo INSTALLED"), "plugins/*/hooks", T0 + 5);
+        assert!(!superset.coalesced());
+        assert_ne!(superset.escalation().id, first.escalation().id);
+        let other_marker = open2(&mut s, ACT, "plugins/_shared", T0 + 6);
+        assert!(!other_marker.coalesced());
+        assert_eq!(s.pending(T0 + 7).len(), 3);
+    }
+
+    #[test]
+    fn a_decided_twin_does_not_coalesce_whatever_the_verdict() {
+        // Approved-and-unspent is the claim door's job; approved-and-spent is a new act;
+        // denied is a refusal the member may re-petition. None of them is "still asking".
+        for approve in [true, false] {
+            let mut s = EscalationStore::default();
+            let first = open2(&mut s, ACT, "plugins/*/hooks", T0).into_escalation();
+            s.decide(
+                &first.id, approve, "operator", "role:constellation:sovereign",
+                Channel::OperatorSession, None, Some("k"), T0 + 20,
+            )
+            .expect("decide");
+            let again = open2(&mut s, ACT, "plugins/*/hooks", T0 + 30);
+            assert!(!again.coalesced(), "approve={approve}: a ruled row is not a pending twin");
+            assert_ne!(again.escalation().id, first.id);
+        }
+    }
+
+    #[test]
+    fn an_expired_twin_does_not_coalesce() {
+        let mut s = EscalationStore::default();
+        let first = s
+            .open_or_coalesce("claude-code", "r", "Bash", "m", Some(ACT), None, None, T0, 100)
+            .unwrap()
+            .into_escalation();
+        let again = open2(&mut s, ACT, "m", T0 + 101);
+        assert!(!again.coalesced(), "the clock refused the first ask; this is a new one");
+        assert_ne!(again.escalation().id, first.id);
+    }
+
+    #[test]
+    fn another_seat_asking_for_the_same_act_is_its_own_ask() {
+        let mut s = EscalationStore::default();
+        let mine = open2(&mut s, ACT, "m", T0).into_escalation();
+        let theirs = s
+            .open_or_coalesce("kimi-code", "r", "Bash", "m", Some(ACT), None, None, T0 + 1, 3600)
+            .unwrap();
+        assert!(!theirs.coalesced(), "a grant is per seat; so is the ask");
+        assert_ne!(theirs.escalation().id, mine.id);
+    }
+
+    #[test]
+    fn an_ask_with_no_act_never_coalesces_and_still_fails_the_mint_guard() {
+        let mut s = EscalationStore::default();
+        let _ = open2(&mut s, ACT, "m", T0);
+        let r = s.open_or_coalesce("claude-code", "r", "Bash", "m", None, None, None, T0 + 1, 3600);
+        assert!(matches!(r, Err(OpenError::MissingField("act"))));
     }
 }

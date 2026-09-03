@@ -770,3 +770,286 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
         _snapshot_unavailable(
             plugin_id, f"{type(e).__name__}:{getattr(e, 'errno', '')}:{str(e)[:120]}")
         return None
+
+
+# ── COLLAPSED FROM THE SEATS (2026-08-25) ─────────────────────────────────────────────────
+# `emit_attestation` lived as a byte-identical copy in BOTH the codex
+# and kimi gates: 19/19 and 62/62 lines, matching line for line. Nothing flagged them,
+# because the collapse ratchet can only see a seat overriding a name the engine ALREADY owns,
+# and the engine never owned these. Two seats answering the same question with two bodies is
+# the shape every drift incident so far has come out of; the copies were identical today only
+# because nobody had edited one yet.
+#
+# THE SHIM BOUNDARY, stated once here because every later slice inherits it: the ENGINE owns
+# the logic, the SEAT supplies its identity. Neither function is seat-specific — what was
+# seat-specific was `HESTIA_PLUGIN_ID` and `_role_bridge()` closed over from module scope,
+# which is exactly why the code could not be shared without being parameterised first. They
+# are arguments now, and a seat that forgets to pass them gets a TypeError at the call rather
+# than a plausible default attributing its acts to somebody else.
+
+
+def emit_attestation(allows, denies, *, plugin_id, role_lct, endpoint=None):
+    """Attest this gate's effective scope to the daemon, best effort.
+
+    `plugin_id` and `role_lct` are REQUIRED and keyword-only. In the seat-local copies both
+    were read from module scope, so the identity a record carried was decided by which file
+    the function happened to live in. Making them arguments is what let one body serve every
+    seat; keyword-only is what stops the two ever being passed in the wrong order, since they
+    are both strings and a silent swap would attribute the attestation to a role.
+    """
+    endpoint = endpoint or os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
+
+    def post(payload, timeout, hdrs=None):
+        req = urllib.request.Request(
+            endpoint, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json, text/event-stream", **(hdrs or {})})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read(), r.headers.get("mcp-session-id")
+
+    _, sid = post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                   "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                              "clientInfo": {"name": "hestia-gate-attest", "version": "1"}}}, 1.0)
+    h = {"mcp-session-id": sid} if sid else {}
+    post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, 0.4, h)
+    # `hestia_request_witness` is an ATTRIBUTED append: it refuses an unconnected caller,
+    # because what lands on the chain must carry a proven WHO and not only caller-supplied
+    # data. Connect first and pass the session, or the attestation is silently refused —
+    # which is exactly how the first cut of this failed.
+    raw, _ = post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                   "params": {"name": "hestia_connect",
+                              "arguments": {"plugin_id": plugin_id,
+                                            "host_agent": plugin_id,
+                                            # DECLARE THE ROLE ON CONNECT (dp, 2026-07-28:
+                                            # "kimi's member alias still shows unmeasured
+                                            # with over 3k actions"). This gate has always
+                                            # KNOWN its role — it writes the role bridge
+                                            # into the attestation payload below — and never
+                                            # told the daemon on connect, so the session
+                                            # defaulted to role:constellation:member and the
+                                            # attestation landed on a grain the member does
+                                            # not act under. Acts on one grain, the decisions
+                                            # governing them on another, and NEITHER can score
+                                            # conduct. The capability to declare arrived with
+                                            # the connect-echoes-role work; this is the caller
+                                            # that never started using it.
+                                            "role": role_lct,
+                                            "instance_name": "gate-attest"}}}, 1.5, h)
+    sess = None
+    for line in raw.decode("utf-8", "replace").splitlines():
+        if line.startswith("data: {"):
+            try:
+                pl = json.loads(line[6:])
+                if "result" in pl:
+                    sess = json.loads(pl["result"]["content"][0]["text"]).get("sessionId")
+            except Exception:
+                pass
+    if not sess:
+        return
+    post({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+          "params": {"name": "hestia_request_witness",
+                     "arguments": {"session_id": sess,
+                                   "event_type": "scope_attestation",
+                                   "event_data": {
+                                       "plugin_id": plugin_id,
+                                       "role_lct": role_lct,
+                                       "allows": allows,
+                                       "denies": denies,
+                                       "attested_by": "plugin-gate:" + plugin_id,
+                                   }}}}, 1.5, h)
+
+# ── Gate-self surface (slice 3: one body per behaviour, seat context as arguments) ──────────
+# codex and kimi carried these five as byte-identical or near-identical copies, each closing
+# over module scope (HESTIA_PLUGIN_ID, _EVENT, IDENTITY, _SNAPSHOT_ROLE, the tally knobs), so
+# what a witness or a claim carried was decided by which file the function happened to live
+# in. Same rule emit_attestation established: seat context is REQUIRED and keyword-only —
+# most of these values are strings, and a silent positional swap would attribute a witness to
+# a filename. The seats keep signature-identical thin wrappers that pass their own context;
+# the wrappers are the adapter, this is the law.
+
+
+def role_bridge(*, snapshot_role, identity_path):
+    """Attribution-only: the role string that witnesses and connects carry. Never used to
+    widen reach.
+
+    Resolution order, unchanged from the seat-local copies this replaces: the daemon's
+    session-resolved role (`hestia_operating_law` identity.role) wins when the snapshot
+    answered, because the alternative is a member-writable file deciding attribution. The
+    identity.json read remains ONLY as the daemon-absent fallback, where the alternative is
+    silently changing the witness grain mid-train.
+    """
+    if isinstance(snapshot_role, str) and snapshot_role.startswith("role:"):
+        return snapshot_role
+    try:
+        r = json.load(open(identity_path, encoding="utf-8")).get("role")
+        if isinstance(r, str) and r.startswith("role:"):
+            return r
+    except Exception:
+        pass
+    return "role:constellation:member"
+
+
+def gate_self_call(tool, args, *, plugin_id, role, client_name, host_session_id=None):
+    """One short daemon round trip for a gate-self event: initialize, connect (session-bound),
+    one tools/call. Returns the unwrapped result dict, or None on ANY failure.
+
+    Never raises and stays inside a ~2.5s budget: the fail-open engines would treat a hook
+    that hangs past its clamp as an allow, so a gate-self exchange that stalls would be
+    strictly worse than a refusal. Callers treat None as refusal (writes) or best-effort
+    loss (witnesses).
+
+    `host_session_id`, when the caller has one, is threaded into the connect so the
+    gate-self session this call mints joins to the per-wake session the outcome rows carry."""
+    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
+
+    def post(payload, hdrs, timeout):
+        req = urllib.request.Request(
+            endpoint, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json, text/event-stream", **hdrs})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read(), r.headers.get("mcp-session-id")
+
+    def unwrap(raw):
+        """The result payload of a tools/call: structuredContent, or the content[0] text JSON —
+        and the body may be plain JSON or SSE-framed (`data: {...}` lines)."""
+        for line in raw.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if not (line.startswith("{") or line.startswith("data: {")):
+                continue
+            try:
+                pl = json.loads(line[line.index("{"):])
+            except Exception:
+                continue
+            res = pl.get("result")
+            if not isinstance(res, dict):
+                continue
+            sc = res.get("structuredContent")
+            if isinstance(sc, dict):
+                return sc
+            content = res.get("content") or []
+            if content and isinstance(content[0], dict):
+                try:
+                    d = json.loads(content[0].get("text") or "{}")
+                    return d if isinstance(d, dict) else None
+                except Exception:
+                    return None
+        return None
+
+    try:
+        _, sid_hdr = post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                           "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                                      "clientInfo": {"name": client_name,
+                                                     "version": "1"}}}, {}, 0.8)
+        h = {"mcp-session-id": sid_hdr} if sid_hdr else {}
+        post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, h, 0.4)
+        connect_args = {"plugin_id": plugin_id,
+                        "host_agent": plugin_id,
+                        "role": role,
+                        "instance_name": "gate-self"}
+        if host_session_id:
+            connect_args["host_session_id"] = host_session_id
+        raw, _ = post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                       "params": {"name": "hestia_connect",
+                                  "arguments": connect_args}}, h, 0.8)
+        conn = unwrap(raw)
+        sess = conn.get("sessionId") if conn else None
+        if not sess:
+            return None  # an unconnected witness/claim is refused by the daemon anyway
+        args = dict(args)
+        args.setdefault("session_id", sess)
+        raw, _ = post({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                       "params": {"name": tool, "arguments": args}}, h, 0.9)
+        return unwrap(raw)
+    except Exception:
+        return None
+
+
+def witness_gate_self(event_type, marker, tool_name, rule=None, *,
+                      plugin_id, role, gate_path, client_name, host_session_id=None):
+    """Record a governance-surface event as its OWN class — `gate_self_read` for a permitted
+    read, `gate_self_access` (appealable) for a refused write. The two stay distinct so an
+    alert on the refusal keeps its meaning. Best effort: a failed record never changes the
+    decision — the daemon's health is not a precondition for reading one's own law, and the
+    deny already happened locally."""
+    return gate_self_call("hestia_request_witness", {
+        "event_type": event_type,
+        "event_data": {"plugin_id": plugin_id,
+                       "tool_name": tool_name,
+                       "marker": marker,
+                       "rule": rule,
+                       "gate_path": gate_path,
+                       "severity": "record" if event_type == "gate_self_read" else "escalate",
+                       "role_lct": role}},
+        plugin_id=plugin_id, role=role, client_name=client_name,
+        host_session_id=host_session_id) is not None
+
+
+def claim_self_write(marker, tool_name, attempted, *,
+                     plugin_id, role, client_name, host_session_id=None):
+    """Ask ONCE whether a human has already approved this exact (member, marker) write.
+    Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
+
+    Never waits. The first attempt is refused and the refusal opens an escalation; a human
+    decides out of band; the member RE-ISSUES the write and the second attempt claims the
+    approval. Every failure — unreachable, malformed, a daemon with no escalation channel —
+    is a refusal: a daemon that cannot answer must not be a way to get a governance write
+    through."""
+    claim_args = {
+        "plugin_id": plugin_id,
+        "role": role,
+        "tool_name": tool_name,
+        "marker": marker,
+        # `reason` carries the ATTEMPTED ACT, not a rationale: an auto-opened escalation HAS no
+        # stated why — the member did not choose to escalate; the gate opened it on a refused
+        # write. Presenting the act as though it were a rationale would look like the member had
+        # explained itself. A member that wants to state a why opens the escalation itself.
+        "reason": attempted or f"{tool_name} -> {marker}",
+        "detail": ("Auto-opened by the gate on a refused write; the member stated no rationale "
+                   "because it did not choose to escalate. Approving authorises this one write."),
+    }
+    # The claimed-row join key (reply-2005/reply-2006, 2026-08-12): of the three session-id
+    # namespaces in a claim window, only the per-wake host session appears on the outcome rows
+    # an auditor joins from — the gate-self connect session above joins only to gate witnesses.
+    # Sent only when in hand: the daemon writes explicit null, and a fabricated placeholder
+    # would be a lie in the exact record used to argue about who authorised what.
+    if host_session_id:
+        claim_args["host_session_id"] = host_session_id
+    r = gate_self_call("hestia_gate_escalation_claim", claim_args,
+                       plugin_id=plugin_id, role=role, client_name=client_name,
+                       host_session_id=host_session_id)
+    if not isinstance(r, dict):
+        return "unreachable", "no answer from the daemon — refused", None, None
+    # BOTH flags, and the daemon owns both — two places deciding what "approved" means is how
+    # they come to disagree, so the hook re-derives nothing.
+    if r.get("claimed") is True and r.get("permits_write") is True:
+        who = r.get("decided_by") or "a human"
+        via = r.get("decided_via") or "unknown-channel"
+        return ("approved",
+                f"claimed an approval from {who} via {via} (single use, now spent)", None, None)
+    esc_id = r.get("escalation_id")
+    if not esc_id:
+        # An old daemon answers {} to a tool it does not know — which must not permit a write by
+        # failing to understand the question, but also cannot open an escalation. Say which.
+        why = r.get("error") or "this daemon has no escalation channel (is it upgraded?)"
+        return "no-channel", f"refused, and NO escalation was opened — {why}", None, None
+    return ("escalated", "refused; escalation opened for out-of-band decision",
+            esc_id, r.get("how_to_decide") or f"hestia gate approve {esc_id}")
+
+
+def tally_scope(allowed, *, tally_dir, tally_path, attest_every, plugin_id, role_lct):
+    """Count this decision; emit an attestation when the window closes."""
+    try:
+        os.makedirs(tally_dir, exist_ok=True)
+        try:
+            t = json.load(open(tally_path))
+        except Exception:
+            t = {"allows": 0, "denies": 0}
+        t["allows" if allowed else "denies"] += 1
+        if t["allows"] + t["denies"] >= attest_every:
+            emit_attestation(t["allows"], t["denies"],
+                             plugin_id=plugin_id, role_lct=role_lct)
+            t = {"allows": 0, "denies": 0}
+        json.dump(t, open(tally_path, "w"))
+    except Exception:
+        pass  # accounting must never change a decision

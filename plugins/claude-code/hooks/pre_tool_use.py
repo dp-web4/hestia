@@ -29,22 +29,17 @@ DESIGN
 
 ENV
   HESTIA_HOOK_DEBUG=1            log to ~/.hestia-claude/hook.log
-  HESTIA_PRE_FAIL_CLOSED=1       fail-CLOSED profile for governed roles:
-                                  any path that cannot get a daemon verdict
-                                  (daemon unreachable, budget exhausted,
-                                  unexpected error) DENIES the tool instead
-                                  of allowing. The legacy fallback is skipped
-                                  entirely — the daemon is the law.
-  HESTIA_PRE_NO_FALLBACK=1       disable the legacy-engine fallback
-                                  (deny-on-daemon-unreachable instead)
   HESTIA_PRE_TOTAL_BUDGET_MS     override TOTAL_BUDGET_MS
   HESTIA_ENDPOINT                override endpoint discovery
-  HESTIA_LEGACY_FALLBACK         path to the legacy web4-governance gate. Set this
-                                  when the hooks are deployed off-repo (local-fs
-                                  deployment), or the relocated gate keeps calling
-                                  a fallback that may not be where it was left.
-                                  A path that does not exist ALLOWS — see
-                                  invoke_legacy_fallback.
+
+FAIL-CLOSED IS NOT A SWITCH (dp, 2026-08-31: "there shouldn't be legacy fallback
+period, and fail closed shouldn't be optional"). Any path that cannot get a daemon
+verdict — daemon unreachable, budget exhausted, empty or unparseable event,
+unexpected error — DENIES. There is no env var that relaxes this and no legacy
+engine to fall back to. `HESTIA_PRE_FAIL_CLOSED`, `HESTIA_PRE_NO_FALLBACK` and
+`HESTIA_LEGACY_FALLBACK` are gone; a launcher still exporting them is harmless and
+has no effect. This closes GATE_BYPASS_CATALOG #2, in which an unreachable endpoint
+plus a non-existent fallback path exited 0 with no stderr at all.
 """
 
 from __future__ import annotations
@@ -53,7 +48,6 @@ import json
 import os
 import re
 import socket
-import subprocess
 import sys
 import time
 import urllib.error
@@ -101,18 +95,12 @@ MAX_POLLS = 5
 # Floor on poll sleep to avoid busy loops if daemon misbehaves.
 MIN_POLL_SLEEP_MS = 50
 
-# Path to the legacy fallback hook. Sourced from the same code we ported,
-# but kept in-place under claude-code/plugins/ for fallback robustness.
-#
-# Overridable since 2026-07-26: this was a hardcoded absolute path naming one machine's
-# workspace, sitting on the fail-OPEN profile's critical path. A machine that deploys its
-# hooks to local fs (the 9p-migration pattern) could relocate the outer gate and silently
-# leave the fallback behind — and if the path is simply wrong, `invoke_legacy_fallback`
-# returns 0, so a missing fallback ALLOWS. Wrong-path and no-policy are indistinguishable
-# at the exit code. The fallback is optional and must be configured explicitly by an
-# installer. An absent value preserves the primary gate's normal no-fallback behavior;
-# public source cannot name an operator-specific legacy checkout.
-LEGACY_FALLBACK = os.environ.get("HESTIA_LEGACY_FALLBACK", "")
+# TOMBSTONE (dp ruling, 2026-08-31). `LEGACY_FALLBACK` lived here and named an
+# operator-supplied path to the pre-port web4-governance gate. It is deleted, not
+# defaulted: an env-supplied path whose ABSENCE means ALLOW is a bypass with a
+# configuration switch on it, and it was the live half of GATE_BYPASS_CATALOG #2
+# (unreachable endpoint + missing fallback = exit 0, no stderr). Nothing replaces
+# it. No verdict now means deny, on every path.
 
 
 def debug_log(msg: str) -> None:
@@ -298,19 +286,120 @@ _GOVERNANCE_FILES = (
 # One fact, one name. `$HESTIA_HOME/shared` is the fleet path the installer already uses.
 _HESTIA_HOME = os.environ.get("HESTIA_HOME") or os.path.join(
     os.path.expanduser("~"), ".hestia")
-_SHARED_DIR = os.environ.get("HESTIA_SHARED_DIR") or os.path.join(_HESTIA_HOME, "shared")
-# Fallback, deliberately one-directional: if the canonical path is not populated yet, keep
-# using the legacy per-vendor directory rather than losing the closure entirely. A host
-# mid-rollout stays governed; a host that has cut over never silently reverts.
-_LEGACY_SHARED_DIR = os.path.join(os.path.dirname(os.path.dirname(_SELF_DIR)), "_shared")
-if not os.path.isdir(_SHARED_DIR) and os.path.isdir(_LEGACY_SHARED_DIR):
-    _SHARED_DIR = _LEGACY_SHARED_DIR
-if os.path.isdir(_SHARED_DIR) and _SHARED_DIR not in sys.path:
-    sys.path.insert(0, _SHARED_DIR)
+
+
+# THE LOADER IS THE ONE LAW-ADJACENT TEXT THAT CANNOT LIVE IN SHARED AUTHORITY, because it is
+# what reaches shared authority. So it is duplicated by necessity across seats and must not be
+# independently maintained: the two functions below are BYTE-IDENTICAL to the Codex seat's
+# (#742, head 03a0ba8), one text, not a dialect. Review of #747 (GPT, 2026-09-01) held the
+# merge on exactly the two places an earlier draft here differed from it:
+#   * `except Exception` at module init let a SystemExit(0) raised by an installed module
+#     escape before main(), ending the hook rc=0 -- an allow -- instead of the explicit
+#     no-shared-authority rc=2. The boundary is BaseException, module INITIALISATION only,
+#     re-raised as ImportError; main()'s own legitimate SystemExit stays outside it.
+#   * inserting the selected dir at sys.path[0] only when its literal string was absent left
+#     a decoy ahead of an already-present installed path. The selected dir is canonicalised,
+#     equivalent spellings removed, and it goes first every time.
+# Three claude-code resolution paths were deleted, not narrowed, on the way here: a repo
+# `plugins/_shared` fallback taken when the installed dir was ABSENT (an existing empty
+# tempdir suppressed it, so the negative test passed while branch-local law still answered);
+# and `_load_mechanism()` / `_record_plane_e()` resolving `parents[2]/_shared` unconditionally
+# at sys.path[0], measured live on build 561 as a 2026-08-14 engine answering marker-touching
+# commands with floor-less grants. A missing installed engine is a fail-closed misdeployment,
+# not permission to execute whatever law the checkout is sitting on.
+# tools/loader_binds_installed_engine_test.py drives the controls on this seat;
+# tools/installed_engine_loader_test.py (#742) drives the same shapes on Codex.
+def _shared_runtime_dir():
+    return os.environ.get("HESTIA_SHARED_DIR") or os.path.join(
+        os.path.expanduser(os.environ.get("HESTIA_HOME", "~/.hestia")), "shared")
+
+
+def _load_shared_module(name):
+    """Load governing code only from the selected installed authority directory."""
+    import importlib.util
+
+    shared = _shared_runtime_dir()
+    required = os.path.realpath(os.path.join(shared, name + ".py"))
+    if not os.path.isfile(required):
+        raise ImportError(
+            f"installed Hestia shared module {name!r} is unavailable at {required!r}; "
+            "run deploy/install-members.sh"
+        )
+
+    # Shared modules legitimately import one another by bare canonical name. Make only
+    # the selected authority directory available to those imports; never add a checkout
+    # fallback. Canonicalize it so a HESTIA_HOME/shared symlink and its build directory
+    # cannot occupy two precedence positions.
+    selected_dir = os.path.dirname(required)
+    selected_key = os.path.normcase(selected_dir)
+    retained = []
+    for entry in sys.path:
+        try:
+            entry_key = os.path.normcase(os.path.realpath(os.fspath(entry) or os.getcwd()))
+        except (TypeError, ValueError, OSError):
+            retained.append(entry)
+            continue
+        if entry_key != selected_key:
+            retained.append(entry)
+    sys.path[:] = [selected_dir, *retained]
+
+    cached = sys.modules.get(name)
+    if cached is not None:
+        cached_file = getattr(cached, "__file__", None)
+        if cached_file and os.path.realpath(cached_file) == required:
+            return cached
+        sys.modules.pop(name, None)
+
+    spec = importlib.util.spec_from_file_location(name, required)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot construct a loader for installed module {required!r}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        sys.modules.pop(name, None)
+        # This boundary is module INITIALIZATION only. Convert even SystemExit(0) into
+        # an ordinary loader failure so module-level callers reach the explicit
+        # fail-closed posture; main()'s legitimate allow/deny SystemExit remains outside.
+        raise ImportError(
+            f"installed Hestia shared module {name!r} failed to initialize"
+        ) from exc
+    loaded_file = getattr(module, "__file__", None)
+    if not loaded_file or os.path.realpath(loaded_file) != required:
+        sys.modules.pop(name, None)
+        raise ImportError(
+            f"shared authority miswire: {name!r} resolved to {loaded_file!r}, "
+            f"expected {required!r}"
+        )
+    return module
+
+
 try:
-    from hestia_governance_closure import classify as _closure_classify
-except Exception:  # noqa: BLE001 — Tier-2: the local matcher below stays in force
+    _closure_classify = _load_shared_module("hestia_governance_closure").classify
+except Exception:  # noqa: BLE001 - Tier-2: the local matcher below stays in force
     _closure_classify = None
+
+# The shell read/write classifier, from the SAME installed engine directory. Deliberately
+# NOT wrapped in try/except: there is no local copy to fall back to any more, and a seat
+# that cannot classify a command must not proceed to guess. An ImportError here is loud and
+# denies every call, which is the ratified posture since fail-closed stopped being optional.
+# deploy/install-members.sh points $HESTIA_HOME/shared at the verified build BEFORE it
+# installs any hook, so a hook can never be newer than the engine it imports.
+# GUARDED, and the guard is the whole point. An unguarded module-level import raises
+# BEFORE main()'s handler exists, so the process dies with a traceback and exit 1 -- and
+# under this harness's PreToolUse contract ONLY exit 2 blocks. Any other non-zero is a
+# hook error the harness does not treat as a refusal, so a missing shared authority would
+# have FAILED OPEN: the precise class deleted in #745. Caught here, refused in main().
+try:
+    _classifier = _load_shared_module("hestia_shell_classifier")
+    _blank_inert_heredoc_bodies = _classifier._blank_inert_heredoc_bodies
+    _is_read_only = _classifier._is_read_only
+    _CLASSIFIER_UNAVAILABLE = None
+except Exception as _exc:  # noqa: BLE001 -- any import failure is a missing authority
+    _blank_inert_heredoc_bodies = None  # type: ignore[assignment]
+    _is_read_only = None  # type: ignore[assignment]
+    _CLASSIFIER_UNAVAILABLE = f"{type(_exc).__name__}: {_exc}"
 
 
 # Commands whose arguments and stdin are DATA, never shell code — the same
@@ -326,23 +415,6 @@ except Exception:  # noqa: BLE001 — Tier-2: the local matcher below stays in f
 # (Mirror of policy::shell's INERT_CONTENT_HEADS note; the shadow test below
 # keeps adding `git` here a loud act, because the `git` arm decides first and a
 # list entry would be unreachable — claude-code's sabotage finding, 2026-08-07.)
-_INERT_CONTENT_HEADS = frozenset({
-    # byte movers
-    "cat", "tee", "head", "tail", "rev", "nl",
-    # pattern search — none of these can execute a match
-    "grep", "egrep", "fgrep", "rg",
-    # output
-    "echo", "printf",
-    # text filters
-    "wc", "sort", "uniq", "cut", "tr", "comm", "diff", "column", "fold", "paste",
-    "join",
-    # structured filters
-    "jq",
-    # path arithmetic
-    "basename", "dirname",
-})
-
-
 # --- `git`: the one head that is not a decision by itself ---------------------
 #
 # Mirror of policy::shell's `git_stdin_is_data` (claude-code, branch
@@ -378,361 +450,10 @@ _INERT_CONTENT_HEADS = frozenset({
 # `core.pager`, `alias.*`, `core.fsmonitor`, `diff.*.textconv`,
 # `credential.helper` …), so the default for an unlisted key is "this might
 # introduce an interpreter".
-_GIT_INERT_CONFIG_KEYS = frozenset({"user.name", "user.email"})
-
 # `git` global options taking no value that cannot re-point it at code.
-_GIT_INERT_GLOBAL_FLAGS = frozenset({
-    "--no-pager", "--bare", "--literal-pathspecs", "--no-replace-objects",
-    "--no-optional-locks",
-})
-
 # `git` global options taking a value (`--git-dir=X` or `--git-dir X`) that
 # select WHERE git works, never WHAT it runs. `--exec-path` and `--config-env`
 # are absent on purpose: both name code or config the command text itself chose.
-_GIT_INERT_GLOBAL_VALUE_OPTS = frozenset({"-C", "--git-dir", "--work-tree", "--namespace"})
-
-
-def _git_config_is_inert(kv: str) -> bool:
-    """`-c KEY=VALUE` where KEY cannot change what git executes."""
-    if "=" not in kv:
-        # `-c key` with no `=` sets it true. No listed key is a boolean, so
-        # this is always some other key: refuse.
-        return False
-    return kv.split("=", 1)[0].lower() in _GIT_INERT_CONFIG_KEYS
-
-
-def _message_comes_from_stdin(rest: list) -> bool:
-    """Does this argv say "read the message from stdin"? `-F -`, `-F-`,
-    `--file=-`, `--file -`. `-F /path` is a FILE and is deliberately not
-    vouched for: the heredoc body is then not what git reads."""
-    i = 0
-    while i < len(rest):
-        a = rest[i]
-        if a == "--file=-":
-            return True
-        if a in ("-F", "--file"):
-            return i + 1 < len(rest) and rest[i + 1] == "-"
-        if a == "-F-":
-            return True
-        i += 1
-    return False
-
-
-def _git_stdin_is_data(args: list) -> bool:
-    """Is this `git` invocation one whose stdin is data, so a quoted heredoc
-    body fed to it can never be executed? See the block comment above."""
-    i = 0
-    # ---- 1. global options, up to the subcommand ----
-    while True:
-        if i >= len(args):
-            return False  # `git` with no subcommand at all
-        a = args[i]
-        if not a.startswith("-"):
-            i += 1
-            break
-        i += 1
-        if a == "-c":
-            if i >= len(args) or not _git_config_is_inert(args[i]):
-                return False
-            i += 1
-            continue
-        if a.startswith("-c"):
-            # git's glued form, `-ckey=value`.
-            if not _git_config_is_inert(a[2:]):
-                return False
-            continue
-        if a in _GIT_INERT_GLOBAL_FLAGS:
-            continue
-        name = a.split("=", 1)[0]
-        if name in _GIT_INERT_GLOBAL_VALUE_OPTS:
-            if "=" not in a:
-                # the value is the next word
-                if i >= len(args):
-                    return False
-                i += 1
-            continue
-        return False  # unrecognised global option: unknown means scanned
-
-    # ---- 2 + 3. subcommand, and the flag that declares stdin to be content ----
-    subcommand = a
-    rest = args[i:]
-    if subcommand in ("commit", "tag"):
-        return _message_comes_from_stdin(rest)
-    if subcommand == "hash-object":
-        return "--stdin" in rest
-    return False
-
-
-def _treats_content_as_data(seg: list) -> bool:
-    """Condition 2: does this segment's command treat its arguments and stdin
-    as data? `git` is matched BEFORE the list, so a list entry for it would be
-    unreachable — the shadow test in test_pre_tool_use_self.py keeps that loud."""
-    head = seg[0]
-    if head == "git":
-        return _git_stdin_is_data(seg[2])
-    return head in _INERT_CONTENT_HEADS
-
-
-def _blank_inert_heredoc_bodies(cmd: str) -> Optional[str]:
-    """A copy of `cmd` with QUOTED heredoc bodies blanked to spaces, else None.
-
-    The scoped port of policy::shell's `executable_positions` for this gate —
-    scoped because the two gates match different things. The destructive preset
-    matches COMMAND TOKENS (`rm -`, `dd `), so it can blank any inert quoted
-    span; this gate matches PATHS, and a path can sit at argument position, so
-    blanking quoted arguments would open `tee "hooks/pre_tool_use.py"` as a
-    one-word evasion. A heredoc BODY is the only span that can never name a
-    destination — it is stdin content — so it is the only span blanked here.
-
-    The three safety conditions are the daemon's, unchanged in kind:
-
-    1. The body cannot expand: only a QUOTED delimiter (`<<'X'`, `<<"X"`,
-       `<<\\X`) qualifies. `cat <<X` can carry `$(...)` and stays visible.
-    2. The command governing the body treats stdin as data: the owning
-       segment's head must be in `_INERT_CONTENT_HEADS` — except `git`, the
-       one head that is not a decision by itself, which `_git_stdin_is_data`
-       answers from the argv (see `_treats_content_as_data`).
-    3. Nothing downstream re-interprets it: inertness propagates backwards
-       along pipes, so `cat <<'X' | sh` keeps its body visible.
-
-    Returns None on anything the parser cannot resolve — unterminated quote,
-    heredoc whose delimiter never arrives, unbalanced `$(`, trailing backslash —
-    and None means "match the raw command" (fail closed, today's behaviour).
-    Length and newlines are preserved in the projection, so a report against it
-    still lines up with the original.
-    """
-    n = len(cmd)
-    # (head, sep, args) per segment; sep is 'pipe', 'break' or 'end'; args is
-    # the argv after the head (no assignment prefixes, no redirection targets),
-    # collected because condition 2 is not always answerable from the head alone.
-    segs: list = [[None, "end", []]]
-    inert_spans: list = []  # (seg_idx, start, end) of candidate bodies
-    pending: list = []      # heredocs opened on this line: dicts
-    seg = 0
-    word: list = []
-    word_quoted = False
-    head_done = False
-    expect_redir_target = False
-    subst_depth = 0
-
-    def flush_word() -> None:
-        nonlocal word_quoted, head_done, expect_redir_target
-        if not word:
-            word_quoted = False
-            return
-        w = "".join(word)
-        if expect_redir_target:
-            expect_redir_target = False
-        elif not head_done:
-            if not word_quoted and _is_shell_assignment(w):
-                pass  # `FOO=bar cmd …` — keep looking for the head
-            else:
-                segs[seg][0] = w.rsplit("/", 1)[-1]
-                head_done = True
-        else:
-            segs[seg][2].append(w)
-        word.clear()
-        word_quoted = False
-
-    def find_unescaped(start: int, close: str, honour_backslash: bool) -> Optional[int]:
-        j = start
-        while j < n:
-            if honour_backslash and cmd[j] == "\\":
-                j += 2
-                continue
-            if cmd[j] == close:
-                return j
-            j += 1
-        return None  # unterminated — fail closed
-
-    def read_delimiter(i: int) -> Optional[Tuple[str, bool, int]]:
-        delim: list = []
-        quoted = False
-        while i < n:
-            c = cmd[i]
-            if c in "'\"":
-                quoted = True
-                end = find_unescaped(i + 1, c, c == '"')
-                if end is None:
-                    return None
-                delim.extend(cmd[i + 1:end])
-                i = end + 1
-            elif c == "\\":
-                if i + 1 >= n:
-                    return None
-                quoted = True
-                delim.append(cmd[i + 1])
-                i += 2
-            elif c.isspace() or c in ";&|<>()":
-                break
-            else:
-                delim.append(c)
-                i += 1
-        if not delim:
-            return None
-        return "".join(delim), quoted, i
-
-    def consume_body(i: int, hd: dict) -> Optional[Tuple[int, int, int]]:
-        body_start = i
-        line_start = i
-        while i <= n:
-            if i == n or cmd[i] == "\n":
-                line = cmd[line_start:i]
-                if hd["strip_tabs"]:
-                    line = line.lstrip("\t")
-                if line.rstrip("\r") == hd["delim"]:
-                    return body_start, line_start, (i if i == n else i + 1)
-                if i == n:
-                    return None  # ran out of input before the terminator
-                line_start = i + 1
-            i += 1
-        return None
-
-    i = 0
-    while i < n:
-        c = cmd[i]
-        if c == "\\":
-            if i + 1 >= n:
-                return None  # trailing backslash: unresolved
-            word.extend((c, cmd[i + 1]))
-            word_quoted = True
-            i += 2
-        elif c == "'":
-            end = find_unescaped(i + 1, "'", False)
-            if end is None:
-                return None
-            word.extend(cmd[i + 1:end])
-            word_quoted = True
-            i = end + 1
-        elif c == '"':
-            end = find_unescaped(i + 1, '"', True)
-            if end is None:
-                return None
-            word.extend(cmd[i + 1:end])
-            word_quoted = True
-            i = end + 1
-        elif c == "$" and i + 1 < n and cmd[i + 1] == "(":
-            subst_depth += 1
-            word.extend("$(")
-            i += 2
-        elif c == "`":
-            end = find_unescaped(i + 1, "`", True)
-            if end is None:
-                return None
-            word_quoted = True
-            i = end + 1
-        elif c == "<" and i + 1 < n and cmd[i + 1] == "<":
-            flush_word()
-            if i + 2 < n and cmd[i + 2] == "<":
-                i += 3  # herestring: the following word is ordinary data
-            else:
-                i += 2
-                strip_tabs = i < n and cmd[i] == "-"
-                if strip_tabs:
-                    i += 1
-                while i < n and cmd[i] in " \t":
-                    i += 1
-                got = read_delimiter(i)
-                if got is None:
-                    return None
-                delim, quoted, i = got
-                pending.append({"delim": delim, "quoted": quoted,
-                                "strip_tabs": strip_tabs, "seg": seg})
-        elif c in "><":
-            if word and all(ch.isdigit() for ch in word):
-                word.clear()
-                word_quoted = False
-            flush_word()
-            i += 1
-            while i < n and cmd[i] in "><&|":
-                i += 1
-            expect_redir_target = True
-        elif c in "|;&({}":
-            if c == "(" and subst_depth > 0:
-                word.append(c)
-                i += 1
-                continue
-            flush_word()
-            is_pipe = c == "|" and not (i + 1 < n and cmd[i + 1] == "|")
-            segs[seg][1] = "pipe" if is_pipe else "break"
-            segs.append([None, "end", []])
-            seg += 1
-            head_done = False
-            expect_redir_target = False
-            i += 1
-            if i < n and cmd[i] == c and c in "&|":
-                i += 1
-        elif c == ")":
-            if subst_depth > 0:
-                subst_depth -= 1
-                word.append(c)
-                i += 1
-            else:
-                flush_word()
-                segs[seg][1] = "break"
-                segs.append([None, "end", []])
-                seg += 1
-                head_done = False
-                expect_redir_target = False
-                i += 1
-        elif c == "\n":
-            flush_word()
-            i += 1
-            for hd in pending:
-                got = consume_body(i, hd)
-                if got is None:
-                    return None
-                body_start, body_end, i = got
-                if hd["quoted"] and subst_depth == 0:
-                    inert_spans.append((hd["seg"], body_start, body_end))
-            pending.clear()
-            segs[seg][1] = "break"
-            segs.append([None, "end", []])
-            seg += 1
-            head_done = False
-            expect_redir_target = False
-        elif c in " \t\r":
-            flush_word()
-            i += 1
-        else:
-            word.append(c)
-            i += 1
-
-    if subst_depth != 0:
-        return None  # unbalanced `$(`
-    if pending:
-        return None  # heredoc opened, body never arrived
-    flush_word()
-
-    # Conditions 2 + 3 together, walking backwards so a segment is inert only
-    # if the segment it pipes into is inert too.
-    inert_seg = [False] * len(segs)
-    for k in range(len(segs) - 1, -1, -1):
-        head_ok = _treats_content_as_data(segs[k])
-        if segs[k][1] == "pipe":
-            inert_seg[k] = head_ok and (inert_seg[k + 1] if k + 1 < len(segs) else False)
-        else:
-            inert_seg[k] = head_ok
-
-    out = list(cmd)
-    for s, start, end in inert_spans:
-        if 0 <= s < len(inert_seg) and inert_seg[s]:
-            for slot in range(start, end):
-                if out[slot] != "\n":
-                    out[slot] = " "
-    return "".join(out)
-
-
-def _is_shell_assignment(word: str) -> bool:
-    """`FOO=bar` — a variable assignment prefix, not the segment's head."""
-    eq = word.find("=")
-    if eq <= 0:
-        return False
-    name = word[:eq]
-    return (name[0].isalpha() or name[0] == "_") and all(
-        ch.isalnum() or ch == "_" for ch in name)
-
-
 def _touches_self(tool_name: str, tool_input: Any) -> Optional[Tuple[str, str, str]]:
     """`(marker, resource, key)` if this call reaches the gate's own code, else None.
 
@@ -1019,50 +740,10 @@ def _touches_registration(tool_name: str, tool_input: Any) -> Optional[str]:
 # small read-only allowlist AND there is no redirection or pipe. Same reasoning as
 # policy::shell's inert-head allowlist: widening requires ADDING a name, a reviewable act;
 # forgetting one costs a false refusal, never a hole.
-_READ_ONLY_TOOLS = {"Read", "Grep", "Glob", "NotebookRead"}
-_WRITE_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
-_READ_ONLY_HEADS = {
-    "cat", "less", "more", "head", "tail", "grep", "rg", "egrep", "fgrep",
-    "wc", "md5sum", "sha256sum", "shasum", "cksum", "diff", "file", "stat", "ls",
-    # Added 2026-08-02 after ELEVEN false refusals in one session, every one of them a
-    # read. Widening is "a reviewable act" per the note above, so each name is here on
-    # purpose and the risky ones are guarded below rather than admitted bare.
-    "echo", "printf", "basename", "dirname", "realpath", "readlink", "pwd",
-    "true", "false", "test", "[", "seq", "nl", "cut", "tr", "uniq",
-    "comm", "rev", "du", "df", "which", "type", "id", "whoami", "uname",
-    "jq", "column", "tree",
-    # `cd` added 2026-08-05, and it is the cheapest of the four fixes in this pass because
-    # `cd` is a head that CANNOT write — there is no flag, no argument and no spelling of it
-    # that modifies a file. Its absence cost a real refusal: `cd h && grep -n foo <gate>`,
-    # a read of the gate for symbol names while writing a defect report about the gate, was
-    # refused and opened escalation 851e0d0ec5a4bf0c on the operator. `grep -n foo <gate>`
-    # alone is permitted, so the only thing the refusal measured was that the member changed
-    # directory first.
-    #
-    # Segment walking is what makes this safe, and the test says so rather than trusting it:
-    # separators split `cd /tmp && sed -i s/a/b/ <gate>` into two segments and the second is
-    # head-checked on `sed`. Adding `cd` frees the `cd` segment, never the one after it.
-    # (`cd_does_not_launder` in tests/gate_false_refusal_test.py.)
-    "cd",
-    # NOT here: `date` and `hostname` (codex peer review, finding 2). `date -s` sets the
-    # system clock; `hostname X` sets the hostname. A read-looking NAME carrying a mutating
-    # FLAG is precisely what a head allowlist cannot see, which is why `_GUARDED_HEADS`
-    # exists for the cases worth keeping.
-    #
-    # These two survived the first rebuild because that edit covered the logic region and
-    # not this set — the classifier then scored 27/29 with exactly these two failing, while
-    # the standalone prototype had passed 30/30. Without running the cases against the REAL
-    # file this would have shipped claiming all four of codex's findings fixed with two of
-    # them still open, and a test that only ever ran against the prototype would have agreed.
-}
 # Heads that are read-only ONLY without their writing flags. Kept separate so the guard is
 # impossible to lose by someone appending to the set above.
 #   find  — `-delete`, `-exec`, `-fprint*` execute or write
 #   sort  — `-o FILE` writes
-_GUARDED_HEADS = {
-    "find": ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls"),
-    "sort": ("-o", "--output"),
-}
 # Admitted UNDER A GRAMMAR, not bare: `sed` — see `_HEAD_GRAMMARS` below. thor refuted an
 # earlier attempt to allow `sed -n` by demonstration, not by argument (`sed -n
 # '1r /etc/shadow'` reads a file whose path never appears as an argument, invisible to
@@ -1104,273 +785,10 @@ _GUARDED_HEADS = {
 # text commands, `s` and `y` with their delimiters, and a closed set of single-letter
 # commands. A real sed construct outside that subset costs a false refusal, never a hole —
 # the same trade the head allowlist makes, one token stream down.
-def _sed_scan_delimited(prog: str, i: int) -> int:
-    """PROG[i] opens a delimited section (`/re/`, the pattern or replacement of `s`,
-    one side of `y`). Return the index just past the CLOSING delimiter, or -1 if there
-    is none. Backslash escapes the next char. A delimiter inside a bracket expression
-    (`s/[/]/x/`) is NOT modelled: the misparse lands on an unknown token, and unknown
-    fails closed."""
-    d = prog[i]
-    i += 1
-    while i < len(prog):
-        if prog[i] == "\\":
-            i += 2
-            continue
-        if prog[i] == d:
-            return i + 1
-        i += 1
-    return -1
-
-
-def _sed_scan_to(prog: str, i: int, d: str) -> int:
-    """Scan from PROG[i] to the next unescaped delimiter D (already known); return
-    just past it, or -1 if there is none. The `s`/`y` sections after the first share
-    the opening delimiter with the section before, so only the first can be found by
-    `_sed_scan_delimited`."""
-    while i < len(prog):
-        if prog[i] == "\\":
-            i += 2
-            continue
-        if prog[i] == d:
-            return i + 1
-        i += 1
-    return -1
-
-
-def _sed_skip_address(prog: str, i: int) -> int:
-    """Skip ONE address at PROG[i]. Return the new index, I unchanged when no address
-    starts here (not an error — the command is next), or -1 on a malformed one."""
-    n = len(prog)
-    if i >= n:
-        return i
-    ch = prog[i]
-    if ch.isdigit():
-        while i < n and prog[i].isdigit():
-            i += 1
-    elif ch == "$":
-        i += 1
-    elif ch in "+~":
-        # GNU range tail standing alone: `addr1,+N` / `addr1,~N`.
-        i += 1
-        if i >= n or not prog[i].isdigit():
-            return -1
-        while i < n and prog[i].isdigit():
-            i += 1
-        return i
-    elif ch == "/":
-        i = _sed_scan_delimited(prog, i)
-        if i < 0:
-            return -1
-        while i < n and prog[i] in "IM":  # GNU regex modifiers
-            i += 1
-    elif ch == "\\":
-        # GNU `\cREc`: backslash, then any delimiter char.
-        if i + 1 >= n:
-            return -1
-        i = _sed_scan_delimited(prog, i + 1)
-        if i < 0:
-            return -1
-    else:
-        return i
-    # GNU `FIRST~STEP` suffix on a numeric or `$` address.
-    if i < n and prog[i] in "+~":
-        i += 1
-        if i >= n or not prog[i].isdigit():
-            return -1
-        while i < n and prog[i].isdigit():
-            i += 1
-    return i
-
-
 # Single-letter commands that can neither write a file, read a hidden one, nor execute.
-_SED_SAFE_COMMANDS = set("pdDnPhHgGxlqQzv=")
-
-
-def _sed_program_is_read_only(prog: str) -> bool:
-    """True only when a sed program text cannot write, execute, or read a hidden path.
-
-    Refused constructs, each named in the adjudication this parser replaces:
-      `w`/`W file`   — write pattern/hold space to a file the redirect check never sees
-      `s///w file`   — the same write as a substitute flag
-      `s///e`        — execute the replacement as a shell command
-      `e [cmd]`      — GNU: execute a shell command outright
-      `r`/`R file`   — read a file whose path lives INSIDE the program, so it is
-                       invisible to every argument-based check (thor's refutation case)
-    """
-    i, n, depth = 0, len(prog), 0
-    while i < n:
-        ch = prog[i]
-        if ch in " \t\n;":
-            i += 1
-            continue
-        if ch == "#":  # comment runs to end of line
-            j = prog.find("\n", i)
-            i = n if j < 0 else j + 1
-            continue
-        if ch == "}":
-            if depth == 0:
-                return False
-            depth -= 1
-            i += 1
-            continue
-        j = _sed_skip_address(prog, i)
-        if j < 0:
-            return False
-        i = j
-        if i < n and prog[i] == ",":
-            j = _sed_skip_address(prog, i + 1)
-            if j < 0 or j == i + 1:  # a comma with no second address is malformed
-                return False
-            i = j
-        while i < n and prog[i] in " \t":
-            i += 1
-        if i < n and prog[i] == "!":
-            i += 1
-            while i < n and prog[i] in " \t":
-                i += 1
-        if i >= n:
-            return False  # an address with no command is malformed
-        c = prog[i]
-        i += 1
-        if c in _SED_SAFE_COMMANDS:
-            continue
-        if c == "{":
-            depth += 1
-            continue
-        if c in "btT:":
-            # Branch/label: the name runs to `;` or end of line and is data, not code.
-            while i < n and prog[i] not in ";\n":
-                i += 1
-            continue
-        if c in "aic":
-            # GNU one-line form: the text is the REST OF THE LINE, semicolons included —
-            # so a `w` appearing there is appended text in real sed too, and skipping it
-            # misses nothing.
-            j = prog.find("\n", i)
-            i = n if j < 0 else j + 1
-            continue
-        if c == "y":
-            if i >= n:
-                return False
-            d = prog[i]
-            i = _sed_scan_delimited(prog, i)   # first string, delimiters included
-            if i < 0:
-                return False
-            i = _sed_scan_to(prog, i, d)       # second string, to the closing delimiter
-            if i < 0:
-                return False
-            continue
-        if c == "s":
-            if i >= n:
-                return False
-            d = prog[i]
-            i = _sed_scan_delimited(prog, i)   # pattern, delimiters included
-            if i < 0:
-                return False
-            i = _sed_scan_to(prog, i, d)       # replacement, to the closing delimiter
-            if i < 0:
-                return False
-            while i < n and prog[i] not in ";\n}":
-                f = prog[i]
-                if f in " \t":
-                    i += 1
-                    continue
-                if f in "wWe":
-                    return False  # s///w writes; s///e executes
-                if f.isdigit() or f in "gpiImM":
-                    i += 1
-                    continue
-                return False  # an unknown flag is a write
-            continue
-        return False  # w W r R e, and every command this parser does not model
-    return depth == 0
-
-
-def _sed_args_are_read_only(args: list[str]) -> bool:
-    """True only when a sed ARGV (post-head tokens, quotes still on) is confidently
-    read-only. Flags are checked one by one — `-ni` is `-i` — and every program text,
-    whether positional or `-e`-supplied, goes through `_sed_program_is_read_only`.
-    Input files are read, never written, by everything admitted here."""
-    scripts: list[str] = []
-    positional: list[str] = []
-    from_expr = False
-    i, n = 0, len(args)
-    while i < n:
-        a = args[i].strip("'\"")
-        if a == "--":
-            positional.extend(x.strip("'\"") for x in args[i + 1:])
-            break
-        if a.startswith("--"):
-            name, eq, val = a[2:].partition("=")
-            if name in ("in-place", "file"):
-                return False
-            if name == "expression":
-                from_expr = True
-                if eq:
-                    scripts.append(val)
-                else:
-                    i += 1
-                    if i >= n:
-                        return False
-                    scripts.append(args[i].strip("'\""))
-            elif name in ("silent", "quiet", "null-data", "posix", "debug",
-                          "regexp-extended", "extended-regexp", "separate",
-                          "follow-symlinks", "sandbox", "unbuffered",
-                          "help", "version"):
-                pass
-            elif name == "line-length":
-                if not eq:
-                    i += 1
-                    if i >= n or not args[i].strip("'\"").isdigit():
-                        return False
-            else:
-                return False
-        elif a.startswith("-") and a != "-":
-            cluster = a[1:]
-            k = 0
-            while k < len(cluster):
-                f = cluster[k]
-                if f in "nErsuz":
-                    k += 1
-                elif f == "l":
-                    if k + 1 < len(cluster):
-                        if not cluster[k + 1:].isdigit():
-                            return False
-                    else:  # the value is the next token
-                        i += 1
-                        if i >= n or not args[i].strip("'\"").isdigit():
-                            return False
-                    k = len(cluster)
-                elif f == "e":
-                    from_expr = True
-                    if k + 1 < len(cluster):
-                        scripts.append(cluster[k + 1:])
-                    else:
-                        i += 1
-                        if i >= n:
-                            return False
-                        scripts.append(args[i].strip("'\""))
-                    k = len(cluster)
-                else:  # `i` and `f` land here, with everything unknown
-                    return False
-        else:
-            positional.append(a)
-        i += 1
-    if not from_expr:
-        if not positional:
-            return False  # no program text at all
-        scripts.append(positional[0])
-        positional = positional[1:]
-    return all(_sed_program_is_read_only(s) for s in scripts)
-
-
 # Heads admitted only through their argument grammar. Checked BEFORE `_READ_ONLY_HEADS`
 # in the segment walk, so the audit cannot be lost by someone appending the head to the
 # bare set — the `_GUARDED_HEADS` principle, one column over.
-_HEAD_GRAMMARS = {
-    "sed": _sed_args_are_read_only,
-}
-
 # Separators that START A NEW COMMAND, and redirect operators. Enumerated rather than
 # regex-matched, because the token stream below yields them as discrete tokens.
 #
@@ -1385,8 +803,6 @@ _HEAD_GRAMMARS = {
 # now because `_command_lines` splits the TEXT first and the caller inserts one `"\n"` token
 # per honoured newline. A membership test that cannot fire looks exactly like one that
 # passes; this entry is why the fix below is a tokenizer change and not a set edit.
-_SEPARATORS = {";", "&", "&&", "|", "||", "\n"}
-_REDIRECTS = {">", ">>", "<", "<<", "<<<", ">&", "&>", ">|", "<&"}
 # INPUT redirects create and modify nothing. Split out 2026-08-05, and the split is the
 # narrow, provable half of a larger argument kimi-code and I have been having about the FP6
 # remedy — "the redirect branch should return the write target". It cannot, for `<`: there
@@ -1407,29 +823,14 @@ _REDIRECTS = {">", ">>", "<", "<<", "<<<", ">&", "&>", ">|", "<&"}
 # the migration rather than the verdict: `shell_reads_a_script` pairs `sh < evil.sh`
 # (refused) with `cat < evil.sh` (permitted), and only a live head check makes that pair
 # possible. Output redirects (`>`, `>>`, `>|`, `>&`, `&>`) are untouched.
-_INPUT_REDIRECTS = {"<", "<<", "<<<", "<&"}
 # `branch` and `remote` are NOT here (codex finding 1): `git branch -d` deletes a ref and
 # `git remote add` rewrites repository config. A read-looking SUBCOMMAND with a mutating
 # FLAG is exactly what a name allowlist cannot see.
-_GIT_READ_SUBCOMMANDS = {"show", "diff", "log", "cat-file", "blame", "status", "rev-parse",
-                         "describe", "ls-files", "ls-tree", "rev-list", "show-ref",
-                         # Added 2026-08-10 (Sprint 5, the `_STILL_OPEN` git-read rows,
-                         # kimi-code notice 1745 §3). Both are plumbing READS with no
-                         # mutating spelling in any form — `merge-base` computes ancestry
-                         # (`--is-ancestor` is the exit-status probe two members ran every
-                         # wake and had refused beside a `rev-list` that read fine), and
-                         # `for-each-ref` enumerates refs. A bare-set add is correct BECAUSE
-                         # neither has a writing mode a flag could hide, unlike `branch`
-                         # (creates from a positional) and `hash-object -w` (writes a blob),
-                         # which is why those two stay OUT of this set and need a grammar.
-                         "merge-base", "for-each-ref"}
 # Read-BY-DEFAULT subcommands carrying a mutating flag get the _GUARDED_HEADS treatment one
 # column over, rather than a bare-set append (claude-code §5.1, notice 1471, escalation
 # 10fb8aa5c095c085): `git hash-object` only hashes, but `git hash-object -w` writes the blob
 # into the object database. The flag, not the name, decides. Prefix match, same as there, so
 # `-w` bundled or separated is caught alike.
-_GIT_GUARDED_SUBCOMMANDS = {"hash-object": ("-w",)}
-
 # Control-flow keywords, modelled 2026-08-07 (FP12, kimi-code; found by claude-code's
 # isolating pair: `for f in a b; do grep -c def <gate>; done` REFUSED while
 # `git show <rev>:<gate> | grep -c ""` ALLOWED — same governance path, same read, the
@@ -1443,131 +844,6 @@ _GIT_GUARDED_SUBCOMMANDS = {"hash-object": ("-w",)}
 # is never seen. The safe shape is a STRIP, not an admission: remove leading keywords,
 # then head-check what remains. The red arm (`do rm`, `then tee`, `done > f`) is in
 # `_SURVIVE`; a green on the false-refusal rows alone would certify the hole.
-_CONTROL_FLOW_BODY = {"do", "then", "else"}        # the remainder is the body command
-_CONTROL_FLOW_COND = {"if", "elif", "while", "until"}  # the remainder EXECUTES (the condition)
-_CONTROL_FLOW_CLOSE = {"done", "fi", "esac"}       # a segment of closers runs nothing
-_FOR_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
-
-
-def _has_live_substitution(text: str) -> bool:
-    """True when `text` carries a command substitution bash would EXECUTE.
-
-    FP14 (claude-code, escalation c80e4a2557df241b, 2026-08-08): the guard this
-    replaces was a substring test on posix=False tokens — `"$(" in t` — so a grep
-    PATTERN that names substitution (`grep -n "=\\$(\\|…" <gate>`, where `\\$` is a
-    literal dollar to bash) refused exactly like a live one. posix=False had already
-    preserved the quoting that separates the two; the check just never read it. It
-    is also the one FP its own search cannot find: grepping the gate for `$(` trips
-    the check being searched for.
-
-    Quoting is a STATE, not a substring, so walk it. Inert by bash's rules: anything
-    inside single quotes, and a backslash-escaped character (any character unquoted;
-    inside double quotes only before $ ` " \\ or newline). Live everywhere else,
-    INCLUDING inside double quotes — `"$(id)"` runs. The walk runs on raw text, not
-    on tokens: punctuation splitting puts the `$(` of `a$(id)b` across two tokens,
-    where no per-token test can see it whole, and a leading quote hid a backtick
-    from the old startswith test. Both were live bypasses; the walk closes them.
-
-    Unterminated quoting cannot reach here — the caller's tokenizer has already
-    failed closed on it — but the walk answers True for it anyway: an unresolved
-    quote means the quoting was never decided, and undecided means write.
-    """
-    state = ""  # "", "'" or '"' — the quoting the walk is inside
-    i = 0
-    while i < len(text):
-        c = text[i]
-        if state == "'":
-            if c == "'":
-                state = ""
-        elif state == '"':
-            if c == '"':
-                state = ""
-            elif c == "\\" and text[i + 1:i + 2] in ('$', '`', '"', "\\", "\n"):
-                i += 1
-            elif c == "`" or text[i:i + 2] == "$(":
-                return True
-        else:
-            if c == "'" or c == '"':
-                state = c
-            elif c == "\\":
-                i += 1
-            elif c == "`" or text[i:i + 2] == "$(":
-                return True
-        i += 1
-    return state != ""
-
-
-def _control_flow_remainder(parts):
-    """Strip leading shell control-flow keywords from one segment.
-
-    Returns the remaining command tokens to head-check; [] for a segment that carries
-    NO command (a bare closer, or a `for VAR [in WORDS]` / `case WORD in` header —
-    the words are data, globbed at most, never executed); or None for a keyword shape
-    this grammar does not model, which the caller must treat as a WRITE, because
-    unparseable input is a write.
-
-    `if`/`while`/`until`/`elif` strip to their CONDITION, not past it: the condition
-    really runs, so `if rm -rf /; then ...; fi` refuses on `rm`. `case` arms
-    (`pattern) body ;;`) stay unmodelled and refuse on their own segments — fail
-    closed, not a hole: the header skip runs nothing by itself.
-    """
-    p = list(parts)
-    while p:
-        w = p[0]
-        if w in _CONTROL_FLOW_BODY or w in _CONTROL_FLOW_COND:
-            p.pop(0)
-            continue
-        if w in _CONTROL_FLOW_CLOSE:
-            return [] if len(p) == 1 else None
-        if w == "for":
-            if (len(p) >= 2 and _FOR_NAME.match(p[1])
-                    and p[1] not in _CONTROL_FLOW_BODY
-                    and p[1] not in _CONTROL_FLOW_COND
-                    and p[1] not in _CONTROL_FLOW_CLOSE and p[1] != "in"
-                    and (len(p) == 2 or p[2] == "in")):
-                return []
-            return None
-        if w == "case":
-            return [] if len(p) == 3 and p[2] == "in" else None
-        return p
-    return []
-
-
-def _assignment_remainder(parts):
-    r"""Consume leading NAME=VALUE assignment prefixes from one segment.
-
-    FP13 (claude-code, notice 1474 §1): the head check read `G=<path>` as a COMMAND —
-    basename(`G=<gate>`) is the gate's own filename, which sits in no head list, so a
-    member spelling a read of its own law through a variable was refused as a WRITE
-    and minted an escalation (the matched pair: `grep … <gate>` permitted,
-    `G=<gate>; grep … "$G"` refused). In shell grammar a leading NAME=VALUE token is a
-    PREFIX, not the command — it runs nothing by itself. So consume leading
-    assignments and head-check what follows; the empty case (`G=x` alone) runs
-    nothing and is read-only.
-
-    A prefix is only free when it is INERT. A command substitution inside the value
-    EXECUTES — `G=`rm -rf …`` runs the rm — so a value carrying a LIVE one fails
-    closed here rather than being consumed. Liveness is `_has_live_substitution`'s
-    call, not a substring test: an escaped or quoted substitution SPELLING in the
-    value is data (FP14), and `G=\`id\`` must not refuse the read that follows it.
-    (The single-quoted `$(` twin never reaches this check: shlex's punctuation_chars
-    mode raises "No closing quotation" on a mid-token quote and the classifier fails
-    closed in the tokenizer — safe, and one layer below this one.)
-
-    A consume, NOT a merge into `_control_flow_remainder` (1474 §1): `for` and
-    `NAME=` have different arities, and one shared strip is how `do rm -rf /` gets
-    freed. The red arm is `assignment_does_not_launder` in `_SURVIVE`; the control
-    proves the sed grammar still decides what follows the prefix.
-    """
-    p = list(parts)
-    while p and _ASSIGNMENT.match(p[0]):
-        if _has_live_substitution(p[0]):
-            return None  # a substitution in the VALUE runs; fail closed
-        p.pop(0)
-    return p
-
-
 # Characters after which an unquoted `#` OPENS A COMMENT, plus the start of a line. Bash
 # begins a comment only at the start of a WORD: `echo a#b; echo two` prints both lines
 # (measured against bash 2026-08-10), because `a#b` is one literal word and the `;` after it
@@ -1595,259 +871,6 @@ def _assignment_remainder(parts):
 # the faithful spelling. Two parsers, one narrower and one more faithful, neither a bypass.
 # Whichever survives, this paragraph is the record that the difference was deliberate and
 # measured rather than an oversight in the loser.
-_COMMENT_OPENS_AFTER = frozenset(" \t\r\f\v;&|")
-
-
-def _command_lines(text: str) -> list[str]:
-    """Split raw command TEXT into the logical lines bash would run, in order.
-
-    THE HOLE THIS CLOSES (found by claude-code 2026-08-08, escalation 4a3e6f6838acabad;
-    fixed by LEGION 2026-08-10 claiming CBP's 0015 offer). `_SEPARATORS` has listed `"\\n"`
-    since it was written, but the caller's `shlex` treats a newline as whitespace and never
-    emits it as a token, so the entry matched nothing. No newline ever split a segment:
-    every line after the first arrived as ARGUMENTS to line one's head. So
-
-        echo checking
-        cp evil.py <the gate>
-
-    was classified from `echo` alone — read-only, permitted, and the `cp` overwrote the
-    enforcing gate with no `gate_self_access` event, no witness and no approval. A silent
-    write to the thing that governs writes is the one class worse than a false refusal.
-
-    WHY THE SPLIT IS ON TEXT AND NOT ON TOKENS. Three constructs make the newline
-    unrecoverable once shlex has run, and each is a red arm in
-    `gate_false_refusal_test.py`:
-
-      - a QUOTED newline is data (`grep -c 'a\\nb' <gate>`), so a blind `text.split("\\n")`
-        cuts a pattern in half and leaves an unbalanced quote — a legitimate read refused
-        for being multi-line;
-      - a `\\`-newline is ONE logical line, so splitting there leaves the gate's PATH
-        standing alone as a segment, and `basename` of it is a head no list carries. That
-        is FP13's exact shape (`assignment_prefix_is_not_a_head`), reintroduced by the fix
-        meant to close a hole;
-      - a COMMENT is consumed by shlex THROUGH the end of the line, separator included, so
-        by the time there is a token stream the newline after `# note` is already gone.
-
-    AND THE COMMENT RULE HAD TO COME WITH IT, not after it. shlex's `commenters` eats from
-    `#` to end of LINE — and a `;` sits on the line, so the comment never needed a newline
-    to swallow a separator: `echo a#b; cp evil.py <gate>` was permitted with the `cp`
-    entirely unseen, while bash ran it. Splitting on newlines does not touch that; line one
-    is the whole command. So the caller sets `commenters = ""` and the rule moves here,
-    where the word-start test that separates bash's comment from bash's literal can actually
-    be applied. The two directions are pinned as a PAIR —
-    `mid_word_hash_is_not_a_comment` must refuse, `word_start_comment_still_comments` must
-    stay permitted — because a fix that just refuses anything containing `#` passes the
-    first and fails the second, and only the pair says which one happened.
-
-    The quoting walk here follows `_has_live_substitution`'s rules character for character
-    (single quotes inert; inside double quotes a backslash escapes only `$` `` ` `` `"` `\\`
-    and newline; unquoted backslash escapes anything). That is deliberate duplication of
-    SHAPE, not of code: it cannot call that function, which answers one bool about the whole
-    string, but two quote walkers in one classifier that disagreed about where a quote ends
-    would be a bypass generator. Change one, read the other.
-
-    Unterminated quoting is NOT resolved here — the walk simply ends inside the quote and
-    the offending line goes back to the caller with the quote still open, where the
-    tokenizer raises and fails closed. One place decides that, and it is the same place as
-    before this function existed.
-    """
-    lines: list[str] = []
-    buf: list[str] = []
-    state = ""            # "", "'" or '"' — the quoting the walk is inside
-    at_word_start = True  # a `#` here opens a comment; mid-word it is a literal
-    i = 0
-    n = len(text)
-    while i < n:
-        c = text[i]
-        if state == "'":
-            buf.append(c)
-            if c == "'":
-                state = ""
-            at_word_start = False
-        elif state == '"':
-            if c == "\\" and text[i + 1:i + 2] in ('$', '`', '"', "\\", "\n"):
-                buf.append(text[i:i + 2])
-                at_word_start = False
-                i += 2
-                continue
-            buf.append(c)
-            if c == '"':
-                state = ""
-            at_word_start = False
-        elif c == "\\":
-            nxt = text[i + 1:i + 2]
-            if nxt == "\n":
-                # Line continuation. Bash removes BOTH characters and the lines become one,
-                # so emit nothing and do NOT touch `at_word_start` — `ec\<nl>ho` is `echo`,
-                # one word across the join.
-                i += 2
-                continue
-            if nxt:
-                buf.append(text[i:i + 2])
-                at_word_start = False
-                i += 2
-                continue
-            buf.append(c)  # a lone trailing backslash; hand it on unchanged
-            at_word_start = False
-        elif c == "\n":
-            lines.append("".join(buf))
-            buf = []
-            at_word_start = True
-        elif c == "#" and at_word_start:
-            # Discard through the end of the line, the newline EXCLUDED so the line still
-            # separates. That exclusion is the whole `comment_does_not_eat_the_separator`
-            # row: shlex's version consumed the newline with the comment.
-            while i < n and text[i] != "\n":
-                i += 1
-            continue
-        else:
-            buf.append(c)
-            if c == "'" or c == '"':
-                state = c
-                at_word_start = False
-            else:
-                at_word_start = c in _COMMENT_OPENS_AFTER
-        i += 1
-    lines.append("".join(buf))
-    return lines
-
-
-def _is_read_only(tool_name: str, tool_input: Any) -> bool:
-    """True only when the call is CONFIDENTLY read-only. Ambiguity means write.
-
-    TOKENISED, NOT SPLIT (codex peer review, 2026-08-02). The previous version split raw
-    command TEXT, so a quoted operator was indistinguishable from a real one:
-    `grep -E "a|b" f` split inside its own quotes, and `grep ">" f` tripped a substring
-    test for `>`. That is the #116 quoted-token class, and an earlier draft of this widening
-    made it worse rather than better.
-
-    `shlex` with `posix=False` is the fix as a CLASS rather than as more special cases: it
-    preserves quoting, so a quoted `|` or `>` arrives as one data token (`'"a|b"'`) and can
-    never be read as syntax. `posix=True` would strip the quotes and silently keep the bug —
-    the trap this nearly walked into.
-
-    codex's structural point, which is why this is a rewrite and not another list:
-
-        "shell syntax is exceeding what a string splitter can safely model. If this
-         classifier stays lexical, its supported grammar needs to be explicit and everything
-         outside that grammar must remain a write. Another growing list of heads and
-         separators will keep alternating false denial and bypass."
-
-    So the grammar is explicit and CLOSED: enumerated separators, enumerated redirects,
-    enumerated control-flow keywords, enumerated heads. Unparseable input is a write.
-    Unknown syntax is a write. Command substitution is a write. The aim is to stop
-    calling `2>/dev/null` a file write — not to make the classifier clever.
-    """
-    if tool_name in _READ_ONLY_TOOLS:
-        return True
-    if tool_name in _WRITE_TOOLS:
-        return False
-    if tool_name not in {"Bash", "Shell"}:
-        return False
-    cmd = tool_input.get("command") if isinstance(tool_input, dict) else None
-    if not isinstance(cmd, str) or not cmd.strip():
-        return False
-
-    # Imported here rather than at module scope: this hook is on the agent's critical path
-    # with an 800ms budget, and `shlex` is only needed on the Bash branch.
-    import shlex
-
-    # ONE TOKENIZER PER LOGICAL LINE, with an explicit `"\n"` token between them — one per
-    # newline `_command_lines` honoured. shlex cannot do this itself: it counts a newline as
-    # whitespace, so a single pass over the whole command emits no separator and every line
-    # after the first becomes argv to line one's head (the bypass above). Tokenising per line
-    # is also what makes `commenters = ""` safe — the comment rule now lives in
-    # `_command_lines`, where bash's word-start test can be applied, instead of in a
-    # tokenizer that eats to end-of-line and takes any `;` on that line with it.
-    tokens: list[str] = []
-    try:
-        for idx, line in enumerate(_command_lines(cmd)):
-            if idx:
-                tokens.append("\n")
-            lx = shlex.shlex(line, posix=False, punctuation_chars=True)
-            lx.whitespace_split = True
-            lx.commenters = ""
-            tokens.extend(lx)
-    except ValueError:
-        # Unbalanced quotes: we cannot know what this runs. Fail closed. Still decided in
-        # exactly one place, and a quote `_command_lines` left open arrives here to be
-        # refused rather than being resolved by a second, divergent walk.
-        return False
-    if not tokens:
-        return False
-
-    # Command substitution runs arbitrary code and its contents are never walked below.
-    # Checked on the RAW command, with quoting walked as a state — not as a substring
-    # test on tokens (FP14): posix=False preserves the quoting, so `grep -n "=\$(\|…"
-    # <gate>` is data bash passes through, and the old test could not tell it from the
-    # live case. The raw walk also sees what no per-token test can: `a$(id)b`, split
-    # across tokens by punctuation_chars, and a backtick behind a leading quote.
-    if _has_live_substitution(cmd):
-        return False
-
-    segments: list[list[str]] = [[]]
-    i = 0
-    while i < len(tokens):
-        t = tokens[i]
-        if t in _SEPARATORS:
-            segments.append([])
-            i += 1
-            continue
-        if t in _REDIRECTS:
-            nxt = tokens[i + 1] if i + 1 < len(tokens) else None
-            # An input redirect writes nothing; consume it and its operand. The operand is
-            # a source file, a heredoc delimiter or a literal — never a destination — so it
-            # must not fall through and be head-checked as if it started a command.
-            if t in _INPUT_REDIRECTS:
-                i += 2
-                continue
-            # fd duplication (`2>&1`) and `/dev/null` write no file. Everything else does.
-            if t in {">&", "&>", "<&"} and nxt and nxt.isdigit():
-                i += 2
-                continue
-            if nxt == "/dev/null":
-                i += 2
-                continue
-            return False
-        segments[-1].append(t)
-        i += 1
-
-    for parts in segments:
-        if not parts:
-            continue
-        parts = _control_flow_remainder(parts)
-        if parts is None:
-            return False
-        parts = _assignment_remainder(parts)
-        if parts is None:
-            return False
-        if not parts:
-            continue
-        head = os.path.basename(parts[0].strip("'\""))
-        if head == "git":
-            if len(parts) < 2:
-                return False
-            if parts[1] in _GIT_GUARDED_SUBCOMMANDS:
-                if any(a.startswith(f) for a in parts[2:] for f in _GIT_GUARDED_SUBCOMMANDS[parts[1]]):
-                    return False
-            elif parts[1] not in _GIT_READ_SUBCOMMANDS:
-                return False
-        elif head in _HEAD_GRAMMARS:
-            # Admitted by head, audited by arguments. BEFORE the bare set, so an append
-            # there can never bypass the grammar — `sed` in `_READ_ONLY_HEADS` would be
-            # dead text, not a hole.
-            if not _HEAD_GRAMMARS[head](parts[1:]):
-                return False
-        elif head in _GUARDED_HEADS:
-            # Read-only only without its writing flags. Prefix match so `-exec`,
-            # `-execdir` and `--output=x` are all caught.
-            if any(a.startswith(f) for a in parts[1:] for f in _GUARDED_HEADS[head]):
-                return False
-        elif head not in _READ_ONLY_HEADS:
-            return False
-    return True
-
-
 def _emit_gate_event(event_type: str, marker: str, tool_name: str, *, severity: str) -> bool:
     """Append a governance-surface event. Best effort, short budget.
 
@@ -2316,11 +1339,7 @@ def _load_mechanism():
     """Import the shared gate mechanism module from plugins/_shared (repo and installed
     layouts both place it two levels up from this hooks dir). Raises on failure — callers
     keep their own fail posture (ask_daemon returns None → fail-closed / legacy below)."""
-    shared = Path(__file__).resolve().parents[2] / "_shared"
-    if str(shared) not in sys.path:
-        sys.path.insert(0, str(shared))
-    import hestia_gate_mechanism
-    return hestia_gate_mechanism
+    return _load_shared_module("hestia_gate_mechanism")
 
 
 def McpHttp(endpoint: str, deadline: float):
@@ -2393,19 +1412,11 @@ def cache_action(tool_use_id: str, action_id: str, tool_name: str) -> None:
         debug_log(f"action cache failed: {e}")
 
 
-# ---- Legacy fallback --------------------------------------------------
-
-def fail_closed() -> bool:
-    return os.environ.get("HESTIA_PRE_FAIL_CLOSED") == "1"
-
-
 def _record_plane_e(cause: str, detail: str, tool_name: str = "unknown") -> None:
     """Persist an infrastructure refusal without scoring it as member conduct."""
     try:
-        shared = Path(__file__).resolve().parents[2] / "_shared"
-        if str(shared) not in sys.path:
-            sys.path.insert(0, str(shared))
-        from hestia_gate_core import record_gate_unavailable  # type: ignore
+        record_gate_unavailable = _load_shared_module(
+            "hestia_gate_core").record_gate_unavailable
         record_gate_unavailable(PLUGIN_ID, tool_name, cause, detail, home=str(DEFAULT_HESTIA_HOME))
     except Exception:
         pass
@@ -2468,36 +1479,6 @@ def deny_no_verdict(why: str, *, cause: str = "unknown", tool_name: str = "unkno
         _record_plane_e(cause, why, tool_name)
     debug_log(f"fail-closed deny: {why} cause={cause}")
     return 2
-
-
-def invoke_legacy_fallback(stdin_payload: str) -> int:
-    """Spawn the legacy web4-governance pre_tool_use.py with the same
-    stdin and return its exit code. Returns 0 if the legacy script
-    isn't available (fail-open), unless HESTIA_PRE_NO_FALLBACK=1 asked
-    for deny-on-daemon-unreachable."""
-    if os.environ.get("HESTIA_PRE_NO_FALLBACK") == "1":
-        # Used to fall OPEN here despite the documented deny semantics
-        # (GPT security review HST-004 / doc-code mismatch).
-        return deny_no_verdict("daemon unreachable, legacy fallback disabled")
-    if not os.path.exists(LEGACY_FALLBACK):
-        debug_log(f"legacy fallback not found at {LEGACY_FALLBACK}; allowing")
-        return 0
-    try:
-        proc = subprocess.run(
-            ["python3", LEGACY_FALLBACK],
-            input=stdin_payload,
-            capture_output=True,
-            text=True,
-            timeout=2.0,
-        )
-        # Forward legacy's stderr so Claude Code surfaces it to the user.
-        if proc.stderr:
-            sys.stderr.write(proc.stderr)
-        debug_log(f"legacy fallback exit={proc.returncode}")
-        return proc.returncode
-    except (subprocess.TimeoutExpired, OSError) as e:
-        debug_log(f"legacy fallback failed: {e}; allowing")
-        return 0
 
 
 def _fallback_self_protection(tool_name: str, tool_input: Any,
@@ -2574,21 +1555,27 @@ def emit_decision(verdict) -> int:
 
 
 def main() -> int:
+    # FIRST, before stdin is read and before any side effect: no shared authority, no tool.
+    # This dominates every other path in the hook, which is what makes the refusal a
+    # property of the decision rather than of where the failure happened to be noticed.
+    if _CLASSIFIER_UNAVAILABLE is not None:
+        sys.stderr.write(
+            "hestia: deny [no-shared-authority] - the shared shell classifier could not be "
+            f"imported ({_CLASSIFIER_UNAVAILABLE}). This seat carries no local copy by "
+            "design, so it cannot classify this command and will not guess. Check that "
+            "$HESTIA_HOME/shared is populated and current.\n")
+        return 2
+
     raw = sys.stdin.read()
     if not raw.strip():
         # Empty stdin = the harness sent no event. Not caller-controllable from
         # inside a session, but under strict fail-closed semantics "no event" is
         # still "no verdict" → no tool (CBP relay-verify micro-seam, 2026-07-07).
-        if fail_closed():
-            return deny_no_verdict("empty hook event")
-        return 0
+        return deny_no_verdict("empty hook event")
     try:
         event = json.loads(raw)
     except json.JSONDecodeError as e:
-        if fail_closed():
-            return deny_no_verdict(f"unparseable hook event: {e}")
-        debug_log(f"bad json: {e}; allowing")
-        return 0
+        return deny_no_verdict(f"unparseable hook event: {e}")
 
     tool_name = event.get("tool_name") or "?"
     # Claude Code's own stable session id — the real per-session audit grain.
@@ -2661,7 +1648,7 @@ def main() -> int:
     # is the exemption surviving on the error path, the same privilege wearing an apology. If
     # the core cannot be reached this seat degrades like every other: deny writes, allow reads.
     try:
-        import hestia_gate_core as _core
+        _core = _load_shared_module("hestia_gate_core")
     except Exception as _e:  # noqa: BLE001
         sys.stderr.write(
             f"hestia: deny [gate.core_unavailable] — the shared law core could not be imported "
@@ -2706,8 +1693,10 @@ def main() -> int:
 
     # The event, normalised the way the core expects. Paths and command come from the same
     # tool_input the closure classifier already read — one extraction, not a second opinion.
-    _paths = [tool_input[k] for k in ("file_path", "path", "notebook_path")
-              if isinstance(tool_input.get(k), str) and tool_input.get(k).strip()]
+    # Reach extraction is the ENGINE's (tool, key) table (slice 5). This is the SCOPE
+    # site only: the 3-key tuples elsewhere in this file answer a different question —
+    # which single key names a WRITE'S DESTINATION — and stay local on purpose.
+    _paths = _core.path_targets(tool_name, tool_input)
     _cmd = tool_input.get("command") if isinstance(tool_input.get("command"), str) else None
     _ev = _core.NormalizedEvent(tool=tool_name, paths=_paths, command=_cmd,
                                 cwd=event.get("cwd"), raw=event)
@@ -2732,7 +1721,7 @@ def main() -> int:
             sys.stderr.write(f"hestia: deny [{_v.rule}] — {_v.reason}\n")
             debug_log(f"scope deny: {_v.rule} {tool_name}")
             return 2
-    elif fail_closed():
+    else:
         # The ratified degraded mode, computed by the core rather than invented here:
         # deny writes, allow reads. Same posture kimi and codex have had since Sprint F.
         _v = _core.degraded_verdict(_ev, _CORE_PROFILE)
@@ -2752,22 +1741,16 @@ def main() -> int:
     # Daemon unavailable or didn't settle. Under the fail-closed profile the
     # daemon is the law: no verdict → no tool (GPT review HST-004; governed /
     # unattended roles must not degrade to fail-open heuristics silently).
-    if fail_closed():
-        return deny_no_verdict(
-            f"daemon path failed for {tool_name}",
-            cause=_LAST_FAILURE,
-            tool_name=tool_name,
-            record=False,  # the daemon path already wrote the plane-E row (see ask_daemon)
-        )
-    debug_log(f"daemon path failed; falling back to legacy for {tool_name}")
-    return invoke_legacy_fallback(raw)
+    return deny_no_verdict(
+        f"daemon path failed for {tool_name}",
+        cause=_LAST_FAILURE,
+        tool_name=tool_name,
+        record=False,  # the daemon path already wrote the plane-E row (see ask_daemon)
+    )
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as e:  # noqa: BLE001
-        if fail_closed():
-            sys.exit(deny_no_verdict(f"hook crashed: {type(e).__name__}: {e}"))
-        debug_log(f"top-level: {e}; allowing")
-        sys.exit(0)
+        sys.exit(deny_no_verdict(f"hook crashed: {type(e).__name__}: {e}"))

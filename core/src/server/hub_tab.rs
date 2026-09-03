@@ -30,8 +30,11 @@ use web4_core::crypto::KeyPair;
 /// ephemeral — this is a compiled fallback, not the configuration surface. The
 /// configuration surface is the editable list ([`HubUrls`]) and the env
 /// override, both of which take precedence and neither of which needs a rebuild.
-const DEFAULT_HUB_URL: &str =
-    "https://meaning-hospital-ahead-instrumentation.trycloudflare.com";
+// The fleet mesh hub over the tailnet ("Web4 Fleet"). Purely a default: env
+// override and the operator's vault hub list both take precedence, and this
+// carries no identity — it is only where the card dials when nothing is
+// configured. (Previously the hackathon trycloudflare tunnel, long dead.)
+const DEFAULT_HUB_URL: &str = "http://hub.tail3d7929.ts.net:8770";
 
 /// The vault key under which the known-hub list is stored (config-in-vault:
 /// PRD_CONFIG_IN_VAULT). The list is not a secret, but the vault is hestia's
@@ -222,6 +225,14 @@ async fn discover_with_timeout(
 }
 
 /// GET /api/hub/status — hub reachability + our identity state. Read-only.
+///
+/// When the hub is reachable AND a member identity exists in the vault, this
+/// also asks the hub for the pinned pubkey of OUR member LCT and compares it
+/// to the local key. That answer is the hub's, not ours: `member` means the
+/// hub has admitted and pinned exactly the key this vault holds; a pin that
+/// exists but differs is reported as its own state rather than flattened into
+/// either yes or no, because "the hub knows a different key for you" is the
+/// one answer an operator must never mistake for membership.
 pub async fn hub_status(State(state): State<SharedState>) -> impl IntoResponse {
     let (url, url_source, identity) = {
         let s = state.lock().await;
@@ -231,21 +242,62 @@ pub async fn hub_status(State(state): State<SharedState>) -> impl IntoResponse {
         (url, src, identity)
     };
     let _ = url_source; // (reachability payload already carries `url`; source is on /api/hub/urls)
-    let (member_lct, member_pubkey) = match identity {
-        Some((l, p)) => (Some(l.to_string()), Some(p)),
+    let (member_lct, member_pubkey) = match &identity {
+        Some((l, p)) => (Some(l.to_string()), Some(p.clone())),
         None => (None, None),
     };
 
     match discover_with_timeout(&url).await {
-        Ok(info) => Json(serde_json::json!({
-            "url": url,
-            "reachable": true,
-            "hub_lct_id": info.hub_lct_id,
-            "hubs": info.hubs,
-            "member_lct": member_lct,
-            "member_pubkey": member_pubkey,
-        }))
-        .into_response(),
+        Ok(info) => {
+            let membership = match &identity {
+                None => serde_json::json!({ "state": "no_identity" }),
+                Some((lct, local_pub)) => {
+                    let hub_id = info.hubs.first().map(|h| h.id).unwrap_or(info.hub_lct_id);
+                    let rest = abs_rest(&url, &info.endpoints.rest);
+                    let client = HubClient::new();
+                    match tokio::time::timeout(
+                        NET_TIMEOUT,
+                        client.resolve_member_pubkey(&rest, hub_id, *lct),
+                    )
+                    .await
+                    {
+                        Err(_) => serde_json::json!({
+                            "state": "unknown",
+                            "detail": "membership check timed out",
+                        }),
+                        Ok(Err(e)) => {
+                            let msg = e.to_string();
+                            if msg.contains("HTTP 404") {
+                                serde_json::json!({ "state": "not_member" })
+                            } else {
+                                serde_json::json!({ "state": "unknown", "detail": msg })
+                            }
+                        }
+                        Ok(Ok(pinned)) => {
+                            let pinned_hex = hex::encode(pinned.to_bytes());
+                            if pinned_hex.eq_ignore_ascii_case(local_pub) {
+                                serde_json::json!({ "state": "member", "pinned": true })
+                            } else {
+                                serde_json::json!({
+                                    "state": "pinned_key_mismatch",
+                                    "hub_pinned_pubkey": pinned_hex,
+                                })
+                            }
+                        }
+                    }
+                }
+            };
+            Json(serde_json::json!({
+                "url": url,
+                "reachable": true,
+                "hub_lct_id": info.hub_lct_id,
+                "hubs": info.hubs,
+                "member_lct": member_lct,
+                "member_pubkey": member_pubkey,
+                "membership": membership,
+            }))
+            .into_response()
+        }
         Err(e) => Json(serde_json::json!({
             "url": url,
             "reachable": false,

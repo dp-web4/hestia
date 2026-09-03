@@ -107,6 +107,54 @@ T0=$(date +%s)
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG" >&2; }
 die() { log "FAIL $*"; exit 1; }
 
+
+# Operator-originated dashboard update status (#751). The dashboard never runs a second
+# deployment implementation: it drops one bounded request next to current-build.json and
+# triggers this same supervisor. The request contains only a generated id. The actual target
+# is not knowable until THIS supervisor syncs its dedicated checkout, so only this script
+# writes the target into status.
+UPDATE_REQUEST="$HESTIA_HOME/deploy-update.request"
+UPDATE_STATUS="$HESTIA_HOME/deploy-status.tsv"
+UPDATE_REQUEST_ID=""
+UPDATE_TARGET=""
+LOCKD_OWNED=0
+
+write_update_status() {
+  [ -n "$UPDATE_REQUEST_ID" ] || return 0
+  local state="$1" now tmp
+  now="$(date -u +%FT%TZ)"
+  tmp="$UPDATE_STATUS.tmp.$$"
+  printf '%s\t%s\t%s\t%s\n' "$state" "$UPDATE_REQUEST_ID" "$UPDATE_TARGET" "$now" > "$tmp"
+  mv "$tmp" "$UPDATE_STATUS"
+}
+
+finish_update_status() {
+  local rc="${1:-$?}"
+  if [ -n "$UPDATE_REQUEST_ID" ]; then
+    if [ "$rc" -eq 0 ]; then write_update_status succeeded
+    else write_update_status failed
+    fi
+  fi
+}
+
+read_update_request_id() {
+  [ -r "$UPDATE_REQUEST" ] || return 1
+  UPDATE_REQUEST_ID="$(head -n 1 "$UPDATE_REQUEST" 2>/dev/null || true)"
+  case "$UPDATE_REQUEST_ID" in
+    ''|*[!A-Za-z0-9-]*) UPDATE_REQUEST_ID=""; return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+cleanup_deploy() {
+  local rc=$?
+  if [ "$LOCKD_OWNED" = "1" ]; then
+    rm -f "$LOCKD/pid"
+    rmdir "$LOCKD" 2>/dev/null || true
+  fi
+  finish_update_status "$rc"
+}
+
 # The parenthesised `git describe` string from a version line, e.g.
 #   hestia 0.0.4 (v0.0.4-444-gdd4300c)  ->  v0.0.4-444-gdd4300c
 describe_of() { grep -oE '\([^)]+\)' | head -1 | tr -d '()'; }
@@ -325,9 +373,28 @@ preflight_gate() {
 
   # Each probe is an act the seat MUST retain in order to undo this install. A gate that denies
   # any of them has taken the escape hatch with it.
+  #
+  # RUN FROM THE GOVERNED CHECKOUT, NOT FROM WHEREVER THE CALLER STOOD (#767, CBP 2026-09-01).
+  # The gate infers its workspace from cwd when HESTIA_WORKSPACE is unset. From `~` that is
+  # /home/<user>, and every absolute path under home that is not a granted repo then reads
+  # as "'.hestia' is not granted" -- including $HOLD. The timer unit sets no WorkingDirectory,
+  # so the timer stood in `~` and the hold probe refused on the FIRST cycle after rule 0
+  # cleared; an operator running this from `~` got the identical verdict. No real member
+  # session has /home/<user> as its workspace: sessions launch inside the repo they govern.
+  # gate-preflight.py already models that with cwd=repo; this probe now does the same, so the
+  # verdict is a property of the gate and the law, not of the caller's shell. Measured both
+  # ways against 2ce595c (rc=2 from `~`, rc=0 from the checkout, same event, same daemon).
+  # AGAINST THE CANDIDATE ENGINE, not the installed one. Since #742/#747 a seat loads shared
+  # law only from HESTIA_SHARED_DIR or the installed $HESTIA_HOME/shared, no fallback. The
+  # first cycle after #747 merged (CBP 2026-09-01T16:10Z) probed the new gate against the
+  # still-installed 3-module engine; the gate correctly refused `no-shared-authority`, and
+  # this preflight read it as "gate refuses a benign read" and blocked the install that ships
+  # the module the gate needed. The pairing that exists after install is gate + the reviewed
+  # tree about to be installed, so that is the pairing probed. gate-preflight.py does the same.
   _probe() {  # $1 = label, $2 = event json
-    printf '%s' "$2" | env HESTIA_PRE_FAIL_CLOSED=1 CLAUDECODE=1 HESTIA_ENDPOINT="$EP" \
-      python3 "$gate" >"$tmp/out" 2>"$tmp/err"
+    printf '%s' "$2" | (cd "$DEPLOY_ROOT/hestia" && env HESTIA_PRE_FAIL_CLOSED=1 CLAUDECODE=1 \
+      HESTIA_SHARED_DIR="$DEPLOY_ROOT/hestia/plugins/_shared" \
+      HESTIA_ENDPOINT="$EP" python3 "$gate") >"$tmp/out" 2>"$tmp/err"
     rc=$?
     [ "$rc" = 0 ] && return 0
     log "WARN preflight probe '$1' -> rc=$rc: $(head -c 300 "$tmp/err" | tr '\n' ' ')"
@@ -357,8 +424,13 @@ preflight_gate() {
   esac
 
   ev='{"session_id":"hestia-deploy-preflight","tool_name":"Bash","tool_input":{"command":"touch '"$HOLD"'"}}'
-  _probe "touch the deploy hold (the in-band stop)" "$ev" || {
-    preflight="FAILED(gate refuses the hold file)"; rm -rf "$tmp"; return 0; }
+  # ADVISORY, not blocking (#767). No seat's scope law grants a member a write to
+  # $HESTIA_HOME/deploy.hold; where this probe passes it passes because the command does not
+  # mention the inferred workspace, which is a scanner blind spot, not a grant. The members'
+  # probes in expects.json carry the same flag. The row stays in the log every cycle; whether
+  # members SHOULD hold the deploy is a ruling for the law, and then this becomes blocking again.
+  _probe "touch the deploy hold (the in-band stop)" "$ev" || \
+    log "WARN advisory: the gate refuses the deploy hold (#767) -- logged, not grounds to refuse the install"
 
   # THERE WAS A THIRD PROBE HERE AND MEASURING IT KILLED IT. It wrote ~/.claude/settings.json —
   # the rule-0 remedy — on the theory that a seat which cannot re-register its own gate has lost
@@ -378,6 +450,26 @@ preflight_gate() {
   # mcnugget reached from the other side when it declined to re-register its own gate from a
   # fired session. The escape hatch a governed seat genuinely retains is the hold file above,
   # and an operator. Those are what this probes.
+
+  # The historical probes above exercise the Claude Code event shape. The installer may also
+  # replace Codex, Kimi, and Gemini gates, whose event vocabulary is not interchangeable with
+  # Claude's. A green Claude result therefore cannot certify the whole set. Run each OTHER
+  # registered candidate through its declared read + hold probes before installation. The
+  # declaration belongs beside the harness's install metadata; the common runner discovers
+  # actual registration and never makes an absent member a deployment requirement.
+  member_probe="$DEPLOY_ROOT/hestia/deploy/from-main/gate-preflight.py"
+  if [ ! -f "$member_probe" ]; then
+    preflight="FAILED(per-member gate probe is missing)"
+    return 0
+  fi
+  member_probe_rc=0
+  python3 "$member_probe" --repo "$DEPLOY_ROOT/hestia" --workspace "$DEPLOY_ROOT" --endpoint "$EP" \
+    --scratch "$tmp/probe" --hold "$HOLD" --exclude-member claude-code >>"$LOG" 2>&1 \
+    || member_probe_rc=$?
+  if [ "$member_probe_rc" != 0 ]; then
+    preflight="FAILED(registered candidate gate did not retain the recovery probes; rc=$member_probe_rc)"
+    return 0
+  fi
 
   rm -rf "$tmp"
   return 0
@@ -459,11 +551,35 @@ manifest_build_id() {
 #   ok, or skipped by explicit HESTIA_DEPLOY_HOOKS=0            -> 0
 #   refused(governed session)                                   -> 1, and the tail names the
 #      constraint: the fix is not "fix the cause" but "run from a party that is not a session"
+#   refused(FAILED(...))  [the preflight refused]               -> 1, and the tail must NOT
+#      promise a repair: see below
 #   FAILED(rc=N), skipped(no bash>=4), skipped(no installer),
 #   skipped(HESTIA_BASH not bash>=4)                            -> 1, fix the cause first
+#
+# TWO PRODUCERS SHARE THE WORD "refused" AND THEY NEED OPPOSITE ADVICE (CBP, 2026-08-31).
+# `refused(governed session)` is rc=3 from the installer and IS repaired by the next timer
+# cycle — the timer is not a session. `refused(FAILED(...))` is install_hooks refusing on a
+# preflight verdict, and the preflight sits on EVERY path into the members' install, the
+# timer's and --hooks-only's alike, so it re-runs and refuses identically forever. The glob
+# was `refused*`, written when rc=3 was the only producer; the preflight producer was added
+# later and inherited a remedy naming a cause it had not hit and a repair that cannot happen.
+# Measured, not theorised: CBP printed "the next timer cycle repairs it" on 7 consecutive
+# cycles — every one since the rule-0 auditor landed — spanning 2026-08-30T03:18:27Z to
+# 2026-08-31T03:18:26Z, while the members' surface stayed pinned at v0.0.4-516-gc991e12 and
+# the daemon walked on to -529. The whole point of this script is that a cycle ends loud and says
+# what to do; a tail that names the wrong cause is worse than silence, because it is followed.
+#
+# This is the third instance of the class this file has already fixed twice (rc=3 vs
+# FAILED(rc=N); installer-rc=0 vs ok) — and the fix each time is the same shape: stop keying
+# on a PREFIX that two causes happen to share, key on the cause.
 hooks_repair_hint() {
   case "$hooks" in
-    refused*) printf '%s' "the members' installer refuses inside a governed session (CLAUDECODE/HESTIA_ROLE set); the next timer cycle repairs it, or run hestia-deploy --hooks-only from an operator shell" ;;
+    "refused(governed session)")
+      printf '%s' "the members' installer refuses inside a governed session (CLAUDECODE/HESTIA_ROLE set); the next timer cycle repairs it, or run hestia-deploy --hooks-only from an operator shell" ;;
+    "refused(FAILED(rule-0:"*)
+      printf '%s' "the gate PREFLIGHT refused on rule 0 — an enforcing gate is registered inside a git worktree; the REFUSED line above names the registration. NO timer cycle and NO --hooks-only run repairs this: the preflight guards every path into the members' install and will refuse identically until the REGISTRATION moves out of the checkout. Check the harness settings for BOTH spellings — the hooks[].command entry and env.HESTIA_LEGACY_FALLBACK, which is a live decider whenever the daemon returns no verdict, not documentation. Moving it is an operator act by design: a governed session has no in-band route to it. HESTIA_DEPLOY_RULE0=warn keeps the seat cycling while the fix is queued" ;;
+    "refused(FAILED("*)
+      printf '%s' "the gate PREFLIGHT refused; the REFUSED line above names which check. NO timer cycle repairs a preflight verdict — it re-runs on every path into the members' install and refuses identically. Fix the cause it names, then hestia-deploy --hooks-only" ;;
     "FAILED(installer rc=0"*) printf '%s' "the installer exited 0 without writing the manifest; its own lines above say why (no member registered on this host, or DRY_RUN=1). Register a member, then hestia-deploy --hooks-only from an operator shell, or let the next timer cycle repair it" ;;
     *)        printf '%s' "fix the cause, then hestia-deploy --hooks-only (from an operator shell, or let the next timer cycle repair it)" ;;
   esac
@@ -497,7 +613,7 @@ LOCKD="$HESTIA_HOME/deploy.lock.d"
 take_lockd() {
   mkdir "$LOCKD" 2>/dev/null || return 1
   echo $$ >"$LOCKD/pid"
-  trap 'rm -f "$LOCKD/pid"; rmdir "$LOCKD" 2>/dev/null' EXIT
+  LOCKD_OWNED=1
 }
 if command -v flock >/dev/null 2>&1; then
   exec 9>"$HESTIA_HOME/deploy.lock"
@@ -512,11 +628,17 @@ elif ! take_lockd; then
   rm -f "$LOCKD/pid"; rmdir "$LOCKD" 2>/dev/null || true
   take_lockd || { log "SKIP another deploy holds the lock ($LOCKD)"; exit 0; }
 fi
+trap cleanup_deploy EXIT
 
 # ---- operator hold -----------------------------------------------------------------------
 if [ -e "$HOLD" ]; then
   age=$(( $(date +%s) - $(mtime_of "$HOLD") ))
   if [ "$age" -lt "$HOLD_MAX_SECS" ]; then
+    if [ "$MODE" = full ] && read_update_request_id; then
+      UPDATE_TARGET=""
+      write_update_status held
+      UPDATE_REQUEST_ID=""  # request remains queued; do not let EXIT call this success
+    fi
     log "SKIP hold present (${age}s old, expires at ${HOLD_MAX_SECS}s): $(head -c 200 "$HOLD" | tr '\n' ' ')"
     exit 0
   fi
@@ -544,6 +666,20 @@ web4_sha="$(git -C "$DEPLOY_ROOT/web4" rev-parse --short HEAD)"
 running="$(running_version)"
 ondisk="$("$BIN" --version 2>/dev/null | describe_of || true)"
 log "target=$target ($target_sha, web4 $web4_sha) running=${running:-none} ondisk=${ondisk:-none} bin=$BIN"
+
+# Claim a dashboard request only now: lock and hold have both passed, and `target` is the
+# supervisor's actual synced target rather than the old current-build authority record.
+if [ "$MODE" = full ] && [ -r "$UPDATE_REQUEST" ]; then
+  if read_update_request_id; then
+    UPDATE_TARGET="$target"
+    rm -f "$UPDATE_REQUEST"
+    write_update_status running
+    log "dashboard update request $UPDATE_REQUEST_ID claimed for $UPDATE_TARGET"
+  else
+    log "dashboard update request malformed; removing it rather than retrying forever"
+    rm -f "$UPDATE_REQUEST"
+  fi
+fi
 
 # BIN must be the file the daemon execs. Otherwise one cycle installs to a path nothing
 # launches, restarts the OLD binary, sees the old version, and "rolls back" a file nobody runs

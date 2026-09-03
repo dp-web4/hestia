@@ -1,0 +1,41 @@
+# Copy this to a `.cargo/config.toml` ABOVE every hestia checkout on a machine that uses a
+# shared CARGO_TARGET_DIR with in-repo `.wt/` worktrees, and fill in that machine's absolute
+# paths. It is an EXAMPLE and not tracked as live config on purpose: the fleet keeps these
+# repos at a different absolute root per machine (WSL under /mnt/c/exe/projects/ai-agents,
+# Linux under ~/ai-workspace, macOS under ~/ai-agents), so the truth is per-machine and
+# does not belong in a tracked Cargo.toml.
+#
+# WHY. hestia/core declares the web4 crates as RELATIVE path deps (`../../web4/...`). Cargo
+# hashes the path STRING it computes and never canonicalizes it. From the main checkout that
+# string is `<root>/web4/web4-core`; from a worktree at `hestia/.wt/<name>/core` it is
+# `hestia/.wt/web4/web4-core` -- a symlink to the same directory, added 2026-08-18 so in-repo
+# worktrees could build at all. Same crate, same real location, two metadata hashes, two
+# artifact sets in the shared target. A downstream crate links the copy its fingerprint did
+# not name and rustc reports "multiple different versions of crate serde_core" while
+# `cargo tree` shows one. Every worktree on CBP stopped building on 2026-08-27 for this.
+#
+# `paths` overrides a path dependency BY PACKAGE NAME with an absolute location, honoured
+# from any config in the ancestor chain, so every checkout under this file computes the
+# identical string and shares one artifact set -- which is what the shared target was for.
+#
+# TWO RULES, both learned the expensive way:
+#
+#   1. List EVERY web4-rooted package in hestia's graph. A partial override is worse than
+#      none: the crates left out still arrive by the old spelling and drag their own copy of
+#      web4-core with them, and the error changes to "multiple versions of web4_core". The
+#      authoritative list is `cargo metadata` filtered to packages under web4/, not the
+#      direct deps in Cargo.toml. As of 2026-08-27 it is the four below.
+#
+#   2. After adding or changing this file run `cargo clean -p <each crate below>` ONCE.
+#      The override changes the crates' identities; the compilations made under the old
+#      spelling are invalid by construction, not merely stale.
+#
+# `tools/shared_target_split_test.py` detects the split state and names it; it runs in
+# `tools/preflight.py`.
+
+paths = [
+  "/ABSOLUTE/PATH/TO/ai-agents/web4/web4-core",
+  "/ABSOLUTE/PATH/TO/ai-agents/web4/web4-trust-core",
+  "/ABSOLUTE/PATH/TO/ai-agents/web4/web4-policy",
+  "/ABSOLUTE/PATH/TO/ai-agents/web4/hub/hub-plugin",
+]

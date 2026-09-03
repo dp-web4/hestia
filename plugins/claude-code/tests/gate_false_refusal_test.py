@@ -114,6 +114,10 @@ REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 # so the two tools disagree about the same resulting file, which is the clearest statement of
 # why the destination, not the payload text, has to be what decides.
 HOOK = os.path.join(REPO, "plugins", "claude-code", "hooks", "pre_tool_use.py")
+# The seat resolves shared law ONLY from an explicit HESTIA_SHARED_DIR or the installed
+# engine (#747); the tree is no longer an implicit fallback. This names the reviewed tree
+# under test explicitly: a fixture, chosen and visible, not an authority fallback.
+os.environ.setdefault("HESTIA_SHARED_DIR", os.path.join(REPO, "plugins", "_shared"))
 
 FAILURES = []
 SKIPPED = []

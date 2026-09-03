@@ -155,6 +155,12 @@ def run_hook(ws, event, endpoint):
     """Execute the real hook the way the engine does: event JSON on stdin, exit code = verdict."""
     env = dict(os.environ)
     env.update({"HESTIA_WORKSPACE": ws,
+                # The tree under test, named explicitly (#742's fixture rule). Without this
+                # the hook resolves an INSTALLED $HESTIA_HOME/shared when the box has one,
+                # and the fixture's engine copy is shadowed by whatever vintage is deployed:
+                # slice 3's wrappers then reach a mechanism without the gate-self bodies and
+                # safe-fail, which reads as 5/9 red locally while CI (no install) is green.
+                "HESTIA_SHARED_DIR": os.path.join(ws, "hestia", "plugins", "_shared"),
                 "HESTIA_KIMI_IDENTITY": os.path.join(ws, "identity.json"),
                 "HESTIA_OBSERVE_DIR": os.path.join(ws, "observe"),
                 "HESTIA_KIMI_GATE_MODE": "enforce",

@@ -48,6 +48,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -141,10 +142,26 @@ class Stub(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
 
+# Every subprocess in this file must point HESTIA_MESH_STATE at a tempdir. Without it
+# the successful-send case (D) appended a row to the OPERATOR's real ledger at
+# ~/.local/state/hestia-mesh/sent/test-member.jsonl — reproduced on CBP, one row dated
+# 2026-08-26T13:22, written by a test run (codex, PR #649). A test that mutates live
+# member state is a worse defect than the duplicate the guard prevents, and nothing in
+# the suite would have said so; the guard only surfaced it by being the first thing to
+# WRITE there from a test path. resend_guard_test.py property 6 pins the path itself.
+STATE = tempfile.mkdtemp(prefix="mesh-cli-exit-code-")
+
+
+def base_env(**extra):
+    env = dict(os.environ, HESTIA_MESH_PLUGIN="test-member", HESTIA_MESH_STATE=STATE,
+               **extra)
+    env.pop("HESTIA_ROLE", None)
+    return env
+
+
 def run(args, env_extra=None, mode="ok"):
     MODE["tool"] = mode
-    env = dict(os.environ, HESTIA_ENDPOINT=EP, HESTIA_MESH_PLUGIN="test-member")
-    env.pop("HESTIA_ROLE", None)
+    env = base_env(HESTIA_ENDPOINT=EP)
     env.update(env_extra or {})
     p = subprocess.run([sys.executable, CLI] + args, capture_output=True, text=True,
                        env=env, timeout=20)
@@ -278,10 +295,8 @@ if __name__ == "__main__":
 
     # I: the one case that really is "I never got there" — nothing listening. Must stay
     # rc=1 and must NOT be reported as a refusal, or the trio collapses again.
-    env = dict(os.environ, HESTIA_ENDPOINT=dead, HESTIA_MESH_PLUGIN="test-member")
-    env.pop("HESTIA_ROLE", None)
     p = subprocess.run([sys.executable, CLI, "peek"], capture_output=True, text=True,
-                       env=env, timeout=20)
+                       env=base_env(HESTIA_ENDPOINT=dead), timeout=20)
     check("I  nothing listening exits 1 (not 3)", p.returncode == 1, f"rc={p.returncode}")
     check("I  nothing listening does not traceback", "Traceback" not in p.stderr,
           p.stderr.strip()[-90:])

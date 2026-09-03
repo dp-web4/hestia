@@ -601,7 +601,9 @@ def test_the_core_is_not_the_only_copy_of_the_scope_rule():
     # installs from) is deleted — with it went codex's last counted file. A future
     # marketplace package must be a rebuilt artifact carrying the canonical content digest
     # (§7.2(6)), never a hand-fork that would grow this number back.
-    KNOWN_DUPLICATE_OWNERS = {"gemini": 1, "kimi": 1}
+    # Slice 4: gemini's copy is deleted — its scope predicates are fail-closed delegates
+    # into the core now, so a fix to the core reaches gemini too. kimi is the last owner.
+    KNOWN_DUPLICATE_OWNERS = {"kimi": 1}
 
     owners = {}
     for root, _dirs, files in os.walk(plugins_dir):

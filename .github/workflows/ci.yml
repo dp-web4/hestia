@@ -251,6 +251,14 @@ jobs:
           python-version: "3.12"
 
       - name: Test hooks
+        # The seats resolve runtime law ONLY from an explicit HESTIA_SHARED_DIR or an
+        # installed $HESTIA_HOME/shared (#742 for codex, #747 for claude-code). A CI runner
+        # has no installed engine, and the repository checkout is deliberately NOT an
+        # implicit fallback any more -- that fallback is what let a hook execute whatever
+        # law the branch happened to carry. So the runner names the reviewed shared tree
+        # explicitly: a test fixture, chosen and visible, not an ambient path lookup.
+        env:
+          HESTIA_SHARED_DIR: ${{ github.workspace }}/plugins/_shared
         run: |
           set -euo pipefail
           # Discovery comes from tools/ci_discovery.py (mode: hooks), the same
@@ -281,3 +289,163 @@ jobs:
             exit 1
           fi
           echo "all ${#tests[@]} passed"
+
+  # ADDITION: the ratchet under the engine collapse.
+  #
+  # The `hooks` job above runs each seat's tests FROM ITS OWN DIRECTORY, which is
+  # correct for what it tests and is also exactly why the seats drift: it proves
+  # every seat is self-consistent and compares no seat to any other. A fix that
+  # lands in one seat's file is green. Three seats, three greens, one law that
+  # differs by seat.
+  #
+  # "The seats all import the shared closure" was true and reported as done for
+  # weeks. It was never the question. The question is what fraction of
+  # LAW-BEARING code still executes per-seat, and on the day this job was added
+  # the answer was 67.7% -- with claude-code alone carrying more law-bearing
+  # SLOC (1,654) than the shared engine's law-bearing portion (1,470).
+  #
+  # This job does not require the number to fall. It requires that it not RISE.
+  # Lower the pins in the same PR that lowers the number; that edit is the
+  # progress record, and it is the thing a verdict could never be.
+  collapse-ratchet:
+    name: gate collapse ratchet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Measure how much of the gate still executes per-seat
+        run: |
+          set -euo pipefail
+          # THREE pins now, because the fork count was one number over two
+          # opposite risks and that cost us a landing.
+          #
+          # --max-divergent-forked is the tight one and keeps the old meaning:
+          # a name the shared engine owns, implemented a SECOND TIME with a
+          # different body. All 4 are gemini's scope predicates, and the step
+          # below independently finds 6 inputs they answer differently from the
+          # engine. This number may not rise.
+          #
+          # --max-verbatim-forked counts copies that are character-for-character
+          # the engine's. It is 0 and stays 0. It briefly stood at 16 to admit
+          # claude-code's shell classifier while a two-step move published it
+          # before deleting it; that transition was wrong. A move publishes and
+          # deletes in ONE act, and the deploy-order problem it was working
+          # around got fixed instead (install-members.sh now repoints
+          # $HESTIA_HOME/shared BEFORE writing any hook, so a hook can never be
+          # newer than the engine it imports). Duplicate law is not preserved to
+          # accommodate the deploy mechanism.
+          #
+          # --max-pct is still the number that actually matters and still
+          # depends on a published vocabulary, so it is arguable -- which is a
+          # reason to print it every run, not a reason to leave it unpinned.
+          # 52.3, not 52.2. The cutover measured 52.2; the mandated fail-closed
+          # import guard (missing shared authority -> exit 2, proven by
+          # plugins/claude-code/tests/missing_shared_authority_blocks_test.py)
+          # added 11 law-bearing sloc to the seat and moved it to 52.3. Pinned at
+          # the MEASURED value. The alternative was writing terser refusal code to
+          # hit a round number, which is optimising the gauge instead of the thing.
+          # 52.8, not 52.3. Review of #747 found the negative test did not model
+          # an ABSENT install (an existing empty dir suppressed the repo fallback),
+          # so the fallback and two unconditional working-tree resolutions were
+          # deleted and replaced by ONE installed-only loader, BYTE-IDENTICAL to
+          # codex's (#742 head 03a0ba8), asserted by the staging script, not
+          # eyeballed. The loader is per-seat law the meter counts. It cannot
+          # live in shared authority because it IS the reach to shared authority.
+          # (An earlier version of this comment predicted the verbatim ratchet
+          # would trip when both seats carried one loader text. Wrong: that grade
+          # covers only names the SHARED ENGINE owns, and the loader is not one; a
+          # duplicated loader lands in the informational unshared-fork surface,
+          # as _load_mechanism already does. Recorded so the next reader does not
+          # inherit the prediction.)
+          #
+          # PER SEAT, NOT FLEET (#771). The fleet aggregate let one shim's added
+          # authority read as a fleet regression and let three lean adapters dilute
+          # one forked shim. Bounds are now one per discovered seat, at the MEASURED
+          # value on this head; a regression names its seat and moves no other
+          # seat's number. A pinned seat that is not discovered fails: unmeasurable
+          # is not compliant. The aggregate is still printed, labeled TREND, and
+          # decides nothing. Deployment readiness over RESIDENT bytes is the other
+          # instrument (tools/installed_seat_readiness.py); CI has no installed
+          # seats, so its self-test runs in the plugin-tests job instead.
+          #
+          # codex 25.0, not 23.9 (#742): the installed-only loader and its refusal
+          # path are per-seat mechanics the meter counts as law. Moved to the
+          # measured value on that head and no other seat's pin touched, which is
+          # the point of pinning per seat: the same change under the fleet gauge
+          # read as "the fleet regressed 0.1".
+          #
+          # Slice 3 (#796) moved the five codex/kimi gate-self bodies into the
+          # shared mechanism. Codex and kimi lose the duplicated bodies; the
+          # shared-law denominator grows for every seat, so all four measured
+          # percentages fall. Pin the exact post-move values in the same PR: a
+          # lower number left only in the PR prose is not a ratchet.
+          python3 tools/gate_collapse_meter.py \
+            --max-divergent-forked 0 --max-verbatim-forked 0 \
+            --max-seat-pct claude-code=28.8 --max-seat-pct codex=20.6 \
+            --max-seat-pct gemini=10.3 --max-seat-pct kimi=16.8
+
+      - name: Do the forked predicates actually disagree with the engine?
+        run: |
+          set -euo pipefail
+          # A fork count is debt; a divergence count is exposure. This pins how
+          # many inputs the forked scope predicates answer differently from the
+          # shared engine -- currently 6, every one of them a defect class the
+          # engine's own docstring says it was hardened against. Collapsing a
+          # fork is what drives it down.
+          # 0 divergent forks and 0 differential divergences (slice 4): gemini's four
+          # scope predicates -- the fleet's last forks of engine-owned names, all measured
+          # fail-open -- are deleted and delegate to the core. gemini 10.7, not 8.8: the
+          # installed-only loader is per-seat mechanics the meter counts as law, the same
+          # move codex made at 25.0. The differential is now a WIRING pin: any re-fork
+          # reads as a divergence and trips at zero.
+          python3 tools/scope_fork_differential_test.py --max-divergences 0
+
+      - name: Does every shim function say why it is in the shim?
+        run: |
+          # dp's ruling: every function in every shim carries an explicit justification for
+          # being in the shim and not in the common gate. plugins/_shared/SHIM_LEDGER.md is
+          # the proof; this checks only that it EXISTS for every function, is CURRENT (a
+          # source hash per row) and that admitted debt names its owning issue. It judges
+          # no justification: a reviewer does. Not a metric, on purpose.
+          python3 tools/shim_ledger_check.py
+
+      - name: Does the scope verdict depend on where the session was parked?
+        run: |
+          # The MRH-layer differential #760 asks for. One command through the shared
+          # command_in_scope at four cells (resolved root wrong/right x event cwd at the
+          # root / in a granted repo). Pinned mode: today's cells, false positives
+          # included (7 of 14 cases; every live refusal of 2026-09-02 reproduced token
+          # for token). A regression AND a fix both move a cell off its pin, so either
+          # must update the pin in the same change. `--strict` is the acceptance for
+          # the TOOLS + FILES replacement model and is red today by design.
+          python3 tools/mrh_scope_differential.py
+
+      - name: Is every seat reaching for the same domain?
+        run: |
+          set -euo pipefail
+          # The collapse percentage measures the PREDICATE. This pins the DOMAIN
+          # the predicate is applied to, which every seat builds itself before
+          # the engine is ever called (#734). A gate can reach 0.0% per-seat law
+          # and still disagree with its peers about which argument is a path.
+          # Floor is the measured number, 3 of 10, so it ratchets up from
+          # reality rather than aspiring downward from a target nobody hit.
+          # Deliberately a SEPARATE step from the collapse meter above: one
+          # number failing should not hide the other behind set -e.
+          # 10, not 3 (slice 5): the reach domain is ONE engine table and every seat
+          # consumes it, so agreed == union by construction. This flat key census is a
+          # TREND, not the contract: it cannot see the (tool, key) typing (delete "glob"
+          # from PATTERN_REACH_TOOLS and it stays 10/10), and a substring delegation
+          # check blessed a re-forked live site (GPT review of #830, both falsified).
+          # The contract is pinned by tools/reach_domain_contract_test.py in the
+          # plugin-tests job: typed behaviour with a sabotage self-check, the live
+          # extraction site proven by AST, and behaviour through every seat under a
+          # stub daemon. claude-code's pin moved 28.7 -> 28.8 (the delegation's own
+          # comment carries law vocabulary the meter counts); gemini/kimi dropped to
+          # their measured floors in the same act. codex 20.6, not 20.5: the review
+          # repair composed apply_patch's shape translator with the engine call at the
+          # call site and said so in two comment lines inside main(), which the meter
+          # counts as law sloc. Pinned at the measured value rather than trimming a
+          # comment to move a gauge.
+          python3 tools/gate_collapse_meter.py --quiet --min-agreed-keys 10

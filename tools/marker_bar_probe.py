@@ -148,7 +148,13 @@ CASES = [
 
 rows = []
 for name, tool, inp in CASES:
-    marker = G._touches_self(tool, inp)
+    hit = G._touches_self(tool, inp)
+    # 5.2 (81286c0, 2026-08-07) made `_touches_self` return the (marker, resource, key)
+    # TRIPLE; this probe kept reading a bare string and crashed at the print loop for 26
+    # days -- neither RED nor GREEN, just absent (a crashed acceptance test reads as no
+    # news). The bar still keys on hit[0] alone; hit[1] is the resource the record drops.
+    marker = hit[0] if isinstance(hit, tuple) else hit
+    resource = hit[1] if isinstance(hit, tuple) and len(hit) > 1 else None
     named = [f for f in GOV if marker and f in marker]
     if marker is None:
         verdict, weak, why = "NOT MATCHED AT ALL", False, ""
@@ -163,12 +169,14 @@ for name, tool, inp in CASES:
     else:
         verdict, weak, why = ("single approver (PROVEN)", True,
                               "GOVERNED NAME THE BAR DOES NOT TEST")
-    rows.append((name, marker, verdict, weak, why))
+    rows.append((name, marker, verdict, weak, why, resource))
 
 w = max(len(r[0]) for r in rows)
 weak_count = 0
-for name, marker, verdict, weak, why in rows:
+for name, marker, verdict, weak, why, resource in rows:
     shown = marker if marker else "-"
+    if resource and resource != marker:
+        shown += f"   (resource: {resource})"
     if why:
         shown += f"   <-- {why}"
     if weak:

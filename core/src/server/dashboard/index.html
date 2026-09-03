@@ -86,6 +86,15 @@
   .deployment-health.stale { color: var(--warning); }
   .deployment-health.unknown { color: var(--fg-faint); }
   .deployment-health .mark { font-size: 0.9rem; font-weight: 700; }
+  .deployment-update {
+    appearance: none; border: 1px solid var(--warning); border-radius: 999px;
+    background: transparent; color: var(--warning); font: inherit; font-size: 0.68rem;
+    letter-spacing: 0.05em; text-transform: uppercase; padding: 0.2rem 0.55rem;
+    cursor: pointer;
+  }
+  .deployment-update:hover:not(:disabled) { background: color-mix(in srgb, var(--warning) 12%, transparent); }
+  .deployment-update:disabled { cursor: default; opacity: 0.7; }
+  .deployment-update.failed { border-color: var(--failure); color: var(--failure); }
 
   /* Top-level view switch (agents | hubs), in the masthead by the Hestia mark. The content
      area below is one view or the other — see the HTML note at #agents-view. A segmented
@@ -941,6 +950,7 @@
       <nav class="view-switch" id="view-switch" aria-label="Dashboard view">
         <button type="button" class="view-chip selected" data-view="agents">agents</button>
         <button type="button" class="view-chip" data-view="hubs">hubs</button>
+        <button type="button" class="view-chip" data-view="channels">channels</button>
         <button type="button" class="view-chip" data-view="devices">devices</button>
         <button type="button" class="view-chip" data-view="govern">govern<span
           class="view-chip-badge" id="govern-chip-badge" hidden></span><span
@@ -980,6 +990,7 @@
          still on the face of the nav. -->
     <div class="live">
       <span class="deployment-health unknown" id="deployment-health" title="Deployment freshness">● deployment unknown</span>
+      <button class="deployment-update" id="deployment-update" type="button" hidden>update</button>
       <span class="dot"></span>
       <span id="live-status">connecting…</span>
     </div>
@@ -1123,6 +1134,18 @@
       </div>
     </div>
     </div><!-- /#hubs-view -->
+
+    <!-- CHANNELS — the gateway to this entity's addressable surfaces (PRD §5.9,
+         dp 2026-09-01). Same doctrine as devices below: the slot is real and it
+         must not LOOK finished. The spec exists (two families, tiered disclosure,
+         role-mediated deepening); the machinery does not. `renderChannels` has the
+         same two legal outputs as `renderDevices`: real channel state, or an
+         explicit "not yet implemented". -->
+    <div id="channels-view" class="dash-view" hidden>
+      <div class="govern-scroll" id="channels-body">
+        <div class="empty">loading…</div>
+      </div>
+    </div>
     <!-- DEVICES — constellation management (PRD_ALLOWLISTS §6.0.3, AC-22).
          The slot is real, and it must not LOOK finished. `core/src/constellation.rs` is
          substantial and the snapshot already carries a `constellation` field, but the screen
@@ -1547,6 +1570,8 @@
     agents:  { el: 'agents-view',  autoDefault: true  },
     hubs:    { el: 'hubs-view',    autoDefault: true,
                mount: () => { if (typeof window.__hubRefresh === 'function') window.__hubRefresh(); } },
+    channels:{ el: 'channels-view', autoDefault: false,
+               mount: () => renderChannels() },
     devices: { el: 'devices-view', autoDefault: false,
                mount: () => renderDevices(lastData) },
     govern:  { el: 'govern-view',  autoDefault: false,
@@ -2612,13 +2637,59 @@
   function renderDeployment(deployment) {
     const d = deployment || { state: 'unknown', note: 'deployment status unavailable' };
     const el = $('deployment-health');
+    const btn = $('deployment-update');
     const state = ['current', 'stale', 'unknown'].includes(d.state) ? d.state : 'unknown';
+    const updateState = d.update_state || 'idle';
     el.className = `deployment-health ${state}`;
     el.textContent = state === 'current'
       ? '● deployment current'
       : state === 'stale' ? '! deployment stale' : '● deployment unknown';
-    el.title = `${d.note || 'deployment status unavailable'}${d.running_build ? ` (running ${d.running_build})` : ''}${d.current_build ? `; current ${d.current_build}` : ''}`;
+    el.title = `${d.note || 'deployment status unavailable'}${d.running_build ? ` (running ${d.running_build})` : ''}${d.current_build ? `; current ${d.current_build}` : ''}${d.update_note ? `; ${d.update_note}` : ''}`;
+
+    if (!btn) return;
+    const active = state === 'stale' && ['requested', 'held', 'running'].includes(updateState);
+    const failed = state === 'stale' && updateState === 'failed';
+    btn.hidden = state !== 'stale' || !d.update_capable;
+    btn.disabled = active;
+    btn.classList.toggle('failed', failed);
+    btn.textContent = updateState === 'held' ? 'update held' : active ? 'updating…' : failed ? 'retry update' : 'update';
+    btn.title = active
+      ? (d.update_note || 'deployment supervisor is updating this installation')
+      : failed ? (d.update_note || 'last update failed; retry')
+      : 'bring this deployment current through the registered supervisor';
   }
+
+  (function wireDeploymentUpdate() {
+    const btn = $('deployment-update');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      btn.textContent = 'requesting…';
+      btn.classList.remove('failed');
+      try {
+        const res = await apiFetch('/api/operator/deployment/update', { method: 'POST' });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+        if (body.status === 'current') {
+          await tick();
+          return;
+        }
+        btn.textContent = 'updating…';
+        $('live-status').textContent = 'updating…';
+        // Re-read authoritative supervisor state rather than inventing a client-side success.
+        // The daemon may disappear during restart; the ordinary poll will reconnect and only
+        // deployment.state=current clears the stale badge.
+        await tick();
+      } catch (error) {
+        btn.disabled = false;
+        btn.classList.add('failed');
+        btn.textContent = 'retry update';
+        btn.title = `update request failed: ${error.message}`;
+        $('live-status').textContent = `update failed (${error.message})`;
+      }
+    });
+  })();
 
   async function fetchFailures() {
     try {
@@ -3120,6 +3191,38 @@
   // top; if the snapshot's `constellation` field carries anything, it is shown BELOW that
   // notice rather than instead of it, because partial data on an unbuilt screen is exactly
   // how "looks finished, shows nothing" gets built by accident.
+  // CHANNELS (PRD §5.9, dp 2026-09-01): "how the world reaches me, and how much it
+  // learns". Static and honest — unlike devices there is not even a snapshot field
+  // to show yet, so the ONLY legal output is the explicit not-implemented notice
+  // plus the spec it will implement. Never-flatter (#435/#438): an empty-looking
+  // panel here would claim "this entity has no channels" when the truth is that
+  // nobody has built the view.
+  function renderChannels() {
+    const root = $('channels-body');
+    if (!root) return;
+    root.innerHTML = `
+      <div class="devices-notice">
+        <strong>Not yet implemented.</strong> Channels is a reserved slot with a written
+        spec (PRD §5.9) and no machinery behind it yet. Nothing on this screen reads or
+        renders real channel state.
+      </div>
+      <div class="esc-note" style="margin-top:0.7rem">
+        <p style="margin:0 0 0.5rem"><strong>What this screen will be:</strong> the gateway to every
+        <em>addressable surface</em> of this entity, in two families:</p>
+        <p style="margin:0 0 0.3rem">· <strong>contact / social</strong> — Discord, Slack, Matrix,
+        Telegram, Meetup, GitHub, site, email: how the world <em>reaches</em> this entity.</p>
+        <p style="margin:0 0 0.5rem">· <strong>record</strong> — the witness log, the governance
+        record, the ledger head: how the world <em>reads</em> it. Witness-log access is itself
+        a channel, behind the same gateway and the same disclosure model.</p>
+        <p style="margin:0 0 0.3rem"><strong>Disclosure is tiered</strong>, and the tiers are depths
+        of question: <em>public</em> answers "that it exists / that an act occurred";
+        <em>member</em> answers "the address / who participated"; <em>governance</em> answers
+        "substance and outcome". Deepening is role-mediated, never a parameter — and a tier-3
+        inquiry is itself a governed, witnessed act by the asker: others can learn who did what,
+        and the asking leaves a trace.</p>
+      </div>`;
+  }
+
   function renderDevices(data) {
     const root = $('devices-body');
     if (!root) return;
@@ -3788,9 +3891,24 @@
       err.hidden = true; ok.hidden = true;
       btn.disabled = true;
       try {
+        // #722: a scope grant path MUST be absolute — but the CLIENT must not infer WHICH
+        // absolute path the operator meant. That is the same reason `require_absolute_grant_path`
+        // refuses on the server: the recorder and the enforcer may not share a mount, so
+        // synthesizing `/` + input would mint an authority-bearing grant to a path the operator
+        // never typed. So validate and REFUSE here too, preserving the typed value, rather than
+        // guess. (GPT review of #781.)
+        const grantPath = path.value.trim();
+        if (!grantPath.startsWith('/')) {
+          err.textContent = 'absolute path required — a scope grant must start with "/". Type the '
+            + 'full absolute path; the daemon refuses a relative grant, which can never match under '
+            + 'prefix containment.';
+          err.hidden = false;
+          sync();
+          return;
+        }
         const body = {
           plugin_id: plugin.value.trim(),
-          path: path.value.trim(),
+          path: grantPath,
           reason: reason.value.trim(),
         };
         if (ttl.value) body.expires_in_secs = Number(ttl.value);
@@ -3990,17 +4108,36 @@
       const r = await hubFetch('/api/hub/status', { cache: 'no-store' });
       const d = await r.json();
       const st = $('hub-state');
+      // Membership is the HUB's answer (pinned-pubkey resolve against our LCT),
+      // not a local claim — so it gets its own words per state, and an unknown
+      // stays unknown rather than defaulting to either yes or no.
+      const mem = d.membership || null;
       if (d.reachable) {
-        st.className = 'hub-state ok';
         const name = (d.hubs && d.hubs[0] && d.hubs[0].name) || 'hub';
-        st.textContent = name + ' — live';
+        if (mem && mem.state === 'member') {
+          st.className = 'hub-state ok';
+          st.textContent = name + ' — member ✓';
+        } else if (mem && mem.state === 'pinned_key_mismatch') {
+          st.className = 'hub-state err';
+          st.textContent = name + ' — hub pins a DIFFERENT key for this identity';
+        } else {
+          st.className = 'hub-state ok';
+          st.textContent = name + ' — live'
+            + (mem && mem.state === 'not_member' ? ' (not a member yet)' : '');
+        }
       } else {
         st.className = 'hub-state err';
         st.textContent = 'unreachable';
       }
+      const memNote =
+        !mem || !d.member_lct ? ''
+        : mem.state === 'member' ? ' · hub has pinned this key (verified member)'
+        : mem.state === 'not_member' ? ' · hub does not know this identity'
+        : mem.state === 'unknown' ? ' · membership unverified (' + esc(mem.detail || 'no answer') + ')'
+        : '';
       $('hub-meta').innerHTML = esc(d.url)
         + (d.member_lct
-           ? ' · member identity <b>' + short(d.member_lct) + '</b> (vault)'
+           ? ' · member identity <b>' + short(d.member_lct) + '</b> (vault)' + memNote
            : ' · no member identity yet');
       $('hub-join').hidden = false;
       $('hub-join-btn').textContent = d.member_lct ? 'join / re-sync' : 'join hub';

@@ -306,11 +306,121 @@ pub struct DeploymentHealth {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_build: Option<String>,
     pub note: String,
+    /// Whether this platform has a supported registered deployment supervisor trigger.
+    #[serde(default)]
+    pub update_capable: bool,
+    /// `idle`, `requested`, `held`, `running`, `failed`, or `unavailable`. This is supervisor
+    /// status for an operator-originated update, not an inference from the browser.
+    #[serde(default)]
+    pub update_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_note: Option<String>,
     /// The last gate-capability self-report accepted during this daemon run, distinct from
     /// the daemon build above. This is A1 historical runtime evidence with no freshness,
     /// session, identity, or build binding — not installed-byte attestation. #481 owns that
     /// stronger claim.
     pub gate_engine: GateEngineHealth,
+}
+
+
+fn deployment_update_status(
+    authority_path: &Path,
+    current: bool,
+) -> (bool, String, Option<String>, Option<String>) {
+    let supported = cfg!(target_os = "linux") || cfg!(target_os = "macos");
+    if !supported {
+        return (
+            false,
+            "unavailable".into(),
+            None,
+            Some(format!("dashboard update is unsupported on {}", std::env::consts::OS)),
+        );
+    }
+    if current {
+        return (true, "idle".into(), None, None);
+    }
+    let Some(parent) = authority_path.parent() else {
+        return (false, "unavailable".into(), None, Some("deployment authority has no parent directory".into()));
+    };
+    let path = parent.join("deploy-status.tsv");
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (true, "idle".into(), None, None);
+        }
+        Err(error) => {
+            return (true, "idle".into(), None, Some(format!("cannot read deployment update status: {error}")));
+        }
+    };
+    let fields: Vec<&str> = raw.trim_end().split('\t').collect();
+    if fields.len() != 4 {
+        return (
+            true,
+            "failed".into(),
+            None,
+            Some("deployment update status is malformed".into()),
+        );
+    }
+    let state = fields[0];
+    let request_id = (!fields[1].is_empty()).then(|| fields[1].to_string());
+    let supervisor_target = fields[2];
+    let Some(updated) = chrono::DateTime::parse_from_rfc3339(fields[3]).ok() else {
+        return (
+            true,
+            "failed".into(),
+            request_id,
+            Some("deployment update status has an invalid timestamp".into()),
+        );
+    };
+    let age_secs = chrono::Utc::now()
+        .signed_duration_since(updated.with_timezone(&chrono::Utc))
+        .num_seconds();
+    let target_note = if supervisor_target.is_empty() {
+        String::new()
+    } else {
+        format!(" toward {supervisor_target}")
+    };
+    match state {
+        "requested" if (0..=420 * 60).contains(&age_secs) => (
+            true,
+            "requested".into(),
+            request_id,
+            Some("deployment update requested; waiting for the supervisor".into()),
+        ),
+        "held" if (0..=420 * 60).contains(&age_secs) => (
+            true,
+            "held".into(),
+            request_id,
+            Some("deployment update is queued behind an active operator hold".into()),
+        ),
+        "running" if (0..=60 * 60).contains(&age_secs) => (
+            true,
+            "running".into(),
+            request_id,
+            Some(format!("deployment supervisor is updating this installation{target_note}")),
+        ),
+        "failed" if (0..=420 * 60).contains(&age_secs) => (
+            true,
+            "failed".into(),
+            request_id,
+            Some("last deployment update failed; the previous working deployment remains in force".into()),
+        ),
+        "succeeded" if (0..=420 * 60).contains(&age_secs) => (
+            true,
+            "failed".into(),
+            request_id,
+            Some("deployment supervisor reported success but the running build is still stale".into()),
+        ),
+        "requested" | "held" | "running" => (
+            true,
+            "failed".into(),
+            request_id,
+            Some("deployment update status expired without reaching a terminal result".into()),
+        ),
+        _ => (true, "idle".into(), None, None),
+    }
 }
 
 fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
@@ -321,6 +431,10 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
             running_build,
             current_build: None,
             note: "deployment authority is not configured".into(),
+            update_capable: false,
+            update_state: "unavailable".into(),
+            update_request_id: None,
+            update_note: Some("deployment authority is not configured".into()),
             gate_engine: GateEngineHealth::default(),
         };
     };
@@ -332,6 +446,10 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
                 running_build,
                 current_build: None,
                 note: format!("cannot read deployment authority: {error}"),
+                update_capable: false,
+                update_state: "unavailable".into(),
+                update_request_id: None,
+                update_note: Some(format!("cannot read deployment authority: {error}")),
                 gate_engine: GateEngineHealth::default(),
             };
         }
@@ -344,6 +462,10 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
                 running_build,
                 current_build: None,
                 note: format!("deployment authority is invalid JSON: {error}"),
+                update_capable: false,
+                update_state: "unavailable".into(),
+                update_request_id: None,
+                update_note: Some(format!("deployment authority is invalid JSON: {error}")),
                 gate_engine: GateEngineHealth::default(),
             };
         }
@@ -360,19 +482,35 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
             running_build,
             current_build: None,
             note: "deployment authority has no build_id".into(),
+            update_capable: false,
+            update_state: "unavailable".into(),
+            update_request_id: None,
+            update_note: Some("deployment authority has no build_id".into()),
             gate_engine: GateEngineHealth::default(),
         };
     };
     let current = current_build == running_build;
+    let (update_capable, update_state, update_request_id, update_note) =
+        deployment_update_status(path, current);
     DeploymentHealth {
         state: if current { "current" } else { "stale" }.into(),
         note: if current {
             "running build matches deployment authority".into()
+        } else if update_state == "held" {
+            "deployment update is queued behind an active operator hold".into()
+        } else if update_state == "running" || update_state == "requested" {
+            "deployment update is in progress".into()
+        } else if update_state == "failed" {
+            "deployment is stale; the last update attempt did not make it current".into()
         } else {
-            "a newer deployment is available; relaunch through the supervisor".into()
+            "running build does not match deployment authority".into()
         },
         running_build,
         current_build: Some(current_build),
+        update_capable,
+        update_state,
+        update_request_id,
+        update_note,
         gate_engine: GateEngineHealth::default(),
     }
 }
@@ -1241,30 +1379,19 @@ impl ServerState {
                             // mechanism works, four writes landed on approvals last night — but
                             // an operator cannot tell a working control from a broken one when
                             // the surface withholds the discriminator.
-                            "operator_alone_suffices": match e.bar {
-                                crate::server::gate_escalation::Bar::SingleApprover => true,
-                                crate::server::gate_escalation::Bar::SovereignPlusPeer => e
-                                    .factors
-                                    .iter()
-                                    .any(|f| {
-                                        f.channel
-                                            == crate::server::gate_escalation::Channel::PeerMember
-                                    }),
-                            },
+                            //
+                            // DERIVED, NOT RESTATED. This arm used to carry its own copy of
+                            // the bar logic ("is there a PeerMember factor?"). It was right
+                            // on 2026-08-04 and wrong from 2026-08-06, when `9d3936d` made
+                            // the peer conjunct evidence rather than a gate and changed
+                            // `bar_met` without changing the sentence describing it. The
+                            // panel built to stop an operator being misled about their own
+                            // approval then misled them, in warning colour, for 25 days.
+                            // Both fields now come from the predicate itself.
+                            "operator_alone_suffices": e.operator_alone_suffices(),
                             // Stated positively so the UI never has to infer the remedy from a
                             // false boolean: what is still missing, in the operator's terms.
-                            "still_needs": match e.bar {
-                                crate::server::gate_escalation::Bar::SovereignPlusPeer
-                                    if !e.factors.iter().any(|f| {
-                                        f.channel
-                                            == crate::server::gate_escalation::Channel::PeerMember
-                                    }) =>
-                                {
-                                    Some("an independent NOT-SAME peer factor \
-                                          (hestia_gate_escalation_corroborate)")
-                                }
-                                _ => None,
-                            },
+                            "still_needs": e.still_needs(),
                         })
                     })
                     .collect()
@@ -1473,6 +1600,34 @@ mod tests {
         let current = deployment_health_from_path(Some(&manifest));
         assert_eq!(current.state, "current");
         assert_eq!(current.current_build.as_deref(), Some(running));
+    }
+
+    #[test]
+    fn deployment_update_status_projects_supervisor_states_without_inventing_success() {
+        if !(cfg!(target_os = "linux") || cfg!(target_os = "macos")) {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let manifest = dir.path().join("current-build.json");
+        std::fs::write(&manifest, r#"{"build_id":"authority-build"}"#).unwrap();
+        let status = dir.path().join("deploy-status.tsv");
+        let now = chrono::Utc::now();
+        for (wire, expected) in [("requested", "requested"), ("held", "held"), ("running", "running"), ("failed", "failed"), ("succeeded", "failed")] {
+            std::fs::write(&status, format!("{wire}\treq-1\ttarget-build\t{}\n", now.to_rfc3339())).unwrap();
+            let health = deployment_health_from_path(Some(&manifest));
+            assert_eq!(health.state, "stale");
+            assert_eq!(health.update_state, expected, "wire state {wire}");
+            assert_eq!(health.update_request_id.as_deref(), Some("req-1"));
+        }
+        std::fs::write(&status, format!("running\treq-future\ttarget-build\t{}\n", (now + chrono::Duration::seconds(30)).to_rfc3339())).unwrap();
+        let future = deployment_health_from_path(Some(&manifest));
+        assert_eq!(future.state, "stale");
+        assert_eq!(future.update_state, "failed");
+        std::fs::write(&manifest, format!(r#"{{"build_id":"{}"}}"#, env!("HESTIA_GIT_VERSION"))).unwrap();
+        let health = deployment_health_from_path(Some(&manifest));
+        assert_eq!(health.state, "current");
+        assert_eq!(health.update_state, "idle");
+        assert!(health.update_request_id.is_none());
     }
 
     #[test]

@@ -54,10 +54,22 @@ SHIM_FILES = {
     "codex": os.environ.get("HGC_CODEX") or _shim_default("codex"),
 }
 
+# This is an intentional reviewed fixture, not a runtime authority fallback. #742 makes
+# Codex load governing modules only from explicit HESTIA_SHARED_DIR or installed
+# $HESTIA_HOME/shared. Point the synthetic cross-harness fixture at the exact shared tree
+# it is testing so the test exercises the new loader contract rather than depending on
+# ambient sys.path behavior.
+os.environ.setdefault("HESTIA_SHARED_DIR", SHARED)
+
 # The module must be importable BEFORE the shims load (each shim's own sys.path insert
 # also points at a _shared dir; this entry guarantees all three bind the SAME module,
 # which the wiring test below then asserts by identity).
 sys.path.insert(0, SHARED)
+# The shims resolve runtime law ONLY from an explicit HESTIA_SHARED_DIR or an installed
+# $HESTIA_HOME/shared (#742 codex, #747 claude-code); the tree is no longer an implicit
+# fallback. This is a reviewed fixture, named explicitly, not an authority fallback:
+# point the in-process shim imports at the exact shared tree under test.
+os.environ.setdefault("HESTIA_SHARED_DIR", SHARED)
 # kimi/codex capture WORKSPACE at import; pin it away from any real workspace.
 os.environ.setdefault("HESTIA_WORKSPACE", os.path.join(BUILD, "ws"))
 os.makedirs(os.environ["HESTIA_WORKSPACE"], exist_ok=True)

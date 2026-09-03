@@ -76,6 +76,13 @@ ENV = dict(os.environ, HESTIA_WORKSPACE=os.path.join(V, "ws"),
            HESTIA_GEMINI_IDENTITY=os.path.join(V, "ident.json"),
            HESTIA_GEMINI_LAUNCH_CWD=os.path.join(V, "ws", "web4"),
            HESTIA_SOCIETY_GATE="/nonexistent/governor.py",
+           # The tree under test, named explicitly (#742's fixture rule). Since slice 4 the
+           # gemini gate loads scope law ONLY from HESTIA_SHARED_DIR or the installed engine,
+           # and fails CLOSED without it -- so on a runner with no install, the absent-governor
+           # arm denied at Gate 1b before the event ever reached the Gate-2 banner this test
+           # exists to require. Naming the reviewed tree restores the arm's precondition.
+           HESTIA_SHARED_DIR=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          "..", "..", "_shared"),
            HESTIA_GEMINI_GATE_MODE="enforce")
 CWD = os.path.join(V, "ws", "web4")
 

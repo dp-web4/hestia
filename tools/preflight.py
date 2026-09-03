@@ -55,6 +55,10 @@ from pathlib import Path
 FAST = (
     "tools/shebang_exec_bit_test.py",
     "tools/public_boundary_test.py",
+    # The one check here that is about the ENVIRONMENT rather than the tree. CI's target
+    # is fresh every run so it can never fail there; a developer's shared target is the
+    # only place it means anything, and preflight is the only thing that runs there.
+    "tools/shared_target_split_test.py",
 )
 
 
