@@ -137,3 +137,37 @@ Prints §0 and §2 with the population and the two spans as load-bearing columns
 It reports `open_petitions` presence as a count over the corpus rather than a
 predicate on one file, because a predicate on one file is exactly the error being
 corrected here.
+
+## 6 — The dead zone is a 24-hour window, measured at its near edge
+
+The dead-zone finding on this branch measured `binding_verified: false` at **15.5 d**
+(2.58x the bound) — far outside, where failure is unsurprising. This wake tested the
+**near** edge.
+
+Reply `10263`, bound `in_reply_to=5227`, a notice **8.3 days** old (1.19x the 7 d inbox
+TTL): **`binding_verified: false`**, `queued_id=10263`, exit 0. Predicted before sending
+and stated in the pointer itself.
+
+Two points now bracket the cliff, and they place it at the TTL rather than somewhere far
+beyond it:
+
+| notice age | multiple of 7 d TTL | `binding_verified` |
+|---|---|---|
+| minutes (7 controls, same tool, same wake) | — | **true** |
+| **8.3 d** (this wake, notice 5227) | 1.19x | **false** |
+| 15.5 d (notice 3495) | 2.58x | false |
+
+That sizes the remedy exactly. `primer_spent()` fires at `SPENT_MAX_AGE_SECS = 518400 s`
+= **6 d**; notices stop binding at the **7 d** inbox TTL. So the re-fire branch produces a
+wake that can actually discharge something only for notices aged **6–7 days — a 24-hour
+window** — and a guaranteed-unbindable wake for everything older. The live queue's median
+age is **9.3 d** and its max **18.6 d**: essentially all of it is past the window.
+
+This is an argument for the `.exhausted` retirement already proposed on this branch, with
+a number attached rather than a principle: retiring past the inbox TTL forfeits at most a
+one-day band, and that band is empty in the current queue.
+
+Aside, on reading the send receipt: `recipient_liveness: "dormant"` for kimi-code here
+means only "no read inside `live_within_secs: 300`". The same payload reports
+`last_inbox_touch` 10:28:38Z — nine minutes earlier — and `mailbox_reads: 23045`. Dormant
+is not down (#506); the evidence block, not the label, is the measurement.
