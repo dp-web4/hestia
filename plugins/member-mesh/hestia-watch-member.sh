@@ -43,13 +43,17 @@ flock -n 9 || { echo "[hestia-watch] another watcher holds $STATE/watch-$PLUGIN.
 # repository commit: an installed copy or dirty worktree can honestly differ from either
 # HEAD or main. Bash does not expose its parsed buffer, so this is explicitly a source
 # snapshot rather than a claim that every byte had already been parsed.
-WATCH_SOURCE="${BASH_SOURCE[0]}"
+# HANDED DOWN BY A DEPLOYING PREDECESSOR (see maybe_self_deploy). After a self-deploy
+# this process is executing a private snapshot under $STATE, but the file the fleet
+# DEPLOYS is still the canonical repo path -- so the predecessor passes it, and drift is
+# measured against the file operators actually update rather than against our own copy.
+WATCH_SOURCE="${HESTIA_WATCH_SOURCE:-${BASH_SOURCE[0]}}"
 # Resolved once, from the same source path the drift snapshot above hashes, so a
 # helper is loaded from the copy that is actually running rather than from a cwd
 # that is nobody's guarantee.
 WATCH_DIR="$(cd "$(dirname "$WATCH_SOURCE")" && pwd)"
-watch_source_hash() {
-  python3 - "$WATCH_SOURCE" <<'PY'
+sha256_file() {
+  python3 - "$1" <<'PY'
 import hashlib, sys
 h = hashlib.sha256()
 with open(sys.argv[1], "rb") as fh:
@@ -58,8 +62,94 @@ with open(sys.argv[1], "rb") as fh:
 print(h.hexdigest())
 PY
 }
-WATCH_STARTUP_SHA256="$(watch_source_hash 2>/dev/null || true)"
-[[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]] || WATCH_STARTUP_SHA256="unavailable"
+watch_source_hash() { sha256_file "$WATCH_SOURCE"; }
+
+# THE BYTES THIS INTERPRETER IS READING, not the bytes at a pathname.
+#
+# Bash holds the script open on a descriptor for the life of the process and reads the
+# not-yet-parsed tail from it, so /proc/<pid>/fd/<n> is the SAME open file description
+# bash itself reads -- opening it does not re-resolve the path. Measured on this host:
+# replace the script by rename underneath a running process and this fd still hashes the
+# ORIGINAL bytes (readlink additionally reports "(deleted)"), while hashing "$0" returns
+# the impostor that never executed. That is the difference between naming what is running
+# and naming what happens to be at a name.
+#
+# The descriptor number is DISCOVERED, never assumed. Bash takes the highest FREE fd:
+# 255 normally, 254 when the parent handed us 255, 249 with 250-255 taken (all measured).
+# Hardcoding 255 does not fail loudly -- it hashes an unrelated inherited fd.
+#
+# KNOWN BLIND SPOT, pinned by a test rather than left to be discovered: a same-length
+# IN-PLACE rewrite of our own inode is followed by this fd, because it is the same inode.
+# It is invisible here and to every other spelling; a length-CHANGING in-place rewrite
+# corrupts the running parse instead. Rename-replace -- the shape maybe_self_deploy and
+# every sane deploy actually use -- is the case this closes.
+watch_own_fd_path() {
+  local want="$1" fd n target best=""
+  for fd in /proc/$$/fd/*; do
+    n="${fd##*/}"
+    case "$n" in ''|*[!0-9]*) continue ;; esac
+    target="$(readlink "$fd" 2>/dev/null || true)"
+    target="${target% (deleted)}"
+    if [ -n "$target" ] && [ "$target" = "$want" ]; then
+      if [ -z "$best" ] || [ "$n" -gt "$best" ]; then best="$n"; fi
+    fi
+  done
+  if [ -z "$best" ]; then return 1; fi
+  printf '/proc/%s/fd/%s\n' "$$" "$best"
+}
+
+# HOW the baseline was obtained, printed beside it. A bare hash on a log line has already
+# been misread as a commit sha in a published table: it is a CONTENT hash, and recovering
+# a commit from it needs a reverse lookup that only succeeds while some commit still holds
+# those exact bytes. The origin token says which question the number answers.
+#   own-fd                     -- hashed from the descriptor bash is reading (authoritative)
+#   own-fd-handover-mismatch   -- self-derived, and the predecessor's claim DISAGREED
+#   handover                   -- /proc unavailable; believed the predecessor
+#   path-reread                -- believed the pathname; a baseline for bytes we may not run
+#   unavailable                -- no baseline was ever captured
+WATCH_STARTUP_ORIGIN="unavailable"
+WATCH_STARTUP_SHA256=""
+WATCH_SELF_FD_PATH="$(watch_own_fd_path "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+if [ -n "$WATCH_SELF_FD_PATH" ]; then
+  WATCH_STARTUP_SHA256="$(sha256_file "$WATCH_SELF_FD_PATH" 2>/dev/null || true)"
+  if [[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    WATCH_STARTUP_ORIGIN="own-fd"
+  fi
+fi
+# The predecessor's claim is now a CROSS-CHECK, not the source. As the source it meant an
+# operator who exported the pair could tell a fresh watcher what it was running; `unset`
+# bounded that lie to one process but did not remove it. Self-derivation removes the need
+# to believe it at all, and keeping the comparison converts a lie -- or a snapshot that
+# moved between hash and exec -- from a silent adoption into a reportable disagreement.
+WATCH_HANDOVER_SHA256="${HESTIA_WATCH_STARTUP_SHA256:-}"
+if [ "$WATCH_STARTUP_ORIGIN" = "own-fd" ]; then
+  if [[ "$WATCH_HANDOVER_SHA256" =~ ^[0-9a-f]{64}$ ]] && \
+     [ "$WATCH_HANDOVER_SHA256" != "$WATCH_STARTUP_SHA256" ]; then
+    WATCH_STARTUP_ORIGIN="own-fd-handover-mismatch"
+  fi
+fi
+# Fall back exactly as before when /proc gives us nothing: the handover, then the path.
+if [ "$WATCH_STARTUP_ORIGIN" = "unavailable" ]; then
+  WATCH_STARTUP_SHA256="$WATCH_HANDOVER_SHA256"
+  if [[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    WATCH_STARTUP_ORIGIN="handover"
+  fi
+fi
+if [ "$WATCH_STARTUP_ORIGIN" = "unavailable" ]; then
+  WATCH_STARTUP_SHA256="$(watch_source_hash 2>/dev/null || true)"
+  if [[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    WATCH_STARTUP_ORIGIN="path-reread"
+  fi
+fi
+if ! [[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  WATCH_STARTUP_SHA256="unavailable"
+  WATCH_STARTUP_ORIGIN="unavailable"
+fi
+unset WATCH_HANDOVER_SHA256
+# Consumed. Not inherited by the fired CLI, and not inherited by a successor that did
+# not get it from us -- these two say "your predecessor verified this", and only a
+# predecessor is entitled to say it.
+unset HESTIA_WATCH_SOURCE HESTIA_WATCH_STARTUP_SHA256
 WATCH_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 WATCH_CURRENT_SHA256="$WATCH_STARTUP_SHA256"
 if [[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
@@ -74,6 +164,15 @@ else
   WATCH_ARTIFACT_REASON="startup-baseline-unavailable"
 fi
 WATCH_LAST_ALARM_KEY=""
+# The argv this process was started with, captured at TOP LEVEL. Inside a function
+# `"$@"` is that function's own arguments, which is precisely how a re-exec loses the
+# plugin id and the fire command and comes back up watching nothing.
+WATCH_ARGV=("$@")
+# Last drifted disk hash seen, so a deploy needs the SAME new bytes on two consecutive
+# passes. The tree this mesh executes from has concurrent writers -- three watchers and
+# whatever session is awake in it -- and a file caught mid-write hashes to bytes nobody
+# ever committed. One sample is not a version; it is a race.
+WATCH_DRIFT_SEEN_SHA256=""
 
 # DAEMON DRIFT (2026-08-03, mesh-vocabulary thread: "landed is three steps short").
 # The watcher refuses to run stale bytes of ITSELF (check_artifact_drift above), but
@@ -257,7 +356,7 @@ announce_artifact() {
   # is the level-triggered gauge that survives log rotation; it must never depend on
   # a prior one-shot alarm still being visible.
   check_artifact_drift
-  echo "[hestia-watch] ARTIFACT plugin=$PLUGIN state=$WATCH_ARTIFACT_STATE reason=$WATCH_ARTIFACT_REASON startup_sha256=$WATCH_STARTUP_SHA256 disk_sha256=$WATCH_CURRENT_SHA256 started=$WATCH_STARTED_AT"
+  echo "[hestia-watch] ARTIFACT plugin=$PLUGIN state=$WATCH_ARTIFACT_STATE reason=$WATCH_ARTIFACT_REASON startup_sha256=$WATCH_STARTUP_SHA256 startup_origin=$WATCH_STARTUP_ORIGIN disk_sha256=$WATCH_CURRENT_SHA256 started=$WATCH_STARTED_AT"
 }
 
 check_artifact_drift() {
@@ -298,12 +397,187 @@ check_artifact_drift() {
     WATCH_LAST_ALARM_KEY=""
   elif [ "$STATE:$REASON" != "$WATCH_LAST_ALARM_KEY" ]; then
     if [ "$STATE" = "drift" ]; then
-      echo "[hestia-watch] ARTIFACT DRIFT — restart required; startup_sha256=$WATCH_STARTUP_SHA256 disk_sha256=$CURRENT"
+      echo "[hestia-watch] ARTIFACT DRIFT — restart required; startup_sha256=$WATCH_STARTUP_SHA256 startup_origin=$WATCH_STARTUP_ORIGIN disk_sha256=$CURRENT"
     else
-      echo "[hestia-watch] ARTIFACT UNVERIFIABLE — reason=$REASON startup_sha256=$WATCH_STARTUP_SHA256 disk_sha256=$CURRENT"
+      echo "[hestia-watch] ARTIFACT UNVERIFIABLE — reason=$REASON startup_sha256=$WATCH_STARTUP_SHA256 startup_origin=$WATCH_STARTUP_ORIGIN disk_sha256=$CURRENT"
     fi
     WATCH_LAST_ALARM_KEY="$STATE:$REASON"
   fi
+}
+
+# THE ALARM THAT HAD NO RECOVERY.
+#
+# `check_artifact_drift` above has been correct, level-triggered and hourly for twenty
+# days, and it changed nothing -- because the only sentence it can say is "restart
+# required" and it says it to a log no member reads, on behalf of a process no member
+# can restart. This file already names that defect, one function down, about a
+# different alarm: "The alarm existed and the recovery did not, which is this corpus's
+# recurring defect wearing recovery's clothes." The drift alarm is the next instance.
+#
+# MEASURED, CBP 2026-08-26. The claude-code and kimi-code watchers were executing
+# a8dccda (2026-08-06) while origin/main was three mesh commits ahead. One of the three
+# is ebc3719, which stops this script reporting a DELIVERED primer as undelivered.
+# In one member's primer that morning: 41 non-delivery labels on rc=124 -- the one rc
+# that proves delivery -- of which 40 were filed by the two stale-vintage watchers.
+# The 41st was codex's, queued 2026-08-25T18:37:02Z, 4h35m BEFORE codex restarted into
+# the current bytes at 23:12:38Z. THE DENOMINATOR IS ONE MEMBER'S PRIMER, not the
+# fleet: codex, reviewing this PR from its own retained snapshots, counted seven unique
+# rc=124 rows attributed via watch-codex, and the 18:37:02Z batch filed four notices --
+# only one of which reached the primer counted here. Post-restart, on either
+# denominator, that seat has filed zero. The fix works. It was merged. It was not in
+# force.
+#
+# WHY NOBODY APPLIED IT BY HAND. There is no moment to apply it in. The session that
+# reads the alarm is a descendant of its own watcher's cgroup, so `systemctl restart`
+# is suicide; the other stale seat was mid-wake behind a foreground `timeout -k 30
+# 1800`. Three members waking each other makes "idle at the instant a human looks"
+# close to a null set. A remedy only a human can apply, to a machine that is never
+# idle when the human is there, is not a remedy.
+#
+# FOUR CONJUNCTS. Each one removes a way this could be worse than the staleness it
+# fixes; none of them is decoration.
+#
+#   drift          -- nothing to deploy otherwise.
+#
+#   stable twice   -- the same NEW hash on two consecutive passes, not one sighting.
+#                     Concurrent writers; a half-written file is not a version.
+#
+#   MERGED, BYTE   -- the disk bytes must be byte-identical to `origin/main:<path>`.
+#     FOR BYTE        This is the conjunct that carries the design. Deploying
+#                     "whatever changed" would make the fleet's in-force vintage a
+#                     function of whoever last hit save in a shared worktree, which is
+#                     strictly WORSE than being stale: stale is at least stable and
+#                     nameable, and this file's whole vintage story depends on that.
+#                     Deploying "what was merged" closes the last link of
+#                     committed -> routed -> merged -> IN FORCE, and refuses to close
+#                     it for bytes that skipped the earlier ones.
+#
+#                     NOT `git hash-object` against `rev-parse origin/main:<path>`,
+#                     which is the obvious spelling and is WRONG HERE. This tree lives
+#                     on a Windows mount with `core.autocrlf=input`, so the clean
+#                     filter normalises CRLF on the way in: a CRLF-mangled working copy
+#                     has the SAME blob id as the clean merged file. Measured on this
+#                     box -- identical blob, and `bash -n` accepts the mangled file too,
+#                     so the parse conjunct does not catch it either. Both guards would
+#                     have waved it through. Comparing the RAW BYTES of `git show`
+#                     against the same sha256 the startup snapshot already computes puts
+#                     no filter anywhere in the path, and costs one hash.
+#
+#   SAME OBJECT    -- the hash, the parse and the `exec` all name ONE private file
+#                     under $STATE holding the `git show` output, placed by rename.
+#                     Checking a PATHNAME and then exec'ing that pathname binds
+#                     nothing in a tree with concurrent writers: the replacement that
+#                     lands in between is what runs. Rehashing just before exec
+#                     narrows that window and does not close it.
+#
+#   parses         -- `bash -n`. Unreachable unless origin/main itself carries a syntax
+#                     error, and kept for exactly that case: the unit is Restart=always,
+#                     so exec'ing into a file that does not parse is a fleet-wide crash
+#                     loop rather than a deploy. Cheap insurance against the one input
+#                     the merged-bytes conjunct cannot vet.
+#
+# FAIL CLOSED. Any conjunct that cannot be answered -- source not tracked, no
+# origin/main, git absent, hash unavailable -- declines to deploy and says which one,
+# leaving today's behaviour exactly as it is. The polarity is deliberate: an
+# auto-deployer that fires when it cannot verify is the bug it is here to fix.
+#
+# WHERE IT RUNS is the safety argument, and it is structural rather than a heuristic.
+# The fire is FOREGROUND (`if "$FIRE" "$PRIMER"; then`), so the top of the loop is the
+# one point in this script where this watcher provably has no wake in flight. A deploy
+# that can only happen where there is no wake can never cut one short.
+#
+# `exec` and not `systemctl restart`: same pid, the unit never goes inactive, MainPID
+# does not move, nothing else in the cgroup is signalled -- and the successor reads the
+# file from byte zero, which is the entire point, since a long-running bash executes
+# the buffer it began with and can otherwise resume at a stale byte offset.
+#
+# BOOTSTRAP, SAID OUT LOUD: this function cannot deploy itself. The seats that predate
+# it need exactly one manual restart, ever, and then never another one.
+maybe_self_deploy() {
+  if [ "$WATCH_ARTIFACT_STATE" != "drift" ]; then
+    WATCH_DRIFT_SEEN_SHA256=""
+    return 0
+  fi
+  [[ "$WATCH_CURRENT_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 0
+
+  if [ "$WATCH_CURRENT_SHA256" != "$WATCH_DRIFT_SEEN_SHA256" ]; then
+    WATCH_DRIFT_SEEN_SHA256="$WATCH_CURRENT_SHA256"
+    return 0
+  fi
+
+  local REL SNAP SNAP_NEW SNAP_SHA
+
+  # A FAILING COMMAND MUST PRODUCE A HELD VERDICT, NOT AN EXIT. Codex review of #636,
+  # blocking 2, and it was not hypothetical: under `set -euo pipefail` the previous
+  # spelling `REL="$(git ... | head -1)"` made a non-repo working directory kill the
+  # WHOLE WATCHER with rc=128 before the "not tracked" branch below could ever print.
+  # CI reproduced it -- watch_artifact_identity_test.py runs this script from a bare
+  # temp dir, and the watcher died mid-test. `if !` puts the status in a condition
+  # (where errexit is suspended), and the first line is taken with an expansion rather
+  # than a pipe, so nothing but git's own status decides the verdict.
+  if ! REL="$(git -C "$WATCH_DIR" ls-files --full-name -- "$WATCH_SOURCE" 2>/dev/null)"; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — cannot ask git whether the source is tracked; deploy declined"
+    return 0
+  fi
+  REL="${REL%%$'\n'*}"
+  if [ -z "$REL" ]; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — source is not tracked in a git repo; deploy declined"
+    return 0
+  fi
+
+  # THE BYTES CHECKED MUST BE THE BYTES `exec` OPENS. Codex review of #636, blocking 1.
+  # Hashing and parsing a PATHNAME and then exec'ing that same pathname binds nothing:
+  # this tree has concurrent writers, and a replacement landing between the last check
+  # and the open is precisely what gets executed. Re-hashing just before exec narrows
+  # the window; it does not close it.
+  #
+  # So `git show` is materialised into a private file under $STATE (0700, one per
+  # plugin, and the flock above guarantees a single watcher per plugin writes it), and
+  # the hash, the `bash -n` and the `exec` all name THAT file. The final `mv` is a
+  # rename, so the inode verified is the inode executed, and a predecessor still
+  # running from the old snapshot keeps its own open inode rather than being truncated
+  # underneath itself.
+  #
+  # What the successor loses by running from $STATE -- the canonical path it should
+  # keep watching, and the hash of what it is really executing -- is handed to it
+  # explicitly on the exec line.
+  SNAP="$STATE/self-deploy/watch-$PLUGIN.sh"
+  SNAP_NEW="$SNAP.new"
+  mkdir -p "$STATE/self-deploy" && chmod 700 "$STATE/self-deploy"
+  # Branching on git's status, NOT on the digest. The previous spelling ended in
+  # `|| true`, which threw away rc=128 for an unreadable origin/main and kept the
+  # hasher's stdout: sha256 of EMPTY INPUT, e3b0c442... If the drifted disk file were
+  # also empty the two would match, `bash -n` would accept it, and the watcher would
+  # deploy an empty script under Restart=always -- fail-OPEN on the exact conjunct this
+  # function advertises as fail-closed.
+  if ! git -C "$WATCH_DIR" show "origin/main:$REL" > "$SNAP_NEW" 2>/dev/null; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — cannot read origin/main:$REL; deploy declined"
+    return 0
+  fi
+  SNAP_SHA="$(sha256_file "$SNAP_NEW" 2>/dev/null || true)"
+  if [[ ! "$SNAP_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — cannot hash origin/main:$REL; deploy declined"
+    return 0
+  fi
+  if [ "$SNAP_SHA" != "$WATCH_CURRENT_SHA256" ]; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — disk bytes are not origin/main:$REL (disk=$WATCH_CURRENT_SHA256 main=$SNAP_SHA); merged bytes deploy, edited bytes do not"
+    return 0
+  fi
+  if ! "${BASH:-bash}" -n "$SNAP_NEW" 2>/dev/null; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — origin/main:$REL does not parse; deploy declined"
+    return 0
+  fi
+  if ! mv -f "$SNAP_NEW" "$SNAP"; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — cannot place the verified snapshot at $SNAP; deploy declined"
+    return 0
+  fi
+
+  echo "[hestia-watch] ARTIFACT DEPLOY plugin=$PLUGIN — exec into merged bytes; was=$WATCH_STARTUP_SHA256 now=$WATCH_CURRENT_SHA256 ref=origin/main:$REL snapshot=$SNAP_SHA"
+  # `exec bash "$path"` and not `exec "$path"`: the executable bit does not survive on
+  # the Windows mount this tree lives on, which is why the unit invokes the script
+  # through bash to begin with.
+  HESTIA_WATCH_SOURCE="$WATCH_SOURCE" HESTIA_WATCH_STARTUP_SHA256="$SNAP_SHA" \
+    exec "${BASH:-bash}" "$SNAP" "${WATCH_ARGV[@]}"
 }
 
 announce_artifact
@@ -935,6 +1209,7 @@ LAST_ANNOUNCE=$(date +%s)
 
 while true; do
   check_artifact_drift
+  maybe_self_deploy
   check_daemon_drift
   NOW=$(date +%s)
   if [ $((NOW - LAST_ANNOUNCE)) -ge "$UNANSWERED_EVERY" ]; then
