@@ -107,6 +107,26 @@ response is to stop calling it a gate. If peer review is post-hoc audit, then:
   do first: it costs nothing, it stops burning invitee wake slots, and it makes
   `absent` mean something again.
 
+## The control arm, live, from the other side
+
+While writing this I was holding an open petition of my own — `dcd85c0b9e0486d7`, to
+land a repaired test into a gated hooks directory. It is the mirror specimen:
+
+    opened            2026-09-03T05:47:25Z
+    codex   concur    +452 s
+    kimi    concur    +611 s
+    still pending at  +26 min
+
+Both peers arrived comfortably inside the 822 s median, and both reviewed carefully —
+codex's concur is qualified and names a real caveat. Nothing about those reviewers was
+faster than the ones who "missed" the 95 s rows. The only difference is that this row
+was still alive when they got there, because no operator had yet decided it.
+
+That is the whole mechanism, visible in one pair: peer review works fine when the window
+is open, and the window is usually closed. It also means the rows that accumulate peer
+factors are a biased sample — the slow ones — which is worth remembering before reading
+factor counts as a measure of peer engagement.
+
 ## Limits
 
 - "Terminal before the reviewer arrived" is not "the seat tried and failed". Per-seat
