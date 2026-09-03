@@ -1,6 +1,6 @@
 # PRD: the disposition reaches the asker the moment it is made
 
-Status: DRAFT for ratification. Owner: hestia. Tracker: #825 (lifecycle state machine); this PRD is its delivery leg. Absorbs #772, #732, #774 (claim-side), #795.
+Status: DRAFT for ratification. Owner: hestia. Tracker: #825 (lifecycle state machine); this PRD is its delivery leg. Informed by #772, #732, #774, #795, #850, #851 and #863; each keeps its own acceptance and none of them closes because this ships.
 
 ## 0. Directive (dp, 2026-09-02, verbatim)
 
@@ -49,7 +49,9 @@ The content is the gate's, composed once by the daemon. The hook renders it on t
 
 **R1. Address the asker.** The disposition row carries `for_session` = the proven `session_id` / `host_session_id` when `asker_basis` is `Session`, and the daemon writes the same disposition to a per-session lane the seat can read without a round trip: `$HESTIA_HOME/dispositions/<host_session_id>.jsonl`, append-only, one line per decision, owned by the daemon. `plugin_id` addressing stays for the gone-asker case.
 
-**R2. Push at decide time.** `decide`, `expire`, `withdraw` and `claim` each append to the lane in the same transaction that appends the chain entry; the chain entry is finality (#480) and the lane line carries its hash. No worker, no interval, no polling by the asker.
+**R2. Project at decide time, ordered behind the evidence.** `decide`, `expire`, `withdraw` and `claim` each append to the lane, and the ordering is fixed: **the chain entry commits first** and is the finality (#480); the lane line is a projection keyed to that ruling's hash and written after it. This is deliberately not a promise of one transaction across two stores. The chain and the lane are different stores, and a claim of cross-store atomicity would be a lie the first time a filesystem write failed after a committed ruling.
+
+What replaces atomicity is **repair**: a missing or unwritable lane line is an obligation the projector re-derives from the chain and rewrites idempotently, keyed by ruling hash, the way the disposition notice row is already re-derived (`project_dispositions`). A ruling whose projection failed is therefore late, never lost. Only a true same-store outbox would license the stronger wording, and until one exists the PRD must not use it. No worker in the delivery path itself, no interval, no polling by the asker.
 
 **R3. One content, absolute, and no field that impersonates a deadline it cannot yet know.** A lane line carries `escalation_id`, `decision`, `decided_at`, `decided_by`, `ruling_hash`, `claimable`, `consumed_at`, `expires_at`, `act_digest`, the bounded `attempted` summary, and the one sentence saying what may be done. Every instant is absolute; no relative seconds anywhere. The 4200 supremum is retired from the refusal text.
 
@@ -93,7 +95,7 @@ An approval that expires with no delivery event, while the asker's session was l
 
 An instrument, `tools/disposition_delivery_probe.py`, against the stub daemon and against a live one:
 
-1. Open a synthetic gate-self escalation from a proven session; approve it via `hestia gate approve`. The lane file gains one line before the CLI returns. The line's `claim_deadline` equals the horizon `hestia gate poll` reports.
+1. Open a synthetic gate-self escalation from a proven session; approve it via `hestia gate approve`. The lane file gains one line before the CLI returns. That line carries **no** `claim_deadline` and no field that could be read as one, and it carries `pre_migration_horizon` with its `basis` and `model` named, matching the horizon `hestia gate poll` reports today. The canonical deadline appears only once committed receipt evidence exists (R5), and its arm is written with that slice.
 2. Fire one PreToolUse event in the asker's session: the hook's output carries the line's content on the engine's measured port, and `gate_escalation_delivered` is on the chain with that session.
 3. Drain as the watcher while the lease is live: the notice is not consumed and `observed_at` is unset. Kill the lease; drain again: consumed, and the primer says relay.
 4. Poll from a second session of the same `plugin_id`: `observed_at` stays unset.
