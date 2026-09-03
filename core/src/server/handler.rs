@@ -5048,6 +5048,60 @@ pub(crate) fn project_dispositions(
 /// daemon is DOWN is never recorded (`rehydrate` skips expired opens), per item
 /// 6 — a historical backfill is a separate, explicit act, not a side effect of
 /// a periodic task.
+/// Render every member's config from the vault and report what drifted.
+///
+/// The vault is the source and the file is a projection, so this writes the artifact when it
+/// differs and reports a verdict for each member. A `Miswired` verdict is appended to the chain
+/// rather than logged: drift on a governance surface is a governance event, and the difference
+/// between the two is whether anyone can find it a week later (PRD_CONFIG_FROM_VAULT).
+///
+/// Order matters and is deliberate: VERIFY first, then render. Rendering first would repair the
+/// artifact and then observe that it matches, which reports a clean fleet while silently undoing
+/// evidence of an edit. The edit is the thing worth recording.
+///
+/// An unreadable or absent vault document renders NOTHING for that member and returns no
+/// verdict for it. There is no fallback to the file that was found: a renderer that trusts the
+/// artifact when the vault is unavailable is a second authority with extra steps.
+pub(crate) fn render_and_verify_seat_configs(
+    s: &mut super::state::ServerState,
+    members: &[String],
+) -> Vec<super::seat_config::ConfigVerdict> {
+    use super::seat_config as sc;
+    let home = s.home.clone();
+    let mut verdicts = Vec::new();
+    for member in members {
+        let Some(bytes) = s.vault.get_document(sc::SEAT_CONFIG_NS, member) else {
+            continue; // the vault declares nothing for this member: nothing to render or claim
+        };
+        let cfg: sc::SeatConfig = match serde_json::from_slice(bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(member = %member, error = %e,
+                    "seat config in the vault is not readable as config; rendering nothing");
+                continue;
+            }
+        };
+        let verdict = sc::verify_one(&home, member, &cfg);
+        if let sc::ConfigVerdict::Miswired { expected, actual, .. } = &verdict {
+            let payload = json!({
+                "member": member,
+                "artifact": sc::render_path(&home, member).to_string_lossy(),
+                "expected_sha256": expected,
+                "found_sha256": actual,
+            });
+            if let Err(e) = s.append_chain("config_miswire", payload) {
+                tracing::warn!(member = %member, error = %e,
+                    "config miswire could NOT be recorded; the drift stands and the record does not");
+            }
+        }
+        if let Err(e) = sc::render_to_disk(&home, member, &cfg) {
+            tracing::warn!(member = %member, error = %e, "seat config could not be rendered");
+        }
+        verdicts.push(verdict);
+    }
+    verdicts
+}
+
 pub(crate) fn record_newly_lapsed(s: &mut super::state::ServerState, now: u64) -> usize {
     let lapsed = s.gate_escalations.newly_lapsed(now);
     let mut recorded = 0;
@@ -9783,6 +9837,123 @@ mod tests {
         r.granted = Some(false);
         assert_eq!(r.status(50), "refused");
         assert!(!r.grants("/x/y.md", 50));
+    }
+
+    /// Config is rendered FROM the vault, and an edit to the rendered file is a chain event.
+    ///
+    /// PRD_CONFIG_FROM_VAULT, dp 2026-09-03. The three properties that make this a mechanism
+    /// rather than an audit are each asserted: the artifact is written from the vault rather
+    /// than hand-authored, a later edit is detected without a restart, and the detection is a
+    /// governance event on the chain rather than a line in a log nobody greps.
+    ///
+    /// The ordering assertion is the subtle one. Verify runs BEFORE render, so an edit is
+    /// recorded and then repaired. Rendering first would repair the file and then observe that
+    /// it matches, reporting a clean fleet while erasing the evidence that anyone edited it.
+    #[tokio::test]
+    async fn seat_config_renders_from_the_vault_and_an_edit_is_recorded() {
+        use super::super::seat_config as sc;
+        let (dir, shared) = make_shared_state();
+        let member = "claude-code".to_string();
+        let cfg = serde_json::json!({
+            "env": {"HESTIA_WORKSPACE": "/w/ai-agents", "HESTIA_ROLE": "role:constellation:member"},
+            "note": "rendered by the daemon, not by hand",
+        });
+
+        {
+            let mut s = shared.lock().await;
+            s.vault
+                .put_document(sc::SEAT_CONFIG_NS, &member, serde_json::to_vec(&cfg).unwrap())
+                .unwrap();
+        }
+
+        let path = sc::render_path(dir.path(), &member);
+        assert!(!path.exists(), "nothing rendered until the pass runs");
+
+        // First pass: the vault declares config, so the artifact appears.
+        let first = {
+            let mut s = shared.lock().await;
+            super::render_and_verify_seat_configs(&mut s, std::slice::from_ref(&member))
+        };
+        assert!(
+            matches!(first.first(), Some(sc::ConfigVerdict::Missing { .. })),
+            "the first pass finds no artifact and says so rather than calling it verified: {first:?}"
+        );
+        let rendered = std::fs::read_to_string(&path).expect("the vault rendered it");
+        assert!(rendered.contains("HESTIA_WORKSPACE=/w/ai-agents"), "{rendered}");
+        assert!(
+            rendered.contains("Do not edit"),
+            "the artifact says what it is, because a file that looks authored invites authoring"
+        );
+
+        // Second pass: unchanged, so it verifies.
+        let second = {
+            let mut s = shared.lock().await;
+            super::render_and_verify_seat_configs(&mut s, std::slice::from_ref(&member))
+        };
+        assert!(
+            matches!(second.first(), Some(sc::ConfigVerdict::Verified { .. })),
+            "an untouched artifact verifies: {second:?}"
+        );
+
+        // A hand edit, of exactly the kind this PRD exists to end: a machine-specific path.
+        let edited = rendered.replace("/w/ai-agents", "/somewhere/else");
+        std::fs::write(&path, &edited).unwrap();
+
+        let before = {
+            let s = shared.lock().await;
+            s.chain_store.len().unwrap()
+        };
+        let third = {
+            let mut s = shared.lock().await;
+            super::render_and_verify_seat_configs(&mut s, std::slice::from_ref(&member))
+        };
+        match third.first() {
+            Some(sc::ConfigVerdict::Miswired { expected, actual, .. }) => {
+                assert_ne!(expected, actual, "a miswire names both digests")
+            }
+            other => panic!("a hand edit must read as a miswire, got {other:?}"),
+        }
+        let after = {
+            let s = shared.lock().await;
+            s.chain_store.len().unwrap()
+        };
+        assert!(
+            after > before,
+            "the miswire is on the CHAIN, not merely in a log: {before} -> {after}"
+        );
+
+        // And it was repaired in the same pass, so the seat is not left running on the edit.
+        let repaired = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(repaired, rendered, "the vault's rendering is restored after being recorded");
+    }
+
+    /// No vault document means nothing is rendered and nothing is claimed.
+    ///
+    /// PRD acceptance arm 5: a renderer that falls back to the file it found is a second
+    /// authority with extra steps, so absence must produce no verdict at all rather than a
+    /// verdict computed against whatever happens to be on disk.
+    #[tokio::test]
+    async fn a_member_the_vault_does_not_declare_is_not_rendered_or_judged() {
+        use super::super::seat_config as sc;
+        let (dir, shared) = make_shared_state();
+        let member = "codex".to_string();
+        let stray = sc::render_path(dir.path(), &member);
+        std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+        std::fs::write(&stray, "HESTIA_WORKSPACE=/authored/by/hand\n").unwrap();
+
+        let verdicts = {
+            let mut s = shared.lock().await;
+            super::render_and_verify_seat_configs(&mut s, std::slice::from_ref(&member))
+        };
+        assert!(
+            verdicts.is_empty(),
+            "an undeclared member yields no verdict: {verdicts:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&stray).unwrap(),
+            "HESTIA_WORKSPACE=/authored/by/hand\n",
+            "and the stray file is neither adopted as truth nor overwritten"
+        );
     }
 
     fn make_shared_state() -> (TempDir, SharedState) {

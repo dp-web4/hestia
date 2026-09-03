@@ -1267,7 +1267,18 @@ pub async fn serve_with_callback(
             let now = super::gate_escalation::now_secs();
             let lapsed = {
                 let mut s = lapse_state.lock().await;
-                super::handler::record_newly_lapsed(&mut s, now)
+                let n = super::handler::record_newly_lapsed(&mut s, now);
+                // Config drift on the same cadence: a file that matched at startup and was
+                // edited at noon is a miswire from noon, not from the next restart.
+                let members: Vec<String> = s.gate_capabilities.keys().cloned().collect();
+                let drifted = super::handler::render_and_verify_seat_configs(&mut s, &members)
+                    .iter()
+                    .filter(|v| v.is_finding())
+                    .count();
+                if drifted > 0 {
+                    tracing::warn!(drifted, "seat config: rendered artifacts do not match the vault");
+                }
+                n
             };
             match super::handler::project_dispositions(&chain_handle, &inbox_handle) {
                 Ok(p) if p.projected > 0 || lapsed > 0 => {
