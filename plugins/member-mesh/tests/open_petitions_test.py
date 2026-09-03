@@ -35,6 +35,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MESH = os.path.dirname(HERE)
 HELPER = os.path.join(MESH, "open-petitions.py")
 
+# Every other arm drives the helper as a SUBPROCESS, which is right: that is how
+# the watcher runs it. But one property — "the tool is prescribed only when it
+# resolves" — has two arms and the box can only ever be in one of them, so the
+# absent/present arm has to be injected. Loading by path because the filename
+# carries a hyphen and is not importable by name.
+import importlib.util
+_spec = importlib.util.spec_from_file_location("open_petitions_helper", HELPER)
+op = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(op)
+
 failures = []
 
 
@@ -194,8 +204,28 @@ with tempfile.TemporaryDirectory() as tmp:
     check("B1c key-absent names BOTH admissible producers",
           "without the fold" in out_absent and "composition fallback" in out_absent,
           repr(out_absent))
-    check("B1c key-absent points at the tool that DOES discriminate them",
-          "process_vintage.py units" in out_absent, repr(out_absent))
+    # B1c-referent: the old form of this check was
+    #     check("... points at the tool that DOES discriminate them",
+    #           "process_vintage.py units" in out_absent)
+    # and it was green for a week on a box where that tool does not exist and
+    # never has. `tools/process_vintage.py` is PR #634 — opened 2026-08-26,
+    # still open — while the sentence naming it merged the same day (#642). An
+    # existence pin over a CONSTANT certifies that the renderer can print a
+    # string; it says nothing about whether the reader can run what it names.
+    # So pin the RESOLUTION, and drive both arms explicitly: the local box can
+    # only ever witness one of them, and a test that sees one arm pins the box
+    # rather than the behaviour.
+    check("B1c prescribes the tool ONLY when the tool resolves",
+          "`%s units` is what tells them apart." % op.VINTAGE_TOOL
+          in op.vintage_hint(present=True), repr(op.vintage_hint(present=True)))
+    check("B1c says so, and does not prescribe, when the tool is ABSENT",
+          "is not on this box" in op.vintage_hint(present=False)
+          and "units` is what tells them apart" not in op.vintage_hint(present=False),
+          repr(op.vintage_hint(present=False)))
+    check("B1c the rendered arm agrees with what is actually on THIS box",
+          (("%s units" % op.VINTAGE_TOOL) in out_absent)
+          == os.path.exists(os.path.join(op._REPO_ROOT, op.VINTAGE_TOOL)),
+          repr(out_absent))
 
     # B1d: a diagnosis is not a remedy. Both not-measured arms named the CAUSE
     # and stopped, and the only action either ever named was a watcher restart —

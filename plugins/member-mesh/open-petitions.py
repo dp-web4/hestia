@@ -22,8 +22,48 @@ petitions is not a claude-code property, and a renderer that lives in one
 template fixes one seat rather than the class.
 """
 import json
+import os
 import re
 import sys
+
+# The discriminator this file points a keyless wake at. It is named here rather
+# than inline because the name and the check must not be able to drift apart:
+# that drift is the defect this constant exists to close.
+#
+# `tools/process_vintage.py` has never been on main. It is PR #634, opened
+# 2026-08-26T09:28:50Z and still open and CLEAN 185 h later; the sentence that
+# tells a member to run it merged the SAME DAY, 2026-08-26T20:14:26Z (#642).
+# The advice landed, the referent did not, and nothing noticed for a week
+# because the suite pinned the STRING and not the thing it names:
+#
+#     check("B1c key-absent points at the tool that DOES discriminate them",
+#           "process_vintage.py units" in out_absent, ...)
+#
+# That check is green against a box where the tool does not exist. A member
+# reading `run X` for an absent X spends its wake finding that out, in the one
+# surface it is guaranteed to read — and this is the not-measured arm, so the
+# reader is already being told it cannot see something. Name the tool when it
+# resolves; say it is unavailable when it does not. If #634 merges, the
+# sentence comes back on its own with no edit here.
+VINTAGE_TOOL = "tools/process_vintage.py"
+_REPO_ROOT = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir))
+
+
+def vintage_hint(present=None):
+    """The clause naming the vintage discriminator, or saying it is absent.
+
+    `present` is injectable so BOTH arms are exercised by the suite on a box
+    where only one of them is reachable — a test that can only ever see the
+    local truth pins the box, not the behaviour.
+    """
+    if present is None:
+        present = os.path.exists(os.path.join(_REPO_ROOT, VINTAGE_TOOL))
+    if present:
+        return "`%s units` is what tells them apart. " % VINTAGE_TOOL
+    return ("the tool that would tell them apart (`%s`) is not on this box, so "
+            "this primer cannot discriminate them — do not spend the wake "
+            "looking for it. " % VINTAGE_TOOL)
 
 # What survives into the primer. `stated_reason` is the SEAT HOOK's truncation of
 # the refused command, not the daemon's — the daemon stores whatever it is handed,
@@ -103,7 +143,9 @@ def render(f):
         # disk and costs nothing: a watcher too old to fold writes NO
         # `open_petitions` key, while a failed read writes `asked:false`.
         # See tools/process_vintage.py for why the watcher's vintage is not
-        # something you can read off /proc.
+        # something you can read off /proc — when that tool is actually here.
+        # It is not on main (PR #634, open since 2026-08-26); `vintage_hint`
+        # is what keeps this branch from prescribing it regardless.
         if f.get("_absent"):
             # Say what the ARTIFACT shows and stop. Key-absence dates THIS PRIMER's
             # producer, not the watcher now running, and codex named two live
@@ -118,8 +160,8 @@ def render(f):
                     "`open_petitions` key, so the read was never attempted for it. "
                     "That dates the primer's PRODUCER (a watcher without the fold, or "
                     "a composition fallback), not necessarily the watcher running now; "
-                    "`tools/process_vintage.py units` is what tells them apart. This "
-                    "is not evidence that you hold none. " + SELF_SERVE)
+                    + vintage_hint() +
+                    "This is not evidence that you hold none. " + SELF_SERVE)
         return ("Open petitions: NOT MEASURED this wake (the pending-escalations "
                 "read failed) — this is not evidence that you hold none. " + SELF_SERVE)
     mine = f.get("mine") or []
