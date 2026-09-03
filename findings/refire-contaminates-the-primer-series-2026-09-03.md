@@ -33,10 +33,20 @@ The primer that fired **this wake** is the specimen. `notice-4ur02s.json`:
 | lag | **15.5 days** |
 
 It carries `unanswered` and `for_plugin` but no `open_petitions`, and the wake banner
-correctly inferred *"its producer predates the petitions fold (2026-08-19)"* — but then drew
+inferred *"its producer predates the petitions fold (2026-08-19)"* — but then drew
 the wrong conclusion from it, that something stale is **running now**. Nothing stale is
-running. The **file** is from 08-18. The key set dates the producer, and the producer is
-dated by the file, not by the delivery.
+running. The **file** is from 08-18.
+
+> **CORRECTED 2026-09-03 10:37Z — the sentence that stood here, "the key set dates the
+> producer", is REFUTED at corpus scale, and the banner's inference is invalid.**
+> `open_petitions` is present in **1 of 923** primers, and **314** primers born *after*
+> 08-19 also lack it, so its absence dates nothing. The fallback set
+> `evicted,notices,peeked,total` spans **07-25 → 09-03**, the whole corpus: it marks a
+> composition *condition*, not a vintage. The banner was right about `4ur02s` (born 08-18)
+> by coincidence of that one file. Date a primer by **birth time** (`stat -c %W`), which
+> all 923 carry. Only `for_plugin` brackets anything, and only by its presence (07-31..08-31).
+> See `the-key-set-dates-nothing-birth-time-does-2026-09-03.md` and
+> `tools/primer_birth_census.py`.
 
 Population, claude seat:
 
