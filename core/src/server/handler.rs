@@ -4832,6 +4832,241 @@ pub(crate) fn ensure_disposition(
     }
 }
 
+/// The asker's lane: `<home>/dispositions/<plugin>.jsonl`.
+///
+/// A disposition row in `member_notices` is durable and addressed, and it is PULLED -- by the
+/// seat watcher, every 60s, consume-once, into a fresh session that is not the asker, cannot
+/// claim, and whose poll would light the asker's fuse (#732). The asker's own live session
+/// reads no mailbox at all after its start. So the ruling existed, was recorded, was even
+/// queued, and the only channel that ever delivered it was a human typing "approved" into the
+/// session (`observed_at` doc; `gate_cli::poll` doc; measured again 2026-09-02, three grants,
+/// two dead at zero seconds).
+///
+/// A file is the delivery the mailbox cannot be: reading it costs no round trip on a daemon
+/// that serializes every member, consumes nothing, and cannot start a claim window. A
+/// bystander session of the same seat may read the whole lane and harm no one, which is why
+/// the address rides IN the line (`for_session`) rather than being enforced by who opens the
+/// file (PRD_DISPOSITION_DELIVERY R1/R6).
+///
+/// `for_session` is the asker's `host_session_id`, and what that is worth is worth stating
+/// exactly: it is a caller-supplied label, copied onto the escalation from a PROVEN session at
+/// open (`record_seat_keys`), never read from the arguments at claim time. So the session it
+/// names was proven; the string itself is a reuse key and never an authorisation discriminator
+/// (`state::Session`, guard B). It is being used here only to ROUTE a rendering, which is the
+/// weakest thing it could be used for, and nothing downstream may treat a match as authority.
+pub(crate) const DISPOSITION_LANE_DIR: &str = "dispositions";
+
+/// Text cap for member-supplied strings that ride to the asker's context window.
+const LANE_TEXT_CAP: usize = 400;
+
+fn lane_clip(v: Option<&String>) -> Option<String> {
+    v.map(|t| {
+        let t = t.trim();
+        if t.chars().count() <= LANE_TEXT_CAP {
+            t.to_string()
+        } else {
+            t.chars().take(LANE_TEXT_CAP).collect::<String>() + " [clipped]"
+        }
+    })
+    .filter(|t| !t.is_empty())
+}
+
+/// Put this ruling on the asker's lane, idempotently, keyed by the ruling hash.
+///
+/// Warn-and-continue at the ruling site, exactly like `ensure_disposition`: the decision has
+/// already committed to the chain, and a failed projection must never unmake a ruling. But it
+/// must not be warn-and-FORGET either (PRD #845 R2): the chain is the evidence and the lane is
+/// a projection of it, so a line that failed to land is re-derived by the projector on its next
+/// pass. That is why this checks for the ruling hash before appending -- the repair path and
+/// the ruling path call the same function, and calling it twice writes one line.
+///
+/// The repair window is the row's lifetime. Once an escalation is reaped there is no row to
+/// render from (#867: a later `open()` reaps, not only a restart), and nothing claimable is
+/// lost by that, because the claim horizon is far shorter than the reap window.
+///
+/// The `render` field is composed HERE, by the gate, and the seat prints it. What was decided,
+/// whether a grant still authorises anything, when it dies and what the asker may do next are
+/// all law; a shim that composed them would be a second legal system with a nicer font
+/// (GATE_ARCHITECTURE section 2, and the SHIM_LEDGER class for the reader is refusal-channel).
+pub(crate) fn ensure_disposition_lane(
+    s: &super::state::ServerState,
+    esc: &super::gate_escalation::Escalation,
+    pointer: &str,
+    ruling_hash: &str,
+    now: u64,
+) -> bool {
+    use std::io::Write;
+    let dir = s.home.join(DISPOSITION_LANE_DIR);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("disposition lane dir {dir:?} unavailable ({e}) - the asker will not be told");
+        return false;
+    }
+    let status = match serde_json::to_value(esc.stored_status()) {
+        Ok(Value::String(v)) => v,
+        _ => "unknown".to_string(),
+    };
+    let claimable = esc.is_claimable(now);
+    // NOT `claim_deadline`. The canonical, delivery-started deadline does not exist yet: it
+    // begins at a witnessed receipt, and receipt has no event (PRD R5/R8, the next slice).
+    // What this horizon IS today is `observed_at.or(decided_at) + window`, and #850 measured
+    // what `observed_at` is: store-only, absent from the chain, unreconstructible by an
+    // offline reader, reset to None on replay, and silently not set by the default CLI
+    // identity. Exporting that as `claim_deadline` would freeze a current implementation
+    // accident into a new outward artifact, which is the debt #845 exists to retire. So it
+    // ships named and versioned, and a reader looking for the canonical deadline finds no
+    // field to mistake for it (GPT review of #849).
+    let horizon = esc.pre_migration_horizon();
+    let utc = |t: u64| chrono::DateTime::from_timestamp(t as i64, 0).map(|d| d.to_rfc3339());
+    let horizon_utc = horizon.and_then(utc);
+    let act = lane_clip(esc.stated_detail.as_ref())
+        .or_else(|| lane_clip(esc.stated_reason.as_ref()))
+        .unwrap_or_else(|| format!("{} {}", esc.tool_name, esc.marker));
+    let by = esc.decided_by.as_deref().unwrap_or("an arbiter").to_string();
+    let why = lane_clip(esc.reason.as_ref())
+        .map(|r| format!(" ({r})"))
+        .unwrap_or_default();
+    let render = if claimable {
+        format!(
+            "{status} - escalation {id} ({act}). Decided by {by}{why}. This grant is UNSPENT and \
+authorises exactly the write it was opened for. Under TODAY'S policy it stops authorising at \
+{until}, a horizon anchored on the ruling rather than on your receipt of it (#845, #850). \
+RE-ISSUE THE SAME WRITE to claim it, single use. Match what you stated: the binding is a \
+digest over a BOUNDED SUMMARY of the act, not over its bytes (#539 measures the classes: a \
+220-character command prefix, a 140-character path tail, and a redaction keyed on length), so a \
+difference inside that summary claims nothing and a difference beyond it may still claim. \
+Anything else lets this lapse. Ruling {hash}.",
+            status = status.to_uppercase(),
+            id = esc.id,
+            until = horizon_utc
+                .clone()
+                .unwrap_or_else(|| "the horizon on record".to_string()),
+            hash = ruling_hash,
+        )
+    } else {
+        format!(
+            "{status} - escalation {id} ({act}). Decided by {by}{why}. Nothing is claimable: \
+{blocked}. Do not re-issue the write; if the rule itself is wrong, appeal it. Ruling {hash}.",
+            status = status.to_uppercase(),
+            id = esc.id,
+            blocked = if esc.consumed_at.is_some() {
+                "this grant was already spent".to_string()
+            } else if status == "approved" {
+                "the approval is past its horizon or short of its bar".to_string()
+            } else {
+                format!("the ruling is {status}")
+            },
+            hash = ruling_hash,
+        )
+    };
+    let row = json!({
+        "v": 1,
+        "written_at": now,
+        "escalation_id": esc.id,
+        "plugin_id": esc.plugin_id,
+        "for_session": esc.host_session_id,
+        "decision": status,
+        "decided_at": esc.decided_at,
+        "decided_by": esc.decided_by,
+        "decided_role": esc.decided_role,
+        "reason": lane_clip(esc.reason.as_ref()),
+        "ruling_hash": ruling_hash,
+        "pointer": pointer,
+        "claimable": claimable,
+        "consumed_at": esc.consumed_at,
+        // The canonical deadline is ABSENT, not null-by-accident: it is not derivable before a
+        // witnessed receipt exists. What is here is today's horizon, named as the projection
+        // it is, so no reader can mistake one for the other.
+        "pre_migration_horizon": horizon,
+        "pre_migration_horizon_utc": horizon_utc,
+        "pre_migration_horizon_basis": if esc.observed_at.is_some() { "observed_at" } else { "decided_at" },
+        "pre_migration_horizon_model":
+            "min(observed_at or decided_at, expires_at) + APPROVAL_CLAIM_WINDOW_SECS; observation is \
+store-only and resets on replay (#850). NOT the canonical delivery-started deadline (#845 R5).",
+        "expires_at": esc.expires_at,
+        "expires_at_utc": utc(esc.expires_at),
+        "act_digest": esc.act_digest,
+        "attempted": lane_clip(esc.stated_detail.as_ref()),
+        "render": render,
+    });
+    let path = dir.join(format!("{}.jsonl", esc.plugin_id));
+    // Idempotent by ESCALATION, not by ruling hash. The ruling site knows the chain entry's
+    // hash; the repair pass has only the row, and #867 says the row may be gone before the
+    // chain page is walked. Keying on the escalation id lets both callers converge on one
+    // line, and a ruling delivered twice is a ruling the asker cannot trust.
+    let marker = format!("\"escalation_id\":\"{}\"", esc.id);
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        if existing.lines().any(|l| l.replace(' ', "").contains(&marker)) {
+            return false;
+        }
+    }
+    let line = match serde_json::to_string(&row) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("disposition lane line for {} not serialisable ({e})", esc.id);
+            return false;
+        }
+    };
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut f) => match writeln!(f, "{line}") {
+            Ok(()) => return true,
+            Err(e) => tracing::warn!("disposition lane {path:?} not written ({e})"),
+        },
+        Err(e) => tracing::warn!("disposition lane {path:?} not open ({e})"),
+    }
+    false
+}
+
+/// Re-derive any lane line a ruling site failed to write. THE REPAIR, not prose about one.
+///
+/// PRD #845 R2 stopped promising that the chain entry and the lane line commit together,
+/// because they are different stores and that promise would be a lie the first time a
+/// filesystem write failed after a committed ruling. What replaces atomicity is this: the
+/// ruling is on the chain, the lane is a projection of it, and a projection that did not land
+/// is rewritten on the next pass. `ensure_disposition_lane` is idempotent by escalation, so
+/// the ruling site and this pass converge on one line and calling both writes once.
+///
+/// Bounded by reaping, deliberately and visibly: a row the store no longer holds cannot be
+/// repaired from here. That costs nothing claimable, because the claim horizon is far shorter
+/// than the reap window, and a caller that needs the ruling after reap has the chain.
+/// The disposition worker's state-side pass, named so a test can hold it.
+///
+/// The worker body is a `tokio::spawn` loop that no test drives, so anything written only
+/// inside it is verified by reading rather than by running. That is how the first cut of this
+/// PR shipped a repair the diff did not contain: the arm exercised the repair FUNCTION and
+/// stayed green with the call site deleted. Both effects of a pass now live behind one name,
+/// and the untested remainder is a single call in the loop rather than the logic itself.
+///
+/// Returns (lapses recorded, lane projections repaired).
+pub(crate) fn disposition_worker_pass(
+    s: &mut super::state::ServerState,
+    now: u64,
+) -> (usize, usize) {
+    let lapsed = record_newly_lapsed(s, now);
+    let repaired = repair_disposition_lanes(s, now);
+    (lapsed, repaired)
+}
+
+pub(crate) fn repair_disposition_lanes(s: &super::state::ServerState, now: u64) -> usize {
+    let repairs: Vec<(String, String)> = s
+        .gate_escalations
+        .rows()
+        .filter(|e| e.decided_at.is_some())
+        .map(|e| (e.id.clone(), format!("hestia://escalation/{}#decided", e.id)))
+        .collect();
+    let mut wrote = 0usize;
+    for (id, pointer) in repairs {
+        if let Some(esc) = s.gate_escalations.get(&id) {
+            if ensure_disposition_lane(s, esc, &pointer, "", now) {
+                wrote += 1;
+            }
+        }
+    }
+    if wrote > 0 {
+        tracing::info!(repaired = wrote, "disposition lanes: rulings whose projection had not landed");
+    }
+    wrote
+}
+
 /// One projector pass's page bound (#480 revised review, item 4a): at most this
 /// many chain positions per pass. The page is an index walk over
 /// `chain_position`, taken on the chain store's OWN connection mutex — never
@@ -12936,6 +13171,296 @@ mod tests {
         );
     }
 
+    /// PRD_DISPOSITION_DELIVERY R1/R2/R3: the ruling reaches the ASKER, at decide time, on a
+    /// lane addressed to the asker's own live session, carrying an ABSOLUTE deadline and the
+    /// one sentence saying what may be done.
+    ///
+    /// The mechanism this replaces was a human. Measured 2026-09-02 on this seat: three
+    /// approvals, every delivery that worked was dp typing "approved" into the session, two
+    /// grants dead at zero seconds remaining. The daemon knew all three the moment it ruled.
+    ///
+    /// Drives the REAL path (`tool_gate_arbitrate_escalation`), not the lane writer directly:
+    /// a test that called the writer would pass with both call sites deleted.
+    #[tokio::test]
+    async fn the_ruling_reaches_the_askers_live_session_at_decide_time() {
+        let (dir, shared) = make_shared_state();
+        let asker = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "host_agent": "h",
+                "host_session_id": "sess-asker-42",
+            }),
+        )
+        .await
+        .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let peer = tool_connect(&shared, &json!({ "plugin_id": "codex", "host_agent": "h" }))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": asker,
+                "tool_name": "Edit",
+                "marker": "hestia_gate_core.py",
+                "act": "Edit -> hestia_gate_core.py",
+                "detail": "add HESTIA_WORKSPACE to the gate hook line",
+            }),
+        )
+        .await
+        .unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap().to_string();
+
+        let lane = dir
+            .path()
+            .join(super::DISPOSITION_LANE_DIR)
+            .join("claude-code.jsonl");
+        assert!(!lane.exists(), "no ruling yet, so nothing to deliver");
+
+        let decided = tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "approve": true,
+                "reason": "the asker must learn this without a human relaying it",
+                "session_id": peer,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(decided["status"], "approved", "{decided}");
+
+        let body = std::fs::read_to_string(&lane)
+            .expect("the ruling must reach the asker's lane, not only the mailbox");
+        let row: Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            row["for_session"], "sess-asker-42",
+            "addressed to the ASKER's own session, so a co-seat session knows it is not theirs: {row}"
+        );
+        assert_eq!(row["decision"], "approved", "{row}");
+        assert_eq!(row["escalation_id"], esc_id, "{row}");
+        // The canonical delivery-started deadline is NOT exported, because it does not exist
+        // until a witnessed receipt does (#845 R5, GPT review of #849). A reader must find no
+        // field it could mistake for one; today's horizon ships named as the projection it is.
+        assert!(
+            row.get("claim_deadline").is_none() && row.get("claim_deadline_utc").is_none(),
+            "no field may impersonate the canonical deadline: {row}"
+        );
+        let horizon = row["pre_migration_horizon"]
+            .as_u64()
+            .expect("today's horizon, absolute, because a countdown decays in flight");
+        let decided_at = row["decided_at"].as_u64().unwrap();
+        assert_eq!(
+            horizon,
+            decided_at + crate::server::gate_escalation::APPROVAL_CLAIM_WINDOW_SECS,
+            "the horizon is the one the gate itself enforces today: {row}"
+        );
+        assert_eq!(
+            row["pre_migration_horizon_basis"], "decided_at",
+            "and it names what it is anchored on, since observation is store-only (#850): {row}"
+        );
+        assert!(
+            row["pre_migration_horizon_utc"].as_str().unwrap().starts_with("20")
+                && row["expires_at_utc"].as_str().unwrap().starts_with("20"),
+            "both instants are legible to whoever reads them: {row}"
+        );
+
+        let render = row["render"].as_str().unwrap();
+        assert!(
+            render.contains(&esc_id) && render.to_lowercase().contains("re-issue"),
+            "the render tells the asker what it may do, composed by the GATE: {render}"
+        );
+        // What the binding IS, stated as narrowly as it is true. `act_digest_of` hashes a
+        // summary the seat already normalised, and that normalisation is lossy in three
+        // measured ways (#539: a 220-char command prefix, a 140-char path tail, a redaction
+        // keyed on length). A render promising "byte-identical, because the digest covers the
+        // whole command" would be false in the direction that costs an asker its grant.
+        assert!(
+            render.contains("BOUNDED SUMMARY") && render.contains("#539"),
+            "the render says what the binding covers, and cites what measured it: {render}"
+        );
+        assert!(
+            !render.to_lowercase().contains("whole command"),
+            "and never promises binding over the whole command: {render}"
+        );
+        assert!(
+            render.contains("add HESTIA_WORKSPACE to the gate hook line"),
+            "and which act it authorises: {render}"
+        );
+        assert_eq!(
+            row["claimable"], true,
+            "a single-approver bar is MET by one peer, so this grant is live: {row}"
+        );
+        assert!(
+            !render.to_lowercase().contains("do not re-issue"),
+            "and a live grant must never be rendered as a spent one: {render}"
+        );
+    }
+
+    /// A ruling whose lane projection did not land is rewritten by the repair pass.
+    ///
+    /// This arm exists because the review of #849 caught the PR describing a repair that the
+    /// diff did not contain: the ruling sites wrote the lane, nothing re-derived it, and the
+    /// prose said the projector would. Deleting the lane after a real ruling is the closest
+    /// honest model of a filesystem write that failed after the chain entry committed.
+    #[tokio::test]
+    async fn a_ruling_whose_lane_write_failed_is_repaired() {
+        let (dir, shared) = make_shared_state();
+        let asker = tool_connect(
+            &shared,
+            &json!({"plugin_id": "claude-code", "host_agent": "h", "host_session_id": "sess-repair-1"}),
+        )
+        .await
+        .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let peer = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h"}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": asker,
+                "tool_name": "Edit",
+                "marker": "hestia_gate_core.py",
+                "act": "Edit -> hestia_gate_core.py",
+            }),
+        )
+        .await
+        .unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap().to_string();
+        tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "approve": true,
+                "reason": "ruled, and then the projection is lost",
+                "session_id": peer,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let lane = dir
+            .path()
+            .join(super::DISPOSITION_LANE_DIR)
+            .join("claude-code.jsonl");
+        assert!(lane.is_file(), "the ruling site wrote it");
+        std::fs::remove_file(&lane).unwrap();
+
+        // THE WORKER'S PASS, not the repair function alone. Calling the function directly
+        // would leave this arm green with the worker's call site deleted, which is exactly how
+        // the previous cut shipped a repair that existed only in prose.
+        let now = crate::server::gate_escalation::now_secs();
+        let repaired = {
+            let mut s = shared.lock().await;
+            super::disposition_worker_pass(&mut s, now).1
+        };
+        assert!(repaired >= 1, "the lost projection is rewritten, not forgotten");
+        let body = std::fs::read_to_string(&lane).expect("the lane is back");
+        let row: Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(row["escalation_id"], esc_id, "and it is the same ruling: {row}");
+        assert_eq!(row["for_session"], "sess-repair-1", "still addressed to the asker: {row}");
+
+        // Idempotent: a second pass must not deliver the same ruling twice.
+        let again = {
+            let mut s = shared.lock().await;
+            super::disposition_worker_pass(&mut s, now).1
+        };
+        assert_eq!(again, 0, "a repaired lane is not repaired again");
+        assert_eq!(
+            std::fs::read_to_string(&lane).unwrap().lines().count(),
+            1,
+            "one ruling, one line"
+        );
+    }
+
+    /// The other half of the same mechanism: a ruling that does NOT authorise anything must not
+    /// read like one that does.
+    ///
+    /// `pre_tool_use.py` draws `Bar::SovereignPlusPeer` (`bar_for`), which one peer does not meet
+    /// — approved, recorded, and claimable by nobody. The first cut of the arm above asserted the
+    /// claimable wording inside `if row["claimable"]`, opened exactly this marker, and therefore
+    /// never ran the branch it existed to check. The bar is the variable, so it is the axis.
+    #[tokio::test]
+    async fn a_ruling_short_of_its_bar_is_not_rendered_as_a_grant() {
+        let (dir, shared) = make_shared_state();
+        let asker = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "host_agent": "h",
+                "host_session_id": "sess-asker-77",
+            }),
+        )
+        .await
+        .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let peer = tool_connect(&shared, &json!({ "plugin_id": "codex", "host_agent": "h" }))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": asker,
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "act": "Edit -> pre_tool_use.py",
+            }),
+        )
+        .await
+        .unwrap();
+        tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({
+                "escalation_id": opened["escalation_id"].as_str().unwrap(),
+                "approve": true,
+                "reason": "one peer, on a two-factor marker",
+                "session_id": peer,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let body = std::fs::read_to_string(
+            dir.path()
+                .join(super::DISPOSITION_LANE_DIR)
+                .join("claude-code.jsonl"),
+        )
+        .expect("a ruling short of its bar is still a ruling, and still reaches the asker");
+        let row: Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(row["decision"], "approved", "{row}");
+        assert_eq!(
+            row["claimable"], false,
+            "approved is not the same fact as claimable: {row}"
+        );
+        let render = row["render"].as_str().unwrap();
+        assert!(
+            render.to_lowercase().contains("do not re-issue")
+                && !render.contains("RE-ISSUE THE SAME WRITE"),
+            "the asker must not be told to spend a grant that authorises nothing: {render}"
+        );
+    }
+
     /// Two members with live sessions and one escalation opened by the first — the fixture
     /// every corroborate-stance test below starts from. Returns (state, escalation_id,
     /// corroborator's session_id).
@@ -17646,6 +18171,9 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
                 &pointer,
                 &entry.hash,
             );
+            // ...and the same ruling on the lane the asker's LIVE session reads, because a
+            // queued notice reaches the next wake and the asker is here now (PRD R2).
+            let _ = ensure_disposition_lane(&s, &decided, &pointer, &entry.hash, now);
             // The bar and whether this decision met it go to the DECIDER, not only to the
             // chain. They were recorded above and withheld here, and the asymmetry had a
             // measured cost: across the whole chain, 66 `sovereign_plus_peer` escalations
