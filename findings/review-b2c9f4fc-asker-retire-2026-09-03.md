@@ -50,11 +50,16 @@ terminal at a median well under the median time-to-factor) on a row where the *a
 decider, so no operator latency is involved. The window is the fleet's own traffic, not anyone's
 diligence.
 
-**It also refines a finding I filed yesterday.** I had recorded that the reap voids performed
-review. This factor was accepted on an already-**decided** row (`recorded: true`,
-`corroborated: true`) because the row was still `source=live_store` — 682s after open, well
-inside the decided-row retention. So the decision does not void a factor; the **reap** does.
-Those are different deadlines and I had them collapsed.
+**It also supplies a control the reap finding was missing.** Yesterday I recorded that the reap
+voids performed review — inferred from five reviews refused at
+`hestia_gate_escalation_corroborate`. But all five had been *decided* as well as *reaped*, so
+decision and reap were **confounded**: nothing in that evidence ruled out "a decided row refuses
+factors, reaped or not."
+
+This factor is the missing positive control. It was **accepted** on an already-decided row
+(`recorded: true`, `corroborated: true`, 682s after open) because the row was still
+`source=live_store`. Decision alone does not void a factor; the **reap** does. The earlier
+finding's attribution was right, and it is now discriminated rather than merely consistent.
 
 ## No dissent
 
