@@ -47,6 +47,14 @@ Demonstrably harness-unique, and therefore allowed in a shim:
 - **Registration.** Where this harness records its hooks, and how that file is read.
 - **Identity.** The plugin id and role this seat acts under, passed to the gate as arguments.
 - **Launch and restart verbs.** systemd against launchctl is a platform fact.
+- **Reachability timing.** How long this harness can wait for the gate before the harness
+  itself times the hook out, and how many retries fit inside that budget. Codex clamps a hook
+  at 3s; claude-code allows far longer. These are harness clocks, so the timeout and retry
+  numbers are harness data. What the shim may calibrate is the TIMING of reaching the authority,
+  never the OUTCOME of failing to reach it: an unreachable authority is fail-closed on every
+  harness, and no timing choice may turn that into an allow. The adapter sees reachability
+  only. Whether a resident hook is miswired is the daemon's view of the adapter, not the
+  adapter's view of itself (PRD_HARNESS_AGNOSTIC_ADAPTERS section 8).
 
 Never in a shim, under any argument:
 
@@ -54,8 +62,9 @@ Never in a shim, under any argument:
 - Any scope or path-containment predicate.
 - Any governance-closure or gate-self determination.
 - Any denial, escalation, appeal or witness content.
-- Any fail-closed or fail-open posture decision.
-- Any timeout, retry or recovery policy.
+- Any fail-closed or fail-open posture decision, including what happens when a timeout expires.
+- Any recovery policy: what to do INSTEAD when the authority does not answer. There is no
+  instead.
 
 If a seat needs different behaviour from one of those, that is a **parameter on the shared
 implementation**, declared as data, not a second implementation.
