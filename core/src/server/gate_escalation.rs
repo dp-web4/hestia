@@ -1585,9 +1585,26 @@ impl EscalationStore {
             // and bar-met is exactly "this record could become claimable" minus the clock,
             // which is the clause being computed — using `is_claimable` here would ask the
             // horizon about itself.
+            //
+            // AND NOT ALREADY SPENT. The clause above says "could become claimable minus the
+            // clock", and a claimed record cannot become claimable at any clock: `claim()`
+            // sets `consumed_at`, `is_claimable` refuses on it, and nothing clears it. Yet
+            // the four conjuncts here did not read it, so the asker seat's first attributed
+            // poll AFTER its own claim stamped `observed_at`, `decided_horizon()` moved to
+            // now+600, and the poll published `observation_started_claim_window: true`
+            // beside a fresh countdown on a permit that had permitted nothing for two
+            // minutes. Measured live 2026-09-01 06:10:39Z on `cd0f8128ee32c02f`: consumed
+            // 06:08:14Z, polled `--as claude-code` → `true`, 600s; 45s later `false`, 555s.
+            // `permits_write` stayed `false` throughout — the enforcement was never wrong,
+            // only the account of it. But "the poll started your window" is exactly the
+            // sentence an asker would act on, and it was said about a window that could
+            // not exist. Observation, like the clock it starts, is about a claimable future;
+            // a spent record has none. (Sibling of the #667 revival — that was an UNSPENT
+            // grant re-armed for real; this is a SPENT one re-armed on paper.)
             Some(e)
                 if e.plugin_id == plugin_id
                     && e.observed_at.is_none()
+                    && e.consumed_at.is_none()
                     && e.status == Status::Approved
                     && e.bar_met() =>
             {
@@ -3287,6 +3304,61 @@ mod tests {
                  not one predicate at all (offset {offset})"
             );
         }
+    }
+
+    /// Observation must not re-arm a SPENT permit. `mark_observed` read four conjuncts and
+    /// `is_claimable` reads four, and they were not the same four: observation never read
+    /// `consumed_at`, so the asker seat's first attributed poll AFTER its own claim stamped
+    /// `observed_at`, moved `decided_horizon()` to now+600 and answered
+    /// `observation_started_claim_window: true` with a fresh countdown about a permit that
+    /// could never be claimed again (live on `cd0f8128ee32c02f`, 2026-09-01 06:10Z).
+    ///
+    /// This is ALSO the first test in the tree to call `mark_observed` at all — the #667
+    /// fuse shipped with its behaviour asserted only in prose. Sabotage arm: drop the
+    /// `consumed_at.is_none()` conjunct and the first assertion goes red.
+    #[test]
+    fn observation_does_not_revive_a_spent_permit() {
+        let mut s = EscalationStore::default();
+        let e = s
+            .open("claude-code", "r", "Bash", "pre_tool_use.py", Some(TEST_ACT), None, None, T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        let id = e.id.clone();
+        s.decide(&id, true, "operator", "role:constellation:sovereign",
+                 Channel::OperatorSession, None, Some("k"), T0 + 5)
+            .unwrap();
+        let claimed = s
+            .claim("claude-code", "pre_tool_use.py", Some(TEST_ACT), T0 + 70)
+            .expect("claimable at T0+70");
+        assert_eq!(claimed.consumed_at, Some(T0 + 70));
+
+        // The asker seat polls its own row two minutes after spending it.
+        let observed = s.mark_observed(&id, "claude-code", T0 + 190);
+        assert!(!observed, "a spent permit has no claimable future to observe");
+        let e = s.get(&id).unwrap();
+        assert_eq!(e.observed_at, None, "and the record must not carry a stamp for it");
+        assert_eq!(
+            e.claim_window_secs_remaining(T0 + 190),
+            Some(APPROVAL_CLAIM_WINDOW_SECS - 185),
+            "the countdown stays anchored at the GRANT, not restarted at the poll: {:?}",
+            e.decision_reply(T0 + 190)
+        );
+        assert!(!e.is_claimable(T0 + 190));
+
+        // Control: the same poll on an UNSPENT sibling does start the fuse (the #667 contract).
+        let u = s
+            .open("claude-code", "r", "Bash", "other_marker.py", Some("Edit -> /repo/other.rs"), None, None, T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        let uid = u.id.clone();
+        s.decide(&uid, true, "operator", "role:constellation:sovereign",
+                 Channel::OperatorSession, None, Some("k"), T0 + 5)
+            .unwrap();
+        assert!(s.mark_observed(&uid, "claude-code", T0 + 190), "unspent: observation arms the fuse");
+        assert_eq!(s.get(&uid).unwrap().observed_at, Some(T0 + 190));
+        assert_eq!(
+            s.get(&uid).unwrap().claim_window_secs_remaining(T0 + 190),
+            Some(APPROVAL_CLAIM_WINDOW_SECS),
+            "the unspent control's window restarts at the poll"
+        );
     }
 
     /// An approval short of the bar must say it permits nothing — the class #219 found, kept
