@@ -39,7 +39,8 @@ late it was relative to a decision it never saw.
 
     factors landing before the ruling       18/71 = 25.4%
     invited rows with an in-time factor    14/134 = 10.4%
-    invitations issued in the window       1,072  → 18 in-time factors
+    invitation SLOTS filled                1,072  (134 rows x 8)
+    REAL-seat invitations                    268  (exactly 2 per row) → 18 in-time factors
 
 ## The fast population is a human, not automation
 
@@ -60,13 +61,30 @@ Two structural facts, both measured:
 
 1. **`invited_peers` is exactly 8 on 134 of 134 rows.** The pool is filled to
    `MAX_INVITED_PEERS` unconditionally — no reference to how long the row is expected
-   to live, because at open nobody knows.
+   to live, because at open nobody knows. Note what fills it: **6 of the 8 names are
+   registry residue on every single row** — `codex-cli`, `a-completely-different-impostor`,
+   `agent-inventory`, `attest-probe`, `claudecode`, `contention-probe`, each appearing
+   134/134 — leaving exactly 2 real seats per row (the asker is excluded from its own
+   pool). That phantom share is *not* a new finding; it is already recorded, same six
+   names, and it is cosmetic for displacement because the sort is live-first and
+   `peer_participation` books them as `invited_without_reader`. It is repeated here only
+   so the invitation count below is read correctly.
 2. **Nothing retracts an invitation when the row goes terminal.** There is no
    counterpart to the open-time mint. `65ca4b09904b7c94` is the specimen.
 
-Between them: 1,072 invitations were issued in 3.16 days against rows whose median
-lifetime is 95 seconds, and the mesh's wake → notify → drain → read path cannot deliver
-a reviewer in 95 seconds. Not "usually does not" — the p10 lifetime is 14 seconds.
+Between them: **268 real-seat invitations** were issued in 3.16 days against rows whose
+median lifetime is 95 seconds, and the mesh's wake → notify → drain → read path cannot
+deliver a reviewer in 95 seconds. Not "usually does not" — the p10 lifetime is 14
+seconds.
+
+**Correction to my own first draft of this document.** I initially reported the
+denominator as 1,072 invitations, which is the count of filled *slots*. Six of every
+eight are phantom ids with no reader, so that number overstates real reach by 4x in the
+direction that flatters my argument. The load-bearing figure is 268, and 18 in-time
+factors against it is ~6.7%, not ~1.7%. The conclusion is unchanged — 86.5% of rows are
+terminal before a median reviewer arrives is a statement about row lifetime and reviewer
+latency, and neither depends on the invitation count — but the headline was wrong and
+the corrected version is four times less dramatic.
 
 ## What this replicates and what it does not
 
@@ -137,6 +155,11 @@ factor counts as a measure of peer engagement.
   favourable to my argument — a fully unbiased latency could be slower still, which
   would widen the gap, or faster, which would narrow it. Untested, not refuted.
 - Single window, single host. 3.16 days.
+- One incidental change from the 08-31 record, noted but not chased: that census found
+  44% of escalations (157/357) invited **nobody**, because `single_approver` withholds
+  the pool when `asker_is_proven` is false. In this window only 4 of 138 rows withheld,
+  and 127 `single_approver` rows did invite. Either the proven-asker condition is now
+  routinely satisfied or the withholding path changed. Untested, not refuted.
 
 ## Reproduce
 
