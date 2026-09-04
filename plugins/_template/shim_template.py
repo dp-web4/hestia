@@ -12,18 +12,28 @@ An adapter. It converts a harness event into the shared normalized form, calls O
 decision path, and converts the result back into the harness's blocking protocol. It holds
 no governance logic of its own.
 
-Four sections are permitted, and they are marked below. A shim that adds a fifth is a
-certification finding (C4).
+THE ALLOW-LIST IS THE CRITERION
+-------------------------------
+`PERMITTED_FUNCTIONS` at the foot of this file is the mechanical statement of C4. It names
+EXACTLY the eight functions a certified shim may define. The section headings below are
+prose for humans; the tuple is what a checker reads. An earlier draft described "four
+sections", "three adapter functions" and a different set of names in the prose, and the
+three descriptions disagreed with each other and with the code — which is precisely the
+ambiguity certification cannot afford (GPT, review of PR #932).
 
-  §1 BOOTSTRAP   the authority loader. The ONLY code that legitimately cannot be shared,
-                 because it is what decides which shared tree to trust. Byte-identical
-                 across every certified shim — a diff here is a C1 failure, not a variant.
+  §1 BOOTSTRAP   `_shared_runtime_dir`, `_load_shared_module`, `_emergency_refuse`.
+                 BYTE-IDENTICAL across every certified shim; a diff here is a C1 failure,
+                 not a variant. This is the only code that legitimately cannot be shared,
+                 because it is what selects and verifies the shared tree — and, for
+                 `_emergency_refuse`, what must still work when that tree is gone.
   §2 PROFILE     the seat's identity and paths, as DATA. All seat variation lives here.
                  If a seat needs something the profile cannot express, the profile gains a
                  field; the shim does not gain a function (C3).
-  §3 ADAPTERS    exactly two: harness event -> NormalizedEvent, and verdict -> the
-                 harness's blocking protocol. These are where harnesses genuinely differ.
-  §4 MAIN        the harness's I/O contract: how the event arrives, how a block is emitted.
+  §3 ADAPTERS    `to_event`, `emit`, `_emergency_block`. Per-seat, because harnesses
+                 genuinely differ in event shape and in how a call is blocked.
+                 `_emergency_block` is separate from `emit` because `emit` renders a shared
+                 verdict object, which does not exist when the core is unavailable.
+  §4 MAIN        `main`, `_read_harness_input`. The harness's I/O and entry contract.
 
 WHAT A SHIM MUST NOT CONTAIN
 ----------------------------
@@ -32,8 +42,9 @@ record rendering, no mode switch, no wrappers that bind seat constants into engi
 Every one of those exists in the shared tree today, and every one of them is currently
 duplicated in at least one deployed shim.
 
-Mechanically: the set of function names defined here, minus the names in §1/§3/§4, must not
-intersect the names exported by the shared modules. That is C2 and it is greppable.
+Mechanically (C2): the set of function names defined in a shim MUST equal
+`PERMITTED_FUNCTIONS` exactly — no extras, no omissions — and must not otherwise intersect
+the names exported by the shared modules. Both halves are greppable.
 
 SIZE IS THE POINT
 -----------------
@@ -161,9 +172,27 @@ def _load_shared_module(name):
 # _witness_gate_self, _claim_self_write) exist ONLY to bind these values; once the
 # mechanism API takes a profile, the wrappers have nothing left to do.
 # ─────────────────────────────────────────────────────────────────────────────────────
-_core = _load_shared_module("hestia_gate_core")
+# The bootstrap is CAPTURED, never fatal. An earlier draft of this template wrote
+#
+#     _core = _load_shared_module("hestia_gate_core")     # module level, unguarded
+#
+# and that is a fail-OPEN, verified 2026-09-04: the ImportError propagates out of module
+# initialization, the process exits 1 before main() is entered, no handler runs — and the
+# repo states in two places that a Claude-lineage engine fails OPEN on a hook crash
+# (hestia_gate_core.py:167-173; plugins/gemini/README.md:268). So the one case C7 exists
+# to cover was, in the reference template for C7, the case that disarmed the gate.
+#
+# Caught by GPT in review of PR #932. It is the best possible argument for certification:
+# the defect was invisible to every behavioural test because on a healthy machine the
+# import always succeeds.
+_core = None
+_BOOTSTRAP_ERROR = None
+try:
+    _core = _load_shared_module("hestia_gate_core")
+except BaseException as _exc:          # noqa: BLE001 — must catch SystemExit too
+    _BOOTSTRAP_ERROR = _exc
 
-PROFILE = _core.HarnessProfile(
+PROFILE_FIELDS = dict(
     member_id="<seat>",                       # the plugin_id asserted to the daemon
     identity_path="~/.<seat>/hestia-instance/identity.json",
     home_markers=("~/.<seat>",),              # paths always the member's own
@@ -173,6 +202,9 @@ PROFILE = _core.HarnessProfile(
     forbidden_extra_env="HESTIA_FORBIDDEN_EXTRA",
     default_role="role:constellation:member",
 )
+# Built only if the core survived. Kept as plain data above so the emergency path can name
+# the seat without needing the shared dataclass.
+PROFILE = _core.HarnessProfile(**PROFILE_FIELDS) if _core is not None else None
 
 # Fields the profile does not yet carry, which the wrappers bind today and which must be
 # ADDED to HarnessProfile rather than re-introduced as shim code:
@@ -222,16 +254,59 @@ def emit(verdict):
 # daemon, and a missing shared module each produce a RECORDED refusal carrying a rule id —
 # and all three are produced by the shared decision path, not by the shim.
 # ─────────────────────────────────────────────────────────────────────────────────────
+def _emergency_refuse(exc):
+    """Block with a deterministic local artifact, using NO shared code. Byte-identical
+    across every certified shim; a diff here is a C1 failure.
+
+    This is the C7b path: the shared recorder is, by construction, the thing that is
+    missing. "Recorded refusal" cannot be demanded of code that is unavailable, so the
+    obligation is weakened honestly — block, and leave a deterministic artifact a later
+    reconciliation can pick up — rather than pretended.
+
+    Pure stdlib, no imports beyond those already at module top, no dependence on `_core`
+    or `PROFILE`. It must not raise: an exception here reproduces the exact fail-open this
+    function exists to prevent.
+    """
+    try:
+        import json
+        import time
+        rec = {
+            "ts": time.time(),
+            "seat": PROFILE_FIELDS["member_id"],
+            "decision": "deny",
+            "rule": "gate-bootstrap-unavailable",
+            "verdict_available": False,      # infra posture, never member conduct
+            "detail": f"{type(exc).__name__}: {exc}"[:400],
+        }
+        d = os.path.join(os.path.expanduser(os.getenv("HESTIA_HOME", "~/.hestia")),
+                         "telemetry")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "gate-bootstrap-unavailable.jsonl"), "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except BaseException:
+        pass          # recording must never convert a fail-closed into a crash
+    return _emergency_block()
+
+
+def _emergency_block():
+    """Per-seat: the smallest possible harness-native BLOCK, using no shared code.
+
+    JUSTIFIED DIFFERENCE (C4) and separate from `emit` on purpose: `emit` renders a shared
+    verdict object, which does not exist when the core is gone. Typically one exit code or
+    one literal JSON line. Keep it literal — no formatting helpers, no shared constants.
+    """
+    raise NotImplementedError("per-seat: block with no shared code available")
+
+
 def main():
+    if _BOOTSTRAP_ERROR is not None:                 # C7b — core absent or miswired
+        return _emergency_refuse(_BOOTSTRAP_ERROR)
     try:
         gate = _load_shared_module("hestia_gate_mechanism")
         event = to_event(_read_harness_input())
         verdict = gate.decide(event, profile=PROFILE)
-    except BaseException as exc:
-        # The missing-module case (C7c) lands here, and it is the one no shim tests today.
-        # The shared recorder is unavailable by construction, so this is the one place a
-        # shim may format its own refusal — and it must still be a REFUSAL, never a pass.
-        return emit(_core.fail_closed(PROFILE, exc))
+    except BaseException as exc:                     # C7a — decision module gone; the
+        return emit(_core.fail_closed(PROFILE, exc))  # recorder survived, so record.
     return emit(verdict)
 
 
@@ -239,6 +314,23 @@ def _read_harness_input():
     """Per-seat: how the event arrives (stdin JSON, argv, a file). Part of §4."""
     raise NotImplementedError
 
+
+# ─────────────────────────────────────────────────────────────────────────────────────
+# THE EXACT ALLOW-LIST (C4). Mechanically checkable; this tuple IS the criterion.
+#
+# A certified shim defines these names and no others. "Sections" and "kinds" are prose for
+# humans; this is what a checker reads. Eight names, three of them byte-identical bootstrap.
+# ─────────────────────────────────────────────────────────────────────────────────────
+PERMITTED_FUNCTIONS = (
+    "_shared_runtime_dir",   # §1 bootstrap — byte-identical across all certified shims
+    "_load_shared_module",   # §1 bootstrap — byte-identical
+    "_emergency_refuse",     # §1 bootstrap — byte-identical
+    "_emergency_block",      # §3 adapter   — per-seat, no shared code available
+    "to_event",              # §3 adapter   — per-seat, harness event shape
+    "emit",                  # §3 adapter   — per-seat, harness blocking protocol
+    "_read_harness_input",   # §4           — per-seat, harness I/O
+    "main",                  # §4           — per-seat, harness entry contract
+)
 
 if __name__ == "__main__":
     raise SystemExit(main())

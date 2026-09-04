@@ -24,6 +24,10 @@ Each row is a defensible decision by whoever made it. Together they mean a refus
 property of the act **and the seat**, which makes cross-seat corroboration of a gate
 verdict unsound: the peer is not re-running your experiment, it is running a different one.
 
+The one-sentence diagnosis, from GPT's review: **we thought we had one gate with four
+shims; we actually had four gates sharing a utility library.** Every criterion below is a
+consequence of that sentence.
+
 **Drift was never free.** An earlier draft of this section said it was, and that was
 wrong in the way that matters. The cost was being paid in full the whole time — by the
 operator, in patience and in trust, because the operator is the only party positioned to
@@ -46,15 +50,24 @@ A certified shim is an **adapter**, not a participant in policy. It converts a h
 event into the shared normalized form, calls one shared decision path, and converts the
 result back into the harness's blocking protocol. It holds no governance logic of its own.
 
-Concretely, a shim may contain exactly four kinds of thing:
+The authoritative statement is `PERMITTED_FUNCTIONS` in
+`plugins/_template/shim_template.py` — a tuple of **exactly eight** names. Prose describes
+it; the tuple decides. (The first draft gave three overlapping descriptions — "four kinds",
+"three adapter functions", and a fourth set of names in the template — which disagreed with
+each other and with the code.)
 
-1. **A profile** — the seat's identity and paths, as data.
-2. **An event adapter** — harness event → `NormalizedEvent`.
-3. **A response adapter** — shared verdict → the harness's blocking protocol.
-4. **A bootstrap** — the authority loader, which cannot live in the shared tree because it
-   is what decides which shared tree to trust.
+| # | function | kind |
+|---|---|---|
+| 1 | `_shared_runtime_dir` | bootstrap, **byte-identical** |
+| 2 | `_load_shared_module` | bootstrap, **byte-identical** |
+| 3 | `_emergency_refuse` | bootstrap, **byte-identical** |
+| 4 | `_emergency_block` | adapter, per-seat |
+| 5 | `to_event` | adapter, per-seat |
+| 6 | `emit` | adapter, per-seat |
+| 7 | `_read_harness_input` | harness I/O, per-seat |
+| 8 | `main` | harness entry, per-seat |
 
-Anything else is a finding.
+Plus one profile, as data. Anything else is a finding.
 
 ## 2. Criteria
 
@@ -78,14 +91,23 @@ initialization converted to `ImportError` so callers reach the fail-closed postu
 > distinct entries. There is no `__file__` verification, so kimi cannot tell whether it
 > loaded the engine it intended.
 
+**C1b — the authority root's own provenance.** The loader chooses its tree from
+`HESTIA_SHARED_DIR` / `HESTIA_HOME`. That is safe only if those values are composed by a
+trusted launch or deployment path and are not member-controlled inputs. A shim can satisfy
+every other criterion, load faithfully, verify the `__file__` — and still be pointed at an
+attacker-selected common gate. Certification MUST therefore state where the authority root
+comes from for each seat, and test that a member-supplied value cannot select it.
+Generalization of catalog row B1 (`HESTIA_ENDPOINT` redirection) from the endpoint to the
+code. Raised by GPT in review; unaddressed by the first draft.
+
 ### C2 — No private governance logic
 
 The shim MUST NOT define any function that duplicates a shared one, and MUST NOT itself
 implement classification, scope resolution, workspace detection, or record rendering.
 
-Mechanically checkable: the set of function names defined in the shim, minus the four
-permitted categories in §1, MUST NOT intersect the set of names exported by the shared
-modules.
+Mechanically checkable, two halves: the set of function names defined in the shim MUST
+equal `PERMITTED_FUNCTIONS` exactly — no extras, no omissions — and MUST NOT otherwise
+intersect the names exported by the shared modules.
 
 > **Fails today: codex and kimi** carry byte-identical private `_detect_workspace`
 > functions while the shared core has `detect_workspace(profile)` — the same algorithm
@@ -113,10 +135,12 @@ profile cannot express, the profile gains a field; the shim does not gain a func
 
 ### C4 — The adapter surface is closed and enumerated
 
-Exactly three adapter functions are permitted: the event adapter, the response adapter,
-and `main`. Their names are fixed by the template. A shim defining a fourth adapter MUST
-justify it in the shim's own header against this document, and that justification is part
-of what is certified.
+The permitted set is the eight names in §1, fixed by the template. Three of them
+(`_shared_runtime_dir`, `_load_shared_module`, `_emergency_refuse`) MUST be byte-identical
+across every certified shim; a diff in those is a C1 failure, not a permitted variant. The
+other five are per-seat, and each per-seat difference MUST be justified in the shim's own
+header against this document. That justification is part of what is certified (§3.1), which
+is why the digest covers comments.
 
 > **Justified today, and expected to remain so:** `main` (4 variants, 22–279 lines),
 > `command_of` (6–9 lines) and `deny` (14–19 lines). The harnesses genuinely differ in
@@ -153,13 +177,33 @@ What the witness chain shows for an act MUST NOT depend on which seat performed 
 > Also fails, uniformly and therefore at least *consistently*: `rule_triggered` is `None`
 > on all 1727 `policy_decision` entries across all three seats (#156).
 
-### C7 — Fail-closed is proven, not asserted
+### C7 — Fail-closed is proven, not asserted, and honestly scoped
 
-Each shim MUST demonstrate, under test, that three conditions each produce a **recorded**
-refusal carrying a rule id: an internal error in the shim, an unreachable daemon, and a
-missing or miswired shared module.
+"Recorded refusal" cannot be demanded of code that is itself unavailable. The obligation
+therefore splits, and the split is the criterion:
 
-The third is the one no shim tests today, and it is the one C1 is about.
+**C7a — the recorder survives.** An internal error in the shim, an unreachable daemon, or
+a missing *decision* module MUST each produce a **recorded** refusal carrying a rule id.
+
+**C7b — the recorder does not survive.** A missing, miswired, or failed-to-initialize
+*core* MUST still **block**, and MUST leave a deterministic local artifact that a later
+reconciliation can pick up. It cannot be asked to produce a witnessed record, because the
+recorder is the thing that is gone.
+
+> **The first draft of the reference template failed C7b, and failed it fail-OPEN.** It
+> wrote `_core = _load_shared_module("hestia_gate_core")` at module level, outside any
+> handler. Verified 2026-09-04: the `ImportError` propagates out of module initialization,
+> the process exits 1 before `main()` is entered, and no handler runs — and this repo
+> states in two places that a Claude-lineage engine fails **open** on a hook crash
+> (`hestia_gate_core.py:167-173`, `plugins/gemini/README.md:268`). So the reference
+> artifact for C7 contained, in the position C7 exists to protect, a silent disarm.
+>
+> Caught by GPT in review of PR #932, not by any test — because on a healthy machine the
+> import always succeeds. This is the single best argument in this document for why
+> certification is worth building: the defect was invisible to every behavioural
+> instrument and obvious on a read.
+
+### C7b evidence
 
 ### C8 — Cross-seat verdict parity
 
@@ -185,9 +229,13 @@ not of a design.
 For each certified shim the vault holds one entry:
 
 ```
-shim-cert/<seat>            = sha256 of the certified shim file, normalized (§3.1)
-shim-cert/<seat>.meta       = { certified_at, certified_by, template_version,
-                                criteria_version, justified_diff_digest }
+shim-cert/<seat>            = sha256_raw of the certified shim file (§3.1)
+shim-cert/<seat>.meta       = { certified_at, certified_by,
+                                sha256_canonical,
+                                template_version, criteria_version,
+                                justified_diff_digest,
+                                gate_api_version,            # the decide() contract
+                                gate_artifact_digest }       # the common gate certified against
 ```
 
 The vault is the right home rather than a file in the repo for one reason: it is sealed, so
@@ -197,11 +245,35 @@ condition certification exists to detect.
 
 ### 3.1 Normalization
 
-The hash is taken over the shim's source with trailing whitespace stripped and line endings
-normalized, and **nothing else** — no comment stripping, no AST canonicalization. A comment
-change is a certification change. That is deliberate: the justification for a permitted
-difference lives in the shim's header comment (C4), so the comments are part of what was
-certified.
+C9 certifies an **exact artifact**, so the primary digest is over **raw bytes** — no
+whitespace stripping, no line-ending normalization, no comment stripping, no AST
+canonicalization. The first draft said "exact artifact" and then specified a normalized
+hash; those are different claims and the algorithm must match the claim (GPT, review).
+
+Two digests are stored, and they answer different questions:
+
+| field | over | answers |
+|---|---|---|
+| `sha256_raw` | the deployed file's exact bytes | "is this the artifact that was certified?" |
+| `sha256_canonical` | source with trailing whitespace stripped, line endings normalized to `\n` | "did this differ only by checkout/platform noise?" |
+
+`sha256_raw` is authoritative: a mismatch is `DRIFTED`. `sha256_canonical` exists only to
+make a raw mismatch *diagnosable* — it distinguishes "someone edited the logic" from "git
+checked this out with different line endings", which are the same verdict but very
+different investigations.
+
+A comment change is a certification change either way. That is deliberate: the
+justification for each permitted difference lives in the shim's header (C4), so the
+comments are part of what was certified.
+
+### 3.1b Certification binds the gate, not only the shim
+
+`gate_api_version` and `gate_artifact_digest` are load-bearing. A shim delegates *all*
+governance to the common gate, so a shim can stay byte-identical and green while the entire
+engine beneath it changes. Certifying the shim alone would certify a wrapper around an
+uncertified decision-maker (GPT, review). A change to the common gate's artifact or to the
+`decide()` contract therefore invalidates every shim certification bound to it, and
+re-certification is a fleet-wide act rather than a per-seat one.
 
 ### 3.2 What certification asserts
 
@@ -222,7 +294,26 @@ vocabulary:
 | verdict | meaning |
 |---|---|
 | `UNCERTIFIED` | deployed shim has no vault entry — never certified, or the entry was removed |
-| `DRIFTED` | deployed shim's hash does not match its vault entry |
+| `DRIFTED` | deployed shim's `sha256_raw` does not match its vault entry |
+
+**Hourly is the backstop, not the loop.** A report nobody acts on still bills drift to the
+operator, one hour later (GPT, review). The success bar in §0 — the operator stops being
+the drift detector — needs verification at the points where drift *enters*, with the hourly
+inventory as recovery for whatever slipped past:
+
+| when | why it is the right moment |
+|---|---|
+| on install / deploy | the act that changes a shim; refuse to install an uncertified artifact |
+| before a governed launch | the last moment before the shim decides anything |
+| on file change (optional) | narrows the window from an hour to seconds where a watcher exists |
+| hourly inventory | recovery — catches what the above missed, and catches removal |
+
+**End state:** `UNCERTIFIED` or `DRIFTED` makes the harness unavailable for *new* governed
+launches unless the law explicitly permits an emergency degraded mode. That is deliberately
+the end state and not the starting one: shipping launch-blocking before the four shims are
+certified would brick the fleet on the day it lands. Sequence it after §6 step 6, and gate
+it on a law amendment rather than a config default — a blocking control that can be turned
+off by an environment variable is C1b's problem again.
 
 `DRIFTED` is deliberately not `MISWIRED`. A miswired shim reads as governed and is not
 governed. A drifted shim *is* governed — by code nobody certified. Those are different
@@ -267,12 +358,33 @@ parts. Promoting six duplicated functions would not have fixed this; the shims w
 kept their orchestration and simply called shared helpers from inside it.
 
 0. **Build `decide(event, profile) -> verdict`** in the shared tree, owning the sequence,
-   plus `fail_closed(profile, exc)` for the one case a shim must format itself (the shared
-   recorder being unavailable). Derive the sequence from the deployed shims — codex's
-   `main` at 279 lines is the most complete existing statement of it — and reconcile the
-   four variants deliberately, recording each reconciliation. This is where the real
-   design decisions are, and doing it by reconciliation rather than by fresh design keeps
-   the incidents each variant already encodes.
+   plus `fail_closed(profile, exc)` for the C7a case.
+
+   **One public call, explicit internal stages.** The contract is a single entry point, but
+   `decide` must not become a 279-line god function. Internally it is a shared pipeline of
+   named, individually testable stages (GPT, review):
+
+   ```
+   normalize -> establish identity/context -> classify act -> resolve scope
+     -> select applicable law -> evaluate -> escalation/authority
+     -> construct verdict -> witness/record -> return
+   ```
+
+   One orchestrator owns the ordering; the stages stay separately testable, which is also
+   what lets C7a/C7b be proven rather than asserted.
+
+   **Reconciliation procedure — no seat is normative.** Codex's `main` is the longest at
+   279 lines. Length is *evidence*, not authority, and using it as the baseline would
+   silently promote one seat's accidents into fleet law. Instead:
+
+   1. Build a behaviour matrix of every unique branch across all four `main`s.
+   2. Attach each branch to the incident, law clause, or issue that caused it. A branch
+      nobody can attribute is a finding in its own right.
+   3. Adjudicate each explicitly: **survives** (and why), **dropped** (and why safe), or
+      **generalized** (and how). Record the adjudication.
+   4. The union of surviving branches defines the pipeline. Anything that appears in one
+      seat only must be justified as fleet-wide behaviour or dropped — "codex does it" is
+      not a justification.
 1. Template (`plugins/_template/shim_template.py`) and criteria (this document).
 2. C1–C3 per seat, now possible because the shim has something to delegate *to*.
    `_detect_workspace` first: three copies of the algorithm that took the fleet down on
@@ -286,3 +398,36 @@ Steps 0 and 2 rewrite the governance surface on four seats. Each write is escala
 construction, and that is correct — but it means this is a staged migration under review,
 not a single change. A hasty version of step 2 is how the codex shim was taken offline for
 eight minutes on 2026-09-03 by a blanket path rewrite that collided with existing content.
+
+## 7. Accountability self-audit
+
+Per `CLAUDE.md`. This document and the reference template create no runtime path: the
+template is not installed, never executes in production, and the criteria are prose. The
+surfaces they *describe* each need their own block when built, and the two that matter are
+named below so they are not forgotten at implementation time.
+
+```
+surface: PRD_SHIM_CERTIFICATION.md + plugins/_template/shim_template.py
+act:     none — specification and a non-deployed reference artifact
+S:       n/a (no consequential act reachable) [construct: template is not installed; no caller path]
+R:       n/a   W: n/a   O: n/a   A: n/a   V: n/a
+verdict: PASS (no surface created)
+```
+
+Owed at implementation, not discharged here:
+
+```
+surface: shared decide(event, profile) -> verdict          [§6 step 0]
+act:     every governed act on every seat — the highest-stakes surface in the system
+S:       high / irreversible-in-effect (a wrong allow cannot be un-allowed)
+V:       MUST be present — this is the one surface where a catastrophic-risk veto is not
+         optional, because it subsumes four existing decision paths at once
+note:    a full RWOA+S+V block is required in the step-0 PR and is a merge precondition
+
+surface: certification verification (§4), once it can block a launch
+act:     making a harness unavailable for governed launches
+S:       med / reversible, but availability IS an authority (PRD_GOVERNANCE §57) — a
+         control that can stop the fleet needs its own veto path and its own escalation
+note:    this is why launch-blocking is sequenced last and gated on a law amendment
+         rather than a config default
+```
