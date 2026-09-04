@@ -1571,6 +1571,17 @@ fn cmd_witness_onboard(home: &std::path::Path, plugin_id: &str, target: &str) ->
     // The operational (witnessing) key = the connection's channel key.
     let op_kp = member_signing_keypair(&vault, &conn.member_key_source)?;
     let mut reg = hestia::member_registry::load_members(&vault);
+    // A filler is never a witness. Named here, before the vouch is attempted, so the
+    // operator reads the reason rather than the generic "is it a minted member?" below —
+    // it IS minted, and that is exactly why the answer is no.
+    if reg.is_filler(plugin_id) {
+        anyhow::bail!(
+            "'{plugin_id}' is a FILLER — a role-bound reasoner this plane invokes and signs \
+             for custodially — and a filler is never a witness: its key is this plane's key, \
+             so its attestation would be this seat witnessing itself under another name. \
+             Nothing to onboard."
+        );
+    }
     if hestia::member_registry::vouch_witnessing_key(&mut vault, &mut reg, plugin_id, op_kp.verifying_key()) {
         let id = reg.get(plugin_id).map(|l| l.lct_id()).unwrap_or_default();
         println!("Vouched operational witnessing key for '{plugin_id}'.");
