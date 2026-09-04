@@ -39,6 +39,22 @@ member mesh, and argued about in the forum without anyone writing a case down:
        a leading quote — both now refused, pinned in `_SURVIVE`. The one FP its own
        search cannot find: grepping the gate for `$(` trips the check being searched
        for, which is how it outlived FP8, FP12 and FP13.
+  FP15 `awk` as a pipe head. `ls -la <gate> | awk '{print $1}'` refused; the same command
+       into `grep` permitted. Pinned open — awk can redirect and can `system()`, so it
+       wants sed's guarded grammar, not a name in the bare set.
+  FP16 `case`/`esac`. FP12 again, one construct further: `esac` is in the closer set and
+       `case` is in none, so it head-checks as a command. Cheapest of this batch.
+  FP17 a live command substitution WRAPPING A READ. `n=$(grep -c def <gate>)` refused.
+       FP14's detector is right that the substitution is live; what is missing is that
+       nothing classifies what it substitutes. Three of four escalations in the
+       2026-09-03 session were this alone.
+  FP18 `xargs` as a head — pinned to force the argument, not to assert a defect.
+
+  These four arrived together on 2026-09-03 during a workspace migration, nine false
+  refusals in one session of ordinary read-only verification. The migration matters: an
+  audit of the gate's own deployment must ENUMERATE governance paths, so the work most
+  likely to be refused is the work checking whether the gate is correctly installed.
+
   cd   `cd h && grep -n foo <gate>` — a read whose only sin is a directory change.
        `cd` is absent from the read-only head allowlist. Fixed here.
 
@@ -545,6 +561,51 @@ _FALSE_REFUSALS = [
 # goes RED the day someone lands the three-valued resolver — which is when this row should
 # move up into _FALSE_REFUSALS, by the person who earned the right to move it.
 _STILL_OPEN = [
+    # ---------------------------------------------------------------------------------
+    # FP15-FP18: nine false refusals in one session, 2026-09-03 (claude-code, CBP), every
+    # one during ORDINARY read-only work — verifying a workspace move, not probing. Four
+    # minted escalations, all four withdrawn by the asker. Isolated afterwards against
+    # this file's own loader, each with a read-only control that PERMITS, so the named
+    # construct is what decides and not the shape.
+    #
+    # The session is also why these rows exist at all. #158 ("gate-self-access classifies
+    # by mention, not by resolution", NINE false denies, closed 2026-08-06) recorded its
+    # case 2 as `wc -l <a> <b>` + `ls -la <dir>` — read-only, path mentioned. Escalation
+    # 36f22a50fdcf60b3 below is that case again, 28 days later, because it was argued in
+    # an issue and never landed here. Prose does not fail a build. Crit 3 of the PRD says
+    # where it should have gone: "Every new false-deny lands here as a case before it is
+    # fixed."
+    ("fp15_awk_is_not_a_read_head", "ls -la {g} | awk '{{print $1}}'",
+     "FP15. `awk` is absent from _READ_ONLY_HEADS, so a read piped into awk for column "
+     "formatting falls out of grammar and the marker decides. Control: the identical "
+     "command piped into `grep` PERMITS. Live specimen: escalation 36f22a50fdcf60b3, an "
+     "`ls -la` of two hook files to confirm they survived a workspace move. NOT a bare "
+     "admission — awk writes with a redirect inside its program and runs system(), so it "
+     "needs the guarded treatment sed got, not a name in the set"),
+    ("fp16_case_esac_head_checked",
+     'for f in a b; do case "$f" in x) continue;; esac; grep -c def {g}; done',
+     "FP16. FP12's mechanism one construct further: `esac` is in _CONTROL_FLOW_CLOSE but "
+     "`case` is in NO control-flow set, so it head-checks as a command name. Control: the "
+     "same loop without the case arm PERMITS. `case X in` executes nothing and its "
+     "patterns are data, so this is the cheapest of the four — the same shape of fix as "
+     "FP12, already proven in this file"),
+    ("fp17_substitution_wrapping_a_read", "n=$(grep -c def {g}); echo $n",
+     "FP17. _has_live_substitution correctly reports a LIVE substitution (FP14's fix "
+     "working as designed), but any live substitution is then treated as write-capable "
+     "regardless of what it substitutes — here a `grep -c`, which writes nothing. "
+     "Control: `sed -n '1,5p' {g}` PERMITS. Three of the session's four escalations were "
+     "this construct alone (f66f87a747c87bcc, 309aebc989e69acb, db75db06aa745827), making "
+     "it the highest-volume FP of the four. The honest fix is recursive classification of "
+     "the substituted command, not admission — a substitution can execute anything"),
+    ("fp17b_backtick_wrapping_a_read", "n=`grep -c def {g}`; echo $n",
+     "FP17, backtick spelling. Same act, same verdict; pinned separately because FP14's "
+     "history in this file shows the two spellings have diverged before"),
+    ("fp18_xargs_is_not_a_read_head", "echo {g} | xargs grep -c def",
+     "FP18. `xargs` head-checks as unknown. Unlike FP15 this may be CORRECT-by-design — "
+     "xargs executes an arbitrary command built from stdin — and it is pinned here to "
+     "record the verdict and force the argument, not to assert it is a defect. If the "
+     "ruling is that xargs stays refused, this row moves to a documented accepted limit "
+     "rather than up into _FALSE_REFUSALS"),
     ("fp6_read_with_output_elsewhere", "diff {g} other.py > /tmp/out",
      "FP6. Refused today. Needs KNOWN/UNKNOWN target resolution, not a wider allowlist. "
      "Hit live 2026-08-08 (escalation 9cdb9bec0fe7a04d): generating a unified diff of the "
