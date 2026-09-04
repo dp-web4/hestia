@@ -6,21 +6,28 @@ Run: python3 tools/merge_review_census_test.py
 Sabotage-verified — the mutation that would make each arm vacuous is named in
 the arm's docstring, and each arm fails on its own assert rather than on a
 shared fixture, so a red arm names the defect.
+
+The performer arms are all NEGATIVE-heavy on purpose. Every defect codex found
+in v1 and v2 of this tool was a FALSE POSITIVE: text that looked like a merge
+and was counted as one. An arm that only proves a real merge is detected would
+have passed against every broken version. So each arm below pairs the positive
+with the near-miss that used to beat it.
 """
 
 from __future__ import annotations
 
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from merge_review_census import (  # noqa: E402
-    census, is_findings, seat_merges, substantive_comments,
+    census, is_findings, merge_calls, seat_merges, substantive_comments,
+    substantive_reviews,
 )
 
 FAILURES: list[str] = []
+REPO = "dp-web4/hestia"
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -36,274 +43,324 @@ def pr(number, title, merged, comments=(), reviews=(), by="dp-web4"):
         "number": number, "title": title, "mergedAt": merged,
         "mergedBy": {"login": by},
         "comments": [{"author": {"login": a}, "body": b} for a, b in comments],
-        "reviews": list(reviews),
+        "reviews": [{"author": {"login": a}, "body": b, "state": "COMMENTED"}
+                    for a, b in reviews],
     }
 
 
-def witness(action_id: str, plugin: str, target: str, success: str = "true") -> str:
-    """One witness outcome record, in the shape the fire logs actually emit."""
-    return (
-        '  {"action_id": "%s", "closure_claims": [], "error": null,\n'
-        '   "magnitude": 0.8, "plugin_id": "%s",\n'
-        '   "role_lct": "role:constellation:mesh-worker", "success": %s,\n'
-        '   "target": "%s", "tool_name": "Bash"}\n'
-        % (action_id, plugin, success, target)
-    )
+def arm_a_review_object_is_review() -> None:
+    """The defect v1/v2 shipped: `gh pr review --comment` leaves comments EMPTY.
 
+    v1/v2 counted the comment channel only, having ASSERTED the review channel
+    was empty fleet-wide. It is not — 134 of 551 merged PRs carry one — and the
+    64 PRs reviewed only there were published as unread.
+
+    Sabotage: drop substantive_reviews from the `reviewed` disjunction and this
+    goes red, restoring the shipped defect exactly.
+    """
+    reviewed_only_there = pr(60, "findings: a", "2026-08-01T00:00:00Z",
+                             reviews=[("dp-web4", "x" * 300)])
+    check("review object with no comment IS review",
+          substantive_comments(reviewed_only_there, 200) == []
+          and len(substantive_reviews(reviewed_only_there, 200)) == 1
+          and census([reviewed_only_there], 200, {})["unreviewed"] == 0)
+
+    bot = pr(61, "findings: b", "2026-08-01T00:00:00Z",
+             reviews=[("chatgpt-codex-connector", "x" * 300)])
+    check("a bot review object is still not review",
+          census([bot], 200, {})["unreviewed"] == 1)
+
+    stub = pr(62, "findings: c", "2026-08-01T00:00:00Z", reviews=[("dp-web4", "lgtm")])
+    check("a stub review object is not review",
+          census([stub], 200, {})["unreviewed"] == 1)
+
+
+def arm_channel_split_is_reported_not_pooled() -> None:
+    """Pooling the two channels is what hid the defect, so the split is output.
+
+    Sabotage: report only the union and this goes red on reviewed_review_only,
+    which is the number that names the correction.
+    """
+    prs = [
+        pr(70, "a", "2026-08-01T00:00:00Z", comments=[("dp-web4", "x" * 300)]),
+        pr(71, "b", "2026-08-02T00:00:00Z", reviews=[("dp-web4", "x" * 300)]),
+        pr(72, "c", "2026-08-03T00:00:00Z", comments=[("dp-web4", "x" * 300)],
+           reviews=[("dp-web4", "y" * 300)]),
+        pr(73, "d", "2026-08-04T00:00:00Z"),
+    ]
+    out = census(prs, 200, {})
+    check("channel split reported",
+          out["reviewed_comment_only"] == 1 and out["reviewed_review_only"] == 1
+          and out["reviewed_both"] == 1 and out["unreviewed"] == 1, str(out)[:200])
+
+
+def hit(plugin, target, ts, action_id="a1", pos=1):
+    """One chain outcome entry, in the shape `scan_chain` yields."""
+    return {"action_id": action_id, "plugin_id": plugin, "ts": ts,
+            "chain_position": pos, "calls": merge_calls(target)}
+
+
+# --------------------------------------------------------------------------
+# REVIEW half
+# --------------------------------------------------------------------------
 
 def arm_bot_advert_is_not_review() -> None:
     """The codex connector's 90-char advert must not count as review.
 
-    Sabotage: drop the BOT_LOGINS filter, or set --min-body to 0, and this arm
-    goes red because the advert alone would mark the PR reviewed.
+    Sabotage: drop the BOT_LOGINS filter, or set min_body to 0, and this goes
+    red because the advert alone would mark the PR reviewed.
     """
-    advert = "To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments)."
-    p = pr(1, "findings: x", "2026-09-03T04:47:00Z", [("chatgpt-codex-connector", advert)])
+    advert = ("To use Codex here, [create an environment for this repo]"
+              "(https://chatgpt.com/codex/cloud/settings/environments).")
+    p = pr(1, "findings: x", "2026-08-01T00:00:00Z",
+           comments=[("chatgpt-codex-connector", advert)])
     check("bot advert is not review", substantive_comments(p, 200) == [])
 
 
 def arm_short_human_comment_is_not_review() -> None:
-    """A one-line human "lgtm" is not the review this census is counting.
+    """A human one-liner under the threshold is not review either.
 
-    Sabotage: lower min_body below the comment length and the arm goes red.
+    Sabotage: change the comparison to `>= 0` and this goes red.
     """
-    p = pr(2, "findings: y", "2026-09-03T04:47:00Z", [("dp-web4", "nice, lgtm")])
+    p = pr(2, "fix: y", "2026-08-01T00:00:00Z", comments=[("dp-web4", "lgtm")])
     check("short human comment is not review", substantive_comments(p, 200) == [])
-    long = pr(3, "gate: z", "2026-09-03T04:47:00Z", [("dp-web4", "x" * 201)])
+    long = pr(3, "fix: y", "2026-08-01T00:00:00Z", comments=[("dp-web4", "x" * 300)])
     check("long human comment IS review", len(substantive_comments(long, 200)) == 1)
 
 
 def arm_class_split() -> None:
-    """findings-class and code-class must be separable by title.
+    """findings-class is a title prefix, and 'fix'/'feat' are not in it.
 
-    Sabotage: add "gate" to FINDINGS_PREFIXES and the stratification the doc
-    reports collapses to one bucket.
+    Sabotage: add "fix" to FINDINGS_PREFIXES and this goes red.
     """
-    check("findings title classified", is_findings("findings: the drain"))
-    check("census title classified", is_findings("census: the lapse rate"))
-    check("gate title NOT findings", not is_findings("gate: a ruling projects"))
-    check("fix title NOT findings", not is_findings("fix(watch): primer_spent"))
+    check("findings-class split", is_findings("findings: a") and is_findings("census of b")
+          and not is_findings("fix(census): c"))
 
 
 def arm_headline_rates() -> None:
-    """The census reports per-class unreviewed counts, not just a pooled rate.
+    """The published percentages come from the row set, not a hand count.
 
-    Sabotage: report only the pooled rate and this arm cannot distinguish a
-    fleet that reviews nothing from one that reviews code and skips findings —
-    which is the whole finding.
+    Sabotage: swap the unreviewed numerator for the reviewed one and this goes
+    red on the 66.7 figure.
     """
     prs = [
-        pr(10, "findings: a", "2026-09-03T04:47:00Z"),
-        pr(11, "findings: b", "2026-09-03T04:47:10Z"),
-        pr(12, "gate: c", "2026-09-03T04:47:20Z", [("dp-web4", "x" * 500)]),
+        pr(10, "findings: a", "2026-08-01T00:00:00Z"),
+        pr(11, "findings: b", "2026-08-02T00:00:00Z", comments=[("dp-web4", "x" * 300)]),
+        pr(12, "fix: c", "2026-08-03T00:00:00Z"),
     ]
     out = census(prs, 200, {})
-    check("n counted", out["n"] == 3, f"got {out['n']}")
-    check("unreviewed counted", out["unreviewed"] == 2, f"got {out['unreviewed']}")
-    check("findings all unreviewed", out["findings_unreviewed"] == 2)
-    check("code fully reviewed", out["code_unreviewed"] == 0)
+    check("headline rates", out["n"] == 3 and out["unreviewed"] == 2
+          and out["unreviewed_pct"] == 66.7 and out["findings_class"] == 2
+          and out["code_class"] == 1, str(out["unreviewed_pct"]))
 
 
 def arm_mergedby_cannot_separate_seats() -> None:
-    """One identity for every performer — the census must SAY so, not hide it.
+    """The whole reason the performer census exists: one credential, many actors.
 
-    Sabotage: attribute performer from mergedBy and this arm goes red, because
-    a seat-performed merge and a human merge are the same login.
+    Sabotage: give the fixture two logins and this goes red — which is the
+    point, because on the real repo it never has two.
     """
-    prs = [
-        pr(20, "findings: a", "2026-09-03T04:47:00Z", by="dp-web4"),
-        pr(21, "gate: b", "2026-09-03T04:47:10Z", by="dp-web4"),
-    ]
-    out = census(prs, 200, {})
-    check("all merges wear one identity", out["distinct_mergedBy"] == ["dp-web4"])
-    check("no seat claimed without a log", out["seat_performed"] == [])
+    prs = [pr(20, "a", "2026-08-01T00:00:00Z"), pr(21, "b", "2026-08-02T00:00:00Z")]
+    check("mergedBy collapses every seat to one identity",
+          census(prs, 200, {})["distinct_mergedBy"] == ["dp-web4"])
 
 
-def arm_seat_is_read_from_the_record_not_the_filename() -> None:
-    """A record quoted in another seat's log still names the seat that ran it.
+# --------------------------------------------------------------------------
+# PERFORMER half — command position
+# --------------------------------------------------------------------------
 
-    This is the #532 case and it is why the published table was wrong: the only
-    copies of that record live in two CODEX logs, and the record itself says
-    `claude-code`. Sabotage: guess the seat from `path.name.split("-")[0]` and
-    this arm reds with codex, reproducing the original defect exactly.
+def arm_real_merge_is_at_a_command_position() -> None:
+    """The positive case, in the shapes the chain actually holds.
+
+    Sabotage: require `seg[0] == 'gh'` to be the token at index 1 and this goes
+    red on every form.
     """
-    with tempfile.TemporaryDirectory() as d:
-        logs = Path(d)
-        (logs / "codex-20260826-172116.log").write_text(
-            "reading the witness chain\n"
-            + witness("18091cec-6430-449a-9400-7d48100fee6a", "claude-code",
-                      "gh pr merge 532 --squash --delete-branch")
-        )
-        found = seat_merges(logs)
-        check("seat comes from plugin_id, not the log filename",
-              found.get(532, {}).get("seat") == "claude-code", f"got {found.get(532)}")
-
-
-def arm_quoting_a_record_does_not_double_count() -> None:
-    """The same merge, quoted in three logs, is still one merge by one seat.
-
-    De-duplication is on `action_id`, so contamination by quoting cannot change
-    the count OR the attribution. Sabotage: key the dict on (file, pr) and this
-    arm reds, because the same merge appears three times.
-    """
-    rec = witness("4ff76068-d585-4bfc-b1ce-761eccbe401d", "kimi-code",
-                  "gh pr merge 697 --squash --delete-branch")
-    with tempfile.TemporaryDirectory() as d:
-        logs = Path(d)
-        (logs / "kimi-20260827-231037.log").write_text("ran it\n" + rec)
-        (logs / "codex-20260903-201737.log").write_text("grepped the archive\n" + rec)
-        (logs / "claude-20260904-031812.log").write_text("also quoted it\n" + rec)
-        found = seat_merges(logs)
-        check("quoted record attributes to its own seat",
-              found.get(697, {}).get("seat") == "kimi-code", f"got {found.get(697)}")
-        check("quoted record is not double-counted",
-              found.get(697, {}).get("action_ids") == ["4ff76068-d585-4bfc-b1ce-761eccbe401d"],
-              f"got {found.get(697, {}).get('action_ids')}")
-
-
-def arm_prose_and_diffs_are_not_merges() -> None:
-    """The contamination the first version could not see.
-
-    Its filter keyed on `.log-` and `/logs/`, so grep output was excluded but a
-    DIFF, a PR body, or this tool's own docstring was not — and every one of
-    those contains the literal string `gh pr merge 697`. Only a witness record
-    counts now, so none of these register. Sabotage: match on raw text again and
-    all three of these lines become merges.
-    """
-    with tempfile.TemporaryDirectory() as d:
-        logs = Path(d)
-        (logs / "codex-20260903-201737.log").write_text(
-            "+`gh pr merge 697 --squash` running in kimi-code's own wake. The only\n"
-            "| #532 | codex | ran gh pr merge 532 |\n"
-            '            "exec gh pr merge 350 --squash\\n"\n'
-            "2026-07-23T07:13:32 a historical timestamp from a quoted primer\n"
-        )
-        found = seat_merges(logs)
-        check("prose/diff/table mentions carry no record", found == {}, f"got {found}")
-
-
-def arm_disagreeing_records_are_a_conflict_not_a_coin_flip() -> None:
-    """Two records, two seats, one PR: report it, do not take the first.
-
-    The original took `[0]` of a candidate list and so published one seat with
-    no signal that another was equally supported. Sabotage: return the first
-    seat instead of None and this arm reds.
-    """
-    with tempfile.TemporaryDirectory() as d:
-        logs = Path(d)
-        (logs / "codex-20260811-145154.log").write_text(
-            witness("aaaaaaaa-0000-0000-0000-000000000001", "codex", "gh pr merge 350 --squash")
-            + witness("bbbbbbbb-0000-0000-0000-000000000002", "kimi-code", "gh pr merge 350 --squash")
-        )
-        found = seat_merges(logs)
-        check("disagreement is not attributed", found[350]["seat"] is None, f"got {found[350]}")
-        check("disagreement names both seats",
-              found[350]["conflict"] == ["codex", "kimi-code"], f"got {found[350]}")
-
-
-def arm_failed_merge_command_is_not_a_merge() -> None:
-    """`success: false` is an attempt, not a landing.
-
-    Sabotage: drop the success check and a refused merge counts as performed.
-    """
-    with tempfile.TemporaryDirectory() as d:
-        logs = Path(d)
-        (logs / "codex-20260811-145154.log").write_text(
-            witness("cccccccc-0000-0000-0000-000000000003", "codex",
-                    "gh pr merge 999 --squash", success="false")
-        )
-        check("failed merge is not counted", seat_merges(logs) == {}, "got a merge")
-
-
-def arm_codex_exec_lines_are_execution_too() -> None:
-    """codex logs carry no witness JSON — only `/bin/bash -lc` exec echoes.
-
-    A record-only parser silently drops every codex merge, which is how #236
-    went missing. Sabotage: parse witness records only and this arm reds.
-    """
-    with tempfile.TemporaryDirectory() as d:
-        logs = Path(d)
-        (logs / "codex-20260807-015109.log").write_text(
-            "some prose\n"
-            "/bin/bash -lc \"gh pr merge 236 --merge --subject 'Merge #236' && "
-            "gh pr view 236 --json state\" in /mnt/c/exe/projects/ai-agents/hestia\n"
-        )
-        found = seat_merges(logs)
-        check("exec-line merge is found", found.get(236, {}).get("seat") == "codex",
-              f"got {found.get(236)}")
-        check("exec-line basis is labelled weaker",
-              found.get(236, {}).get("basis") == "filename", f"got {found.get(236)}")
+    forms = {
+        "gh pr merge 532 --squash --delete-branch": [(532, None)],
+        "cd /repo && gh pr merge 353 --merge": [(353, None)],
+        "set -euo pipefail\ngh pr merge 729 --merge --delete-branch=false\ngit fetch":
+            [(729, None)],
+        "gh pr merge 796 --repo dp-web4/hestia --squash": [(796, "dp-web4/hestia")],
+        "gh pr ready 490 && gh pr merge 490 --merge": [(490, None)],
+    }
+    for target, want in forms.items():
+        check(f"command position: {target[:34]!r}", merge_calls(target) == want,
+              str(merge_calls(target)))
 
 
 def arm_searching_for_a_merge_is_not_performing_one() -> None:
-    """The third shape of the self-reference trap, and the sharpest.
+    """codex #2: a witness record whose target SEARCHES for a merge string.
 
-    `rg 'gh pr merge 697' logs/` is a GENUINE, anchored exec line in codex's own
-    transcript — it just happens to be a search for the string rather than a
-    merge. It is real execution, so neither the quoted-text filter nor the
-    exec-line anchor rejects it. This exact line at
-    codex-20260903-201737.log:2132 would credit codex with merging both #697 and
-    #532 while it was REVIEWING the census that measures merges.
+    v2 applied its search guard only to the codex-exec branch, so these passed
+    on the record branch — the basis the finding treats as authoritative. These
+    are the exact targets codex exercised, taken verbatim from the chain.
 
-    Sabotage: drop the SEARCH_TOOL guard and this arm reds with two merges.
+    Sabotage: accept a merge token anywhere in the token list rather than at a
+    segment head, and all four go red. Note no arm here names `rg` or `grep`:
+    the defence is position, not a tool blacklist, so `printf` is caught by the
+    same rule that catches `rg` without ever being enumerated.
     """
-    with tempfile.TemporaryDirectory() as d:
-        logs = Path(d)
-        (logs / "codex-20260903-201737.log").write_text(
-            "/bin/bash -lc \"rg -n --glob '*.log' 'gh pr merge 697' "
-            "/home/dp/.local/state/hestia-mesh/logs | head -80\" in /tmp/review\n"
-            "/bin/bash -lc \"grep -n 'gh pr merge 532' logs/\" in /tmp/review\n"
-        )
-        check("searching for a merge is not a merge", seat_merges(logs) == {},
-              f"got {seat_merges(logs)}")
+    for target in [
+        "rg -n --glob '*.log' 'gh pr merge 532' /home/dp/.local/state/hestia-mesh/logs",
+        "rg -n --glob '*.log' 'gh pr merge 697' /home/dp/.local/state/hestia-mesh/logs",
+        "printf 'gh pr merge 532'",
+        'grep -rhE "gh pr merge 236" /logs/ 2>/dev/null | head',
+    ]:
+        check(f"search is not a merge: {target[:38]!r}", merge_calls(target) == [])
 
 
-def arm_grep_output_never_starts_its_line() -> None:
-    """A quoted exec survives into another log behind a `<path>.log-<n>-` prefix.
+def arm_the_census_reading_itself_is_not_a_merge() -> None:
+    """The self-contamination case, as it appears in the chain TODAY.
 
-    Two guards reject it and they are REDUNDANT, which I verified rather than
-    assumed: the `^` anchor on EXEC_LINE, and GREP_PREFIX. Removing either one
-    alone leaves this arm green, because `^` without re.MULTILINE anchors to the
-    string start whether you call `match` or `search`. The arm reds only when
-    BOTH are removed at once — so it is evidence for the pair, not for either.
+    This is the target codex ran while reviewing #891 — a heredoc that imports
+    this very module. Under v2's log grep it produced a #353 attribution and
+    flipped the published census to AMBIGUOUS with no merge occurring.
 
-    Saying that precisely is the point. The arm this one replaces claimed to
-    prove a guard it could not have failed on, and that false credit is what let
-    the contamination ship.
+    Sabotage: lex the whole target as one string instead of per line, or match
+    the pattern against raw text, and this goes red.
     """
-    with tempfile.TemporaryDirectory() as d:
-        logs = Path(d)
-        (logs / "codex-20260831-175622.log").write_text(
-            "/home/dp/.local/state/hestia-mesh/logs/codex-20260807-015109.log-794-"
-            "/bin/bash -lc \"gh pr merge 236 --merge\" in /mnt/c\n"
-        )
-        check("quoted exec line is not a merge", seat_merges(logs) == {},
-              f"got {seat_merges(logs)}")
+    target = ("python3 - <<'PY'\nfrom pathlib import Path\nimport sys\n"
+              "sys.path.insert(0, 'tools')\nimport merge_review_census as m\n"
+              "# gh pr merge 353 appears in the docstring\nPY")
+    check("reading the census is not merging", merge_calls(target) == [],
+          str(merge_calls(target)))
+
+
+def arm_unlexable_target_is_dropped_not_guessed() -> None:
+    """An unbalanced quote must under-count, never fall back to text matching.
+
+    Sabotage: replace the ValueError guard with a regex fallback and this goes
+    red — which is the whole v1 failure mode returning.
+    """
+    check("unlexable line is skipped", merge_calls("gh pr merge 5 \"unclosed") == [])
+
+
+# --------------------------------------------------------------------------
+# PERFORMER half — corroboration
+# --------------------------------------------------------------------------
+
+def arm_wrapper_success_needs_a_merge_instant() -> None:
+    """codex #3: `success: true` is the SHELL's exit code, not the merge's.
+
+    The target is #532's real one: `2>&1 | tail -5; echo "rc=$?"` exits zero
+    whether or not `gh` did. The two hits below are byte-identical in every
+    field the parser reads EXCEPT the timestamp. Only the one that lands beside
+    the merge instant counts; the other is reported as uncorroborated.
+
+    Sabotage: drop the window test in seat_merges and this goes red, because
+    both hits would be accepted and the masked failure would be a merge.
+    """
+    target = 'gh pr merge 532 --squash --delete-branch 2>&1 | tail -5; echo "rc=$?"'
+    prs = [pr(532, "x", "2026-08-19T05:00:51Z")]
+
+    real = seat_merges([hit("claude-code", target, "2026-08-19T05:00:56Z")],
+                       prs, REPO, window=300.0)
+    check("outcome beside the merge instant is a merge",
+          set(real["corroborated"]) == {532}
+          and real["corroborated"][532]["seat"] == "claude-code")
+
+    masked = seat_merges([hit("claude-code", target, "2026-08-19T09:00:56Z")],
+                         prs, REPO, window=300.0)
+    check("identical success far from the instant is NOT a merge",
+          masked["corroborated"] == {} and len(masked["uncorroborated"]) == 1,
+          str(masked))
+
+
+def arm_merge_before_the_instant_is_rejected() -> None:
+    """An outcome recorded BEFORE the merge cannot have caused it.
+
+    The outcome row is written when the command returns, so it follows the
+    merge; only a small skew slack is allowed backwards.
+
+    Sabotage: widen back_slack to the full window and this goes red.
+    """
+    prs = [pr(700, "x", "2026-08-28T06:00:00Z")]
+    early = seat_merges([hit("kimi-code", "gh pr merge 700 --squash",
+                             "2026-08-28T05:50:00Z")], prs, REPO, window=3600.0)
+    check("outcome 10 min BEFORE the instant is rejected",
+          early["corroborated"] == {}, str(early))
+
+
+def arm_foreign_repo_is_not_this_repos_pr() -> None:
+    """A merge in another repo must not match this repo's same-numbered PR.
+
+    Without the --repo test, `gh pr merge 31 --repo dp-web4/private-context`
+    matches hestia's #31 with a 26-DAY gap and reads as a clock fault.
+
+    Sabotage: ignore explicit_repo and this goes red on foreign_repo == 0.
+    """
+    prs = [pr(31, "x", "2026-07-23T00:00:00Z")]
+    out = seat_merges([hit("codex", "gh pr merge 31 --repo dp-web4/private-context "
+                                    "--merge --delete-branch",
+                           "2026-08-17T22:42:22Z")], prs, REPO, window=300.0)
+    check("foreign-repo merge is excluded, not mis-dated",
+          out["corroborated"] == {} and out["foreign_repo"] == 1
+          and out["uncorroborated"] == [], str(out))
+
+
+def arm_nearest_outcome_wins_over_a_retry() -> None:
+    """Two seats both ran a merge command; the one at the instant performed it.
+
+    A retry after a failed attempt is a real pattern in the chain. The census
+    must attribute to the outcome that coincides with the merge, not to
+    whichever it scanned first.
+
+    Sabotage: keep the first hit instead of the nearest and this goes red,
+    because the walk yields newest-first.
+    """
+    prs = [pr(800, "x", "2026-09-01T00:00:00Z")]
+    out = seat_merges(
+        [hit("codex", "gh pr merge 800 --merge", "2026-09-01T00:04:00Z", "far", 2),
+         hit("claude-code", "gh pr merge 800 --merge", "2026-09-01T00:00:03Z", "near", 1)],
+        prs, REPO, window=300.0)
+    check("nearest outcome wins", set(out["corroborated"]) == {800}
+          and out["corroborated"][800]["seat"] == "claude-code"
+          and out["corroborated"][800]["action_id"] == "near", str(out))
+
+
+def arm_a_seat_merge_is_reported_against_the_credential() -> None:
+    """End to end: mergedBy says dp-web4, the census says a seat did it.
+
+    This is the finding in one row. Sabotage: return an empty dict from
+    seat_merges and this goes red on seat_performed.
+    """
+    prs = [pr(532, "fix: x", "2026-08-19T05:00:51Z"),
+           pr(533, "fix: y", "2026-08-19T06:00:00Z")]
+    merges = seat_merges([hit("claude-code", "gh pr merge 532 --squash",
+                              "2026-08-19T05:00:56Z")], prs, REPO, window=300.0)
+    out = census(prs, 200, merges)
+    check("seat merge reported behind one credential",
+          out["distinct_mergedBy"] == ["dp-web4"] and out["seat_performed"] == 1
+          and out["seat_performed_by"] == {"claude-code": 1}
+          and out["seat_performed_numbers"] == [532]
+          and out["rows"][0]["performed_by_seat"] == "claude-code"
+          and out["rows"][1]["performed_by_seat"] is None, str(out["seat_performed_by"]))
+
+
+def arm_chain_unreadable_leaves_the_review_census_intact() -> None:
+    """The review half must not depend on the daemon being up.
+
+    Sabotage: read merges before computing `reviewed` and this goes red when
+    the chain is empty.
+    """
+    prs = [pr(40, "findings: a", "2026-08-01T00:00:00Z"),
+           pr(41, "fix: b", "2026-08-02T00:00:00Z", comments=[("dp-web4", "x" * 300)])]
+    out = census(prs, 200, seat_merges([], prs, REPO, window=300.0))
+    check("review census survives an unreadable chain",
+          out["unreviewed"] == 1 and out["seat_performed"] == 0)
 
 
 def main() -> int:
-    for arm in (
-        arm_bot_advert_is_not_review,
-        arm_short_human_comment_is_not_review,
-        arm_class_split,
-        arm_headline_rates,
-        arm_mergedby_cannot_separate_seats,
-        arm_seat_is_read_from_the_record_not_the_filename,
-        arm_quoting_a_record_does_not_double_count,
-        arm_prose_and_diffs_are_not_merges,
-        arm_disagreeing_records_are_a_conflict_not_a_coin_flip,
-        arm_failed_merge_command_is_not_a_merge,
-        arm_codex_exec_lines_are_execution_too,
-        arm_searching_for_a_merge_is_not_performing_one,
-        arm_grep_output_never_starts_its_line,
-    ):
-        print(f"{arm.__name__}:")
-        arm()
+    print("merge_review_census arms")
+    for name, fn in sorted(globals().items()):
+        if name.startswith("arm_"):
+            print(f"\n{name}")
+            fn()
     print()
     if FAILURES:
-        print(f"FAILED {len(FAILURES)}: {', '.join(FAILURES)}")
+        print(f"{len(FAILURES)} FAILED: {FAILURES}")
         return 1
-    print("all arms passed")
+    print("all arms pass")
     return 0
 
 

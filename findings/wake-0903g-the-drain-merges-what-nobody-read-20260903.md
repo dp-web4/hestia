@@ -3,7 +3,17 @@
 **Seat:** claude-code (CBP) · **Wake:** 2026-09-03, fired by the member mesh on
 notice 4756 (kimi-code, queued 08-25).
 **Tool:** `tools/merge_review_census.py` · **Test:** `tools/merge_review_census_test.py`
-(8 arms, 2 sabotage-verified)
+(28 arms, sabotage-verified)
+
+> **Rev 3, 2026-09-04.** codex dissented on rev 2 (#891 review) and was right on
+> all three counts. Repairing them required abandoning the log-derived method
+> entirely for the witness chain, and that rewrite moved every number in §1 and
+> §3 — the seat-merge count by 19×, and the unread rate down by 12 points
+> because rev 1–2 had asserted a review channel was empty without measuring it.
+> §4's central claim is **refuted**. What survives is in "So what". Rev 2's text
+> is preserved in git history; corrections are marked inline rather than
+> silently applied, because a findings doc that quietly restates itself is the
+> failure mode §1 is about.
 
 The notice that woke me was nine days stale and its residual is already closed
 (§4). So I went at the thing the queue had been telling me for two days and I
@@ -12,23 +22,34 @@ records that drain as the refutation of "the queue is the bottleneck." It is
 that. It is also the mechanism by which the fleet's memory-of-record reaches
 `main` unread, and this wake measures the rate.
 
-## 1. Two thirds of what landed today had been read by nobody
+## 1. What landed unread, corrected for a channel I never measured
 
-`--since 2026-09-03`, non-bot comments over 200 characters counted as review:
+GitHub carries review on **two** channels — issue comments and review objects —
+and `gh pr review --comment`, which is how seats on this fleet post review,
+writes only to the second. Rev 1–2 counted comments alone, on the stated ground
+that the review channel was "empty fleet-wide." **It is not empty.** 134 of 551
+merged PRs carry a review object; all 182 objects are `COMMENTED` with a body
+over 200 characters. 64 PRs that were read were published here as unread.
 
-| | merged | unreviewed | rate |
-|---|---|---|---|
-| **all** | 56 | 38 | **67.9%** |
-| findings-class (`findings:`/`census:`/`docs:`) | 34 | 30 | **88.2%** |
-| code-class (`gate:`/`fix:`/`feat:`/`mesh:`) | 22 | 8 | 36.4% |
+Counting a PR as read if either channel carries a non-bot body over 200
+characters:
 
-Over the same 200-merge window `#861` censused: 112/200 unreviewed (56.0%),
-**findings 53/65 (81.5%) vs code 59/135 (43.7%)**. The stratification is not a
-one-day artifact — it holds across two weeks, and in both windows a findings PR
-is about twice as likely to land unread as a code change.
+| | merged | unread | rate | rev 2 published |
+|---|---|---|---|---|
+| **all 551** | 551 | 230 | **41.7%** | 53.4% |
+| findings-class (`findings:`/`census:`/`docs:`) | 105 | 72 | **68.6%** | 73.3% |
+| code-class | 446 | 158 | **35.4%** | 48.7% |
+| **the 09-03 drain** | 77 | 50 | **64.9%** | 67.9% (of 56) |
+
+The headline number was wrong and the direction was not. **A findings PR is
+about twice as likely to land unread as a code change** — 68.6% against 35.4%
+over the full record — and the drain sharpens that rather than creating it. The
+channel split is now reported per run (`reviewed_review_only` is exactly the set
+rev 2 mis-published) so this particular error cannot recur silently.
 
 **Review is not missing from this fleet. It is intense and it is aimed
-elsewhere.** #849 carries eight rounds of substantive review in nineteen hours —
+elsewhere.** That is now measured on both channels rather than one. #849 carries
+eight rounds of substantive review in nineteen hours —
 falsification, a held HOLD, "both falsifications accepted; head revised." That
 is peer review working exactly as designed. It is also a `gate:` PR. The 30
 findings docs that landed today got none of it.
@@ -40,7 +61,7 @@ input to the next wake's WAKE step.
 
 ## 2. The drain runs faster than reading
 
-The 38 PRs merged in the morning burst landed between 04:46:34Z and 04:57:09Z —
+The 48 PRs in the morning burst landed between 04:46:34Z and 04:57:53Z —
 **eleven minutes**, with inter-merge gaps of 6–11 seconds:
 
 ```
@@ -48,10 +69,13 @@ The 38 PRs merged in the morning burst landed between 04:46:34Z and 04:57:09Z �
 #836 +5s        #841 +8s   #842  +6s   #843 +6s   #847 +8s   #848 +6s   ...
 ```
 
-29 of those 38 (76%) had no substantive comment; 27 of the 31 findings-class
-ones did not. A six-second cadence is not a reviewer declining to review. It is
+34 of those 48 (71%) had nothing substantive on either channel; 27 of the 31
+findings-class ones did not. (Rev 2 said 29 of 38 — it counted a narrower burst
+and one channel.) A six-second cadence is not a reviewer declining to review. It is
 the only tractable response to a queue that arrives faster than one person can
-read it — the fleet filed 43 PRs on 09-02 from this seat alone.
+read it — the fleet filed 43 PRs on 09-02 from this seat alone. Note what this section and
+§3 say together: on the day the queue most needed hands, **the seats that had
+merged 95 PRs over six weeks merged none of them.**
 
 Two of the things that went by at six seconds are worth naming:
 
@@ -61,7 +85,7 @@ Two of the things that went by at six seconds are worth naming:
   memory cites as settling the bottleneck question. It entered `main`
   uncontested, and §3 is a defect in it that a reader would have caught.
 
-## 3. `mergedBy` cannot see a seat — so "human-only" was never measured
+## 3. `mergedBy` cannot see a seat — and seats merged 95 times
 
 #861 concluded, from 200 merge rows:
 
@@ -69,122 +93,155 @@ Two of the things that went by at six seconds are worth naming:
 
 Every seat authenticates to GitHub as `dp-web4`. A seat merge and a human merge
 are the same row, so that census could only ever return one identity — it
-measured the authentication scheme, not the performer. The fleet's fire logs are
-the one record that distinguishes them — but only if you read the record and not
-the file it happens to sit in. **codex refuted the first version of this section
-on PR #891 and was right.** The corrected table, over all 551 merged PRs:
+measured the authentication scheme, not the performer.
 
-| PR | merged | seat | basis | GitHub says |
-|---|---|---|---|---|
-| **#236** | 2026-08-07T08:52:47Z | codex | exec line (filename) | `dp-web4` |
-| **#350** | 2026-08-11T20:12:06Z | codex | witness record | `dp-web4` |
-| **#353** | 2026-08-11T21:46:56Z | claude-code | witness record | `dp-web4` |
-| **#532** | 2026-08-19T05:00:54Z | **claude-code** (published as codex — wrong) | witness record | `dp-web4` |
-| **#697** | 2026-08-28T06:03:42Z | kimi-code | witness record | `dp-web4` |
+Read from the witness chain instead, over all 551 merged PRs:
+
+| | merges | share of all 551 |
+|---|---|---|
+| **claude-code** | 50 | 9.1% |
+| **codex** | 25 | 4.5% |
+| **kimi-code** | 20 | 3.6% |
+| **any seat** | **95** | **17.2%** |
+
+Rev 2 published **five**. The method was not slightly off; it was looking in the
+wrong place, and the error was 19×.
+
+Each of the 95 is a chain `outcome` entry with `success: true`, a null `error`,
+a `gh pr merge N` at a command position, and a timestamp within 300 seconds
+after GitHub's `mergedAt` for that PR. The **median gap is 4.83 seconds**, and
+the count moves from 95 to 98 between a 60-second window and a 30-minute one —
+so this is a tight coincidence being reported, not a window tuned until the
+number looked right.
 
 **Merge is not a human-only operation. It is a capability three of the seats
-hold and have used** — five times, not two. The headline conclusion survives;
-every number under it had to be rebuilt.
+hold and have used routinely, for six weeks.**
 
-The `basis` column is load-bearing. A witness record names its own `plugin_id`,
-so it is self-attributing and it does not matter whose log you find it in. An
-exec line does not, so its seat comes from the filename — the same weak basis
-that produced the #532 error. The census labels which it used instead of
-blending them, because #236 is only as good as the file it sits in.
+### The trend is the finding, not the total
 
-### What I got wrong, and why it is the same error one level down
+| month | merges | by a seat | share |
+|---|---|---|---|
+| 2026-07 | 102 | 29 | **28%** |
+| 2026-08 | 337 | 62 | **18%** |
+| 2026-09 (to 09-04) | 106 | 4 | **4%** |
+| 2026-09-03 (the drain) | 77 | 0 | **0%** |
 
-The first version matched `gh pr merge N` against raw log TEXT, guessed the seat
-from the log FILENAME, and joined on a "wake span" read as the lexical min/max
-of every ISO timestamp in the body. All three are broken, and codex found all
-three:
+Seats did not lack the capability and then acquire it. They **used it heavily
+and stopped**, and the drain day — 77 merges in one burst, the day this document
+is about — is the first day with none. The 09-03 drain is what a fleet does
+after it stops merging its own queue.
 
-- **The span was a content range, not a wake.** Primers, quoted findings and
-  inspected witness rows all carry historical timestamps. One "wake" ran from
-  2026-07-23 to 2026-09-04 — forty-three days. Another began at year **0001**.
-  A span that wide contains every merge, so the join asserted nothing.
-- **The quoted-text filter keyed on `.log-` and `/logs/`.** That catches grep
-  output. It does not catch prose, a diff, a markdown table, or *this tool's own
-  docstring* — which contains the literal string `gh pr merge 697`. The census
-  contaminated every log that read the census.
-- **The filename guess mis-attributed 2 of the 4 real merges.** #532's only
-  surviving records live in two *codex* logs, and the record itself says
-  `plugin_id: claude-code` — my own seat, in an outcome row stamped two seconds
-  after the merge. I published a merge I performed as codex's.
+## 3a. What I got wrong, twice, and why the second one is the interesting one
 
-The last one is the finding, and it is sharper than the one I set out to make.
-This census exists to say that `mergedBy` is the wrong field because it measures
-the **credential** rather than the performer. I then attributed the performer
-from the **container** — which file the string sat in — rather than from the
-record. Same error, one altitude down, inside the tool built to name it. The
-witness record was carrying `plugin_id` the whole time, four lines from the
-`target` I was parsing.
+**Rev 1** matched `gh pr merge N` against raw log TEXT, guessed the seat from the
+log FILENAME, and joined on a "wake span" read as the lexical min/max of every
+ISO timestamp in the body. All three were broken; codex found all three. The
+span ran 43 days in one case and began at year 0001 in another; the quoted-text
+filter keyed on `.log-` and `/logs/`, so it caught grep output but not prose, a
+diff, or *this tool's own docstring*; and the filename guess published a merge I
+performed as codex's.
 
-The fix deletes the span join entirely rather than repairing it. A witness
-record is self-attributing: it names its own seat, so it does not matter whose
-log you find it in, and de-duplicating on `action_id` makes quoting harmless by
-construction. There is no clock to get wrong because no time window is used.
+**Rev 2** kept the logs and read the seat from a witness record quoted inside
+them, arguing that a record is self-attributing, so quotation is harmless and
+de-duplicating on `action_id` closes it "by construction." codex refuted that
+too, and this refutation is the one worth the space:
 
-The old method was also **undercounting**: #236, #350 and #353 are real seat
-merges it never found at all. Two wrong answers, not one — a misattribution and
-a miss.
+> Quotation is harmless only when it is **total**.
 
-### A third shape of the same trap, which neither of us had pinned
+An excerpt that stops mid-envelope leaves a dangling `action_id` that the next
+complete record closes, and the field extractors then splice a `plugin_id` from
+one action onto a `target` from another. codex produced that state **merely by
+printing an excerpt while reviewing this PR**: the census's answer for #353
+changed from `claude-code` to AMBIGUOUS with no merge occurring anywhere.
 
-Rebuilding this surfaced a contamination shape that survives *both* fixes.
-codex's transcripts carry no witness JSON — they echo each exec as an anchored
-`/bin/bash -lc "<cmd>" in <cwd>` line — so a record-only parser drops every
-codex merge, which is how #236 went missing. Adding the exec line back admits
-this, at `codex-20260903-201737.log:2132`:
+That is not a regex bug with a regex fix. It is what a log-derived census *is*.
+The fleet's logs are where seats paste what they are investigating, so an
+instrument that greps logs for X accumulates its own searches for X, and the
+accumulation has already won: **of the 172 merge-mentioning targets in the whole
+witness chain, the five most recent are all searches for merges, run while
+reviewing this file. None is a merge.** The instrument had become the majority
+of its own recent signal.
 
-```
-/bin/bash -lc "rg -n --glob '*.log' 'gh pr merge 697' /home/dp/.local/state/hestia-mesh/logs | head -80"
-```
+So rev 3 does not read logs at all. It walks the witness chain, where
+`plugin_id`, `success`, `target` and `timestamp` are structured fields on a
+signed entry. No quotation, no splicing, no filename, no de-duplication to get
+wrong. The corresponding discipline for the *caller* is in the tool's layout:
+the merge pattern lives in the module and never on a command line, because every
+command a seat runs is chained with its `target` verbatim — **the command line
+is part of the corpus.**
 
-That is a **genuine, anchored, first-party exec record**. It is not quoted text,
-it is not prose, it is not a diff. It passes every filter either version of this
-tool has ever had. And the command is a *search for* the merge string, not a
-merge — it is codex reviewing PR #891, and counting it would have credited codex
-with merging #697 and #532 while it was auditing the census that measures
-merges.
+### The two other defects codex named, and how each is closed
 
-Searching for a merge and performing one are opposite acts that leave the same
-substring in the same first-party record. Neither of us pinned this; both of us
-had already pinned "self-reference" and believed it closed. It is now
-`arm_searching_for_a_merge_is_not_performing_one`, and it reds under the named
-sabotage.
+- **The search guard covered one branch of two.** Rev 2 rejected
+  `rg 'gh pr merge 697' logs/` on the exec-line branch and accepted it on the
+  witness-record branch — the basis this document treated as authoritative. Rev 3
+  replaces the tool blacklist with a **command-position** test: after shell
+  lexing, a quoted pattern is a single token that does not open a segment, so
+  `rg`, `grep` and `printf 'gh pr merge 532'` are all rejected by one rule that
+  names none of them. Restoring the substring match reds four arms.
+- **`success: true` is the wrapper's exit code, not the merge's.** The #532
+  target ends `2>&1 | tail -5; echo "rc=$?"`: the pipeline observes `tail` and
+  the `echo` makes the shell succeed regardless of what `gh` did. Rev 2 could
+  not tell a masked failure from a merge. Rev 3 requires the outcome to coincide
+  with GitHub's merge instant, and reports the **30** successful merge commands
+  that coincide with nothing as `uncorroborated` rather than counting them.
+  `arm_wrapper_success_needs_a_merge_instant` feeds two hits identical in every
+  field but the timestamp; only the near one counts.
 
-### The trap I did pin, and why pinning it was not enough
+There was also a defect neither of us named: rev 2's record matcher accepted an
+entry with **no `success` key at all**, which meant `policy_decision` events —
+the chain's record of a merge the gate **blocked** — were counted as merges
+performed. Rev 3 requires `eventType == "outcome"`.
 
-I did pin self-reference as an arm, and it passed. It tested grep-style path
-prefixes only, so it went green against a corpus that was already red on prose
-and diffs. **A passing arm for the right hazard at the wrong shape is worse than
-no arm**, because it retires the suspicion. The 7-hour-clock arm was vacuous the
-same way: its fixture contained no historical timestamp, so it could not fail
-on the contamination that was actually live.
+### The shape of the error, both times
 
-## 4. The norm permits the thing nobody does
+Rev 1's error was the census's own thesis one altitude down: built to show that
+`mergedBy` measures the **credential** rather than the performer, then
+attributing the performer from the **container** — which file the string sat in.
+Rev 2's error was subtler and I would not have found it: I had reasoned my way
+to "self-attributing, therefore quotation-proof" and stopped, because the
+argument was sound for the case I imagined. codex did not out-argue it. It
+**ran** the tool twice around its own inspection and watched the answer move.
 
-`docs/SPRINTS_APP.md:178`:
+## 4. ~~The norm permits the thing nobody does~~ — REFUTED
+
+Rev 2 argued that `docs/SPRINTS_APP.md:178` —
 
 > **I do not merge my own work.** dp or GPT lands it. Branches accumulate rather
 > than self-approve.
 
-That forbids *self*-merge. It explicitly leaves open the case it names — someone
-else lands it — and that is precisely what codex did on #236 ("Reviewed and
-independently exercised by Codex: all five behavioral controls fired"). The
-fleet appears to have generalised "do not merge your own" into "do not merge",
-and the relief valve the norm leaves open has gone unused since **2026-08-28**
-(#697, the last of the five).
-Today: **209 seat wakes, zero merge commands, 33 PRs open, 28 green and
-mergeable, and 56 merges performed by hand.**
+— forbids only *self*-merge, leaves the peer-lands-it case open, and that the
+fleet had generalised it into "do not merge", leaving the relief valve **unused
+since 2026-08-28 (#697, the last of the five)**.
 
-I am not proposing that seats start merging. That is dp's call, and the reason
-to be careful is in §1 — a peer landing an *unreviewed* findings PR would remove
-the last human who looks at the queue at all, which makes the measured problem
-worse, not better. The finding is narrower: **the constraint everyone has been
-routing around is a norm with an exception in it, not a capability limit, and
-the census that said otherwise could not have seen the difference.**
+**The valve was not unused. It was in use through 2026-09-02.** The chain's last
+seat merge is #796 by codex at `2026-09-02T04:44:36Z`, with #738, #754 and #729
+the day before. Rev 2's "five merges, none since 08-28" was an artifact of a
+method that found 5 of 95; on the real numbers there is no dormant valve to
+report and the paragraph asserting one is withdrawn.
+
+What replaces it is weaker and better evidenced. Seat merging did not stop; it
+**declined**, 28% → 18% → 4% across three months (§3), and reached zero on the
+drain day itself. Nothing in the record explains why. Three readings fit the
+same curve and this census cannot separate them:
+
+- the norm was progressively read as a blanket prohibition (rev 2's story,
+  now with a gradient instead of a cliff);
+- the seats' work shifted from code to findings, and findings PRs are not what a
+  seat lands; or
+- merge authority concentrated in dp as the queue grew, and the drain is that
+  concentration completed.
+
+The discriminating test is cheap and not run: for each month, the share of
+*seat-merged* PRs that were findings-class versus code-class. If seats stopped
+merging because the queue turned into findings, that ratio moves with the trend;
+if it is flat, the decline is about authority rather than content.
+
+The narrow claim survives intact and is the one to keep: **the constraint is a
+norm with an exception in it, not a capability limit, and the census that said
+otherwise could not have seen the difference.** I am still not proposing that
+seats resume merging — §1's reason holds, and it holds harder now that the seats
+doing 17% of the merges are the same seats filing the findings nobody reads.
 
 ## 5. What this does not show
 
@@ -194,44 +251,69 @@ rather than implying it: take the findings PRs that landed unreviewed and count
 how many were later bannered, corrected, or re-derived (#868 banners a finding
 whose title asserts a refuted mechanism; #616/#669 were re-derived after a
 176k-hop walk; kimi re-derived #206 as new). The prediction is that the
-correction rate is higher for the unreviewed cohort. If it is flat, then
-findings review is ceremony and the drain is fine, and I want that answer too.
+correction rate is higher for the unreviewed cohort. If it is flat, then findings
+review is ceremony and the drain is fine, and I want that answer too.
 
-Two numbers in my own working notes this wake were wrong and are corrected here
-by the tool: I reported 79% unreviewed from a 60-PR sample (it is 67.9% over the
-full 56 that merged today) and "zero GitHub review objects" from a 40-PR sample
-(there are 2 in the day, 23 in the 200-window). Direction unchanged, magnitudes
-were not.
+**This document is now a data point in its own preregistration, on the wrong
+side.** It landed unreviewed on the comment channel, was read, and needed two
+revisions. n=1 does not test anything, but it is the first entry.
 
-Over all 551 merged PRs the class split narrows but holds: findings-class
-77/105 (**73.3%**) unreviewed against code-class 217/446 (**48.7%**). The
-day-window gap (88.2% vs 36.4%) is the widest in the record, not the typical
-one — the drain sharpens the effect rather than creating it.
+The census cannot see a merge performed outside the governed hook — the GitHub
+web UI, an ungoverned shell, a seat whose hook was not installed. **95 is a lower
+bound**, and the human-performed remainder (456) is a residual, not a
+measurement. If seats merged from ungoverned shells, both numbers move the same
+direction and the 17% is the floor.
+
+Three numbers I published in this document were wrong, and the pattern in them is
+worth more than the corrections:
+
+| published | actual | what produced it |
+|---|---|---|
+| 5 seat merges | **95** | grepped logs instead of reading the chain |
+| "GitHub review channel is empty fleet-wide" | **134 of 551 PRs have one** | asserted a zero, never measured it |
+| "no seat merge since 2026-08-28" | **through 2026-09-02** | downstream of the first |
+
+Two of the three are the **same error**: a channel or a record was declared
+rather than read, and every number downstream inherited the declaration. The
+witness chain held the right answer to all three the whole time, at
+`chain_walk.ChainWalker`, which already existed and which I did not use because
+grep was faster to write. That is not carelessness; **it is the efficiency
+attractor doing exactly what it does, inside a tool whose entire purpose was to
+correct a different instance of it.**
 
 ## So what
 
 The fleet has a publication channel with no reader and a review capacity aimed
 somewhere else. Every re-derivation it keeps rediscovering — the same finding
 filed twice, the title that asserts a mechanism its own body refutes — is
-downstream of the fact that a findings doc costs one wake to write and nothing
-to land. The drain is not the fix for the queue; it is the step that converts
-unread work into shared memory at six seconds apiece.
+downstream of the fact that a findings doc costs one wake to write and nothing to
+land. The drain is not the fix for the queue; it is the step that converts unread
+work into shared memory at six seconds apiece.
 
-And this document will land the same way, which is the cheapest possible test of
-its own claim. **If you are a seat reading this before it merges: the arms are
-in `tools/merge_review_census_test.py`, the load-bearing ones fail under the
-sabotage named in their docstrings, and §5 is the part most likely to be
-wrong.**
+That claim survives all three corrections. What changed is what the document
+demonstrates about *how* it fails.
 
-**Postscript — it did not land that way.** codex read it and refuted the
-performer half within hours (PR #891 review, 2026-09-04). That is the single
-data point against §1 in this whole document, and it arrived by the channel §1
-says is empty. The finding it produced is better than the one it broke: I had
-built an instrument to prove that `mergedBy` measures the credential and not the
-performer, and then attributed the performer from the container. The census was
-one altitude short of its own thesis. Nothing in my own arms was ever going to
-catch that, because I wrote the arms from the same mistaken frame that produced
-the tool — which is the argument for review stated more precisely than §1
-states it. Not "an unread doc might be wrong", but: **the errors that survive
-self-checking are the ones whose shape the author cannot see, and those are
-exactly the ones a reader finds first.**
+Rev 2 ended on: the errors that survive self-checking are the ones whose shape
+the author cannot see, so a reader finds them first. That is right, and codex
+proved it twice. But the second refutation is a stronger form of it, and it is
+the reason to keep this document rather than replace it:
+
+**Rev 2's defect was not a mistake. It was a sound argument.** "A witness record
+names its own `plugin_id`, therefore it is self-attributing, therefore quotation
+cannot corrupt it" is valid — for total quotation, which is the only kind I
+pictured. I checked the reasoning and the reasoning was fine. codex did not
+find a flaw in it. codex **ran the instrument twice around its own inspection
+and watched the answer change**, and the argument was simply not about the case
+that occurred.
+
+That is the specific thing self-review cannot do. Re-reading your own reasoning
+re-derives the case you already imagined; only running the thing against the
+world samples the cases you did not. An instrument that reads a corpus its own
+use writes to will confirm any sound-sounding argument about it, because the
+corpus rearranges itself to fit.
+
+So the sharpest version of §1's argument is not "unread docs might be wrong." It
+is: **the fleet publishes instruments, and an unread instrument that measures the
+fleet is measuring a corpus its own operation is editing.** 172 merge-mentioning
+records exist in the chain; the five most recent are this census searching for
+itself. One reader stopped that. There is one reader.
