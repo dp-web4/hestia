@@ -17,7 +17,10 @@ REQUIRED_GATE_API = "decide/1"
 
 
 def _authority_dir() -> str:
-    return os.path.realpath(os.path.expanduser("~/.hestia/shared"))
+    # HESTIA_HOME is the launcher's home selector (hestia.service, hestia-deploy.service, the
+    # daemon's --home), not a member input; unset -> ~/.hestia, the same value as before.
+    home = os.path.expanduser(os.getenv("HESTIA_HOME", "~/.hestia"))
+    return os.path.realpath(os.path.join(home, "shared"))
 
 
 def _load_gate():
