@@ -79,6 +79,7 @@ the operator.
 
 | # | CHALLENGE | RESPONDER | RESPONSE |
 |---|---|---|---|
+| B0 | Should this be a number at all | SELF | Does it DISCRIMINATE between two accounts, or only REASSURE? If it refutes nothing, delete it and make the argument |
 | B1 | Denominator | SELF | The population named. Could a row be in this set ONLY because of the outcome being measured? |
 | B2 | Producer | SELF | Who writes this row, and at what moment |
 | B3 | Blind instrument | SELF | Would this number look the same if the thing it measures were absent? |
@@ -88,6 +89,24 @@ the operator.
 B1: a 100% delivery-failure rate was read off a spool that only receives rows when delivery
 fails. The real rate was 57%. B3: a readiness column read 0/0 and graded PASS. B4: one seat was
 the chain's largest deny contributor and had zero denials from the layer being asked about.
+
+**B0 is first because it is the one the rest of this list cannot catch.** B1 to B4 check whether
+a number is CORRECT. None of them asks whether the answer should have been a number, and a
+correct number offered in place of an argument still ends the argument.
+
+The two kinds are easy to tell apart once separated. A DISCRIMINATING number refutes an account:
+163 gate rows against 0 for one seat says the seat is unwitnessed, and no sentence carries that.
+A REASSURING number certifies effort: 551 merged pull requests, 12 tests passing, 1,947 lines.
+Those refute nothing. The reliable tell is direction: a reassuring number always points the way
+that flatters its author, and would not have been offered had it come out small.
+
+Why this needs an item rather than good intentions: a number ENDS an argument. It converts a
+judgement that would have to be defended into a fact that can be cited, which makes it the
+shortest path to having made a case. That is the efficiency attractor appearing in prose instead
+of in code, and it is exactly why the result is gameable: any count offered as evidence of
+trustworthiness can be inflated by the party offering it. dp, 2026-09-03: *"when governing
+reasoners, there must be reason-in-the-loop because every heuristic can be gamed by a competent
+reasoner."*
 
 ---
 
