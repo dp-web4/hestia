@@ -147,12 +147,48 @@ is why the digest covers comments.
 > event shape and in how a call is blocked. Note the size: at 6–19 lines these are closer
 > to adapter *data* than code, and the template treats them accordingly.
 
-### C5 — One decision vocabulary
+### C5 — One decision vocabulary, and no per-seat law
 
-All shims MUST produce the same decision kinds from the same rule ids, and MUST agree on
-whether a mode switch exists. Either every seat honours a warn/enforce mode or none does.
-A mode switch present on some seats and absent on others is a certification failure
-regardless of its default.
+Ruled by dp, 2026-09-04, when this criterion was still posed as an open question:
+
+> there can be no odd seats out. no per-seat law.
+
+That is stronger than the question I asked, and it settles it. I had framed C5 as "either
+every seat honours a warn/enforce mode or none does" — a *uniformity* requirement. Uniform
+code is necessary and **not sufficient**, because of what the mode switch actually is:
+
+```python
+MODE = os.environ.get("HESTIA_<SEAT>_GATE_MODE", "enforce").lower()   # codex, kimi, gemini
+...
+decision = "deny" if MODE == "enforce" else "warn"                     # ~10 sites per seat
+```
+
+Even if all four seats carried identical code, **a per-seat environment variable means each
+seat selects its own enforcement posture at runtime.** That is per-seat law by definition —
+the uniformity would be in the source and absent from the behaviour, which is the exact
+failure this document exists to end. It is also C1b in another costume: a governance
+control selectable by a member-observable environment variable is not a control.
+
+**The requirement.** All shims MUST produce the same decision kinds from the same rule ids,
+and the *enforcement posture is not a shim input at all*. Whether a warn posture exists is a
+question for the law; it is never a question for the seat, and never for the environment the
+seat runs in. Any per-seat mode selector is a certification failure regardless of its
+default value and regardless of whether every seat has one.
+
+> **Fails today, all four, in two different ways.** codex, kimi and gemini each carry an
+> env-selectable `MODE` defaulting to `enforce`; claude-code carries none. So three seats
+> can downgrade a non-innate deny to a warn through an environment variable, and the fourth
+> cannot — non-uniform *and* per-seat-selectable.
+>
+> Measured over 40,000 chain entries: claude-code's recorded decisions are 94% `warn`
+> (1066 of 1132); codex's and kimi-code's are 98–99% `deny`. Two candidate explanations —
+> differing workload or differing governance — and C8 is the experiment that separates
+> them.
+>
+> An earlier revision of this document reported the mode switch as present on two seats.
+> That was wrong: it grepped `pre_tool_use.py`, and gemini's hook is `before_tool.py`, so
+> gemini was never examined. The correction matters for the ruling, because it inverts who
+> the outlier is — claude-code, for lacking the switch, not codex and kimi for having it.
 
 > **Fails today.** `HESTIA_CODEX_GATE_MODE` and `HESTIA_KIMI_GATE_MODE` gate ~10 decision
 > points apiece as `decision = "deny" if MODE == "enforce" else "warn"`. The claude-code
@@ -217,6 +253,47 @@ diverge.
 > command substitution (FP15/FP17, pinned open in its corpus, and not defects on the peers
 > at all because the shared closure permits them). Instrument:
 > `plugins/_shared/cross_seat_verdict_parity_test.py`.
+
+### C11 — Every decision is witnessed, and no decision class is exempt
+
+Every decision a shim reaches — allow, warn, deny, escalate, no-verdict — MUST produce a
+chain entry carrying its rule id, on every seat. No class of decision may be exempt, and a
+per-seat telemetry file is not a substitute for the chain.
+
+**Why this is a certification criterion and not a nice-to-have.** A refusal nobody can see
+cannot be audited, cannot be appealed, and cannot be counted. It is indistinguishable from
+an act that never happened — the phrasing `hestia_gate_core.py` already uses for the
+daemon-down case, applied here to a rule class that is working exactly as designed. And the
+member on the receiving end has no chain hash, so `hestia_appeal` — the remedy the law's own
+deny text names — cannot be composed. The law promises a route that does not exist for that
+class (PRD_GOVERNANCE requirement 11).
+
+> **Measured, 2026-09-03/04, one seat, one session: 13 gate false positives.**
+>
+> | class | count | in chain? |
+> |---|---|---|
+> | `gate-self-access` (minted an escalation) | 6 | **yes** — `gate_escalation_opened`, `..._withdrawn`, `member_notice`, `outcome`; full lifecycle |
+> | innate secret-matcher denials | **7** | **no** — absent from a 20,000-entry walk |
+>
+> The split is not random and it is the wrong way round: the six that were *disputable*
+> are richly recorded, and the seven with **no remedy path at all** leave no trace. Every
+> false positive that could not be appealed also could not be seen.
+>
+> Compounding it, the recording asymmetry is per-seat: `gate-denies-codex.jsonl` (900 rows)
+> and `gate-denies-kimi-code.jsonl` (917 rows) exist; there is no
+> `gate-denies-claude-code.jsonl` at all. And `rule_triggered` is `None` on all 1727
+> `policy_decision` entries across all three seats (#156) — so even the recorded decisions
+> do not say *which rule* produced them.
+>
+> An earlier revision of this document claimed innate denials reach the chain zero times on
+> this seat. Corrected: a 40,000-entry walk finds 2. The rate is 0.18% against 5.6% (codex)
+> and 7.8% (kimi-code), so the finding is a 30–40× asymmetry rather than a total absence.
+
+**Prior art, and the reason this is a criterion rather than an issue.** #625 states exactly
+this and was **closed 2026-08-26**; it reproduced unchanged eight days later. #622 predicted
+that the refusals most likely to be false positives would be the ones with no chain hash,
+which is precisely the 7/13 split above. An issue closed twice is a defect the process
+cannot hold. A certification criterion can.
 
 ### C10 — Capability parity, and the only permitted exception
 
