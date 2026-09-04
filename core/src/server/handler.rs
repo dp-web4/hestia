@@ -11209,7 +11209,10 @@ mod tests {
         let withdrawn = open_one("witness.py").await;
         tool_gate_arbitrate_escalation(
             &shared,
-            &json!({ "escalation_id": &withdrawn, "approve": false, "session_id": sid }),
+            &json!({
+                "escalation_id": &withdrawn, "approve": false, "session_id": sid,
+                "reason": "self-withdraw: the marker matched the path inside a quoted string",
+            }),
         )
         .await
         .expect("a member must be able to retire its own ask");
@@ -11341,6 +11344,7 @@ mod tests {
             &shared,
             &json!({
                 "escalation_id": &to_withdraw, "approve": false, "session_id": sid,
+                "reason": "self-withdraw: re-read the rule, it already covers this",
             }),
         )
         .await
@@ -18124,18 +18128,6 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
         }
     };
 
-    // Approving needs a stated reason; refusing does not. Refusing is the default and costs
-    // nothing to explain; permitting is what a reader will have to weigh later.
-    if approve {
-        let r = reason.trim();
-        if r.is_empty() || r.len() > 512 || r.chars().any(char::is_control) {
-            return Err(anyhow::anyhow!(
-                "approving a governance write requires a single-line 'reason' (<=512 bytes) — \
-                 a deny does not"
-            ));
-        }
-    }
-
     // A withdrawal is filed under its own channel and its own event kind. `independence:
     // None` alone would not be enough — an absent field reads as "not computed", and the
     // channel is what `is_sovereign`/`bar_met` actually consult.
@@ -18150,6 +18142,49 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
              member granting itself a governance write is the one thing this path exists to \
              prevent"
         ));
+    }
+
+    // TWO of the three acts need a stated reason, for OPPOSITE reasons.
+    //
+    // APPROVING: permitting is what a reader will have to weigh later.
+    //
+    // WITHDRAWING: the asker is the only party who knows why the gate fired on a command it
+    // is now abandoning, and this field is the only place it can say so. Measured over the
+    // chain 2026-08-27..09-04 (`tools/withdrawal_reason_census.py`): 56 withdrawals across
+    // all three seats, 33 of them (59%) state a marker FALSE POSITIVE in prose and 4 more a
+    // misclassified READ — while 11 carry no reason at all, because until this conjunct
+    // existed the cheapest withdrawal was the silent one. Those 11 are the rows that would
+    // have said the most. #608 concluded the marker-layer FP rate was unreconstructable from
+    // the chain; it is unreconstructable from `stated_detail`, which is a fixed literal, but
+    // THIS field reconstructs it. Making the record mandatory on the one act that produces it
+    // is cheaper than any new detector, and the data is already being volunteered.
+    //
+    // A PEER DENIAL still needs none: refusing someone else's ask is the conservative default,
+    // and taxing it with prose would price the safe verdict above the permissive one.
+    //
+    // Pre-mutation, therefore RETRYABLE: nothing has been decided, the ask stays pending, and
+    // the caller re-sends with a reason. This conjunct cannot strand an escalation open.
+    if approve || withdrawn {
+        let r = reason.trim();
+        if r.is_empty() || r.len() > 512 || r.chars().any(char::is_control) {
+            return Err(anyhow::anyhow!(
+                "{} requires a single-line 'reason' (<=512 bytes) — a peer DENY does not. \
+                 Nothing has been decided: the escalation is still pending, so re-send this \
+                 call with a reason.{}",
+                if approve {
+                    "approving a governance write"
+                } else {
+                    "withdrawing your own escalation"
+                },
+                if approve {
+                    ""
+                } else {
+                    " You are the only party who knows why the gate fired on a command you \
+                     are now dropping — if it misfired, this field is the only record of it \
+                     that anyone can read later."
+                }
+            ));
+        }
     }
 
     // Witness IS finality (revised #480 review, defect 2). The store mutation
@@ -20251,6 +20286,81 @@ mod disposition_durability_tests {
         }
     }
 
+    /// A SILENT WITHDRAWAL IS REFUSED, and the refusal is retryable.
+    ///
+    /// The asker is the only party who ever learns why the gate fired on a command it then
+    /// abandons, and `reason` is the only field it can write. Over 2026-08-27..09-04 the
+    /// chain held 56 withdrawals, 33 of which state a marker false positive in prose and 11
+    /// of which state nothing — the silent ones were the cheapest to file. This asserts the
+    /// three properties that conjunct has to have to be safe: the silent withdrawal errors,
+    /// the escalation SURVIVES the error still pending (so nothing is stranded), and the
+    /// retry with a reason succeeds. A peer denial is checked separately for the converse —
+    /// it must stay free.
+    #[tokio::test]
+    async fn a_withdrawal_must_say_why_and_the_refusal_leaves_the_ask_retryable() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let sid = super::appeal_tests::seat(&state, "kimi-code").await;
+        let opened = tool_gate_escalation_open(&state, &json!({
+            "plugin_id": "kimi-code", "tool_name": "policy_edit", "marker": "policy.json",
+            "act": "policy_edit -> policy.json",
+            "reason": "the marker matched a path quoted inside prose",
+            "session_id": sid.to_string(),
+        })).await.unwrap();
+        let esc_id = opened["escalation_id"].as_str().expect("the open returns its id").to_string();
+
+        // SILENT: refused.
+        let silent = tool_gate_arbitrate_escalation(&state, &json!({
+            "escalation_id": &esc_id, "approve": false, "session_id": sid.to_string(),
+        })).await;
+        let msg = format!("{silent:?}");
+        assert!(
+            silent.is_err(),
+            "a withdrawal with no reason was accepted — the one field that records a gate \
+             misfire is optional again: {msg}"
+        );
+        assert!(
+            msg.contains("still pending"),
+            "the refusal must tell the withdrawer the ask survived and the call can be \
+             re-sent; without that it reads as a dead end and the seat abandons it: {msg}"
+        );
+
+        // NOT STRANDED: the ask is still there to retry. This is the property that makes the
+        // conjunct safe to add — the check runs before `decide`, so no state moved.
+        {
+            let s = state.lock().await;
+            let esc = s.gate_escalations.get(&esc_id).expect(
+                "the refused withdrawal consumed the escalation — a validation error before \
+                 the mutation must leave it pending, or requiring a reason strands it",
+            );
+            assert!(esc.decided_at.is_none(), "a refused withdrawal decided the ask anyway");
+        }
+
+        // RETRY WITH A REASON: accepted, and the prose is what lands on the chain.
+        let spoken = tool_gate_arbitrate_escalation(&state, &json!({
+            "escalation_id": &esc_id, "approve": false, "session_id": sid.to_string(),
+            "reason": "self-withdraw: false positive, the marker is inside a quoted string",
+        })).await.unwrap();
+        assert!(
+            spoken.get("_hestia_error").is_none(),
+            "the retry with a reason must succeed: {spoken}"
+        );
+        {
+            let s = state.lock().await;
+            let e = s
+                .recent_chain(20)
+                .into_iter()
+                .find(|e| e.event_type == "gate_escalation_withdrawn")
+                .expect("the retry emitted no withdrawal event");
+            assert!(
+                e.event_data["reason"].as_str().unwrap_or_default().contains("false positive"),
+                "the withdrawer's prose is the whole point of the conjunct; it must reach the \
+                 chain verbatim: {}",
+                e.event_data
+            );
+        }
+    }
+
     /// The projector path for a withdrawal: the terminal entry was witnessed but
     /// the daemon died before the ensure — the cursor projector mints from the
     /// record, pointer `#withdrawn`. Same guarantee the decided and lapsed kinds
@@ -20301,6 +20411,7 @@ mod disposition_durability_tests {
 
         let ruled = tool_gate_arbitrate_escalation(&state, &json!({
             "escalation_id": esc_id, "approve": false, "session_id": sid.to_string(),
+            "reason": "self-withdraw: turns out the rule already covers it",
         })).await.unwrap();
         assert!(
             ruled.get("_hestia_error").is_none(),
