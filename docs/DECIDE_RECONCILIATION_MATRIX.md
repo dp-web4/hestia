@@ -105,15 +105,66 @@ separate adjudication with a corpus row behind it.
 | claude-code | `fetch_policy_snapshot` → `resolve_agent_policy` → `evaluate` → `ask_daemon` → `deny_no_verdict` | **survives** |
 | codex | `fetch_policy_snapshot` → `resolve_agent_policy` → `evaluate` → `AgentPolicy` | **survives** |
 | kimi | same, plus `query_society_safety` in `main` | **survives**; society-safety is a stage, not a seat feature |
-| gemini | **none of it** | **finding, and the most serious in this document** |
+| gemini | **delegates by subprocess to claude-code's shim** | **generalized — see correction** |
 
-**Gemini does not run the policy path.** No `fetch_policy_snapshot`, no
-`resolve_agent_policy`, no `evaluate`, no `degraded_verdict`, no closure. It performs scope
-and egress checks and stops. Consistent with #730 (CLOSED — "gemini's gate does not refuse
-on an unreachable daemon where codex and kimi do — one law, three behaviours"), which the
-symbol counts now explain: there is no daemon path in gemini to be unreachable.
+### CORRECTION (2026-09-04, same day): gemini DOES reach the policy path
 
-This is why gemini onboarding is a governance question and not a config question.
+An earlier revision of this document said *"gemini does not run the policy path at all."*
+**That is wrong**, and wrong the same way an earlier claim in this session was wrong:
+asserted from symbol counts without reading the mechanism.
+
+Gemini's actual architecture, from `hooks/before_tool.py` and `README.md:114-119`:
+
+| layer | what | how |
+|---|---|---|
+| Gate-1a | innate denylist — credential paths, egress (`url`/`prompt`/`query`, mcp args) | in-process, gemini's own |
+| Gate-1b | scope containment | in-process, **shared** `_core.path_in_scope` / `command_in_scope` |
+| Gate-2 | society safety / policy | **`subprocess.run([sys.executable, HESTIA_SOCIETY_GATE])`**, defaulting to claude-code's own shim, with the event reshaped by `to_claude_lineage()` |
+
+So gemini loads the shared core, uses shared scope primitives, and reaches `evaluate` /
+`fetch_policy_snapshot` / `degraded_verdict` **inside a spawned claude-code shim** rather
+than in-process. The symbol counts were right; the conclusion drawn from them was not.
+
+The delegation is carefully built — a missing governor is detected *before* the spawn,
+because `python3 /nonexistent.py` exits 2 with stderr text byte-for-byte the shape of a
+real verdict, so without the pre-check a missing daemon would report as a clean policy deny
+and block *silently*. That is a subtle catch and it must survive the migration.
+
+**What is nonetheless a substantive structural difference:**
+
+1. **Gemini's law is another seat's shim, not the common gate.** It therefore inherits
+   claude-code's private classifier — including FP15 and FP17, live false positives — while
+   having no corpus of its own in which to pin them.
+2. **Different failure modes**: a 6-second timeout, a spawn error, and lossy event
+   translation through `to_claude_lineage()` (37 lines, 7 branches). None of the in-process
+   seats have these.
+3. **`HESTIA_SOCIETY_GATE` selects the governor by environment variable** — C1b applied to
+   the decision-maker itself.
+
+**This is not an intrinsic harness limitation.** Gemini's hook is Python, already calls
+`_load_shared_module`, and already holds `_core` and a `HarnessProfile`. It *can* call a
+shared `decide()` in-process. The subprocess is a reuse decision taken before a shared
+`decide()` existed — precisely the gap this document closes. **Adjudication: dropped.**
+Gate-2 delegation is replaced by an in-process `decide()` call like every other seat.
+
+### CORRECTION 2: the mode switch is 3-of-4, not 2-of-4
+
+An earlier claim in this session said `MODE` exists on codex and kimi only. Wrong — I
+grepped `pre_tool_use.py`, and gemini's hook is `before_tool.py`, so gemini was never
+checked:
+
+| seat | mode switch | default |
+|---|---|---|
+| claude-code | **none** | — |
+| codex | `HESTIA_CODEX_GATE_MODE` | `enforce` |
+| kimi | `HESTIA_KIMI_GATE_MODE` | `enforce` |
+| gemini | `HESTIA_GEMINI_GATE_MODE` | `enforce` |
+
+The fleet convention is a per-seat env-selectable mode, and **claude-code is the outlier for
+lacking one** — the inverse of how I first framed it. C5's ruling is therefore "adopt
+fleet-wide or remove fleet-wide", with the majority position being *adopt*. That makes C1b
+sharper rather than softer: three seats can downgrade a non-innate deny to a warn through an
+environment variable.
 
 ### 6. escalation / authority
 
@@ -158,10 +209,32 @@ put in front of dp rather than resolve in review.
 2. **Stage 3 case-by-case.** Each of the 4 divergent parity cases needs a ruling on which
    classifier is correct. FP16 (`case`/`esac`) looks safe to fix in the closure's favour;
    FP17 (`$( )` wrapping a read) is the hard one and the highest-volume.
-3. **Gemini's missing stages 3, 5, 6.** Bring gemini up to the pipeline before onboarding,
-   or onboard it explicitly as a lower-assurance seat with that recorded? The second is
-   defensible under web4's "inspectable evidence, not prescribed trust" — but it must be a
-   decision, not an accident.
+3. ~~**Gemini's missing stages.** Bring gemini up to the pipeline, or onboard it as a
+   lower-assurance seat with that recorded?~~ **RESOLVED — and the question was
+   malformed.** dp, 2026-09-04:
+
+   > there can be no substantive difference in capability between shims. the gate is the
+   > law. if harness intrinsically prevents compliance, that should be flagged prominently
+   > and explained, and trust caps adjusted accordingly (with reason)
+
+   "Onboard it as a lower-assurance seat" is not on the menu. A shim does not get to do
+   less. The only admissible exception is an **intrinsic harness limitation**, and it is
+   not a shrug — it must be *proven* intrinsic, flagged prominently, explained, and paid
+   for with a trust cap carrying its reason.
+
+   Applied to gemini, this splits cleanly, and the split is the useful part:
+
+   | difference | intrinsic to the harness? | disposition |
+   |---|---|---|
+   | Gate-2 by subprocess to another seat's shim | **No** — the hook is Python, already loads shared modules, already holds `_core` and a profile | **Fix.** In-process `decide()`, like every other seat |
+   | no in-process `evaluate`/`degraded_verdict` | **No** — consequence of the above | **Fix** |
+   | `to_claude_lineage()` event translation | **No** — becomes the `to_event` adapter, which every seat has | **Fix** (it is C4-permitted, not an exception) |
+   | **native containment covers file tools only** — for shell, MCP and egress the gate is the **ONLY** layer (`README.md:114-119`) | **Yes.** This is gemini-cli's own sandbox, not something a shim can add | **Flag + trust cap.** The remaining seats have a second layer under the gate; gemini does not, so an identical gate verdict rests on strictly less evidence |
+
+   Only the last row is a genuine harness limitation, and it is exactly the shape dp's rule
+   describes: the *shim* becomes identical, and the *harness's own containment* is what
+   differs, gets flagged, and is priced into trust. The first three rows were being
+   defended as harness differences and are not — they are shim drift wearing a costume.
 4. **UNATTRIBUTED branches.** 25 `if`s in codex's `main`, 18 in kimi's, 15 in gemini's
    `_gate`. The per-branch attribution pass is the remaining bulk of step 0 and is not done
    in this revision.
