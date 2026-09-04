@@ -320,6 +320,15 @@ def _read_harness_input():
 #
 # A certified shim defines these names and no others. "Sections" and "kinds" are prose for
 # humans; this is what a checker reads. Eight names, three of them byte-identical bootstrap.
+#
+# THIS FILE IS THE SINGLE SOURCE. `shim_certification_test.py` parses these two tuples out
+# of this file rather than restating them. That is not a style preference — it is the
+# repair for a defect this PR shipped and then found by reading (2026-09-04): the checker
+# had been written with its OWN transcription of the allow-list, and the two copies
+# disagreed on 4 of 8 names within a single PR. A criterion stated twice is a criterion
+# that will drift, which is exactly the finding (@codex review #1) that produced this
+# tuple in the first place. Restating it in a second file re-committed the error one
+# layer along. Do not copy these names anywhere; parse them.
 # ─────────────────────────────────────────────────────────────────────────────────────
 PERMITTED_FUNCTIONS = (
     "_shared_runtime_dir",   # §1 bootstrap — byte-identical across all certified shims
@@ -330,6 +339,21 @@ PERMITTED_FUNCTIONS = (
     "emit",                  # §3 adapter   — per-seat, harness blocking protocol
     "_read_harness_input",   # §4           — per-seat, harness I/O
     "main",                  # §4           — per-seat, harness entry contract
+)
+
+# C1 — the subset whose BYTES must be identical across every certified shim. The
+# complement of this set is per-seat BY DESIGN and must NOT be hashed for identity.
+#
+# Getting this membership wrong is not cosmetic, and the first cut had it exactly
+# inverted: it demanded byte-identity of `_emergency_block` (which the template requires
+# to differ per seat — one harness-native exit code) while never hashing `_emergency_refuse`
+# (which the template declares byte-identical and which is the whole C7b fail-closed path).
+# So the one function whose silent divergence reintroduces a fail-OPEN was the one function
+# with no identity check, and the one function that must differ was required to match.
+BYTE_IDENTICAL = (
+    "_shared_runtime_dir",
+    "_load_shared_module",
+    "_emergency_refuse",
 )
 
 if __name__ == "__main__":
