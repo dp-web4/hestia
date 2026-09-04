@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Codex -> Hestia common-gate shim.
 
-CERTIFIED SHIM CONTRACT: this file contains only authority bootstrap, profile data,
-harness syntax translation, and harness response rendering.  It contains no policy,
-classification, scope logic, enforcement mode, escalation sequencing, or decision recorder.
+HARNESS-DIFFERENCE: Codex supplies a PreToolUse JSON event on stdin and treats exit 2 as a
+blocking hook result. No governance semantics differ from any other seat.
 """
 from __future__ import annotations
 
@@ -12,13 +11,12 @@ import json
 import os
 import sys
 
+SHIM_CERTIFICATION_SCHEMA = "hestia-shim-cert/v1"
+CERTIFICATION_CRITERIA = "PRD_SHIM_CERTIFICATION.md@2026-09-04"
+REQUIRED_GATE_API = "decide/1"
 
-# 1. AUTHORITY BOOTSTRAP -- byte-identical across certified shims.
+
 def _authority_dir() -> str:
-    if os.environ.get("HESTIA_GATE_TEST_MODE") == "1":
-        test_dir = os.environ.get("HESTIA_SHARED_DIR")
-        if test_dir:
-            return os.path.realpath(os.path.expanduser(test_dir))
     return os.path.realpath(os.path.expanduser("~/.hestia/shared"))
 
 
@@ -60,15 +58,36 @@ def _load_gate():
         sys.modules.pop(name, None)
         raise ImportError(
             f"common gate authority miswire: loaded {loaded!r}, expected {required!r}")
+    if getattr(module, "GATE_API_VERSION", None) != REQUIRED_GATE_API:
+        sys.modules.pop(name, None)
+        raise ImportError(
+            f"common gate API mismatch: got {getattr(module, 'GATE_API_VERSION', None)!r}, "
+            f"expected {REQUIRED_GATE_API!r}")
     return module
 
 
 def _emergency_block(reason: str) -> int:
-    sys.stderr.write("hestia: deny [gate.unavailable] - " + reason + "\n")
+    try:
+        import time
+        row = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "seat": PROFILE.get("member_id", "unknown"),
+            "decision": "deny",
+            "rule": "gate.bootstrap_unavailable",
+            "verdict_available": False,
+            "detail": str(reason)[:400],
+        }
+        home = os.path.expanduser("~/.hestia")
+        path = os.path.join(home, "telemetry", "gate-unavailable.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+    except BaseException:
+        pass
+    sys.stderr.write("hestia: deny [gate.bootstrap_unavailable] - " + reason + "\n")
     return 2
 
 
-# 2. PROFILE DATA -- context, never law.
 PROFILE = {
     "member_id": "codex",
     "identity_path": os.path.expanduser("~/.codex/hestia-instance/identity.json"),
@@ -80,10 +99,9 @@ PROFILE = {
 }
 
 
-# 3. HARNESS SYNTAX ADAPTERS.
 def to_event(gate, raw):
     if not isinstance(raw, dict) or raw.get("hook_event_name") != "PreToolUse":
-        raise ValueError("expected Codex PreToolUse event")
+        raise ValueError("expected PreToolUse event")
     tool = raw.get("tool_name")
     tool_input = raw.get("tool_input")
     if not isinstance(tool, str) or not tool:
@@ -95,7 +113,7 @@ def to_event(gate, raw):
         tool_input=tool_input,
         cwd=raw.get("cwd") if isinstance(raw.get("cwd"), str) else None,
         session_id=raw.get("session_id") if isinstance(raw.get("session_id"), str) else None,
-        tool_use_id=(raw.get("tool_use_id") if isinstance(raw.get("tool_use_id"), str) else None),
+        tool_use_id=raw.get("tool_use_id") if isinstance(raw.get("tool_use_id"), str) else None,
         raw=raw,
     )
 
@@ -119,7 +137,6 @@ def read_harness_event():
     return json.loads(raw)
 
 
-# 4. MAIN -- same decision call for every harness.
 def main() -> int:
     try:
         gate = _load_gate()
@@ -128,8 +145,8 @@ def main() -> int:
             f"common gate could not be loaded ({type(exc).__name__}: {exc})")
     try:
         raw = read_harness_event()
-        ev = to_event(gate, raw)
-        decision = gate.decide(ev, gate.GateProfile(**PROFILE))
+        event = to_event(gate, raw)
+        decision = gate.decide(event, gate.GateProfile(**PROFILE))
         return emit(decision)
     except BaseException as exc:
         return _emergency_block(
