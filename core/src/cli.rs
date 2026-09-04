@@ -172,7 +172,8 @@ enum GateCmd {
         wait: Option<u64>,
     },
 
-    /// Approve a governance write. Requires --reason; a deny does not.
+    /// Approve a governance write. Requires --reason; a PEER deny does not (but
+    /// withdrawing your OWN escalation does — see `deny`).
     Approve {
         /// Escalation id from the deny text
         escalation_id: String,
@@ -181,11 +182,19 @@ enum GateCmd {
         reason: String,
     },
 
-    /// Refuse a governance write
+    /// Refuse a governance write — or, aimed at your own escalation, WITHDRAW it.
+    ///
+    /// Those are two different acts through one verb, and they have different
+    /// requirements. Denying a PEER's ask needs no rationale: refusing is the
+    /// conservative default and should not be taxed. Withdrawing your OWN ask
+    /// REQUIRES --reason, because you are the only party who knows why the gate
+    /// fired on a command you are now dropping, and this is the only field where
+    /// that can be recorded. The daemon refuses a silent self-withdrawal; the
+    /// escalation stays pending, so just re-run with --reason.
     Deny {
         /// Escalation id from the deny text
         escalation_id: String,
-        /// Optional rationale
+        /// Why. Optional against a peer's ask; REQUIRED to withdraw your own.
         #[arg(long)]
         reason: Option<String>,
     },
