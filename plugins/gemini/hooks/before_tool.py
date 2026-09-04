@@ -1,577 +1,231 @@
 #!/usr/bin/env python3
-"""Hestia Phase-1 BeforeTool GATE for a foreign member (Google Gemini CLI) - reference adapter.
+"""Gemini CLI -> Hestia common-gate shim.
 
-Adapted from the Codex/Kimi reference gates. Gemini's hook engine is INDEPENDENT lineage (its own
-Before*/After* event vocabulary), but its wire protocol is concept-parallel to the Claude lineage
-and, per Google's official hooks reference, near-identical in the fields this gate needs:
+CERTIFIED SHIM CONTRACT: this file contains only authority bootstrap, profile data,
+harness syntax translation, and Gemini's documented response rendering.  It contains no
+policy, classification, scope logic, enforcement mode, escalation sequencing, or recorder.
 
-  - Base stdin JSON carries `session_id`, `transcript_path`, `cwd`, `hook_event_name`, `timestamp`.
-  - `BeforeTool` adds `tool_name` (string) and `tool_input` (object, the raw model arguments).
-  - Exit-code contract (SOURCE-VERIFIED from packages/core/src/hooks/hookRunner.ts@main,
-    convertPlainTextToHookOutput L537-560 + close-handler L434-506; NOT just the docs):
-      * exit 0  -> {decision:'allow'}                         (allow)
-      * exit 1  (EXIT_CODE_NON_BLOCKING_ERROR) -> {decision:'allow', systemMessage:'Warning: '+text}
-                (a NON-blocking warning: the tool STILL RUNS - exit 1 is NOT a block)
-      * exit 2 or any other non-zero -> {decision:'deny', reason:text}   (BLOCK)
-      * timeout (default 60000ms, L36) or spawn error -> success:false, NO output -> FAIL OPEN
-    So the ONLY fail-open surface is a TIMEOUT or spawn error (hence CBP's ext4-not-/mnt/c note: a 9p
-    cold-load that exceeds the hook timeout fails open). A running gate that exits 2+ blocks.
-  - CRITICAL: a block requires EMITTED TEXT. The runner parses `stdout.trim() || stderr.trim()`
-    (L455); on exit 2 with EMPTY output, `output` is undefined and the call is NOT denied. So every
-    exit-2 path here writes a reason to stderr first.
-  - A stdout JSON `{"decision":"deny","reason":...}` at exit 0 ALSO blocks (L459-467). This gate uses
-    BOTH channels, split by cause - see "TWO DENY CHANNELS" below.
-
-TWO DENY CHANNELS (2026-07-28, CBP - answering nomad's UX finding from the Nomad live pass):
-Per-hook `success` is exactly `exitCode === 0` (close-handler), and `logHookExecution` prints a yellow
-operator banner - `Hook(s) [...] failed for event BeforeTool` - for every result with success=false.
-So an exit-2 deny is reported to the OPERATOR as a failed hook. It blocks correctly and the banner is
-a UI "user-feedback" event that never reaches the model, so this was never a safety bug. It was a
-SIGNAL bug: with exit-2-always, the banner fired identically for "boundary held", "gate crashed" and
-"gate timed out", so it carried no information and a real malfunction was invisible inside the noise.
-
-The obvious fix - move ALL denies to exit 0 + stdout JSON - was rejected, because the exit code is
-this gate's fail-closed anchor. On exit 2, ANY emitted text denies (unparseable text falls back to
-{decision:'deny'}). On exit 0, the verdict survives only if the JSON parses: a truncated, prefixed or
-otherwise corrupted payload falls back to {decision:'allow'} - corruption fails OPEN. Blanket-swapping
-would trade a cosmetic banner for a new fail-open surface on the one path that must never have one.
-
-So the channel is chosen by CAUSE, which is also what makes the banner informative again:
-  - POLICY deny (Gate-1a innate, Gate-1b scope/command-scope, an explicit governor verdict) -> exit 0
-    + stdout JSON. These are paths where the gate reached a decision and fully controls fd 1, so the
-    fail-open-on-corruption risk is bounded by _emit_verdict() below. Clean deny, no banner.
-  - ANOMALY (unparseable event, governor unreachable or inconclusive, any uncaught exception) ->
-    exit 2 + stderr, unchanged. Corruption here still falls back to deny.
-Net: the banner now means "the gate could not do its job", and a held boundary is silent. The gate's
-own deny text has always said "This is a boundary, not a failure" - the wire protocol now agrees.
-Tests assert the RUNNER's decision (tests/runner_decision.py), never the bare exit code, because
-under this split the exit code alone no longer distinguishes allow from deny.
-
-This gate is therefore FAIL-CLOSED BY CONSTRUCTION: it only ever exits 0 (a confirmed allow, or a
-policy deny carried in stdout JSON) or 2 (an anomaly, with text). It never exits 1, so it never emits
-an allow-with-warning by accident. That last claim is only true because main() wraps the whole gate in
-a deny-on-exception - an uncaught Python exception exits 1, which the engine reads as ALLOW. See main().
-
-FIDELITY NOTE (2026-07-22): the exit-code/deny/fail-open contract above is SOURCE-verified (file+lines
-cited) AND now LIVE-VERIFIED by CBP against an installed gemini-cli 0.52.0 with real model
-round-trips (forum/cbp-to-nomad-gemini-hook-contract-LIVE-VERIFIED-2026-07-22.md). Live additions:
-  - hook deny beats `--approval-mode yolo` - the hook layer sits before the policy engine;
-  - MCP calls fire BeforeTool as `mcp_<server>_<tool>` AND carry an `mcp_context` object
-    ({server_name, tool_name, command, args}) - use those fields, not string-parsing (see
-    to_claude_lineage);
-  - `hooksConfig.enabled` defaults true but is a one-line kill-switch: install docs must pin it.
-The per-tool `tool_input` arg names are source-read from `tools/definitions/base-declarations.ts`
-(notably read_many_files = `include`/`exclude`, NOT `paths`) plus a defensive superset - because the
-gate is fail-closed, an unrecognized shape over-blocks (safe).
-ADAPTER-TIER LIVE PASS (CBP, 2026-07-22, forum/cbp-to-nomad-gemini-adapter-review-LIVE-VERIFIED-*):
-this gate was wired in as gemini-cli 0.52.0's real BeforeTool hook and fired with model round-trips.
-In-scope read allowed; out-of-scope read, ../ traversal, symlink escape, absolute oos, oos shell
-command, governor deny, and malformed JSON all denied exit 2 with the reason surfaced to the model.
-Confirmed live: read_file -> `file_path` (absolute), run_shell_command -> `command`. The pass also
-found the two holes closed here (ungated web_fetch egress; mcp_context unread by Gate-1). RE-FIRE
-(CBP, 2026-07-22, ...-LIVE-VERIFIED-re-fire-*): both verified live against 7e2d8f4; follow-on note
-folded in here - an HTTP/SSE MCP server's `url`/`cwd` (no command/args) is the same egress class,
-now swept by mcp_egress()/mcp_strings() and lifted into the governor handoff.
-Also live: gemini-cli natively confines FILE tools to the launch dir (+ --include-directories) and
-refuses .env - so for file paths this gate is layer 2. Shell, MCP and web egress have NO native
-layer, i.e. this gate is the ONLY thing between the model and them. That is the hardening priority.
-Gemini also has a NATIVE policy engine (docs/reference/policy-engine.md) + BeforeToolSelection/
-BeforeModel events; those are complementary (this gate is the BeforeTool scope+safety layer we own),
-not reinvented here.
-
-Config (all env-overridable; defaults suit a generic install):
-  HESTIA_WORKSPACE         root that contains the granted repos       (set explicitly at install)
-  HESTIA_SOCIETY_GATE      path to the society-safety gate caller      (default: $WORKSPACE/hestia/plugins/claude-code/hooks/pre_tool_use.py)
-  HESTIA_GEMINI_IDENTITY   the member's live identity.json             (default: ~/.gemini/hestia-instance/identity.json)
-  HESTIA_GEMINI_GATE_MODE  warn | enforce   (default: enforce - deny-tight, relax as trust accrues)
-  HESTIA_GEMINI_LAUNCH_CWD launch dir granted for the session          (default: os.getcwd())
-  HESTIA_FORBIDDEN_EXTRA   comma-separated extra forbidden path tokens (e.g. your private repo names)
+JUSTIFIED DIFFERENCES from the Claude-lineage shim:
+  * Gemini calls the event `BeforeTool` and uses different tool/argument names.
+  * Gemini exposes MCP transport metadata in `mcp_context`; this adapter preserves it and
+    translates command/argument spellings without judging them.
+  * Gemini's runner treats exit-0 JSON {decision:"deny"} as a clean policy block, while
+    exit 2 denotes a hook anomaly.  `emit` therefore uses JSON for decided policy denies and
+    stderr+2 for infrastructure/anomaly denies.  Both block the tool.
 """
-import contextlib
+from __future__ import annotations
+
+import importlib.util
 import json
 import os
 import re
 import sys
-import subprocess
-
-# Shared realpath-containment lib (hestia/plugins/lib/path_scope.py) - the one implementation of
-# Gate-1b, so every adapter's scope check is identical and hardened against ../ / symlink / absolute
-# escapes that string-prefix logic cannot see. This gemini gate is its first adopter; if it is absent
-# (partial checkout), we fall back to the inline string check, which still denies the bare-root case.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "lib"))
-# fd 1 is the VERDICT CHANNEL (see TWO DENY CHANNELS above): the runner JSON-parses stdout in
-# preference to stderr, so a single stray byte printed by an imported module would shadow a deny
-# payload and - at exit 0 - degrade it to an allow. Import under a redirect so nothing but
-# _emit_verdict() can ever reach stdout.
-with contextlib.redirect_stdout(sys.stderr):
-    try:
-        from path_scope import check_paths as _shared_check_paths  # type: ignore
-    except Exception:
-        _shared_check_paths = None
-
-# ── The shared engine, through the installed-only loader ─────────────────────────────────
-# BYTE-IDENTICAL to the codex/claude loader (#742/#747; asserted by the staging script, not
-# eyeballed): the loader is the one law-adjacent text that cannot itself be loaded from
-# shared authority. Gemini was the last seat without it, and its four private scope
-# predicates measured strictly FAIL-OPEN against the engine (scope_fork_differential_test,
-# 6 of 12 inputs SEAT GRANTS WHAT THE ENGINE DENIES: substring-home x2 [fleet-review
-# blocker 8], startswith-temp-root x2 [#169], lexical traversal x2 [#940 B5]). Loaded under
-# the same stdout redirect as path_scope above: fd 1 is the verdict channel, and a stray
-# byte printed by a module would shadow a deny payload into an allow.
-def _shared_runtime_dir():
-    return os.environ.get("HESTIA_SHARED_DIR") or os.path.join(
-        os.path.expanduser(os.environ.get("HESTIA_HOME", "~/.hestia")), "shared")
 
 
-def _load_shared_module(name):
-    """Load governing code only from the selected installed authority directory."""
-    import importlib.util
+# 1. AUTHORITY BOOTSTRAP -- byte-identical across certified shims.
+def _authority_dir() -> str:
+    if os.environ.get("HESTIA_GATE_TEST_MODE") == "1":
+        test_dir = os.environ.get("HESTIA_SHARED_DIR")
+        if test_dir:
+            return os.path.realpath(os.path.expanduser(test_dir))
+    return os.path.realpath(os.path.expanduser("~/.hestia/shared"))
 
-    shared = _shared_runtime_dir()
+
+def _load_gate():
+    name = "hestia_single_gate"
+    shared = _authority_dir()
     required = os.path.realpath(os.path.join(shared, name + ".py"))
     if not os.path.isfile(required):
-        raise ImportError(
-            f"installed Hestia shared module {name!r} is unavailable at {required!r}; "
-            "run deploy/install-members.sh"
-        )
-
-    # Shared modules legitimately import one another by bare canonical name. Make only
-    # the selected authority directory available to those imports; never add a checkout
-    # fallback. Canonicalize it so a HESTIA_HOME/shared symlink and its build directory
-    # cannot occupy two precedence positions.
-    selected_dir = os.path.dirname(required)
-    selected_key = os.path.normcase(selected_dir)
+        raise ImportError(f"installed common gate unavailable at {required!r}")
+    selected_key = os.path.normcase(shared)
     retained = []
     for entry in sys.path:
         try:
-            entry_key = os.path.normcase(os.path.realpath(os.fspath(entry) or os.getcwd()))
+            key = os.path.normcase(os.path.realpath(os.fspath(entry) or os.getcwd()))
         except (TypeError, ValueError, OSError):
             retained.append(entry)
             continue
-        if entry_key != selected_key:
+        if key != selected_key:
             retained.append(entry)
-    sys.path[:] = [selected_dir, *retained]
-
+    sys.path[:] = [shared, *retained]
     cached = sys.modules.get(name)
     if cached is not None:
-        cached_file = getattr(cached, "__file__", None)
-        if cached_file and os.path.realpath(cached_file) == required:
+        loaded = getattr(cached, "__file__", None)
+        if loaded and os.path.realpath(loaded) == required:
             return cached
         sys.modules.pop(name, None)
-
     spec = importlib.util.spec_from_file_location(name, required)
     if spec is None or spec.loader is None:
-        raise ImportError(f"cannot construct a loader for installed module {required!r}")
+        raise ImportError(f"cannot construct loader for {required!r}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     try:
         spec.loader.exec_module(module)
     except BaseException as exc:
         sys.modules.pop(name, None)
-        # This boundary is module INITIALIZATION only. Convert even SystemExit(0) into
-        # an ordinary loader failure so module-level callers reach the explicit
-        # fail-closed posture; main()'s legitimate allow/deny SystemExit remains outside.
-        raise ImportError(
-            f"installed Hestia shared module {name!r} failed to initialize"
-        ) from exc
-    loaded_file = getattr(module, "__file__", None)
-    if not loaded_file or os.path.realpath(loaded_file) != required:
+        raise ImportError("installed common gate failed to initialize") from exc
+    loaded = getattr(module, "__file__", None)
+    if not loaded or os.path.realpath(loaded) != required:
         sys.modules.pop(name, None)
         raise ImportError(
-            f"shared authority miswire: {name!r} resolved to {loaded_file!r}, "
-            f"expected {required!r}"
-        )
+            f"common gate authority miswire: loaded {loaded!r}, expected {required!r}")
     return module
 
 
-with contextlib.redirect_stdout(sys.stderr):
-    try:
-        _core = _load_shared_module("hestia_gate_core")
-    except Exception:
-        _core = None
-
-WORKSPACE = os.environ.get("HESTIA_WORKSPACE") or os.getcwd()
-IDENTITY = os.path.expanduser(
-    os.environ.get("HESTIA_GEMINI_IDENTITY", "~/.gemini/hestia-instance/identity.json"))
-_CORE_PROFILE = (_core.HarnessProfile(
-    member_id="gemini",
-    identity_path=IDENTITY,
-    home_markers=("~/.gemini",),
-    launch_cwd_env="HESTIA_GEMINI_LAUNCH_CWD",
-) if _core is not None else None)
-CLAUDE_PRE = os.environ.get(
-    "HESTIA_SOCIETY_GATE",
-    os.path.join(WORKSPACE, "hestia/plugins/claude-code/hooks/pre_tool_use.py"))
-
-# Innate egress/secret invariants - denied even inside a granted repo. Trust never relaxes these (S1).
-FORBIDDEN = ("/.ssh", ".env", "credentials", "id_rsa", "id_ed25519", "/.git/config", "secrets") + tuple(
-    t.strip() for t in os.environ.get("HESTIA_FORBIDDEN_EXTRA", "").split(",") if t.strip())
-
-# Gemini builtin LOCAL read-class tools (no write, no exec, no network) - they may skip Gate-2.
-READ_CLASS = {"read_file", "read_many_files", "glob", "search_file_content", "list_directory"}
-
-# Egress tools. These READ, but they read the *network* - and egress is the irreversible direction
-# (a prompt-injected `web_fetch` is exfiltration). They were in READ_CLASS, which skipped Gate-2, so
-# on gemini - which has no sandbox behind the gate - egress never met the governor at all.
-# They are NOT writes to the filesystem, so Gate-1b must not treat them as such (see for_write below).
-EGRESS_CLASS = {"google_web_search", "web_fetch"}
-
-# The agent's own home is always in scope (state, identity, config).
-GEMINI_HOME = os.path.expanduser("~/.gemini")
+def _emergency_block(reason: str) -> int:
+    sys.stderr.write("hestia: deny [gate.unavailable] - " + reason + "\n")
+    return 2
 
 
-def load_in_scope():
-    """Return no standing grants from the continuity replica.
-
-    identity.json is member-writable continuity, not authorization. The shared daemon
-    policy is authoritative; until this reference adapter consumes that snapshot directly,
-    standing scope remains deny-tight. The explicit launch directory remains a per-session
-    operator choice rather than a public-source grant.
-    """
-    return []
-
-
-def _launch_grant():
-    """Engine's launch-grant rule; the local copy judged WORKSPACE by SUBSTRING.
-    Engine absent: no dynamic grant, the tighter direction."""
-    if _core is None or _CORE_PROFILE is None:
-        return []
-    return _core.launch_cwd_repo(_CORE_PROFILE, WORKSPACE)
+# 2. PROFILE DATA -- context, never law.
+PROFILE = {
+    "member_id": "gemini",
+    "identity_path": os.path.expanduser("~/.gemini/hestia-instance/identity.json"),
+    "home_markers": ("~/.gemini",),
+    "host_agent": "gemini",
+    "client_name": "hestia-gemini-gate",
+    "gate_path": os.path.abspath(__file__),
+    "observe_dir": "~/.gemini/hestia-observe",
+}
 
 
+# 3. HARNESS SYNTAX ADAPTERS.
+_TOOL = {
+    "run_shell_command": "Shell",
+    "write_file": "Write",
+    "replace": "Edit",
+    "read_file": "Read",
+    "read_many_files": "Read",
+    "glob": "Glob",
+    "search_file_content": "Grep",
+    "list_directory": "Read",
+    "web_fetch": "WebFetch",
+    "google_web_search": "WebSearch",
+}
+_ARG = {"absolute_path": "file_path", "dir_path": "path"}
 
 
-def command_of(tool_input):
-    """Gemini's run_shell_command passes the command string under tool_input.command."""
-    if isinstance(tool_input, dict):
-        c = tool_input.get("command")
-        if isinstance(c, str):
-            return c
-        if isinstance(c, list):
-            return " ".join(str(x) for x in c)
-    return None
-
-
-def _strings(v, depth=0):
-    """Every string leaf of an arbitrarily-shaped value (bounded depth). Used to sweep free-text and
-    MCP argument objects, whose shape is the *server's*, not ours - we cannot enumerate their keys."""
-    if isinstance(v, str):
-        return [v]
+def _string_leaves(value, depth=0):
+    if isinstance(value, str):
+        return [value]
     if depth > 4:
         return []
-    if isinstance(v, (list, tuple)):
-        return [s for x in v for s in _strings(x, depth + 1)]
-    if isinstance(v, dict):
-        return [s for x in v.values() for s in _strings(x, depth + 1)]
+    if isinstance(value, (list, tuple)):
+        return [s for item in value for s in _string_leaves(item, depth + 1)]
+    if isinstance(value, dict):
+        return [s for item in value.values() for s in _string_leaves(item, depth + 1)]
     return []
 
 
-def egress_targets(tool_input):
-    """The network tools' arguments: `url` (web_fetch), free-text `prompt`, `query`.
+def to_event(gate, raw):
+    if not isinstance(raw, dict) or raw.get("hook_event_name") != "BeforeTool":
+        raise ValueError("expected Gemini BeforeTool event")
+    native_tool = raw.get("tool_name")
+    native_input = raw.get("tool_input")
+    if not isinstance(native_tool, str) or not native_tool:
+        raise ValueError("BeforeTool event has no tool_name")
+    if not isinstance(native_input, dict):
+        raise ValueError("BeforeTool event has non-object tool_input")
 
-    These must be swept by Gate-1a - a secret is laundered out *inside* a URL or a prompt, and the
-    GEMINI.md promise ("you cannot launder a secret out through ... a web fetch") is only true if the
-    innate denylist actually looks at them. They must NOT be fed to Gate-1b: realpath containment on
-    `https://...` resolves under cwd and would deny every fetch, so egress rests on Gate-1a + Gate-2.
-    """
-    out = []
-    if isinstance(tool_input, dict):
-        for k in ("url", "urls", "prompt", "query"):
-            out.extend(_strings(tool_input.get(k)))
-    return out
+    ti = {_ARG.get(k, k): v for k, v in native_input.items()}
+    if "file_path" not in ti and "path" not in ti:
+        include = native_input.get("include")
+        if isinstance(include, list) and include and isinstance(include[0], str):
+            ti["path"] = include[0]
 
-
-def mcp_strings(mcp):
-    """The MCP transport surface: `mcp_context` = {server_name, tool_name, command, args}.
-
-    An `mcp_<server>_<tool>` call's `tool_input` is the *server's* argument object, so path_targets()
-    and command_of() see nothing they recognize - Gate-1a and command-scope were blind to MCP
-    arguments entirely (live-confirmed by CBP 2026-07-22: an out-of-scope path inside
-    `mcp_context.args` passed Gate-1). Sweep the transport command and every string leaf of args.
-    """
-    if not isinstance(mcp, dict):
-        return []
-    # `cwd` is the server's launch dir - a real local path, so it belongs to command/path scope
-    # alongside command+args. `url` does NOT: it's a network endpoint (see mcp_egress), scoping it
-    # against local repo names only mis-fires. LIVE-VERIFIED shape carries cwd/url on HTTP/SSE servers.
-    return _strings(mcp.get("command")) + _strings(mcp.get("args")) + _strings(mcp.get("cwd"))
-
-
-def mcp_egress(mcp):
-    """An HTTP/SSE MCP server is reached by `url` (extractMcpContext: `serverConfig.url ?? httpUrl`),
-    carrying NO command/args - a live egress surface with the same shape as web_fetch's url. A member
-    pointed at an out-of-scope HTTP MCP endpoint would otherwise sail past Gate-1 entirely (CBP note,
-    2026-07-22). Swept by Gate-1a for secrets and handed to the governor; NOT command-scoped, because
-    a URL is not a local path and repo-name matching on it only produces false denies."""
-    if not isinstance(mcp, dict):
-        return []
-    return _strings(mcp.get("url"))
-
-
-def dedupe(seq):
-    """Order-preserving unique. `scopes` is identity-grant + launch-cwd-grant, which collide whenever
-    the member is launched inside a repo it already holds - live denies printed "scope (web4+web4)"
-    and listed the same root twice in the path_scope reason."""
-    seen, out = set(), []
-    for s in seq:
-        if s and s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
-
-
-# Gemini's event vocabulary -> the Claude-lineage names the society gate dispatches on. The governor
-# (plugins/claude-code/hooks/pre_tool_use.py) extracts its target from `file_path`/`path`/`url`/
-# `notebook_path`, and only reads `command` when tool_name is in {"Bash","Shell"}. Gemini emits none
-# of those names, so an UNTRANSLATED handoff gave the governor target=None for every shell command -
-# it was consulted, but blind. Translate at the boundary; the gate stays the lineage adapter.
-LINEAGE_TOOL = {"run_shell_command": "Shell", "write_file": "Write", "replace": "Edit",
-                "read_file": "Read", "read_many_files": "Read", "glob": "Glob",
-                "search_file_content": "Grep", "list_directory": "Read",
-                "web_fetch": "WebFetch", "google_web_search": "WebSearch"}
-LINEAGE_ARG = {"absolute_path": "file_path", "dir_path": "path"}
-
-
-def to_claude_lineage(event, tool, tinput, mcp):
-    """Re-shape a Gemini BeforeTool event into the Claude-lineage shape the governor understands.
-
-    Kept lossless: the original gemini fields ride along under `source_event` so the daemon can
-    witness what actually happened, and `mcp_context` (LIVE-VERIFIED present on gemini 0.52.0 MCP
-    calls, CBP 2026-07-22) is used for MCP naming instead of parsing `mcp_<server>_<tool>` - the
-    string form is ambiguous when a server or tool name itself contains an underscore.
-    """
-    out = dict(event)
-    if mcp and isinstance(mcp.get("server_name"), str):
-        out["tool_name"] = f"mcp__{mcp['server_name']}__{mcp.get('tool_name') or '?'}"
-        # command+args are the server's real egress surface - hand them to the governor explicitly.
-        out["mcp_server_command"] = " ".join(
-            [str(mcp.get("command") or "")] + [str(a) for a in (mcp.get("args") or [])]).strip()
-    else:
-        out["tool_name"] = LINEAGE_TOOL.get(tool.lower(), tool)
-    if isinstance(tinput, dict):
-        ti = {LINEAGE_ARG.get(k, k): v for k, v in tinput.items()}
-        # `include` is a glob LIST; the governor wants one string target.
-        if "file_path" not in ti and "path" not in ti:
-            inc = tinput.get("include")
-            if isinstance(inc, list) and inc and isinstance(inc[0], str):
-                ti["path"] = inc[0]
-        # web_fetch carries its URLs INSIDE the free-text `prompt`; lift the first one to `url` so the
-        # governor's egress check sees a real target instead of None. The prompt is preserved as-is.
-        if "url" not in ti:
-            m = re.search(r"https?://[^\s\"'<>)]+", str(tinput.get("prompt") or ""))
-            if m:
-                ti["url"] = m.group(0)
-        # An HTTP/SSE MCP server has no command/args - its egress target is `mcp_context.url`. Lift it
-        # so the governor sees a real url instead of None (same fix as run_shell_command's target).
-        if "url" not in ti and mcp and isinstance(mcp.get("url"), str) and mcp["url"]:
+    mcp = raw.get("mcp_context")
+    if isinstance(mcp, dict):
+        ti["_hestia_mcp_context"] = mcp
+        server = mcp.get("server_name")
+        tool = mcp.get("tool_name")
+        canonical_tool = (
+            f"mcp__{server}__{tool or '?'}" if isinstance(server, str) and server
+            else _TOOL.get(native_tool.lower(), native_tool)
+        )
+        # MCP command/args/cwd are local execution/reach syntax.  Preserve all of them in the
+        # canonical command field so the common command-scope rule, not this adapter, judges it.
+        parts = []
+        existing = ti.get("command")
+        if isinstance(existing, str):
+            parts.append(existing)
+        elif isinstance(existing, list):
+            parts.extend(str(x) for x in existing)
+        parts.extend(_string_leaves(mcp.get("command")))
+        parts.extend(_string_leaves(mcp.get("args")))
+        parts.extend(_string_leaves(mcp.get("cwd")))
+        if parts:
+            ti["command"] = " ".join(parts)
+        if "url" not in ti and isinstance(mcp.get("url"), str) and mcp.get("url"):
             ti["url"] = mcp["url"]
-        out["tool_input"] = ti
-    out["source_event"] = {"lineage": "gemini", "tool_name": tool, "tool_input": tinput,
-                           "mcp_context": mcp}
-    return out
+    else:
+        canonical_tool = _TOOL.get(native_tool.lower(), native_tool)
+
+    # Gemini web_fetch may encode the target URL only inside its prompt.  Lift the spelling;
+    # whether the target is allowed remains entirely the common gate's decision.
+    if canonical_tool == "WebFetch" and "url" not in ti:
+        match = re.search(r"https?://[^\s\"'<>)]+", str(native_input.get("prompt") or ""))
+        if match:
+            ti["url"] = match.group(0)
+
+    canonical_raw = dict(raw)
+    canonical_raw["source_event"] = {
+        "lineage": "gemini",
+        "tool_name": native_tool,
+        "tool_input": native_input,
+        "mcp_context": mcp,
+    }
+    return gate.GateEvent(
+        tool=canonical_tool,
+        tool_input=ti,
+        cwd=raw.get("cwd") if isinstance(raw.get("cwd"), str) else None,
+        session_id=raw.get("session_id") if isinstance(raw.get("session_id"), str) else None,
+        tool_use_id=(raw.get("tool_use_id") if isinstance(raw.get("tool_use_id"), str) else None),
+        raw=canonical_raw,
+    )
 
 
+def emit(decision) -> int:
+    text = f"hestia: {decision.decision} [{decision.rule or 'gate'}]"
+    if decision.reason:
+        text += " - " + decision.reason
+    if decision.remedy:
+        text += ". " + decision.remedy
+    if decision.decision == "deny":
+        if decision.anomaly:
+            # Gemini runner: nonzero+text is the corruption-resistant anomaly deny channel.
+            sys.stderr.write(text + "\n")
+            return 2
+        # Gemini runner: a decided policy deny is a clean exit-0 JSON block.
+        sys.stdout.write(json.dumps({"decision": "deny", "reason": text}, ensure_ascii=True))
+        return 0
+    if decision.decision == "warn":
+        sys.stderr.write(text + "\n")
+    return 0
 
 
-def _scope_path(path, scopes):
-    """Engine's path predicate (normalise first, containment at the boundary). This is the
-    FALLBACK arm behind path_scope's realpath containment, and the fallback is exactly where
-    the fail-opens lived: it only runs on a partial checkout, the least-reviewed state.
-    Engine absent: out of scope -- Gate-1b's fail-closed direction."""
-    if _core is None or _CORE_PROFILE is None:
-        return False
-    return _core.path_in_scope(path, scopes, WORKSPACE, _CORE_PROFILE, cwd=os.getcwd())
+def read_harness_event():
+    raw = sys.stdin.read()
+    if not raw:
+        raise ValueError("empty hook event")
+    return json.loads(raw)
 
 
-def _scope_command(cmd, scopes):
-    """Engine's command predicate; the local copy consulted a lexical repo list and judged
-    the workspace by substring. Engine absent: out of scope, fail closed."""
-    if _core is None:
-        return False
-    ok, _tok = _core.command_in_scope(cmd, scopes, WORKSPACE, cwd=os.getcwd())
-    return ok
-
-
-# Rollout mode: DENY-TIGHT by default - a foreign agent starts enforced and RELAXES as role-scoped
-# trust accrues (defensive trust: start at zero, earn the widening). Egress/secret is `innate` -
-# always blocks regardless of mode. Set warn via HESTIA_GEMINI_GATE_MODE=warn only while shaking down.
-MODE = os.environ.get("HESTIA_GEMINI_GATE_MODE", "enforce").lower()
-
-
-def _emit_verdict(reason):
-    """POLICY-deny channel: write the runner's decision object as the ONLY bytes on fd 1.
-
-    Written with os.write in a full-write loop rather than print(): a short write would truncate the
-    JSON, and truncated JSON at exit 0 is an ALLOW (convertPlainTextToHookOutput's exit-0 branch).
-    ensure_ascii keeps the payload single-byte so a non-ASCII reason cannot straddle a partial write.
-    The caller exits 0 immediately after - there is no code path between this write and the exit.
-    """
-    blob = json.dumps({"decision": "deny", "reason": reason}, ensure_ascii=True).encode("ascii")
-    written = 0
-    while written < len(blob):
-        written += os.write(1, blob[written:])
-
-
-def deny(reason, what_to_do, innate=False):
-    """A POLICY deny: the gate reached a verdict. innate=True -> ALWAYS blocks (egress/secret is
-    irreversible); tunable rules honor MODE.
-
-    Exits 0 with a stdout JSON deny, NOT exit 2 - a held boundary is not a hook failure, and reserving
-    exit 2 for anomalies is what gives the operator's banner its meaning back (TWO DENY CHANNELS).
-    The reason text is unchanged and still reaches the model, now as `reason` on the decision object
-    instead of as scraped stderr."""
-    if innate or MODE == "enforce":
-        _emit_verdict(
-            f"hestia: deny [scope] - {reason}. This is a boundary, not a failure: don't re-run the "
-            f"same call. {what_to_do} Asking is a trust-building act; reaching is witnessed.")
-        sys.exit(0)
-    sys.stderr.write(f"hestia: warn [scope] - {reason} (warn-rollout: allowed; would block under enforce)\n")
-
-
-def anomaly(reason):
-    """The ANOMALY channel: the gate could NOT reach a verdict (unreadable event, unreachable or
-    inconclusive governor, crash). Keeps exit 2 + stderr, where the runner denies on ANY emitted text
-    - so corruption of this message still fails closed - and raises the operator banner, which now
-    means what it says: the gate could not do its job."""
-    sys.stderr.write(reason if reason.endswith("\n") else reason + "\n")
-    sys.exit(2)
-
-
-def _gate():
-    # fd 1 is the verdict channel and nothing else. Rebinding sys.stdout means a stray print() added
-    # here later lands on stderr (ignored whenever stdout carries a verdict) instead of shadowing the
-    # deny payload. Only _emit_verdict(), which writes fd 1 directly, can reach stdout.
-    sys.stdout = sys.stderr
-    # Fail-closed skeleton: any unexpected error -> deny (never fall through to allow).
+# 4. MAIN -- same decision call for every harness.
+def main() -> int:
     try:
-        event = json.loads(sys.stdin.read() or "{}")
-    except Exception:
-        # ANOMALY, not policy: an unreadable event means the gate never got to judge the act.
-        anomaly("hestia: deny [gate] - could not parse the tool event; failing closed.")
-
-    if event.get("hook_event_name") != "BeforeTool":
-        sys.exit(0)  # not our event
-
-    # Slice 5: reach extraction lives in the engine, so an absent engine would return no
-    # paths and Gate-1b would silently judge nothing. That is a bypass, not a degrade —
-    # an ANOMALY deny in enforce mode, same class as an unreadable event.
-    if _core is None and MODE == "enforce":
-        anomaly("hestia: deny [gate] - shared engine unavailable (no reach extraction); failing closed.")
-
-    raw_tool = event.get("tool_name")
-    tool = raw_tool if isinstance(raw_tool, str) and raw_tool else "?"
-    tinput = event.get("tool_input") or {}
-    mcp = event.get("mcp_context") if isinstance(event.get("mcp_context"), dict) else None
-    cwd = event.get("cwd") or os.environ.get("HESTIA_GEMINI_LAUNCH_CWD") or os.getcwd()
-    scopes = dedupe(load_in_scope() + _launch_grant())
-    paths = _core.path_targets(tool, tinput)
-    cmd = command_of(tinput)
-    egress = egress_targets(tinput) + mcp_egress(mcp)  # url/prompt/query + HTTP-MCP url: Gate-1a only
-    mcp_args = mcp_strings(mcp)          # the MCP transport surface Gate-1 could not see (command+args+cwd)
-
-    # Gate 1a - egress/secret innate invariant (denied even inside a granted repo). ALWAYS enforced.
-    # The sweep covers every channel a secret can leave by: file paths, the shell command, the
-    # network tools' url/prompt/query, and MCP arguments. Anything added here must be added there.
-    for blob in paths + egress + mcp_args + ([cmd] if cmd else []):
-        if any(f in blob.lower() for f in FORBIDDEN):
-            deny(f"'{tool}' names a forbidden target (secret/credential or out-of-MRH private repo)",
-                 "There is no in-scope way to do this; it is not yours to touch.", innate=True)
-
-    # Gate 1b - MRH scope. File paths use path-scope; shell commands use command-scope.
-    if paths:
-        if _shared_check_paths is not None:
-            # Hardened realpath containment via the shared lib. Roots = granted repos + agent home +
-            # tmp, all absolute. It denies ../ / symlink / absolute escapes that the string check can't.
-            roots = [os.path.join(WORKSPACE, s) for s in scopes] + [GEMINI_HOME, "/tmp", "/var/tmp"]
-            is_write = tool.lower() not in READ_CLASS and tool.lower() not in EGRESS_CLASS
-            res = _shared_check_paths(paths, roots, cwd, for_write=is_write)
-            if not res.allowed:
-                deny(f"'{tool}': {res.reason}",
-                     "Adjust to work within scope, or if legitimately needed, request it (request_scope).")
-        else:
-            for p in paths:
-                if not _scope_path(p, scopes):
-                    deny(f"'{tool}' targets '{p[:60]}' outside your granted scope ({'+'.join(scopes)})",
-                         "Adjust to work within scope, or if legitimately needed, request it (request_scope).")
-    # Command-scope covers the shell command AND the MCP transport (its command + args are a real
-    # exec surface: an oos root handed to a filesystem server is an oos read the file gates never see).
-    for c in ([cmd] if cmd is not None else []) + mcp_args:
-        if not _scope_command(c, scopes):
-            where = "command" if c == cmd else "mcp_context argument"
-            deny(f"'{tool}' {where} reaches outside your granted scope ({'+'.join(scopes)})",
-                 "Scope it to a granted repo, or if legitimately needed, request it (request_scope).")
-
-    # Gate 2 - society safety (the governor). Local-read-class skips it; write/exec AND EGRESS need
-    # the daemon's verdict; fail closed.
-    if tool.lower() not in READ_CLASS:
-        # A governor that isn't there is an ANOMALY, and it has to be detected BEFORE the spawn:
-        # `python3 /nonexistent/governor.py` exits 2 with text on stderr, which is byte-for-byte the
-        # shape of a real governor verdict. Without this check the missing-daemon case would report
-        # as a clean policy deny - it would still block, but it would block silently, hiding exactly
-        # the malfunction the banner exists to show. (Caught by gate_holes_repro.sh, whose governor
-        # is a nonexistent path on purpose.)
-        if not os.path.isfile(CLAUDE_PRE):
-            if MODE == "enforce":
-                anomaly(f"hestia: deny [safety] - the society safety gate is not at {CLAUDE_PRE}; "
-                        "failing closed on a consequential act.")
-            sys.stderr.write("hestia: warn [safety] - governor missing (warn-rollout: allowed).\n")
-            sys.exit(0)
-        try:
-            env = dict(os.environ, HESTIA_PLUGIN_ID="gemini-cli", HESTIA_PRE_FAIL_CLOSED="1")
-            r = subprocess.run([sys.executable, CLAUDE_PRE], input=json.dumps(to_claude_lineage(event, tool, tinput, mcp)),
-                               capture_output=True, text=True, timeout=6, env=env)
-            if r.returncode != 0:  # daemon denied, or inconclusive -> fail-closed for a write/exec act
-                # Split by which of the two it was. returncode 2 WITH a reason is the governor's own
-                # verdict - a policy deny, carried on the clean channel. Anything else (a crash, a
-                # deny with no reason, an unexpected code) is inconclusive: the governor did not
-                # actually vouch either way, so it takes the anomaly channel and raises the banner.
-                # `[fail-closed]` is the governor's OWN no-verdict marker (claude-code
-                # pre_tool_use.deny_no_verdict): it exits 2 like a verdict but means the policy daemon
-                # was unreachable, so it is an anomaly here too - the operator should see that.
-                text = r.stderr.strip()
-                verdict = text if (r.returncode == 2 and text
-                                   and "[fail-closed]" not in text) else None
-                if MODE == "enforce":
-                    if verdict:
-                        _emit_verdict(verdict)
-                        sys.exit(0)
-                    anomaly(text or "hestia: deny [safety] - blocked/inconclusive at the society "
-                                    "safety gate.")
-                msg = text or "hestia: deny [safety] - blocked/inconclusive at the society safety gate."
-                sys.stderr.write("hestia: warn [safety] - " + msg.split("- ", 1)[-1] +
-                                 " (warn-rollout: allowed; would block under enforce)\n")
-        except Exception:          # SystemExit is a BaseException: the verdicts above pass through
-            if MODE == "enforce":
-                anomaly("hestia: deny [safety] - could not reach the governor; failing "
-                        "closed on a consequential act.")
-            sys.stderr.write("hestia: warn [safety] - governor unreachable (warn-rollout: allowed).\n")
-
-    sys.exit(0)  # the ONLY allow path - reached only after every gate explicitly passed
-
-
-def main():
-    """Top-level deny-on-exception.
-
-    LIVE-VERIFIED (CBP, gemini-cli 0.52.0, 2026-07-22): exit 1 is ALLOW+warning, and an uncaught
-    Python exception exits 1. So without this wrapper a crashing fail-closed gate silently OPENS -
-    confirmed here by repro (`tool_name` non-string -> AttributeError -> exit 1 -> tool ran).
-    SystemExit must pass through untouched: it carries the gate's real verdict - which since the
-    two-channel split is exit 0 for a policy deny (payload already on stdout) as well as for an
-    allow, so this handler must never re-interpret an exit code it did not raise itself.
-    A crash IS an anomaly, so the wrapper's own deny stays on the exit-2 stderr channel: if the crash
-    happened mid-payload, the partial JSON on stdout is unparseable, and unparseable text at exit 2
-    falls back to deny. That is exactly why the anomaly channel kept the exit code.
-    """
+        gate = _load_gate()
+    except BaseException as exc:
+        return _emergency_block(
+            f"common gate could not be loaded ({type(exc).__name__}: {exc})")
     try:
-        _gate()
-    except SystemExit:
-        raise                      # the gate's own verdict - never reinterpret it
-    except BaseException as exc:   # incl. KeyboardInterrupt/MemoryError: still a consequential act
-        sys.stderr.write(
-            f"hestia: deny [gate] - the gate crashed ({type(exc).__name__}: {str(exc)[:200]}) and "
-            f"cannot vouch for this call; failing closed. This is a boundary, not a failure.\n")
-        sys.exit(2)
+        raw = read_harness_event()
+        ev = to_event(gate, raw)
+        decision = gate.decide(ev, gate.GateProfile(**PROFILE))
+        return emit(decision)
+    except BaseException as exc:
+        return _emergency_block(
+            f"shim could not translate/emit the event ({type(exc).__name__}: {exc})")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
