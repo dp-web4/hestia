@@ -10157,6 +10157,108 @@ mod tests {
         );
     }
 
+    /// A finding opened before a restart can still be CLOSED after it.
+    ///
+    /// GPT blocker on #898, and the sequence is only reachable because opening and repairing
+    /// happen in the same pass: miswire detected, opening row written, artifact repaired, daemon
+    /// restarts, in-memory state gone, next pass sees a clean artifact and has nothing to close.
+    /// The chain is then left asserting a finding that is permanently open, for drift that was
+    /// fixed before the restart.
+    ///
+    /// The state is rebuilt from the chain at `ServerState::open`, so this arm reconstructs the
+    /// state over the same home rather than reusing the handle — a test that kept the in-memory
+    /// map would pass without the fix and prove nothing.
+    #[tokio::test]
+    async fn a_finding_opened_before_a_restart_is_resolved_after_it() {
+        use super::super::seat_config as sc;
+        let dir = TempDir::new().unwrap();
+        let member = "claude-code".to_string();
+        let one = std::slice::from_ref(&member);
+        let cfg = serde_json::json!({"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""});
+        let vpath = dir.path().join("v.enc");
+
+        let open_state = |first: bool| {
+            let vault = if first {
+                let mut v = Vault::init(vpath.clone(), "p".into()).unwrap();
+                v.add(crate::vault::VaultEntry::new(
+                    "ai_identity_secret",
+                    hex::encode(web4_core::crypto::KeyPair::generate().secret_key_bytes()),
+                ))
+                .unwrap();
+                v
+            } else {
+                Vault::open(vpath.clone(), "p".into()).unwrap()
+            };
+            super::super::state::ServerState::open(vault, dir.path(), "p").unwrap()
+        };
+
+        // ---- first daemon run: declare config, render, then break it so a finding opens.
+        let (opened_rows, path) = {
+            let mut s = open_state(true);
+            s.vault
+                .put_document(sc::SEAT_CONFIG_NS, &member, serde_json::to_vec(&cfg).unwrap())
+                .unwrap();
+            super::render_and_verify_seat_configs(&mut s, one); // Missing -> renders
+            super::render_and_verify_seat_configs(&mut s, one); // Verified
+            let path = sc::render_path(dir.path(), &member);
+            let good = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, good.replace("/w/ai", "/elsewhere")).unwrap();
+
+            let before = s.chain_store.len().unwrap();
+            let v = super::render_and_verify_seat_configs(&mut s, one);
+            assert!(
+                matches!(v.first(), Some(sc::ConfigVerdict::Miswired { .. })),
+                "the edit opens a finding: {v:?}"
+            );
+            let after = s.chain_store.len().unwrap();
+            assert!(
+                s.config_findings_open.contains_key(&member),
+                "the finding is open in the first run"
+            );
+            (after - before, path)
+        };
+        assert_eq!(opened_rows, 1, "exactly one opening row");
+        // The same pass repaired the artifact. THIS is what makes the restart lossy without
+        // rehydration: there is no longer anything on disk to re-detect.
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("/w/ai"),
+            "the opening pass also repaired, which is why the next run sees clean"
+        );
+
+        // ---- restart: a brand new ServerState over the same home.
+        let mut s2 = open_state(false);
+        assert!(
+            s2.config_findings_open.contains_key(&member),
+            "the open finding is rebuilt from the chain, not lost with the process"
+        );
+
+        let before = s2.chain_store.len().unwrap();
+        let v = super::render_and_verify_seat_configs(&mut s2, one);
+        let after = s2.chain_store.len().unwrap();
+        assert!(
+            matches!(v.first(), Some(sc::ConfigVerdict::Verified { .. })),
+            "the artifact is clean after the restart: {v:?}"
+        );
+        assert_eq!(
+            after - before,
+            1,
+            "exactly one resolution row, so the chain does not keep asserting an open finding"
+        );
+        assert!(
+            !s2.config_findings_open.contains_key(&member),
+            "and the finding is closed"
+        );
+
+        // A further pass must not write a second resolution: closing is an edge too.
+        let before = s2.chain_store.len().unwrap();
+        super::render_and_verify_seat_configs(&mut s2, one);
+        assert_eq!(
+            s2.chain_store.len().unwrap(),
+            before,
+            "a clean seat with no open finding writes nothing at all"
+        );
+    }
+
     /// Vault content that cannot be rendered IS a finding, even with nothing on disk.
     ///
     /// The third case, and the one that keeps the "no config, no artifact" skip from being

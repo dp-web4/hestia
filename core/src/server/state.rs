@@ -253,9 +253,18 @@ pub struct ServerState {
     /// The edge, not the level. A stateless check can only ever report "miswired again" on every
     /// pass, which makes the chain a function of the poll interval, and it can never report the
     /// close — so drift has no duration and a fixed one is indistinguishable from an unexamined
-    /// one (GPT review of #898, finding 3). Present here rather than in the vault because it is
-    /// observation bookkeeping, not authority: losing it on restart re-opens the finding, which
-    /// is the safe direction.
+    /// one (GPT review of #898, finding 3).
+    ///
+    /// DERIVED FROM THE CHAIN, REBUILT AT OPEN. It stays observation bookkeeping rather than
+    /// vault authority — the chain already records both edges, so it is the source, and a second
+    /// durable copy could drift from it. But it must be RECONSTRUCTED, not started empty.
+    ///
+    /// An earlier version of this comment said losing the map on restart "re-opens the finding,
+    /// which is the safe direction". That was wrong, and wrong in the unsafe direction: the pass
+    /// that opens a finding also repairs the artifact, so after a restart the next pass sees a
+    /// clean file, has no memory of anything open, and writes no resolution. Nothing re-opens.
+    /// The chain is simply left asserting a finding that is permanently open, for drift that was
+    /// fixed before the restart (GPT blocker on #898).
     pub config_findings_open: HashMap<String, u64>,
     /// In-scope work awaiting attestation, keyed by (plugin_id, role_lct) → (allows, denies).
     ///
@@ -637,7 +646,11 @@ impl ServerState {
 
         let mut st = Self {
             gate_capabilities: HashMap::new(),
-            config_findings_open: HashMap::new(),
+            // REBUILT FROM THE CHAIN, not started empty. Starting empty loses the ability to
+            // close any finding opened before this restart, because the pass that opened it
+            // also repaired the artifact — so the next pass sees clean, has nothing to close,
+            // and the chain keeps asserting an open finding forever.
+            config_findings_open: crate::server::seat_config::rehydrate_open_findings(&chain_store),
             scope_tally: std::collections::HashMap::new(),
             vault,
             sessions: HashMap::new(),

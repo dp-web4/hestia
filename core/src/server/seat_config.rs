@@ -234,6 +234,78 @@ pub fn verify_one(home: &Path, member: &str, cfg: &SeatConfig) -> ConfigVerdict 
     }
 }
 
+/// The three chain event types this module writes. Kept beside `chain_event()` so the writer
+/// and the reader cannot drift apart: a new event name added there without adding it here would
+/// make findings that can be opened but never rehydrated.
+pub const FINDING_EVENT_TYPES: [&str; 3] = [
+    "config_miswire",
+    "config_integrity_finding",
+    "config_integrity_resolved",
+];
+
+/// How many config events to look back over when rebuilding open findings at startup.
+///
+/// Bounded, and the bound is honest: a finding older than this many CONFIG events, with nothing
+/// newer for the same member, is not rehydrated and its resolution row is lost. The filter is by
+/// event type, so this is a walk over config history rather than over the chain — on this box
+/// that is a few hundred rows against ~160k entries.
+pub const REHYDRATE_SCAN_LIMIT: u64 = 10_000;
+
+/// Rebuild "which members currently have an open config finding" from the chain.
+///
+/// WHY THIS EXISTS (GPT blocker on #898, after the three-state fix). `config_findings_open` is
+/// memory-only, and the pass that OPENS a finding also REPAIRS the artifact. So:
+///
+///   miswire detected -> opening row on the chain -> artifact repaired -> daemon restarts
+///   -> in-memory state gone -> next pass sees a clean artifact -> no resolution row
+///
+/// and the chain is left asserting a finding that is permanently open, for drift that was fixed
+/// before the restart. My own comment claimed losing the map "re-opens the finding, which is the
+/// safe direction". That was wrong: because the repair already happened in the opening pass,
+/// nothing re-opens. The state loss removes only the ability to CLOSE.
+///
+/// The map stays derived observation state rather than becoming vault authority — the chain
+/// already records both edges, so it is the source, and reconstructing from it is cheaper and
+/// more honest than maintaining a second durable copy that could itself drift.
+///
+/// Newest-first, first row per member wins: a resolution means closed, any finding means open.
+pub fn rehydrate_open_findings(
+    chain: &crate::storage::chain::SqliteChainStore,
+) -> std::collections::HashMap<String, u64> {
+    let mut open = std::collections::HashMap::new();
+    let mut decided = std::collections::HashSet::new();
+    let rows = match chain.read_recent_by_types(None, &FINDING_EVENT_TYPES, REHYDRATE_SCAN_LIMIT) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e,
+                "could not rebuild open config findings from the chain; \
+                 resolutions for findings opened before this restart will not be recorded");
+            return open;
+        }
+    };
+    for entry in rows {
+        let Some(member) = entry.event_data.get("member").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // The newest row for a member decides its state; older ones are history.
+        if !decided.insert(member.to_string()) {
+            continue;
+        }
+        if entry.event_type == "config_integrity_resolved" {
+            continue;
+        }
+        let first_observed = entry
+            .event_data
+            .get("first_observed_at")
+            .and_then(|v| v.as_u64())
+            // A row written before `first_observed_at` existed still has a timestamp, and an
+            // approximate open time beats dropping the finding on the floor.
+            .unwrap_or_else(|| entry.timestamp.timestamp().max(0) as u64);
+        open.insert(member.to_string(), first_observed);
+    }
+    open
+}
+
 /// Move an unbacked projection aside so nothing can read it as current.
 ///
 /// RENAMED, NOT DELETED. The stale file is the only evidence of what the seat was running with
