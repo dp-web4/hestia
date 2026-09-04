@@ -870,6 +870,71 @@ def test_gate_unavailability_is_recorded_outside_the_chain():
           "a changed cause starts a new outage window rather than inflating the prior one")
 
 
+def test_success_latency_is_recorded_so_the_budget_is_not_a_one_way_ratchet():
+    """The counterpart of `test_gate_unavailability_is_recorded_outside_the_chain`.
+
+    That test pins that FAILURES are recorded with a cause. This one pins that SUCCESSES
+    are recorded with a duration, and the reason is §17 of the bypass catalogue: the gate
+    budget must sit below the harness hook deadline, and the only evidence that can size it
+    is the distribution of legs that RETURNED. Until 2026-09-04 the gate recorded only legs
+    that failed -- so every argument the record could support was an argument to RAISE the
+    budget (800 -> 2500 -> 4000, each step justified by a real incident), and no observation
+    the system was capable of making could ever argue to lower it. Two of four seats ended up
+    unable to deliver a refusal inside their harness deadline. The ratchet was in the
+    instrument, not in the daemon.
+    """
+    home = _workspace()
+    path = os.path.join(home, G.GATE_LATENCY_RELPATH)
+
+    # A leg at or above the tail threshold is ALWAYS recorded -- this is the band the budget
+    # argument is about, so it must never be sampled away.
+    for _ in range(5):
+        check("tail_leg_written", G.record_gate_latency("kimi-code", "society-safety",
+                                                        G.GATE_LATENCY_TAIL_MS + 1.0, home=home))
+    rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+    check("every_tail_leg_recorded", len(rows) == 5, f"{len(rows)} rows")
+    if not rows:
+        return
+    r = rows[0]
+    check("names_the_member", r["member"] == "kimi-code")
+    check("names_the_leg", r["leg"] == "society-safety")
+    check("carries_the_duration", isinstance(r["ms"], (int, float)) and r["ms"] > 0)
+    # Same load-bearing property as the unavailability log: timing is infrastructure, and a
+    # slow daemon must never be scored as a member's conduct.
+    check("declares_it_is_not_a_member_act",
+          r["kind"] == "gate_latency" and "conduct" in r["note"])
+
+    # THE PER-SEAT PROPERTY (#939's mistake): a latency row that does not say which budget it
+    # ran under cannot be pooled across seats. kimi ran 14000 where the engine default was
+    # 4000, and reading one number fleet-wide is exactly what hid it.
+    G.record_gate_latency("kimi-code", "policy-snapshot", 999.0, budget_ms=14000, home=home)
+    rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+    check("row_carries_the_budget_in_force", rows[-1].get("budget_ms") == 14000,
+          "a fleet-wide reading of a per-seat number is how Class T stayed invisible")
+
+    # Fast legs are SAMPLED, not dropped: without a denominator, "12 slow legs" means nothing.
+    # Statistical, so assert only what must hold for any seed -- some rows written, far fewer
+    # than were offered.
+    before = len(rows)
+    for _ in range(2000):
+        G.record_gate_latency("m", "policy-snapshot", 1.0, home=home)
+    rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+    sampled = [x for x in rows[before:] if x["outcome"] == "sampled"]
+    check("fast_legs_supply_a_denominator", len(sampled) > 0,
+          "no fast rows at all means the tail rows have no denominator")
+    check("fast_legs_are_not_all_written", len(sampled) < 500,
+          f"{len(sampled)}/2000 written -- sampling is what keeps this off the hot path")
+
+    # Never raises, on any input, for the same reason record_gate_unavailable never does:
+    # this runs on the hot path of a gate whose crash, on a fail-open harness, is an ALLOW.
+    for bad in (None, "banana", float("nan"), -1.0):
+        try:
+            G.record_gate_latency("m", "society-safety", bad, home=home)
+        except Exception as e:  # noqa: BLE001
+            check("never_raises", False, f"{bad!r} raised {type(e).__name__}")
+    check("never_raises", True)
+
+
 def test_telemetry_never_raises_on_the_failure_path():
     """It runs when the system is ALREADY degraded. A telemetry writer that can throw turns an
     infra hiccup into a gate crash — and on a fail-open harness a gate crash is an ALLOW."""
@@ -962,6 +1027,7 @@ ALL_TESTS = [
     "test_prefixed_wildcard_is_not_unscoped",
     "test_policy_resolution_names_its_source_and_fails_closed",
     "test_gate_unavailability_is_recorded_outside_the_chain",
+    "test_success_latency_is_recorded_so_the_budget_is_not_a_one_way_ratchet",
     "test_telemetry_never_raises_on_the_failure_path",
     "test_egress_beats_scope",
     "test_missing_identity_fails_narrow_not_wide",
@@ -1039,6 +1105,7 @@ if __name__ == "__main__":
     test_prefixed_wildcard_is_not_unscoped()
     test_policy_resolution_names_its_source_and_fails_closed()
     test_gate_unavailability_is_recorded_outside_the_chain()
+    test_success_latency_is_recorded_so_the_budget_is_not_a_one_way_ratchet()
     test_telemetry_never_raises_on_the_failure_path()
     test_egress_beats_scope()
     test_missing_identity_fails_narrow_not_wide()

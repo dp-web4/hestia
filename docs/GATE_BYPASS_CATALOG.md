@@ -1011,6 +1011,70 @@ and precisely what claude and kimi cannot do because nothing is holding a clock 
   in good faith to fix real false denials. The next increment of the same size ungoverns
   codex. This is the section's own scenario, one commit away, on a number nobody owns.
 
+#### AMENDED AGAIN 2026-09-04 (claude-code, CBP) — the budget was a ONE-WAY RATCHET, and the ratchet was in the instrument
+
+The section above leaves "which trade" open, as dp's call: lower the budget and risk the
+false denials of 2026-08-14, or raise the harness deadline. **It was never a trade.** It read
+as one because of a property of the evidence, not of the system.
+
+`record_gate_unavailable` logs legs that FAILED. Nothing logged legs that SUCCEEDED. So the
+only observations the gate was capable of making were timeouts, every argument the record
+could support was an argument to RAISE the budget, and the history reads exactly as that
+predicts: `800 → 2500` (#422, a cold-start dropout) `→ 4000` (the 2026-08-14 field dropout).
+Three numbers, three incidents, no distribution. **A parameter defended only by incident
+reports can only ever grow**, and this one grew until two of four seats could no longer
+deliver a refusal inside their harness deadline.
+
+Measured against the live warm daemon on CBP (n=250 active probes, plus the 5,638-row
+unavailability record from 2026-08-28 to 2026-09-04):
+
+| quantity | measured | vs the 4000 ms budget |
+|---|---|---|
+| policy-snapshot leg, 4 daemon round-trips | **3.9 ms** p50 | ~1000× headroom |
+| full verdict leg (connect + begin_action + poll to decided) | **5.3 ms** p50, 29.4 ms max | ~750× headroom |
+| whole policy-snapshot leg incl. local work | **97.9 ms** | ~40× headroom |
+| legs observed in the 1.5–4.0 s band | **0 of 250** | the band the 2500→4000 raise was bought to cover |
+
+The verdict was `decided` on the **first** poll in 10 of 10 samples. The band the last raise
+was purchased to cover has never been observed by anything, because until now nothing was
+able to observe it.
+
+**And the failures a budget could not have fixed anyway.** Of 5,638 unavailability events,
+**83.6% fall in episodes of ≥10 events**, median duration **519 s**, max 3,571 s — 20.3 hours
+of outage across a 176.7-hour record (11.5% of wall-clock). A 4000 ms budget covers **0.77%**
+of a median episode; 1500 ms covers 0.29%. On the failures that actually happen, the choice of
+budget is not the difference between success and failure — it is the difference between two
+failures. The budget was being sized against a mode it cannot address.
+
+So the trade dissolves: **for claude, a budget under 1539 ms costs nothing that has ever been
+observed and restores the invariant.** That is arithmetic now, not judgment. What changed is
+not the daemon — it is that somebody wrote down a success.
+
+The instrument is now `record_gate_latency` (`plugins/_shared/hestia_gate_core.py`), the
+success-path counterpart of `record_gate_unavailable`, writing `telemetry/gate-latency.jsonl`:
+every leg at or above 200 ms recorded in full, a 1-in-64 sample below it for the denominator,
+and **the budget in force stamped on every row** — because #939 compared the *engine* default
+against the harness deadline and so could not see that kimi had set 14000 on its own hook
+command line. Pinned by `test_success_latency_is_recorded_so_the_budget_is_not_a_one_way_ratchet`.
+
+#### The dominant term on the healthy path is not the daemon — it is stale governance data
+
+The 97.9 ms leg above decomposes as **3.9 ms of daemon** and **89.7 ms of local path
+resolution**, and the local part is entirely waste: all 26 society-floor entries point at the
+pre-move workspace mount and **none of them exist**, so each costs ~3.5 ms in `realpath` to
+resolve to nothing (a resolving path costs 0.03 ms — a factor of ~120). Filed as **#940**;
+the floor is vault state behind governance events, so the fix is an operator action.
+
+Two consequences for this section specifically:
+
+1. Every latency argument here, including #939's, has been conducted as a question about
+   **daemon round-trip time**. On the healthy path the daemon is 4% of the cost. The quantity
+   under discussion was off by 25×, in the *safe* direction, which is why nothing caught it.
+2. It does **not** change the starved-path measurements (12.38 s claude, 13.91 s codex,
+   16.91 s kimi, 6.08 s gemini) — under starvation `hestia_scope_status` never returns, so the
+   floor is never walked. Healthy latency and starved wall time are different measurements and
+   this section needs both. It had neither until today.
+
 Pinned executably: `plugins/claude-code/tests/gate_deadline_fits_harness_test.py` arm C
 (RED — claude and kimi), which reads each seat's budget and deadline from its own config
 and **skips, loudly, any seat not installed on the running machine**. A skip is not a pass.

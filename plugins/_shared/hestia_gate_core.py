@@ -1331,6 +1331,97 @@ def record_gate_unavailable(member_id: str, tool: str, cause: str,
         return False
 
 
+GATE_LATENCY_RELPATH = "telemetry/gate-latency.jsonl"
+# Log EVERY leg at or above this, and a 1-in-N sample below it. The threshold is where a
+# leg starts to be evidence about the budget: healthy legs measured 2026-09-04 on CBP ran
+# 2.8-29 ms, so 200 ms is ~7x the observed worst case and still an order of magnitude
+# below the smallest budget anyone has proposed. Everything the budget argument needs
+# lives above it; the sample below it supplies the denominator.
+GATE_LATENCY_TAIL_MS = 200.0
+GATE_LATENCY_FAST_SAMPLE = 64
+
+
+def record_gate_latency(member_id: str, leg: str, elapsed_ms: float,
+                        outcome: str = "ok", budget_ms: Optional[int] = None,
+                        home: Optional[str] = None) -> bool:
+    """Record how long a leg took when it SUCCEEDED. Returns True if written.
+
+    NEVER RAISES and never changes a decision -- the same contract as
+    record_gate_unavailable, for the same reason: this runs on the hot path of a gate
+    whose crash, on a fail-open harness, is an ALLOW.
+
+    WHY THIS EXISTS. record_gate_unavailable logs only legs that FAILED, and it was
+    itself a fix for logging failures without a cause. Both steps in the history of
+    TOTAL_BUDGET_MS -- 800 -> 2500 (#422) -> 4000 (the 2026-08-14 dropout) -- were argued
+    from that file, because it was the only evidence there was. A record containing
+    nothing but timeouts can only ever argue for a LARGER number: there is no observation
+    it is capable of making that would argue for a smaller one. The budget was therefore a
+    one-way ratchet, and the ratchet was a property of the INSTRUMENT, not of the daemon.
+
+    Measured 2026-09-04 on CBP against the warm live daemon, n=250 active probes:
+    policy-snapshot leg 2.8 ms p50 / 28.7 ms max; full verdict leg (connect +
+    begin_action + poll to decided) 5.3 ms p50 / 29.4 ms max, decided on the first poll
+    every time. Against the 4000 ms budget in force that is ~750x headroom, with ZERO
+    observations anywhere in the 1.5-4.0 s band the 2500 -> 4000 raise was bought to
+    cover. That band was unobserved rather than empty, because nothing recorded it.
+    This function records it.
+
+    `leg` is "policy-snapshot" or "society-safety" -- the two entry points that mint a
+    budget. `outcome` is "ok" for a leg at or above the threshold, "sampled" for a
+    1-in-N fast-leg denominator record; a reader estimating total call volume multiplies
+    the "sampled" rows by GATE_LATENCY_FAST_SAMPLE and adds the "ok" rows.
+
+    `budget_ms` is PASSED IN, never re-read here from the process. The caller already holds
+    the budget it minted the deadline from, and a recorder that re-derives its own copy is
+    a second source for a number whose whole defect was being read in two places -- #939
+    compared the ENGINE default against the harness deadline and so could not see that kimi
+    had set 14000 on its own hook command line.
+    """
+    try:
+        elapsed_ms = float(elapsed_ms)
+        if elapsed_ms < GATE_LATENCY_TAIL_MS:
+            # Cheap path: no I/O for ~99% of legs. randrange is ~1us, an append ~100us --
+            # which would otherwise be ~2% of a healthy 5 ms leg on every governed call.
+            if __import__("random").randrange(GATE_LATENCY_FAST_SAMPLE) != 0:
+                return False
+            outcome = "sampled"
+        root = home or os.getenv("HESTIA_HOME") or os.path.expanduser("~/.hestia")
+        path = os.path.join(root, GATE_LATENCY_RELPATH)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Rotate rather than truncate, for the reason given in record_gate_unavailable:
+        # the oldest rows are the ones that establish a trend.
+        try:
+            if os.path.getsize(path) > GATE_TELEMETRY_MAX_BYTES:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        try:
+            budget = int(budget_ms or 0)
+        except (TypeError, ValueError):
+            budget = 0
+        rec = {
+            "ts": int(__import__("time").time()),
+            "member": member_id,
+            "leg": leg,
+            "ms": round(elapsed_ms, 1),
+            "outcome": outcome,
+            # The budget IN FORCE for this seat, recorded per row. #939 assumed one budget
+            # fleet-wide because the engine has one default; kimi set 14000 on its own hook
+            # command line. A latency row that does not say which budget it ran under
+            # cannot be pooled across seats. None means "engine default, not overridden".
+            "budget_ms": budget or None,
+            "kind": "gate_latency",
+            "note": "infrastructure timing, NOT a member act - must never score conduct",
+        }
+        # O_APPEND so concurrent members interleave whole lines. Several harnesses write
+        # this file at once, by design -- same as the unavailability log beside it.
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        return True
+    except Exception:
+        return False
+
+
 def needs_society_gate(tool: str) -> bool:
     """Read-class is fully covered above, so only write/exec-class needs the daemon's verdict.
     This is what keeps a down daemon from bricking reads while still failing closed on writes."""
