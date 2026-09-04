@@ -266,11 +266,39 @@ diverge.
 > at all because the shared closure permits them). Instrument:
 > `plugins/_shared/cross_seat_verdict_parity_test.py`.
 
-### C11 — Every decision is witnessed, and no decision class is exempt
+### C11 — Evidence is committed before a consequential effect, and no class is exempt
 
 Every decision a shim reaches — allow, warn, deny, escalate, no-verdict — MUST produce a
 chain entry carrying its rule id, on every seat. No class of decision may be exempt, and a
 per-seat telemetry file is not a substitute for the chain.
+
+**AMENDED 2026-09-04, strengthened because #934 implemented something better than this
+criterion asked for.** As first written, C11 required a decision to "produce a chain
+entry". That is satisfiable by *calling the recorder*, which is not the same as the
+evidence existing — and the old shared recorder described itself as the deny/warn recorder
+while falling back to a local telemetry file when daemon delivery failed. The weaker
+reading was not hypothetical; it was the shipped behaviour.
+
+The requirement is therefore:
+
+> A **consequential** permit — `allow` or `warn` on a write/exec-class act — MUST have its
+> decision witness **committed** before the effect is permitted. If the witness cannot be
+> committed before the common deadline, the permit becomes a denial
+> (`gate.evidence_uncommitted`), carrying fallback evidence naming what the decision would
+> otherwise have been.
+
+State must not outrun its evidence. A denial that cannot be committed remains a denial and
+carries `evidence_committed=false`; reads retain the ratified degraded-read posture and
+surface the anomaly rather than converting to a block — a read without a record is an audit
+gap, while a write without a record is an unwitnessed change to the world.
+
+Calling the recorder is not committing evidence, and a criterion that cannot tell them
+apart certifies the difference away.
+
+> Implemented on #934, verified in `hestia_single_gate.py`: `_finalize(...,
+> require_commit=True)` on the write/exec path after society safety,
+> `require_commit=False` for `READ_CLASS` and the degraded read, and Plane-E evidence
+> carrying `supersedes_uncommitted` to name the superseded verdict.
 
 **Why this is a certification criterion and not a nice-to-have.** A refusal nobody can see
 cannot be audited, cannot be appealed, and cannot be counted. It is indistinguishable from
