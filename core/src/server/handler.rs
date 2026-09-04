@@ -5078,19 +5078,34 @@ pub(crate) fn render_and_verify_seat_configs(
         // nothing. The module header already promised the opposite. Now an unbacked projection
         // is quarantined, so the failure mode is "the seat has no config" rather than "the seat
         // silently runs yesterday's config".
-        let decoded: Result<sc::SeatConfig, String> =
-            match s.vault.get_document(sc::SEAT_CONFIG_NS, member) {
-                None => Err("the vault declares no config for this member".to_string()),
-                Some(bytes) => serde_json::from_slice::<sc::SeatConfig>(bytes)
+        // THREE CASES, and only two of them are this pass's business. Collapsing the first two
+        // is its own defect: a member the vault simply does not configure has nothing unbacked
+        // about it, and reporting one would open a finding that can never resolve — the member
+        // never becomes `Verified`, so the closing edge never fires and `config_findings_open`
+        // accumulates a permanent entry per unconfigured seat.
+        let declared: Option<Result<sc::SeatConfig, String>> =
+            s.vault.get_document(sc::SEAT_CONFIG_NS, member).map(|bytes| {
+                serde_json::from_slice::<sc::SeatConfig>(bytes)
                     .map_err(|e| format!("vault config does not decode as seat config: {e}"))
                     // Malformed-but-decodable content is refused for the same reason: it would
                     // render as executable config with an ambiguous number of assignments.
-                    .and_then(|c| c.validate().map(|_| c)),
-            };
+                    .and_then(|c| c.validate().map(|_| c))
+            });
 
-        let cfg = match decoded {
-            Ok(c) => c,
-            Err(reason) => {
+        let cfg = match declared {
+            Some(Ok(c)) => c,
+            unusable => {
+                let artifact_exists = sc::render_path(&home, member).exists();
+                let reason = match unusable {
+                    Some(Err(e)) => e,
+                    // Nothing declared AND nothing on disk: not a finding, not an event, not
+                    // this pass's business. This is the case the original `continue` got right,
+                    // and the one the first version of the fix wrongly swept up with it.
+                    _ if !artifact_exists => continue,
+                    _ => "the vault declares no config for this member, but a rendered artifact \
+                          is present"
+                        .to_string(),
+                };
                 let quarantined = match sc::quarantine(&home, member) {
                     Ok(p) => p.map(|p| p.to_string_lossy().to_string()),
                     Err(e) => {
@@ -10107,8 +10122,13 @@ mod tests {
     ///
     /// The companion to the test above, and the reason that one is not over-broad: quarantine
     /// fires on an unbacked ARTIFACT, not on an unmentioned member. Without this arm, "no vault
-    /// config" and "no vault config but a live file" would be indistinguishable in the suite,
-    /// and a future change could start emitting a finding for every member that has none.
+    /// config" and "no vault config but a live file" are indistinguishable in the suite.
+    ///
+    /// The first version of the quarantine fix DID collapse them, and this test caught it only
+    /// after its own name was read against its body: it was called `produces_no_finding` while
+    /// asserting that a chain row was written. Two things were wrong at once. Substantively, a
+    /// finding here can never resolve — an unconfigured member never becomes `Verified`, so the
+    /// closing edge never fires and `config_findings_open` grows a permanent entry per seat.
     #[tokio::test]
     async fn an_undeclared_member_with_no_artifact_produces_no_finding() {
         let (_dir, shared) = make_shared_state();
@@ -10121,20 +10141,68 @@ mod tests {
             let mut s = shared.lock().await;
             super::render_and_verify_seat_configs(&mut s, std::slice::from_ref(&member))
         };
+        assert!(
+            verdicts.is_empty(),
+            "an unmentioned member with no artifact yields no verdict: {verdicts:?}"
+        );
+        let after = {
+            let s = shared.lock().await;
+            s.chain_store.len().unwrap()
+        };
+        assert_eq!(after, before, "and no chain row: there is nothing to report");
+        let s = shared.lock().await;
+        assert!(
+            !s.config_findings_open.contains_key(&member),
+            "and no open finding is left behind that could never be closed"
+        );
+    }
+
+    /// Vault content that cannot be rendered IS a finding, even with nothing on disk.
+    ///
+    /// The third case, and the one that keeps the "no config, no artifact" skip from being
+    /// over-broad in the other direction. Silence is right when the vault says nothing; it is
+    /// wrong when the vault says something unusable, because that is a real misconfiguration
+    /// that no later pass will fix on its own.
+    #[tokio::test]
+    async fn vault_config_that_cannot_be_rendered_is_reported_even_with_no_artifact() {
+        use super::super::seat_config as sc;
+        let (dir, shared) = make_shared_state();
+        let member = "kimi".to_string();
+        // A value carrying a line break: it would render as two assignments rather than one.
+        let cfg = serde_json::json!({
+            "env": {"HESTIA_WORKSPACE": "/w/ai\nHESTIA_ROLE=role:constellation:sovereign"},
+            "note": "",
+        });
+        {
+            let mut s = shared.lock().await;
+            s.vault
+                .put_document(sc::SEAT_CONFIG_NS, &member, serde_json::to_vec(&cfg).unwrap())
+                .unwrap();
+        }
+        let before = {
+            let s = shared.lock().await;
+            s.chain_store.len().unwrap()
+        };
+        let verdicts = {
+            let mut s = shared.lock().await;
+            super::render_and_verify_seat_configs(&mut s, std::slice::from_ref(&member))
+        };
         match verdicts.first() {
-            Some(super::super::seat_config::ConfigVerdict::Unbacked { quarantined_to, .. }) => {
-                assert!(
-                    quarantined_to.is_none(),
-                    "nothing was quarantined because nothing was there"
-                );
+            Some(sc::ConfigVerdict::Unbacked { reason, quarantined_to, .. }) => {
+                assert!(reason.contains("line break"), "the reason names it: {reason}");
+                assert!(quarantined_to.is_none(), "nothing was on disk to quarantine");
             }
-            other => panic!("expected an unbacked verdict with no quarantine, got {other:?}"),
+            other => panic!("unusable vault config must be reported, got {other:?}"),
         }
         let after = {
             let s = shared.lock().await;
             s.chain_store.len().unwrap()
         };
-        assert!(after > before, "still witnessed: silence about an unconfigured seat is what hid #839");
+        assert!(after > before, "and it reaches the chain: {before} -> {after}");
+        assert!(
+            !sc::render_path(dir.path(), &member).exists(),
+            "and nothing was rendered from content that does not validate"
+        );
     }
 
     /// Drift gets a DURATION: the finding opens once and closes once.
