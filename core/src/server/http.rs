@@ -1154,6 +1154,10 @@ pub async fn serve_with_callback(
         // carries `request_id: null` and `origin: "operator_initiated"`. A reader can always
         // tell them apart. What is gone is the DEPENDENCY, not the distinction.
         .route("/api/scope/grant", post(scope_grant))
+        // Re-root: the one operation a workspace move needs and the revoke/add pair cannot
+        // give, because a pair has a gap in the middle and this does not. Same operator wall
+        // as every other widening.
+        .route("/api/scope/reroot", post(scope_reroot))
         // THE SOCIETY FLOOR (dp, 2026-08-16). Same operator wall as every other widening, and
         // deliberately NOT reachable from MCP: a member that could edit the floor could widen
         // itself AND every peer in one act, which is the largest privilege escalation this
@@ -3195,6 +3199,195 @@ async fn scope_floor_remove(
 /// be recorded is refused, same as the grant), but on a failed PERSIST the in-memory removal
 /// is KEPT rather than rolled back — a failure here may only ever leave the TIGHTER state in
 /// force, and the error says the disk still holds the grant so the operator retries.
+/// Move every standing grant from one root to another as ONE act.
+///
+/// Without this, relocating a workspace costs a revoke and a grant per grant, and between the
+/// two the member holds neither. Twenty-seven of those is not a migration, it is an outage with
+/// paperwork — and the operator has to retype twenty-seven paths correctly to end it. Worse, a
+/// half-finished dance leaves a scope set that is internally inconsistent with no record saying
+/// so, because each pair witnesses as two unrelated decisions.
+///
+/// Here the whole rewrite is one plan, one witness, one commit. `dry_run` returns the plan
+/// without touching anything, because the operator should be able to read what will move before
+/// it moves.
+///
+/// REFUSES A MOVE ONTO A ROOT THAT IS NOT THERE. A re-root to a mistyped or not-yet-populated
+/// target does not fail: it succeeds, and silently leaves every member holding grants that match
+/// nothing. That is the exact miswire this endpoint exists to end, so producing it by accident is
+/// not an acceptable failure mode. `allow_missing_target` is the deliberate override for granting
+/// ahead of a tree that does not exist yet.
+async fn scope_reroot(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let str_field = |k: &str| {
+        body.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let (from_raw, to_raw, reason) = (str_field("from"), str_field("to"), str_field("reason"));
+    let member = {
+        let m = str_field("plugin_id");
+        if m.is_empty() { None } else { Some(m) }
+    };
+    let dry_run = body.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    let allow_missing = body
+        .get("allow_missing_target")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if from_raw.is_empty() || to_raw.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "from and to are required"})),
+        );
+    }
+    // Same rule as every other widening on this surface: a reach whose rationale is unrecorded
+    // is indistinguishable afterwards from a misconfiguration. A re-root touches EVERY grant a
+    // member holds, so it needs the account more than a single grant does, not less.
+    if reason.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "reason is required — a re-root rewrites every matching grant at once, \
+                          and its rationale is the only account of why the member's whole reach \
+                          moved"
+            })),
+        );
+    }
+
+    let from = crate::server::state::normalize_scope_path(&from_raw);
+    let to = crate::server::state::normalize_scope_path(&to_raw);
+    for p in [&from, &to] {
+        if let Err(msg) = crate::server::state::require_absolute_grant_path(p) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": msg})),
+            );
+        }
+    }
+
+    let target_exists = std::path::Path::new(&to).is_dir();
+    if !target_exists && !allow_missing {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "refusing to re-root onto '{to}', which is not a directory on this host. A \
+                     re-root onto a path that is not there does not fail — it leaves every \
+                     rewritten grant matching nothing, which is a silent total revocation. Pass \
+                     allow_missing_target:true if you are deliberately granting ahead of the tree."
+                ),
+                "target_exists": false
+            })),
+        );
+    }
+
+    let mut s = state.lock().await;
+
+    // PLAN FIRST, on a clone, so the witness record can name every path that will move rather
+    // than a count. A record saying "27 grants re-rooted" cannot be checked against anything.
+    let plan = {
+        let mut probe = s.standing_scope.clone();
+        probe.reroot(&from, &to, member.as_deref())
+    };
+    let moved_json: Vec<serde_json::Value> = plan
+        .iter()
+        .map(|(m, old, new)| serde_json::json!({"plugin_id": m, "from": old, "to": new}))
+        .collect();
+
+    if plan.is_empty() {
+        // NOT an error, and deliberately not silent either: a mistyped `from` is the likely
+        // cause, and reporting it as a bland success is how an operator concludes a migration
+        // that never happened.
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "moved": [],
+                "matched": 0,
+                "note": format!(
+                    "no standing grant is at or under '{from}' — nothing was changed. If a move \
+                     was expected, check the from-prefix: containment is judged at a segment \
+                     boundary, so '/a/b' does not match '/a/b-old'."
+                ),
+                "generation": s.standing_scope.generation,
+            })),
+        );
+    }
+
+    if dry_run {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "dry_run": true,
+                "matched": plan.len(),
+                "moved": moved_json,
+                "target_exists": target_exists,
+                "generation": s.standing_scope.generation,
+            })),
+        );
+    }
+
+    // ORDER: INTENT -> COMMIT -> SUCCESS, matching `witness_and_commit_standing_grant`. Witness
+    // first so a failed vault write cannot leave the chain silent about an attempted rewrite of
+    // the entire scope set.
+    let record = serde_json::json!({
+        "from_root": from,
+        "to_root": to,
+        "plugin_id": member.clone().unwrap_or_else(|| "*".to_string()),
+        "reason": reason,
+        "decided_by": "operator",
+        "via": "operator_session",
+        "matched": plan.len(),
+        "moved": moved_json,
+        "target_exists": target_exists,
+        "standing_generation": s.standing_scope.generation + 1,
+    });
+    let intent = match s.append_chain("scope_reroot_intent", record.clone()) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("witness append failed, re-root NOT applied: {e}")
+                })),
+            );
+        }
+    };
+
+    let (f, t, m) = (from.clone(), to.clone(), member.clone());
+    if let Err(e) = s.commit_standing_scope(move |st| {
+        st.reroot(&f, &t, m.as_deref());
+    }) {
+        // `commit_standing_scope` persists a candidate before swapping it live, so the live
+        // store is bit-identical here, generation included. Nothing partial was applied.
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("re-root NOT applied, the scope store is unchanged: {e}"),
+                "intentEntryHash": intent.hash,
+            })),
+        );
+    }
+
+    let done = s.append_chain("scope_rerooted", record).ok();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "matched": plan.len(),
+            "moved": moved_json,
+            "generation": s.standing_scope.generation,
+            "intentEntryHash": intent.hash,
+            "witnessEntryHash": done.map(|e| e.hash),
+        })),
+    )
+}
+
 async fn scope_standing_revoke(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
