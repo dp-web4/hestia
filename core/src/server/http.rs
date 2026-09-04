@@ -1153,6 +1153,11 @@ pub async fn serve_with_callback(
         // ratification carries a `request_id` and the ask it answered; an originated grant
         // carries `request_id: null` and `origin: "operator_initiated"`. A reader can always
         // tell them apart. What is gone is the DEPENDENCY, not the distinction.
+        // Writing a member's config INTO the vault. Same operator wall as every widening, and
+        // deliberately not reachable from MCP: a member that could author its own config could
+        // set its own `HESTIA_WORKSPACE`, which is to say choose the tree its gate polices.
+        // That is the whole boundary, so this door opens from one direction only.
+        .route("/api/config/seat", put(config_put_seat))
         .route("/api/scope/grant", post(scope_grant))
         // THE SOCIETY FLOOR (dp, 2026-08-16). Same operator wall as every other widening, and
         // deliberately NOT reachable from MCP: a member that could edit the floor could widen
@@ -1270,7 +1275,11 @@ pub async fn serve_with_callback(
                 let n = super::handler::record_newly_lapsed(&mut s, now);
                 // Config drift on the same cadence: a file that matched at startup and was
                 // edited at noon is a miswire from noon, not from the next restart.
-                let members: Vec<String> = s.gate_capabilities.keys().cloned().collect();
+                // Not `gate_capabilities.keys()` alone: that is who CONNECTED, which is a
+                // different question from who has config (#898 review, finding 4).
+                let connected: Vec<String> = s.gate_capabilities.keys().cloned().collect();
+                let home = s.home.clone();
+                let members = super::seat_config::members_to_check(&s.vault, &home, &connected);
                 let drifted = super::handler::render_and_verify_seat_configs(&mut s, &members)
                     .iter()
                     .filter(|v| v.is_finding())
@@ -2708,6 +2717,132 @@ async fn scope_decide(
 /// ask; this one answers nothing, so it is durable until revoked, or until `expires_in_secs`
 /// if the operator wants it bounded — and a bounded STANDING grant still survives a restart,
 /// which is strictly better than what the fleet has been losing on every deploy.
+/// Write a member's configuration into the vault, and render it in the same act.
+///
+/// The missing half of #898: the substrate could render and verify, but nothing could put a
+/// document there, so the vault was authoritative over content only a Rust test could create. A
+/// mechanism whose authority cannot be written to is not yet the source of truth for anything.
+///
+/// VALIDATED BEFORE IT IS STORED, not only before it is rendered. Storing content that cannot
+/// render would leave the vault holding an authority that produces a permanent finding and no
+/// artifact — an unbacked projection one layer up, where nothing can quarantine it.
+async fn config_put_seat(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use super::seat_config as sc;
+
+    let member = body
+        .get("plugin_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if member.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "plugin_id is required"})),
+        );
+    }
+    // A member id becomes a FILENAME (`<home>/seats/<member>.env`). A separator or a parent
+    // reference here would place the artifact outside the render directory, turning a config
+    // write into an arbitrary file write on the operator surface.
+    if member.contains('/') || member.contains('\\') || member.contains("..") || member.starts_with('.')
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "plugin_id becomes a filename and may not contain a path separator, a \
+                          parent reference, or a leading dot"
+            })),
+        );
+    }
+
+    let cfg: sc::SeatConfig = match serde_json::from_value(
+        body.get("config").cloned().unwrap_or(serde_json::Value::Null),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("config does not parse: {e}")})),
+            );
+        }
+    };
+    if let Err(msg) = cfg.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": msg})),
+        );
+    }
+
+    let bytes = match serde_json::to_vec(&cfg) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("could not serialise config: {e}")})),
+            );
+        }
+    };
+
+    let mut s = state.lock().await;
+    let home = s.home.clone();
+    let existed = s.vault.get_document(sc::SEAT_CONFIG_NS, &member).is_some();
+
+    // WITNESS FIRST, the same ordering as every other authority write here: a failed vault write
+    // must not leave the chain silent about an attempted change to what a seat runs with. The
+    // record names the KEYS, never the values — a config document can carry a token, and the
+    // chain is the one store that never forgets.
+    let record = serde_json::json!({
+        "member": member,
+        "keys": cfg.env.keys().cloned().collect::<Vec<_>>(),
+        "note": cfg.note,
+        "replaces": existed,
+        "decided_by": "operator",
+        "via": "operator_session",
+    });
+    let intent = match s.append_chain("config_seat_write_intent", record.clone()) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("witness append failed, config NOT written: {e}")
+                })),
+            );
+        }
+    };
+
+    if let Err(e) = s.vault.put_document(sc::SEAT_CONFIG_NS, &member, bytes) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("config NOT written to the vault: {e}"),
+                "intentEntryHash": intent.hash,
+            })),
+        );
+    }
+
+    // Render immediately rather than waiting for the worker's next tick: an operator who just
+    // set a workspace root should not have to guess whether the artifact has caught up.
+    let members = vec![member.clone()];
+    let verdicts = super::handler::render_and_verify_seat_configs(&mut s, &members);
+    let _ = s.append_chain("config_seat_written", record);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "member": member,
+            "replaced": existed,
+            "artifact": sc::render_path(&home, &member).to_string_lossy(),
+            "verdict": verdicts,
+            "intentEntryHash": intent.hash,
+        })),
+    )
+}
+
 async fn scope_grant(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
@@ -4152,6 +4287,107 @@ mod disposition_tests {
         let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
         let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
         (dir, state)
+    }
+
+    /// A member id becomes a FILENAME, so it is validated as one.
+    ///
+    /// Without this the operator surface offers an arbitrary file write: `../../something`
+    /// renders outside the seats directory. Written as its own arm because the happy path
+    /// cannot show it — a handler that accepts every id passes every ordinary test.
+    #[tokio::test]
+    async fn a_seat_id_that_would_escape_the_render_directory_is_refused() {
+        let (_dir, state) = test_state().await;
+        for bad in ["../escape", "a/b", "a\\b", ".hidden", ""] {
+            let body = serde_json::json!({
+                "plugin_id": bad,
+                "config": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""},
+            });
+            let status = axum::response::IntoResponse::into_response(
+                super::config_put_seat(axum::extract::State(state.clone()), axum::Json(body)).await,
+            )
+            .status();
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "id {bad:?} must be refused: it does not name one file inside the render dir"
+            );
+        }
+    }
+
+    /// Content that cannot render is refused BEFORE it reaches the vault.
+    ///
+    /// Storing it would leave the authority holding something that produces a permanent finding
+    /// and no artifact — an unbacked projection one layer up, where nothing can quarantine it.
+    #[tokio::test]
+    async fn seat_config_that_cannot_render_never_reaches_the_vault() {
+        use crate::server::seat_config as sc;
+        let (_dir, state) = test_state().await;
+        let body = serde_json::json!({
+            "plugin_id": "claude-code",
+            "config": {"env": {"HESTIA_WORKSPACE": "/w/ai\nHESTIA_ROLE=role:sovereign"}, "note": ""},
+        });
+        let status = axum::response::IntoResponse::into_response(
+            super::config_put_seat(axum::extract::State(state.clone()), axum::Json(body)).await,
+        )
+        .status();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let s = state.lock().await;
+        assert!(
+            s.vault.get_document(sc::SEAT_CONFIG_NS, "claude-code").is_none(),
+            "the vault must not hold config that cannot be rendered"
+        );
+    }
+
+    /// The write lands, renders in the same act, and the chain names KEYS but not VALUES.
+    #[tokio::test]
+    async fn a_seat_config_write_renders_immediately_and_does_not_log_values() {
+        use crate::server::seat_config as sc;
+        let (dir, state) = test_state().await;
+        let before = {
+            let s = state.lock().await;
+            s.chain_store.len().unwrap()
+        };
+        let body = serde_json::json!({
+            "plugin_id": "claude-code",
+            "config": {
+                "env": {"HESTIA_WORKSPACE": "/w/ai", "HESTIA_TOKEN": "super-secret-value"},
+                "note": "set by the operator",
+            },
+        });
+        let status = axum::response::IntoResponse::into_response(
+            super::config_put_seat(axum::extract::State(state.clone()), axum::Json(body)).await,
+        )
+        .status();
+        assert_eq!(status, StatusCode::OK);
+
+        let rendered = std::fs::read_to_string(sc::render_path(dir.path(), "claude-code"))
+            .expect("rendered in the same act, not on the worker's next tick");
+        assert!(rendered.contains("HESTIA_WORKSPACE=/w/ai"), "{rendered}");
+
+        // The chain is the one store that never forgets, and a config document can carry a
+        // token. Keys are evidence; values are not ours to keep.
+        let s = state.lock().await;
+        let rows = s.chain_store.read_recent(20).unwrap();
+        // Named explicitly rather than by prefix. `config_seat_written` does NOT start with
+        // `config_seat_write` — it diverges at `writt` — so a prefix filter here matches the
+        // intent row only and reads as "the completion was never written". Caught by this
+        // assertion failing at 1; the pair was on the chain the whole time.
+        let intents = rows.iter().filter(|e| e.event_type == "config_seat_write_intent").count();
+        let done = rows.iter().filter(|e| e.event_type == "config_seat_written").count();
+        assert_eq!((intents, done), (1, 1), "intent and completion are both witnessed");
+        for e in &rows {
+            let blob = serde_json::to_string(&e.event_data).unwrap();
+            assert!(
+                !blob.contains("super-secret-value"),
+                "a config VALUE reached the chain in {}: {blob}",
+                e.event_type
+            );
+            if e.event_type == "config_seat_write_intent" {
+                assert!(blob.contains("HESTIA_TOKEN"), "but the key is recorded: {blob}");
+            }
+        }
+        assert!(s.chain_store.len().unwrap() > before);
     }
 
     /// Minting site B (#459): the operator's scope decision tells the REQUESTER.

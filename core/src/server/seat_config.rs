@@ -234,6 +234,51 @@ pub fn verify_one(home: &Path, member: &str, cfg: &SeatConfig) -> ConfigVerdict 
     }
 }
 
+/// Every member this pass must look at, from all three places one can appear.
+///
+/// GPT review of #898, finding 4. The worker enumerated `gate_capabilities.keys()`, which is a
+/// record of who has CONNECTED and reported a capability this daemon run. That set answers a
+/// different question than "who has config", and using it meant:
+///
+///   * a member the vault configures but that has not connected is never rendered, so the
+///     workspace-root move is not a one-vault-change operation for it;
+///   * a stray artifact belonging to a member in neither list is never quarantined, because
+///     nothing enumerates it — the exact case the quarantine was added for;
+///   * "every seat is verified" was true only of seats that happened to report a capability.
+///
+/// The union of the three is the honest domain: what the vault declares, what has connected,
+/// and what is already written on disk. Sorted and de-duplicated so a pass is deterministic and
+/// two runs produce the same order of chain rows.
+pub fn members_to_check(vault: &crate::vault::Vault, home: &Path, connected: &[String]) -> Vec<String> {
+    let mut set: std::collections::BTreeSet<String> = connected.iter().cloned().collect();
+
+    // 1. Declared in the vault. The authority, and the reason this function exists.
+    for item in vault.document_index() {
+        if item.namespace == SEAT_CONFIG_NS {
+            set.insert(item.name);
+        }
+    }
+
+    // 2. Already rendered on disk. A file nobody enumerates cannot be quarantined, and an
+    //    orphan artifact is precisely what has no other trace.
+    if let Ok(entries) = std::fs::read_dir(home.join(RENDER_DIR)) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // Only live projections. `.env.unbacked` quarantines and `.env.tmp` write-temporaries
+            // must not be read back as members, or a quarantine would resurrect its own subject
+            // as a new member name on the next pass.
+            if let Some(member) = name.strip_suffix(".env") {
+                if !member.is_empty() {
+                    set.insert(member.to_string());
+                }
+            }
+        }
+    }
+
+    set.into_iter().collect()
+}
+
 /// The three chain event types this module writes. Kept beside `chain_event()` so the writer
 /// and the reader cannot drift apart: a new event name added there without adding it here would
 /// make findings that can be opened but never rehydrated.
@@ -461,6 +506,48 @@ mod tests {
         }
         // The positive control, so the rule is not simply "refuse everything".
         assert!(cfg().validate().is_ok(), "an ordinary config still validates");
+    }
+
+    /// The domain is the UNION of three sources, and each one contributes something the
+    /// others cannot see.
+    ///
+    /// The orphan case is the point: a rendered artifact belonging to a member that neither the
+    /// vault declares nor the daemon has seen connect. Under the old enumeration
+    /// (`gate_capabilities.keys()`) nothing looked at it, so the quarantine added for exactly
+    /// that file could never fire on it. A fix whose trigger is unreachable is not a fix.
+    #[test]
+    fn the_check_domain_unions_vault_connected_and_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault =
+            crate::vault::Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        vault
+            .put_document(SEAT_CONFIG_NS, "declared-only", b"{}".to_vec())
+            .unwrap();
+
+        // An artifact with no vault document and no connection: the orphan.
+        let orphan = render_path(dir.path(), "on-disk-only");
+        std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+        std::fs::write(&orphan, "X=1\n").unwrap();
+        // Neighbours that must NOT be read back as members, or a quarantine would resurrect
+        // its own subject on the next pass and a write-temporary would become a seat.
+        std::fs::write(orphan.with_extension("env.unbacked"), "X=1\n").unwrap();
+        std::fs::write(orphan.with_extension("env.tmp"), "X=1\n").unwrap();
+
+        let members = members_to_check(&vault, dir.path(), &["connected-only".to_string()]);
+
+        assert!(members.contains(&"declared-only".to_string()), "{members:?}");
+        assert!(members.contains(&"connected-only".to_string()), "{members:?}");
+        assert!(
+            members.contains(&"on-disk-only".to_string()),
+            "an orphan artifact must be enumerated or it can never be quarantined: {members:?}"
+        );
+        assert!(
+            !members.iter().any(|m| m.contains("unbacked") || m.contains("tmp")),
+            "quarantines and write-temporaries are not members: {members:?}"
+        );
+        let mut sorted = members.clone();
+        sorted.sort();
+        assert_eq!(members, sorted, "deterministic order, so chain rows are reproducible");
     }
 
     /// Quarantine preserves rather than destroys, and is idempotent.
