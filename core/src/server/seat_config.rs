@@ -32,20 +32,21 @@
 //! than left for a reader to discover). This is the render/verify/witness SUBSTRATE. It is not
 //! yet the source of truth for anything, because nothing consumes it:
 //!
-//!   * No seat or hook loads `<home>/seats/<member>.env` at startup. The rendered artifact is
-//!     currently written and checked, and then read by nobody, so a correct render and a
-//!     quarantined one have the same effect on a running seat: none.
-//!   * The only production caller is the periodic worker, which enumerates
-//!     `gate_capabilities.keys()`. A member with vault config but no capability row is never
-//!     looked at, so "every seat is verified" is true only of seats that happen to have
-//!     reported a capability.
+//!   * No seat or hook loads the rendered artifact at startup. It is written and checked and
+//!     then read by nobody, so a correct render and a quarantined one have the same effect on a
+//!     running seat: none.
 //!   * Readiness does not consume the verdicts, so an INDETERMINATE seat still reports as it
 //!     did before.
 //!
-//! Until those three are wired, this module makes drift VISIBLE and makes an unbacked artifact
+//! Until those two are wired, this module makes drift VISIBLE and makes an unbacked artifact
 //! UNUSABLE. It does not yet make the vault the thing a seat actually starts from. Saying so is
 //! the point: an unconsumed producer that reads as a completed mechanism is the defect this
 //! codebase keeps re-finding, and it is not improved by being introduced with confidence.
+//!
+//! CLOSED SINCE: the enumeration limit named here was the third item, and `members_to_check`
+//! replaced it with the union of vault-declared, connected and on-disk. Struck rather than left
+//! standing, because a limits section that outlives its limits is how a reader concludes a fixed
+//! thing is still broken, and how an author concludes it is still on the list.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
