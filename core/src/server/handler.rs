@@ -5048,6 +5048,197 @@ pub(crate) fn project_dispositions(
 /// daemon is DOWN is never recorded (`rehydrate` skips expired opens), per item
 /// 6 — a historical backfill is a separate, explicit act, not a side effect of
 /// a periodic task.
+/// Render every member's config from the vault and report what drifted.
+///
+/// The vault is the source and the file is a projection, so this writes the artifact when it
+/// differs and reports a verdict for each member. A `Miswired` verdict is appended to the chain
+/// rather than logged: drift on a governance surface is a governance event, and the difference
+/// between the two is whether anyone can find it a week later (PRD_CONFIG_FROM_VAULT).
+///
+/// Order matters and is deliberate: VERIFY first, then render. Rendering first would repair the
+/// artifact and then observe that it matches, which reports a clean fleet while silently undoing
+/// evidence of an edit. The edit is the thing worth recording.
+///
+/// An unreadable or absent vault document renders NOTHING for that member and returns no
+/// verdict for it. There is no fallback to the file that was found: a renderer that trusts the
+/// artifact when the vault is unavailable is a second authority with extra steps.
+pub(crate) fn render_and_verify_seat_configs(
+    s: &mut super::state::ServerState,
+    members: &[String],
+) -> Vec<super::seat_config::ConfigVerdict> {
+    use super::seat_config as sc;
+    let home = s.home.clone();
+    let mut verdicts = Vec::new();
+    for member in members {
+        // THE VAULT IS THE ONLY AUTHORITY, AND ITS ABSENCE IS NOT A PASS.
+        //
+        // GPT review of #898, finding 1. This used to `continue` when the vault held nothing or
+        // held something undecodable, which left any existing `<home>/seats/<member>.env`
+        // untouched and fully consumable — fallback to the stale artifact, achieved by doing
+        // nothing. The module header already promised the opposite. Now an unbacked projection
+        // is quarantined, so the failure mode is "the seat has no config" rather than "the seat
+        // silently runs yesterday's config".
+        // THREE CASES, and only two of them are this pass's business. Collapsing the first two
+        // is its own defect: a member the vault simply does not configure has nothing unbacked
+        // about it, and reporting one would open a finding that can never resolve — the member
+        // never becomes `Verified`, so the closing edge never fires and `config_findings_open`
+        // accumulates a permanent entry per unconfigured seat.
+        let declared: Option<Result<sc::SeatConfig, String>> =
+            s.vault.get_document(sc::SEAT_CONFIG_NS, member).map(|bytes| {
+                serde_json::from_slice::<sc::SeatConfig>(bytes)
+                    .map_err(|e| format!("vault config does not decode as seat config: {e}"))
+                    // Malformed-but-decodable content is refused for the same reason: it would
+                    // render as executable config with an ambiguous number of assignments.
+                    .and_then(|c| c.validate().map(|_| c))
+            });
+
+        let cfg = match declared {
+            Some(Ok(c)) => c,
+            unusable => {
+                let artifact_exists = sc::render_path(&home, member).exists();
+                let reason = match unusable {
+                    Some(Err(e)) => e,
+                    // Nothing declared AND nothing on disk: not a finding, not an event, not
+                    // this pass's business. This is the case the original `continue` got right,
+                    // and the one the first version of the fix wrongly swept up with it.
+                    _ if !artifact_exists => continue,
+                    _ => "the vault declares no config for this member, but a rendered artifact \
+                          is present"
+                        .to_string(),
+                };
+                let quarantined = match sc::quarantine(&home, member) {
+                    Ok(p) => p.map(|p| p.to_string_lossy().to_string()),
+                    Err(e) => {
+                        tracing::warn!(member = %member, error = %e,
+                            "unbacked seat config could NOT be quarantined; it is still readable");
+                        None
+                    }
+                };
+                verdicts.push(sc::ConfigVerdict::Unbacked {
+                    member: member.clone(),
+                    reason,
+                    quarantined_to: quarantined,
+                });
+                continue;
+            }
+        };
+
+        let verdict = sc::verify_one(&home, member, &cfg);
+        // Repair every state that is not already correct. `Unreadable` is included: if the
+        // artifact cannot be read, re-rendering it from the authority IS the repair, and if the
+        // rewrite also fails the error says so rather than the pass going quiet.
+        if matches!(
+            verdict,
+            sc::ConfigVerdict::Miswired { .. }
+                | sc::ConfigVerdict::Missing { .. }
+                | sc::ConfigVerdict::Unreadable { .. }
+        ) {
+            if let Err(e) = sc::render_to_disk(&home, member, &cfg) {
+                tracing::warn!(member = %member, error = %e, "seat config could not be rendered");
+            }
+        }
+        verdicts.push(verdict);
+    }
+
+    // Witness AFTER the loop so the transition bookkeeping sees the whole pass at once, and so
+    // a repair cannot be recorded before the finding that motivated it.
+    witness_config_verdicts(s, &home, &verdicts);
+    verdicts
+}
+
+/// Record findings, and record their RESOLUTION.
+///
+/// GPT review of #898, finding 3: the previous pass recorded a miswire and repaired it in the
+/// same breath, so the next pass returned Verified and nothing ever committed the transition
+/// back to clean. Drift therefore had no duration — only a series of identical stateless
+/// complaints, or silence, with no way to tell "fixed" from "not looked at". State lives in
+/// `config_findings_open` so the edge can be detected rather than the level.
+fn witness_config_verdicts(
+    s: &mut super::state::ServerState,
+    home: &std::path::Path,
+    verdicts: &[super::seat_config::ConfigVerdict],
+) {
+    use super::seat_config as sc;
+    let now = super::gate_escalation::now_secs();
+
+    for verdict in verdicts {
+        let member = verdict.member().to_string();
+        let artifact = sc::render_path(home, &member).to_string_lossy().to_string();
+
+        match verdict.chain_event() {
+            Some(event) => {
+                // Only the FIRST observation of a continuing finding is witnessed. A row per
+                // pass would make the chain a function of the poll interval rather than of the
+                // drift, and 96 identical rows a day is how a real finding becomes background.
+                //
+                // ASK WHETHER IT WAS INSERTED, never whether its timestamp equals `now`. The
+                // first version compared `first_seen != now`, which is the same question only
+                // while the clock is finer than the poll: two passes inside one second read as
+                // "newly opened" twice and witnessed twice. Caught by the test, which runs both
+                // passes in the same second — the condition a real deployment reaches whenever
+                // a check is triggered twice in quick succession.
+                let is_new = !s.config_findings_open.contains_key(&member);
+                let first_seen = *s.config_findings_open.entry(member.clone()).or_insert(now);
+                if !is_new {
+                    continue;
+                }
+                let mut payload = json!({
+                    "member": member,
+                    "artifact": artifact,
+                    "status": verdict.status(),
+                    "first_observed_at": first_seen,
+                });
+                match verdict {
+                    sc::ConfigVerdict::Miswired { expected, actual, .. } => {
+                        payload["expected_sha256"] = json!(expected);
+                        payload["found_sha256"] = json!(actual);
+                    }
+                    sc::ConfigVerdict::Missing { expected, .. } => {
+                        payload["expected_sha256"] = json!(expected);
+                    }
+                    sc::ConfigVerdict::Unreadable { error, .. } => {
+                        payload["error"] = json!(error);
+                    }
+                    sc::ConfigVerdict::Unbacked { reason, quarantined_to, .. } => {
+                        payload["reason"] = json!(reason);
+                        payload["quarantined_to"] = json!(quarantined_to);
+                    }
+                    sc::ConfigVerdict::Verified { .. } => {}
+                }
+                if let Err(e) = s.append_chain(event, payload) {
+                    // The finding stands even though the record does not. Clear the state so the
+                    // next pass retries the witness rather than treating an unrecorded finding
+                    // as already reported.
+                    s.config_findings_open.remove(&member);
+                    tracing::warn!(member = %member, error = %e,
+                        "config finding could NOT be recorded; the drift stands and the record does not");
+                }
+            }
+            None => {
+                // Verified. Emit the closing edge if and only if this member was open.
+                if let Some(opened_at) = s.config_findings_open.remove(&member) {
+                    let payload = json!({
+                        "member": member,
+                        "artifact": artifact,
+                        "status": "resolved",
+                        "first_observed_at": opened_at,
+                        "resolved_at": now,
+                        // The number the pair exists to produce. Without it a reader can see
+                        // that drift happened and that it stopped, but not for how long the
+                        // seat ran miswired.
+                        "open_secs": now.saturating_sub(opened_at),
+                    });
+                    if let Err(e) = s.append_chain("config_integrity_resolved", payload) {
+                        s.config_findings_open.insert(member.clone(), opened_at);
+                        tracing::warn!(member = %member, error = %e,
+                            "config resolution could NOT be recorded; leaving the finding open");
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn record_newly_lapsed(s: &mut super::state::ServerState, now: u64) -> usize {
     let lapsed = s.gate_escalations.newly_lapsed(now);
     let mut recorded = 0;
@@ -9783,6 +9974,409 @@ mod tests {
         r.granted = Some(false);
         assert_eq!(r.status(50), "refused");
         assert!(!r.grants("/x/y.md", 50));
+    }
+
+    /// Config is rendered FROM the vault, and an edit to the rendered file is a chain event.
+    ///
+    /// PRD_CONFIG_FROM_VAULT, dp 2026-09-03. The three properties that make this a mechanism
+    /// rather than an audit are each asserted: the artifact is written from the vault rather
+    /// than hand-authored, a later edit is detected without a restart, and the detection is a
+    /// governance event on the chain rather than a line in a log nobody greps.
+    ///
+    /// The ordering assertion is the subtle one. Verify runs BEFORE render, so an edit is
+    /// recorded and then repaired. Rendering first would repair the file and then observe that
+    /// it matches, reporting a clean fleet while erasing the evidence that anyone edited it.
+    #[tokio::test]
+    async fn seat_config_renders_from_the_vault_and_an_edit_is_recorded() {
+        use super::super::seat_config as sc;
+        let (dir, shared) = make_shared_state();
+        let member = "claude-code".to_string();
+        let cfg = serde_json::json!({
+            "env": {"HESTIA_WORKSPACE": "/w/ai-agents", "HESTIA_ROLE": "role:constellation:member"},
+            "note": "rendered by the daemon, not by hand",
+        });
+
+        {
+            let mut s = shared.lock().await;
+            s.vault
+                .put_document(sc::SEAT_CONFIG_NS, &member, serde_json::to_vec(&cfg).unwrap())
+                .unwrap();
+        }
+
+        let path = sc::render_path(dir.path(), &member);
+        assert!(!path.exists(), "nothing rendered until the pass runs");
+
+        // First pass: the vault declares config, so the artifact appears.
+        let first = {
+            let mut s = shared.lock().await;
+            super::render_and_verify_seat_configs(&mut s, std::slice::from_ref(&member))
+        };
+        assert!(
+            matches!(first.first(), Some(sc::ConfigVerdict::Missing { .. })),
+            "the first pass finds no artifact and says so rather than calling it verified: {first:?}"
+        );
+        let rendered = std::fs::read_to_string(&path).expect("the vault rendered it");
+        assert!(rendered.contains("HESTIA_WORKSPACE=/w/ai-agents"), "{rendered}");
+        assert!(
+            rendered.contains("Do not edit"),
+            "the artifact says what it is, because a file that looks authored invites authoring"
+        );
+
+        // Second pass: unchanged, so it verifies.
+        let second = {
+            let mut s = shared.lock().await;
+            super::render_and_verify_seat_configs(&mut s, std::slice::from_ref(&member))
+        };
+        assert!(
+            matches!(second.first(), Some(sc::ConfigVerdict::Verified { .. })),
+            "an untouched artifact verifies: {second:?}"
+        );
+
+        // A hand edit, of exactly the kind this PRD exists to end: a machine-specific path.
+        let edited = rendered.replace("/w/ai-agents", "/somewhere/else");
+        std::fs::write(&path, &edited).unwrap();
+
+        let before = {
+            let s = shared.lock().await;
+            s.chain_store.len().unwrap()
+        };
+        let third = {
+            let mut s = shared.lock().await;
+            super::render_and_verify_seat_configs(&mut s, std::slice::from_ref(&member))
+        };
+        match third.first() {
+            Some(sc::ConfigVerdict::Miswired { expected, actual, .. }) => {
+                assert_ne!(expected, actual, "a miswire names both digests")
+            }
+            other => panic!("a hand edit must read as a miswire, got {other:?}"),
+        }
+        let after = {
+            let s = shared.lock().await;
+            s.chain_store.len().unwrap()
+        };
+        assert!(
+            after > before,
+            "the miswire is on the CHAIN, not merely in a log: {before} -> {after}"
+        );
+
+        // And it was repaired in the same pass, so the seat is not left running on the edit.
+        let repaired = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(repaired, rendered, "the vault's rendering is restored after being recorded");
+    }
+
+    /// An artifact the vault does not back is QUARANTINED, not left sitting there readable.
+    ///
+    /// THIS TEST PREVIOUSLY ASSERTED THE DEFECT. Its earlier form ended with "the stray file is
+    /// neither adopted as truth nor overwritten" and passed, because the pass simply `continue`d
+    /// on a missing vault document. That is fallback to the artifact achieved by inaction: a
+    /// seat starting from `<home>/seats/<member>.env` would source a file no authority stands
+    /// behind, and the check that exists to catch exactly that would report nothing at all.
+    /// GPT's review of #898 (finding 1) named it, and the module header had already promised
+    /// the opposite — "an unreadable vault renders nothing and the caller is told INDETERMINATE
+    /// rather than handed a stale value that looks current".
+    ///
+    /// So the expectation is inverted deliberately: absence of authority must INVALIDATE the
+    /// projection, not preserve it. The file is renamed rather than deleted, because it is the
+    /// only evidence of what the seat was running with before the vault stopped backing it.
+    #[tokio::test]
+    async fn an_artifact_the_vault_no_longer_backs_is_quarantined() {
+        use super::super::seat_config as sc;
+        let (dir, shared) = make_shared_state();
+        let member = "codex".to_string();
+        let stray = sc::render_path(dir.path(), &member);
+        std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+        std::fs::write(&stray, "HESTIA_WORKSPACE=/authored/by/hand\n").unwrap();
+
+        let before = {
+            let s = shared.lock().await;
+            s.chain_store.len().unwrap()
+        };
+        let verdicts = {
+            let mut s = shared.lock().await;
+            super::render_and_verify_seat_configs(&mut s, std::slice::from_ref(&member))
+        };
+
+        match verdicts.first() {
+            Some(sc::ConfigVerdict::Unbacked { quarantined_to, reason, .. }) => {
+                assert!(reason.contains("declares no config"), "the reason is named: {reason}");
+                assert!(quarantined_to.is_some(), "and the quarantine path is recorded");
+            }
+            other => panic!("an unbacked artifact must be reported, got {other:?}"),
+        }
+        assert!(
+            !stray.exists(),
+            "the unbacked projection must no longer be readable at the path a seat would source"
+        );
+        assert!(
+            stray.with_extension("env.unbacked").exists(),
+            "and it is preserved as evidence rather than destroyed"
+        );
+        let after = {
+            let s = shared.lock().await;
+            s.chain_store.len().unwrap()
+        };
+        assert!(after > before, "an unbacked projection is a governance event: {before} -> {after}");
+    }
+
+    /// A member the vault does not declare, with NOTHING on disk, is simply not our business.
+    ///
+    /// The companion to the test above, and the reason that one is not over-broad: quarantine
+    /// fires on an unbacked ARTIFACT, not on an unmentioned member. Without this arm, "no vault
+    /// config" and "no vault config but a live file" are indistinguishable in the suite.
+    ///
+    /// The first version of the quarantine fix DID collapse them, and this test caught it only
+    /// after its own name was read against its body: it was called `produces_no_finding` while
+    /// asserting that a chain row was written. Two things were wrong at once. Substantively, a
+    /// finding here can never resolve — an unconfigured member never becomes `Verified`, so the
+    /// closing edge never fires and `config_findings_open` grows a permanent entry per seat.
+    #[tokio::test]
+    async fn an_undeclared_member_with_no_artifact_produces_no_finding() {
+        let (_dir, shared) = make_shared_state();
+        let member = "gemini".to_string();
+        let before = {
+            let s = shared.lock().await;
+            s.chain_store.len().unwrap()
+        };
+        let verdicts = {
+            let mut s = shared.lock().await;
+            super::render_and_verify_seat_configs(&mut s, std::slice::from_ref(&member))
+        };
+        assert!(
+            verdicts.is_empty(),
+            "an unmentioned member with no artifact yields no verdict: {verdicts:?}"
+        );
+        let after = {
+            let s = shared.lock().await;
+            s.chain_store.len().unwrap()
+        };
+        assert_eq!(after, before, "and no chain row: there is nothing to report");
+        let s = shared.lock().await;
+        assert!(
+            !s.config_findings_open.contains_key(&member),
+            "and no open finding is left behind that could never be closed"
+        );
+    }
+
+    /// A finding opened before a restart can still be CLOSED after it.
+    ///
+    /// GPT blocker on #898, and the sequence is only reachable because opening and repairing
+    /// happen in the same pass: miswire detected, opening row written, artifact repaired, daemon
+    /// restarts, in-memory state gone, next pass sees a clean artifact and has nothing to close.
+    /// The chain is then left asserting a finding that is permanently open, for drift that was
+    /// fixed before the restart.
+    ///
+    /// The state is rebuilt from the chain at `ServerState::open`, so this arm reconstructs the
+    /// state over the same home rather than reusing the handle — a test that kept the in-memory
+    /// map would pass without the fix and prove nothing.
+    #[tokio::test]
+    async fn a_finding_opened_before_a_restart_is_resolved_after_it() {
+        use super::super::seat_config as sc;
+        let dir = TempDir::new().unwrap();
+        let member = "claude-code".to_string();
+        let one = std::slice::from_ref(&member);
+        let cfg = serde_json::json!({"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""});
+        let vpath = dir.path().join("v.enc");
+
+        let open_state = |first: bool| {
+            let vault = if first {
+                let mut v = Vault::init(vpath.clone(), "p".into()).unwrap();
+                v.add(crate::vault::VaultEntry::new(
+                    "ai_identity_secret",
+                    hex::encode(web4_core::crypto::KeyPair::generate().secret_key_bytes()),
+                ))
+                .unwrap();
+                v
+            } else {
+                Vault::open(vpath.clone(), "p".into()).unwrap()
+            };
+            super::super::state::ServerState::open(vault, dir.path(), "p").unwrap()
+        };
+
+        // ---- first daemon run: declare config, render, then break it so a finding opens.
+        let (opened_rows, path) = {
+            let mut s = open_state(true);
+            s.vault
+                .put_document(sc::SEAT_CONFIG_NS, &member, serde_json::to_vec(&cfg).unwrap())
+                .unwrap();
+            super::render_and_verify_seat_configs(&mut s, one); // Missing -> renders
+            super::render_and_verify_seat_configs(&mut s, one); // Verified
+            let path = sc::render_path(dir.path(), &member);
+            let good = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, good.replace("/w/ai", "/elsewhere")).unwrap();
+
+            let before = s.chain_store.len().unwrap();
+            let v = super::render_and_verify_seat_configs(&mut s, one);
+            assert!(
+                matches!(v.first(), Some(sc::ConfigVerdict::Miswired { .. })),
+                "the edit opens a finding: {v:?}"
+            );
+            let after = s.chain_store.len().unwrap();
+            assert!(
+                s.config_findings_open.contains_key(&member),
+                "the finding is open in the first run"
+            );
+            (after - before, path)
+        };
+        assert_eq!(opened_rows, 1, "exactly one opening row");
+        // The same pass repaired the artifact. THIS is what makes the restart lossy without
+        // rehydration: there is no longer anything on disk to re-detect.
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("/w/ai"),
+            "the opening pass also repaired, which is why the next run sees clean"
+        );
+
+        // ---- restart: a brand new ServerState over the same home.
+        let mut s2 = open_state(false);
+        assert!(
+            s2.config_findings_open.contains_key(&member),
+            "the open finding is rebuilt from the chain, not lost with the process"
+        );
+
+        let before = s2.chain_store.len().unwrap();
+        let v = super::render_and_verify_seat_configs(&mut s2, one);
+        let after = s2.chain_store.len().unwrap();
+        assert!(
+            matches!(v.first(), Some(sc::ConfigVerdict::Verified { .. })),
+            "the artifact is clean after the restart: {v:?}"
+        );
+        assert_eq!(
+            after - before,
+            1,
+            "exactly one resolution row, so the chain does not keep asserting an open finding"
+        );
+        assert!(
+            !s2.config_findings_open.contains_key(&member),
+            "and the finding is closed"
+        );
+
+        // A further pass must not write a second resolution: closing is an edge too.
+        let before = s2.chain_store.len().unwrap();
+        super::render_and_verify_seat_configs(&mut s2, one);
+        assert_eq!(
+            s2.chain_store.len().unwrap(),
+            before,
+            "a clean seat with no open finding writes nothing at all"
+        );
+    }
+
+    /// Vault content that cannot be rendered IS a finding, even with nothing on disk.
+    ///
+    /// The third case, and the one that keeps the "no config, no artifact" skip from being
+    /// over-broad in the other direction. Silence is right when the vault says nothing; it is
+    /// wrong when the vault says something unusable, because that is a real misconfiguration
+    /// that no later pass will fix on its own.
+    #[tokio::test]
+    async fn vault_config_that_cannot_be_rendered_is_reported_even_with_no_artifact() {
+        use super::super::seat_config as sc;
+        let (dir, shared) = make_shared_state();
+        let member = "kimi".to_string();
+        // A value carrying a line break: it would render as two assignments rather than one.
+        let cfg = serde_json::json!({
+            "env": {"HESTIA_WORKSPACE": "/w/ai\nHESTIA_ROLE=role:constellation:sovereign"},
+            "note": "",
+        });
+        {
+            let mut s = shared.lock().await;
+            s.vault
+                .put_document(sc::SEAT_CONFIG_NS, &member, serde_json::to_vec(&cfg).unwrap())
+                .unwrap();
+        }
+        let before = {
+            let s = shared.lock().await;
+            s.chain_store.len().unwrap()
+        };
+        let verdicts = {
+            let mut s = shared.lock().await;
+            super::render_and_verify_seat_configs(&mut s, std::slice::from_ref(&member))
+        };
+        match verdicts.first() {
+            Some(sc::ConfigVerdict::Unbacked { reason, quarantined_to, .. }) => {
+                assert!(reason.contains("line break"), "the reason names it: {reason}");
+                assert!(quarantined_to.is_none(), "nothing was on disk to quarantine");
+            }
+            other => panic!("unusable vault config must be reported, got {other:?}"),
+        }
+        let after = {
+            let s = shared.lock().await;
+            s.chain_store.len().unwrap()
+        };
+        assert!(after > before, "and it reaches the chain: {before} -> {after}");
+        assert!(
+            !sc::render_path(dir.path(), &member).exists(),
+            "and nothing was rendered from content that does not validate"
+        );
+    }
+
+    /// Drift gets a DURATION: the finding opens once and closes once.
+    ///
+    /// GPT review of #898, finding 3. Before this, a miswire was recorded and repaired in the
+    /// same pass, so the chain held complaints with no closing edge — a reader could see that
+    /// drift happened but not whether it was ever fixed, and a fixed one looked identical to one
+    /// nobody had examined. Both edges are asserted here, and so is the thing that makes the
+    /// pair readable: `open_secs`.
+    #[tokio::test]
+    async fn a_miswire_opens_once_and_its_repair_is_witnessed() {
+        use super::super::seat_config as sc;
+        let (dir, shared) = make_shared_state();
+        let member = "claude-code".to_string();
+        let cfg = serde_json::json!({"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""});
+        {
+            let mut s = shared.lock().await;
+            s.vault
+                .put_document(sc::SEAT_CONFIG_NS, &member, serde_json::to_vec(&cfg).unwrap())
+                .unwrap();
+        }
+        let one = std::slice::from_ref(&member);
+        // Pass 1 renders it; pass 2 verifies clean.
+        {
+            let mut s = shared.lock().await;
+            super::render_and_verify_seat_configs(&mut s, one);
+            super::render_and_verify_seat_configs(&mut s, one);
+        }
+        let path = sc::render_path(dir.path(), &member);
+        let good = std::fs::read_to_string(&path).unwrap();
+
+        // Edit it, then run TWICE without repairing in between... except the pass repairs, so
+        // re-break it to prove a continuing finding is not re-witnessed every pass.
+        std::fs::write(&path, good.replace("/w/ai", "/elsewhere")).unwrap();
+        let (open_rows, second_rows) = {
+            let mut s = shared.lock().await;
+            let a = s.chain_store.len().unwrap();
+            super::render_and_verify_seat_configs(&mut s, one);
+            let b = s.chain_store.len().unwrap();
+            // Break it again so the finding stays open across the next pass.
+            std::fs::write(&path, good.replace("/w/ai", "/elsewhere")).unwrap();
+            super::render_and_verify_seat_configs(&mut s, one);
+            let c = s.chain_store.len().unwrap();
+            (b - a, c - b)
+        };
+        assert_eq!(open_rows, 1, "the finding opens with exactly one row");
+        assert_eq!(
+            second_rows, 0,
+            "a CONTINUING finding is not re-witnessed: a row per pass makes the chain a function \
+             of the poll interval rather than of the drift"
+        );
+
+        // Now let it settle: the artifact is repaired, so the next pass verifies and must close.
+        let closed = {
+            let mut s = shared.lock().await;
+            let a = s.chain_store.len().unwrap();
+            let v = super::render_and_verify_seat_configs(&mut s, one);
+            let b = s.chain_store.len().unwrap();
+            assert!(
+                matches!(v.first(), Some(sc::ConfigVerdict::Verified { .. })),
+                "the repair from the previous pass leaves it clean: {v:?}"
+            );
+            b - a
+        };
+        assert_eq!(closed, 1, "the resolution is witnessed exactly once");
+        {
+            let s = shared.lock().await;
+            assert!(
+                !s.config_findings_open.contains_key(&member),
+                "and the member is no longer carrying an open finding"
+            );
+        }
     }
 
     fn make_shared_state() -> (TempDir, SharedState) {
