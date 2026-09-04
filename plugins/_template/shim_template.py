@@ -263,6 +263,17 @@ def _emergency_refuse(exc):
     obligation is weakened honestly — block, and leave a deterministic artifact a later
     reconciliation can pick up — rather than pretended.
 
+    THE SINK IS THE ONE THAT IS ALREADY READ. `telemetry/gate-unavailable.jsonl` is the
+    core's plane-E availability log (`GATE_TELEMETRY_RELPATH` in `hestia_gate_core.py`),
+    it is populated in the field, and it is what a human audit actually opens — the
+    2026-08-28 heuristic audit read 428 rows out of it to time a deploy window. The first
+    cut of this function invented `gate-bootstrap-unavailable.jsonl` beside it, which no
+    reader on either branch opens: a record with no reader is the same as no record, and
+    "a later reconciliation can pick it up" was a claim about a reconciliation that does
+    not exist. This path cannot import the core to reuse the constant — that is the whole
+    premise of C7b — so it spells the same relative path and distinguishes itself with the
+    `rule` field, which is what a reader filters on anyway.
+
     Pure stdlib, no imports beyond those already at module top, no dependence on `_core`
     or `PROFILE`. It must not raise: an exception here reproduces the exact fail-open this
     function exists to prevent.
@@ -281,7 +292,8 @@ def _emergency_refuse(exc):
         d = os.path.join(os.path.expanduser(os.getenv("HESTIA_HOME", "~/.hestia")),
                          "telemetry")
         os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, "gate-bootstrap-unavailable.jsonl"), "a") as fh:
+        # Same file as the core's GATE_TELEMETRY_RELPATH — spelled, not imported (C7b).
+        with open(os.path.join(d, "gate-unavailable.jsonl"), "a") as fh:
             fh.write(json.dumps(rec) + "\n")
     except BaseException:
         pass          # recording must never convert a fail-closed into a crash

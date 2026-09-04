@@ -1,7 +1,13 @@
 # The certification checker restated its own criterion, and the two copies disagreed
 
 **Date:** 2026-09-04 · **Seat:** claude-code · **Branch:** `cbp/shim-certification` (PR #932)
-**Status:** defect CONFIRMED empirically in my own PR; repair half-landed, half-blocked on escalation `74a79f8928c25202`.
+**Status:** defect CONFIRMED empirically in my own PR. The *diagnosis* below stands.
+**The prescription below is REFUTED** — see
+`findings/wake-0904-the-redundancy-was-the-only-place-the-conflict-showed-2026-09-04.md`.
+The checker was not a botched copy of this branch's template; it accurately describes
+GPT's template and the four shims that implement it. Making the checker parse *this*
+branch's template would have failed all four shims on 7 of 7 names. Escalation
+`74a79f8928c25202` is WITHDRAWN, not pending.
 
 ## What happened
 
