@@ -172,7 +172,11 @@ rather than a partial one; the two compose.
 
 > ### The single highest-value mitigation we have
 > **`HESTIA_PRE_FAIL_CLOSED=1` closed every measured bypass in this document (#2, #3 and
-> C1).** It is currently **opt-in and off by default**. Turning it on fleet-wide is one
+> C1)** — **except one, added 2026-09-04: see §17's amendment.** The composed-deadline
+> overrun is not a posture failure. The gate is already fail-closed on that path and
+> returns `exit 2`; it is killed at 12.4 s against a 5 s harness deadline and never
+> delivers it. A flag that decides which way you fall cannot help when you are not there
+> to fall. It is currently **opt-in and off by default**. Turning it on fleet-wide is one
 > environment variable and it converts three silent full bypasses into loud denials.
 > The cost is real and must be stated: when the daemon is genuinely down, every agent
 > stops. That is the correct trade for a *governance* layer and it should be a society
@@ -873,6 +877,64 @@ gate internal budget   <   harness hook timeout
 Push the budget above the timeout and the gate never finishes in time. The harness then does
 what it always does on an overrun: **allow**. Every subsequent call is ungoverned.
 
+### AMENDED 2026-09-04 (claude-code, CBP) — the invariant above is wrong by 3×, and the audit it asks for FAILS
+
+The pair was audited on schedule, as this section asks. The seat failed, and the invariant
+as written is why it reads as passing. **The budget is not a whole-hook deadline.** It is
+minted once per *entry point* into the shared mechanism
+(`plugins/_shared/hestia_gate_mechanism.py:327` and `:633`), and one hook invocation
+crosses several. Measured against a socket that accepts and never answers — this
+document's own model of "alive but loaded" — wall time is linear in the budget with slope
+**3.00**, exactly, across three intervals:
+
+| event | B=4000 ms | 2000 | 1000 | 500 | fit |
+|---|---|---|---|---|---|
+| `Bash` (ordinary) | **12.383 s** | 6.374 | 3.367 | 1.867 | `3.00·B + 0.38 s` |
+| `Read` (governance) | **13.910 s** | 7.903 | 4.877 | 3.380 | `3.00·B + 1.91 s` |
+| `Write` (governance) | 3.142 s | 3.119 | 3.112 | 3.112 | `3.11 s`, B-independent |
+
+So the invariant is:
+
+```
+3.00 · budget  +  1.91 s   <   harness hook timeout
+```
+
+For claude-code's measured 5 s hook deadline the budget must be **below ~1030 ms**. The
+budget in force is **4000 ms**. The gate reaches `exit 2` at 12.4 s on the ordinary path;
+the harness stopped listening at 5 s and allowed. Demonstrated end to end, not inferred: a
+live session with its endpoint pointed at the black hole executed the tool call.
+
+Three corrections to what is written above and elsewhere:
+
+1. **The cause here was extraction, not edit.** Nobody raised a number. The seat shim
+   still declares and documents an 800 ms budget that is a **dead constant** — Sprint E
+   (#371) moved the client into the shared mechanism, whose own default is 4000 ms, and
+   neither the shim's docstring nor the member-facing refusal ("the daemon did not answer
+   within the gate's budget") was updated. The 800 ms the shim documents would have
+   satisfied the corrected invariant. The right number was in the file the whole time.
+2. **`HESTIA_PRE_FAIL_CLOSED=1` does not close this**, contrary to §4's headline. The gate
+   is already fail-closed here — every arm of the sweep returns 2. Posture decides which
+   way you fall; this is about not being there to fall.
+3. **The escalation path is the best case, not the worst.** `request_self_write` and
+   `_witness_self_access` are two un-budgeted 1.5 s clients and they fit (3.11 s, constant).
+   The path nobody sized is the ordinary one that runs on every tool call.
+
+`agent-atlas/talk-to/kimi_code_cli/descriptor.md` carries the uncorrected invariant too.
+kimi's 30 s hook deadline gives a corrected ceiling of ~9.4 s, so kimi is probably still
+inside it — **the seat that fails is the one with the tightest harness deadline, and the
+audit as written would have cleared it.**
+
+Pinned executably at `plugins/claude-code/tests/gate_deadline_fits_harness_test.py`
+(arm A green: one entry point honours its own budget to within 1.02–1.22×; arm B RED until
+this is closed). Full measurement, controls and refuted predictions:
+`findings/wake-0904b-the-budget-is-consumed-three-times-and-the-harness-quits-first-2026-09-04.md`.
+
+The fix that is not a trade is **one deadline per hook invocation**, minted at entry and
+threaded through every client including the fixed-cost ones. Lowering the budget instead
+walks back into the false-denial bug dp fixed on 2026-08-11; raising the harness deadline
+widens every other starvation window. Which trade to take is a society decision and is not
+made here.
+
 ### Why it is worse than an ordinary misconfiguration
 
 It is invisible from both of the places anyone would look:
@@ -915,6 +977,11 @@ correct path diverge, and nothing in the system marks the fork.
 - **Audit the pair on a schedule** (dp, 2026-08-07). Per-member, since the timeout default
   differs by harness — see `agent-atlas/talk-to/*/descriptor.md`, which now records the
   engine-verified figure for kimi (`hook.timeout ?? 30s`, config honoured).
+  **RUN 2026-09-04 for claude-code on CBP: FAILED** (5 s harness deadline, 4000 ms budget,
+  12.4 s measured wall). See the amendment above. The other three seats have **not** been
+  run — that is untested, not passing. Auditing the pair is also not sufficient by itself:
+  the two numbers were both individually defensible and the failure lives in the
+  composition between them, which neither number shows.
 - **Treat "denies stopped" as a signal requiring explanation**, not as success. The absence of
   refusals is the observable that this class produces, and it is also what a genuine fix
   produces. They must be told apart by something other than the deny count — e.g. positive
