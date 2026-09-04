@@ -16,10 +16,7 @@ CERTIFICATION_CRITERIA = "PRD_SHIM_CERTIFICATION.md@2026-09-04"
 REQUIRED_GATE_API = "decide/1"
 
 
-# 1. AUTHORITY BOOTSTRAP - byte-identical across certified shims.
 def _authority_dir() -> str:
-    # Production authority has one location. Tests stage that location under a temporary
-    # HOME or patch this function; no environment variable selects a different gate tree.
     return os.path.realpath(os.path.expanduser("~/.hestia/shared"))
 
 
@@ -70,9 +67,6 @@ def _load_gate():
 
 
 def _emergency_block(reason: str) -> int:
-    # This path exists precisely when shared code cannot be trusted/loaded. Leave a
-    # deterministic Plane-E record using stdlib only; never let recording failure turn the
-    # harness crash into an allow-by-timeout.
     try:
         import time
         row = {
@@ -94,7 +88,6 @@ def _emergency_block(reason: str) -> int:
     return 2
 
 
-# 2. PROFILE DATA - context, never law.
 PROFILE = {
     "member_id": "claude-code",
     "identity_path": os.path.expanduser("~/.claude/hestia-instance/identity.json"),
@@ -106,7 +99,6 @@ PROFILE = {
 }
 
 
-# 3. HARNESS SYNTAX ADAPTERS.
 def to_event(gate, raw):
     if not isinstance(raw, dict) or raw.get("hook_event_name") != "PreToolUse":
         raise ValueError("expected PreToolUse event")
@@ -145,7 +137,6 @@ def read_harness_event():
     return json.loads(raw)
 
 
-# 4. MAIN - byte-identical across certified shims.
 def main() -> int:
     try:
         gate = _load_gate()
