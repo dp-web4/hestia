@@ -418,6 +418,20 @@ _READ_ONLY_HEADS = {
     # head-checked on `sed`. Adding `cd` frees the `cd` segment, never the one after it.
     # (`cd_does_not_launder` in tests/gate_false_refusal_test.py.)
     "cd",
+    # `continue` and `break` added 2026-09-04, found while fixing FP16 and NOT part of it.
+    # The FP16 reproducer put a `continue` in the case arm, so the arm fix alone left it
+    # red -- and the second mechanism turned out to be independent of `case` entirely:
+    # `for f in a b; do continue; grep -c def <gate>; done` is refused with no `case` in
+    # it. Both are POSIX loop control. Neither runs a program, neither takes an operand
+    # that can name a file (the optional argument is a loop-nesting integer), and neither
+    # has a mutating spelling -- the `merge-base`/`for-each-ref` test for a safe bare add.
+    # A redirect stapled to one (`continue > f`) is caught by the redirect branch, which
+    # decides independently of the head: `echo hi > /tmp/x` is a write today and `echo` is
+    # in this set, so admitting a head has never been what admits its redirect.
+    #
+    # NOT here: `:`. It is the same class and would be safe for the same reasons, but no
+    # measured refusal named it, and this set takes specimens rather than siblings.
+    "continue", "break",
     # NOT here: `date` and `hostname` (codex peer review, finding 2). `date -s` sets the
     # system clock; `hostname X` sets the hostname. A read-looking NAME carrying a mutating
     # FLAG is precisely what a head allowlist cannot see, which is why `_GUARDED_HEADS`
@@ -692,7 +706,19 @@ _HEAD_GRAMMARS = {
     "sed": _sed_args_are_read_only,
 }
 
-_SEPARATORS = {";", "&", "&&", "|", "||", "\n"}
+# `;;` added 2026-09-04 WITH the FP16 case-arm fix, and that fix is unsafe without it.
+# shlex(punctuation_chars=True) emits `;;` as ONE token, which was in neither this set nor
+# any other, so a whole multi-arm `case` arrived as a SINGLE segment. Skipping the header's
+# patterns to the first `)` and head-checking the remainder then classified the FIRST ARM
+# and silently carried every later arm with it: `case x in a) grep f;; b) cp evil.py f;;
+# esac` came back READ-ONLY with the `cp` never looked at. Measured on this file before the
+# separator landed; the twins are `case_second_arm_*` in tests/gate_false_refusal_test.py.
+#
+# It is the `do rm -rf /` lesson in a new construct, and it is why the arm fix could not be
+# a one-line change to `_control_flow_remainder`: that function sees one segment and cannot
+# be made safe by a segmenter that hands it two commands as one. `;;` IS a separator in
+# bash, so this is a correctness fix in its own right and not scaffolding for the widening.
+_SEPARATORS = {";", ";;", "&", "&&", "|", "||", "\n"}
 
 _REDIRECTS = {">", ">>", "<", "<<", "<<<", ">&", "&>", ">|", "<&"}
 
@@ -780,9 +806,15 @@ def _control_flow_remainder(parts):
     unparseable input is a write.
 
     `if`/`while`/`until`/`elif` strip to their CONDITION, not past it: the condition
-    really runs, so `if rm -rf /; then ...; fi` refuses on `rm`. `case` arms
-    (`pattern) body ;;`) stay unmodelled and refuse on their own segments — fail
-    closed, not a hole: the header skip runs nothing by itself.
+    really runs, so `if rm -rf /; then ...; fi` refuses on `rm`.
+
+    `case` strips its header AND the first arm's patterns, then head-checks that arm's
+    BODY (FP16, 2026-09-04). Arms after the first are separate segments — `;;` is in
+    `_SEPARATORS` as of the same change, and it has to be, or the strip would hand back
+    arm one and carry arms two onward along with it. A bare arm segment still
+    head-checks on its pattern token and so refuses: only the arm sharing the header's
+    segment is modelled, which is fail-closed and pinned in
+    `case_second_arm_read_still_refused`.
     """
     p = list(parts)
     while p:
@@ -801,7 +833,37 @@ def _control_flow_remainder(parts):
                 return []
             return None
         if w == "case":
-            return [] if len(p) == 3 and p[2] == "in" else None
+            # `case WORD in` runs nothing: WORD is expanded, the arm patterns are globbed,
+            # and neither executes. But bash lets the FIRST ARM open on the header's own
+            # line -- `case "$f" in x) grep -c def f;; esac` -- which is the spelling
+            # members actually write, and the arity guard this replaces (`len(p) == 3`)
+            # matched only a header sitting ALONE on its segment. So every one-line `case`
+            # fell out of the grammar and was classified a WRITE.
+            #
+            # FP16, claude-code 2026-09-04, and the row that pinned it named the mechanism
+            # WRONG: it recorded "`case` is in NO control-flow set, so it head-checks as a
+            # command name", which is false -- `case` has been handled here since the
+            # keyword arm was written. The header was never the problem; the ARM was. That
+            # error is why this comment states the arity, not the keyword.
+            #
+            # Patterns are DATA up to the arm's `)`, exactly as `for`'s words are data. So
+            # skip the header, skip the patterns to the first bare `)`, and head-check what
+            # FOLLOWS. The arm BODY still decides on its own head, which is what keeps this
+            # a grammar and not an admission: `case x in y) cp evil.py f` refuses on `cp`.
+            #
+            # Two shapes return exactly what they returned before. A bare header (nothing
+            # after `in`) runs nothing -> []. A segment with no bare `)` means no arm opened
+            # on it -- either a header split across lines, or an alternation pattern whose
+            # `|` the segmenter already cut into another segment -> None, a write, because
+            # unmodelled shape is a write. Neither is a widening.
+            if len(p) < 3 or p[2] != "in":
+                return None
+            rest = p[3:]
+            if not rest:
+                return []
+            if ")" not in rest:
+                return None
+            return rest[rest.index(")") + 1:]
         return p
     return []
 
