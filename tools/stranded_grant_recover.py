@@ -24,12 +24,35 @@ act, and every cross-wake grant becomes permanently unspendable.
 Read `--census` before quoting a recovery rate: a row whose digest does NOT reproduce from
 its `stated_reason` has an act that exists nowhere durable, and no later wake can spend it.
 
+HOW THE GRANT IS ACTUALLY SPENT, AND THE TRAP THIS TOOL SHIPPED WITH. Corrected
+2026-09-04 after burning two real grants proving it. The claim is NOT something the member
+calls; it is something the GATE HOOK calls, from inside the refused tool call, when the act
+you re-issue digests to a grant that is decided and UNCONSUMED. So there are two events, and
+only one of them delivers the write:
+
+  * re-issue the act  -> hook sees an unconsumed grant, claims it, THE WRITE PROCEEDS.
+  * call `hestia_gate_escalation_claim` yourself -> the grant is consumed and witnessed,
+    and the write has not happened. When you then re-issue the act, the hook looks for an
+    unconsumed grant, finds none, and opens a BRAND NEW escalation. The approval is gone.
+
+This tool's first version did the second thing and told you to "perform the act afterwards".
+That is not a warning you can act on — by then there is nothing left to claim. Measured live:
+grant `75e11706934de096` claimed out-of-band (`claimed: true`), then the act re-issued with a
+byte-identical 226-char digest prefix, and the gate refused it and minted escalation
+`193dd9ce2365a8d3`. Two grants (`d55e55d5e00c7a4c` too) were destroyed demonstrating it.
+
+So `--claim` now RECOVERS AND PRINTS the act, and spends nothing. The out-of-band API call
+is kept behind `--spend-out-of-band` for a surface that has no gate hook in front of it —
+which, on this fleet, is no surface at all.
+
+Read `--census` before quoting a recovery rate: a row whose digest does NOT reproduce from
+its `stated_reason` has an act that exists nowhere durable, and no later wake can spend it.
+
     python3 tools/stranded_grant_recover.py --as claude-code            # what can I spend?
     python3 tools/stranded_grant_recover.py --as claude-code --census   # how much is lost?
     python3 tools/stranded_grant_recover.py --as claude-code --claim <escalation_id>
 
-Read-only unless --claim. --claim SPENDS the approval (single use) and witnesses the spend;
-perform the act afterwards or you have burned a grant for nothing.
+Read-only. Nothing here spends a grant unless you pass --spend-out-of-band, which burns it.
 """
 from __future__ import annotations
 
@@ -164,6 +187,39 @@ def cmd_claim(w: ChainWalker, args) -> int:
               "grant is bound to is not on the chain, so it cannot be re-issued. This grant "
               "is stranded; nothing this tool can do will spend it.")
         return 1
+    poll = w._call("hestia_gate_escalation_poll",
+                   {"session_id": sid, "escalation_id": args.claim, "plugin_id": args.as_})
+    if not poll.get("permits_write"):
+        print(f"NOT SPENDABLE: status={poll.get('status')!r} granted={poll.get('granted')} "
+              f"permits_write={poll.get('permits_write')}. Nothing to recover.")
+        return 1
+
+    if not args.spend_out_of_band:
+        truncated = sr.rstrip().endswith("…")
+        # The poll above is what starts the claim fuse (#667: it burns from OBSERVATION),
+        # so the window quoted here is the one the member actually has from now.
+        print(f"RECOVERED — nothing spent. Claim window {poll.get('claim_window_secs_remaining')}s "
+              f"from this poll (#667: the fuse burns from observation).\n")
+        print("RE-ISSUE this act yourself. The gate hook in front of your tool call is what "
+              "claims the grant;\nif you claim it any other way the write is refused and the "
+              "approval is gone (see module docstring).\n")
+        print(f"  tool={o.get('tool_name')!r}  marker={o.get('marker')!r}")
+        print(f"  act ({len(sr)} chars, truncated={truncated}):")
+        print(f"  {sr}")
+        if truncated:
+            # Not a trick to teach — it is the only way a member spends its own truncated
+            # grant, and hiding it would stall exactly the case --census says is the majority.
+            print(f"\n  NOTE: this act is a TRUNCATED preview and the digest binds it verbatim "
+                  f"(#627).\n  The command you issue must render to this same {len(sr)}-char "
+                  f"preview — i.e. it must\n  begin with the {len(sr.rstrip()[:-1].rstrip())} "
+                  f"characters before the ellipsis. What follows the cap is\n  NOT bound, which "
+                  f"is #627's open hazard and not a licence to append something the\n  approver "
+                  f"did not see.")
+        return 0
+
+    print("SPENDING OUT OF BAND. This consumes the single-use grant WITHOUT performing the "
+          "act, and the gate will refuse the act afterwards. Only correct where no gate hook "
+          "fronts your tool call.\n")
     body = w._call("hestia_gate_escalation_claim", {
         "session_id": sid, "plugin_id": args.as_, "role": "role:constellation:member",
         "tool_name": o.get("tool_name"), "marker": o.get("marker"), "act": sr,
@@ -171,8 +227,8 @@ def cmd_claim(w: ChainWalker, args) -> int:
     })
     print(json.dumps(body, indent=1))
     if body.get("claimed"):
-        print("\nSPENT. Now PERFORM the act — a claimed-and-unperformed grant is a burned one:")
-        print(f"  {sr}")
+        print("\nSPENT, and the write has NOT happened. If a gate hook fronts your tool call, "
+              "this grant is now burned.")
     return 0 if body.get("claimed") else 1
 
 
@@ -181,7 +237,11 @@ def main() -> int:
     ap.add_argument("--as", dest="as_", required=True, help="your plugin_id")
     ap.add_argument("--max", type=int, default=6000, help="hop budget (a budget, not a date)")
     ap.add_argument("--census", action="store_true")
-    ap.add_argument("--claim", metavar="ESCALATION_ID")
+    ap.add_argument("--claim", metavar="ESCALATION_ID",
+                    help="recover and PRINT the act to re-issue; spends nothing")
+    ap.add_argument("--spend-out-of-band", action="store_true",
+                    help="consume the grant via the daemon WITHOUT performing the act. This "
+                         "burns it wherever a gate hook fronts the tool call — see docstring")
     ap.add_argument("--reason", default="Re-issuing my own act, reconstructed from the "
                     "chain's stated_reason, to spend a grant whose asking wake has ended.")
     args = ap.parse_args()
