@@ -447,6 +447,68 @@ _SHELL_BLOCK_KEYWORDS = frozenset({
     "if", "then", "elif", "else", "fi", "while", "until", "for", "do", "done",
     "case", "esac", "function", "select", "{", "}", "((", "[[",
 })
+# ── Control-flow strip (FP12, ported 2026-09-04) ─────────────────────────────────────────
+# The comment above says control flow "can hide or gate a write". It cannot HIDE one: the
+# body of `for f in a b; do cp x GATE; done` arrives at _flush_simple_command as its own
+# segment (`do cp x GATE`) because `;`/`\n` are separators — the keyword only stopped this
+# parser from LOOKING at it. Refusing every segment headed by a keyword therefore bought no
+# safety on the write side and cost every read-only loop that names a governance path: the
+# shape of 20 of 20 false positives in one claude-code session (2026-09-03), each minting an
+# escalation, each withdrawn. Auditing the gate's own deployment necessarily enumerates
+# governance paths, and enumerating anything across N files is a `for` loop.
+#
+# The remedy is the one the shell classifier proved for FP12 (2026-08-07): strip the
+# keyword and resolve what follows. `do`/`then`/`else` prefix a body that runs; `if`/
+# `elif`/`while`/`until` prefix a CONDITION that runs (so `if cp x GATE; then …` still
+# refuses on the cp); a bare closer, a `for VAR [in WORDS]` header, or a `case WORD in`
+# header runs nothing — the words are data, globbed at most. Every other block shape
+# (`{ }`, `((`, `[[`, `function`, `select`, a `case` ARM) stays unmodelled and out of
+# grammar: None here is still a refusal, so nothing that was closed opens.
+#
+# COPIED from hestia_shell_classifier.py rather than imported. That module is no longer on
+# any seat's decision path after the single-gate collapse (#870 — reachable only when THIS
+# module failed to import), and the closure is loaded standalone through the authority
+# bootstrap; an import edge back to an orphaned module is a load-order hazard for the one
+# file that must always load. The closure is now the canonical home of the strip. The
+# guard against the two copies drifting is test_control_flow_strip_matches_classifier in
+# hestia_governance_closure_test.py — the same "fail-safe literal + drift test" idiom
+# hestia_gate_core uses for GOVERNANCE_FILES.
+_CONTROL_FLOW_BODY = frozenset({"do", "then", "else"})            # remainder is the body
+_CONTROL_FLOW_COND = frozenset({"if", "elif", "while", "until"})  # remainder EXECUTES
+_CONTROL_FLOW_CLOSE = frozenset({"done", "fi", "esac"})          # a closer runs nothing
+_FOR_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _control_flow_remainder(parts: list):
+    """Strip leading shell control-flow keywords from ONE segment.
+
+    Returns the remaining command tokens to resolve; [] for a segment that runs NO
+    command (bare closer, `for VAR [in WORDS]` header, `case WORD in` header); or None
+    for a keyword shape this grammar does not model — which the caller MUST treat as out
+    of grammar, because unparseable input is a write.
+    """
+    p = list(parts)
+    while p:
+        w = p[0]
+        if w in _CONTROL_FLOW_BODY or w in _CONTROL_FLOW_COND:
+            p.pop(0)
+            continue
+        if w in _CONTROL_FLOW_CLOSE:
+            return [] if len(p) == 1 else None
+        if w == "for":
+            if (len(p) >= 2 and _FOR_NAME.match(p[1])
+                    and p[1] not in _CONTROL_FLOW_BODY
+                    and p[1] not in _CONTROL_FLOW_COND
+                    and p[1] not in _CONTROL_FLOW_CLOSE and p[1] != "in"
+                    and (len(p) == 2 or p[2] == "in")):
+                return []
+            return None
+        if w == "case":
+            return [] if len(p) == 3 and p[2] == "in" else None
+        return p
+    return []
+
+
 # Interpreters whose `-c` operand is an opaque program string (out of grammar when `-c` given).
 _SUBSHELL_CMDS = frozenset({"bash", "sh", "dash", "zsh", "ksh", "mksh", "busybox"})
 
@@ -810,9 +872,29 @@ def _flush_simple_command(words: list, eff: str, targets: list, stdin_src=None) 
         return eff
     head = stripped[0]
     base = os.path.basename(head) if isinstance(head, str) else ""
-    # Shell block / control-flow keyword governing this command -> out of grammar.
+    # Shell block / control-flow keyword governing this command. FP12 port (2026-09-04):
+    # strip the keyword and resolve the command that FOLLOWS it — see the block comment
+    # above _control_flow_remainder for why the keyword never hid a write. None (an
+    # unmodelled block shape) is still out of grammar; [] (header/closer) runs nothing.
     if head in _SHELL_BLOCK_KEYWORDS or base in _SHELL_BLOCK_KEYWORDS:
-        raise _OutOfGrammar()
+        remainder = _control_flow_remainder(stripped)
+        if remainder is None:
+            raise _OutOfGrammar()
+        if not remainder:
+            return eff
+        # The strip consumes what it models and hands back the rest unchanged. If what it
+        # hands back STILL starts with a block keyword — `{`, `}`, `((`, `[[`, `function`,
+        # `select` — the construct is unmodelled and must stay out of grammar. This check is
+        # load-bearing here and not in the classifier: an unknown head REFUSES there (it is
+        # absent from the read-only allowlist) but contributes NO write targets here (the
+        # anti-FP default), so without it `{ cp x GATE; }` resolved to nothing and was
+        # permitted. Caught by test_control_flow_read_is_read_fp12's write arm before it
+        # shipped, 2026-09-04.
+        if remainder[0] in _SHELL_BLOCK_KEYWORDS:
+            raise _OutOfGrammar()
+        words = stripped = remainder
+        head = stripped[0]
+        base = os.path.basename(head) if isinstance(head, str) else ""
     # `bash -c` / `sh -c` / `eval` -> opaque program string -> out of grammar.
     if base == "eval":
         raise _OutOfGrammar()

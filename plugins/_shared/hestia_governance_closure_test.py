@@ -441,6 +441,97 @@ def _closure_target() -> str:
                         "hestia_governance_closure.py")
 
 
+def test_control_flow_read_is_read_fp12():
+    """FP12 port (2026-09-04): a read-only command inside `for`/`if`/`while`/`until`
+    that names a governance path is a READ, not an out-of-grammar write.
+
+    Before the port every one of these refused: the closure raised _OutOfGrammar on any
+    segment headed by a block keyword, then failed closed on the vocabulary scan. That
+    was 20 of 20 false positives in one claude-code session (2026-09-03), each minting an
+    escalation, each withdrawn — and under the single-gate collapse it fired identically
+    on all four seats, because the fix lived in the classifier the collapse orphaned.
+
+    The write arm is the half that matters more: a write INSIDE control flow must still
+    refuse, and it now refuses with the precise rule (the body was resolved) rather than
+    the blanket out-of-grammar rule. Unmodelled block shapes stay out of grammar.
+    """
+    tgt = _closure_target()
+    oog = "governance-closure-out-of-grammar"
+
+    # Reads under control flow: permitted. The last rows are the exact live FP shape.
+    for cmd in (
+        f"for f in a b; do grep -c def {tgt}; done",
+        f"if grep -q def {tgt}; then echo y; fi",
+        f"until grep -q def {tgt}; do echo hit; done",
+        f"while read f; do grep -c def {tgt}; done",
+        f"for f in a b; do grep -c def {tgt} | awk '{{print $1}}'; done",
+        f"for f in a b\ndo\n  grep -c def {tgt}\ndone",
+    ):
+        v = cls("Bash", {"command": cmd})
+        assert v.classification != "write", (
+            f"a read inside control flow refused as a write (FP12 regression): "
+            f"{cmd!r} -> {v.classification!r} rule={v.rule!r}")
+
+    # Writes under control flow: still refused — and PRECISELY, because the body/condition
+    # was resolved rather than the whole line abandoned.
+    for cmd in (
+        f"for f in a; do cp /tmp/evil {tgt}; done",
+        f"if cp /tmp/evil {tgt}; then echo y; fi",          # the CONDITION executes
+        f"while true; do echo x > {tgt}; done",
+        f"until false; do sudo cp /tmp/evil {tgt}; done",   # wrapper after the keyword
+    ):
+        v = cls("Bash", {"command": cmd})
+        assert v.classification == "write", (
+            f"a write inside control flow was PERMITTED — the port opened a hole: {cmd!r}")
+        assert v.rule != oog, (
+            f"write inside control flow refused only by the blanket out-of-grammar rule, "
+            f"so the body was NOT resolved: {cmd!r} rule={v.rule!r}")
+
+    # Unmodelled block shapes: still out of grammar, still refused. Nothing closed opens.
+    for cmd in (
+        f"case x in a) cp /tmp/evil {tgt};; esac",
+        f"{{ cp /tmp/evil {tgt}; }}",
+        f"(( 1 )) && cp /tmp/evil {tgt}",
+    ):
+        v = cls("Bash", {"command": cmd})
+        assert v.classification == "write", f"unmodelled block shape permitted: {cmd!r}"
+
+    # The #463 row, verbatim: a substitution in write position inside a loop.
+    v = cls("Bash", {"command": f"printf hi\nfor f in {tgt}\ndo\ncp /tmp/evil $f\ndone"})
+    assert v.classification == "write", "#463 loop-with-$f row opened by the FP12 port"
+
+    # Headers and closers run nothing and must not themselves be refused.
+    for cmd in (f"for f in {tgt}; do :; done", "done", "fi"):
+        v = cls("Bash", {"command": cmd})
+        assert v.classification != "write", f"header/closer refused: {cmd!r} rule={v.rule!r}"
+
+
+def test_control_flow_strip_matches_classifier():
+    """Drift guard: the closure's copy of the control-flow strip must equal the shell
+    classifier's, for as long as both exist. The classifier is orphaned by the single-gate
+    collapse (#870) and may leave the runtime manifest; when it does, the closure is the
+    canonical home and this guard has nothing to compare — that is a pass, not a skip."""
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    src = os.path.join(here, "hestia_shell_classifier.py")
+    if not os.path.isfile(src):
+        return  # classifier removed: the closure is canonical; no second copy to drift
+    spec = importlib.util.spec_from_file_location("_shell_for_drift", src)
+    sc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sc)
+    for name in ("_CONTROL_FLOW_BODY", "_CONTROL_FLOW_COND", "_CONTROL_FLOW_CLOSE"):
+        assert set(getattr(g, name)) == set(getattr(sc, name)), \
+            f"{name} drifted between closure and classifier"
+    samples = (
+        ["for", "f", "in", "a", "b"], ["do", "grep", "x"], ["done"], ["fi", "x"],
+        ["if", "grep", "-q", "x"], ["case", "x", "in"], ["case", "x"],
+        ["while", "read", "f"], ["for", "in"], ["for", "f"], ["elif", "then", "cmd"],
+    )
+    for s in samples:
+        assert g._control_flow_remainder(s) == sc._control_flow_remainder(s), \
+            f"_control_flow_remainder drifted on {s!r}"
+
+
 def test_newline_separates_commands_463():
     """#463: a write to the closure behind one benign line must NOT be invisible.
 
@@ -638,6 +729,8 @@ ALL = [
     test_newline_separates_commands_463,
     test_comment_does_not_eat_the_separator_463,
     test_463_pins_do_not_refuse_benign_forms,
+    test_control_flow_read_is_read_fp12,
+    test_control_flow_strip_matches_classifier,
 ]
 
 if __name__ == "__main__":

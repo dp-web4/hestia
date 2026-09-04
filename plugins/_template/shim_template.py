@@ -1,8 +1,10 @@
-#!/usr/bin/env python3
-"""Claude Code -> Hestia common-gate shim.
+"""Certified Hestia harness shim template.
 
-HARNESS-DIFFERENCE: Claude Code supplies a PreToolUse JSON event on stdin and treats exit 2
-as a blocking hook result. No governance semantics differ from any other seat.
+A shim translates an event. It never decides how that event is governed.
+
+The tuples below are the machine-readable structural contract consumed by
+`plugins/_shared/shim_certification_test.py`; prose and checker do not carry separate
+allow-lists that can drift.
 """
 from __future__ import annotations
 
@@ -15,7 +17,29 @@ SHIM_CERTIFICATION_SCHEMA = "hestia-shim-cert/v1"
 CERTIFICATION_CRITERIA = "PRD_SHIM_CERTIFICATION.md@2026-09-04"
 REQUIRED_GATE_API = "decide/1"
 
+PERMITTED_FUNCTIONS = (
+    "_authority_dir",
+    "_load_gate",
+    "_emergency_block",
+    "to_event",
+    "emit",
+    "read_harness_event",
+    "main",
+)
+BYTE_IDENTICAL_FUNCTIONS = (
+    "_authority_dir",
+    "_load_gate",
+    "_emergency_block",
+    "main",
+)
+ADAPTER_FUNCTIONS = ("to_event", "emit", "read_harness_event")
+PERMITTED_PROFILE_KEYS = {
+    "member_id", "identity_path", "home_markers", "host_agent",
+    "client_name", "gate_path", "observe_dir",
+}
 
+
+# 1. AUTHORITY BOOTSTRAP. Copy byte-for-byte.
 def _authority_dir() -> str:
     return os.path.realpath(os.path.expanduser("~/.hestia/shared"))
 
@@ -88,55 +112,32 @@ def _emergency_block(reason: str) -> int:
     return 2
 
 
+# 2. PROFILE DATA. Replace values, never add policy.
 PROFILE = {
-    "member_id": "claude-code",
-    "identity_path": os.path.expanduser("~/.claude/hestia-instance/identity.json"),
-    "home_markers": ("~/.claude",),
-    "host_agent": "claude-code",
-    "client_name": "hestia-claude-code-gate",
+    "member_id": "<seat>",
+    "identity_path": "<absolute-or-expanded identity path>",
+    "home_markers": ("<harness-home>",),
+    "host_agent": "<seat>",
+    "client_name": "hestia-<seat>-gate",
     "gate_path": os.path.abspath(__file__),
-    "observe_dir": "~/.claude/hestia-observe",
+    "observe_dir": "<observe-dir>",
 }
 
 
+# 3. HARNESS SYNTAX ADAPTERS. Pure translation/rendering only.
 def to_event(gate, raw):
-    if not isinstance(raw, dict) or raw.get("hook_event_name") != "PreToolUse":
-        raise ValueError("expected PreToolUse event")
-    tool = raw.get("tool_name")
-    tool_input = raw.get("tool_input")
-    if not isinstance(tool, str) or not tool:
-        raise ValueError("PreToolUse event has no tool_name")
-    if not isinstance(tool_input, dict):
-        raise ValueError("PreToolUse event has non-object tool_input")
-    return gate.GateEvent(
-        tool=tool,
-        tool_input=tool_input,
-        cwd=raw.get("cwd") if isinstance(raw.get("cwd"), str) else None,
-        session_id=raw.get("session_id") if isinstance(raw.get("session_id"), str) else None,
-        tool_use_id=raw.get("tool_use_id") if isinstance(raw.get("tool_use_id"), str) else None,
-        raw=raw,
-    )
+    raise NotImplementedError("translate harness event to gate.GateEvent")
 
 
 def emit(decision) -> int:
-    if decision.decision == "allow":
-        return 0
-    text = f"hestia: {decision.decision} [{decision.rule or 'gate'}]"
-    if decision.reason:
-        text += " - " + decision.reason
-    if decision.remedy:
-        text += ". " + decision.remedy
-    sys.stderr.write(text + "\n")
-    return 2 if decision.decision == "deny" else 0
+    raise NotImplementedError("render GateDecision using the harness blocking protocol")
 
 
 def read_harness_event():
-    raw = sys.stdin.read()
-    if not raw:
-        raise ValueError("empty hook event")
-    return json.loads(raw)
+    raise NotImplementedError("read one harness-native event")
 
 
+# 4. MAIN. Copy byte-for-byte.
 def main() -> int:
     try:
         gate = _load_gate()
