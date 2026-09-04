@@ -27,6 +27,25 @@
 //! the artifact when the vault is unavailable is a second authority with extra steps, and the
 //! PRD's acceptance arm 5 exists to forbid exactly that: an unreadable vault renders nothing and
 //! the caller is told INDETERMINATE rather than handed a stale value that looks current.
+//!
+//! WHAT THIS SLICE DOES NOT YET ESTABLISH (GPT review of #898, finding 4 — stated here rather
+//! than left for a reader to discover). This is the render/verify/witness SUBSTRATE. It is not
+//! yet the source of truth for anything, because nothing consumes it:
+//!
+//!   * No seat or hook loads `<home>/seats/<member>.env` at startup. The rendered artifact is
+//!     currently written and checked, and then read by nobody, so a correct render and a
+//!     quarantined one have the same effect on a running seat: none.
+//!   * The only production caller is the periodic worker, which enumerates
+//!     `gate_capabilities.keys()`. A member with vault config but no capability row is never
+//!     looked at, so "every seat is verified" is true only of seats that happen to have
+//!     reported a capability.
+//!   * Readiness does not consume the verdicts, so an INDETERMINATE seat still reports as it
+//!     did before.
+//!
+//! Until those three are wired, this module makes drift VISIBLE and makes an unbacked artifact
+//! UNUSABLE. It does not yet make the vault the thing a seat actually starts from. Saying so is
+//! the point: an unconsumed producer that reads as a completed mechanism is the defect this
+//! codebase keeps re-finding, and it is not improved by being introduced with confidence.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -62,6 +81,14 @@ pub enum ConfigVerdict {
     /// The artifact cannot be read. NOT reported as verified, and not as miswired either:
     /// an unreadable file is an unknown, and absence of evidence gets its own name.
     Unreadable { member: String, error: String },
+    /// An artifact exists on disk that the vault no longer backs, or backs with content this
+    /// module refuses to render (see `SeatConfig::validate`).
+    ///
+    /// GPT review of #898, finding 1: the first version simply `continue`d here, which left the
+    /// stale file untouched and fully consumable. That is fallback to the artifact by omission —
+    /// precisely what this module's own header says it does not do. An unbacked projection is
+    /// quarantined so it cannot be read as current, and the reason is carried here.
+    Unbacked { member: String, reason: String, quarantined_to: Option<String> },
 }
 
 impl ConfigVerdict {
@@ -73,8 +100,84 @@ impl ConfigVerdict {
             ConfigVerdict::Verified { member, .. }
             | ConfigVerdict::Miswired { member, .. }
             | ConfigVerdict::Missing { member, .. }
-            | ConfigVerdict::Unreadable { member, .. } => member,
+            | ConfigVerdict::Unreadable { member, .. }
+            | ConfigVerdict::Unbacked { member, .. } => member,
         }
+    }
+
+    /// The chain event name this verdict is witnessed under.
+    ///
+    /// GPT review of #898, finding 2: only `Miswired` reached the chain, so a runtime deletion
+    /// or an unreadable artifact became a log line and a silent rewrite. `is_finding()` already
+    /// said those were findings; the witness disagreed with it. Every finding now names an
+    /// event, and the mapping lives beside the enum so a new variant cannot be added without
+    /// answering this question.
+    pub fn chain_event(&self) -> Option<&'static str> {
+        match self {
+            ConfigVerdict::Verified { .. } => None,
+            ConfigVerdict::Miswired { .. } => Some("config_miswire"),
+            ConfigVerdict::Missing { .. }
+            | ConfigVerdict::Unreadable { .. }
+            | ConfigVerdict::Unbacked { .. } => Some("config_integrity_finding"),
+        }
+    }
+
+    /// Short status word for the witness payload, so one event type stays queryable.
+    pub fn status(&self) -> &'static str {
+        match self {
+            ConfigVerdict::Verified { .. } => "verified",
+            ConfigVerdict::Miswired { .. } => "miswired",
+            ConfigVerdict::Missing { .. } => "missing",
+            ConfigVerdict::Unreadable { .. } => "unreadable",
+            ConfigVerdict::Unbacked { .. } => "unbacked",
+        }
+    }
+}
+
+/// A rendered `KEY=value` line is CONFIG THAT WILL BE SOURCED. Validate before rendering.
+///
+/// GPT review of #898, finding 5. `render()` wrote arbitrary vault keys and values raw, so a
+/// value containing a newline does not produce a wrong assignment — it produces EXTRA
+/// assignments, changing how many variables the file sets and what they are. The vault is
+/// authoritative, but authoritative malformed data must be refused rather than rendered
+/// ambiguously, because the rendered file is executable config and the digest check would
+/// happily certify the injected version as correct.
+pub fn validate_env_pair(k: &str, v: &str) -> Result<(), String> {
+    if k.is_empty() {
+        return Err("empty environment key".to_string());
+    }
+    let mut chars = k.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return Err(format!(
+            "environment key '{k}' must start with a letter or underscore"
+        ));
+    }
+    if !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(format!(
+            "environment key '{k}' may only contain letters, digits and underscores"
+        ));
+    }
+    if v.contains('\n') || v.contains('\r') {
+        return Err(format!(
+            "value for '{k}' contains a line break, which would render as additional \
+             assignments rather than as one value"
+        ));
+    }
+    if v.contains('\0') {
+        return Err(format!("value for '{k}' contains a NUL byte"));
+    }
+    Ok(())
+}
+
+impl SeatConfig {
+    /// Every pair must be renderable, or the whole config is refused. Partial rendering would
+    /// write a file that is neither the vault's content nor a recognisable failure.
+    pub fn validate(&self) -> Result<(), String> {
+        for (k, v) in &self.env {
+            validate_env_pair(k, v)?;
+        }
+        Ok(())
     }
 }
 
@@ -131,12 +234,40 @@ pub fn verify_one(home: &Path, member: &str, cfg: &SeatConfig) -> ConfigVerdict 
     }
 }
 
+/// Move an unbacked projection aside so nothing can read it as current.
+///
+/// RENAMED, NOT DELETED. The stale file is the only evidence of what the seat was running with
+/// before the vault stopped backing it, and a migration that destroys its own predecessor state
+/// cannot be diagnosed afterwards. The suffix is fixed rather than timestamped so repeated
+/// passes converge instead of littering: quarantining twice overwrites the first quarantine,
+/// which is correct — the interesting artifact is the one that was live.
+///
+/// Returns the quarantine path when something was moved, `None` when there was nothing there.
+pub fn quarantine(home: &Path, member: &str) -> std::io::Result<Option<PathBuf>> {
+    let path = render_path(home, member);
+    match std::fs::metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+        Ok(_) => {
+            let dest = path.with_extension("env.unbacked");
+            std::fs::rename(&path, &dest)?;
+            Ok(Some(dest))
+        }
+    }
+}
+
 /// Write the rendered artifact. Returns whether the bytes on disk CHANGED.
 ///
 /// Atomic by rename, so a reader never sees a half-written config: a seat that read a truncated
 /// env file would resolve a wrong workspace root and enforce against the wrong tree, which is
 /// the failure this whole document exists to end.
 pub fn render_to_disk(home: &Path, member: &str, cfg: &SeatConfig) -> std::io::Result<bool> {
+    // Refuse here as well as at the call site. A writer that trusts its caller to have
+    // validated is one refactor away from writing an injected file, and this is the only
+    // function in the module that makes bytes durable.
+    if let Err(msg) = cfg.validate() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+    }
     let path = render_path(home, member);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -211,5 +342,73 @@ mod tests {
         let v = verify_one(dir.path(), "claude-code", &cfg());
         assert!(matches!(v, ConfigVerdict::Missing { .. }), "got {v:?}");
         assert!(v.is_finding(), "absence is a finding, never a silent pass");
+    }
+
+    /// A newline in a vault value would render as EXTRA ASSIGNMENTS, not as a wrong value.
+    ///
+    /// GPT review of #898, finding 5. This is the arm that fails on the original `render()`,
+    /// which wrote `format!("{k}={v}\n")` raw. The consequence is worse than a bad value: the
+    /// rendered file sets a different NUMBER of variables than the vault declares, and the
+    /// digest check then certifies the injected file as correct, because it is exactly what the
+    /// renderer produces. Refusing at validation is the only point where the two can still be
+    /// told apart.
+    #[test]
+    fn a_value_carrying_a_line_break_is_refused_rather_than_rendered() {
+        let mut env = BTreeMap::new();
+        env.insert(
+            "HESTIA_WORKSPACE".to_string(),
+            "/w/ai\nHESTIA_ROLE=role:constellation:sovereign".to_string(),
+        );
+        let bad = SeatConfig { env, note: String::new() };
+
+        let err = bad.validate().expect_err("an injected value must not validate");
+        assert!(err.contains("line break"), "the refusal names the reason: {err}");
+
+        // And nothing reaches disk, checked separately: a validator nobody calls at the write
+        // site is a claim, not a guard.
+        let dir = tempfile::tempdir().unwrap();
+        let e = render_to_disk(dir.path(), "claude-code", &bad)
+            .expect_err("the writer refuses too, not only the caller");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            !render_path(dir.path(), "claude-code").exists(),
+            "no partial artifact is left behind"
+        );
+    }
+
+    #[test]
+    fn an_unusable_environment_key_is_refused() {
+        for bad_key in ["", "9LEADING_DIGIT", "HAS-DASH", "HAS SPACE", "HAS=EQUALS"] {
+            let mut env = BTreeMap::new();
+            env.insert(bad_key.to_string(), "value".to_string());
+            let cfg = SeatConfig { env, note: String::new() };
+            assert!(
+                cfg.validate().is_err(),
+                "key {bad_key:?} must be refused: it does not render as one assignment"
+            );
+        }
+        // The positive control, so the rule is not simply "refuse everything".
+        assert!(cfg().validate().is_ok(), "an ordinary config still validates");
+    }
+
+    /// Quarantine preserves rather than destroys, and is idempotent.
+    #[test]
+    fn quarantine_moves_the_artifact_aside_and_converges() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = render_path(dir.path(), "codex");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "HESTIA_WORKSPACE=/authored/by/hand\n").unwrap();
+
+        let moved = quarantine(dir.path(), "codex").unwrap().expect("something moved");
+        assert!(!p.exists(), "not readable where a seat would source it");
+        assert_eq!(
+            std::fs::read_to_string(&moved).unwrap(),
+            "HESTIA_WORKSPACE=/authored/by/hand\n",
+            "the evidence is preserved verbatim"
+        );
+        assert!(
+            quarantine(dir.path(), "codex").unwrap().is_none(),
+            "quarantining nothing reports nothing rather than erroring"
+        );
     }
 }

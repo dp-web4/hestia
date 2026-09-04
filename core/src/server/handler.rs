@@ -5070,36 +5070,158 @@ pub(crate) fn render_and_verify_seat_configs(
     let home = s.home.clone();
     let mut verdicts = Vec::new();
     for member in members {
-        let Some(bytes) = s.vault.get_document(sc::SEAT_CONFIG_NS, member) else {
-            continue; // the vault declares nothing for this member: nothing to render or claim
-        };
-        let cfg: sc::SeatConfig = match serde_json::from_slice(bytes) {
+        // THE VAULT IS THE ONLY AUTHORITY, AND ITS ABSENCE IS NOT A PASS.
+        //
+        // GPT review of #898, finding 1. This used to `continue` when the vault held nothing or
+        // held something undecodable, which left any existing `<home>/seats/<member>.env`
+        // untouched and fully consumable — fallback to the stale artifact, achieved by doing
+        // nothing. The module header already promised the opposite. Now an unbacked projection
+        // is quarantined, so the failure mode is "the seat has no config" rather than "the seat
+        // silently runs yesterday's config".
+        let decoded: Result<sc::SeatConfig, String> =
+            match s.vault.get_document(sc::SEAT_CONFIG_NS, member) {
+                None => Err("the vault declares no config for this member".to_string()),
+                Some(bytes) => serde_json::from_slice::<sc::SeatConfig>(bytes)
+                    .map_err(|e| format!("vault config does not decode as seat config: {e}"))
+                    // Malformed-but-decodable content is refused for the same reason: it would
+                    // render as executable config with an ambiguous number of assignments.
+                    .and_then(|c| c.validate().map(|_| c)),
+            };
+
+        let cfg = match decoded {
             Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(member = %member, error = %e,
-                    "seat config in the vault is not readable as config; rendering nothing");
+            Err(reason) => {
+                let quarantined = match sc::quarantine(&home, member) {
+                    Ok(p) => p.map(|p| p.to_string_lossy().to_string()),
+                    Err(e) => {
+                        tracing::warn!(member = %member, error = %e,
+                            "unbacked seat config could NOT be quarantined; it is still readable");
+                        None
+                    }
+                };
+                verdicts.push(sc::ConfigVerdict::Unbacked {
+                    member: member.clone(),
+                    reason,
+                    quarantined_to: quarantined,
+                });
                 continue;
             }
         };
+
         let verdict = sc::verify_one(&home, member, &cfg);
-        if let sc::ConfigVerdict::Miswired { expected, actual, .. } = &verdict {
-            let payload = json!({
-                "member": member,
-                "artifact": sc::render_path(&home, member).to_string_lossy(),
-                "expected_sha256": expected,
-                "found_sha256": actual,
-            });
-            if let Err(e) = s.append_chain("config_miswire", payload) {
-                tracing::warn!(member = %member, error = %e,
-                    "config miswire could NOT be recorded; the drift stands and the record does not");
+        // Repair every state that is not already correct. `Unreadable` is included: if the
+        // artifact cannot be read, re-rendering it from the authority IS the repair, and if the
+        // rewrite also fails the error says so rather than the pass going quiet.
+        if matches!(
+            verdict,
+            sc::ConfigVerdict::Miswired { .. }
+                | sc::ConfigVerdict::Missing { .. }
+                | sc::ConfigVerdict::Unreadable { .. }
+        ) {
+            if let Err(e) = sc::render_to_disk(&home, member, &cfg) {
+                tracing::warn!(member = %member, error = %e, "seat config could not be rendered");
             }
-        }
-        if let Err(e) = sc::render_to_disk(&home, member, &cfg) {
-            tracing::warn!(member = %member, error = %e, "seat config could not be rendered");
         }
         verdicts.push(verdict);
     }
+
+    // Witness AFTER the loop so the transition bookkeeping sees the whole pass at once, and so
+    // a repair cannot be recorded before the finding that motivated it.
+    witness_config_verdicts(s, &home, &verdicts);
     verdicts
+}
+
+/// Record findings, and record their RESOLUTION.
+///
+/// GPT review of #898, finding 3: the previous pass recorded a miswire and repaired it in the
+/// same breath, so the next pass returned Verified and nothing ever committed the transition
+/// back to clean. Drift therefore had no duration — only a series of identical stateless
+/// complaints, or silence, with no way to tell "fixed" from "not looked at". State lives in
+/// `config_findings_open` so the edge can be detected rather than the level.
+fn witness_config_verdicts(
+    s: &mut super::state::ServerState,
+    home: &std::path::Path,
+    verdicts: &[super::seat_config::ConfigVerdict],
+) {
+    use super::seat_config as sc;
+    let now = super::gate_escalation::now_secs();
+
+    for verdict in verdicts {
+        let member = verdict.member().to_string();
+        let artifact = sc::render_path(home, &member).to_string_lossy().to_string();
+
+        match verdict.chain_event() {
+            Some(event) => {
+                // Only the FIRST observation of a continuing finding is witnessed. A row per
+                // pass would make the chain a function of the poll interval rather than of the
+                // drift, and 96 identical rows a day is how a real finding becomes background.
+                //
+                // ASK WHETHER IT WAS INSERTED, never whether its timestamp equals `now`. The
+                // first version compared `first_seen != now`, which is the same question only
+                // while the clock is finer than the poll: two passes inside one second read as
+                // "newly opened" twice and witnessed twice. Caught by the test, which runs both
+                // passes in the same second — the condition a real deployment reaches whenever
+                // a check is triggered twice in quick succession.
+                let is_new = !s.config_findings_open.contains_key(&member);
+                let first_seen = *s.config_findings_open.entry(member.clone()).or_insert(now);
+                if !is_new {
+                    continue;
+                }
+                let mut payload = json!({
+                    "member": member,
+                    "artifact": artifact,
+                    "status": verdict.status(),
+                    "first_observed_at": first_seen,
+                });
+                match verdict {
+                    sc::ConfigVerdict::Miswired { expected, actual, .. } => {
+                        payload["expected_sha256"] = json!(expected);
+                        payload["found_sha256"] = json!(actual);
+                    }
+                    sc::ConfigVerdict::Missing { expected, .. } => {
+                        payload["expected_sha256"] = json!(expected);
+                    }
+                    sc::ConfigVerdict::Unreadable { error, .. } => {
+                        payload["error"] = json!(error);
+                    }
+                    sc::ConfigVerdict::Unbacked { reason, quarantined_to, .. } => {
+                        payload["reason"] = json!(reason);
+                        payload["quarantined_to"] = json!(quarantined_to);
+                    }
+                    sc::ConfigVerdict::Verified { .. } => {}
+                }
+                if let Err(e) = s.append_chain(event, payload) {
+                    // The finding stands even though the record does not. Clear the state so the
+                    // next pass retries the witness rather than treating an unrecorded finding
+                    // as already reported.
+                    s.config_findings_open.remove(&member);
+                    tracing::warn!(member = %member, error = %e,
+                        "config finding could NOT be recorded; the drift stands and the record does not");
+                }
+            }
+            None => {
+                // Verified. Emit the closing edge if and only if this member was open.
+                if let Some(opened_at) = s.config_findings_open.remove(&member) {
+                    let payload = json!({
+                        "member": member,
+                        "artifact": artifact,
+                        "status": "resolved",
+                        "first_observed_at": opened_at,
+                        "resolved_at": now,
+                        // The number the pair exists to produce. Without it a reader can see
+                        // that drift happened and that it stopped, but not for how long the
+                        // seat ran miswired.
+                        "open_secs": now.saturating_sub(opened_at),
+                    });
+                    if let Err(e) = s.append_chain("config_integrity_resolved", payload) {
+                        s.config_findings_open.insert(member.clone(), opened_at);
+                        tracing::warn!(member = %member, error = %e,
+                            "config resolution could NOT be recorded; leaving the finding open");
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn record_newly_lapsed(s: &mut super::state::ServerState, now: u64) -> usize {
@@ -9927,13 +10049,22 @@ mod tests {
         assert_eq!(repaired, rendered, "the vault's rendering is restored after being recorded");
     }
 
-    /// No vault document means nothing is rendered and nothing is claimed.
+    /// An artifact the vault does not back is QUARANTINED, not left sitting there readable.
     ///
-    /// PRD acceptance arm 5: a renderer that falls back to the file it found is a second
-    /// authority with extra steps, so absence must produce no verdict at all rather than a
-    /// verdict computed against whatever happens to be on disk.
+    /// THIS TEST PREVIOUSLY ASSERTED THE DEFECT. Its earlier form ended with "the stray file is
+    /// neither adopted as truth nor overwritten" and passed, because the pass simply `continue`d
+    /// on a missing vault document. That is fallback to the artifact achieved by inaction: a
+    /// seat starting from `<home>/seats/<member>.env` would source a file no authority stands
+    /// behind, and the check that exists to catch exactly that would report nothing at all.
+    /// GPT's review of #898 (finding 1) named it, and the module header had already promised
+    /// the opposite — "an unreadable vault renders nothing and the caller is told INDETERMINATE
+    /// rather than handed a stale value that looks current".
+    ///
+    /// So the expectation is inverted deliberately: absence of authority must INVALIDATE the
+    /// projection, not preserve it. The file is renamed rather than deleted, because it is the
+    /// only evidence of what the seat was running with before the vault stopped backing it.
     #[tokio::test]
-    async fn a_member_the_vault_does_not_declare_is_not_rendered_or_judged() {
+    async fn an_artifact_the_vault_no_longer_backs_is_quarantined() {
         use super::super::seat_config as sc;
         let (dir, shared) = make_shared_state();
         let member = "codex".to_string();
@@ -9941,19 +10072,141 @@ mod tests {
         std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
         std::fs::write(&stray, "HESTIA_WORKSPACE=/authored/by/hand\n").unwrap();
 
+        let before = {
+            let s = shared.lock().await;
+            s.chain_store.len().unwrap()
+        };
         let verdicts = {
             let mut s = shared.lock().await;
             super::render_and_verify_seat_configs(&mut s, std::slice::from_ref(&member))
         };
+
+        match verdicts.first() {
+            Some(sc::ConfigVerdict::Unbacked { quarantined_to, reason, .. }) => {
+                assert!(reason.contains("declares no config"), "the reason is named: {reason}");
+                assert!(quarantined_to.is_some(), "and the quarantine path is recorded");
+            }
+            other => panic!("an unbacked artifact must be reported, got {other:?}"),
+        }
         assert!(
-            verdicts.is_empty(),
-            "an undeclared member yields no verdict: {verdicts:?}"
+            !stray.exists(),
+            "the unbacked projection must no longer be readable at the path a seat would source"
         );
+        assert!(
+            stray.with_extension("env.unbacked").exists(),
+            "and it is preserved as evidence rather than destroyed"
+        );
+        let after = {
+            let s = shared.lock().await;
+            s.chain_store.len().unwrap()
+        };
+        assert!(after > before, "an unbacked projection is a governance event: {before} -> {after}");
+    }
+
+    /// A member the vault does not declare, with NOTHING on disk, is simply not our business.
+    ///
+    /// The companion to the test above, and the reason that one is not over-broad: quarantine
+    /// fires on an unbacked ARTIFACT, not on an unmentioned member. Without this arm, "no vault
+    /// config" and "no vault config but a live file" would be indistinguishable in the suite,
+    /// and a future change could start emitting a finding for every member that has none.
+    #[tokio::test]
+    async fn an_undeclared_member_with_no_artifact_produces_no_finding() {
+        let (_dir, shared) = make_shared_state();
+        let member = "gemini".to_string();
+        let before = {
+            let s = shared.lock().await;
+            s.chain_store.len().unwrap()
+        };
+        let verdicts = {
+            let mut s = shared.lock().await;
+            super::render_and_verify_seat_configs(&mut s, std::slice::from_ref(&member))
+        };
+        match verdicts.first() {
+            Some(super::super::seat_config::ConfigVerdict::Unbacked { quarantined_to, .. }) => {
+                assert!(
+                    quarantined_to.is_none(),
+                    "nothing was quarantined because nothing was there"
+                );
+            }
+            other => panic!("expected an unbacked verdict with no quarantine, got {other:?}"),
+        }
+        let after = {
+            let s = shared.lock().await;
+            s.chain_store.len().unwrap()
+        };
+        assert!(after > before, "still witnessed: silence about an unconfigured seat is what hid #839");
+    }
+
+    /// Drift gets a DURATION: the finding opens once and closes once.
+    ///
+    /// GPT review of #898, finding 3. Before this, a miswire was recorded and repaired in the
+    /// same pass, so the chain held complaints with no closing edge — a reader could see that
+    /// drift happened but not whether it was ever fixed, and a fixed one looked identical to one
+    /// nobody had examined. Both edges are asserted here, and so is the thing that makes the
+    /// pair readable: `open_secs`.
+    #[tokio::test]
+    async fn a_miswire_opens_once_and_its_repair_is_witnessed() {
+        use super::super::seat_config as sc;
+        let (dir, shared) = make_shared_state();
+        let member = "claude-code".to_string();
+        let cfg = serde_json::json!({"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""});
+        {
+            let mut s = shared.lock().await;
+            s.vault
+                .put_document(sc::SEAT_CONFIG_NS, &member, serde_json::to_vec(&cfg).unwrap())
+                .unwrap();
+        }
+        let one = std::slice::from_ref(&member);
+        // Pass 1 renders it; pass 2 verifies clean.
+        {
+            let mut s = shared.lock().await;
+            super::render_and_verify_seat_configs(&mut s, one);
+            super::render_and_verify_seat_configs(&mut s, one);
+        }
+        let path = sc::render_path(dir.path(), &member);
+        let good = std::fs::read_to_string(&path).unwrap();
+
+        // Edit it, then run TWICE without repairing in between... except the pass repairs, so
+        // re-break it to prove a continuing finding is not re-witnessed every pass.
+        std::fs::write(&path, good.replace("/w/ai", "/elsewhere")).unwrap();
+        let (open_rows, second_rows) = {
+            let mut s = shared.lock().await;
+            let a = s.chain_store.len().unwrap();
+            super::render_and_verify_seat_configs(&mut s, one);
+            let b = s.chain_store.len().unwrap();
+            // Break it again so the finding stays open across the next pass.
+            std::fs::write(&path, good.replace("/w/ai", "/elsewhere")).unwrap();
+            super::render_and_verify_seat_configs(&mut s, one);
+            let c = s.chain_store.len().unwrap();
+            (b - a, c - b)
+        };
+        assert_eq!(open_rows, 1, "the finding opens with exactly one row");
         assert_eq!(
-            std::fs::read_to_string(&stray).unwrap(),
-            "HESTIA_WORKSPACE=/authored/by/hand\n",
-            "and the stray file is neither adopted as truth nor overwritten"
+            second_rows, 0,
+            "a CONTINUING finding is not re-witnessed: a row per pass makes the chain a function \
+             of the poll interval rather than of the drift"
         );
+
+        // Now let it settle: the artifact is repaired, so the next pass verifies and must close.
+        let closed = {
+            let mut s = shared.lock().await;
+            let a = s.chain_store.len().unwrap();
+            let v = super::render_and_verify_seat_configs(&mut s, one);
+            let b = s.chain_store.len().unwrap();
+            assert!(
+                matches!(v.first(), Some(sc::ConfigVerdict::Verified { .. })),
+                "the repair from the previous pass leaves it clean: {v:?}"
+            );
+            b - a
+        };
+        assert_eq!(closed, 1, "the resolution is witnessed exactly once");
+        {
+            let s = shared.lock().await;
+            assert!(
+                !s.config_findings_open.contains_key(&member),
+                "and the member is no longer carrying an open finding"
+            );
+        }
     }
 
     fn make_shared_state() -> (TempDir, SharedState) {

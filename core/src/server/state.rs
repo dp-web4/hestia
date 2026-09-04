@@ -248,6 +248,15 @@ pub struct ServerState {
     /// it understood a newly served field. #481 remains the integrity boundary for proving
     /// which installed bytes made that report.
     pub gate_capabilities: HashMap<String, HashSet<String>>,
+    /// Member → wall-clock time its current seat-config finding was FIRST observed.
+    ///
+    /// The edge, not the level. A stateless check can only ever report "miswired again" on every
+    /// pass, which makes the chain a function of the poll interval, and it can never report the
+    /// close — so drift has no duration and a fixed one is indistinguishable from an unexamined
+    /// one (GPT review of #898, finding 3). Present here rather than in the vault because it is
+    /// observation bookkeeping, not authority: losing it on restart re-opens the finding, which
+    /// is the safe direction.
+    pub config_findings_open: HashMap<String, u64>,
     /// In-scope work awaiting attestation, keyed by (plugin_id, role_lct) → (allows, denies).
     ///
     /// WHY THIS EXISTS. Trust could only be earned two ways — be denied and comply, or be
@@ -628,6 +637,7 @@ impl ServerState {
 
         let mut st = Self {
             gate_capabilities: HashMap::new(),
+            config_findings_open: HashMap::new(),
             scope_tally: std::collections::HashMap::new(),
             vault,
             sessions: HashMap::new(),
