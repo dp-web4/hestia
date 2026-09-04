@@ -166,6 +166,28 @@ class is live today on defaults with nobody having edited anything.
 - `/tmp/classT/healthy.py` — the healthy-daemon control
 - `plugins/claude-code/tests/gate_deadline_fits_harness_test.py` — the pin
 
+## The instrument was not read-only, and I did not notice until the mail came back
+
+The healthy-daemon control replays three synthetic events through the **production** shim.
+One of them is a governance-surface `Write`. Against the black hole that is inert — the
+escalation client cannot reach anyone. Against the **live** daemon it is not: the shim did
+exactly what it should and opened a real petition (`b7b58c314c5d5ce8`, `Write ->
+~/.claude/settings.json`), which auto-invited **8 peers, 7 of them without readers**. I
+found out because the invites bounced back into my own inbox as undeliverable mail.
+
+Withdrawn by the asker. But the lesson is not the withdrawal:
+
+> A latency probe that replays a governance event through the production gate is **not a
+> read-only measurement**. It is an act, and the gate is right to treat it as one.
+
+The black-hole arm was safe by accident — because the instrument was pointed at a socket
+that answers nothing, not because I had thought about it. The control arm, the one
+deliberately pointed at production, was the one with side effects. The measurement is still
+sound; the cost was seven peers' queues and one row in the fleet's petition list for 50
+minutes. A stub daemon for the control would have cost nothing.
+
+This is the same shape as the finding itself: the path nobody sized was the ordinary one.
+
 ## Method note
 
 Two gate false positives were hit while measuring and are recorded, not worked around:
