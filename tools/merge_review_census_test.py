@@ -12,13 +12,12 @@ from __future__ import annotations
 
 import sys
 import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from merge_review_census import (  # noqa: E402
-    census, is_findings, seat_merges, substantive_comments, wake_span,
+    census, is_findings, seat_merges, substantive_comments,
 )
 
 FAILURES: list[str] = []
@@ -39,6 +38,17 @@ def pr(number, title, merged, comments=(), reviews=(), by="dp-web4"):
         "comments": [{"author": {"login": a}, "body": b} for a, b in comments],
         "reviews": list(reviews),
     }
+
+
+def witness(action_id: str, plugin: str, target: str, success: str = "true") -> str:
+    """One witness outcome record, in the shape the fire logs actually emit."""
+    return (
+        '  {"action_id": "%s", "closure_claims": [], "error": null,\n'
+        '   "magnitude": 0.8, "plugin_id": "%s",\n'
+        '   "role_lct": "role:constellation:mesh-worker", "success": %s,\n'
+        '   "target": "%s", "tool_name": "Bash"}\n'
+        % (action_id, plugin, success, target)
+    )
 
 
 def arm_bot_advert_is_not_review() -> None:
@@ -109,67 +119,166 @@ def arm_mergedby_cannot_separate_seats() -> None:
     check("no seat claimed without a log", out["seat_performed"] == [])
 
 
-def arm_seat_merge_join_needs_the_span() -> None:
-    """A seat merge is attributed only when the merge falls inside its wake.
+def arm_seat_is_read_from_the_record_not_the_filename() -> None:
+    """A record quoted in another seat's log still names the seat that ran it.
 
-    This is the #697 case: kimi ran `gh pr merge 697` and GitHub logged
-    dp-web4. Sabotage: attribute on the log CONTAINING the number regardless of
-    time, and an unrelated later merge of the same number is misattributed.
-    """
-    merges = {
-        697: [("kimi", datetime(2026, 8, 28, 5, 54, tzinfo=timezone.utc),
-                       datetime(2026, 8, 28, 6, 30, tzinfo=timezone.utc))],
-    }
-    inside = census([pr(697, "fix(witness): fail-open", "2026-08-28T06:03:42Z")], 200, merges)
-    check("merge inside the wake is seat-attributed",
-          inside["seat_performed"] == [(697, "kimi")], f"got {inside['seat_performed']}")
-
-    outside = census([pr(697, "fix(witness): fail-open", "2026-08-29T06:03:42Z")], 200, merges)
-    check("merge outside the wake is NOT attributed",
-          outside["seat_performed"] == [], f"got {outside['seat_performed']}")
-
-
-def arm_quoted_merge_is_not_a_merge() -> None:
-    """A log that greps the archive quotes other logs' merge commands.
-
-    This is the contamination that made 16 logs look like merge performers when
-    exactly one was. Sabotage: drop the QUOTED filter and the quoting log is
-    credited with a merge it only ever read.
+    This is the #532 case and it is why the published table was wrong: the only
+    copies of that record live in two CODEX logs, and the record itself says
+    `claude-code`. Sabotage: guess the seat from `path.name.split("-")[0]` and
+    this arm reds with codex, reproducing the original defect exactly.
     """
     with tempfile.TemporaryDirectory() as d:
         logs = Path(d)
-        (logs / "kimi-20260827-231037.log").write_text(
-            "2026-08-28T05:54:47 start\n"
-            "exec gh pr merge 697 --squash --delete-branch\n"
-            "2026-08-28T06:30:37 end\n"
-        )
-        (logs / "codex-20260831-175622.log").write_text(
-            "2026-08-31T18:00:00 start\n"
-            "/home/dp/.local/state/hestia-mesh/logs/codex-20260807-015109.log-794-"
-            "gh pr merge 236 --merge\n"
-            "2026-08-31T18:30:00 end\n"
+        (logs / "codex-20260826-172116.log").write_text(
+            "reading the witness chain\n"
+            + witness("18091cec-6430-449a-9400-7d48100fee6a", "claude-code",
+                      "gh pr merge 532 --squash --delete-branch")
         )
         found = seat_merges(logs)
-        check("real merge command found", 697 in found, f"got {sorted(found)}")
-        check("quoted merge command ignored", 236 not in found, f"got {sorted(found)}")
+        check("seat comes from plugin_id, not the log filename",
+              found.get(532, {}).get("seat") == "claude-code", f"got {found.get(532)}")
 
 
-def arm_span_is_read_from_the_body() -> None:
-    """The filename is local time, the body is UTC — a 7h trap.
+def arm_quoting_a_record_does_not_double_count() -> None:
+    """The same merge, quoted in three logs, is still one merge by one seat.
 
-    Sabotage: derive the span from the filename and the #697 join fails, which
-    is exactly the false non-overlap this census hit on first read.
+    De-duplication is on `action_id`, so contamination by quoting cannot change
+    the count OR the attribution. Sabotage: key the dict on (file, pr) and this
+    arm reds, because the same merge appears three times.
+    """
+    rec = witness("4ff76068-d585-4bfc-b1ce-761eccbe401d", "kimi-code",
+                  "gh pr merge 697 --squash --delete-branch")
+    with tempfile.TemporaryDirectory() as d:
+        logs = Path(d)
+        (logs / "kimi-20260827-231037.log").write_text("ran it\n" + rec)
+        (logs / "codex-20260903-201737.log").write_text("grepped the archive\n" + rec)
+        (logs / "claude-20260904-031812.log").write_text("also quoted it\n" + rec)
+        found = seat_merges(logs)
+        check("quoted record attributes to its own seat",
+              found.get(697, {}).get("seat") == "kimi-code", f"got {found.get(697)}")
+        check("quoted record is not double-counted",
+              found.get(697, {}).get("action_ids") == ["4ff76068-d585-4bfc-b1ce-761eccbe401d"],
+              f"got {found.get(697, {}).get('action_ids')}")
+
+
+def arm_prose_and_diffs_are_not_merges() -> None:
+    """The contamination the first version could not see.
+
+    Its filter keyed on `.log-` and `/logs/`, so grep output was excluded but a
+    DIFF, a PR body, or this tool's own docstring was not — and every one of
+    those contains the literal string `gh pr merge 697`. Only a witness record
+    counts now, so none of these register. Sabotage: match on raw text again and
+    all three of these lines become merges.
     """
     with tempfile.TemporaryDirectory() as d:
-        p = Path(d) / "kimi-20260827-231037.log"
-        p.write_text("2026-08-28T05:54:47 a\n2026-08-28T06:30:37 b\n")
-        span = wake_span(p)
-        check("span read from body, not filename",
-              span is not None and span[0].hour == 5 and span[1].hour == 6,
-              f"got {span}")
-        check("span contains the 06:03Z merge",
-              span is not None
-              and span[0] <= datetime(2026, 8, 28, 6, 3, 42, tzinfo=timezone.utc) <= span[1])
+        logs = Path(d)
+        (logs / "codex-20260903-201737.log").write_text(
+            "+`gh pr merge 697 --squash` running in kimi-code's own wake. The only\n"
+            "| #532 | codex | ran gh pr merge 532 |\n"
+            '            "exec gh pr merge 350 --squash\\n"\n'
+            "2026-07-23T07:13:32 a historical timestamp from a quoted primer\n"
+        )
+        found = seat_merges(logs)
+        check("prose/diff/table mentions carry no record", found == {}, f"got {found}")
+
+
+def arm_disagreeing_records_are_a_conflict_not_a_coin_flip() -> None:
+    """Two records, two seats, one PR: report it, do not take the first.
+
+    The original took `[0]` of a candidate list and so published one seat with
+    no signal that another was equally supported. Sabotage: return the first
+    seat instead of None and this arm reds.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        logs = Path(d)
+        (logs / "codex-20260811-145154.log").write_text(
+            witness("aaaaaaaa-0000-0000-0000-000000000001", "codex", "gh pr merge 350 --squash")
+            + witness("bbbbbbbb-0000-0000-0000-000000000002", "kimi-code", "gh pr merge 350 --squash")
+        )
+        found = seat_merges(logs)
+        check("disagreement is not attributed", found[350]["seat"] is None, f"got {found[350]}")
+        check("disagreement names both seats",
+              found[350]["conflict"] == ["codex", "kimi-code"], f"got {found[350]}")
+
+
+def arm_failed_merge_command_is_not_a_merge() -> None:
+    """`success: false` is an attempt, not a landing.
+
+    Sabotage: drop the success check and a refused merge counts as performed.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        logs = Path(d)
+        (logs / "codex-20260811-145154.log").write_text(
+            witness("cccccccc-0000-0000-0000-000000000003", "codex",
+                    "gh pr merge 999 --squash", success="false")
+        )
+        check("failed merge is not counted", seat_merges(logs) == {}, "got a merge")
+
+
+def arm_codex_exec_lines_are_execution_too() -> None:
+    """codex logs carry no witness JSON — only `/bin/bash -lc` exec echoes.
+
+    A record-only parser silently drops every codex merge, which is how #236
+    went missing. Sabotage: parse witness records only and this arm reds.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        logs = Path(d)
+        (logs / "codex-20260807-015109.log").write_text(
+            "some prose\n"
+            "/bin/bash -lc \"gh pr merge 236 --merge --subject 'Merge #236' && "
+            "gh pr view 236 --json state\" in /mnt/c/exe/projects/ai-agents/hestia\n"
+        )
+        found = seat_merges(logs)
+        check("exec-line merge is found", found.get(236, {}).get("seat") == "codex",
+              f"got {found.get(236)}")
+        check("exec-line basis is labelled weaker",
+              found.get(236, {}).get("basis") == "filename", f"got {found.get(236)}")
+
+
+def arm_searching_for_a_merge_is_not_performing_one() -> None:
+    """The third shape of the self-reference trap, and the sharpest.
+
+    `rg 'gh pr merge 697' logs/` is a GENUINE, anchored exec line in codex's own
+    transcript — it just happens to be a search for the string rather than a
+    merge. It is real execution, so neither the quoted-text filter nor the
+    exec-line anchor rejects it. This exact line at
+    codex-20260903-201737.log:2132 would credit codex with merging both #697 and
+    #532 while it was REVIEWING the census that measures merges.
+
+    Sabotage: drop the SEARCH_TOOL guard and this arm reds with two merges.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        logs = Path(d)
+        (logs / "codex-20260903-201737.log").write_text(
+            "/bin/bash -lc \"rg -n --glob '*.log' 'gh pr merge 697' "
+            "/home/dp/.local/state/hestia-mesh/logs | head -80\" in /tmp/review\n"
+            "/bin/bash -lc \"grep -n 'gh pr merge 532' logs/\" in /tmp/review\n"
+        )
+        check("searching for a merge is not a merge", seat_merges(logs) == {},
+              f"got {seat_merges(logs)}")
+
+
+def arm_grep_output_never_starts_its_line() -> None:
+    """A quoted exec survives into another log behind a `<path>.log-<n>-` prefix.
+
+    Two guards reject it and they are REDUNDANT, which I verified rather than
+    assumed: the `^` anchor on EXEC_LINE, and GREP_PREFIX. Removing either one
+    alone leaves this arm green, because `^` without re.MULTILINE anchors to the
+    string start whether you call `match` or `search`. The arm reds only when
+    BOTH are removed at once — so it is evidence for the pair, not for either.
+
+    Saying that precisely is the point. The arm this one replaces claimed to
+    prove a guard it could not have failed on, and that false credit is what let
+    the contamination ship.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        logs = Path(d)
+        (logs / "codex-20260831-175622.log").write_text(
+            "/home/dp/.local/state/hestia-mesh/logs/codex-20260807-015109.log-794-"
+            "/bin/bash -lc \"gh pr merge 236 --merge\" in /mnt/c\n"
+        )
+        check("quoted exec line is not a merge", seat_merges(logs) == {},
+              f"got {seat_merges(logs)}")
 
 
 def main() -> int:
@@ -179,9 +288,14 @@ def main() -> int:
         arm_class_split,
         arm_headline_rates,
         arm_mergedby_cannot_separate_seats,
-        arm_seat_merge_join_needs_the_span,
-        arm_quoted_merge_is_not_a_merge,
-        arm_span_is_read_from_the_body,
+        arm_seat_is_read_from_the_record_not_the_filename,
+        arm_quoting_a_record_does_not_double_count,
+        arm_prose_and_diffs_are_not_merges,
+        arm_disagreeing_records_are_a_conflict_not_a_coin_flip,
+        arm_failed_merge_command_is_not_a_merge,
+        arm_codex_exec_lines_are_execution_too,
+        arm_searching_for_a_merge_is_not_performing_one,
+        arm_grep_output_never_starts_its_line,
     ):
         print(f"{arm.__name__}:")
         arm()

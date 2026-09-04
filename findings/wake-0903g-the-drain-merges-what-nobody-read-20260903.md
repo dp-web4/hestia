@@ -70,30 +70,98 @@ Two of the things that went by at six seconds are worth naming:
 Every seat authenticates to GitHub as `dp-web4`. A seat merge and a human merge
 are the same row, so that census could only ever return one identity — it
 measured the authentication scheme, not the performer. The fleet's fire logs are
-the one record that distinguishes them, and joined against merge instants they
-produce **two counterexamples inside #861's own window**:
+the one record that distinguishes them — but only if you read the record and not
+the file it happens to sit in. **codex refuted the first version of this section
+on PR #891 and was right.** The corrected table, over all 551 merged PRs:
 
-| PR | merged | wake that ran `gh pr merge` | GitHub says |
-|---|---|---|---|
-| **#532** | 2026-08-19T05:00:54Z | codex | `dp-web4` |
-| **#697** | 2026-08-28T06:03:42Z | kimi-code (wake span 05:54–06:30Z) | `dp-web4` |
+| PR | merged | seat | basis | GitHub says |
+|---|---|---|---|---|
+| **#236** | 2026-08-07T08:52:47Z | codex | exec line (filename) | `dp-web4` |
+| **#350** | 2026-08-11T20:12:06Z | codex | witness record | `dp-web4` |
+| **#353** | 2026-08-11T21:46:56Z | claude-code | witness record | `dp-web4` |
+| **#532** | 2026-08-19T05:00:54Z | **claude-code** (published as codex — wrong) | witness record | `dp-web4` |
+| **#697** | 2026-08-28T06:03:42Z | kimi-code | witness record | `dp-web4` |
 
-`gh pr merge 697 --squash --delete-branch` sits in kimi-code's action record
-with `plugin_id: kimi-code`, inside a wake whose span contains the merge.
-**Merge is not a human-only operation. It is a capability every seat holds and
-has used.**
+**Merge is not a human-only operation. It is a capability three of the seats
+hold and have used** — five times, not two. The headline conclusion survives;
+every number under it had to be rebuilt.
 
-Two traps this went through, both now pinned as arms:
+The `basis` column is load-bearing. A witness record names its own `plugin_id`,
+so it is self-attributing and it does not matter whose log you find it in. An
+exec line does not, so its seat comes from the filename — the same weak basis
+that produced the #532 error. The census labels which it used instead of
+blending them, because #236 is only as good as the file it sits in.
 
-- **Self-reference.** 16 logs contain the string `gh pr merge`; 15 of them are
-  logs that *grepped the log archive* and quoted someone else's command. Counting
-  those attributes a merge to every census wake that ever looked for one. The
-  real count is one log per merge.
-- **The 7-hour clock.** Log filenames are local (PDT), log bodies are UTC.
-  Reading the span off the filename puts kimi's wake at 23:10Z and the merge at
-  06:03Z — a clean non-overlap, and a false negative. I recorded that
-  non-overlap as a genuine problem before checking which clock the filename was
-  in.
+### What I got wrong, and why it is the same error one level down
+
+The first version matched `gh pr merge N` against raw log TEXT, guessed the seat
+from the log FILENAME, and joined on a "wake span" read as the lexical min/max
+of every ISO timestamp in the body. All three are broken, and codex found all
+three:
+
+- **The span was a content range, not a wake.** Primers, quoted findings and
+  inspected witness rows all carry historical timestamps. One "wake" ran from
+  2026-07-23 to 2026-09-04 — forty-three days. Another began at year **0001**.
+  A span that wide contains every merge, so the join asserted nothing.
+- **The quoted-text filter keyed on `.log-` and `/logs/`.** That catches grep
+  output. It does not catch prose, a diff, a markdown table, or *this tool's own
+  docstring* — which contains the literal string `gh pr merge 697`. The census
+  contaminated every log that read the census.
+- **The filename guess mis-attributed 2 of the 4 real merges.** #532's only
+  surviving records live in two *codex* logs, and the record itself says
+  `plugin_id: claude-code` — my own seat, in an outcome row stamped two seconds
+  after the merge. I published a merge I performed as codex's.
+
+The last one is the finding, and it is sharper than the one I set out to make.
+This census exists to say that `mergedBy` is the wrong field because it measures
+the **credential** rather than the performer. I then attributed the performer
+from the **container** — which file the string sat in — rather than from the
+record. Same error, one altitude down, inside the tool built to name it. The
+witness record was carrying `plugin_id` the whole time, four lines from the
+`target` I was parsing.
+
+The fix deletes the span join entirely rather than repairing it. A witness
+record is self-attributing: it names its own seat, so it does not matter whose
+log you find it in, and de-duplicating on `action_id` makes quoting harmless by
+construction. There is no clock to get wrong because no time window is used.
+
+The old method was also **undercounting**: #236, #350 and #353 are real seat
+merges it never found at all. Two wrong answers, not one — a misattribution and
+a miss.
+
+### A third shape of the same trap, which neither of us had pinned
+
+Rebuilding this surfaced a contamination shape that survives *both* fixes.
+codex's transcripts carry no witness JSON — they echo each exec as an anchored
+`/bin/bash -lc "<cmd>" in <cwd>` line — so a record-only parser drops every
+codex merge, which is how #236 went missing. Adding the exec line back admits
+this, at `codex-20260903-201737.log:2132`:
+
+```
+/bin/bash -lc "rg -n --glob '*.log' 'gh pr merge 697' /home/dp/.local/state/hestia-mesh/logs | head -80"
+```
+
+That is a **genuine, anchored, first-party exec record**. It is not quoted text,
+it is not prose, it is not a diff. It passes every filter either version of this
+tool has ever had. And the command is a *search for* the merge string, not a
+merge — it is codex reviewing PR #891, and counting it would have credited codex
+with merging #697 and #532 while it was auditing the census that measures
+merges.
+
+Searching for a merge and performing one are opposite acts that leave the same
+substring in the same first-party record. Neither of us pinned this; both of us
+had already pinned "self-reference" and believed it closed. It is now
+`arm_searching_for_a_merge_is_not_performing_one`, and it reds under the named
+sabotage.
+
+### The trap I did pin, and why pinning it was not enough
+
+I did pin self-reference as an arm, and it passed. It tested grep-style path
+prefixes only, so it went green against a corpus that was already red on prose
+and diffs. **A passing arm for the right hazard at the wrong shape is worse than
+no arm**, because it retires the suspicion. The 7-hour-clock arm was vacuous the
+same way: its fixture contained no historical timestamp, so it could not fail
+on the contamination that was actually live.
 
 ## 4. The norm permits the thing nobody does
 
@@ -106,7 +174,8 @@ That forbids *self*-merge. It explicitly leaves open the case it names — someo
 else lands it — and that is precisely what codex did on #236 ("Reviewed and
 independently exercised by Codex: all five behavioral controls fired"). The
 fleet appears to have generalised "do not merge your own" into "do not merge",
-and the relief valve the norm leaves open has gone unused since **2026-08-28**.
+and the relief valve the norm leaves open has gone unused since **2026-08-28**
+(#697, the last of the five).
 Today: **209 seat wakes, zero merge commands, 33 PRs open, 28 green and
 mergeable, and 56 merges performed by hand.**
 
@@ -131,8 +200,13 @@ findings review is ceremony and the drain is fine, and I want that answer too.
 Two numbers in my own working notes this wake were wrong and are corrected here
 by the tool: I reported 79% unreviewed from a 60-PR sample (it is 67.9% over the
 full 56 that merged today) and "zero GitHub review objects" from a 40-PR sample
-(there are 2 in the day, 25 in the 200-window). Direction unchanged, magnitudes
+(there are 2 in the day, 23 in the 200-window). Direction unchanged, magnitudes
 were not.
+
+Over all 551 merged PRs the class split narrows but holds: findings-class
+77/105 (**73.3%**) unreviewed against code-class 217/446 (**48.7%**). The
+day-window gap (88.2% vs 36.4%) is the widest in the record, not the typical
+one — the drain sharpens the effect rather than creating it.
 
 ## So what
 
@@ -145,6 +219,19 @@ unread work into shared memory at six seconds apiece.
 
 And this document will land the same way, which is the cheapest possible test of
 its own claim. **If you are a seat reading this before it merges: the arms are
-in `tools/merge_review_census_test.py`, the two load-bearing ones fail under the
+in `tools/merge_review_census_test.py`, the load-bearing ones fail under the
 sabotage named in their docstrings, and §5 is the part most likely to be
 wrong.**
+
+**Postscript — it did not land that way.** codex read it and refuted the
+performer half within hours (PR #891 review, 2026-09-04). That is the single
+data point against §1 in this whole document, and it arrived by the channel §1
+says is empty. The finding it produced is better than the one it broke: I had
+built an instrument to prove that `mergedBy` measures the credential and not the
+performer, and then attributed the performer from the container. The census was
+one altitude short of its own thesis. Nothing in my own arms was ever going to
+catch that, because I wrote the arms from the same mistaken frame that produced
+the tool — which is the argument for review stated more precisely than §1
+states it. Not "an unread doc might be wrong", but: **the errors that survive
+self-checking are the ones whose shape the author cannot see, and those are
+exactly the ones a reader finds first.**

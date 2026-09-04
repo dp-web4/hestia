@@ -19,18 +19,41 @@ that carries review at all.
 **PERFORMER.** `mergedBy` cannot answer "who merged this". Every seat
 authenticates as the same GitHub identity (`dp-web4`), so a seat merge and a
 human merge are the same row. #861 read 200 such rows and concluded "merge is a
-human-only operation"; PR #697 is inside that window and was merged by
-`gh pr merge 697 --squash` running in kimi-code's own wake. The only record that
-distinguishes them is the seat's fire log, so `--logs` joins against it.
+human-only operation"; four of those rows were performed by seats.
 
-The join is on the merge instant falling inside a wake's span, and the log's
-INTERNAL timestamps are authoritative for that span — the filename is local time
-and the body is UTC, which is a 7-hour trap that made this look like a
-non-overlap on first read.
+The performer is read from the witness chain, not from the log text. Every
+executed command leaves an action/outcome record carrying its own `plugin_id`,
+`target` and `action_id`. That record is SELF-ATTRIBUTING: whichever log you
+find it in — the seat's own, or a later seat's that grepped the archive and
+quoted it — it still names the seat that ran it. De-duplicating on `action_id`
+therefore makes quoting harmless by construction, and no time-window join is
+needed at all.
 
-Both defaults are deliberately conservative: a PR counts as reviewed on one
-comment, and a merge counts as seat-performed only when a merge command for that
-exact PR number sits in a wake whose span contains the merge.
+The first version of this tool did none of that. It matched `gh pr merge N`
+against raw log TEXT, guessed the seat from the log FILENAME, and joined on a
+"wake span" taken as the lexical min/max of every ISO timestamp in the body.
+codex refuted all three on PR #891, and it was right on the evidence:
+
+  * the span was a CONTENT range, not a wake — primers, quoted findings and
+    inspected witness rows carry historical timestamps, so one "wake" ran from
+    2026-07-23 to 2026-09-04 and another began at year 0001;
+  * the quoted-text filter keyed on `.log-`/`/logs/`, which catches grep output
+    but not prose or a diff — so this file's own docstring, which contains the
+    string `gh pr merge 697`, contaminated every log that read it;
+  * and the filename guess mis-attributed 2 of the 4 real merges, including
+    #532, which this census originally published as codex and which the
+    outcome record two seconds after the merge names `claude-code`.
+
+That last one is the same error one altitude down. The census exists to say
+that `mergedBy` measures the CREDENTIAL rather than the performer — and then
+attributed the performer from the CONTAINER (which file the string sat in)
+rather than from the record. Asking the artifact who ran it is the fix at both
+altitudes.
+
+Both defaults are conservative: a PR counts as reviewed on one comment, and a
+merge counts as seat-performed only when a successful witness record names that
+exact PR number. Where two records for one PR name different seats the census
+reports the conflict instead of picking one.
 """
 
 from __future__ import annotations
@@ -40,7 +63,6 @@ import json
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 BOT_LOGINS = {"chatgpt-codex-connector", "github-actions"}
@@ -48,16 +70,30 @@ BOT_LOGINS = {"chatgpt-codex-connector", "github-actions"}
 # is the point of the census: these are the fleet's memory-of-record.
 FINDINGS_PREFIXES = ("findings", "census", "docs", "shim ledger")
 MERGE_CMD = re.compile(r"gh pr merge\s+(\d+)")
-# A log that greps the log archive quotes other logs' merge commands. Those
-# lines carry a log path, and counting them attributes every census wake a
-# merge it never performed — this filter is why the seat-merge count is 1 and
-# not 16.
-QUOTED = re.compile(r"\.log-|/logs/")
-ISO_IN_BODY = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
-
-
-def _parse(ts: str) -> datetime:
-    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+# One witness action/outcome record: the keys are emitted in alphabetical order,
+# so `action_id` opens it and `tool_name` closes it. Matching the whole record
+# (rather than a line) is what lets the seat be read from `plugin_id` INSIDE the
+# record instead of guessed from the filename outside it.
+WITNESS_REC = re.compile(
+    r'"action_id"\s*:\s*"([0-9a-fA-F-]{8,})"(.{0,4000}?)"tool_name"\s*:\s*"[^"]*"', re.S
+)
+REC_PLUGIN = re.compile(r'"plugin_id"\s*:\s*"([^"]*)"')
+REC_TARGET = re.compile(r'"target"\s*:\s*"((?:[^"\\]|\\.)*)"')
+REC_SUCCESS = re.compile(r'"success"\s*:\s*(true|false|null)')
+# codex's transcripts do not emit witness JSON; they echo each exec as its own
+# line, `/bin/bash -lc "<cmd>" in <cwd>`. That is still an execution-specific
+# structure, but it carries no plugin_id, so its seat comes from the filename —
+# a WEAKER basis, and the census labels it as such rather than blending the two.
+EXEC_LINE = re.compile(r'^/bin/bash -lc (.*)$')
+# grep -n output re-prints a whole line behind `<path>.log-<n>-`, which is how a
+# quoted exec survives into another seat's log. The anchor above is what rejects
+# it: a quoted exec never starts its line.
+GREP_PREFIX = re.compile(r'^\S*\.log[-:]\d+[-:]')
+# A third shape of the same trap, and the one that fooled both reviewers of
+# #891: an exec line that is GENUINE and anchored, but whose command is
+# `rg 'gh pr merge 697' logs/` — the merge string is a search PATTERN, not a
+# command. Searching for a merge is the opposite of performing one.
+SEARCH_TOOL = re.compile(r'\b(rg|grep|egrep|fgrep|ag|ack)\b')
 
 
 def substantive_comments(pr: dict, min_body: int) -> list[dict]:
@@ -76,43 +112,66 @@ def is_findings(title: str) -> bool:
     return any(t.startswith(p) for p in FINDINGS_PREFIXES)
 
 
-def wake_span(path: Path) -> tuple[datetime, datetime] | None:
-    """The UTC span of a wake, from timestamps in the log BODY.
+def seat_merges(log_dir: Path) -> dict[int, dict]:
+    """PR number -> {seat, action_ids, seats} for merges a seat ran itself.
 
-    The filename is local time; the body is UTC. Trusting the filename shifts
-    every span by the UTC offset and silently breaks the join.
+    Scans every log for witness action/outcome records, but attributes each one
+    to the `plugin_id` the record carries. A record quoted in three other seats'
+    logs is still one merge by one seat, because de-duplication is on
+    `action_id`. Text that merely MENTIONS a merge command — prose, a diff, this
+    module's own docstring — carries no record and is therefore never counted.
     """
-    try:
-        text = path.read_text(errors="replace")
-    except OSError:
-        return None
-    stamps = sorted(ISO_IN_BODY.findall(text))
-    if not stamps:
-        return None
-    return _parse(stamps[0] + "Z"), _parse(stamps[-1] + "Z")
-
-
-def seat_merges(log_dir: Path) -> dict[int, list[tuple[str, datetime, datetime]]]:
-    """PR number -> [(seat, wake_start, wake_end)] for merges a seat ran itself."""
-    found: dict[int, list[tuple[str, datetime, datetime]]] = {}
+    by_action: dict[str, tuple[int, str, str]] = {}
     for path in sorted(log_dir.glob("*.log")):
         try:
-            lines = path.read_text(errors="replace").splitlines()
+            text = path.read_text(errors="replace")
         except OSError:
             continue
-        nums = set()
-        for line in lines:
-            if QUOTED.search(line):
+        if "gh pr merge" not in text:
+            continue
+
+        # Basis 1: the witness record, which names its own seat.
+        for m in WITNESS_REC.finditer(text):
+            action_id, body = m.group(1), m.group(2)
+            target = REC_TARGET.search(body)
+            if not target:
                 continue
-            nums.update(int(m) for m in MERGE_CMD.findall(line))
-        if not nums:
-            continue
-        span = wake_span(path)
-        if span is None:
-            continue
-        seat = path.name.split("-", 1)[0]
-        for n in nums:
-            found.setdefault(n, []).append((seat, span[0], span[1]))
+            success = REC_SUCCESS.search(body)
+            if success and success.group(1) != "true":
+                continue
+            seat = REC_PLUGIN.search(body)
+            if not seat:
+                continue
+            for n in MERGE_CMD.findall(target.group(1)):
+                by_action[f"{action_id}:{n}"] = (int(n), seat.group(1), "record")
+
+        # Basis 2: an anchored exec line, whose seat can only come from the file.
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if GREP_PREFIX.match(line):
+                continue
+            m = EXEC_LINE.match(line)
+            if not m or SEARCH_TOOL.search(m.group(1)):
+                continue
+            for n in MERGE_CMD.findall(m.group(1)):
+                key = f"{path.name}#{lineno}:{n}"
+                by_action[key] = (int(n), path.name.split("-", 1)[0], "filename")
+
+    found: dict[int, dict] = {}
+    for key, (number, seat, basis) in sorted(by_action.items()):
+        row = found.setdefault(number, {"seat": seat, "seats": set(), "basis": basis,
+                                        "action_ids": []})
+        row["seats"].add(seat)
+        row["action_ids"].append(key.split(":", 1)[0])
+        # A record beats a filename guess wherever both exist for one PR.
+        if basis == "record":
+            row["basis"] = "record"
+    for row in found.values():
+        # Two sources naming different seats is a real ambiguity, not a tie to
+        # break by ordering. Say so rather than publishing the first one.
+        row["seats"] = sorted(row["seats"])
+        if len(row["seats"]) > 1:
+            row["seat"] = None
+            row["conflict"] = row["seats"]
     return found
 
 
@@ -129,13 +188,9 @@ def census(prs: list[dict], min_body: int, merges: dict) -> dict:
     for p in prs:
         if not p.get("mergedAt"):
             continue
-        merged = _parse(p["mergedAt"])
         performer = (p.get("mergedBy") or {}).get("login")
-        claimed_by = None
-        for seat, start, end in merges.get(p["number"], []):
-            if start <= merged <= end:
-                claimed_by = seat
-                break
+        record = merges.get(p["number"]) or {}
+        claimed_by = record.get("seat")
         rows.append({
             "number": p["number"],
             "title": p.get("title") or "",
@@ -145,6 +200,8 @@ def census(prs: list[dict], min_body: int, merges: dict) -> dict:
             "findings_class": is_findings(p.get("title") or ""),
             "mergedBy": performer,
             "performed_by_seat": claimed_by,
+            "seat_conflict": record.get("conflict"),
+            "seat_basis": record.get("basis"),
         })
     n = len(rows)
     unrev = [r for r in rows if not r["reviewed"]]
@@ -161,7 +218,11 @@ def census(prs: list[dict], min_body: int, merges: dict) -> dict:
         "code_unreviewed": sum(1 for r in code if not r["reviewed"]),
         "distinct_mergedBy": sorted({r["mergedBy"] for r in rows if r["mergedBy"]}),
         "seat_performed": sorted(
-            (r["number"], r["performed_by_seat"]) for r in rows if r["performed_by_seat"]
+            (r["number"], r["performed_by_seat"], r["seat_basis"])
+            for r in rows if r["performed_by_seat"]
+        ),
+        "seat_conflicts": sorted(
+            (r["number"], r["seat_conflict"]) for r in rows if r.get("seat_conflict")
         ),
         "rows": rows,
     }
@@ -197,7 +258,9 @@ def main() -> int:
     print(f"  code-class:     {out['code_class']}, of which unreviewed "
           f"{out['code_unreviewed']}")
     print(f"  distinct mergedBy identities: {out['distinct_mergedBy']}")
-    print(f"  merges a seat performed in its own wake: {out['seat_performed'] or 'none found'}")
+    print(f"  merges a seat performed itself: {out['seat_performed'] or 'none found'}")
+    if out["seat_conflicts"]:
+        print(f"  AMBIGUOUS (records disagree on the seat): {out['seat_conflicts']}")
     return 0
 
 
