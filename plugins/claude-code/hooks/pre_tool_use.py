@@ -1071,7 +1071,16 @@ def _attempted_summary(tool_name: str, tool_input: Any) -> str:
                 if _credential_shaped(v):
                     return (f"{tool_name} [REDACTED — the target is a credential-shaped path; "
                             f"{len(v)} chars withheld rather than copied into the record]")
-                return f"{tool_name} -> {v[-140:]}"
+                # MARK THE HEAD CUT. The bound keeps the TAIL (the filename, which is the
+                # half a reviewer needs) and drops the HEAD (the location). Unmarked, the
+                # residue of an absolute path reads as a relative one: escalations
+                # 4458c3bb90166bf1 and f93341f695702b07 (2026-09-04) recorded
+                # `Edit -> mp/claude-1000/...` for a write under `/tmp/claude-1000/...`, and
+                # the operator approved the first as written. The command arm below has
+                # always marked its cut; this arm cut in silence. The mark sits INSIDE the
+                # bound, so the recorded width does not change and #627's digest-prefix
+                # equivalence is not widened by it.
+                return f"{tool_name} -> {v if len(v) <= 140 else '…' + v[-139:]}"
         return f"{tool_name} (no command or path in input)"
     s = " ".join(raw.split())
     if _credential_shaped(s):

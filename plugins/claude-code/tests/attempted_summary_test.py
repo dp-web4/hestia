@@ -116,6 +116,31 @@ def test_the_path_fallback_is_redacted_too():
           f"credential path echoed into the record verbatim: {out!r}")
 
 
+def test_the_path_fallback_marks_a_head_cut():
+    """A path over the cap keeps its TAIL (the filename) and loses its HEAD (the location).
+    Unmarked, the residue of an absolute path reads as a relative one. Measured 2026-09-04:
+    escalations 4458c3bb90166bf1 and f93341f695702b07 recorded `Edit -> mp/claude-1000/...`
+    for a write under `/tmp/claude-1000/...`, and the operator approved the first as
+    written. The command arm already marks its cut (`test_the_summary_is_bounded`); the
+    path arm cut in silence. Two of 136 opened write-tool rows in the recent chain hit the
+    cap — both today, both this shape — so the bound itself is not the defect; the
+    silence is."""
+    m = _load_hook()
+    short = "/tmp/" + ("a" * 100) + "/x.py"
+    out = m._attempted_summary("Edit", {"file_path": short})
+    check("short_path_is_whole", out == f"Edit -> {short}",
+          f"a path under the cap was altered: {out!r}")
+    long_path = "/tmp/claude-1000/" + ("b" * 200) + "/plugins/_shared/x_test.py"
+    out = m._attempted_summary("Edit", {"file_path": long_path})
+    tail = out.split(" -> ", 1)[1] if " -> " in out else out
+    check("head_cut_is_marked", tail.startswith("…"),
+          f"a head-cut path with no mark reads as a relative path: {out!r}")
+    check("head_cut_keeps_the_filename", tail.endswith("/plugins/_shared/x_test.py"),
+          f"the cut took the filename, which is the half a reviewer needs: {out!r}")
+    check("head_cut_holds_the_bound", len(tail) <= 140,
+          f"{len(tail)} chars after ' -> ' — the mark widened the bound")
+
+
 def test_no_input_is_stated_not_guessed():
     m = _load_hook()
     check("non_dict_input", "no inspectable input" in m._attempted_summary("Bash", None))
@@ -203,6 +228,7 @@ ALL_TESTS = [
     "test_credential_shapes_are_redacted",
     "test_ordinary_commands_are_not_redacted",
     "test_the_path_fallback_is_redacted_too",
+    "test_the_path_fallback_marks_a_head_cut",
     "test_no_input_is_stated_not_guessed",
 ]
 
@@ -221,6 +247,7 @@ if __name__ == "__main__":
     test_credential_shapes_are_redacted()
     test_ordinary_commands_are_not_redacted()
     test_the_path_fallback_is_redacted_too()
+    test_the_path_fallback_marks_a_head_cut()
     test_no_input_is_stated_not_guessed()
     print()
     if FAILURES:
