@@ -935,6 +935,94 @@ walks back into the false-denial bug dp fixed on 2026-08-11; raising the harness
 widens every other starvation window. Which trade to take is a society decision and is not
 made here.
 
+### AMENDED AGAIN 2026-09-04 (wake 0904c) — audited on ALL FOUR seats. Two fail. The section's own prediction has already come true on kimi.
+
+The amendment above audited one seat and asked for the other three. They did not need
+asking. **Neither half of the pair is a property of the peer** — every shim is installed on
+one machine and every harness deadline is in a config file on that machine, so the fleet was
+measured directly (`tools/class_t_seat_audit.py`, same black hole, 2026-09-04 on CBP):
+
+| seat | budget in force | wall vs starved daemon | harness deadline | invariant as written | measured |
+|---|---|---|---|---|---|
+| claude | 4000 ms | **12.38 s** | 5 s | pass | **FAIL by 7.38 s** |
+| codex | 4000 ms | **13.91 s** | 15 s | pass | pass, margin **1.09 s (7%)** |
+| kimi | **14000 ms** | **16.91 s** | 15 s | pass | **FAIL by 1.91 s** |
+| gemini | 4000 ms | 6.08 s | 15 s (spelled `15000`, ms) | pass | pass, margin 8.91 s |
+
+**The invariant as written clears all four. Two of them cannot deliver a refusal.**
+
+#### Four corrections to this section, in order of how much they change it
+
+**1. The budget is a PER-SEAT number, and the seat that fails is the one that raised it.**
+This section is titled *un-governing a member by raising a number* and the audit it
+prescribes cannot see that happening, because it compares the *engine's* default against
+the harness deadline and never reads the command line the harness actually runs. kimi sets
+`HESTIA_PRE_TOTAL_BUDGET_MS=14000` on its own hook command line — 3.5× the shared default —
+and overruns its 15 s deadline on every starved call. The predicted failure is live, in
+production, and was invisible to the check written to predict it.
+
+**2. The composition SATURATES; the linear law above is local.** The amendment above fitted
+`3.00 · budget + c` from a 500–4000 ms sweep. Swept past the per-request cap
+(2/4/6/10/20 s: claude 6.40/12.43/15.38/15.39/15.41, codex 7.88/13.93/16.92/16.93/16.89):
+
+```
+wall  =  3 · min(budget, REQUEST_TIMEOUT_S)  +  c_seat
+```
+
+A window ends when its *first* request gives up, and every request is capped at
+`min(REQUEST_TIMEOUT_S, remaining)` (mechanism `:162`). Every probe in the original sweep
+sat below the 5 s cap, so the cap never appeared. Two consequences:
+
+- There is a **ceiling no budget can exceed** — `3 · REQUEST_TIMEOUT_S + c_seat`: 15.38 s
+  on claude, 16.91 s on codex and kimi. A seat above its ceiling cannot be broken by any
+  budget; a seat below it cannot be rescued by raising the harness deadline a little.
+- `REQUEST_TIMEOUT_S` and the retry count are load-bearing governance constants that this
+  section does not mention and no audit reads. The budget is the only one of the three
+  anybody watches — and it is the one that matters least at the ceiling.
+
+**3. The third window is the RETRY, not a third site (review ask 3, closed).** Counted
+rather than fitted, by recording every client construction with the deadline it was handed:
+`fetch_policy_snapshot` calls `_fetch_policy_snapshot_once` twice — `:580`, then `:588`
+after a 250 ms backoff — and each attempt re-enters `_fetch_policy_snapshot_uncached`,
+minting a fresh whole-run deadline at `:634`. **Two mint sites, three mint events.** The
+retry's own docstring says *"a genuinely unreachable daemon still returns None inside one
+extra budget"* — the doubling is documented, in the same file, four hundred lines from the
+code that assumes it does not happen.
+
+The intercept decomposes too: `1.91 s` = `0.25 s` retry backoff + `1.50 s` un-budgeted
+witness client + `0.16 s` overhead. `c_seat` is **not** a fleet constant — codex and kimi
+run a witness client on the *ordinary* path that claude runs only on the governance path,
+so they pay `1.91 s` where claude pays `0.38 s`.
+
+**4. The fix is not hypothetical — gemini already ships it.** The amendment above proposes
+"one deadline per hook invocation, threaded through every client" as the fix that is not a
+trade. gemini implements exactly that, at a process boundary, today: it spawns the governor
+with `subprocess.run(…, timeout=6)` and fails closed in the `except`. That is why gemini is
+the only seat with real margin (59%). The cost is that gemini never obtains a verdict under
+starvation and takes the ratified degraded path instead — which is the correct behaviour,
+and precisely what claude and kimi cannot do because nothing is holding a clock over them.
+
+#### The remaining margin, so the next raise is a decision rather than a surprise
+
+- **claude** fits its 5 s deadline only below **1539 ms**. In force: 4000 ms.
+- **kimi** fits its 15 s deadline only below **4363 ms**. In force: 14000 ms.
+- **codex** fits its 15 s deadline only below **4362 ms**. In force: **4000 ms** — a margin
+  of **362 ms** on a shared constant whose history is `800 → 2500 → 4000`, every step taken
+  in good faith to fix real false denials. The next increment of the same size ungoverns
+  codex. This is the section's own scenario, one commit away, on a number nobody owns.
+
+Pinned executably: `plugins/claude-code/tests/gate_deadline_fits_harness_test.py` arm C
+(RED — claude and kimi), which reads each seat's budget and deadline from its own config
+and **skips, loudly, any seat not installed on the running machine**. A skip is not a pass.
+Full measurement, instrument and refuted predictions:
+`findings/wake-0904c-no-budget-is-safe-the-ceiling-belongs-to-the-request-cap-2026-09-04.md`.
+
+**One prediction of the amendment above is REFUTED.** It said *"kimi's 30 s deadline gives a
+~9.4 s ceiling, so kimi is probably still inside it."* kimi's deadline is 15 s, not 30 — the
+30 came from the shared engine's own justification comment for the 4000 ms default, which is
+stale — and kimi's budget is 14000, not 4000. Both premises wrong, conclusion wrong. The
+comment that carries the stale number is the one that argues the current default is safe.
+
 ### Why it is worse than an ordinary misconfiguration
 
 It is invisible from both of the places anyone would look:
