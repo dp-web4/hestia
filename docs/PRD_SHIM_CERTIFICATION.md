@@ -71,6 +71,18 @@ Plus one profile, as data. Anything else is a finding.
 
 ## 2. Criteria
 
+### The invariant
+
+> **A shim translates an event. It never decides how that event is governed.**
+> — chatgpt-gpt5.6-sol, 2026-09-04
+
+Everything below is a consequence. `MODE`, unrecorded innate decisions, private
+classifiers, private fail-closed paths, and seat-specific scope behaviour are not five
+problems — they are one architectural violation seen from five angles. When a proposed
+difference is argued, this is the question to ask of it: *does this translate, or does it
+decide?* If it decides, it belongs in `hestia_single_gate.py` regardless of how local or
+how small it looks.
+
 Each criterion is stated so it can **fail**. A criterion no shim can fail is not a
 criterion.
 
@@ -355,6 +367,39 @@ deployed copy MUST match the repository copy. Certification is of a *specific ar
 not of a design.
 
 ## 3. Certification record and the vault
+
+> **SUPERSEDED, 2026-09-04.** This section proposed a new `shim-cert/*` store. It should
+> not be built: `vault::gate_integrity` already exists and does this job better. Verified
+> in `core/src/vault/gate_integrity.rs` — expectations held in the encrypted vault,
+> verdicts `Verified` / `Modified` / `Unratified` / `Missing` / `Unreadable`, `verify()`
+> comparing hashes the **daemon** computes against the stored expectation, and
+> `/api/gates/ratify` operator-gated. Its design explicitly rejects self-attested hashes,
+> which is the property a certification store most needs and which my `shim-cert/*` sketch
+> did not have. Two stores would have been two sources of truth about the same bytes.
+>
+> **Extend `gate_integrity`; do not add a second store beside it.** (GPT, #934.)
+>
+> The substantive correction is what the expectation binds. Not `sha256(shim.py)` — that
+> permits the absurd state where a 140-line shim stays certified while the 480-line engine
+> beneath it changes. Bind a **certification preimage**:
+>
+> ```
+> certification = sha256( criteria_version
+>                       + exact shim bytes
+>                       + exact common runtime set
+>                       + gate API version
+>                       + justified harness-difference declaration )
+> ```
+>
+> One hash to verify rather than a hash plus a side condition someone forgets to check.
+> **The runtime set bound must be the DEPLOYED one, not the repository's** — `agent-inventory`
+> already resolves each seat's deployed hook target, and the repo/deployed gap is where
+> drift has historically hidden.
+>
+> §3.1's two-digest scheme still applies to the shim-bytes component: raw bytes
+> authoritative, canonical retained only to make a mismatch diagnosable.
+>
+> The rest of this section is kept for the reasoning, not the design.
 
 For each certified shim the vault holds one entry:
 
