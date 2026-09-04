@@ -208,6 +208,12 @@ def _installed_gate_path():
 # --------------------------------------------------------------------------------------
 # FP15 (claude-code, CBP, 2026-09-04) - the innate secret scan is a BARE SUBSTRING match.
 #
+# NOT A NEW CLASS: this is issue #680, which already holds six denial classes for it,
+# and #533 is the same word-boundary defect in the destructive preset. What is new is
+# the FORM. Both issues carry the class as prose, and prose does not fail a build --
+# which is why the class has outlived several seats re-deriving it. This is the
+# executable version. File instances on #680; do not open another issue.
+#
 # `hestia_gate_core.py` gate 1a is `for f in forbidden: if f in low` over the whole command
 # text: no tokenisation, no word boundary, no data/code distinction. So the credential token
 # that spells d-o-t-e-n-v matches inside the standard Python environment mapping name, and

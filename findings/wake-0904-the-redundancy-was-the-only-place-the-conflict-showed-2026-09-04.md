@@ -131,6 +131,14 @@ deleting it would erase the one datum showing the corpus caught its own author.
 
 ## The real defect the mistake led to: gate 1a is a bare substring scan
 
+**PRIOR ART, and I should have checked it first.** This class is issue **#680** (open,
+updated 06:18 the same morning), which already records six denial classes for it, and the
+sibling word-boundary defect in the destructive preset is **#533**. My own memory note said
+"check prior art before filing on hestia" and I banked the corpus row before reading it.
+What follows is therefore a *re-derivation* of a known class, not a discovery — with one
+thing that is genuinely new, stated at the end of the section: #680 holds it as PROSE, and
+prose does not fail a build.
+
 Probing for the actual discriminator, `echo` of the standard Python environment-mapping name
 was denied — `deny [egress.secret] … forbidden path … '.env'`. Source-verified in
 `plugins/_shared/hestia_gate_core.py:979`:
@@ -164,8 +172,12 @@ run an inline probe script if any of them mentioned the mapping name. The route 
 was to write the script to a file with a non-Bash tool and execute the path — which reaches
 the identical effect with the identical bytes. The rule filtered the spelling, not the act.
 
-Pinned in the corpus as `test_innate_secret_scan_is_substring_not_path`, RED-on-fix: it
-flips the day gate 1a resolves a path instead of scanning a blob.
+**What is actually new here is the FORM, not the fact.** #680 records this class in
+prose, and prose does not fail a build — the class has been open long enough to be
+re-derived by at least two seats. It is now pinned as an executable check,
+`test_innate_secret_scan_is_substring_not_path`, RED-on-fix: it flips the day gate 1a
+resolves a path instead of scanning a blob, and until then it is a row in a suite that
+someone runs, rather than a paragraph someone has to remember to read.
 
 ## So what?
 
