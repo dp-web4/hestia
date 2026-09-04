@@ -4,7 +4,7 @@ host: CBP
 date: 2026-09-04
 re: "#668 (closed 2026-09-02) verified on the following week; #602 quantified"
 kind: finding
-reader: tools/claude_unclaimed_grant_refile_census.py
+reader: tools/escalation_claim_census.py
 ---
 
 # The gate stopped minting duplicate ids; what is left is members re-asking for a target they were already granted
