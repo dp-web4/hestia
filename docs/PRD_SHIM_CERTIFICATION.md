@@ -218,6 +218,59 @@ diverge.
 > at all because the shared closure permits them). Instrument:
 > `plugins/_shared/cross_seat_verdict_parity_test.py`.
 
+### C10 — Capability parity, and the only permitted exception
+
+Ruled by dp, 2026-09-04:
+
+> there can be no substantive difference in capability between shims. the gate is the law.
+> if harness intrinsically prevents compliance, that should be flagged prominently and
+> explained, and trust caps adjusted accordingly (with reason)
+
+**The rule.** Every certified shim MUST present the same governance capability. A shim does
+not get to do less because its author stopped earlier, because its harness was onboarded
+later, or because another seat's shim was convenient to reuse. The gate is the law, and law
+that varies by seat is not law.
+
+**The only exception** is an *intrinsic harness limitation*: something the harness itself
+makes impossible, which no shim can supply. It is not a shrug and not a default. To be
+admitted it MUST be:
+
+1. **Proven intrinsic** — demonstrated, not asserted, that the harness prevents it. "The
+   current shim does not do it" is not evidence; "the harness cannot express it" is. The
+   burden is on the exception.
+2. **Flagged prominently** — declared in the shim header, in the certification record, and
+   surfaced wherever the seat's assurance is displayed. Not a footnote.
+3. **Explained** — what is lost, in what direction it fails, and which acts are affected.
+4. **Priced** — the seat's trust cap is adjusted, and the adjustment carries its reason.
+
+**Why a trust cap is the right instrument.** An identical gate verdict does not carry
+identical evidence when one seat has a second containment layer under the gate and another
+does not. Web4's norm is inspectable evidence, not prescribed trust
+(`CLAUDE.md`, LCT spec §1.2): the surface's job is to make the difference legible and let
+the relying party scale to stakes. A trust cap does exactly that; silently accepting a
+weaker gate does the opposite.
+
+**Anti-drift provision.** A declared limitation is re-proven at each certification, and its
+justification is part of the digest (§3.1). A limitation that becomes untrue — the harness
+gains the capability, or someone finds a way to express it — MUST be removed and the trust
+cap restored. Otherwise "intrinsic limitation" becomes the permanent excuse that
+re-creates the condition this document exists to end.
+
+> **Worked example — gemini, 2026-09-04.** Four differences were on the table. Three
+> collapse under scrutiny and one survives:
+>
+> | difference | intrinsic? | disposition |
+> |---|---|---|
+> | Gate-2 policy by subprocess to claude-code's shim | **no** — gemini's hook is Python, already loads shared modules, already holds `_core` and a profile | fix: in-process `decide()` |
+> | no in-process `evaluate` / `degraded_verdict` | **no** — consequence of the above | fix |
+> | `to_claude_lineage()` event translation | **no** — this is the `to_event` adapter every seat has | fix (C4-permitted, not an exception) |
+> | native containment covers **file tools only**; for shell, MCP and egress the gate is the **ONLY** layer (`plugins/gemini/README.md:114-119`) | **yes** — gemini-cli's own sandbox; no shim can add it | **flag + trust cap** |
+>
+> Only the last is a harness limitation. The first three were being defended as harness
+> differences and are not — they are shim drift in a costume, which is precisely what this
+> criterion is for. And the survivor is the right shape: the *shim* becomes identical, the
+> *harness's own containment* is what differs, is flagged, and is priced.
+
 ### C9 — Provenance
 
 The shim's content hash MUST match the certified hash stored in the vault (§3), and the
