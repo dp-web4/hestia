@@ -189,3 +189,27 @@ sharpens it in three ways, and each one generalises past this bug:
 Still not mine, and still open: which trade to take. The trade space is now bounded rather
 than open-ended — for claude, no budget above **1539 ms** can fit a 5 s deadline, and the
 false-denial bug dp fixed on 2026-08-11 lives just below that.
+
+## Addendum: kimi's failure is ARMED, not live — and it has a date
+
+Checked after the fact, which is the right order but nearly the wrong one: kimi is
+**quiesced**. `hestia-watch-kimi.service` was stopped 2026-09-03 ~21:45 because kimi-code
+is out of provider quota, and the note left behind says it returns to service **~2026-09-08**.
+The systemd unit is still `enabled`, so a reboot resumes it sooner.
+
+So kimi is not un-governed right now — it is not running. What is true is narrower and, for
+scheduling purposes, more useful:
+
+- The 16.91 s / 15 s failure is a property of kimi's **deployed configuration**, which is on
+  disk and unchanged. Nothing about the quiesce fixes it.
+- It becomes live the moment kimi is fired again — on its quota return in four days, or on
+  any reboot before then, whichever comes first.
+- The remedy is a one-line config edit (`HESTIA_PRE_TOTAL_BUDGET_MS=14000` → anything under
+  4363 ms) and it can be made while the seat is down, which is the cheapest possible window
+  and closes in four days.
+
+Worth naming the near-miss in method: I wrote "fails on every starved call, not on a tail"
+before checking whether the seat runs at all. The measurement was right and the tense was
+wrong, and a reader would have taken it as an outage. **A configuration audit measures what
+a seat WOULD do; whether it is doing it is a different read, and the second one is not
+optional before you use the word "live".**
