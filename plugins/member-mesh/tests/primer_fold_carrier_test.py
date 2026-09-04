@@ -196,11 +196,13 @@ def renderer_for(script):
     return m.group(1) if m else None
 
 
-def render(script, primer_obj, cap=None):
+def render(script, primer_obj, cap=None, budget=None):
     code = renderer_for(script)
     env = dict(os.environ)
     if cap is not None:
         env["HESTIA_DEBT_ROWS_SHOWN"] = str(cap)
+    if budget is not None:
+        env["HESTIA_DEBT_MAX_BYTES"] = str(budget)
     with tempfile.TemporaryDirectory() as td:
         p = os.path.join(td, "primer.json")
         json.dump(primer_obj, open(p, "w", encoding="utf-8"))
@@ -265,6 +267,37 @@ for script in ("fire-claude.sh", "fire-codex.sh", "fire-kimi.sh"):
     out = render(script, {**BASE, "unanswered": {"asked": True, "i_owe": rows(2), "owed_to_me": []}})
     check(f"D6 {seat}: an uncapped fold carries no cap notice",
           "NOT SHOWN" not in out and "DISPLAY cap" not in out, repr(out[-200:]))
+
+print("\nD7-D10. THE BYTE BACKSTOP -- rows are not the unit the kernel counts")
+
+# The arm that ties this file to the kernel. `claude -p "$PROMPT"` passes the rendered
+# block, inlined, as ONE argv string; execve caps a single string at MAX_ARG_STRLEN.
+# A ROW cap cannot bound that: measured on CBP 2026-09-04 against a live 1,189-row
+# fold, HESTIA_DEBT_ROWS_SHOWN=500 rendered 168,237 B and every fire on the seat then
+# died E2BIG -- no wake at all, where the bug this change repairs merely degraded one.
+# The safe row value is not even a constant, since it falls as the fold grows.
+MAX_ARG_STRLEN = 131072   # 32 pages, measured: 131,000 passes and 131,100 fails
+huge = {**BASE, "unanswered": {"asked": True, "i_owe": rows(1200), "owed_to_me": rows(1200)}}
+for script in ("fire-claude.sh", "fire-codex.sh", "fire-kimi.sh"):
+    seat = script.split("-")[1].split(".")[0]
+
+    out = render(script, huge, cap=100000)
+    n = len(out.encode("utf-8"))
+    check(f"D7 {seat}: no row-cap value can push the block past argv's per-string limit",
+          n < MAX_ARG_STRLEN, f"{n} B >= {MAX_ARG_STRLEN} -- the fire would die E2BIG")
+    check(f"D8 {seat}: the byte drop announces itself and names its own knob",
+          "HESTIA_DEBT_MAX_BYTES" in out and "DROPPED" in out, repr(out[-400:]))
+
+    # D5's discipline, one layer along: a display BUDGET must not manufacture a zero.
+    out0 = render(script, huge, cap=100000, budget=0)
+    check(f"D9 {seat}: BUDGET=0 does not turn real debt into `you owe nobody`",
+          "MEASURED ZERO" not in out0 and "DROPPED" in out0, repr(out0[:300]))
+
+    # And a fold that fits must not grow a byte notice it did not earn.
+    small = render(script, {**BASE, "unanswered": {"asked": True, "i_owe": rows(2),
+                                                   "owed_to_me": []}})
+    check(f"D10 {seat}: a fold under both caps carries no byte notice",
+          "HESTIA_DEBT_MAX_BYTES" not in small, repr(small[-200:]))
 
 # Each seat keeps its own prompt wording; this repair moved the header, it did not merge
 # three seats' text into one.

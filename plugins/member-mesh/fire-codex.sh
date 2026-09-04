@@ -223,6 +223,31 @@ if isinstance(u, dict):
         if len(got) > CAP:
             notes.append(f"... and {len(got)-CAP} further `{label}` rows NOT SHOWN "
                          f"({len(got)} in the fold, {CAP} rendered).")
+# THE ROW CAP CANNOT BOUND BYTES, AND THE FIRE'S ARGV CAN. This block is inlined into
+# $PROMPT and the seat runs `claude -p "$PROMPT"` -- ONE argv string, under the same
+# MAX_ARG_STRLEN = 131,072 B that deleted the fold in the first place, now one hop
+# downstream. Measured on this seat 2026-09-04 against a live 1,189-row fold: the
+# default 25 renders 13,779 B, but HESTIA_DEBT_ROWS_SHOWN=500 renders 168,237 B and
+# every fire on that seat then dies E2BIG -- NO WAKE AT ALL, where the bug this change
+# repairs merely degraded one. Worse, it is self-feeding: a fire that cannot exec is
+# reported unreachable, which bounces mail, which grows the fold. And the safe row
+# ceiling is not a constant -- it falls as the fold grows, so a value that was safe
+# when it was set stops being safe on its own, with no edit and no signal. Rows are
+# not the unit the kernel counts; bytes are. So bytes are what is capped here, and
+# loudly, for exactly the reason the row cap is loud.
+BUDGET = int(os.getenv("HESTIA_DEBT_MAX_BYTES") or 65536)
+kept, used, dropped = [], 0, 0
+for i, r in enumerate(rows):
+    n = len(r.encode("utf-8")) + 1
+    if used + n > BUDGET:
+        dropped = len(rows) - i
+        break
+    kept.append(r)
+    used += n
+rows = kept
+if dropped:
+    notes.append(f"... and a further {dropped} rows that the row cap ADMITTED were "
+                 f"DROPPED to hold this block under {BUDGET} B (HESTIA_DEBT_MAX_BYTES).")
 # Branch on the fold's own count, never on how many rows survived the cap: with CAP=0
 # `rows` is empty while the debt is real, and falling through to the zero arm would
 # report "you owe nobody" on the strength of a display setting.
@@ -232,7 +257,8 @@ if total:
         print("\n".join(rows))
     if notes:
         print("\n".join(notes))
-        print("Those are a DISPLAY cap (HESTIA_DEBT_ROWS_SHOWN), NOT a measurement — the "
+        print("Those are a DISPLAY cap (HESTIA_DEBT_ROWS_SHOWN rows, then "
+              "HESTIA_DEBT_MAX_BYTES bytes), NOT a measurement — the "
               "full fold is in this primer's JSON, named at the top of this prompt. Read "
               "it there before concluding anything about how much you owe.")
 elif u is None:
