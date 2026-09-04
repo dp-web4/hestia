@@ -1,38 +1,42 @@
-#!/usr/bin/env python3
-"""The ONE Hestia gate orchestrator.
+"""The one Hestia gate orchestrator.
 
-Harness shims translate syntax into :class:`GateEvent`, call :func:`decide`, and translate
-:class:`GateDecision` back to the harness blocking protocol.  They do not sequence policy.
+Harness shims translate syntax into GateEvent, call decide(), and translate GateDecision
+back to the harness protocol. They do not sequence governance.
 
-This module deliberately sits above the transport-free law core (hestia_gate_core), the
-daemon transport (hestia_gate_mechanism), and the governance-closure classifier.  Those
-modules remain independently testable; this module owns their ORDER and therefore owns the
-governance decision path.
+Two invariants are load-bearing here:
 
-There is no per-seat warn/enforce switch here.  Enforcement posture is law, not harness
-configuration.  A seat environment cannot select which law applies to itself.
+1. ONE INVOCATION, ONE DEADLINE. The shortest measured harness deadline is 4 s. The common
+   gate owns a 3 s absolute deadline and clamps every daemon client/poll to it. Helper-local
+   budgets and per-seat environment variables cannot mint fresh time.
+2. EFFECT-PERMITTING DECISIONS NEED COMMITTED EVIDENCE. A write/exec allow or warn is not
+   returned if the canonical decision witness cannot be committed. Denies still stand when
+   the witness plane is unavailable, with explicit Plane-E fallback evidence. Read allows
+   preserve the ratified degraded-read posture but surface evidence_committed=False.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import os
-import re
-from dataclasses import dataclass, field
 from pathlib import Path
+import re
+import time
 from typing import Any, Optional
 
 import hestia_gate_core as core
 import hestia_gate_mechanism as mechanism
 import hestia_governance_closure as closure
 
-GATE_API_VERSION = "1"
+GATE_API_VERSION = "decide/1"
+GATE_DEADLINE_SECONDS = 3.0
 _ACTION_CACHE_DIR = Path("/tmp/hestia-actions")
 
 
 @dataclass(frozen=True)
 class GateProfile:
-    """Harness facts only.  No policy or enforcement posture belongs here."""
+    """Harness facts only. No law or enforcement posture belongs here."""
 
     member_id: str
     identity_path: str
@@ -53,7 +57,7 @@ class GateProfile:
             identity_path=self.identity_path,
             home_markers=self.home_markers,
             launch_cwd_env=self.launch_cwd_env,
-            # Explicitly empty: a per-seat mode selector is per-seat law.
+            # Deliberately empty. A seat-selectable mode is seat-selectable law.
             mode_env="",
             workspace_env=self.workspace_env,
             forbidden_extra_env=self.forbidden_extra_env,
@@ -63,7 +67,7 @@ class GateProfile:
 
 @dataclass
 class GateEvent:
-    """Canonical harness event.  Shims may translate names/keys, never judge them."""
+    """Canonical harness event. Shims translate names/keys, never judge them."""
 
     tool: str
     tool_input: dict = field(default_factory=dict)
@@ -82,6 +86,7 @@ class GateDecision:
     verdict_available: bool = True
     action_id: Optional[str] = None
     anomaly: bool = False         # infrastructure/no-verdict, not member conduct
+    evidence_committed: bool = False
 
     @property
     def blocks(self) -> bool:
@@ -89,15 +94,14 @@ class GateDecision:
 
 
 def gate_artifact_digest() -> str:
-    """Digest the exact shared decision surface this shim certification depends on."""
+    """Diagnostic digest of the loaded law-bearing modules, never a certification oracle."""
     h = hashlib.sha256()
-    for mod in (core, mechanism, closure):
+    modules = (core, mechanism, closure)
+    for mod in modules:
         try:
-            p = Path(mod.__file__).resolve()
-            h.update(p.name.encode("utf-8"))
-            h.update(b"\0")
-            h.update(p.read_bytes())
-            h.update(b"\0")
+            path = Path(mod.__file__).resolve()
+            h.update(path.name.encode("utf-8")); h.update(b"\0")
+            h.update(path.read_bytes()); h.update(b"\0")
         except Exception:
             h.update(b"UNREADABLE\0")
     try:
@@ -105,6 +109,51 @@ def gate_artifact_digest() -> str:
     except Exception:
         h.update(b"UNREADABLE-ORCHESTRATOR")
     return h.hexdigest()
+
+
+def _remaining(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
+
+
+@contextmanager
+def _one_deadline(deadline: float):
+    """Clamp every mechanism-created client/poll to one absolute invocation deadline.
+
+    The older mechanism owns several useful operations, but historically each one minted a
+    fresh TOTAL_BUDGET_MS window. A single hook could therefore consume that budget several
+    times and lose the race to the harness's own timeout. We do not lower each helper's
+    budget; we remove its authority to mint time.
+
+    The mechanism is process-local in a short-lived hook. Restore everything anyway so the
+    contract remains testable and nested callers do not inherit hidden state.
+    """
+    old_client = mechanism._McpHttp
+    old_poll = getattr(mechanism, "_poll_policy", None)
+    old_budget = mechanism.TOTAL_BUDGET_MS
+    old_request_timeout = mechanism.REQUEST_TIMEOUT_S
+
+    def bounded_client(endpoint, requested_deadline):
+        return old_client(endpoint, min(float(requested_deadline), deadline))
+
+    def bounded_poll(client, action_id, session_id, requested_deadline):
+        return old_poll(client, action_id, session_id,
+                        min(float(requested_deadline), deadline))
+
+    mechanism._McpHttp = bounded_client
+    if old_poll is not None:
+        mechanism._poll_policy = bounded_poll
+    # Ignore seat/env-selected transport posture while this decision is active. These are
+    # mechanism limits, not law. The absolute deadline above remains the real authority.
+    mechanism.TOTAL_BUDGET_MS = max(1, int(_remaining(deadline) * 1000))
+    mechanism.REQUEST_TIMEOUT_S = max(0.05, _remaining(deadline))
+    try:
+        yield
+    finally:
+        mechanism._McpHttp = old_client
+        if old_poll is not None:
+            mechanism._poll_policy = old_poll
+        mechanism.TOTAL_BUDGET_MS = old_budget
+        mechanism.REQUEST_TIMEOUT_S = old_request_timeout
 
 
 def _strings(value: Any, depth: int = 0) -> list[str]:
@@ -148,7 +197,6 @@ def _mcp_repo_target(tool_input: dict) -> Optional[str]:
 
 
 def _extra_egress_strings(event: GateEvent) -> list[str]:
-    """Network/MCP strings that are egress evidence but are not filesystem paths."""
     ti = event.tool_input if isinstance(event.tool_input, dict) else {}
     out: list[str] = []
     low = event.tool.lower()
@@ -166,7 +214,6 @@ def _extra_egress_strings(event: GateEvent) -> list[str]:
 def _normalized(event: GateEvent) -> core.NormalizedEvent:
     paths = core.path_targets(event.tool, event.tool_input)
     paths.extend(_apply_patch_targets(event.tool, event.tool_input))
-    # preserve order but remove duplicate targets produced by shape translation + key table
     paths = list(dict.fromkeys(str(p) for p in paths if isinstance(p, str) and p))
     repo = _mcp_repo_target(event.tool_input) if event.tool.startswith("mcp__") else None
     raw = dict(event.raw or {})
@@ -196,7 +243,7 @@ _CREDENTIAL_KEYS = (
 
 
 def attempted_summary(event: GateEvent, limit: int = 400) -> str:
-    """Bounded and scrubbed WHAT for witnesses/escalations; never copy an unbounded payload."""
+    """Bounded/scrubbed WHAT. Full act identity is a separate versioned binding problem."""
     ti = event.tool_input if isinstance(event.tool_input, dict) else {}
     raw: Any = ti.get("command") or ti.get("file_path") or ti.get("path") or ""
     if not raw and ti:
@@ -210,15 +257,11 @@ def attempted_summary(event: GateEvent, limit: int = 400) -> str:
     for token in text.split(" "):
         low = token.lstrip("-").rstrip(":").lower()
         if mask_next and not token.startswith("-"):
-            out.append("***")
-            mask_next = False
-            continue
+            out.append("***"); mask_next = False; continue
         if "=" in token:
-            key, _, _ = token.partition("=")
+            key, _, _value = token.partition("=")
             if any(s in key.lstrip("-").lower() for s in _CREDENTIAL_KEYS):
-                out.append(key + "=***")
-                mask_next = False
-                continue
+                out.append(key + "=***"); mask_next = False; continue
         mask_next = low in _CREDENTIAL_KEYS
         out.append(token)
     scrubbed = " ".join(out)
@@ -241,22 +284,73 @@ def _role(profile: GateProfile, snapshot_role: Optional[str] = None) -> str:
         return profile.default_role
 
 
-def _record(profile: GateProfile, event: GateEvent, *, decision: str, rule: str,
-            verdict_available: bool, attempted: Optional[str] = None) -> bool:
-    """Every final decision takes the same witness path.  Recording never changes the verdict."""
+def _plane_e_path(plugin_id: str) -> Path:
+    home = Path(os.path.expanduser(os.getenv("HESTIA_HOME", "~/.hestia")))
+    safe = "".join(c if c.isalnum() or c in "-_." else "-" for c in (plugin_id or "unknown"))
+    return home / "telemetry" / f"gate-decisions-{safe}.jsonl"
+
+
+def _plane_e(profile: GateProfile, event: GateEvent, record: dict, error: str) -> None:
+    """Durable local fallback when canonical witnessing is unavailable. Never raises."""
     try:
-        return bool(mechanism.witness_decision_unified(
-            None,
-            plugin_id=profile.member_id,
-            decision=decision,
-            rule=rule,
-            tool_name=event.tool,
-            target=_target(event),
-            session_id=event.session_id,
-            verdict_available=verdict_available,
-            attempted_summary=attempted if attempted is not None else attempted_summary(event),
-        ))
-    except Exception:
+        row = dict(record)
+        row["canonical_witness_committed"] = False
+        row["witness_delivery_failed"] = error[:400]
+        row["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        path = _plane_e_path(profile.member_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, default=str, sort_keys=True) + "\n")
+    except BaseException:
+        pass
+
+
+def _record(profile: GateProfile, event: GateEvent, *, decision: str, rule: str,
+            verdict_available: bool, deadline: float,
+            attempted: Optional[str] = None) -> bool:
+    """Commit one canonical decision witness, or leave explicit Plane-E evidence.
+
+    This is deliberately not the historical deny-only helper: allows use the same path.
+    Returns True only when the daemon acknowledged the canonical witness.
+    """
+    record = {
+        "plugin_id": profile.member_id,
+        "decision": decision,
+        "rule": (rule or "")[:300],
+        "tool_name": event.tool or "",
+        "target": _target(event),
+        "session_id": event.session_id,
+        "verdict_available": bool(verdict_available),
+        "attempted": attempted if attempted is not None else attempted_summary(event),
+        "gate_api_version": GATE_API_VERSION,
+    }
+    try:
+        if _remaining(deadline) <= 0:
+            raise TimeoutError("common gate deadline exhausted before witness")
+        endpoint = mechanism._discover_endpoint()
+        if endpoint is None:
+            raise RuntimeError("no daemon endpoint discovered")
+        client = mechanism._McpHttp(endpoint, deadline)
+        if "result" not in client.initialize():
+            raise RuntimeError("initialize failed")
+        client.initialized()
+        out = client.call_tool("hestia_witness_decision", {
+            "plugin_id": profile.member_id,
+            "decision": decision,
+            "adjudicator": f"plugin-gate:{profile.member_id}",
+            "reason": (rule or "")[:300],
+            "verdict_available": bool(verdict_available),
+            "tool_name": event.tool or "",
+            "target": record["target"],
+            "session_id": event.session_id,
+            "attempted": record["attempted"],
+            "gate_api_version": GATE_API_VERSION,
+        })
+        if not (isinstance(out, dict) and "result" in out):
+            raise RuntimeError("witness call returned no result")
+        return True
+    except BaseException as exc:
+        _plane_e(profile, event, record, f"{type(exc).__name__}: {exc}")
         return False
 
 
@@ -289,13 +383,51 @@ def _cache_action(event: GateEvent, action_id: Optional[str]) -> None:
         pass
 
 
-def _deny_from_core(profile: GateProfile, event: GateEvent, verdict: core.Verdict,
-                    *, verdict_available: bool = True, anomaly: bool = False) -> GateDecision:
-    _record(profile, event, decision="deny", rule=verdict.rule,
-            verdict_available=verdict_available)
-    _tally(profile, False, _role(profile))
-    return GateDecision("deny", verdict.rule, verdict.reason, verdict.remedy,
-                        verdict_available=verdict_available, anomaly=anomaly)
+def _finalize(profile: GateProfile, event: GateEvent, decision: GateDecision,
+              deadline: float, *, require_commit: bool = False,
+              role: Optional[str] = None) -> GateDecision:
+    committed = _record(
+        profile, event,
+        decision=decision.decision,
+        rule=decision.rule,
+        verdict_available=decision.verdict_available,
+        deadline=deadline,
+    )
+    _tally(profile, decision.decision != "deny", role or _role(profile))
+
+    if require_commit and decision.decision in ("allow", "warn") and not committed:
+        # The effect has NOT been permitted yet. Convert the unrecordable permit into an
+        # infrastructure denial instead of allowing state to outrun its evidence.
+        denied = GateDecision(
+            "deny",
+            "gate.evidence_uncommitted",
+            "the decision witness could not be committed before the common deadline",
+            "Retry when the canonical witness path is healthy.",
+            verdict_available=False,
+            action_id=decision.action_id,
+            anomaly=True,
+            evidence_committed=False,
+        )
+        _plane_e(profile, event, {
+            "plugin_id": profile.member_id,
+            "decision": "deny",
+            "rule": denied.rule,
+            "tool_name": event.tool,
+            "target": _target(event),
+            "session_id": event.session_id,
+            "verdict_available": False,
+            "attempted": attempted_summary(event),
+            "supersedes_uncommitted": decision.decision,
+        }, "canonical evidence required before consequential effect")
+        return denied
+
+    if committed:
+        return replace(decision, evidence_committed=True)
+    # A fail-closed decision may have only Plane-E evidence when the daemon is unavailable.
+    # Preserve the decision but make the evidence state explicit. Read allows preserve the
+    # ratified degraded-read posture and surface the infrastructure anomaly.
+    return replace(decision, evidence_committed=False,
+                   anomaly=(decision.anomaly or decision.decision == "allow"))
 
 
 def _egress_precheck(event: GateEvent, cprofile: core.HarnessProfile) -> Optional[core.Verdict]:
@@ -306,64 +438,54 @@ def _egress_precheck(event: GateEvent, cprofile: core.HarnessProfile) -> Optiona
             if token in low:
                 return core._deny(
                     "egress.secret",
-                    f"'{event.tool}' carries a forbidden secret/credential token through an "
-                    f"egress surface: '{token}'",
+                    f"'{event.tool}' carries a forbidden secret/credential token through an egress surface: '{token}'",
                     innate=True,
                 )
     return None
 
 
+def _fetch_snapshot(profile: GateProfile, event: GateEvent, deadline: float) -> Optional[dict]:
+    """At most two attempts, both inside the one common deadline."""
+    snap = mechanism._fetch_policy_snapshot_once(
+        profile.member_id,
+        host_agent=profile.host_agent or profile.member_id,
+        host_session_id=event.session_id,
+    )
+    if snap is not None:
+        return snap
+    remaining = _remaining(deadline)
+    if remaining <= 0.30:
+        return None
+    time.sleep(min(0.25, max(0.0, remaining - 0.05)))
+    if _remaining(deadline) <= 0.05:
+        return None
+    return mechanism._fetch_policy_snapshot_once(
+        profile.member_id,
+        host_agent=profile.host_agent or profile.member_id,
+        host_session_id=event.session_id,
+        use_cache=False,
+    )
+
+
 def decide(event: GateEvent, profile: GateProfile) -> GateDecision:
-    """ONE decision sequence for every harness.
-
-    Order is law-bearing and intentionally centralized:
-      governance closure -> live policy/local scope+egress -> degraded posture OR society
-      safety -> witness/tally -> return.
-
-    Any unexpected exception becomes an infrastructure denial.  A broken gate never becomes
-    a harness-specific allow path.
-    """
+    """One law-bearing sequence for every harness."""
+    deadline = time.monotonic() + GATE_DEADLINE_SECONDS
     try:
         if not isinstance(event, GateEvent):
             raise TypeError("decide requires GateEvent")
-        if os.environ.get("HESTIA_TEST_SABOTAGE"):
-            raise RuntimeError("HESTIA_TEST_SABOTAGE: injected decision-time fault")
-
         cprofile = profile.core_profile()
         normalized = _normalized(event)
         attempted = attempted_summary(event)
 
-        # Gate 1c: governance closure first, independent of daemon availability.
-        cv = closure.classify(event.tool, event.tool_input, cwd=event.cwd)
-        if cv.classification == "read":
-            try:
-                mechanism.witness_gate_self(
-                    "gate_self_read", cv.marker or cv.rule or "governance", event.tool, cv.rule,
-                    plugin_id=profile.member_id,
-                    role=_role(profile),
-                    gate_path=profile.gate_path or "",
-                    client_name=profile.client_name or ("hestia-" + profile.member_id + "-gate"),
-                    host_session_id=event.session_id,
-                )
-            except Exception:
-                pass
-        elif cv.classification == "write":
-            marker = cv.marker or cv.rule or "governance"
-            try:
-                claimed, detail, esc_id, how = mechanism.claim_self_write(
-                    marker, event.tool, attempted,
-                    plugin_id=profile.member_id,
-                    role=_role(profile),
-                    client_name=profile.client_name or ("hestia-" + profile.member_id + "-gate"),
-                    host_session_id=event.session_id,
-                )
-            except Exception:
-                claimed, detail, esc_id, how = (
-                    "unreachable", "no answer from the daemon - refused", None, None)
-            if claimed != "approved":
+        with _one_deadline(deadline):
+            # Governance closure is evaluated before ordinary policy. Approval of the
+            # closure write removes only the closure bar; ordinary law still runs below.
+            cv = closure.classify(event.tool, event.tool_input, cwd=event.cwd)
+            if cv.classification == "read":
                 try:
                     mechanism.witness_gate_self(
-                        "gate_self_access", marker, event.tool, cv.rule,
+                        "gate_self_read", cv.marker or cv.rule or "governance",
+                        event.tool, cv.rule,
                         plugin_id=profile.member_id,
                         role=_role(profile),
                         gate_path=profile.gate_path or "",
@@ -372,111 +494,136 @@ def decide(event: GateEvent, profile: GateProfile) -> GateDecision:
                     )
                 except Exception:
                     pass
-                esc = (f" Escalation {esc_id} is open ({how}); re-issue after approval."
-                       if esc_id else "")
-                v = core._deny(
-                    "gate.self_access",
-                    f"'{event.tool}' would WRITE the governance surface "
-                    f"({cv.resource or marker}; rule {cv.rule or 'gate-self'}; {detail}).{esc}",
-                    innate=True,
+            elif cv.classification == "write":
+                marker = cv.marker or cv.rule or "governance"
+                try:
+                    claimed, detail, esc_id, how = mechanism.claim_self_write(
+                        marker, event.tool, attempted,
+                        plugin_id=profile.member_id,
+                        role=_role(profile),
+                        client_name=profile.client_name or ("hestia-" + profile.member_id + "-gate"),
+                        host_session_id=event.session_id,
+                    )
+                except Exception:
+                    claimed, detail, esc_id, how = (
+                        "unreachable", "no answer from daemon - refused", None, None)
+                if claimed != "approved":
+                    try:
+                        mechanism.witness_gate_self(
+                            "gate_self_access", marker, event.tool, cv.rule,
+                            plugin_id=profile.member_id,
+                            role=_role(profile),
+                            gate_path=profile.gate_path or "",
+                            client_name=profile.client_name or ("hestia-" + profile.member_id + "-gate"),
+                            host_session_id=event.session_id,
+                        )
+                    except Exception:
+                        pass
+                    esc = (f" Escalation {esc_id} is open ({how}); re-issue after approval."
+                           if esc_id else "")
+                    d = GateDecision(
+                        "deny", "gate.self_access",
+                        f"'{event.tool}' would WRITE the governance surface "
+                        f"({cv.resource or marker}; rule {cv.rule or 'gate-self'}; {detail}).{esc}",
+                    )
+                    return _finalize(profile, event, d, deadline)
+
+            extra_egress = _egress_precheck(event, cprofile)
+            if extra_egress is not None:
+                d = GateDecision("deny", extra_egress.rule, extra_egress.reason,
+                                 extra_egress.remedy, verdict_available=True)
+                return _finalize(profile, event, d, deadline)
+
+            snapshot = _fetch_snapshot(profile, event, deadline)
+            if snapshot is None:
+                degraded = core.degraded_verdict(normalized, cprofile)
+                if degraded.blocks:
+                    innate = bool(getattr(degraded, "innate", False))
+                    d = GateDecision(
+                        "deny", degraded.rule, degraded.reason, degraded.remedy,
+                        verdict_available=innate, anomaly=not innate,
+                    )
+                    return _finalize(profile, event, d, deadline)
+                try:
+                    core.record_gate_unavailable(
+                        profile.member_id, event.tool, "unknown",
+                        "degraded: policy snapshot fetch failed (allow-read)")
+                except Exception:
+                    pass
+                d = GateDecision(
+                    "allow", "gate.degraded.allow_read",
+                    "read permitted by the ratified degraded posture",
+                    verdict_available=False, anomaly=True,
                 )
-                return _deny_from_core(profile, event, v)
+                return _finalize(profile, event, d, deadline, require_commit=False)
 
-        # Network/MCP egress strings are not filesystem paths, so check them separately before
-        # core.evaluate() rather than feeding URLs into path scope.
-        extra_egress = _egress_precheck(event, cprofile)
-        if extra_egress is not None:
-            return _deny_from_core(profile, event, extra_egress)
+            snapshot_role = snapshot.get("role") if isinstance(snapshot, dict) else None
+            role = _role(profile, snapshot_role if isinstance(snapshot_role, str) else None)
+            policy = core.resolve_agent_policy(cprofile, vault_reader=lambda _member: snapshot)
+            local = core.evaluate(normalized, cprofile, core.detect_workspace(cprofile), policy=policy)
+            if local.blocks:
+                d = GateDecision("deny", local.rule, local.reason, local.remedy)
+                return _finalize(profile, event, d, deadline, role=role)
 
-        snapshot = mechanism.fetch_policy_snapshot(
-            profile.member_id,
-            host_agent=profile.host_agent or profile.member_id,
-            host_session_id=event.session_id,
-        )
-
-        if snapshot is None:
-            # The ratified common degraded posture.  There is no per-seat warn mode and no
-            # member-writable replica on this path.
-            degraded = core.degraded_verdict(normalized, cprofile)
-            if degraded.blocks:
-                return _deny_from_core(
-                    profile, event, degraded,
-                    verdict_available=bool(degraded.innate),
-                    anomaly=not degraded.innate,
+            if normalized.tool in core.READ_CLASS:
+                return _finalize(
+                    profile, event, GateDecision("allow", "gate.allow"), deadline,
+                    require_commit=False, role=role,
                 )
-            try:
-                core.record_gate_unavailable(
-                    profile.member_id, event.tool, "unknown",
-                    "degraded: policy snapshot fetch failed (allow-read)")
-            except Exception:
-                pass
-            _record(profile, event, decision="allow", rule="gate.degraded.allow_read",
-                    verdict_available=False)
-            _tally(profile, True, _role(profile))
-            return GateDecision("allow", "gate.degraded.allow_read",
-                                "read permitted by the ratified degraded posture",
-                                verdict_available=False, anomaly=True)
 
-        snapshot_role = snapshot.get("role") if isinstance(snapshot, dict) else None
-        role = _role(profile, snapshot_role if isinstance(snapshot_role, str) else None)
-        policy = core.resolve_agent_policy(cprofile, vault_reader=lambda _member: snapshot)
-        local = core.evaluate(normalized, cprofile, core.detect_workspace(cprofile), policy=policy)
-        if local.blocks:
-            return _deny_from_core(profile, event, local)
+            safety = mechanism.query_society_safety(
+                normalized.raw,
+                plugin_id=profile.member_id,
+                host_agent=profile.host_agent or profile.member_id,
+                host_session_id=event.session_id,
+            )
+            _cache_action(event, safety.action_id)
+            if not safety.allow:
+                if safety.decided:
+                    d = GateDecision(
+                        "deny", "society.safety",
+                        safety.message or "society law refused the act",
+                        action_id=safety.action_id,
+                    )
+                    return _finalize(profile, event, d, deadline, role=role)
+                d = GateDecision(
+                    "deny", "society.unreachable",
+                    safety.message or "no usable society-safety verdict",
+                    verdict_available=False, action_id=safety.action_id, anomaly=True,
+                )
+                return _finalize(profile, event, d, deadline, role=role)
 
-        # Read-class acts are completely decided by the shared local law.  Consequential acts
-        # additionally require a society-safety verdict.
-        if normalized.tool in core.READ_CLASS:
-            _record(profile, event, decision="allow", rule="gate.allow",
-                    verdict_available=True)
-            _tally(profile, True, role)
-            return GateDecision("allow", "gate.allow")
-
-        safety = mechanism.query_society_safety(
-            normalized.raw,
-            plugin_id=profile.member_id,
-            host_agent=profile.host_agent or profile.member_id,
-            host_session_id=event.session_id,
-        )
-        _cache_action(event, safety.action_id)
-        if not safety.allow:
-            if safety.decided:
-                v = core._deny("society.safety",
-                               safety.message or "society law refused the act")
-                _record(profile, event, decision="deny", rule="society.safety",
-                        verdict_available=True)
-                _tally(profile, False, role)
-                return GateDecision("deny", "society.safety", v.reason, v.remedy,
-                                    verdict_available=True, action_id=safety.action_id)
-            v = core._deny("society.unreachable",
-                           safety.message or "no usable society-safety verdict")
-            _record(profile, event, decision="deny", rule="society.unreachable",
-                    verdict_available=False)
-            _tally(profile, False, role)
-            return GateDecision("deny", "society.unreachable", v.reason, v.remedy,
-                                verdict_available=False, action_id=safety.action_id, anomaly=True)
-
-        kind = safety.kind if safety.kind in ("allow", "warn") else "allow"
-        rule = "society.safety.warn" if kind == "warn" else "gate.allow"
-        _record(profile, event, decision=kind, rule=rule, verdict_available=True)
-        _tally(profile, True, role)
-        return GateDecision(kind, rule, safety.message or "", "",
-                            verdict_available=True, action_id=safety.action_id)
+            kind = safety.kind if safety.kind in ("allow", "warn") else "allow"
+            rule = "society.safety.warn" if kind == "warn" else "gate.allow"
+            d = GateDecision(
+                kind, rule, safety.message or "", "",
+                verdict_available=True, action_id=safety.action_id,
+            )
+            # This path permits a write/exec effect. Evidence must commit first.
+            return _finalize(profile, event, d, deadline, require_commit=True, role=role)
 
     except BaseException as exc:
-        # Catch SystemExit too: the shared gate is a value-returning API and must never let a
-        # dependency terminate a fail-open harness process before the shim can emit a block.
         detail = f"{type(exc).__name__}: {exc}"
-        try:
-            _record(profile, event, decision="deny", rule="gate.internal_error",
-                    verdict_available=False, attempted=detail[:200])
-        except Exception:
-            pass
-        return GateDecision(
+        d = GateDecision(
             "deny", "gate.internal_error",
             "the common gate could not complete the decision: " + detail,
             "This is an infrastructure fault, not a judgement of the attempted act. "
             "The gate fails closed until the decision path is healthy.",
-            verdict_available=False,
-            anomaly=True,
+            verdict_available=False, anomaly=True,
         )
+        try:
+            with _one_deadline(deadline):
+                return _finalize(profile, event, d, deadline)
+        except BaseException:
+            try:
+                _plane_e(profile, event, {
+                    "plugin_id": getattr(profile, "member_id", "unknown"),
+                    "decision": "deny",
+                    "rule": d.rule,
+                    "tool_name": getattr(event, "tool", "unknown"),
+                    "verdict_available": False,
+                    "attempted": detail[:200],
+                }, "common gate exception path could not reach canonical witness")
+            except BaseException:
+                pass
+            return d
