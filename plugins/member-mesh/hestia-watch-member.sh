@@ -1392,7 +1392,24 @@ while true; do
     # The strong asker: fold the member's outstanding debt into the primer, so
     # the question is asked where an answer is possible — inside the wake that
     # is happening anyway. Costs one read; never causes a fire on its own.
-    UN=$(unanswered 2>/dev/null || echo '{}')
+    # THE FOLD TRAVELS BY FILE, NOT BY ENVIRONMENT. `execve` caps ONE string at
+    # MAX_ARG_STRLEN = 32 pages = 131,072 B (measured, not cited: `getconf` exposes
+    # ARG_MAX, a different and much larger TOTAL-size limit). This seat's live fold
+    # measured 442,074 B on 2026-09-04 -- 3.37x -- so exporting it failed E2BIG, the
+    # interpreter never started, and the `||` fallback wrote the raw drain response
+    # with `unanswered`, `open_petitions` AND `for_plugin` all missing. The size is
+    # per-seat and NOT monotone: codex's own fold shipped at 118,995 B the same day
+    # (codex, review of #858), so there is no global floor and no single onset date.
+    # A file has no such cap.
+    #
+    # Carrier failure is NOT empty debt. `mktemp` failing, or the write failing part
+    # way, must leave the primer saying "not measured" -- never `i_owe: []`, which
+    # reads as "you owe nothing". That is the same absence-as-verdict class this
+    # repair is about, so it gets an explicit third state below.
+    UN_FILE=$(mktemp "${TMPDIR:-/tmp}/hestia-un-$PLUGIN.XXXXXX" 2>/dev/null || true)
+    if [ -n "$UN_FILE" ]; then
+      unanswered > "$UN_FILE" 2>/dev/null || : > "$UN_FILE"
+    fi
     # The mirror of the debt fold: petitions THIS member has open. Filtered
     # here, by `asked_by`, because the tool answers for the whole society and
     # another member's rows are not this member's work — the same reason the
@@ -1403,13 +1420,27 @@ while true; do
     PET=$(open_petitions 2>/dev/null \
           | timeout 5 python3 "$WATCH_DIR/open-petitions.py" fold "$PLUGIN" \
           2>/dev/null || echo '{"asked":false,"mine":[]}')
-    printf '%s' "$OUT" | UN="$UN" PET="$PET" FOR_PLUGIN="$PLUGIN" python3 -c '
+    printf '%s' "$OUT" | UN_FILE="$UN_FILE" PET="$PET" FOR_PLUGIN="$PLUGIN" python3 -c '
 import json,os,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
-try: u=json.loads(os.environ.get("UN") or "{}")
-except Exception: u={}
-d["unanswered"]={k:u.get(k,[]) for k in ("i_owe","owed_to_me")}
+# TRI-STATE, mirroring `open_petitions`. `asked:true` with empty lists is a MEASURED
+# zero; `asked:false` is a read that never completed. Those are different facts and
+# the renderer says which. The two-state form collapsed them: ANY failure became
+# {"i_owe":[],"owed_to_me":[]} -- a positive assertion of no debt, manufactured out
+# of a channel error. `asked` is additive; primers written before it have no such key
+# and readers that only take i_owe/owed_to_me are unaffected.
+u=None
+try:
+    with open(os.getenv("UN_FILE") or "", encoding="utf-8") as f: u=json.load(f)
+except Exception: u=None
+# A refusal, an error envelope or a truncated body is not an empty debt. The keys must
+# be PRESENT and be lists: `.get("i_owe") or []` reads every one of those as "nothing
+# owed". This is the predicate `primer_spent` already applies to its own carrier.
+if isinstance(u,dict) and all(isinstance(u.get(k),list) for k in ("i_owe","owed_to_me")):
+    d["unanswered"]={"asked":True,"i_owe":u["i_owe"],"owed_to_me":u["owed_to_me"]}
+else:
+    d["unanswered"]={"asked":False,"i_owe":[],"owed_to_me":[]}
 try: d["open_petitions"]=json.loads(os.environ.get("PET") or "")
 except Exception: d["open_petitions"]={"asked":False,"mine":[]}
 # WHO THIS IS FOR — the one fact the primer never stated. It recorded from_plugin on
@@ -1422,6 +1453,7 @@ except Exception: d["open_petitions"]={"asked":False,"mine":[]}
 d["for_plugin"]=os.environ["FOR_PLUGIN"]
 json.dump(d,sys.stdout)
 ' > "$PRIMER" 2>/dev/null || echo "$OUT" > "$PRIMER"
+    [ -n "$UN_FILE" ] && rm -f "$UN_FILE"
     echo "[hestia-watch] $N notice(s) for $PLUGIN -> $PRIMER"
     if [ -n "$FIRE" ]; then
       # Success: primer is spent, remove it. Failure: KEEP it — the drain was

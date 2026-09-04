@@ -119,7 +119,7 @@ fi
 # by construction: an unanswered report that only one member is shown would
 # measure one member.
 DEBT=$(python3 - "$PRIMER" <<'PY'
-import datetime,json,re,sys,time
+import datetime,json,os,re,sys,time
 clean=lambda s: re.sub(r"[\x00-\x1f\x7f]","",str(s))[:512]
 
 def _age_secs(ts):
@@ -174,20 +174,76 @@ def liveness(x):
         bits.append("ONE touch ever, at first contact — this NAME has never worked")
     return f"; recipient {live or 'seen'}: " + ", ".join(bits)
 
-u=json.load(open(sys.argv[1])).get("unanswered") or {}
-for label,key in (("you have not answered","i_owe"),("nobody has answered you","owed_to_me")):
-    for x in u.get(key) or []:
-        seen = "delivered" if x.get("drained_at") else "never picked up"
-        hint = liveness(x)
-        print(f"- id={clean(x.get('id',''))} {clean(x.get('kind',''))} "
-              f"{clean(x.get('from_plugin',''))}->{clean(x.get('to_plugin',''))} "
-              f"({label}; {seen}{hint}) {clean(x.get('pointer_uri',''))}")
+# THE THIRD STATE HAS TO BE AUDIBLE. `.get("unanswered") or {}` rendered an absent
+# key, a present-but-empty fold and a real zero identically: as nothing at all. A
+# missing debt block reads as "you owe nobody", so a channel failure became a positive
+# all-clear and no reader could tell. That is why the E2BIG fold loss ran 15 days on
+# this seat while the sibling `open_petitions` gap -- whose renderer prints `asked:false`
+# in words -- was noticed the same day. The header moved in here so that it is emitted
+# only when there are rows for it to head.
+HEADER = 'Unanswered (no notice binds a response to these — responsiveness only; a member that woke and silently acted still shows here):\nRecipient liveness is EVIDENCE, not a diagnosis: `quiet Xm` is how long since that recipient last READ its mailbox, `reads=N` its lifetime read count. A member drains once at the top of a wake and then works, so a BUSY member reads quiet for most of it — quiet is not down (#506). `NEVER SEEN` means no liveness record exists at all.'
+u = json.load(open(sys.argv[1])).get("unanswered")
+# A DISPLAY cap, and it announces itself. Fixing the carrier means the whole fold now
+# arrives: 1,102 rows / ~205 KB of prompt on this seat on 2026-09-04, most of it the
+# member's own bounced mail plus rows addressed to roster ids that never drain (#541).
+# Rendering all of it would trade a silent absence for a flood -- the same failure, in
+# the other direction. What must NOT happen is a quiet truncation, so the notice below
+# carries both numbers and says which of the two it is.
+CAP = int(os.getenv("HESTIA_DEBT_ROWS_SHOWN") or 25)
+rows, notes, total = [], [], 0
+if isinstance(u, dict):
+    for label,key in (("you have not answered","i_owe"),("nobody has answered you","owed_to_me")):
+        got = u.get(key) or []
+        total += len(got)
+        for x in got[:CAP]:
+            seen = "delivered" if x.get("drained_at") else "never picked up"
+            hint = liveness(x)
+            rows.append(f"- id={clean(x.get('id',''))} {clean(x.get('kind',''))} "
+                        f"{clean(x.get('from_plugin',''))}->{clean(x.get('to_plugin',''))} "
+                        f"({label}; {seen}{hint}) {clean(x.get('pointer_uri',''))}")
+        if len(got) > CAP:
+            notes.append(f"... and {len(got)-CAP} further `{label}` rows NOT SHOWN "
+                         f"({len(got)} in the fold, {CAP} rendered).")
+# Branch on the fold's own count, never on how many rows survived the cap: with CAP=0
+# `rows` is empty while the debt is real, and falling through to the zero arm would
+# report "you owe nobody" on the strength of a display setting.
+if total:
+    print(HEADER)
+    if rows:
+        print("\n".join(rows))
+    if notes:
+        print("\n".join(notes))
+        print("Those are a DISPLAY cap (HESTIA_DEBT_ROWS_SHOWN), NOT a measurement — the "
+              "full fold is in this primer's JSON, named at the top of this prompt. Read "
+              "it there before concluding anything about how much you owe.")
+elif u is None:
+    # No `unanswered` key at all: the composer never wrote one. Either the fold exceeded
+    # MAX_ARG_STRLEN and the whole interpreter died E2BIG (the `||` fallback then writes
+    # the raw drain response), or this primer predates the fold.
+    print("Unanswered debt: NOT MEASURED this wake \u2014 this primer carries no `unanswered` "
+          "key, so the composer never wrote one. This is NOT a statement that you owe "
+          "nobody. Either the fold exceeded the exec argument limit and the composition "
+          "fallback fired, or the primer predates the fold. Measure it yourself: "
+          "`python3 plugins/member-mesh/hestia-mesh.py unanswered 0`.")
+elif u.get("asked") is False:
+    # The carrier itself failed -- mktemp, the write, or an unparseable/mistyped body.
+    # The composer refuses to turn that into `i_owe: []`; so does this.
+    print("Unanswered debt: NOT MEASURED this wake \u2014 the fold carrier failed (the "
+          "composer could not create, write or parse it), so the read never completed. "
+          "The empty lists in this primer are a REFUSAL, not a zero. Measure it "
+          "yourself: `python3 plugins/member-mesh/hestia-mesh.py unanswered 0`.")
+elif u.get("asked") is True:
+    # A real zero, and worth saying: it is the one case where silence would have been
+    # correct, and it is indistinguishable from the two above unless it speaks.
+    print("Unanswered debt: MEASURED ZERO \u2014 the fold was read; you owe nobody and "
+          "nobody owes you. This is a measurement, not a missing block.")
 PY
 )
 DEBT_BLOCK=""
+# The header and the liveness legend now live inside the block above, emitted only when
+# there are rows to head. This wrapper stays dumb on purpose: every state the renderer
+# can report is a state the reader must see, so there is nothing left here to gate on.
 [ -n "$DEBT" ] && DEBT_BLOCK="
-Unanswered (no notice binds a response to these — responsiveness only; a member that woke and silently acted still shows here):
-Recipient liveness is EVIDENCE, not a diagnosis: \`quiet Xm\` is how long since that recipient last READ its mailbox, \`reads=N\` its lifetime read count. A member drains once at the top of a wake and then works, so a BUSY member reads quiet for most of it — quiet is not down (#506). \`NEVER SEEN\` means no liveness record exists at all.
 $DEBT"
 # LAST WORDS — the reporting-void repair (decision of record, dp 2026-08-04:
 # shared-context/forum/kimi-decision-of-record-no-deprivation-experiments-2026-08-04.md).
