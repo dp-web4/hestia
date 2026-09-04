@@ -1,29 +1,46 @@
-#!/usr/bin/env python3
-"""CERTIFIED SHIM TEMPLATE.
+"""Certified Hestia harness shim template.
 
-A production shim may contain only these four sections:
-  1. byte-identical authority bootstrap;
-  2. profile DATA;
-  3. harness syntax adapters (`to_event`, `emit`, `read_harness_event`);
-  4. the byte-identical `main` skeleton.
+A shim translates an event. It never decides how that event is governed.
 
-Anything that classifies, scopes, interprets law, chooses an enforcement mode, records a
-policy decision, or sequences gates belongs in `hestia_single_gate.py`, never here.
+The tuples below are the machine-readable structural contract consumed by
+`plugins/_shared/shim_certification_test.py`; prose and checker do not carry separate
+allow-lists that can drift.
 """
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 
+SHIM_CERTIFICATION_SCHEMA = "hestia-shim-cert/v1"
+CERTIFICATION_CRITERIA = "PRD_SHIM_CERTIFICATION.md@2026-09-04"
+REQUIRED_GATE_API = "decide/1"
 
-# 1. AUTHORITY BOOTSTRAP -- byte-identical across certified shims.
+PERMITTED_FUNCTIONS = (
+    "_authority_dir",
+    "_load_gate",
+    "_emergency_block",
+    "to_event",
+    "emit",
+    "read_harness_event",
+    "main",
+)
+BYTE_IDENTICAL_FUNCTIONS = (
+    "_authority_dir",
+    "_load_gate",
+    "_emergency_block",
+    "main",
+)
+ADAPTER_FUNCTIONS = ("to_event", "emit", "read_harness_event")
+PERMITTED_PROFILE_KEYS = {
+    "member_id", "identity_path", "home_markers", "host_agent",
+    "client_name", "gate_path", "observe_dir",
+}
+
+
+# 1. AUTHORITY BOOTSTRAP. Copy byte-for-byte.
 def _authority_dir() -> str:
-    """Production authority is the installed per-user tree, never an ambient worktree."""
-    if os.environ.get("HESTIA_GATE_TEST_MODE") == "1":
-        test_dir = os.environ.get("HESTIA_SHARED_DIR")
-        if test_dir:
-            return os.path.realpath(os.path.expanduser(test_dir))
     return os.path.realpath(os.path.expanduser("~/.hestia/shared"))
 
 
@@ -65,44 +82,62 @@ def _load_gate():
         sys.modules.pop(name, None)
         raise ImportError(
             f"common gate authority miswire: loaded {loaded!r}, expected {required!r}")
+    if getattr(module, "GATE_API_VERSION", None) != REQUIRED_GATE_API:
+        sys.modules.pop(name, None)
+        raise ImportError(
+            f"common gate API mismatch: got {getattr(module, 'GATE_API_VERSION', None)!r}, "
+            f"expected {REQUIRED_GATE_API!r}")
     return module
 
 
 def _emergency_block(reason: str) -> int:
-    """The only decision a shim may make: no common authority means no tool execution."""
-    sys.stderr.write("hestia: deny [gate.unavailable] - " + reason + "\n")
+    try:
+        import time
+        row = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "seat": PROFILE.get("member_id", "unknown"),
+            "decision": "deny",
+            "rule": "gate.bootstrap_unavailable",
+            "verdict_available": False,
+            "detail": str(reason)[:400],
+        }
+        home = os.path.expanduser("~/.hestia")
+        path = os.path.join(home, "telemetry", "gate-unavailable.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+    except BaseException:
+        pass
+    sys.stderr.write("hestia: deny [gate.bootstrap_unavailable] - " + reason + "\n")
     return 2
 
 
-# 2. PROFILE DATA -- concrete shims fill values, never add policy fields.
+# 2. PROFILE DATA. Replace values, never add policy.
 PROFILE = {
     "member_id": "<seat>",
-    "identity_path": "~/.<seat>/hestia-instance/identity.json",
-    "home_markers": ("~/.<seat>",),
+    "identity_path": "<absolute-or-expanded identity path>",
+    "home_markers": ("<harness-home>",),
     "host_agent": "<seat>",
     "client_name": "hestia-<seat>-gate",
     "gate_path": os.path.abspath(__file__),
-    "observe_dir": "~/.<seat>/hestia-observe",
+    "observe_dir": "<observe-dir>",
 }
 
 
-# 3. HARNESS SYNTAX ADAPTERS -- the only justified code differences.
+# 3. HARNESS SYNTAX ADAPTERS. Pure translation/rendering only.
 def to_event(gate, raw):
-    """Harness event -> gate.GateEvent. Extract/rename only; do not classify."""
-    raise NotImplementedError
+    raise NotImplementedError("translate harness event to gate.GateEvent")
 
 
 def emit(decision) -> int:
-    """gate.GateDecision -> the harness's documented block/allow protocol."""
-    raise NotImplementedError
+    raise NotImplementedError("render GateDecision using the harness blocking protocol")
 
 
 def read_harness_event():
-    """Harness input transport only (usually JSON on stdin)."""
-    raise NotImplementedError
+    raise NotImplementedError("read one harness-native event")
 
 
-# 4. MAIN -- byte-identical across certified shims.
+# 4. MAIN. Copy byte-for-byte.
 def main() -> int:
     try:
         gate = _load_gate()
@@ -111,8 +146,8 @@ def main() -> int:
             f"common gate could not be loaded ({type(exc).__name__}: {exc})")
     try:
         raw = read_harness_event()
-        ev = to_event(gate, raw)
-        decision = gate.decide(ev, gate.GateProfile(**PROFILE))
+        event = to_event(gate, raw)
+        decision = gate.decide(event, gate.GateProfile(**PROFILE))
         return emit(decision)
     except BaseException as exc:
         return _emergency_block(
