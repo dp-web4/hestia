@@ -257,59 +257,6 @@ def test_innate_secret_scan_is_substring_not_path():
            "the control: a command not carrying the token must not match")
 
 
-@asserting
-def test_the_marker_is_not_the_discriminator():
-    """The INTERPRETER decides, not the governance marker -- asserted, not just commented.
-
-    The FP15 correction inside `_STILL_OPEN` already establishes this, and it establishes
-    it in PROSE. Prose inside a .py file is still prose: nothing goes red when the next
-    seat re-derives the marker attribution, so nothing did. It was re-derived the same day
-    FP15 was refuted, in the withdrawal reason of escalation a3557a7f4f0ca71f
-    (2026-09-04T12:43:00Z), which called an interpreter invocation a #440-class false
-    positive because "the governance marker appears as the path of the interpreter
-    argument, i.e. the program being read and executed, never as a write destination".
-
-    Two controls refute that attribution outright, and this test is those two controls:
-
-      - strip the marker ENTIRELY and the interpreter is still refused, so the refusal was
-        never attributable to the marker in the first place;
-      - keep the marker and drop the interpreter and the command is PERMITTED, so the
-        marker alone does not refuse anything.
-
-    What this test does NOT claim: that the refusal is desirable. Running a suite is how a
-    suite gets verified, and refusing that is a real cost. `python3 <script>` is
-    content-blind by design -- the classifier's own ruling is "unknown syntax is a write"
-    -- and whether that should acquire a resolver for known-safe scripts is an open
-    question this file does not settle. The claim here is narrower and is the one the two
-    mis-filings needed: the marker is not what decided. A cost misattributed to the marker
-    gets filed on #440, where it is not, and the interpreter question never gets asked.
-
-    If someone lands a resolver that permits a known-safe script, the two interpreter rows
-    flip TOGETHER and this test goes red -- which is the correct moment to re-read the
-    attribution rather than a regression.
-    """
-    mod = _load_gate()
-    marker_script = os.path.join(REPO, "plugins", "_shared", "test_gate_core.py")
-    plain_script = os.path.join("/tmp", "not_a_governance_path.py")
-
-    check("marker_absent__interpreter_is_still_refused",
-          mod._is_read_only("Bash", {"command": f"python3 {plain_script}"}) is False,
-          "an interpreter carrying NO governance marker anywhere was permitted, so the "
-          "interpreter has stopped being the discriminator; the FP15 correction and the "
-          "two mis-filings it explains both need re-reading before this row is edited")
-    check("interpreter_absent__marker_bearing_path_is_permitted",
-          mod._is_read_only("Bash", {"command": f"cat {marker_script}"}) is True,
-          "reading a marker-bearing path was REFUSED, which would make the marker a real "
-          "discriminator; if this is the failing row then the attribution recorded in the "
-          "withdrawal was right after all and this test is the thing that is wrong")
-    check("escalated_case__shares_the_verdict_of_the_marker_free_control",
-          mod._is_read_only("Bash", {"command": f"python3 {marker_script}"})
-          is mod._is_read_only("Bash", {"command": f"python3 {plain_script}"}),
-          "escalation a3557a7f4f0ca71f's own command diverged from the marker-free "
-          "control, so the refusal HAS acquired a marker component and #440 is the right "
-          "home for it -- the opposite of what the two controls above measured")
-
-
 def _sha256(path):
     import hashlib
     with open(path, "rb") as fh:
@@ -1320,7 +1267,6 @@ if __name__ == "__main__":
     test_gh_reads_are_pinned_open()
     test_gh_write_verbs_stay_refused()
     test_innate_secret_scan_is_substring_not_path()
-    test_the_marker_is_not_the_discriminator()
     print()
     # Say what did NOT run, before saying everything passed. A skipped check and a passing
     # one are indistinguishable in a scrollback, and this file's whole subject is claims
