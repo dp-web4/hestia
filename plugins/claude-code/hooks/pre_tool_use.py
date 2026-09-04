@@ -1422,6 +1422,26 @@ def _record_plane_e(cause: str, detail: str, tool_name: str = "unknown") -> None
         pass
 
 
+def _mech_refuse(verdict, **kw):
+    """Delegate to the shared refusal.
+
+    CALLERS PASS `_attempted_summary(tool_name, tool_input)` — the one at :1025, which redacts
+    credential-shaped tokens and has a test suite asserting it. An earlier draft of this
+    collapse shipped a second local helper whose docstring claimed "bounded, redacted" and
+    whose body was `cmd[:220]`: truncation, not redaction, so an egress deny would have copied
+    the credential it refused into the witness chain. It was written from scratch thirty lines
+    from a tested function doing the same job. A PR whose purpose is deleting per-seat law
+    should not be where per-seat law gets re-derived, worse, in triplicate. Imported lazily: an unimportable mechanism must not turn
+    a denial into a crash, and the caller still gets the block code."""
+    try:
+        m = _load_shared_module("hestia_gate_mechanism")
+        return m.refuse(verdict, **kw)
+    except Exception:  # noqa: BLE001 - the refusal STANDS regardless
+        sys.stderr.write("hestia: deny [%s] - %s\n" % (verdict.rule, verdict.reason))
+        sys.stderr.write("hestia: WARNING - shared refusal unavailable; deny NOT witnessed\n")
+        return 2
+
+
 def deny_no_verdict(why: str, *, cause: str = "unknown", tool_name: str = "unknown",
                     record: bool = True) -> int:
     """Fail-closed refusal: no daemon verdict → the tool does not run.
@@ -1718,17 +1738,22 @@ def main() -> int:
                                              vault_reader=lambda _m: _snapshot)
         _v = _core.evaluate(_ev, _CORE_PROFILE, _WS, policy=_policy)
         if _v.blocks:
-            sys.stderr.write(f"hestia: deny [{_v.rule}] — {_v.reason}\n")
             debug_log(f"scope deny: {_v.rule} {tool_name}")
-            return 2
+            # ONE refusal path (#916/#918). The sentence and the witness live in the shared
+            # mechanism, so this seat cannot render a denial without recording it.
+            return _mech_refuse(_v, plugin_id=PLUGIN_ID, tool_name=tool_name,
+                                raw_event=event,
+                                attempted=_attempted_summary(tool_name, tool_input))
     else:
         # The ratified degraded mode, computed by the core rather than invented here:
         # deny writes, allow reads. Same posture kimi and codex have had since Sprint F.
         _v = _core.degraded_verdict(_ev, _CORE_PROFILE)
         if _v.blocks:
-            sys.stderr.write(f"hestia: deny [{_v.rule}] — {_v.reason}\n")
             debug_log(f"degraded scope deny: {_v.rule} {tool_name}")
-            return 2
+            return _mech_refuse(_v, plugin_id=PLUGIN_ID, tool_name=tool_name,
+                                raw_event=event,
+                                attempted=_attempted_summary(tool_name, tool_input),
+                                degraded=True)
 
     # Try the daemon first — IN-PROCESS via the shared mechanism (Sprint E, one transport).
     verdict = ask_daemon(tool_name, tool_input, tool_use_id, host_session_id)

@@ -1053,3 +1053,62 @@ def tally_scope(allowed, *, tally_dir, tally_path, attest_every, plugin_id, role
         json.dump(t, open(tally_path, "w"))
     except Exception:
         pass  # accounting must never change a decision
+
+
+def refuse(verdict, *, plugin_id, tool_name, raw_event, attempted, degraded=False):
+    """Render a refusal, witness it, and return the hook's block code.
+
+    ONE refusal path, so witnessing a denial is not something a shim can forget.
+
+    #916 measured the alternative: the claude-code seat witnessed no gate denial at all and
+    gemini none either, while codex and kimi did. The obvious repair is to paste codex's witness
+    call into the other two, which closes the instance and leaves the mechanism: four
+    hand-maintained copies of a law line, two of which happened to be right. #918 put that
+    arrangement at 39 functions and 1,947 lines of per-seat law, and named `deny` as the one
+    function that had ALREADY diverged.
+
+    So the refusal collapses instead. A shim's stderr formatting plus its debug line become one
+    delegation, per-seat law goes DOWN rather than up, and the witness is reached by
+    construction rather than by remembering.
+
+    Returns 2, the block code every harness here uses, so a caller writes `return refuse(...)`
+    and cannot accidentally continue past a denial.
+
+    NEVER RAISES. A witnessing failure must not change the decision: the refusal stands, and the
+    record goes to the seat fallback spool, which is the one place the loss stays visible.
+    """
+    sys.stderr.write("hestia: deny [%s] - %s\n" % (verdict.rule, verdict.reason))
+    # THE TWO LIVE SEATS ALREADY AGREE ON THIS SPLIT, and an earlier draft of this function got
+    # it wrong in BOTH directions before landing here. codex (pre_tool_use.py:808-818) and kimi
+    # (:668-679) each branch degraded denials on `innate`:
+    #
+    #   innate egress deny  -> conduct  (the transport-free core DECIDED it; no daemon needed)
+    #   any other degraded  -> infra    (criterion 9(c): the gate could not decide)
+    #
+    # `verdict_available=True` unconditional scored daemon outages against the member. The
+    # obvious repair, `not degraded`, is ALSO wrong: it books a member reaching for a credential
+    # during an outage as infra, which is the one rule no mode relaxes. Neither is a posture this
+    # seat gets to pick alone — the field feeds temperament, and 245 codex + 406 kimi live
+    # `gate.degraded` rows are what it would have to agree with.
+    innate = bool(getattr(verdict, "innate", False))
+    try:
+        witness_decision_unified(
+            None,
+            plugin_id=plugin_id,
+            decision="deny",
+            rule=verdict.rule,
+            tool_name=tool_name or "",
+            # A deny used to reach the chain with target=None, which is the Sprint E audit hole
+            # (§3.3) reopened: the record says a refusal happened and not what it was about.
+            target=_extract_target((raw_event or {}).get("tool_input"), tool_name or ""),
+            session_id=(raw_event or {}).get("session_id"),
+            verdict_available=(not degraded) or innate,
+            attempted_summary=attempted,
+        )
+    except Exception as e:  # noqa: BLE001 - non-silent, never fatal
+        try:
+            sys.stderr.write("hestia: WARNING - deny receipt not delivered: %s: %s\n"
+                             % (type(e).__name__, e))
+        except Exception:
+            pass
+    return 2
