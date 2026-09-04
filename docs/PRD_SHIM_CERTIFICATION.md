@@ -335,6 +335,60 @@ that the refusals most likely to be false positives would be the ones with no ch
 which is precisely the 7/13 split above. An issue closed twice is a defect the process
 cannot hold. A certification criterion can.
 
+### C12 — A move across a context boundary is certified by its unhandled case
+
+This criterion is about **changes**, not steady state. It exists because the four-gate
+problem this document was written to end reappeared at file scale on the very day the
+fleet-scale instance was removed — three times, in one PR, from three different authors.
+
+**The pattern.** Code is moved or copied from context A to context B. A and B agree on the
+happy path and disagree on the *unhandled* case — the unknown head, the absent seam, the
+missing variable. The moved code silently adopts B's default. Nobody notices, because the
+unhandled case is by definition the one nobody exercised.
+
+| instance, 2026-09-04 | moved from → to | A's default | B's default | consequence |
+|---|---|---|---|---|
+| `_control_flow_remainder` copied classifier → closure (#942) | an unknown head | **refuses** (absent from the read allowlist) | **permits** (contributes no write targets — the anti-FP stance) | `{ cp x GATE; }` permitted |
+| the witness call refactored `witness_decision_unified` → direct `_McpHttp` (`453c7d0`) | a test seam nothing calls | the fake intercepts and records | the real path runs against no daemon; records stay empty | the C11 test went red while C11 got *stronger* |
+| authority resolution rewritten `_shared_runtime_dir` → `_authority_dir` (#934) | which home | `$HESTIA_HOME`, default `~/.hestia` | hardcoded `~` | eleven fail-closed proofs blind; shim and daemon can disagree about the vault |
+
+The first was caught by a test asserting the *refusal* direction. The second was caught by a
+test going red for a reason unrelated to what it tests. The third was caught by reading. None
+was caught by the happy path, because the happy path was identical on both sides.
+
+**The requirement, in three failable forms:**
+
+**C12a — a copied or moved decision helper ships with a refusal-direction test in the
+destination.** Mechanically: a function whose body appears in two modules, or which is
+deleted from one and added to another in the same change, MUST be accompanied by a test in
+the *destination* module that feeds it the unhandled case and asserts the fail-closed
+outcome. A test of the happy path does not satisfy this. `test_control_flow_read_is_read_fp12`'s
+write arm is the model; its read arm alone would have certified the hole.
+
+**C12b — a test seam proves it is on the path.** Any test that patches a private name to
+intercept a decision MUST also assert the fake was invoked at least once. Then a refactor that
+routes around the seam turns the test red *for the stated reason* — "seam not reached" —
+instead of red for a confusing one or, worse, green by accident when the real path happens to
+succeed. Better still, the seam is an injectable parameter rather than a private name; a
+private name is a promise the next refactor does not know it is breaking.
+
+**C12c — removing a resolver input enumerates who else read it.** When an environment or
+configuration input is removed from authority or home resolution, the change MUST list every
+other consumer of that input and classify each as member-controlled or launcher-controlled.
+Removing a member-controlled input is the point (C1b). Removing a launcher-controlled one
+alongside it is a finding, and the daemon's own home selector is the canonical example: the
+shim that ignores `HESTIA_HOME` reports to a daemon that honours it.
+
+**Why this is a certification criterion and not a code-review note.** Every one of the three
+instances passed review by an author who had just finished writing, correctly, about exactly
+this class of defect at fleet scale. Attention does not scale down. A criterion does.
+
+> **Fails today, all three forms, one each:** #942's first cut (C12a — caught, fixed, and the
+> test that caught it is the reason the criterion has a model); `hestia_single_gate_test.py`
+> on `e7a2627` (C12b — the fake patches a name nothing calls and asserts nothing about being
+> reached); the four collapsed shims' `_authority_dir` (C12c — `HESTIA_HOME` appears zero
+> times, and the change that removed it enumerated `HESTIA_SHARED_DIR` only).
+
 ### C10 — Capability parity, and the only permitted exception
 
 Ruled by dp, 2026-09-04:
