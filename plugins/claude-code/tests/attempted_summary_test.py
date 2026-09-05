@@ -124,7 +124,15 @@ def test_the_path_fallback_marks_a_head_cut():
     written. The command arm already marks its cut (`test_the_summary_is_bounded`); the
     path arm cut in silence. Two of 136 opened write-tool rows in the recent chain hit the
     cap — both today, both this shape — so the bound itself is not the defect; the
-    silence is."""
+    silence is.
+
+    The mark sits INSIDE the bound (`'…' + v[-139:]`), so the recorded width does not change
+    and #627's digest-prefix equivalence is not widened by it. This paragraph and the one
+    above are the explanation #941 first wrote as a nine-line comment inside the gate
+    function; the gate-collapse meter counts comments in a law-bearing function as local
+    law, and that block alone moved claude-code from the 28.8% pin to 29.0% (#950). The
+    explanation belongs here, beside the assertion that would fail without it — not in the
+    seat-local function whose size is the thing being ratcheted down."""
     m = _load_hook()
     short = "/tmp/" + ("a" * 100) + "/x.py"
     out = m._attempted_summary("Edit", {"file_path": short})
