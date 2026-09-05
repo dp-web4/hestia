@@ -35,6 +35,10 @@ checks = {
     'inspect is witnessed by member and keys, not values': '"config_seat_inspected"' in http
         and '"keys": cfg.env.keys().cloned().collect::<Vec<_>>()' in http[http.index('"config_seat_inspected"') - 400:http.index('"config_seat_inspected"') + 400],
     'inspect id is validated as one plain name': 'if !seat_id_is_a_plain_name(&member)' in http,
+    # the act row NAMES its authorization (GateWitness pointer + provenance), never a generic claim
+    'inspect row is stamped with the gate witness': 'stamp_gate(' in http[http.index('"config_seat_inspected"'):http.index('"config_seat_inspected"') + 300]
+        and 'gate: Option<axum::Extension<super::operator_auth::GateWitness>>' in http[http.index('async fn config_get_seat'):http.index('async fn config_get_seat') + 300],
+    'inspect row carries no generic decided_by claim': '"decided_by"' not in http[http.index('"config_seat_inspected"'):http.index('"config_seat_inspected"') + 300],
     # --- stakes: above the read flood, below the credential tier
     'inspect stakes are high-reversible': 'path.starts_with("/api/config/seat/")' in auth and 'return Stakes::HighReversible;' in auth[auth.index('path.starts_with("/api/config/seat/")'):auth.index('path.starts_with("/api/config/seat/")') + 200],
     # --- no ambient exposure

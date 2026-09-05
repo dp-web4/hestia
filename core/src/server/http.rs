@@ -2944,8 +2944,16 @@ async fn config_list_seats(State(state): State<SharedState>) -> impl IntoRespons
 /// surface. `Stakes::classify` rates it above the read flood so the operator gate writes a row
 /// naming who looked; this handler adds the member and the KEYS looked at, never the values —
 /// the chain is the one store that never forgets, and a config document can carry a token.
+///
+/// THE ROW NAMES ITS AUTHORIZATION (GPT DA review of #949). The first version wrote
+/// `decided_by: operator / via: operator_session` — a generic claim — while the proof of WHO
+/// and WHICH authorization sat in the adjacent `operator_gate` row. Adjacency is not a join
+/// (forum 2662/2664/2666; `GateWitness`): the act row must carry the pointer to the gate row
+/// that admitted it, hash-committed, and the composed provenance when the session has one.
+/// Same mechanism as every `policy_edit` site, for the same reason.
 async fn config_get_seat(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     axum::extract::Path(plugin_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     use super::seat_config as sc;
@@ -2978,12 +2986,14 @@ async fn config_get_seat(
     };
     let _ = s.append_chain(
         "config_seat_inspected",
-        serde_json::json!({
-            "member": member,
-            "keys": cfg.env.keys().cloned().collect::<Vec<_>>(),
-            "decided_by": "operator",
-            "via": "operator_session",
-        }),
+        stamp_gate(
+            serde_json::json!({
+                "member": member,
+                "keys": cfg.env.keys().cloned().collect::<Vec<_>>(),
+                "act": format!("GET /api/config/seat/{member}"),
+            }),
+            &gate,
+        ),
     );
     (
         StatusCode::OK,
@@ -4604,9 +4614,22 @@ mod disposition_tests {
         std::fs::write(&artifact, "HESTIA_WORKSPACE=/somewhere/else\n").unwrap();
         let tampered = std::fs::read_to_string(&artifact).unwrap();
 
+        // The witness the middleware would have inserted: a composed session's provenance plus
+        // the hash of the gate row that admitted this request.
+        let witness = crate::server::operator_auth::GateWitness {
+            provenance: Some(crate::server::operator_auth::OperatorProvenance {
+                actor: "lct:web4:actor:app".into(),
+                principal: "lct:web4:operator:dp".into(),
+                via_device: "lct:web4:device:cbp".into(),
+                office: "operator".into(),
+                authority: "session-ref-42".into(),
+            }),
+            gate_entry_hash: Some("gate-row-hash-for-this-request".into()),
+        };
         let resp = axum::response::IntoResponse::into_response(
             super::config_get_seat(
                 axum::extract::State(state.clone()),
+                Some(axum::Extension(witness)),
                 axum::extract::Path("kimi-code".to_string()),
             )
             .await,
@@ -4627,17 +4650,49 @@ mod disposition_tests {
         let rows = s.chain_store.read_recent(20).unwrap();
         let looked: Vec<_> = rows.iter().filter(|e| e.event_type == "config_seat_inspected").collect();
         assert_eq!(looked.len(), 1, "one inspect, one row");
-        let blob = serde_json::to_string(&looked[0].event_data).unwrap();
+        let row = &looked[0].event_data;
+        let blob = serde_json::to_string(row).unwrap();
         assert!(blob.contains("HESTIA_TOKEN") && blob.contains("kimi-code"), "{blob}");
         assert!(!blob.contains("inspect-shows-this") && !blob.contains("/w/ai"), "a VALUE reached the chain: {blob}");
+        // THE ROW NAMES ITS AUTHORIZATION — the pointer and the composed provenance, on the act
+        // row itself, not in a neighbour. `decided_by: operator` is gone: a generic claim
+        // beside a proof is the defect, not a summary of it.
+        assert_eq!(row["authorized_by_gate"], "gate-row-hash-for-this-request", "{blob}");
+        assert_eq!(row["principal"], "lct:web4:operator:dp", "{blob}");
+        assert_eq!(row["actor"], "lct:web4:actor:app", "{blob}");
+        assert_eq!(row["authority"], "session-ref-42", "{blob}");
+        assert_eq!(row["act"], "GET /api/config/seat/kimi-code", "{blob}");
+        assert!(row.get("decided_by").is_none(), "the generic claim must not survive beside the proof: {blob}");
         // The handler locks the state; holding this guard across the next calls deadlocks the
         // test (it did: the first run hung here for 42 minutes at 3% CPU).
         drop(s);
+
+        // CONTROL: no witness (a route reached without the gate, or a dev-override) writes NO
+        // authorization field — absent, not null and not empty, so a reader can tell
+        // "unauthorized path" from "unrecorded" (PIN 1 of policy_edit_names_its_authorization).
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_get_seat(
+                axum::extract::State(state.clone()),
+                None,
+                axum::extract::Path("kimi-code".to_string()),
+            )
+            .await,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        {
+            let s = state.lock().await;
+            let rows = s.chain_store.read_recent(20).unwrap();
+            let bare = rows.iter().filter(|e| e.event_type == "config_seat_inspected").next()
+                .expect("the unwitnessed inspect still writes its row");
+            assert!(bare.event_data.get("authorized_by_gate").is_none(), "{}", bare.event_data);
+            assert!(bare.event_data.get("principal").is_none(), "{}", bare.event_data);
+        }
 
         // An unknown seat is a 404 with the summary, and reveals nothing.
         let resp = axum::response::IntoResponse::into_response(
             super::config_get_seat(
                 axum::extract::State(state.clone()),
+                None,
                 axum::extract::Path("nobody".to_string()),
             )
             .await,
@@ -4647,6 +4702,7 @@ mod disposition_tests {
             let resp = axum::response::IntoResponse::into_response(
                 super::config_get_seat(
                     axum::extract::State(state.clone()),
+                    None,
                     axum::extract::Path(bad.to_string()),
                 )
                 .await,
@@ -4709,6 +4765,65 @@ mod disposition_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // THE POSITIVE HALF OF THE SAME ARM, through the real middleware: an operator whose key
+        // is in the law signs a challenge, opens a session, and inspects. The chain row for
+        // that inspect must NAME the `operator_gate` row that admitted it — by hash, on the
+        // row itself — and that gate row must be the one for this very request. Values still
+        // never reach the chain.
+        let kp = web4_core::crypto::KeyPair::generate();
+        let lct_id = web4_core::lct::derive_lct_id(&kp.verifying_key());
+        {
+            let mut s = state.lock().await;
+            let mut policy = s.vault.policy().clone();
+            policy.operator_access.push(crate::vault::OperatorIdentity {
+                lct_id: lct_id.clone(),
+                public_key_hex: hex::encode(kp.public_key_bytes()),
+                label: "test operator".into(),
+            });
+            s.vault.set_policy(policy).unwrap();
+            s.reload_policy();
+        }
+        let ch: serde_json::Value = client
+            .post(format!("{base}/api/operator/challenge"))
+            .send().await.unwrap().json().await.unwrap();
+        let challenge = ch["challenge"].as_str().expect("a challenge").to_string();
+        let sess: serde_json::Value = client
+            .post(format!("{base}/api/operator/session"))
+            .json(&serde_json::json!({
+                "lct_id": lct_id,
+                "challenge": challenge,
+                "signature": kp.sign(challenge.as_bytes()).to_hex(),
+            }))
+            .send().await.unwrap().json().await.unwrap();
+        let token = sess["token"].as_str().expect(&format!("a session token: {sess}")).to_string();
+
+        let resp = client
+            .get(format!("{base}/api/config/seat/codex"))
+            .bearer_auth(&token)
+            .send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["config"]["env"]["HESTIA_TOKEN"], "never-over-plain-http", "the session DOES see the value");
+
+        let s = state.lock().await;
+        let rows = s.chain_store.read_recent(50).unwrap();
+        let inspected = rows.iter().filter(|e| e.event_type == "config_seat_inspected").next()
+            .expect("the inspect wrote its row");
+        let pointer = inspected.event_data["authorized_by_gate"].as_str()
+            .expect(&format!("the inspect row must name the gate row that admitted it: {}", inspected.event_data))
+            .to_string();
+        let gate_row = rows.iter().find(|e| e.hash == pointer)
+            .expect(&format!("authorized_by_gate {pointer} must resolve to a chain row"));
+        assert_eq!(gate_row.event_type, "operator_gate", "{}", gate_row.event_data);
+        let gate_blob = serde_json::to_string(&gate_row.event_data).unwrap();
+        assert!(gate_blob.contains("GET /api/config/seat/codex"), "the gate row is for THIS request: {gate_blob}");
+        assert!(gate_blob.contains(&lct_id), "the gate row names the operator who signed: {gate_blob}");
+        for e in &rows {
+            let blob = serde_json::to_string(&e.event_data).unwrap();
+            assert!(!blob.contains("never-over-plain-http"), "a VALUE reached the chain in {}: {blob}", e.event_type);
+        }
+        drop(s);
         server.abort();
     }
 
