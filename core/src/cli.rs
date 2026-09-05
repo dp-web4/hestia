@@ -3639,13 +3639,14 @@ fn cmd_delegate_grant(
         .map(|r| delegation::parse_role(r))
         .collect::<Result<_, _>>()?;
 
-    // For now, use a fresh keypair as the delegator.
-    // In production, this would come from the vault's LCT identity.
-    let delegator_kp = web4_core::crypto::KeyPair::generate();
-    let delegator_id = uuid::Uuid::new_v4();
+    // The delegator is the vault's own identity key, never a throwaway (#952): a delegation
+    // signed by a key discarded microseconds later claims a provenance it does not have, and
+    // the daemon now refuses a delegation it cannot verify against this key.
+
 
     let mut vault = open_vault(home)?;
     let mut store = DelegationStore::load(&vault)?;
+    let (delegator_id, delegator_kp) = delegation::vault_delegator(&vault)?;
     let deleg = store.create_delegation(
         delegator_id,
         agent_id,
@@ -3689,7 +3690,7 @@ fn cmd_delegate_agent_id(home: &std::path::Path, plugin_id: &str) -> AnyResult<(
     println!();
     println!("grant a bounded scope-ruling authority to this seat with, e.g.:");
     println!(
-        "  hestia delegate grant {key} --action 'scope.decide:/abs/prefix@<member>' --expires 720"
+        "  hestia delegate grant {key} --action 'scope.decide:<member>:/abs/prefix' --expires 720"
     );
     Ok(())
 }
