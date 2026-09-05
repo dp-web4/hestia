@@ -38,7 +38,7 @@ Module-level law (marker tables, mode defaults, timeout constants, loader fallba
 | `_witness_self_access` | LAW-DEBT | 33df07e4 | Picks the `escalate` severity and event class for a refused write: the record-vs-escalate split is escalation content (#844). |
 | `_describe_hit` | LAW-DEBT | c35218e8 | Writes the words of the refusal and of the escalation record, including the payload-vs-destination judgement; denial content, forbidden in a shim (#844). |
 | `deny_self_access` | LAW-DEBT | 58d71e99 | The exit code and stderr are this harness's channel; the multi-paragraph refusal, the escalation invitation and the witness-failure-is-not-permission rule are gate content (#844). |
-| `_attempted_summary` | LAW-DEBT | 78da80d9 | Builds the redacted, bounded escalation reason. Its own docstring says it belongs on `Verdict` in the core; codex and kimi carry copies (#844). |
+| `_attempted_summary` | LAW-DEBT | c7f1b9c3 | Builds the redacted, bounded escalation reason. Its own docstring says it belongs on `Verdict` in the core; codex and kimi carry copies (#844). |
 | `_credential_shaped` | LAW-DEBT | 6efef61c | Redaction predicate over payload text deciding what may enter the witness chain; nothing about it is Claude Code specific (#844). |
 | `_connect_session` | LAW-DEBT | fbc90c89 | Passing plugin id, role and protocol version is identity, but the never-raise degrade rule ("the record degrades, never the channel") is recovery policy chosen here (#844). |
 | `request_self_write` | LAW-DEBT | 3c206ed5 | The appeal channel: single round trip policy, every-failure-is-refusal posture, and the operator-facing banner. All three are named never-in-a-shim (#844). |
