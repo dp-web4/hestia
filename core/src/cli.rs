@@ -3793,13 +3793,20 @@ fn cmd_delegate_list(home: &std::path::Path) -> AnyResult<()> {
         let roles: Vec<String> = d.scope.roles.iter()
             .map(|r| format!("{:?}", r))
             .collect();
-        let role_str = if roles.is_empty() { "*".into() } else { roles.join(", ") };
+        // An action-only delegation used to print `roles=[*]`, which reads as UNRESTRICTED
+        // and hid the one thing an operator revoking it needs to see (#952). Print exactly
+        // what the record says: roles, actions, and `unrestricted` only when both are empty.
+        let scope_str = match (roles.is_empty(), d.scope.actions.is_empty()) {
+            (true, true) => "UNRESTRICTED".to_string(),
+            (false, true) => format!("roles=[{}]", roles.join(", ")),
+            (true, false) => format!("actions=[{}]", d.scope.actions.join(", ")),
+            (false, false) => format!("roles=[{}] actions=[{}]", roles.join(", "), d.scope.actions.join(", ")),
+        };
         let exp = d.expires_at
             .map(|e| e.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_else(|| "never".into());
 
-        println!("{} → agent={} roles=[{}] expires={}",
-            d.id, d.agent_lct_id, role_str, exp);
+        println!("{} → agent={} {} expires={}", d.id, d.agent_lct_id, scope_str, exp);
     }
     println!("\n{} active delegation(s), {} total", store.active().len(), store.delegations.len());
     Ok(())
