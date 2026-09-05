@@ -21265,7 +21265,7 @@ mod disposition_durability_tests {
 /// 4. **Bounded by path prefix, and optionally by member.** A prefix alone is right for a
 ///    being's own home; it is NOT enough for a shared path like `shared-context`, where it
 ///    would let the holder rule that path for any member that asks (sprout-claude). So
-///    `scope.decide:<prefix>@<member>` ANDs the two. Containment is separator-anchored, so
+///    `scope.decide:<member>:<prefix>` ANDs the two. Containment is separator-anchored, so
 ///    `/x/b` never covers `/x/bb` — a different being's home.
 /// 5. **A delegated GRANT is always STANDING.** A live grant dies on the next daemon restart,
 ///    and the entire reason this exists is that the operator is not there to re-issue it. A
