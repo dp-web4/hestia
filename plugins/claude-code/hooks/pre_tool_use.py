@@ -64,8 +64,72 @@ HOOK_VERSION = "0.0.2"
 
 STATE_DIR = Path.home() / ".hestia-claude"
 ACTIONS_DIR = Path("/tmp/hestia-actions")
-DEFAULT_HESTIA_HOME = Path.home() / ".hestia"
 DEFAULT_ENDPOINT = "http://127.0.0.1:7711/mcp"
+
+
+# ---------------------------------------------------------------------------
+# THE PROJECTION IS THE ONLY SOURCE OF THIS SEAT'S CONFIGURATION (PRD_CONFIG_FROM_VAULT; #944)
+# ---------------------------------------------------------------------------
+# One bootstrap locator, launcher-supplied, no default: HESTIA_HOME. Everything else this hook
+# needs — the workspace it polices, where the shared runtime is, the endpoint, its own state
+# dirs — comes from `$HESTIA_HOME/seats/<plugin_id>.env`, which the daemon renders from the
+# vault and checks against it. Every key the projection carries is exported over whatever the
+# launcher happened to set: the vault is the authority, a hook line is not. Two things are
+# deliberately NOT here. A fallback ("no locator, try ~/.hestia") is a second authority with
+# extra steps and is the pattern #943 was held for. And HESTIA_ROLE: role is launch context
+# (interactive vs mesh-worker), set by whoever launched the seat, never a config value.
+#
+# Loaded at IMPORT, because the shared runtime dir is resolved at import and must already be
+# the projection's. Import never fails: the outcome is recorded in `_PROJECTION_ERROR` and
+# main() denies on it first, before stdin is read, so a test can import this module and a
+# seat with no projection cannot act. This function is bootstrap wiring, not law: it decides
+# nothing about any tool call. It is byte-identical across seats by intent, like the loader.
+PROJECTION_DIR = "seats"
+
+
+def _load_projection(plugin_id):
+    """Export the seat's rendered projection into the environment. Returns None, or the
+    reason the seat is not configured — never raises."""
+    home = os.environ.get("HESTIA_HOME")
+    if not home:
+        return ("config.unbacked", "HESTIA_HOME is not set; the launcher must supply the "
+                "bootstrap locator (there is no default, by design)")
+    path = os.path.join(home, PROJECTION_DIR, plugin_id + ".env")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        return ("config.unbacked", f"no rendered projection for {plugin_id} at {path} ({e}); "
+                "populate this seat's config in the vault (Govern -> Runtime config)")
+    # Imported here, not at module scope: this function is byte-identical across seats, and
+    # a seat whose module happened not to import `re` raised at import instead of reporting
+    # its own absence (caught by the witness arm of projection_consumer_test).
+    import hashlib
+    import re
+    digest = hashlib.sha256(raw).hexdigest()
+    pairs = []
+    for ln in raw.decode("utf-8", "replace").split("\n"):
+        if not ln or ln.startswith("#") or "=" not in ln:
+            continue
+        k, v = ln.split("=", 1)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
+            return ("config.unbacked", f"projection {path} carries an unusable key {k!r}")
+        pairs.append((k, v))
+    projected = dict(pairs)
+    if "HESTIA_HOME" in projected and os.path.realpath(projected["HESTIA_HOME"]) != os.path.realpath(home):
+        return ("config.miswired", f"the launcher supplied HESTIA_HOME={home!r} but the vault "
+                f"projection says {projected['HESTIA_HOME']!r}; this seat is running against a "
+                "home the authority does not name")
+    for k, v in pairs:
+        if k == "HESTIA_ROLE":
+            continue   # launch context, never config
+        os.environ[k] = v
+    os.environ["HESTIA_PROJECTION_SHA256"] = digest
+    os.environ["HESTIA_PROJECTION_PATH"] = path
+    return None
+
+
+_PROJECTION_ERROR = _load_projection(PLUGIN_ID)
 
 # Total time budget across all daemon round-trips + re-polls.
 TOTAL_BUDGET_MS = int(os.environ.get("HESTIA_PRE_TOTAL_BUDGET_MS", "800"))
@@ -118,9 +182,11 @@ def discover_endpoint() -> Optional[str]:
     env = os.environ.get("HESTIA_ENDPOINT")
     if env:
         return env
-    home = Path(os.environ.get("HESTIA_HOME", str(DEFAULT_HESTIA_HOME)))
+    home = os.environ.get("HESTIA_HOME")
+    if not home:
+        return None
     try:
-        v = (home / "endpoint").read_text().strip()
+        v = (Path(home) / "endpoint").read_text().strip()
         return v or None
     except OSError:
         return None
@@ -284,8 +350,8 @@ _GOVERNANCE_FILES = (
 # while every seat kept running a nine-day-old closure (#583).
 #
 # One fact, one name. `$HESTIA_HOME/shared` is the fleet path the installer already uses.
-_HESTIA_HOME = os.environ.get("HESTIA_HOME") or os.path.join(
-    os.path.expanduser("~"), ".hestia")
+# No default: with no locator there is no home, and `_shared_runtime_dir` says so.
+_HESTIA_HOME = os.environ.get("HESTIA_HOME")
 
 
 # THE LOADER IS THE ONE LAW-ADJACENT TEXT THAT CANNOT LIVE IN SHARED AUTHORITY, because it is
@@ -310,8 +376,13 @@ _HESTIA_HOME = os.environ.get("HESTIA_HOME") or os.path.join(
 # tools/loader_binds_installed_engine_test.py drives the controls on this seat;
 # tools/installed_engine_loader_test.py (#742) drives the same shapes on Codex.
 def _shared_runtime_dir():
-    return os.environ.get("HESTIA_SHARED_DIR") or os.path.join(
-        os.path.expanduser(os.environ.get("HESTIA_HOME", "~/.hestia")), "shared")
+    explicit = os.environ.get("HESTIA_SHARED_DIR")
+    if explicit:
+        return explicit
+    home = os.environ.get("HESTIA_HOME")
+    # Composed relative to the authoritative root only; never a guessed root. An empty
+    # string resolves nowhere, and the loader reports the absence.
+    return os.path.join(home, "shared") if home else ""
 
 
 def _load_shared_module(name):
@@ -1418,7 +1489,8 @@ def _record_plane_e(cause: str, detail: str, tool_name: str = "unknown") -> None
     try:
         record_gate_unavailable = _load_shared_module(
             "hestia_gate_core").record_gate_unavailable
-        record_gate_unavailable(PLUGIN_ID, tool_name, cause, detail, home=str(DEFAULT_HESTIA_HOME))
+        record_gate_unavailable(PLUGIN_ID, tool_name, cause, detail,
+                                home=os.environ.get("HESTIA_HOME") or "")
     except Exception:
         pass
 
@@ -1565,6 +1637,12 @@ def main() -> int:
             f"imported ({_CLASSIFIER_UNAVAILABLE}). This seat carries no local copy by "
             "design, so it cannot classify this command and will not guess. Check that "
             "$HESTIA_HOME/shared is populated and current.\n")
+        return 2
+    # SECOND, still before stdin: not configured, does not act. Why, in projection_consumer_test.
+    if _PROJECTION_ERROR is not None:
+        rule, why = _PROJECTION_ERROR
+        sys.stderr.write(f"hestia: deny [{rule}] — {why}\n")
+        _record_plane_e(rule, why)
         return 2
 
     raw = sys.stdin.read()
