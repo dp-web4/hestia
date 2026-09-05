@@ -1,4 +1,5 @@
 pub mod chain;
+pub mod config;
 pub mod dashboard;
 pub mod operator;
 pub mod policy;

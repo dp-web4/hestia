@@ -560,6 +560,16 @@ impl Stakes {
             if path.starts_with("/api/vault/") && path.len() > "/api/vault/".len() {
                 return Stakes::Irreversible;
             }
+            // GET /api/config/seat/<member> reveals a seat's authoritative env VALUES (#944
+            // phase 0). Not the read flood: the gate must witness who looked. Not the secret
+            // tier either — a seat config is paths and knobs by design, and the quorum that
+            // guards a credential release would make the operator's own recovery view
+            // unreachable from a single session, which is the lockout #944 exists to prevent.
+            // The value in a config document that IS a token is the operator's to keep out
+            // of it; the list view never shows one.
+            if path.starts_with("/api/config/seat/") && path.len() > "/api/config/seat/".len() {
+                return Stakes::HighReversible;
+            }
             return Stakes::LowReversible;
         }
         // Removing the last operator or an irreversible law amendment: the caller
@@ -715,6 +725,16 @@ mod tests {
         assert_eq!(
             Stakes::classify("GET", "/api/vault/openai-key"),
             Stakes::Irreversible
+        );
+        // the seat-config LIST is keys and health (read flood); the INSPECT reveals values and
+        // is witnessed, but must stay reachable from one operator session (#944 phase 0)
+        assert_eq!(
+            Stakes::classify("GET", "/api/config/seat"),
+            Stakes::LowReversible
+        );
+        assert_eq!(
+            Stakes::classify("GET", "/api/config/seat/claude-code"),
+            Stakes::HighReversible
         );
         // policy edits are high but reversible
         assert_eq!(

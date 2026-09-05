@@ -140,3 +140,51 @@ export interface AppConfig {
   daemon_url: string;
   remotes: RemoteEntry[];
 }
+
+// ---- Vault-authored seat config (#944 phase 0) ----
+
+/** What the daemon's projection check found for one seat. `status` is the discriminator. */
+export interface SeatConfigVerdict {
+  status: "verified" | "miswired" | "missing" | "unreadable" | "unbacked" | "unconfigured" | string;
+  member: string;
+  sha256?: string;
+  expected?: string;
+  actual?: string;
+  reason?: string;
+  error?: string;
+  quarantined_to?: string | null;
+}
+
+/** One row of GET /api/config/seat. Keys and health — never a value. */
+export interface SeatConfigSummary {
+  member: string;
+  configured: boolean;
+  keys: string[];
+  note: string;
+  artifact: string;
+  expected_sha256?: string;
+  verdict: SeatConfigVerdict;
+  finding_open_since?: number | null;
+}
+
+export interface SeatConfigList {
+  seats: SeatConfigSummary[];
+  render_dir: string;
+}
+
+/** GET /api/config/seat/:id — the one place values are shown. */
+export interface SeatConfigInspect {
+  member: string;
+  config: { env: Record<string, string>; note: string };
+  summary: SeatConfigSummary;
+}
+
+/** PUT /api/config/seat — the daemon renders in the same act and returns that render's verdict. */
+export interface SeatConfigPutResult {
+  ok: boolean;
+  member: string;
+  replaced: boolean;
+  artifact: string;
+  verdict: SeatConfigVerdict[];
+  intentEntryHash: string;
+}

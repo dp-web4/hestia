@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { vaultList, vaultSet, vaultDelete } from "../lib/tauri";
+import { RuntimeConfig } from "../components/RuntimeConfig";
 
 interface VaultEntry {
   id: string;
@@ -142,6 +143,8 @@ export function Vault() {
           ))
         )}
       </div>
+
+      <RuntimeConfig />
     </div>
   );
 }
