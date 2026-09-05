@@ -976,7 +976,11 @@ STALE_AFTER="${STALE_AFTER:-21600}"            # a notice is stale at 6h unbound
 # `role` is caller-supplied and any member that loses `HESTIA_ROLE` collides with
 # it silently. Do NOT build a detector on this field alone (see the note on the
 # `#undelivered:` marker at `report_unreachable`) — the durable fix is a reserved
-# KIND for a non-delivery report, which is vocabulary work in KINDS.md.
+# KIND for a non-delivery report, which is vocabulary work in KINDS.md. Still
+# owed as of 2026-09-05: the report moved from `reply` to `forum-note` that day
+# (see branch 4 below), which stops it being booked as the sender's debt but
+# does NOT make it reserved — `forum-note` is an ordinary member kind, so it is
+# no more a detector than `reply` was.
 #
 # `plugin_id` is still the member's: the watcher genuinely acts on that member's
 # mailbox, and a distinct gateway identity is a daemon-side enrolment question.
@@ -1090,11 +1094,48 @@ for label,key in (("I OWE A RESPONSE","i_owe"),("NOBODY ANSWERED ME","owed_to_me
 # REPORTS to the sender. Without this, a dead fire and a notice never sent are
 # indistinguishable at both ends — the sender's unanswered view reads
 # "delivered, unanswered" for mail the member never saw (41 fires / 3 dead /
-# all reported success). The report is a `reply` bound to the failed notice:
-# reply awaits a disposition, so the failure sits in the SENDER's debt row
-# until it acks — reroute, resend, or abandon, and the decision is witnessed.
-# A coordination-kind report could be ignored in silence, which is the silent
-# drop again one layer up. It is sent under the failed member's own plugin
+# all reported success).
+#
+# THE REPORT RIDES `forum-note`, AND UNTIL 2026-09-05 IT RODE `reply`. That was
+# a deliberate choice with a stated reason, reversed here on measurement rather
+# than on taste, so the reason is kept rather than deleted:
+#
+#   "The report is a `reply` bound to the failed notice: reply awaits a
+#    disposition, so the failure sits in the SENDER's debt row until it acks —
+#    reroute, resend, or abandon, and the decision is witnessed. A
+#    coordination-kind report could be ignored in silence, which is the silent
+#    drop again one layer up."
+#
+# The objection was right when written, and is now paid by a different mechanism.
+# Three measurements retire it (issue #926, three wakes, CBP seat):
+#
+#  1. The counted kind did not buy the acknowledgement it was for. On 2026-09-05
+#     this seat's `i_owe` was 161 of 161 `#undelivered:` rows — 100%, along a
+#     monotone 86% -> 91% -> 100% — and not one had been acted on. `reply` made
+#     the failure durable without making it read.
+#  2. It cost the ledger everything else. `MEMBER_KINDS_AWAIT_RESPONSE` is
+#     `["review_request", "reply"]`, so every bounce lands in the one fold a seat
+#     triages at wake. At 100% saturation `i_owe` can no longer carry a REAL
+#     obligation into anyone's attention: the anti-silence device is what made
+#     every other obligation silent. The rows are also unclearable by the route
+#     the suppression below teaches — `member_unanswered` clears a row only on a
+#     binder whose OWN pointer lacks `#undelivered:`, and echoing the bounce
+#     pointer is exactly what the visited bit rewards.
+#  3. The anti-silence guarantee MOVED. It belongs to the renderer now, not to
+#     the kind: every fire template prints `!! NOT-AN-ANSWER` at the front of the
+#     line and says what the echo means (PR #216, 2026-08-06 — eleven days after
+#     this rationale was written). That predicate reads the POINTER, never the
+#     kind, so it survives this change untouched, and it reaches the member at
+#     wake, which a debt row never did.
+#
+# What is given up, said plainly: a `forum-note` is announced once and holds no
+# standing row afterwards, so a member that does not act in that wake is not
+# asked again. That is the right trade only because the standing row was provably
+# not being acted on either. If durability is wanted back, its home is a per-peer
+# non-delivery summary (#927 — the mesh has no representation for a temporarily
+# unavailable member), not a per-notice debt booked against the sender.
+#
+# The report is sent under the failed member's own plugin
 # identity — and that is the report's remaining dishonesty (CBP review §4,
 # 2026-07-26): the daemon derives the instance LCT from plugin_id alone and
 # drops `instance_name` on connect, so on the chain an unreachable report is
@@ -1282,9 +1323,16 @@ classify_fire_failure() {
 # "#525 re-review — invariant 1" and "claude asked for a test with a member holding a
 # live scope grant". That wake then ran past `timeout -k 30 1800` at 08:46:56Z. rc=124,
 # primer retained, and this function mailed claude-code two `kind=reply` notices saying
-# the notices kimi had just spent thirty minutes answering were undelivered. `reply` is
+# the notices kimi had just spent thirty minutes answering were undelivered. `reply` was
 # in MEMBER_KINDS_AWAIT_RESPONSE, so each one also became a row in the SENDER's `i_owe`
 # and woke a session to read it.
+#
+# HALF OF THAT IS GONE AS OF 2026-09-05, AND THE HALF THAT MATTERS HERE IS NOT. The
+# report now rides `forum-note` (branch 4 above), so it no longer books an `i_owe` row.
+# It still WAKES the sender — the report is a notice, the primer carries it, and the fire
+# template renders it `!! NOT-AN-ANSWER`. The amplifier described below is a wake
+# amplifier, not a ledger one, so the rc=124 guard is untouched by that change and this
+# whole rationale still holds.
 #
 # That is an amplifier pointed the wrong way: the longer and more thorough a member's
 # wake, the likelier it is cut short by the bound, and the more of its peers are told
@@ -1337,7 +1385,12 @@ for n in d.get("notices",[]):
     # remove. The reserved region is the whole fragment, observer included.
     frag=f"#undelivered:{why};via={via}".encode()[:512]
     p=p.encode()[:512-len(frag)].decode(errors="ignore")+frag.decode(errors="ignore")
-    print(json.dumps({"to_plugin_id":sender,"kind":"reply",
+    # `forum-note`, NOT `reply` — see the branch-4 block above. The kind must
+    # stay OUT of handler.rs's MEMBER_KINDS_AWAIT_RESPONSE, which is what makes
+    # a non-delivery report an announcement rather than a debt booked against
+    # the member whose mail died. The binding is kept: `in_reply_to` is what
+    # names WHICH notice failed, and it is legal on every kind.
+    print(json.dumps({"to_plugin_id":sender,"kind":"forum-note",
                       "pointer_uri":p,"in_reply_to":nid}))
 PY
 ) || ROWS=""
