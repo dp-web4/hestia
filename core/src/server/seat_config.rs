@@ -267,6 +267,23 @@ pub fn effective(shared: Option<&SeatConfig>, own: &SeatConfig) -> (SeatConfig, 
     (SeatConfig { env, note: own.note.clone() }, shadowed)
 }
 
+/// THE SEAT TOKEN AND THE LINE PREFIX (design A, dp 2026-09-05). An environment name cannot
+/// carry a hyphen, so a member name is mangled to a token -- `kimi-code` -> `KIMI_CODE` --
+/// and every per-seat line in the RENDERED projection is `TOKEN__KEY=value`. Shared lines are
+/// plain: that is what shared means. Documents and readers never see the prefix: the operator
+/// types `HESTIA_OBSERVE_DIR`, the reader reads `HESTIA_OBSERVE_DIR`, and only the artifact --
+/// the thing that gets copied, tampered with, or someday merged -- carries the owner on each
+/// line. The loader strips its OWN token and refuses any other, so a line can never be
+/// consumed by a seat it was not rendered for.
+pub const SEAT_PREFIX_SEP: &str = "__";
+
+pub fn seat_token(member: &str) -> String {
+    member
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .collect()
+}
+
 /// `effective` with the identity line rendered from the member name -- the composition
 /// every projection uses. Kept apart from `effective` so the shadowed report stays about the
 /// operator's own keys.
@@ -292,15 +309,35 @@ pub fn keys_owned_by_shared(shared: Option<&SeatConfig>, own: &SeatConfig) -> Ve
 /// there is no shared set, so existing projections do not read as drift the day this lands.
 pub fn render_effective(member: &str, shared: Option<&SeatConfig>, own: &SeatConfig) -> (String, Vec<String>) {
     let (eff, shadowed) = effective_for(member, shared, own);
-    let mut out = render(member, &eff);
+    // Prefix every line the seat OWNS with its token; a shared key that the seat restated is
+    // rendered as the shared line only (shared wins), never twice.
+    let mut prefixed = SeatConfig { env: BTreeMap::new(), note: eff.note.clone() };
+    let shared_keys: std::collections::BTreeSet<&str> = shared
+        .map(|sh| sh.env.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    let token = seat_token(member);
+    for (k, v) in &eff.env {
+        if shared_keys.contains(k.as_str()) || is_shared(member) {
+            prefixed.env.insert(k.clone(), v.clone());
+        } else {
+            prefixed.env.insert(format!("{token}{SEAT_PREFIX_SEP}{k}"), v.clone());
+        }
+    }
+    let mut out = render(member, &prefixed);
+    let marker = format!("# member: {member}\n");
+    let mut header = String::new();
+    if !is_shared(member) {
+        header.push_str(&format!("# seat: {token}\n"));
+    }
     if let Some(sh) = shared {
         if !sh.env.is_empty() {
             let keys: Vec<&str> = sh.env.keys().map(String::as_str).collect();
-            // Inserted after the member line so the header stays: source, warning, member, provenance.
-            let marker = format!("# member: {member}\n");
-            let line = format!("# shared: {}\n", keys.join(" "));
-            out = out.replacen(&marker, &format!("{marker}{line}"), 1);
+            header.push_str(&format!("# shared: {}\n", keys.join(" ")));
         }
+    }
+    if !header.is_empty() {
+        // Inserted after the member line so the header stays: source, warning, member, provenance.
+        out = out.replacen(&marker, &format!("{marker}{header}"), 1);
     }
     (out, shadowed)
 }
@@ -582,11 +619,15 @@ mod tests {
 
     #[test]
     fn a_seat_is_attributed_by_its_document_name_not_by_a_typed_value() {
-        // derived: a document with no id renders one, from its name
+        // derived: a document with no id renders one, from its name -- prefixed with the
+        // seat's token, like every line the seat owns (design A)
         let (eff, _) = effective_for("kimi-code", None, &cfg());
         assert_eq!(eff.env["HESTIA_PLUGIN_ID"], "kimi-code");
         let (rendered, _) = render_effective("kimi-code", None, &cfg());
-        assert!(rendered.contains("HESTIA_PLUGIN_ID=kimi-code\n"), "{rendered}");
+        assert!(rendered.contains("KIMI_CODE__HESTIA_PLUGIN_ID=kimi-code\n"), "{rendered}");
+        assert!(rendered.contains("# seat: KIMI_CODE\n"), "{rendered}");
+        assert_eq!(seat_token("claude-code"), "CLAUDE_CODE");
+        assert_eq!(seat_token("gemini"), "GEMINI");
         // stated the same: fine
         let mut same = cfg();
         same.env.insert("HESTIA_PLUGIN_ID".into(), "kimi-code".into());
@@ -622,16 +663,19 @@ mod tests {
         assert_eq!(eff.env["HESTIA_ROLE"], "role:constellation:member", "own keys survive");
         assert_eq!(shadowed, vec!["HESTIA_WORKSPACE".to_string()]);
         assert_eq!(keys_owned_by_shared(Some(&shared), &cfg()), vec!["HESTIA_WORKSPACE".to_string()]);
-        // the projection names the shared keys in its header, and stays byte-identical to the
-        // plain render when there is no shared set
+        // the projection names the shared keys in its header; shared lines are PLAIN and the
+        // seat's own lines carry its token (design A) -- including the shadowed key, which is
+        // rendered once, as the shared line
         let (with, _) = render_effective("claude-code", Some(&shared), &cfg());
         assert!(with.contains("# shared: HESTIA_HOME HESTIA_WORKSPACE\n"), "{with}");
+        assert!(with.contains("\nHESTIA_HOME=/h\n") && with.contains("\nHESTIA_WORKSPACE=/w/shared\n"), "{with}");
+        assert!(with.contains("CLAUDE_CODE__HESTIA_ROLE=role:constellation:member\n"), "{with}");
+        assert!(!with.contains("CLAUDE_CODE__HESTIA_WORKSPACE"), "a shadowed key renders once, as shared: {with}");
         // With no shared set the render is the plain render of the seat's own config PLUS the
         // one derived line: identity comes from the document's name, never from the header.
         let (without, _) = render_effective("claude-code", None, &cfg());
-        let (eff, _) = effective_for("claude-code", None, &cfg());
-        assert_eq!(without, render("claude-code", &eff));
-        assert!(without.contains("HESTIA_PLUGIN_ID=claude-code\n"), "{without}");
+        assert!(without.contains("CLAUDE_CODE__HESTIA_PLUGIN_ID=claude-code\n"), "{without}");
+        assert!(without.contains("CLAUDE_CODE__HESTIA_ROLE=role:constellation:member\n"), "{without}");
         assert!(!without.contains("# shared:"), "no shared header without a shared set: {without}");
         // _shared is never a member of the check domain
         assert!(is_shared(SHARED_MEMBER));

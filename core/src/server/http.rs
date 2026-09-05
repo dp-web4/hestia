@@ -4621,7 +4621,7 @@ mod disposition_tests {
 
         let rendered = std::fs::read_to_string(sc::render_path(dir.path(), "claude-code"))
             .expect("rendered in the same act, not on the worker's next tick");
-        assert!(rendered.contains("HESTIA_WORKSPACE=/w/ai"), "{rendered}");
+        assert!(rendered.contains("CLAUDE_CODE__HESTIA_WORKSPACE=/w/ai"), "{rendered}");
 
         // The chain is the one store that never forgets, and a config document can carry a
         // token. Keys are evidence; values are not ours to keep.
@@ -4721,7 +4721,8 @@ mod disposition_tests {
         let (st, _) = put(serde_json::json!({"plugin_id": "kimi-code", "config": {"env": {"HESTIA_HARNESS_HOME": "/h/kimi"}, "note": ""}})).await;
         assert_eq!(st, StatusCode::OK);
         let rendered = std::fs::read_to_string(sc::render_path(dir.path(), "kimi-code")).unwrap();
-        assert!(rendered.contains("HESTIA_PLUGIN_ID=kimi-code\n"), "{rendered}");
+        assert!(rendered.contains("KIMI_CODE__HESTIA_PLUGIN_ID=kimi-code\n"), "{rendered}");
+        assert!(rendered.contains("KIMI_CODE__HESTIA_HARNESS_HOME=/h/kimi\n"), "{rendered}");
         // and the inspect's effective set shows it, while the own config does not carry it
         let resp = axum::response::IntoResponse::into_response(
             super::config_get_seat(axum::extract::State(state.clone()), None, axum::extract::Path("kimi-code".to_string())).await,
@@ -4770,8 +4771,9 @@ mod disposition_tests {
         // every seat's projection now carries the shared keys, names them, and its own keys survive
         for m in ["claude-code", "codex"] {
             let rendered = std::fs::read_to_string(sc::render_path(dir.path(), m)).unwrap();
-            assert!(rendered.contains("HESTIA_HOME=/h\n") && rendered.contains("HESTIA_WORKSPACE=/w/ai\n"), "{rendered}");
-            assert!(rendered.contains(&format!("HESTIA_PLUGIN_ID={m}\n")), "{rendered}");
+            assert!(rendered.contains("HESTIA_HOME=/h\n") && rendered.contains("HESTIA_WORKSPACE=/w/ai\n"), "shared lines are plain: {rendered}");
+            let token = sc::seat_token(m);
+            assert!(rendered.contains(&format!("{token}__HESTIA_PLUGIN_ID={m}\n")), "own lines carry the seat token: {rendered}");
             assert!(rendered.contains("# shared: HESTIA_HOME HESTIA_SHARED_TOKEN HESTIA_WORKSPACE\n"), "{rendered}");
         }
 
