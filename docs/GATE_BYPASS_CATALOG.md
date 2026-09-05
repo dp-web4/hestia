@@ -860,7 +860,9 @@ structural and holds today; G2 is unverified and should be probed, not assumed.*
 
 ## 17. Class T — the timeout pair: un-governing a member by raising a number
 
-**Status: structural, live on every fail-open-engine member, and silent in both directions.**
+**Status: structural, live on every fail-open-engine member, and silent in both directions.
+MEASURED FAILING on 2 of 4 seats (claude, kimi) as of 2026-09-04 — see the amendments and the
+corrected invariant below.**
 Found 2026-08-07 while diagnosing intermittent kimi denies; flagged by dp as something the
 system should re-check periodically rather than trust once.
 
@@ -871,11 +873,25 @@ is the fail-closed party — it must reach a verdict and `exit 2` *before* the h
 That makes two independently-editable numbers load-bearing together:
 
 ```
-gate internal budget   <   harness hook timeout
+3 · min(budget, REQUEST_TIMEOUT_S)  +  c_seat   <   harness hook timeout
 ```
 
-Push the budget above the timeout and the gate never finishes in time. The harness then does
-what it always does on an overrun: **allow**. Every subsequent call is ungoverned.
+**Corrected in place 2026-09-04.** As filed on 2026-08-07 this read `gate internal budget <
+harness hook timeout`, and that is the pair the section's own audit compared. It is wrong by
+3× and it saturates: the budget is minted once per *entry point* into the shared mechanism
+and one hook invocation crosses three (two mint sites, one retry), each request is capped at
+`min(REQUEST_TIMEOUT_S, remaining)`, and `c_seat` is the un-budgeted fixed-cost work that
+differs by seat (0.38 s claude, 1.91 s codex and kimi). The three numbers on the left are
+`HESTIA_PRE_TOTAL_BUDGET_MS` **as set on the seat's own hook command line**, not the engine
+default; `REQUEST_TIMEOUT_S` (`hestia_gate_mechanism.py:65`, default 5 s); and the retry
+count. Only the first is watched anywhere. The original form is kept here because it is what
+every descriptor and audit written before 2026-09-04 checked, and a reader who finds it in one
+of those should know it clears seats that fail. codex's review of #939 (notice 11357) named the
+defect exactly: the section, as it stood, cleared `budget < timeout` without measuring the
+composition — the amendments below said so, but the prescription above them still did not.
+
+Push the composed wall above the timeout and the gate never finishes in time. The harness
+then does what it always does on an overrun: **allow**. Every subsequent call is ungoverned.
 
 ### AMENDED 2026-09-04 (claude-code, CBP) — the invariant above is wrong by 3×, and the audit it asks for FAILS
 
@@ -1122,18 +1138,28 @@ correct path diverge, and nothing in the system marks the fork.
 
 ### Mitigation
 
-- **Assert the invariant where both numbers are visible.** The launcher knows the harness
-  timeout and passes the budget; it is the only place the pair is co-located. A gate that
-  cannot prove it fits inside its harness deadline should refuse to start rather than run
-  ungoverned.
+- **Assert the COMPOSED wall where both numbers are visible, not the pair.** The launcher
+  knows the harness timeout and passes the budget; it is the only place the two are
+  co-located. But the number to hold against the deadline is the measured wall against a
+  starved daemon (`tools/class_t_seat_audit.py`, run on the machine the seat is installed
+  on), not `budget < timeout` — that comparison passed all four seats on 2026-09-04 while two
+  of them could not deliver a refusal. A gate that cannot prove its composed wall fits inside
+  its harness deadline should refuse to start rather than run ungoverned. gemini's shim is the
+  existing implementation: one `subprocess.run(…, timeout=6)` at the process boundary,
+  fail-closed on overrun.
 - **Audit the pair on a schedule** (dp, 2026-08-07). Per-member, since the timeout default
   differs by harness — see `agent-atlas/talk-to/*/descriptor.md`, which now records the
   engine-verified figure for kimi (`hook.timeout ?? 30s`, config honoured).
-  **RUN 2026-09-04 for claude-code on CBP: FAILED** (5 s harness deadline, 4000 ms budget,
-  12.4 s measured wall). See the amendment above. The other three seats have **not** been
-  run — that is untested, not passing. Auditing the pair is also not sufficient by itself:
-  the two numbers were both individually defensible and the failure lives in the
-  composition between them, which neither number shows.
+  **RUN 2026-09-04 on all four seats, on CBP: claude FAILED** (5 s deadline, 4000 ms budget,
+  12.38 s wall), **kimi FAILED** (15 s deadline, 14000 ms budget on its own command line,
+  16.91 s wall), codex passed by 1.09 s (7%), gemini passed by 8.91 s. codex's independent
+  re-run of the codex seat (review of #939, 3 runs, mean 13.94 s, rc 2) reproduced the
+  margin to within 30 ms. Auditing the pair is not sufficient by itself: the two numbers
+  were both individually defensible and the failure lives in the composition between them,
+  which neither number shows. The audit is now executable — `tools/class_t_seat_audit.py`
+  and `plugins/claude-code/tests/gate_deadline_fits_harness_test.py` arm C, which reads each
+  seat's budget and deadline from that seat's own config and skips loudly (not passes) for
+  any seat not installed on the running machine.
 - **Treat "denies stopped" as a signal requiring explanation**, not as success. The absence of
   refusals is the observable that this class produces, and it is also what a genuine fix
   produces. They must be told apart by something other than the deny count — e.g. positive
@@ -1148,8 +1174,11 @@ Class T is the *converse* of Class G. G is a member gaining authority it was nev
 T is a member losing the governance it was always under — and where G at least leaves an
 actor in the record, T leaves nothing at all, because there is no act to attribute.
 
-*Filed by claude-code, 2026-08-07. The invariant is structural and holds today; the periodic
-audit is dp's requirement and is not yet implemented anywhere.*
+*Filed by claude-code, 2026-08-07, with the invariant `budget < timeout`; corrected in place
+2026-09-04 after the audit it asked for was run and the invariant cleared two seats that fail.
+The periodic audit dp required is implemented as `tools/class_t_seat_audit.py` and pinned as
+arm C of the harness-fit test; it is RED on claude and kimi and will stay RED on `main` until
+the composed deadline lands. That is deliberate.*
 
 ---
 
