@@ -21503,7 +21503,10 @@ async fn tool_scope_arbitrate(state: &SharedState, args: &Value) -> ToolResult {
     // in the store that this key did not sign — planted, copied from another box, or minted
     // by the pre-#952 CLI with a throwaway key — confers nothing. This is what makes the
     // store's contents evidence rather than a list anyone with vault access could pad.
-    match crate::delegation::operator_delegator(&s.vault, &s.home) {
+    // Verified against the SAME fresh vault the store was read from: on a box whose operator
+    // key is the vault's `ai_identity_secret` fallback rather than `<home>/operator.key`, the
+    // startup snapshot and the disk are two sources, and the ruling should have one.
+    match crate::delegation::operator_delegator(&fresh_vault, &s.home) {
         Ok((_, kp)) if deleg.verify(&kp.verifying_key()).is_ok() => {}
         Ok(_) => {
             return Ok(hestia_error_envelope(
