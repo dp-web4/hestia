@@ -270,9 +270,137 @@ def invocation_log(unit, invocation_id):
     told them it did not. Bind to `_SYSTEMD_INVOCATION_ID` or say you did not.
     """
     if invocation_id:
-        return _run(["journalctl", "--user",
+        return _run(["journalctl", "--user", "-o", "short-iso",
                      f"_SYSTEMD_INVOCATION_ID={invocation_id}", "--no-pager"]), True
-    return _run(["journalctl", "--user", "-u", unit, "--no-pager"]), False
+    return _run(["journalctl", "--user", "-o", "short-iso",
+                 "-u", unit, "--no-pager"]), False
+
+
+# ---------------------------------------------------------------------------
+# WHY THERE IS NO LEVEL LINE. `cmd_units` used to answer that question with a
+# reassurance: "wait for the next level line." Measured on CBP 2026-09-03, with
+# #880's parser fix already merged, that reassurance was false on the only active
+# watcher on the box. The level line is emitted by `announce_artifact`, which lives
+# INSIDE the watcher's main `while true` loop. `retry_stale_primers` runs once
+# BEFORE that loop, as a `for` over every retained primer, and each iteration fires
+# a full synchronous wake (14-29 min observed). With 46 primers retained the loop is
+# not reached for the better part of a day, and for that whole time the gauge is not
+# late — it is UNREACHABLE CODE for that process.
+#
+# This is the same defect class the rest of this file is about, one level up: an
+# absent artifact read as a property of the subject rather than of the path to it.
+# "No level line yet" and "no level line ever, by construction" are opposite verdicts
+# and the tool printed the reassuring one for both.
+#
+# The discriminator is already in the journal and needs nothing deployed: the sweep
+# announces itself on every iteration, and the loop announces itself on every gauge
+# period. Sweep lines present + zero loop lines, spanning longer than one gauge
+# period, is starvation. The span is read from the journal's own timestamps, so it is
+# a LOWER bound (retention truncates the left edge) - which is the conservative
+# direction: it can only under-report how long the loop has been unreachable.
+SWEEP_MARKS = ("[hestia-watch] STALE PRIMER", "[hestia-watch] RETRYING stale primer")
+# Every line the main loop emits on its gauge tick. `announce_unanswered` is
+# deliberately NOT here: it prints nothing when the member owes nothing, so its
+# absence is not evidence.
+LOOP_MARKS = ("[hestia-watch] ARTIFACT plugin=", "[hestia-watch] DAEMON ")
+RETRY_RE = re.compile(r"RETRYING stale primer \(attempt \d+/\d+\): (?P<primer>\S+)")
+# `-o short-iso` puts `2026-09-03T13:02:14-0700` first on every line.
+STAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2}):(\d{2})")
+# Quotes optional on purpose: the watcher spells it `UNANSWERED_EVERY="${...:-3600}"`
+# today and an unquoted form is equally valid shell. A reader that pins the QUOTING
+# of the producer fails the same way a reader that pins field order does.
+GAUGE_PERIOD_RE = re.compile(
+    r"^UNANSWERED_EVERY=[\"']?\$\{UNANSWERED_EVERY:-(\d+)\}", re.M)
+GAUGE_PERIOD_DEFAULT = 3600
+
+
+def gauge_period(repo):
+    """Seconds between level lines, read from the PRODUCER, not assumed.
+
+    A constant copied into the reader is the failure #880 fixed in the parser: the
+    watcher moved and the reader did not. Read it out of the watcher source; fall
+    back only if the source cannot be read, and the caller says which it got.
+    """
+    try:
+        with open(os.path.join(repo, WATCH_PATH)) as fh:
+            m = GAUGE_PERIOD_RE.search(fh.read())
+        if m:
+            return int(m.group(1)), "watcher source"
+    except OSError:
+        pass
+    return GAUGE_PERIOD_DEFAULT, "fallback default"
+
+
+def _stamp_seconds(line):
+    """Seconds-of-day for one journal line, or None. Day-of-month is carried so a
+    span that crosses midnight is not silently folded into a negative number."""
+    m = STAMP_RE.match(line or "")
+    if not m:
+        return None
+    return (m.group(1),
+            int(m.group(2)) * 3600 + int(m.group(3)) * 60 + int(m.group(4)))
+
+
+def journal_span(lines):
+    """Wall seconds between the first and last stamped line, or None."""
+    stamps = [x for x in (_stamp_seconds(l) for l in lines) if x]
+    if len(stamps) < 2:
+        return None
+    (d0, s0), (d1, s1) = stamps[0], stamps[-1]
+    span = s1 - s0
+    if d1 != d0:                      # one or more midnights; count them
+        from datetime import date
+        y0, m0, dd0 = (int(x) for x in d0.split("-"))
+        y1, m1, dd1 = (int(x) for x in d1.split("-"))
+        span += (date(y1, m1, dd1) - date(y0, m0, dd0)).days * 86400
+    return span
+
+
+def list_primers(directory):
+    """The retained primers a restart would sweep, in the order bash's glob yields.
+
+    Seam, not convenience: the tests stub this, and the ORDER is load-bearing. The
+    watcher iterates `for stale in "$PRIMERS"/notice-*.json`, and bash expands that
+    glob ONCE, under the unit's collation (no LANG is set by the unit, so C). Sorting
+    any other way would report a sweep position that is not the sweep's position.
+    """
+    import glob
+    return sorted(glob.glob(os.path.join(directory, "notice-*.json")))
+
+
+def sweep_diagnosis(log, period):
+    """Is this invocation starved inside the pre-loop stale-primer sweep?
+
+    Returns None when the journal cannot tell (no sweep lines, or unstamped), so the
+    caller keeps its old, honest "not due yet" wording rather than inventing a cause.
+    A loop line present is decisive the other way: the loop HAS been reached, and the
+    missing level line is then a real question this function is not the answer to.
+    """
+    lines = (log or "").splitlines()
+    sweep = [l for l in lines if any(m in l for m in SWEEP_MARKS)]
+    loop = [l for l in lines if any(m in l for m in LOOP_MARKS)]
+    if loop or not sweep:
+        return None
+    span = journal_span(sweep)
+    if span is None or span < period:
+        return None
+    d = {"span": span, "sweeps": len(sweep), "primer": None,
+         "position": None, "pending": None, "directory": None}
+    retries = [m.group("primer") for m in
+               (RETRY_RE.search(l) for l in lines) if m]
+    if retries:
+        d["primer"] = retries[-1]
+        d["directory"] = os.path.dirname(retries[-1])
+        pending = list_primers(d["directory"])
+        if d["primer"] in pending:
+            d["position"] = pending.index(d["primer"]) + 1
+            d["pending"] = len(pending)
+    return d
+
+
+def humanise(seconds):
+    h, m = divmod(int(seconds) // 60, 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m"
 
 
 def cmd_units(repo):
@@ -307,10 +435,32 @@ def cmd_units(repo):
             continue
         if not art:
             if bound:
+                period, source = gauge_period(repo)
+                starved = sweep_diagnosis(log, period)
+                if starved:
+                    where = ""
+                    if starved["position"]:
+                        where = (f" Sweep position {starved['position']} of "
+                                 f"{starved['pending']} in {starved['directory']}; "
+                                 f"{starved['pending'] - starved['position']} primer(s) "
+                                 f"still to fire.")
+                    print(f"{unit}: active as pid {st.get('MainPID') or '?'} and "
+                          f"STARVED — vintage NOT MEASURED, and the level line is not "
+                          f"late, it is unreachable. This invocation has been inside "
+                          f"the pre-loop stale-primer sweep for at least "
+                          f"{humanise(starved['span'])} ({starved['sweeps']} sweep "
+                          f"announcements, zero main-loop announcements, gauge period "
+                          f"{period}s from {source}). Until the sweep ends the watcher "
+                          f"also does not poll for live mail, does not check daemon "
+                          f"drift, and does not run maybe_self_deploy — so it cannot "
+                          f"adopt the merged fix for this.{where}\n")
+                    continue
                 print(f"{unit}: active as pid {st.get('MainPID') or '?'} but THIS "
                       f"invocation has emitted no ARTIFACT level line yet (it is "
-                      f"hourly) — vintage NOT MEASURED. This is NOT evidence the "
-                      f"restart failed to take; wait for the next level line.\n")
+                      f"emitted every {period}s, per the {source}) — vintage NOT "
+                      f"MEASURED. No sweep starvation is visible in this invocation's "
+                      f"journal, so this is NOT evidence the restart failed to take; "
+                      f"wait for the next level line.\n")
             else:
                 print(f"{unit}: no ARTIFACT level line in the journal window — "
                       f"vintage NOT MEASURED (not 'current')\n")
