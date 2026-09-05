@@ -163,11 +163,52 @@ pub fn agent_key_for_lct(lct_id: &str) -> Uuid {
 /// creates is EVIDENCE: the chain records a ruling attributable to a key, not to a name a
 /// caller typed. Domain-separated and versioned so it can never be confused with another
 /// signature this fleet produces.
-pub fn arbitration_message(request_id: &str, granted: bool, reason: &str) -> String {
+///
+/// WHAT THE BYTES SAY (v2, HUB review of #962). v1 signed `request_id \n verdict \n reason`,
+/// and the mapping from a request id to a member and a path lived only in daemon memory
+/// (#908). After a restart the signature's referent survived only through the daemon's own
+/// `scope_grant_intent` row — the daemon's assertion, not the signer's — so what was
+/// attributable was "the seat said yes to an id", not "the seat said yes to THIS member
+/// reaching THIS path". v2 puts the member and the path inside the signed bytes. The daemon
+/// fills them from the pending request, so a signature made for one path cannot be verified
+/// against a request for another, and a client that honours the `signs` hint from the
+/// unsigned envelope sees, in the bytes it signs, exactly what it is endorsing.
+///
+/// Lines, in order: header, request id, member, path, verdict, reason. The reason is last
+/// because it is the only field that may itself contain a newline.
+pub fn arbitration_message(
+    request_id: &str,
+    member: &str,
+    path: &str,
+    granted: bool,
+    reason: &str,
+) -> String {
     format!(
-        "hestia:scope-arbitrate:v1\n{request_id}\n{}\n{reason}",
+        "{ARBITRATION_HEADER}\n{request_id}\n{member}\n{path}\n{}\n{reason}",
         if granted { "granted" } else { "refused" }
     )
+}
+
+/// The domain-separation line of [`arbitration_message`]. Bumped with the layout.
+pub const ARBITRATION_HEADER: &str = "hestia:scope-arbitrate:v2";
+
+/// Read the member and path back out of a canonical v2 arbitration message — what a signer
+/// uses to learn, from the daemon's `signs` hint, WHO it is about to let reach WHAT, before
+/// rebuilding the message itself and signing bytes it constructed. Returns `None` for
+/// anything that is not a v2 message; a signer must never sign a hint it cannot parse.
+pub fn arbitration_subject(message: &str) -> Option<(String, String)> {
+    let mut lines = message.split('\n');
+    if lines.next()? != ARBITRATION_HEADER {
+        return None;
+    }
+    let _request_id = lines.next()?;
+    let member = lines.next()?;
+    let path = lines.next()?;
+    let verdict = lines.next()?;
+    if !matches!(verdict, "granted" | "refused") || member.is_empty() || !path.starts_with('/') {
+        return None;
+    }
+    Some((member.to_string(), path.to_string()))
 }
 
 /// The delegable action name for scope rulings.
@@ -376,6 +417,32 @@ mod tests {
 
     /// Keyed to the LCT, so the same seat resolves to the same key anywhere, and two seats
     /// never collide.
+    /// HUB on #962: the signed bytes must say what was granted, not just which id. A
+    /// signature over "yes to scope-1" that could be verified against ANY request called
+    /// scope-1 attributes less than the record claims; naming the member and the path makes
+    /// the ruling's referent the signer's statement rather than the daemon's.
+    #[test]
+    fn arbitration_message_names_the_member_and_the_path_and_round_trips() {
+        let m = arbitration_message("scope-1", "legion-being", "/home/x/being", true, "why\nnot");
+        assert_eq!(
+            m,
+            "hestia:scope-arbitrate:v2\nscope-1\nlegion-being\n/home/x/being\ngranted\nwhy\nnot"
+        );
+        assert_eq!(
+            arbitration_subject(&m),
+            Some(("legion-being".to_string(), "/home/x/being".to_string()))
+        );
+        assert_ne!(
+            m,
+            arbitration_message("scope-1", "legion-being", "/home/x/other", true, "why\nnot"),
+            "a different path must be different bytes, or the signature says nothing about it"
+        );
+        // A v1-shaped hint, a wrong verdict word, or a relative path are not signable.
+        assert_eq!(arbitration_subject("hestia:scope-arbitrate:v1\nscope-1\ngranted\nwhy"), None);
+        assert_eq!(arbitration_subject("hestia:scope-arbitrate:v2\nscope-1\nm\n/p\ndenied\n"), None);
+        assert_eq!(arbitration_subject("hestia:scope-arbitrate:v2\nscope-1\nm\nrel\ngranted\n"), None);
+    }
+
     #[test]
     fn agent_key_is_deterministic_per_lct() {
         let a = agent_key_for_lct("lct:web4:mb32:baaa");
