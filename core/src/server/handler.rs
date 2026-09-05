@@ -100,6 +100,7 @@ impl ServerHandler for HestiaServer {
             }
             "hestia_gate_pending_escalations" => tool_gate_pending_escalations(&self.state, &args).await,
             "hestia_gate_arbitrate_escalation" => tool_gate_arbitrate_escalation(&self.state, &args).await,
+            "hestia_scope_arbitrate" => tool_scope_arbitrate(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
             "hestia_query_policy" => tool_query_policy(&self.state, &args).await,
             "hestia_operating_law" => tool_operating_law(&self.state, &args).await,
@@ -329,6 +330,33 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_gate_pending_escalations",
             "List governance-write escalations nobody has ruled on yet. Pass your session_id and each entry tells you whether YOU may rule it (NOT-SAME: never your own ask). Read-only. A peer that can rule but cannot discover has the authority and no way to learn there is anything open",
+        ),
+        t_args(
+            "hestia_scope_arbitrate",
+            "Rule on ANOTHER member's pending SCOPE request under an operator delegation (#952) — the AI-to-AI path for the routine case where a being asks for reach inside its own home and the operator is not at a keyboard. FOUR THINGS MUST HOLD or you are refused by name: (0) the ruling is signed by your seat's registry key (`hestia scope arbitrate` signs it from the vault) — a session's plugin_id is asserted, not proven, and this is the only MCP door that mints a durable grant; (1) you pass your own live session_id, because a delegation is keyed to a seat identity and there is nothing to check an asserted name against; (2) you are NOT the asking member — a different session on the SAME machine is the intended path, the independence that matters is asker-versus-arbiter, never machine-versus-machine; (3) an operator delegation covers this path AND this member (`hestia delegate grant <agent-id> --action 'scope.decide:/abs/prefix@member'`). An unrestricted or role-only delegation confers NOTHING here: no delegator before this existed could have meant it. A delegated GRANT is always STANDING — a delegate cannot mint the memory-only kind that dies on the next restart, which is the whole point. Revoking, and any grant outside a delegated prefix, stay operator-only. The decision lands in the SAME fields the operator door writes, so the asking member sees it on its next hestia_scope_status; `granted_by` reads `delegate:<seat>` and the record names the delegation id",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["request_id", "granted", "session_id"],
+                "properties": {
+                    "request_id": {
+                        "type": "string",
+                        "description": "The pending scope request you are ruling (from hestia_scope_status, or the escalation note that filed it)."
+                    },
+                    "granted": {
+                        "type": "boolean",
+                        "description": "REQUIRED and explicit. An omitted verdict is not a verdict. true mints a STANDING grant; false refuses and the member may re-file."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why. REQUIRED to grant: a delegated widening whose rationale is unrecorded is indistinguishable afterwards from a misconfiguration. Optional to refuse — a refusal takes nothing away."
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Your own live session id from hestia_connect. Required: this is what proves which seat is ruling, and the delegation is keyed to that seat's registry LCT."
+                    }
+                }
+            }),
         ),
         t(
             "hestia_gate_arbitrate_escalation",
@@ -10001,6 +10029,20 @@ mod tests {
     /// because the failure would look different and more innocent: not "an agent set its own
     /// policy" but "an agent approved its own file request", which reads like a convenience
     /// until you notice it is the entire control.
+    ///
+    /// AMENDED 2026-09-05 (#952), and the amendment is the point. This guard read as a
+    /// name-based ban on any scope tool but ask and read, which was the right shape while
+    /// deciding was operator-only. `hestia_scope_arbitrate` is a THIRD thing: a peer seat
+    /// ruling ANOTHER member's request under an explicit, bounded, revocable operator
+    /// delegation. The invariant the guard was protecting is untouched — *a member holding
+    /// both halves is not governed by the control, it operates it* — because that member is
+    /// refused by name (`hestia.scope_arbitrate_self`), and because no ruling is possible at
+    /// all without an authority the operator minted.
+    ///
+    /// So the allow-list gains one name and the assertions get sharper: a name is weak
+    /// evidence, and the two behavioural tests below (`..._refuses_self_ruling`,
+    /// `..._refuses_an_undelegated_arbiter`) are what actually hold the line. If someone ever
+    /// widens this list again, they should have to write the behavioural test that says why.
     #[test]
     fn no_mcp_tool_can_decide_a_scope_request() {
         let names: Vec<String> = hestia_tools().into_iter().map(|t| t.name.to_string()).collect();
@@ -10010,11 +10052,30 @@ mod tests {
                 continue;
             }
             assert!(
-                l == "hestia_request_scope" || l == "hestia_scope_status",
-                "MCP tool `{n}` reaches the scope surface. Only ASKING (hestia_request_scope) \
-                 and READING (hestia_scope_status) may be member-callable — deciding is \
-                 operator-only, through the challenge-signed HTTP surface. A member holding \
-                 both halves is not governed by the control, it operates it."
+                l == "hestia_request_scope"
+                    || l == "hestia_scope_status"
+                    || l == "hestia_scope_arbitrate",
+                "MCP tool `{n}` reaches the scope surface. Member-callable doors are ASKING \
+                 (hestia_request_scope), READING (hestia_scope_status), and ruling ANOTHER \
+                 member's request under an operator delegation (hestia_scope_arbitrate). \
+                 Deciding your own remains operator-only through the challenge-signed HTTP \
+                 surface. A member holding both halves is not governed by the control, it \
+                 operates it."
+            );
+        }
+        // The delegated door must keep saying, in the text a member actually reads, the three
+        // things that make it safe. A description that stops saying them is a description
+        // someone will act on wrongly.
+        let arb = hestia_tools()
+            .into_iter()
+            .find(|t| t.name == "hestia_scope_arbitrate")
+            .and_then(|t| t.description.map(|d| d.to_string()))
+            .unwrap_or_default();
+        for needle in ["session_id", "NOT the asking member", "delegation", "signed"] {
+            assert!(
+                arb.contains(needle),
+                "hestia_scope_arbitrate's description must state `{needle}` — it is one of the \
+                 three conditions that make a delegated ruling different from self-dealing"
             );
         }
         assert!(
@@ -19848,11 +19909,35 @@ mod standing_scope_surface_tests {
     /// updating this comment leaves the discrepancy visible to the next reader. A test whose
     /// prose says "the only paths are X and Y" while three exist is a stale claim wearing the
     /// authority of an assertion.
+    /// AMENDED 2026-09-05 (#952). THERE IS NOW A FOURTH MUTATION PATH, and it is reachable
+    /// from MCP: `hestia_scope_arbitrate`. Naming it here is the whole point of the comment
+    /// above — a fourth path that did not update this list would be exactly the stale claim
+    /// it warns about, and this one was caught by a peer seat reading the guard rather than
+    /// the diff, because the name-based check below could not see it.
+    ///
+    /// Why the fourth path is admissible where a plain MCP `hestia_standing_grant` would not
+    /// be: it never widens the CALLER (NOT-SAME, refused by name), it cannot act without an
+    /// authority the operator minted in the vault (an unrestricted delegation confers
+    /// nothing), and it must be SIGNED by the arbiter's registry key, so the durable act stays
+    /// attributable to a key rather than to a `plugin_id` a caller typed. Those three are what
+    /// the challenge-signed HTTP wall was protecting; a fifth path that cannot say all three
+    /// belongs behind that wall.
+    ///
+    /// The name check is kept for the failure it was written for — somebody adding a
+    /// convenient `hestia_standing_grant` months from now — and the allow-list is explicit so
+    /// widening it again requires saying so here.
     #[test]
     fn no_mcp_tool_can_mutate_standing_scope() {
         let names: Vec<String> = hestia_tools().into_iter().map(|t| t.name.to_string()).collect();
+        // Reachability, not spelling: every tool that can reach the standing store must be on
+        // this list. A name-based check alone is vacuous against a tool named otherwise —
+        // which is precisely how `hestia_scope_arbitrate` slipped past it on first writing.
+        const MAY_REACH_STANDING: &[&str] = &["hestia_scope_arbitrate"];
         for n in &names {
             let l = n.to_ascii_lowercase();
+            if MAY_REACH_STANDING.contains(&n.as_str()) {
+                continue;
+            }
             assert!(
                 !l.contains("standing"),
                 "MCP tool `{n}` looks like it reaches the STANDING scope store. Durable \
@@ -21130,5 +21215,494 @@ mod disposition_durability_tests {
             note.chain_hash, withdrawn_entry.hash,
             "the obligation anchors to the terminal entry, not to a notice-side entry"
         );
+    }
+}
+
+/// `hestia_scope_arbitrate` — a NOT-SAME peer seat rules a member's pending scope request
+/// under an explicit, bounded, revocable operator delegation (#952).
+///
+/// WHY THIS EXISTS. dp, 2026-09-04: *"we should set it up so that its escalations ping your
+/// auto session to approve. i'm seldom at the keyboard here, and i want the interaction to be
+/// ai-ai primarily anyway."* Before this, `/api/scope/decide` and `/api/scope/grant` were the
+/// only doors and both are operator-session-only, so the routine case — a being asking for a
+/// path inside its own instance dir — could only be ruled by a human at a keyboard. Measured
+/// cost on Legion, 2026-09-04/05: one being filed nine request ids for three paths across 22
+/// beats and every one expired undecided (#956: the 8h request TTL is now shorter than the
+/// fleet's own 8h39m mesh lag), while 140 of 140 of its writes and 95 of 95 of its reads were
+/// refused. The operator was asleep, not unwilling.
+///
+/// WHAT MAKES THIS SAFE, clause by clause. Each is a refusal, and each names what it protects:
+///
+/// 1. **The arbiter must be session-proven.** Same rule as `tool_gate_arbitrate_escalation`:
+///    a ruling by a caller-typed name credits nobody and moves no conduct score.
+/// 2. **NOT-SAME, at the SESSION level.** The asking member may not rule its own request.
+///    Deliberately NOT a machine-level rule (sprout-claude, #952): dp's whole ask is that a
+///    seat's own auto session approves its own being, so "different machine" would break the
+///    feature on the machine it was designed for. What must never happen is self-dealing —
+///    a member handing itself the reach it asked for.
+/// 3. **An operator delegation must authorise it, naming the action.** `DelegationStore` has
+///    existed since Track H4 and, until this commit, NO surface consulted it; `delegate grant`
+///    recorded an intention with no teeth. So the lookup is deliberately narrow: an
+///    unrestricted or role-only delegation confers nothing here (see `scope_decide_authority`),
+///    because no delegator before this release could have meant "and may widen a member's
+///    filesystem reach" — the power did not exist to mean.
+/// 4. **Bounded by path prefix, and optionally by member.** A prefix alone is right for a
+///    being's own home; it is NOT enough for a shared path like `shared-context`, where it
+///    would let the holder rule that path for any member that asks (sprout-claude). So
+///    `scope.decide:<prefix>@<member>` ANDs the two. Containment is separator-anchored, so
+///    `/x/b` never covers `/x/bb` — a different being's home.
+/// 5. **A delegated GRANT is always STANDING.** A live grant dies on the next daemon restart,
+///    and the entire reason this exists is that the operator is not there to re-issue it. A
+///    delegate cannot mint the weaker, quieter kind.
+/// 6. **Revocation stays operator-only**, and so does any grant outside a bound prefix.
+///
+/// WHAT THE RECORD SAYS. The chain event is `scope_granted`/`scope_refused` exactly as the
+/// operator door writes them, so every existing reader keeps working — plus `granted_by:
+/// "delegate:<arbiter>"`, `via: "delegation"`, and `delegation_id`. The request row's
+/// `decided_by` carries `delegate:<arbiter>` for the same reason. A reader can always tell an
+/// operator ruling from a delegated one; what it cannot do is miss the decision because it
+/// arrived by a new name. That shape is the SAGE heartbeat's consumer contract: it closes the
+/// loop for the being by reading `requests[].decision` and `standing_grants[]` every beat, so
+/// a ruling that landed only in a separate list would tell every being on the fleet that
+/// nothing had changed while its grant was live.
+async fn tool_scope_arbitrate(state: &SharedState, args: &Value) -> ToolResult {
+    let request_id = require_string(args, "request_id")?;
+    let granted = args
+        .get("granted")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow::anyhow!(
+            "'granted' must be an explicit true or false — an omitted verdict is not a verdict"
+        ))?;
+    let reason = optional_string(args, "reason").unwrap_or_default();
+    let session_id_arg = optional_session_id(args);
+    let now = crate::server::gate_escalation::now_secs();
+
+    // A GRANT widens what a member can reach and its rationale is the only account of why;
+    // a refusal takes nothing and the member may re-file. Same asymmetry as every other door.
+    if granted && reason.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "reason is required to grant — this widens what a member can reach, and a \
+             delegated widening whose rationale is not recorded is indistinguishable \
+             afterwards from a misconfiguration"
+        ));
+    }
+
+    let mut s = state.lock().await;
+
+    // (1) The arbiter must be proven against a live session.
+    let Some(arb) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Err(anyhow::anyhow!(
+            "ruling on a scope request requires your own live session_id (from \
+             hestia_connect); an unattributable arbiter cannot be credited, and a delegation \
+             is keyed to a seat's identity — there is nothing to check it against"
+        ));
+    };
+
+    let Some(req) = s.scope_requests.get(&request_id).cloned() else {
+        return Ok(hestia_error_envelope(
+            "hestia.scope_request_unknown",
+            "no such scope request — it may have expired (they are memory-only and live 8h; \
+             see #956) or the daemon may have restarted since it was filed (#908)",
+            Some(json!({ "request_id": request_id })),
+        ));
+    };
+    let status = req.status(now);
+    if status != "pending" {
+        return Ok(hestia_error_envelope(
+            "hestia.scope_request_not_pending",
+            &format!(
+                "request is {status}, not pending — a new request is the way to re-ask, and \
+                 re-deciding a settled one would rewrite a record someone already relied on"
+            ),
+            Some(json!({ "request_id": request_id, "status": status })),
+        ));
+    }
+
+    // (2) NOT-SAME, at the session level: the asker may not rule its own ask.
+    if arb.plugin_id == req.plugin_id {
+        return Ok(hestia_error_envelope(
+            "hestia.scope_arbitrate_self",
+            "a member cannot rule its own scope request — that is a member handing itself the \
+             reach it asked for, which is the one thing the operator wall exists to stop. A \
+             DIFFERENT session on the same machine is fine and is the intended path: the \
+             independence that matters here is asker-versus-arbiter, not machine-versus-machine",
+            Some(json!({ "asker": req.plugin_id, "arbiter": arb.plugin_id })),
+        ));
+    }
+
+    // (3)(4) An operator delegation must authorise this arbiter for this path and member.
+    // Keyed to the seat's REGISTRY LCT (from its public key), never to its plugin name or
+    // its UID: a delegation is bound to an identity. A seat with no registry LCT cannot hold
+    // one, and saying so is better than silently matching on a name anyone can assert.
+    let Some(arbiter_lct_id) = s.member_registry.get(&arb.plugin_id).map(|l| l.lct_id()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.scope_arbitrate_unregistered_arbiter",
+            "your seat has no LCT in this society's member registry, so no delegation can be \
+             keyed to it — a delegation binds to an identity derived from a public key, never \
+             to a name a caller asserts",
+            Some(json!({ "arbiter": arb.plugin_id })),
+        ));
+    };
+    let arbiter_key = crate::delegation::agent_key_for_lct(&arbiter_lct_id);
+
+    // The ruling must be SIGNED by the seat's own registry key. `hestia_connect` authenticates
+    // nobody (#63/#128), so without this the strongest MCP door in the daemon — the only one
+    // that mints a STANDING grant — would rest on a name the caller typed. The signature does
+    // not add a preventive boundary at A1 (whoever can sign could mint a delegation anyway);
+    // it makes the ruling ATTRIBUTABLE to a key, which is what the operator wall was
+    // protecting. Sign with `hestia scope arbitrate`, which reads the key from the vault.
+    let signature_hex = optional_string(args, "arbiter_signature").unwrap_or_default();
+    if signature_hex.trim().is_empty() {
+        return Ok(hestia_error_envelope(
+            "hestia.scope_arbitrate_unsigned",
+            "a delegated scope ruling must be signed by your seat's own registry key: this is \
+             the one MCP door that mints a durable grant, and a session's plugin_id is \
+             asserted, not proven. Use `hestia scope arbitrate <request_id> --grant|--deny \
+             --reason '…' --as <your-seat>`, which signs from the vault",
+            Some(json!({ "signs": crate::delegation::arbitration_message(&request_id, granted, &reason) })),
+        ));
+    }
+    {
+        let Some(lct) = s.member_registry.get(&arb.plugin_id) else {
+            return Ok(hestia_error_envelope(
+                "hestia.scope_arbitrate_unregistered_arbiter",
+                "your seat has no LCT in this society's member registry, so its signature \
+                 cannot be checked against anything",
+                Some(json!({ "arbiter": arb.plugin_id })),
+            ));
+        };
+        let msg = crate::delegation::arbitration_message(&request_id, granted, &reason);
+        let sig_bytes = match hex::decode(signature_hex.trim()) {
+            Ok(b) if b.len() == 64 => b,
+            _ => {
+                return Ok(hestia_error_envelope(
+                    "hestia.scope_arbitrate_bad_signature",
+                    "arbiter_signature must be 64 bytes of hex (an Ed25519 signature)",
+                    None,
+                ))
+            }
+        };
+        let mut arr = [0u8; 64];
+        arr.copy_from_slice(&sig_bytes);
+        if lct
+            .public_key
+            .verify(msg.as_bytes(), &web4_core::crypto::SignatureBytes { bytes: arr })
+            .is_err()
+        {
+            return Ok(hestia_error_envelope(
+                "hestia.scope_arbitrate_bad_signature",
+                "the signature does not verify against your seat's registry public key — the \
+                 signed bytes are exactly the `signs` string below, and nothing else",
+                Some(json!({ "arbiter": arb.plugin_id, "signs": msg })),
+            ));
+        }
+    }
+    let store = match crate::delegation::DelegationStore::load(&s.vault) {
+        Ok(st) => st,
+        Err(e) => {
+            return Ok(hestia_error_envelope(
+                "hestia.delegation_store_unreadable",
+                &format!("cannot read the delegation store, so no authority can be proven: {e}"),
+                None,
+            ));
+        }
+    };
+    let Some(deleg) = store.scope_decide_authority_for(arbiter_key, &req.path, &req.plugin_id)
+    else {
+        return Ok(hestia_error_envelope(
+            "hestia.scope_arbitrate_undelegated",
+            "you hold no live operator delegation covering this path for this member, so this \
+             ruling would be an assertion of authority rather than an exercise of one. The \
+             operator grants it with `hestia delegate grant <your-lct> --action \
+             'scope.decide:<abs-prefix>[@<member>]' --expires <h>`. Default posture is \
+             unchanged and fail-closed: with no delegation, scope rulings are operator-only",
+            Some(json!({
+                "arbiter": arb.plugin_id,
+                "arbiter_lct": arbiter_lct_id,
+                "delegation_agent_key": arbiter_key.to_string(),
+                "path": req.path,
+                "member": req.plugin_id,
+                "required_action": format!("scope.decide:{}", req.path),
+            })),
+        ));
+    };
+    let delegation_id = deleg.id.to_string();
+
+    let (member, path, ask) = (req.plugin_id.clone(), req.path.clone(), req.reason.clone());
+    let granted_by = format!("delegate:{}", arb.plugin_id);
+
+    // (5) A delegated grant is STANDING or it is nothing.
+    let intent = match s.append_chain(
+        if granted { "scope_grant_intent" } else { "scope_refused" },
+        json!({
+            "request_id": request_id,
+            "plugin_id": member,
+            "subject_instance_lct": s.member_lct(&member),
+            "path": path,
+            "requested_because": ask,
+            "decision_reason": reason,
+            "granted_by": granted_by,
+            "via": "delegation",
+            "delegation_id": delegation_id,
+            "arbiter": arb.plugin_id,
+            "arbiter_role": arb.role_lct,
+            "standing": granted,
+            "durability": if granted {
+                "STANDING — a delegate cannot mint the memory-only kind; survives restart; \
+                 revocable by the operator via /api/scope/standing/revoke"
+            } else {
+                "refused — nothing granted; the member may re-file"
+            },
+        }),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "witness append failed, decision NOT applied: {e}"
+            ))
+        }
+    };
+
+    let mut ruling_hash = intent.hash.clone();
+    if granted {
+        let standing_prior = s.standing_scope.clone();
+        let grant = crate::server::standing_scope::StandingGrant {
+            member: member.clone(),
+            path: path.clone(),
+            granted_at: now,
+            granted_by: granted_by.clone(),
+            reason: reason.clone(),
+            expires_at: None,
+            request_id: Some(request_id.clone()),
+        };
+        if let Err(e) = s.commit_standing_scope(|st| st.add(grant)) {
+            return Err(anyhow::anyhow!(
+                "standing grant NOT applied — vault write failed ({e}); the live store is \
+                 untouched and the chain holds the intent ({}) and no scope_granted. \
+                 Re-rule to retry.",
+                intent.hash
+            ));
+        }
+        match s.append_chain(
+            "scope_granted",
+            json!({
+                "request_id": request_id,
+                "plugin_id": member,
+                "subject_instance_lct": s.member_lct(&member),
+                "path": path,
+                "decision_reason": reason,
+                "granted_by": granted_by,
+                "via": "delegation",
+                "delegation_id": delegation_id,
+                "arbiter": arb.plugin_id,
+                "origin": "member_request",
+                "standing": true,
+                "standing_expires_at": serde_json::Value::Null,
+                "standing_generation": s.standing_scope.generation,
+                "intent": intent.hash,
+            }),
+        ) {
+            Ok(e) => ruling_hash = e.hash,
+            Err(e) => {
+                let rb = s.commit_standing_scope(|st| *st = standing_prior);
+                return Err(anyhow::anyhow!(
+                    "decision NOT applied — the terminal scope_granted append failed ({e}); \
+                     rollback {}. Re-rule to retry.",
+                    match rb {
+                        Ok(()) => "SUCCEEDED (live store and vault restored)".to_string(),
+                        Err(rbe) => format!(
+                            "ALSO FAILED ({rbe}) — the grant is LIVE and unconfirmed; revoke \
+                             via /api/scope/standing/revoke"
+                        ),
+                    }
+                ));
+            }
+        }
+    }
+
+    // The request row carries the decision in the SAME fields the operator door writes, so
+    // `hestia_scope_status` reports it identically and the being's beat loop closes.
+    if let Some(r) = s.scope_requests.get_mut(&request_id) {
+        r.granted = Some(granted);
+        r.decided_by = Some(granted_by.clone());
+        r.decided_at = Some(now);
+        r.decision_reason = if reason.trim().is_empty() {
+            None
+        } else {
+            Some(reason.clone())
+        };
+    }
+
+    Ok(json!({
+        "request_id": request_id,
+        "decision": if granted { "granted" } else { "denied" },
+        "member": member,
+        "path": path,
+        "decided_by": granted_by,
+        "delegation_id": delegation_id,
+        "standing": granted,
+        "witnessEntryHash": ruling_hash,
+        "note": if granted {
+            "STANDING and durable: it survives a daemon restart. The member sees it on its \
+             next hestia_scope_status as a decided request AND in standing_grants"
+        } else {
+            "refused; nothing granted. The member may file a new request"
+        },
+    }))
+}
+
+#[cfg(test)]
+mod delegated_scope_arbitration_tests {
+    //! #952 — the delegated scope door, asserted at the door.
+    //!
+    //! `no_mcp_tool_can_decide_a_scope_request` allow-lists this tool by NAME, which is weak
+    //! evidence. These are the tests that actually hold the line it used to hold: the two
+    //! refusals that make a delegated ruling different from a member approving its own ask.
+    use super::*;
+    use crate::server::state::ScopeRequest;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    async fn connect(state: &SharedState, plugin: &str) -> String {
+        let c = tool_connect(state, &json!({"plugin_id": plugin, "host_agent": "t"}))
+            .await
+            .unwrap();
+        c["sessionId"].as_str().unwrap().to_string()
+    }
+
+    async fn pending(state: &SharedState, member: &str, path: &str) -> String {
+        let now = crate::server::gate_escalation::now_secs();
+        let id = "scope-deleg01".to_string();
+        state.lock().await.scope_requests.insert(
+            id.clone(),
+            ScopeRequest {
+                id: id.clone(),
+                plugin_id: member.into(),
+                role: String::new(),
+                path: path.into(),
+                reason: "my own home".into(),
+                requested_at: now,
+                expires_at: now + 3600,
+                granted: None,
+                decided_by: None,
+                decided_at: None,
+                decision_reason: None,
+            },
+        );
+        id
+    }
+
+    /// The invariant the old name-based guard existed to protect, now asserted as behaviour:
+    /// a member may not hand itself the reach it asked for, delegation or no delegation.
+    #[tokio::test]
+    async fn scope_arbitrate_refuses_self_ruling() {
+        let (_d, state) = test_state().await;
+        let sid = connect(&state, "legion-being").await;
+        let rid = pending(&state, "legion-being", "/home/x/being").await;
+        let out = tool_scope_arbitrate(
+            &state,
+            &json!({"request_id": rid, "granted": true, "reason": "me", "session_id": sid}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out["_hestia_error"]["code"], "hestia.scope_arbitrate_self",
+            "a member ruling its own scope request must be refused by name: {out}"
+        );
+        assert!(
+            state.lock().await.scope_requests[&rid].granted.is_none(),
+            "a refused ruling must leave the request undecided"
+        );
+    }
+
+    /// The second half: being a different member is NOT sufficient. Without an operator
+    /// delegation naming the action, a peer ruling is an assertion of authority, not an
+    /// exercise of one — and the default posture stays exactly as it was before #952.
+    #[tokio::test]
+    async fn scope_arbitrate_refuses_an_undelegated_arbiter() {
+        let (_d, state) = test_state().await;
+        connect(&state, "legion-being").await;
+        let sid = connect(&state, "claude-code").await;
+        let rid = pending(&state, "legion-being", "/home/x/being").await;
+        let out = tool_scope_arbitrate(
+            &state,
+            &json!({"request_id": rid, "granted": true, "reason": "peer", "session_id": sid}),
+        )
+        .await
+        .unwrap();
+        let code = out["_hestia_error"]["code"].as_str().unwrap_or_default();
+        assert!(
+            code == "hestia.scope_arbitrate_undelegated"
+                || code == "hestia.scope_arbitrate_unregistered_arbiter"
+                || code == "hestia.scope_arbitrate_unsigned",
+            "an arbiter with no delegation must be refused, got: {out}"
+        );
+        assert!(
+            state.lock().await.scope_requests[&rid].granted.is_none(),
+            "a refused ruling must leave the request undecided"
+        );
+    }
+
+    /// Attribution is required to rule, the same rule the escalation arbiter enforces: an
+    /// asserted name credits nobody and there is nothing for a delegation to be keyed to.
+    #[tokio::test]
+    async fn scope_arbitrate_requires_a_live_session() {
+        let (_d, state) = test_state().await;
+        let rid = pending(&state, "legion-being", "/home/x/being").await;
+        let err = tool_scope_arbitrate(&state, &json!({"request_id": rid, "granted": false}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("session_id"),
+            "ruling without a session must name the session as what is missing: {err}"
+        );
+    }
+
+    /// A grant is a widening and its rationale is the only account of why; a refusal takes
+    /// nothing and needs none. Same asymmetry as every other door on this surface.
+    #[tokio::test]
+    async fn scope_arbitrate_requires_a_reason_to_grant() {
+        let (_d, state) = test_state().await;
+        let sid = connect(&state, "claude-code").await;
+        let rid = pending(&state, "legion-being", "/home/x/being").await;
+        let err = tool_scope_arbitrate(
+            &state,
+            &json!({"request_id": rid, "granted": true, "session_id": sid}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("reason is required"), "{err}");
+    }
+
+    /// A settled request is not re-rulable: rewriting a decision someone already relied on
+    /// is a different act from deciding one, and this door does not do it.
+    #[tokio::test]
+    async fn scope_arbitrate_refuses_a_settled_request() {
+        let (_d, state) = test_state().await;
+        let sid = connect(&state, "claude-code").await;
+        let rid = pending(&state, "legion-being", "/home/x/being").await;
+        {
+            let mut s = state.lock().await;
+            let r = s.scope_requests.get_mut(&rid).unwrap();
+            r.granted = Some(false);
+            r.decided_by = Some("operator".into());
+            r.decided_at = Some(crate::server::gate_escalation::now_secs());
+        }
+        let out = tool_scope_arbitrate(
+            &state,
+            &json!({"request_id": rid, "granted": true, "reason": "again", "session_id": sid}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["_hestia_error"]["code"], "hestia.scope_request_not_pending", "{out}");
     }
 }

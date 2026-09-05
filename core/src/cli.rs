@@ -666,6 +666,17 @@ enum DelegateCmd {
         expires: Option<u64>,
     },
 
+    /// Print the delegation key for a seat, derived from its registry LCT (#952).
+    ///
+    /// `delegate grant` takes a UUID, member LCTs are mb32 strings, so this is the
+    /// deterministic bridge: same seat, same key, on any machine. Grant against what this
+    /// prints, never against a name.
+    #[command(name = "agent-id")]
+    AgentId {
+        /// The seat's member id, e.g. claude-code
+        plugin_id: String,
+    },
+
     /// List active delegations
     List,
 
@@ -800,6 +811,7 @@ pub fn run() -> AnyResult<()> {
             PolicyCmd::RmRule { id, role } => cmd_policy_rm_rule(&home, &id, role),
         },
         Command::Delegate(d) => match d {
+            DelegateCmd::AgentId { plugin_id } => cmd_delegate_agent_id(&home, &plugin_id),
             DelegateCmd::Grant { agent, role, action, expires } => {
                 cmd_delegate_grant(&home, &agent, role, action, expires)
             }
@@ -3614,6 +3626,32 @@ fn cmd_delegate_grant(
     println!("  id:      {id}");
     println!("  agent:   {agent_id}");
     println!("  expires: {exp}");
+    Ok(())
+}
+
+/// Print the delegation key for a seat (#952). Reads the member registry, derives the
+/// UUIDv5 the store is keyed on, and shows the grant line an operator would run — so the
+/// operator never has to hand-translate an mb32 LCT into a UUID.
+fn cmd_delegate_agent_id(home: &std::path::Path, plugin_id: &str) -> AnyResult<()> {
+    let vault = open_vault(home)?;
+    let registry = hestia::member_registry::load_members(&vault);
+    let Some(lct) = registry.get(plugin_id) else {
+        anyhow::bail!(
+            "'{plugin_id}' has no LCT in this society's member registry, so no delegation can \
+             be keyed to it — a delegation binds to an identity derived from a public key, \
+             never to a name. Connect that seat once, then retry."
+        );
+    };
+    let lct_id: String = lct.lct_id();
+    let key = delegation::agent_key_for_lct(&lct_id);
+    println!("member    {plugin_id}");
+    println!("lct       {lct_id}");
+    println!("agent-id  {key}");
+    println!();
+    println!("grant a bounded scope-ruling authority to this seat with, e.g.:");
+    println!(
+        "  hestia delegate grant {key} --action 'scope.decide:/abs/prefix@<member>' --expires 720"
+    );
     Ok(())
 }
 
