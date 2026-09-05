@@ -213,8 +213,46 @@ pub fn load_shared(vault: &crate::vault::Vault) -> Option<Result<SeatConfig, Str
     })
 }
 
+/// ATTRIBUTION (dp, 2026-09-05: "make sure the right vars are attributed to the right
+/// entity"). A seat's identity is a fact of WHICH document this is, not a value an operator
+/// types: `HESTIA_PLUGIN_ID` is rendered from the document's name, and a document that
+/// states a different one is refused at the door (`validate_attribution`). Without this, a
+/// typo or a break-glass edit could put another seat's id into a document and every
+/// outcome, notice and mailbox of that seat would be attributed to the other -- attribution
+/// laundered through config. The shared set carries no identity-shaped key for the same
+/// reason: identity is the one thing that is never shared.
+pub const ATTRIBUTION_KEY: &str = "HESTIA_PLUGIN_ID";
+/// Keys that name WHO a seat is. Refused in `_shared`; the first is derived per seat.
+pub const IDENTITY_KEYS: [&str; 4] = [
+    "HESTIA_PLUGIN_ID", "HESTIA_MESH_PLUGIN", "HESTIA_MESH_HOST_AGENT", "HESTIA_HOST_AGENT",
+];
+
+/// Refuse a document that mis-attributes. `member` is the document's name.
+pub fn validate_attribution(member: &str, cfg: &SeatConfig) -> Result<(), String> {
+    if is_shared(member) {
+        let carried: Vec<&str> = IDENTITY_KEYS.iter().copied().filter(|k| cfg.env.contains_key(*k)).collect();
+        if !carried.is_empty() {
+            return Err(format!(
+                "the shared set may not carry identity keys {carried:?}: identity is per seat and \
+                 is never shared"
+            ));
+        }
+        return Ok(());
+    }
+    if let Some(stated) = cfg.env.get(ATTRIBUTION_KEY) {
+        if stated != member {
+            return Err(format!(
+                "{ATTRIBUTION_KEY}={stated:?} in the document for {member:?}: a seat's id is derived \
+                 from its document's name and cannot be restated as another seat"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The projection a seat actually renders: shared first, own on top, shared winning on a
-/// collision. Returns the composed config and the keys the seat tried to restate.
+/// collision, and the seat's identity DERIVED from the document name. Returns the composed
+/// config and the keys the seat tried to restate.
 pub fn effective(shared: Option<&SeatConfig>, own: &SeatConfig) -> (SeatConfig, Vec<String>) {
     let mut env = own.env.clone();
     let mut shadowed = Vec::new();
@@ -227,6 +265,17 @@ pub fn effective(shared: Option<&SeatConfig>, own: &SeatConfig) -> (SeatConfig, 
         }
     }
     (SeatConfig { env, note: own.note.clone() }, shadowed)
+}
+
+/// `effective` with the identity line rendered from the member name -- the composition
+/// every projection uses. Kept apart from `effective` so the shadowed report stays about the
+/// operator's own keys.
+pub fn effective_for(member: &str, shared: Option<&SeatConfig>, own: &SeatConfig) -> (SeatConfig, Vec<String>) {
+    let (mut eff, shadowed) = effective(shared, own);
+    if !is_shared(member) {
+        eff.env.insert(ATTRIBUTION_KEY.to_string(), member.to_string());
+    }
+    (eff, shadowed)
 }
 
 /// Keys a seat document may not carry because the shared set owns them. Checked at the write
@@ -242,7 +291,7 @@ pub fn keys_owned_by_shared(shared: Option<&SeatConfig>, own: &SeatConfig) -> Ve
 /// a reader of the file can tell which lines the seat owns. Byte-identical to `render()` when
 /// there is no shared set, so existing projections do not read as drift the day this lands.
 pub fn render_effective(member: &str, shared: Option<&SeatConfig>, own: &SeatConfig) -> (String, Vec<String>) {
-    let (eff, shadowed) = effective(shared, own);
+    let (eff, shadowed) = effective_for(member, shared, own);
     let mut out = render(member, &eff);
     if let Some(sh) = shared {
         if !sh.env.is_empty() {
@@ -279,7 +328,7 @@ pub fn verify_effective(home: &Path, member: &str, shared: Option<&SeatConfig>, 
 
 /// `render_to_disk` over the composed projection. Returns whether the bytes on disk CHANGED.
 pub fn render_effective_to_disk(home: &Path, member: &str, shared: Option<&SeatConfig>, own: &SeatConfig) -> std::io::Result<bool> {
-    let (eff, _) = effective(shared, own);
+    let (eff, _) = effective_for(member, shared, own);
     if let Err(msg) = eff.validate() {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
     }
@@ -532,6 +581,35 @@ mod tests {
     }
 
     #[test]
+    fn a_seat_is_attributed_by_its_document_name_not_by_a_typed_value() {
+        // derived: a document with no id renders one, from its name
+        let (eff, _) = effective_for("kimi-code", None, &cfg());
+        assert_eq!(eff.env["HESTIA_PLUGIN_ID"], "kimi-code");
+        let (rendered, _) = render_effective("kimi-code", None, &cfg());
+        assert!(rendered.contains("HESTIA_PLUGIN_ID=kimi-code\n"), "{rendered}");
+        // stated the same: fine
+        let mut same = cfg();
+        same.env.insert("HESTIA_PLUGIN_ID".into(), "kimi-code".into());
+        assert!(validate_attribution("kimi-code", &same).is_ok());
+        // stated as ANOTHER seat: refused -- this is the laundering the check exists to stop
+        let mut other = cfg();
+        other.env.insert("HESTIA_PLUGIN_ID".into(), "codex".into());
+        let err = validate_attribution("kimi-code", &other).unwrap_err();
+        assert!(err.contains("derived from its document's name"), "{err}");
+        // and even if such a document existed, the render would still say the truth
+        let (eff, _) = effective_for("kimi-code", None, &other);
+        assert_eq!(eff.env["HESTIA_PLUGIN_ID"], "kimi-code", "the name wins over the typed value");
+        // the shared set may not carry identity
+        let mut sh = SeatConfig::default();
+        sh.env.insert("HESTIA_MESH_PLUGIN".into(), "claude-code".into());
+        let err = validate_attribution(SHARED_MEMBER, &sh).unwrap_err();
+        assert!(err.contains("never shared"), "{err}");
+        // _shared itself renders no identity line
+        let (eff, _) = effective_for(SHARED_MEMBER, None, &sh);
+        assert!(!eff.env.contains_key("HESTIA_PLUGIN_ID"));
+    }
+
+    #[test]
     fn the_shared_set_is_inherited_and_wins_and_names_itself() {
         let mut sh_env = BTreeMap::new();
         sh_env.insert("HESTIA_HOME".to_string(), "/h".to_string());
@@ -548,8 +626,13 @@ mod tests {
         // plain render when there is no shared set
         let (with, _) = render_effective("claude-code", Some(&shared), &cfg());
         assert!(with.contains("# shared: HESTIA_HOME HESTIA_WORKSPACE\n"), "{with}");
+        // With no shared set the render is the plain render of the seat's own config PLUS the
+        // one derived line: identity comes from the document's name, never from the header.
         let (without, _) = render_effective("claude-code", None, &cfg());
-        assert_eq!(without, render("claude-code", &cfg()));
+        let (eff, _) = effective_for("claude-code", None, &cfg());
+        assert_eq!(without, render("claude-code", &eff));
+        assert!(without.contains("HESTIA_PLUGIN_ID=claude-code\n"), "{without}");
+        assert!(!without.contains("# shared:"), "no shared header without a shared set: {without}");
         // _shared is never a member of the check domain
         assert!(is_shared(SHARED_MEMBER));
     }
