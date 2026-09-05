@@ -21484,9 +21484,11 @@ async fn tool_scope_arbitrate(state: &SharedState, args: &Value) -> ToolResult {
             "hestia.scope_arbitrate_undelegated",
             "you hold no live operator delegation covering this path for this member, so this \
              ruling would be an assertion of authority rather than an exercise of one. The \
-             operator grants it with `hestia delegate grant <your-lct> --action \
-             'scope.decide:<abs-prefix>[@<member>]' --expires <h>`. Default posture is \
-             unchanged and fail-closed: with no delegation, scope rulings are operator-only",
+             operator grants it with `hestia delegate grant <your-agent-id> --action \
+             'scope.decide[:<member>]:/abs/prefix' --expires <h>` (`required_action` below is \
+             the exact string; `hestia delegate agent-id <seat>` prints the id). Default \
+             posture is unchanged and fail-closed: with no delegation, scope rulings are \
+             operator-only",
             Some(json!({
                 "arbiter": arb.plugin_id,
                 "arbiter_lct": arbiter_lct_id,
