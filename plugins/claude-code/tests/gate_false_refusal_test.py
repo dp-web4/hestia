@@ -263,6 +263,16 @@ _SURVIVE = [
     ("for_loop_sed_in_place",
      "for f in a b; do sed -i s/a/b/ {g}; done", "for f in a b; do sed -n 1p {g}; done",
      "the sed grammar must still decide INSIDE a loop"),
+    ("sed_program_from_shell_expansion",
+     'for r in 1-3; do sed -n "${{r}}p" {g}; done', 'for f in {g}; do sed -n 1p "$f"; done',
+     "escalation c83eccb2dc985f8a (2026-09-05): withdrawn as a #440 loop false positive, "
+     "corrected by codex's cross-vendor factor and replicated on this seat against both the "
+     "tree and the installed hook. The loop is not the discriminator and neither is the "
+     "expansion as such — the control expands the FILE and permits. The PROGRAM is: `${r}` "
+     "may expand to `1w <path>`, so a sed program the grammar cannot read is one that may "
+     "write, and refusing it is the conservative arm of the per-head grammar, not #440. "
+     "A future resolver that reads `r` off a literal `for` list would move this row to "
+     "_FALSE_REFUSALS; until then the refusal is by design and must survive"),
     ("done_with_output_redirect",
      "for x in a; do cat $x; done > /tmp/fp12_out", "for x in a; do cat $x; done",
      "the redirect branch consumes `>` upstream of every head check — refused for free"),
