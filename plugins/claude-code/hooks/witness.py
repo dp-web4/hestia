@@ -57,12 +57,77 @@ PROTOCOL_VERSION = "2024-11-05"
 TIMEOUT_S = float(os.environ.get("HESTIA_WITNESS_TIMEOUT_S") or "2.0")
 HOOK_VERSION = "0.0.4"
 
+DEFAULT_ENDPOINT = "http://127.0.0.1:7711/mcp"
+
+
+# ---------------------------------------------------------------------------
+# THE PROJECTION IS THE ONLY SOURCE OF THIS SEAT'S CONFIGURATION (PRD_CONFIG_FROM_VAULT; #944)
+# ---------------------------------------------------------------------------
+# One bootstrap locator, launcher-supplied, no default: HESTIA_HOME. Everything else this hook
+# needs — the workspace it polices, where the shared runtime is, the endpoint, its own state
+# dirs — comes from `$HESTIA_HOME/seats/<plugin_id>.env`, which the daemon renders from the
+# vault and checks against it. Every key the projection carries is exported over whatever the
+# launcher happened to set: the vault is the authority, a hook line is not. Two things are
+# deliberately NOT here. A fallback ("no locator, try ~/.hestia") is a second authority with
+# extra steps and is the pattern #943 was held for. And HESTIA_ROLE: role is launch context
+# (interactive vs mesh-worker), set by whoever launched the seat, never a config value.
+#
+# Loaded at IMPORT, because the shared runtime dir is resolved at import and must already be
+# the projection's. Import never fails: the outcome is recorded in `_PROJECTION_ERROR` and
+# run() returns on it, so a test can import this module and
+# a seat with no projection witnesses nothing (there is nothing authoritative to witness AS). This function is bootstrap wiring, not law: it decides
+# nothing about any tool call. It is byte-identical across seats by intent, like the loader.
+PROJECTION_DIR = "seats"
+
+
+def _load_projection(plugin_id):
+    """Export the seat's rendered projection into the environment. Returns None, or the
+    reason the seat is not configured — never raises."""
+    home = os.environ.get("HESTIA_HOME")
+    if not home:
+        return ("config.unbacked", "HESTIA_HOME is not set; the launcher must supply the "
+                "bootstrap locator (there is no default, by design)")
+    path = os.path.join(home, PROJECTION_DIR, plugin_id + ".env")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        return ("config.unbacked", f"no rendered projection for {plugin_id} at {path} ({e}); "
+                "populate this seat's config in the vault (Govern -> Runtime config)")
+    # Imported here, not at module scope: this function is byte-identical across seats, and
+    # a seat whose module happened not to import `re` raised at import instead of reporting
+    # its own absence (caught by the witness arm of projection_consumer_test).
+    import hashlib
+    import re
+    digest = hashlib.sha256(raw).hexdigest()
+    pairs = []
+    for ln in raw.decode("utf-8", "replace").split("\n"):
+        if not ln or ln.startswith("#") or "=" not in ln:
+            continue
+        k, v = ln.split("=", 1)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
+            return ("config.unbacked", f"projection {path} carries an unusable key {k!r}")
+        pairs.append((k, v))
+    projected = dict(pairs)
+    if "HESTIA_HOME" in projected and os.path.realpath(projected["HESTIA_HOME"]) != os.path.realpath(home):
+        return ("config.miswired", f"the launcher supplied HESTIA_HOME={home!r} but the vault "
+                f"projection says {projected['HESTIA_HOME']!r}; this seat is running against a "
+                "home the authority does not name")
+    for k, v in pairs:
+        if k == "HESTIA_ROLE":
+            continue   # launch context, never config
+        os.environ[k] = v
+    os.environ["HESTIA_PROJECTION_SHA256"] = digest
+    os.environ["HESTIA_PROJECTION_PATH"] = path
+    return None
+
+
+_PROJECTION_ERROR = _load_projection(PLUGIN_ID)
+
 STATE_DIR = Path(
     os.environ.get("HESTIA_STATE_DIR")
     or str(Path.home() / (".hestia-claude" if PLUGIN_ID == "claude-code" else f".hestia-{PLUGIN_ID}"))
 )
-DEFAULT_HESTIA_HOME = Path.home() / ".hestia"
-DEFAULT_ENDPOINT = "http://127.0.0.1:7711/mcp"
 
 
 def debug_log(msg: str) -> None:
@@ -81,8 +146,10 @@ def discover_endpoint() -> Optional[str]:
     env = os.environ.get("HESTIA_ENDPOINT")
     if env:
         return env
-    home = Path(os.environ.get("HESTIA_HOME", str(DEFAULT_HESTIA_HOME)))
-    endpoint_file = home / "endpoint"
+    home = os.environ.get("HESTIA_HOME")
+    if not home:
+        return None
+    endpoint_file = Path(home) / "endpoint"
     try:
         return endpoint_file.read_text().strip() or None
     except OSError:
@@ -387,6 +454,11 @@ def witness_one(client: "McpHttp", session_id: Optional[str], intent: dict) -> s
 
 
 def run() -> int:
+    if _PROJECTION_ERROR is not None:
+        # No projection, no authority to witness as. Logged, not scored: a missing config is
+        # infrastructure, not conduct, and the gate already refused the act.
+        debug_log(f"projection: {_PROJECTION_ERROR[0]}: {_PROJECTION_ERROR[1]}")
+        return 0
     raw = sys.stdin.read()
     if not raw.strip():
         return 0

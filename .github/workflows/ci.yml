@@ -381,9 +381,20 @@ jobs:
           # shared-law denominator grows for every seat, so all four measured
           # percentages fall. Pin the exact post-move values in the same PR: a
           # lower number left only in the PR prose is not a ratchet.
+          #
+          # claude-code 28.8 -> 28.9 (#944, the projection consumer). The seat now
+          # refuses before stdin when its vault-rendered config is missing or names a
+          # different home than the launcher supplied. That refusal is LAW, and it is
+          # per-seat only because each shim owns its own `main` -- SHIM_LEDGER's `main`
+          # row carries it as debt with #934's decide() as the retirement path. The
+          # explanatory comment was kept OUT of the function (the #950/#951 lesson),
+          # which is why this is +0.1 and not +0.2. Adjudicated, not absorbed: the
+          # alternative was to route the refusal through deny_no_verdict, whose
+          # remedies are about daemon reachability, and tell the operator to retry a
+          # daemon that is fine.
           python3 tools/gate_collapse_meter.py \
             --max-divergent-forked 0 --max-verbatim-forked 0 \
-            --max-seat-pct claude-code=28.8 --max-seat-pct codex=20.6 \
+            --max-seat-pct claude-code=28.9 --max-seat-pct codex=20.6 \
             --max-seat-pct gemini=10.3 --max-seat-pct kimi=16.8
 
       - name: Do the forked predicates actually disagree with the engine?
