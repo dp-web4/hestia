@@ -324,6 +324,7 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
         endpoint = _discover_endpoint()
         if endpoint is None:
             return _no_verdict(plugin_id, tool_name, "refused", "no daemon endpoint discovered")
+        _leg_t0 = time.monotonic()
         deadline = time.monotonic() + (TOTAL_BUDGET_MS / 1000.0)
         target = _extract_target(tool_input, tool_name)
         client = _McpHttp(endpoint, deadline)
@@ -377,6 +378,10 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
             return _no_verdict(plugin_id, tool_name, "unknown",
                                "daemon returned a malformed or unrecognized decision")
         verdict.action_id = action_id  # correlation key for the caller's outcome cache
+        # Recorded here and not before `_interpret`: this is the leg that actually reached a
+        # decision, which is the only latency the budget is sized to accommodate. A leg that
+        # ended in `_no_verdict` is already in the unavailability log.
+        _record_leg_latency(plugin_id, "society-safety", _leg_t0)
         return verdict
     except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
         reason = getattr(e, "reason", None)
@@ -623,6 +628,22 @@ def _snapshot_unavailable(plugin_id: str, cause: str) -> None:
         pass
 
 
+def _record_leg_latency(plugin_id: str, leg: str, t0: float) -> None:
+    """The SUCCESS-path counterpart of `_snapshot_unavailable` (never raises).
+
+    That function exists because every failure used to collapse to a causeless None.
+    This one exists because every SUCCESS still collapses to no record at all, and the
+    two numbers §17 of the bypass catalogue sizes against each other -- the budget and
+    the harness deadline -- can only be sized from the distribution of successes. A log
+    of nothing but timeouts can only ever argue upward; see `record_gate_latency`."""
+    try:
+        from hestia_gate_core import record_gate_latency  # type: ignore
+        record_gate_latency(plugin_id, leg, (time.monotonic() - t0) * 1000.0,
+                            budget_ms=TOTAL_BUDGET_MS, home=str(DEFAULT_HESTIA_HOME))
+    except Exception:
+        pass
+
+
 def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
                                     host_session_id: Optional[str]) -> Optional[dict]:
     try:
@@ -630,6 +651,7 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
         if endpoint is None:
             _snapshot_unavailable(plugin_id, "no-endpoint")
             return None
+        _leg_t0 = time.monotonic()
         deadline = time.monotonic() + (TOTAL_BUDGET_MS / 1000.0)
         client = _McpHttp(endpoint, deadline)
         if "result" not in client.initialize():
@@ -765,6 +787,7 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             floor_digest = scope.get("society_floor_digest")
             if isinstance(floor_digest, str) and len(floor_digest) == 64:
                 snap["society_floor_digest"] = floor_digest
+        _record_leg_latency(plugin_id, "policy-snapshot", _leg_t0)
         return snap
     except Exception as e:  # noqa: BLE001 — any failure is "unreachable"; the caller degrades
         _snapshot_unavailable(
