@@ -244,24 +244,39 @@ pub fn parse_role(s: &str) -> Result<SocietyRole> {
     }
 }
 
-/// The delegator every delegation on this box is signed by: the vault's own identity key
-/// (`ai_identity_secret`), the same key `hub join` and `profile push` sign with. Before #952
-/// `delegate grant` signed with `KeyPair::generate()` and named a random UUID as delegator,
-/// so every record claimed a provenance it did not have. The delegator id is the UUIDv5 of
-/// the key's derived LCT id, so a reader can recompute who signed from the key alone.
-pub fn vault_delegator(vault: &crate::vault::Vault) -> Result<(Uuid, KeyPair)> {
-    let secret_hex = vault
-        .get("ai_identity_secret")
-        .map(|e| e.secret.clone())
-        .ok_or_else(|| anyhow::anyhow!(
-            "no identity key in the vault (ai_identity_secret) — run `hestia init --ai`; a \
-             delegation must be signed by the operator's own key, not a throwaway"
-        ))?;
-    let bytes = hex::decode(secret_hex.trim()).context("ai_identity_secret is not hex")?;
+/// The delegator every delegation on this box is signed by: THE OPERATOR'S OWN KEY.
+///
+/// Preferred source is `<home>/operator.key` — the Ed25519 key the dashboard sign-in and the
+/// challenge-signed HTTP wall already treat as the operator (`state.rs` writes it 0600 at
+/// init). That is the identity an "operator delegation" is a delegation FROM, so it is the
+/// key that should sign one. Fallback is the vault's `ai_identity_secret` for a box that has
+/// an identity key but no operator key. Before #952 `delegate grant` signed with
+/// `KeyPair::generate()` and named a random UUID, so every record claimed a provenance it
+/// did not have. The delegator id is the UUIDv5 of the signing key's derived LCT id, so a
+/// reader can recompute who signed from the key alone.
+pub fn operator_delegator(vault: &crate::vault::Vault, home: &std::path::Path) -> Result<(Uuid, KeyPair)> {
+    let secret_hex: String = match std::fs::read_to_string(home.join("operator.key")) {
+        Ok(text) => {
+            let v: serde_json::Value = serde_json::from_str(&text).context("operator.key is not JSON")?;
+            v.get("secret_key_hex")
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("operator.key has no secret_key_hex"))?
+        }
+        Err(_) => vault
+            .get("ai_identity_secret")
+            .map(|e| e.secret.clone())
+            .ok_or_else(|| anyhow::anyhow!(
+                "no operator key on this box (neither <home>/operator.key nor the vault's \
+                 ai_identity_secret) — a delegation must be signed by the operator's own key, \
+                 not a throwaway"
+            ))?,
+    };
+    let bytes = hex::decode(secret_hex.trim()).context("operator key is not hex")?;
     let arr: [u8; 32] = bytes
         .as_slice()
         .try_into()
-        .map_err(|_| anyhow::anyhow!("ai_identity_secret is not 32 bytes"))?;
+        .map_err(|_| anyhow::anyhow!("operator key is not 32 bytes"))?;
     let kp = KeyPair::from_secret_bytes(&arr);
     let lct_id = web4_core::derive_lct_id(&kp.verifying_key());
     Ok((agent_key_for_lct(&lct_id), kp))
