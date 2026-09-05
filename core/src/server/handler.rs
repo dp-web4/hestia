@@ -333,7 +333,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t_args(
             "hestia_scope_arbitrate",
-            "Rule on ANOTHER member's pending SCOPE request under an operator delegation (#952) — the AI-to-AI path for the routine case where a being asks for reach inside its own home and the operator is not at a keyboard. FOUR THINGS MUST HOLD or you are refused by name: (0) the ruling is signed by your seat's registry key (`hestia scope arbitrate` signs it from the vault) — a session's plugin_id is asserted, not proven, and this is the only MCP door that mints a durable grant; (1) you pass your own live session_id, because a delegation is keyed to a seat identity and there is nothing to check an asserted name against; (2) you are NOT the asking member — a different session on the SAME machine is the intended path, the independence that matters is asker-versus-arbiter, never machine-versus-machine; (3) an operator delegation covers this path AND this member (`hestia delegate grant <agent-id> --action 'scope.decide:/abs/prefix@member'`). An unrestricted or role-only delegation confers NOTHING here: no delegator before this existed could have meant it. A delegated GRANT is always STANDING — a delegate cannot mint the memory-only kind that dies on the next restart, which is the whole point. Revoking, and any grant outside a delegated prefix, stay operator-only. The decision lands in the SAME fields the operator door writes, so the asking member sees it on its next hestia_scope_status; `granted_by` reads `delegate:<seat>` and the record names the delegation id",
+            "Rule on ANOTHER member's pending SCOPE request under an operator delegation (#952) — the AI-to-AI path for the routine case where a being asks for reach inside its own home and the operator is not at a keyboard. FOUR THINGS MUST HOLD or you are refused by name: (0) the ruling is signed by your seat's registry key (`hestia scope arbitrate` signs it from the vault) — a session's plugin_id is asserted, not proven, and this is the only MCP door that mints a durable grant; (1) you pass your own live session_id, because a delegation is keyed to a seat identity and there is nothing to check an asserted name against; (2) you are NOT the asking member — a different session on the SAME machine is the intended path, the independence that matters is asker-versus-arbiter, never machine-versus-machine; (3) an operator delegation covers this path AND this member (`hestia delegate grant <agent-id> --action 'scope.decide:<member>:/abs/prefix'`). An unrestricted or role-only delegation confers NOTHING here: no delegator before this existed could have meant it. A delegated GRANT is always STANDING — a delegate cannot mint the memory-only kind that dies on the next restart, which is the whole point. Revoking, and any grant outside a delegated prefix, stay operator-only. The decision lands in the SAME fields the operator door writes, so the asking member sees it on its next hestia_scope_status; `granted_by` reads `delegate:<seat>` and the record names the delegation id",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -21427,10 +21427,34 @@ async fn tool_scope_arbitrate(state: &SharedState, args: &Value) -> ToolResult {
                 "delegation_agent_key": arbiter_key.to_string(),
                 "path": req.path,
                 "member": req.plugin_id,
-                "required_action": format!("scope.decide:{}", req.path),
+                "required_action": format!("scope.decide:{}:{}", req.plugin_id, req.path),
             })),
         ));
     };
+    // The delegation itself must be SIGNED by this box's operator identity key. A record
+    // in the store that this key did not sign — planted, copied from another box, or minted
+    // by the pre-#952 CLI with a throwaway key — confers nothing. This is what makes the
+    // store's contents evidence rather than a list anyone with vault access could pad.
+    match crate::delegation::vault_delegator(&s.vault) {
+        Ok((_, kp)) if deleg.verify(&kp.verifying_key()).is_ok() => {}
+        Ok(_) => {
+            return Ok(hestia_error_envelope(
+                "hestia.scope_arbitrate_delegation_unverified",
+                "the delegation covering this path is not signed by this box's operator identity \
+                 key, so it is not this operator's grant of authority — re-mint it with `hestia \
+                 delegate grant` on this box (pre-#952 delegations were signed with a throwaway key \
+                 and must be re-minted)",
+                Some(json!({ "delegation_id": deleg.id.to_string() })),
+            ));
+        }
+        Err(e) => {
+            return Ok(hestia_error_envelope(
+                "hestia.scope_arbitrate_no_operator_key",
+                &format!("cannot load the operator identity key to verify the delegation: {e}"),
+                None,
+            ));
+        }
+    }
     let delegation_id = deleg.id.to_string();
 
     let (member, path, ask) = (req.plugin_id.clone(), req.path.clone(), req.reason.clone());

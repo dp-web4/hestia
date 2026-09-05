@@ -175,9 +175,16 @@ pub fn arbitration_message(request_id: &str, granted: bool, reason: &str) -> Str
 /// Forms, narrowest last:
 /// * `scope.decide` — every path, every member. An operator can still say this deliberately.
 /// * `scope.decide:/abs/prefix` — that subtree, any member.
-/// * `scope.decide:/abs/prefix@member` — that subtree AND only that member's requests.
+/// * `scope.decide:<member>:/abs/prefix` — that subtree AND only that member's requests.
 ///
-/// The `@member` form exists because a prefix alone is sufficient for a being's own home but
+/// The member comes BEFORE the path, and the path is always absolute. That ordering is what
+/// makes the grammar unambiguous: an earlier draft put the member after the path as
+/// `…:/abs/prefix@member`, and `@` is legal in a path (`/home/dp/mail@archive` parsed as
+/// prefix `/home/dp/mail`, member `archive`). Caught by the mesh session on #952 before any
+/// such delegation existed. With the member first, the first `:` after the action name
+/// starts either a member (no leading `/`) or a path (leading `/`), and nothing else can.
+///
+/// The member form exists because a prefix alone is sufficient for a being's own home but
 /// NOT for a shared path (sprout-claude, #952): delegating `scope.decide:/…/shared-context`
 /// without it would let the holder rule that path for any member that asks.
 pub const ACTION_SCOPE_DECIDE: &str = "scope.decide";
@@ -191,32 +198,35 @@ pub const ACTION_SCOPE_DECIDE: &str = "scope.decide";
 /// the two do not necessarily share a mount, so this must not resolve symlinks it cannot see.
 pub fn action_covers(action: &str, path: &str, member: &str) -> bool {
     let path = path.trim_end_matches('/');
-    let (head, bound_member) = match action.split_once('@') {
-        Some((h, m)) => (h, Some(m.trim())),
-        None => (action, None),
+    let Some((name, rest)) = action.split_once(':') else {
+        return action == ACTION_SCOPE_DECIDE;
+    };
+    if name != ACTION_SCOPE_DECIDE {
+        return false;
+    }
+    // `rest` is either `/abs/prefix` or `<member>:/abs/prefix`. A member never starts with
+    // `/` and never contains `:` (it is a plugin id), so the split is exact.
+    let (bound_member, prefix) = if rest.starts_with('/') {
+        (None, rest)
+    } else {
+        match rest.split_once(':') {
+            Some((m, p)) => (Some(m.trim()), p),
+            None => return false, // `scope.decide:legion-being` with no path binds nothing
+        }
     };
     if let Some(m) = bound_member {
         if m.is_empty() || m != member {
             return false;
         }
     }
-    match head.split_once(':') {
-        None => head == ACTION_SCOPE_DECIDE,
-        Some((name, prefix)) => {
-            if name != ACTION_SCOPE_DECIDE {
-                return false;
-            }
-            let prefix = prefix.trim().trim_end_matches('/');
-            // An empty or relative prefix authorises nothing: `scope.decide:` would otherwise
-            // read as unbounded, which is the opposite of what typing a bound means.
-            if prefix.is_empty() || !prefix.starts_with('/') {
-                return false;
-            }
-            path == prefix || path.starts_with(&format!("{prefix}/"))
-        }
+    let prefix = prefix.trim().trim_end_matches('/');
+    // An empty or relative prefix authorises nothing: `scope.decide:` would otherwise read
+    // as unbounded, which is the opposite of what typing a bound means.
+    if prefix.is_empty() || !prefix.starts_with('/') {
+        return false;
     }
+    path == prefix || path.starts_with(&format!("{prefix}/"))
 }
-
 
 /// Parse a role name string into a SocietyRole.
 pub fn parse_role(s: &str) -> Result<SocietyRole> {
@@ -232,6 +242,29 @@ pub fn parse_role(s: &str) -> Result<SocietyRole> {
         "auditor" => Ok(SocietyRole::Auditor),
         other => Ok(SocietyRole::Custom(other.to_string())),
     }
+}
+
+/// The delegator every delegation on this box is signed by: the vault's own identity key
+/// (`ai_identity_secret`), the same key `hub join` and `profile push` sign with. Before #952
+/// `delegate grant` signed with `KeyPair::generate()` and named a random UUID as delegator,
+/// so every record claimed a provenance it did not have. The delegator id is the UUIDv5 of
+/// the key's derived LCT id, so a reader can recompute who signed from the key alone.
+pub fn vault_delegator(vault: &crate::vault::Vault) -> Result<(Uuid, KeyPair)> {
+    let secret_hex = vault
+        .get("ai_identity_secret")
+        .map(|e| e.secret.clone())
+        .ok_or_else(|| anyhow::anyhow!(
+            "no identity key in the vault (ai_identity_secret) — run `hestia init --ai`; a \
+             delegation must be signed by the operator's own key, not a throwaway"
+        ))?;
+    let bytes = hex::decode(secret_hex.trim()).context("ai_identity_secret is not hex")?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("ai_identity_secret is not 32 bytes"))?;
+    let kp = KeyPair::from_secret_bytes(&arr);
+    let lct_id = web4_core::derive_lct_id(&kp.verifying_key());
+    Ok((agent_key_for_lct(&lct_id), kp))
 }
 
 #[cfg(test)]
@@ -271,7 +304,7 @@ mod tests {
     /// `@member` form ANDs the two.
     #[test]
     fn member_bound_action_only_covers_that_member() {
-        let a = "scope.decide:/home/dp/ws/shared-context@legion-being";
+        let a = "scope.decide:legion-being:/home/dp/ws/shared-context";
         assert!(action_covers(a, "/home/dp/ws/shared-context/forum", "legion-being"));
         assert!(!action_covers(a, "/home/dp/ws/shared-context/forum", "sprout-being"));
         assert!(!action_covers(a, "/home/dp/ws/other", "legion-being"));
@@ -282,7 +315,11 @@ mod tests {
         assert!(action_covers("scope.decide", "/anything/at/all", "m"));
         assert!(!action_covers("scope.decide:", "/anything", "m"));
         assert!(!action_covers("scope.decide:relative/path", "/relative/path", "m"));
-        assert!(!action_covers("scope.decide:/a@", "/a", "m"));
+        assert!(!action_covers("scope.decide:legion-being", "/a", "m")); // member, no path
+        assert!(!action_covers("scope.decide::/a", "/a", "m"));          // empty member
+        // `@` is legal in a path and must never be read as a member separator
+        assert!(action_covers("scope.decide:/home/dp/mail@archive", "/home/dp/mail@archive/x", "m"));
+        assert!(!action_covers("scope.decide:/home/dp/mail@archive", "/home/dp/mail", "m"));
         assert!(!action_covers("witness.attest:/a", "/a", "m"));
     }
 
