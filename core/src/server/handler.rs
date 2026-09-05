@@ -21402,7 +21402,20 @@ async fn tool_scope_arbitrate(state: &SharedState, args: &Value) -> ToolResult {
             ));
         }
     }
-    let store = match crate::delegation::DelegationStore::load(&s.vault) {
+    // Read the delegation store FRESH from disk: a delegation the operator minted after the
+    // daemon started is otherwise invisible until a restart, and a restart destroys the very
+    // pending request it was minted to answer (measured 2026-09-05).
+    let fresh_vault = match s.vault.reopen() {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(hestia_error_envelope(
+                "hestia.delegation_store_unreadable",
+                &format!("cannot re-read the vault from disk, so no authority can be proven: {e}"),
+                None,
+            ));
+        }
+    };
+    let store = match crate::delegation::DelegationStore::load(&fresh_vault) {
         Ok(st) => st,
         Err(e) => {
             return Ok(hestia_error_envelope(
