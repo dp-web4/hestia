@@ -32,7 +32,13 @@ use crate::vault::Vault;
 
 /// Build the shared server state from an unlocked Vault. Opens the
 /// SQLite witness chain and the file-backed trust store rooted at `home`.
-pub fn build_state(vault: Vault, home: &Path, passphrase: &str) -> Result<SharedState> {
+///
+/// The daemon is the normal long-lived vault writer, so it takes the stable
+/// writer lease before any startup path can mint or persist authority. The
+/// lease lives inside `Vault`, which lives inside `ServerState`, and therefore
+/// remains held for the daemon lifetime. A break-glass writer cannot race it.
+pub fn build_state(mut vault: Vault, home: &Path, passphrase: &str) -> Result<SharedState> {
+    vault.hold_writer_lease()?;
     let state = ServerState::open(vault, home, passphrase)?;
 
     // `public-identity.json` is a convenience projection for the LOCKED tier,

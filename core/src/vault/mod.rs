@@ -30,6 +30,10 @@ pub struct Vault {
     path: PathBuf,
     passphrase: String,
     data: VaultData,
+    /// Long-lived exclusive writer lease when this Vault is the daemon or an explicit
+    /// break-glass writer. Read-only Vault opens do not acquire it. Ordinary short-lived
+    /// writers acquire the same lease around each save in `storage::save_if_current`.
+    writer_lease: Option<storage::WriterLease>,
 }
 
 impl Vault {
@@ -40,6 +44,7 @@ impl Vault {
             path,
             passphrase,
             data,
+            writer_lease: None,
         })
     }
 
@@ -59,7 +64,25 @@ impl Vault {
             path,
             passphrase,
             data,
+            writer_lease: None,
         })
+    }
+
+    /// Hold the stable exclusive writer lease until this Vault is dropped.
+    ///
+    /// The daemon calls this before building mutable server state; the offline break-glass
+    /// writer calls it before touching authority. Calling it twice is idempotent. A competing
+    /// process receives `VaultWriterBusy` rather than relying on a ceremonial "offline" flag.
+    pub fn hold_writer_lease(&mut self) -> Result<()> {
+        if self.writer_lease.is_none() {
+            self.writer_lease = Some(storage::acquire_writer_lease(&self.path)?);
+        }
+        Ok(())
+    }
+
+    /// Current persisted-authority generation as loaded/last saved by this snapshot.
+    pub fn generation(&self) -> u64 {
+        self.data.generation
     }
 
     /// Number of entries
@@ -115,8 +138,14 @@ impl Vault {
         Ok(removed)
     }
 
-    fn save(&self) -> Result<()> {
-        storage::save(&self.path, &self.passphrase, &self.data)
+    fn save(&mut self) -> Result<()> {
+        let next_generation = if self.writer_lease.is_some() {
+            storage::save_if_current_locked(&self.path, &self.passphrase, &self.data)?
+        } else {
+            storage::save_if_current(&self.path, &self.passphrase, &self.data)?
+        };
+        self.data.generation = next_generation;
+        Ok(())
     }
 
     pub fn path(&self) -> &std::path::Path {
@@ -340,8 +369,8 @@ impl Vault {
     // ---- Recursion: a sub-vault is a sealed document whose plaintext is itself
     // a whole `VaultData`, opened with its own credential. ----
 
-    /// Store a nested vault, sealed under its own `credential`. The sub-vault's
-    /// contents are invisible (and unreadable) under the outer unlock alone.
+    /// Store a nested vault, sealed under its own `credential`.
+    /// The sub-vault's contents are invisible (and unreadable) under the outer unlock alone.
     pub fn put_subvault(
         &mut self,
         namespace: &str,
@@ -449,6 +478,7 @@ mod tests {
         let _v = Vault::init(path.clone(), "passphrase".into()).unwrap();
         let v2 = Vault::open(path, "passphrase".into()).unwrap();
         assert_eq!(v2.len(), 0);
+        assert_eq!(v2.generation(), 0);
     }
 
     #[test]
@@ -457,6 +487,59 @@ mod tests {
         Vault::init(path.clone(), "p".into()).unwrap();
         let result = Vault::init(path, "p".into());
         assert!(matches!(result, Err(CoreError::VaultAlreadyExists(_))));
+    }
+
+    #[test]
+    fn writer_lease_excludes_a_competing_writer_and_releases_on_drop() {
+        let (_dir, path) = temp_path();
+        let mut daemon = Vault::init(path.clone(), "p".into()).unwrap();
+        daemon.hold_writer_lease().unwrap();
+
+        let mut rescue = Vault::open(path.clone(), "p".into()).unwrap();
+        assert!(matches!(
+            rescue.hold_writer_lease(),
+            Err(CoreError::VaultWriterBusy(_))
+        ));
+
+        drop(daemon);
+        rescue.hold_writer_lease().unwrap();
+        rescue
+            .put_document("seat-config", "claude-code", b"repaired".to_vec())
+            .unwrap();
+        assert_eq!(rescue.generation(), 1);
+    }
+
+    #[test]
+    fn stale_snapshot_cannot_overwrite_newer_authority_after_lease_release() {
+        let (_dir, path) = temp_path();
+        let mut stale = Vault::init(path.clone(), "p".into()).unwrap();
+        let mut writer = Vault::open(path.clone(), "p".into()).unwrap();
+        writer.hold_writer_lease().unwrap();
+        writer
+            .put_document("seat-config", "claude-code", b"new".to_vec())
+            .unwrap();
+        assert_eq!(writer.generation(), 1);
+        drop(writer);
+
+        let err = stale
+            .put_document("seat-config", "codex", b"stale".to_vec())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::VaultGenerationConflict {
+                expected: 0,
+                actual: 1,
+                ..
+            }
+        ));
+
+        let reopened = Vault::open(path, "p".into()).unwrap();
+        assert_eq!(reopened.generation(), 1);
+        assert_eq!(
+            reopened.get_document("seat-config", "claude-code").unwrap(),
+            b"new"
+        );
+        assert!(reopened.get_document("seat-config", "codex").is_none());
     }
 
     #[test]
