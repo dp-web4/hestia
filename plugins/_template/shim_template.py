@@ -18,6 +18,7 @@ CERTIFICATION_CRITERIA = "PRD_SHIM_CERTIFICATION.md@2026-09-04"
 REQUIRED_GATE_API = "decide/1"
 
 PERMITTED_FUNCTIONS = (
+    "_load_projection",
     "_authority_dir",
     "_load_gate",
     "_emergency_block",
@@ -27,6 +28,7 @@ PERMITTED_FUNCTIONS = (
     "main",
 )
 BYTE_IDENTICAL_FUNCTIONS = (
+    "_load_projection",
     "_authority_dir",
     "_load_gate",
     "_emergency_block",
@@ -39,9 +41,58 @@ PERMITTED_PROFILE_KEYS = {
 }
 
 
+# 0. CONFIGURATION BOOTSTRAP. Copy byte-for-byte.
+# The projection `$HESTIA_HOME/seats/<member>` is this seat's ONLY configuration source
+# (PRD_CONFIG_FROM_VAULT; #944). HESTIA_HOME is the one launcher-supplied locator and has no
+# default anywhere. Every projected key is exported over the launcher's environment except
+# HESTIA_ROLE, which is launch context and never config. Import never fails; `main` refuses
+# on the recorded outcome before it reads the harness event.
+def _load_projection(member: str):
+    home = os.environ.get("HESTIA_HOME")
+    if not home:
+        return ("config.unbacked", "HESTIA_HOME is not set; the launcher must supply the "
+                "bootstrap locator (there is no default, by design)")
+    path = os.path.join(home, "seats", member + ".env")
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        return ("config.unbacked", f"no rendered projection for {member} at {path} ({exc}); "
+                "populate this seat's config in the vault (Govern -> Runtime config)")
+    import hashlib
+    import re as _re
+    pairs = []
+    for line in raw.decode("utf-8", "replace").split("\n"):
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if not _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            return ("config.unbacked", f"projection {path} carries an unusable key {key!r}")
+        pairs.append((key, value))
+    projected = dict(pairs)
+    if "HESTIA_HOME" in projected and os.path.realpath(projected["HESTIA_HOME"]) != os.path.realpath(home):
+        return ("config.miswired", f"the launcher supplied HESTIA_HOME={home!r} but the vault "
+                f"projection says {projected['HESTIA_HOME']!r}; this seat is running against a "
+                "home the authority does not name")
+    for key, value in pairs:
+        if key == "HESTIA_ROLE":
+            continue
+        os.environ[key] = value
+    os.environ["HESTIA_PROJECTION_SHA256"] = hashlib.sha256(raw).hexdigest()
+    os.environ["HESTIA_PROJECTION_PATH"] = path
+    return None
+
+
+MEMBER_ID = "<seat>"
+_PROJECTION_ERROR = _load_projection(MEMBER_ID)
+
+
 # 1. AUTHORITY BOOTSTRAP. Copy byte-for-byte.
 def _authority_dir() -> str:
-    return os.path.realpath(os.path.expanduser("~/.hestia/shared"))
+    home = os.environ.get("HESTIA_HOME")
+    if not home:
+        raise ImportError("HESTIA_HOME is not set; no shared authority can be located")
+    return os.path.realpath(os.path.join(home, "shared"))
 
 
 def _load_gate():
@@ -90,37 +141,40 @@ def _load_gate():
     return module
 
 
-def _emergency_block(reason: str) -> int:
-    try:
-        import time
-        row = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "seat": PROFILE.get("member_id", "unknown"),
-            "decision": "deny",
-            "rule": "gate.bootstrap_unavailable",
-            "verdict_available": False,
-            "detail": str(reason)[:400],
-        }
-        home = os.path.expanduser("~/.hestia")
-        path = os.path.join(home, "telemetry", "gate-unavailable.jsonl")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row, sort_keys=True) + "\n")
-    except BaseException:
-        pass
-    sys.stderr.write("hestia: deny [gate.bootstrap_unavailable] - " + reason + "\n")
+def _emergency_block(reason: str, rule: str = "gate.bootstrap_unavailable") -> int:
+    home = os.environ.get("HESTIA_HOME")
+    if home:
+        try:
+            import time
+            row = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "seat": PROFILE.get("member_id", "unknown"),
+                "decision": "deny",
+                "rule": rule,
+                "verdict_available": False,
+                "detail": str(reason)[:400],
+            }
+            path = os.path.join(home, "telemetry", "gate-unavailable.jsonl")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, sort_keys=True) + "\n")
+        except BaseException:
+            pass
+    sys.stderr.write("hestia: deny [" + rule + "] - " + reason + "\n")
     return 2
 
 
-# 2. PROFILE DATA. Replace values, never add policy.
+# 2. PROFILE DATA. Replace values, never add policy. Every path is READ from the projected
+# environment (`os.environ.get("<KEY>")`, no default): the vault authored it, the launcher
+# supplied only the locator, and a default here would be the #943 class.
 PROFILE = {
     "member_id": "<seat>",
-    "identity_path": "<absolute-or-expanded identity path>",
-    "home_markers": ("<harness-home>",),
+    "identity_path": os.environ.get("HESTIA_<SEAT>_IDENTITY"),
+    "home_markers": (os.environ.get("HESTIA_HARNESS_HOME"),),
     "host_agent": "<seat>",
     "client_name": "hestia-<seat>-gate",
     "gate_path": os.path.abspath(__file__),
-    "observe_dir": "<observe-dir>",
+    "observe_dir": os.environ.get("HESTIA_OBSERVE_DIR"),
 }
 
 
@@ -139,6 +193,8 @@ def read_harness_event():
 
 # 4. MAIN. Copy byte-for-byte.
 def main() -> int:
+    if _PROJECTION_ERROR is not None:
+        return _emergency_block(_PROJECTION_ERROR[1], rule=_PROJECTION_ERROR[0])
     try:
         gate = _load_gate()
     except BaseException as exc:
