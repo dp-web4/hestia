@@ -159,7 +159,12 @@ export interface SeatConfigVerdict {
 export interface SeatConfigSummary {
   member: string;
   configured: boolean;
+  /** This seat's OWN keys. */
   keys: string[];
+  /** Keys inherited from the shared set (`_shared`); shared wins on a collision. */
+  inherited?: string[];
+  /** Own keys that restate a shared key — reported, never silently resolved. */
+  shadowed?: string[];
   note: string;
   artifact: string;
   expected_sha256?: string;
@@ -168,6 +173,8 @@ export interface SeatConfigSummary {
 }
 
 export interface SeatConfigList {
+  /** The shared set: society facts every seat inherits. Keys only. */
+  shared?: { configured: boolean; keys: string[]; note?: string; error?: string };
   seats: SeatConfigSummary[];
   render_dir: string;
 }
@@ -176,6 +183,8 @@ export interface SeatConfigList {
 export interface SeatConfigInspect {
   member: string;
   config: { env: Record<string, string>; note: string };
+  /** shared ∪ own, as the seat renders it. */
+  effective?: Record<string, string>;
   summary: SeatConfigSummary;
 }
 

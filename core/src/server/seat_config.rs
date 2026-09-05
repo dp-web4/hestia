@@ -182,6 +182,123 @@ impl SeatConfig {
     }
 }
 
+/// THE SHARED SET (dp, 2026-09-05: "we need a SHARED set, and only genuinely per-harness vars
+/// belong in individual configs. that's the whole part about a common gate").
+///
+/// One reserved document in the same namespace, written and read through the same operator
+/// API. Every seat's projection is `shared ∪ own`, and SHARED WINS: the society's facts — where
+/// home is, which workspace is governed, where the common runtime and the endpoint are — are
+/// not a seat's to restate. A seat document that repeats a shared key is refused at the write
+/// door (`keys_owned_by_shared`), and a collision that already exists is reported as
+/// `shadowed` rather than silently resolved either way. Per-seat law was the defect the common
+/// gate ended; per-seat config of common facts is the same defect one layer down.
+///
+/// `_shared` is never a member: it renders no artifact of its own, is excluded from the check
+/// domain, and cannot be a seat's plugin_id.
+pub const SHARED_MEMBER: &str = "_shared";
+
+pub fn is_shared(member: &str) -> bool {
+    member == SHARED_MEMBER
+}
+
+/// The shared document as the vault holds it. `None` when no shared set has been written yet
+/// (every seat renders its own document alone); `Some(Err)` when the vault declares one that
+/// cannot be used — which makes EVERY seat's projection unbacked, because a projection built on
+/// an unusable authority is not a projection.
+pub fn load_shared(vault: &crate::vault::Vault) -> Option<Result<SeatConfig, String>> {
+    vault.get_document(SEAT_CONFIG_NS, SHARED_MEMBER).map(|bytes| {
+        serde_json::from_slice::<SeatConfig>(bytes)
+            .map_err(|e| format!("shared config does not decode as seat config: {e}"))
+            .and_then(|c| c.validate().map(|_| c))
+    })
+}
+
+/// The projection a seat actually renders: shared first, own on top, shared winning on a
+/// collision. Returns the composed config and the keys the seat tried to restate.
+pub fn effective(shared: Option<&SeatConfig>, own: &SeatConfig) -> (SeatConfig, Vec<String>) {
+    let mut env = own.env.clone();
+    let mut shadowed = Vec::new();
+    if let Some(sh) = shared {
+        for (k, v) in &sh.env {
+            if own.env.contains_key(k) {
+                shadowed.push(k.clone());
+            }
+            env.insert(k.clone(), v.clone());
+        }
+    }
+    (SeatConfig { env, note: own.note.clone() }, shadowed)
+}
+
+/// Keys a seat document may not carry because the shared set owns them. Checked at the write
+/// door so a new collision cannot be created; `effective()` reports the ones that exist.
+pub fn keys_owned_by_shared(shared: Option<&SeatConfig>, own: &SeatConfig) -> Vec<String> {
+    match shared {
+        Some(sh) => own.env.keys().filter(|k| sh.env.contains_key(*k)).cloned().collect(),
+        None => Vec::new(),
+    }
+}
+
+/// The exact bytes a seat's projection renders to, with the shared keys named in the header so
+/// a reader of the file can tell which lines the seat owns. Byte-identical to `render()` when
+/// there is no shared set, so existing projections do not read as drift the day this lands.
+pub fn render_effective(member: &str, shared: Option<&SeatConfig>, own: &SeatConfig) -> (String, Vec<String>) {
+    let (eff, shadowed) = effective(shared, own);
+    let mut out = render(member, &eff);
+    if let Some(sh) = shared {
+        if !sh.env.is_empty() {
+            let keys: Vec<&str> = sh.env.keys().map(String::as_str).collect();
+            // Inserted after the member line so the header stays: source, warning, member, provenance.
+            let marker = format!("# member: {member}\n");
+            let line = format!("# shared: {}\n", keys.join(" "));
+            out = out.replacen(&marker, &format!("{marker}{line}"), 1);
+        }
+    }
+    (out, shadowed)
+}
+
+/// `verify_one` over the composed projection.
+pub fn verify_effective(home: &Path, member: &str, shared: Option<&SeatConfig>, own: &SeatConfig) -> ConfigVerdict {
+    let (expected_bytes, _) = render_effective(member, shared, own);
+    let expected = sha256_of(expected_bytes.as_bytes());
+    let path = render_path(home, member);
+    match std::fs::read(&path) {
+        Ok(found) => {
+            let actual = sha256_of(&found);
+            if actual == expected {
+                ConfigVerdict::Verified { member: member.to_string(), sha256: actual }
+            } else {
+                ConfigVerdict::Miswired { member: member.to_string(), expected, actual }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            ConfigVerdict::Missing { member: member.to_string(), expected }
+        }
+        Err(e) => ConfigVerdict::Unreadable { member: member.to_string(), error: e.to_string() },
+    }
+}
+
+/// `render_to_disk` over the composed projection. Returns whether the bytes on disk CHANGED.
+pub fn render_effective_to_disk(home: &Path, member: &str, shared: Option<&SeatConfig>, own: &SeatConfig) -> std::io::Result<bool> {
+    let (eff, _) = effective(shared, own);
+    if let Err(msg) = eff.validate() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+    }
+    let path = render_path(home, member);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let (bytes, _) = render_effective(member, shared, own);
+    if let Ok(found) = std::fs::read(&path) {
+        if found == bytes.as_bytes() {
+            return Ok(false);
+        }
+    }
+    let tmp = path.with_extension("env.tmp");
+    std::fs::write(&tmp, bytes.as_bytes())?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(true)
+}
+
 /// The rendered path for a member under a given hestia home.
 pub fn render_path(home: &Path, member: &str) -> PathBuf {
     home.join(RENDER_DIR).join(format!("{member}.env"))
@@ -255,7 +372,8 @@ pub fn members_to_check(vault: &crate::vault::Vault, home: &Path, connected: &[S
 
     // 1. Declared in the vault. The authority, and the reason this function exists.
     for item in vault.document_index() {
-        if item.namespace == SEAT_CONFIG_NS {
+        // The shared set is authority every seat inherits, not a seat: no artifact, no verdict.
+        if item.namespace == SEAT_CONFIG_NS && !is_shared(&item.name) {
             set.insert(item.name);
         }
     }
@@ -411,6 +529,29 @@ mod tests {
         env.insert("HESTIA_WORKSPACE".to_string(), "/w/ai".to_string());
         env.insert("HESTIA_ROLE".to_string(), "role:constellation:member".to_string());
         SeatConfig { env, note: "test".into() }
+    }
+
+    #[test]
+    fn the_shared_set_is_inherited_and_wins_and_names_itself() {
+        let mut sh_env = BTreeMap::new();
+        sh_env.insert("HESTIA_HOME".to_string(), "/h".to_string());
+        sh_env.insert("HESTIA_WORKSPACE".to_string(), "/w/shared".to_string());
+        let shared = SeatConfig { env: sh_env, note: "society".into() };
+        // own restates HESTIA_WORKSPACE with a different value: shared wins, and it is reported
+        let (eff, shadowed) = effective(Some(&shared), &cfg());
+        assert_eq!(eff.env["HESTIA_WORKSPACE"], "/w/shared", "shared wins on a collision");
+        assert_eq!(eff.env["HESTIA_HOME"], "/h");
+        assert_eq!(eff.env["HESTIA_ROLE"], "role:constellation:member", "own keys survive");
+        assert_eq!(shadowed, vec!["HESTIA_WORKSPACE".to_string()]);
+        assert_eq!(keys_owned_by_shared(Some(&shared), &cfg()), vec!["HESTIA_WORKSPACE".to_string()]);
+        // the projection names the shared keys in its header, and stays byte-identical to the
+        // plain render when there is no shared set
+        let (with, _) = render_effective("claude-code", Some(&shared), &cfg());
+        assert!(with.contains("# shared: HESTIA_HOME HESTIA_WORKSPACE\n"), "{with}");
+        let (without, _) = render_effective("claude-code", None, &cfg());
+        assert_eq!(without, render("claude-code", &cfg()));
+        // _shared is never a member of the check domain
+        assert!(is_shared(SHARED_MEMBER));
     }
 
     #[test]

@@ -5066,9 +5066,34 @@ pub(crate) fn render_and_verify_seat_configs(
     s: &mut super::state::ServerState,
     members: &[String],
 ) -> Vec<super::seat_config::ConfigVerdict> {
+    render_and_verify_seat_configs_as(s, members, ConfigPass::Detect)
+}
+
+/// Which question a pass is asking. The order of render and verify IS the question.
+///
+/// `Detect` (the worker): verify first — the artifact is expected to match, and a difference
+/// is somebody's edit, which is a finding. `Author` (the operator write door): render first —
+/// the authority just changed, so the artifact is EXPECTED to differ, and verifying it before
+/// rendering reports the operator's own act as drift. Measured 2026-09-05 on the first two
+/// seat writes on CBP: each opened a `config_integrity_finding{missing}` and returned
+/// `missing` as the verdict of a document that was rendered in the same act (#944).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigPass {
+    Detect,
+    Author,
+}
+
+pub(crate) fn render_and_verify_seat_configs_as(
+    s: &mut super::state::ServerState,
+    members: &[String],
+    pass: ConfigPass,
+) -> Vec<super::seat_config::ConfigVerdict> {
     use super::seat_config as sc;
     let home = s.home.clone();
     let mut verdicts = Vec::new();
+    // The shared set is loaded once per pass: it is one authority for every member, and a
+    // pass that read it per member could see two different shared sets in one act.
+    let shared = sc::load_shared(&s.vault);
     for member in members {
         // THE VAULT IS THE ONLY AUTHORITY, AND ITS ABSENCE IS NOT A PASS.
         //
@@ -5092,6 +5117,17 @@ pub(crate) fn render_and_verify_seat_configs(
                     .and_then(|c| c.validate().map(|_| c))
             });
 
+        // An unusable SHARED set makes every configured seat unbacked: a projection built on an
+        // authority that cannot be used is not a projection, and rendering the seat's own keys
+        // alone would be a silent fallback to a narrower authority.
+        let declared = match (&shared, declared) {
+            (Some(Err(e)), Some(_)) => Some(Err(format!("shared set unusable: {e}"))),
+            (_, d) => d,
+        };
+        let shared_ok: Option<&sc::SeatConfig> = match &shared {
+            Some(Ok(c)) => Some(c),
+            _ => None,
+        };
         let cfg = match declared {
             Some(Ok(c)) => c,
             unusable => {
@@ -5123,20 +5159,32 @@ pub(crate) fn render_and_verify_seat_configs(
             }
         };
 
-        let verdict = sc::verify_one(&home, member, &cfg);
-        // Repair every state that is not already correct. `Unreadable` is included: if the
-        // artifact cannot be read, re-rendering it from the authority IS the repair, and if the
-        // rewrite also fails the error says so rather than the pass going quiet.
-        if matches!(
-            verdict,
-            sc::ConfigVerdict::Miswired { .. }
-                | sc::ConfigVerdict::Missing { .. }
-                | sc::ConfigVerdict::Unreadable { .. }
-        ) {
-            if let Err(e) = sc::render_to_disk(&home, member, &cfg) {
-                tracing::warn!(member = %member, error = %e, "seat config could not be rendered");
+        let verdict = match pass {
+            ConfigPass::Author => {
+                // The authority changed; write it, then say what is on disk.
+                if let Err(e) = sc::render_effective_to_disk(&home, member, shared_ok, &cfg) {
+                    tracing::warn!(member = %member, error = %e, "seat config could not be rendered");
+                }
+                sc::verify_effective(&home, member, shared_ok, &cfg)
             }
-        }
+            ConfigPass::Detect => {
+                let verdict = sc::verify_effective(&home, member, shared_ok, &cfg);
+                // Repair every state that is not already correct. `Unreadable` is included: if
+                // the artifact cannot be read, re-rendering it from the authority IS the repair,
+                // and if the rewrite also fails the error says so rather than the pass going quiet.
+                if matches!(
+                    verdict,
+                    sc::ConfigVerdict::Miswired { .. }
+                        | sc::ConfigVerdict::Missing { .. }
+                        | sc::ConfigVerdict::Unreadable { .. }
+                ) {
+                    if let Err(e) = sc::render_effective_to_disk(&home, member, shared_ok, &cfg) {
+                        tracing::warn!(member = %member, error = %e, "seat config could not be rendered");
+                    }
+                }
+                verdict
+            }
+        };
         verdicts.push(verdict);
     }
 
