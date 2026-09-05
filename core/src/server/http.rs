@@ -1157,7 +1157,15 @@ pub async fn serve_with_callback(
         // deliberately not reachable from MCP: a member that could author its own config could
         // set its own `HESTIA_WORKSPACE`, which is to say choose the tree its gate polices.
         // That is the whole boundary, so this door opens from one direction only.
-        .route("/api/config/seat", put(config_put_seat))
+        // The READ half (#944 phase 0). A config system that can fail closed but cannot be
+        // viewed from the operator surface is a lockout mechanism, so the view lands before
+        // any seat consumes the projection. Two shapes, deliberately: the LIST names keys and
+        // health and never a value, so it can sit on a page that refreshes; the INSPECT is the
+        // one place a value is revealed, and it is classified above low stakes (see
+        // `Stakes::classify`) so the gate witnesses who looked. Neither is reachable from MCP:
+        // a member that could read its own authoritative config could read its peers'.
+        .route("/api/config/seat", put(config_put_seat).get(config_list_seats))
+        .route("/api/config/seat/:plugin_id", get(config_get_seat))
         .route("/api/scope/grant", post(scope_grant))
         // THE SOCIETY FLOOR (dp, 2026-08-16). Same operator wall as every other widening, and
         // deliberately NOT reachable from MCP: a member that could edit the floor could widen
@@ -2843,6 +2851,150 @@ async fn config_put_seat(
     )
 }
 
+/// `plugin_id` becomes a filename (`<home>/seats/<member>.env`) on the write side, and the same
+/// rule holds on the read side so a GET cannot name a document the PUT could never have made.
+fn seat_id_is_a_plain_name(member: &str) -> bool {
+    !member.is_empty()
+        && !member.contains('/')
+        && !member.contains('\\')
+        && !member.contains("..")
+        && !member.starts_with('.')
+}
+
+/// What the operator surface says about one seat WITHOUT revealing a value. Shared by the list
+/// and the inspect so the two cannot disagree about health.
+///
+/// Read-only by construction: `verify_one` compares and never writes, and no finding is opened
+/// or closed here. The worker and the PUT are the two places that render and witness; a GET
+/// that repaired the artifact would be a read with a side effect, and a page refresh would
+/// become the drift detector.
+fn seat_config_summary(
+    s: &super::state::ServerState,
+    member: &str,
+) -> serde_json::Value {
+    use super::seat_config as sc;
+    let home = s.home.clone();
+    let artifact = sc::render_path(&home, member);
+    let declared = s.vault.get_document(sc::SEAT_CONFIG_NS, member).map(|bytes| {
+        serde_json::from_slice::<sc::SeatConfig>(bytes)
+            .map_err(|e| format!("vault config does not decode as seat config: {e}"))
+            .and_then(|c| c.validate().map(|_| c))
+    });
+    let open_since = s.config_findings_open.get(member).copied();
+    match declared {
+        Some(Ok(cfg)) => {
+            let verdict = sc::verify_one(&home, member, &cfg);
+            serde_json::json!({
+                "member": member,
+                "configured": true,
+                "keys": cfg.env.keys().cloned().collect::<Vec<_>>(),
+                "note": cfg.note,
+                "artifact": artifact.to_string_lossy(),
+                "expected_sha256": sc::sha256_of(sc::render(member, &cfg).as_bytes()),
+                "verdict": verdict,
+                "finding_open_since": open_since,
+            })
+        }
+        Some(Err(reason)) => serde_json::json!({
+            "member": member,
+            "configured": true,
+            "keys": [],
+            "note": "",
+            "artifact": artifact.to_string_lossy(),
+            "verdict": {"status": "unbacked", "member": member, "reason": reason},
+            "finding_open_since": open_since,
+        }),
+        None => serde_json::json!({
+            "member": member,
+            "configured": false,
+            "keys": [],
+            "note": "",
+            "artifact": artifact.to_string_lossy(),
+            // Nothing declared. If an artifact is on disk anyway the worker will quarantine
+            // it on its next pass and say so; this read only reports what it sees.
+            "verdict": {
+                "status": if artifact.exists() { "unbacked" } else { "unconfigured" },
+                "member": member,
+            },
+            "finding_open_since": open_since,
+        }),
+    }
+}
+
+/// `GET /api/config/seat` — every seat this daemon would check (vault-declared ∪ connected ∪
+/// on-disk, the same domain as the worker), with keys, note, health and digests. NO VALUES:
+/// this is the view a page polls, and a polled surface is the one an operator leaves open.
+async fn config_list_seats(State(state): State<SharedState>) -> impl IntoResponse {
+    let s = state.lock().await;
+    let connected: Vec<String> = s.gate_capabilities.keys().cloned().collect();
+    let home = s.home.clone();
+    let members = super::seat_config::members_to_check(&s.vault, &home, &connected);
+    let seats: Vec<serde_json::Value> = members.iter().map(|m| seat_config_summary(&s, m)).collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "seats": seats,
+            "render_dir": home.join(super::seat_config::RENDER_DIR).to_string_lossy(),
+        })),
+    )
+}
+
+/// `GET /api/config/seat/:plugin_id` — the authoritative `SeatConfig` from the vault, values
+/// included, plus the current projection verdict. THE ONE DELIBERATE VALUE REVEAL on this
+/// surface. `Stakes::classify` rates it above the read flood so the operator gate writes a row
+/// naming who looked; this handler adds the member and the KEYS looked at, never the values —
+/// the chain is the one store that never forgets, and a config document can carry a token.
+async fn config_get_seat(
+    State(state): State<SharedState>,
+    axum::extract::Path(plugin_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    use super::seat_config as sc;
+    let member = plugin_id.trim().to_string();
+    if !seat_id_is_a_plain_name(&member) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "plugin_id names one document and may not contain a path separator, a \
+                          parent reference, or a leading dot"
+            })),
+        );
+    }
+    let mut s = state.lock().await;
+    let summary = seat_config_summary(&s, &member);
+    let cfg: Option<sc::SeatConfig> = s
+        .vault
+        .get_document(sc::SEAT_CONFIG_NS, &member)
+        .and_then(|bytes| serde_json::from_slice::<sc::SeatConfig>(bytes).ok());
+    let Some(cfg) = cfg else {
+        // Absent or undecodable: the summary already says which, and there is no value to
+        // reveal, so nothing is witnessed beyond the gate's own row.
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("the vault declares no decodable config for '{member}'"),
+                "summary": summary,
+            })),
+        );
+    };
+    let _ = s.append_chain(
+        "config_seat_inspected",
+        serde_json::json!({
+            "member": member,
+            "keys": cfg.env.keys().cloned().collect::<Vec<_>>(),
+            "decided_by": "operator",
+            "via": "operator_session",
+        }),
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "member": member,
+            "config": cfg,
+            "summary": summary,
+        })),
+    )
+}
+
 async fn scope_grant(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
@@ -4388,6 +4540,176 @@ mod disposition_tests {
             }
         }
         assert!(s.chain_store.len().unwrap() > before);
+    }
+
+    /// The LIST never carries a value, on any seat, in any state (#944 phase 0).
+    ///
+    /// Written against the response bytes rather than the shape, because the shape is the
+    /// thing a later edit changes: a field renamed, a verdict enriched, a summary that starts
+    /// carrying `config` "for convenience". The bytes cannot carry the value by accident.
+    #[tokio::test]
+    async fn the_seat_config_list_names_keys_and_health_but_never_a_value() {
+        let (_dir, state) = test_state().await;
+        let body = serde_json::json!({
+            "plugin_id": "claude-code",
+            "config": {
+                "env": {"HESTIA_WORKSPACE": "/w/ai", "HESTIA_TOKEN": "list-must-not-show-this"},
+                "note": "phase 0",
+            },
+        });
+        let put = axum::response::IntoResponse::into_response(
+            super::config_put_seat(axum::extract::State(state.clone()), axum::Json(body)).await,
+        );
+        assert_eq!(put.status(), StatusCode::OK);
+
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_list_seats(axum::extract::State(state.clone())).await,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!text.contains("list-must-not-show-this"), "a VALUE leaked into the list: {text}");
+        assert!(!text.contains("/w/ai"), "a VALUE leaked into the list: {text}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let seat = v["seats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["member"] == "claude-code")
+            .expect("the configured seat is listed");
+        assert_eq!(seat["configured"], true);
+        let keys: Vec<&str> = seat["keys"].as_array().unwrap().iter().map(|k| k.as_str().unwrap()).collect();
+        assert_eq!(keys, vec!["HESTIA_TOKEN", "HESTIA_WORKSPACE"], "keys ARE listed, sorted");
+        assert_eq!(seat["verdict"]["status"], "verified", "rendered by the PUT, so verified: {seat}");
+        assert!(seat["expected_sha256"].as_str().unwrap().len() == 64);
+    }
+
+    /// The INSPECT reveals the authoritative values, reports the projection verdict, and
+    /// witnesses the LOOK by member and keys — never by value. A hand edit of the artifact
+    /// between the write and the inspect is reported as a miswire by the inspect WITHOUT
+    /// being repaired: a read is not the drift detector, the worker is.
+    #[tokio::test]
+    async fn the_seat_config_inspect_reveals_values_and_witnesses_keys_only() {
+        use crate::server::seat_config as sc;
+        let (dir, state) = test_state().await;
+        let body = serde_json::json!({
+            "plugin_id": "kimi-code",
+            "config": {"env": {"HESTIA_WORKSPACE": "/w/ai", "HESTIA_TOKEN": "inspect-shows-this"}, "note": "n"},
+        });
+        let put = axum::response::IntoResponse::into_response(
+            super::config_put_seat(axum::extract::State(state.clone()), axum::Json(body)).await,
+        );
+        assert_eq!(put.status(), StatusCode::OK);
+        let artifact = sc::render_path(dir.path(), "kimi-code");
+        std::fs::write(&artifact, "HESTIA_WORKSPACE=/somewhere/else\n").unwrap();
+        let tampered = std::fs::read_to_string(&artifact).unwrap();
+
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_get_seat(
+                axum::extract::State(state.clone()),
+                axum::extract::Path("kimi-code".to_string()),
+            )
+            .await,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["config"]["env"]["HESTIA_TOKEN"], "inspect-shows-this");
+        assert_eq!(v["config"]["env"]["HESTIA_WORKSPACE"], "/w/ai");
+        assert_eq!(v["summary"]["verdict"]["status"], "miswired", "{v}");
+        assert_eq!(
+            std::fs::read_to_string(&artifact).unwrap(),
+            tampered,
+            "a GET must not repair the artifact; that is the worker's act, witnessed as such"
+        );
+
+        let s = state.lock().await;
+        let rows = s.chain_store.read_recent(20).unwrap();
+        let looked: Vec<_> = rows.iter().filter(|e| e.event_type == "config_seat_inspected").collect();
+        assert_eq!(looked.len(), 1, "one inspect, one row");
+        let blob = serde_json::to_string(&looked[0].event_data).unwrap();
+        assert!(blob.contains("HESTIA_TOKEN") && blob.contains("kimi-code"), "{blob}");
+        assert!(!blob.contains("inspect-shows-this") && !blob.contains("/w/ai"), "a VALUE reached the chain: {blob}");
+        // The handler locks the state; holding this guard across the next calls deadlocks the
+        // test (it did: the first run hung here for 42 minutes at 3% CPU).
+        drop(s);
+
+        // An unknown seat is a 404 with the summary, and reveals nothing.
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_get_seat(
+                axum::extract::State(state.clone()),
+                axum::extract::Path("nobody".to_string()),
+            )
+            .await,
+        );
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        for bad in ["../escape", "a/b", ".hidden"] {
+            let resp = axum::response::IntoResponse::into_response(
+                super::config_get_seat(
+                    axum::extract::State(state.clone()),
+                    axum::extract::Path(bad.to_string()),
+                )
+                .await,
+            );
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+    }
+
+    /// THE NEGATIVE ARM #944 REQUIRES: an unauthenticated HTTP client obtains no value from
+    /// either GET. Run against the real served router — the middleware is the thing under
+    /// test, and a handler-level test cannot see it. No dev-override token in this process.
+    #[tokio::test]
+    async fn unauthenticated_http_cannot_read_seat_config_values() {
+        std::env::remove_var("HESTIA_OPERATOR_DEV_TOKEN");
+        let (_dir, state) = test_state().await;
+        {
+            let body = serde_json::json!({
+                "plugin_id": "codex",
+                "config": {"env": {"HESTIA_TOKEN": "never-over-plain-http"}, "note": ""},
+            });
+            let put = axum::response::IntoResponse::into_response(
+                super::config_put_seat(axum::extract::State(state.clone()), axum::Json(body)).await,
+            );
+            assert_eq!(put.status(), StatusCode::OK);
+        }
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let bind = format!("127.0.0.1:{port}");
+        let served = state.clone();
+        let server = tokio::spawn(async move {
+            let _ = super::serve_with_callback(served, &bind, None).await;
+        });
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+        let mut up = false;
+        for _ in 0..50 {
+            if client.get(format!("{base}/api/config/seat")).send().await.is_ok() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(up, "the test server never came up on {base}");
+
+        for path in ["/api/config/seat", "/api/config/seat/codex"] {
+            let resp = client.get(format!("{base}{path}")).send().await.unwrap();
+            let status = resp.status();
+            let text = resp.text().await.unwrap();
+            assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "{path}: {text}");
+            assert!(!text.contains("never-over-plain-http"), "{path} leaked a value: {text}");
+            assert!(!text.contains("HESTIA_TOKEN"), "{path} leaked a key without a session: {text}");
+        }
+        // A wrong bearer is the same as none.
+        let resp = client
+            .get(format!("{base}/api/config/seat/codex"))
+            .bearer_auth("not-a-session")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+        server.abort();
     }
 
     /// Minting site B (#459): the operator's scope decision tells the REQUESTER.

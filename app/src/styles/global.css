@@ -1133,3 +1133,31 @@ input::placeholder {
 .receipt-contrib { color: #e2e8f0; }
 .receipt-meta { color: #64748b; }
 .receipt-ref { color: #94a3b8; font-style: italic; word-break: break-word; }
+
+/* ---- Runtime config (vault-authored seat env, #944 phase 0) ---- */
+.runtime-config { margin-top: 32px; }
+.runtime-config h2 { font-size: 1.1rem; margin: 0; }
+.cfg-hint { opacity: 0.75; font-size: 0.9rem; margin: 6px 0 12px; }
+.cfg-hint code { font-size: 0.85em; }
+.cfg-seats { display: flex; flex-direction: column; gap: 6px; }
+.cfg-seat { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border: 1px solid var(--border, #333); border-radius: 6px; }
+.cfg-seat-selected { border-color: var(--accent, #6aa9ff); }
+.cfg-seat-new input { flex: 1; }
+.cfg-seat-name { font-weight: 600; min-width: 120px; }
+.cfg-seat-keys { flex: 1; opacity: 0.8; font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cfg-seat-keylist { opacity: 0.7; }
+.cfg-verdict { font-size: 0.75rem; padding: 2px 8px; border-radius: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+.cfg-verdict-ok { background: rgba(60, 180, 90, 0.18); color: #3cb45a; }
+.cfg-verdict-bad { background: rgba(220, 70, 70, 0.18); color: #e05252; }
+.cfg-verdict-none { background: rgba(140, 140, 140, 0.18); color: #999; }
+.cfg-editor { margin-top: 16px; padding: 12px; border: 1px solid var(--border, #333); border-radius: 6px; }
+.cfg-editor-header { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+.cfg-digest { font-family: monospace; font-size: 0.8rem; opacity: 0.7; }
+.cfg-env { width: 100%; border-collapse: collapse; }
+.cfg-env th { text-align: left; font-size: 0.8rem; opacity: 0.7; padding: 4px; }
+.cfg-env td { padding: 4px; }
+.cfg-env input { width: 100%; font-family: monospace; }
+.cfg-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.cfg-actions .cfg-note { flex: 1; }
+.cfg-saved { margin-top: 12px; padding: 10px; border-left: 3px solid var(--accent, #6aa9ff); font-size: 0.9rem; }
+.cfg-saved-verdicts { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }

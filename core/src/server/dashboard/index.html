@@ -780,6 +780,27 @@
   /* --- per-member policy grants --- */
   .grant-note { font-size: 0.74rem; color: var(--fg-dim); line-height: 1.5; margin: 0.3rem 0 0.6rem;
     padding: 0.45rem 0.6rem; background: var(--bg); border-left: 2px solid var(--warning); border-radius: 3px; }
+  /* --- govern -> runtime config (#944 phase 0) --- */
+  .cfg-seat { display: flex; align-items: center; gap: 0.6rem; padding: 0.35rem 0.5rem; border: 1px solid var(--border); border-radius: 4px; margin-bottom: 0.3rem; }
+  .cfg-seat.selected { border-color: var(--accent); }
+  .cfg-seat-name { font-weight: 600; min-width: 7rem; font-size: 0.85rem; }
+  .cfg-seat-keys { flex: 1; color: var(--fg-dim); font-size: 0.74rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cfg-verdict { font-size: 0.64rem; padding: 0.1rem 0.45rem; border-radius: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .cfg-verdict.ok { background: #4ade8018; color: var(--success); }
+  .cfg-verdict.bad { background: #f8717118; color: var(--coral); }
+  .cfg-verdict.none { background: var(--bg-elev-2); color: var(--fg-faint); }
+  .cfg-new { margin: 0.4rem 0 0.8rem; }
+  .cfg-editor { border: 1px solid var(--border); border-radius: 4px; padding: 0.6rem; margin-top: 0.6rem; }
+  .cfg-editor-head { display: flex; align-items: center; gap: 0.6rem; }
+  .cfg-digest { font-family: var(--mono); font-size: 0.7rem; color: var(--fg-faint); }
+  .cfg-env { width: 100%; border-collapse: collapse; }
+  .cfg-env th { text-align: left; font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--fg-faint); padding: 0.2rem; }
+  .cfg-env td { padding: 0.15rem 0.2rem; }
+  .cfg-env input { width: 100%; font-family: var(--mono); }
+  .cfg-note { flex: 1; }
+  .cfg-save { color: var(--accent); border-color: var(--accent); }
+  .cfg-err { color: var(--coral); font-size: 0.78rem; margin-top: 0.5rem; }
+  .cfg-saved { border-left: 3px solid var(--accent); padding: 0.4rem 0.6rem; margin-top: 0.6rem; font-size: 0.78rem; color: var(--fg-dim); line-height: 1.5; }
   .grant-add { flex-wrap: wrap; }
   .grant-row { display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap;
     border: 1px solid var(--warning); border-radius: 5px; padding: 0.45rem 0.6rem; margin-bottom: 0.45rem; background: var(--bg); }
@@ -1192,6 +1213,7 @@
         <button type="button" class="govern-chip" data-gov="grants">grants</button>
         <button type="button" class="govern-chip" data-gov="acts">acts</button>
         <button type="button" class="govern-chip" data-gov="policy">policy</button>
+        <button type="button" class="govern-chip" data-gov="config">runtime config</button>
       </nav>
 
       <div class="govern-body">
@@ -1438,6 +1460,49 @@
                 <button class="pol-btn" id="pol-add-btn">add</button>
               </div>
             </details>
+          </div>
+        </section>
+        <!-- RUNTIME CONFIG (#944 phase 0). The govern view's sub-screen over the vault-authored
+             seat environment: the same GET list / GET inspect / PUT contract the desktop app's
+             Vault -> Runtime config uses, through the same apiFetch wrapper, so the two UIs are
+             two windows onto one authority and never two stores. The LIST names keys and health
+             and is safe to leave open; a VALUE appears only after the operator opens one seat,
+             and the daemon witnesses that look. There is no delete here: removing a variable is
+             an edit, removing the document is the lockout this screen exists to make unneeded. -->
+        <section class="govern-pane" id="govern-config" hidden>
+          <div class="govern-pane-head">
+            <h2>Runtime config <span class="pol-mode" id="cfg-status"></span></h2>
+            <button type="button" class="pol-btn" id="cfg-refresh">refresh</button>
+          </div>
+          <div class="govern-scroll">
+            <div class="grant-note">
+              Each seat's environment is authored here and held in the <strong>vault</strong>; the daemon
+              renders it to <code id="cfg-render-dir">…/seats</code> and checks the file against the vault.
+              Keys and health below; open a seat to see its values (witnessed).
+            </div>
+            <div id="cfg-seat-list"><div class="empty">Loading…</div></div>
+            <div class="pol-add cfg-new">
+              <input class="pol-input" id="cfg-new-id" placeholder="seat id not listed (e.g. gemini)" size="24">
+              <button type="button" class="pol-btn" id="cfg-new-open" disabled>configure</button>
+            </div>
+            <div id="cfg-editor" class="cfg-editor" hidden>
+              <div class="cfg-editor-head">
+                <strong id="cfg-editor-member"></strong>
+                <span class="cfg-verdict" id="cfg-editor-verdict"></span>
+                <span class="cfg-digest" id="cfg-editor-digest"></span>
+              </div>
+              <div class="pol-section-label">Variables</div>
+              <table class="cfg-env"><thead><tr><th>variable</th><th>value</th><th></th></tr></thead>
+                <tbody id="cfg-env-rows"></tbody></table>
+              <div class="pol-add">
+                <button type="button" class="pol-btn" id="cfg-add-row">+ variable</button>
+                <input class="pol-input cfg-note" id="cfg-note" placeholder="note (why this config is what it is)" size="40">
+                <button type="button" class="pol-btn cfg-save" id="cfg-save">save to vault</button>
+                <button type="button" class="pol-btn" id="cfg-discard">discard changes</button>
+              </div>
+              <div class="cfg-err" id="cfg-err" hidden></div>
+              <div class="cfg-saved" id="cfg-saved" hidden></div>
+            </div>
           </div>
         </section>
       </div>
@@ -3749,6 +3814,8 @@
     // exist would be the "looks wired" shape this file keeps refusing.
     acts:   { el: 'govern-acts', mount: () => governPrefillActs() },
     policy: { el: 'govern-policy', mount: () => fetchPolicy() },
+    // The list is the mount: keys and health only. Values are fetched by an explicit open.
+    config: { el: 'govern-config', mount: () => cfgLoadList() },
   };
   let governSection = 'ledger';
   function governShow(section) {
@@ -3771,6 +3838,158 @@
     if (nav) nav.addEventListener('click', (e) => {
       const chip = e.target.closest('.govern-chip');
       if (chip) governShow(chip.dataset.gov);
+    });
+  })();
+
+  // ---- RUNTIME CONFIG pane (#944 phase 0) -------------------------------------------------
+  // Three calls, one contract, shared with the desktop app: GET /api/config/seat (list, no
+  // values), GET /api/config/seat/<id> (inspect, values, witnessed), PUT /api/config/seat
+  // (save; the daemon renders in the same act and returns that render's verdict, shown here
+  // before the operator can wonder whether the artifact caught up).
+  const cfgEsc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  let cfgSelected = null;       // member currently open in the editor
+  let cfgRows = [];             // [{key, value}] the editor holds (a draft, not the vault)
+  let cfgSeats = [];            // last list
+
+  function cfgVerdictHtml(v) {
+    const st = (v && v.status) || 'unknown';
+    const cls = st === 'verified' ? 'ok' : st === 'unconfigured' ? 'none' : 'bad';
+    const why = st === 'miswired' ? `expected ${(v.expected||'').slice(0,12)}… found ${(v.actual||'').slice(0,12)}…`
+      : st === 'missing' ? 'no rendered artifact on disk'
+      : st === 'unreadable' ? (v.error || '')
+      : st === 'unbacked' ? (v.reason || 'artifact present, vault declares nothing')
+      : st === 'verified' ? `sha256 ${(v.sha256||'').slice(0,12)}…` : '';
+    return `<span class="cfg-verdict ${cls}" title="${cfgEsc(why)}">${cfgEsc(st)}</span>`;
+  }
+
+  async function cfgLoadList() {
+    const status = $('cfg-status');
+    try {
+      const res = await apiFetch('/api/config/seat');
+      if (!res.ok) throw new Error((await res.text()) || ('HTTP ' + res.status));
+      const data = await res.json();
+      cfgSeats = data.seats || [];
+      $('cfg-render-dir').textContent = data.render_dir || '…/seats';
+      const list = $('cfg-seat-list');
+      if (!cfgSeats.length) { list.innerHTML = '<div class="empty">No seats known to the daemon yet.</div>'; }
+      else {
+        list.innerHTML = cfgSeats.map(s => `
+          <div class="cfg-seat${s.member === cfgSelected ? ' selected' : ''}" data-member="${cfgEsc(s.member)}" data-configured="${s.configured ? 1 : 0}">
+            <span class="cfg-seat-name">${cfgEsc(s.member)}</span>
+            <span class="cfg-seat-keys">${s.configured
+              ? `${s.keys.length} var${s.keys.length === 1 ? '' : 's'}${s.keys.length ? ' — ' + cfgEsc(s.keys.join(', ')) : ''}`
+              : 'not configured'}</span>
+            ${cfgVerdictHtml(s.verdict)}
+            <button type="button" class="pol-btn cfg-open">${s.configured ? 'inspect' : 'configure'}</button>
+          </div>`).join('');
+      }
+      if (status) status.textContent = '';
+    } catch (e) { if (status) status.textContent = '⚠ ' + e.message; }
+  }
+
+  function cfgRenderRows() {
+    $('cfg-env-rows').innerHTML = cfgRows.map((r, i) => `
+      <tr data-i="${i}">
+        <td><input class="pol-input cfg-key" value="${cfgEsc(r.key)}" placeholder="HESTIA_WORKSPACE"></td>
+        <td><input class="pol-input cfg-value" value="${cfgEsc(r.value)}"></td>
+        <td><button type="button" class="pol-btn pol-remove cfg-remove" title="remove this variable">×</button></td>
+      </tr>`).join('');
+  }
+
+  // Open one seat. A configured seat is INSPECTED (values revealed; the daemon witnesses it);
+  // an unconfigured one opens as an empty draft with no read, because there is nothing to
+  // reveal and a 404 is not news the operator needs.
+  async function cfgOpen(member, configured) {
+    cfgSelected = member;
+    $('cfg-editor').hidden = false;
+    $('cfg-editor-member').textContent = member;
+    $('cfg-err').hidden = true; $('cfg-saved').hidden = true;
+    $('cfg-editor-verdict').innerHTML = ''; $('cfg-editor-digest').textContent = '';
+    document.querySelectorAll('#cfg-seat-list .cfg-seat').forEach(el => el.classList.toggle('selected', el.dataset.member === member));
+    if (!configured) { cfgRows = []; $('cfg-note').value = ''; cfgRenderRows(); return; }
+    try {
+      const res = await apiFetch('/api/config/seat/' + encodeURIComponent(member));
+      if (!res.ok) throw new Error((await res.text()) || ('HTTP ' + res.status));
+      const data = await res.json();
+      const env = (data.config && data.config.env) || {};
+      cfgRows = Object.keys(env).sort().map(k => ({ key: k, value: env[k] }));
+      $('cfg-note').value = (data.config && data.config.note) || '';
+      const sum = data.summary || {};
+      $('cfg-editor-verdict').innerHTML = cfgVerdictHtml(sum.verdict);
+      $('cfg-editor-digest').textContent = sum.expected_sha256 ? 'expects ' + sum.expected_sha256.slice(0, 16) + '…' : '';
+      $('cfg-editor-digest').title = sum.artifact || '';
+      cfgRenderRows();
+    } catch (e) { const el = $('cfg-err'); el.textContent = e.message; el.hidden = false; }
+  }
+
+  function cfgReadRows() {
+    const rows = [];
+    document.querySelectorAll('#cfg-env-rows tr').forEach(tr => {
+      rows.push({ key: tr.querySelector('.cfg-key').value, value: tr.querySelector('.cfg-value').value });
+    });
+    cfgRows = rows;
+    return rows;
+  }
+
+  async function cfgSave() {
+    if (!cfgSelected) return;
+    const err = $('cfg-err'), ok = $('cfg-saved');
+    err.hidden = true; ok.hidden = true;
+    const env = {};
+    for (const r of cfgReadRows()) {
+      const k = r.key.trim();
+      if (!k) continue;
+      if (k in env) { err.textContent = 'duplicate key ' + k; err.hidden = false; return; }
+      env[k] = r.value;
+    }
+    const btn = $('cfg-save'); btn.disabled = true;
+    try {
+      const res = await apiFetch('/api/config/seat', {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ plugin_id: cfgSelected, config: { env, note: $('cfg-note').value } }),
+      });
+      if (!res.ok) throw new Error((await res.text()) || ('HTTP ' + res.status));
+      const r = await res.json();
+      const verdicts = Array.isArray(r.verdict) ? r.verdict : [];
+      ok.innerHTML = `${r.replaced ? 'Replaced' : 'Created'} <strong>${cfgEsc(r.member)}</strong> in the vault; rendered to `
+        + `<code>${cfgEsc(r.artifact)}</code>. Intent <code>${cfgEsc((r.intentEntryHash||'').slice(0,16))}…</code> on the chain.<br>`
+        + (verdicts.length
+          ? verdicts.map(v => cfgVerdictHtml(v) + ' ' + (v.status === 'verified'
+              ? 'the projection on disk matches what you saved'
+              : `the projection is ${cfgEsc(v.status)}; see the daemon\'s chain row`)).join('<br>')
+          : '<span class="cfg-verdict bad">no verdict returned — the render did not run</span>');
+      ok.hidden = false;
+      await cfgOpen(cfgSelected, true);   // re-inspect: show what the vault now holds, not the form
+      await cfgLoadList();
+    } catch (e) { err.textContent = e.message; err.hidden = false; }
+    finally { btn.disabled = false; }
+  }
+
+  (function wireRuntimeConfig() {
+    const pane = $('govern-config');
+    if (!pane) return;
+    $('cfg-refresh').addEventListener('click', () => cfgLoadList());
+    $('cfg-seat-list').addEventListener('click', (e) => {
+      const b = e.target.closest('.cfg-open'); if (!b) return;
+      const row = b.closest('.cfg-seat');
+      cfgOpen(row.dataset.member, row.dataset.configured === '1');
+    });
+    const newId = $('cfg-new-id'), newBtn = $('cfg-new-open');
+    newId.addEventListener('input', () => { newBtn.disabled = !newId.value.trim(); });
+    newBtn.addEventListener('click', () => {
+      const id = newId.value.trim(); if (!id) return;
+      newId.value = ''; newBtn.disabled = true;
+      cfgOpen(id, cfgSeats.some(s => s.member === id && s.configured));
+    });
+    $('cfg-add-row').addEventListener('click', () => { cfgReadRows(); cfgRows.push({ key: '', value: '' }); cfgRenderRows(); });
+    $('cfg-env-rows').addEventListener('click', (e) => {
+      const b = e.target.closest('.cfg-remove'); if (!b) return;
+      cfgReadRows(); cfgRows.splice(Number(b.closest('tr').dataset.i), 1); cfgRenderRows();
+    });
+    $('cfg-save').addEventListener('click', () => cfgSave());
+    $('cfg-discard').addEventListener('click', () => {
+      if (!cfgSelected) return;
+      cfgOpen(cfgSelected, cfgSeats.some(s => s.member === cfgSelected && s.configured));
     });
   })();
 

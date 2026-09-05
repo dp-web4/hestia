@@ -1,5 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DashboardSnapshot, DaemonStatus, AppConfig, RemoteEntry, DerivationReceipt, OperatorStatus } from "./types";
+import type {
+  DashboardSnapshot,
+  DaemonStatus,
+  AppConfig,
+  RemoteEntry,
+  DerivationReceipt,
+  OperatorStatus,
+  SeatConfigList,
+  SeatConfigInspect,
+  SeatConfigPutResult,
+} from "./types";
 
 export async function getDashboard(): Promise<DashboardSnapshot> {
   return invoke("get_dashboard");
@@ -31,6 +41,23 @@ export async function vaultSet(
 
 export async function vaultDelete(name: string): Promise<unknown> {
   return invoke("vault_delete", { name });
+}
+
+// Vault-authored seat config (#944 phase 0). Same authed transport; no delete by design.
+export async function configSeatList(): Promise<SeatConfigList> {
+  return invoke("config_seat_list");
+}
+
+export async function configSeatGet(pluginId: string): Promise<SeatConfigInspect> {
+  return invoke("config_seat_get", { req: { plugin_id: pluginId } });
+}
+
+export async function configSeatPut(
+  pluginId: string,
+  env: Record<string, string>,
+  note: string
+): Promise<SeatConfigPutResult> {
+  return invoke("config_seat_put", { req: { plugin_id: pluginId, env, note } });
 }
 
 export async function getPolicy(): Promise<unknown> {
