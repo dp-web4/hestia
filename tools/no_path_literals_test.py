@@ -160,10 +160,11 @@ PINNED_BASELINE: dict | None = {
     "deploy/install-members.sh":                    {"expanduser-tilde": 1, "shell-home-default": 1, "shell-home-hestia": 1},
 }
 
-_FAILS: list[str] = []
+_FAILS: list[str] = []          # every counted code hit, "rel:line  [class]  text"
+_INFRA: list[str] = []          # the scan could not measure: unreadable manifest / file
 _HITS: dict[str, dict | None] = {}  # rel -> {class: count}; None = unreadable
-_PROSE: list[str] = []
-_ALLOWED_HITS: list[str] = []
+_PROSE: list[str] = []          # hits in comments/docstrings, reported never counted
+_ALLOWED_HITS: list[str] = []   # hits absorbed by a declared exception, with its reason
 
 
 def runtime_set() -> list[str]:
@@ -172,10 +173,10 @@ def runtime_set() -> list[str]:
         names = [ln.strip() for ln in open(manifest, encoding="utf-8")
                  if ln.strip() and not ln.lstrip().startswith("#")]
     except OSError as exc:
-        _FAILS.append(f"manifest unreadable: {manifest}: {exc}")
+        _INFRA.append(f"manifest unreadable: {manifest}: {exc}")
         return []
     if not names:
-        _FAILS.append(f"manifest is empty: {manifest}")
+        _INFRA.append(f"manifest is empty: {manifest}")
         return []
     files = ["plugins/_shared/" + n for n in names]
     files += ["plugins/claude-code/hooks/" + _HOOK, "plugins/codex/hooks/" + _HOOK,
@@ -223,7 +224,7 @@ def scan(rel: str) -> int:
     try:
         src = open(path, encoding="utf-8").read()
     except OSError as exc:
-        _FAILS.append(f"{rel}: unreadable ({exc}) — never clean by absence")
+        _INFRA.append(f"{rel}: unreadable ({exc}) — never clean by absence")
         _HITS[rel] = None
         return -1
     if rel.endswith(".py"):
@@ -260,6 +261,41 @@ def _scan_all() -> None:
         scan(rel)
     for rel in DEPLOY_SET:
         scan(rel)
+
+
+def test_the_runtime_set_was_measured():
+    """Never clean by absence. The first version routed an unreadable manifest into the hit
+    list, where nothing asserted on it — so a tree with NO manifest scanned zero files and the
+    pin test PASSED on an empty measurement. Found while adding the pytest channel the review
+    asked for (GPT on #947); the review was about delivery, the hole was about evidence."""
+    _scan_all()
+    assert not _INFRA, "the scan could not measure the runtime set:\n  " + "\n  ".join(_INFRA)
+    assert _HITS, "no runtime file was scanned — an empty measurement is not a clean one"
+
+
+def test_every_declared_exception_is_live():
+    """A declared exception that matches nothing is stale or misspelled, and a stale exception
+    is a hole waiting for a line to fall into it. Each ALLOWED row must absorb at least one
+    hit on the tree it was declared against — this file's own tree. Under HESTIA_RUNTIME_ROOT
+    the scan is measuring a DIFFERENT tree, where an exception written for this one may
+    legitimately match nothing (the collapse branch moved gemini's cwd line); that is not
+    staleness, so the check is skipped there rather than reported as a defect."""
+    _scan_all()
+    if os.getenv("HESTIA_RUNTIME_ROOT"):
+        return
+    for cls, needle, why in ALLOWED:
+        assert any(f"[{cls}]" in h and why in h for h in _ALLOWED_HITS), (
+            f"declared exception [{cls}] {needle!r} absorbed no hit — retire it or fix it: {why}")
+
+
+def test_prose_is_reported_not_counted():
+    """A line is prose or code, never both. A tokenizer slip that classified one line into
+    both lists would count a docstring literal as a defect AND report it as prose — the count
+    would be wrong and the report would say why it was right."""
+    _scan_all()
+    counted = {h.split("  [")[0] for h in _FAILS}
+    prose = {h.split("  [")[0] for h in _PROSE}
+    assert not (counted & prose), f"lines classified as both prose and code: {sorted(counted & prose)}"
 
 
 def test_no_new_path_literals():
@@ -304,7 +340,16 @@ def test_the_directive_is_not_yet_met():
         "make test_no_new_path_literals assert a total of zero. The directive is met.")
 
 
-ALL = [test_no_new_path_literals, test_the_directive_is_not_yet_met]
+ALL = [test_the_runtime_set_was_measured, test_every_declared_exception_is_live,
+       test_prose_is_reported_not_counted, test_no_new_path_literals,
+       test_the_directive_is_not_yet_met]
+
+
+def teardown_module(module):
+    """The house channel (ci_selfexec_test): whatever the scan could not measure is delivered
+    to pytest here as well as by the test above, so a partial measurement cannot read as a
+    pass under either invocation."""
+    assert not _INFRA, _INFRA
 
 
 def main() -> int:
