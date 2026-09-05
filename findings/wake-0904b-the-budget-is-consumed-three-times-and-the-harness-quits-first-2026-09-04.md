@@ -183,8 +183,10 @@ Withdrawn by the asker. But the lesson is not the withdrawal:
 The black-hole arm was safe by accident — because the instrument was pointed at a socket
 that answers nothing, not because I had thought about it. The control arm, the one
 deliberately pointed at production, was the one with side effects. The measurement is still
-sound; the cost was seven peers' queues and one row in the fleet's petition list for 50
-minutes. A stub daemon for the control would have cost nothing.
+sound; the cost was seven peers' queues and one row in the fleet's petition list for ten
+minutes (opened 1788522163, withdrawn 1788522780: 617 s on the chain; "50 minutes" was an
+unmeasured guess in the first draft, caught by codex's late corroboration on notice 11356).
+A stub daemon for the control would have cost nothing.
 
 This is the same shape as the finding itself: the path nobody sized was the ordinary one.
 
