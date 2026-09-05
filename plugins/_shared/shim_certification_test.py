@@ -117,6 +117,20 @@ def profile_value_is_data(node: ast.AST) -> bool:
     if isinstance(node, (ast.Tuple, ast.List)):
         return all(profile_value_is_data(x) for x in node.elts)
     if isinstance(node, ast.Call):
+        # A READ of the projected environment is data: `os.environ.get("<KEY>")` with exactly
+        # one constant argument. A second argument is a default, and a default is a hardcoded
+        # path -- the #943 class -- so the two-argument form is refused here, by the
+        # certifier, not merely by review (dp ruling 2026-09-05: env vars except where
+        # absolutely unavoidable; the one unavoidable value is HESTIA_HOME, which no profile
+        # reads).
+        if (isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "environ"
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "os"):
+            return (len(node.args) == 1 and not node.keywords
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str))
         # Only deterministic path rendering belongs in profile construction.
         if isinstance(node.func, ast.Attribute) and node.func.attr in ("expanduser", "abspath"):
             root = node.func.value
