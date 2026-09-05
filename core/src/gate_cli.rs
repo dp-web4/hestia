@@ -113,6 +113,19 @@ impl Mcp {
         let v = self.rpc("tools/call", Some(json!({"name": name, "arguments": args})))?;
         tool_payload(name, &v)
     }
+
+    /// Like `tool`, but a refusal envelope comes back as a VALUE, not an `Err`. For the one
+    /// caller that needs to read a refusal's payload — `scope arbitrate`'s unsigned preflight,
+    /// whose `_hestia_error.data.signs` carries the bytes to sign (#962). Every other caller
+    /// keeps `tool`, so a refusal can never reach an operator as a verdict by accident.
+    pub fn tool_envelope(&mut self, name: &str, args: Value) -> Result<Value> {
+        let v = self.rpc("tools/call", Some(json!({"name": name, "arguments": args})))?;
+        let text = v
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("tool {name}: no content in daemon response"))?;
+        serde_json::from_str(text).with_context(|| format!("tool {name}: undecodable payload"))
+    }
 }
 
 /// Take the first NON-EMPTY `data:` frame off the daemon's SSE response.
