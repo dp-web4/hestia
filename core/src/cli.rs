@@ -661,6 +661,14 @@ enum DelegateCmd {
         #[arg(long)]
         action: Vec<String>,
 
+        /// AND every `scope.decide:<prefix>` action with this member (#952). A path prefix
+        /// alone is enough for a being's own home — one member owns that subtree — but not
+        /// for a SHARED path, where the prefix alone would let the holder rule for any
+        /// member that asked. Composes into `scope.decide:<member>:<prefix>` so the
+        /// grammar does not have to be hand-spelled.
+        #[arg(long)]
+        member: Option<String>,
+
         /// Expiration in hours (e.g. --expires 24)
         #[arg(long)]
         expires: Option<u64>,
@@ -800,8 +808,8 @@ pub fn run() -> AnyResult<()> {
             PolicyCmd::RmRule { id, role } => cmd_policy_rm_rule(&home, &id, role),
         },
         Command::Delegate(d) => match d {
-            DelegateCmd::Grant { agent, role, action, expires } => {
-                cmd_delegate_grant(&home, &agent, role, action, expires)
+            DelegateCmd::Grant { agent, role, action, member, expires } => {
+                cmd_delegate_grant(&home, &agent, role, action, member, expires)
             }
             DelegateCmd::List => cmd_delegate_list(&home),
             DelegateCmd::Revoke { id } => cmd_delegate_revoke(&home, &id),
@@ -3574,15 +3582,77 @@ fn cmd_constellation_cosign_serve(home: &std::path::Path, once: bool, target: &s
 
 // ---- delegation commands ----------------------------------------------------
 
+/// Fold `--member` into every `scope.decide:<prefix>` action, producing the ANDed
+/// `scope.decide:<member>:<prefix>` spelling (#952, sprout's amendment).
+///
+/// Refuses rather than silently doing nothing in the two cases where the operator plainly
+/// meant a bound and would not get one:
+///
+///   * `--member` with no `scope.decide` action at all — the flag binds nothing, and a flag
+///     that binds nothing is indistinguishable at the prompt from a flag that worked.
+///   * `--member` alongside a BARE `scope.decide` (unbounded, no path) — composing there
+///     would yield `scope.decide:<member>`, which `action_covers` refuses by design, so the
+///     operator would end up with a delegation that authorises nothing while reading like it
+///     authorises something narrow. Bounding by asker alone is not a spelling; say so here,
+///     at the moment it is typed, rather than at the moment it fails to rule.
+fn compose_member_bound_actions(
+    actions: Vec<String>,
+    member: Option<&str>,
+) -> AnyResult<Vec<String>> {
+    let Some(member) = member else { return Ok(actions) };
+    let member = member.trim();
+    if member.is_empty() || member.contains('/') || member.contains(':') {
+        anyhow::bail!(
+            "--member must be a plain plugin id: `{member}` is empty or contains `/` or `:`, \
+             which would make the action grammar ambiguous"
+        );
+    }
+    let prefix = format!("{}:", delegation::ACTION_SCOPE_DECIDE);
+    let mut bound = 0usize;
+    let out: Vec<String> = actions
+        .into_iter()
+        .map(|a| {
+            if a.trim() == delegation::ACTION_SCOPE_DECIDE {
+                anyhow::bail!(
+                    "--member cannot bound a bare `{}`: a member bound with no path bound is \
+                     not a spelling, because bounding by asker alone would let this seat rule \
+                     any path that member asked for. Give a prefix: --action {}:/abs/path",
+                    delegation::ACTION_SCOPE_DECIDE,
+                    delegation::ACTION_SCOPE_DECIDE,
+                );
+            }
+            match a.strip_prefix(&prefix) {
+                // Already member-bound (the rest is not an absolute path): leave it alone
+                // rather than nesting a second bound into it.
+                Some(rest) if rest.starts_with('/') => {
+                    bound += 1;
+                    Ok(format!("{}{}:{}", prefix, member, rest))
+                }
+                _ => Ok(a),
+            }
+        })
+        .collect::<AnyResult<Vec<String>>>()?;
+    if bound == 0 {
+        anyhow::bail!(
+            "--member was given but no `{}:/abs/prefix` action was, so the flag would bind \
+             nothing. Either drop --member or add the action it is meant to bound.",
+            delegation::ACTION_SCOPE_DECIDE
+        );
+    }
+    Ok(out)
+}
+
 fn cmd_delegate_grant(
     home: &std::path::Path,
     agent: &str,
     role_names: Vec<String>,
     actions: Vec<String>,
+    member: Option<String>,
     expires: Option<u64>,
 ) -> AnyResult<()> {
     let agent_id = uuid::Uuid::parse_str(agent)
         .with_context(|| format!("invalid agent UUID: {agent}"))?;
+    let actions = compose_member_bound_actions(actions, member.as_deref())?;
 
     let roles: Vec<_> = role_names.iter()
         .map(|r| delegation::parse_role(r))
@@ -3636,8 +3706,18 @@ fn cmd_delegate_list(home: &std::path::Path) -> AnyResult<()> {
             .map(|e| e.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_else(|| "never".into());
 
-        println!("{} → agent={} roles=[{}] expires={}",
-            d.id, d.agent_lct_id, role_str, exp);
+        // Actions are DISCLOSED, not just roles (#952). Until this line, `delegate list`
+        // printed roles only — so a `scope.decide:...` delegation, the one kind of entry in
+        // this store that now confers real authority, was invisible in the only place an
+        // operator goes to look. An authority nobody can enumerate cannot be revoked on
+        // purpose, only by accident.
+        let act_str = if d.scope.actions.is_empty() {
+            "*".into()
+        } else {
+            d.scope.actions.join(", ")
+        };
+        println!("{} → agent={} roles=[{}] actions=[{}] expires={}",
+            d.id, d.agent_lct_id, role_str, act_str, exp);
     }
     println!("\n{} active delegation(s), {} total", store.active().len(), store.delegations.len());
     Ok(())
@@ -4144,4 +4224,73 @@ mod member_key_source_tests {
 
     // `expand_tilde` moved to `hestia::hub` with member_signing_keypair; its test
     // moved with it (hub.rs `expand_tilde_expands_leading_home`).
+}
+
+#[cfg(test)]
+mod member_bound_action_tests {
+    use super::compose_member_bound_actions;
+
+    #[test]
+    fn member_composes_into_the_anded_spelling() {
+        let out = compose_member_bound_actions(
+            vec!["scope.decide:/w/shared-context".into(), "attest".into()],
+            Some("sage-sprout"),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                "scope.decide:sage-sprout:/w/shared-context".to_string(),
+                "attest".to_string(),
+            ],
+            "the member binds the scope action and leaves unrelated actions alone"
+        );
+    }
+
+    #[test]
+    fn no_member_is_a_pass_through() {
+        let given = vec!["scope.decide:/w/x".to_string()];
+        assert_eq!(
+            compose_member_bound_actions(given.clone(), None).unwrap(),
+            given
+        );
+    }
+
+    #[test]
+    fn a_flag_that_would_bind_nothing_is_an_error_not_a_no_op() {
+        // The failure this catches: at the prompt, a --member that silently bound nothing is
+        // indistinguishable from one that worked, and the operator walks away believing the
+        // delegation is narrower than it is.
+        let err = compose_member_bound_actions(vec!["attest".into()], Some("sage")).unwrap_err();
+        assert!(format!("{err}").contains("would bind \nnothing")
+            || format!("{err}").contains("bind nothing"), "{err}");
+
+        // Bare `scope.decide` + --member would compose to `scope.decide:<member>`, which the
+        // matcher refuses by design — so the operator would hold a delegation that reads
+        // narrow and authorises nothing. Refuse at typing time instead.
+        let err = compose_member_bound_actions(vec!["scope.decide".into()], Some("sage"))
+            .unwrap_err();
+        assert!(format!("{err}").contains("not a spelling"), "{err}");
+    }
+
+    #[test]
+    fn a_member_id_that_would_make_the_grammar_ambiguous_is_refused() {
+        for bad in ["", "  ", "a/b", "a:b"] {
+            assert!(
+                compose_member_bound_actions(vec!["scope.decide:/w/x".into()], Some(bad)).is_err(),
+                "`{bad}` must be refused as a member id"
+            );
+        }
+    }
+
+    #[test]
+    fn an_already_bound_action_is_not_double_bound() {
+        let out = compose_member_bound_actions(
+            vec!["scope.decide:codex:/w/x".into()],
+            Some("sage"),
+        );
+        // Not an error path we want to invent behaviour for: the action already carries a
+        // member bound, so the flag has nothing to bind and that is the "binds nothing" case.
+        assert!(out.is_err(), "an already-bound action leaves --member with nothing to bind");
+    }
 }
