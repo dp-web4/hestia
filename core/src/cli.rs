@@ -3767,7 +3767,7 @@ fn cmd_scope_arbitrate(
     // about to endorse, and signs bytes it constructed — never an opaque string it was told to
     // sign. Every refusal that precedes the signature check (no such request, not pending,
     // self-ruling) surfaces here, before anything is signed.
-    let probe = m.tool(
+    let probe = m.tool_envelope(
         "hestia_scope_arbitrate",
         serde_json::json!({
             "request_id": request_id,
