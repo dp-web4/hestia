@@ -56,12 +56,21 @@ five files, the per-file total does not move. What no pin catches: replacing one
 another of the SAME class. That is still a literal, still counted, still the directive's
 problem — but not a regression this file can see.
 
-WHAT IS SCANNED. The runtime set is a declaration, not a glob (#481/#525 ruling): the
-modules RUNTIME_MANIFEST.txt installs, plus the four seat shims, plus the template when the
-manifest ships the single gate (the collapse lands both together; on a tree without the
-single gate there is no template to certify). Tests, docs and tools are not runtime.
-Comments and docstrings are scanned and reported separately: a literal in prose is not a
-defect, but it is exactly where the next copy is pasted from.
+WHAT IS SCANNED — two declared sets, two pins, one rule (#944 §6: "a release-blocking scan
+over runtime/deploy/config source"). Sets are declarations, not globs (#481/#525 ruling).
+  RUNTIME: the modules RUNTIME_MANIFEST.txt installs, the four seat gate shims, each seat's
+    other hook scripts (witness.py, observe.sh, hydrate.sh where the seat has them), and the
+    template when the manifest ships the single gate.
+  DEPLOY: the systemd unit templates, the from-main deploy unit/timer/script, and the
+    installers that write unit files or resolve HESTIA_HOME. `%h/.hestia` in a unit file is
+    the literal that makes HESTIA_HOME look "supplied" while being hardcoded one layer out —
+    #944 names it explicitly, so it is counted, not grandfathered.
+  NOT (yet) SCANNED, stated so nobody assumes it: the daemon (`core/src/*.rs`), the operator
+    app (`app/`), the plugin SDKs. Those carry literals too (measured 2026-09-05: 20+ files).
+    Extending this file there is the §6 work that remains after the Python/deploy surfaces.
+Tests, docs and tools are not runtime. Comments and docstrings are scanned and reported
+separately: a literal in prose is not a defect, but it is exactly where the next copy is
+pasted from. For non-Python files a line whose first non-blank character is `#` is prose.
 
 FAIL DIRECTION. An unreadable runtime file, a missing manifest, or an unset pin is a
 FAILURE — never clean by absence.
@@ -91,12 +100,22 @@ PATTERNS = [
      "a machine-specific mount path"),
     ("expanduser-tilde",    r"expanduser\(\s*[\"']~",
      "expanding a tilde literal is a hardcoded home"),
-    ("getenv-path-default", r"(?:getenv|environ\.get)\(\s*[\"'][A-Z0-9_]+[\"']\s*,\s*[\"'][~/]",
-     "an env read WITH a path-shaped default: the default is a hardcoded path (the #943 class)"),
+    ("getenv-path-default", r"(?:getenv|environ\.get)\(\s*[\"'](?:HESTIA_[A-Z0-9_]*(?:HOME|DIR|ROOT|PATH|FILE|IDENTITY|WORKSPACE)|[A-Z0-9_]+)[\"']\s*,\s*(?:[\"'][~/]|str\(|os\.path|Path\(|DEFAULT_)",
+     "an env read WITH a path-shaped default — literal or via a constant: the default is a hardcoded path (the #943 class)"),
     ("cwd-root-fallback",   r"(?:\bor\s+os\.getcwd\(\)|return\s+os\.getcwd\(\)|=\s*os\.getcwd\(\)\s*$)",
      "cwd used as a ROOT: layout inference, not authority"),
     ("checkout-inference",  r"parents\[\d\]|dirname\(\s*dirname\(",
      "resolving a root from __file__: checkout inference, not authority"),
+    ("unit-home-hestia",    r"%h/\.hestia",
+     "a systemd specifier spelling the daemon home: HESTIA_HOME supplied by a literal one layer out (#944)"),
+    ("shell-home-default",  r":-\$\{?HOME\}?/|:-~/|:-/home/|:-/mnt/",
+     "a shell parameter default that is a home/machine path: the #943 class in sh"),
+    ("shell-home-hestia",   r"\$\{?HOME\}?/\.hestia",
+     "the daemon home composed from $HOME: a hardcoded layout, not a vault-backed value"),
+    ("tilde-workspace",     r"~/ai-workspace|~/ai-agents",
+     "the workspace spelled as a literal (#944)"),
+    ("abs-tmp-state",       r"(?<![\w/])/tmp/hestia",
+     "hestia state at a literal location under /tmp"),
 ]
 
 # Declared exceptions: (class, substring that identifies the accepted spelling, justification).
@@ -107,21 +126,38 @@ ALLOWED = [
      "canonicalizing the EMPTY sys.path entry, which Python defines as cwd; not selecting authority"),
     ("cwd-root-fallback", "(cwd or os.getcwd())",
      "resolving the ACT's relative target against the event cwd; data about the act, not a root"),
+    ("cwd-root-fallback", 'event.get("cwd") or',
+     "the act's cwd taken from the event first; same shape as the scope resolvers, on the gemini seat"),
 ]
 
 # Per-file, per-class CODE hit counts on origin/main, measured 2026-09-04 at cc64864 by running
 # this file with HESTIA_RUNTIME_ROOT pointing at a clean origin/main worktree. A file absent
 # here is "unpinned" and RED. None until measured — an unset pin is a failure, so this file
-# cannot pass by accident before its first measurement.
+# cannot pass by accident before its first measurement. Deploy-set rows are pinned in the
+# same dict; the two sets share one rule.
 PINNED_BASELINE: dict | None = {
+    # RUNTIME set
     "plugins/_shared/hestia_gate_core.py":          {"cwd-root-fallback": 3, "expanduser-tilde": 1, "tilde-hestia": 1},
-    "plugins/_shared/hestia_gate_mechanism.py":     {},
+    "plugins/_shared/hestia_gate_mechanism.py":     {"getenv-path-default": 2},
     "plugins/_shared/hestia_governance_closure.py": {},
     "plugins/_shared/hestia_shell_classifier.py":   {},
-    "plugins/claude-code/hooks/" + _HOOK:           {"expanduser-tilde": 2, "getenv-path-default": 1, "tilde-hestia": 1},
+    "plugins/claude-code/hooks/" + _HOOK:           {"abs-tmp-state": 1, "expanduser-tilde": 2, "getenv-path-default": 2, "tilde-hestia": 1},
     "plugins/codex/hooks/" + _HOOK:                 {"cwd-root-fallback": 2, "expanduser-tilde": 1, "getenv-path-default": 3, "tilde-hestia": 1},
     "plugins/kimi/hooks/" + _HOOK:                  {"cwd-root-fallback": 2, "expanduser-tilde": 1, "getenv-path-default": 2},
-    "plugins/gemini/hooks/" + _GEM:                 {"cwd-root-fallback": 2, "expanduser-tilde": 1, "getenv-path-default": 2, "tilde-hestia": 1},
+    "plugins/gemini/hooks/" + _GEM:                 {"cwd-root-fallback": 1, "expanduser-tilde": 1, "getenv-path-default": 2, "tilde-hestia": 1},
+    "plugins/claude-code/hooks/witness.py":         {"getenv-path-default": 1},
+    "plugins/codex/hooks/witness.py":               {"getenv-path-default": 1},
+    "plugins/kimi/hooks/observe.sh":                {"shell-home-default": 1},
+    "plugins/kimi/hooks/hydrate.sh":                {"shell-home-default": 3},
+    "plugins/gemini/hooks/observe.sh":              {"shell-home-default": 1},
+    "plugins/gemini/hooks/hydrate.sh":              {"shell-home-default": 1},
+    # DEPLOY set
+    "deploy/templates/hestia.service":              {"unit-home-hestia": 4},
+    "deploy/from-main/hestia-deploy.service":       {"unit-home-hestia": 2},
+    "deploy/from-main/hestia-deploy.timer":         {},
+    "deploy/from-main/hestia-deploy.sh":            {"shell-home-default": 3, "shell-home-hestia": 2},
+    "deploy/fleet/install.sh":                      {"shell-home-default": 1, "shell-home-hestia": 5, "unit-home-hestia": 4},
+    "deploy/install-members.sh":                    {"expanduser-tilde": 1, "shell-home-default": 1, "shell-home-hestia": 1},
 }
 
 _FAILS: list[str] = []
@@ -144,9 +180,29 @@ def runtime_set() -> list[str]:
     files = ["plugins/_shared/" + n for n in names]
     files += ["plugins/claude-code/hooks/" + _HOOK, "plugins/codex/hooks/" + _HOOK,
               "plugins/kimi/hooks/" + _HOOK, "plugins/gemini/hooks/" + _GEM]
+    files += _SEAT_HOOKS
     if "hestia_single_gate.py" in names:
         files.append("plugins/_template/shim_template.py")
     return files
+
+
+# The seats' other hook scripts — runtime on the seat, so runtime here. Declared, not globbed.
+_SEAT_HOOKS = [
+    "plugins/claude-code/hooks/witness.py",
+    "plugins/codex/hooks/witness.py",
+    "plugins/kimi/hooks/observe.sh", "plugins/kimi/hooks/hydrate.sh",
+    "plugins/gemini/hooks/observe.sh", "plugins/gemini/hooks/hydrate.sh",
+]
+
+# Deployment surfaces (#944 §6). Declared, not globbed.
+DEPLOY_SET = [
+    "deploy/templates/hestia.service",
+    "deploy/from-main/hestia-deploy.service",
+    "deploy/from-main/hestia-deploy.timer",
+    "deploy/from-main/hestia-deploy.sh",
+    "deploy/fleet/install.sh",
+    "deploy/install-members.sh",
+]
 
 
 def _prose_lines(src: str):
@@ -170,7 +226,10 @@ def scan(rel: str) -> int:
         _FAILS.append(f"{rel}: unreadable ({exc}) — never clean by absence")
         _HITS[rel] = None
         return -1
-    comments, docstrings = _prose_lines(src)
+    if rel.endswith(".py"):
+        comments, docstrings = _prose_lines(src)
+    else:
+        comments, docstrings = set(), set()
     per: dict[str, int] = {}
     n = 0
     for ln, line in enumerate(src.split("\n"), 1):
@@ -198,6 +257,8 @@ def _scan_all() -> None:
     if _HITS:
         return
     for rel in runtime_set():
+        scan(rel)
+    for rel in DEPLOY_SET:
         scan(rel)
 
 
