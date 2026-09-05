@@ -1142,6 +1142,12 @@ input::placeholder {
 .cfg-seats { display: flex; flex-direction: column; gap: 6px; }
 .cfg-seat { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border: 1px solid var(--border, #333); border-radius: 6px; }
 .cfg-seat-selected { border-color: var(--accent, #6aa9ff); }
+.cfg-seat-shared { background: rgba(106, 169, 255, 0.06); }
+.cfg-inh { color: var(--accent, #6aa9ff); font-size: 0.8rem; }
+.cfg-inherited { margin: 6px 0 10px; }
+.cfg-inherited-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.7; margin-bottom: 4px; }
+.cfg-env-inherited td { opacity: 0.75; font-family: monospace; font-size: 0.85rem; padding: 2px 4px; }
+.cfg-inh-key { width: 30%; }
 .cfg-seat-new input { flex: 1; }
 .cfg-seat-name { font-weight: 600; min-width: 120px; }
 .cfg-seat-keys { flex: 1; opacity: 0.8; font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
