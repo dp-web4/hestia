@@ -783,6 +783,10 @@
   /* --- govern -> runtime config (#944 phase 0) --- */
   .cfg-seat { display: flex; align-items: center; gap: 0.6rem; padding: 0.35rem 0.5rem; border: 1px solid var(--border); border-radius: 4px; margin-bottom: 0.3rem; }
   .cfg-seat.selected { border-color: var(--accent); }
+  .cfg-seat-shared { background: var(--bg-elev); }
+  .cfg-inh { color: var(--accent); font-size: 0.7rem; }
+  .cfg-env-inherited td { color: var(--fg-dim); font-family: var(--mono); font-size: 0.74rem; padding: 0.1rem 0.3rem; }
+  .cfg-inh-key { width: 30%; }
   .cfg-seat-name { font-weight: 600; min-width: 7rem; font-size: 0.85rem; }
   .cfg-seat-keys { flex: 1; color: var(--fg-dim); font-size: 0.74rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .cfg-verdict { font-size: 0.64rem; padding: 0.1rem 0.45rem; border-radius: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
@@ -1491,6 +1495,7 @@
                 <span class="cfg-verdict" id="cfg-editor-verdict"></span>
                 <span class="cfg-digest" id="cfg-editor-digest"></span>
               </div>
+              <div id="cfg-inherited" hidden></div>
               <div class="pol-section-label">Variables</div>
               <table class="cfg-env"><thead><tr><th>variable</th><th>value</th><th></th></tr></thead>
                 <tbody id="cfg-env-rows"></tbody></table>
@@ -3848,6 +3853,7 @@
   // before the operator can wonder whether the artifact caught up).
   const cfgEsc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   let cfgSelected = null;       // member currently open in the editor
+  let cfgShared = { configured: false, keys: [] };   // the shared set, from the last list
   let cfgRows = [];             // [{key, value}] the editor holds (a draft, not the vault)
   let cfgSeats = [];            // last list
 
@@ -3869,15 +3875,27 @@
       if (!res.ok) throw new Error((await res.text()) || ('HTTP ' + res.status));
       const data = await res.json();
       cfgSeats = data.seats || [];
+      cfgShared = data.shared || { configured: false, keys: [] };
       $('cfg-render-dir').textContent = data.render_dir || '…/seats';
       const list = $('cfg-seat-list');
-      if (!cfgSeats.length) { list.innerHTML = '<div class="empty">No seats known to the daemon yet.</div>'; }
+      // THE SHARED SET FIRST. Society facts (home, workspace, shared runtime, endpoint) live
+      // here once and every seat inherits them; a seat row below carries only its own.
+      const sharedRow = `
+          <div class="cfg-seat cfg-seat-shared${cfgSelected === '_shared' ? ' selected' : ''}" data-member="_shared" data-configured="${cfgShared.configured ? 1 : 0}">
+            <span class="cfg-seat-name">shared set</span>
+            <span class="cfg-seat-keys">${cfgShared.configured
+              ? `${cfgShared.keys.length} var${cfgShared.keys.length === 1 ? '' : 's'} inherited by every seat${cfgShared.keys.length ? ' — ' + cfgEsc(cfgShared.keys.join(', ')) : ''}`
+              : 'not configured — every seat renders alone'}</span>
+            ${cfgShared.error ? `<span class="cfg-verdict bad" title="${cfgEsc(cfgShared.error)}">unusable</span>` : ''}
+            <button type="button" class="pol-btn cfg-open">${cfgShared.configured ? 'inspect' : 'configure'}</button>
+          </div>`;
+      if (!cfgSeats.length) { list.innerHTML = sharedRow + '<div class="empty">No seats known to the daemon yet.</div>'; }
       else {
-        list.innerHTML = cfgSeats.map(s => `
+        list.innerHTML = sharedRow + cfgSeats.map(s => `
           <div class="cfg-seat${s.member === cfgSelected ? ' selected' : ''}" data-member="${cfgEsc(s.member)}" data-configured="${s.configured ? 1 : 0}">
             <span class="cfg-seat-name">${cfgEsc(s.member)}</span>
             <span class="cfg-seat-keys">${s.configured
-              ? `${s.keys.length} var${s.keys.length === 1 ? '' : 's'}${s.keys.length ? ' — ' + cfgEsc(s.keys.join(', ')) : ''}`
+              ? `${s.keys.length} own${s.keys.length ? ' — ' + cfgEsc(s.keys.join(', ')) : ''}${(s.inherited||[]).length ? ` <span class="cfg-inh">+${s.inherited.length} shared</span>` : ''}${(s.shadowed||[]).length ? ` <span class="cfg-verdict bad" title="restates a shared key; shared wins">shadowed: ${cfgEsc(s.shadowed.join(', '))}</span>` : ''}`
               : 'not configured'}</span>
             ${cfgVerdictHtml(s.verdict)}
             <button type="button" class="pol-btn cfg-open">${s.configured ? 'inspect' : 'configure'}</button>
@@ -3906,7 +3924,7 @@
     $('cfg-err').hidden = true; $('cfg-saved').hidden = true;
     $('cfg-editor-verdict').innerHTML = ''; $('cfg-editor-digest').textContent = '';
     document.querySelectorAll('#cfg-seat-list .cfg-seat').forEach(el => el.classList.toggle('selected', el.dataset.member === member));
-    if (!configured) { cfgRows = []; $('cfg-note').value = ''; cfgRenderRows(); return; }
+    if (!configured) { cfgRows = []; $('cfg-note').value = ''; $('cfg-inherited').hidden = true; cfgRenderRows(); return; }
     try {
       const res = await apiFetch('/api/config/seat/' + encodeURIComponent(member));
       if (!res.ok) throw new Error((await res.text()) || ('HTTP ' + res.status));
@@ -3914,6 +3932,22 @@
       const env = (data.config && data.config.env) || {};
       cfgRows = Object.keys(env).sort().map(k => ({ key: k, value: env[k] }));
       $('cfg-note').value = (data.config && data.config.note) || '';
+      // INHERITED, READ-ONLY. The lines this seat gets from the shared set, with their values,
+      // shown above its own rows so the whole projection is visible while only the seat's own
+      // lines are editable here. Editing a shared value means opening the shared set.
+      const inh = $('cfg-inherited');
+      const inherited = (data.summary && data.summary.inherited) || [];
+      const eff = data.effective || {};
+      if (member !== '_shared' && inherited.length) {
+        inh.hidden = false;
+        inh.innerHTML = '<div class="pol-section-label">Inherited from the shared set (edit there)</div>'
+          + '<table class="cfg-env cfg-env-inherited"><tbody>'
+          + inherited.map(k => `<tr><td class="cfg-inh-key">${cfgEsc(k)}</td><td class="cfg-inh-val">${cfgEsc(eff[k] ?? '')}</td></tr>`).join('')
+          + '</tbody></table>';
+      } else if (member === '_shared') {
+        inh.hidden = false;
+        inh.innerHTML = '<div class="grant-note">These variables are inherited by <strong>every</strong> seat and win over any seat\'s own line. Society facts only — home, workspace, shared runtime, endpoint. Nothing per-harness belongs here.</div>';
+      } else { inh.hidden = true; inh.innerHTML = ''; }
       const sum = data.summary || {};
       $('cfg-editor-verdict').innerHTML = cfgVerdictHtml(sum.verdict);
       $('cfg-editor-digest').textContent = sum.expected_sha256 ? 'expects ' + sum.expected_sha256.slice(0, 16) + '…' : '';

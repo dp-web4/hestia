@@ -2797,6 +2797,31 @@ async fn config_put_seat(
     let mut s = state.lock().await;
     let home = s.home.clone();
     let existed = s.vault.get_document(sc::SEAT_CONFIG_NS, &member).is_some();
+    let writing_shared = sc::is_shared(&member);
+
+    // A SEAT MAY NOT RESTATE A SHARED KEY. The shared set owns the society's facts; a seat
+    // document is only what is genuinely per-harness. Refused at the door so a new collision
+    // cannot be created (an existing one is reported as `shadowed`, never silently resolved).
+    if !writing_shared {
+        let shared_now = match sc::load_shared(&s.vault) {
+            Some(Ok(c)) => Some(c),
+            _ => None,
+        };
+        let owned = sc::keys_owned_by_shared(shared_now.as_ref(), &cfg);
+        if !owned.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "keys {:?} belong to the shared set and are inherited by every seat; \
+                         remove them from this seat's document (edit `_shared` to change them)",
+                        owned
+                    ),
+                    "shared_keys": owned,
+                })),
+            );
+        }
+    }
 
     // WITNESS FIRST, the same ordering as every other authority write here: a failed vault write
     // must not leave the chain silent about an attempted change to what a seat runs with. The
@@ -2804,6 +2829,7 @@ async fn config_put_seat(
     // chain is the one store that never forgets.
     let record = serde_json::json!({
         "member": member,
+        "shared": writing_shared,
         "keys": cfg.env.keys().cloned().collect::<Vec<_>>(),
         "note": cfg.note,
         "replaces": existed,
@@ -2833,9 +2859,19 @@ async fn config_put_seat(
     }
 
     // Render immediately rather than waiting for the worker's next tick: an operator who just
-    // set a workspace root should not have to guess whether the artifact has caught up.
-    let members = vec![member.clone()];
-    let verdicts = super::handler::render_and_verify_seat_configs(&mut s, &members);
+    // set a workspace root should not have to guess whether the artifact has caught up. As an
+    // AUTHOR pass: render, then verify — the artifact is expected to differ from what it was,
+    // and that difference is the operator's act, not drift. A write to the shared set
+    // re-renders every seat in the same act, because every seat inherits it.
+    let members = if writing_shared {
+        let connected: Vec<String> = s.gate_capabilities.keys().cloned().collect();
+        sc::members_to_check(&s.vault, &home, &connected)
+    } else {
+        vec![member.clone()]
+    };
+    let verdicts = super::handler::render_and_verify_seat_configs_as(
+        &mut s, &members, super::handler::ConfigPass::Author,
+    );
     let _ = s.append_chain("config_seat_written", record);
 
     (
@@ -2843,8 +2879,12 @@ async fn config_put_seat(
         Json(serde_json::json!({
             "ok": true,
             "member": member,
+            "shared": writing_shared,
             "replaced": existed,
-            "artifact": sc::render_path(&home, &member).to_string_lossy(),
+            // The shared set renders no artifact of its own; its effect is every seat's.
+            "artifact": if writing_shared { serde_json::Value::Null } else {
+                serde_json::json!(sc::render_path(&home, &member).to_string_lossy())
+            },
             "verdict": verdicts,
             "intentEntryHash": intent.hash,
         })),
@@ -2881,16 +2921,30 @@ fn seat_config_summary(
             .and_then(|c| c.validate().map(|_| c))
     });
     let open_since = s.config_findings_open.get(member).copied();
+    let shared = sc::load_shared(&s.vault);
+    let declared = match (&shared, declared) {
+        (Some(Err(e)), Some(_)) => Some(Err(format!("shared set unusable: {e}"))),
+        (_, d) => d,
+    };
+    let shared_ok: Option<&sc::SeatConfig> = match &shared {
+        Some(Ok(c)) => Some(c),
+        _ => None,
+    };
     match declared {
         Some(Ok(cfg)) => {
-            let verdict = sc::verify_one(&home, member, &cfg);
+            let verdict = sc::verify_effective(&home, member, shared_ok, &cfg);
+            let (expected_bytes, shadowed) = sc::render_effective(member, shared_ok, &cfg);
             serde_json::json!({
                 "member": member,
                 "configured": true,
+                // What THIS seat carries. The inherited keys are listed apart, so a reader can
+                // tell a seat fact from a society fact at a glance.
                 "keys": cfg.env.keys().cloned().collect::<Vec<_>>(),
+                "inherited": shared_ok.map(|sh| sh.env.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
+                "shadowed": shadowed,
                 "note": cfg.note,
                 "artifact": artifact.to_string_lossy(),
-                "expected_sha256": sc::sha256_of(sc::render(member, &cfg).as_bytes()),
+                "expected_sha256": sc::sha256_of(expected_bytes.as_bytes()),
                 "verdict": verdict,
                 "finding_open_since": open_since,
             })
@@ -2930,9 +2984,19 @@ async fn config_list_seats(State(state): State<SharedState>) -> impl IntoRespons
     let home = s.home.clone();
     let members = super::seat_config::members_to_check(&s.vault, &home, &connected);
     let seats: Vec<serde_json::Value> = members.iter().map(|m| seat_config_summary(&s, m)).collect();
+    let shared = match super::seat_config::load_shared(&s.vault) {
+        None => serde_json::json!({"configured": false, "keys": [], "note": ""}),
+        Some(Ok(c)) => serde_json::json!({
+            "configured": true,
+            "keys": c.env.keys().cloned().collect::<Vec<_>>(),
+            "note": c.note,
+        }),
+        Some(Err(e)) => serde_json::json!({"configured": true, "keys": [], "note": "", "error": e}),
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
+            "shared": shared,
             "seats": seats,
             "render_dir": home.join(super::seat_config::RENDER_DIR).to_string_lossy(),
         })),
@@ -2968,11 +3032,26 @@ async fn config_get_seat(
         );
     }
     let mut s = state.lock().await;
-    let summary = seat_config_summary(&s, &member);
+    let summary = if sc::is_shared(&member) {
+        // The shared set has no artifact and no verdict of its own: its health is every seat's.
+        serde_json::json!({
+            "member": member,
+            "configured": s.vault.get_document(sc::SEAT_CONFIG_NS, &member).is_some(),
+            "keys": [], "inherited": [], "shadowed": [], "note": "",
+            "artifact": serde_json::Value::Null,
+            "verdict": {"status": "shared", "member": member},
+        })
+    } else {
+        seat_config_summary(&s, &member)
+    };
     let cfg: Option<sc::SeatConfig> = s
         .vault
         .get_document(sc::SEAT_CONFIG_NS, &member)
         .and_then(|bytes| serde_json::from_slice::<sc::SeatConfig>(bytes).ok());
+    let shared_ok: Option<sc::SeatConfig> = match sc::load_shared(&s.vault) {
+        Some(Ok(c)) => Some(c),
+        _ => None,
+    };
     let Some(cfg) = cfg else {
         // Absent or undecodable: the summary already says which, and there is no value to
         // reveal, so nothing is witnessed beyond the gate's own row.
@@ -2995,11 +3074,20 @@ async fn config_get_seat(
             &gate,
         ),
     );
+    let (effective, _) = if sc::is_shared(&member) {
+        (cfg.clone(), Vec::new())
+    } else {
+        sc::effective(shared_ok.as_ref(), &cfg)
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "member": member,
             "config": cfg,
+            // The composed set the seat actually renders — shared keys included, values and
+            // all — so the operator can see the whole projection in one place while editing
+            // only the seat's own lines.
+            "effective": effective.env,
             "summary": summary,
         })),
     )
@@ -4592,6 +4680,103 @@ mod disposition_tests {
         assert_eq!(keys, vec!["HESTIA_TOKEN", "HESTIA_WORKSPACE"], "keys ARE listed, sorted");
         assert_eq!(seat["verdict"]["status"], "verified", "rendered by the PUT, so verified: {seat}");
         assert!(seat["expected_sha256"].as_str().unwrap().len() == 64);
+    }
+
+    /// THE SHARED SET (dp, 2026-09-05). Written through the same door under the reserved id;
+    /// inherited by every seat with shared winning; a seat that restates a shared key is refused
+    /// at the door; a shared write re-renders every seat in the same act; the list names the
+    /// shared keys and never a value; the projection header names the shared keys.
+    #[tokio::test]
+    async fn the_shared_set_is_inherited_by_every_seat_and_a_seat_may_not_restate_it() {
+        use crate::server::seat_config as sc;
+        let (dir, state) = test_state().await;
+        let put = |body: serde_json::Value| {
+            let st = state.clone();
+            async move {
+                let resp = axum::response::IntoResponse::into_response(
+                    super::config_put_seat(axum::extract::State(st), axum::Json(body)).await,
+                );
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap())
+            }
+        };
+        // two seats first, each carrying only its own facts
+        for (m, role) in [("claude-code", "role:constellation:interactive-dev"), ("codex", "role:constellation:member")] {
+            let (st, _) = put(serde_json::json!({"plugin_id": m, "config": {"env": {"HESTIA_ROLE": role, "HESTIA_PLUGIN_ID": m}, "note": ""}})).await;
+            assert_eq!(st, StatusCode::OK);
+        }
+        // the shared set: society facts, and a token-shaped value that must never reach the chain
+        let (st, out) = put(serde_json::json!({"plugin_id": "_shared", "config": {
+            "env": {"HESTIA_HOME": "/h", "HESTIA_WORKSPACE": "/w/ai", "HESTIA_SHARED_TOKEN": "shared-secret-value"},
+            "note": "society"}})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert_eq!(out["shared"], true);
+        assert!(out["artifact"].is_null(), "the shared set renders no artifact of its own: {out}");
+        let statuses: Vec<&str> = out["verdict"].as_array().unwrap().iter().map(|v| v["status"].as_str().unwrap()).collect();
+        assert_eq!(statuses.len(), 2, "a shared write re-renders EVERY seat in the same act: {out}");
+        assert!(statuses.iter().all(|s| *s == "verified"), "author pass: render then verify: {out}");
+
+        // every seat's projection now carries the shared keys, names them, and its own keys survive
+        for m in ["claude-code", "codex"] {
+            let rendered = std::fs::read_to_string(sc::render_path(dir.path(), m)).unwrap();
+            assert!(rendered.contains("HESTIA_HOME=/h\n") && rendered.contains("HESTIA_WORKSPACE=/w/ai\n"), "{rendered}");
+            assert!(rendered.contains(&format!("HESTIA_PLUGIN_ID={m}\n")), "{rendered}");
+            assert!(rendered.contains("# shared: HESTIA_HOME HESTIA_SHARED_TOKEN HESTIA_WORKSPACE\n"), "{rendered}");
+        }
+
+        // a seat may not restate a shared key
+        let (st, out) = put(serde_json::json!({"plugin_id": "codex", "config": {"env": {"HESTIA_WORKSPACE": "/w/mine", "HESTIA_PLUGIN_ID": "codex"}, "note": ""}})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{out}");
+        assert!(out["error"].as_str().unwrap().contains("belong to the shared set"), "{out}");
+
+        // the list names the shared keys apart from each seat's own, and carries no value
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_list_seats(axum::extract::State(state.clone())).await,
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!text.contains("shared-secret-value") && !text.contains("/w/ai"), "a VALUE leaked into the list: {text}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["shared"]["configured"], true);
+        assert_eq!(v["shared"]["keys"].as_array().unwrap().len(), 3);
+        let codex = v["seats"].as_array().unwrap().iter().find(|s| s["member"] == "codex").unwrap();
+        assert_eq!(codex["keys"].as_array().unwrap().len(), 2, "own keys only: {codex}");
+        assert_eq!(codex["inherited"].as_array().unwrap().len(), 3, "{codex}");
+        assert_eq!(codex["verdict"]["status"], "verified");
+        assert!(v["seats"].as_array().unwrap().iter().all(|s| s["member"] != "_shared"), "_shared is not a seat: {text}");
+
+        // inspecting _shared reveals its values (witnessed); inspecting a seat shows own + effective
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_get_seat(axum::extract::State(state.clone()), None, axum::extract::Path("_shared".to_string())).await,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["config"]["env"]["HESTIA_SHARED_TOKEN"], "shared-secret-value");
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_get_seat(axum::extract::State(state.clone()), None, axum::extract::Path("codex".to_string())).await,
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["config"]["env"].get("HESTIA_HOME").is_none(), "own config carries no shared key: {v}");
+        assert_eq!(v["effective"]["HESTIA_HOME"], "/h", "the effective set carries it: {v}");
+        assert_eq!(v["effective"]["HESTIA_PLUGIN_ID"], "codex");
+
+        // and the chain: no value, ever; the shared write is marked as such
+        let s = state.lock().await;
+        for e in s.chain_store.read_recent(40).unwrap() {
+            let blob = serde_json::to_string(&e.event_data).unwrap();
+            assert!(!blob.contains("shared-secret-value"), "a VALUE reached the chain in {}: {blob}", e.event_type);
+            if e.event_type == "config_seat_written" && e.event_data["member"] == "_shared" {
+                assert_eq!(e.event_data["shared"], true);
+            }
+        }
+        // AUTHOR PASS: no seat write opened an integrity finding. Before this, every first
+        // write opened `config_integrity_finding{missing}` for a document rendered in the same act.
+        let findings = s.chain_store.read_recent(40).unwrap().iter()
+            .filter(|e| e.event_type == "config_integrity_finding" || e.event_type == "config_miswire").count();
+        assert_eq!(findings, 0, "an authority change was witnessed as drift");
     }
 
     /// The INSPECT reveals the authoritative values, reports the projection verdict, and

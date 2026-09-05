@@ -54,6 +54,8 @@ function rowsFromEnv(env: Record<string, string>): EnvRow[] {
 
 export function RuntimeConfig() {
   const [seats, setSeats] = useState<SeatConfigSummary[]>([]);
+  const [shared, setShared] = useState<{ configured: boolean; keys: string[]; error?: string }>({ configured: false, keys: [] });
+  const [inherited, setInherited] = useState<{ key: string; value: string }[]>([]);
   const [renderDir, setRenderDir] = useState<string>("");
   const [listError, setListError] = useState<string | null>(null);
 
@@ -70,6 +72,7 @@ export function RuntimeConfig() {
     try {
       const result = await configSeatList();
       setSeats(result.seats ?? []);
+      setShared(result.shared ?? { configured: false, keys: [] });
       setRenderDir(result.render_dir ?? "");
       setListError(null);
     } catch (e) {
@@ -92,6 +95,7 @@ export function RuntimeConfig() {
       setRows([]);
       setNote("");
       setLoaded(null);
+      setInherited([]);
       return;
     }
     setBusy(true);
@@ -100,6 +104,9 @@ export function RuntimeConfig() {
       setRows(rowsFromEnv(r.config.env));
       setNote(r.config.note ?? "");
       setLoaded(r.summary);
+      // Inherited lines, read-only: the whole projection is visible, only own lines edit here.
+      const inh = member === "_shared" ? [] : (r.summary.inherited ?? []);
+      setInherited(inh.map((k) => ({ key: k, value: (r.effective ?? {})[k] ?? "" })));
     } catch (e) {
       setEditError(String(e));
     } finally {
@@ -129,6 +136,8 @@ export function RuntimeConfig() {
       setRows(rowsFromEnv(r.config.env));
       setNote(r.config.note ?? "");
       setLoaded(r.summary);
+      const inh = selected === "_shared" ? [] : (r.summary.inherited ?? []);
+      setInherited(inh.map((k) => ({ key: k, value: (r.effective ?? {})[k] ?? "" })));
       await refresh();
     } catch (e) {
       setEditError(String(e));
@@ -166,6 +175,21 @@ export function RuntimeConfig() {
       {listError && <div className="error-banner">{listError}</div>}
 
       <div className="cfg-seats">
+        <div className={"cfg-seat cfg-seat-shared" + (selected === "_shared" ? " cfg-seat-selected" : "")}>
+          <span className="cfg-seat-name">shared set</span>
+          <span className="cfg-seat-keys">
+            {shared.configured
+              ? `${shared.keys.length} var${shared.keys.length === 1 ? "" : "s"} inherited by every seat`
+              : "not configured — every seat renders alone"}
+            {shared.configured && shared.keys.length > 0 && (
+              <span className="cfg-seat-keylist"> — {shared.keys.join(", ")}</span>
+            )}
+          </span>
+          {shared.error && <span className="cfg-verdict cfg-verdict-bad" title={shared.error}>unusable</span>}
+          <button className="btn btn-sm" onClick={() => open("_shared", shared.configured)} disabled={busy}>
+            {shared.configured ? "Inspect" : "Configure"}
+          </button>
+        </div>
         {seats.length === 0 ? (
           <p className="empty">No seats known to the daemon yet</p>
         ) : (
@@ -176,9 +200,17 @@ export function RuntimeConfig() {
             >
               <span className="cfg-seat-name">{s.member}</span>
               <span className="cfg-seat-keys">
-                {s.configured ? `${s.keys.length} var${s.keys.length === 1 ? "" : "s"}` : "not configured"}
+                {s.configured ? `${s.keys.length} own` : "not configured"}
                 {s.configured && s.keys.length > 0 && (
                   <span className="cfg-seat-keylist"> — {s.keys.join(", ")}</span>
+                )}
+                {s.configured && (s.inherited?.length ?? 0) > 0 && (
+                  <span className="cfg-inh"> +{s.inherited!.length} shared</span>
+                )}
+                {s.configured && (s.shadowed?.length ?? 0) > 0 && (
+                  <span className="cfg-verdict cfg-verdict-bad" title="restates a shared key; shared wins">
+                    shadowed: {s.shadowed!.join(", ")}
+                  </span>
                 )}
               </span>
               <VerdictBadge v={s.verdict} />
@@ -225,6 +257,27 @@ export function RuntimeConfig() {
           </div>
 
           {editError && <div className="error-banner">{editError}</div>}
+
+          {selected === "_shared" ? (
+            <p className="cfg-hint">
+              These variables are inherited by <strong>every</strong> seat and win over any seat's own line.
+              Society facts only — home, workspace, shared runtime, endpoint. Nothing per-harness belongs here.
+            </p>
+          ) : inherited.length > 0 ? (
+            <div className="cfg-inherited">
+              <div className="cfg-inherited-label">Inherited from the shared set (edit there)</div>
+              <table className="cfg-env cfg-env-inherited">
+                <tbody>
+                  {inherited.map((r) => (
+                    <tr key={r.key}>
+                      <td className="cfg-inh-key">{r.key}</td>
+                      <td className="cfg-inh-val">{r.value}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
 
           <table className="cfg-env">
             <thead>

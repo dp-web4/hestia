@@ -39,6 +39,15 @@ checks = {
     'inspect row is stamped with the gate witness': 'stamp_gate(' in http[http.index('"config_seat_inspected"'):http.index('"config_seat_inspected"') + 300]
         and 'gate: Option<axum::Extension<super::operator_auth::GateWitness>>' in http[http.index('async fn config_get_seat'):http.index('async fn config_get_seat') + 300],
     'inspect row carries no generic decided_by claim': '"decided_by"' not in http[http.index('"config_seat_inspected"'):http.index('"config_seat_inspected"') + 300],
+    # --- the shared set (dp 2026-09-05): one reserved document every seat inherits, same API
+    'shared set is a reserved document, not a seat': 'pub const SHARED_MEMBER: &str = "_shared";' in Path('core/src/server/seat_config.rs').read_text(encoding='utf-8')
+        and '!is_shared(&item.name)' in Path('core/src/server/seat_config.rs').read_text(encoding='utf-8'),
+    'a seat may not restate a shared key': 'keys_owned_by_shared' in http and 'belong to the shared set' in http,
+    'a shared write re-renders every seat as an author pass': 'ConfigPass::Author' in http and 'sc::members_to_check(&s.vault, &home, &connected)' in http[http.index('async fn config_put_seat'):http.index('async fn scope_grant')],
+    'the worker still detects (verify before render)': 'render_and_verify_seat_configs_as(s, members, ConfigPass::Detect)' in Path('core/src/server/handler.rs').read_text(encoding='utf-8'),
+    'list names shared keys apart, never values': '"shared": shared,' in http and '"inherited":' in http,
+    'dashboard shows the shared row and inherited lines': 'data-member="_shared"' in ui and "id=\"cfg-inherited\"" in ui,
+    'app shows the shared row and inherited lines': 'open("_shared", shared.configured)' in app_ui and 'cfg-env-inherited' in app_ui,
     # --- stakes: above the read flood, below the credential tier
     'inspect stakes are high-reversible': 'path.starts_with("/api/config/seat/")' in auth and 'return Stakes::HighReversible;' in auth[auth.index('path.starts_with("/api/config/seat/")'):auth.index('path.starts_with("/api/config/seat/")') + 200],
     # --- no ambient exposure
