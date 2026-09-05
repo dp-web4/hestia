@@ -18,6 +18,19 @@ pub enum CoreError {
     #[error("vault file already exists at {0} (use --force to overwrite)")]
     VaultAlreadyExists(PathBuf),
 
+    #[error("vault writer lease is already held at {0}")]
+    VaultWriterBusy(PathBuf),
+
+    #[error(
+        "vault changed since this snapshot was opened at {path}: expected generation {expected}, found {actual}",
+        path = path.display()
+    )]
+    VaultGenerationConflict {
+        path: PathBuf,
+        expected: u64,
+        actual: u64,
+    },
+
     #[error("vault file at {path} is corrupted: {reason}", path = path.display())]
     VaultCorrupted { path: PathBuf, reason: String },
 

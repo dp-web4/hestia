@@ -13,11 +13,13 @@
 //! struct (which holds the list of entries + metadata).
 //!
 //! Atomic writes use temp-file-and-rename so a crash during write doesn't
-//! corrupt the vault.
+//! corrupt the vault. Writer serialization is a separate property: a stable
+//! sibling lock artifact plus a persisted generation prevents an older in-memory
+//! snapshot from atomically overwriting newer authority.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -42,6 +44,9 @@ const HEADER_LEN: usize = 4 + 1 + 16 + 12; // = 33
 ///   metadata, state) that used to live in plaintext sidecar files, each
 ///   carrying its own `Protection` (Master / Sealed). `#[serde(default)]` so
 ///   older vaults load transparently. See `vault/document.rs`.
+///
+/// Later additive fields remain serde-defaulted for transparent old-vault opens.
+/// `generation` is the authority-CAS epoch: old vaults begin at generation zero.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultData {
     pub version: u32,
@@ -62,6 +67,11 @@ pub struct VaultData {
     /// an existing vault opens unchanged.
     #[serde(default)]
     pub gate_expectations: super::gate_integrity::GateExpectations,
+    /// Monotonic authority generation. Every `Vault` mutation compares the generation it
+    /// loaded with the generation currently on disk while holding the writer lease, then
+    /// increments exactly once. This turns stale-snapshot overwrite into a named refusal.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 impl Default for VaultData {
@@ -74,6 +84,7 @@ impl Default for VaultData {
             documents: Vec::new(),
             policy_lists: Default::default(),
             gate_expectations: Default::default(),
+            generation: 0,
         }
     }
 }
@@ -81,6 +92,101 @@ impl Default for VaultData {
 /// Path to the vault file, given a hestia home directory.
 pub fn vault_path(hestia_home: &Path) -> PathBuf {
     hestia_home.join("vault.enc")
+}
+
+/// Stable sibling lock artifact. Do not lock `vault.enc` itself: atomic save replaces that
+/// inode, so an inode lock would stop protecting the authority after the first rename.
+fn writer_lock_path(vault_path: &Path) -> PathBuf {
+    vault_path.with_extension("writer.lock")
+}
+
+/// An exclusive writer lease over one vault authority.
+///
+/// On Unix this is an advisory `flock` held by the open file description, so a process crash
+/// releases the lease even though the stable lock artifact remains. On non-Unix targets the
+/// conservative fallback uses `create_new` and removes the artifact on ordinary drop.
+pub(super) struct WriterLease {
+    _file: File,
+    path: PathBuf,
+    remove_on_drop: bool,
+}
+
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn acquire_platform_lock(lock_path: &Path) -> Result<WriterLease> {
+    use std::os::fd::AsRawFd;
+    use std::os::raw::c_int;
+
+    const LOCK_EX: c_int = 2;
+    const LOCK_NB: c_int = 4;
+
+    extern "C" {
+        fn flock(fd: c_int, operation: c_int) -> c_int;
+    }
+
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|e| CoreError::io(lock_path, e))?;
+
+    // SAFETY: `file.as_raw_fd()` is live for the call and flock only changes kernel lock state
+    // associated with that open file description. The descriptor remains owned by WriterLease.
+    let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        let busy = e.kind() == std::io::ErrorKind::WouldBlock
+            || matches!(e.raw_os_error(), Some(11) | Some(35));
+        return if busy {
+            Err(CoreError::VaultWriterBusy(lock_path.to_path_buf()))
+        } else {
+            Err(CoreError::io(lock_path, e))
+        };
+    }
+
+    Ok(WriterLease {
+        _file: file,
+        path: lock_path.to_path_buf(),
+        remove_on_drop: false,
+    })
+}
+
+#[cfg(not(unix))]
+fn acquire_platform_lock(lock_path: &Path) -> Result<WriterLease> {
+    let file = match OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(CoreError::VaultWriterBusy(lock_path.to_path_buf()));
+        }
+        Err(e) => return Err(CoreError::io(lock_path, e)),
+    };
+
+    Ok(WriterLease {
+        _file: file,
+        path: lock_path.to_path_buf(),
+        remove_on_drop: true,
+    })
+}
+
+pub(super) fn acquire_writer_lease(vault_path: &Path) -> Result<WriterLease> {
+    let lock_path = writer_lock_path(vault_path);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| CoreError::io(parent, e))?;
+    }
+    acquire_platform_lock(&lock_path)
 }
 
 /// Default hestia home directory (`~/.hestia`).
@@ -176,6 +282,43 @@ pub fn save(path: &Path, passphrase: &str, data: &VaultData) -> Result<()> {
     Ok(())
 }
 
+/// Persist one mutation while the caller already owns the writer lease.
+///
+/// Crash atomicity comes from `save`; authority atomicity comes from comparing the loaded
+/// generation to the current encrypted file before the rename. The caller's changed data is
+/// never written when the snapshot is stale.
+pub(super) fn save_if_current_locked(
+    path: &Path,
+    passphrase: &str,
+    data: &VaultData,
+) -> Result<u64> {
+    let on_disk = load(path, passphrase)?;
+    let expected = data.generation;
+    let actual = on_disk.generation;
+    if actual != expected {
+        return Err(CoreError::VaultGenerationConflict {
+            path: path.to_path_buf(),
+            expected,
+            actual,
+        });
+    }
+
+    let next_generation = expected.checked_add(1).ok_or_else(|| CoreError::VaultCorrupted {
+        path: path.to_path_buf(),
+        reason: "vault generation overflow".into(),
+    })?;
+    let mut next = data.clone();
+    next.generation = next_generation;
+    save(path, passphrase, &next)?;
+    Ok(next_generation)
+}
+
+/// Persist one mutation from a caller that does not already own a long-lived writer lease.
+pub(super) fn save_if_current(path: &Path, passphrase: &str, data: &VaultData) -> Result<u64> {
+    let _lease = acquire_writer_lease(path)?;
+    save_if_current_locked(path, passphrase, data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +343,7 @@ mod tests {
         assert_eq!(loaded.entries[0].name, "key1");
         assert_eq!(loaded.entries[0].secret, "secret1");
         assert_eq!(loaded.entries[1].name, "key2");
+        assert_eq!(loaded.generation, 0);
     }
 
     #[test]
