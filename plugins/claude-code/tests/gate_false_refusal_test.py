@@ -263,6 +263,18 @@ _SURVIVE = [
     ("for_loop_sed_in_place",
      "for f in a b; do sed -i s/a/b/ {g}; done", "for f in a b; do sed -n 1p {g}; done",
      "the sed grammar must still decide INSIDE a loop"),
+    ("sed_program_from_shell_expansion",
+     'for r in 1-3; do sed -n "${{r}}p" {g}; done', 'for f in {g}; do sed -n 1p "$f"; done',
+     "what THIS classifier (`_is_read_only`) refuses here is the sed PROGRAM: `${r}` may "
+     "expand to `1w <path>`, so a program the grammar cannot read is one that may write, "
+     "and the file-position expansion in the control permits. That is this layer's "
+     "conservative arm and must survive. It is NOT why escalation c83eccb2dc985f8a "
+     "(2026-09-05) was opened: that row, like every gate-self-access escalation since "
+     "7d39f0a, was decided by `hestia_governance_closure.classify`, which is consulted "
+     "FIRST in the hook and on which the `for` block itself is out of grammar — the "
+     "control here is also WRITE there (plugins/_shared/shell_grammar_test.py suite 3). "
+     "The withdrawal reason (#440, the loop) was right; the cross-vendor factor and the "
+     "first version of this row measured this layer and misattributed it"),
     ("done_with_output_redirect",
      "for x in a; do cat $x; done > /tmp/fp12_out", "for x in a; do cat $x; done",
      "the redirect branch consumes `>` upstream of every head check — refused for free"),

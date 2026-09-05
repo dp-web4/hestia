@@ -276,9 +276,59 @@ def test_differential_against_real_shell():
     check("differential", not failures, "\n  ".join(failures))
 
 
+# ── Suite 3: BLOCK AROUND A READ-ONLY BODY — the #440 class, pinned as OPEN ─────────────────
+# The contract above resolves write positions for simple commands only; a `for`/`if`/`while`
+# block is out of grammar, and out-of-grammar means "closure vocabulary anywhere => write".
+# So a block whose BODY is a plain read of a closure file is refused as a write, and the
+# same body outside the block is not. Three real escalations, each self-withdrawn within
+# 15 s and each mis-attributed at least once by a seat that measured the shim's legacy
+# `_is_read_only` (which permits these loops since 50f78c4) instead of THIS classifier:
+#   a3557a7f4f0ca71f 2026-09-04  python3 <shared test> | tail; for t in tests/*.py; do ...
+#   c83eccb2dc985f8a 2026-09-05  for r in <ranges>; do sed -n "${r}p" <shared file>; done
+#   0a850f87d37a908b 2026-09-05  for f in <deploy files>; do grep -n ... "$f"; done
+# Each case asserts the CURRENT verdict (write, out-of-grammar) next to its unblocked body
+# (not-write). When a repair narrows the out-of-grammar haystack so that a block with no
+# write position inside it is no longer a write, the block half goes red: move the pair
+# into CASES as "not-write" — do not loosen this suite.
+_BLOCK_READ_OPEN = [
+    ("a3557a7f__interpreter_then_loop",
+     f'python3 {SHARED_DIR}/{CORE} 2>&1 | tail -3; echo "=== t ==="; '
+     f'for t in plugins/kimi/tests/*.py; do r=$(python3 "$t" 2>&1 | tail -1); echo "$r"; done',
+     f'python3 {SHARED_DIR}/{CORE} 2>&1 | tail -3'),
+    ("c83eccb2__loop_sed_n_program_expansion",
+     f'for r in 1-3 5-7; do echo "--- $r"; sed -n "${{r}}p" {SHARED_DIR}/{CORE}; done',
+     f'sed -n "${{r}}p" {SHARED_DIR}/{CORE}'),
+    ("c83eccb2_control__loop_static_sed_n",
+     f'for r in 1 2; do sed -n 1,3p {SHARED_DIR}/{CORE}; done',
+     f'sed -n 1,3p {SHARED_DIR}/{CORE}'),
+    ("0a850f87__loop_grep_over_closure_files",
+     f'for f in {HOOKS}/{HOOK} {SHARED_DIR}/{CORE}; do grep -n "def " "$f"; done',
+     f'grep -n "def " {HOOKS}/{HOOK} {SHARED_DIR}/{CORE}'),
+    ("if_block_read_only_body",
+     f'if grep -q def {SHARED_DIR}/{CORE}; then cat {SHARED_DIR}/{CORE}; fi',
+     f'grep -q def {SHARED_DIR}/{CORE} && cat {SHARED_DIR}/{CORE}'),
+]
+
+
+def test_block_around_read_only_body_is_still_out_of_grammar():
+    failures = []
+    for name, block, body in _BLOCK_READ_OPEN:
+        vb = cls(body)
+        if vb.classification == "write":
+            failures.append(f"{name}: the UNBLOCKED body is a write ({vb}); the control is "
+                            f"broken, so the block half proves nothing")
+            continue
+        v = cls(block)
+        if v.classification != "write" or v.rule != OOG:
+            failures.append(f"{name}: block is no longer write/{OOG} (got {v}) — the #440 "
+                            f"class moved; promote this pair into CASES as not-write")
+    check("block_read_only_body_pinned_open", not failures, "\n  ".join(failures))
+
+
 ALL = [
     test_explicit_all_grammar_cases,
     test_differential_against_real_shell,
+    test_block_around_read_only_body_is_still_out_of_grammar,
 ]
 
 if __name__ == "__main__":
@@ -295,4 +345,5 @@ if __name__ == "__main__":
     if failed:
         print(f"FAILURES: {failed}")
         sys.exit(1)
-    print(f"OK — {len(ALL)} suites, {len(CASES)} explicit cases, {len(_DIFF_CASES)} differential")
+    print(f"OK — {len(ALL)} suites, {len(CASES)} explicit cases, {len(_DIFF_CASES)} differential, "
+          f"{len(_BLOCK_READ_OPEN)} block-read pairs pinned open")
