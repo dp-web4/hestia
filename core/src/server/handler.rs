@@ -21384,11 +21384,16 @@ async fn tool_scope_arbitrate(state: &SharedState, args: &Value) -> ToolResult {
         };
         let mut arr = [0u8; 64];
         arr.copy_from_slice(&sig_bytes);
-        if lct
-            .public_key
-            .verify(msg.as_bytes(), &web4_core::crypto::SignatureBytes { bytes: arr })
-            .is_err()
-        {
+        // The seat signs with whatever key `hestia hub set-member-key` points at: the LCT's
+        // binding key, or an OPERATIONAL key the binding key vouched (the witness-onboarded
+        // channel key). Both are the seat's own identity; only a vouch that verifies counts.
+        let sig = web4_core::crypto::SignatureBytes { bytes: arr };
+        let by_binding = lct.public_key.verify(msg.as_bytes(), &sig).is_ok();
+        let by_vouched_operational = lct.operational_keys.iter().any(|k| {
+            lct.operational_key_for(&k.purpose).as_ref() == Some(&k.pubkey)
+                && k.pubkey.verify(msg.as_bytes(), &sig).is_ok()
+        });
+        if !(by_binding || by_vouched_operational) {
             return Ok(hestia_error_envelope(
                 "hestia.scope_arbitrate_bad_signature",
                 "the signature does not verify against your seat's registry public key — the \
