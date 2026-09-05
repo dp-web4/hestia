@@ -3756,13 +3756,55 @@ fn cmd_scope_arbitrate(
             }
         }
     }
-    let msg = delegation::arbitration_message(request_id, granted, &reason);
-    let sig = keypair.sign(msg.as_bytes());
-    let sig_hex = hex::encode(sig.bytes);
-
     let mut m = hestia::gate_cli::Mcp::connect(endpoint)?;
     let (sid, _who) = hestia::gate_cli::open_session(&mut m, as_member, "role:constellation:member")?;
     eprintln!("identity ASSERTED as '{as_member}' at connect; the RULING is signed by its registry key, which the daemon verifies.");
+
+    // Preflight, unsigned. The signed bytes name the MEMBER and the PATH (v2, HUB on #962),
+    // and only the daemon knows which member and path a request id stands for. The unsigned
+    // refusal hands them back in `signs`; this seat reads them out, rebuilds the canonical
+    // message ITSELF from them, checks it is byte-identical to the hint, prints what it is
+    // about to endorse, and signs bytes it constructed — never an opaque string it was told to
+    // sign. Every refusal that precedes the signature check (no such request, not pending,
+    // self-ruling) surfaces here, before anything is signed.
+    let probe = m.tool(
+        "hestia_scope_arbitrate",
+        serde_json::json!({
+            "request_id": request_id,
+            "granted": granted,
+            "reason": reason,
+            "session_id": sid,
+        }),
+    )?;
+    let code = probe["_hestia_error"]["code"].as_str().unwrap_or_default().to_string();
+    if code != "hestia.scope_arbitrate_unsigned" {
+        println!("{}", serde_json::to_string_pretty(&probe)?);
+        anyhow::bail!("the daemon refused the ruling before the signature was checked (see above)");
+    }
+    let signs = probe["_hestia_error"]["data"]["signs"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("the daemon's unsigned refusal carried no `signs` hint"))?;
+    let (member, path) = delegation::arbitration_subject(signs).ok_or_else(|| {
+        anyhow::anyhow!(
+            "the daemon's `signs` hint is not a canonical {} message; refusing to sign bytes \
+             this seat cannot reconstruct: {signs:?}",
+            delegation::ARBITRATION_HEADER
+        )
+    })?;
+    let msg = delegation::arbitration_message(request_id, &member, &path, granted, &reason);
+    if msg != signs {
+        anyhow::bail!(
+            "the daemon's `signs` hint differs from the canonical message this seat rebuilt \
+             from it; refusing to sign.\n  hint:  {signs:?}\n  built: {msg:?}"
+        );
+    }
+    eprintln!(
+        "signing: '{member}' {} {path}  (request {request_id})",
+        if granted { "MAY reach" } else { "may NOT reach" }
+    );
+    let sig = keypair.sign(msg.as_bytes());
+    let sig_hex = hex::encode(sig.bytes);
+
     let r = m.tool(
         "hestia_scope_arbitrate",
         serde_json::json!({
