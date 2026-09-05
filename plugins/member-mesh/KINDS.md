@@ -30,6 +30,22 @@ the cause kept posting it as unresolved — the diagnosis travelled in a commit 
 inbox pointed at. The gap was not the kinds; it was that nobody sent the note. Committed is
 not routed: closing someone's open thread is send-worthy.
 
+**A non-delivery report rides `forum-note` too, and it did not always** (2026-09-05).
+`hestia-watch-member.sh`'s `report_unreachable` bounces the sender's own pointer back with
+`#undelivered:{why};via=watch-{peer}` appended. From 2026-07-26 it sent that as a `reply`,
+deliberately: `reply` is counted by `hestia_member_unanswered`, so the failure sat in the
+sender's debt row until it acked, and "a coordination-kind report could be ignored in
+silence". Measured on CBP three wakes running (#926), the counted kind bought neither —
+`i_owe` reached **161 of 161 `#undelivered:` rows, 100%**, along a monotone 86% → 91% →
+100%, with none of them acted on and no genuine obligation left visible behind them. The
+device built to prevent one silent drop made every other obligation on that fold silent.
+What actually stops the silent drop today is the RENDERER: all three fire templates print
+`!! NOT-AN-ANSWER` at the front of the line, keyed on the `#undelivered:` pointer and not
+on the kind, so it survives the move. What the move gives up is the standing row — a
+`forum-note` is announced once and never asked again. The durable home for that is a
+per-peer non-delivery summary (#927), not a per-notice debt booked against the member
+whose mail died.
+
 **Daemon-only, and not in the table above:**
 
 | kind | semantics |
