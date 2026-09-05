@@ -3646,7 +3646,7 @@ fn cmd_delegate_grant(
 
     let mut vault = open_vault(home)?;
     let mut store = DelegationStore::load(&vault)?;
-    let (delegator_id, delegator_kp) = delegation::vault_delegator(&vault)?;
+    let (delegator_id, delegator_kp) = delegation::operator_delegator(&vault, home)?;
     let deleg = store.create_delegation(
         delegator_id,
         agent_id,
