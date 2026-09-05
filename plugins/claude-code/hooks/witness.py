@@ -108,12 +108,28 @@ def _load_projection(plugin_id):
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
             return ("config.unbacked", f"projection {path} carries an unusable key {k!r}")
         pairs.append((k, v))
-    projected = dict(pairs)
+    # OWNERSHIP RIDES ON EVERY LINE (design A). A per-seat line is `TOKEN__KEY`; shared lines
+    # are plain. This seat strips ITS token and exports the bare key; a line carrying any other
+    # seat's token is a miswire, not a value -- it cannot be consumed here, whatever it says.
+    token = "".join(ch.upper() if ch.isalnum() else "_" for ch in plugin_id)
+    projected = {}
+    for k, v in pairs:
+        if "__" in k:
+            prefix, bare = k.split("__", 1)
+            if prefix != token:
+                return ("config.miswired", f"projection {path} carries a line for seat token "
+                        f"{prefix!r}, but this seat is {token!r} ({plugin_id}); a line cannot be "
+                        "consumed by a seat it was not rendered for")
+            k = bare
+        projected[k] = v
     if "HESTIA_HOME" in projected and os.path.realpath(projected["HESTIA_HOME"]) != os.path.realpath(home):
         return ("config.miswired", f"the launcher supplied HESTIA_HOME={home!r} but the vault "
                 f"projection says {projected['HESTIA_HOME']!r}; this seat is running against a "
                 "home the authority does not name")
-    for k, v in pairs:
+    if projected.get("HESTIA_PLUGIN_ID", plugin_id) != plugin_id:
+        return ("config.miswired", f"projection {path} says HESTIA_PLUGIN_ID="
+                f"{projected['HESTIA_PLUGIN_ID']!r} but this seat is {plugin_id!r}")
+    for k, v in projected.items():
         if k == "HESTIA_ROLE":
             continue   # launch context, never config
         os.environ[k] = v
