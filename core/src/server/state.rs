@@ -61,6 +61,17 @@ pub struct Session {
     /// Guard B (HUB ruling 2026-07-24): this is NEVER an authorization discriminator — no policy/authz
     /// decision may key off it (nor off `soft_lct`). It names a session; it never confers capability.
     pub host_session_id: Option<String>,
+    /// HOW the principal behind this session was established (PRD_FLEET §4.2,
+    /// #824). `Asserted` is the legacy A1 posture: the caller typed `plugin_id`.
+    /// `ProofOfPossession` means the caller signed a daemon-issued nonce with the
+    /// key its canonical id derives from. Fixed at mint; Guard A reuse never
+    /// upgrades or downgrades it.
+    pub identity_basis: crate::server::connect_pop::IdentityBasis,
+    /// The proven canonical id (`lct:web4:mb32:…`) when `identity_basis` is
+    /// `ProofOfPossession`; `None` for asserted sessions. This — not the
+    /// label-derived custodial `member_lct` — is the instance the outcome chain
+    /// attributes a proven session's acts to.
+    pub principal_lct_id: Option<String>,
 }
 
 /// In-flight R6 action.
@@ -422,6 +433,12 @@ pub struct ServerState {
     /// established operator sessions. See `server::operator_auth`.
     pub operator_challenges: crate::server::operator_auth::ChallengeStore,
     pub operator_sessions: crate::server::operator_auth::SessionStore,
+    /// Proof-of-possession at connect (PRD_FLEET §4.2 class 2): issued-but-
+    /// unredeemed challenges (single-use, TTL-bounded, bound to the claimed id)
+    /// and the durable `plugin_id → canonical lct_id` pins a first proof
+    /// establishes. See `server::connect_pop`.
+    pub pop_challenges: crate::server::connect_pop::PopChallengeStore,
+    pub pop_pins: crate::server::connect_pop::PopPins,
     /// Pending human-approval escalations for writes to the governance surface (stage 2 of
     /// dp's 2026-07-29 ruling). In-memory ON PURPOSE: a restart drops them, and every
     /// escalation in flight then reads Expired, which is a deny. Persisting them would let a
@@ -610,6 +627,21 @@ impl ServerState {
             )?
         };
 
+        // Proof-of-possession pins (`plugin_id → canonical lct_id`). Same posture as
+        // the synthetic set: present-but-unparseable aborts startup, because an
+        // empty pin map would silently downgrade every strongly enrolled label to
+        // asserted — the exact failure #824 forbids.
+        let pop_pins: crate::server::connect_pop::PopPins = {
+            use anyhow::Context;
+            crate::vault::load_doc(
+                &vault,
+                crate::server::connect_pop::POP_PINS_NAMESPACE,
+                crate::server::connect_pop::POP_PINS_DOC,
+                crate::server::connect_pop::POP_PINS_LEGACY_FILE,
+            )
+            .context("proof-of-possession pin map unreadable — failing closed instead of treating it as empty")?
+        };
+
         // Standing scope grants (durable loosenings — POLICY_SCOPE_ASYMMETRY row 3).
         // Present-but-unparseable must abort startup like the synthetic set: collapsing a
         // corrupt store to empty would silently drop operator-made durable grants, and a
@@ -689,6 +721,8 @@ impl ServerState {
             vci_nonces: HashSet::new(),
             operator_challenges: crate::server::operator_auth::ChallengeStore::default(),
             operator_sessions: crate::server::operator_auth::SessionStore::default(),
+            pop_challenges: Default::default(),
+            pop_pins,
             gate_escalations: Default::default(),
         };
 
@@ -1948,6 +1982,8 @@ mod tests {
                 soft_lct: "lct:test:a".into(),
                 connected_at: Utc::now(),
                 host_session_id: None,
+                identity_basis: crate::server::connect_pop::IdentityBasis::Asserted,
+                principal_lct_id: None,
             },
         );
         state.sessions.insert(
@@ -1964,6 +2000,8 @@ mod tests {
                 soft_lct: "lct:test:b".into(),
                 connected_at: Utc::now() + chrono::Duration::seconds(1),
                 host_session_id: None,
+                identity_basis: crate::server::connect_pop::IdentityBasis::Asserted,
+                principal_lct_id: None,
             },
         );
 
