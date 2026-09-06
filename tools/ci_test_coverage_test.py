@@ -107,6 +107,12 @@ NOT_A_TEST = {
         "package marker, no assertions",
     "plugin-sdk/python/tests/mock_hestia_server.py":
         "fixture: the stub daemon the SDK suites connect to, imported not run",
+    "plugins/claude-code/tests/projection_fixture.py":
+        "fixture: renders a seat config projection under a fixture HESTIA_HOME, imported "
+        "not run (projection_consumer_test.py and the end-to-end suites import "
+        "write_projection/projection_env). It renders the same shape the daemon does, so a "
+        "test's projection is the real artifact rather than a lookalike -- naming it a test "
+        "would make CI grade the fixture by itself",
     "plugins/gemini/tests/runner_decision.py":
         "fidelity model of gemini-cli's hook-result parser, imported not run "
         "(channel_contract_test.py:33 `from runner_decision import decide`); it is "
