@@ -1470,8 +1470,17 @@ while true; do
     # file (`open-petitions.py`) so one suite covers both; an unparseable or
     # failed read yields `asked:false`, which the renderer says out loud rather
     # than rendering as "you hold none".
+    # The 4th argument is the ledger of host sessions THIS watcher has fired
+    # (fire-*.sh appends one line per wake). `asked_by` is the plugin NAME, and
+    # on every box two seats share it — the interactive session and the wake —
+    # so name-equality alone renders a co-seat's live petition as the reader's
+    # own and prescribes WITHDRAW for it (#732, CBP 2026-09-06). With the ledger,
+    # a row whose `host_session_id` is not in it is folded as `co_seat`, not
+    # `mine`. A missing ledger or a daemon that omits the field degrades to the
+    # name-only fold, never to "none of these are yours".
     PET=$(open_petitions 2>/dev/null \
           | timeout 5 python3 "$WATCH_DIR/open-petitions.py" fold "$PLUGIN" \
+              "$STATE/wake-sessions-$PLUGIN" \
           2>/dev/null || echo '{"asked":false,"mine":[]}')
     printf '%s' "$OUT" | UN_FILE="$UN_FILE" PET="$PET" FOR_PLUGIN="$PLUGIN" python3 -c '
 import json,os,sys

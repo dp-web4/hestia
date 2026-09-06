@@ -122,26 +122,70 @@ def producer_from_keys(keys):
 # discriminator between a gate-auto-minted petition and one the member chose to
 # file, and those two want different responses.
 KEEP = ("escalation_id", "secs_remaining", "marker", "tool_name", "opened_at",
-        "stated_reason", "stated_detail", "peer_participation", "bar")
+        "stated_reason", "stated_detail", "peer_participation", "bar",
+        "host_session_id")
 
 clean = lambda s: re.sub(r"[\x00-\x1f\x7f]", "", str(s))[:400]
 
 
-def fold(payload, for_plugin):
+def read_own_sessions(path):
+    """The ledger of host sessions THIS watcher has fired: one id per line, first
+    whitespace-separated token (fire-*.sh appends `<uuid> <stamp> <primer>`).
+
+    None (not an empty set) when there is no ledger: "this watcher never recorded
+    which sessions it fired" and "this watcher fired none" are different facts,
+    and only the second licenses calling a same-name row a co-seat's.
+    """
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            ids = {ln.split()[0] for ln in fh if ln.strip()}
+    except Exception:
+        return None
+    return ids
+
+
+def fold(payload, for_plugin, own_sessions=None):
     """Filter a pending-escalations response down to one member's rows.
 
     `asked` is NOT derivable from `mine` being empty: a failed RPC and a member
     that holds nothing are the same empty list, and they want opposite readings.
     So the flag records whether the question was actually put, and the renderer
     says which case it is looking at.
+
+    `mine` versus `co_seat` (#732). `asked_by` is a plugin NAME, and on every box
+    two processes answer to it: the interactive session and the mesh-fired wake.
+    A row is this seat's only if its `host_session_id` is one this watcher fired
+    (`own_sessions`). A same-name row with a host session NOT in that set is a
+    co-seat's — live, possibly being polled that second — and goes under
+    `co_seat`, which the renderer never tells the reader to withdraw. Measured
+    on CBP 2026-09-06: two consecutive wakes were told to withdraw petitions the
+    interactive seat had open; one was approved by the operator 2 min after the
+    primer said to withdraw it.
+
+    Degrades toward the OLD reading, never past it: with no ledger, or a row the
+    daemon sent without `host_session_id`, the row stays in `mine`, tagged
+    `seat: "unknown"` so the renderer can say the discriminator was absent rather
+    than assert ownership it did not measure.
     """
     pending = payload.get("pending") if isinstance(payload, dict) else None
-    return {
-        "asked": isinstance(pending, list),
-        "mine": [{k: r.get(k) for k in KEEP if k in r}
-                 for r in (pending or [])
-                 if isinstance(r, dict) and r.get("asked_by") == for_plugin],
-    }
+    mine, co_seat = [], []
+    for r in (pending or []):
+        if not (isinstance(r, dict) and r.get("asked_by") == for_plugin):
+            continue
+        row = {k: r.get(k) for k in KEEP if k in r}
+        hsid = r.get("host_session_id")
+        if own_sessions is None or not hsid:
+            row["seat"] = "unknown"
+            mine.append(row)
+        elif hsid in own_sessions:
+            row["seat"] = "mine"
+            mine.append(row)
+        else:
+            row["seat"] = "co-seat"
+            co_seat.append(row)
+    return {"asked": isinstance(pending, list), "mine": mine, "co_seat": co_seat}
 
 
 def short(sec):
@@ -223,8 +267,11 @@ def render(f):
         return ("Open petitions: NOT MEASURED this wake (the pending-escalations "
                 "read failed) — this is not evidence that you hold none. " + SELF_SERVE)
     mine = f.get("mine") or []
-    if not mine:
+    co_seat = f.get("co_seat") or []
+    if not mine and not co_seat:
         return ""
+    if not mine:
+        return render_co_seat(co_seat)
     out = ["Petitions YOU have open (nothing else tells you these exist; the id "
            "is printed once, into a refusal, in a wake that has usually ended):"]
     for r in mine:
@@ -247,6 +294,14 @@ def render(f):
             f"marker={clean(r.get('marker', ''))} tool={clean(r.get('tool_name', ''))}")
         if r.get("stated_reason"):
             out.append(f"    for: {clean(r['stated_reason'])}")
+        if r.get("seat") == "unknown":
+            # The discriminator was absent (no ledger, or a daemon that predates
+            # the field). Say so on the row: "yours" is then a name-match, and a
+            # name is shared with the interactive seat on this box (#732).
+            out.append("    seat: UNKNOWN — matched on plugin name only; the "
+                       "interactive session on this box answers to the same name. "
+                       "Read the `gate_escalation_opened` event's host_session_id "
+                       "from the chain before withdrawing.")
     # The move, said out loud because the absence of a surface was only half the
     # defect. The other half is that the sanctioned action is not reachable from
     # the refusal text, which offers re-issue (a recast, scored below compliance)
@@ -258,6 +313,30 @@ def render(f):
         "independence, needs no peer and counts toward no bar. Letting it lapse "
         "instead mints a record whose note says the deadline passed with no decision, "
         "which is false about a petition you had already made moot.")
+    if co_seat:
+        out.append(render_co_seat(co_seat))
+    return "\n".join(out)
+
+
+def render_co_seat(rows):
+    """Same plugin name, a DIFFERENT host session: a sibling process's petition.
+
+    Rendered so the reader knows the row exists (a wake that also touches the
+    same governed path will otherwise collide with it) and knows it is NOT its
+    own to withdraw. No WITHDRAW paragraph here — that instruction, applied to a
+    row in this block, kills a petition the sibling is polling (#732).
+    """
+    out = ["Petitions open under YOUR PLUGIN NAME by a CO-SEAT (a different host "
+           "session — usually the interactive session on this box). NOT yours: do "
+           "not withdraw, arbitrate, or re-issue these; the owner is waiting on them."]
+    for r in rows:
+        out.append(
+            f"- {clean(r.get('escalation_id', ''))} host_session="
+            f"{clean(r.get('host_session_id', ''))[:8]} expires in "
+            f"{short(r.get('secs_remaining'))}; marker={clean(r.get('marker', ''))} "
+            f"tool={clean(r.get('tool_name', ''))}")
+        if r.get("stated_reason"):
+            out.append(f"    for: {clean(r['stated_reason'])}")
     return "\n".join(out)
 
 
@@ -267,7 +346,9 @@ def main(argv):
             payload = json.load(sys.stdin)
         except Exception:
             payload = {}
-        json.dump(fold(payload, argv[2]), sys.stdout)
+        # Optional 3rd positional: the watcher's wake-session ledger (#732).
+        own = read_own_sessions(argv[3]) if len(argv) >= 4 else None
+        json.dump(fold(payload, argv[2], own), sys.stdout)
         return 0
     if len(argv) >= 3 and argv[1] == "render":
         try:
@@ -290,7 +371,7 @@ def main(argv):
             print(block)
         return 0
     print(__doc__.strip().splitlines()[0], file=sys.stderr)
-    print("usage: open-petitions.py fold <for_plugin> | render <primer.json>",
+    print("usage: open-petitions.py fold <for_plugin> [own_sessions_file] | render <primer.json>",
           file=sys.stderr)
     return 2
 

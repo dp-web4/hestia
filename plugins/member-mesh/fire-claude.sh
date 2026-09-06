@@ -436,8 +436,20 @@ except Exception:
          "interactive-dev or lost to 'unattributed' (escalation 411bf87a, 2026-08-06)." >&2
   fi
 fi
+# WHICH SEAT THIS WAKE IS (#732). The gate hook reports the harness session id as
+# `host_session_id` on every escalation it opens, and the pending-escalations row
+# now carries it. Choosing the id HERE, before launch, and appending it to the
+# ledger the watcher hands `open-petitions.py fold`, is what lets the next primer
+# tell a petition this seat's own dead wake stranded (withdraw it) from one the
+# interactive session on the same plugin name is polling right now (leave it).
+# Recorded before the launch, not after: a wake that is killed mid-flight still
+# has to be attributable. A `claude` too old for `--session-id` fails the launch
+# loudly rather than silently running under a random id the ledger never saw.
+WAKE_SID="$(uuidgen 2>/dev/null || python3 -c 'import uuid;print(uuid.uuid4())')"
+WAKE_LEDGER="${HESTIA_MESH_STATE:-$HOME/.local/state/hestia-mesh}/wake-sessions-claude-code"
+printf '%s %s %s\n' "$WAKE_SID" "$STAMP" "$(basename "$PRIMER")" >> "$WAKE_LEDGER" 2>/dev/null || true
 cd "${HESTIA_WORKSPACE:-$(cd "$HERE_DIR/../../.." && pwd)}" && "$HERE_DIR/with-member-lock.sh" claude-code \
-  timeout -k 30 1800 claude -p --dangerously-skip-permissions "$PROMPT" > "$LOG_DIR/claude-$STAMP.log" 2>&1
+  timeout -k 30 1800 claude -p --dangerously-skip-permissions --session-id "$WAKE_SID" "$PROMPT" > "$LOG_DIR/claude-$STAMP.log" 2>&1
 # The fired CLI's rc IS this script's rc. Interpolating $? into an echo made the
 # trailing echo the last command, so the script exited 0 whatever happened — the
 # watcher's "retained on failure" alarm could never fire for the failure mode it
