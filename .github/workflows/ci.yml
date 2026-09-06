@@ -392,9 +392,18 @@ jobs:
           # alternative was to route the refusal through deny_no_verdict, whose
           # remedies are about daemon reachability, and tell the operator to retry a
           # daemon that is fine.
+          #
+          # claude-code 28.9 -> 29.0 (#944, liveness). One line in `_connect_session`
+          # presents the loaded projection's digest to the daemon on connect, beside
+          # the role it already presents from the same environment. The function is
+          # already SHIM_LEDGER debt (#844, the never-raise degrade rule), so its one
+          # new line of identity wiring counts as law under the meter's per-function
+          # attribution; the wiring itself has no legislative content. Adjudicated,
+          # not absorbed: the alternative was a second connect-args builder outside
+          # the debt function, which is more shim, not less.
           python3 tools/gate_collapse_meter.py \
             --max-divergent-forked 0 --max-verbatim-forked 0 \
-            --max-seat-pct claude-code=28.9 --max-seat-pct codex=20.6 \
+            --max-seat-pct claude-code=29.0 --max-seat-pct codex=20.6 \
             --max-seat-pct gemini=10.3 --max-seat-pct kimi=16.8
 
       - name: Do the forked predicates actually disagree with the engine?

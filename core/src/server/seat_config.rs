@@ -163,6 +163,51 @@ impl ConfigVerdict {
     }
 }
 
+/// What a seat SAID it was running, the last time it connected.
+///
+/// LIVENESS, as distinct from drift. The worker's Detect pass answers "does the artifact on disk
+/// match the vault?" every 300 s. It cannot answer "is the seat that just called me running
+/// that artifact?" — the consumer loads the projection at import and exports its digest into
+/// its own environment, and until #944's liveness step nothing carried that digest back. A seat
+/// presents `projection_sha256` on `hestia_connect`; this is the daemon's record of it. One
+/// entry per member, updated on every connect, WITNESSED only on first presentation and on
+/// change (a hook connects on every tool call; a row per connect would drown the chain).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LiveProjection {
+    /// The digest the seat presented.
+    pub sha256: String,
+    /// The digest the vault would render for this member at the time of the last connect.
+    /// `None` when the member is unconfigured or unbacked, in which case a presented digest is
+    /// evidence of a projection the vault does not stand behind.
+    pub expected_sha256: Option<String>,
+    pub first_seen_at: u64,
+    pub last_seen_at: u64,
+}
+
+impl LiveProjection {
+    /// `Some(true)` running the vault's render; `Some(false)` running something else; `None`
+    /// when there is no expectation to compare against.
+    pub fn matches_expected(&self) -> Option<bool> {
+        self.expected_sha256.as_ref().map(|e| *e == self.sha256)
+    }
+}
+
+/// The digest the vault would render for `member` right now, or `None` if the vault does not
+/// (or cannot) back this member. Read-only: nothing is rendered to disk, no finding is opened.
+pub fn expected_sha256(vault: &crate::vault::Vault, member: &str) -> Option<String> {
+    let shared = load_shared(vault);
+    let own = vault.get_document(SEAT_CONFIG_NS, member).and_then(|bytes| {
+        serde_json::from_slice::<SeatConfig>(bytes).ok().filter(|c| c.validate().is_ok())
+    })?;
+    let shared_ok = match &shared {
+        Some(Ok(c)) => Some(c),
+        Some(Err(_)) => return None,
+        None => None,
+    };
+    let (bytes, _) = render_effective(member, shared_ok, &own);
+    Some(sha256_of(bytes.as_bytes()))
+}
+
 /// One open finding, as the witness tracks it between passes.
 ///
 /// `first_observed_at` anchors the duration the resolution row reports; `fingerprint` is what
