@@ -120,9 +120,15 @@ PY
 # repair for a misread would have shipped as "never deliver the mail", and the refusal
 # would have libelled an allowlisted sender on its way out.
 #
-# That inverts branch 4's contract (hestia-watch-member.sh:604-611) — the report is a
-# `reply` SO THAT the failure sits in the sender's debt row until it acks, "and the
-# decision is witnessed". A member that never wakes witnesses nothing.
+# That inverted branch 4's contract as it then stood (hestia-watch-member.sh) — the
+# report was a `reply` SO THAT the failure sat in the sender's debt row until it acked,
+# "and the decision is witnessed". A member that never wakes witnesses nothing.
+#
+# As of 2026-09-05 the report rides `forum-note` and books no debt at all (#926: 161 of
+# 161 `i_owe` rows were these echoes, 100%, none acted on). The anti-silence guarantee is
+# now THIS FILE'S: the `!! NOT-AN-ANSWER` line below, and the fireworthiness rule under
+# it, are the only thing that still makes a delivery failure reach a member. That makes
+# the exclusion rule here load-bearing rather than belt-and-braces.
 #
 # So: everything that is not an explicit `! WITHHELD` disclosure wakes the member. A
 # line kind added later inherits "deliver" instead of silently emptying the batch, and
