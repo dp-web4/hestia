@@ -24,7 +24,7 @@
 //! simply not-yet-publishable, never a refused connect (unlike the fail-CLOSED
 //! synthetic exclusion, which is a safety gate).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use web4_core::{EntityType, Lct, LegacyAlias, LegacyDerivation, MrhEdge};
 
 const MEMBERS_NAMESPACE: &str = "members";
@@ -40,17 +40,36 @@ struct PersistedMember {
     plugin_id: String,
     lct: Lct,
     keypair_secret_hex: String,
+    /// A FILLER, not a member: the durable custodial LCT under which the plane signs a
+    /// role-bound reasoner it invokes for one act (the lean path, 2026-09-03 — keyed per
+    /// (backend, resolved model), minted once, never per act). Same enrollment class,
+    /// same custody, same vault doctrine as a member; what differs is what it may become.
+    /// A filler is never a witness (`vouch_witnessing_key` refuses it) and never a
+    /// connecting member (`ensure_member` will not return it). Defaults false so every
+    /// row written before this field existed reads as a member, which is what it was.
+    #[serde(default)]
+    filler: bool,
 }
 
 /// In-memory member registry: `plugin_id → LCT`, rebuilt from the vault each boot.
 #[derive(Default)]
 pub struct MemberRegistry {
     members: HashMap<String, Lct>,
+    /// The subset of `members` minted as fillers. Kept beside the map rather than on the
+    /// LCT because the LCT is what gets PUBLISHED, and the registry ingest is not the
+    /// place to teach a new field; the refusals that need this fact all run here.
+    fillers: HashSet<String>,
 }
 
 impl MemberRegistry {
     pub fn get(&self, plugin_id: &str) -> Option<&Lct> {
         self.members.get(plugin_id)
+    }
+    /// Is this id a filler — a custodial LCT the plane invokes, never a member that
+    /// connects, witnesses, or confers? The witness-onboard path asks this BEFORE the
+    /// vault is opened, so the refusal names itself instead of reading as a missing mint.
+    pub fn is_filler(&self, plugin_id: &str) -> bool {
+        self.fillers.contains(plugin_id)
     }
     pub fn len(&self) -> usize {
         self.members.len()
@@ -75,10 +94,14 @@ pub fn load_members(vault: &crate::vault::Vault) -> MemberRegistry {
         crate::vault::load_doc(vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE)
             .unwrap_or_default();
     let mut members = HashMap::new();
+    let mut fillers = HashSet::new();
     for p in persisted {
+        if p.filler {
+            fillers.insert(p.plugin_id.clone());
+        }
         members.insert(p.plugin_id, p.lct);
     }
-    MemberRegistry { members }
+    MemberRegistry { members, fillers }
 }
 
 /// Attach a citizenship reference to a member's LCT and re-persist, so the member
@@ -144,6 +167,19 @@ pub fn vouch_witnessing_key(
     let Some(p) = persisted.iter_mut().find(|p| p.plugin_id == plugin_id) else {
         return false;
     };
+    // A FILLER IS NEVER A WITNESS. Three minted fillers conferring the plane's own being
+    // is the lean path's refusal one altitude up (cbp, 2026-09-03): a filler's key is the
+    // plane's key, so its attestation is the plane witnessing itself under another name —
+    // the `LocalCli` "one channel wearing two names" defect at the membership seam. Before
+    // this branch, witness onboard could not tell a filler from a member (legion's one
+    // hazard into the membership work), because nothing recorded the difference.
+    if p.filler {
+        eprintln!(
+            "[members] REFUSED: '{plugin_id}' is a filler (an invoked role occupant signed \
+             custodially by this plane), and a filler is never a witness — vouch refused"
+        );
+        return false;
+    }
     // Recover the custodial binding keypair (sealed in the vault) to sign the vouch.
     let Some(binding_kp) = hex::decode(&p.keypair_secret_hex)
         .ok()
@@ -216,7 +252,68 @@ pub fn ensure_member(
     if id.is_empty() || is_synthetic {
         return None; // mirror member_lct's fail-closed domain exactly
     }
+    mint_once(
+        vault,
+        registry,
+        id,
+        false,
+        sovereign_lct_id,
+        sovereign_anchor,
+    )
+}
+
+/// Ensure a FILLER LCT exists for `filler_id` — the durable custodial identity of a
+/// role-bound reasoner the plane invokes (the lean path). Same mint as a member, same
+/// vault, same enrollment class; marked so the refusals in this module can tell it apart.
+///
+/// This is the SEAM, not the policy: the caller owns the key (`(backend, resolved model)`,
+/// with the model as the backend reports it resolved, and NO mint when the backend cannot
+/// report one — cbp's pin, 2026-09-03). What this guarantees is only that whatever id is
+/// minted here can never be vouched as a witness or returned as a connecting member.
+/// Minted once, idempotent, never per act. Refuses (None) when the id already names a
+/// member: an id cannot be re-labelled into a filler by asking.
+pub fn ensure_filler(
+    vault: &mut crate::vault::Vault,
+    registry: &mut MemberRegistry,
+    filler_id: &str,
+    sovereign_lct_id: &str,
+    sovereign_anchor: &str,
+) -> Option<String> {
+    let id = filler_id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    mint_once(
+        vault,
+        registry,
+        id,
+        true,
+        sovereign_lct_id,
+        sovereign_anchor,
+    )
+}
+
+/// The one mint. `filler` is recorded on the persisted row and in the registry's filler
+/// set; a hit under the OTHER kind returns `None` rather than the existing LCT, because
+/// an id that is a member must not answer as a filler and a filler must not answer as a
+/// member — the whole reason the field exists is that the two were indistinguishable.
+fn mint_once(
+    vault: &mut crate::vault::Vault,
+    registry: &mut MemberRegistry,
+    id: &str,
+    filler: bool,
+    sovereign_lct_id: &str,
+    sovereign_anchor: &str,
+) -> Option<String> {
     if let Some(lct) = registry.members.get(id) {
+        if registry.fillers.contains(id) != filler {
+            eprintln!(
+                "[members] REFUSED: '{id}' is already minted as a {} and was asked for as a {}",
+                if filler { "member" } else { "filler" },
+                if filler { "filler" } else { "member" },
+            );
+            return None;
+        }
         return Some(lct.lct_id()); // hot path: already present
     }
 
@@ -240,6 +337,7 @@ pub fn ensure_member(
         plugin_id: id.to_string(),
         lct: lct.clone(),
         keypair_secret_hex: hex::encode(keypair.secret_key_bytes()),
+        filler,
     });
     if let Err(e) = crate::vault::save_doc(
         vault,
@@ -256,6 +354,9 @@ pub fn ensure_member(
     }
     let lct_id = lct.lct_id();
     registry.members.insert(id.to_string(), lct);
+    if filler {
+        registry.fillers.insert(id.to_string());
+    }
     Some(lct_id)
 }
 
@@ -284,6 +385,111 @@ mod tests {
         let b = ensure_member(&mut vault, &mut reg, "alice", false, "sid", "anchor").unwrap();
         assert_ne!(a1, b);
         assert_eq!(reg.len(), 2);
+    }
+
+    #[test]
+    fn a_filler_is_minted_once_and_never_answers_as_a_member() {
+        let (_dir, mut vault) = fresh_vault();
+        let mut reg = MemberRegistry::default();
+        let f1 = ensure_filler(
+            &mut vault,
+            &mut reg,
+            "ollama:qwen3:2b@sha256:8f1c",
+            "sid",
+            "anchor",
+        )
+        .expect("first mint");
+        let f2 = ensure_filler(
+            &mut vault,
+            &mut reg,
+            "ollama:qwen3:2b@sha256:8f1c",
+            "sid",
+            "anchor",
+        )
+        .expect("idempotent");
+        assert_eq!(
+            f1, f2,
+            "one LCT per (backend, resolved model), never per act"
+        );
+        assert!(reg.is_filler("ollama:qwen3:2b@sha256:8f1c"));
+        // The same id asked for as a MEMBER is refused, not returned: a filler that could
+        // answer a connect as a member would have presence it never earned.
+        assert!(
+            ensure_member(
+                &mut vault,
+                &mut reg,
+                "ollama:qwen3:2b@sha256:8f1c",
+                false,
+                "sid",
+                "anchor"
+            )
+            .is_none()
+        );
+        // And a member cannot be re-labelled into a filler by asking.
+        ensure_member(&mut vault, &mut reg, "claude-code", false, "sid", "anchor").unwrap();
+        assert!(ensure_filler(&mut vault, &mut reg, "claude-code", "sid", "anchor").is_none());
+        assert!(!reg.is_filler("claude-code"));
+        // The mark survives the vault round trip, which is where the onboard path reads it.
+        let reloaded = load_members(&vault);
+        assert!(reloaded.is_filler("ollama:qwen3:2b@sha256:8f1c"));
+        assert!(!reloaded.is_filler("claude-code"));
+        assert_eq!(reloaded.len(), 2);
+    }
+
+    #[test]
+    fn a_filler_cannot_be_vouched_as_a_witness() {
+        // The one reach of the lean path into the membership work. Before the `filler`
+        // mark, this call succeeded for any minted id — witness onboard could not tell a
+        // filler from a member, so three fillers could confer the plane's own being.
+        let (_dir, mut vault) = fresh_vault();
+        let mut reg = MemberRegistry::default();
+        ensure_filler(
+            &mut vault,
+            &mut reg,
+            "ollama:qwen3:2b@sha256:8f1c",
+            "sid",
+            "anchor",
+        )
+        .unwrap();
+        ensure_member(&mut vault, &mut reg, "claude-code", false, "sid", "anchor").unwrap();
+        let op = web4_core::crypto::KeyPair::generate();
+        assert!(
+            !vouch_witnessing_key(
+                &mut vault,
+                &mut reg,
+                "ollama:qwen3:2b@sha256:8f1c",
+                op.verifying_key()
+            ),
+            "a filler is never a witness"
+        );
+        assert_eq!(
+            reg.get("ollama:qwen3:2b@sha256:8f1c")
+                .unwrap()
+                .operational_key_for(web4_core::WITNESS_PURPOSE),
+            None,
+            "and the refusal left no vouch behind, in memory"
+        );
+        assert_eq!(
+            load_members(&vault)
+                .get("ollama:qwen3:2b@sha256:8f1c")
+                .unwrap()
+                .operational_key_for(web4_core::WITNESS_PURPOSE),
+            None,
+            "or in the vault"
+        );
+        // The control: the same call for a member still vouches.
+        assert!(vouch_witnessing_key(
+            &mut vault,
+            &mut reg,
+            "claude-code",
+            op.verifying_key()
+        ));
+        assert_eq!(
+            reg.get("claude-code")
+                .unwrap()
+                .operational_key_for(web4_core::WITNESS_PURPOSE),
+            Some(op.verifying_key())
+        );
     }
 
     #[test]
