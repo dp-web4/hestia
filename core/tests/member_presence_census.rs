@@ -115,13 +115,29 @@
 //!
 //! **Method, stated so it is checkable against its own evidence:** walk
 //! `core/src/**/*.rs`, SKIP each `#[cfg(test)] mod` block and resume after it
-//! (test modules are consumers of the *API*, not of *presence*), track the nearest
-//! preceding `fn` definition per line (the `fn` keyword in item position —
-//! start of line after visibility/modifier prefixes — so a comment saying
-//! "fn" can never re-key what follows; same-named fns in one file are
-//! suffixed `#2`, `#3`, … and no file in the pinned sets currently needs
-//! it), and collect the trimmed text of lines
-//! matching the symbol set, skipping the registry fns' own definition lines.
+//! (test modules are consumers of the *API*, not of *presence*), track the
+//! ENCLOSING `fn` per line (the `fn` keyword in item position — start of line
+//! after visibility/modifier prefixes — so a comment saying "fn" can never
+//! re-key what follows; same-named fns in one file are suffixed `#2`, `#3`, …),
+//! and collect the trimmed text of lines matching the symbol set, skipping the
+//! registry fns' own definition lines.
+//!
+//! *Enclosing*, corrected 2026-09-06 (#907 review). This paragraph used to say
+//! "the nearest preceding `fn` definition", and so did the code: ownership was
+//! never restored when a NESTED fn closed, so a fn's later lines were filed
+//! under its helper, and lines outside any fn were filed under whichever fn
+//! happened to precede them. It mattered the moment a governance handler grew a
+//! nested helper. On #907's branch `tool_connect` declares `fn witness_refusal`
+//! inside itself, and the census reported
+//! `handler.rs::witness_refusal: ["crate::member_registry::ensure_member("]`
+//! against an expected `handler.rs::tool_connect` — the instrument naming the
+//! wrong function for the one line whose reading it exists to schedule. Neither
+//! reading changes any pinned table on `main` (measured: all three census tests
+//! pass under both), which is the uncomfortable part — the defect was invisible
+//! to every test in this file until a nested helper appeared. The fixture arms
+//! `a_nested_helper_does_not_own_the_lines_after_it` and
+//! `repeat_fn_names_keep_their_ordinal_suffix` are what see it now: both go red
+//! under the old reading, and neither depends on the tree's current shape.
 //! The definition of `fn member_lct` (`core/src/server/state.rs:420`) does
 //! not match `.member_lct(`. Tables verified against `origin/main` at
 //! `fb6cc87` — reachable from `main`, stated deliberately: a census recorded
@@ -840,6 +856,24 @@ fn fn_item_name(line: &str) -> Option<String> {
 /// Walk `src`, and for every line matching `symbols` (in the production
 /// prefix, skipping registry fn definition lines when `skip_defs`) record
 /// its trimmed text under `(file, enclosing fn)`.
+///
+/// ENCLOSING, not most-recently-declared (#907 review, 2026-09-06). The first version set
+/// `current_fn` to the last `fn` token it had seen and never restored it, so a fn's ownership
+/// of its own lines ended at the first NESTED fn inside it — every consumer line after that
+/// point was filed under the helper. On #907's branch that is not hypothetical: `tool_connect`
+/// declares a nested `fn witness_refusal`, and the pinned table it produces says the nested
+/// helper calls `crate::member_registry::ensure_member(` while `tool_connect` does not. Both
+/// halves are false, and this table's whole job is to schedule a human's reading of exactly
+/// that line ("is this a safety use of presence?"). A table that names the wrong function
+/// sends the reading to the wrong place, and blessing it writes the error into the pin.
+///
+/// Ownership is tracked by INDENTATION, the same item-position discipline `production_lines`
+/// uses to find the test module's closing brace, and for the same reason: it needs no Rust
+/// parser and it is exact on rustfmt-formatted code, where a fn's closing brace sits at the
+/// column of its `fn`. A stack of `(name, indent)` opens on a fn item line and closes on a
+/// `}` at or left of that indent. The assumption is stated because it is falsifiable: hand-
+/// formatted code that closes a fn at the wrong column would mis-scope, and `cargo fmt --check`
+/// is the guard that keeps that out of this tree.
 fn census(symbols: &[&str], skip_defs: bool) -> BTreeMap<String, Vec<String>> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
@@ -855,14 +889,9 @@ fn census(symbols: &[&str], skip_defs: bool) -> BTreeMap<String, Vec<String>> {
             .to_str()
             .expect("utf-8 path")
             .replace('\\', "/");
-        let mut current_fn = "(top-level)".to_string();
-        let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-        for line in production_lines(&text) {
-            if let Some(name) = fn_item_name(line) {
-                let n = seen.entry(name.clone()).or_insert(0);
-                *n += 1;
-                current_fn = if *n == 1 { name } else { format!("{name}#{n}") };
-            }
+        let lines = production_lines(&text);
+        for (line, current_fn) in lines.iter().zip(fn_owners(&text)) {
+            let line = *line;
             if !symbols.iter().any(|s| line.contains(s)) {
                 continue;
             }
@@ -901,17 +930,149 @@ fn fn_production_lines(rel: &str, want_fn: &str) -> Vec<String> {
     let text = fs::read_to_string(src.join(rel))
         .unwrap_or_else(|e| panic!("read {rel}: {e}"));
     let want = want_fn.split('#').next().unwrap_or(want_fn);
-    let mut current_fn = "(top-level)".to_string();
+    production_lines(&text)
+        .iter()
+        .zip(fn_owners(&text))
+        .filter(|(_, owner)| owner.split('#').next().unwrap_or(owner) == want)
+        .map(|(line, _)| line.trim().to_string())
+        .collect()
+}
+
+/// The ENCLOSING fn of every production line of `text`, in the order `production_lines`
+/// returns them — the whole of this file's lexical-ownership reading, in one place both
+/// consumers call, so a sabotage arm can drive it on a fixture rather than on the tree.
+///
+/// A fn opens on its item line and closes on a `}` at or left of that line's column. The
+/// closing brace itself is attributed to the PARENT (the pop runs before the line is read),
+/// which is what makes a fn's last line its own and the line after it the parent's.
+///
+/// Repeat names get the `#N` suffix the tables use, counted per file in item order.
+fn fn_owners(text: &str) -> Vec<String> {
+    let mut stack: Vec<(String, usize)> = Vec::new();
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     let mut out = Vec::new();
-    for line in production_lines(&text) {
+    for line in production_lines(text) {
+        let indent = indent_of(line);
+        if line.trim() == "}" {
+            while stack.last().is_some_and(|(_, w)| *w >= indent) {
+                stack.pop();
+            }
+        }
         if let Some(name) = fn_item_name(line) {
-            current_fn = name;
+            let n = seen.entry(name.clone()).or_insert(0);
+            *n += 1;
+            let display = if *n == 1 { name } else { format!("{name}#{n}") };
+            stack.push((display, indent));
         }
-        if current_fn == want {
-            out.push(line.trim().to_string());
-        }
+        out.push(
+            stack
+                .last()
+                .map(|(n, _)| n.clone())
+                .unwrap_or_else(|| "(top-level)".to_string()),
+        );
     }
     out
+}
+
+/// Leading-space count. This tree is `cargo fmt`-formatted and uses no tabs; a tab would
+/// count as one column, which mis-scopes rather than crashes. The arms below assert the
+/// property on realistic formatting rather than trusting this note.
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// SABOTAGE ARM (#907 review, 2026-09-06). The reading this file needs is *enclosing* fn, and
+/// the cheap reading — "the last `fn` token I saw" — is indistinguishable from it on a file
+/// with no nested fns, which is most files. It is not indistinguishable on `tool_connect`,
+/// which declares `fn witness_refusal` inside itself: under the cheap reading every consumer
+/// line after that helper is filed under the helper, so the table asserts that a nested
+/// closure-shaped helper mints members and that the connect handler does not. Measured on
+/// #907's branch: the registry census went red naming
+/// `handler.rs::witness_refusal: ["crate::member_registry::ensure_member("]` against an
+/// expected `handler.rs::tool_connect`, and blessing that table would have written the false
+/// attribution into the pin.
+///
+/// Each assertion below is FALSIFIED by the cheap reading, so this test fails if the tracker
+/// regresses to it — that is the arm, not the coverage.
+#[test]
+fn a_nested_helper_does_not_own_the_lines_after_it() {
+    let src = "\
+fn outer() {
+    let reg = &state.member_registry;
+    fn helper(x: u8) -> u8 {
+        x + 1
+    }
+    crate::member_registry::ensure_member(reg);
+}
+
+pub struct State {
+    pub member_registry: MemberRegistry,
+}
+
+impl State {
+    fn open() -> Self {
+        Self { member_registry: MemberRegistry::new() }
+    }
+}
+";
+    let lines = production_lines(src);
+    let owners = fn_owners(src);
+    assert_eq!(lines.len(), owners.len(), "one owner per production line");
+    let owner_of = |needle: &str| -> String {
+        let i = lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("fixture line {needle:?} not found"));
+        owners[i].clone()
+    };
+
+    // THE MEASURED CASE. Under the cheap reading this is "helper".
+    assert_eq!(
+        owner_of("ensure_member(reg)"),
+        "outer",
+        "a line after a nested fn still belongs to the fn that lexically contains it"
+    );
+    // The nested fn still owns its own body.
+    assert_eq!(owner_of("x + 1"), "helper");
+    // The line before it was never in doubt, and must not become collateral.
+    assert_eq!(owner_of("&state.member_registry"), "outer");
+    // Items outside any fn belong to no fn. Under the cheap reading this is "helper" too:
+    // a struct field filed under a function is how a pinned table grows a member it can
+    // never explain.
+    assert_eq!(
+        owner_of("pub member_registry: MemberRegistry"),
+        "(top-level)",
+        "a struct field belongs to no fn"
+    );
+    // A method inside an impl opens and closes like any other fn.
+    assert_eq!(owner_of("Self { member_registry"), "open");
+    // Nothing is left open at the end of a balanced file.
+    assert_eq!(owners.last().map(String::as_str), Some("(top-level)"));
+}
+
+/// The `#N` suffix is per NAME per file and survives the stack, so two same-named nested
+/// helpers stay distinguishable — the tables key on the suffixed form.
+#[test]
+fn repeat_fn_names_keep_their_ordinal_suffix() {
+    let src = "\
+fn a() {
+    fn dup() {
+        let one = x.member_registry;
+    }
+    let mid = y.member_registry;
+    fn dup() {
+        let two = z.member_registry;
+    }
+}
+";
+    let lines = production_lines(src);
+    let owners = fn_owners(src);
+    let owner_of = |needle: &str| {
+        owners[lines.iter().position(|l| l.contains(needle)).expect("line")].clone()
+    };
+    assert_eq!(owner_of("let one"), "dup");
+    assert_eq!(owner_of("let mid"), "a", "the parent resumes between the two helpers");
+    assert_eq!(owner_of("let two"), "dup#2");
 }
 
 #[test]
