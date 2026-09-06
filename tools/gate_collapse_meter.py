@@ -410,9 +410,17 @@ def main() -> int:
             missing = sorted(union - per_seat[seat])
             if missing:
                 print(f"    {seat:<13} omits {len(missing):>2}: {', '.join(missing)}")
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         # Loud, never silent. An extraction figure that vanishes on error would let the
         # per-seat percentage be quoted alone again, which is the exact gap this line closes.
+        #
+        # SystemExit is named because the probe is a CLI that `raise SystemExit(...)`s when no
+        # gate declares path_targets, and SystemExit is not an Exception: on the collapse base
+        # (where extraction moved into the engine, so no gate declares it) the guard missed,
+        # the process died here, and none of the ratchet predicates below ever ran -- the job
+        # was red for a reason it never stated, the exact failure this comment says it
+        # refuses (#967). Catching it restores the verdict; what the probe should anchor on
+        # once no gate declares path_targets is #967's design half.
         print(f"EXTRACTION DOMAIN: cannot determine ({type(exc).__name__}: {exc})")
 
     # Print the compared value on BOTH sides, always. A threshold guard that prints only its
