@@ -164,10 +164,11 @@ def fold(payload, for_plugin, own_sessions=None):
     interactive seat had open; one was approved by the operator 2 min after the
     primer said to withdraw it.
 
-    Degrades toward the OLD reading, never past it: with no ledger, or a row the
-    daemon sent without `host_session_id`, the row stays in `mine`, tagged
-    `seat: "unknown"` so the renderer can say the discriminator was absent rather
-    than assert ownership it did not measure.
+    Degrades to LESS authority, never to the old action with a caveat: with no
+    ledger, or a row the daemon sent without `host_session_id`, the row stays in
+    `mine` (the name matched) tagged `seat: "unknown"`, and the renderer puts it
+    in a block that is visible but NOT actionable — no withdraw prescription
+    binds to a row whose owner seat was not measured (GPT review of #974).
     """
     pending = payload.get("pending") if isinstance(payload, dict) else None
     mine, co_seat = [], []
@@ -270,51 +271,85 @@ def render(f):
     co_seat = f.get("co_seat") or []
     if not mine and not co_seat:
         return ""
-    if not mine:
-        return render_co_seat(co_seat)
-    out = ["Petitions YOU have open (nothing else tells you these exist; the id "
-           "is printed once, into a refusal, in a wake that has usually ended):"]
-    for r in mine:
-        pp = r.get("peer_participation") or {}
-        invited = pp.get("invited") or []
-        auto = ("gate-auto" if "did not choose to escalate" in str(r.get("stated_detail", ""))
-                else "member-filed")
-        # `bar` is NOT in the live `hestia_gate_pending_escalations` payload
-        # (measured against the running daemon 2026-08-19) even though the
-        # `opened` chain event has always carried it. Kept in KEEP so the block
-        # improves for free if it is ever added, but rendered as absent rather
-        # than as "?" — a placeholder in the slot where a bar goes reads as a bar
-        # the reader failed to parse, not as a field the daemon never sent.
-        tags = ([clean(r["bar"])] if r.get("bar") else []) + [auto]
+    # ONLY A POSITIVELY MEASURED SEAT LICENSES THE WITHDRAW PRESCRIPTION. A row tagged
+    # unknown (no ledger, or a daemon that predates `host_session_id`) and a row from a
+    # fold that predates the tag at all (no `seat` key) are the same case: the name
+    # matched, the owner seat was not measured, and the interactive session on this
+    # box answers to the same name. The first version of this branch rendered those
+    # rows under "YOU have open" with a caveat and STILL prescribed WITHDRAW — the
+    # unsafe action survived exactly when the evidence was absent (GPT review of
+    # #974). Unknown now degrades to less authority: visible, not actionable.
+    known = [r for r in mine if r.get("seat") == "mine"]
+    unknown = [r for r in mine if r.get("seat") != "mine"]
+    out = []
+    if known:
+        out.append("Petitions YOU have open (nothing else tells you these exist; the id "
+                   "is printed once, into a refusal, in a wake that has usually ended):")
+        for r in known:
+            out.extend(row_lines(r))
+        # The move, said out loud because the absence of a surface was only half the
+        # defect. The other half is that the sanctioned action is not reachable from
+        # the refusal text, which offers re-issue (a recast, scored below compliance)
+        # and appeal (about the RULE, not this row) and nothing else.
         out.append(
-            f"- {clean(r.get('escalation_id', ''))} "
-            f"[{', '.join(tags)}] expires in "
-            f"{short(r.get('secs_remaining'))}; {len(invited)} invited, "
-            f"{pp.get('concurred', 0)} concurred, {pp.get('dissented', 0)} dissented; "
-            f"marker={clean(r.get('marker', ''))} tool={clean(r.get('tool_name', ''))}")
-        if r.get("stated_reason"):
-            out.append(f"    for: {clean(r['stated_reason'])}")
-        if r.get("seat") == "unknown":
-            # The discriminator was absent (no ledger, or a daemon that predates
-            # the field). Say so on the row: "yours" is then a name-match, and a
-            # name is shared with the interactive seat on this box (#732).
-            out.append("    seat: UNKNOWN — matched on plugin name only; the "
-                       "interactive session on this box answers to the same name. "
-                       "Read the `gate_escalation_opened` event's host_session_id "
-                       "from the chain before withdrawing.")
-    # The move, said out loud because the absence of a surface was only half the
-    # defect. The other half is that the sanctioned action is not reachable from
-    # the refusal text, which offers re-issue (a recast, scored below compliance)
-    # and appeal (about the RULE, not this row) and nothing else.
-    out.append(
-        "You cannot rule your own (NOT-SAME). If the act is done, abandoned, or you "
-        "recast around it, WITHDRAW — `hestia_gate_arbitrate_escalation` with "
-        "approve:false and your session_id — which files `self_withdrawn`, claims no "
-        "independence, needs no peer and counts toward no bar. Letting it lapse "
-        "instead mints a record whose note says the deadline passed with no decision, "
-        "which is false about a petition you had already made moot.")
+            "You cannot rule your own (NOT-SAME). If the act is done, abandoned, or you "
+            "recast around it, WITHDRAW — `hestia_gate_arbitrate_escalation` with "
+            "approve:false and your session_id — which files `self_withdrawn`, claims no "
+            "independence, needs no peer and counts toward no bar. Letting it lapse "
+            "instead mints a record whose note says the deadline passed with no decision, "
+            "which is false about a petition you had already made moot.")
+    if unknown:
+        out.append(render_unknown(unknown))
     if co_seat:
         out.append(render_co_seat(co_seat))
+    return "\n".join(out)
+
+
+def row_lines(r):
+    """One petition, as the reader needs it: id, tags, deadline, participation, marker."""
+    pp = r.get("peer_participation") or {}
+    invited = pp.get("invited") or []
+    auto = ("gate-auto" if "did not choose to escalate" in str(r.get("stated_detail", ""))
+            else "member-filed")
+    # `bar` is NOT in the live `hestia_gate_pending_escalations` payload
+    # (measured against the running daemon 2026-08-19) even though the
+    # `opened` chain event has always carried it. Kept in KEEP so the block
+    # improves for free if it is ever added, but rendered as absent rather
+    # than as "?" — a placeholder in the slot where a bar goes reads as a bar
+    # the reader failed to parse, not as a field the daemon never sent.
+    tags = ([clean(r["bar"])] if r.get("bar") else []) + [auto]
+    lines = [
+        f"- {clean(r.get('escalation_id', ''))} "
+        f"[{', '.join(tags)}] expires in "
+        f"{short(r.get('secs_remaining'))}; {len(invited)} invited, "
+        f"{pp.get('concurred', 0)} concurred, {pp.get('dissented', 0)} dissented; "
+        f"marker={clean(r.get('marker', ''))} tool={clean(r.get('tool_name', ''))}"]
+    if r.get("stated_reason"):
+        lines.append(f"    for: {clean(r['stated_reason'])}")
+    return lines
+
+
+def render_unknown(rows):
+    """Same plugin name, owner seat NOT measured: no ledger, a daemon that predates
+    `host_session_id`, or a fold that predates the tag.
+
+    Visible, because a wake about to touch the same governed path collides with
+    these whether or not they are its own. NOT actionable: the interactive
+    session on this box answers to the same name, and on CBP (2026-09-06) the
+    row a primer called "yours" was the sibling's, approved by the operator two
+    minutes after the primer said to withdraw it (#732). No withdraw prescription
+    here, and no ownership claim either way.
+    """
+    out = ["Petitions open under YOUR PLUGIN NAME whose OWNER SEAT IS UNKNOWN (the row "
+           "carries no host_session_id, or this wake has no session ledger). The "
+           "interactive session on this box answers to the same name, so these may be "
+           "its. Visible so you do not collide with them; not actionable from this "
+           "primer: do not withdraw, arbitrate or re-issue any of these until the owner "
+           "is resolved — read host_session_id off the `gate_escalation_opened` event "
+           "and compare it with the wake ledger."]
+    for r in rows:
+        out.extend(row_lines(r))
+        out.append("    seat: UNKNOWN — matched on plugin name only.")
     return "\n".join(out)
 
 

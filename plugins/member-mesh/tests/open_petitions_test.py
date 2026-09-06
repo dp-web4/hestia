@@ -319,9 +319,12 @@ with tempfile.TemporaryDirectory() as tmp:
     check("B2 measured-and-empty renders nothing",
           render({"asked": True, "mine": []}, tmp).strip() == "", "expected empty")
 
-    # B3: a held petition names itself, its clock, and the move.
-    out = render(fold({"pending": [row("claude-code", "abc123", secs_remaining=603)]},
-                      "claude-code"), tmp)
+    # B3: a held petition names itself, its clock, and the move. The row is POSITIVELY
+    # this seat's (its host session is in the ledger): since #974 only a measured owner
+    # gets the move prescribed; an unmeasured one is rendered under B9, without it.
+    out = render(op.fold({"pending": [row("claude-code", "abc123", secs_remaining=603,
+                                          host_session_id="wake-b3")]},
+                         "claude-code", own_sessions={"wake-b3"}), tmp)
     check("B3 names the escalation id", "abc123" in out, repr(out))
     check("B3 names the time left, not the raw seconds", "10m" in out, repr(out))
     check("B3 marks a gate-auto-minted petition as such", "gate-auto" in out, repr(out))
@@ -435,9 +438,33 @@ with tempfile.TemporaryDirectory() as tmp:
     out = render(unk, tmp)
     check("B8 an unknown-seat row says the match was on NAME only", "seat: UNKNOWN" in out and "plugin name only" in out, repr(out))
     check("B8 and points at the chain field that discriminates", "host_session_id" in out, repr(out))
+    # B9: UNKNOWN OWNERSHIP REDUCES AUTHORITY (GPT review of #974). The first version
+    # of this branch rendered unknown rows under "YOU have open" with a caveat and
+    # still prescribed WITHDRAW — the unsafe instruction survived exactly when the
+    # evidence for it was absent. Unknown rows are visible and NOT actionable.
+    check("B9 an unknown-seat row is NOT headed `Petitions YOU have open`", "Petitions YOU have open" not in out, repr(out))
+    check("B9 an unknown-seat row carries NO WITHDRAW prescription", "WITHDRAW" not in out, repr(out))
+    check("B9 the unknown block says the owner seat is unknown and names the sibling", "OWNER SEAT IS UNKNOWN" in out and "interactive session" in out, repr(out))
+    # B9 the two degraded folds from A7b/A7c (no ledger; missing ledger) render the same way.
+    for label, degraded in (("no ledger", f2), ("missing ledger", f3)):
+        out = render(degraded, tmp)
+        check(f"B9 degraded fold ({label}) renders every same-name row", all(i in out for i in ("old1", "own1", "sib1")), repr(out))
+        check(f"B9 degraded fold ({label}) prescribes no WITHDRAW", "WITHDRAW" not in out, repr(out))
+        check(f"B9 degraded fold ({label}) claims no ownership", "Petitions YOU have open" not in out, repr(out))
+    # B9 a ledger present but a row the daemon sent WITHOUT host_session_id: that row
+    # alone is unknown; a positively-known own row in the same fold still gets WITHDRAW,
+    # and the instruction sits between the known row and the unknown block.
+    out = render(f, tmp)
+    i_own, i_with, i_unk, i_co = out.find("own1"), out.find("WITHDRAW"), out.find("OWNER SEAT IS UNKNOWN"), out.find("NOT yours")
+    check("B9 mixed known/unknown/co-seat renders all three rows", all(i in out for i in ("own1", "old1", "sib1")), repr(out))
+    check("B9 mixed: WITHDRAW binds only to the known row (own < WITHDRAW < unknown block < co-seat block)",
+          -1 < i_own < i_with < i_unk < i_co, f"own={i_own} withdraw={i_with} unknown={i_unk} co={i_co}")
+    check("B9 mixed: the unknown row is listed after the WITHDRAW paragraph, not before it", out.find("old1") > i_with, repr(out))
+    check("B9 mixed: exactly one WITHDRAW in the whole primer", out.count("WITHDRAW") == 1, repr(out))
     legacy = {"asked": True, "mine": [row("claude-code", "abc123")]}   # pre-#732 fold, no seat/co_seat keys
     out = render(legacy, tmp)
     check("B8 a legacy fold (no seat, no co_seat) still renders the own row", "abc123" in out, repr(out))
+    check("B9 a legacy fold's rows are ownership-unknown too: visible, no WITHDRAW", "WITHDRAW" not in out and "OWNER SEAT IS UNKNOWN" in out, repr(out))
 
 print()
 print("C. adoption — the call sites exist")
