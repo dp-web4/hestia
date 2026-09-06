@@ -133,6 +133,67 @@ impl ConfigVerdict {
             ConfigVerdict::Unbacked { .. } => "unbacked",
         }
     }
+
+    /// WHAT MAKES THIS FINDING THIS FINDING, as opposed to another finding on the same member.
+    ///
+    /// #971. The witness dedups "continuing" findings so that a row is a function of the drift
+    /// rather than of the poll interval. It used to key that dedup on the member alone, which
+    /// folded every later finding on a member into whichever one happened to be open: a
+    /// projection edited a second time, with different bytes, while a first finding was still
+    /// open was repaired and never witnessed (measured on CBP, 2026-09-06: a renderer upgrade
+    /// opened all four seats, and a tamper four minutes later left no row). The fingerprint is
+    /// the identity the dedup must key on, and it lives beside `status()` / `chain_event()` so a
+    /// new variant cannot skip the question.
+    ///
+    /// The material is exactly what the witness payload already carries, and `fingerprint_from_
+    /// payload` derives the same string from a row, so a finding rebuilt from the chain after a
+    /// restart compares equal to the one the live pass would compute (parity is tested).
+    /// `Unbacked` deliberately EXCLUDES `quarantined_to`: quarantine is the repair's consequence,
+    /// so pass 1 (moved the file) and pass 2 (nothing left to move) are the same condition.
+    pub fn finding_fingerprint(&self) -> Option<String> {
+        match self {
+            ConfigVerdict::Verified { .. } => None,
+            ConfigVerdict::Miswired { expected, actual, .. } => {
+                Some(format!("miswired:{expected}:{actual}"))
+            }
+            ConfigVerdict::Missing { expected, .. } => Some(format!("missing:{expected}")),
+            ConfigVerdict::Unreadable { error, .. } => Some(format!("unreadable:{error}")),
+            ConfigVerdict::Unbacked { reason, .. } => Some(format!("unbacked:{reason}")),
+        }
+    }
+}
+
+/// One open finding, as the witness tracks it between passes.
+///
+/// `first_observed_at` anchors the duration the resolution row reports; `fingerprint` is what
+/// a later verdict on the same member is compared against to decide "still the same finding"
+/// from "a new one" (#971).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenConfigFinding {
+    pub first_observed_at: u64,
+    pub fingerprint: String,
+}
+
+/// Derive a finding's fingerprint from a witnessed row's payload.
+///
+/// New rows carry `finding_fingerprint` explicitly and that wins. Rows written before #971 do
+/// not, and for those the same material is reassembled from the fields the row does carry, in
+/// the same shape `ConfigVerdict::finding_fingerprint` produces — so rehydration after a restart
+/// yields the identity the live pass would have, rather than reintroducing the member-only key
+/// across daemon boundaries. A row missing even those fields gets a status-only fingerprint,
+/// which is the pre-#971 behaviour for that row and no worse.
+pub fn fingerprint_from_payload(payload: &serde_json::Value) -> String {
+    if let Some(fp) = payload.get("finding_fingerprint").and_then(|v| v.as_str()) {
+        return fp.to_string();
+    }
+    let field = |k: &str| payload.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    match field("status") {
+        "miswired" => format!("miswired:{}:{}", field("expected_sha256"), field("found_sha256")),
+        "missing" => format!("missing:{}", field("expected_sha256")),
+        "unreadable" => format!("unreadable:{}", field("error")),
+        "unbacked" => format!("unbacked:{}", field("reason")),
+        other => other.to_string(),
+    }
 }
 
 /// A rendered `KEY=value` line is CONFIG THAT WILL BE SOURCED. Validate before rendering.
@@ -519,9 +580,13 @@ pub const REHYDRATE_SCAN_LIMIT: u64 = 10_000;
 /// more honest than maintaining a second durable copy that could itself drift.
 ///
 /// Newest-first, first row per member wins: a resolution means closed, any finding means open.
+///
+/// The FINGERPRINT is rebuilt too, not only the timestamp (#971): a restart between two distinct
+/// findings on one member must leave the second one witnessable, exactly as it would be without
+/// the restart.
 pub fn rehydrate_open_findings(
     chain: &crate::storage::chain::SqliteChainStore,
-) -> std::collections::HashMap<String, u64> {
+) -> std::collections::HashMap<String, OpenConfigFinding> {
     let mut open = std::collections::HashMap::new();
     let mut decided = std::collections::HashSet::new();
     let rows = match chain.read_recent_by_types(None, &FINDING_EVENT_TYPES, REHYDRATE_SCAN_LIMIT) {
@@ -551,7 +616,13 @@ pub fn rehydrate_open_findings(
             // A row written before `first_observed_at` existed still has a timestamp, and an
             // approximate open time beats dropping the finding on the floor.
             .unwrap_or_else(|| entry.timestamp.timestamp().max(0) as u64);
-        open.insert(member.to_string(), first_observed);
+        open.insert(
+            member.to_string(),
+            OpenConfigFinding {
+                first_observed_at: first_observed,
+                fingerprint: fingerprint_from_payload(&entry.event_data),
+            },
+        );
     }
     open
 }
@@ -609,6 +680,50 @@ pub fn render_to_disk(home: &Path, member: &str, cfg: &SeatConfig) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #971 parity: for every finding variant, the fingerprint the live pass computes from the
+    /// verdict equals the one rehydration derives from a row WITHOUT the explicit field (a row
+    /// written before #971). A variant added without both halves agreeing would open the
+    /// member-only hole again, but only across a restart, where nothing else would notice.
+    #[test]
+    fn a_fingerprint_derived_from_a_legacy_row_equals_the_live_one_for_every_variant() {
+        let m = "codex".to_string();
+        let cases: Vec<(ConfigVerdict, serde_json::Value)> = vec![
+            (
+                ConfigVerdict::Miswired { member: m.clone(), expected: "E".into(), actual: "F".into() },
+                serde_json::json!({"status": "miswired", "expected_sha256": "E", "found_sha256": "F"}),
+            ),
+            (
+                ConfigVerdict::Missing { member: m.clone(), expected: "E".into() },
+                serde_json::json!({"status": "missing", "expected_sha256": "E"}),
+            ),
+            (
+                ConfigVerdict::Unreadable { member: m.clone(), error: "EACCES".into() },
+                serde_json::json!({"status": "unreadable", "error": "EACCES"}),
+            ),
+            (
+                ConfigVerdict::Unbacked { member: m.clone(), reason: "no doc".into(), quarantined_to: Some("/q".into()) },
+                serde_json::json!({"status": "unbacked", "reason": "no doc", "quarantined_to": "/q"}),
+            ),
+            (
+                // quarantine state changed, same reason: same fingerprint
+                ConfigVerdict::Unbacked { member: m.clone(), reason: "no doc".into(), quarantined_to: None },
+                serde_json::json!({"status": "unbacked", "reason": "no doc", "quarantined_to": null}),
+            ),
+        ];
+        for (verdict, legacy_row) in &cases {
+            let live = verdict.finding_fingerprint().expect("a finding");
+            assert_eq!(live, fingerprint_from_payload(legacy_row), "{verdict:?}");
+            assert!(live.starts_with(verdict.status()), "the status leads: {live}");
+        }
+        assert_eq!(cases[3].0.finding_fingerprint(), cases[4].0.finding_fingerprint());
+        assert!(ConfigVerdict::Verified { member: m, sha256: "S".into() }.finding_fingerprint().is_none());
+        // An explicit field on a new row wins over derivation.
+        assert_eq!(
+            fingerprint_from_payload(&serde_json::json!({"status": "miswired", "finding_fingerprint": "x"})),
+            "x"
+        );
+    }
 
     fn cfg() -> SeatConfig {
         let mut env = BTreeMap::new();

@@ -5225,17 +5225,34 @@ fn witness_config_verdicts(
                 // "newly opened" twice and witnessed twice. Caught by the test, which runs both
                 // passes in the same second — the condition a real deployment reaches whenever
                 // a check is triggered twice in quick succession.
-                let is_new = !s.config_findings_open.contains_key(&member);
-                let first_seen = *s.config_findings_open.entry(member.clone()).or_insert(now);
-                if !is_new {
-                    continue;
-                }
+                //
+                // "CONTINUING" MEANS THE SAME FINDING, NOT THE SAME MEMBER (#971). The first
+                // version keyed the dedup on the member, so any later finding on a member
+                // with one already open was folded into it: a projection tampered a second
+                // time with different bytes, while the renderer-upgrade finding was still
+                // open, was repaired and never witnessed. A verdict whose fingerprint differs
+                // from the open finding's is a NEW finding; it is witnessed with a pointer to
+                // the one it supersedes, and it replaces the open entry so the eventual
+                // resolution anchors its duration at the last edit rather than the first.
+                let fingerprint = verdict
+                    .finding_fingerprint()
+                    .expect("every finding verdict has a fingerprint; Verified is the None arm");
+                let prior = s.config_findings_open.get(&member).cloned();
+                let supersedes = match &prior {
+                    Some(open) if open.fingerprint == fingerprint => continue,
+                    Some(open) => Some(open.first_observed_at),
+                    None => None,
+                };
                 let mut payload = json!({
                     "member": member,
                     "artifact": artifact,
                     "status": verdict.status(),
-                    "first_observed_at": first_seen,
+                    "first_observed_at": now,
+                    "finding_fingerprint": fingerprint,
                 });
+                if let Some(prior_at) = supersedes {
+                    payload["supersedes_first_observed_at"] = json!(prior_at);
+                }
                 match verdict {
                     sc::ConfigVerdict::Miswired { expected, actual, .. } => {
                         payload["expected_sha256"] = json!(expected);
@@ -5253,31 +5270,43 @@ fn witness_config_verdicts(
                     }
                     sc::ConfigVerdict::Verified { .. } => {}
                 }
-                if let Err(e) = s.append_chain(event, payload) {
-                    // The finding stands even though the record does not. Clear the state so the
-                    // next pass retries the witness rather than treating an unrecorded finding
-                    // as already reported.
-                    s.config_findings_open.remove(&member);
-                    tracing::warn!(member = %member, error = %e,
-                        "config finding could NOT be recorded; the drift stands and the record does not");
+                match s.append_chain(event, payload) {
+                    Ok(_) => {
+                        s.config_findings_open.insert(
+                            member.clone(),
+                            sc::OpenConfigFinding { first_observed_at: now, fingerprint },
+                        );
+                    }
+                    Err(e) => {
+                        // The finding stands even though the record does not. The open state is
+                        // left as it was (absent, or the superseded entry) so the next pass
+                        // retries the witness rather than treating an unrecorded finding as
+                        // already reported.
+                        tracing::warn!(member = %member, error = %e,
+                            "config finding could NOT be recorded; the drift stands and the record does not");
+                    }
                 }
             }
             None => {
                 // Verified. Emit the closing edge if and only if this member was open.
-                if let Some(opened_at) = s.config_findings_open.remove(&member) {
+                if let Some(open) = s.config_findings_open.remove(&member) {
                     let payload = json!({
                         "member": member,
                         "artifact": artifact,
                         "status": "resolved",
-                        "first_observed_at": opened_at,
+                        "first_observed_at": open.first_observed_at,
+                        // Which finding this closes. With supersession a member can have had
+                        // several findings before one resolution; the fingerprint names the
+                        // one whose duration `open_secs` measures.
+                        "finding_fingerprint": open.fingerprint,
                         "resolved_at": now,
                         // The number the pair exists to produce. Without it a reader can see
                         // that drift happened and that it stopped, but not for how long the
                         // seat ran miswired.
-                        "open_secs": now.saturating_sub(opened_at),
+                        "open_secs": now.saturating_sub(open.first_observed_at),
                     });
                     if let Err(e) = s.append_chain("config_integrity_resolved", payload) {
-                        s.config_findings_open.insert(member.clone(), opened_at);
+                        s.config_findings_open.insert(member.clone(), open);
                         tracing::warn!(member = %member, error = %e,
                             "config resolution could NOT be recorded; leaving the finding open");
                     }
@@ -10425,6 +10454,297 @@ mod tests {
                 "and the member is no longer carrying an open finding"
             );
         }
+    }
+
+    /// Config rows on the chain, NEWEST FIRST, as (event_type, payload).
+    fn config_rows(s: &super::super::state::ServerState) -> Vec<(String, serde_json::Value)> {
+        use super::super::seat_config as sc;
+        s.chain_store
+            .read_recent_by_types(None, &sc::FINDING_EVENT_TYPES, 100)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.event_type.to_string(), e.event_data))
+            .collect()
+    }
+
+    /// Declare a seat, render it and verify it, so a test starts from a clean, open-free seat.
+    fn settle_seat(s: &mut super::super::state::ServerState, member: &str, workspace: &str) {
+        use super::super::seat_config as sc;
+        let cfg = serde_json::json!({"env": {"HESTIA_WORKSPACE": workspace}, "note": ""});
+        s.vault
+            .put_document(sc::SEAT_CONFIG_NS, member, serde_json::to_vec(&cfg).unwrap())
+            .unwrap();
+        let one = [member.to_string()];
+        super::render_and_verify_seat_configs(s, &one); // Missing -> renders
+        let v = super::render_and_verify_seat_configs(s, &one);
+        assert!(
+            matches!(v.first(), Some(sc::ConfigVerdict::Verified { .. })),
+            "the seat settles clean before the arm begins: {v:?}"
+        );
+        assert!(!s.config_findings_open.contains_key(member), "and nothing is open");
+    }
+
+    /// THE MEASURED CASE (#971). A projection edited twice, with different bytes, before a clean
+    /// pass closes the first finding: on CBP (2026-09-06) the renderer upgrade opened every seat
+    /// and a tamper four minutes later was repaired with no row at all, because the dedup keyed
+    /// on the member. Two distinct edits are two findings; the second names the one it
+    /// supersedes, and the resolution anchors at the second.
+    ///
+    /// Sabotage arms this test is built to catch: key the dedup on the member alone and the
+    /// second row is absent (assert 1); key it on the status alone and both edits are
+    /// `miswired`, so the second row is absent for the same reason (assert 1). Anchoring the
+    /// resolution at the first finding fails assert 3.
+    #[tokio::test]
+    async fn a_second_distinct_edit_inside_an_open_finding_is_witnessed_and_supersedes_the_first() {
+        use super::super::seat_config as sc;
+        let (dir, shared) = make_shared_state();
+        let member = "claude-code".to_string();
+        let one = std::slice::from_ref(&member);
+        let mut s = shared.lock().await;
+        settle_seat(&mut s, &member, "/w/ai");
+        let path = sc::render_path(dir.path(), &member);
+        let good = std::fs::read_to_string(&path).unwrap();
+
+        // Edit A opens a finding (and the pass repairs the file).
+        std::fs::write(&path, good.replace("/w/ai", "/elsewhere")).unwrap();
+        super::render_and_verify_seat_configs(&mut s, one);
+        let rows_after_a = config_rows(&s);
+        let (ev_a, row_a) = rows_after_a.first().cloned().unwrap();
+        assert_eq!(ev_a, "config_miswire");
+        assert!(row_a.get("supersedes_first_observed_at").is_none(), "A supersedes nothing");
+        let fp_a = row_a["finding_fingerprint"].as_str().unwrap().to_string();
+
+        // Edit B, DIFFERENT bytes, before any clean pass.
+        std::fs::write(&path, format!("{good}# a second, distinct edit\n")).unwrap();
+        let v = super::render_and_verify_seat_configs(&mut s, one);
+        assert!(matches!(v.first(), Some(sc::ConfigVerdict::Miswired { .. })), "{v:?}");
+        let rows_after_b = config_rows(&s);
+        // (1) B is its own row.
+        assert_eq!(
+            rows_after_b.len(),
+            rows_after_a.len() + 1,
+            "a second, distinct edit inside an open finding is a second finding row: {rows_after_b:?}"
+        );
+        let (ev_b, row_b) = rows_after_b.first().cloned().unwrap();
+        assert_eq!(ev_b, "config_miswire");
+        let fp_b = row_b["finding_fingerprint"].as_str().unwrap().to_string();
+        assert_ne!(fp_a, fp_b, "different bytes, different finding");
+        assert_ne!(row_a["found_sha256"], row_b["found_sha256"]);
+        assert_eq!(row_a["expected_sha256"], row_b["expected_sha256"], "same authority both times");
+        // (2) B names A.
+        assert_eq!(
+            row_b["supersedes_first_observed_at"], row_a["first_observed_at"],
+            "the second finding points at the one it supersedes"
+        );
+        assert_eq!(
+            s.config_findings_open.get(&member).map(|f| f.fingerprint.as_str()),
+            Some(fp_b.as_str()),
+            "the open entry now IS the second finding"
+        );
+
+        // A clean pass closes exactly one finding, and it is B.
+        let v = super::render_and_verify_seat_configs(&mut s, one);
+        assert!(matches!(v.first(), Some(sc::ConfigVerdict::Verified { .. })), "{v:?}");
+        let rows_after_close = config_rows(&s);
+        assert_eq!(rows_after_close.len(), rows_after_b.len() + 1, "one resolution row");
+        let (ev_r, row_r) = rows_after_close.first().cloned().unwrap();
+        assert_eq!(ev_r, "config_integrity_resolved");
+        // (3) The resolution anchors at B, not A.
+        assert_eq!(row_r["finding_fingerprint"].as_str(), Some(fp_b.as_str()));
+        assert_eq!(row_r["first_observed_at"], row_b["first_observed_at"]);
+        assert!(!s.config_findings_open.contains_key(&member));
+    }
+
+    /// The same bytes on disk under a CHANGED expectation is also a new finding: the vault moved,
+    /// so "what this seat is running against" changed even though the file did not.
+    #[tokio::test]
+    async fn a_changed_expectation_over_the_same_found_bytes_is_a_new_finding() {
+        use super::super::seat_config as sc;
+        let (dir, shared) = make_shared_state();
+        let member = "codex".to_string();
+        let one = std::slice::from_ref(&member);
+        let mut s = shared.lock().await;
+        settle_seat(&mut s, &member, "/w/ai");
+        let path = sc::render_path(dir.path(), &member);
+        let tampered = std::fs::read_to_string(&path).unwrap().replace("/w/ai", "/elsewhere");
+
+        std::fs::write(&path, &tampered).unwrap();
+        super::render_and_verify_seat_configs(&mut s, one);
+        let (_, row_a) = config_rows(&s).first().cloned().unwrap();
+
+        // The authority changes; the SAME tampered bytes are put back.
+        let cfg = serde_json::json!({"env": {"HESTIA_WORKSPACE": "/w/two"}, "note": ""});
+        s.vault
+            .put_document(sc::SEAT_CONFIG_NS, &member, serde_json::to_vec(&cfg).unwrap())
+            .unwrap();
+        std::fs::write(&path, &tampered).unwrap();
+        let before = config_rows(&s).len();
+        super::render_and_verify_seat_configs(&mut s, one);
+        let rows = config_rows(&s);
+        assert_eq!(rows.len(), before + 1, "a changed expectation is a second finding: {rows:?}");
+        let (_, row_b) = rows.first().cloned().unwrap();
+        assert_eq!(row_a["found_sha256"], row_b["found_sha256"], "same bytes found");
+        assert_ne!(row_a["expected_sha256"], row_b["expected_sha256"], "different authority");
+        assert_eq!(row_b["supersedes_first_observed_at"], row_a["first_observed_at"]);
+    }
+
+    /// `Missing` carries the expectation too: an artifact still absent after the authority moved
+    /// is not the same finding continuing.
+    #[tokio::test]
+    async fn a_missing_artifact_under_a_changed_expectation_is_a_new_finding() {
+        use super::super::seat_config as sc;
+        let (dir, shared) = make_shared_state();
+        let member = "gemini".to_string();
+        let one = std::slice::from_ref(&member);
+        let mut s = shared.lock().await;
+        settle_seat(&mut s, &member, "/w/ai");
+        let path = sc::render_path(dir.path(), &member);
+
+        std::fs::remove_file(&path).unwrap();
+        super::render_and_verify_seat_configs(&mut s, one); // Missing(E1), renders
+        let (ev_a, row_a) = config_rows(&s).first().cloned().unwrap();
+        assert_eq!(ev_a, "config_integrity_finding");
+        assert_eq!(row_a["status"], "missing");
+
+        let cfg = serde_json::json!({"env": {"HESTIA_WORKSPACE": "/w/two"}, "note": ""});
+        s.vault
+            .put_document(sc::SEAT_CONFIG_NS, &member, serde_json::to_vec(&cfg).unwrap())
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let before = config_rows(&s).len();
+        let v = super::render_and_verify_seat_configs(&mut s, one); // Missing(E2)
+        assert!(matches!(v.first(), Some(sc::ConfigVerdict::Missing { .. })), "{v:?}");
+        let rows = config_rows(&s);
+        assert_eq!(rows.len(), before + 1, "Missing under a new expectation is a new finding");
+        let (_, row_b) = rows.first().cloned().unwrap();
+        assert_eq!(row_b["status"], "missing");
+        assert_ne!(row_a["expected_sha256"], row_b["expected_sha256"]);
+        assert_eq!(row_b["supersedes_first_observed_at"], row_a["first_observed_at"]);
+
+        // And it still closes, once, at the second finding.
+        super::render_and_verify_seat_configs(&mut s, one);
+        let (ev_r, row_r) = config_rows(&s).first().cloned().unwrap();
+        assert_eq!(ev_r, "config_integrity_resolved");
+        assert_eq!(row_r["finding_fingerprint"], row_b["finding_fingerprint"]);
+    }
+
+    /// The quarantine path is the REPAIR's consequence, not part of the finding's identity: pass 1
+    /// moves the stray file (`quarantined_to: Some`), pass 2 has nothing left to move (`None`),
+    /// and the same unbacked condition must not read as two findings.
+    #[tokio::test]
+    async fn an_unbacked_finding_is_one_finding_across_the_quarantine() {
+        use super::super::seat_config as sc;
+        let (dir, shared) = make_shared_state();
+        let member = "kimi-code".to_string();
+        let one = std::slice::from_ref(&member);
+        let mut s = shared.lock().await;
+        // Declared, but with content the renderer refuses (a value carrying a newline), so the
+        // seat is unbacked whether or not anything is on disk.
+        let cfg = serde_json::json!({"env": {"HESTIA_WORKSPACE": "/w\nINJECTED=1"}, "note": ""});
+        s.vault
+            .put_document(sc::SEAT_CONFIG_NS, &member, serde_json::to_vec(&cfg).unwrap())
+            .unwrap();
+        let stray = sc::render_path(dir.path(), &member);
+        std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+        std::fs::write(&stray, "HESTIA_WORKSPACE=/authored/by/hand\n").unwrap();
+
+        let v1 = super::render_and_verify_seat_configs(&mut s, one);
+        let rows1 = config_rows(&s);
+        let v2 = super::render_and_verify_seat_configs(&mut s, one);
+        let rows2 = config_rows(&s);
+        match (v1.first(), v2.first()) {
+            (
+                Some(sc::ConfigVerdict::Unbacked { quarantined_to: q1, reason: r1, .. }),
+                Some(sc::ConfigVerdict::Unbacked { quarantined_to: q2, reason: r2, .. }),
+            ) => {
+                assert!(q1.is_some() && q2.is_none(), "the quarantine path changed: {q1:?} -> {q2:?}");
+                assert_eq!(r1, r2, "and the reason did not");
+            }
+            other => panic!("both passes are unbacked: {other:?}"),
+        }
+        assert_eq!(rows1.first().unwrap().1["status"], "unbacked");
+        assert_eq!(rows2.len(), rows1.len(), "one finding, not one per quarantine state: {rows2:?}");
+    }
+
+    /// Rehydration parity (#971): a restart between two distinct findings must leave the second
+    /// witnessable exactly as it would be without the restart. The map is rebuilt from the chain
+    /// WITH its fingerprint; a rebuild that carried only the timestamp would reintroduce the
+    /// member-only key across every daemon boundary.
+    #[tokio::test]
+    async fn a_restart_between_two_distinct_findings_still_witnesses_the_second() {
+        use super::super::seat_config as sc;
+        let dir = TempDir::new().unwrap();
+        let member = "claude-code".to_string();
+        let one = std::slice::from_ref(&member);
+        let vpath = dir.path().join("v.enc");
+        let open_state = |first: bool| {
+            let vault = if first {
+                let mut v = Vault::init(vpath.clone(), "p".into()).unwrap();
+                v.add(crate::vault::VaultEntry::new(
+                    "ai_identity_secret",
+                    hex::encode(web4_core::crypto::KeyPair::generate().secret_key_bytes()),
+                ))
+                .unwrap();
+                v
+            } else {
+                Vault::open(vpath.clone(), "p".into()).unwrap()
+            };
+            super::super::state::ServerState::open(vault, dir.path(), "p").unwrap()
+        };
+
+        let (row_a, path, good) = {
+            let mut s = open_state(true);
+            settle_seat(&mut s, &member, "/w/ai");
+            let path = sc::render_path(dir.path(), &member);
+            let good = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, good.replace("/w/ai", "/elsewhere")).unwrap();
+            super::render_and_verify_seat_configs(&mut s, one);
+            (config_rows(&s).first().cloned().unwrap().1, path, good)
+        };
+
+        let mut s2 = open_state(false);
+        assert_eq!(
+            s2.config_findings_open.get(&member).map(|f| f.fingerprint.as_str()),
+            row_a["finding_fingerprint"].as_str(),
+            "the rebuilt finding carries A's fingerprint, not only its timestamp"
+        );
+        std::fs::write(&path, format!("{good}# edited after the restart\n")).unwrap();
+        let before = config_rows(&s2).len();
+        super::render_and_verify_seat_configs(&mut s2, one);
+        let rows = config_rows(&s2);
+        assert_eq!(rows.len(), before + 1, "B is witnessed after the restart: {rows:?}");
+        let (_, row_b) = rows.first().cloned().unwrap();
+        assert_eq!(row_b["supersedes_first_observed_at"], row_a["first_observed_at"]);
+    }
+
+    /// A row written before #971 has no `finding_fingerprint`; rehydration derives one from the
+    /// fields it does carry, in the shape the live pass produces, so a pre-upgrade open finding
+    /// compares correctly against the first post-upgrade verdict.
+    #[tokio::test]
+    async fn a_legacy_finding_row_rehydrates_with_the_derived_fingerprint() {
+        use super::super::seat_config as sc;
+        let (_dir, shared) = make_shared_state();
+        let s = shared.lock().await;
+        s.append_chain(
+            "config_miswire",
+            serde_json::json!({
+                "member": "codex", "artifact": "/x/seats/codex.env", "status": "miswired",
+                "expected_sha256": "E", "found_sha256": "F", "first_observed_at": 1700000000u64,
+            }),
+        )
+        .unwrap();
+        let open = sc::rehydrate_open_findings(&s.chain_store);
+        assert_eq!(
+            open.get("codex"),
+            Some(&sc::OpenConfigFinding { first_observed_at: 1700000000, fingerprint: "miswired:E:F".into() }),
+        );
+        assert_eq!(
+            sc::ConfigVerdict::Miswired { member: "codex".into(), expected: "E".into(), actual: "F".into() }
+                .finding_fingerprint()
+                .as_deref(),
+            Some("miswired:E:F"),
+            "and that is the string the live pass computes"
+        );
     }
 
     fn make_shared_state() -> (TempDir, SharedState) {

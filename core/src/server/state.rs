@@ -265,7 +265,11 @@ pub struct ServerState {
     /// clean file, has no memory of anything open, and writes no resolution. Nothing re-opens.
     /// The chain is simply left asserting a finding that is permanently open, for drift that was
     /// fixed before the restart (GPT blocker on #898).
-    pub config_findings_open: HashMap<String, u64>,
+    ///
+    /// Keyed by member, but the VALUE carries the finding's fingerprint (#971): two distinct
+    /// findings on one member are two events, and a map that only knew the member folded the
+    /// second into the first.
+    pub config_findings_open: HashMap<String, crate::server::seat_config::OpenConfigFinding>,
     /// In-scope work awaiting attestation, keyed by (plugin_id, role_lct) → (allows, denies).
     ///
     /// WHY THIS EXISTS. Trust could only be earned two ways — be denied and comply, or be
