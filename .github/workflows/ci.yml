@@ -250,15 +250,32 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Stage the fixture home the seats consume
+        # The seats resolve runtime law ONLY from $HESTIA_HOME/shared (HESTIA_SHARED_DIR was a
+        # member-settable selector and is retired on this branch -- #967 §1), and since #966
+        # they refuse to act without a rendered projection at $HESTIA_HOME/seats/<seat>. A CI
+        # runner has no installed engine and no vault, so the job stages both: the reviewed
+        # shared tree, chosen and visible, and one minimal projection per seat in the shape
+        # the daemon renders (design A: the seat's own lines carry its token). Never the
+        # checkout as an implicit fallback -- that is what let a hook execute whatever law
+        # the branch happened to carry.
+        run: |
+          set -euo pipefail
+          home="$RUNNER_TEMP/hestia-home"
+          mkdir -p "$home/shared" "$home/seats"
+          cp plugins/_shared/hestia_*.py "$home/shared/"
+          for seat in claude-code codex kimi-code gemini; do
+            token="$(printf '%s' "$seat" | tr 'a-z-' 'A-Z_')"
+            printf '# member: %s\n# seat: %s\nHESTIA_HOME=%s\n%s__HESTIA_PLUGIN_ID=%s\n' \
+              "$seat" "$token" "$home" "$token" "$seat" > "$home/seats/$seat.env"
+          done
+          echo "HESTIA_HOME=$home" >> "$GITHUB_ENV"
+          # One test imports the shared classifier directly rather than through a shim;
+          # the fixture names that tree for it explicitly.
+          echo "PYTHONPATH=$home/shared" >> "$GITHUB_ENV"
+          ls -l "$home/seats"
+
       - name: Test hooks
-        # The seats resolve runtime law ONLY from an explicit HESTIA_SHARED_DIR or an
-        # installed $HESTIA_HOME/shared (#742 for codex, #747 for claude-code). A CI runner
-        # has no installed engine, and the repository checkout is deliberately NOT an
-        # implicit fallback any more -- that fallback is what let a hook execute whatever
-        # law the branch happened to carry. So the runner names the reviewed shared tree
-        # explicitly: a test fixture, chosen and visible, not an ambient path lookup.
-        env:
-          HESTIA_SHARED_DIR: ${{ github.workspace }}/plugins/_shared
         run: |
           set -euo pipefail
           # Discovery comes from tools/ci_discovery.py (mode: hooks), the same
