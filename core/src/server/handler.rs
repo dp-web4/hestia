@@ -504,7 +504,7 @@ fn make_resource_template(uri_template: &str, name: &str, description: &str) -> 
 
 type ToolResult = Result<Value, anyhow::Error>;
 
-async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
+pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     let plugin_id = require_string(args, "plugin_id")?;
     // `/` is the routed-address separator (r6-routing branch 2: `peer/member`), so a
     // member id containing one makes the address form AMBIGUOUS at its own parse site.
@@ -596,6 +596,13 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
                 .collect()
         });
     let gate_capability_report_accepted = gate_capabilities.is_some();
+    // The digest of the rendered projection this caller LOADED (#944 liveness). Optional:
+    // consumers that predate the projection, and the app, do not carry it. Shape-checked
+    // only — a caller can assert any digest, exactly as it can assert any plugin_id at A1;
+    // what the daemon adds is the comparison against the vault's own render, recorded.
+    let projection_sha256 = optional_string(args, "projection_sha256")
+        .map(|d| d.trim().to_ascii_lowercase())
+        .filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()));
     let synthetic = args
         .get("synthetic")
         .and_then(|v| v.as_bool())
@@ -716,6 +723,9 @@ async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     // that a loaded gate is active.
     if let Some(capabilities) = gate_capabilities {
         s.gate_capabilities.insert(plugin_id.clone(), capabilities);
+    }
+    if let (Some(digest), false) = (&projection_sha256, synthetic) {
+        observe_seat_projection(&mut s, &plugin_id, digest);
     }
     // Readback, not a mirror (the #68 shape, one field over): the fresh path
     // echoes the STORED, normalized role — the same value the reuse path
@@ -5192,6 +5202,60 @@ pub(crate) fn render_and_verify_seat_configs_as(
     // a repair cannot be recorded before the finding that motivated it.
     witness_config_verdicts(s, &home, &verdicts);
     verdicts
+}
+
+/// A seat presented the digest of the projection it loaded (#944 liveness).
+///
+/// Compared against the vault's render for that member AT THIS MOMENT, and recorded in RAM on
+/// every connect. WITNESSED on the first presentation and on every change of either side of the
+/// comparison — the presented digest or the expectation — never per connect: a hook connects on
+/// every tool call, and a row per call would make the chain a function of the seat's activity.
+///
+/// This is the call-time complement of the worker's Detect pass. The worker sees the artifact
+/// within 300 s; this sees what the seat is RUNNING, at the moment it asks to act. A mismatch
+/// here is a seat acting under config the vault did not render — reported, not refused: whether
+/// the gate should refuse the call on it is a ruling this record exists to inform.
+pub(crate) fn observe_seat_projection(
+    s: &mut super::state::ServerState,
+    member: &str,
+    presented: &str,
+) {
+    use super::seat_config as sc;
+    let now = super::gate_escalation::now_secs();
+    let expected = sc::expected_sha256(&s.vault, member);
+    let prior = s.seat_live.get(member).cloned();
+    let unchanged = prior
+        .as_ref()
+        .map(|p| p.sha256 == presented && p.expected_sha256 == expected)
+        .unwrap_or(false);
+    let entry = sc::LiveProjection {
+        sha256: presented.to_string(),
+        expected_sha256: expected.clone(),
+        first_seen_at: if unchanged { prior.as_ref().unwrap().first_seen_at } else { now },
+        last_seen_at: now,
+    };
+    let matches = entry.matches_expected();
+    s.seat_live.insert(member.to_string(), entry);
+    if unchanged {
+        return;
+    }
+    let mut payload = json!({
+        "member": member,
+        "presented_sha256": presented,
+        "expected_sha256": expected,
+        "matches_expected": matches,
+        "observed_at": now,
+    });
+    if let Some(p) = prior {
+        payload["previous_sha256"] = json!(p.sha256);
+        payload["previous_expected_sha256"] = json!(p.expected_sha256);
+    }
+    if let Err(e) = s.append_chain("config_seat_live", payload) {
+        // The record failed, not the observation. Forget the entry so the next connect
+        // re-attempts the witness rather than treating an unrecorded change as reported.
+        s.seat_live.remove(member);
+        tracing::warn!(member = %member, error = %e, "seat liveness could NOT be recorded");
+    }
 }
 
 /// Record findings, and record their RESOLUTION.
@@ -10745,6 +10809,143 @@ mod tests {
             Some("miswired:E:F"),
             "and that is the string the live pass computes"
         );
+    }
+
+    /// `config_seat_live` rows, newest first.
+    fn live_rows(s: &super::super::state::ServerState) -> Vec<serde_json::Value> {
+        s.chain_store
+            .read_recent_by_types(None, &["config_seat_live"], 100)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.event_data)
+            .collect()
+    }
+
+    /// LIVENESS (#944). A seat presents the digest of the projection it loaded on connect; the
+    /// daemon compares it with the vault's render at that moment, keeps the latest in RAM, and
+    /// witnesses the first presentation and every CHANGE — never a row per connect, because a
+    /// hook connects on every tool call.
+    #[tokio::test]
+    async fn a_seat_presents_its_projection_digest_and_only_changes_are_witnessed() {
+        use super::super::seat_config as sc;
+        let (dir, shared) = make_shared_state();
+        let member = "claude-code".to_string();
+        let expected = {
+            let mut s = shared.lock().await;
+            settle_seat(&mut s, &member, "/w/ai");
+            let on_disk = std::fs::read(sc::render_path(dir.path(), &member)).unwrap();
+            sc::sha256_of(&on_disk)
+        };
+        let connect = |digest: &str| json!({"plugin_id": "claude-code", "host_agent": "t", "projection_sha256": digest});
+
+        // First connect: recorded and witnessed as matching.
+        super::tool_connect(&shared, &connect(&expected)).await.unwrap();
+        {
+            let s = shared.lock().await;
+            let live = s.seat_live.get(&member).expect("the seat has a liveness record");
+            assert_eq!(live.sha256, expected);
+            assert_eq!(live.matches_expected(), Some(true), "{live:?}");
+            let rows = live_rows(&s);
+            assert_eq!(rows.len(), 1, "first presentation is witnessed once: {rows:?}");
+            assert_eq!(rows[0]["matches_expected"], true);
+            assert!(rows[0].get("previous_sha256").is_none());
+        }
+        // Same digest again (the next tool call): no new row.
+        super::tool_connect(&shared, &connect(&expected)).await.unwrap();
+        {
+            let s = shared.lock().await;
+            assert_eq!(live_rows(&s).len(), 1, "a repeat presentation is not a row");
+        }
+        // A different digest: the seat is running something the vault did not render.
+        let other = sc::sha256_of(b"tampered");
+        super::tool_connect(&shared, &connect(&other)).await.unwrap();
+        {
+            let s = shared.lock().await;
+            let live = s.seat_live.get(&member).unwrap();
+            assert_eq!(live.matches_expected(), Some(false));
+            let rows = live_rows(&s);
+            assert_eq!(rows.len(), 2, "the change is witnessed: {rows:?}");
+            assert_eq!(rows[0]["matches_expected"], false);
+            assert_eq!(rows[0]["presented_sha256"], other);
+            assert_eq!(rows[0]["expected_sha256"], expected);
+            assert_eq!(rows[0]["previous_sha256"], expected, "the row names what it replaced");
+        }
+        // Not a digest: ignored rather than recorded as a mystery.
+        super::tool_connect(&shared, &connect("not-a-digest")).await.unwrap();
+        {
+            let s = shared.lock().await;
+            assert_eq!(s.seat_live.get(&member).unwrap().sha256, other, "a malformed digest changes nothing");
+            assert_eq!(live_rows(&s).len(), 2);
+        }
+        // No digest at all (an app connect): the record is kept, not erased.
+        super::tool_connect(&shared, &json!({"plugin_id": "claude-code", "host_agent": "app"})).await.unwrap();
+        {
+            let s = shared.lock().await;
+            assert!(s.seat_live.contains_key(&member), "absence is 'no new evidence', not 'gone'");
+        }
+    }
+
+    /// The EXPECTATION side changes too: the operator re-saves the seat, the seat is still
+    /// running the previous render until its next call re-imports. That transition is a change
+    /// worth a row (the seat is momentarily behind the vault), and the next connect after the
+    /// seat reloads is another (it caught up).
+    #[tokio::test]
+    async fn a_changed_vault_render_is_a_liveness_change_even_if_the_seat_presents_the_same_digest() {
+        use super::super::seat_config as sc;
+        let (dir, shared) = make_shared_state();
+        let member = "codex".to_string();
+        let first = {
+            let mut s = shared.lock().await;
+            settle_seat(&mut s, &member, "/w/ai");
+            sc::sha256_of(&std::fs::read(sc::render_path(dir.path(), &member)).unwrap())
+        };
+        let connect = |digest: &str| json!({"plugin_id": "codex", "host_agent": "t", "projection_sha256": digest});
+        super::tool_connect(&shared, &connect(&first)).await.unwrap();
+
+        // The authority moves; the seat has not reloaded yet.
+        {
+            let mut s = shared.lock().await;
+            let cfg = serde_json::json!({"env": {"HESTIA_WORKSPACE": "/w/two"}, "note": ""});
+            s.vault.put_document(sc::SEAT_CONFIG_NS, &member, serde_json::to_vec(&cfg).unwrap()).unwrap();
+        }
+        super::tool_connect(&shared, &connect(&first)).await.unwrap();
+        let second = {
+            let s = shared.lock().await;
+            let live = s.seat_live.get(&member).unwrap();
+            assert_eq!(live.matches_expected(), Some(false), "behind the vault: {live:?}");
+            let rows = live_rows(&s);
+            assert_eq!(rows.len(), 2, "falling behind is a change: {rows:?}");
+            assert_eq!(rows[0]["previous_expected_sha256"], first);
+            live.expected_sha256.clone().unwrap()
+        };
+        assert_ne!(first, second);
+        // The seat reloads and presents the new render: caught up, and that is a row too.
+        super::tool_connect(&shared, &connect(&second)).await.unwrap();
+        {
+            let s = shared.lock().await;
+            assert_eq!(s.seat_live.get(&member).unwrap().matches_expected(), Some(true));
+            assert_eq!(live_rows(&s).len(), 3);
+        }
+    }
+
+    /// A seat the vault does not configure, presenting a digest, is running a projection the
+    /// vault does not stand behind: recorded with no expectation, so the surface can say so.
+    #[tokio::test]
+    async fn an_unconfigured_seat_presenting_a_digest_is_recorded_as_unbacked_liveness() {
+        use super::super::seat_config as sc;
+        let (_dir, shared) = make_shared_state();
+        let digest = sc::sha256_of(b"from somewhere");
+        super::tool_connect(&shared, &json!({"plugin_id": "gemini", "host_agent": "t", "projection_sha256": digest}))
+            .await
+            .unwrap();
+        let s = shared.lock().await;
+        let live = s.seat_live.get("gemini").unwrap();
+        assert_eq!(live.expected_sha256, None);
+        assert_eq!(live.matches_expected(), None);
+        let rows = live_rows(&s);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0]["expected_sha256"].is_null());
+        assert!(rows[0]["matches_expected"].is_null());
     }
 
     fn make_shared_state() -> (TempDir, SharedState) {

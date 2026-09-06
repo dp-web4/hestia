@@ -2929,6 +2929,15 @@ fn seat_config_summary(
             .and_then(|c| c.validate().map(|_| c))
     });
     let open_since = s.config_findings_open.get(member).map(|f| f.first_observed_at);
+    let live = s.seat_live.get(member).map(|l| {
+        serde_json::json!({
+            "sha256": l.sha256,
+            "expected_sha256": l.expected_sha256,
+            "matches_expected": l.matches_expected(),
+            "first_seen_at": l.first_seen_at,
+            "last_seen_at": l.last_seen_at,
+        })
+    });
     let shared = sc::load_shared(&s.vault);
     let declared = match (&shared, declared) {
         (Some(Err(e)), Some(_)) => Some(Err(format!("shared set unusable: {e}"))),
@@ -2955,6 +2964,10 @@ fn seat_config_summary(
                 "expected_sha256": sc::sha256_of(expected_bytes.as_bytes()),
                 "verdict": verdict,
                 "finding_open_since": open_since,
+                // What the seat itself last said it was running (#944 liveness). Absent until
+                // the seat connects with a digest; `matches_expected` is against the render
+                // current at that connect, which is why it is stored rather than recomputed.
+                "live": live,
             })
         }
         Some(Err(reason)) => serde_json::json!({
@@ -2965,6 +2978,7 @@ fn seat_config_summary(
             "artifact": artifact.to_string_lossy(),
             "verdict": {"status": "unbacked", "member": member, "reason": reason},
             "finding_open_since": open_since,
+            "live": live,
         }),
         None => serde_json::json!({
             "member": member,
@@ -2979,6 +2993,7 @@ fn seat_config_summary(
                 "member": member,
             },
             "finding_open_since": open_since,
+            "live": live,
         }),
     }
 }
@@ -4646,6 +4661,46 @@ mod disposition_tests {
             }
         }
         assert!(s.chain_store.len().unwrap() > before);
+    }
+
+    /// The list shows LIVENESS beside drift (#944): absent until the seat connects with a
+    /// digest, then what it presented, what the vault expected, and whether they agree — and
+    /// still never a value.
+    #[tokio::test]
+    async fn the_seat_config_list_shows_what_the_seat_is_running() {
+        use super::super::seat_config as sc;
+        let (dir, state) = test_state().await;
+        let body = serde_json::json!({
+            "plugin_id": "claude-code",
+            "config": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""},
+        });
+        let put = axum::response::IntoResponse::into_response(
+            super::config_put_seat(axum::extract::State(state.clone()), axum::Json(body)).await,
+        );
+        assert_eq!(put.status(), StatusCode::OK);
+        let list = || async {
+            let resp = axum::response::IntoResponse::into_response(
+                super::config_list_seats(axum::extract::State(state.clone())).await,
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(!text.contains("/w/ai"), "a VALUE leaked into the list: {text}");
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            v["seats"].as_array().unwrap().iter().find(|s| s["member"] == "claude-code").unwrap().clone()
+        };
+        assert!(list().await["live"].is_null(), "no connect yet, no liveness claim");
+
+        let on_disk = sc::sha256_of(&std::fs::read(sc::render_path(dir.path(), "claude-code")).unwrap());
+        super::super::handler::tool_connect(
+            &state,
+            &serde_json::json!({"plugin_id": "claude-code", "host_agent": "t", "projection_sha256": on_disk}),
+        )
+        .await
+        .unwrap();
+        let seat = list().await;
+        assert_eq!(seat["live"]["sha256"], on_disk);
+        assert_eq!(seat["live"]["matches_expected"], true);
+        assert_eq!(seat["live"]["expected_sha256"], seat["expected_sha256"]);
     }
 
     /// The LIST never carries a value, on any seat, in any state (#944 phase 0).

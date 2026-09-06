@@ -544,6 +544,10 @@ def run() -> int:
         role_basis = os.environ.get("HESTIA_ROLE_BASIS")
         if role_basis:
             connect_args["role_basis"] = role_basis
+        # Liveness (#944): the digest of the projection this process loaded at import.
+        projection = os.environ.get("HESTIA_PROJECTION_SHA256")
+        if projection:
+            connect_args["projection_sha256"] = projection
         connect_resp = client.call_tool("hestia_connect", connect_args)
         connect = unwrap_tool_result(connect_resp)
         if "_hestia_error" in connect:

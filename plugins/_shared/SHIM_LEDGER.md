@@ -41,7 +41,7 @@ Module-level law (marker tables, mode defaults, timeout constants, loader fallba
 | `deny_self_access` | LAW-DEBT | 58d71e99 | The exit code and stderr are this harness's channel; the multi-paragraph refusal, the escalation invitation and the witness-failure-is-not-permission rule are gate content (#844). |
 | `_attempted_summary` | LAW-DEBT | c7f1b9c3 | Builds the redacted, bounded escalation reason. Its own docstring says it belongs on `Verdict` in the core; codex and kimi carry copies (#844). |
 | `_credential_shaped` | LAW-DEBT | 6efef61c | Redaction predicate over payload text deciding what may enter the witness chain; nothing about it is Claude Code specific (#844). |
-| `_connect_session` | LAW-DEBT | fbc90c89 | Passing plugin id, role and protocol version is identity, but the never-raise degrade rule ("the record degrades, never the channel") is recovery policy chosen here (#844). |
+| `_connect_session` | LAW-DEBT | 19a54975 | Passing plugin id, role, protocol version and the loaded projection's digest (#944 liveness) is identity, but the never-raise degrade rule ("the record degrades, never the channel") is recovery policy chosen here (#844). |
 | `request_self_write` | LAW-DEBT | 3c206ed5 | The appeal channel: single round trip policy, every-failure-is-refusal posture, and the operator-facing banner. All three are named never-in-a-shim (#844). |
 | `_escalation_plugin_id` | identity | cffc0046 | The plugin id this seat escalates under, from env or the module constant; identity passed to the gate (#244 fixed the fallback). |
 | `_dig` | LAW-DEBT | 19193d70 | Generic MCP envelope search. It decides nothing, and it is not harness-unique: it duplicates what the shared `unwrap_tool_result` exists for and belongs beside it (#371). |

@@ -3868,6 +3868,18 @@
     return `<span class="cfg-verdict ${cls}" title="${cfgEsc(why)}">${cfgEsc(st)}</span>`;
   }
 
+  // LIVENESS, beside drift. `verdict` is what the worker found on disk (within 300 s); `live`
+  // is what the seat itself said it LOADED, the last time it connected. A seat that has not
+  // connected since the daemon started has no claim, and the badge says so rather than guessing.
+  function cfgLiveHtml(l) {
+    if (!l) return `<span class="cfg-verdict none" title="no connect carrying a projection digest since the daemon started">not seen</span>`;
+    const ago = Math.max(0, Math.round(Date.now() / 1000 - (l.last_seen_at || 0)));
+    const when = ago < 90 ? `${ago}s ago` : ago < 5400 ? `${Math.round(ago / 60)}m ago` : `${Math.round(ago / 3600)}h ago`;
+    if (l.matches_expected === true) return `<span class="cfg-verdict ok" title="running ${cfgEsc(l.sha256)} — the vault's render at that connect (${when})">live ✓ ${when}</span>`;
+    if (l.matches_expected === false) return `<span class="cfg-verdict bad" title="running ${cfgEsc(l.sha256)} but the vault renders ${cfgEsc(l.expected_sha256 || '')} (${when})">live ≠ vault ${when}</span>`;
+    return `<span class="cfg-verdict bad" title="running ${cfgEsc(l.sha256)} with nothing in the vault to compare against (${when})">live, unbacked ${when}</span>`;
+  }
+
   async function cfgLoadList() {
     const status = $('cfg-status');
     try {
@@ -3898,6 +3910,7 @@
               ? `${s.keys.length} own${s.keys.length ? ' — ' + cfgEsc(s.keys.join(', ')) : ''}${(s.inherited||[]).length ? ` <span class="cfg-inh">+${s.inherited.length} shared</span>` : ''}${(s.shadowed||[]).length ? ` <span class="cfg-verdict bad" title="restates a shared key; shared wins">shadowed: ${cfgEsc(s.shadowed.join(', '))}</span>` : ''}`
               : 'not configured'}</span>
             ${cfgVerdictHtml(s.verdict)}
+            ${cfgLiveHtml(s.live)}
             <button type="button" class="pol-btn cfg-open">${s.configured ? 'inspect' : 'configure'}</button>
           </div>`).join('');
       }

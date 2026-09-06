@@ -1253,6 +1253,8 @@ def _connect_session(client: "McpHttp", host_session_id: Optional[str]) -> Optio
             args["role"] = role
         if host_session_id:
             args["host_session_id"] = host_session_id
+        # Liveness (#944): which rendered projection this process LOADED (None when unset).
+        args["projection_sha256"] = os.environ.get("HESTIA_PROJECTION_SHA256")
         conn = unwrap_tool_result(client.call_tool("hestia_connect", args))
         sid = conn.get("sessionId")
         return sid if isinstance(sid, str) and sid else None
