@@ -13653,6 +13653,164 @@ mod tests {
         );
     }
 
+    /// THE DOOR PROVED YOU MAY RULE AND HAS TO SAY SO — a DELIVERY test, not an existence pin.
+    ///
+    /// Specimen `dcd85c0b9e0486d7` (2026-09-03, this seat's own): opened `single_approver`
+    /// with `asker_basis: session`; codex concurred at +452s and kimi-code at +611s, both
+    /// cross-vendor, both recorded `bar_met_if_decided_now: true`; it LAPSED unruled at
+    /// +3636s with `factors_concurring: 2, factors_dissenting: 0`. codex's own mesh pointer
+    /// on its concurrence ended `-pending-no-authority`. codex was wrong: reaching the Ok
+    /// branch of this door requires `eligibility(..) == Eligible`, and `eligibility(p)` is
+    /// literally `eligibility_for(p, Disposition::ForAppellant)` — the call
+    /// `tool_gate_arbitrate_escalation` makes over an identical `AppealParties` to admit an
+    /// approval. Nothing on the invited-peer path (mesh notice -> poll -> corroborate) said
+    /// so; `you_may_rule` lived only on `pending`, a queue-discovery surface a peer invited
+    /// by POINTER never opens. Chain census, 90k hops 2026-08-13..2026-09-03: SEVEN
+    /// petitions lapsed carrying unanimous concurrence and zero dissent — 14% of all 51
+    /// lapses in the window — while peers ruled 18 of 446 decisions, so the capability was
+    /// live and merely unreachable from where the peer was standing.
+    ///
+    /// WHY THE LAST ARM IS THE TEST. Asserting the string is in the note would pass against
+    /// a promise that had become FALSE. So this spends the promise: the same session that
+    /// was told `you_may_rule: true` then rules, and the ruling must be admitted. Red if the
+    /// field goes away, red if the note stops naming the verb, and red if the two doors ever
+    /// stop agreeing about who may act.
+    #[tokio::test]
+    async fn corroborate_tells_an_eligible_peer_it_may_rule() {
+        // NOT `opened_escalation_with_peer()`: that fixture's marker is `witness.py`, one of
+        // the four names `bar_for` prices `sovereign_plus_peer`, and under that bar
+        // `bar_met_over` reads the sovereign conjunct ALONE — no peer factor can ever meet
+        // it, so the specimen would not reproduce. `bar_for` sends every marker outside
+        // those four to `single_approver`; the live specimen's was a `plugins` glob matching
+        // a test ABOUT hooks, and a governance doc lands on the same bar without putting a
+        // marker basename in this file.
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": session_of["claude-code"],
+                "tool_name": "Bash",
+                "marker": "docs/GATE_ARCHITECTURE.md",
+                "act": "Bash -> docs/GATE_ARCHITECTURE.md",
+            }),
+        )
+        .await
+        .unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap().to_string();
+        let codex_sid = session_of["codex"].clone();
+        assert_eq!(
+            opened["asker_basis"], "session",
+            "#128 clause 0: an ASSERTED asker collects no peer factor at all, so the \
+             specimen requires a session-proven open: {opened}"
+        );
+
+        let r = tool_gate_escalation_corroborate(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "session_id": codex_sid,
+                "stance": "concur",
+                "argument": "read the act; the write is exactly what the reason claims",
+            }),
+        )
+        .await
+        .expect("a concurrence from an eligible cross-vendor peer must land");
+
+        assert_eq!(
+            r["bar"], "single_approver",
+            "fixture premise: the lapse class is single_approver, which one peer factor \
+             satisfies (`bar_met_over`): {r}"
+        );
+        assert_eq!(
+            r["bar_met_if_decided_now"], true,
+            "one peer factor meets single_approver — if this is false the fixture no longer \
+             reproduces the specimen: {r}"
+        );
+        assert_eq!(
+            r["you_may_rule"], true,
+            "THE DEFECT: this door computed `eligibility` to admit the factor and threw the \
+             answer away, so the peer was never told it could close what it had just \
+             endorsed. The field must be ON THIS RESPONSE, where the peer is: {r}"
+        );
+
+        let note = r["note"].as_str().expect("note");
+        assert!(
+            note.contains("hestia_gate_arbitrate_escalation"),
+            "eligibility with no verb is not delivery — the note must name the call that \
+             lands the decision, not say in the passive voice that it must land: {note}"
+        );
+        assert!(
+            note.contains("--as"),
+            "the printed CLI ruling line is refused as typed without `--as <seat>` (the \
+             default matches no lineage), so telling a peer it may rule while handing it a \
+             command that fails converts a silence into a failure: {note}"
+        );
+
+        // SPEND THE PROMISE. The same peer, the same escalation, the verb it was just
+        // pointed at. A note that says `you_may_rule: true` over a door that then refuses
+        // is worse than the silence this test exists to end.
+        let ruled = tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "approve": true,
+                "reason": "acting on the eligibility this door just reported to me",
+                "session_id": codex_sid,
+            }),
+        )
+        .await
+        .expect(
+            "the response promised `you_may_rule: true` — the ruling door must honour it. \
+             Corroborating already required the identical `eligibility` check, and nothing \
+             excludes a member that has filed a factor from ruling",
+        );
+        assert_eq!(ruled["status"], "approved", "{ruled}");
+        assert_eq!(
+            ruled["decided_by"], "codex",
+            "the peer that was told it may rule is the one credited with the ruling: {ruled}"
+        );
+    }
+
+    /// The same answer at the OTHER door on the invited-peer path. `poll` is what a peer
+    /// handed `hestia://escalation/<id>` actually opens, and it returned `bar`, `bar_met`,
+    /// `factors_present`, `permits_write` and `granted` — every field the ASKER wants and
+    /// none a reviewing PEER does. Null vs false is load-bearing: an unattributed reader has
+    /// not been judged ineligible, it has not been judged, and rendering that as `false`
+    /// is the failure `tool_gate_pending_escalations` already calls out in its caveat.
+    #[tokio::test]
+    async fn poll_tells_an_attributed_peer_whether_it_may_rule() {
+        let (_dir, shared, esc_id, codex_sid) = opened_escalation_with_peer().await;
+
+        let attributed = tool_gate_escalation_poll(
+            &shared,
+            &json!({ "escalation_id": esc_id, "session_id": codex_sid }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            attributed["you_may_rule"], true,
+            "the peer reading the pointer it was invited on must learn it may rule: \
+             {attributed}"
+        );
+
+        let anon = tool_gate_escalation_poll(&shared, &json!({ "escalation_id": esc_id }))
+            .await
+            .unwrap();
+        assert!(
+            anon["you_may_rule"].is_null(),
+            "an unattributed reader is UNJUDGED, not ineligible — false would be a \
+             well-formed wrong answer: {anon}"
+        );
+    }
+
     /// Refuse-don't-default, the missing-input arm. The silent path — a call that names no
     /// stance — is exactly how the specimen's dissent became concurrence, so it dies:
     /// an absent stance refuses and mints NO factor.
@@ -17513,7 +17671,8 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
     // not an act. What requires proof is MOVING THE CLOCK: an asserted plugin_id here would
     // let any caller extend (or, by racing, fix) another member's deadline. Unproven callers
     // get exactly the answer they got before; nothing regresses for them.
-    let observed = match resolve_attributed_caller(&s, session_id_arg.as_deref()) {
+    let caller = resolve_attributed_caller(&s, session_id_arg.as_deref());
+    let observed = match &caller {
         Some(c) => s.gate_escalations.mark_observed(&id, &c.plugin_id, now),
         None => false,
     };
@@ -17521,9 +17680,38 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
     let status = s.gate_escalations.status_of(&id, now);
     let esc = s.gate_escalations.get(&id);
 
+    // WHETHER THE READER MAY RULE IT. An INVITED peer arrives by pointer, not by queue: the
+    // mesh hands it `hestia://escalation/<id>` and this is the door it opens. `you_may_rule`
+    // existed only on `pending`, a queue-DISCOVERY surface such a peer has no reason to call
+    // -- so along the whole invited-peer path (notice -> poll -> corroborate) nothing ever
+    // said the reader was eligible to decide. Measured 2026-09-03 over 90k chain hops: seven
+    // petitions lapsed carrying unanimous peer concurrence and zero dissent, every one on
+    // `single_approver`, which `bar_met_over` satisfies with a lone peer factor. The peers
+    // had passed the eligibility check -- corroborating requires it -- and were never told.
+    //
+    // This is the lesson the `permits_write` comment below already learned on this same
+    // response: the right answer existing somewhere does not put it on the path anyone
+    // takes. It goes HERE, where the reader is.
+    let may_rule = match (&caller, esc) {
+        (Some(c), Some(e)) => Some(matches!(
+            crate::arbiter::eligibility(&crate::arbiter::AppealParties {
+                appellant: &e.plugin_id,
+                appellant_basis: e.asker_basis,
+                deny_adjudicator: None,
+                arbiter: &c.plugin_id,
+            }),
+            crate::arbiter::Eligibility::Eligible { .. }
+        )),
+        // Null, never false: an unattributed reader has not been judged ineligible, it has
+        // not been judged. Rendering that as `false` is the failure `pending` calls out.
+        _ => None,
+    };
+
     Ok(json!({
         "escalation_id": id,
         "status": status,
+        // See `may_rule` above. Null means "not attributed", not "not eligible".
+        "you_may_rule": may_rule,
         // Told, not inferred: if this poll is what started the claim fuse, the member should
         // know its window is now measured from THIS moment and not from the ruling.
         "observation_started_claim_window": observed,
@@ -18530,13 +18718,40 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                 "bar": updated.bar,
                 "bar_met_if_decided_now": updated.bar_met(),
                 "witnessEntryHash": entry.ok().map(|e| e.hash),
+                // YOU MAY RULE THIS, AND WE ALREADY PROVED IT. Reaching this line required
+                // `eligibility(..)` above to answer `Eligible` -- and `eligibility(p)` IS
+                // `eligibility_for(p, Disposition::ForAppellant)` (arbiter.rs), which is
+                // exactly what `tool_gate_arbitrate_escalation` calls to admit an approval,
+                // over an identical `AppealParties`. So the predicate that let this
+                // corroboration land is the predicate that would let this caller's approval
+                // land; there is no further bar and no "already filed a factor" exclusion.
+                // The door computed that, used it to admit the factor, and discarded it.
+                //
+                // Constant `true` is the honest value here, not a re-derivation: it is a
+                // statement about control flow. If a later edit admits a corroboration from
+                // a member that may not rule, these two must stop agreeing LOUDLY -- which
+                // is what `corroborate_tells_an_eligible_peer_it_may_rule` pins.
+                "you_may_rule": true,
                 "note": if dissent {
                     "your dissent is ON THE RECORD as evidence for review — never a veto: \
                      the sovereign decision stands or lands regardless, with your argument \
                      visible to the decider"
+                } else if updated.bar_met() {
+                    "a corroboration is evidence, not a verdict — it permits nothing by \
+                     itself; the decision still has to land. YOU MAY LAND IT: your factor \
+                     already meets the stated bar, and admitting this corroboration required \
+                     the same eligibility check that admits an approval. Call \
+                     hestia_gate_arbitrate_escalation {escalation_id, approve: true, reason} \
+                     — or `hestia gate approve <id> --as <your plugin_id>`, where --as is \
+                     REQUIRED because the CLI default matches no lineage. Leaving it for the \
+                     operator is a legitimate choice; this line exists so that it is a \
+                     choice you make rather than one you make by not knowing you had it"
                 } else {
                     "a corroboration is evidence, not a verdict — it permits nothing by \
-                     itself; the decision still has to land and the stated bar be met"
+                     itself; the decision still has to land and the stated bar be met. You \
+                     are eligible to rule this (the check that admitted this factor is the \
+                     one that admits an approval), but the bar is NOT yet met, so a ruling \
+                     now would be recorded short of it and permit nothing"
                 },
             }))
         }
