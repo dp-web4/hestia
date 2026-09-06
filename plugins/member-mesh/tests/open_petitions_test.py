@@ -319,9 +319,12 @@ with tempfile.TemporaryDirectory() as tmp:
     check("B2 measured-and-empty renders nothing",
           render({"asked": True, "mine": []}, tmp).strip() == "", "expected empty")
 
-    # B3: a held petition names itself, its clock, and the move.
-    out = render(fold({"pending": [row("claude-code", "abc123", secs_remaining=603)]},
-                      "claude-code"), tmp)
+    # B3: a held petition names itself, its clock, and the move. The row is POSITIVELY
+    # this seat's (its host session is in the ledger): since #974 only a measured owner
+    # gets the move prescribed; an unmeasured one is rendered under B9, without it.
+    out = render(op.fold({"pending": [row("claude-code", "abc123", secs_remaining=603,
+                                          host_session_id="wake-b3")]},
+                         "claude-code", own_sessions={"wake-b3"}), tmp)
     check("B3 names the escalation id", "abc123" in out, repr(out))
     check("B3 names the time left, not the raw seconds", "10m" in out, repr(out))
     check("B3 marks a gate-auto-minted petition as such", "gate-auto" in out, repr(out))
@@ -366,6 +369,104 @@ with tempfile.TemporaryDirectory() as tmp:
 
 
 print()
+print("A7/B8. seat attribution — a plugin NAME is two processes (#732)")
+
+# A7: THE ARM THAT DISCRIMINATES SEATS. Two rows, same `asked_by`, differing only
+# in `host_session_id`; a ledger naming one of them. Both sides asserted on one
+# input, so a fold that drops everything, or keeps everything, fails somewhere.
+import tempfile
+with tempfile.TemporaryDirectory() as tmp:
+    ledger = os.path.join(tmp, "wake-sessions-claude-code")
+    with open(ledger, "w") as fh:
+        fh.write("wake-1111 20260906-061635 notice-A.json\nwake-2222 20260906-070000 notice-B.json\n")
+    payload = {"pending": [row("claude-code", "own1", host_session_id="wake-1111"),
+                           row("claude-code", "sib1", host_session_id="9261dc9a-interactive"),
+                           row("claude-code", "old1"),
+                           row("kimi-code", "theirs1", host_session_id="wake-1111")]}
+    r = subprocess.run([sys.executable, HELPER, "fold", "claude-code", ledger],
+                       input=json.dumps(payload), capture_output=True, text=True)
+    f = json.loads(r.stdout)
+    mine = {x["escalation_id"]: x.get("seat") for x in f["mine"]}
+    co = {x["escalation_id"]: x.get("seat") for x in f.get("co_seat", [])}
+    check("A7 a row whose host session this watcher fired is `mine`", mine.get("own1") == "mine", json.dumps(f))
+    check("A7 a same-name row from a session NOT in the ledger is `co_seat`, not `mine`",
+          "sib1" in co and "sib1" not in mine, json.dumps(f))
+    check("A7 co-seat row is tagged as such", co.get("sib1") == "co-seat", json.dumps(f))
+    check("A7 a row the daemon sent WITHOUT host_session_id stays `mine`, tagged unknown",
+          mine.get("old1") == "unknown", json.dumps(f))
+    check("A7 the peer's row is in NEITHER list, even with a matching host session",
+          "theirs1" not in mine and "theirs1" not in co, json.dumps(f))
+    check("A7 host_session_id survives the trim (the renderer names it)",
+          any(x.get("host_session_id") == "9261dc9a-interactive" for x in f["co_seat"]), json.dumps(f))
+    # A7b: NO ledger -> the OLD reading, tagged unknown, never "none are yours".
+    r = subprocess.run([sys.executable, HELPER, "fold", "claude-code"],
+                       input=json.dumps(payload), capture_output=True, text=True)
+    f2 = json.loads(r.stdout)
+    check("A7b without a ledger every same-name row is `mine` (degrades to the old fold)",
+          sorted(x["escalation_id"] for x in f2["mine"]) == ["old1", "own1", "sib1"], json.dumps(f2))
+    check("A7b and each is tagged unknown, not asserted as owned",
+          all(x.get("seat") == "unknown" for x in f2["mine"]), json.dumps(f2))
+    check("A7b co_seat is an empty LIST (a measured none), not absent", f2.get("co_seat") == [], json.dumps(f2))
+    # A7c: an unreadable ledger path is the same as no ledger.
+    r = subprocess.run([sys.executable, HELPER, "fold", "claude-code", os.path.join(tmp, "nope")],
+                       input=json.dumps(payload), capture_output=True, text=True)
+    f3 = json.loads(r.stdout)
+    check("A7c a missing ledger file degrades like no ledger (rc 0, all `mine`, unknown)",
+          r.returncode == 0 and len(f3["mine"]) == 3 and f3["co_seat"] == [], json.dumps(f3))
+
+    # B8: the render. A co-seat row must be VISIBLE (the wake may be about to
+    # touch the same path) and must NOT carry the WITHDRAW prescription.
+    co_only = {"asked": True, "mine": [], "co_seat": [dict(row("claude-code", "sib1",
+               host_session_id="9261dc9a-1703-4964"), seat="co-seat")]}
+    out = render(co_only, tmp)
+    check("B8 co-seat-only fold renders (not the measured-empty silence)", "sib1" in out, repr(out))
+    check("B8 co-seat block says NOT yours", "NOT yours" in out, repr(out))
+    check("B8 co-seat block names the host session prefix", "9261dc9a" in out, repr(out))
+    check("B8 co-seat block does NOT prescribe WITHDRAW", "WITHDRAW" not in out, repr(out))
+    check("B8 co-seat block does NOT say `Petitions YOU have open`", "Petitions YOU have open" not in out, repr(out))
+    mixed = {"asked": True,
+             "mine": [dict(row("claude-code", "own1", host_session_id="wake-1111"), seat="mine")],
+             "co_seat": co_only["co_seat"]}
+    out = render(mixed, tmp)
+    i_mine, i_with, i_co = out.find("own1"), out.find("WITHDRAW"), out.find("NOT yours")
+    check("B8 mixed fold renders both rows", "own1" in out and "sib1" in out, repr(out))
+    check("B8 mixed: WITHDRAW sits between the own row and the co-seat block, binding only the first",
+          -1 < i_mine < i_with < i_co, f"mine={i_mine} withdraw={i_with} co={i_co}")
+    check("B8 an owned row with a known seat carries no UNKNOWN caveat",
+          "seat: UNKNOWN" not in out.split("NOT yours")[0], repr(out))
+    unk = {"asked": True, "mine": [dict(row("claude-code", "old1"), seat="unknown")], "co_seat": []}
+    out = render(unk, tmp)
+    check("B8 an unknown-seat row says the match was on NAME only", "seat: UNKNOWN" in out and "plugin name only" in out, repr(out))
+    check("B8 and points at the chain field that discriminates", "host_session_id" in out, repr(out))
+    # B9: UNKNOWN OWNERSHIP REDUCES AUTHORITY (GPT review of #974). The first version
+    # of this branch rendered unknown rows under "YOU have open" with a caveat and
+    # still prescribed WITHDRAW — the unsafe instruction survived exactly when the
+    # evidence for it was absent. Unknown rows are visible and NOT actionable.
+    check("B9 an unknown-seat row is NOT headed `Petitions YOU have open`", "Petitions YOU have open" not in out, repr(out))
+    check("B9 an unknown-seat row carries NO WITHDRAW prescription", "WITHDRAW" not in out, repr(out))
+    check("B9 the unknown block says the owner seat is unknown and names the sibling", "OWNER SEAT IS UNKNOWN" in out and "interactive session" in out, repr(out))
+    # B9 the two degraded folds from A7b/A7c (no ledger; missing ledger) render the same way.
+    for label, degraded in (("no ledger", f2), ("missing ledger", f3)):
+        out = render(degraded, tmp)
+        check(f"B9 degraded fold ({label}) renders every same-name row", all(i in out for i in ("old1", "own1", "sib1")), repr(out))
+        check(f"B9 degraded fold ({label}) prescribes no WITHDRAW", "WITHDRAW" not in out, repr(out))
+        check(f"B9 degraded fold ({label}) claims no ownership", "Petitions YOU have open" not in out, repr(out))
+    # B9 a ledger present but a row the daemon sent WITHOUT host_session_id: that row
+    # alone is unknown; a positively-known own row in the same fold still gets WITHDRAW,
+    # and the instruction sits between the known row and the unknown block.
+    out = render(f, tmp)
+    i_own, i_with, i_unk, i_co = out.find("own1"), out.find("WITHDRAW"), out.find("OWNER SEAT IS UNKNOWN"), out.find("NOT yours")
+    check("B9 mixed known/unknown/co-seat renders all three rows", all(i in out for i in ("own1", "old1", "sib1")), repr(out))
+    check("B9 mixed: WITHDRAW binds only to the known row (own < WITHDRAW < unknown block < co-seat block)",
+          -1 < i_own < i_with < i_unk < i_co, f"own={i_own} withdraw={i_with} unknown={i_unk} co={i_co}")
+    check("B9 mixed: the unknown row is listed after the WITHDRAW paragraph, not before it", out.find("old1") > i_with, repr(out))
+    check("B9 mixed: exactly one WITHDRAW in the whole primer", out.count("WITHDRAW") == 1, repr(out))
+    legacy = {"asked": True, "mine": [row("claude-code", "abc123")]}   # pre-#732 fold, no seat/co_seat keys
+    out = render(legacy, tmp)
+    check("B8 a legacy fold (no seat, no co_seat) still renders the own row", "abc123" in out, repr(out))
+    check("B9 a legacy fold's rows are ownership-unknown too: visible, no WITHDRAW", "WITHDRAW" not in out and "OWNER SEAT IS UNKNOWN" in out, repr(out))
+
+print()
 print("C. adoption — the call sites exist")
 
 watch = open(os.path.join(MESH, "hestia-watch-member.sh")).read()
@@ -394,6 +495,23 @@ for tpl in sorted(templates):
     check(f"C8 {tpl}: splices $PETITIONS_BLOCK into PROMPT",
           re.search(r'PROMPT="[^"]*\$PETITIONS_BLOCK', src, re.S) is not None
           or "$DIGEST$DEBT_BLOCK$PETITIONS_BLOCK$LAST_WORDS_BLOCK" in src, tpl)
+
+# C9: the seat discriminator is WIRED, not just implemented. The watcher hands the
+# fold its ledger; the claude fire chooses the session id, records it in that
+# same ledger, and launches under it. One of the three missing and every wake
+# reads `seat: unknown` forever, which is the pre-#732 behaviour with a label.
+check("C9 watcher passes its wake-session ledger to the fold",
+      re.search(r'fold\s+"\$PLUGIN"\s*\\\s*\n\s*"\$STATE/wake-sessions-\$PLUGIN"', watch) is not None,
+      "fold not given the ledger")
+fire_claude = open(os.path.join(MESH, "fire-claude.sh")).read()
+check("C9 fire-claude chooses the wake's session id before launch",
+      re.search(r'^WAKE_SID="\$\(uuidgen', fire_claude, re.M) is not None, "no WAKE_SID")
+check("C9 fire-claude appends it to the ledger the watcher reads (same STATE root, same file name)",
+      'wake-sessions-claude-code' in fire_claude and '>> "$WAKE_LEDGER"' in fire_claude, "no ledger append")
+check("C9 fire-claude launches claude under that id",
+      re.search(r'claude -p [^\n]*--session-id "\$WAKE_SID"', fire_claude) is not None, "no --session-id")
+check("C9 the ledger is written BEFORE the launch line, so a killed wake is still attributable",
+      fire_claude.find('>> "$WAKE_LEDGER"') < fire_claude.find('--session-id "$WAKE_SID"'), "order")
 
 print()
 if failures:

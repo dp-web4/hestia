@@ -18682,6 +18682,16 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
                 "escalation_id": e.id,
                 "asked_by": e.plugin_id,
                 "asked_by_role": e.role,
+                // WHICH SEAT on that plugin name (#732). `asked_by` is the plugin name and
+                // two processes share it on every box: the interactive session and the
+                // mesh-fired wake. The `opened` chain event has carried the host session
+                // since #542; this row did not, so a mesh wake's primer rendered a
+                // co-seat's live petition under "petitions YOU have open" and told the
+                // reader to withdraw it (CBP 2026-09-06, ef800fc67cdd5e23: the owner was
+                // polling it; it was approved 2 min after the primer said to withdraw).
+                // None when the open carried no host session — a reader must not
+                // default it to "mine".
+                "host_session_id": e.host_session_id,
                 // Proven at open or merely asserted — the field `you_may_rule` is reading
                 // (#128 clause 0). Absent from this payload a reader cannot tell a rulable
                 // ask from one only the sovereign may decide.
