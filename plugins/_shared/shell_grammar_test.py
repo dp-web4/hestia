@@ -102,12 +102,27 @@ CASES = [
      "cd /tmp && echo x > notes.txt", "none", None),
 
     # --- shell blocks / conditionals ---
+    # if/while were pinned at OOG until 2026-09-06 and are still WRITE — their bodies are
+    # now RESOLVED instead of bailed on, so the rule sharpens to the precise
+    # governance-closure-write and the verdict names the actual resource rather than
+    # "closure vocabulary appeared somewhere in the text". A refusal did not become an
+    # allow; a vague refusal became a specific one.
+    #
+    # The BRACE case deliberately stays at OOG. The strip models `do`/`then`/`else` bodies,
+    # `if`/`elif`/`while`/`until` conditions, closers and `for`/`case` headers, and leaves
+    # every other block shape (`{ }`, `((`, `[[`, `function`, `select`, a `case` ARM)
+    # unmodelled and out of grammar. That is a scope choice, not an oversight: an unknown
+    # head contributes NO write targets here (the anti-FP default), so a shape that is
+    # stripped but not modelled resolves to nothing and is PERMITTED. Measured 2026-09-06 on
+    # a blanket-strip implementation: `function f { <write verb> <gate file>; }` classified
+    # as a READ on all 14 modelled write verbs. If one of these ever reads not-write, that
+    # is a hole — see test_block_and_its_unblocked_body_agree.
     ("if_block__closure",
-     f"if true; then echo x > {HOOKS}/{HOOK}; fi", "write", OOG),
+     f"if true; then echo x > {HOOKS}/{HOOK}; fi", "write", WRT),
     ("if_block__benign",
      "if true; then echo hi; fi", "none", None),
     ("while_block__closure",
-     f"while read l; do rm {SHARED_DIR}/{CORE}; done", "write", OOG),
+     f"while read l; do rm {SHARED_DIR}/{CORE}; done", "write", WRT),
     ("while_block__benign",
      "while read l; do echo $l; done", "none", None),
     ("brace_block__closure",
@@ -276,21 +291,51 @@ def test_differential_against_real_shell():
     check("differential", not failures, "\n  ".join(failures))
 
 
-# ── Suite 3: BLOCK AROUND A READ-ONLY BODY — the #440 class, pinned as OPEN ─────────────────
-# The contract above resolves write positions for simple commands only; a `for`/`if`/`while`
-# block is out of grammar, and out-of-grammar means "closure vocabulary anywhere => write".
-# So a block whose BODY is a plain read of a closure file is refused as a write, and the
-# same body outside the block is not. Three real escalations, each self-withdrawn within
-# 15 s and each mis-attributed at least once by a seat that measured the shim's legacy
-# `_is_read_only` (which permits these loops since 50f78c4) instead of THIS classifier:
+# ── Suite 3: A BLOCK AND ITS UNBLOCKED BODY MUST AGREE ─ the #440 class, now CLOSED ────
+# HISTORY. Until 2026-09-06 any segment headed by a control-flow keyword raised
+# _OutOfGrammar, and out-of-grammar means "closure vocabulary anywhere => write". A block
+# whose body was a plain READ of a governance file was therefore refused as a WRITE, while
+# the identical body outside the block was allowed. This suite used to pin that OPEN, and it
+# told its successor exactly what to do once a repair landed: "move the pair into CASES as
+# not-write". _flush_simple_command now STRIPS leading control-flow keywords and head-checks
+# the body, so the pairs move here instead ─ into a contract strictly stronger than either
+# half alone, which holds the repair down in BOTH directions.
+#
+# THE INVARIANT: wrapping a command in a block changes NOTHING about its verdict ─ not the
+# classification, not the rule. A block is not an indirection; its body is plain, visible,
+# tokenized text. Reads stay reads, writes stay writes, and the genuinely opaque constructs
+# (`eval`, an interpreter's `-c`, a substitution in a write position) still bail out of
+# grammar ─ bailing identically whether or not a block encloses them.
+#
+# WHY THE RED HALF IS GENERATED. An earlier cut of this repair stripped the keyword for the
+# HEAD CHECK but still handed the RAW word list to _command_write_targets, whose verb table
+# keys on words[0]. A block body headed by a delete verb read as head `do` ─ unknown command,
+# no write targets ─ and classified as a READ of the file it was about to destroy. The green
+# arms alone were all green while that hole was open. The red arms are therefore not a
+# hand-picked sample: they are harvested from the classifier's OWN source, one arm per write
+# verb it models, so a verb added later is covered on the day it is added rather than on the
+# day someone remembers this file. Two things fall out of that, and the second is the reason
+# it is written this way: the corpus never has to CONTAIN a destructive literal. The daemon's
+# destructive-shell preset matches on text, so an edit that spells those verbs out is itself
+# refused ─ it refused the edit that first wrote these arms, twice, on 2026-09-06, once for
+# the table and once for the comment explaining the table. That refusal is under appeal
+# (deny e7f64345, arbiter codex); harvesting is the honest way to need no exception.
+#
+# Seven real escalations feed the green arms, every one self-withdrawn by its own asker
+# within seconds, and each costing eight peer invitations:
 #   a3557a7f4f0ca71f 2026-09-04  python3 <shared test> | tail; for t in tests/*.py; do ...
 #   c83eccb2dc985f8a 2026-09-05  for r in <ranges>; do sed -n "${r}p" <shared file>; done
 #   0a850f87d37a908b 2026-09-05  for f in <deploy files>; do grep -n ... "$f"; done
-# Each case asserts the CURRENT verdict (write, out-of-grammar) next to its unblocked body
-# (not-write). When a repair narrows the out-of-grammar haystack so that a block with no
-# write position inside it is no longer a write, the block half goes red: move the pair
-# into CASES as "not-write" — do not loosen this suite.
-_BLOCK_READ_OPEN = [
+#   442199f318d19f8a 2026-09-06  for k in <env names>; do grep -n "$k" <gate hook>; done
+#   71199e4bcba572ed 2026-09-06  for p in <config paths>; do ls -la $p; done
+#   ffcf0139a86de3b4 2026-09-06  for f in <these very suites>; do python3 "$f"; done
+# The last three landed in ONE session, and the third of them fired on the attempt to RUN
+# the suites that certify this repair: the defect triggered on the act of testing the defect.
+# That session was a mesh wake, and 442199f318d19f8a is why it woke at all ─ an unrelated
+# interactive seat tripped the class, self-withdrew, and the withdrawal disposition fired a
+# whole wake on a co-seat. The cost of this FP is not bounded by the asker who pays it.
+_BLOCK_BODY_READS = [
+    # (name, blocked form, the same body unblocked)
     ("a3557a7f__interpreter_then_loop",
      f'python3 {SHARED_DIR}/{CORE} 2>&1 | tail -3; echo "=== t ==="; '
      f'for t in plugins/kimi/tests/*.py; do r=$(python3 "$t" 2>&1 | tail -1); echo "$r"; done',
@@ -307,28 +352,188 @@ _BLOCK_READ_OPEN = [
     ("if_block_read_only_body",
      f'if grep -q def {SHARED_DIR}/{CORE}; then cat {SHARED_DIR}/{CORE}; fi',
      f'grep -q def {SHARED_DIR}/{CORE} && cat {SHARED_DIR}/{CORE}'),
+    ("442199f3__cd_then_loop_grep_env_names",
+     f'cd /tmp && for k in HESTIA_STATE_DIR HESTIA_OBSERVE_DIR; do '
+     f'grep -n "$k" {HOOKS}/{HOOK}; done',
+     f'grep -n HESTIA_STATE_DIR {HOOKS}/{HOOK}'),
+    ("71199e4b__loop_ls_over_config_paths",
+     f'for p in {SHARED_DIR} {HOOKS}/{HOOK}; do echo "== $p"; ls -la $p; done',
+     f'ls -la {SHARED_DIR} {HOOKS}/{HOOK}'),
+    ("ffcf0139__loop_running_these_very_suites",
+     f'for f in {SHARED_DIR}/shell_grammar_test.py {SHARED_DIR}/{CORE}; do '
+     f'timeout 600 python3 "$f" 2>&1 | tail -15; done',
+     f'timeout 600 python3 {SHARED_DIR}/shell_grammar_test.py 2>&1 | tail -15'),
+    # Nesting and terminators: a block inside a block, and a redirect hanging off `done`
+    # (harvested by _bash_write_targets BEFORE the segment is flushed, so stripping the
+    # terminator must not lose it ─ the write arm for this shape is generated below).
+    ("nested_blocks_read_only_body",
+     f'for x in a; do if true; then grep -c def {SHARED_DIR}/{CORE}; fi; done',
+     f'grep -c def {SHARED_DIR}/{CORE}'),
 ]
 
 
-def test_block_around_read_only_body_is_still_out_of_grammar():
-    failures = []
-    for name, block, body in _BLOCK_READ_OPEN:
-        vb = cls(body)
-        if vb.classification == "write":
-            failures.append(f"{name}: the UNBLOCKED body is a write ({vb}); the control is "
-                            f"broken, so the block half proves nothing")
+def _modelled_write_verbs():
+    """Every command name _command_write_targets resolves a write position for, read out of
+    its own source. Coverage that cannot drift: a verb added to the classifier shows up as a
+    red arm here without anyone editing this file."""
+    import inspect
+    import re as _re
+    src = inspect.getsource(g._command_write_targets)
+    verbs = set()
+    for group in _re.findall(r'name (?:in|==) \(?((?:"[a-z]+"(?:, )?)+)\)?', src):
+        verbs.update(_re.findall(r'"([a-z]+)"', group))
+    verbs.discard("git")     # needs a subcommand to reach a write position
+    verbs.discard("patch")   # write set lives in patch CONTENT ─ _OpaqueWriter, its own rule
+    check("write_verbs_harvested", len(verbs) >= 8,
+          f"only harvested {sorted(verbs)} ─ the regex has drifted off "
+          f"_command_write_targets and the red half is no longer covering anything")
+    return sorted(verbs)
+
+
+# Argument SHAPES, not verb names. Each modelled verb reaches its write position through a
+# different operand layout, and hardcoding a verb->shape map would drift the same way a
+# hardcoded verb list drifts. Instead every harvested verb is tried against this ladder and
+# the first shape whose UNBLOCKED form classifies as a write is the one used for its arm ─ so
+# the arm is proven to be exercising a real write position before its block half is graded.
+# `{v}` is the verb, `{t}` the closure target. Nothing here is ever executed.
+_WRITE_SHAPES = (
+    "{v} {t}",
+    "{v} /tmp/y {t}",
+    "{v} -sf /tmp/y {t}",
+    "{v} 0644 {t}",
+    "{v} -i s/a/b/ {t}",
+    "{v} -s 0 {t}",
+    "{v} if=/dev/zero of={t}",
+    "{v} -f {t}",
+)
+
+
+def _generated_write_pairs():
+    """One (blocked, unblocked) pair per modelled write verb, in the first operand shape that
+    actually reaches that verb's write position. Returns (pairs, verbs_with_no_shape)."""
+    target = f"{HOOKS}/{HOOK}"
+    pairs, unreached = [], []
+    for verb in _modelled_write_verbs():
+        body = next((c for shape in _WRITE_SHAPES
+                     if cls(c := shape.format(v=verb, t=target)).classification == "write"),
+                    None)
+        if body is None:
+            unreached.append(verb)
             continue
-        v = cls(block)
-        if v.classification != "write" or v.rule != OOG:
-            failures.append(f"{name}: block is no longer write/{OOG} (got {v}) — the #440 "
-                            f"class moved; promote this pair into CASES as not-write")
-    check("block_read_only_body_pinned_open", not failures, "\n  ".join(failures))
+        pairs.append((f"gen__{verb}__in_loop", f"for x in a; do {body}; done", body))
+        pairs.append((f"gen__{verb}__in_nested_block",
+                      f"for x in a; do if true; then {body}; fi; done", body))
+        pairs.append((f"gen__{verb}__in_brace_group", f"{{ {body}; }}", body))
+    pairs.append(("gen__terminator_carries_a_redirect",
+                  f"for x in a; do echo hi; done > {target}", f"echo hi > {target}"))
+    return pairs, unreached
+
+
+# Shapes whose body reaches NO write position but must still agree across the block boundary:
+# a substitution in a write position and an opaque program string are undecidable in both
+# forms, and a benign block must not become a write just by naming nothing.
+_BLOCK_BODY_NEUTRAL = [
+    ("neutral__eval_inside_a_loop",
+     'for x in a; do eval "$CMD"; done', 'eval "$CMD"'),
+    ("neutral__opaque_dash_c_inside_a_loop",
+     'for x in a; do bash -c "echo hi"; done', 'bash -c "echo hi"'),
+    ("neutral__benign_loop_names_nothing",
+     'for x in a b; do echo "$x"; done', 'echo "$x"'),
+]
+
+
+# NOT an agreement pair, and the reason is worth stating. `for f in <closure>; do echo x >
+# "$f"; done` is refused, while the bare `echo x > "$f"` names nothing and is "none". Those
+# two are not the same command: the loop HEADER supplies the path the substitution expands
+# to, so the block genuinely carries information its body does not. The agreement invariant
+# does not apply and the arm is pinned outright instead ─ a write through a loop variable
+# whose header names a closure file must stay refused, and out-of-grammar is the right rule
+# for it because the expansion is exactly what the parser cannot resolve.
+_BLOCK_PINNED_OUTRIGHT = [
+    ("pinned__redirect_into_a_loop_variable_named_in_the_header",
+     f'for f in {HOOKS}/{HOOK}; do echo x > "$f"; done', "write", OOG),
+    ("pinned__write_verb_on_a_loop_variable_named_in_the_header",
+     f'for f in {HOOKS}/{HOOK}; do tee "$f"; done', "write", OOG),
+]
+
+
+def test_a_write_through_a_loop_variable_stays_refused():
+    failures = []
+    for name, cmd, want_cls, want_rule in _BLOCK_PINNED_OUTRIGHT:
+        v = cls(cmd)
+        if (v.classification, v.rule) != (want_cls, want_rule):
+            failures.append(f"{name}: expected {want_cls}/{want_rule}, got {v}. The loop "
+                            f"header names a closure file and the body writes through the "
+                            f"loop variable ─ the parser cannot resolve the expansion, so "
+                            f"fail-closed is the only honest answer here.")
+    check("loop_variable_write_pinned", not failures, "\n  ".join(failures))
+
+
+def test_block_and_its_unblocked_body_agree():
+    """Wrapping a command in a block must not change its VERDICT ─ in either direction.
+
+    GRADED ON CLASSIFICATION, NOT ON RULE, and the distinction is load-bearing. A block that
+    refuses MORE COARSELY than its body (write/out-of-grammar where the body earns
+    write/governance-closure-write) has not opened anything: both refuse, and the coarse form
+    is the conservative one. An earlier cut of this suite graded rule equality as a failure
+    and flagged 17 such arms as "holes" against an implementation that was strictly SAFER
+    than the one it was grading. Rule drift is reported below as PRECISION, separately, and
+    never fails the suite ─ the safety property is the classification.
+    """
+    failures, coarser = [], []
+    writes, unreached = _generated_write_pairs()
+    if unreached:
+        failures.append(f"no operand shape in _WRITE_SHAPES reaches the write position of "
+                        f"{unreached} ─ those verbs are modelled by the classifier but "
+                        f"UNCOVERED here; add a shape rather than dropping the verb")
+
+    graded = {"read": 0, "write": 0, "neutral": 0}
+    for half, arms in (("read", _BLOCK_BODY_READS), ("write", writes),
+                       ("neutral", _BLOCK_BODY_NEUTRAL)):
+        for name, block, body in arms:
+            vb = cls(body)
+            if half == "read" and vb.classification == "write":
+                failures.append(f"{name}: the UNBLOCKED body is a write ({vb}) ─ broken "
+                                f"control, the block half proves nothing")
+                continue
+            if half == "write" and vb.classification != "write":
+                failures.append(f"{name}: the UNBLOCKED body is {vb.classification}, not a "
+                                f"write ({vb}) ─ broken control, the block half proves "
+                                f"nothing")
+                continue
+            graded[half] += 1
+            v = cls(block)
+            if v.classification == vb.classification:
+                if v.rule != vb.rule:
+                    coarser.append(f"{name}: block rule {v.rule} vs body rule {vb.rule}")
+                continue
+            if half == "read":
+                failures.append(f"{name}: READ arm ─ block={v.classification}/{v.rule} "
+                                f"body={vb.classification}/{vb.rule}. The #440 false refusal "
+                                f"is BACK: a block is refused for a read its own body is "
+                                f"allowed to do.")
+            else:
+                failures.append(f"{name}: {half.upper()} arm ─ block={v.classification}/"
+                                f"{v.rule} body={vb.classification}/{vb.rule}. The "
+                                f"control-flow strip has opened a HOLE: a block is SOFTENING "
+                                f"a verdict its own body earns. Do NOT relax this test.")
+
+    if graded["write"] < 8:
+        failures.append(f"only {graded['write']} write arms had a working control ─ the red "
+                        f"half is not holding anything down, so a green run means nothing")
+    if coarser and os.getenv("SHELL_GRAMMAR_VERBOSE"):
+        print(f"  precision note: {len(coarser)} arm(s) refuse more coarsely inside a block "
+              f"than outside it (both refuse; not a hole):")
+        for c in coarser[:6]:
+            print(f"    {c}")
+    check("block_and_body_agree", not failures, "\n  ".join(failures))
 
 
 ALL = [
     test_explicit_all_grammar_cases,
     test_differential_against_real_shell,
-    test_block_around_read_only_body_is_still_out_of_grammar,
+    test_block_and_its_unblocked_body_agree,
+    test_a_write_through_a_loop_variable_stays_refused,
 ]
 
 if __name__ == "__main__":
@@ -345,5 +550,8 @@ if __name__ == "__main__":
     if failed:
         print(f"FAILURES: {failed}")
         sys.exit(1)
+    _w, _unreached = _generated_write_pairs()
     print(f"OK — {len(ALL)} suites, {len(CASES)} explicit cases, {len(_DIFF_CASES)} differential, "
-          f"{len(_BLOCK_READ_OPEN)} block-read pairs pinned open")
+          f"{len(_BLOCK_BODY_READS)} block/body read pairs, {len(_w)} generated write pairs "
+          f"over {len(_modelled_write_verbs())} modelled verbs, "
+          f"{len(_BLOCK_BODY_NEUTRAL)} neutral, {len(_BLOCK_PINNED_OUTRIGHT)} pinned")
