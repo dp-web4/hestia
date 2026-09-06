@@ -63,6 +63,46 @@ def _commands_from_registration(path: Path, reader: str) -> list[str]:
     raise ValueError(f"unknown install.registration.reader: {reader!r}")
 
 
+# The one environment variable a seat cannot derive: its bootstrap locator. A candidate that
+# consumes the vault projection refuses to act without it, so the preflight must probe under
+# what the SEAT's launcher supplies, not under what the deploy unit happens to carry.
+BOOTSTRAP_LOCATOR = "HESTIA_HOME"
+
+
+def _launcher_env(commands: Iterable[str], entry: str) -> dict[str, str]:
+    """The `KEY=value` assignments the registered hook line supplies to exactly this gate.
+
+    A hook command is `ENV=v ENV2=v2 python3 /abs/path/gate.py`; the launcher's supply is
+    the assignments before the interpreter. Values are read as the shell would read a
+    double-quoted assignment on that line: `$HOME`-style references expand, and a
+    `${X:-default}` default is honoured as the launcher's own choice (the launcher is the one
+    place a default for the locator is permitted -- it is the launcher supplying it).
+    """
+    import shlex
+    wanted = Path(entry).name
+    for command in commands:
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            tokens = command.split()
+        if not any(token.startswith("/") and Path(token).name == wanted for token in tokens):
+            continue
+        supplied: dict[str, str] = {}
+        for token in tokens:
+            if "=" not in token or token.startswith(("/", "-")):
+                break
+            key, value = token.split("=", 1)
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                break
+            # `${X:-default}` -> default when X is not in the launcher's own environment
+            m = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-(.*)\}", value)
+            if m:
+                value = os.environ.get(m.group(1)) or m.group(2)
+            supplied[key] = os.path.expandvars(value)
+        return supplied
+    return {}
+
+
 def _registered(commands: Iterable[str], entry: str) -> bool:
     """Whether a registration invokes exactly this gate entrypoint basename."""
     wanted = Path(entry).name
@@ -162,7 +202,19 @@ def run_probes(
             rows.append({"member": member, "status": "unmeasured", "reason": "invalid probe environment"})
             good = False
             continue
-        environment = dict(os.environ)
+        # THE PROBE RUNS UNDER THE LAUNCHER'S ENVIRONMENT, NOT THE DEPLOY UNIT'S. The unit that
+        # runs this deploy carries HESTIA_HOME (it needs it for its own daemon), and until
+        # 2026-09-05 that value leaked into the probe. The first candidate that CONSUMES the
+        # vault projection (#959) therefore answered the preflight on a box whose interactive
+        # launcher and watcher units supplied no locator at all, and would have been installed
+        # into seats that could then not act -- fail-closed by design, an outage in fact
+        # (CBP; the timer was stopped by hand, #944). The preflight's question is "after this
+        # install, can this seat still stop this timer?", and the seat runs under what its
+        # LAUNCHER supplies: the assignments on its registered hook line. So: the deploy's
+        # locator is stripped, the launcher's assignments are applied, and a candidate that
+        # cannot act under them is refused -- with the candidate's own reason on the row.
+        environment = {k: v for k, v in os.environ.items() if k != BOOTSTRAP_LOCATOR}
+        environment.update(_launcher_env(commands, entry))
         environment.update(declared_env)
         environment.update({"HESTIA_ENDPOINT": endpoint, "HESTIA_WORKSPACE": workspace_text})
         # THE CANDIDATE GATE IS PROBED AGAINST THE CANDIDATE ENGINE, not the installed one.
@@ -209,6 +261,13 @@ def run_probes(
                     if completed.returncode != 0
                     else "candidate returned denial payload"
                 )
+                # THE CANDIDATE'S OWN WORDS, on the row. "candidate exited 2" tells an operator
+                # nothing about which of the gate's refusals fired -- and since #959 one of them
+                # is "your launcher does not supply the locator", which the operator repairs in a
+                # different place than a law refusal. Last stderr line, bounded.
+                said = [line.strip() for line in (completed.stderr or "").splitlines() if line.strip()]
+                if said:
+                    reason += ": " + said[-1][:200]
                 # ADVISORY (#767): a probe may be declared advisory when it asserts a right the
                 # law has not granted. The deploy-hold probe is one: no seat's scope admits a
                 # write to $HESTIA_HOME/deploy.hold, so from #729's first cycle every member
