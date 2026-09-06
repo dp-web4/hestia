@@ -2928,7 +2928,7 @@ fn seat_config_summary(
             .map_err(|e| format!("vault config does not decode as seat config: {e}"))
             .and_then(|c| c.validate().map(|_| c))
     });
-    let open_since = s.config_findings_open.get(member).copied();
+    let open_since = s.config_findings_open.get(member).map(|f| f.first_observed_at);
     let shared = sc::load_shared(&s.vault);
     let declared = match (&shared, declared) {
         (Some(Err(e)), Some(_)) => Some(Err(format!("shared set unusable: {e}"))),
