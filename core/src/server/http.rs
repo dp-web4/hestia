@@ -2783,6 +2783,14 @@ async fn config_put_seat(
             Json(serde_json::json!({"error": msg})),
         );
     }
+    // WHO this document is for is its name, not a value in it. Refused before the vault holds
+    // it, so the authority can never carry a mis-attributed seat (dp, 2026-09-05).
+    if let Err(msg) = sc::validate_attribution(&member, &cfg) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": msg, "attribution": true})),
+        );
+    }
 
     let bytes = match serde_json::to_vec(&cfg) {
         Ok(b) => b,
@@ -3077,7 +3085,7 @@ async fn config_get_seat(
     let (effective, _) = if sc::is_shared(&member) {
         (cfg.clone(), Vec::new())
     } else {
-        sc::effective(shared_ok.as_ref(), &cfg)
+        sc::effective_for(&member, shared_ok.as_ref(), &cfg)
     };
     (
         StatusCode::OK,
@@ -4613,7 +4621,7 @@ mod disposition_tests {
 
         let rendered = std::fs::read_to_string(sc::render_path(dir.path(), "claude-code"))
             .expect("rendered in the same act, not on the worker's next tick");
-        assert!(rendered.contains("HESTIA_WORKSPACE=/w/ai"), "{rendered}");
+        assert!(rendered.contains("CLAUDE_CODE__HESTIA_WORKSPACE=/w/ai"), "{rendered}");
 
         // The chain is the one store that never forgets, and a config document can carry a
         // token. Keys are evidence; values are not ours to keep.
@@ -4682,6 +4690,49 @@ mod disposition_tests {
         assert!(seat["expected_sha256"].as_str().unwrap().len() == 64);
     }
 
+    /// ATTRIBUTION (dp, 2026-09-05): a document cannot claim to be another seat, the shared
+    /// set cannot carry identity, and every rendered projection states its seat's id from
+    /// its document's name.
+    #[tokio::test]
+    async fn a_document_cannot_be_attributed_to_another_seat() {
+        use crate::server::seat_config as sc;
+        let (dir, state) = test_state().await;
+        let put = |body: serde_json::Value| {
+            let st = state.clone();
+            async move {
+                let resp = axum::response::IntoResponse::into_response(
+                    super::config_put_seat(axum::extract::State(st), axum::Json(body)).await,
+                );
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap())
+            }
+        };
+        // kimi's document claiming to be codex: refused, and the vault never holds it
+        let (st, out) = put(serde_json::json!({"plugin_id": "kimi-code", "config": {"env": {"HESTIA_PLUGIN_ID": "codex"}, "note": ""}})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{out}");
+        assert_eq!(out["attribution"], true, "{out}");
+        assert!(state.lock().await.vault.get_document(sc::SEAT_CONFIG_NS, "kimi-code").is_none());
+        // the shared set carrying an identity key: refused
+        let (st, out) = put(serde_json::json!({"plugin_id": "_shared", "config": {"env": {"HESTIA_MESH_PLUGIN": "claude-code"}, "note": ""}})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{out}");
+        assert!(out["error"].as_str().unwrap().contains("never shared"), "{out}");
+        // a document with NO id renders one, derived from its name
+        let (st, _) = put(serde_json::json!({"plugin_id": "kimi-code", "config": {"env": {"HESTIA_HARNESS_HOME": "/h/kimi"}, "note": ""}})).await;
+        assert_eq!(st, StatusCode::OK);
+        let rendered = std::fs::read_to_string(sc::render_path(dir.path(), "kimi-code")).unwrap();
+        assert!(rendered.contains("KIMI_CODE__HESTIA_PLUGIN_ID=kimi-code\n"), "{rendered}");
+        assert!(rendered.contains("KIMI_CODE__HESTIA_HARNESS_HOME=/h/kimi\n"), "{rendered}");
+        // and the inspect's effective set shows it, while the own config does not carry it
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_get_seat(axum::extract::State(state.clone()), None, axum::extract::Path("kimi-code".to_string())).await,
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["effective"]["HESTIA_PLUGIN_ID"], "kimi-code", "{v}");
+        assert!(v["config"]["env"].get("HESTIA_PLUGIN_ID").is_none(), "{v}");
+    }
+
     /// THE SHARED SET (dp, 2026-09-05). Written through the same door under the reserved id;
     /// inherited by every seat with shared winning; a seat that restates a shared key is refused
     /// at the door; a shared write re-renders every seat in the same act; the list names the
@@ -4720,8 +4771,9 @@ mod disposition_tests {
         // every seat's projection now carries the shared keys, names them, and its own keys survive
         for m in ["claude-code", "codex"] {
             let rendered = std::fs::read_to_string(sc::render_path(dir.path(), m)).unwrap();
-            assert!(rendered.contains("HESTIA_HOME=/h\n") && rendered.contains("HESTIA_WORKSPACE=/w/ai\n"), "{rendered}");
-            assert!(rendered.contains(&format!("HESTIA_PLUGIN_ID={m}\n")), "{rendered}");
+            assert!(rendered.contains("HESTIA_HOME=/h\n") && rendered.contains("HESTIA_WORKSPACE=/w/ai\n"), "shared lines are plain: {rendered}");
+            let token = sc::seat_token(m);
+            assert!(rendered.contains(&format!("{token}__HESTIA_PLUGIN_ID={m}\n")), "own lines carry the seat token: {rendered}");
             assert!(rendered.contains("# shared: HESTIA_HOME HESTIA_SHARED_TOKEN HESTIA_WORKSPACE\n"), "{rendered}");
         }
 

@@ -135,17 +135,22 @@ ALLOWED = [
 # here is "unpinned" and RED. None until measured — an unset pin is a failure, so this file
 # cannot pass by accident before its first measurement. Deploy-set rows are pinned in the
 # same dict; the two sets share one rule.
+#
+# 2026-09-05: claude-code's two hooks FELL (6 -> 2 and 1 -> 0) when that seat became the first
+# consumer of the vault projection (#944): every `~/.hestia` default and every `expanduser("~")`
+# root left the bootstrap path. Recorded here rather than absorbed, because a pin that only ever
+# rises is a ratchet that forgot which direction it was supposed to turn.
 PINNED_BASELINE: dict | None = {
     # RUNTIME set
     "plugins/_shared/hestia_gate_core.py":          {"cwd-root-fallback": 3, "expanduser-tilde": 1, "tilde-hestia": 1},
     "plugins/_shared/hestia_gate_mechanism.py":     {"getenv-path-default": 2},
     "plugins/_shared/hestia_governance_closure.py": {},
     "plugins/_shared/hestia_shell_classifier.py":   {},
-    "plugins/claude-code/hooks/" + _HOOK:           {"abs-tmp-state": 1, "expanduser-tilde": 2, "getenv-path-default": 2, "tilde-hestia": 1},
+    "plugins/claude-code/hooks/" + _HOOK:      {"abs-tmp-state": 1, "expanduser-tilde": 1},
     "plugins/codex/hooks/" + _HOOK:                 {"cwd-root-fallback": 2, "expanduser-tilde": 1, "getenv-path-default": 3, "tilde-hestia": 1},
     "plugins/kimi/hooks/" + _HOOK:                  {"cwd-root-fallback": 2, "expanduser-tilde": 1, "getenv-path-default": 2},
     "plugins/gemini/hooks/" + _GEM:                 {"cwd-root-fallback": 1, "expanduser-tilde": 1, "getenv-path-default": 2, "tilde-hestia": 1},
-    "plugins/claude-code/hooks/witness.py":         {"getenv-path-default": 1},
+    "plugins/claude-code/hooks/witness.py":    {},
     "plugins/codex/hooks/witness.py":               {"getenv-path-default": 1},
     "plugins/kimi/hooks/observe.sh":                {"shell-home-default": 1},
     "plugins/kimi/hooks/hydrate.sh":                {"shell-home-default": 3},
