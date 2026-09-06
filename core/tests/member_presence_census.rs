@@ -953,16 +953,30 @@ fn fn_owners(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in production_lines(text) {
         let indent = indent_of(line);
-        if line.trim() == "}" {
+        let code = code_before_comment(line);
+        if code == "}" {
             while stack.last().is_some_and(|(_, w)| *w >= indent) {
                 stack.pop();
             }
         }
         if let Some(name) = fn_item_name(line) {
-            let n = seen.entry(name.clone()).or_insert(0);
-            *n += 1;
-            let display = if *n == 1 { name } else { format!("{name}#{n}") };
-            stack.push((display, indent));
+            // A DECLARATION OPENS NO SCOPE. `fn malloc_trim(pad: usize) -> c_int;` in an
+            // `extern "C"` block, and a trait's method signatures, have no body, so pushing
+            // them starts a scope nothing closes until an enclosing brace does — every line
+            // after such a declaration would be filed under it (#975 review). Two live today
+            // (`vault/storage.rs::flock`, `server/http.rs::malloc_trim`), neither followed by
+            // a pinned symbol, so no table moves either way; the fixture arm is what holds it.
+            // Bounded honestly: a declaration whose signature WRAPS to several lines does not
+            // end in `;` on its item line and still opens a scope, closed by the block around
+            // it. None exist here; if one appears, this is where it is handled.
+            if !code.ends_with(';') {
+                // The `#N` ordinal counts scopes that can own a line, so adding an extern
+                // declaration cannot renumber the real fns the tables key on.
+                let n = seen.entry(name.clone()).or_insert(0);
+                *n += 1;
+                let display = if *n == 1 { name } else { format!("{name}#{n}") };
+                stack.push((display, indent));
+            }
         }
         out.push(
             stack
@@ -979,6 +993,36 @@ fn fn_owners(text: &str) -> Vec<String> {
 /// property on realistic formatting rather than trusting this note.
 fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start().len()
+}
+
+/// The line with any trailing `//` comment and inline `/* … */` spans removed, trimmed.
+///
+/// USED ONLY TO CLASSIFY THE LINE — does it close a scope, is it a bodyless declaration —
+/// never to decide whether a line matches the symbol set. The tables pin the trimmed text of
+/// call-site lines exactly as written, comments included, and stripping there would move every
+/// pinned line that carries one.
+///
+/// The `//` cut is naive about string literals, and that is safe HERE for a reason worth
+/// stating: a wrong cut can only shorten the line, and the two questions asked of the result
+/// are "is it exactly `}`" and "does it end in `;`". `println!("//");` cuts to `println!("`,
+/// which answers no to both, as it should. What the cut buys is the case that matters:
+/// `}  // end of the helper` is a closing brace, and the first version of this reader — which
+/// compared the whole trimmed line to `}` — left that fn open forever (#975 review, GPT).
+fn code_before_comment(line: &str) -> String {
+    let mut s = line.to_string();
+    while let Some(a) = s.find("/*") {
+        match s[a..].find("*/") {
+            Some(b) => s.replace_range(a..a + b + 2, ""),
+            None => {
+                s.truncate(a);
+                break;
+            }
+        }
+    }
+    if let Some(i) = s.find("//") {
+        s.truncate(i);
+    }
+    s.trim().to_string()
 }
 
 /// SABOTAGE ARM (#907 review, 2026-09-06). The reading this file needs is *enclosing* fn, and
@@ -1050,8 +1094,95 @@ impl State {
     assert_eq!(owners.last().map(String::as_str), Some("(top-level)"));
 }
 
+/// A nested fn closed by `} // comment` is closed (#975 review, GPT). rustfmt keeps a trailing
+/// comment on a closing brace, so this is valid formatting the first reader mis-read: it
+/// compared the whole trimmed line to `}`, found `} // done`, and left the helper open — the
+/// same false ownership the enclosing-fn repair exists to end, reintroduced by punctuation.
+///
+/// LATENT, measured: zero production `}` lines in this tree carry a trailing comment (main
+/// 40cf00de and `legion/connect-pop` 957e3fe, both 0). So no pinned table can hold this — a
+/// tree-derived pin cannot see a shape the tree does not contain, which is exactly why the
+/// acceptance rule for these readers is a synthetic fixture that makes the cheap
+/// implementation disagree with the intended one.
+#[test]
+fn a_closing_brace_with_a_trailing_comment_still_closes_its_fn() {
+    let src = "\
+fn outer() {
+    fn helper() {
+        let inner = a.member_registry;
+    } // the helper ends here, and rustfmt keeps this comment
+    crate::member_registry::ensure_member(reg);
+    let after = b.member_registry;
+} /* and a block comment closes the outer one */
+
+pub struct S {
+    pub member_registry: R,
+}
+";
+    let lines = production_lines(src);
+    let owners = fn_owners(src);
+    let owner_of = |needle: &str| {
+        owners[lines.iter().position(|l| l.contains(needle)).expect("fixture line")].clone()
+    };
+    assert_eq!(owner_of("let inner"), "helper");
+    // Both FAIL when the pop test is `line.trim() == "}"`: the helper never closes.
+    assert_eq!(
+        owner_of("ensure_member(reg)"),
+        "outer",
+        "a closing brace with a trailing comment closes the helper, so the parent owns what follows"
+    );
+    assert_eq!(owner_of("let after"), "outer");
+    assert_eq!(
+        owner_of("pub member_registry: R"),
+        "(top-level)",
+        "and a closing brace with a block comment closes the outer fn"
+    );
+}
+
+/// A bodyless `fn …;` opens no scope (#975 review, GPT). `extern "C"` blocks and trait method
+/// signatures declare functions that own no lines; pushing one starts a scope that only an
+/// enclosing brace can close, so every line after it is filed under a function that has no
+/// body to contain them.
+///
+/// LIVE but currently harmless, measured on main: two such items (`vault/storage.rs::flock`,
+/// `server/http.rs::malloc_trim`), neither followed by a pinned symbol inside its block, so
+/// the tables are identical either way. Recorded as a count rather than a reassurance.
+#[test]
+fn a_bodyless_fn_declaration_opens_no_scope() {
+    let src = "\
+extern \"C\" {
+    fn malloc_trim(pad: usize) -> c_int;
+}
+
+static REG: Registry = Registry::new();
+
+fn real() {
+    let x = s.member_registry;
+}
+";
+    let lines = production_lines(src);
+    let owners = fn_owners(src);
+    let owner_of = |needle: &str| {
+        owners[lines.iter().position(|l| l.contains(needle)).expect("fixture line")].clone()
+    };
+    // FAILS when a declaration pushes: the static, and the `}` closing the extern block,
+    // are filed under `malloc_trim`.
+    assert_eq!(
+        owner_of("static REG"),
+        "(top-level)",
+        "an item after a bodyless declaration belongs to no fn"
+    );
+    assert_eq!(owner_of("let x"), "real", "and the next real fn owns its own body");
+    assert!(
+        !owners.iter().any(|o| o == "malloc_trim"),
+        "a declaration owns no line at all: {owners:?}"
+    );
+}
+
 /// The `#N` suffix is per NAME per file and survives the stack, so two same-named nested
-/// helpers stay distinguishable — the tables key on the suffixed form.
+/// helpers stay distinguishable — the tables key on the suffixed form. The ordinal counts
+/// scopes that can own a line, so a bodyless declaration sharing a name with a real fn does
+/// not renumber it (the wrapper-over-`extern` shape, which this tree has).
 #[test]
 fn repeat_fn_names_keep_their_ordinal_suffix() {
     let src = "\
