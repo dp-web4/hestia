@@ -5235,8 +5235,9 @@ pub(crate) fn observe_seat_projection(
         last_seen_at: now,
     };
     let matches = entry.matches_expected();
-    s.seat_live.insert(member.to_string(), entry);
     if unchanged {
+        // Same claim as last time: refresh `last_seen_at`, nothing to witness.
+        s.seat_live.insert(member.to_string(), entry);
         return;
     }
     let mut payload = json!({
@@ -5246,15 +5247,46 @@ pub(crate) fn observe_seat_projection(
         "matches_expected": matches,
         "observed_at": now,
     });
-    if let Some(p) = prior {
+    if let Some(p) = &prior {
         payload["previous_sha256"] = json!(p.sha256);
         payload["previous_expected_sha256"] = json!(p.expected_sha256);
     }
-    if let Err(e) = s.append_chain("config_seat_live", payload) {
-        // The record failed, not the observation. Forget the entry so the next connect
-        // re-attempts the witness rather than treating an unrecorded change as reported.
-        s.seat_live.remove(member);
-        tracing::warn!(member = %member, error = %e, "seat liveness could NOT be recorded");
+    let witnessed = s.append_chain("config_seat_live", payload).map(|_| ()).map_err(|e| e.to_string());
+    settle_seat_liveness(&mut s.seat_live, member, prior, entry, witnessed);
+}
+
+/// Commit a liveness observation to RAM according to whether its witness landed.
+///
+/// The invariant is #972's: A FAILED WITNESS LEAVES THE LAST WITNESSED STATE INTACT. The first
+/// version of this inserted the new entry before appending and removed it on failure, which
+/// threw away the previously witnessed state as well — the operator saw "not seen" instead of
+/// the last known claim, and the retry on the next connect had lost its `previous_*` lineage
+/// (GPT review of #973). Now the map changes only when the row is on the chain; on failure the
+/// prior entry (or its absence) stands, so the next connect re-attempts the same transition
+/// against the same prior. Split out so the failure arm can be tested without a failing disk.
+pub(crate) fn settle_seat_liveness(
+    seat_live: &mut std::collections::HashMap<String, super::seat_config::LiveProjection>,
+    member: &str,
+    prior: Option<super::seat_config::LiveProjection>,
+    entry: super::seat_config::LiveProjection,
+    witnessed: Result<(), String>,
+) {
+    match witnessed {
+        Ok(()) => {
+            seat_live.insert(member.to_string(), entry);
+        }
+        Err(e) => {
+            match prior {
+                Some(p) => {
+                    seat_live.insert(member.to_string(), p);
+                }
+                None => {
+                    seat_live.remove(member);
+                }
+            }
+            tracing::warn!(member = %member, error = %e,
+                "seat liveness change could NOT be recorded; the last witnessed state stands and the next connect retries");
+        }
     }
 }
 
@@ -10926,6 +10958,84 @@ mod tests {
             assert_eq!(s.seat_live.get(&member).unwrap().matches_expected(), Some(true));
             assert_eq!(live_rows(&s).len(), 3);
         }
+    }
+
+    /// A first presentation whose witness fails leaves NO entry, and the next connect witnesses
+    /// it as a first presentation (GPT review of #973: the record changes only when the row
+    /// landed). Failure is injected at the settle step; the retry runs the real connect.
+    #[tokio::test]
+    async fn a_failed_first_liveness_witness_leaves_no_entry_and_the_next_connect_retries() {
+        use super::super::seat_config as sc;
+        let (dir, shared) = make_shared_state();
+        let member = "claude-code".to_string();
+        let mut s = shared.lock().await;
+        settle_seat(&mut s, &member, "/w/ai");
+        let digest = sc::sha256_of(&std::fs::read(sc::render_path(dir.path(), &member)).unwrap());
+        let now = super::super::gate_escalation::now_secs();
+        let entry = sc::LiveProjection {
+            sha256: digest.clone(),
+            expected_sha256: Some(digest.clone()),
+            first_seen_at: now,
+            last_seen_at: now,
+        };
+        super::settle_seat_liveness(&mut s.seat_live, &member, None, entry, Err("disk full".into()));
+        assert!(!s.seat_live.contains_key(&member), "nothing witnessed, nothing claimed");
+        assert!(live_rows(&s).is_empty());
+        drop(s);
+
+        super::tool_connect(&shared, &json!({"plugin_id": "claude-code", "host_agent": "t", "projection_sha256": digest}))
+            .await
+            .unwrap();
+        let s = shared.lock().await;
+        let rows = live_rows(&s);
+        assert_eq!(rows.len(), 1, "the retry witnesses it as a FIRST presentation: {rows:?}");
+        assert!(rows[0].get("previous_sha256").is_none());
+        assert_eq!(s.seat_live.get(&member).unwrap().sha256, digest);
+    }
+
+    /// A CHANGED presentation whose witness fails keeps the LAST WITNESSED state — not the
+    /// unrecorded change, and not nothing — so the operator still sees the last known claim and
+    /// the retry on the next connect carries the `previous_*` lineage from that state.
+    #[tokio::test]
+    async fn a_failed_changed_liveness_witness_keeps_the_last_witnessed_state_and_retries_with_lineage() {
+        use super::super::seat_config as sc;
+        let (dir, shared) = make_shared_state();
+        let member = "claude-code".to_string();
+        let first = {
+            let mut s = shared.lock().await;
+            settle_seat(&mut s, &member, "/w/ai");
+            sc::sha256_of(&std::fs::read(sc::render_path(dir.path(), &member)).unwrap())
+        };
+        let connect = |d: &str| json!({"plugin_id": "claude-code", "host_agent": "t", "projection_sha256": d});
+        super::tool_connect(&shared, &connect(&first)).await.unwrap();
+        let other = sc::sha256_of(b"tampered");
+        {
+            let mut s = shared.lock().await;
+            let prior = s.seat_live.get(&member).cloned();
+            assert_eq!(prior.as_ref().map(|p| p.sha256.as_str()), Some(first.as_str()));
+            let now = super::super::gate_escalation::now_secs();
+            let changed = sc::LiveProjection {
+                sha256: other.clone(),
+                expected_sha256: Some(first.clone()),
+                first_seen_at: now,
+                last_seen_at: now,
+            };
+            super::settle_seat_liveness(&mut s.seat_live, &member, prior.clone(), changed, Err("disk full".into()));
+            assert_eq!(
+                s.seat_live.get(&member), prior.as_ref(),
+                "the last WITNESSED state stands; the unrecorded change is not adopted"
+            );
+            assert_eq!(live_rows(&s).len(), 1, "and no row was written");
+        }
+        // The seat calls again, still running the other bytes: the change is witnessed now,
+        // and it names the state it supersedes.
+        super::tool_connect(&shared, &connect(&other)).await.unwrap();
+        let s = shared.lock().await;
+        let rows = live_rows(&s);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["presented_sha256"], other);
+        assert_eq!(rows[0]["previous_sha256"], first, "lineage preserved across the failed attempt");
+        assert_eq!(s.seat_live.get(&member).unwrap().sha256, other);
     }
 
     /// A seat the vault does not configure, presenting a digest, is running a projection the
