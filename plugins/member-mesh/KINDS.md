@@ -11,6 +11,30 @@
 > This table is the local (member↔member) vocabulary. It called itself a "mirror"
 > of the fleet list while diverging from it — this one had `review_request`, the
 > fleet had only `pr_review_request` — which is how the divergence was found.
+>
+> **Implemented in the daemon as of #977, and this banner was a lie for 34 days
+> before that.** The ruling above dates from 2026-07-24; `tool_member_notify`
+> checked `MEMBER_NOTICE_KINDS.contains(&kind)` — flat, exact — and its schema told
+> callers in so many words that "this surface does not accept prefixed
+> specializations", pointing them at THIS FILE for the vocabulary. Both sentences
+> lived in the same repository, and 79a4315 (2026-08-03) wrote the exact-match one
+> while adding 64 lines to this file without touching the banner it contradicted.
+> A doc every fired member is told to follow (`fire-claude.sh`, `fire-codex.sh`,
+> `fire-kimi.sh`: "act per KINDS semantics") promised a rule the daemon refused, and
+> the refusal was loud, so nobody who hit it mistook it for anything else — it just
+> cost a round trip and a re-read, every time, for a month. Recorded rather than
+> quietly fixed: the failure was not the flat check, it was that the two documents
+> could disagree for 34 days with nothing in CI able to see it.
+>
+> **The local rule is deliberately narrower than `hub-watch.sh`'s in two ways.**
+> `case "$kind" in "$entry".*` admits an empty segment (`coordination.`) and any
+> bytes at all after the dot; `kind_under` in `core/src/server/handler.rs` requires
+> each dotted segment to be non-empty `[a-z0-9_-]+` and bounds the whole kind at 64
+> bytes. hub-watch matches to ROUTE a notice it already holds; this is a write gate
+> on a witnessed chain record that every renderer downstream will display, and the
+> seven-string enum used to provide that bound for free. The two rules agree on
+> every well-formed dotted kind, which is the only agreement that matters; where
+> they differ, this one refuses.
 
 | kind | semantics |
 |---|---|
