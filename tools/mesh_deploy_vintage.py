@@ -120,12 +120,93 @@ def drift_direction(repo, relpath, wt_blob):
     return "fork"
 
 
+# ---------------------------------------------------------------------------
+# THE BANNER. `mesh_deploy_vintage.py` has been able to answer "is the mesh
+# running main?" since 2026-08-25 and #606 stayed open for 12 more days, because
+# an instrument nobody runs reports nothing. The binary layer solved exactly this
+# and its solution is not a better instrument: `hestia --version` prints
+# `v0.0.4-709-g839fc0e`, so the vintage arrives WITH the thing whose vintage it
+# is. This mode is that, for the script layer -- one block the fire path pastes
+# into the primer, so the next member to be handed a stale instruction is told
+# why in the same breath.
+#
+# Three rules, and the silence is the important one:
+#
+#   nothing stranded          -> PRINT NOTHING. A banner on the healthy path is
+#                                noise, and noise is what gets filtered out right
+#                                before the one time it mattered.
+#   HEAD merged into main     -> LOUD. After the merge there is no reason for the
+#                                tree to be there, so this has no legitimate arm
+#                                and needs no age threshold. #606 originally used
+#                                "7 days old", which fires on a member legitimately
+#                                mid-feature; "already merged" does not.
+#   unmerged feature branch   -> QUIET, factual. Someone is working. Say what is
+#                                stranded and let them decide.
+#
+# NO FETCH. This runs on the fire path, before a wake, holding the member lock.
+# It reads the `origin/main` ref as last fetched, so its own answer can be stale
+# in the safe direction: it can miss a fix merged since the last fetch, and it
+# cannot invent one. `main()` fetches; this deliberately does not.
+def primer_banner(repo):
+    """Zero or more lines for the wake primer. Empty string = tree is current."""
+    head = git(repo, "rev-parse", "--short", "HEAD")
+    if not head:
+        return ""                      # not a checkout we can read; say nothing
+    branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD") or "(detached)"
+    stranded = [l for l in git(
+        repo, "log", "HEAD..origin/main", "--format=%h %s", "--", MESH_DIR
+    ).splitlines() if l]
+    if not stranded:
+        return ""
+    merged = subprocess.run(
+        ["git", "-C", repo, "merge-base", "--is-ancestor", "HEAD", "origin/main"],
+        capture_output=True, timeout=30,
+    ).returncode == 0
+    lines = []
+    if merged:
+        lines.append(
+            "!! THE CODE THAT RENDERED THIS PROMPT IS NOT main. The shared tree is on "
+            f"`{branch}` ({head}), which is ALREADY MERGED into origin/main "
+            f"({git(repo, 'rev-parse', '--short', 'origin/main')}). Every mesh fix merged "
+            "since is un-deployed, for every seat. Nothing about this branch is still "
+            "needed; moving the tree to main is the whole repair (#606)."
+        )
+    else:
+        lines.append(
+            "!! THE CODE THAT RENDERED THIS PROMPT IS NOT main. The shared tree is on "
+            f"`{branch}` ({head}) -- unmerged, so someone may be mid-feature. Mesh fixes "
+            "merged to main are NOT in force here (#606)."
+        )
+    lines.append(
+        f"   {len(stranded)} commit(s) touching {MESH_DIR} are merged and NOT executing:"
+    )
+    for l in stranded[:6]:
+        lines.append(f"     {l}")
+    if len(stranded) > 6:
+        lines.append(f"     ... and {len(stranded) - 6} more")
+    lines.append(
+        "   Treat every instruction above as possibly rendered by superseded code, and "
+        "check `git log HEAD..origin/main` before concluding a defect is new. Full "
+        "report: tools/mesh_deploy_vintage.py"
+    )
+    return "\n".join(lines)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=DEFAULT_REPO)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--primer-banner", action="store_true",
+                    help="print the wake-primer block (empty if the tree is current) "
+                         "and exit; makes no network call")
     args = ap.parse_args()
     repo = args.repo
+
+    if args.primer_banner:
+        b = primer_banner(repo)
+        if b:
+            print(b)
+        return 0
 
     git(repo, "fetch", "origin", "main", "-q")
     head = git(repo, "rev-parse", "HEAD")
