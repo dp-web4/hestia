@@ -287,6 +287,31 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/handler.rs::tool_record_reversal", &[
         "let subject_instance_lct = s.member_lct(&subject_plugin_id);",
     ], SiteClass::Naming),
+    // A DELEGATE's answer to a scope request (#952, `hestia_scope_arbitrate`). A peer seat
+    // holding an operator delegation rules another member's request; these lines name the
+    // SUBJECT — the asking member — in the resulting chain entries.
+    //
+    // TWO IDENTICAL LINES, for exactly the reason recorded at `scope_decide` above and not a
+    // new one: a delegated grant is always STANDING, so it records INTENT -> COMMIT -> SUCCESS.
+    // The first names the subject in `scope_grant_intent`, the second in the `scope_granted`
+    // appended only after the vault commit lands. Either can be the last word: if the commit
+    // fails, the intent is the only account of who the widening was for.
+    //
+    // READING, both questions. (1) Who gets named? The ASKING member (`member`, taken from the
+    // stored request), never the arbiter — the arbiter is recorded separately and by name in
+    // `granted_by: "delegate:<seat>"` and `delegation_id`, so a reader can always tell a
+    // delegated ruling from an operator one. (2) Compared to decide control flow? No. The three
+    // decisions on this path are made before any of this: the signature check compares against
+    // the arbiter's REGISTRY public key (a registry read, censused separately below), NOT-SAME
+    // compares plugin_ids, and authority compares the delegation's action string to the path and
+    // member. None of them reads a value derived by `member_lct`. Naming, same class as
+    // `scope_decide` and `scope_grant`, and the HST-005 caveat holds unchanged: the request's
+    // `plugin_id` was caller-asserted when the request was filed, so this is a well-formed name
+    // derived from a self-reported id, not evidence of membership.
+    ("server/handler.rs::tool_scope_arbitrate", &[
+        "\"subject_instance_lct\": s.member_lct(&member),",
+        "\"subject_instance_lct\": s.member_lct(&member),",
+    ], SiteClass::Naming),
     ("server/handler.rs::tool_witness_adjudication", &[
         "let adjudicator_instance_lct = s.member_lct(&adjudicator.plugin_id);",
         "let subject_instance_lct = s.member_lct(&subject_plugin_id);",
@@ -613,8 +638,29 @@ const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
 /// That entry is the reason this table exists: the first census keying could
 /// not see it at all.
 const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
+    // #952 adds three registry READS, and all three are the safety direction: each one
+    // REFUSES when the registry does not hold the member, rather than proceeding on a name.
+    //
+    // READING for `cmd_delegate_agent_id`: presence, and it is the whole point of the verb.
+    // A delegation is keyed to a seat's LCT-derived id, so this prints what an operator must
+    // grant against. A seat absent from the registry has no id to key to, and the command
+    // says so and exits non-zero rather than emitting a plausible-looking UUID that would
+    // mint a delegation nothing could ever satisfy. Fail-CLOSED, and visibly.
+    ("cli.rs::cmd_delegate_agent_id", &[
+        "let registry = hestia::member_registry::load_members(&vault);",
+    ]),
     ("cli.rs::cmd_lct_publish", &[
         "let members = hestia::member_registry::load_members(&vault);",
+    ]),
+    // READING for `cmd_scope_arbitrate`: presence, used to PREFLIGHT the signer against the
+    // key the daemon will verify with. The command holds a vault key and is about to sign a
+    // ruling; this read answers "would the daemon accept this signature for `--as <seat>`?"
+    // before anything is signed, and names the fixing command (`witness onboard`) when the
+    // answer is no. It grants nothing: the daemon repeats the check against its own registry
+    // and refuses independently. A local check that only ever turns a remote refusal into an
+    // earlier, clearer one is conservative by construction.
+    ("cli.rs::cmd_scope_arbitrate", &[
+        "let reg = hestia::member_registry::load_members(&vault);",
     ]),
     ("cli.rs::cmd_witness_attest", &[
         "let reg = hestia::member_registry::load_members(&vault);",
@@ -716,6 +762,25 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("server/handler.rs::tool_appeal", &[
         ".iter_sorted()",
         ".member_registry",
+    ]),
+    // READING for `tool_scope_arbitrate` (#952): presence, and SAFETY-BEARING — this is the
+    // strongest use of the registry in the tree, so it is logged rather than waved through.
+    //
+    // Both lines read the ARBITER, never the asker. The first derives the arbiter's LCT id to
+    // key the delegation lookup; the second takes its LCT to verify the ruling's signature
+    // against the binding key, or an operational key that binding key vouched. A seat absent
+    // from the registry is REFUSED by name (`scope_arbitrate_unregistered_arbiter`) and no
+    // grant is minted — the fail-CLOSED direction, unlike `resolve_invitation` above, where
+    // absence silently shrinks a pool.
+    //
+    // Why this matters more here than anywhere else in this table: `hestia_connect`
+    // authenticates nobody (#63/#128), so a session's `plugin_id` is asserted. This is the one
+    // MCP door that mints a STANDING grant, and the registry public key is what turns an
+    // asserted name into a checked signature. If this read ever became advisory, the durable
+    // widening would rest on a name a caller typed. It must stay a refusal.
+    ("server/handler.rs::tool_scope_arbitrate", &[
+        "let Some(arbiter_lct_id) = s.member_registry.get(&arb.plugin_id).map(|l| l.lct_id()) else {",
+        "let Some(lct) = s.member_registry.get(&arb.plugin_id) else {",
     ]),
     ("server/handler.rs::tool_connect", &[
         "crate::member_registry::ensure_member(",
