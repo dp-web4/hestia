@@ -51,22 +51,26 @@ Measured 2026-08-19 against three closures, same probe, neutral cwd, LITERAL_FLO
     #534's in-branch fd-skip unreachable, because #538 pops the digit earlier. These arms
     exist so that claim is a test rather than a paragraph.
 
-  OPEN DEFECT PINS — green on ALL THREE closures, including the fix. TWO independent
-    out-of-grammar over-refusal classes, neither closed by #538. Both share a shape: once
-    ANYTHING throws the command out of grammar, the ENTIRE token vocabulary is matched
-    under the broader rules, and a quoted heredoc body stops being inert. The body is
-    never the trigger — with the trigger removed, the identical body is a read.
+  OUT-OF-GRAMMAR OVER-REFUSAL — TWO independent classes were pinned here, neither closed
+    by #538. ONE IS NOW CLOSED. Both shared a shape: once ANYTHING threw the command out of
+    grammar, the ENTIRE token vocabulary was matched under the broader rules, and a quoted
+    heredoc body stopped being inert. The body is never the trigger — with the trigger
+    removed, the identical body is a read.
 
-    FP12  a control-flow keyword anywhere in the command flips it out of grammar, so a
-          plain READ of the closure is refused as a write. Not fixed by #538. Pinned at
-          the CURRENT (wrong) verdict so the suite is green; a RED here means someone
-          repaired it and this arm should be inverted, not deleted. Encountered live
-          while building this file: `for w in A B; do PYTHONPATH=$w/<dir> ...; done` was
-          refused, and the same command un-looped was allowed. The benign twin (a loop
-          naming no closure vocabulary) stays "none", so the trigger is keyword + marker,
-          not the keyword alone. NOTE the near-miss: the `$VAR` assignment is NOT the
-          cause — rows for `ASSIGN=$VAR/<dir>` and `ASSIGN=/literal/<dir>` are both
-          "read". Blaming the assignment would have mis-filed this as FP13.
+    FP12  CLOSED 2026-09-06. A control-flow keyword anywhere in the command used to flip it
+          out of grammar, so a plain READ of the closure was refused as a write.
+          _flush_simple_command now STRIPS leading control-flow keywords and head-checks the
+          body, so a block and its unblocked body classify alike. The pin that stood here
+          asked its successor to INVERT it on repair rather than delete it, and that is what
+          test_a_control_flow_keyword_no_longer_refuses_a_plain_read is: same five rows, the
+          first one now asserting "read". Its supporting rows still carry the discrimination
+          the pin established — the benign twin (a loop naming no closure vocabulary) stayed
+          "none", so the trigger was keyword + marker, not the keyword alone; and the `$VAR`
+          assignment was NOT the cause, since `ASSIGN=$VAR/<dir>` and `ASSIGN=/literal/<dir>`
+          were both "read" throughout. Blaming the assignment would have mis-filed this as
+          FP13. Eight instances were paid between 2026-08-19 and the repair, every one a
+          self-withdrawn escalation; the ledger and the two-directional contract that holds
+          the repair down live in plugins/_shared/shell_grammar_test.py.
 
     OOG   a substitution in a WRITE POSITION (`cat > $V/a.md`) does the same, and this one
           has a price on record: it refused a note ABOUT the gate whose destination path
@@ -259,24 +263,33 @@ def test_patch_writer_verdicts_are_decided_by_the_patch_not_the_fd():
 
 # ── OPEN DEFECT PIN: green today on ALL THREE, including the fix ────────────────────────
 
-def test_pin_a_control_flow_keyword_refuses_a_plain_read():
-    """OPEN DEFECT, pinned at the WRONG verdict so this suite stays green.
+def test_a_control_flow_keyword_no_longer_refuses_a_plain_read():
+    """FP12 CLOSED 2026-09-06 ─ this arm is the inversion the pin asked for, not a relaxation.
 
-    A RED here means someone repaired FP12. That is the good outcome: invert this arm to
-    assert "read" and move it up into the discriminators. Do NOT relax the assertion to
-    make it pass again.
+    The pin that stood here asserted the WRONG verdict on purpose and said: "A RED here
+    means someone repaired FP12. That is the good outcome: invert this arm to assert 'read'
+    and move it up into the discriminators. Do NOT relax the assertion to make it pass
+    again." _flush_simple_command now strips leading control-flow keywords and head-checks
+    the body, so the loop below reads as the read it always was.
+
+    The four supporting rows are kept exactly as the pin left them, because they are what
+    makes this a discriminator rather than a single green light: the benign twin, the
+    un-looped read, and the two assignment rows together say the trigger was keyword +
+    marker and never the `$VAR`. The pin's own near-miss note stands ─ blaming the
+    assignment would have mis-filed this as FP13.
 
     Encountered live 2026-08-19 while building this file, on a command that only READ the
-    closure directory. Un-looped, the identical read is allowed — so the loop keyword is
-    the whole cause.
+    closure directory. Seven more instances were paid between then and the repair; the
+    ledger is in plugins/_shared/shell_grammar_test.py, whose block/body agreement suite is
+    what holds the repair down in both directions. This arm holds the direction that suite's
+    read half holds; the hole direction is held by its generated write half.
     """
     looped = "for w in /tmp/a /tmp/b; do PYTHONPATH=$w/" + SHARED_DIR + " python3 t.py; done"
     got = verdict(looped)
-    check("FP12_loop_over_refuses_a_read", got[0] == "write",
-          "FP12 APPEARS FIXED — a loop naming the closure now classifies "
-          f"{got[0]!r}. Invert this pin to assert 'read'; do not weaken it.")
-    check("FP12_reason_is_out_of_grammar", got[1] == g.RULE_OUT_OF_GRAMMAR,
-          f"the over-refusal should still be the grammar rule; got {got[1]}")
+    check("FP12_loop_over_a_read_is_a_read", got[0] == "read",
+          f"FP12 HAS REGRESSED — a loop that only reads the closure is {got[0]!r} again "
+          f"(rule {got[1]}). Do not re-pin this at 'write': find what stopped stripping the "
+          f"control-flow keyword in _flush_simple_command.")
 
     twin = cls("for w in /tmp/a /tmp/b; do cat $w/readme; done")
     check("FP12_benign_twin", twin == "none",
@@ -285,11 +298,13 @@ def test_pin_a_control_flow_keyword_refuses_a_plain_read():
     unlooped = cls("PYTHONPATH=$w/" + SHARED_DIR + " python3 t.py")
     check("FP12_unlooped_is_a_read", unlooped == "read",
           f"the same read without the loop is allowed; got {unlooped}")
+    check("FP12_loop_agrees_with_its_unlooped_body", got[0] == unlooped,
+          f"the loop and its own body must agree; loop={got[0]!r} body={unlooped!r}")
 
     literal = cls("PYTHONPATH=/tmp/a/" + SHARED_DIR + " python3 t.py")
     check("FP12_assignment_is_not_the_cause", literal == "read",
-          "a literal-valued assignment naming the closure is also a read — the $VAR is "
-          f"not what triggers FP12; got {literal}")
+          "a literal-valued assignment naming the closure is also a read — the $VAR was "
+          f"never what triggered FP12; got {literal}")
 
 
 def test_pin_a_variable_in_a_write_position_sweeps_in_a_quoted_body():
@@ -367,7 +382,7 @@ ALL = [
     test_fd_digit_does_not_manufacture_a_write,
     test_fd_redirect_at_the_marker_is_a_write,
     test_patch_writer_verdicts_are_decided_by_the_patch_not_the_fd,
-    test_pin_a_control_flow_keyword_refuses_a_plain_read,
+    test_a_control_flow_keyword_no_longer_refuses_a_plain_read,
     test_pin_a_variable_in_a_write_position_sweeps_in_a_quoted_body,
     test_every_case_in_this_file_is_in_ALL,
 ]
