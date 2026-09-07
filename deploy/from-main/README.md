@@ -47,18 +47,44 @@ And policy resolution reports an empty scope when nothing answers, so **both sta
 identical `(granted: )` banner**. That is why the cheap observable cannot tell them apart: the
 emptiness pub saw was a symptom of the daemon failure, read at the wrong layer.
 
-Measured, one box, one gate, one event — the three arms this preflight distinguishes:
+Measured — the arms this preflight distinguishes. The first three are one box, one gate, one
+event (CBP); the last two were added 2026-09-07 from Sprout and Legion, and they are the reason
+the verdict column alone is not enough to act on:
 
-| seat state | `--preflight` |
-|---|---|
-| healthy, envelope empty or not | `ok`, exit 0 |
-| daemon unreachable (the pub signature) | `FAILED(gate refuses a benign read)`, exit 4 |
-| gate registered in a worktree | `FAILED(rule-0: …)`, exit 4 |
+| seat state | `--preflight` | the probe's own message says |
+|---|---|---|
+| healthy, envelope empty or not | `ok`, exit 0 | — |
+| daemon unreachable (the pub signature) | `FAILED(gate refuses a benign read)`, exit 4 | connection refused / no endpoint |
+| gate registered in a worktree | `FAILED(rule-0: …)`, exit 4 | `rule-0: …` |
+| **seat config never rendered** (timer arm, `HESTIA_HOME` set) | `FAILED(gate refuses a benign read)`, exit 4 | `deny [config.unbacked] — no rendered projection for <seat> at ~/.hestia/seats/<seat>.env` |
+| **`HESTIA_HOME` not supplied** (fired-session arm) | `FAILED(gate refuses a benign read)`, exit 4 | `deny [config.unbacked] — HESTIA_HOME is not set; the launcher must supply the bootstrap locator` |
+
+**Read the probe's message, not the bucket.** The last four rows are one bucket and four
+different causes, and the bucket cannot tell them apart — every one is `FAILED(gate refuses a
+benign read)`, exit 4. Only the `WARN preflight probe …` line in `deploy.log` names which. In
+particular, a `config.unbacked` verdict is **not** the daemon-unreachable row: the daemon is
+answering, and answering *deny*. Check which before debugging a healthy daemon —
+
+    ss -ltnp | grep 7711        # LISTEN → daemon is up; the refusal is a verdict, not an outage
+
+Measured on Sprout and Legion 2026-09-07, both boxes on `v0.0.4-730-g8783aa8`: daemon reachable,
+`~/.hestia/seats/` absent entirely, members' manifest frozen at `v0.0.4-679-g8cc13bf` since
+2026-09-05 while the binary advanced four cycles past it. The two `config.unbacked` arms above
+are that pair verbatim; which one a caller gets depends only on whether it exported
+`HESTIA_HOME`, so the *same box* shows both — the timer's arm and a fired session's arm.
 
 A note on what the preflight deliberately does *not* test: whether the seat can rewrite its own
 gate registration. It cannot, on any healthy machine — `gate-self-access` refuses it, correctly.
 A governed session has no in-band route to the rule-0 remedy, so a rule-0 finding is something
 to **refuse and report to an operator**, never something a seat repairs for itself.
+
+**`config.unbacked` has that same property, and the printed remedy does not say so.** The verdict
+tells the reader to *"populate this seat's config in the vault (Govern → Runtime config)"* and
+then `hestia-deploy --hooks-only`. The first half is a **vault write** — operator territory,
+unreachable from the governed session that is reading the message, exactly as with rule-0. So
+`config.unbacked` is also **refuse and report**, never self-repair; a seat that reads its own
+deploy log finds a remedy it is not the actor for. `--hooks-only` alone re-runs the same
+preflight and refuses identically, so there is nothing for the seat to retry.
 
 ## Install — Linux, user systemd (once per box)
 
