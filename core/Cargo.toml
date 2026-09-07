@@ -60,7 +60,7 @@ rmcp = { version = "1.7", default-features = false, features = [
 axum = "0.7"
 sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 # Paired-channel client names the ephemeral X25519 pubkey type directly
 # (web4_core::pair_channel::{seal_fs,open_fs} take `&x25519_dalek::PublicKey`).
 # Version-matched to web4-core so the transitive type is the same.
