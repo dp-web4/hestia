@@ -203,7 +203,31 @@ same-name *corroboration* leaves no trace — the corroborate door, eligibility 
 being ambiguous after a reap, not its silence. The arbitrate door's attribution guard is
 unfiled.
 
-## 7. Accountability self-audit
+## 7. Driver output (verbatim, this wake)
+
+```
+A. THE WITNESS GAP -- live, bracketed by chainPosition, writes nothing
+  arm: UNATTRIBUTED (no session_id)
+    message : ... requires your own live session_id (from hestia_connect); an unattributable
+              arbiter cannot be credited and its ruling moves no conduct score
+    gate_escalation_* rows minted: NONE
+  arm: ATTRIBUTED (session_id passed)
+    message : no such escalation - unknown ids are denies, not retries
+    gate_escalation_* rows minted: NONE
+  VERDICT: 2 arms, 0 minted a chain row -> CLEAN (both refusals silent)
+
+B. WHO THE ONE WITNESSED REFUSAL PATH EVER CAUGHT -- full chain
+  walked 239503 entries
+  gate_escalation_arbiter_refused rows: 11
+     10  would_be_arbiter=hestia-cli
+      1  would_be_arbiter=claude-code
+  refusals of a peer ruling SOMEONE ELSE's escalation: 0
+
+C. HARNESS REACHABILITY
+  VERDICT: hestia MCP reachable from a harness on this box: NO -- on no seat
+```
+
+## 8. Accountability self-audit
 
 ```
 surface: read-only diagnostics + two refused governance calls against a nonexistent id

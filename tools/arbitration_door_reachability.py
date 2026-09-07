@@ -18,7 +18,7 @@ Three independent measurements, none of which requires a peer to be awake:
      words for that shape, at `refuse_asker_mismatch`, are "indistinguishable, to every
      reader of the chain, from the server having crashed."
 
-     The load-bearing one is the FIRST guard: `resolve_attributed_caller` (handler.rs:18757).
+     The load-bearing one is the FIRST guard: `resolve_attributed_caller` (handler.rs:19165 @ 4c3c5ed).
      A would-be arbiter that cannot attribute itself is turned away before the escalation is
      even looked up, and nothing is written. So the door witnesses the refusal you get AFTER
      proving who you are, and drops the one you get for FAILING to prove it.
