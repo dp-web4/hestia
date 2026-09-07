@@ -448,7 +448,7 @@ fn hestia_tools() -> Vec<Tool> {
                         // `kind_under` does, so the published interface and the gate admit
                         // the same set and a validating client fails fast for the same
                         // reasons the daemon would.
-                        "description": "Notice kind (see plugins/member-mesh/KINDS.md). A dotted path narrowing left-to-right, accepted by PREFIX: any specialization of a listed root is accepted, so `coordination.renotify` and `review_request.pr` need no vocabulary edit. Roots: coordination, review_request, review_done, reply, handoff, forum-note, ack. Only these roots — a kind that is not one of them, or a longer word merely starting like one (`coordinationX`), is refused.",
+                        "description": "Notice kind (see plugins/member-mesh/KINDS.md). A dotted path narrowing left-to-right, accepted by PREFIX: any specialization of a listed root is accepted, so `coordination.renotify` and `review_done.pr` need no vocabulary edit. Roots: coordination, review_request, review_done, reply, handoff, forum-note, ack. Only these roots — a kind that is not one of them, or a longer word merely starting like one (`coordinationX`), is refused. NOTE: the `review_request` family is accepted HERE but refused by the fleet transport, which spells the concept `pr_review_request`; see KINDS.md.",
                         "pattern": member_notice_kind_pattern(),
                         "maxLength": MAX_NOTICE_KIND_BYTES
                     },
@@ -3967,6 +3967,26 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
 /// entry, PR). Every send is a witnessed `member_notice` chain event BEFORE it is
 /// queued (O: witness precedes delivery), carrying sender WHO + recipient + kind +
 /// pointer — never a payload.
+///
+/// **Six of these seven cross the fleet seam; `review_request` does not.** Compared
+/// as sets against `hub-watch.sh`'s `KINDS` (Sprout on the receiver seat, reproduced
+/// on Legion, 2026-09-06): `coordination`, `review_done`, `reply`, `handoff`,
+/// `forum-note` and `ack` are all accepted there, each with its whole dotted family.
+/// `review_request` is refused — the transport spells the concept
+/// `pr_review_request`, and `review_request` is not beneath `review` because the
+/// prefix rule requires a literal `.` separator. So `review_request` REFUSE,
+/// `review_request.pr` REFUSE, while `review.request.pr` and `pr_review_request`
+/// both ACCEPT there and are refused HERE. No spelling of "please review this" is
+/// currently admitted by both.
+///
+/// Latent, not live — the kind has never crossed (zero occurrences in 132,310 lines
+/// of `hub-watch.log`). Left unfixed deliberately: choosing between `review_request`
+/// and `pr_review_request` is a fleet-naming decision, and adding the second
+/// spelling on either side is vocabulary drift, not a fix. It is dp's call. What
+/// this change does to it is make it legible: once the gate is fractal and
+/// `member_unanswered` matches the gate, such a notice becomes a permanent,
+/// uncleanable `i_owe` row instead of a silent loss — which is the right failure of
+/// the two, and the reason it is recorded here rather than worked around.
 const MEMBER_NOTICE_KINDS: &[&str] = &[
     "coordination",
     "review_request",
@@ -3997,8 +4017,11 @@ const MAX_NOTICE_KIND_BYTES: usize = 64;
 /// "$kind" in "$entry".*`), so the fleet transport and this local surface admit the
 /// same strings. A kind is a dotted path narrowing left-to-right (dp, 2026-07-24;
 /// `plugins/member-mesh/KINDS.md` has carried the ruling in its banner since):
-/// `review_request` accepts `review_request.pr`, and a specialization needs no
+/// `coordination` accepts `coordination.renotify`, and a specialization needs no
 /// vocabulary edit because it is already accepted by whoever accepts its parent.
+/// (The example is `coordination`, not `review_request`, on purpose — see the
+/// note on [`MEMBER_NOTICE_KINDS`]: `review_request` is the one root whose whole
+/// dotted family the fleet transport refuses.)
 ///
 /// **The separator is the whole safety property.** Acceptance is on `"{entry}."`,
 /// never on `entry` alone, so a listed root does not admit a longer sibling that
@@ -4011,13 +4034,20 @@ const MAX_NOTICE_KIND_BYTES: usize = 64;
 /// `member_notify_admits_fractal_specializations` asserts it instead of this
 /// sentence claiming it.
 ///
-/// **Deliberately STRICTER than the shell rule in two ways**, and it is a divergence
-/// worth naming rather than smoothing over. `case "$kind" in "$entry".*` admits
-/// `coordination.` (empty segment) and `coordination.<newline>`; this admits
-/// neither. hub-watch matches to route a notice it already holds; this one is a
-/// write gate on a witnessed record, so the two are not obliged to be equally
-/// permissive — only to agree on every kind anyone actually sends. They do: every
-/// well-formed dotted kind is admitted by both.
+/// **Stricter than the shell rule, and the write gate being tighter than the router
+/// is the correct ordering rather than a divergence to reconcile.** An earlier
+/// version of this comment named the wrong two ways — it said `case "$kind" in
+/// "$entry".*` admits `coordination.` and `coordination.<newline>`. It admits
+/// neither: `kind_under` in `hub-watch.sh` has three guards ABOVE that loop (charset
+/// `*[!A-Za-z0-9._-]*`, `.*|*.`, `*..*`), so both sides refuse both. That claim was
+/// written by reading four lines of the shell rule instead of running it, which is
+/// exactly the defect this change exists to fix, so it is corrected here rather than
+/// deleted. What remains: hub-watch's charset is `[A-Za-z0-9._-]` with no length
+/// bound, this is `[a-z0-9_-]` with a 64-byte cap. Nothing this surface admits can
+/// be something the transport refuses on charset or length, which is the only
+/// direction that matters — the write gate on a witnessed record may be tighter than
+/// the router that forwards it. (Measured by Sprout on the receiver seat and
+/// reproduced on Legion, 2026-09-06.)
 fn kind_under(vocab: &[&str], kind: &str) -> bool {
     if kind.len() > MAX_NOTICE_KIND_BYTES {
         return false;
@@ -9581,6 +9611,11 @@ mod member_mesh_tests {
     /// The `coordination.renotify` arm is the one that made this concrete: a retry is
     /// the notice most likely to be unanswered, so a ledger blind to it is blind
     /// precisely when it is being consulted.
+    ///
+    /// `review_request.pr` stays the worked arm here even though that family is
+    /// refused by the fleet transport (see [`MEMBER_NOTICE_KINDS`]) — the trap below
+    /// needs a root containing `_`, and a kind that cannot leave this daemon is still
+    /// a kind this daemon must account for. That is the point of the row.
     ///
     /// The negative arm is the LIKE-wildcard trap, asserted rather than commented
     /// because the wrong spelling is the obvious one. Four of seven roots contain `_`,

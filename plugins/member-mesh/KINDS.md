@@ -26,15 +26,47 @@
 > quietly fixed: the failure was not the flat check, it was that the two documents
 > could disagree for 34 days with nothing in CI able to see it.
 >
-> **The local rule is deliberately narrower than `hub-watch.sh`'s in two ways.**
-> `case "$kind" in "$entry".*` admits an empty segment (`coordination.`) and any
-> bytes at all after the dot; `kind_under` in `core/src/server/handler.rs` requires
-> each dotted segment to be non-empty `[a-z0-9_-]+` and bounds the whole kind at 64
-> bytes. hub-watch matches to ROUTE a notice it already holds; this is a write gate
-> on a witnessed chain record that every renderer downstream will display, and the
-> seven-string enum used to provide that bound for free. The two rules agree on
-> every well-formed dotted kind, which is the only agreement that matters; where
-> they differ, this one refuses.
+> **The local rule is narrower than `hub-watch.sh`'s — but not where an earlier
+> draft of this paragraph said, and the difference is instructive.** That draft
+> claimed `case "$kind" in "$entry".*` admits an empty segment (`coordination.`)
+> and any bytes at all after the dot. It does not. Measured against the shipping
+> script (Sprout, receiver seat, 2026-09-06; reproduced on Legion), `kind_under`
+> there opens with three guards ABOVE that loop — a charset gate
+> (`*[!A-Za-z0-9._-]*`), an empty leading/trailing segment gate (`.*|*.`) and an
+> empty interior segment gate (`*..*`) — so `coordination.`,
+> `coordination.<newline>`, `coordination..x` and `.coordination` are REFUSE on
+> both sides. The draft described the shell rule by reading four lines of it
+> instead of running it, which is the same defect this document exists to record,
+> committed while recording it.
+>
+> What actually remains: hub-watch's charset is `[A-Za-z0-9._-]` with no length
+> bound; `kind_under` in `core/src/server/handler.rs` requires each segment to be
+> non-empty `[a-z0-9_-]+` and bounds the whole kind at 64 bytes. The bound stands,
+> for the reason it always had — hub-watch matches to ROUTE a notice it already
+> holds, this is a write gate on a witnessed chain record every renderer
+> downstream will display, and the seven-string enum used to provide that bound
+> for free. But it is the write gate being strictly tighter than the router, which
+> is the correct ordering, not a divergence anyone has to reconcile: nothing this
+> surface admits can be something the transport refuses on charset or length.
+>
+> **One root does diverge, and it is `review_request`.** Comparing the two
+> vocabularies as sets — this file's seven against the fleet seam's `KINDS` — six
+> agree (`coordination`, `review_done`, `reply`, `handoff`, `forum-note`, `ack`,
+> each with its whole dotted family). The seventh does not: the fleet seam spells
+> the concept `pr_review_request`, and `review_request` is not beneath `review`
+> because `kind_under` requires a literal `.` separator. Measured at the seam:
+> `review_request` REFUSE, `review_request.pr` REFUSE, `review.request.pr` ACCEPT,
+> `pr_review_request` ACCEPT. There is currently **no spelling of "please review
+> this" that both gates accept** — hestia refuses the two the transport takes, and
+> the transport refuses the two hestia takes.
+>
+> It is latent, not live: zero `review_request` in 132,310 lines of
+> `hub-watch.log`, and no path carries it today. It is named here rather than
+> fixed because fixing it means choosing a canonical fleet spelling, and a second
+> spelling for a concept that already has one is vocabulary drift, not a fix.
+> **That is dp's call.** Until it is made, do not use `review_request.pr` as the
+> worked example of a fractal kind — it is the one family that cannot leave this
+> daemon. `coordination.renotify` and `review_done.pr` both cross.
 
 | kind | semantics |
 |---|---|
