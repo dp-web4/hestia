@@ -194,13 +194,32 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true", help="write (default is a dry run)")
     args = parser.parse_args(argv)
 
+    # THE BOOTSTRAP LOCATOR IS SUPPLIED, NEVER GUESSED (#944, and the #987 review). A
+    # migration tool that falls back to `~/.hestia` reintroduces the default this cutover
+    # exists to remove, in the one place nobody would look for it — and it would cheerfully
+    # seed the wrong vault on a box whose home is elsewhere.
+    configured_home = os.environ.get("HESTIA_HOME")
+    if not configured_home:
+        print("HESTIA_HOME is not set. The bootstrap locator is supplied by the launcher and")
+        print("has no default, by design; this tool will not guess which vault to seed.")
+        return 2
+    hestia_home = Path(configured_home)
+    # The harness homes are relative to the OS user's home, which is what each plugin's
+    # `expects.json` states (`~/.claude`). That is the user's home, not a hestia root, and it
+    # is not a default for anything the vault owns.
     home = Path(os.path.expanduser("~"))
-    hestia_home = Path(os.environ.get("HESTIA_HOME") or (home / ".hestia"))
     host = socket.gethostname().split(".")[0].lower()
+    endpoint_file = hestia_home / "endpoint"
     try:
-        endpoint = (hestia_home / "endpoint").read_text().strip()
-    except OSError:
-        endpoint = "http://127.0.0.1:7711/mcp"
+        endpoint = endpoint_file.read_text().strip()
+    except OSError as e:
+        print(f"no endpoint at {endpoint_file} ({e}). The daemon writes it; a box without one")
+        print("is not a box this tool can seed. Start the daemon, or point HESTIA_HOME at the")
+        print("configured home.")
+        return 2
+    if not endpoint:
+        print(f"{endpoint_file} is empty; refusing to invent an endpoint")
+        return 2
 
     operator = Operator(endpoint.rsplit("/mcp", 1)[0], hestia_home / "operator.key")
     who = operator.open_session()
@@ -240,21 +259,31 @@ def main(argv: list[str] | None = None) -> int:
     if not args.apply:
         return 0
 
+    # ONE ACT, NOT N WRITES (#987 review). This used to PUT each document in turn, which
+    # meant a failure after the first left a namespace that was neither empty nor complete —
+    # and this tool's own empty-only ratchet would then refuse to repair it, forever. The
+    # daemon owns the compare-and-commit: it re-checks emptiness under its own lock, validates
+    # and renders everything, and writes the vault once. This side is the planner.
     note = f"seeded on {host}: the seat-config namespace was empty (tools/seed_seat_config.py)"
-    for member, env in documents:
-        status, result = operator.call("PUT", "/api/config/seat", {
-            "plugin_id": member, "config": {"env": env, "note": note},
-        })
-        print(f"  {member}: {status} {json.dumps(result)[:120]}")
-        if status != 200:
-            print("  STOPPING — the write was refused; the namespace is left as it is")
-            return 1
+    status, result = operator.call("POST", "/api/config/seed", {
+        "documents": {member: {"env": env, "note": note} for member, env in documents},
+    })
+    if status == 409:
+        print(f"\nREFUSED: the namespace was occupied between the plan and the commit.")
+        print(f"  {json.dumps(result)[:300]}")
+        print("  Nothing was written. Another writer won; that is the ratchet working.")
+        return 0
+    if status != 200:
+        print(f"\nSEED REFUSED ({status}): {json.dumps(result)[:300]}")
+        print("  Nothing was written — the namespace is byte-identical.")
+        return 1
 
-    status, listing = operator.call("GET", "/api/config/seat")
-    for row in (listing.get("seats") if isinstance(listing, dict) else listing) or []:
-        if isinstance(row, dict):
-            print(f"  {row.get('member'):14} {(row.get('verdict') or {}).get('status')}")
-    print("\nSeeded. The seats can act; the operator grants anything beyond the minimum.")
+    for verdict in result.get("verdict") or []:
+        if isinstance(verdict, dict):
+            print(f"  {verdict.get('member', '?'):14} {verdict.get('status', verdict)}")
+    print(f"\nSeeded {result.get('seeded')} in one act "
+          f"(intent {str(result.get('intentEntryHash'))[:12]}).")
+    print("The seats can act; the operator grants anything beyond the minimum.")
     return 0
 
 

@@ -1164,6 +1164,7 @@ pub async fn serve_with_callback(
         // one place a value is revealed, and it is classified above low stakes (see
         // `Stakes::classify`) so the gate witnesses who looked. Neither is reachable from MCP:
         // a member that could read its own authoritative config could read its peers'.
+        .route("/api/config/seed", post(config_seed_seats))
         .route("/api/config/seat", put(config_put_seat).get(config_list_seats))
         .route("/api/config/seat/:plugin_id", get(config_get_seat))
         .route("/api/scope/grant", post(scope_grant))
@@ -2734,6 +2735,222 @@ async fn scope_decide(
 /// VALIDATED BEFORE IT IS STORED, not only before it is rendered. Storing content that cannot
 /// render would leave the vault holding an authority that produces a permanent finding and no
 /// artifact — an unbacked projection one layer up, where nothing can quarantine it.
+/// `POST /api/config/seed` — initialise an EMPTY seat-config namespace in ONE act.
+///
+/// WHY A SEPARATE DOOR AND NOT A LOOP OVER `config_put_seat`. A client that reads the
+/// namespace, finds it empty and then writes N documents has two failure classes it cannot
+/// repair: another writer can occupy the namespace between the read and the writes, and a
+/// failure after the first document leaves a namespace that is neither empty nor complete.
+/// The second is the worse one, because the ratchet that makes seeding safe — write only into
+/// an empty namespace — then refuses to touch the half-state forever. The bootstrap's own
+/// guard would strand the box it exists to rescue (#987 review).
+///
+/// So the whole act happens here, under one lock: verify emptiness, validate and render
+/// EVERY proposed document, then commit them as a single vault write. A failure before the
+/// commit leaves the namespace byte-identical; a concurrent writer makes this refuse cleanly
+/// with what it found. One intent row and one result row, not one pair per document — the
+/// chain should say "this box was initialised", because that is the act.
+///
+/// It seeds DESCRIPTION. Nothing here grants: the documents are seat layout and society
+/// facts, and every authority surface (scope, standing scope, operator sets) is untouched and
+/// unreadable from this handler.
+async fn config_seed_seats(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use super::seat_config as sc;
+
+    let proposed = match body.get("documents").and_then(|v| v.as_object()) {
+        Some(map) if !map.is_empty() => map.clone(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "documents is required and must be a non-empty object of \
+                              member -> {env, note}"
+                })),
+            );
+        }
+    };
+
+    // PARSE AND VALIDATE EVERYTHING BEFORE ANYTHING IS WRITTEN. The commit below is one
+    // vault save; the point of validating first is that the save is then the only thing that
+    // can fail, and it fails whole.
+    let mut parsed: Vec<(String, sc::SeatConfig)> = Vec::new();
+    for (member, value) in proposed.iter() {
+        let member = member.trim().to_string();
+        if member.is_empty()
+            || member.contains('/')
+            || member.contains('\\')
+            || member.contains("..")
+            || member.starts_with('.')
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "member {member:?} becomes a filename and may not be empty or contain a \
+                         path separator, a parent reference, or a leading dot"
+                    )
+                })),
+            );
+        }
+        let cfg: sc::SeatConfig = match serde_json::from_value(value.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("document for {member:?} does not parse: {e}")
+                    })),
+                );
+            }
+        };
+        if let Err(msg) = cfg.validate() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("{member}: {msg}")})),
+            );
+        }
+        if let Err(msg) = sc::validate_attribution(&member, &cfg) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("{member}: {msg}"), "attribution": true})),
+            );
+        }
+        parsed.push((member, cfg));
+    }
+    parsed.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // A SEAT MAY NOT RESTATE A SHARED KEY — checked against the set being seeded in the same
+    // act, since there is no earlier one to check against.
+    let shared_proposed = parsed
+        .iter()
+        .find(|(m, _)| sc::is_shared(m))
+        .map(|(_, c)| c.clone());
+    for (member, cfg) in &parsed {
+        if sc::is_shared(member) {
+            continue;
+        }
+        let owned = sc::keys_owned_by_shared(shared_proposed.as_ref(), cfg);
+        if !owned.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "{member} restates keys {owned:?} that the shared set in this same seed \
+                         already owns; every seat inherits them"
+                    ),
+                    "shared_keys": owned,
+                })),
+            );
+        }
+    }
+
+    let mut encoded: Vec<(String, Vec<u8>)> = Vec::new();
+    for (member, cfg) in &parsed {
+        match serde_json::to_vec(cfg) {
+            Ok(b) => encoded.push((member.clone(), b)),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("could not serialise {member}: {e}")
+                    })),
+                );
+            }
+        }
+    }
+
+    let mut s = state.lock().await;
+
+    // THE COMPARE. Under the same lock the commit runs under, so nothing can occupy the
+    // namespace between deciding and writing.
+    if !sc::namespace_is_empty(&s.vault) {
+        let occupied = sc::declared_members(&s.vault);
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "the seat-config namespace is not empty; seeding initialises a box that \
+                          has never been configured, and the half it does not know about is a \
+                          choice it must not overwrite",
+                "declared": occupied,
+            })),
+        );
+    }
+
+    // WITNESS FIRST, and once: the act is "this box was initialised", not N writes. Keys only,
+    // never values — a config document can carry a token and the chain never forgets.
+    let record = serde_json::json!({
+        "members": parsed.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(),
+        "keys": parsed
+            .iter()
+            .map(|(m, c)| (m.clone(), c.env.keys().cloned().collect::<Vec<_>>()))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        "decided_by": "operator",
+        "via": "operator_session",
+        "precondition": "namespace_empty",
+    });
+    let intent = match s.append_chain("config_seed_intent", record.clone()) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("witness append failed, nothing was seeded: {e}")
+                })),
+            );
+        }
+    };
+
+    // THE COMMIT. One vault save for every document; on failure the vault is byte-identical
+    // and the namespace is still empty, so the next attempt is a clean retry rather than a
+    // repair.
+    if let Err(e) = s.vault.put_documents(sc::SEAT_CONFIG_NS, &encoded) {
+        let _ = s.append_chain(
+            "config_seed_failed",
+            serde_json::json!({"error": e.to_string(), "intent": intent.hash}),
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("seed NOT committed, the namespace is unchanged: {e}"),
+                "intent": intent.hash,
+            })),
+        );
+    }
+
+    // Render immediately rather than waiting for the worker's next tick: an operator who just
+    // seeded a box expects its seats to be able to act, and the verdicts are the evidence.
+    let members: Vec<String> = parsed
+        .iter()
+        .map(|(m, _)| m.clone())
+        .filter(|m| !sc::is_shared(m))
+        .collect();
+    let verdicts = super::handler::render_and_verify_seat_configs_as(
+        &mut s,
+        &members,
+        super::handler::ConfigPass::Author,
+    );
+    let _ = s.append_chain(
+        "config_seeded",
+        serde_json::json!({
+            "members": parsed.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(),
+            "intent": intent.hash,
+        }),
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "seeded": parsed.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(),
+            "verdict": verdicts,
+            "intentEntryHash": intent.hash,
+        })),
+    )
+}
+
 async fn config_put_seat(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
@@ -4661,6 +4878,178 @@ mod disposition_tests {
             }
         }
         assert!(s.chain_store.len().unwrap() > before);
+    }
+
+    /// Seeding an empty namespace is ONE act: all documents or none, one witness pair.
+    ///
+    /// The arms below are written against the failure the client-side version had (#987
+    /// review): read-then-write-N leaves a half-configured namespace when anything fails
+    /// partway, and the ratchet that makes seeding safe then refuses to repair it forever.
+    /// So each arm asks what the namespace looks like AFTER a refusal, not merely whether the
+    /// call returned an error.
+    #[tokio::test]
+    async fn seeding_an_empty_namespace_is_one_atomic_act() {
+        use super::super::seat_config as sc;
+        let (dir, state) = test_state().await;
+        let seed = serde_json::json!({"documents": {
+            "_shared": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": "society facts"},
+            "claude-code": {"env": {"HESTIA_PLUGIN_ID": "claude-code"}, "note": ""},
+            "codex": {"env": {"HESTIA_PLUGIN_ID": "codex"}, "note": ""},
+        }});
+        let before = { state.lock().await.chain_store.len().unwrap() };
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_seed_seats(axum::extract::State(state.clone()), axum::Json(seed)).await,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let s = state.lock().await;
+        assert_eq!(
+            sc::declared_members(&s.vault),
+            vec!["_shared", "claude-code", "codex"],
+            "every proposed document landed"
+        );
+        assert!(
+            sc::render_path(dir.path(), "claude-code").exists()
+                && sc::render_path(dir.path(), "codex").exists(),
+            "and each seat's projection was rendered in the same act"
+        );
+        // ONE act, not one per document: intent + seeded, and nothing per-member.
+        let rows: Vec<String> = s
+            .chain_store
+            .read_recent_by_types(None, &["config_seed_intent", "config_seeded", "config_seat_written"], 50)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.event_type.to_string())
+            .collect();
+        assert_eq!(rows.iter().filter(|t| *t == "config_seed_intent").count(), 1, "{rows:?}");
+        assert_eq!(rows.iter().filter(|t| *t == "config_seeded").count(), 1, "{rows:?}");
+        assert_eq!(
+            rows.iter().filter(|t| *t == "config_seat_written").count(),
+            0,
+            "seeding is not N single writes wearing a hat: {rows:?}"
+        );
+        assert!(s.chain_store.len().unwrap() > before);
+        // The intent names the KEYS and never a value.
+        let intent = s
+            .chain_store
+            .read_recent_by_types(None, &["config_seed_intent"], 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let blob = serde_json::to_string(&intent.event_data).unwrap();
+        assert!(blob.contains("HESTIA_PLUGIN_ID"), "keys are recorded: {blob}");
+        assert!(!blob.contains("/w/ai"), "a VALUE reached the chain: {blob}");
+    }
+
+    /// A namespace that is not empty is refused, and says what occupies it.
+    #[tokio::test]
+    async fn seeding_refuses_a_namespace_that_is_not_empty() {
+        use super::super::seat_config as sc;
+        let (_dir, state) = test_state().await;
+        let first = serde_json::json!({"documents": {
+            "_shared": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""},
+            "claude-code": {"env": {"HESTIA_PLUGIN_ID": "claude-code"}, "note": ""},
+        }});
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_seed_seats(axum::extract::State(state.clone()), axum::Json(first)).await,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // A second seed — the concurrent-writer case, and the re-run case.
+        let second = serde_json::json!({"documents": {
+            "codex": {"env": {"HESTIA_PLUGIN_ID": "codex"}, "note": "would overwrite nothing"},
+        }});
+        let before = {
+            let s = state.lock().await;
+            (sc::declared_members(&s.vault), s.chain_store.len().unwrap())
+        };
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_seed_seats(axum::extract::State(state.clone()), axum::Json(second)).await,
+        );
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "the loser refuses cleanly");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("claude-code"), "it names what occupies the namespace: {text}");
+
+        let s = state.lock().await;
+        assert_eq!(sc::declared_members(&s.vault), before.0, "and changes nothing");
+        assert_eq!(s.chain_store.len().unwrap(), before.1, "not even a chain row");
+    }
+
+    /// ONE bad document refuses the WHOLE seed, and the namespace stays empty.
+    ///
+    /// This is the arm the sequential client could not pass: it wrote the shared set, then
+    /// failed on the seat, and left a namespace that its own empty-only ratchet would refuse
+    /// to touch on every later run.
+    #[tokio::test]
+    async fn one_invalid_document_refuses_the_whole_seed_and_leaves_the_namespace_empty() {
+        use super::super::seat_config as sc;
+        let (_dir, state) = test_state().await;
+        for (label, seed) in [
+            (
+                "a value carrying a newline renders extra assignments",
+                serde_json::json!({"documents": {
+                    "_shared": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""},
+                    "claude-code": {"env": {"HESTIA_X": "a\nINJECTED=1"}, "note": ""},
+                }}),
+            ),
+            (
+                "a member id that would escape the render directory",
+                serde_json::json!({"documents": {
+                    "_shared": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""},
+                    "../escape": {"env": {"HESTIA_X": "1"}, "note": ""},
+                }}),
+            ),
+            (
+                "a seat restating a key the shared set in this same seed owns",
+                serde_json::json!({"documents": {
+                    "_shared": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""},
+                    "claude-code": {"env": {"HESTIA_WORKSPACE": "/w/mine"}, "note": ""},
+                }}),
+            ),
+            (
+                "a document attributed to another seat",
+                serde_json::json!({"documents": {
+                    "_shared": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""},
+                    "claude-code": {"env": {"HESTIA_PLUGIN_ID": "codex"}, "note": ""},
+                }}),
+            ),
+        ] {
+            let resp = axum::response::IntoResponse::into_response(
+                super::config_seed_seats(axum::extract::State(state.clone()), axum::Json(seed)).await,
+            );
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{label}");
+            let s = state.lock().await;
+            assert!(
+                sc::namespace_is_empty(&s.vault),
+                "{label}: the namespace must be byte-identical after a refusal, found {:?}",
+                sc::declared_members(&s.vault)
+            );
+        }
+        // And the valid form still works afterwards, so nothing above wedged the door.
+        let good = serde_json::json!({"documents": {
+            "claude-code": {"env": {"HESTIA_PLUGIN_ID": "claude-code"}, "note": ""},
+        }});
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_seed_seats(axum::extract::State(state.clone()), axum::Json(good)).await,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// An empty or absent proposal is refused rather than treated as "seed nothing".
+    #[tokio::test]
+    async fn seeding_nothing_is_a_bad_request_not_a_silent_success() {
+        let (_dir, state) = test_state().await;
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"documents": {}}),
+            serde_json::json!({"documents": []}),
+        ] {
+            let resp = axum::response::IntoResponse::into_response(
+                super::config_seed_seats(axum::extract::State(state.clone()), axum::Json(body)).await,
+            );
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
     }
 
     /// The list shows LIVENESS beside drift (#944): absent until the seat connects with a
