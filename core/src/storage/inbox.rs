@@ -1211,10 +1211,29 @@ impl SqliteInboxStore {
         let before = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
+        // Fractal kinds, matched the way the send gate matches them (#977). `kind IN
+        // (?)` was exact, which was right while `tool_member_notify` was exact too.
+        // Once the gate admits `review_request.pr`, an exact `IN` makes this ledger —
+        // the accountability half, the thing `hestia_member_unanswered` reports and
+        // `i_owe` is computed from — silently blind to precisely the specializations
+        // the gate now exists to admit. Not a refusal: a sent, witnessed, queued
+        // notice that never appears in anyone's debt row. A gate and a ledger that
+        // disagree about what a kind is, is worse than either rule alone.
+        //
+        // `substr(...) = ? || '.'`, NOT `LIKE ? || '.%'`, and the difference is not
+        // style. `_` is a single-character WILDCARD in SQL LIKE, and four of the
+        // seven roots contain one — `LIKE 'review_request.%'` also matches
+        // `reviewXrequest.pr`, a kind the send gate refuses. The obvious spelling
+        // would have made the ledger LOOSER than the gate in exactly the direction
+        // that lets a refused kind be counted. `substr`/`length` has no wildcard
+        // semantics at all, so there is nothing to escape and nothing to get wrong.
         let placeholders = (0..kinds.len())
-            .map(|i| format!("?{}", i + 3))
+            .map(|i| {
+                let p = i + 3;
+                format!("(n.kind = ?{p} OR substr(n.kind, 1, length(?{p}) + 1) = ?{p} || '.')")
+            })
             .collect::<Vec<_>>()
-            .join(",");
+            .join(" OR ");
         let sql = format!(
             "SELECT id, to_plugin, from_plugin, kind, pointer_uri, queued_at, drained_at,
                     in_reply_to
@@ -1222,7 +1241,7 @@ impl SqliteInboxStore {
              WHERE (n.to_plugin = ?1 OR n.from_plugin = ?1)
                AND n.dest_peer IS NULL
                AND n.queued_at < ?2
-               AND n.kind IN ({placeholders})
+               AND ({placeholders})
                AND NOT EXISTS (SELECT 1 FROM member_notices r
                                WHERE r.in_reply_to = n.id
                                  AND (r.pointer_uri IS NULL

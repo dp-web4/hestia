@@ -425,15 +425,32 @@ fn hestia_tools() -> Vec<Tool> {
                     },
                     "kind": {
                         "type": "string",
-                        // Exact match, NOT prefix (kimi review of notice 764, F2): the
-                        // handler is `MEMBER_NOTICE_KINDS.contains(&kind)`, so a caller
-                        // told it could send `review_request.pr` gets refused. Fractal
-                        // kind-roots are a real design on the fleet hub-mesh and are not
-                        // implemented on this local surface — advertising them here is
-                        // the exact failure this schema exists to end: a description that
-                        // promises an argument shape the handler does not honor.
-                        "description": "Notice kind (see plugins/member-mesh/KINDS.md). Matched exactly against the enum below; this surface does not accept prefixed specializations.",
-                        "enum": MEMBER_NOTICE_KINDS
+                        // Fractal, NOT exact (#977). Until this change the schema
+                        // published `"enum": MEMBER_NOTICE_KINDS` plus a sentence saying
+                        // matching was exact — which agreed with the handler and
+                        // disagreed with `plugins/member-mesh/KINDS.md`, whose banner has
+                        // said "acceptance is by prefix" since dp ruled it on 2026-07-24,
+                        // in the same file the exact-match commit (79a4315) was editing.
+                        // The kimi review of notice 764 (F2) named the defect correctly —
+                        // a description must not promise an argument shape the handler
+                        // does not honor — and was fixed on the wrong side: the handler
+                        // was made to match the sentence rather than the ruling. This
+                        // inverts that half and leaves F2's actual invariant intact,
+                        // now asserted rather than asserted-against.
+                        //
+                        // `enum` is GONE on purpose and `pattern` replaces it. JSON Schema
+                        // cannot say "one of these, or a dotted specialization of one of
+                        // these" with an enum, so leaving the enum up would keep a
+                        // schema-validating client refusing `coordination.renotify`
+                        // client-side, before the round trip — a refusal in the client's
+                        // own words that never reaches this handler and never shows up as
+                        // `hestia.member_notify_unknown_kind`. `pattern` says exactly what
+                        // `kind_under` does, so the published interface and the gate admit
+                        // the same set and a validating client fails fast for the same
+                        // reasons the daemon would.
+                        "description": "Notice kind (see plugins/member-mesh/KINDS.md). A dotted path narrowing left-to-right, accepted by PREFIX: any specialization of a listed root is accepted, so `coordination.renotify` and `review_done.pr` need no vocabulary edit. Roots: coordination, review_request, review_done, reply, handoff, forum-note, ack. Only these roots — a kind that is not one of them, or a longer word merely starting like one (`coordinationX`), is refused. NOTE: the `review_request` family is accepted HERE but refused by the fleet transport, which spells the concept `pr_review_request`; see KINDS.md.",
+                        "pattern": member_notice_kind_pattern(),
+                        "maxLength": MAX_NOTICE_KIND_BYTES
                     },
                     "pointer_uri": {
                         "type": "string",
@@ -3950,6 +3967,26 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
 /// entry, PR). Every send is a witnessed `member_notice` chain event BEFORE it is
 /// queued (O: witness precedes delivery), carrying sender WHO + recipient + kind +
 /// pointer — never a payload.
+///
+/// **Six of these seven cross the fleet seam; `review_request` does not.** Compared
+/// as sets against `hub-watch.sh`'s `KINDS` (Sprout on the receiver seat, reproduced
+/// on Legion, 2026-09-06): `coordination`, `review_done`, `reply`, `handoff`,
+/// `forum-note` and `ack` are all accepted there, each with its whole dotted family.
+/// `review_request` is refused — the transport spells the concept
+/// `pr_review_request`, and `review_request` is not beneath `review` because the
+/// prefix rule requires a literal `.` separator. So `review_request` REFUSE,
+/// `review_request.pr` REFUSE, while `review.request.pr` and `pr_review_request`
+/// both ACCEPT there and are refused HERE. No spelling of "please review this" is
+/// currently admitted by both.
+///
+/// Latent, not live — the kind has never crossed (zero occurrences in 132,310 lines
+/// of `hub-watch.log`). Left unfixed deliberately: choosing between `review_request`
+/// and `pr_review_request` is a fleet-naming decision, and adding the second
+/// spelling on either side is vocabulary drift, not a fix. It is dp's call. What
+/// this change does to it is make it legible: once the gate is fractal and
+/// `member_unanswered` matches the gate, such a notice becomes a permanent,
+/// uncleanable `i_owe` row instead of a silent loss — which is the right failure of
+/// the two, and the reason it is recorded here rather than worked around.
 const MEMBER_NOTICE_KINDS: &[&str] = &[
     "coordination",
     "review_request",
@@ -3959,6 +3996,89 @@ const MEMBER_NOTICE_KINDS: &[&str] = &[
     "forum-note",
     "ack",
 ];
+
+/// A kind is a name, not a payload. Bounded for the same reason
+/// [`MAX_POINTER_URI_BYTES`] is: it lands in the witness chain, in every inbox row
+/// and in every rendering path, and it is caller-supplied.
+///
+/// This bound is NEW with fractal acceptance and is the cost of it. While the gate
+/// was `MEMBER_NOTICE_KINDS.contains(&kind)`, the vocabulary bounded the field for
+/// free — seven known strings, none of them long, none containing a control
+/// character. Opening the tail to specializations opens it to arbitrary bytes, so
+/// the bound the enum was providing implicitly has to be restated explicitly. Same
+/// for the segment charset in [`kind_under`]: a newline in a kind is not a
+/// specialization, it is a rendering exploit against every reader downstream.
+const MAX_NOTICE_KIND_BYTES: usize = 64;
+
+/// Is `kind` admitted by `vocab` under the fractal rule — exact, or a dotted
+/// specialization of a listed root?
+///
+/// The rule is `hub-watch.sh`'s `kind_under` (`[ "$kind" = "$entry" ]` or `case
+/// "$kind" in "$entry".*`), so the fleet transport and this local surface admit the
+/// same strings. A kind is a dotted path narrowing left-to-right (dp, 2026-07-24;
+/// `plugins/member-mesh/KINDS.md` has carried the ruling in its banner since):
+/// `coordination` accepts `coordination.renotify`, and a specialization needs no
+/// vocabulary edit because it is already accepted by whoever accepts its parent.
+/// (The example is `coordination`, not `review_request`, on purpose — see the
+/// note on [`MEMBER_NOTICE_KINDS`]: `review_request` is the one root whose whole
+/// dotted family the fleet transport refuses.)
+///
+/// **The separator is the whole safety property.** Acceptance is on `"{entry}."`,
+/// never on `entry` alone, so a listed root does not admit a longer sibling that
+/// merely starts with the same bytes — `coordination` admits `coordination.renotify`
+/// and refuses `coordinationX`. That is what keeps the daemon-only kinds
+/// unforgeable: [`DAEMON_NOTICE_KIND_UNREACHABLE`] and
+/// [`DAEMON_NOTICE_KIND_DISPOSITION`] are new ROOTS, prefix-disjoint from all seven
+/// member entries, so no dotted member kind can reach them. That disjointness is an
+/// invariant this change depends on rather than a coincidence, so
+/// `member_notify_admits_fractal_specializations` asserts it instead of this
+/// sentence claiming it.
+///
+/// **Stricter than the shell rule, and the write gate being tighter than the router
+/// is the correct ordering rather than a divergence to reconcile.** An earlier
+/// version of this comment named the wrong two ways — it said `case "$kind" in
+/// "$entry".*` admits `coordination.` and `coordination.<newline>`. It admits
+/// neither: `kind_under` in `hub-watch.sh` has three guards ABOVE that loop (charset
+/// `*[!A-Za-z0-9._-]*`, `.*|*.`, `*..*`), so both sides refuse both. That claim was
+/// written by reading four lines of the shell rule instead of running it, which is
+/// exactly the defect this change exists to fix, so it is corrected here rather than
+/// deleted. What remains: hub-watch's charset is `[A-Za-z0-9._-]` with no length
+/// bound, this is `[a-z0-9_-]` with a 64-byte cap. Nothing this surface admits can
+/// be something the transport refuses on charset or length, which is the only
+/// direction that matters — the write gate on a witnessed record may be tighter than
+/// the router that forwards it. (Measured by Sprout on the receiver seat and
+/// reproduced on Legion, 2026-09-06.)
+fn kind_under(vocab: &[&str], kind: &str) -> bool {
+    if kind.len() > MAX_NOTICE_KIND_BYTES {
+        return false;
+    }
+    let Some(root) = vocab
+        .iter()
+        .find(|entry| kind == **entry || kind.starts_with(&format!("{entry}.")))
+    else {
+        return false;
+    };
+    if kind.len() == root.len() {
+        return true;
+    }
+    kind[root.len() + 1..].split('.').all(|seg| {
+        !seg.is_empty()
+            && seg
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+    })
+}
+
+/// The published `pattern` for a member notice `kind`, generated from
+/// [`MEMBER_NOTICE_KINDS`] so the advertised interface cannot drift from the gate.
+///
+/// Generated, never literal: a hand-written regex beside a `const` list is the same
+/// two-sources-of-truth shape that produced the defect this change fixes.
+/// `member_notify_admits_fractal_specializations` checks the generated pattern
+/// against [`kind_under`] over a corpus rather than trusting that reading.
+fn member_notice_kind_pattern() -> String {
+    format!("^({})(\\.[a-z0-9_-]+)*$", MEMBER_NOTICE_KINDS.join("|"))
+}
 
 /// The daemon's own notice kind, and deliberately NOT in [`MEMBER_NOTICE_KINDS`].
 ///
@@ -4131,7 +4251,7 @@ const MEMBER_NOTIFY_WINDOW_MS: u64 = 600_000;
 async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     let to_plugin = require_string(args, "to_plugin_id")?;
     let kind = require_string(args, "kind")?;
-    if !MEMBER_NOTICE_KINDS.contains(&kind.as_str()) {
+    if !kind_under(MEMBER_NOTICE_KINDS, &kind) {
         return Ok(hestia_error_envelope(
             "hestia.member_notify_unknown_kind",
             &format!("kind '{}' not in {:?}", kind, MEMBER_NOTICE_KINDS),
@@ -4480,7 +4600,7 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     // unbound send is what leaves the sender's notice sitting "unanswered"
     // forever. Refusing it would be worse — a member with something to say and
     // a lost id would be silenced by the bookkeeping.
-    if in_reply_to.is_none() && MEMBER_KINDS_ARE_DISPOSITIONS.contains(&kind.as_str()) {
+    if in_reply_to.is_none() && kind_under(MEMBER_KINDS_ARE_DISPOSITIONS, &kind) {
         out["unbound_notice"] = json!(format!(
             "kind '{kind}' is a disposition — pass in_reply_to:<notice id> so the notice \
              it answers stops counting as unanswered"
@@ -9479,6 +9599,99 @@ mod member_mesh_tests {
         assert!(rows["recipient_liveness_scope"].is_string(), "{rows}");
     }
 
+    /// **The site the fractal change could have broken silently, and the reason it is
+    /// a five-site edit and not a four-site one.** `member_notify`'s gate and
+    /// `member_unanswered`'s query are two different rules over the same vocabulary:
+    /// the gate decides what may be SENT, the query decides what is OWED. Making only
+    /// the gate fractal admits `review_request.pr` and then loses it — sent, witnessed,
+    /// queued, and absent from every debt row, because the query was `kind IN (...)`.
+    /// That is not a refusal anyone sees; it is an accountability hole shaped exactly
+    /// like the specializations the change exists to allow.
+    ///
+    /// The `coordination.renotify` arm is the one that made this concrete: a retry is
+    /// the notice most likely to be unanswered, so a ledger blind to it is blind
+    /// precisely when it is being consulted.
+    ///
+    /// `review_request.pr` stays the worked arm here even though that family is
+    /// refused by the fleet transport (see [`MEMBER_NOTICE_KINDS`]) — the trap below
+    /// needs a root containing `_`, and a kind that cannot leave this daemon is still
+    /// a kind this daemon must account for. That is the point of the row.
+    ///
+    /// The negative arm is the LIKE-wildcard trap, asserted rather than commented
+    /// because the wrong spelling is the obvious one. Four of seven roots contain `_`,
+    /// which LIKE reads as "any single character", so `LIKE 'review_request.%'` counts
+    /// `reviewXrequest.pr` — a kind `tool_member_notify` refuses. A ledger looser than
+    /// its gate is how a kind that cannot be sent shows up as a debt.
+    #[tokio::test]
+    async fn unanswered_counts_fractal_specializations_and_only_those() {
+        let (_dir, state) = test_state().await;
+        let claude = connect(&state, "claude-code").await;
+        for kind in ["review_request", "review_request.pr", "reply.renotify"] {
+            tool_member_notify(
+                &state,
+                &json!({"to_plugin_id": "kimi-code", "kind": kind,
+                        "pointer_uri": "pr/1", "session_id": claude}),
+            )
+            .await
+            .unwrap();
+        }
+        // Not under any counted root: `ack` is a terminator, and `coordination` is not
+        // in MEMBER_KINDS_AWAIT_RESPONSE at all. Neither may be pulled in by widening.
+        for kind in ["ack", "coordination.renotify"] {
+            tool_member_notify(
+                &state,
+                &json!({"to_plugin_id": "kimi-code", "kind": kind,
+                        "pointer_uri": "pr/1", "session_id": claude}),
+            )
+            .await
+            .unwrap();
+        }
+        // The LIKE-wildcard witness. It cannot be sent through the gate — that is the
+        // point — so it is written straight to the store, which is the only way to
+        // observe a query looser than the surface above it.
+        {
+            let st = state.lock().await;
+            st.inbox_store
+                .enqueue_member(
+                    "kimi-code",
+                    "claude-code",
+                    "member",
+                    "reviewXrequest.pr",
+                    Some("pr/1"),
+                    "witness-hash-for-the-wildcard-arm",
+                    None,
+                )
+                .expect("direct store write for the wildcard witness");
+        }
+
+        let rows = tool_member_unanswered(
+            &state,
+            &json!({"session_id": claude, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let kinds: Vec<String> = rows["owed_to_me"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["kind"].as_str().unwrap_or_default().to_string())
+            .collect();
+        for owed in ["review_request", "review_request.pr", "reply.renotify"] {
+            assert!(
+                kinds.iter().any(|k| k == owed),
+                "`{owed}` is under a counted root and was sent, but no debt row carries \
+                 it — the ledger is blind to a kind the gate admits: {rows}"
+            );
+        }
+        for not_owed in ["ack", "coordination.renotify", "reviewXrequest.pr"] {
+            assert!(
+                !kinds.iter().any(|k| k == not_owed),
+                "`{not_owed}` is not under any counted root but was counted — the query \
+                 is looser than the gate: {rows}"
+            );
+        }
+    }
+
     /// Two dispositions, one pointer, different bindings. The report must show what
     /// tells them apart, or the reader groups by the proxy and acks a live claim.
     ///
@@ -9764,19 +9977,43 @@ mod member_mesh_tests {
         );
     }
 
-    /// The `kind` schema advertises exact matching; the handler must not be looser or
-    /// tighter than the enum it publishes (kimi review of notice 764, F2). The schema
-    /// previously told callers kinds were "accepted by prefix, so a specialization like
-    /// review_request.pr needs no vocabulary edit" — true of the fleet hub-mesh, false
-    /// here, where the check is `MEMBER_NOTICE_KINDS.contains(&kind)`. A caller that
-    /// believed the sentence got refused.
+    /// **This is the explicit edit the previous version of this test asked for.**
+    /// It used to be `member_notify_kind_enum_is_exactly_what_the_handler_accepts`, and
+    /// it asserted the negation of everything below: that the advertised `enum` equalled
+    /// `MEMBER_NOTICE_KINDS`, and that `coordination.sub` came back
+    /// `hestia.member_notify_unknown_kind`. Its own closing sentence is why it is being
+    /// rewritten rather than deleted:
     ///
-    /// Two directions, because a description can drift either way: every kind the schema
-    /// lists must actually send, and a prefixed specialization of a listed kind must
-    /// actually be refused. If fractal kind-roots are implemented here later, this test
-    /// is where that decision has to be made explicitly rather than by a comment.
+    /// > If fractal kind-roots are implemented here later, this test is where that
+    /// > decision has to be made explicitly rather than by a comment.
+    ///
+    /// They are, so this is that. Recorded here in the same place the opposite decision
+    /// was recorded, which is the only reason the reversal is legible at all.
+    ///
+    /// **What the kimi review of notice 764 (F2) actually held, and why this is not a
+    /// regression of it.** F2's defect was a `kind` description promising prefix
+    /// acceptance the handler did not implement — a schema lying about an argument
+    /// shape. That invariant is untouched and is now asserted in the direction it was
+    /// always meant to run: the published surface and the gate admit the SAME SET,
+    /// checked over a corpus rather than by reading. What F2's fix got wrong was the
+    /// side it fixed. `plugins/member-mesh/KINDS.md` had carried dp's 2026-07-24 ruling
+    /// — "acceptance is by prefix" — in its banner since before that commit, and 79a4315
+    /// added 64 lines to that very file without touching the banner it was contradicting
+    /// four files away. The repo has held both sentences, in the two documents the same
+    /// commit edited, ever since; the schema then pointed callers at KINDS.md while
+    /// telling them the opposite of it. This does not overturn F2. It finishes it on the
+    /// side the ruling was already on.
+    ///
+    /// Four directions, because the failure modes are not symmetric:
+    /// 1. every listed root still sends (the old direction, unchanged);
+    /// 2. a dotted specialization of a listed root sends (the inverted one);
+    /// 3. an unlisted root, and a longer word that merely STARTS like a listed root,
+    ///    are still refused — the separator is the safety property, not the prefix;
+    /// 4. the daemon-only kinds stay unreachable from this surface, including under
+    ///    specialization, which is the invariant fractal acceptance could plausibly
+    ///    have broken and the one reason to assert 3 at all.
     #[tokio::test]
-    async fn member_notify_kind_enum_is_exactly_what_the_handler_accepts() {
+    async fn member_notify_admits_fractal_specializations() {
         let (_dir, state) = test_state().await;
         let sid = connect(&state, "claude-code").await;
 
@@ -9784,55 +10021,149 @@ mod member_mesh_tests {
             .into_iter()
             .find(|t| t.name == "hestia_member_notify")
             .expect("hestia_member_notify is not on the tool surface");
-        let advertised: Vec<String> = tool.input_schema["properties"]["kind"]["enum"]
-            .as_array()
-            .expect("`kind` must publish an enum")
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(
-            advertised,
-            MEMBER_NOTICE_KINDS.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
-            "the published enum drifted from the list the handler checks"
-        );
+        let kind_schema = &tool.input_schema["properties"]["kind"];
 
-        // The prose, not just the enum. This is the assertion that would have caught the
-        // original defect: the enum was already exact and correct while the description
-        // beside it promised prefix acceptance, and a caller reads the sentence. Keyed on
-        // the word rather than the sentence so a reworded version of the same promise
-        // still trips it — if prefix matching is ever implemented, this line is the
-        // deliberate edit that records the decision.
-        let kind_desc = tool.input_schema["properties"]["kind"]["description"]
+        // The enum is GONE, and its absence is load-bearing rather than incidental: an
+        // enum cannot express "or a specialization of one of these", so a
+        // schema-validating client that still saw one would refuse `coordination.renotify`
+        // in its own words, before the round trip, and never reach the gate this test
+        // exercises. Asserted so that re-adding it for tidiness fails here instead of
+        // in some other process's validator.
+        assert!(
+            kind_schema.get("enum").is_none(),
+            "`kind` re-published an enum; an enum cannot express fractal acceptance and \
+             makes validating clients refuse specializations the handler accepts: {kind_schema}"
+        );
+        let pattern = kind_schema["pattern"]
+            .as_str()
+            .expect("`kind` must publish a pattern now that it publishes no enum");
+        let re = regex::Regex::new(pattern).expect("published `kind` pattern must compile");
+
+        // The prose, kept as an assertion because it is the assertion that would have
+        // caught the ORIGINAL defect — the enum was correct while the sentence beside it
+        // lied. Same test, opposite polarity: the description must now promise the prefix
+        // rule, because that is what the handler does.
+        let kind_desc = kind_schema["description"]
             .as_str()
             .unwrap_or_default()
             .to_lowercase();
         assert!(
-            !kind_desc.contains("prefix") || kind_desc.contains("does not accept"),
-            "the `kind` description promises prefix acceptance the handler does not \
-             implement: {kind_desc}"
+            kind_desc.contains("prefix"),
+            "the `kind` description no longer tells callers matching is by prefix, which \
+             is what the handler does: {kind_desc}"
+        );
+        assert!(
+            !kind_desc.contains("does not accept prefixed"),
+            "the `kind` description still carries the exact-match sentence this change \
+             reverses: {kind_desc}"
         );
 
-        let args_for = |kind: &str| {
-            json!({
-                "to_plugin_id": "kimi-code", "kind": kind,
-                "pointer_uri": "shared-context/forum/x.md", "session_id": sid
-            })
-        };
-        for kind in &advertised {
-            let out = tool_member_notify(&state, &args_for(kind)).await.unwrap();
+        // 1 + 2. Every root sends, and so does a specialization of every root. Run over
+        // ALL seven rather than a sample: `advertised[0]` was the old test's coverage and
+        // it would not have noticed a rule keyed on one entry.
+        for root in MEMBER_NOTICE_KINDS {
+            for kind in [
+                root.to_string(),
+                format!("{root}.renotify"),
+                format!("{root}.a.b"),
+            ] {
+                let out = tool_member_notify(&state, &args_for_kind(&kind, &sid))
+                    .await
+                    .unwrap();
+                assert!(
+                    out["queued_id"].is_number(),
+                    "fractal kind `{kind}` was refused by the handler: {out}"
+                );
+                assert!(
+                    re.is_match(&kind),
+                    "the handler accepted `{kind}` but the published pattern refuses it — \
+                     a validating client would fail before the round trip"
+                );
+            }
+        }
+
+        // 3 + 4. The separator is the safety property. `coordinationX` starts with a
+        // listed root and is NOT under it; `unreachable` and `disposition` are the
+        // daemon's own kinds and stay unforgeable by construction — new roots,
+        // prefix-disjoint from all seven — which is the invariant that makes prefix
+        // acceptance safe here at all. Asserted, per the argument that carried this
+        // change, rather than left to a comment.
+        for (root, why) in [
+            (DAEMON_NOTICE_KIND_UNREACHABLE, "daemon-only kind"),
+            (DAEMON_NOTICE_KIND_DISPOSITION, "daemon-only kind"),
+        ] {
             assert!(
-                out["queued_id"].is_number(),
-                "schema advertises kind `{kind}` but the handler refused it: {out}"
+                !MEMBER_NOTICE_KINDS
+                    .iter()
+                    .any(|e| root == *e || root.starts_with(&format!("{e}."))),
+                "{why} `{root}` is under a member root — prefix acceptance would let a \
+                 member forge it"
             );
         }
-        for kind in [format!("{}.pr", advertised[0]), "coordination.sub".into()] {
-            let out = tool_member_notify(&state, &args_for(&kind)).await.unwrap();
+        for bad in [
+            "coordinationX",             // starts like a root, is not under it
+            "coordination_renotify",     // `_` is a LIKE wildcard, never a separator
+            "renotify",                  // unlisted root
+            "renotify.coordination",     // a listed root in a non-initial segment
+            "unreachable",               // daemon-only
+            "unreachable.report",        // daemon-only, specialized
+            "disposition.ruled",         // daemon-only, specialized
+            "coordination.",             // empty trailing segment
+            "coordination..sub",         // empty interior segment
+            "coordination.SUB",          // segment charset
+            "coordination.a b",          // whitespace in a name
+            "coordination.a\nb",         // a kind is rendered by every reader downstream
+        ] {
+            let out = tool_member_notify(&state, &args_for_kind(bad, &sid))
+                .await
+                .unwrap();
             assert_eq!(
-                out["_hestia_error"]["code"], "hestia.member_notify_unknown_kind",
-                "prefixed kind `{kind}` was accepted — the schema must stop saying \
-                 matching is exact: {out}"
+                out["_hestia_error"]["code"],
+                "hestia.member_notify_unknown_kind",
+                "`{bad}` was accepted — prefix acceptance must be on the SEPARATOR, not \
+                 on the bytes: {out}"
+            );
+            assert!(
+                !re.is_match(bad),
+                "the handler refused `{bad}` but the published pattern admits it — the \
+                 schema is advertising a kind that cannot be sent"
             );
         }
+
+        // The bound the enum used to provide for free. Seven fixed strings could not be
+        // long; an open tail can, and a kind lands in the witness chain and every
+        // renderer. Checked at the boundary in both directions so the const and the
+        // published `maxLength` cannot drift apart.
+        assert_eq!(
+            kind_schema["maxLength"].as_u64(),
+            Some(MAX_NOTICE_KIND_BYTES as u64),
+            "the published maxLength drifted from the bound the handler enforces"
+        );
+        let root = MEMBER_NOTICE_KINDS[0];
+        let at_bound = format!("{root}.{}", "x".repeat(MAX_NOTICE_KIND_BYTES - root.len() - 1));
+        assert_eq!(at_bound.len(), MAX_NOTICE_KIND_BYTES);
+        assert!(
+            tool_member_notify(&state, &args_for_kind(&at_bound, &sid))
+                .await
+                .unwrap()["queued_id"]
+                .is_number(),
+            "a kind exactly on the bound was refused"
+        );
+        let over = format!("{at_bound}x");
+        assert_eq!(
+            tool_member_notify(&state, &args_for_kind(&over, &sid))
+                .await
+                .unwrap()["_hestia_error"]["code"],
+            "hestia.member_notify_unknown_kind",
+            "a kind one byte over the bound was accepted"
+        );
+    }
+
+    fn args_for_kind(kind: &str, sid: &str) -> Value {
+        json!({
+            "to_plugin_id": "kimi-code", "kind": kind,
+            "pointer_uri": "shared-context/forum/x.md", "session_id": sid
+        })
     }
 
     /// Blast radius of the refusal above. A deny is only correct if it denies ONLY
