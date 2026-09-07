@@ -203,19 +203,28 @@ SPOOL_MAX_ENTRIES = 500
 SPOOL_DRAIN_PER_RUN = 8
 
 
-def spool_save(intent: dict) -> None:
+def spool_save(intent: dict) -> bool:
     """Best-effort append. FIFO: the name sorts by act time. When full, drop
-    the NEWEST (this one) — the backlog is the alarm, so it is preserved."""
+    the NEWEST (this one) — the backlog is the alarm, so it is preserved.
+
+    RETURNS WHETHER THE ROW IS NOW DURABLE, because the caller uses that to
+    decide whether the act's correlation file may be released (#977 review).
+    Both failure modes here — a full spool and a failed write — drop this row,
+    and releasing the cache on either would destroy the last durable carrier of
+    the action's identity while nothing had yet recorded it.
+    """
     try:
         SPOOL_DIR.mkdir(parents=True, exist_ok=True)
         if len(list(SPOOL_DIR.glob("*.json"))) >= SPOOL_MAX_ENTRIES:
             debug_log(f"spool FULL ({SPOOL_MAX_ENTRIES}) — dropping newest row; backlog preserved")
-            return
+            return False
         (SPOOL_DIR / f"{intent['client_ts']:.3f}-{uuid.uuid4().hex}.json").write_text(
             json.dumps(intent)
         )
     except (OSError, KeyError) as e:
         debug_log(f"spool save failed: {e}")
+        return False
+    return True
 
 
 def spool_drain(client: "McpHttp", session_id: Optional[str]) -> None:
@@ -626,19 +635,23 @@ def run() -> int:
         # `None` is a normal value here and takes a cold path that names itself.
         "action_id": cached_action_id(tool_use_id),
     }
-    # The cache has no reader left: its one value now lives in `intent`, which
-    # is either recorded or spooled to disk from here on. Retiring it HERE
-    # rather than after the verdict is deliberate — if this process dies before
-    # either happens, the act has a decision and no outcome, which is a real
-    # state worth seeing (a decision lacking a terminal outcome) and is not made
-    # truer by leaving a file behind that nothing will ever read.
-    retire_cached_action(tool_use_id)
+    # TWO-PHASE HANDOFF (#977 review). The cache is released only once this act
+    # is durable somewhere else — an outcome on the chain, or a spool row on
+    # disk. The first version released it here, as soon as the id was in memory,
+    # on the argument that a decision with no outcome is a truthful state. It is;
+    # but keeping the file does not make it less truthful, and it preserves WHICH
+    # unfinished action the decision belonged to. Dying in the gap would have
+    # destroyed the last durable carrier of that identity for nothing.
+    def hand_off_to_spool() -> None:
+        """Park the act durably, then release its correlation file — never before."""
+        if spool_save(intent):
+            retire_cached_action(tool_use_id)
 
     endpoint = discover_endpoint()
     if endpoint is None:
         warn_once_daemon_missing()
         debug_log("no endpoint discovered; spooling")
-        spool_save(intent)
+        hand_off_to_spool()
         return 0
 
     client = McpHttp(endpoint)
@@ -646,7 +659,7 @@ def run() -> int:
         init_resp = client.initialize()
         if "result" not in init_resp:
             debug_log(f"initialize failed: {init_resp}")
-            spool_save(intent)
+            hand_off_to_spool()
             return 0
         client.initialized()
 
@@ -690,18 +703,23 @@ def run() -> int:
 
         verdict = witness_one(client, session_id, intent)
         if verdict == "transient":
-            spool_save(intent)
-        elif verdict == "recorded":
-            debug_log(
-                f"post {tool_name} success={success} magnitude={intent['magnitude']}"
-            )
+            hand_off_to_spool()
+        else:
+            # "recorded" — the outcome is on the chain — or "rejected", where the
+            # daemon RULED and a replay can never succeed. Either way the act is
+            # durably disposed of and the correlation file has no reader left.
+            retire_cached_action(tool_use_id)
+            if verdict == "recorded":
+                debug_log(
+                    f"post {tool_name} success={success} magnitude={intent['magnitude']}"
+                )
     except urllib.error.URLError as e:
         debug_log(f"network: {e}")
         warn_once_daemon_missing()
-        spool_save(intent)
+        hand_off_to_spool()
     except Exception as e:  # noqa: BLE001 — fail-open at top level
         debug_log(f"unexpected: {type(e).__name__}: {e}")
-        spool_save(intent)
+        hand_off_to_spool()
     return 0
 
 

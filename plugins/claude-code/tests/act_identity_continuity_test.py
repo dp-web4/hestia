@@ -161,6 +161,41 @@ def main() -> int:
         w.retire_cached_action("already-gone")
         check("C6 retiring a file that is not there is not an error", True)
 
+        print("D. the two-phase handoff: release the cache only once the act is DURABLE")
+        # The first version of this change released the correlation file as soon as the id
+        # was in memory, arguing that a decision with no outcome is a truthful state. It is —
+        # but keeping the file does not make it less truthful, and it records WHICH unfinished
+        # action the decision belonged to. Dying in that gap destroyed the last durable carrier
+        # of the identity for nothing (#977 review). `spool_save` therefore has to REPORT
+        # durability, and both of its drop paths must report failure.
+        def hand_off(tool_use_id: str) -> bool:
+            """The wiring under test, as `main` composes it."""
+            if w.spool_save({"client_ts": 1.0, "tool_name": "Bash"}):
+                w.retire_cached_action(tool_use_id)
+                return True
+            return False
+
+        w.SPOOL_DIR = Path(tmp) / "spool"
+        (w.ACTIONS_DIR / "keep-1.json").write_text(json.dumps({"action_id": "KEEP-1"}))
+        check("D1 a successful spool reports durable", hand_off("keep-1") is True)
+        check("D1 and only then is the cache released",
+              not (w.ACTIONS_DIR / "keep-1.json").exists())
+
+        # A FULL spool drops this row — the backlog is the alarm — so it is not durable.
+        (w.ACTIONS_DIR / "keep-2.json").write_text(json.dumps({"action_id": "KEEP-2"}))
+        saved_max, w.SPOOL_MAX_ENTRIES = w.SPOOL_MAX_ENTRIES, 1
+        check("D2 a full spool reports NOT durable", hand_off("keep-2") is False)
+        check("D2 and the cache SURVIVES, still naming the unfinished action",
+              w.cached_action_id("keep-2") == "KEEP-2",
+              str(sorted(p.name for p in w.ACTIONS_DIR.iterdir())))
+        w.SPOOL_MAX_ENTRIES = saved_max
+
+        # A write failure is the other drop path: same rule.
+        w.SPOOL_DIR = Path(tmp) / "not-a-dir" / "spool"
+        (Path(tmp) / "not-a-dir").write_text("this is a file, so mkdir must fail")
+        check("D3 a failed spool write reports NOT durable", hand_off("keep-2") is False)
+        check("D3 and the cache still survives", w.cached_action_id("keep-2") == "KEEP-2")
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILURE(S): {FAILURES}")
