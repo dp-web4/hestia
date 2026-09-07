@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 /// so this is a weaker claim than it looks — see #128.
 const DEFAULT_ASSERTED_ID: &str = "hestia-cli";
 
-struct Mcp {
+pub struct Mcp {
     client: reqwest::blocking::Client,
     url: String,
     mcp_session: Option<String>,
@@ -48,7 +48,7 @@ struct Mcp {
 }
 
 impl Mcp {
-    fn connect(endpoint: &str) -> Result<Self> {
+    pub fn connect(endpoint: &str) -> Result<Self> {
         let url = if endpoint.ends_with("/mcp") {
             endpoint.to_string()
         } else {
@@ -109,9 +109,22 @@ impl Mcp {
     /// envelope — a refusal shaped like a success. #135 is the same class one layer up (a
     /// refused notice exiting 0, so a rejected send read as a sent one). Anything that is
     /// not an answer becomes an `Err` here, so it can never reach the operator as a verdict.
-    fn tool(&mut self, name: &str, args: Value) -> Result<Value> {
+    pub fn tool(&mut self, name: &str, args: Value) -> Result<Value> {
         let v = self.rpc("tools/call", Some(json!({"name": name, "arguments": args})))?;
         tool_payload(name, &v)
+    }
+
+    /// Like `tool`, but a refusal envelope comes back as a VALUE, not an `Err`. For the one
+    /// caller that needs to read a refusal's payload — `scope arbitrate`'s unsigned preflight,
+    /// whose `_hestia_error.data.signs` carries the bytes to sign (#962). Every other caller
+    /// keeps `tool`, so a refusal can never reach an operator as a verdict by accident.
+    pub fn tool_envelope(&mut self, name: &str, args: Value) -> Result<Value> {
+        let v = self.rpc("tools/call", Some(json!({"name": name, "arguments": args})))?;
+        let text = v
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("tool {name}: no content in daemon response"))?;
+        serde_json::from_str(text).with_context(|| format!("tool {name}: undecodable payload"))
     }
 }
 
@@ -187,7 +200,7 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 /// Open an attributed session. Returns (session_id, asserted_plugin_id).
-fn open_session(m: &mut Mcp, asserted_id: &str, role: &str) -> Result<(String, String)> {
+pub fn open_session(m: &mut Mcp, asserted_id: &str, role: &str) -> Result<(String, String)> {
     let r = m.tool(
         "hestia_connect",
         json!({"plugin_id": asserted_id, "role": role, "host_agent": asserted_id}),

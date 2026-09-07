@@ -150,7 +150,15 @@ PINNED_BASELINE: dict | None = {
     "plugins/codex/hooks/" + _HOOK:                 {"cwd-root-fallback": 2, "expanduser-tilde": 1, "getenv-path-default": 3, "tilde-hestia": 1},
     "plugins/kimi/hooks/" + _HOOK:                  {"cwd-root-fallback": 2, "expanduser-tilde": 1, "getenv-path-default": 2},
     "plugins/gemini/hooks/" + _GEM:                 {"cwd-root-fallback": 1, "expanduser-tilde": 1, "getenv-path-default": 2, "tilde-hestia": 1},
-    "plugins/claude-code/hooks/witness.py":    {},
+    # 2026-09-06: RISES 0 -> 1, and the direction is the point. `ACTIONS_DIR` is now declared
+    # on BOTH sides of the Pre→Post contract, because the outcome hook must read the action id
+    # the gate cached rather than begin a second action (#977: measured 4,121 outcomes and 450
+    # gated decisions sharing zero `action_id`). The literal is that contract's only carrier,
+    # and moving it to the vault in the same change would make a failed join impossible to
+    # attribute to the repair or to the migration. It retires under #944, as ONE pair with the
+    # pre-hook's `abs-tmp-state: 1` below — a lone survivor here means the two sides diverged,
+    # which is the failure mode the whole issue is about.
+    "plugins/claude-code/hooks/witness.py":    {"abs-tmp-state": 1},
     "plugins/codex/hooks/witness.py":               {"getenv-path-default": 1},
     "plugins/kimi/hooks/observe.sh":                {"shell-home-default": 1},
     "plugins/kimi/hooks/hydrate.sh":                {"shell-home-default": 3},

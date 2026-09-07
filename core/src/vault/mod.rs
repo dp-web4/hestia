@@ -37,6 +37,18 @@ pub struct Vault {
 }
 
 impl Vault {
+    /// Re-read THIS vault from disk with the same path and passphrase.
+    ///
+    /// The daemon holds one `Vault` in memory from startup; documents the CLI writes after
+    /// that (a delegation minted with `hestia delegate grant`) are invisible to it until a
+    /// restart — and a restart destroys every pending scope request, so "restart to see the
+    /// delegation" would also destroy the ask it was minted to answer (measured on Legion,
+    /// 2026-09-05, #952). A surface that must see the operator's latest durable state reads
+    /// it fresh through this instead of the startup snapshot.
+    pub fn reopen(&self) -> Result<Self> {
+        Self::open(self.path.clone(), self.passphrase.clone())
+    }
+
     /// Open an existing vault file at `path` using `passphrase`.
     pub fn open(path: PathBuf, passphrase: String) -> Result<Self> {
         let data = storage::load(&path, &passphrase)?;

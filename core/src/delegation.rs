@@ -82,6 +82,191 @@ impl DelegationStore {
             .filter(|d| d.agent_lct_id == agent_lct_id && d.is_active())
             .collect()
     }
+
+    /// THE FIRST ENFORCEMENT POINT THIS STORE HAS EVER HAD (#952).
+    ///
+    /// Until now `DelegationStore` was written by the CLI, listed by the CLI, and rendered by
+    /// the dashboard, and **no surface consulted it before deciding anything**. `delegate grant`
+    /// recorded an intention with no teeth. That is the honest starting state, and it is why
+    /// this lookup is deliberately narrow rather than a general "may agent X do action Y":
+    /// giving a dormant store its first authority is the moment to be conservative about what
+    /// it can confer, not the moment to generalise.
+    ///
+    /// Answers exactly one question: may `agent_lct_id` rule a scope request for `path`?
+    ///
+    /// Matching, and why each clause is the way it is:
+    ///
+    /// * **`actions` must name it.** An UNRESTRICTED delegation (empty roles AND empty actions,
+    ///   `DelegationScope::unrestricted`) does NOT confer this. Every delegation minted before
+    ///   this commit is unrestricted or role-only, and none of their delegators could have meant
+    ///   "and may also widen a member's filesystem reach" — the power did not exist to mean. A
+    ///   dormant record must not gain authority by a later release; the operator re-grants
+    ///   naming the action, which is one command and leaves a dated record of the intent.
+    /// * **Roles confer nothing here.** Same reasoning: `--role administrator` was never a
+    ///   statement about scope rulings.
+    /// * **Bounded by path prefix, not by asker.** `scope.decide:<prefix>` lets an operator
+    ///   delegate "rulings on that being's own home" without also delegating rulings on
+    ///   shared-context, a repo, or `/`. Bounding by asker instead would let one seat grant its
+    ///   own being anything that being thought to ask for.
+    /// * **Containment is `_within_path_grant`'s rule**, separator-anchored, so a delegation on
+    ///   `/a/b` never covers `/a/bc`. Bare `scope.decide` is unbounded and covers any path — an
+    ///   operator can still say that, deliberately, and the record shows it.
+    ///
+    /// Returns the delegation that authorises the ruling, so the caller can name its id in the
+    /// witnessed record. A ruling whose authority is not attributable is not auditable.
+    pub fn scope_decide_authority_for(
+        &self,
+        agent_lct_id: Uuid,
+        path: &str,
+        member: &str,
+    ) -> Option<&DelegatedAuthority> {
+        self.delegations.iter().find(|d| {
+            d.agent_lct_id == agent_lct_id
+                && d.is_active()
+                && d.scope
+                    .actions
+                    .iter()
+                    .any(|a| action_covers(a, path, member))
+        })
+    }
+}
+
+/// The delegation-store key for a seat, derived from its **registry LCT** — the id that comes
+/// from its public key — and not from its plugin name, its UID, or its machine (sprout-claude
+/// on #952: "keyed to the seat's LCT rather than a UID or machine name"; hestia #954 is about
+/// to make UID identity meaningful and this must not acquire a dependency on it).
+///
+/// `DelegatedAuthority.agent_lct_id` is a `Uuid` in web4-core while member LCTs are mb32
+/// strings, so this is a deterministic UUIDv5 over the LCT string under a fixed hestia
+/// namespace: same seat, same key, on any machine, with no schema change and no allocator.
+/// `hestia delegate agent-id <plugin_id>` prints it so an operator can grant against it.
+pub fn agent_key_for_lct(lct_id: &str) -> Uuid {
+    // A fixed, arbitrary namespace constant: it only has to be stable, and it is.
+    const NS: Uuid = Uuid::from_bytes([
+        0x68, 0x65, 0x73, 0x74, 0x69, 0x61, 0x2d, 0x64, 0x65, 0x6c, 0x65, 0x67, 0x61, 0x74, 0x65,
+        0x00,
+    ]);
+    Uuid::new_v5(&NS, lct_id.trim().as_bytes())
+}
+
+/// The exact bytes a delegate signs to rule a scope request (#952).
+///
+/// WHY A SIGNATURE AT ALL. `hestia_connect` authenticates nobody (#63/#128): a session's
+/// `plugin_id` is asserted by the caller. That is tolerable for the escalation arbiter, which
+/// records a second-party review; it is NOT tolerable for the one MCP path that mints a
+/// STANDING grant, because durable loosening is the thing the operator wall exists to keep
+/// attributable. So the ruling carries a signature by the delegate's own registry key, and the
+/// daemon verifies it against the public key the member registry already holds.
+///
+/// This does not create a new preventive boundary at assurance A1 — anyone who can open the
+/// vault to sign could also mint a delegation or write a standing grant directly. What it
+/// creates is EVIDENCE: the chain records a ruling attributable to a key, not to a name a
+/// caller typed. Domain-separated and versioned so it can never be confused with another
+/// signature this fleet produces.
+///
+/// WHAT THE BYTES SAY (v2, HUB review of #962). v1 signed `request_id \n verdict \n reason`,
+/// and the mapping from a request id to a member and a path lived only in daemon memory
+/// (#908). After a restart the signature's referent survived only through the daemon's own
+/// `scope_grant_intent` row — the daemon's assertion, not the signer's — so what was
+/// attributable was "the seat said yes to an id", not "the seat said yes to THIS member
+/// reaching THIS path". v2 puts the member and the path inside the signed bytes. The daemon
+/// fills them from the pending request, so a signature made for one path cannot be verified
+/// against a request for another, and a client that honours the `signs` hint from the
+/// unsigned envelope sees, in the bytes it signs, exactly what it is endorsing.
+///
+/// Lines, in order: header, request id, member, path, verdict, reason. The reason is last
+/// because it is the only field that may itself contain a newline.
+pub fn arbitration_message(
+    request_id: &str,
+    member: &str,
+    path: &str,
+    granted: bool,
+    reason: &str,
+) -> String {
+    format!(
+        "{ARBITRATION_HEADER}\n{request_id}\n{member}\n{path}\n{}\n{reason}",
+        if granted { "granted" } else { "refused" }
+    )
+}
+
+/// The domain-separation line of [`arbitration_message`]. Bumped with the layout.
+pub const ARBITRATION_HEADER: &str = "hestia:scope-arbitrate:v2";
+
+/// Read the member and path back out of a canonical v2 arbitration message — what a signer
+/// uses to learn, from the daemon's `signs` hint, WHO it is about to let reach WHAT, before
+/// rebuilding the message itself and signing bytes it constructed. Returns `None` for
+/// anything that is not a v2 message; a signer must never sign a hint it cannot parse.
+pub fn arbitration_subject(message: &str) -> Option<(String, String)> {
+    let mut lines = message.split('\n');
+    if lines.next()? != ARBITRATION_HEADER {
+        return None;
+    }
+    let _request_id = lines.next()?;
+    let member = lines.next()?;
+    let path = lines.next()?;
+    let verdict = lines.next()?;
+    if !matches!(verdict, "granted" | "refused") || member.is_empty() || !path.starts_with('/') {
+        return None;
+    }
+    Some((member.to_string(), path.to_string()))
+}
+
+/// The delegable action name for scope rulings.
+///
+/// Forms, narrowest last:
+/// * `scope.decide` — every path, every member. An operator can still say this deliberately.
+/// * `scope.decide:/abs/prefix` — that subtree, any member.
+/// * `scope.decide:<member>:/abs/prefix` — that subtree AND only that member's requests.
+///
+/// The member comes BEFORE the path, and the path is always absolute. That ordering is what
+/// makes the grammar unambiguous: an earlier draft put the member after the path as
+/// `…:/abs/prefix@member`, and `@` is legal in a path (`/home/dp/mail@archive` parsed as
+/// prefix `/home/dp/mail`, member `archive`). Caught by the mesh session on #952 before any
+/// such delegation existed. With the member first, the first `:` after the action name
+/// starts either a member (no leading `/`) or a path (leading `/`), and nothing else can.
+///
+/// The member form exists because a prefix alone is sufficient for a being's own home but
+/// NOT for a shared path (sprout-claude, #952): delegating `scope.decide:/…/shared-context`
+/// without it would let the holder rule that path for any member that asks.
+pub const ACTION_SCOPE_DECIDE: &str = "scope.decide";
+
+/// Does the delegated action string authorise a scope ruling on `path` for `member`?
+///
+/// Containment is separator-anchored, matching the gate's `_within_path_grant`: a prefix
+/// covers itself and its descendants and nothing else, so a delegation on `/x/b` never covers
+/// `/x/bb` — which on this fleet is a DIFFERENT being's home, one directory over. Purely
+/// lexical on already-normalised absolute paths: the daemon records and the gate enforces, and
+/// the two do not necessarily share a mount, so this must not resolve symlinks it cannot see.
+pub fn action_covers(action: &str, path: &str, member: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    let Some((name, rest)) = action.split_once(':') else {
+        return action == ACTION_SCOPE_DECIDE;
+    };
+    if name != ACTION_SCOPE_DECIDE {
+        return false;
+    }
+    // `rest` is either `/abs/prefix` or `<member>:/abs/prefix`. A member never starts with
+    // `/` and never contains `:` (it is a plugin id), so the split is exact.
+    let (bound_member, prefix) = if rest.starts_with('/') {
+        (None, rest)
+    } else {
+        match rest.split_once(':') {
+            Some((m, p)) => (Some(m.trim()), p),
+            None => return false, // `scope.decide:legion-being` with no path binds nothing
+        }
+    };
+    if let Some(m) = bound_member {
+        if m.is_empty() || m != member {
+            return false;
+        }
+    }
+    let prefix = prefix.trim().trim_end_matches('/');
+    // An empty or relative prefix authorises nothing: `scope.decide:` would otherwise read
+    // as unbounded, which is the opposite of what typing a bound means.
+    if prefix.is_empty() || !prefix.starts_with('/') {
+        return false;
+    }
+    path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
 /// Parse a role name string into a SocietyRole.
@@ -100,9 +285,170 @@ pub fn parse_role(s: &str) -> Result<SocietyRole> {
     }
 }
 
+/// The delegator every delegation on this box is signed by: THE OPERATOR'S OWN KEY.
+///
+/// Preferred source is `<home>/operator.key` — the Ed25519 key the dashboard sign-in and the
+/// challenge-signed HTTP wall already treat as the operator (`state.rs` writes it 0600 at
+/// init). That is the identity an "operator delegation" is a delegation FROM, so it is the
+/// key that should sign one. Fallback is the vault's `ai_identity_secret` for a box that has
+/// an identity key but no operator key. Before #952 `delegate grant` signed with
+/// `KeyPair::generate()` and named a random UUID, so every record claimed a provenance it
+/// did not have. The delegator id is the UUIDv5 of the signing key's derived LCT id, so a
+/// reader can recompute who signed from the key alone.
+pub fn operator_delegator(vault: &crate::vault::Vault, home: &std::path::Path) -> Result<(Uuid, KeyPair)> {
+    let secret_hex: String = match std::fs::read_to_string(home.join("operator.key")) {
+        Ok(text) => {
+            let v: serde_json::Value = serde_json::from_str(&text).context("operator.key is not JSON")?;
+            v.get("secret_key_hex")
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("operator.key has no secret_key_hex"))?
+        }
+        Err(_) => vault
+            .get("ai_identity_secret")
+            .map(|e| e.secret.clone())
+            .ok_or_else(|| anyhow::anyhow!(
+                "no operator key on this box (neither <home>/operator.key nor the vault's \
+                 ai_identity_secret) — a delegation must be signed by the operator's own key, \
+                 not a throwaway"
+            ))?,
+    };
+    let bytes = hex::decode(secret_hex.trim()).context("operator key is not hex")?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("operator key is not 32 bytes"))?;
+    let kp = KeyPair::from_secret_bytes(&arr);
+    let lct_id = web4_core::derive_lct_id(&kp.verifying_key());
+    Ok((agent_key_for_lct(&lct_id), kp))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- #952: the first enforcement point, and the cases that would bite ----
+
+    fn store_with(actions: Vec<&str>) -> (DelegationStore, Uuid) {
+        let kp = KeyPair::generate();
+        let agent = Uuid::new_v4();
+        let mut st = DelegationStore::default();
+        st.create_delegation(
+            Uuid::new_v4(),
+            agent,
+            vec![],
+            actions.into_iter().map(String::from).collect(),
+            None,
+            &kp,
+        );
+        (st, agent)
+    }
+
+    /// The one sprout-claude flagged: a bare string prefix would also match the being next
+    /// door. `/…/instances/b` must never cover `/…/instances/bb`.
+    #[test]
+    fn prefix_is_separator_anchored_not_a_string_prefix() {
+        let a = "scope.decide:/home/dp/ws/instances/b";
+        assert!(action_covers(a, "/home/dp/ws/instances/b", "m"));
+        assert!(action_covers(a, "/home/dp/ws/instances/b/journal.md", "m"));
+        assert!(!action_covers(a, "/home/dp/ws/instances/bb", "m"));
+        assert!(!action_covers(a, "/home/dp/ws/instances/bb/journal.md", "m"));
+        assert!(!action_covers(a, "/home/dp/ws/instances", "m"));
+    }
+
+    /// A prefix alone is enough for a being's own home but not for a shared path, so the
+    /// `@member` form ANDs the two.
+    #[test]
+    fn member_bound_action_only_covers_that_member() {
+        let a = "scope.decide:legion-being:/home/dp/ws/shared-context";
+        assert!(action_covers(a, "/home/dp/ws/shared-context/forum", "legion-being"));
+        assert!(!action_covers(a, "/home/dp/ws/shared-context/forum", "sprout-being"));
+        assert!(!action_covers(a, "/home/dp/ws/other", "legion-being"));
+    }
+
+    #[test]
+    fn bare_action_is_unbounded_and_relative_or_empty_prefix_authorises_nothing() {
+        assert!(action_covers("scope.decide", "/anything/at/all", "m"));
+        assert!(!action_covers("scope.decide:", "/anything", "m"));
+        assert!(!action_covers("scope.decide:relative/path", "/relative/path", "m"));
+        assert!(!action_covers("scope.decide:legion-being", "/a", "m")); // member, no path
+        assert!(!action_covers("scope.decide::/a", "/a", "m"));          // empty member
+        // `@` is legal in a path and must never be read as a member separator
+        assert!(action_covers("scope.decide:/home/dp/mail@archive", "/home/dp/mail@archive/x", "m"));
+        assert!(!action_covers("scope.decide:/home/dp/mail@archive", "/home/dp/mail", "m"));
+        assert!(!action_covers("witness.attest:/a", "/a", "m"));
+    }
+
+    /// A delegation minted before this action existed must not silently gain the power to
+    /// widen a member's filesystem reach.
+    #[test]
+    fn unrestricted_and_role_only_delegations_confer_nothing() {
+        let kp = KeyPair::generate();
+        let agent = Uuid::new_v4();
+        let mut st = DelegationStore::default();
+        st.create_delegation(Uuid::new_v4(), agent, vec![], vec![], None, &kp); // unrestricted
+        st.create_delegation(
+            Uuid::new_v4(),
+            agent,
+            vec![SocietyRole::Administrator],
+            vec![],
+            None,
+            &kp,
+        );
+        assert!(st.scope_decide_authority_for(agent, "/home/dp/ws", "m").is_none());
+    }
+
+    #[test]
+    fn authority_requires_the_same_agent_and_survives_only_while_active() {
+        let (mut st, agent) = store_with(vec!["scope.decide:/home/dp/ws/x"]);
+        assert!(st
+            .scope_decide_authority_for(agent, "/home/dp/ws/x/journal.md", "m")
+            .is_some());
+        assert!(st
+            .scope_decide_authority_for(Uuid::new_v4(), "/home/dp/ws/x/journal.md", "m")
+            .is_none());
+        assert!(st.scope_decide_authority_for(agent, "/home/dp/ws/y", "m").is_none());
+        let id = st.delegations[0].id;
+        st.revoke(id).unwrap();
+        assert!(st
+            .scope_decide_authority_for(agent, "/home/dp/ws/x/journal.md", "m")
+            .is_none());
+    }
+
+    /// Keyed to the LCT, so the same seat resolves to the same key anywhere, and two seats
+    /// never collide.
+    /// HUB on #962: the signed bytes must say what was granted, not just which id. A
+    /// signature over "yes to scope-1" that could be verified against ANY request called
+    /// scope-1 attributes less than the record claims; naming the member and the path makes
+    /// the ruling's referent the signer's statement rather than the daemon's.
+    #[test]
+    fn arbitration_message_names_the_member_and_the_path_and_round_trips() {
+        let m = arbitration_message("scope-1", "legion-being", "/home/x/being", true, "why\nnot");
+        assert_eq!(
+            m,
+            "hestia:scope-arbitrate:v2\nscope-1\nlegion-being\n/home/x/being\ngranted\nwhy\nnot"
+        );
+        assert_eq!(
+            arbitration_subject(&m),
+            Some(("legion-being".to_string(), "/home/x/being".to_string()))
+        );
+        assert_ne!(
+            m,
+            arbitration_message("scope-1", "legion-being", "/home/x/other", true, "why\nnot"),
+            "a different path must be different bytes, or the signature says nothing about it"
+        );
+        // A v1-shaped hint, a wrong verdict word, or a relative path are not signable.
+        assert_eq!(arbitration_subject("hestia:scope-arbitrate:v1\nscope-1\ngranted\nwhy"), None);
+        assert_eq!(arbitration_subject("hestia:scope-arbitrate:v2\nscope-1\nm\n/p\ndenied\n"), None);
+        assert_eq!(arbitration_subject("hestia:scope-arbitrate:v2\nscope-1\nm\nrel\ngranted\n"), None);
+    }
+
+    #[test]
+    fn agent_key_is_deterministic_per_lct() {
+        let a = agent_key_for_lct("lct:web4:mb32:baaa");
+        assert_eq!(a, agent_key_for_lct("  lct:web4:mb32:baaa  "));
+        assert_ne!(a, agent_key_for_lct("lct:web4:mb32:bbbb"));
+    }
 
     #[test]
     fn test_create_and_list() {
