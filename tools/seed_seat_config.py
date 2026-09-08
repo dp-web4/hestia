@@ -22,6 +22,24 @@ box that is half-configured is a box somebody is configuring, and the missing ha
 choice this tool cannot read. Nothing is ever modified or deleted; the only write is the
 first one.
 
+THE ONE BOOTSTRAP PATH (#1001). This is the only tool that seeds the namespace, and its only
+write is one `POST /api/config/seed`, which the daemon commits all-or-nothing under its own
+lock. `tools/seat_config_ratchet.py` used to do the same job as three sequential PUTs — a
+failure after the first left a namespace neither empty nor complete, which this ratchet
+then correctly refused to touch, forever. That file is now a wrapper over this one, kept
+for the operators whose notes name it. Four lessons it carried came here with it:
+
+  * the workspace is never guessed. `--workspace`, else `HESTIA_WORKSPACE`, else a directory
+    that EXISTS among the known names; otherwise refuse. A cwd fallback once sent two seats
+    after a shared library that was present and correct the whole time;
+  * the endpoint written to the vault is the daemon's own `$HESTIA_HOME/endpoint`, and it
+    must be the MCP URL. A bare base URL in the vault shadows the endpoint file and fails as
+    a 405 that looks nothing like a config error;
+  * the EFFECT is verified, not the call: a document the daemon accepted but did not render
+    is the unbacked-projection state, and this exits non-zero on it;
+  * either Ed25519 backend signs the operator challenge (PyNaCl or `cryptography`); a seat
+    with one and not the other is still a seat.
+
     python3 tools/seed_seat_config.py            # measure, print the plan, change nothing
     python3 tools/seed_seat_config.py --apply    # write, only if the namespace is empty
 """
@@ -80,9 +98,38 @@ def declared_seats(repo: Path, home: Path) -> tuple[list[dict], list[str]]:
     return seats, skipped
 
 
-def shared_env(home: Path, hestia_home: Path, endpoint: str) -> dict:
-    workspace = next((p for p in (home / "ai-workspace", home / "ai-agents") if p.is_dir()),
-                     home / "ai-workspace")
+#: The workspace names a box may use, tried in order when nothing names one explicitly.
+#: Only a directory that EXISTS is taken — an absent one is never written into the vault.
+WORKSPACE_CANDIDATES = ("ai-workspace", "ai-agents")
+
+
+def resolve_workspace(home: Path, explicit: str | None) -> Path | None:
+    """The workspace this box's seats share, or None when it cannot be known.
+
+    An explicit name (flag or `HESTIA_WORKSPACE`) wins and must exist; otherwise the first
+    existing candidate under `home`. NEVER a default and never the cwd: the retired seeder's
+    hardest-won line was "if it cannot be resolved authoritatively, REFUSE rather than
+    guess", after a cwd fallback rendered `<cwd>/hestia_shell_classifier.py` as though it
+    were a configured location and sent two seats after a library that was fine.
+    """
+    if explicit:
+        candidate = Path(os.path.expanduser(explicit))
+        return candidate.resolve() if candidate.is_dir() else None
+    return next((home / name for name in WORKSPACE_CANDIDATES if (home / name).is_dir()), None)
+
+
+def endpoint_is_mcp(endpoint: str) -> bool:
+    """Whether an endpoint is the daemon's MCP URL — the only shape the vault may carry.
+
+    A seat's shim reads `HESTIA_ENDPOINT` straight from its projection and POSTs to it. The
+    base URL (`http://host:7711`) answers that with a 405, which reads as a daemon fault,
+    not as the config error it is. Measured on two seats before the retired seeder learned
+    to refuse it.
+    """
+    return endpoint.rstrip("/").endswith("/mcp") and "://" in endpoint
+
+
+def shared_env(home: Path, hestia_home: Path, endpoint: str, workspace: Path) -> dict:
     return {
         "HESTIA_HOME": str(hestia_home),
         "HESTIA_WORKSPACE": str(workspace),
@@ -125,16 +172,24 @@ def namespace_state(listing: dict | list) -> tuple[bool, list[str]]:
 
 
 def plan(listing, seats: list[dict], home: Path, hestia_home: Path, endpoint: str,
-         host: str) -> tuple[str, list[tuple[str, dict]]]:
+         host: str, workspace: str | None = None) -> tuple[str, list[tuple[str, dict]]]:
     """The whole decision, as a pure function so the ratchet can be tested without a daemon.
 
-    Returns `(verdict, documents)` where verdict is `seed`, `occupied` or `no-seats`.
+    Returns `(verdict, documents)` where verdict is `seed`, `occupied`, `no-seats`,
+    `no-workspace` or `bad-endpoint`. Refusals are ordered by what they cost to learn: an
+    occupied namespace first (nothing else matters), then the two facts that would have been
+    written WRONG rather than not at all.
     """
     shared_configured, configured = namespace_state(listing)
     if shared_configured or configured:
         return "occupied", []
+    if not endpoint_is_mcp(endpoint):
+        return "bad-endpoint", []
+    resolved = resolve_workspace(home, workspace)
+    if resolved is None:
+        return "no-workspace", []
     documents: list[tuple[str, dict]] = [
-        (SHARED_MEMBER, shared_env(home, hestia_home, endpoint))
+        (SHARED_MEMBER, shared_env(home, hestia_home, endpoint, resolved))
     ]
     for seat in seats:
         if seat["harness_home"].is_dir():
@@ -170,15 +225,30 @@ class Operator:
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"null")
 
-    def open_session(self) -> str:
-        from nacl.signing import SigningKey
+    @staticmethod
+    def _signer(seed: bytes):
+        """Ed25519 by whichever backend this seat has. Same key, same 64-byte signature.
 
+        `tools/gate-probe.py` uses PyNaCl; `cryptography` ships on more seats (a darwin seat
+        had only that). Requiring one of them is a seat's-worth of difference for nothing.
+        """
+        try:
+            from nacl.signing import SigningKey
+            return lambda message: SigningKey(seed).sign(message).signature
+        except ImportError:
+            try:
+                from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            except ImportError:
+                raise SystemExit("need an Ed25519 backend: pip install pynacl OR cryptography")
+            return Ed25519PrivateKey.from_private_bytes(seed).sign
+
+    def open_session(self) -> str:
         cred = json.loads(self.key_path.read_text())
-        signing = SigningKey(bytes.fromhex(cred["secret_key_hex"])[:32])
+        sign = self._signer(bytes.fromhex(cred["secret_key_hex"])[:32])
         status, challenge = self.call("POST", "/api/operator/challenge")
         if status != 200:
             raise SystemExit(f"operator challenge refused ({status})")
-        signature = signing.sign(challenge["challenge"].encode()).signature.hex()
+        signature = sign(challenge["challenge"].encode()).hex()
         status, session = self.call("POST", "/api/operator/session", {
             "lct_id": cred["lct_id"], "challenge": challenge["challenge"],
             "signature": signature,
@@ -189,9 +259,37 @@ class Operator:
         return session.get("operator") or cred["lct_id"]
 
 
+def verify_rendered(hestia_home: Path, documents: list[tuple[str, dict]]) -> list[str]:
+    """Which seeded seats have NO projection on disk, or one missing a seeded key.
+
+    The daemon accepted the documents; that is the call. The projection each seat reads is
+    the effect, and a 200 that rendered nothing is exactly the state this tool exists to
+    end. Shared keys render into every seat's file, so each seat file is checked for its
+    own keys and the shared ones.
+    """
+    shared = dict(documents).get(SHARED_MEMBER, {})
+    missing: list[str] = []
+    for member, env in documents:
+        if member == SHARED_MEMBER:
+            continue
+        rendered = hestia_home / "seats" / f"{member}.env"
+        try:
+            body = "\n" + rendered.read_text()
+        except OSError:
+            missing.append(f"{member}: {rendered} did not render")
+            continue
+        absent = [k for k in list(shared) + list(env) if f"\n{k}=" not in body]
+        if absent:
+            missing.append(f"{member}: rendered without {absent}")
+    return missing
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Seed an EMPTY seat-config namespace.")
     parser.add_argument("--apply", action="store_true", help="write (default is a dry run)")
+    parser.add_argument("--workspace", default=os.environ.get("HESTIA_WORKSPACE"),
+                        help="the shared workspace root (else HESTIA_WORKSPACE, else an "
+                             "existing ~/ai-workspace or ~/ai-agents; never guessed)")
     args = parser.parse_args(argv)
 
     # THE BOOTSTRAP LOCATOR IS SUPPLIED, NEVER GUESSED (#944, and the #987 review). A
@@ -220,6 +318,11 @@ def main(argv: list[str] | None = None) -> int:
     if not endpoint:
         print(f"{endpoint_file} is empty; refusing to invent an endpoint")
         return 2
+    if not endpoint_is_mcp(endpoint):
+        print(f"{endpoint_file} holds '{endpoint}', which is not the daemon's MCP URL. Written")
+        print("to the vault it would shadow the endpoint file and every seat would fail with a")
+        print("405 that looks like a daemon fault. Nothing is attempted.")
+        return 2
 
     operator = Operator(endpoint.rsplit("/mcp", 1)[0], hestia_home / "operator.key")
     who = operator.open_session()
@@ -236,8 +339,18 @@ def main(argv: list[str] | None = None) -> int:
     seats, skipped = declared_seats(REPO, home)
     for note in skipped:
         print(f"  ! skipped {note}")
-    verdict, documents = plan(listing, seats, home, hestia_home, endpoint, host)
+    verdict, documents = plan(listing, seats, home, hestia_home, endpoint, host,
+                              workspace=args.workspace)
 
+    if verdict == "no-workspace":
+        print("\nNO WORKSPACE RESOLVED — nothing is written. Pass --workspace, set")
+        print("  HESTIA_WORKSPACE, or have one of " + ", ".join(f"~/{n}" for n in WORKSPACE_CANDIDATES)
+              + " exist. This tool does not fall back to the cwd: that fallback is what made a")
+        print("  present-and-correct shared library report as missing on two seats.")
+        return 2
+    if verdict == "bad-endpoint":
+        print(f"\nENDPOINT '{endpoint}' is not the daemon's MCP URL — nothing is written.")
+        return 2
     if verdict == "occupied":
         print("\nNAMESPACE IS NOT EMPTY — nothing is written.")
         print("  This tool seeds a box that has never been configured. A box that is partly")
@@ -283,6 +396,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {verdict.get('member', '?'):14} {verdict.get('status', verdict)}")
     print(f"\nSeeded {result.get('seeded')} in one act "
           f"(intent {str(result.get('intentEntryHash'))[:12]}).")
+
+    # VERIFY THE EFFECT, not the call. The daemon renders `$HESTIA_HOME/seats/<seat>.env` as
+    # part of the same act; a seat whose file is absent or short is a seat that will refuse
+    # its next tool call while this tool has just said "seeded". Report it as the failure
+    # it is, so the operator learns it from this line and not from the seat.
+    unrendered = verify_rendered(hestia_home, documents)
+    if unrendered:
+        print("\nSEEDED BUT NOT RENDERED — the vault holds the documents and the seats cannot")
+        print("  read them yet. The daemon is the renderer; check it is current and running.")
+        for line in unrendered:
+            print(f"  ! {line}")
+        return 1
+    print("Every seeded seat's projection rendered with its keys.")
     print("The seats can act; the operator grants anything beyond the minimum.")
     return 0
 

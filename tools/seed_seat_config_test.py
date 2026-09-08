@@ -44,6 +44,7 @@ def main() -> int:
         # Two harness homes exist on this fixture box; two do not.
         (home / ".claude" / "hestia-instance").mkdir(parents=True)
         (home / ".codex").mkdir(parents=True)
+        (home / "ai-workspace").mkdir()      # the workspace must EXIST to be seeded (#1001)
         seats = [
             {"member": "claude-code", "harness_home": home / ".claude"},
             {"member": "codex", "harness_home": home / ".codex"},
@@ -94,6 +95,37 @@ def main() -> int:
         check("C the shared set is four society facts",
               sorted(shared) == ["HESTIA_ENDPOINT", "HESTIA_HOME", "HESTIA_SHARED_DIR",
                                  "HESTIA_WORKSPACE"], str(sorted(shared)))
+
+        print("C2. the two facts the retired seeder refused to guess are refused here too")
+        verdict, docs = seeder.plan(listing(False, []), seats, home, hestia_home,
+                                    "http://127.0.0.1:7711", "testbox")
+        check("C2 a base URL (no /mcp) is bad-endpoint, not a document",
+              verdict == "bad-endpoint" and docs == [], f"{verdict} {docs}")
+        verdict, docs = seeder.plan(listing(False, []), seats, *args,
+                                    workspace=str(home / "does-not-exist"))
+        check("C2 an explicit workspace that does not exist is no-workspace",
+              verdict == "no-workspace" and docs == [], f"{verdict} {docs}")
+        check("C2 no candidate on the box resolves to None, never to a made-up path",
+              seeder.resolve_workspace(home / "empty", None) is None)
+        verdict, docs = seeder.plan(listing(False, []), seats, *args,
+                                    workspace=str(home / "ai-workspace"))
+        check("C2 an explicit existing workspace is written as given",
+              verdict == "seed" and dict(docs)["_shared"]["HESTIA_WORKSPACE"]
+              == str((home / "ai-workspace").resolve()), str(docs[:1]))
+
+        print("C3. the effect is verified per seat, shared keys included")
+        seats_dir = hestia_home / "seats"
+        seats_dir.mkdir(parents=True)
+        shared_env, seat_env = dict(docs)["_shared"], dict(docs)["claude-code"]
+        (seats_dir / "claude-code.env").write_text(
+            "\n".join(f"{k}={v}" for k, v in {**shared_env, **seat_env}.items()) + "\n")
+        missing = seeder.verify_rendered(hestia_home, docs)
+        check("C3 the seat with a full projection passes; the seat with none is named",
+              len(missing) == 1 and missing[0].startswith("codex:"), str(missing))
+        (seats_dir / "claude-code.env").write_text("HESTIA_PLUGIN_ID=claude-code\n")
+        missing = seeder.verify_rendered(hestia_home, docs)
+        check("C3 a projection missing a SHARED key is reported, not passed on the 200",
+              any(m.startswith("claude-code:") and "HESTIA_HOME" in m for m in missing), str(missing))
 
         print("D. a box with no seat is not seeded at all")
         bare = [{"member": "kimi-code", "harness_home": home / ".kimi-code"}]
