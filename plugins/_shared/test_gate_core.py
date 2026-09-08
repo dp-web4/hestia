@@ -363,6 +363,18 @@ def test_path_grants_keep_their_type_and_match_resolved_boundaries():
     ev = G.NormalizedEvent(tool="Read", paths=[os.path.join(deep, "note.md")], cwd=ws)
     check("workspace_root_exact_grant_does_not_admit_descendant",
           G.evaluate(ev, root_exact, ws).blocks)
+    # 2026-09-08: the deny must SAY the grant is exact. Three seats on one box were refused
+    # `<ws>/<repo>` under an exact `<ws>` grant the same afternoon, and the message named the
+    # grant in its "granted:" list as if it should have reached — nothing said why it did not.
+    v = G.evaluate(ev, root_exact, ws)
+    real_root = "path:" + os.path.realpath(ws)
+    check("exact_root_deny_names_the_exact_grant_and_the_recursive_spelling",
+          real_root + " is EXACT" in v.reason and real_root + "/**" in v.reason, v.reason)
+    v = G.evaluate(G.NormalizedEvent(tool="Bash", command=f"cat {deep}/note.md", cwd=ws),
+                   root_exact, ws)
+    check("exact_root_shell_deny_names_the_exact_grant",
+          v.blocks and real_root + " is EXACT" in v.reason and real_root + "/**" in v.reason,
+          v.reason)
     root = _profile(ws, [root_entry + "/**"])
     check("workspace_root_recursive_grant_admits_descendant",
           G.evaluate(ev, root, ws).decision == "allow")
@@ -378,6 +390,9 @@ def test_path_grants_keep_their_type_and_match_resolved_boundaries():
     ev = G.NormalizedEvent(tool="Read", paths=[os.path.join(deep, "child.txt")], cwd=ws)
     check("deep_directory_exact_grant_does_not_admit_child",
           G.evaluate(ev, exact, ws).blocks)
+    v = G.evaluate(ev, exact, ws)
+    check("deep_exact_deny_names_the_deep_grant_it_lies_beneath",
+          "path:" + os.path.realpath(deep) + " is EXACT" in v.reason, v.reason)
     narrow = _profile(_workspace(), [deep_entry + "/**"])
     check("deep_directory_recursive_grant_admits_child",
           G.evaluate(ev, narrow, ws).decision == "allow")
@@ -387,6 +402,11 @@ def test_path_grants_keep_their_type_and_match_resolved_boundaries():
 
     ev = G.NormalizedEvent(tool="Read", paths=[os.path.join(sibling, "loot")], cwd=ws)
     check("path_prefix_sibling_is_not_a_descendant", G.evaluate(ev, narrow, ws).blocks)
+    # The hint is owed only when an exact grant CONTAINS the path. A sibling of a recursive
+    # grant is outside every grant: no exact root to name, so no sentence claiming one.
+    v = G.evaluate(ev, narrow, ws)
+    check("a_path_beneath_no_exact_grant_gets_no_exact_grant_hint",
+          "is EXACT" not in v.reason, v.reason)
     ev = G.NormalizedEvent(tool="Bash", command=f"cat {sibling}/loot", cwd=ws)
     check("shell_path_prefix_sibling_is_not_a_descendant", G.evaluate(ev, narrow, ws).blocks)
 
