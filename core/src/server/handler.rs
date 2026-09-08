@@ -674,8 +674,14 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
     // Connect idempotency (HUB ruling 2026-07-24): the claude-code hook connects on EVERY tool call
     // (fresh MCP connection per hook subprocess), so without this each tool call mints a distinct
     // session — an interactive session becomes ephemeral churn invisible to coordination. If the caller
-    // supplies a stable `host_session_id` and a live session already carries it, REUSE that session so
-    // one host session = one stable hestia session.
+    // supplies a stable `host_session_id` and a live session for the SAME member already carries it,
+    // REUSE that session so one member's host session = one stable hestia session. Host-session ids
+    // are correlation evidence written onto the public witness chain; they are neither globally
+    // unique across harnesses nor bearer credentials. Looking up by that field alone handed a caller
+    // using another `plugin_id` the first matching member's exact session bearer. At A1 `plugin_id`
+    // is still asserted; proof-of-possession is the stronger identity boundary (#907). Scoping this
+    // convenience lookup to the currently claimed member prevents the reuse mechanism itself from
+    // crossing the identity grain it stores.
     //   Guard A — reuse is LIVENESS-ONLY and CAPABILITY-INVARIANT: bump `connected_at` and NOTHING else;
     //     return the SAME `soft_lct`/role; never re-issue an LCT, change role, or adopt a new agent.
     //   Not witnessed — local, RAM-only (host_session_id is already witnessed at begin_action grain).
@@ -684,7 +690,9 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
         if let Some(existing) = s
             .sessions
             .values_mut()
-            .find(|sess| sess.host_session_id.as_deref() == Some(hsid))
+            .find(|sess| {
+                sess.plugin_id == plugin_id && sess.host_session_id.as_deref() == Some(hsid)
+            })
         {
             existing.connected_at = Utc::now(); // Guard A: liveness only — no other field mutates
             // Guard A means a reused session keeps the role it was MINTED with — this
@@ -11594,9 +11602,47 @@ mod tests {
         assert!(!body.contains("lct:test"), "soft_lct (bearer) must be redacted: {body}");
     }
 
-    /// Connect idempotency (HUB ruling): a stable host_session_id reuses the live session instead of
-    /// minting churn per tool call. Guard A: reuse is liveness-only + capability-invariant — same
-    /// session_id, same soft_lct; a distinct host_session_id is a distinct session.
+    /// A host-session id is a per-member correlation key, not a global session bearer.
+    ///
+    /// This arm was run red before the member predicate existed: `other-member` received the exact
+    /// `sessionId` minted for `victim`, and the state still contained only the victim's session.
+    /// Since host-session ids are written onto the witness chain, that made the convenience lookup
+    /// cross the very principal boundary its returned bearer is later used to prove.
+    #[tokio::test]
+    async fn connect_reuse_is_scoped_to_the_claimed_member() {
+        let (_dir, shared) = make_shared_state();
+        let victim = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "victim", "host_agent": "victim-host",
+                "host_session_id": "public-host-session"
+            }),
+        )
+        .await
+        .unwrap();
+        let victim_sid = victim["sessionId"].as_str().unwrap().to_string();
+
+        let other = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "other-member", "host_agent": "other-host",
+                "host_session_id": "public-host-session"
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(
+            other["sessionId"].as_str().unwrap(),
+            victim_sid.as_str(),
+            "a host_session_id is public correlation evidence, not a cross-member bearer token"
+        );
+        let s = shared.lock().await;
+        assert_eq!(s.sessions.len(), 2);
+        assert!(s.sessions.values().any(|session| session.plugin_id == "victim"));
+        assert!(s.sessions.values().any(|session| session.plugin_id == "other-member"));
+    }
+
     #[tokio::test]
     async fn connect_reuses_session_on_host_session_id_liveness_only() {
         let (_dir, shared) = make_shared_state();
