@@ -3,6 +3,7 @@
     "PreToolUse"
   ],
   "install": {
+    "member": "claude-code",
     "dest": "~/.claude/hooks/hestia",
     "registration": {
       "reader": "json-hook-commands",

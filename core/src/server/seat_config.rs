@@ -559,6 +559,31 @@ pub fn verify_one(home: &Path, member: &str, cfg: &SeatConfig) -> ConfigVerdict 
 /// The union of the three is the honest domain: what the vault declares, what has connected,
 /// and what is already written on disk. Sorted and de-duplicated so a pass is deterministic and
 /// two runs produce the same order of chain rows.
+/// Does the vault declare NOTHING for any seat — no shared set, no seat document?
+///
+/// The precondition of seeding (#987), and deliberately about the VAULT alone. A rendered
+/// artifact on disk with no document behind it is an unbacked projection, which the worker
+/// quarantines; it is not evidence that the authority is occupied, and treating it as such
+/// would make a box unseedable because of a file the vault already disowns.
+pub fn namespace_is_empty(vault: &crate::vault::Vault) -> bool {
+    !vault
+        .document_index()
+        .iter()
+        .any(|item| item.namespace == SEAT_CONFIG_NS)
+}
+
+/// Every member the vault declares, shared set included, for saying WHAT occupies a namespace.
+pub fn declared_members(vault: &crate::vault::Vault) -> Vec<String> {
+    let mut names: Vec<String> = vault
+        .document_index()
+        .into_iter()
+        .filter(|item| item.namespace == SEAT_CONFIG_NS)
+        .map(|item| item.name)
+        .collect();
+    names.sort();
+    names
+}
+
 pub fn members_to_check(vault: &crate::vault::Vault, home: &Path, connected: &[String]) -> Vec<String> {
     let mut set: std::collections::BTreeSet<String> = connected.iter().cloned().collect();
 

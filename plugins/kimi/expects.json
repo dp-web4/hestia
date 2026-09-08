@@ -3,6 +3,7 @@
     "PreToolUse"
   ],
   "install": {
+    "member": "kimi-code",
     "dest": "~/.kimi-code/hooks",
     "registration": {
       "reader": "toml-hook-commands",

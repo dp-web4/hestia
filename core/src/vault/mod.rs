@@ -331,6 +331,34 @@ impl Vault {
         self.save()
     }
 
+    /// Store SEVERAL master-tier documents as ONE commit: all of them land, or none does.
+    ///
+    /// `put_document` saves per call, so a caller writing a set writes a sequence of commits,
+    /// and a failure partway leaves the vault holding a prefix of what was intended. For an
+    /// initialisation that claims to be all-or-none (`#987`: seeding an empty seat-config
+    /// namespace) a prefix is the worst outcome available — it is neither the old state nor
+    /// the new one, and a ratchet that refuses non-empty namespaces can then never repair it.
+    ///
+    /// The vault file is written whole, so staging every document and saving once IS the
+    /// atomic commit. On a failed save the in-memory index is rolled back to its snapshot, so
+    /// memory and disk still agree: without that, a caller that ignored the error would go on
+    /// serving documents the vault does not contain.
+    pub fn put_documents(&mut self, namespace: &str, entries: &[(String, Vec<u8>)]) -> Result<()> {
+        let snapshot = self.data.documents.clone();
+        for (name, bytes) in entries {
+            let doc = Document::master(namespace, name, bytes.clone());
+            match self.doc_pos(namespace, name) {
+                Some(i) => self.data.documents[i] = doc,
+                None => self.data.documents.push(doc),
+            }
+        }
+        if let Err(e) = self.save() {
+            self.data.documents = snapshot;
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Read a master-tier document's bytes. `None` if absent or sealed (use
     /// [`open_document`](Self::open_document) for sealed items).
     pub fn get_document(&self, namespace: &str, name: &str) -> Option<&[u8]> {

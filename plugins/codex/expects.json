@@ -3,6 +3,7 @@
     "PreToolUse"
   ],
   "install": {
+    "member": "codex",
     "dest": "~/.codex/hooks",
     "registration": {
       "reader": "toml-hook-commands",
