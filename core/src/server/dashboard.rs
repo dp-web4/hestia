@@ -1450,6 +1450,7 @@ impl ServerState {
                             "origin": "member_request",
                             "expires_at": r.expires_at,
                             "secs_remaining": r.expires_at.saturating_sub(now),
+                            "recursive": r.recursive,
                             "durability": "memory-only — the next daemon restart revokes this",
                         })
                     })
@@ -1465,6 +1466,7 @@ impl ServerState {
                             "requested_because": serde_json::Value::Null,
                             "granted_by": g.granted_by,
                             "request_id": g.request_id,
+                            "recursive": g.recursive,
                             // The distinction the route table argues for: a grant that
                             // ratified a member's ask carries that ask's id; one the operator
                             // originated carries none. Derived, never stored twice.
@@ -1690,6 +1692,7 @@ mod tests {
             decided_by: granted.map(|_| "operator".to_string()),
             decided_at: granted.map(|_| now),
             decision_reason: None,
+            recursive: false,
         };
 
         state.scope_requests.insert(

@@ -542,6 +542,35 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/http.rs::scope_standing_revoke", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
+    // ADDED 2026-09-08 (legion-claude, dp's "make standing" / "make recursive" buttons).
+    // The census went red on the full `cargo test` after `--lib` was green — the exact
+    // trap this file's header describes, and the reason the branch was not pushed on
+    // the `--lib` result.
+    //
+    // READING, both questions. (1) Who gets named? The subject of a `scope_grant_intent`
+    // and, after the vault commit, a `scope_granted` entry — the member whose LIVE grant is
+    // being made durable. TWO IDENTICAL LINES for the same reason as `scope_decide`: the
+    // intent record and the success record each name the subject, and the success is
+    // appended only after the commit landed. `plugin_id` is operator-typed here
+    // (HST-005 caveat unchanged), but a mismatch 404s on the live-grant lookup before either
+    // line runs. (2) Compared to decide control flow? No — the promotion keys on the live
+    // request's `(plugin_id, path)` strings; the derived LCT is serialised into the two
+    // witness entries and read by nothing. Naming.
+    ("server/http.rs::scope_standing_promote", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
+    // READING, both questions. (1) Who gets named? The subject of a
+    // `scope_reach_change_intent` and, after the vault commit, a `scope_reach_changed`
+    // entry — the member whose grant is being widened to its subtree or narrowed back to
+    // exact. Derived ONCE into a local and serialised into both records (GPT review of
+    // #1002, blocker 2: the first cut witnessed completion before the durable effect; the
+    // rewrite is intent -> commit -> terminal, so one derivation feeds two records).
+    // (2) Compared to decide control flow? No — keyed on `(member, path)` strings against
+    // both stores; the LCT is serialised and read by nothing. Naming.
+    ("server/http.rs::scope_standing_recursive", &[
+        "let subject = s.member_lct(&plugin_id);",
+    ], SiteClass::Naming),
     // ADDED 2026-08-15 (claude-code, the operator-originated grant `POST /api/scope/grant`).
     // The census went red the moment the site was written — the instrument working, and it
     // caught a change I had already convinced myself was verified: I had run only

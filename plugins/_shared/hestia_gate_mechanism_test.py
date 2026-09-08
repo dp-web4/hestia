@@ -172,10 +172,12 @@ def test_standing_grant_becomes_admitting_scope_with_certification():
             "hestia_scope_status": {
                 "plugin_id": "kimi-code", "requests": [], "live_grants": [],
                 "standing_grants": [
-                    {"path": ws + "/web4", "granted_by": "operator",
-                     "reason": "standing repo grant", "expires_at": None},
+                    {"path": ws + "/web4", "granted_by": "operator", "recursive": True,
+                     "reason": "standing repo grant, whole tree", "expires_at": None},
                     {"path": ws + "/web4/deep/file.txt", "granted_by": "operator",
                      "reason": "file grant stays a path grant", "expires_at": None},
+                    {"path": ws + "/exactrepo", "granted_by": "operator",
+                     "reason": "an EXACT grant on a workspace-direct repo root", "expires_at": None},
                 ],
                 "generation": 4,
                 "snapshot_expires_at": horizon},
@@ -184,10 +186,19 @@ def test_standing_grant_becomes_admitting_scope_with_certification():
         m._McpHttp = lambda ep, dl: fake
         snap = m.fetch_policy_snapshot("kimi-code", use_cache=False)
         check("standing_snap_present", isinstance(snap, dict), repr(snap))
-        check("standing_repo_root_maps_to_name", "web4" in snap["in_scope"], str(snap))
+        check("standing_recursive_repo_root_maps_to_name", "web4" in snap["in_scope"], str(snap))
         check("standing_deep_path_stays_path",
               ("path:" + ws + "/web4/deep/file.txt") in snap["in_scope"], str(snap))
-        check("standing_list_carried", len(snap["standing_grants"]) == 2, str(snap))
+        # GPT review of #1002, blocker 1: the mapper used to turn EVERY workspace-direct root
+        # into the bare repo name — whole-repo by construction — so an EXACT grant on
+        # /ws/exactrepo admitted /ws/exactrepo/child at the gate while the daemon's
+        # covers_path() said it reached /ws/exactrepo alone. The exact form must survive the
+        # mapper as a `path:` entry, and it must NOT be spelled recursive.
+        check("standing_exact_repo_root_stays_a_path_entry",
+              ("path:" + ws + "/exactrepo") in snap["in_scope"]
+              and "exactrepo" not in snap["in_scope"]
+              and ("path:" + ws + "/exactrepo/**") not in snap["in_scope"], str(snap))
+        check("standing_list_carried", len(snap["standing_grants"]) == 3, str(snap))
         check("standing_generation", snap["generation"] == 4, str(snap))
         check("standing_expires_at", snap["expires_at"] == horizon, str(snap))
 
@@ -198,6 +209,21 @@ def test_standing_grant_becomes_admitting_scope_with_certification():
         check("standing_scope_admits_name", "web4" in pol.scope, str(pol))
         check("standing_cert_generation", pol.generation == 4, str(pol))
         check("standing_cert_expires_at", pol.expires_at == horizon, str(pol))
+        # THE FALSIFIER, through the production composition (daemon rows -> snapshot ->
+        # _scope_entry_for_grant -> resolve_agent_policy -> the gate's containment), not a
+        # hand-authored entry: an exact root denies its child, a recursive root admits it.
+        # Asserted on `_within_path_grant`, the containment path_in_scope uses for `path:`
+        # entries, rather than on path_in_scope itself: this workspace is a tempdir, and
+        # path_in_scope admits anything under the temp root BEFORE consulting grants — a
+        # confound that made the first version of this check pass for the wrong reason.
+        check("exact_repo_root_grant_admits_itself",
+              core._within_path_grant(ws + "/exactrepo", pol.scope, ws), str(pol.scope))
+        check("exact_repo_root_grant_DENIES_its_child_through_the_real_mapping",
+              not core._within_path_grant(ws + "/exactrepo/child.rs", pol.scope, ws),
+              str(pol.scope))
+        check("recursive_repo_root_grant_ADMITS_its_child_through_the_real_mapping",
+              core.path_in_scope(ws + "/web4/anything.rs", pol.scope, ws, prof, None)
+              and "web4" in pol.scope, str(pol.scope))
         check("standing_path_in_scope_admits",
               core.path_in_scope(ws + "/web4/anything.rs", pol.scope, ws, prof, None),
               f"scope={pol.scope} ws={ws}")
@@ -240,8 +266,13 @@ def test_society_floor_is_uniform_and_admitting_for_two_members():
         check("floor_digest_identical",
               kimi["society_floor_digest"] == codex["society_floor_digest"] == digest,
               f"kimi={kimi} codex={codex}")
+        # The floor is EXACT at the gate, as it always was at the daemon (`floor_allows`
+        # compares `f.path == path`). Mapping the floor root to a whole-repo name was the
+        # same daemon/gate seam #1002 closes for grants; a FloorEntry has no `recursive`
+        # flag yet, so a floor that should be a tree is a follow-up, not a silent default.
         check("floor_maps_for_both",
-              "web4" in kimi["in_scope"] and "web4" in codex["in_scope"],
+              ("path:" + floor_path) in kimi["in_scope"] and ("path:" + floor_path) in codex["in_scope"]
+              and "web4" not in kimi["in_scope"],
               f"kimi={kimi} codex={codex}")
         # Codex has no personal grant in the daemon response; the floor alone still admits.
         codex["standing_grants"] = []
@@ -249,9 +280,14 @@ def test_society_floor_is_uniform_and_admitting_for_two_members():
         profile = core.HarnessProfile(member_id="codex",
                                       identity_path="/nonexistent/identity.json")
         policy = core.resolve_agent_policy(profile, vault_reader=lambda mid: codex)
-        check("zero_personal_still_admits_floor",
-              core.path_in_scope(floor_path + "/src/lib.rs", policy.scope, ws, profile, None),
-              str(policy))
+        check("floor_alone_admits_the_floor_path",
+              core._within_path_grant(floor_path, policy.scope, ws), str(policy.scope))
+        # EXACT: the floor reaches the floor path, not what is under it — at the gate as at
+        # the daemon. Asserted on the containment function rather than path_in_scope, whose
+        # temp-root rule admits this tempdir workspace before grants are consulted.
+        check("floor_alone_does_not_admit_a_child_of_the_floor_path",
+              not core._within_path_grant(floor_path + "/src/lib.rs", policy.scope, ws),
+              str(policy.scope))
     finally:
         if old is None:
             os.environ.pop("HESTIA_WORKSPACE", None)
@@ -300,7 +336,7 @@ def test_live_grant_repo_root_maps_via_shared_resolver():
     old = os.environ.get("HESTIA_WORKSPACE")
     os.environ["HESTIA_WORKSPACE"] = ws
     try:
-        snap = _fetch_with(_std_stub(ws, live=[{"path": ws + "/web4",
+        snap = _fetch_with(_std_stub(ws, live=[{"path": ws + "/web4", "recursive": True,
                                                 "expires_at": int(time.time()) + 600}]))
         check("live_root_maps", "web4" in snap["in_scope"], str(snap))
     finally:
@@ -319,7 +355,7 @@ def test_workspace_mapping_discovers_root_without_env():
     old_cwd = os.getcwd()
     os.chdir(ws)
     try:
-        snap = _fetch_with(_std_stub(ws, standing=[{"path": ws + "/web4",
+        snap = _fetch_with(_std_stub(ws, standing=[{"path": ws + "/web4", "recursive": True,
                                                     "granted_by": "operator",
                                                     "reason": "r", "expires_at": None}]))
         check("discovered_root_maps", "web4" in snap["in_scope"], str(snap))
@@ -338,7 +374,7 @@ def test_workspace_mapping_invalid_env_falls_back_to_discovery():
     old_cwd = os.getcwd()
     os.chdir(ws)
     try:
-        snap = _fetch_with(_std_stub(ws, standing=[{"path": ws + "/web4",
+        snap = _fetch_with(_std_stub(ws, standing=[{"path": ws + "/web4", "recursive": True,
                                                     "granted_by": "operator",
                                                     "reason": "r", "expires_at": None}]))
         check("invalid_env_discovered", "web4" in snap["in_scope"], str(snap))
@@ -363,7 +399,7 @@ def test_cached_snapshot_refused_after_bounded_horizon():
         soon = int(time.time()) + 60
         snap = _fetch_with(_std_stub(
             ws,
-            standing=[{"path": ws + "/web4", "granted_by": "operator",
+            standing=[{"path": ws + "/web4", "granted_by": "operator", "recursive": True,
                        "reason": "short grant", "expires_at": soon}],
             generation=7, horizon=soon))
         check("horizon_carried", snap["expires_at"] == soon, str(snap))

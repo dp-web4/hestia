@@ -812,6 +812,15 @@
   .grant-preset { color: var(--warning); font-size: 0.78rem; }
   .grant-why { color: var(--fg-dim); font-size: 0.74rem; flex-basis: 100%; }
   .grant-ttl { margin-left: auto; font-size: 0.72rem; color: var(--fg-dim); white-space: nowrap; }
+  /* dp's two buttons (2026-09-08). "make standing": a LIVE grant dies with the daemon, and
+     an operator who has watched it used well should not re-decide it from a fresh ask after
+     every restart. "make recursive": exact is the DEFAULT — a grant on a directory reaches
+     that directory — and the subtree is an explicit, witnessed widening the operator has
+     read the word for. The reach badge (/**) renders only when it is true. */
+  .grant-act { background: transparent; color: var(--accent); border: 1px solid var(--accent);
+    border-radius: 4px; font-size: 11px; padding: 2px 8px; cursor: pointer; margin-left: 6px; }
+  .grant-act:hover { filter: brightness(1.2); }
+  .grant-reach { color: var(--accent); margin-left: 2px; font-weight: 600; }
   .grant-revoke { background: transparent; color: var(--coral); border: 1px solid var(--coral);
     border-radius: 4px; padding: 0.15rem 0.6rem; font: inherit; font-size: 0.72rem; cursor: pointer; }
 
@@ -3241,10 +3250,18 @@
         <div class="grant-row">
           <span class="grant-who">${escapeHtml(String(g.plugin_id ?? '?'))}</span>
           <span class="grant-preset${live ? '' : ' scope-standing'}">${live ? 'LIVE' : 'STANDING'}</span>
-          <code>${escapeHtml(String(g.path ?? ''))}</code>
+          <code>${escapeHtml(String(g.path ?? ''))}${g.recursive ? '<span class="grant-reach" title="reaches the whole subtree">/**</span>' : ''}</code>
           <span class="grant-ttl">${escapeHtml(when)}</span>
           <span class="grant-why">${escapeHtml(origin)}${
             g.reason ? ' · ' + escapeHtml(String(g.reason)) : ''}</span>
+          ${live ? `<button class="grant-act" data-promote-member="${
+            escapeHtml(String(g.plugin_id))}" data-promote-path="${
+            escapeHtml(String(g.path))}" title="write this grant to the vault so it survives a daemon restart">make standing</button>` : ''}
+          <button class="grant-act" data-reach-member="${
+            escapeHtml(String(g.plugin_id))}" data-reach-path="${
+            escapeHtml(String(g.path))}" data-reach-to="${g.recursive ? 'false' : 'true'}" title="${
+            g.recursive ? 'narrow this grant back to exactly its path' : 'widen this grant to everything under its path'}">${
+            g.recursive ? 'make exact' : 'make recursive'}</button>
           ${live ? '' : `<button class="grant-revoke" data-revoke-member="${
             escapeHtml(String(g.plugin_id))}" data-revoke-path="${
             escapeHtml(String(g.path))}">revoke</button>`}
@@ -4210,6 +4227,46 @@
     pane.addEventListener('click', async (e) => {
       const open = e.target.closest('[data-open-scope]');
       if (open) { $('scope-modal').hidden = false; return; }
+      // make standing — POST /api/scope/standing/promote
+      const pro = e.target.closest('[data-promote-member]');
+      if (pro) {
+        const member = pro.dataset.promoteMember, p = pro.dataset.promotePath;
+        const why = prompt(`Make this grant STANDING for ${member}?\n\n${p}\n\nIt will survive daemon restarts until revoked. Reason (blank = keep the live grant's reason):`);
+        if (why === null) return;
+        pro.disabled = true; err.hidden = true;
+        try {
+          const res = await apiFetch('/api/scope/standing/promote', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ plugin_id: member, path: p, reason: why }),
+          });
+          const out = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+          await tick(); renderScopeGrants(lastData);
+        } catch (e2) { err.textContent = `make standing failed: ${e2.message}`; err.hidden = false; pro.disabled = false; }
+        return;
+      }
+      // make recursive / make exact — POST /api/scope/standing/recursive
+      const rch = e.target.closest('[data-reach-member]');
+      if (rch) {
+        const member = rch.dataset.reachMember, p = rch.dataset.reachPath;
+        const to = rch.dataset.reachTo === 'true';
+        const why = to
+          ? prompt(`Make this grant RECURSIVE for ${member}?\n\n${p}\n\nIt will reach everything under this path. Reason (required):`)
+          : (confirm(`Narrow this grant back to EXACTLY ${p} for ${member}?`) ? '' : null);
+        if (why === null) return;
+        if (to && !why.trim()) { err.textContent = 'a reason is required to widen a grant'; err.hidden = false; return; }
+        rch.disabled = true; err.hidden = true;
+        try {
+          const res = await apiFetch('/api/scope/standing/recursive', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ plugin_id: member, path: p, recursive: to, reason: why }),
+          });
+          const out = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+          await tick(); renderScopeGrants(lastData);
+        } catch (e2) { err.textContent = `${to ? 'make recursive' : 'make exact'} failed: ${e2.message}`; err.hidden = false; rch.disabled = false; }
+        return;
+      }
       const rev = e.target.closest('[data-revoke-member]');
       if (!rev) return;
       const member = rev.dataset.revokeMember, p = rev.dataset.revokePath;

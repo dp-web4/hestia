@@ -163,13 +163,22 @@ pub struct ScopeRequest {
     pub decided_by: Option<String>,
     pub decided_at: Option<u64>,
     pub decision_reason: Option<String>,
+    /// Set by the OPERATOR at decide time, never by the asking member: a request names one
+    /// path (the doc comment above still holds), and whether the answer reaches the subtree
+    /// under it is the operator's explicit choice. Exact by default (dp, 2026-09-08).
+    #[serde(default)]
+    pub recursive: bool,
 }
 
 impl ScopeRequest {
     /// Live = granted, and not past its window. A refused or expired request grants nothing,
     /// and an unanswered one grants nothing — the default is always the standing MRH.
+    /// Reach is by the grant's own rule (`covers_path`): exact unless the operator made it
+    /// recursive — the same rule the standing store uses, so the two channels agree.
     pub fn grants(&self, path: &str, now: u64) -> bool {
-        self.granted == Some(true) && now < self.expires_at && self.path == path
+        self.granted == Some(true)
+            && now < self.expires_at
+            && crate::server::standing_scope::covers_path(&self.path, self.recursive, path)
     }
 
     /// One word for the whole record. `expires_at` means the same thing in both phases — the
@@ -1999,6 +2008,7 @@ mod tests {
             reason: "forced-failure fixture".into(),
             expires_at: None,
             request_id: None,
+        recursive: false,
         }
     }
 

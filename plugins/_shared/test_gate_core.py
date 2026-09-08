@@ -324,8 +324,14 @@ def test_path_grant_reaches_a_sibling_of_the_repos():
     without = _profile(ws, ["repo:granted"])
     check("sibling_denied_without_path_grant", G.evaluate(ev, without, ws).blocks)
 
-    with_grant = _profile(_workspace(), ["repo:granted", "path:.git-inbox"])
-    check("sibling_allowed_with_path_grant",
+    # EXACT BY DEFAULT (dp, 2026-09-08): a bare `path:` grant reaches exactly that path, so
+    # a grant on `.git-inbox` does not admit `.git-inbox/submissions`. The subtree is the
+    # operator's explicit act, spelled `/**` in the entry.
+    exact = _profile(_workspace(), ["repo:granted", "path:.git-inbox"])
+    check("sibling_dir_grant_is_exact_and_does_not_admit_its_child",
+          G.evaluate(ev, exact, ws).blocks)
+    with_grant = _profile(_workspace(), ["repo:granted", "path:.git-inbox/**"])
+    check("sibling_allowed_with_recursive_path_grant",
           G.evaluate(ev, with_grant, ws).decision == "allow")
 
 
@@ -335,9 +341,10 @@ def test_path_grants_keep_their_type_and_match_resolved_boundaries():
     inert: the parser stripped ``path:``, then the matcher compared the resulting absolute
     string with a first repo segment.
 
-    Pin the two properties the operator actually granted: a path reaches itself and its
-    descendants, and never a sibling that merely shares its textual prefix. Exercise both
-    explicit path tools and the shell's absolute-path pass; fixing only one leaves the seat
+    Pin the two properties the operator actually granted: a path reaches itself — and its
+    descendants ONLY when the grant is spelled recursive (`/**`; dp 2026-09-08: exact is the
+    default, recursive the option) — and never a sibling that merely shares its textual
+    prefix. Exercise both explicit path tools and the shell's absolute-path pass; fixing only one leaves the seat
     disabled on its next Bash call.
     """
     ws = _workspace()
@@ -351,22 +358,31 @@ def test_path_grants_keep_their_type_and_match_resolved_boundaries():
     check("path_type_survives_policy_parse",
           G._parse_scope_entries([root_entry]) == (root_entry,),
           repr(G._parse_scope_entries([root_entry])))
-    root = _profile(ws, [root_entry])
-
+    # exact root grant: reaches the root, not what is under it
+    root_exact = _profile(ws, [root_entry])
     ev = G.NormalizedEvent(tool="Read", paths=[os.path.join(deep, "note.md")], cwd=ws)
-    check("workspace_root_grant_admits_descendant",
+    check("workspace_root_exact_grant_does_not_admit_descendant",
+          G.evaluate(ev, root_exact, ws).blocks)
+    root = _profile(ws, [root_entry + "/**"])
+    check("workspace_root_recursive_grant_admits_descendant",
           G.evaluate(ev, root, ws).decision == "allow")
     ev = G.NormalizedEvent(tool="Bash", command=f"cat {deep}/note.md", cwd=ws)
-    check("workspace_root_grant_admits_absolute_shell_path",
+    check("workspace_root_recursive_grant_admits_absolute_shell_path",
           G.evaluate(ev, root, ws).decision == "allow")
 
     deep_entry = "path:" + deep
-    narrow = _profile(_workspace(), [deep_entry])
+    exact = _profile(_workspace(), [deep_entry])
+    ev = G.NormalizedEvent(tool="Read", paths=[deep], cwd=ws)
+    check("deep_directory_exact_grant_admits_itself",
+          G.evaluate(ev, exact, ws).decision == "allow")
     ev = G.NormalizedEvent(tool="Read", paths=[os.path.join(deep, "child.txt")], cwd=ws)
-    check("deep_directory_grant_admits_child",
+    check("deep_directory_exact_grant_does_not_admit_child",
+          G.evaluate(ev, exact, ws).blocks)
+    narrow = _profile(_workspace(), [deep_entry + "/**"])
+    check("deep_directory_recursive_grant_admits_child",
           G.evaluate(ev, narrow, ws).decision == "allow")
     ev = G.NormalizedEvent(tool="Bash", command=f"cat {deep}/child.txt", cwd=ws)
-    check("deep_directory_grant_admits_shell_child",
+    check("deep_directory_recursive_grant_admits_shell_child",
           G.evaluate(ev, narrow, ws).decision == "allow")
 
     ev = G.NormalizedEvent(tool="Read", paths=[os.path.join(sibling, "loot")], cwd=ws)

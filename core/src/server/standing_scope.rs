@@ -88,12 +88,41 @@ pub struct StandingGrant {
     /// provenance pairing the standing widening with the member's original stated need.
     #[serde(default)]
     pub request_id: Option<String>,
+    /// Whether this grant covers the whole SUBTREE under `path`, or exactly `path`.
+    ///
+    /// EXACT IS THE DEFAULT, on dp's word (2026-09-08): "the exact path is useful, and is
+    /// preferred as default. recursive should be an option." Every grant written before
+    /// this field existed deserialises as exact, so nothing an operator already read
+    /// silently widens. Recursion is a separate, explicit, witnessed act — the operator
+    /// reads the word "recursive" and chooses it — which is what makes it safe to have
+    /// at all: the concern in `has_live` was never subtrees, it was UNREAD widening.
+    #[serde(default)]
+    pub recursive: bool,
 }
 
 impl StandingGrant {
     pub fn is_live(&self, now: u64) -> bool {
         self.expires_at.is_none_or(|e| now < e)
     }
+
+    /// Does this grant reach `path`? Exact match always; the subtree only when `recursive`.
+    /// Containment is at the separator, so `/a/b` never covers `/a/bc`.
+    pub fn covers(&self, path: &str) -> bool {
+        covers_path(&self.path, self.recursive, path)
+    }
+}
+
+/// The ONE containment rule for both grant channels (live and standing) — so the daemon
+/// never answers "already granted" for a path the other channel would not have covered.
+pub fn covers_path(root: &str, recursive: bool, path: &str) -> bool {
+    if root == path {
+        return true;
+    }
+    if !recursive {
+        return false;
+    }
+    let root = root.trim_end_matches('/');
+    path.starts_with(root) && path[root.len()..].starts_with('/')
 }
 
 /// The whole durable store, serialised as one vault document (`scope`/`standing`).
@@ -210,8 +239,10 @@ impl StandingScopeStore {
         live
     }
 
-    /// Exact-path membership, same comparison discipline as `has_scope_grant`: a grant is
-    /// for one path, and prefix matching would silently widen what the operator read.
+    /// Membership by the grant's OWN rule: exact for an exact grant, subtree for a grant an
+    /// operator explicitly made recursive. This used to be exact-only, with the comment
+    /// "prefix matching would silently widen what the operator read" — still true, and
+    /// still honoured: a recursive grant is one the operator read as recursive.
     pub fn has_live(&self, member: &str, path: &str, now: u64) -> bool {
         // THE UNION, and the floor is checked FIRST because it is the common case and
         // because it is member-independent: if the society allows this path, no per-member
@@ -220,7 +251,7 @@ impl StandingScopeStore {
             || self
                 .grants
                 .iter()
-                .any(|g| g.member == member && g.path == path && g.is_live(now))
+                .any(|g| g.member == member && g.is_live(now) && g.covers(path))
     }
 
     /// Does the society floor admit this path, for anyone?
@@ -407,6 +438,23 @@ impl StandingScopeStore {
         self.generation += 1;
     }
 
+    /// Flip a grant's reach between exact and subtree. Returns whether a grant of record
+    /// existed AND changed; the generation moves only on a real change, so `law_hash` moves
+    /// exactly when what a member may reach moved.
+    pub fn set_recursive(&mut self, member: &str, path: &str, recursive: bool) -> bool {
+        let mut changed = false;
+        for g in self.grants.iter_mut() {
+            if g.member == member && g.path == path && g.recursive != recursive {
+                g.recursive = recursive;
+                changed = true;
+            }
+        }
+        if changed {
+            self.generation += 1;
+        }
+        changed
+    }
+
     /// Remove a grant. Returns whether anything was removed; the generation moves only
     /// when the store actually changed, so the counter never claims a mutation that did
     /// not happen.
@@ -419,6 +467,64 @@ impl StandingScopeStore {
             self.generation += 1;
         }
         removed
+    }
+}
+
+#[cfg(test)]
+mod reach_tests {
+    use super::*;
+
+    fn g(path: &str, recursive: bool) -> StandingGrant {
+        StandingGrant {
+            member: "m".into(), path: path.into(), granted_at: 1, granted_by: "op".into(),
+            reason: "r".into(), expires_at: None, request_id: None, recursive,
+        }
+    }
+
+    /// EXACT IS THE DEFAULT (dp, 2026-09-08). A grant on /a reaches /a and nothing else
+    /// unless an operator explicitly made it recursive; and even then, containment is at
+    /// the separator so /a never fronts for /ab.
+    #[test]
+    fn exact_by_default_subtree_only_when_asked_never_a_sibling() {
+        let exact = g("/w/tree", false);
+        assert!(exact.covers("/w/tree"));
+        assert!(!exact.covers("/w/tree/sub"), "exact must not reach the subtree");
+        assert!(!exact.covers("/w"), "nor the parent");
+
+        let rec = g("/w/tree", true);
+        assert!(rec.covers("/w/tree"));
+        assert!(rec.covers("/w/tree/sub/deep/file.py"));
+        assert!(!rec.covers("/w/treeful"), "a recursive grant never covers a sibling with the same prefix");
+        assert!(!rec.covers("/w"), "nor its parent");
+        assert!(!rec.covers("/other"));
+    }
+
+    /// A grant written before `recursive` existed deserialises as EXACT — nothing an
+    /// operator already read silently widens when the daemon upgrades.
+    #[test]
+    fn a_pre_existing_grant_deserialises_as_exact() {
+        let old = r#"{"member":"m","path":"/w/tree","granted_at":1,"granted_by":"op","reason":"r"}"#;
+        let grant: StandingGrant = serde_json::from_str(old).unwrap();
+        assert!(!grant.recursive);
+        assert!(!grant.covers("/w/tree/sub"));
+    }
+
+    /// The store's membership honours each grant's OWN rule, and flipping it is a real
+    /// change: the generation (hence law_hash) moves, and a no-op flip does not move it.
+    #[test]
+    fn set_recursive_moves_the_generation_only_on_a_real_change() {
+        let mut st = StandingScopeStore::default();
+        st.add(g("/w/tree", false));
+        let gen0 = st.generation;
+        assert!(!st.has_live("m", "/w/tree/x", 5));
+        assert!(st.set_recursive("m", "/w/tree", true));
+        assert_eq!(st.generation, gen0 + 1);
+        assert!(st.has_live("m", "/w/tree/x", 5));
+        assert!(!st.set_recursive("m", "/w/tree", true), "already recursive: no change");
+        assert_eq!(st.generation, gen0 + 1, "and the generation did not move");
+        assert!(!st.set_recursive("m", "/nope", true), "no grant of record: no change");
+        assert!(st.set_recursive("m", "/w/tree", false));
+        assert!(!st.has_live("m", "/w/tree/x", 5), "back to exact");
     }
 }
 
@@ -437,6 +543,7 @@ mod tests {
             reason: "test".into(),
             expires_at,
             request_id: None,
+        recursive: false,
         }
     }
 
