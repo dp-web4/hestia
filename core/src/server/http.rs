@@ -4095,6 +4095,16 @@ async fn scope_standing_promote(
 /// tree, so the operator has READ the word before it means anything. Applies to the
 /// standing grant of record and, if a live grant on the same path exists, to that too, so
 /// the two channels never disagree about the same (member, path).
+///
+/// ORDER: INTENT, COMMIT, THEN THE TERMINAL RECORD (GPT review of #1002, blocker 2). The
+/// first cut appended `scope_reach_changed` and THEN wrote the vault — so a failed commit
+/// left the chain permanently asserting a reach change that never happened, and a no-op
+/// request pre-announced `generation + 1` for a store that did not move. Now: a no-op is a
+/// 409 and writes nothing; a standing change witnesses an intent, commits, and appends the
+/// terminal `scope_reach_changed` carrying the intent's hash and the generation the commit
+/// actually produced, rolling back through the commit path if that terminal append fails;
+/// a live-only change (nothing durable to fail) witnesses first and applies the in-memory
+/// flag after, which cannot fail — the same order `scope_decide` uses for a memory-only grant.
 async fn scope_standing_recursive(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
@@ -4120,51 +4130,116 @@ async fn scope_standing_recursive(
     let now = crate::server::gate_escalation::now_secs();
 
     let mut s = state.lock().await;
-    let has_standing = s.standing_scope.grants.iter()
-        .any(|g| g.member == plugin_id && g.path == path && g.is_live(now));
-    let live_id: Option<String> = s.scope_requests.values()
+    // What WOULD change, decided before anything is written: a grant of record whose reach
+    // already equals the request is a no-op, and a no-op mints no witness and moves no
+    // generation. `set_recursive` is idempotent, but the record must be too.
+    let standing_now: Option<bool> = s.standing_scope.grants.iter()
+        .find(|g| g.member == plugin_id && g.path == path && g.is_live(now))
+        .map(|g| g.recursive);
+    let live: Option<(String, bool)> = s.scope_requests.values()
         .find(|r| r.plugin_id == plugin_id && r.path == path && r.granted == Some(true) && now < r.expires_at)
-        .map(|r| r.id.clone());
-    if !has_standing && live_id.is_none() {
+        .map(|r| (r.id.clone(), r.recursive));
+    if standing_now.is_none() && live.is_none() {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({
             "error": "no grant of record (live or standing) for that (plugin_id, path)"})));
     }
+    let standing_changes = standing_now.is_some_and(|cur| cur != recursive);
+    let live_changes = live.as_ref().is_some_and(|(_, cur)| *cur != recursive);
+    if !standing_changes && !live_changes {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!("that grant is already {}; nothing to change, nothing witnessed",
+                             if recursive { "recursive" } else { "exact" }),
+            "recursive": recursive,
+            "generation": s.standing_scope.generation,
+        })));
+    }
+    let live_id = live.as_ref().map(|(id, _)| id.clone());
 
-    let entry = match s.append_chain("scope_reach_changed", serde_json::json!({
-        "plugin_id": plugin_id,
-        "subject_instance_lct": s.member_lct(&plugin_id),
-        "path": path,
-        "recursive": recursive,
-        "reason": reason,
-        "changed_by": "operator",
-        "via": "operator_session",
-        "applies_to": {"standing": has_standing, "live": live_id},
-        "standing_generation": if has_standing { s.standing_scope.generation + 1 } else { s.standing_scope.generation },
-    })) {
+    let subject = s.member_lct(&plugin_id);
+    let record = |kind: &str, extra: serde_json::Value| {
+        let mut v = serde_json::json!({
+            "plugin_id": plugin_id,
+            "subject_instance_lct": subject,
+            "path": path,
+            "recursive": recursive,
+            "reason": reason,
+            "changed_by": "operator",
+            "via": "operator_session",
+            "applies_to": {"standing": standing_changes, "live": if live_changes { live_id.clone() } else { None }},
+        });
+        v.as_object_mut().unwrap().insert("kind".into(), serde_json::Value::String(kind.into()));
+        if let Some(obj) = extra.as_object() {
+            for (k, val) in obj { v.as_object_mut().unwrap().insert(k.clone(), val.clone()); }
+        }
+        v
+    };
+
+    if standing_changes {
+        // INTENT first: the durable effect has not happened and may not.
+        let intent = match s.append_chain("scope_reach_change_intent",
+            record("intent", serde_json::json!({"standing_generation": s.standing_scope.generation + 1}))) {
+            Ok(e) => e,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("witness append failed, reach NOT changed: {e}")}))),
+        };
+        let prior = s.standing_scope.clone();
+        if let Err(e) = s.commit_standing_scope(|st| { st.set_recursive(&plugin_id, &path, recursive); }) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("reach NOT changed — vault write failed ({e}); the live store is \
+                                  untouched (the candidate was persisted first). Retry."),
+                "state": "the chain holds the INTENT and no scope_reach_changed",
+                "intentEntryHash": intent.hash,
+            })));
+        }
+        // TERMINAL, only now, with the generation the commit actually produced.
+        let success = match s.append_chain("scope_reach_changed",
+            record("terminal", serde_json::json!({
+                "standing_generation": s.standing_scope.generation, "intent": intent.hash}))) {
+            Ok(e) => e,
+            Err(e) => {
+                return match s.commit_standing_scope(|st| *st = prior) {
+                    Ok(()) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                        "error": format!("reach NOT changed — the terminal record failed ({e}); \
+                                          rolled back (live store and vault), the chain holds \
+                                          only the intent. Retry."),
+                        "intentEntryHash": intent.hash,
+                    }))),
+                    Err(rb) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                        "error": format!("THE REACH CHANGE IS LIVE but its terminal record could \
+                                          not be appended ({e}) AND the rollback failed ({rb}). \
+                                          Repair the chain — do not assume the store is consistent."),
+                        "intentEntryHash": intent.hash,
+                    }))),
+                };
+            }
+        };
+        if live_changes {
+            if let Some(id) = &live_id {
+                if let Some(r) = s.scope_requests.get_mut(id) { r.recursive = recursive; }
+            }
+        }
+        return (StatusCode::OK, Json(serde_json::json!({
+            "ok": true, "plugin_id": plugin_id, "path": path, "recursive": recursive,
+            "applied_to": {"standing": true, "live": if live_changes { live_id } else { None }},
+            "generation": s.standing_scope.generation,
+            "witnessEntryHash": success.hash,
+        })));
+    }
+
+    // LIVE ONLY: nothing durable can fail, so witness first and apply after — the order
+    // scope_decide uses for a memory-only grant.
+    let entry = match s.append_chain("scope_reach_changed",
+        record("terminal", serde_json::json!({"standing_generation": s.standing_scope.generation}))) {
         Ok(e) => e,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "error": format!("witness append failed, reach NOT changed: {e}")}))),
     };
-    if has_standing {
-        if let Err(e) = s.commit_standing_scope(|st| { st.set_recursive(&plugin_id, &path, recursive); }) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": format!("reach NOT changed — vault write failed ({e}); the live store is \
-                                  untouched, retry"),
-                "witnessEntryHash": entry.hash,
-            })));
-        }
-    }
     if let Some(id) = &live_id {
-        if let Some(r) = s.scope_requests.get_mut(id) {
-            r.recursive = recursive;
-        }
+        if let Some(r) = s.scope_requests.get_mut(id) { r.recursive = recursive; }
     }
     (StatusCode::OK, Json(serde_json::json!({
-        "ok": true,
-        "plugin_id": plugin_id,
-        "path": path,
-        "recursive": recursive,
-        "applied_to": {"standing": has_standing, "live": live_id},
+        "ok": true, "plugin_id": plugin_id, "path": path, "recursive": recursive,
+        "applied_to": {"standing": false, "live": live_id},
         "generation": s.standing_scope.generation,
         "witnessEntryHash": entry.hash,
     })))
@@ -5977,11 +6052,9 @@ mod disposition_tests {
             assert!(s.has_scope_grant("kimi-code", "/w/tree"));
             assert!(!s.has_scope_grant("kimi-code", "/w/tree/child.py"), "EXACT by default");
         }
-        // widening without a reason is refused
         let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
             "plugin_id": "kimi-code", "path": "/w/tree", "recursive": true}))).await.into_response();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        // no grant of record
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "widening without a reason is refused");
         let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
             "plugin_id": "kimi-code", "path": "/nope", "recursive": true, "reason": "r"}))).await.into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -5997,13 +6070,109 @@ mod disposition_tests {
             assert!(!s.has_scope_grant("kimi-code", "/w/treeful"), "never a sibling");
             assert_eq!(s.standing_scope.generation, gen0 + 1, "law_hash moves with reach");
             assert!(s.scope_requests["scope-live-2"].recursive, "the live channel agrees");
-            assert!(s.recent_chain(10).iter().any(|e| e.event_type == "scope_reach_changed"));
+            let chain = s.recent_chain(10);
+            let term = chain.iter().find(|e| e.event_type == "scope_reach_changed").expect("terminal record");
+            let intent = chain.iter().find(|e| e.event_type == "scope_reach_change_intent").expect("intent record");
+            assert_eq!(term.event_data["intent"], serde_json::json!(intent.hash), "terminal carries the intent's hash");
+            assert_eq!(term.event_data["standing_generation"], serde_json::json!(gen0 + 1),
+                       "the generation the commit ACTUALLY produced, not a prediction");
         }
-        // and back to exact needs no reason
+        // back to exact needs no reason
         let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
             "plugin_id": "kimi-code", "path": "/w/tree", "recursive": false}))).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(!state.lock().await.has_scope_grant("kimi-code", "/w/tree/child.py"));
+    }
+
+    /// A no-op (already that reach) is a 409: nothing witnessed, generation unmoved.
+    /// GPT review of #1002, blocker 2: the first cut pre-announced `generation + 1` in a
+    /// record for a store that then did not move.
+    #[tokio::test]
+    async fn recursive_no_op_writes_nothing_and_moves_nothing() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
+                granted_by: "operator".into(), reason: "r".into(), expires_at: None,
+                request_id: None, recursive: false,
+            })).unwrap();
+        }
+        let (gen0, chain0) = { let s = state.lock().await; (s.standing_scope.generation, s.recent_chain(50).len()) };
+        let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/w/tree", "recursive": false}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "already exact: a no-op is a conflict, not a change");
+        let s = state.lock().await;
+        assert_eq!(s.standing_scope.generation, gen0, "no generation movement on a no-op");
+        assert_eq!(s.recent_chain(50).len(), chain0, "no witness row for a change that did not happen");
+    }
+
+    /// A failed vault commit leaves the chain holding the INTENT and no terminal record,
+    /// and the store bit-identical — the record can never say reach changed when it did not.
+    #[tokio::test]
+    async fn recursive_failed_commit_leaves_intent_only_and_store_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
+                granted_by: "operator".into(), reason: "r".into(), expires_at: None,
+                request_id: None, recursive: false,
+            })).unwrap();
+        }
+        let (before_grants, before_gen) = {
+            let s = state.lock().await;
+            (s.standing_scope.grants.clone(), s.standing_scope.generation)
+        };
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/w/tree", "recursive": true, "reason": "r"}))).await.into_response();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "the vault write must have failed for this test to test anything");
+        let s = state.lock().await;
+        assert_eq!(s.standing_scope.grants, before_grants, "store bit-identical");
+        assert_eq!(s.standing_scope.generation, before_gen, "generation included");
+        assert!(!s.has_scope_grant("kimi-code", "/w/tree/child.py"));
+        let chain = s.recent_chain(20);
+        assert!(chain.iter().any(|e| e.event_type == "scope_reach_change_intent"), "the intent is the record of the attempt");
+        assert!(!chain.iter().any(|e| e.event_type == "scope_reach_changed"), "no terminal record for a change not in force");
+    }
+
+    /// A failed TERMINAL witness rolls the reach change back through the commit path, so a
+    /// reach change without its terminal record is never live.
+    #[tokio::test]
+    async fn recursive_failed_terminal_witness_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
+                granted_by: "operator".into(), reason: "r".into(), expires_at: None,
+                request_id: None, recursive: false,
+            })).unwrap();
+        }
+        let gen0 = state.lock().await.standing_scope.generation;
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_reach_terminal BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'scope_reach_changed' AND NEW.event_data LIKE '%\"intent\"%'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;").unwrap();
+        let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/w/tree", "recursive": true, "reason": "r"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        conn.execute_batch("DROP TRIGGER fail_reach_terminal").unwrap();
+        let s = state.lock().await;
+        assert!(!s.has_scope_grant("kimi-code", "/w/tree/child.py"), "rolled back: not recursive");
+        assert_eq!(s.standing_scope.generation, gen0, "generation restored by the rollback commit");
+        let chain = s.recent_chain(20);
+        assert!(chain.iter().any(|e| e.event_type == "scope_reach_change_intent"));
+        assert!(!chain.iter().any(|e| e.event_type == "scope_reach_changed"));
     }
 
     /// The operator may choose recursive AT decide time; the member never can.

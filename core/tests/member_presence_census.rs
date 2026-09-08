@@ -560,15 +560,16 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
-    // READING, both questions. (1) Who gets named? The subject of a `scope_reach_changed`
+    // READING, both questions. (1) Who gets named? The subject of a
+    // `scope_reach_change_intent` and, after the vault commit, a `scope_reach_changed`
     // entry — the member whose grant is being widened to its subtree or narrowed back to
-    // exact. One record: the reach flip is a single vault commit with no intent/success
-    // pair, because a failed commit leaves the store bit-identical (candidate persisted
-    // first) and the record says `reach NOT changed`. (2) Compared to decide control flow?
-    // No — keyed on `(member, path)` strings against both stores; the LCT is serialised
-    // and read by nothing. Naming.
+    // exact. Derived ONCE into a local and serialised into both records (GPT review of
+    // #1002, blocker 2: the first cut witnessed completion before the durable effect; the
+    // rewrite is intent -> commit -> terminal, so one derivation feeds two records).
+    // (2) Compared to decide control flow? No — keyed on `(member, path)` strings against
+    // both stores; the LCT is serialised and read by nothing. Naming.
     ("server/http.rs::scope_standing_recursive", &[
-        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+        "let subject = s.member_lct(&plugin_id);",
     ], SiteClass::Naming),
     // ADDED 2026-08-15 (claude-code, the operator-originated grant `POST /api/scope/grant`).
     // The census went red the moment the site was written — the instrument working, and it

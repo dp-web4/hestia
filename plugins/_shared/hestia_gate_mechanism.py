@@ -570,10 +570,16 @@ def _scope_entry_for_grant(path: str, recursive: bool = False) -> str:
     p = os.path.realpath(os.path.expanduser(path.strip()))
     ws = os.path.realpath(os.path.expanduser(_workspace_root()))
     par, name = os.path.split(p.rstrip("/"))
-    if par == ws and name:
-        # A repo NAME is a whole-repo grant by construction — the core's segment-keyed
-        # model admits the repo and everything in it. Exact-vs-recursive is a `path:`
-        # distinction; a repo-root grant was always the tree.
+    if par == ws and name and recursive:
+        # A repo NAME is a whole-repo entry by construction — the core's segment-keyed
+        # model admits the repo and everything in it. So ONLY a RECURSIVE grant on a
+        # workspace-direct root may take that form. The first cut mapped every such root
+        # to the name regardless of `recursive`, which silently widened an EXACT grant on
+        # /ws/repo into the whole repo at the gate while the daemon's covers_path() said it
+        # reached /ws/repo alone — the daemon/gate disagreement this change exists to end,
+        # recreated for the most common directory shape (GPT review of #1002, blocker 1).
+        # An exact grant on a repo root stays the faithful `path:` form, which the core
+        # matches at exactly that boundary. Declarative `repo:` scope is untouched.
         return name
     return "path:" + path.strip().rstrip("/") + (RECURSIVE_SUFFIX if recursive else "")
 
