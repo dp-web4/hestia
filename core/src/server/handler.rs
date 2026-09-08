@@ -10493,6 +10493,7 @@ mod tests {
             decided_by: Some("operator".into()),
             decided_at: Some(110),
             decision_reason: Some("yes, that file".into()),
+            recursive: false,
         };
         assert!(r.grants("/mnt/c/exe/dpx/notes.md", 150));
         // The sibling, the parent and the child are all OUTSIDE the grant.
@@ -10547,6 +10548,7 @@ mod tests {
             decided_by: None,
             decided_at: None,
             decision_reason: None,
+            recursive: false,
         };
         assert_eq!(r.status(50), "pending");
         assert_eq!(r.status(100), "expired");
@@ -16480,6 +16482,7 @@ mod appeal_tests {
                 decided_by: Some("operator".into()),
                 decided_at: Some(now),
                 decision_reason: Some("yes, that file".into()),
+                recursive: false,
             });
         }
         let body = read_resource_body(&state, "hestia://scope/scope-test459a")
@@ -18364,6 +18367,7 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
         decided_by: None,
         decided_at: None,
         decision_reason: None,
+        recursive: false,
     };
     s.scope_requests.insert(id.clone(), req);
 
@@ -18463,7 +18467,8 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         // permission.
         "live_grants": s.live_scope_grants(&plugin_id)
             .iter()
-            .map(|r| json!({"path": r.path, "expires_at": r.expires_at, "granted_by": r.decided_by}))
+            .map(|r| json!({"path": r.path, "expires_at": r.expires_at, "granted_by": r.decided_by,
+                            "recursive": r.recursive}))
             .collect::<Vec<_>>(),
         // The DURABLE list, additive beside live_grants (Sprint F R1): operator-promoted
         // standing grants from the vault-persisted store. Expired grants are filtered in
@@ -18477,6 +18482,10 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
                 "reason": g.reason,
                 "expires_at": g.expires_at,
                 "request_id": g.request_id,
+                // Exact by default; a subtree only when an operator said so. The consumer
+                // spells a recursive grant `path:<root>/**` and treats a bare `path:` as
+                // exact, so this field is what decides whether a child path is reachable.
+                "recursive": g.recursive,
             }))
             .collect::<Vec<_>>(),
         // CERTIFICATION, issued by the authority — the two fields the plugin gate's
@@ -19625,6 +19634,7 @@ mod standing_scope_surface_tests {
             decided_by: Some("operator".into()),
             decided_at: Some(now),
             decision_reason: None,
+            recursive: false,
         }
     }
 
@@ -19637,6 +19647,7 @@ mod standing_scope_surface_tests {
             reason: "durable test grant".into(),
             expires_at,
             request_id: Some("scope-test01".into()),
+        recursive: false,
         }
     }
 
@@ -21905,6 +21916,7 @@ async fn tool_scope_arbitrate(state: &SharedState, args: &Value) -> ToolResult {
             reason: reason.clone(),
             expires_at: None,
             request_id: Some(request_id.clone()),
+            recursive: false,
         };
         if let Err(e) = s.commit_standing_scope(|st| st.add(grant)) {
             return Err(anyhow::anyhow!(
@@ -22106,6 +22118,7 @@ mod delegated_scope_arbitration_tests {
                 decided_by: None,
                 decided_at: None,
                 decision_reason: None,
+                recursive: false,
             },
         );
         id

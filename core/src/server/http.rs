@@ -1133,6 +1133,10 @@ pub async fn serve_with_callback(
         // member that could revoke — or, worse, could NOT be revoked — would hold the
         // control.
         .route("/api/scope/standing/revoke", post(scope_standing_revoke))
+        // dp's two buttons (2026-09-08): a live grant made durable; a grant made to reach
+        // its subtree (or back to exact). Exact stays the default everywhere.
+        .route("/api/scope/standing/promote", post(scope_standing_promote))
+        .route("/api/scope/standing/recursive", post(scope_standing_recursive))
         // THE GRANT HALF NOW HAS A ROUTE, REVERSING A DELIBERATE DECISION RECORDED HERE.
         //
         // What stood here said: "The GRANT half deliberately has no route of its own: a
@@ -2375,6 +2379,9 @@ async fn scope_decide(
         .trim()
         .to_string();
     let standing = body.get("standing").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Exact by default (dp, 2026-09-08). Recursion is the operator's explicit choice at
+    // decide time, never something the asking member can set: a request names ONE path.
+    let recursive = body.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
     let granted = match body.get("granted").and_then(|v| v.as_bool()) {
         Some(g) => g,
         // No default. An absent verdict is not a deny and not an approve — it is a malformed
@@ -2505,6 +2512,7 @@ async fn scope_decide(
             // expiry and the generation it will mint travel with the ruling that made it.
             "standing": standing,
             "standing_expires_at": standing_expires_at,
+            "recursive": recursive,
             "standing_generation": if standing {
                 serde_json::json!(s.standing_scope.generation + 1)
             } else {
@@ -2573,6 +2581,7 @@ async fn scope_decide(
             reason: reason.clone(),
             expires_at: standing_expires_at,
             request_id: Some(request_id.clone()),
+            recursive,
         };
         if let Err(e) = s.commit_standing_scope(|st| st.add(grant)) {
             return (
@@ -2663,6 +2672,7 @@ async fn scope_decide(
             Some(reason.clone())
         };
         req.expires_at = expires_at;
+        req.recursive = recursive;
     }
 
     // #459: the decision's RETURN EDGE. The requester filed through MCP and until
@@ -3389,6 +3399,8 @@ async fn scope_grant(
         .and_then(|v| v.as_u64())
         .filter(|w| *w > 0)
         .map(|w| now + w);
+    // Exact by default; the operator opts into the subtree (dp, 2026-09-08).
+    let recursive = body.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let mut s = state.lock().await;
     // A GRANT TO A MEMBER NOBODY HAS SEEN IS ALMOST ALWAYS A TYPO, and it fails silently:
@@ -3424,6 +3436,7 @@ async fn scope_grant(
         // an act the operator originated.
         "request_id": serde_json::Value::Null,
         "origin": "operator_initiated",
+        "recursive": recursive,
         "plugin_id": plugin_id,
         "subject_instance_lct": s.member_lct(&plugin_id),
         "path": path,
@@ -3451,6 +3464,7 @@ async fn scope_grant(
         expires_at,
         // None, for the same reason `request_id` is null in the record above.
         request_id: None,
+        recursive,
     };
     let (intent_hash, entry_hash) = match s.witness_and_commit_standing_grant(grant, record) {
         Ok(pair) => pair,
@@ -3939,6 +3953,223 @@ async fn scope_standing_revoke(
 /// `None` is a real state and stamps nothing: a route reachable without the gate (or a
 /// dev-override) must produce an unstamped row rather than a row that claims an
 /// authorization it never had.
+/// `POST /api/scope/standing/promote` {plugin_id, path, reason?, expires_in_secs?}
+///
+/// A LIVE grant becomes a STANDING one — dp's "make standing" button (2026-09-08). The
+/// live channel is memory-only and dies with the daemon; an operator who has watched a
+/// member use a grant well should not have to re-decide it from a fresh ask after every
+/// restart. The promotion carries the live grant's provenance (its request id, the
+/// member's stated need, its reach) into the durable store, so the standing row still
+/// says why it exists and how far it goes.
+///
+/// Same discipline as a standing decide: witness the INTENT, commit the vault write,
+/// witness the SUCCESS carrying the intent's hash, roll back through the commit path if
+/// the success record fails. A standing grant nothing recorded must not exist.
+async fn scope_standing_promote(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let plugin_id = body.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if plugin_id.is_empty() || raw_path.is_empty() {
+        return (StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "plugin_id and path are required"})));
+    }
+    let path = crate::server::state::normalize_scope_path(&raw_path);
+    let now = crate::server::gate_escalation::now_secs();
+    let expires_at: Option<u64> = body
+        .get("expires_in_secs").and_then(|v| v.as_u64()).filter(|w| *w > 0).map(|w| now + w);
+
+    let mut s = state.lock().await;
+    let Some(live) = s
+        .scope_requests
+        .values()
+        .find(|r| r.plugin_id == plugin_id && r.path == path && r.granted == Some(true) && now < r.expires_at)
+        .cloned()
+    else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "no LIVE grant of record for that (plugin_id, path) — only a live grant \
+                      can be promoted; an operator-originated standing grant goes through \
+                      /api/scope/grant"
+        })));
+    };
+    let reason = {
+        let given = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if given.is_empty() { live.decision_reason.clone().unwrap_or_default() } else { given }
+    };
+    if reason.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "reason is required: the live grant carried none and none was given — a \
+                      durable widening whose rationale is not recorded is indistinguishable \
+                      afterwards from a misconfiguration"
+        })));
+    }
+
+    let intent = match s.append_chain("scope_grant_intent", serde_json::json!({
+        "request_id": live.id,
+        "plugin_id": plugin_id,
+        "subject_instance_lct": s.member_lct(&plugin_id),
+        "path": path,
+        "requested_because": live.reason,
+        "decision_reason": reason,
+        "granted_by": "operator",
+        "via": "operator_session",
+        "origin": "promoted_from_live",
+        "recursive": live.recursive,
+        "standing": true,
+        "standing_expires_at": expires_at,
+        "standing_generation": s.standing_scope.generation + 1,
+    })) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("witness append failed, promotion NOT applied: {e}")}))),
+    };
+    let prior = s.standing_scope.clone();
+    let grant = crate::server::standing_scope::StandingGrant {
+        member: plugin_id.clone(),
+        path: path.clone(),
+        granted_at: now,
+        granted_by: "operator".to_string(),
+        reason: reason.clone(),
+        expires_at,
+        request_id: Some(live.id.clone()),
+        recursive: live.recursive,
+    };
+    if let Err(e) = s.commit_standing_scope(|st| st.add(grant)) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("promotion NOT applied — vault write failed ({e}); the live store \
+                              is untouched, retry"),
+            "intentEntryHash": intent.hash,
+        })));
+    }
+    let success = match s.append_chain("scope_granted", serde_json::json!({
+        "request_id": live.id,
+        "plugin_id": plugin_id,
+        "subject_instance_lct": s.member_lct(&plugin_id),
+        "path": path,
+        "decision_reason": reason,
+        "granted_by": "operator",
+        "via": "operator_session",
+        "origin": "promoted_from_live",
+        "recursive": live.recursive,
+        "standing": true,
+        "standing_expires_at": expires_at,
+        "standing_generation": s.standing_scope.generation,
+        "intent": intent.hash,
+    })) {
+        Ok(e) => e,
+        Err(e) => {
+            return match s.commit_standing_scope(|st| *st = prior) {
+                Ok(()) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("promotion NOT applied — the terminal record failed ({e}); \
+                                      rolled back, the chain holds only the intent. Retry."),
+                    "intentEntryHash": intent.hash,
+                }))),
+                Err(rb) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("THE STANDING GRANT IS LIVE but its success record could not \
+                                      be appended ({e}) AND the rollback failed ({rb}). Revoke or \
+                                      repair the chain — do not assume the store is consistent."),
+                    "intentEntryHash": intent.hash,
+                }))),
+            };
+        }
+    };
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true,
+        "plugin_id": plugin_id,
+        "path": path,
+        "recursive": live.recursive,
+        "promoted_from_request": live.id,
+        "generation": s.standing_scope.generation,
+        "witnessEntryHash": success.hash,
+        "durability": "STANDING — written to the vault; survives restart; revocable via \
+                       /api/scope/standing/revoke. The live grant remains until it lapses.",
+    })))
+}
+
+/// `POST /api/scope/standing/recursive` {plugin_id, path, recursive, reason}
+///
+/// dp's "make recursive" button (2026-09-08): a grant on a directory reaches the whole
+/// subtree under it, or — `recursive: false` — goes back to exactly that path. Exact is the
+/// default everywhere; this is the one explicit, witnessed act that widens a grant to a
+/// tree, so the operator has READ the word before it means anything. Applies to the
+/// standing grant of record and, if a live grant on the same path exists, to that too, so
+/// the two channels never disagree about the same (member, path).
+async fn scope_standing_recursive(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let plugin_id = body.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let Some(recursive) = body.get("recursive").and_then(|v| v.as_bool()) else {
+        return (StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "recursive must be explicitly true or false"})));
+    };
+    if plugin_id.is_empty() || raw_path.is_empty() {
+        return (StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "plugin_id and path are required"})));
+    }
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if recursive && reason.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "reason is required to make a grant recursive — it widens what a member \
+                      can reach from one path to a whole tree"
+        })));
+    }
+    let path = crate::server::state::normalize_scope_path(&raw_path);
+    let now = crate::server::gate_escalation::now_secs();
+
+    let mut s = state.lock().await;
+    let has_standing = s.standing_scope.grants.iter()
+        .any(|g| g.member == plugin_id && g.path == path && g.is_live(now));
+    let live_id: Option<String> = s.scope_requests.values()
+        .find(|r| r.plugin_id == plugin_id && r.path == path && r.granted == Some(true) && now < r.expires_at)
+        .map(|r| r.id.clone());
+    if !has_standing && live_id.is_none() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "no grant of record (live or standing) for that (plugin_id, path)"})));
+    }
+
+    let entry = match s.append_chain("scope_reach_changed", serde_json::json!({
+        "plugin_id": plugin_id,
+        "subject_instance_lct": s.member_lct(&plugin_id),
+        "path": path,
+        "recursive": recursive,
+        "reason": reason,
+        "changed_by": "operator",
+        "via": "operator_session",
+        "applies_to": {"standing": has_standing, "live": live_id},
+        "standing_generation": if has_standing { s.standing_scope.generation + 1 } else { s.standing_scope.generation },
+    })) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("witness append failed, reach NOT changed: {e}")}))),
+    };
+    if has_standing {
+        if let Err(e) = s.commit_standing_scope(|st| { st.set_recursive(&plugin_id, &path, recursive); }) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("reach NOT changed — vault write failed ({e}); the live store is \
+                                  untouched, retry"),
+                "witnessEntryHash": entry.hash,
+            })));
+        }
+    }
+    if let Some(id) = &live_id {
+        if let Some(r) = s.scope_requests.get_mut(id) {
+            r.recursive = recursive;
+        }
+    }
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true,
+        "plugin_id": plugin_id,
+        "path": path,
+        "recursive": recursive,
+        "applied_to": {"standing": has_standing, "live": live_id},
+        "generation": s.standing_scope.generation,
+        "witnessEntryHash": entry.hash,
+    })))
+}
+
 fn stamp_gate(
     record: serde_json::Value,
     gate: &Option<axum::Extension<super::operator_auth::GateWitness>>,
@@ -5529,6 +5760,7 @@ mod disposition_tests {
                     decided_by: None,
                     decided_at: None,
                     decision_reason: None,
+                    recursive: false,
                 },
             );
         }
@@ -5676,6 +5908,124 @@ mod disposition_tests {
     /// operator gets an error, and the request stays pending. Failure injected
     /// by a trigger that fails only the success insert (the intent names no
     /// `intent` key; the success entry does).
+    fn live_req(id: &str, path: &str, now: u64) -> crate::server::state::ScopeRequest {
+        crate::server::state::ScopeRequest {
+            id: id.into(),
+            plugin_id: "kimi-code".into(),
+            role: String::new(),
+            path: path.into(),
+            reason: "the member's stated need".into(),
+            requested_at: now,
+            expires_at: now + 3600,
+            granted: Some(true),
+            decided_by: Some("operator".into()),
+            decided_at: Some(now),
+            decision_reason: Some("watched it used well".into()),
+            recursive: false,
+        }
+    }
+
+    /// dp's "make standing" button (2026-09-08). A live grant — memory-only, dies with the
+    /// daemon — becomes a durable one, carrying its provenance: the request id and the
+    /// member's stated need travel into the standing row. Witnessed intent -> commit ->
+    /// witnessed success, like a standing decide.
+    #[tokio::test]
+    async fn promote_makes_a_live_grant_standing_with_its_provenance() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-live-1".into(), live_req("scope-live-1", "/x/tree", now));
+        }
+        // nothing to promote for a path with no live grant
+        let resp = scope_standing_promote(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/x/other"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = scope_standing_promote(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/x/tree"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "a live grant promotes");
+        let s = state.lock().await;
+        let g = s.standing_scope.grants.iter()
+            .find(|g| g.member == "kimi-code" && g.path == "/x/tree")
+            .expect("a standing row now exists");
+        assert_eq!(g.request_id.as_deref(), Some("scope-live-1"), "provenance travels");
+        assert_eq!(g.reason, "watched it used well", "the live decision's reason is kept when none is given");
+        assert!(!g.recursive, "reach is carried, and the live grant was exact");
+        assert!(s.standing_scope.has_live("kimi-code", "/x/tree", now));
+        let chain = s.recent_chain(20);
+        let ok = chain.iter().find(|e| e.event_type == "scope_granted").expect("terminal record");
+        assert_eq!(ok.event_data["origin"], "promoted_from_live");
+        assert!(chain.iter().any(|e| e.event_type == "scope_grant_intent"), "intent precedes success");
+    }
+
+    /// dp's "make recursive" button. Exact is the default; this is the one explicit,
+    /// witnessed act that makes a grant reach its subtree — and it moves BOTH channels for
+    /// that (member, path) so they never disagree. Widening needs a reason; narrowing does not.
+    #[tokio::test]
+    async fn recursive_flips_reach_on_both_channels_and_is_exact_by_default() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-live-2".into(), live_req("scope-live-2", "/w/tree", now));
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
+                granted_by: "operator".into(), reason: "r".into(), expires_at: None,
+                request_id: None, recursive: false,
+            })).unwrap();
+            assert!(s.has_scope_grant("kimi-code", "/w/tree"));
+            assert!(!s.has_scope_grant("kimi-code", "/w/tree/child.py"), "EXACT by default");
+        }
+        // widening without a reason is refused
+        let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/w/tree", "recursive": true}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // no grant of record
+        let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/nope", "recursive": true, "reason": "r"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let gen0 = state.lock().await.standing_scope.generation;
+        let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/w/tree", "recursive": true,
+            "reason": "it works the whole worktree"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        {
+            let s = state.lock().await;
+            assert!(s.has_scope_grant("kimi-code", "/w/tree/child.py"), "the subtree is reachable now");
+            assert!(!s.has_scope_grant("kimi-code", "/w/treeful"), "never a sibling");
+            assert_eq!(s.standing_scope.generation, gen0 + 1, "law_hash moves with reach");
+            assert!(s.scope_requests["scope-live-2"].recursive, "the live channel agrees");
+            assert!(s.recent_chain(10).iter().any(|e| e.event_type == "scope_reach_changed"));
+        }
+        // and back to exact needs no reason
+        let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/w/tree", "recursive": false}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!state.lock().await.has_scope_grant("kimi-code", "/w/tree/child.py"));
+    }
+
+    /// The operator may choose recursive AT decide time; the member never can.
+    #[tokio::test]
+    async fn decide_can_grant_recursive_and_the_ask_stays_one_path() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            let mut r = live_req("scope-ask-3", "/y/tree", now);
+            r.granted = None; r.decided_by = None; r.decided_at = None; r.decision_reason = None;
+            s.scope_requests.insert("scope-ask-3".into(), r);
+        }
+        let resp = scope_decide(State(state.clone()), Json(serde_json::json!({
+            "request_id": "scope-ask-3", "granted": true, "reason": "whole tree, reviewed",
+            "recursive": true}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let s = state.lock().await;
+        assert!(s.has_scope_grant("kimi-code", "/y/tree/deep/x.rs"));
+        assert!(s.recent_chain(5).iter().any(|e| e.event_type == "scope_granted" && e.event_data["recursive"] == true));
+    }
+
     #[tokio::test]
     async fn an_unwitnessed_standing_grant_is_rolled_back() {
         let (dir, state) = test_state().await;
@@ -5696,6 +6046,7 @@ mod disposition_tests {
                     decided_by: None,
                     decided_at: None,
                     decision_reason: None,
+                    recursive: false,
                 },
             );
         }

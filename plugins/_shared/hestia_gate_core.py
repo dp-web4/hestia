@@ -599,6 +599,33 @@ def _parse_scope_entries(entries) -> tuple:
     return tuple(s for s in out if s.strip("."))
 
 
+#: A `path:` grant that ends in this reaches its whole subtree; a bare one reaches exactly
+#: its path (dp, 2026-09-08: "the exact path is useful, and is preferred as default.
+#: recursive should be an option"). Spelled in the entry so an older consumer fails closed.
+RECURSIVE_SUFFIX = "/**"
+
+
+def _scope_roots_with_reach(scopes, workspace: str) -> tuple:
+    """``((root, recursive), ...)`` for every `path:` grant, resolved like `_scope_parts`."""
+    out = []
+    ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
+    for scope in scopes:
+        if not isinstance(scope, str) or not scope.startswith("path:"):
+            continue
+        raw = os.path.expanduser(scope[len("path:"):]).replace("\\", "/")
+        recursive = raw.endswith(RECURSIVE_SUFFIX)
+        if recursive:
+            raw = raw[: -len(RECURSIVE_SUFFIX)]
+        if not raw:
+            continue
+        if not raw.startswith("/"):
+            raw = os.path.join(ws, raw)
+        root = os.path.realpath(os.path.normpath(raw)).replace("\\", "/").rstrip("/")
+        if root:
+            out.append((root, recursive))
+    return tuple(out)
+
+
 def _scope_parts(scopes, workspace: str) -> tuple:
     """Return ``(repo_names, resolved_path_roots)`` without conflating their semantics.
 
@@ -614,6 +641,8 @@ def _scope_parts(scopes, workspace: str) -> tuple:
             continue
         if scope.startswith("path:"):
             raw = os.path.expanduser(scope[len("path:"):]).replace("\\", "/")
+            if raw.endswith(RECURSIVE_SUFFIX):     # reach is `_scope_roots_with_reach`'s job
+                raw = raw[: -len(RECURSIVE_SUFFIX)]
             if not raw:
                 continue
             if not raw.startswith("/"):
@@ -627,10 +656,16 @@ def _scope_parts(scopes, workspace: str) -> tuple:
 
 
 def _within_path_grant(path: str, scopes, workspace: str) -> bool:
-    """Whether ``path`` is exactly a granted path root or descends from one."""
+    """Whether ``path`` is a granted root, or descends from a root granted RECURSIVELY.
+
+    Until 2026-09-08 every `path:` grant was matched as a prefix here while the daemon
+    recorded it as exact — so the daemon answered a member's re-ask for a child path with a
+    fresh grant while this gate had been admitting that child all along. Two producers of
+    one fact. Now both read the same rule: exact by default, subtree only when the entry is
+    spelled `path:<root>/**`, which only an operator's explicit act produces."""
     candidate = os.path.realpath(os.path.normpath(path)).replace("\\", "/").rstrip("/")
-    _, roots = _scope_parts(scopes, workspace)
-    return any(candidate == root or candidate.startswith(root + "/") for root in roots)
+    return any(candidate == root or (recursive and candidate.startswith(root + "/"))
+               for root, recursive in _scope_roots_with_reach(scopes, workspace))
 
 
 def resolve_agent_policy(profile: HarnessProfile,

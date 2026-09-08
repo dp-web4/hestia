@@ -545,7 +545,17 @@ def _workspace_root() -> str:
         return env if env and os.path.isdir(env) else os.getcwd()
 
 
-def _scope_entry_for_grant(path: str) -> str:
+# Reach travels IN the spelling, so an older consumer fails CLOSED on it (2026-09-08):
+# `path:/x/**` names a subtree; `path:/x` names exactly /x. An old gate that does not know
+# `/**` resolves it as a literal root that nothing descends from, so a recursive grant is
+# inert there rather than wide — and its bare `path:` entries keep the old prefix behaviour
+# until the gate is updated. Deploy order is therefore safe in both directions; the only
+# thing an update changes is that bare `path:` grants tighten to EXACT on that box, which is
+# the default dp asked for. Flip the grants that need a subtree BEFORE updating a box's gate.
+RECURSIVE_SUFFIX = "/**"
+
+
+def _scope_entry_for_grant(path: str, recursive: bool = False) -> str:
     """A granted path becomes the `in_scope` spelling the core can actually honour —
     the ONE mapping, used by live and standing grants alike (GPT #431 blocker 4;
     subsumes #430's inline live-grant fix).
@@ -561,8 +571,11 @@ def _scope_entry_for_grant(path: str) -> str:
     ws = os.path.realpath(os.path.expanduser(_workspace_root()))
     par, name = os.path.split(p.rstrip("/"))
     if par == ws and name:
+        # A repo NAME is a whole-repo grant by construction — the core's segment-keyed
+        # model admits the repo and everything in it. Exact-vs-recursive is a `path:`
+        # distinction; a repo-root grant was always the tree.
         return name
-    return "path:" + path.strip()
+    return "path:" + path.strip().rstrip("/") + (RECURSIVE_SUFFIX if recursive else "")
 
 
 #: One fetch per gate invocation — gate processes are short-lived, so a per-process cache
@@ -706,6 +719,7 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             if isinstance(grants, list):
                 for g in grants:
                     p = g.get("path") if isinstance(g, dict) else None
+                    rec = bool(g.get("recursive")) if isinstance(g, dict) else False
                     if isinstance(p, str) and p.strip():
                         snap["scope_grants"].append(p.strip())
                         # ONE mapping for both grant channels (GPT #431 blocker 4;
@@ -714,7 +728,7 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
                         # anything deeper keeps the faithful typed "path:" form; the core
                         # admits only that resolved boundary and descendants (R2) — a file
                         # grant must not front for its whole repo.
-                        snap["in_scope"].append(_scope_entry_for_grant(p))
+                        snap["in_scope"].append(_scope_entry_for_grant(p, rec))
             # STANDING grants (Sprint F R1) — the durable, operator-promoted list the
             # daemon persists in its vault. Additive beside live_grants; absent on an
             # older daemon, in which case everything below is a no-op and the snapshot
@@ -723,15 +737,17 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             if isinstance(standing, list):
                 for g in standing:
                     p = g.get("path") if isinstance(g, dict) else None
+                    rec = bool(g.get("recursive")) if isinstance(g, dict) else False
                     if isinstance(p, str) and p.strip():
                         snap["standing_grants"].append({
                             "path": p.strip(),
                             "expires_at": g.get("expires_at"),
                             "granted_by": g.get("granted_by"),
                             "reason": g.get("reason"),
+                            "recursive": rec,
                         })
                         snap["scope_grants"].append(p.strip())
-                        snap["in_scope"].append(_scope_entry_for_grant(p))
+                        snap["in_scope"].append(_scope_entry_for_grant(p, rec))
             # CERTIFICATION, issued by the authority (Sprint F R1): the standing store's
             # monotonic generation ("WHICH policy is this copy") and the daemon's honor
             # horizon for it. Booleans are excluded deliberately — isinstance(True, int)
