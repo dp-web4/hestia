@@ -689,6 +689,18 @@ def run() -> int:
         projection = os.environ.get("HESTIA_PROJECTION_SHA256")
         if projection:
             connect_args["projection_sha256"] = projection
+        # THE HOST SESSION, so connect is IDEMPOTENT across hook invocations (#981
+        # prerequisite). The gate hook has always sent this; this one sent it on
+        # `hestia_begin_action` and not on connect, which is the only call idempotency reads.
+        # So every PostToolUse minted a fresh daemon session: measured on CBP over 4,554 rows,
+        # 80 host sessions produced 48 daemon sessions behind the gate rows and 4,076 behind
+        # the outcome rows, sharing none. Two consequences, and the second is why this is a
+        # prerequisite rather than tidying. It is the dominant producer in the session leak
+        # (#320). And #981 will enforce that only the session which BEGAN an action may close
+        # it — until Pre and Post resolve to the same daemon session, every legitimate closer
+        # is a foreign closer, and enforcing ownership would refuse every outcome on the fleet.
+        if host_session_id:
+            connect_args["host_session_id"] = host_session_id
         connect_resp = client.call_tool("hestia_connect", connect_args)
         connect = unwrap_tool_result(connect_resp)
         if "_hestia_error" in connect:
