@@ -392,7 +392,15 @@ preflight_gate() {
   # the module the gate needed. The pairing that exists after install is gate + the reviewed
   # tree about to be installed, so that is the pairing probed. gate-preflight.py does the same.
   _probe() {  # $1 = label, $2 = event json
+    # HESTIA_HOME is the bootstrap locator and has no default by design (#944): since the
+    # config-from-vault consumer landed, a gate that cannot find the vault refuses every tool
+    # with `config.unbacked`. This script sets HESTIA_HOME at the top but never EXPORTS it, so
+    # it passes it explicitly to install-members.sh — and did not to the probe, which made the
+    # preflight refuse a benign read on every box whose seats are correctly configured, with a
+    # message about the seat's config rather than about the probe's own environment (Sprout,
+    # 2026-09-08: four rendered projections, all four probes still denied).
     printf '%s' "$2" | (cd "$DEPLOY_ROOT/hestia" && env HESTIA_PRE_FAIL_CLOSED=1 CLAUDECODE=1 \
+      HESTIA_HOME="$HESTIA_HOME" \
       HESTIA_SHARED_DIR="$DEPLOY_ROOT/hestia/plugins/_shared" \
       HESTIA_ENDPOINT="$EP" python3 "$gate") >"$tmp/out" 2>"$tmp/err"
     rc=$?
