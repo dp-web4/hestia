@@ -79,6 +79,12 @@ Measured 2026-08-19 against three closures, same probe, neutral cwd, LITERAL_FLO
           body, literal destination, allowed. A variable in an assignment VALUE or in a
           READ position is also allowed — it is the write position specifically.
 
+    BRACE a `{ ...; }` GROUP with a read-only body — the residual #978 left out of grammar
+          on purpose (the `function f { }` hole). Both read-only escalations opened since
+          #978 merged carry it: d947d3194d9d84ae and cbb02c1f3440d077, 2026-09-08/09,
+          `[ -f "$f" ] && { ...; }` inside a loop, every brace-free variant a read.
+          Pinned at the wrong verdict with its twins, like the arm above it.
+
 Arms I, J and K carry BENIGN TWINS in the same assertion. Without them each would be
 satisfied by a classifier that answers "write" to anything naming a marker — which the
 baseline very nearly is, so a suite of over-refusal arms alone would be a one-way gradient
@@ -355,6 +361,63 @@ def test_pin_a_variable_in_a_write_position_sweeps_in_a_quoted_body():
           f"a variable in a READ position does not throw the command out of grammar; got {read_position}")
 
 
+def test_pin_a_brace_group_with_a_read_only_body_is_refused():
+    """OPEN DEFECT, pinned at the WRONG verdict. Third out-of-grammar class — the residual
+    #978 left on purpose, now measured live on main.
+
+    #978 strips `for`/`if`/`while`/`case` headers and `do`/`then`/`else` bodies and resolves
+    what is left, and it names `{ }` as a shape it leaves out of grammar because a blanket
+    strip turns `function f { <write verb> <gate file>; }` into head `f` — an unknown
+    command, PERMITTED. That scope is load-bearing for a DEFINITION. A brace GROUP is not a
+    definition: `[ -f "$f" ] && { a; b; }` is the ordinary shell idiom for "two commands
+    under one guard", and the closure refuses it whenever the body names a marker, however
+    read-only the body is.
+
+    Measured 2026-09-09 on CBP, installed copy byte-identical to main (`_control_flow_remainder`
+    present): both read-only escalations opened since #978 merged — d947d3194d9d84ae
+    (2026-09-08 19:41Z) and cbb02c1f3440d077 (2026-09-09 03:07Z), both from the interactive
+    seat — carry exactly this shape inside a loop, and every variant without the braces
+    (the loop, the `$(basename)` substitution, the `[ -f ]` test, `python3 "$t"` on the
+    iteration variable) classifies "read". The record cut both inside the group, so the
+    reviewer saw `{` opened and never closed; the second was withdrawn by its asker as
+    FP12, one second after the operator had already approved it. Same price as FP12 per
+    hit: eight invitations, a codex fire, a kimi fire, a claude wake, a grant never claimed.
+
+    The candidate repair is to model `{`/`}` the way `do`/`done` are modelled and re-raise
+    on `function`, which keeps the definition hole closed; the grouped-write row below is
+    the twin that must stay "write" when someone does that. Not done here: the closure is
+    a governed write and this file cannot be.
+
+    A RED on the first check means someone repaired it. Invert that arm to assert "read";
+    keep every other row exactly as it is.
+    """
+    grouped = 'for f in /tmp/a /tmp/b; do [ -f "$f" ] && { cat ' + MARK + '; }; done'
+    got = verdict(grouped)
+    check("BRACE_group_with_read_only_body_is_refused", got[0] == "write",
+          "THE BRACE-GROUP OVER-REFUSAL APPEARS FIXED — a `{ }` group whose body only reads "
+          f"the closure now classifies {got[0]!r}. Invert this pin to assert 'read'.")
+    check("BRACE_reason_is_out_of_grammar", got[1] == g.RULE_OUT_OF_GRAMMAR,
+          f"the over-refusal should still be the grammar rule; got {got[1]}")
+
+    ungrouped = cls('for f in /tmp/a /tmp/b; do [ -f "$f" ] && cat ' + MARK + '; done')
+    check("BRACE_same_guard_without_braces_is_a_read", ungrouped == "read",
+          "the PAIRED CONTROL: loop, test and && all present, braces absent, and it is the "
+          f"read it always was — the group is the trigger, not the guard; got {ungrouped}")
+
+    no_loop = cls('[ -f /tmp/a ] && { cat ' + MARK + '; }')
+    check("BRACE_no_loop_still_refused", no_loop == "write",
+          f"the loop is not the trigger either: the bare group is refused alone; got {no_loop}")
+
+    twin = cls('for f in /tmp/a; do [ -f "$f" ] && { cat ' + BENIGN + '; }; done')
+    check("BRACE_benign_twin", twin == "none",
+          f"a group naming no closure vocabulary must stay none; got {twin}")
+
+    grouped_write = cls('{ echo x > ' + MARK + '; }')
+    check("BRACE_grouped_write_stays_a_write", grouped_write == "write",
+          "the hole direction: a repair that models `{ }` must still see the write inside "
+          f"the group; got {grouped_write}")
+
+
 def test_every_case_in_this_file_is_in_ALL():
     """An explicit ALL satisfies tools/ci_selfexec_test.py, which refuses a `def test_*`
     that no Name node references — reflection over globals() is invisible to a static
@@ -384,6 +447,7 @@ ALL = [
     test_patch_writer_verdicts_are_decided_by_the_patch_not_the_fd,
     test_a_control_flow_keyword_no_longer_refuses_a_plain_read,
     test_pin_a_variable_in_a_write_position_sweeps_in_a_quoted_body,
+    test_pin_a_brace_group_with_a_read_only_body_is_refused,
     test_every_case_in_this_file_is_in_ALL,
 ]
 
