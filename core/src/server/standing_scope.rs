@@ -210,6 +210,18 @@ pub struct ProjectionAudit {
     pub divergence: Vec<String>,
 }
 
+/// Why `reassign` moved nothing. Each is a distinct answer the caller must give the
+/// operator, and none of them moves the generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReassignRefused {
+    /// No grant of record for `(from, path)`.
+    NoSuchGrant,
+    /// `from == to`: a no-op is not a mutation.
+    SameMember,
+    /// The destination already holds that path; which reach wins is the operator's call.
+    DestinationHoldsPath,
+}
+
 /// One floor path: every member may reach this, because the society says so.
 ///
 /// It carries its own provenance for the same reason a standing grant does — a widening whose
@@ -455,6 +467,50 @@ impl StandingScopeStore {
         changed
     }
 
+    /// Move one grant to another member, as ONE mutation: the source row is removed and a
+    /// destination row with the same `(path, recursive, expires_at)` is added, and the
+    /// generation moves once. The repair for a grant made against a mistyped member id.
+    ///
+    /// Why one mutation and not `add` + `revoke`: the two-step shape is what the dashboard
+    /// first shipped (grant destination, promote recursive, revoke source — three durable
+    /// writes) and it recreates the partial-transaction class #920/#987/#1001 rejected. An
+    /// interruption leaves both grants present; a failed promotion leaves the destination
+    /// with a narrower reach than the source it claims to carry unchanged. Here the store
+    /// changes in one call under one lock, `commit_standing_scope` writes it once, and the
+    /// reach shape cannot diverge because it is copied, not re-derived.
+    ///
+    /// Returns the grant that moved, or the reason nothing did. A self-reassign is a no-op
+    /// and moves nothing, generation included. A destination that already holds the path is
+    /// refused rather than merged: which reach wins is an operator's call, and the operator
+    /// has `revoke` and `set_recursive` to make it explicitly.
+    pub fn reassign(&mut self, from: &str, path: &str, to: &str, now: u64,
+                    reason: &str) -> Result<StandingGrant, ReassignRefused> {
+        if from == to {
+            return Err(ReassignRefused::SameMember);
+        }
+        let Some(src) = self.grants.iter().find(|g| g.member == from && g.path == path).cloned()
+        else {
+            return Err(ReassignRefused::NoSuchGrant);
+        };
+        if self.grants.iter().any(|g| g.member == to && g.path == path) {
+            return Err(ReassignRefused::DestinationHoldsPath);
+        }
+        let moved = StandingGrant {
+            member: to.to_string(),
+            path: src.path.clone(),
+            granted_at: now,
+            granted_by: "operator".into(),
+            reason: reason.to_string(),
+            expires_at: src.expires_at,
+            request_id: None,
+            recursive: src.recursive,
+        };
+        self.grants.retain(|g| !(g.member == from && g.path == path));
+        self.grants.push(moved.clone());
+        self.generation += 1;
+        Ok(moved)
+    }
+
     /// Remove a grant. Returns whether anything was removed; the generation moves only
     /// when the store actually changed, so the counter never claims a mutation that did
     /// not happen.
@@ -511,6 +567,42 @@ mod reach_tests {
 
     /// The store's membership honours each grant's OWN rule, and flipping it is a real
     /// change: the generation (hence law_hash) moves, and a no-op flip does not move it.
+    /// `reassign` is one mutation: the reach shape travels with the grant, the generation
+    /// moves once, and every refusal leaves the store byte-identical.
+    #[test]
+    fn reassign_carries_the_reach_shape_in_one_mutation_and_refuses_cleanly() {
+        let mut st = StandingScopeStore::default();
+        st.add(g("/w/tree", true));                       // member "m", recursive
+        st.grants[0].expires_at = Some(9_999_999_999);
+        let gen0 = st.generation;
+        let before = st.clone();
+
+        // Refusals: nothing moves, generation included.
+        assert_eq!(st.reassign("m", "/w/tree", "m", 5, "r"), Err(ReassignRefused::SameMember));
+        assert_eq!(st.reassign("m", "/w/nope", "n", 5, "r"), Err(ReassignRefused::NoSuchGrant));
+        assert_eq!(st.reassign("ghost", "/w/tree", "n", 5, "r"), Err(ReassignRefused::NoSuchGrant));
+        assert_eq!(st.grants, before.grants, "a refusal is a pure read");
+        assert_eq!(st.generation, gen0, "a refusal moves no generation");
+
+        // The move: one row out, one row in, recursive and expiry copied, generation +1.
+        let moved = st.reassign("m", "/w/tree", "n", 5, "typo repair").expect("moves");
+        assert_eq!(moved.member, "n");
+        assert!(moved.recursive, "a recursive source stays recursive at the destination");
+        assert_eq!(moved.expires_at, Some(9_999_999_999), "expiry travels with the grant");
+        assert_eq!(moved.reason, "typo repair");
+        assert_eq!(st.generation, gen0 + 1, "one mutation, one generation step");
+        assert_eq!(st.grants.len(), 1, "no residue on the source member");
+        assert!(!st.has_live("m", "/w/tree/child", 5) && st.has_live("n", "/w/tree/child", 5));
+
+        // The destination already holds the path: refused, not merged — even for an exact
+        // source under a recursive destination.
+        st.add(g("/w/tree", false));                      // member "m" again, exact
+        let gen1 = st.generation;
+        assert_eq!(st.reassign("m", "/w/tree", "n", 5, "r"), Err(ReassignRefused::DestinationHoldsPath));
+        assert_eq!(st.generation, gen1);
+        assert!(st.has_live("n", "/w/tree/child", 5), "the destination's reach is untouched");
+    }
+
     #[test]
     fn set_recursive_moves_the_generation_only_on_a_real_change() {
         let mut st = StandingScopeStore::default();

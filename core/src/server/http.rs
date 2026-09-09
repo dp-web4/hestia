@@ -1137,6 +1137,7 @@ pub async fn serve_with_callback(
         // its subtree (or back to exact). Exact stays the default everywhere.
         .route("/api/scope/standing/promote", post(scope_standing_promote))
         .route("/api/scope/standing/recursive", post(scope_standing_recursive))
+        .route("/api/scope/standing/reassign", post(scope_standing_reassign))
         // THE GRANT HALF NOW HAS A ROUTE, REVERSING A DELIBERATE DECISION RECORDED HERE.
         //
         // What stood here said: "The GRANT half deliberately has no route of its own: a
@@ -4245,6 +4246,151 @@ async fn scope_standing_recursive(
     })))
 }
 
+/// `POST /api/scope/standing/reassign` {plugin_id, path, to, reason} — move ONE standing
+/// grant from a mistyped member to the real one, as one act.
+///
+/// The dashboard's first cut of "reassign" choreographed three authority writes from the
+/// page: grant the destination, promote it recursive, revoke the source. Any interruption
+/// between them leaves both grants present, or a destination with a narrower reach than the
+/// source it claims to carry unchanged — the partial-transaction class #920/#987/#1001
+/// rejected (GPT's hold on #1006). Here the whole move is one store mutation under the state
+/// lock, one vault write, and the `scope_reach_change_intent` → commit → `scope_reassigned`
+/// order `scope_standing_recursive` uses, with the same rollback when the terminal record
+/// cannot be appended.
+///
+/// Refusals, all before any write and none moving the generation: the destination is not
+/// in the member registry (that is the mistake this exists to undo, so it is not repeated
+/// under a different name — 400); no grant of record for `(plugin_id, path)` (404);
+/// self-reassign (409, a no-op is not a mutation); the destination already holds that path
+/// (409 — which reach wins is the operator's explicit call, via revoke / make recursive).
+/// A reason is required: this widens the destination's reach.
+async fn scope_standing_reassign(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let from = body.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let to = body.get("to").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if from.is_empty() || to.is_empty() || raw_path.is_empty() {
+        return (StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "plugin_id, path and to are required"})));
+    }
+    if reason.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "reason is required to reassign a grant — it widens what the destination \
+                      member can reach"
+        })));
+    }
+    let path = crate::server::state::normalize_scope_path(&raw_path);
+    let now = crate::server::gate_escalation::now_secs();
+
+    let mut s = state.lock().await;
+    // THE DESTINATION MUST BE A MEMBER THIS DAEMON HAS RECORDED. `member_lct` derives a
+    // label for any string and cannot say no (see `scope_grant`); the registry can. A grant
+    // to an id nobody has seen is exactly what this operation repairs, so it must not be
+    // able to produce one.
+    if s.member_registry.get(&to).is_none() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("'{to}' is not a member this daemon has recorded; a reassign to an \
+                              unseen id would recreate the mistake it exists to undo. Nothing \
+                              was changed."),
+            "member_known": false,
+        })));
+    }
+    // What WOULD change, decided on a scratch copy before anything durable happens, so
+    // every refusal below is a pure read: no intent, no generation movement.
+    let preview = {
+        let mut probe = s.standing_scope.clone();
+        probe.reassign(&from, &path, &to, now, &reason)
+    };
+    let moved = match preview {
+        Ok(g) => g,
+        Err(crate::server::standing_scope::ReassignRefused::NoSuchGrant) => {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                "error": format!("no standing grant of record for ('{from}', '{path}')")})));
+        }
+        Err(crate::server::standing_scope::ReassignRefused::SameMember) => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "source and destination are the same member; nothing to move, nothing witnessed",
+                "generation": s.standing_scope.generation})));
+        }
+        Err(crate::server::standing_scope::ReassignRefused::DestinationHoldsPath) => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": format!("'{to}' already holds a standing grant on '{path}'; which reach \
+                                  wins is your call — revoke one, or make the survivor recursive"),
+                "generation": s.standing_scope.generation})));
+        }
+    };
+
+    let subject_from = s.member_lct(&from);
+    let subject_to = s.member_lct(&to);
+    let record = |kind: &str, extra: serde_json::Value| {
+        let mut v = serde_json::json!({
+            "plugin_id": from,
+            "to": to,
+            "subject_instance_lct": subject_from,
+            "destination_instance_lct": subject_to,
+            "path": path,
+            "recursive": moved.recursive,
+            "expires_at": moved.expires_at,
+            "reason": reason,
+            "changed_by": "operator",
+            "via": "operator_session",
+            "applies_to": {"standing": true, "live": null},
+        });
+        v.as_object_mut().unwrap().insert("kind".into(), serde_json::Value::String(kind.into()));
+        if let Some(obj) = extra.as_object() {
+            for (k, val) in obj { v.as_object_mut().unwrap().insert(k.clone(), val.clone()); }
+        }
+        v
+    };
+
+    // INTENT first: the durable effect has not happened and may not.
+    let intent = match s.append_chain("scope_reassign_intent",
+        record("intent", serde_json::json!({"standing_generation": s.standing_scope.generation + 1}))) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("witness append failed, grant NOT moved: {e}")}))),
+    };
+    let prior = s.standing_scope.clone();
+    if let Err(e) = s.commit_standing_scope(|st| { let _ = st.reassign(&from, &path, &to, now, &reason); }) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("grant NOT moved — vault write failed ({e}); the live store is \
+                              untouched (the candidate was persisted first). Retry."),
+            "state": "the chain holds the INTENT and no scope_reassigned",
+            "intentEntryHash": intent.hash,
+        })));
+    }
+    // TERMINAL, only now, with the generation the commit actually produced.
+    let success = match s.append_chain("scope_reassigned",
+        record("terminal", serde_json::json!({
+            "standing_generation": s.standing_scope.generation, "intent": intent.hash}))) {
+        Ok(e) => e,
+        Err(e) => {
+            return match s.commit_standing_scope(|st| *st = prior) {
+                Ok(()) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("grant NOT moved — the terminal record failed ({e}); rolled \
+                                      back (live store and vault), the chain holds only the \
+                                      intent. Retry."),
+                    "intentEntryHash": intent.hash,
+                }))),
+                Err(rb) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("THE MOVE IS LIVE but its terminal record could not be \
+                                      appended ({e}) AND the rollback failed ({rb}). Repair the \
+                                      chain — do not assume the store is consistent."),
+                    "intentEntryHash": intent.hash,
+                }))),
+            };
+        }
+    };
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true, "plugin_id": from, "to": to, "path": path, "recursive": moved.recursive,
+        "generation": s.standing_scope.generation,
+        "witnessEntryHash": success.hash,
+    })))
+}
+
 fn stamp_gate(
     record: serde_json::Value,
     gate: &Option<axum::Extension<super::operator_auth::GateWitness>>,
@@ -6173,6 +6319,162 @@ mod disposition_tests {
         let chain = s.recent_chain(20);
         assert!(chain.iter().any(|e| e.event_type == "scope_reach_change_intent"));
         assert!(!chain.iter().any(|e| e.event_type == "scope_reach_changed"));
+    }
+
+    /// A standing grant on `member` with the given reach, committed through the vault.
+    async fn seed_grant(state: &SharedState, member: &str, path: &str, recursive: bool) {
+        let now = crate::server::gate_escalation::now_secs();
+        let mut s = state.lock().await;
+        s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+            member: member.into(), path: path.into(), granted_at: now,
+            granted_by: "operator".into(), reason: "r".into(), expires_at: None,
+            request_id: None, recursive,
+        })).unwrap();
+    }
+
+    /// A member the daemon has RECORDED — connect registers it, which is the only way
+    /// `member_registry` can say yes (it can say no; `member_lct` cannot).
+    async fn register_member(state: &SharedState, id: &str) {
+        super::super::handler::tool_connect(state, &serde_json::json!({
+            "plugin_id": id, "host_agent": "test"})).await.unwrap();
+    }
+
+    async fn reassign(state: &SharedState, body: serde_json::Value) -> axum::response::Response {
+        scope_standing_reassign(State(state.clone()), Json(body)).await.into_response()
+    }
+
+    fn snapshot(s: &crate::server::state::ServerState) -> (Vec<crate::server::standing_scope::StandingGrant>, u64, usize) {
+        (s.standing_scope.grants.clone(), s.standing_scope.generation, s.recent_chain(50).len())
+    }
+
+    /// GPT's hold on #1006: reassign is ONE act. A recursive source arrives recursive, the
+    /// source row is gone in the same commit, the generation moves once, and the terminal
+    /// record carries the intent's hash and the generation the commit actually produced.
+    #[tokio::test]
+    async fn reassign_moves_the_grant_with_its_reach_in_one_act() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "codex").await;
+        seed_grant(&state, "Claude-code", "/w/tree", true).await;   // the McNugget typo, recursive
+        let (_, gen0, rows0) = { let s = state.lock().await; snapshot(&s) };
+
+        let resp = reassign(&state, serde_json::json!({
+            "plugin_id": "Claude-code", "path": "/w/tree", "to": "codex",
+            "reason": "granted to a typo; the seat is codex"})).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let s = state.lock().await;
+        assert!(s.has_scope_grant("codex", "/w/tree/child.py"), "recursive source stays recursive at the destination");
+        assert!(!s.has_scope_grant("Claude-code", "/w/tree"), "no residue on the source");
+        assert_eq!(s.standing_scope.grants.len(), 1, "one row moved, none duplicated");
+        assert_eq!(s.standing_scope.generation, gen0 + 1, "one mutation, one generation step");
+        let chain = s.recent_chain(20);
+        let intent = chain.iter().find(|e| e.event_type == "scope_reassign_intent").expect("intent record");
+        let term = chain.iter().find(|e| e.event_type == "scope_reassigned").expect("terminal record");
+        assert_eq!(term.event_data["intent"], serde_json::json!(intent.hash));
+        assert_eq!(term.event_data["standing_generation"], serde_json::json!(gen0 + 1));
+        assert_eq!(term.event_data["recursive"], serde_json::json!(true));
+        assert_eq!(term.event_data["to"], serde_json::json!("codex"));
+        assert_eq!(s.recent_chain(50).len(), rows0 + 2, "exactly the intent and the terminal");
+        drop(s);
+
+        // CONCURRENT WRITER: the state lock serialises the two; the loser finds no grant
+        // and writes nothing — there is no half-state for it to complete or to double.
+        let (_, gen1, rows1) = { let s = state.lock().await; snapshot(&s) };
+        let resp = reassign(&state, serde_json::json!({
+            "plugin_id": "Claude-code", "path": "/w/tree", "to": "codex", "reason": "again"})).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "the second writer loses cleanly");
+        let s = state.lock().await;
+        assert_eq!((s.standing_scope.generation, s.recent_chain(50).len()), (gen1, rows1));
+    }
+
+    /// Every refusal is a pure read: unknown destination, self-reassign, no such grant,
+    /// destination already holding the path, missing reason — zero writes, zero rows, the
+    /// generation where it was.
+    #[tokio::test]
+    async fn reassign_refusals_write_nothing() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "codex").await;
+        seed_grant(&state, "Claude-code", "/w/tree", false).await;
+        seed_grant(&state, "codex", "/w/other", true).await;
+        let before = { let s = state.lock().await; snapshot(&s) };
+
+        let cases = [
+            (serde_json::json!({"plugin_id": "Claude-code", "path": "/w/tree", "to": "kimi-cod", "reason": "r"}),
+             StatusCode::BAD_REQUEST, "unknown destination = the mistake this undoes"),
+            // Self-reassign on a KNOWN member: the registry check passes, the no-op is caught.
+            // (A self-reassign on the typo id itself is refused one step earlier, as unknown.)
+            (serde_json::json!({"plugin_id": "codex", "path": "/w/other", "to": "codex", "reason": "r"}),
+             StatusCode::CONFLICT, "self-reassign is a no-op"),
+            (serde_json::json!({"plugin_id": "nobody", "path": "/w/tree", "to": "codex", "reason": "r"}),
+             StatusCode::NOT_FOUND, "no such grant"),
+            (serde_json::json!({"plugin_id": "Claude-code", "path": "/w/tree", "to": "codex"}),
+             StatusCode::BAD_REQUEST, "a reason is required: this widens reach"),
+        ];
+        for (body, want, why) in cases {
+            let resp = reassign(&state, body).await;
+            assert_eq!(resp.status(), want, "{why}");
+            let s = state.lock().await;
+            assert_eq!(snapshot(&s), before, "{why}: byte-identical store, no rows");
+        }
+        // Destination already holds the path: refused, not merged.
+        seed_grant(&state, "codex", "/w/tree", true).await;
+        let before2 = { let s = state.lock().await; snapshot(&s) };
+        let resp = reassign(&state, serde_json::json!({
+            "plugin_id": "Claude-code", "path": "/w/tree", "to": "codex", "reason": "r"})).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let s = state.lock().await;
+        assert_eq!(snapshot(&s), before2, "which reach wins is the operator's explicit call");
+    }
+
+    /// Injected failure at the COMMIT stage: the chain holds the intent and no terminal
+    /// record, and the store is byte-identical — both grants where they were.
+    #[tokio::test]
+    async fn reassign_failed_commit_leaves_intent_only_and_store_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, state) = test_state().await;
+        register_member(&state, "codex").await;
+        seed_grant(&state, "Claude-code", "/w/tree", true).await;
+        let (grants0, gen0, _) = { let s = state.lock().await; snapshot(&s) };
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let resp = reassign(&state, serde_json::json!({
+            "plugin_id": "Claude-code", "path": "/w/tree", "to": "codex", "reason": "r"})).await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "the vault write must have failed for this test to test anything");
+        let s = state.lock().await;
+        assert_eq!(s.standing_scope.grants, grants0, "store byte-identical: the source still holds it, the destination never did");
+        assert_eq!(s.standing_scope.generation, gen0);
+        assert!(!s.has_scope_grant("codex", "/w/tree"));
+        let chain = s.recent_chain(20);
+        assert!(chain.iter().any(|e| e.event_type == "scope_reassign_intent"), "the intent is the record of the attempt");
+        assert!(!chain.iter().any(|e| e.event_type == "scope_reassigned"), "no terminal record for a move not in force");
+    }
+
+    /// Injected failure at the TERMINAL stage: the move is rolled back through the commit
+    /// path, so committed authority never outlives a missing terminal record.
+    #[tokio::test]
+    async fn reassign_failed_terminal_witness_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        register_member(&state, "codex").await;
+        seed_grant(&state, "Claude-code", "/w/tree", true).await;
+        let (grants0, gen0, _) = { let s = state.lock().await; snapshot(&s) };
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_reassign_terminal BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'scope_reassigned'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;").unwrap();
+        let resp = reassign(&state, serde_json::json!({
+            "plugin_id": "Claude-code", "path": "/w/tree", "to": "codex", "reason": "r"})).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        conn.execute_batch("DROP TRIGGER fail_reassign_terminal").unwrap();
+        let s = state.lock().await;
+        assert_eq!(s.standing_scope.grants, grants0, "rolled back: the source holds it again");
+        assert_eq!(s.standing_scope.generation, gen0, "generation restored by the rollback commit");
+        assert!(!s.has_scope_grant("codex", "/w/tree/child.py"));
+        let chain = s.recent_chain(20);
+        assert!(chain.iter().any(|e| e.event_type == "scope_reassign_intent"));
+        assert!(!chain.iter().any(|e| e.event_type == "scope_reassigned"));
     }
 
     /// The operator may choose recursive AT decide time; the member never can.

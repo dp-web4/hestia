@@ -3347,6 +3347,10 @@
           ${live ? '' : `<button class="grant-revoke" data-revoke-member="${
             escapeHtml(String(g.plugin_id))}" data-revoke-path="${
             escapeHtml(String(g.path))}">revoke</button>`}
+          ${live ? '' : `<button class="grant-act" data-move-member="${
+            escapeHtml(String(g.plugin_id))}" data-move-path="${
+            escapeHtml(String(g.path))}" data-move-recursive="${g.recursive ? 'true' : 'false'}"
+            title="give this same grant to a different member, in one act — the repair for a mistyped id">reassign</button>`}
         </div>`;
     }).join('');
   }
@@ -4355,13 +4359,54 @@
         } catch (e2) { err.textContent = `${to ? 'make recursive' : 'make exact'} failed: ${e2.message}`; err.hidden = false; rch.disabled = false; }
         return;
       }
-      // `reassign` — the repair for a grant made against a mistyped id — is deliberately
-      // NOT here yet. Its first cut choreographed three authority writes from this page
-      // (grant destination, promote recursive, revoke source); an interruption between them
-      // leaves both grants present, or a destination with a narrower reach than the source
-      // it claims to carry unchanged — the partial-transaction class #920/#987/#1001 rejected.
-      // It returns as one daemon-side atomic act under the standing-scope lock, with this
-      // page calling that one operation.
+      // REASSIGN — the repair for a grant made against a mistyped member id.
+      //
+      // Fixing one used to mean revoking and re-typing the path into the grant form — the
+      // same keyboard that produced the mistake. The first cut of this button choreographed
+      // three authority writes from here (grant destination, promote recursive, revoke
+      // source), which an interruption turns into both grants present or a destination
+      // narrower than its source. So the page now asks the daemon for ONE act:
+      // `POST /api/scope/standing/reassign` moves the grant under the standing-scope lock,
+      // `(path, recursive)` copied not re-derived, one intent and one terminal record. The
+      // destination is picked from members the daemon has actually seen; the daemon checks
+      // its registry again before it mutates anything.
+      const mv = e.target.closest('[data-move-member]');
+      if (mv) {
+        const from = mv.dataset.moveMember, p2 = mv.dataset.movePath;
+        const rec = mv.dataset.moveRecursive === 'true';
+        const seen = [...knownMembers.keys()].filter(id => id !== from);
+        if (!seen.length) {
+          err.textContent = 'reassign: no other member has connected to this daemon yet.';
+          err.hidden = false; return;
+        }
+        const to = prompt(`Reassign this ${rec ? 'recursive' : 'exact'} grant from "${from}" to which member?\n\n${p2}\n\n`
+          + `Members this daemon has actually seen:\n  ${seen.join('\n  ')}\n\n`
+          + `Type the destination id exactly:`);
+        if (to === null) return;
+        const dest = to.trim();
+        if (!dest) return;
+        if (!knownMembers.has(dest)) {
+          err.textContent = `reassign refused: "${dest}" is not a member this daemon has seen. `
+            + `That is the mistake this action exists to undo, so it will not repeat it.`;
+          err.hidden = false; return;
+        }
+        const why = prompt(`Reason (required — this widens ${dest}'s reach):`);
+        if (why === null || !why.trim()) return;
+        mv.disabled = true; err.hidden = true;
+        try {
+          const r = await apiFetch('/api/scope/standing/reassign', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ plugin_id: from, path: p2, to: dest, reason: why }),
+          });
+          const o = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(o?.error || `HTTP ${r.status}`);
+          await tick(); renderScopeGrants(lastData);
+        } catch (e2) {
+          err.textContent = `reassign failed: ${e2.message}`;
+          err.hidden = false; mv.disabled = false;
+        }
+        return;
+      }
 
       const rev = e.target.closest('[data-revoke-member]');
       if (!rev) return;
