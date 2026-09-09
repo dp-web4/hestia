@@ -393,6 +393,23 @@ def test_path_grants_keep_their_type_and_match_resolved_boundaries():
     v = G.evaluate(ev, exact, ws)
     check("deep_exact_deny_names_the_deep_grant_it_lies_beneath",
           "path:" + os.path.realpath(deep) + " is EXACT" in v.reason, v.reason)
+    # THE SHELL SURFACE MUST AGREE (GPT review of #1003). The first cut rebuilt the hint's
+    # path as `<ws>/<offending segment>`, which under an exact grant on `<ws>/repo/sub`
+    # names `<ws>/repo` — outside every exact root — so the Read deny explained itself and
+    # the shell deny for the same reach did not. Now the checker's resolved path is carried.
+    v = G.evaluate(G.NormalizedEvent(tool="Bash", command=f"cat {deep}/child.txt", cwd=ws),
+                   exact, ws)
+    real_deep = "path:" + os.path.realpath(deep)
+    check("deep_exact_shell_deny_names_the_deep_grant_it_lies_beneath",
+          v.blocks and real_deep + " is EXACT" in v.reason and real_deep + "/**" in v.reason,
+          v.reason)
+    # The two-field contract the shims read is unchanged; the third field is the new fact.
+    ok, tok = G.command_in_scope(f"cat {deep}/child.txt", [deep_entry], ws, ws)
+    ok3, tok3, refused = G.command_scope_reach(f"cat {deep}/child.txt", [deep_entry], ws, ws)
+    check("command_in_scope_keeps_its_two_field_contract",
+          (ok, tok) == (ok3, tok3) and not ok, f"{(ok, tok)} vs {(ok3, tok3)}")
+    check("command_scope_reach_carries_the_resolved_refused_path",
+          refused == os.path.normpath(f"{deep}/child.txt").replace("\\", "/"), str(refused))
     narrow = _profile(_workspace(), [deep_entry + "/**"])
     check("deep_directory_recursive_grant_admits_child",
           G.evaluate(ev, narrow, ws).decision == "allow")

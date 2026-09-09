@@ -887,7 +887,24 @@ def path_in_scope(path: str, scopes, workspace: str, profile: HarnessProfile,
 
 
 def command_in_scope(cmd: str, scopes, workspace: str, cwd: Optional[str] = None):
-    """Returns (ok, offending_token).
+    """Returns (ok, offending_token) — the two-field contract every seat's shim reads.
+
+    `command_scope_reach` is the same check carrying the third fact the deny text needs:
+    the resolved path that was refused. This wrapper exists so the shims (kimi, gemini,
+    the parity test) keep their contract while `evaluate` reads the richer one."""
+    ok, offending, _resolved = command_scope_reach(cmd, scopes, workspace, cwd)
+    return ok, offending
+
+
+def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = None):
+    """Returns (ok, offending_token, resolved_path).
+
+    `resolved_path` is the candidate the check actually judged — absolute, normalised — or
+    None when nothing was refused. It is carried rather than reconstructed: the deny text
+    used to rebuild `<ws>/<offending segment>` from the display token, which names the
+    right repo and the wrong depth, so a deny beneath a DEEPER exact grant (`<ws>/repo/sub`
+    granted exact, `<ws>/repo/sub/file` reached) got no explanation while the equivalent
+    Read deny did (GPT review of #1003). The checker already knew the path; now it says so.
 
     A reach is judged by WHERE IT RESOLVES, not by what it lexically mentions. Lexical
     mention-scanning false-denied two whole classes, both found live via the Codex gate on
@@ -907,10 +924,10 @@ def command_in_scope(cmd: str, scopes, workspace: str, cwd: Optional[str] = None
         tok = re.split(r"""[\s"'`);&|<>]""", after.lstrip("/"), 1)[0]
         resolved = os.path.normpath(f"{ws}/{tok}").replace("\\", "/")
         if resolved != ws and not resolved.startswith(ws + "/"):
-            return False, (tok or "<workspace root>")   # traversed out of the workspace
+            return False, (tok or "<workspace root>"), resolved   # traversed out of the workspace
         seg = resolved[len(ws):].lstrip("/").split("/", 1)[0]
         if seg not in repo_scopes and not _within_path_grant(resolved, scopes, workspace):
-            return False, (seg or "<workspace root>")
+            return False, (seg or "<workspace root>"), resolved
 
     # Pass 2 — relative tokens. The event cwd is NOT reliable: the engine may run each command
     # with a per-command workdir the event does not carry (observed live via the Codex gate —
@@ -941,26 +958,27 @@ def command_in_scope(cmd: str, scopes, workspace: str, cwd: Optional[str] = None
             while k < len(comps) and comps[k] == "..":
                 k += 1
             probe = "/".join(comps[:k + 1]) if k < len(comps) else "/".join(comps)
-            in_scope_vote, oos_vote = False, None
+            in_scope_vote, oos_vote, oos_path = False, None, None
             for base in bases:
                 cand = os.path.normpath(os.path.join(base, probe)).replace("\\", "/")
                 if not os.path.exists(cand):
                     continue
                 if cand == ws:
                     oos_vote = oos_vote or "<workspace root>"
+                    oos_path = oos_path or cand
                     continue
                 if cand.startswith(ws + "/"):
                     seg = cand[len(ws) + 1:].split("/", 1)[0]
                     if seg in repo_scopes or _within_path_grant(cand, scopes, workspace):
                         in_scope_vote = True
                         break
-                    oos_vote = seg
+                    oos_vote, oos_path = seg, cand
                 elif _within_path_grant(cand, scopes, workspace):
                     in_scope_vote = True
                     break
             if not in_scope_vote and oos_vote:
-                return False, oos_vote
-    return True, None
+                return False, oos_vote, oos_path
+    return True, None, None
 
 
 #: Roots that are always reachable regardless of MRH — scratch space, not governed territory.
@@ -1119,15 +1137,14 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
                 f"(granted: {'+'.join(scopes)}){hint}",
             )
     if event.command is not None:
-        ok, offending = command_in_scope(event.command, scopes, ws, event.cwd)
+        ok, offending, refused = command_scope_reach(event.command, scopes, ws, event.cwd)
         if not ok:
             # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
-            # debugging blind (Codex live session, 2026-07-23). The offending token is a
-            # workspace-relative segment (or a `<...>` placeholder that names no path), so
-            # the exact-grant hint is judged on `<ws>/<segment>` — the reach that was refused.
-            hint = ""
-            if offending and not offending.startswith("<"):
-                hint = _exact_grant_hint(f"{ws.rstrip('/')}/{offending}", scopes, ws)
+            # debugging blind (Codex live session, 2026-07-23). The exact-grant hint is
+            # judged on the path the checker actually refused — carried out of the check,
+            # not rebuilt from the display token, which has the right repo and the wrong
+            # depth (GPT review of #1003).
+            hint = _exact_grant_hint(refused, scopes, ws) if refused else ""
             return _deny(
                 "mrh.command",
                 f"'{event.tool}' command reaches outside your granted scope: '{offending}' "
