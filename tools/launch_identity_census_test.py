@@ -139,6 +139,16 @@ def main() -> int:
 
     print("D. launcher exercise is counted from the fire script's OWN per-run logs")
     import tempfile
+    import time
+    # The fire scripts stamp in the HOST'S local clock; pin the host to UTC for the counting
+    # arms so the fixture reads the same on every box, and to a DST zone for the straddle.
+    saved_tz = os.environ.get("TZ")
+
+    def set_tz(name):
+        os.environ["TZ"] = name
+        time.tzset()
+
+    set_tz("UTC")
     with tempfile.TemporaryDirectory() as tmp:
         logs = Path(tmp) / "logs"
         logs.mkdir()
@@ -171,6 +181,40 @@ def main() -> int:
               fs["fire-codex.sh"]["log_prefix"] == "codex"
               and fs["fire-codex.sh"]["log_dir"] == os.path.expanduser("~/.local/state/hestia-mesh/logs"),
               str(fs))
+
+        # D5, GPT's clock-domain hold. The host is in a DST zone (UTC-7 in September); the
+        # window is chain time. Two fires straddle the window start by the host offset: a
+        # local stamp that READS after the window's date digits but is before it in real
+        # time, and one that reads before local midnight but is inside. A lexical compare
+        # of the digits gets both wrong; the epoch compare gets both right.
+        set_tz("America/Los_Angeles")
+        straddle = Path(tmp) / "straddle"
+        straddle.mkdir()
+        (straddle / "kimi-20260909-000100.log").write_text("x")   # 00:01 PDT = 07:01Z Sep 9
+        (straddle / "kimi-20260908-225959.log").write_text("x")   # 22:59 PDT = 05:59Z Sep 9
+        (straddle / "kimi-20260908-230001.log").write_text("x")   # 23:00 PDT = 06:00Z Sep 9
+        fires_s = {"fire-kimi.sh": {"roles": set(), "session_id_flag": False, "plugin": None,
+                                    "log_dir": str(straddle), "log_prefix": "kimi"}}
+        ex = c.fire_exercise(fires_s, "2026-09-09T06:00:00Z")
+        check("D5 window 06:00Z on a UTC-7 host: 23:00 local and later count, 22:59 local does not",
+              ex["fire-kimi.sh"] == 2, str(ex))
+        ex = c.fire_exercise(fires_s, "2026-09-09T00:00:00")
+        check("D5 a naive window start is chain time (UTC), so a lexical read of the date digits "
+              "would count 1 and the epoch compare counts all 3",
+              ex["fire-kimi.sh"] == 3, str(ex))
+        ex = c.fire_exercise(fires_s, "2026-09-08T23:00:00-07:00")
+        check("D5 an explicit offset on the window is honoured (same instant as 06:00Z)",
+              ex["fire-kimi.sh"] == 2, str(ex))
+        check("D5 the conversion is the host's timezone rules, not a constant: stamp_epoch moves "
+              "with TZ", c.stamp_epoch("20260909-000000") == c.since_epoch("2026-09-09T07:00:00Z"))
+        set_tz("UTC")
+        check("D5 under a UTC host the same stamp is the same instant as its digits",
+              c.stamp_epoch("20260909-000000") == c.since_epoch("2026-09-09T00:00:00Z"))
+    if saved_tz is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = saved_tz
+    time.tzset()
 
     print()
     if FAILURES:

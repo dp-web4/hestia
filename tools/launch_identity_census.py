@@ -138,14 +138,23 @@ def fire_scripts(mesh_dir: Path | None) -> dict[str, dict]:
 def fire_exercise(fires: dict[str, dict], since: str) -> dict[str, int | None]:
     """How many times each fire script RAN in the window, from its own per-invocation logs.
 
-    `since` is the census window's ISO start; a log is in the window when the stamp in its
-    name (`<prefix>-YYYYmmdd-HHMMSS.log`, the fire script's own clock) is at or after it.
-    None when the script names no log location or the directory cannot be listed — the
-    verdict layer then says "not observed", never "never ran". This is the fact GPT's hold
-    on #1000 asked for: a launcher's declared role can only be called LOST if the launcher
-    was exercised; a declaration nothing ran is untested, not refuted.
+    `since` is the census window's start — chain time, i.e. UTC unless it carries an offset.
+    A log is in the window when the stamp in its name (`<prefix>-YYYYmmdd-HHMMSS.log`) is at
+    or after it. None when the script names no log location or the directory cannot be
+    listed — the verdict layer then says "not observed", never "never ran". This is the fact
+    GPT's hold on #1000 asked for: a launcher's declared role can only be called LOST if the
+    launcher was exercised; a declaration nothing ran is untested, not refuted.
+
+    TWO CLOCK DOMAINS, made one explicitly (GPT's second hold). The fire scripts stamp the
+    filename with plain `date +%Y%m%d-%H%M%S` — the HOST'S LOCAL clock — while the window is
+    chain time. Comparing the digits lexically counted a fire on the wrong side of the window
+    for the hours between local midnight and UTC midnight, and here that is not cosmetic:
+    zero reads UNTESTED-LAUNCHER, one reads DECLARED!=SEEN. So both sides become epochs: the
+    stamp through the host's own timezone database (`time.mktime`, DST and all — never a
+    hardcoded offset), the window through `since_epoch`. If the fire scripts ever stamp in
+    UTC, `stamp_epoch` is the one place to follow them.
     """
-    since_stamp = re.sub(r"[^0-9]", "", since)[:14]
+    since_ts = since_epoch(since)
     out: dict[str, int | None] = {}
     for name, f in fires.items():
         d, prefix = f.get("log_dir"), f.get("log_prefix")
@@ -157,14 +166,34 @@ def fire_exercise(fires: dict[str, dict], since: str) -> dict[str, int | None]:
         except OSError:
             out[name] = None
             continue
-        pat = re.compile(rf"^{re.escape(prefix)}-(\d{{8}})-(\d{{6}})\.log$")
+        pat = re.compile(rf"^{re.escape(prefix)}-(\d{{8}}-\d{{6}})\.log$")
         n = 0
         for fn in names:
             m = pat.match(fn)
-            if m and (m.group(1) + m.group(2)) >= since_stamp:
+            if m and stamp_epoch(m.group(1)) >= since_ts:
                 n += 1
         out[name] = n
     return out
+
+
+def since_epoch(since: str) -> float:
+    """The window start as an epoch. ISO-8601; a trailing `Z` or an explicit offset is
+    honoured, and a naive stamp is UTC because that is what the chain writes."""
+    import datetime as _dt
+    text = since.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = _dt.datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+    return parsed.timestamp()
+
+
+def stamp_epoch(stamp: str) -> float:
+    """A fire-log stamp (`YYYYmmdd-HHMMSS`, the host's LOCAL clock as `date` wrote it) as an
+    epoch, through the host's timezone rules — the same rules that produced it."""
+    import time as _time
+    return _time.mktime(_time.strptime(stamp, "%Y%m%d-%H%M%S"))
 
 
 def harness_hook_lines(repo: Path, home: Path) -> dict[str, list[dict]]:
