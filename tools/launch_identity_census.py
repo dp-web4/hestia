@@ -227,17 +227,47 @@ def harness_hook_lines(repo: Path, home: Path) -> dict[str, list[dict]]:
 # ---- observed side ----------------------------------------------------------------------
 
 
-def observe(since: str, max_entries: int = 20000) -> dict[str, dict]:
+def chain_epoch(timestamp: str) -> float | None:
+    """A chain row's RFC3339 timestamp (`2026-09-08T19:33:15.288358535+00:00`) as an epoch,
+    or None when it will not parse. The fraction is cut to microseconds because the daemon
+    writes nine digits and `fromisoformat` accepts six."""
+    import datetime as _dt
+    text = timestamp.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    text = re.sub(r"(\.\d{6})\d+", r"\1", text)
+    try:
+        parsed = _dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+    return parsed.timestamp()
+
+
+def observe(since: str, max_entries: int = 20000, entries=None) -> dict[str, dict]:
+    """Per actor: rows, roles, role-less kinds and host sessions, over the window.
+
+    ONE CLOCK DOMAIN GOVERNS BOTH INPUTS of the verdict join (GPT's third hold on #1000).
+    The window start is the same instant `fire_exercise` uses (`since_epoch`), and each
+    chain timestamp is parsed to an instant before the comparison — never the raw string
+    cut to 19 characters, which put an explicit-offset `--since` on a different boundary
+    for the two sides of `DECLARED!=SEEN`. `entries` lets a test feed rows without a daemon.
+    """
     sys.path.insert(0, str(REPO / "tools"))
     import chain_walk as cw  # noqa: E402
 
+    since_ts = since_epoch(since)
     acts: dict[str, dict] = collections.defaultdict(lambda: {
         "rows": 0, "roles": collections.Counter(), "no_role_kinds": collections.Counter(),
         "kinds": collections.Counter(), "host_sessions": set(),
     })
-    for e in cw.ChainWalker().walk(max_entries=max_entries):
-        ts = (e.get("timestamp") or "")[:19]
-        if ts < since:
+    rows = entries if entries is not None else cw.ChainWalker().walk(max_entries=max_entries)
+    for e in rows:
+        ts = chain_epoch(e.get("timestamp") or "")
+        if ts is None:
+            continue
+        if ts < since_ts:
             break
         p = cw.payload(e)
         rb = p.get("requested_by") or {}

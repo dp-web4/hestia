@@ -210,6 +210,40 @@ def main() -> int:
         set_tz("UTC")
         check("D5 under a UTC host the same stamp is the same instant as its digits",
               c.stamp_epoch("20260909-000000") == c.since_epoch("2026-09-09T00:00:00Z"))
+
+        # E, GPT's third hold: the verdict is a JOIN, and one clock domain must govern both
+        # inputs. The same explicit-offset window must include and exclude the same boundary
+        # instants on the fire side and on the chain side. Chain rows are newest-first, as
+        # the walker yields them, with the daemon's nine-digit fractions and +00:00.
+        set_tz("America/Los_Angeles")
+        window = "2026-09-08T23:00:00-07:00"                    # 06:00Z Sep 9, as an offset
+        rows = [
+            {"timestamp": "2026-09-09T06:00:00.000000001+00:00", "eventType": "outcome",
+             "eventData": {"plugin_id": "kimi-code", "role_lct": "role:constellation:mesh-worker"}},
+            {"timestamp": "2026-09-09T05:59:59.999999999+00:00", "eventType": "outcome",
+             "eventData": {"plugin_id": "kimi-code", "role_lct": "role:constellation:interactive-dev"}},
+            {"timestamp": "2026-09-08T23:00:00.000000000+00:00", "eventType": "outcome",
+             "eventData": {"plugin_id": "kimi-code", "role_lct": "role:constellation:interactive-dev"}},
+        ]
+        obs_e = c.observe(window, entries=rows)
+        check("E1 chain side: the row at 06:00Z is in, the rows before it are out — the walk stops "
+              "at the instant, not at the string '2026-09-08T23:00:00'",
+              obs_e["kimi-code"]["rows"] == 1 and obs_e["kimi-code"]["roles"].get("role:constellation:mesh-worker") == 1,
+              str(dict(obs_e)))
+        ex_e = c.fire_exercise(fires_s, window)
+        check("E1 fire side, same window: 23:00 local (06:00:01Z) and later are in, 22:59 is out",
+              ex_e["fire-kimi.sh"] == 2, str(ex_e))
+        # The same rows under a Z window at the same instant: identical answer on both sides.
+        obs_z = c.observe("2026-09-09T06:00:00Z", entries=rows)
+        ex_z = c.fire_exercise(fires_s, "2026-09-09T06:00:00Z")
+        check("E2 an offset window and its Z equivalent give the same answer on both sides",
+              obs_z["kimi-code"]["rows"] == obs_e["kimi-code"]["rows"] and ex_z == ex_e,
+              f"{dict(obs_z)} {ex_z}")
+        # A trailing Z on the window used to make the 19-char lexical cut subtly wrong; the
+        # boundary row itself is included under every spelling of the same instant.
+        check("E3 the nine-digit daemon fraction parses, and a row exactly at the boundary is IN",
+              c.chain_epoch("2026-09-09T06:00:00.000000000+00:00") == c.since_epoch("2026-09-09T06:00:00Z")
+              and c.chain_epoch("garbage") is None)
     if saved_tz is None:
         os.environ.pop("TZ", None)
     else:
