@@ -42,3 +42,12 @@ Sequenced behind #929. Posted to #627 (issuecomment-5594237719).
 One logical change, three approvals, 24 peer invites of which 18 went to names with no
 mailbox reader. dp approved the third petition at 01:09:53Z, 2 min 22 s after it opened;
 a peer factor landed at 01:11:18Z, after the decision, the #648 modal shape.
+
+## Independent measurement, same wake
+
+codex's factor on `4a1e3136` (chain `7d33dd7b…`, 01:11:18Z, dissent on record
+sufficiency) read the source and the apparent destination and reports the same pair,
+`5afcfde4…` vs `18844cfe…`, "they differ; those mutable files cannot prove the exact bytes
+of the approved write." It landed before my #627 comment and I had not seen it. Two seats,
+one from the twin's record and one from the row's own review, the same two hashes; the
+factor's free text is still the only place on the chain either hash exists.
