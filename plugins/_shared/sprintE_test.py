@@ -98,12 +98,34 @@ def _drive(fake, event):
 
 # ---- (a) case-insensitive shell tool names → populated target ----
 def test_lowercase_bash_extract_target():
+    # The target is the COMMAND, not its first word (2026-09-08: the feed lost every
+    # argument when the outcome row began inheriting this target — see `_shell_target`).
     for name in ("bash", "Bash", "shell", "Shell", "BASH"):
         check(f"extract-{name}",
-              m._extract_target({"command": "rm -rf /x"}, name) == "rm", name)
+              m._extract_target({"command": "rm -rf /x"}, name) == "rm -rf /x", name)
     check("non-shell-still-none", m._extract_target({"command": "rm x"}, "bashful") is None,
           "substring/prefix names must NOT be treated as shell")
     check("non-str-tool", m._extract_target({"command": "rm x"}, None) is None, "None tool_name")
+    # Paths are untouched: only the shell target is a command.
+    check("path-target-unchanged",
+          m._extract_target({"file_path": "/w/auth=1/x"}, "Read") == "/w/auth=1/x")
+
+
+def test_shell_target_is_masked_and_bounded():
+    # `--token VALUE` masks the next token; `PASSWORD=VALUE` keeps the key, masks the value.
+    t = m._extract_target({"command": "curl --token abc123 -H x PASSWORD=hunter2 https://h"}, "Bash")
+    check("space-flag-value-masked", "abc123" not in t and "--token ***" in t, t)
+    check("assignment-value-masked", "hunter2" not in t and "PASSWORD=***" in t, t)
+    check("the-rest-stays-legible", t.startswith("curl --token *** -H x") and "https://h" in t, t)
+    # A bare flag whose next token is another flag masks nothing.
+    t = m._extract_target({"command": "cmd --token --verbose"}, "Bash")
+    check("flag-followed-by-flag-not-masked", t == "cmd --token --verbose", t)
+    # Bounded at TARGET_MAX with a visible cut; whitespace collapses like the daemon's pass.
+    long = "echo " + "x" * 500
+    t = m._extract_target({"command": long}, "Bash")
+    check("bounded-with-visible-cut", len(t) == m.TARGET_MAX and t.endswith("..."), str(len(t)))
+    t = m._extract_target({"command": "cat > f <<'EOF'\nline one\nEOF"}, "Bash")
+    check("heredoc-collapses-to-one-line", t == "cat > f <<'EOF' line one EOF", t)
 
 
 def test_codex_shaped_event_populates_begin_target():
@@ -112,8 +134,9 @@ def test_codex_shaped_event_populates_begin_target():
     check("allow", v.allow and v.decided, str(v))
     begins = fake.args_of("hestia_begin_action")
     check("begin-called", len(begins) == 1, str(fake.calls))
-    check("target-populated", begins[0].get("target") == "git",
-          f"codex-shaped event must carry a non-empty target; got {begins[0].get('target')!r}")
+    # The target is the command, not its verb (2026-09-08) — the arm's point stands: non-empty.
+    check("target-populated", begins[0].get("target") == "git push origin HEAD",
+          f"codex-shaped event must carry the command as target; got {begins[0].get('target')!r}")
 
 
 # ---- (b) SafetyVerdict.kind — present, populated, backward-compatible ----
@@ -279,6 +302,7 @@ def test_boundary_transport_arms_pass():
 
 ALL = [
     test_lowercase_bash_extract_target,
+    test_shell_target_is_masked_and_bounded,
     test_codex_shaped_event_populates_begin_target,
     test_kind_field_populated,
     test_kind_none_on_no_verdict_and_backcompat,
