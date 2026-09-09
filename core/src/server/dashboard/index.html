@@ -326,6 +326,14 @@
      is what leaves the chain room to be the thing you watch.
      Heights are in rem, not px, so they track the type scale: a trust row is two lines
      (id + dimension), a tool row is one. Tune the two numbers if 3 rows is wrong. */
+  /* A grant to a member nobody has seen is not a success message (HST-005). */
+  .grant-note.grant-warn {
+    border-left: 3px solid var(--amber, #d79921);
+    padding-left: 0.6rem;
+    background: color-mix(in srgb, var(--amber, #d79921) 8%, transparent);
+  }
+  /* Members that exist only because someone typed them, in the pickers. */
+  select.member-pick option.member-phantom { opacity: 0.7; font-style: italic; }
   .trust-list, .tool-list { overflow-y: auto; min-height: 0; }
   .live-grid .trust-list { max-height: 10.5rem; }   /* ≈ 3 trust rows */
   .live-grid .tool-list  { max-height: 7rem; }      /* ≈ 3 tool rows  */
@@ -1299,7 +1307,7 @@
               revocable above.
             </div>
             <div class="pol-add grant-add">
-              <input class="pol-input" id="sg-plugin" placeholder="plugin_id (e.g. kimi-code)" size="16">
+              <select class="pol-input member-pick" id="sg-plugin" data-empty="member…"></select>
               <input class="pol-input" id="sg-path" placeholder="absolute path" size="34">
               <select class="pol-select" id="sg-ttl">
                 <option value="">until revoked</option>
@@ -1347,7 +1355,7 @@
               be prescribed trust, which is the thing web4 exists not to do.
             </div>
             <div class="pol-add grant-add">
-              <input class="pol-input" id="adj-plugin" placeholder="plugin_id" size="14">
+              <select class="pol-input member-pick" id="adj-plugin" data-empty="member…"></select>
               <input class="pol-input" id="adj-role" placeholder="role" list="grant-roles" size="24">
               <select class="pol-select" id="adj-axis">
                 <option value="validity">validity</option>
@@ -1375,8 +1383,8 @@
               and refused without a pointer: no evidence, no join.
             </div>
             <div class="pol-add grant-add">
-              <input class="pol-input" id="ali-of" placeholder="alias_of — the SURVIVING id" size="18">
-              <input class="pol-input" id="ali-alias" placeholder="alias — folds INTO it" size="18">
+              <select class="pol-input member-pick" id="ali-of" data-empty="alias_of — the SURVIVING id"></select>
+              <select class="pol-input member-pick" id="ali-alias" data-empty="alias — folds INTO it"></select>
               <input class="pol-input" id="ali-ref" placeholder="evidence pointer (required)" size="26">
               <input class="pol-input" id="ali-reason" placeholder="reason" size="20">
               <button class="pol-btn-add" id="ali-btn" disabled>join identities</button>
@@ -1433,7 +1441,7 @@
             <details class="pol-add-wrap">
               <summary>+ Grant a member a preset</summary>
               <div class="pol-add grant-add">
-                <input class="pol-input" id="grant-plugin" placeholder="plugin_id (e.g. kimi-code)" size="16">
+                <select class="pol-input member-pick" id="grant-plugin" data-empty="member…"></select>
                 <input class="pol-input" id="grant-role" placeholder="role" list="grant-roles" size="20">
                 <datalist id="grant-roles">
                   <option value="role:constellation:member"></option>
@@ -1997,6 +2005,7 @@
       for (const [k, ids] of Object.entries(inv.gaps || {})) for (const id of ids || []) st[id] = k === 'unknown' ? 'ungovernable' : k;
       for (const id of inv.governed || []) if (!st[id]) st[id] = 'governed';
       govByAgent = st;
+        noteMembers([]);   // fold installed-agent coverage into the pickers
       if (lastData) rerender(lastData);   // repaint chips with fresh dots
     } catch (_) { /* transient — keep last known coverage */ }
   }
@@ -2157,6 +2166,7 @@
     trustShown = [];   // no per-grain detail buttons in the aggregate view
     const connected = new Set(orchs.filter(o => o.connected).map(o => o.id));
     const rows = aggregateHarnessTrust(trust).sort((a, b) => b.action_count - a.action_count);
+    noteMembers(rows);   // keep the member pickers backed by real evidence
     if (!rows.length) {
       root.innerHTML = '<div class="empty">No plugins recorded yet. Connect one to start building trust.</div>';
       return;
@@ -2665,6 +2675,70 @@
     return String(s ?? '').replace(/[&<>"']/g, c => ({
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
     }[c]));
+  }
+
+  // ── Member pickers (HST-005 mitigation) ──────────────────────────────────────
+  //
+  // Every id on this page used to be free text. That is not a cosmetic problem: a
+  // scope grant against a mistyped id SUCCEEDS. The daemon accepts any plugin_id as
+  // a member, so `Claude-code` records a perfectly-formed standing grant that the
+  // seat `claude-code` never sees, and the operator is told it worked. Measured
+  // live on McNugget 2026-09-08: three "claude-code" members, two with no evidence
+  // behind them, one real seat still denied. dp asked for this twice before.
+  //
+  // So the id is now PICKED, not typed. The list is the machine's own answer to
+  // "who is actually here": harnesses with witnessed action history, plus agents
+  // the inventory found installed. An id that is neither cannot be selected, which
+  // is the whole point — you cannot grant to a member that does not exist.
+  //
+  // Each option carries its evidence, because "which of these three is real" is the
+  // question the operator actually has: action count, measured roles, governance.
+  let knownMembers = new Map();   // id -> { actions, measured, gov, installed }
+
+  function noteMembers(rows) {
+    for (const r of rows || []) {
+      const id = r.plugin_id;
+      if (!id) continue;
+      const cur = knownMembers.get(id) || { actions: 0, measured: 0, gov: null, installed: false };
+      cur.actions = Math.max(cur.actions, r.action_count || 0);
+      cur.measured = Math.max(cur.measured, r.measured || 0);
+      knownMembers.set(id, cur);
+    }
+    for (const [id, gov] of Object.entries(govByAgent || {})) {
+      const cur = knownMembers.get(id) || { actions: 0, measured: 0, gov: null, installed: false };
+      cur.gov = gov; cur.installed = true;
+      knownMembers.set(id, cur);
+    }
+    refreshMemberPickers();
+  }
+
+  function memberLabel(id, m) {
+    const bits = [];
+    if (m.installed) bits.push(m.gov === 'governed' ? 'governed' : (m.gov || 'installed'));
+    if (m.actions) bits.push(`${m.actions} act${m.actions === 1 ? '' : 's'}`);
+    if (m.measured) bits.push(`${m.measured} measured`);
+    // The important case: a member that exists only because someone typed it.
+    if (!bits.length) bits.push('no evidence — typed, never acted');
+    return `${id} — ${bits.join(' · ')}`;
+  }
+
+  function refreshMemberPickers() {
+    // Evidence first, phantoms last: the ordering answers "which one is the real seat".
+    const ids = [...knownMembers.entries()].sort((a, b) => {
+      const score = m => (m.installed ? 2 : 0) + (m.actions > 0 ? 1 : 0);
+      const d = score(b[1]) - score(a[1]);
+      return d !== 0 ? d : a[0].localeCompare(b[0]);
+    });
+    for (const sel of document.querySelectorAll('select.member-pick')) {
+      const keep = sel.value;
+      sel.innerHTML = `<option value="">${escapeHtml(sel.dataset.empty || 'member…')}</option>` +
+        ids.map(([id, m]) =>
+          `<option value="${escapeHtml(id)}"${m.actions || m.installed ? '' : ' class="member-phantom"'}>${escapeHtml(memberLabel(id, m))}</option>`
+        ).join('');
+      // Preserve an in-progress selection across refreshes; drop it if the id vanished.
+      if (keep && ids.some(([id]) => id === keep)) sel.value = keep;
+      sel.dispatchEvent(new Event('input', { bubbles: true }));
+    }
   }
 
   function rerender(data) {
@@ -3265,6 +3339,10 @@
           ${live ? '' : `<button class="grant-revoke" data-revoke-member="${
             escapeHtml(String(g.plugin_id))}" data-revoke-path="${
             escapeHtml(String(g.path))}">revoke</button>`}
+          ${live ? '' : `<button class="grant-act" data-move-member="${
+            escapeHtml(String(g.plugin_id))}" data-move-path="${
+            escapeHtml(String(g.path))}" data-move-recursive="${g.recursive ? 'true' : 'false'}"
+            title="give this same grant to a different member — the repair for a mistyped id">reassign</button>`}
         </div>`;
     }).join('');
   }
@@ -4204,12 +4282,18 @@
         // The daemon reports whether that plugin_id has ever connected. A grant to a member
         // nobody has seen is legitimate (granting ahead of a first connect) and is ALSO what
         // a typo looks like — so its own answer is shown rather than a generic success.
+        // A warning rendered in the success element, leading with the word "Granted", reads
+        // as success with a footnote — which is how a mistyped grant sat unnoticed on this
+        // box while the real seat stayed denied (McNugget 2026-09-08). The unknown-member
+        // case is now styled AS a warning and leads with the doubt, not the confirmation.
+        ok.classList.toggle('grant-warn', !out.member_known);
         ok.innerHTML = out.member_known
           ? `Granted <code>${escapeHtml(out.path)}</code> to <strong>${escapeHtml(out.plugin_id)}</strong>
              — standing, generation ${out.generation}. The gate consults it immediately.`
-          : `<strong>Granted, but no member called "${escapeHtml(out.plugin_id)}" has ever
-             connected to this daemon.</strong> That is fine if you are granting ahead of a
-             first connect — and it is also what a typo looks like. Check the spelling.`;
+          : `<strong>⚠ NO MEMBER CALLED "${escapeHtml(out.plugin_id)}" HAS EVER CONNECTED here.</strong>
+             The grant was recorded and no seat may ever read it. This is what a typo looks
+             like; it is only correct if you are granting ahead of a first connect.
+             <em>Nothing is enforced differently until a member by that exact id connects.</em>`;
         ok.hidden = false;
         path.value = ''; reason.value = '';
         sync();
@@ -4267,6 +4351,68 @@
         } catch (e2) { err.textContent = `${to ? 'make recursive' : 'make exact'} failed: ${e2.message}`; err.hidden = false; rch.disabled = false; }
         return;
       }
+      // REASSIGN — the repair for a grant made against a mistyped member id.
+      //
+      // Before this, fixing one meant revoking and then re-typing the path into the grant
+      // form, which is the same keyboard that produced the mistake. Here the destination is
+      // PICKED from members the machine has actually seen, and the path is carried over
+      // untouched. Two witnessed acts, deliberately: the grant to the correct member lands
+      // FIRST, so a failure between them leaves the reach too wide rather than too narrow —
+      // the same direction every other widening/tightening pair on this page is ordered.
+      const mv = e.target.closest('[data-move-member]');
+      if (mv) {
+        const from = mv.dataset.moveMember, p2 = mv.dataset.movePath;
+        const rec = mv.dataset.moveRecursive === 'true';
+        const seen = [...knownMembers.keys()].filter(id => id !== from);
+        if (!seen.length) {
+          err.textContent = 'reassign: no other member has connected to this daemon yet.';
+          err.hidden = false; return;
+        }
+        const to = prompt(`Reassign this grant from "${from}" to which member?\n\n${p2}\n\n`
+          + `Members this daemon has actually seen:\n  ${seen.join('\n  ')}\n\n`
+          + `Type the destination id exactly:`);
+        if (to === null) return;
+        const dest = to.trim();
+        if (!dest) return;
+        if (!knownMembers.has(dest)) {
+          err.textContent = `reassign refused: "${dest}" is not a member this daemon has seen. `
+            + `That is the mistake this action exists to undo, so it will not repeat it.`;
+          err.hidden = false; return;
+        }
+        const why = prompt(`Reason (required — this widens ${dest}'s reach):`);
+        if (why === null || !why.trim()) return;
+        mv.disabled = true; err.hidden = true;
+        try {
+          const g1 = await apiFetch('/api/scope/grant', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ plugin_id: dest, path: p2, reason: why }),
+          });
+          const o1 = await g1.json().catch(() => ({}));
+          if (!g1.ok) throw new Error(o1?.error || `HTTP ${g1.status}`);
+          if (rec) {
+            const g2 = await apiFetch('/api/scope/standing/recursive', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ plugin_id: dest, path: p2, recursive: true, reason: why }),
+            });
+            const o2 = await g2.json().catch(() => ({}));
+            if (!g2.ok) throw new Error(`granted to ${dest} but could not carry the subtree reach: `
+              + (o2?.error || `HTTP ${g2.status}`));
+          }
+          const r1 = await apiFetch('/api/scope/standing/revoke', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ plugin_id: from, path: p2, reason: `reassigned to ${dest}: ${why}` }),
+          });
+          const o3 = await r1.json().catch(() => ({}));
+          if (!r1.ok) throw new Error(`granted to ${dest} but the old grant on ${from} REMAINS: `
+            + (o3?.error || `HTTP ${r1.status}`));
+          await tick(); renderScopeGrants(lastData);
+        } catch (e2) {
+          err.textContent = `reassign failed: ${e2.message}`;
+          err.hidden = false; mv.disabled = false;
+        }
+        return;
+      }
+
       const rev = e.target.closest('[data-revoke-member]');
       if (!rev) return;
       const member = rev.dataset.revokeMember, p = rev.dataset.revokePath;
