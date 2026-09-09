@@ -817,7 +817,18 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
 
 async fn tool_begin_action(state: &SharedState, args: &Value) -> ToolResult {
     let tool_name = require_string(args, "tool_name")?;
-    let target = optional_string(args, "target");
+    // A shell act's `target` is the command itself — the shims send it whole so the feed
+    // shows the act and not just its verb (2026-09-08, after #977 made the outcome row
+    // inherit this field). Scrub it exactly as `attempted` is scrubbed below: the outcome
+    // row carries it verbatim for as long as the chain lives, and "the sender promised to
+    // scrub" is the assumption this codebase keeps finding wrong. Paths are left alone.
+    let target = optional_string(args, "target").map(|t| {
+        if tool_name.eq_ignore_ascii_case("bash") || tool_name.eq_ignore_ascii_case("shell") {
+            redact_secrets(&t)
+        } else {
+            t
+        }
+    });
     let session_id_arg = optional_session_id(args);
     let parameters = args.get("parameters").cloned();
     // The accountability WHY — the actor's stated reason, captured at begin.
@@ -7094,6 +7105,56 @@ mod accountability_tests {
             outcome.event_data["intent"].is_null(),
             "unstated intent must be null"
         );
+    }
+
+    /// 2026-09-08: a shell act's `target` is the whole command, and the outcome row
+    /// inherits it verbatim (#977) — so the daemon scrubs it as it scrubs `attempted`,
+    /// on the way in. Pinned in both directions: the shell target is masked and STILL
+    /// carries the rest of the command (the feed must show the act, not just its verb);
+    /// a non-shell target is a path and is left exactly as sent, `=` and all.
+    #[tokio::test]
+    async fn a_shell_target_is_scrubbed_on_begin_and_the_outcome_inherits_it() {
+        let (_dir, state) = test_state().await;
+        let connected = tool_connect(&state, &json!({"plugin_id":"claude-code","host_agent":"test"}))
+            .await
+            .unwrap();
+        let sid = connected["sessionId"].as_str().unwrap().to_string();
+
+        let begin = tool_begin_action(&state, &json!({
+            "tool_name": "Bash",
+            "target": "curl --token abc123 -H x PASSWORD=hunter2 https://h",
+            "session_id": sid,
+        }))
+        .await
+        .unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        tool_record_outcome(&state, &json!({"action_id":aid,"success":true}))
+            .await
+            .unwrap();
+        let begin2 = tool_begin_action(&state, &json!({
+            "tool_name": "Read",
+            "target": "/w/auth=1/x",
+            "session_id": sid,
+        }))
+        .await
+        .unwrap();
+        let aid2 = begin2["actionId"].as_str().unwrap().to_string();
+        tool_record_outcome(&state, &json!({"action_id":aid2,"success":true}))
+            .await
+            .unwrap();
+
+        let s = state.lock().await;
+        let chain = s.recent_chain(20);
+        let targets: Vec<String> = chain
+            .iter()
+            .filter(|e| e.event_type == "outcome")
+            .filter_map(|e| e.event_data.get("target").and_then(|t| t.as_str()).map(String::from))
+            .collect();
+        let shell = targets.iter().find(|t| t.starts_with("curl")).expect("the shell outcome row");
+        assert!(!shell.contains("abc123") && !shell.contains("hunter2"), "unscrubbed: {shell}");
+        assert!(shell.contains("--token ***") && shell.contains("PASSWORD=***"), "{shell}");
+        assert!(shell.contains("-H x") && shell.contains("https://h"), "the act itself must survive: {shell}");
+        assert!(targets.iter().any(|t| t == "/w/auth=1/x"), "a path target is not a command: {targets:?}");
     }
 
     /// #696: `client_ts` is the witness hook's own clock at act time, and the

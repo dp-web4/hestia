@@ -200,6 +200,58 @@ def _discover_endpoint() -> Optional[str]:
         return None
 
 
+#: A shell act's `target` is the command itself, bounded for chain hygiene. The bound is the
+#: one the claude Post-hook witness used for the same field for five weeks (240).
+TARGET_MAX = 240
+
+#: The same give-away shapes the daemon masks in `attempted` (handler.rs `redact_secrets`).
+#: Shape-based and conservative on purpose: mask the VALUE after a credential-ish flag or
+#: assignment, keep the key so the reader still learns which knob was set, and leave the
+#: rest legible — the point of storing the command is that a human can read it.
+_MASKED_KEYS = ("password", "passwd", "secret", "token", "api_key", "apikey", "api-key",
+                "auth", "authorization", "bearer", "credential", "private_key", "passphrase",
+                "access_key", "session_key", "client_secret")
+
+
+def _mask_credential_values(command: str) -> str:
+    """Defence in depth on the SENDING side: the daemon scrubs whatever it is handed, and
+    the sender is closer to the payload. Same two passes as the daemon: `--token=VALUE` /
+    `TOKEN=VALUE` keep the key and mask the value; `--token VALUE` masks the next token.
+    Whitespace collapses to single spaces, as the daemon's pass does."""
+    first = []
+    for tok in command.split():
+        if "=" in tok:
+            key = tok.split("=", 1)[0]
+            if any(s in key.lstrip("-").lower() for s in _MASKED_KEYS):
+                first.append(key + "=***")
+                continue
+        first.append(tok)
+    out, mask_next = [], False
+    for tok in first:
+        if mask_next and not tok.startswith("-"):
+            out.append("***")
+            mask_next = False
+            continue
+        mask_next = tok.lstrip("-").rstrip(":").lower() in _MASKED_KEYS
+        out.append(tok)
+    return " ".join(out)
+
+
+def _shell_target(command: str) -> str:
+    """The command, masked and bounded — not its first word.
+
+    Until 2026-09-07 the chain feed showed every shell act's arguments, because the claude
+    Post hook opened a second action whose `target` was the full command ("for forensic
+    readability in the chain feed"). #977 made the outcome close the action the gate
+    authorized instead — the right act identity — and the outcome row inherited THIS
+    function's target, which was `cmd.split()[0]`. Every argument vanished from the feed in
+    one deploy and the operator noticed within a day. The daemon's own comment on the
+    policy row says `target` "already carries the command for Bash/Shell by overloading";
+    this makes that true at the one place every seat's shell target is made."""
+    masked = _mask_credential_values(command.strip())
+    return masked if len(masked) <= TARGET_MAX else masked[:TARGET_MAX - 3] + "..."
+
+
 def _extract_target(tool_input: Any, tool_name: str) -> Optional[str]:
     if not isinstance(tool_input, dict):
         return None
@@ -214,7 +266,7 @@ def _extract_target(tool_input: Any, tool_name: str) -> Optional[str]:
     if isinstance(tool_name, str) and tool_name.lower() in {"bash", "shell"}:
         cmd = tool_input.get("command")
         if isinstance(cmd, str) and cmd.strip():
-            return cmd.split()[0]
+            return _shell_target(cmd)
     return None
 
 
