@@ -302,23 +302,42 @@ fn balanced_args(text: &str, open: usize) -> Option<&str> {
 fn gate_call_site_categories() -> BTreeMap<String, BTreeSet<String>> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/handler.rs");
     let raw = fs::read_to_string(&path).expect("read handler.rs");
-    let text = strip_line_comments(&raw);
+    call_sites_in(&raw, "server/handler.rs")
+}
 
-    // Enclosing-fn index by byte offset.
-    let mut fn_at: Vec<(usize, String)> = Vec::new();
-    let mut off = 0usize;
-    for line in text.split_inclusive('\n') {
-        if let Some(name) = fn_item_name(line) {
-            fn_at.push((off, name));
+/// The whole of producer 1 over one file's text, so a fixture can drive it (#976).
+///
+/// Two readings were wrong here, and neither could be seen by the pinned table because the
+/// tree lacked the shape that separates them (measured 2026-09-06: 0 of 12 call sites moved
+/// under either fix, on `main` and on `legion/connect-pop`). The arms below hold them.
+///
+/// 1. **Enclosing fn, not last-declared.** The first version indexed every `fn` item by byte
+///    offset and attributed a call to the last one at or before it. A fn's ownership of its
+///    own lines therefore ended at the first NESTED fn inside it: every call after the helper
+///    was filed under the helper. The member-presence census had the identical reading and it
+///    filed `ensure_member(` under a nested `witness_refusal` (#975). Ownership is now lexical,
+///    by indentation, the same item-position discipline `production_lines` uses there.
+/// 2. **Test modules are cut.** `#[cfg(test)] mod` blocks were scanned like production, so a
+///    test that constructs a `gate_direct_tool` call would have entered the census as a
+///    minting site. The census cuts them with `production_lines`; this file did not.
+fn call_sites_in(raw: &str, rel: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let text = strip_line_comments(raw);
+    let owners = fn_owners(&text);
+
+    // Byte offset -> line index, so a call found in the flat text is attributed by LINE.
+    let mut line_starts: Vec<usize> = vec![0];
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i + 1);
         }
-        off += line.len();
     }
+    let line_of = |at: usize| line_starts.partition_point(|&s| s <= at) - 1;
 
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let needle = "gate_direct_tool(";
     let mut from = 0usize;
-    while let Some(rel) = text[from..].find(needle) {
-        let at = from + rel;
+    while let Some(off) = text[from..].find(needle) {
+        let at = from + off;
         from = at + needle.len();
         // The definition itself is not a call site.
         if text[..at].ends_with("fn ") {
@@ -328,23 +347,101 @@ fn gate_call_site_categories() -> BTreeMap<String, BTreeSet<String>> {
         let Some(args) = balanced_args(&text, open) else {
             continue;
         };
+        // Inside a `#[cfg(test)] mod`: a test's call is not a minting site.
+        let Some(enclosing) = owners[line_of(at)].clone() else {
+            continue;
+        };
         let lits = string_literals(args);
         // (s, who, tool_name, category, target): tool_name then category.
         let Some(category) = lits.get(1) else {
             panic!("gate_direct_tool call at byte {at} has fewer than two string literals — \
                     the argument shape this test assumes has changed; re-read the signature");
         };
-        let enclosing = fn_at
-            .iter()
-            .rev()
-            .find(|(o, _)| *o <= at)
-            .map(|(_, n)| n.clone())
-            .unwrap_or_else(|| "(top-level)".into());
         out.entry(category.clone())
             .or_default()
-            .insert(format!("server/handler.rs::{enclosing}"));
+            .insert(format!("{rel}::{enclosing}"));
     }
     out
+}
+
+/// The ENCLOSING fn of every line, in order; `None` for lines inside a `#[cfg(test)] mod`.
+///
+/// A fn opens on its item line and closes on a `}` at or left of that line's column, with
+/// comments stripped before the brace is classified so `} // done` and `} /* x */` close as
+/// `}` does. A bodyless `fn name(...);` (extern block, trait signature) opens nothing — it
+/// has no body to own, and pushing it started a scope only an enclosing brace could close.
+/// A test module is cut the way `production_lines` cuts it: a column-0 `#[cfg(test)]` whose
+/// next non-blank line opens a `mod`, through the next column-0 `}`.
+///
+/// The assumption is stated because it is falsifiable: rustfmt puts a fn's closing brace at
+/// its `fn`'s column, and `cargo fmt --check` keeps that true in this tree.
+fn fn_owners(text: &str) -> Vec<Option<String>> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut stack: Vec<(String, usize)> = Vec::new();
+    let mut in_test_mod = false;
+    let mut out = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        if in_test_mod {
+            if *line == "}" {
+                in_test_mod = false;
+            }
+            out.push(None);
+            continue;
+        }
+        if line.starts_with("#[cfg(test)]") {
+            let opens_mod = lines[i + 1..]
+                .iter()
+                .find(|l| !l.trim().is_empty())
+                .is_some_and(|l| {
+                    let t = l.trim_start();
+                    t.starts_with("mod ") || t.starts_with("pub mod ")
+                });
+            if opens_mod {
+                in_test_mod = true;
+                out.push(None);
+                continue;
+            }
+        }
+        let indent = line.len() - line.trim_start().len();
+        let code = code_before_comment(line);
+        if code == "}" {
+            while stack.last().is_some_and(|(_, w)| *w >= indent) {
+                stack.pop();
+            }
+        }
+        if let Some(name) = fn_item_name(line) {
+            if !code.ends_with(';') {
+                stack.push((name, indent));
+            }
+        }
+        out.push(Some(
+            stack
+                .last()
+                .map(|(n, _)| n.clone())
+                .unwrap_or_else(|| "(top-level)".into()),
+        ));
+    }
+    out
+}
+
+/// A line with its trailing `//` tail and inline `/* … */` spans removed, trimmed. Used ONLY
+/// to classify a line (is it a closing brace, is it bodyless) — never to decide whether it is
+/// a call site; the call-site scan runs over `strip_line_comments`' output as before.
+fn code_before_comment(line: &str) -> String {
+    let mut s = line.to_string();
+    while let Some(a) = s.find("/*") {
+        match s[a..].find("*/") {
+            Some(b) => s.replace_range(a..a + b + 2, ""),
+            None => {
+                s.truncate(a);
+                break;
+            }
+        }
+    }
+    if let Some(i) = s.find("//") {
+        s.truncate(i);
+    }
+    s.trim().to_string()
 }
 
 /// Producer 2: every category `policy::extract::classify` can return, read
@@ -466,6 +563,87 @@ fn ruled_categories_have_a_shipped_rule() {
          Either the rule was removed (the gate is now silently default-allow and\n\
          the declaration is a lie), or it moved to an overlay this test cannot\n\
          see (then say so and reclassify).\n"
+    );
+}
+
+/// #976, arm 1: a call after a NESTED fn belongs to the fn that lexically contains it.
+///
+/// Under the last-declared reading this is filed under `helper`. Zero of 12 live call sites
+/// in `handler.rs` currently sit after a nested fn inside their own handler, so no pin over
+/// the tree can see this; the fixture is the only thing that does.
+#[test]
+fn a_nested_helper_does_not_own_the_call_after_it() {
+    let src = "\
+async fn tool_outer(s: &S) {
+    fn helper(x: u8) -> u8 {
+        x + 1
+    } // the helper ends here, and rustfmt keeps this comment
+    gate_direct_tool(s, who, \"outer_tool\", \"outer_cat\", None);
+}
+
+extern \"C\" {
+    fn malloc_trim(pad: usize) -> c_int;
+}
+
+impl Thing {
+    fn method(&self) {
+        gate_direct_tool(s, who, \"m_tool\", \"method_cat\", None); /* trailing */
+    }
+}
+";
+    let sites = call_sites_in(src, "f.rs");
+    assert_eq!(
+        sites.get("outer_cat").map(|s| s.iter().cloned().collect::<Vec<_>>()),
+        Some(vec!["f.rs::tool_outer".to_string()]),
+        "the call after the helper belongs to tool_outer, not helper: {sites:?}"
+    );
+    assert_eq!(
+        sites.get("method_cat").map(|s| s.iter().cloned().collect::<Vec<_>>()),
+        Some(vec!["f.rs::method".to_string()]),
+        "a bodyless extern decl opens no scope, so the impl method owns its own call: {sites:?}"
+    );
+    let owners = fn_owners(&strip_line_comments(src));
+    assert_eq!(owners[2].as_deref(), Some("helper"), "the helper still owns its own body");
+    assert_eq!(owners[4].as_deref(), Some("tool_outer"), "`}} // comment` closed the helper");
+    assert_eq!(owners[8].as_deref(), Some("(top-level)"), "a bodyless declaration owns nothing");
+}
+
+/// #976, arm 2: a call inside a `#[cfg(test)] mod` is not a minting site.
+///
+/// The census cuts test modules; this file scanned them like production, so a test that
+/// constructs a gate call would have entered the pinned category table. Zero live today —
+/// all 12 call sites are in production code — which is exactly why it needs a fixture.
+#[test]
+fn a_call_inside_a_test_module_is_not_a_minting_site() {
+    let src = "\
+async fn tool_real(s: &S) {
+    gate_direct_tool(s, who, \"real_tool\", \"real_cat\", None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_test_that_gates() {
+        gate_direct_tool(s, who, \"test_tool\", \"test_only_cat\", None);
+    }
+}
+
+async fn tool_after(s: &S) {
+    gate_direct_tool(s, who, \"after_tool\", \"after_cat\", None);
+}
+";
+    let sites = call_sites_in(src, "f.rs");
+    assert!(sites.contains_key("real_cat"), "{sites:?}");
+    assert!(
+        !sites.contains_key("test_only_cat"),
+        "a category minted only by a test must not enter the coverage table: {sites:?}"
+    );
+    assert_eq!(
+        sites.get("after_cat").map(|s| s.iter().cloned().collect::<Vec<_>>()),
+        Some(vec!["f.rs::tool_after".to_string()]),
+        "scanning resumes after the module's column-0 closing brace: {sites:?}"
     );
 }
 
