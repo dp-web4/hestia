@@ -6241,6 +6241,9 @@ pub(crate) const POINTER_LOOKUP_MAX: u64 = 1000;
 struct PagedLookup {
     primary: Option<crate::storage::chain::ChainEntry>,
     secondary: Option<crate::storage::chain::ChainEntry>,
+    /// An OPTIONAL third kind, collected on the way past and never part of the
+    /// stop condition. See `paged_chain_lookup` for why that costs nothing.
+    tertiary: Option<crate::storage::chain::ChainEntry>,
     searched: u64,
     complete: bool,
 }
@@ -6254,14 +6257,32 @@ struct PagedLookup {
 /// disposition pointer whose memory row had been reaped. A lookup by
 /// `escalation_id` / `request_id` has no index to use, so it pages; the cap is
 /// what keeps the page from becoming the window it replaced.
+///
+/// `want_tertiary` is a THIRD kind collected opportunistically, and it is
+/// deliberately NOT part of the stop condition. That is sound only because of an
+/// ordering argument, and it is written down here because the cheap-looking
+/// version of this change is the expensive one: making the scan wait for a third
+/// hit would page the full [`POINTER_LOOKUP_MAX`] on every lookup whose third
+/// kind does not exist, which is the common case.
+///
+/// The argument: pages run NEWEST-FIRST, and the stop condition needs `primary`,
+/// which for both call sites is the OLDEST event in the record's lifecycle (the
+/// `opened` / decision entry). Any tertiary entry is younger than that, so it has
+/// already been read by the time the scan is allowed to stop. Equivalently — and
+/// this is the half a caller needs — whenever `primary` is `Some`, EVERY entry
+/// naming that record was examined, so a `tertiary` of `None` is a measured
+/// absence rather than an unsearched one. If a caller ever passes a `primary`
+/// that is not the oldest kind, that guarantee is gone and this comment is wrong.
 fn paged_chain_lookup(
     chain: &crate::storage::chain::SqliteChainStore,
     want_primary: &dyn Fn(&crate::storage::chain::ChainEntry) -> bool,
     want_secondary: &dyn Fn(&crate::storage::chain::ChainEntry) -> bool,
+    want_tertiary: &dyn Fn(&crate::storage::chain::ChainEntry) -> bool,
 ) -> anyhow::Result<PagedLookup> {
     let mut found = PagedLookup {
         primary: None,
         secondary: None,
+        tertiary: None,
         searched: 0,
         complete: false,
     };
@@ -6281,6 +6302,9 @@ fn paged_chain_lookup(
             }
             if found.secondary.is_none() && want_secondary(e) {
                 found.secondary = Some(e.clone());
+            }
+            if found.tertiary.is_none() && want_tertiary(e) {
+                found.tertiary = Some(e.clone());
             }
         }
         if found.primary.is_some() && found.secondary.is_some() {
@@ -6478,10 +6502,13 @@ fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value 
             e.event_type == "scope_requested"
                 && e.event_data.get("request_id").and_then(Value::as_str) == Some(ptr)
         },
+        // A scope request has no third lifecycle event to collect.
+        &|_: &crate::storage::chain::ChainEntry| false,
     );
     let PagedLookup {
         primary: decision,
         secondary: requested,
+        tertiary: _,
         searched,
         complete,
     } = match scan {
@@ -6598,6 +6625,34 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
             "decided_by": esc.decided_by,
             "decided_at": esc.decided_at,
             "reason": esc.reason,
+            // WAS THE GRANT SPENT? The one field that separates a claimed approval
+            // from one that lapsed unclaimed, and this resolver answered without it
+            // for its whole life. `consumed_at` is NOT a claim-WINDOW field: the
+            // window fields (`claim_window_secs_remaining`, `permits_write`) are
+            // computed against `now` behind `mark_observed`, which is what lights the
+            // asker's 600s fuse (#732) and is why every non-asker reader was moved
+            // onto this route in the first place. `consumed_at` is a stored timestamp
+            // of a past event that already has its own witnessed chain entry
+            // (`gate_escalation_claimed`); reading it starts no clock. One correct
+            // principle, over-applied by exactly one field.
+            //
+            // What that cost, measured on CBP 2026-09-08 over 200,000 chain entries
+            // (2026-07-09 -> 09-08): 859 approved escalations, 334 of them claimed —
+            // every one of which rendered here as an approval with no claim, i.e. as
+            // a lapse. The error rate is not stable and it moves the WRONG WAY: the
+            // claim rate ran ~35% through August and 82-100% over 09-03..09-07, so as
+            // the fleet got better at spending its grants inside the window, this
+            // reader got wronger about them. Live instance: `356ea6de418fd439`,
+            // approved 15s after open and claimed 64s after open (chain 227506,
+            // 227508), read through this path at 19:39Z and published by the asker in
+            // two witnessed acks (227871, 227953) as "LAPSED-UNCLAIMED". Caught from
+            // the chain by kimi-code four days later, not by the reader.
+            "consumed_at": esc.consumed_at,
+            "claimed": esc.consumed_at.is_some(),
+            // WHERE THE INSTANT COMES FROM, stated on the record rather than assumed by the
+            // reader: here the live store's own `consumed_at`, set at the claim. The chain
+            // arm below cannot say the same, and says so.
+            "consumed_at_basis": esc.consumed_at.map(|_| "live_store_claim"),
             "opened_at": esc.opened_at,
             "expires_at": esc.expires_at,
         });
@@ -6618,10 +6673,16 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
                 "gate_escalation_decided" | "gate_escalation_withdrawn" | "gate_escalation_expired"
             ) && id_of(e) == Some(ptr)
         },
+        // THE SPEND, which is not a settlement and must not be mistaken for one:
+        // feeding `gate_escalation_claimed` to the `secondary` predicate would make
+        // the newest event win and `status` read its absent `status` field as
+        // `denied`. It is its own slot for that reason.
+        &|e| e.event_type == "gate_escalation_claimed" && id_of(e) == Some(ptr),
     );
     let PagedLookup {
         primary: opened,
         secondary: settled,
+        tertiary: claimed,
         searched,
         complete,
     } = match scan {
@@ -6689,6 +6750,23 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
         "bar": get("bar"),
         "invited_peers": get("invited_peers"),
         "asker_basis": get("asker_basis"),
+        // Shape parity with the live arm on the SPEND too — see there for why this
+        // is not a fuse field. `claimed: false` is a measured absence here, not an
+        // unsearched one: reaching this arm means `opened` was found, and every
+        // entry naming this escalation is younger than its open, so the scan read
+        // all of them (the ordering argument is spelled out on
+        // `paged_chain_lookup`). `consumed_at` is null on `gate_escalation_claimed`
+        // entries — the payload carries `decided_at` and `secs_from_decision_to_use`
+        // but never the consume instant, the same gap `rehydrate` works around — so
+        // the entry's own append timestamp is the daemon's witness of the spend.
+        "claimed": claimed.is_some(),
+        "consumed_at": claimed.as_ref().map(|e| e.timestamp.timestamp().max(0)),
+        // THE HONEST CAVEAT, on the record (GPT review of #996): `gate_escalation_claimed`
+        // carries no `consumed_at` of its own, so the instant above is the entry's APPEND
+        // time — the daemon's witness of the spend, not the spend's own clock. A reader
+        // that wants exact spend time must know it is not getting it here.
+        "consumed_at_basis": claimed.as_ref().map(|_| "chain_append_time"),
+        "claimed_entry": claimed.as_ref().map(chain_entry_json),
         "opened_at": get("opened_at"),
         "expires_at": get("expires_at"),
         "decided_by": settled_get("decided_by"),
@@ -21370,6 +21448,135 @@ mod disposition_durability_tests {
         let found = resolve_escalation_pointer(&s, &id2);
         assert_eq!(found["source"], "witness_chain", "{found}");
         assert_eq!(found["escalation_id"], id2);
+    }
+
+    /// A SPENT grant and a grant that LAPSED UNCLAIMED must not render identically,
+    /// on either arm.
+    ///
+    /// They did, for this resolver's whole life, and the cost was published: on
+    /// 2026-09-03 this seat read `356ea6de418fd439` through here and wrote two
+    /// witnessed acks (chain 227871, 227953) calling it `LAPSED-UNCLAIMED` — the
+    /// chain holds `gate_escalation_claimed` for it at 18:19:36, 64 s after it
+    /// opened and 21 minutes before the TTL it was said to have lapsed at. A peer
+    /// found that off the chain four days later; no reader could have.
+    ///
+    /// The omission looked like the fuse rule (`mark_observed` starts the asker's
+    /// 600 s window, #732, which is why non-askers were moved onto this route at
+    /// all). It is not: `consumed_at` is a stored timestamp of a past event with
+    /// its own chain entry, and reading it starts no clock. Measured blast radius
+    /// on CBP, 200k entries: 334 of 859 approved escalations were claimed, and the
+    /// claim rate is RISING (32.7% in August, 90.2% over 09-03..09-07) — so the
+    /// wrongness grows as the fleet's claim discipline improves.
+    ///
+    /// The assertion that matters is the LAST one in each arm: not that a spend
+    /// reads as spent, but that a spend and a lapse are DISTINGUISHABLE. A field
+    /// that is always `false` would pass every other check here.
+    #[tokio::test]
+    async fn a_spent_grant_and_a_lapsed_one_do_not_render_identically() {
+        let (_dir, state) = test_state().await;
+        let real_now = now_secs();
+        let mut s = state.lock().await;
+
+        // Two approvals alike in everything the resolver reports — same marker, same
+        // act, same bar, both approved by the operator, both past their TTL by the
+        // time they are read. One gets spent. Nothing else separates them.
+        let spent = witness_open(&mut s, "claude-code", Some("spend me"), real_now - 30, 3600);
+        let lapsed = witness_open(&mut s, "kimi-code", Some("do not spend me"), real_now - 30, 3600);
+        for id in [spent.clone(), lapsed.clone()] {
+            let esc = s
+                .gate_escalations
+                .decide(
+                    &id,
+                    true,
+                    "operator",
+                    "role:constellation:sovereign",
+                    crate::server::gate_escalation::Channel::OperatorSession,
+                    None,
+                    Some("k"),
+                    real_now - 20,
+                )
+                .unwrap();
+            s.append_chain(
+                "gate_escalation_decided",
+                json!({
+                    "escalation_id": id,
+                    "plugin_id": esc.plugin_id,
+                    "status": "approved",
+                    "bar": esc.bar,
+                    "bar_met": true,
+                    "decided_by": "operator",
+                    "decided_role": "role:constellation:sovereign",
+                    "decided_via": "operator_session",
+                    "reason": "k",
+                    "factors_present": esc.factors,
+                }),
+            )
+            .unwrap();
+        }
+        let claimed = s
+            .gate_escalations
+            .claim(
+                "claude-code",
+                "policy.json",
+                Some("policy_edit -> policy.json"),
+                real_now - 10,
+            )
+            .expect("the approval is claimable");
+        assert_eq!(claimed.id, spent, "the spend landed on the wrong row");
+        s.append_chain(
+            "gate_escalation_claimed",
+            json!({
+                "escalation_id": spent,
+                "plugin_id": "claude-code",
+                "marker": "policy.json",
+                "decided_by": "operator",
+                "secs_from_decision_to_use": 10,
+            }),
+        )
+        .unwrap();
+
+        // ARM 1 — the live store still holds both rows.
+        let a = resolve_escalation_pointer(&s, &spent);
+        let b = resolve_escalation_pointer(&s, &lapsed);
+        assert_eq!(a["source"], "live_store", "{a}");
+        assert_eq!(a["status"], json!("approved"), "{a}");
+        assert_eq!(a["claimed"], json!(true), "the grant was spent: {a}");
+        assert!(a["consumed_at"].is_u64(), "the spend instant: {a}");
+        assert_eq!(a["consumed_at_basis"], json!("live_store_claim"), "the record says where the instant came from: {a}");
+        assert_eq!(b["claimed"], json!(false), "this one was never spent: {b}");
+        assert!(b["consumed_at_basis"].is_null(), "no spend, no basis: {b}");
+        assert_ne!(
+            a["claimed"], b["claimed"],
+            "a spend and a lapse rendered identically — the whole defect"
+        );
+
+        // ARM 2 — past the reap, answered from the witness chain. Shape parity has
+        // to include the spend, or the arms disagree about the one field a reader
+        // following a `#decided` pointer after the fact is asking about.
+        let past_reap = real_now - 30 + 3600 + REAP_KEEP_SECS + 1;
+        s.gate_escalations.reap(past_reap, REAP_KEEP_SECS);
+        assert!(s.gate_escalations.get(&spent).is_none(), "not reaped");
+        let a = resolve_escalation_pointer(&s, &spent);
+        let b = resolve_escalation_pointer(&s, &lapsed);
+        assert_eq!(a["source"], "witness_chain", "{a}");
+        assert_eq!(a["claimed"], json!(true), "the chain holds the claim: {a}");
+        assert!(
+            a["claimed_entry"]["eventType"] == "gate_escalation_claimed",
+            "the witness rides along: {a}"
+        );
+        assert_eq!(
+            a["consumed_at_basis"], json!("chain_append_time"),
+            "the honest caveat is ON the record: the instant is the claim entry's append time, \
+             not the spend's own clock, because gate_escalation_claimed carries no consumed_at: {a}"
+        );
+        assert_eq!(b["claimed"], json!(false), "{b}");
+        assert!(
+            b["claimed_entry"].is_null(),
+            "no spend, no witness — and this is a MEASURED absence: reaching this \
+             arm means the open was found, and every entry naming an escalation is \
+             younger than its open, so the scan read all of them: {b}"
+        );
+        assert_ne!(a["claimed"], b["claimed"], "identical again on the chain arm");
     }
 
     /// Blocker 2 (revised review): the cursor exists from STATE OPEN — written

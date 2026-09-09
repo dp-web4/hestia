@@ -26,11 +26,22 @@ else. (Specimen was this seat's own already-spent grant, so the destructive leg
 cost nobody anything -- do not run leg 2 against a peer's live petition.)
 
 What you give up: the fuse-related fields. `resolve_escalation_pointer` returns
-status, bar, factors, `asker_basis`, `decided_by`/`decided_at`/`reason` and the
-timestamps -- everything needed to WEIGH a petition or learn a ruling landed. It
-does not return `claim_window_secs_remaining` or `permits_write`, because knowing
-those requires starting the clock. That is the trade, and it is the right one for
-any reader that is not about to perform the act.
+status, bar, factors, `asker_basis`, `decided_by`/`decided_at`/`reason`, WHETHER
+THE GRANT WAS SPENT, and the timestamps -- everything needed to WEIGH a petition
+or learn a ruling landed. It does not return `claim_window_secs_remaining` or
+`permits_write`, because knowing those requires starting the clock. That is the
+trade, and it is the right one for any reader that is not about to perform the act.
+
+`claimed`/`consumed_at` were NOT in that set until 2026-09-08, and their absence
+was not a trade -- it was the fuse rule over-applied by one field. The spend is a
+past event with its own witnessed chain entry; reading it starts no clock. Without
+it an approved petition past its TTL rendered exactly like one that lapsed
+unclaimed, which is the shape 334 of 859 approved escalations (2026-07-09..09-08)
+actually were NOT in. This seat published two witnessed acks calling a grant
+"LAPSED-UNCLAIMED" that the chain shows claimed 64s after it opened
+(`356ea6de418fd439`). If you are reading a record whose claim state matters and
+the daemon you are talking to predates that change, `claimed` will be missing
+entirely -- go to `gate_escalation_claimed` on the chain, do not infer it.
 
 So: poll when you are the asker and are about to claim. Read when you are anyone
 else, including a co-seat session that a disposition notice happened to wake.
@@ -161,9 +172,27 @@ def render(body: dict) -> str:
         )
     if body.get("stated_reason"):
         lines.append(f"  stated_reason: {body['stated_reason']}")
+    # The SPEND, printed on its own line and never inferred from status+expiry.
+    # `None` means this daemon predates the field, which is a different fact from
+    # `False` and must not render as one.
+    if "claimed" in body:
+        if body.get("claimed"):
+            basis = body.get("consumed_at_basis")
+            note = {"live_store_claim": "the store's own claim instant",
+                    "chain_append_time": "the claim entry's APPEND time, not the spend's own clock"
+                    }.get(basis, "basis unreported")
+            lines.append(f"  claimed: YES (spent)  consumed_at: {body.get('consumed_at')}  ({note})")
+        else:
+            lines.append("  claimed: no  (never spent -- if approved and past expiry, it lapsed unclaimed)")
+    else:
+        lines.append(
+            "  claimed: UNREPORTED -- this daemon predates the field. Do NOT read "
+            "approved+expired as lapsed-unclaimed; check gate_escalation_claimed on the chain."
+        )
     lines.append(
-        "  (no claim-window fields by design: learning them requires starting the "
-        "clock. Poll only if you are the asker and about to claim.)"
+        "  (no claim-WINDOW fields by design: learning how much window is left "
+        "requires starting the clock. Whether it was already spent does not, and is "
+        "above. Poll only if you are the asker and about to claim.)"
     )
     return "\n".join(lines)
 
