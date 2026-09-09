@@ -779,6 +779,19 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("server/http.rs::scope_standing_reassign", &[
         "if s.member_registry.get(&to).is_none() {",
     ]),
+    // ADDED 2026-09-09 (cbp, #998 display alias). READING: presence, used as a GATE on a
+    // PRESENTATION write — a display alias may not be another member's real id, or the
+    // console would show one member under another's name (the #1007 typo class from the
+    // other side). No authority is involved: the alias store is read by the console only,
+    // never by anything witnessed, and the refusal protects what a human sees.
+    //
+    // DEGRADATION DIRECTION: an empty or unreadable registry accepts any alias, including a
+    // real member's id — the console could then mislabel, and nothing else changes: no grant,
+    // no row, no reach. The wrong direction would be a registry that refuses every alias,
+    // which merely leaves ids on screen. Both are cosmetic, which is the point of the design.
+    ("server/http.rs::ui_alias_set", &[
+        "if !alias.is_empty() && alias != plugin_id && s.member_registry.get(&alias).is_some() {",
+    ]),
     // Added 2026-08-17 (codex, PR #490 NOT-SAME pass). READING, answering the question
     // this table schedules — **is this a safety use of presence?**
     //
