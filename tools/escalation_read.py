@@ -177,7 +177,11 @@ def render(body: dict) -> str:
     # `False` and must not render as one.
     if "claimed" in body:
         if body.get("claimed"):
-            lines.append(f"  claimed: YES (spent)  consumed_at: {body.get('consumed_at')}")
+            basis = body.get("consumed_at_basis")
+            note = {"live_store_claim": "the store's own claim instant",
+                    "chain_append_time": "the claim entry's APPEND time, not the spend's own clock"
+                    }.get(basis, "basis unreported")
+            lines.append(f"  claimed: YES (spent)  consumed_at: {body.get('consumed_at')}  ({note})")
         else:
             lines.append("  claimed: no  (never spent -- if approved and past expiry, it lapsed unclaimed)")
     else:

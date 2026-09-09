@@ -6640,6 +6640,10 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
             // the chain by kimi-code four days later, not by the reader.
             "consumed_at": esc.consumed_at,
             "claimed": esc.consumed_at.is_some(),
+            // WHERE THE INSTANT COMES FROM, stated on the record rather than assumed by the
+            // reader: here the live store's own `consumed_at`, set at the claim. The chain
+            // arm below cannot say the same, and says so.
+            "consumed_at_basis": esc.consumed_at.map(|_| "live_store_claim"),
             "opened_at": esc.opened_at,
             "expires_at": esc.expires_at,
         });
@@ -6748,6 +6752,11 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
         // the entry's own append timestamp is the daemon's witness of the spend.
         "claimed": claimed.is_some(),
         "consumed_at": claimed.as_ref().map(|e| e.timestamp.timestamp().max(0)),
+        // THE HONEST CAVEAT, on the record (GPT review of #996): `gate_escalation_claimed`
+        // carries no `consumed_at` of its own, so the instant above is the entry's APPEND
+        // time — the daemon's witness of the spend, not the spend's own clock. A reader
+        // that wants exact spend time must know it is not getting it here.
+        "consumed_at_basis": claimed.as_ref().map(|_| "chain_append_time"),
         "claimed_entry": claimed.as_ref().map(chain_entry_json),
         "opened_at": get("opened_at"),
         "expires_at": get("expires_at"),
@@ -21464,7 +21473,9 @@ mod disposition_durability_tests {
         assert_eq!(a["status"], json!("approved"), "{a}");
         assert_eq!(a["claimed"], json!(true), "the grant was spent: {a}");
         assert!(a["consumed_at"].is_u64(), "the spend instant: {a}");
+        assert_eq!(a["consumed_at_basis"], json!("live_store_claim"), "the record says where the instant came from: {a}");
         assert_eq!(b["claimed"], json!(false), "this one was never spent: {b}");
+        assert!(b["consumed_at_basis"].is_null(), "no spend, no basis: {b}");
         assert_ne!(
             a["claimed"], b["claimed"],
             "a spend and a lapse rendered identically — the whole defect"
@@ -21483,6 +21494,11 @@ mod disposition_durability_tests {
         assert!(
             a["claimed_entry"]["eventType"] == "gate_escalation_claimed",
             "the witness rides along: {a}"
+        );
+        assert_eq!(
+            a["consumed_at_basis"], json!("chain_append_time"),
+            "the honest caveat is ON the record: the instant is the claim entry's append time, \
+             not the spend's own clock, because gate_escalation_claimed carries no consumed_at: {a}"
         );
         assert_eq!(b["claimed"], json!(false), "{b}");
         assert!(
