@@ -26,7 +26,14 @@ VERDICTS, per actor (several can apply):
                     (named per launcher: an actor's fire script can declare a role while its
                     interactive hook line declares none, and that line is the one defaulting)
   NO-ROWS-IN-WINDOW a declared, connecting actor with nothing on the chain in the window
-  DECLARED!=SEEN    a declared role that never appears on the chain
+  DECLARED!=SEEN    a declared role that never appears on the chain, from a launcher that
+                    DID run in the window — so the declaration was carried and lost
+  UNTESTED-LAUNCHER a fire script declares a role and ran ZERO times in the window: its
+                    role's absence from the chain is evidence of nothing (GPT's hold on
+                    #1000 — absence in an actor aggregate is not a launcher's failure)
+  DECLARED-NOT-OBSERVED
+                    a fire script declares a role, the role is absent, and whether the
+                    script ran cannot be established (no fire logs readable)
   NO-WAKE-SESSION   a fire script with no --session-id: its wakes are indistinguishable
                     from each other and from the interactive seat (#974's root)
   ROLE-OFF-RECORD   event kinds this actor emits that carry no role field at all
@@ -108,9 +115,55 @@ def fire_scripts(mesh_dir: Path | None) -> dict[str, dict]:
     out = {}
     for p in sorted(mesh_dir.glob("fire-*.sh")):
         try:
-            out[p.name] = parse_launch_line(p.read_text())
+            text = p.read_text()
         except OSError:
             continue
+        facts = parse_launch_line(text)
+        # WHERE THIS LAUNCHER RECORDS ITS OWN RUNS. Every fire script writes one log per
+        # invocation, `$LOG_DIR/<prefix>-$STAMP.log`, and names both in its own text. Read
+        # from the script rather than assumed, so a box that relocates the state dir is
+        # measured, not guessed; None when the script does not say.
+        facts["log_dir"] = None
+        facts["log_prefix"] = None
+        m = re.search(r'^LOG_DIR="([^"]+)"', text, re.M)
+        if m:
+            facts["log_dir"] = os.path.expandvars(m.group(1).replace("$HOME", os.path.expanduser("~")))
+        m = re.search(r'\$LOG_DIR/([a-z0-9_-]+)-\$STAMP\.log', text)
+        if m:
+            facts["log_prefix"] = m.group(1)
+        out[p.name] = facts
+    return out
+
+
+def fire_exercise(fires: dict[str, dict], since: str) -> dict[str, int | None]:
+    """How many times each fire script RAN in the window, from its own per-invocation logs.
+
+    `since` is the census window's ISO start; a log is in the window when the stamp in its
+    name (`<prefix>-YYYYmmdd-HHMMSS.log`, the fire script's own clock) is at or after it.
+    None when the script names no log location or the directory cannot be listed — the
+    verdict layer then says "not observed", never "never ran". This is the fact GPT's hold
+    on #1000 asked for: a launcher's declared role can only be called LOST if the launcher
+    was exercised; a declaration nothing ran is untested, not refuted.
+    """
+    since_stamp = re.sub(r"[^0-9]", "", since)[:14]
+    out: dict[str, int | None] = {}
+    for name, f in fires.items():
+        d, prefix = f.get("log_dir"), f.get("log_prefix")
+        if not d or not prefix:
+            out[name] = None
+            continue
+        try:
+            names = os.listdir(d)
+        except OSError:
+            out[name] = None
+            continue
+        pat = re.compile(rf"^{re.escape(prefix)}-(\d{{8}})-(\d{{6}})\.log$")
+        n = 0
+        for fn in names:
+            m = pat.match(fn)
+            if m and (m.group(1) + m.group(2)) >= since_stamp:
+                n += 1
+        out[name] = n
     return out
 
 
@@ -191,8 +244,25 @@ def verdicts(declared: dict[str, dict], observed: dict[str, dict]) -> dict[str, 
             out[actor].append("NO-ROWS-IN-WINDOW")
         if d.get("undeclared_sources") and obs and obs["roles"].get(DEFAULT_ROLE):
             out[actor].append("SILENT-DEFAULT:" + ",".join(d["undeclared_sources"]))
-        for r in d["roles"]:
-            if not obs or not obs["roles"].get(r):
+        for r in sorted(d["roles"]):
+            if obs and obs["roles"].get(r):
+                continue
+            # The role is absent. WHICH launcher declared it decides what that absence
+            # means. A hook line's role rides every interactive act, so the actor having
+            # rows at all is the launcher being exercised. A fire script's role rides only
+            # its wakes, and those are counted from its own logs: zero runs makes the
+            # absence evidence of nothing; unknown runs makes it unobserved; runs with the
+            # role still absent is the one reading that says "carried and lost".
+            fire_only = r in d.get("fire_roles", set()) and r not in d.get("hook_roles", set())
+            if not fire_only:
+                out[actor].append(f"DECLARED!=SEEN:{r}")
+                continue
+            ran = d.get("exercised")
+            if ran is None:
+                out[actor].append(f"DECLARED-NOT-OBSERVED:{r}")
+            elif ran == 0:
+                out[actor].append(f"UNTESTED-LAUNCHER:{r}")
+            else:
                 out[actor].append(f"DECLARED!=SEEN:{r}")
         if d.get("wake_session") is False:
             out[actor].append("NO-WAKE-SESSION")
@@ -208,7 +278,12 @@ def fold_declared(unit_facts, fires, hooks) -> dict[str, dict]:
     """Collapse the three declared sources into one record per actor."""
     d: dict[str, dict] = collections.defaultdict(lambda: {"roles": set(), "connects": None,
                                                            "wake_session": None, "sources": [],
-                                                           "undeclared_sources": []})
+                                                           "undeclared_sources": [],
+                                                           # which LAUNCHER KIND declared each
+                                                           # role, and how often the fire
+                                                           # scripts ran (None = unknown)
+                                                           "fire_roles": set(), "hook_roles": set(),
+                                                           "fire_scripts": [], "exercised": None})
     for name, f in unit_facts.items():
         if name.startswith("hestia-watch-") and f["plugin"]:
             d[f["plugin"]]["sources"].append(name)
@@ -229,8 +304,10 @@ def fold_declared(unit_facts, fires, hooks) -> dict[str, dict]:
         actor = {"fire-claude.sh": "claude-code", "fire-codex.sh": "codex",
                  "fire-kimi.sh": "kimi-code"}.get(name, f["plugin"] or name)
         d[actor]["sources"].append(name)
+        d[actor]["fire_scripts"].append(name)
         if f["roles"]:
             d[actor]["roles"] |= f["roles"]
+            d[actor]["fire_roles"] |= f["roles"]
         else:
             d[actor]["undeclared_sources"].append(name)
         d[actor]["wake_session"] = bool(f["session_id_flag"])
@@ -242,6 +319,7 @@ def fold_declared(unit_facts, fires, hooks) -> dict[str, dict]:
             d[member]["sources"].append(src)
             if ln.get("roles"):
                 d[member]["roles"] |= ln["roles"]
+                d[member]["hook_roles"] |= ln["roles"]
             elif src not in d[member]["undeclared_sources"]:
                 # THIS is the silent default's launcher: a hook line that sets no role, so
                 # every act it starts lands as role:constellation:member. Kept per SOURCE,
@@ -267,13 +345,22 @@ def main(argv=None) -> int:
     fires = fire_scripts(mesh)
     hooks = harness_hook_lines(REPO, home)
     declared = fold_declared(unit_facts, fires, hooks)
+    # LAUNCHER EXERCISE, from each fire script's own per-run logs, folded per actor: None
+    # if any of the actor's fire scripts cannot be counted, else the sum.
+    exercise = fire_exercise(fires, args.since)
+    for actor, d in declared.items():
+        counts = [exercise.get(s) for s in d.get("fire_scripts", [])]
+        if counts:
+            d["exercised"] = None if any(c is None for c in counts) else sum(counts)
     observed = observe(args.since)
     verd = verdicts(declared, observed)
 
     if args.json:
         print(json.dumps({
             "mesh_dir": str(mesh) if mesh else None,
-            "declared": {k: {**v, "roles": sorted(v["roles"])} for k, v in declared.items()},
+            "declared": {k: {**v, "roles": sorted(v["roles"]), "fire_roles": sorted(v["fire_roles"]),
+                             "hook_roles": sorted(v["hook_roles"])} for k, v in declared.items()},
+            "fire_exercise": exercise,
             "observed": {k: {"rows": v["rows"], "roles": dict(v["roles"]),
                              "no_role_kinds": dict(v["no_role_kinds"]),
                              "host_sessions": len(v["host_sessions"])} for k, v in observed.items()},
@@ -283,15 +370,16 @@ def main(argv=None) -> int:
 
     print(f"launch-identity census on {home.name}; chain window since {args.since}")
     print(f"mesh launchers execute from: {mesh or '(no watcher unit found)'}")
-    print(f"\n{'actor':16} {'declared roles':34} {'wake sid':8} {'rows':>5} {'observed roles':40} verdicts")
+    print(f"\n{'actor':16} {'declared roles':34} {'wake sid':8} {'fires':>5} {'rows':>5} {'observed roles':40} verdicts")
     for actor in sorted(set(declared) | set(observed)):
-        d = declared.get(actor, {"roles": set(), "wake_session": None})
+        d = declared.get(actor, {"roles": set(), "wake_session": None, "exercised": None, "fire_scripts": []})
         o = observed.get(actor)
         dr = ",".join(sorted(r.split(":")[-1] for r in d["roles"])) or "-"
         ws = {True: "yes", False: "NO", None: "-"}[d.get("wake_session")]
+        fires_col = "-" if not d.get("fire_scripts") else ("?" if d.get("exercised") is None else str(d["exercised"]))
         orr = ",".join(f"{r.split(':')[-1]}={n}" for r, n in o["roles"].most_common()) if o else "-"
         rows = o["rows"] if o else 0
-        print(f"{actor:16} {dr:34} {ws:8} {rows:>5} {orr[:40]:40} {' '.join(verd.get(actor, [])) or 'ok'}")
+        print(f"{actor:16} {dr:34} {ws:8} {fires_col:>5} {rows:>5} {orr[:40]:40} {' '.join(verd.get(actor, [])) or 'ok'}")
     return 0
 
 

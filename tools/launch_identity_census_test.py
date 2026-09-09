@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from collections import Counter
 from pathlib import Path
@@ -59,8 +60,11 @@ def main() -> int:
         "stranger": {"rows": 1, "roles": Counter(), "no_role_kinds": Counter({"x": 1}), "host_sessions": set()},
     }
     dec = {
+        # codex's only role comes from its FIRE script (as the fold records in C1/C5); the
+        # interactive line declares none. No fire-run count is given here: unknown.
         "codex": {"roles": {"role:constellation:mesh-worker"}, "connects": None, "wake_session": False,
-                  "undeclared_sources": ["config.toml"]},
+                  "undeclared_sources": ["config.toml"],
+                  "fire_roles": {"role:constellation:mesh-worker"}, "hook_roles": set()},
         "claude-code": {"roles": {"role:constellation:interactive-dev"}, "connects": None, "wake_session": True,
                         "undeclared_sources": []},
         "agent-inventory": {"roles": set(), "connects": None, "wake_session": None,
@@ -76,8 +80,32 @@ def main() -> int:
           "SILENT-DEFAULT:config.toml" in v["codex"], str(v))
     check("B2 a declared actor with no rows is NO-ROWS-IN-WINDOW, not ok",
           v["gemini"] == ["NO-ROWS-IN-WINDOW"], str(v))
-    check("B3 a declared role that never appears is DECLARED!=SEEN",
-          any(x.startswith("DECLARED!=SEEN:role:constellation:mesh-worker") for x in v["codex"]), str(v))
+    # B3, GPT's hold on #1000: a fire script's role absent from the chain is only "lost"
+    # if the fire script RAN. The fixture above declares mesh-worker from a fire script,
+    # records interactive member rows, and says nothing about fire runs — so the verdict
+    # must be the weaker one, never a diagnosis of role loss.
+    check("B3 fire-declared role absent, fire runs unknown -> DECLARED-NOT-OBSERVED, not DECLARED!=SEEN",
+          "DECLARED-NOT-OBSERVED:role:constellation:mesh-worker" in v["codex"]
+          and not any(x.startswith("DECLARED!=SEEN") for x in v["codex"]), str(v))
+    dec_zero = {**dec, "codex": {**dec["codex"], "exercised": 0}}
+    vz = c.verdicts(dec_zero, obs)
+    check("B3 the zero-fire fixture: interactive member rows + mesh-worker fire declaration + ZERO fires "
+          "-> UNTESTED-LAUNCHER, never role-loss",
+          "UNTESTED-LAUNCHER:role:constellation:mesh-worker" in vz["codex"]
+          and not any(x.startswith("DECLARED!=SEEN") for x in vz["codex"]), str(vz))
+    dec_ran = {**dec, "codex": {**dec["codex"], "exercised": 3}}
+    vr = c.verdicts(dec_ran, obs)
+    check("B3 three fires ran and the role is still absent -> DECLARED!=SEEN (carried and lost)",
+          "DECLARED!=SEEN:role:constellation:mesh-worker" in vr["codex"], str(vr))
+    # A HOOK-declared role needs no fire count: the actor's own rows are the launcher running.
+    dec_hook = {**dec, "kimi-code": {"roles": {"role:constellation:mesh-worker"}, "connects": None,
+                                     "wake_session": None, "undeclared_sources": [],
+                                     "hook_roles": {"role:constellation:mesh-worker"}, "fire_roles": set()}}
+    obs_hook = {**obs, "kimi-code": {"rows": 4, "roles": Counter({c.DEFAULT_ROLE: 4}),
+                                     "no_role_kinds": Counter(), "host_sessions": set()}}
+    vh = c.verdicts(dec_hook, obs_hook)
+    check("B3 a hook-line role absent from an actor WITH rows is DECLARED!=SEEN without a fire count",
+          "DECLARED!=SEEN:role:constellation:mesh-worker" in vh["kimi-code"], str(vh))
     check("B3 and codex's fire script without --session-id is NO-WAKE-SESSION",
           "NO-WAKE-SESSION" in v["codex"], str(v))
     check("B4 event kinds carrying no role are named, not folded into a default",
@@ -104,6 +132,45 @@ def main() -> int:
     check("C4 the two role-less sources are named as such; the fire script is not",
           set(d["codex"]["undeclared_sources"]) == {"hestia-watch-codex.service", "config.toml"},
           str(d["codex"]["undeclared_sources"]))
+    check("C5 the fold records WHICH launcher kind declared the role, and which fire scripts exist",
+          d["codex"]["fire_roles"] == {"role:constellation:mesh-worker"} and d["codex"]["hook_roles"] == set()
+          and d["codex"]["fire_scripts"] == ["fire-codex.sh"] and d["codex"]["exercised"] is None,
+          str(d["codex"]))
+
+    print("D. launcher exercise is counted from the fire script's OWN per-run logs")
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        logs = Path(tmp) / "logs"
+        logs.mkdir()
+        for stamp in ("20260905-235959", "20260906-000000", "20260907-120000"):
+            (logs / f"codex-{stamp}.log").write_text("x")
+        (logs / "codex-20260907-130000.log.bak").write_text("x")     # not a run log
+        (logs / "claude-20260907-140000.log").write_text("x")        # another launcher's run
+        fires = {
+            "fire-codex.sh": {"roles": set(), "session_id_flag": False, "plugin": None,
+                              "log_dir": str(logs), "log_prefix": "codex"},
+            "fire-kimi.sh": {"roles": set(), "session_id_flag": False, "plugin": None,
+                             "log_dir": None, "log_prefix": None},
+            "fire-claude.sh": {"roles": set(), "session_id_flag": False, "plugin": None,
+                               "log_dir": str(Path(tmp) / "missing"), "log_prefix": "claude"},
+        }
+        ex = c.fire_exercise(fires, "2026-09-06T00:00:00")
+        check("D1 runs at or after the window start are counted; earlier ones are not",
+              ex["fire-codex.sh"] == 2, str(ex))
+        check("D2 a script that names no log location is None (unknown), not zero",
+              ex["fire-kimi.sh"] is None, str(ex))
+        check("D3 an unlistable log dir is None (unknown), not zero",
+              ex["fire-claude.sh"] is None, str(ex))
+        # The location and prefix are read off the script text itself.
+        mesh = Path(tmp) / "mesh"
+        mesh.mkdir()
+        (mesh / "fire-codex.sh").write_text('LOG_DIR="$HOME/.local/state/hestia-mesh/logs"; mkdir -p "$LOG_DIR"\n'
+                                            'timeout 5 codex -p "$PROMPT" > "$LOG_DIR/codex-$STAMP.log" 2>&1\n')
+        fs = c.fire_scripts(mesh)
+        check("D4 fire_scripts reads the log dir and prefix off the script's own text",
+              fs["fire-codex.sh"]["log_prefix"] == "codex"
+              and fs["fire-codex.sh"]["log_dir"] == os.path.expanduser("~/.local/state/hestia-mesh/logs"),
+              str(fs))
 
     print()
     if FAILURES:
