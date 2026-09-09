@@ -571,6 +571,23 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/http.rs::scope_standing_recursive", &[
         "let subject = s.member_lct(&plugin_id);",
     ], SiteClass::Naming),
+    // ADDED 2026-09-09 (cbp, the atomic `reassign` — GPT's hold on #1006). Caught by the
+    // full `cargo test` after `--lib` was green, exactly as the header warns.
+    //
+    // READING, both questions. (1) Who gets named? TWO members, in one record pair: the
+    // source (`subject_instance_lct`, the mistyped id the grant is leaving) and the
+    // destination (`destination_instance_lct`, the real seat receiving it), on both the
+    // `scope_reassign_intent` and the `scope_reassigned` entry. Both ids are operator-typed
+    // (HST-005 caveat unchanged); the destination is additionally checked against the
+    // member registry BEFORE either line runs (see this fn in REGISTRY_CENSUS), and the
+    // source is corroborated by the grant lookup 404ing on a mismatch. (2) Compared to
+    // decide control flow? No — the move keys on `(member, path)` strings in the store;
+    // both LCTs are derived once into locals, serialised into the two witness entries and
+    // read by nothing. Naming.
+    ("server/http.rs::scope_standing_reassign", &[
+        "let subject_from = s.member_lct(&from);",
+        "let subject_to = s.member_lct(&to);",
+    ], SiteClass::Naming),
     // ADDED 2026-08-15 (claude-code, the operator-originated grant `POST /api/scope/grant`).
     // The census went red the moment the site was written — the instrument working, and it
     // caught a change I had already convinced myself was verified: I had run only
@@ -744,6 +761,23 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     // must be redone.
     ("server/http.rs::scope_grant", &[
         "let member_known = s.member_registry.get(&plugin_id).is_some();",
+    ]),
+    // ADDED 2026-09-09 (cbp, the atomic `reassign`). READING: presence, used as a GATE, not
+    // an advisory — the one thing the `scope_grant` reading above said would need its own
+    // reading if it ever happened. An unknown destination is refused with 400 before any
+    // durable mutation. Why a gate is right here and an advisory was right there: `scope_grant`
+    // may legitimately grant AHEAD of a member's first connect, so it warns; `reassign` exists
+    // only to repair a grant made to a member nobody has seen, and a reassign to another
+    // unseen id would recreate that state under a new name, so it refuses.
+    //
+    // DEGRADATION DIRECTION: an empty or unreadable registry refuses every reassign — the
+    // operator is told "not a member this daemon has recorded" and falls back to revoke +
+    // grant, which still warns. Nothing is moved and nothing is silently trusted: the loud,
+    // narrow direction. The opposite failure (a registry wrongly reporting presence) would
+    // let a grant move to a phantom, which is exactly what the source grant already was —
+    // no worse than the state being repaired, and visible on the row it produces.
+    ("server/http.rs::scope_standing_reassign", &[
+        "if s.member_registry.get(&to).is_none() {",
     ]),
     // Added 2026-08-17 (codex, PR #490 NOT-SAME pass). READING, answering the question
     // this table schedules — **is this a safety use of presence?**
