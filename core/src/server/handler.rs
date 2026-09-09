@@ -674,17 +674,26 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
     // Connect idempotency (HUB ruling 2026-07-24): the claude-code hook connects on EVERY tool call
     // (fresh MCP connection per hook subprocess), so without this each tool call mints a distinct
     // session — an interactive session becomes ephemeral churn invisible to coordination. If the caller
-    // supplies a stable `host_session_id` and a live session already carries it, REUSE that session so
-    // one host session = one stable hestia session.
+    // supplies a stable `host_session_id` and a live session FOR THE SAME CLAIMED MEMBER already
+    // carries it, REUSE that session so one member's host session = one stable hestia session.
     //   Guard A — reuse is LIVENESS-ONLY and CAPABILITY-INVARIANT: bump `connected_at` and NOTHING else;
     //     return the SAME `soft_lct`/role; never re-issue an LCT, change role, or adopt a new agent.
     //   Not witnessed — local, RAM-only (host_session_id is already witnessed at begin_action grain).
     //   Guard B (enforced by test): host_session_id is a descriptive reuse key, never an authz key.
+    //   Guard C (enforced by test): the reuse key is `(plugin_id, host_session_id)`, never the host
+    //     session id alone. Host-session ids are correlation evidence written onto the PUBLIC witness
+    //     chain — neither globally unique across harnesses nor bearer credentials — and a lookup by
+    //     that field alone handed a caller claiming a different `plugin_id` the first matching
+    //     member's exact session bearer (measured: the arm below was run red first). Scoping the
+    //     convenience lookup to the claimed member stops the reuse mechanism itself from crossing
+    //     the identity grain it stores. It proves nothing about ownership of the label: at A1
+    //     `plugin_id` is still asserted, proof-of-possession is #824's boundary, and #981's close
+    //     predicate remains exact action/session identity, not this pair.
     if let Some(hsid) = host_session_id.as_deref() {
         if let Some(existing) = s
             .sessions
             .values_mut()
-            .find(|sess| sess.host_session_id.as_deref() == Some(hsid))
+            .find(|sess| sess.plugin_id == plugin_id && sess.host_session_id.as_deref() == Some(hsid))
         {
             existing.connected_at = Utc::now(); // Guard A: liveness only — no other field mutates
             // Guard A means a reused session keeps the role it was MINTED with — this
@@ -11766,6 +11775,66 @@ mod tests {
             sess.constellation_role, "role:constellation:member",
             "Guard B: an asserted host_session_id must not change role on reuse"
         );
+    }
+
+    /// Guard C: a host-session id is a per-member correlation key, not a global session bearer.
+    ///
+    /// Run RED before the member predicate existed (codex, #995): `other-member` received the
+    /// exact `sessionId` minted for `victim`, and the state still held only the victim's session.
+    /// Host-session ids are written onto the public witness chain, so the convenience lookup
+    /// was crossing the very principal boundary its returned bearer is later used to prove.
+    ///
+    /// The limitation, stated so nobody reads more into this arm than it holds: it prevents
+    /// reuse from crossing two DIFFERENTLY CLAIMED labels. It is not proof that a caller owns
+    /// the label it claims — that is #824's proof-of-possession boundary — and #981's close
+    /// predicate stays exact action/session identity, not `(plugin_id, host_session_id)`.
+    #[tokio::test]
+    async fn connect_reuse_is_scoped_to_the_claimed_member() {
+        let (_dir, shared) = make_shared_state();
+        let victim = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "victim", "host_agent": "victim-host",
+                "host_session_id": "public-host-session"
+            }),
+        )
+        .await
+        .unwrap();
+        let victim_sid = victim["sessionId"].as_str().unwrap().to_string();
+
+        let other = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "other-member", "host_agent": "other-host",
+                "host_session_id": "public-host-session"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            other["sessionId"].as_str().unwrap(),
+            victim_sid.as_str(),
+            "a host_session_id is public correlation evidence, not a cross-member bearer token"
+        );
+        assert_eq!(other["reused"], json!(null), "a different member never REUSES; it connects");
+
+        // The victim's own reuse still works — the pair, not the id alone, is the key.
+        let again = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "victim", "host_agent": "victim-host",
+                "host_session_id": "public-host-session"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(again["sessionId"].as_str().unwrap(), victim_sid, "same member, same host session: reused");
+        assert_eq!(again["reused"], json!(true));
+
+        let s = shared.lock().await;
+        assert_eq!(s.sessions.len(), 2, "one session per (member, host session)");
+        assert!(s.sessions.values().any(|session| session.plugin_id == "victim"));
+        assert!(s.sessions.values().any(|session| session.plugin_id == "other-member"));
     }
 
     /// The declared constellation role must be READABLE BACK. Before this, a member
