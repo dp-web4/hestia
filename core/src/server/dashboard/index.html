@@ -432,6 +432,14 @@
     transition: background 200ms, border-color 200ms;
     user-select: none;
   }
+  /* The governance id, beside the display name.
+     KnownOrch carries both `name` ("Claude Code") and `id` ("claude-code"); only the name
+     was ever rendered. But the id is what the chain records and what a scope grant must
+     name, so the operator had to GUESS it from the label. Measured on McNugget 2026-09-08:
+     two standing grants to "Claude-code" — a plausible guess at what the chip called
+     "Claude Code" — both perfectly formed and both inert. The registry is full of the same
+     trap: OpenClaw/openclaw, Kimi Code/kimi-code. Showing the id costs a few pixels. */
+  .orch-chip .orch-id { font-family: var(--mono); font-size: 0.68rem; opacity: 0.55; margin-left: 0.35rem; }
   .orch-chip:hover { background: var(--bg-elev-2); border-color: var(--fg-faint); }
   .orch-chip.selected {
     background: var(--accent-dim);
@@ -2061,8 +2069,8 @@
         const badge = o.engaged
           ? (t.action_count != null ? `<span class="count">${fmt.int(t.action_count)}</span>` : '')
           : `<span class="orch-idle">idle</span>`;
-        return `<span class="orch-chip${sel}" data-pid="${escapeHtml(o.id)}" title="connected · ${state} — click to view its history/stats">
-                  ${govDot(o.id)}<span>${escapeHtml(o.name)}</span>
+        return `<span class="orch-chip${sel}" data-pid="${escapeHtml(o.id)}" title="connected · ${state} — click to view its history/stats&#10;&#10;governance id: ${escapeHtml(o.id)} — the id the chain records and the id a grant must name; the label is only a display name">
+                  ${govDot(o.id)}<span>${escapeHtml(o.name)}</span><span class="orch-id">${escapeHtml(o.id)}</span>
                   ${t.level ? `<span class="level">${escapeHtml(t.level)}</span>` : ''}
                   ${badge}
                 </span>`;
