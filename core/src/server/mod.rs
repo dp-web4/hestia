@@ -10,6 +10,7 @@ pub mod governance_ledger;
 mod handler;
 mod http;
 mod hub_tab;
+pub mod member_alias;
 pub mod operator_auth;
 pub mod seat_config;
 mod public_identity;

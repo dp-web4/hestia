@@ -334,6 +334,14 @@
   }
   /* Members that exist only because someone typed them, in the pickers. */
   select.member-pick option.member-phantom { opacity: 0.7; font-style: italic; }
+  /* A DISPLAY ALIAS (#998): what this console calls a member. Marked so it is never mistaken
+     for the id — the record, the chain and every grant name the id, and the hover says so. */
+  .member-alias {
+    color: var(--amber, #d79921);
+    border-bottom: 1px dotted var(--amber, #d79921);
+    cursor: help;
+  }
+  .alias-add .pol-hint { opacity: 0.7; font-size: 0.85em; margin-left: 0.5rem; }
   .trust-list, .tool-list { overflow-y: auto; min-height: 0; }
   .live-grid .trust-list { max-height: 10.5rem; }   /* ≈ 3 trust rows */
   .live-grid .tool-list  { max-height: 7rem; }      /* ≈ 3 tool rows  */
@@ -1314,6 +1322,14 @@
               an act you originated rather than a reply to a request nobody made, and is
               revocable above.
             </div>
+            <div class="pol-add alias-add" title="a display alias changes only what this console shows — the record, the chain and every grant keep naming the id">
+              <select class="pol-input member-pick" id="alias-plugin" data-empty="member…"></select>
+              <input class="pol-input" id="alias-text" placeholder="display alias (console only)" size="22" maxlength="48">
+              <button id="alias-set">set alias</button>
+              <button id="alias-clear">clear alias</button>
+              <span class="pol-hint">display only, never on the record</span>
+              <div class="pol-err" id="alias-err" hidden></div>
+            </div>
             <div class="pol-add grant-add">
               <select class="pol-input member-pick" id="sg-plugin" data-empty="member…"></select>
               <input class="pol-input" id="sg-path" placeholder="absolute path" size="34">
@@ -2070,7 +2086,7 @@
           ? (t.action_count != null ? `<span class="count">${fmt.int(t.action_count)}</span>` : '')
           : `<span class="orch-idle">idle</span>`;
         return `<span class="orch-chip${sel}" data-pid="${escapeHtml(o.id)}" title="connected · ${state} — click to view its history/stats&#10;&#10;governance id: ${escapeHtml(o.id)} — the id the chain records and the id a grant must name; the label is only a display name">
-                  ${govDot(o.id)}<span>${escapeHtml(o.name)}</span><span class="orch-id">${escapeHtml(o.id)}</span>
+                  ${govDot(o.id)}<span>${memberAliases[o.id] ? memberName(o.id) : escapeHtml(o.name)}</span><span class="orch-id">${escapeHtml(o.id)}</span>
                   ${t.level ? `<span class="level">${escapeHtml(t.level)}</span>` : ''}
                   ${badge}
                 </span>`;
@@ -2631,7 +2647,7 @@
       const whoPid = whoRole ? `<span class="feed-pid">${escapeHtml(whoRole)}</span>` : '';
       return `
         <div class="feed-row${isNew ? ' new' : ''}">
-          <span class="feed-pos" title="${escapeHtml(posHover)}"><span class="feed-agent">${escapeHtml(whoAgent)}</span>${whoPid}</span>
+          <span class="feed-pos" title="${escapeHtml(posHover)}"><span class="feed-agent">${memberName(whoAgent)}</span>${whoPid}</span>
           <span class="feed-time" title="${escapeHtml(absTime)}">${fmt.relTime(e.timestamp)}</span>
           <span class="feed-event ${e.event_type}">${escapeHtml(e.event_type)}</span>
           <span class="feed-detail" title="${escapeHtml(hover || detail)}">
@@ -2703,6 +2719,37 @@
   // question the operator actually has: action count, measured roles, governance.
   let knownMembers = new Map();   // id -> { actions, measured, gov, installed }
 
+  // ── Display aliases (#998) ──────────────────────────────────────────────────────────
+  //
+  // dp: "a ui presentation artifact, consistent across all parts of the ui; not an artifact
+  // of record." So: ONE resolution point. Every surface that draws a member goes through
+  // `memberName` (HTML) or `memberNameText` (plain text), never through its own lookup, so
+  // a screen cannot show the alias while the next shows the id and an operator believes
+  // they are looking at two members. The map comes from `/api/ui/member-aliases`, fetched
+  // beside the snapshot; it is never merged into snapshot data, and `<option value>`,
+  // `data-*` attributes and every request body keep carrying the id.
+  let memberAliases = {};   // id -> alias
+
+  async function loadAliases() {
+    try {
+      const r = await apiFetch('/api/ui/member-aliases', { cache: 'no-store' });
+      if (r.ok) memberAliases = (await r.json()).aliases || {};
+    } catch (_) { /* the console falls back to ids; nothing is lost */ }
+  }
+
+  function memberName(id) {
+    const real = String(id ?? '?');
+    const a = memberAliases[real];
+    if (!a) return escapeHtml(real);
+    return `<span class="member-alias" title="display alias — the record names ${escapeHtml(real)}">${escapeHtml(a)}</span>`;
+  }
+
+  function memberNameText(id) {
+    const real = String(id ?? '?');
+    const a = memberAliases[real];
+    return a ? `${a} (alias of ${real})` : real;
+  }
+
   function noteMembers(rows) {
     for (const r of rows || []) {
       const id = r.plugin_id;
@@ -2727,7 +2774,9 @@
     if (m.measured) bits.push(`${m.measured} measured`);
     // The important case: a member that exists only because someone typed it.
     if (!bits.length) bits.push('no evidence — typed, never acted');
-    return `${id} — ${bits.join(' · ')}`;
+    // The picker's VALUE is always the id; only the label carries the alias, id beside it.
+    const shown = memberAliases[id] ? `${memberAliases[id]} (${id})` : id;
+    return `${shown} — ${bits.join(' · ')}`;
   }
 
   function refreshMemberPickers() {
@@ -2889,6 +2938,7 @@
     if (tickInFlight) return;
     tickInFlight = true;
     try {
+      await loadAliases();   // before the render, so every name drawn below resolves the same way
       const res = await apiFetch(`/api/dashboard?range=${rangeSel}`, { cache: 'no-store' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
@@ -3055,7 +3105,7 @@
       row.innerHTML = `
         <div class="esc-row-head">
           <span class="esc-tool">read</span>
-          <span class="esc-who">claimed by ${escapeHtml(String(r.claimed_by ?? '?'))}${
+          <span class="esc-who">claimed by ${memberName(r.claimed_by ?? '?')}${
             r.role ? ' · ' + escapeHtml(String(r.role)) : ''}</span>
           <span class="esc-ttl" id="scope-ttl-${escapeHtml(String(r.request_id))}">${
             escapeHtml(`expires in ${escFmtAge(r.secs_remaining ?? 0)}`)}</span>
@@ -3285,7 +3335,7 @@
       pl.innerHTML = pend.length
         ? pend.map(r => `
             <div class="grant-row">
-              <span class="grant-who">${escapeHtml(String(r.claimed_by ?? '?'))}</span>
+              <span class="grant-who">${memberName(r.claimed_by ?? '?')}</span>
               <span class="grant-preset">wants</span>
               <code>${escapeHtml(String(r.path ?? ''))}</code>
               <span class="grant-ttl">expires in ${escFmtAge(r.secs_remaining ?? 0)}</span>
@@ -3330,7 +3380,7 @@
       const origin = g.origin === 'operator_initiated' ? 'you granted this directly' : 'answered a request';
       return `
         <div class="grant-row">
-          <span class="grant-who">${escapeHtml(String(g.plugin_id ?? '?'))}</span>
+          <span class="grant-who">${memberName(g.plugin_id ?? '?')}</span>
           <span class="grant-preset${live ? '' : ' scope-standing'}">${live ? 'LIVE' : 'STANDING'}</span>
           <code>${escapeHtml(String(g.path ?? ''))}${g.recursive ? '<span class="grant-reach" title="reaches the whole subtree">/**</span>' : ''}</code>
           <span class="grant-ttl">${escapeHtml(when)}</span>
@@ -3517,7 +3567,7 @@
       // "claimed" is said out loud: plugin_id is caller-asserted (HST-005) and the
       // operator is deciding partly on this string.
       row.querySelector('.esc-who').textContent =
-        `claimed by ${e.claimed_by || 'unattributed'} · ${e.role || 'no role'}`;
+        `claimed by ${memberNameText(e.claimed_by || 'unattributed')} · ${e.role || 'no role'}`;
       row.querySelector('.esc-ttl').textContent = `expires in ${escFmtAge(e.secs_remaining ?? 0)}`;
       row.querySelector('.esc-marker').textContent = e.marker || '(no target recorded)';
       // THE BASIS. An operator ruling from tool + path fragment is choosing without grounds
@@ -4535,6 +4585,36 @@
 
   tick();
   setInterval(tick, REFRESH_MS);
+
+  // Display alias editor (#998). Set and clear are operator acts on the console's own
+  // presentation store; neither is witnessed, by ruling. The picker's value is the id.
+  async function aliasAct(method, path, body) {
+    const err = $('alias-err');
+    err.hidden = true;
+    try {
+      const r = await apiFetch(path, {
+        method, headers: { 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      const o = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(o?.error || `HTTP ${r.status}`);
+      await loadAliases();
+      if (lastData) rerender(lastData);
+    } catch (e) {
+      err.textContent = `alias: ${e.message}`;
+      err.hidden = false;
+    }
+  }
+  $('alias-set')?.addEventListener('click', () => {
+    const id = $('alias-plugin').value, alias = $('alias-text').value.trim();
+    if (!id) { $('alias-err').textContent = 'alias: pick a member first'; $('alias-err').hidden = false; return; }
+    aliasAct('PUT', '/api/ui/member-aliases', { plugin_id: id, alias });
+  });
+  $('alias-clear')?.addEventListener('click', () => {
+    const id = $('alias-plugin').value;
+    if (!id) { $('alias-err').textContent = 'alias: pick a member first'; $('alias-err').hidden = false; return; }
+    aliasAct('DELETE', `/api/ui/member-aliases/${encodeURIComponent(id)}`);
+  });
 })();
 </script>
 <script>

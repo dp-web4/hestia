@@ -1172,6 +1172,12 @@ pub async fn serve_with_callback(
         .route("/api/config/seed", post(config_seed_seats))
         .route("/api/config/seat", put(config_put_seat).get(config_list_seats))
         .route("/api/config/seat/:plugin_id", get(config_get_seat))
+        // DISPLAY ALIASES (#998): what the console CALLS a member. Operator-only like every
+        // other write here, but — by dp's ruling — NOT witnessed and NOT an artifact of
+        // record: the chain, the projections and every `plugin_id` field keep naming the id.
+        // See `member_alias.rs` for the invariant and `http.rs` tests for the leak arm.
+        .route("/api/ui/member-aliases", get(ui_alias_list).put(ui_alias_set))
+        .route("/api/ui/member-aliases/:plugin_id", delete(ui_alias_clear))
         .route("/api/scope/grant", post(scope_grant))
         // THE SOCIETY FLOOR (dp, 2026-08-16). Same operator wall as every other widening, and
         // deliberately NOT reachable from MCP: a member that could edit the floor could widen
@@ -4391,6 +4397,72 @@ async fn scope_standing_reassign(
     })))
 }
 
+/// `GET /api/ui/member-aliases` — `{aliases: {plugin_id: alias}}`, the console's whole
+/// alias map. Fetched by the dashboard beside the snapshot and resolved through one render
+/// helper, so every screen draws the same name for a member.
+async fn ui_alias_list(State(state): State<SharedState>) -> impl IntoResponse {
+    let s = state.lock().await;
+    match crate::server::member_alias::MemberAliases::load(&s.vault) {
+        Ok(a) => (StatusCode::OK, Json(serde_json::json!({"aliases": a.aliases}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR,
+                   Json(serde_json::json!({"error": format!("alias store unreadable: {e}")}))),
+    }
+}
+
+/// `PUT /api/ui/member-aliases` {plugin_id, alias} — set what the console calls a member.
+///
+/// NOT WITNESSED, by ruling (dp 2026-09-07, #998): a chain row saying "the console now
+/// calls X Y" would make the alias part of the record. Refused when the alias is another
+/// member's real id — that would make the console show one member under another's name,
+/// which is the typo class #1007 exists to end, from the other side.
+async fn ui_alias_set(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let plugin_id = body.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let alias = body.get("alias").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let mut s = state.lock().await;
+    if !alias.is_empty() && alias != plugin_id && s.member_registry.get(&alias).is_some() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("'{alias}' is another member's id; an alias may not wear a real \
+                              member's name")})));
+    }
+    let mut store = match crate::server::member_alias::MemberAliases::load(&s.vault) {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                          Json(serde_json::json!({"error": format!("alias store unreadable: {e}")}))),
+    };
+    if let Err(why) = store.set(&plugin_id, &alias) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": why})));
+    }
+    if let Err(e) = store.save(&mut s.vault) {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("alias NOT saved: {e}")})));
+    }
+    (StatusCode::OK, Json(serde_json::json!({"plugin_id": plugin_id, "alias": alias})))
+}
+
+/// `DELETE /api/ui/member-aliases/:plugin_id` — the console shows the id again.
+async fn ui_alias_clear(
+    State(state): State<SharedState>,
+    axum::extract::Path(plugin_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let mut s = state.lock().await;
+    let mut store = match crate::server::member_alias::MemberAliases::load(&s.vault) {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                          Json(serde_json::json!({"error": format!("alias store unreadable: {e}")}))),
+    };
+    let cleared = store.clear(&plugin_id);
+    if cleared {
+        if let Err(e) = store.save(&mut s.vault) {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("alias NOT cleared: {e}")})));
+        }
+    }
+    (StatusCode::OK, Json(serde_json::json!({"plugin_id": plugin_id, "cleared": cleared})))
+}
+
 fn stamp_gate(
     record: serde_json::Value,
     gate: &Option<axum::Extension<super::operator_auth::GateWitness>>,
@@ -6475,6 +6547,90 @@ mod disposition_tests {
         let chain = s.recent_chain(20);
         assert!(chain.iter().any(|e| e.event_type == "scope_reassign_intent"));
         assert!(!chain.iter().any(|e| e.event_type == "scope_reassigned"));
+    }
+
+    /// #998, the invariant that IS the feature: an alias exists at the moment a name is drawn
+    /// for a human and nowhere behind it. Set one, exercise the surfaces that produce records
+    /// — connect, a governed act and its outcome, a standing-scope change, a self-read — and
+    /// assert the alias string reaches no chain row, no identity, and no `plugin_id` field.
+    /// Setting and clearing it are themselves unwitnessed: the chain length does not move.
+    #[tokio::test]
+    async fn a_display_alias_reaches_no_record() {
+        use crate::server::member_alias::MemberAliases;
+        let (_dir, state) = test_state().await;
+        super::super::handler::tool_connect(&state, &serde_json::json!({
+            "plugin_id": "claude-code", "host_agent": "test"})).await.unwrap();
+        let (lct_before, rows_before) = {
+            let s = state.lock().await;
+            (s.member_lct("claude-code"), s.recent_chain(200).len())
+        };
+
+        // SET — refused when it wears another member's id; accepted otherwise; unwitnessed.
+        super::super::handler::tool_connect(&state, &serde_json::json!({
+            "plugin_id": "codex", "host_agent": "test"})).await.unwrap();
+        let rows_after_connects = state.lock().await.recent_chain(200).len();
+        let resp = ui_alias_set(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "claude-code", "alias": "codex"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "an alias may not wear a real member's id");
+        let resp = ui_alias_set(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "claude-code", "alias": "Nugget"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        {
+            let s = state.lock().await;
+            assert_eq!(s.recent_chain(200).len(), rows_after_connects, "setting an alias writes no chain row");
+            assert_eq!(MemberAliases::load(&s.vault).unwrap().display("claude-code"), "Nugget");
+            assert_eq!(s.member_lct("claude-code"), lct_before, "the identity is a hash of the id, and did not move");
+        }
+
+        // EXERCISE the record-producing surfaces under the alias.
+        let sid = super::super::handler::tool_connect(&state, &serde_json::json!({
+            "plugin_id": "claude-code", "host_agent": "test"})).await.unwrap()["sessionId"]
+            .as_str().unwrap().to_string();
+        let begin = super::super::handler::tool_begin_action(&state, &serde_json::json!({
+            "tool_name": "Bash", "target": "ls -la", "session_id": sid})).await.unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        super::super::handler::tool_record_outcome(&state, &serde_json::json!({
+            "action_id": aid, "success": true})).await.unwrap();
+        {
+            let now = crate::server::gate_escalation::now_secs();
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "claude-code".into(), path: "/w/tree".into(), granted_at: now,
+                granted_by: "operator".into(), reason: "r".into(), expires_at: None,
+                request_id: None, recursive: false,
+            })).unwrap();
+        }
+        let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "claude-code", "path": "/w/tree", "recursive": true, "reason": "r"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // THE ARM: the alias is in no record.
+        let s = state.lock().await;
+        let chain = s.recent_chain(200);
+        // The exercise chains an outcome and the reach change's intent + terminal (an allow
+        // decision is not chained; connects are not chained): three rows, at least.
+        assert!(chain.len() >= rows_before + 3, "the exercise produced rows: {}", chain.len());
+        for e in &chain {
+            let text = serde_json::to_string(&e.event_data).unwrap();
+            assert!(!text.contains("Nugget"), "the alias leaked into a {} row: {text}", e.event_type);
+            if let Some(pid) = e.event_data.get("plugin_id").and_then(|v| v.as_str()) {
+                assert_ne!(pid, "Nugget", "a plugin_id field wore the alias");
+            }
+        }
+        // The alias document lives in its own namespace, not beside anything rendered.
+        assert!(s.vault.get_document(crate::server::member_alias::NS, crate::server::member_alias::NAME).is_some());
+        assert!(s.vault.get_document("seat-config", "claude-code").is_none()
+                || !String::from_utf8_lossy(s.vault.get_document("seat-config", "claude-code").unwrap()).contains("Nugget"),
+                "the seat document never carries the alias");
+        drop(s);
+
+        // CLEAR — the original name is back, still unwitnessed.
+        let rows = state.lock().await.recent_chain(200).len();
+        let resp = ui_alias_clear(State(state.clone()), axum::extract::Path("claude-code".to_string())).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let s = state.lock().await;
+        assert_eq!(MemberAliases::load(&s.vault).unwrap().display("claude-code"), "claude-code");
+        assert_eq!(s.recent_chain(200).len(), rows, "clearing an alias writes no chain row");
     }
 
     /// The operator may choose recursive AT decide time; the member never can.

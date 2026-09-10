@@ -824,7 +824,7 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
     }))
 }
 
-async fn tool_begin_action(state: &SharedState, args: &Value) -> ToolResult {
+pub(crate) async fn tool_begin_action(state: &SharedState, args: &Value) -> ToolResult {
     let tool_name = require_string(args, "tool_name")?;
     // A shell act's `target` is the command itself — the shims send it whole so the feed
     // shows the act and not just its verb (2026-09-08, after #977 made the outcome row
@@ -874,7 +874,7 @@ async fn tool_begin_action(state: &SharedState, args: &Value) -> ToolResult {
     }))
 }
 
-async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
+pub(crate) async fn tool_record_outcome(state: &SharedState, args: &Value) -> ToolResult {
     let action_id_str = require_string(args, "action_id")?;
     let action_id = Uuid::parse_str(&action_id_str)
         .map_err(|_| anyhow::anyhow!("invalid action_id: not a UUID"))?;
