@@ -1138,6 +1138,7 @@ pub async fn serve_with_callback(
         .route("/api/scope/standing/promote", post(scope_standing_promote))
         .route("/api/scope/standing/recursive", post(scope_standing_recursive))
         .route("/api/scope/standing/reassign", post(scope_standing_reassign))
+        .route("/api/scope/reroot", post(scope_reroot))
         // THE GRANT HALF NOW HAS A ROUTE, REVERSING A DELIBERATE DECISION RECORDED HERE.
         //
         // What stood here said: "The GRANT half deliberately has no route of its own: a
@@ -4463,6 +4464,183 @@ async fn ui_alias_clear(
     (StatusCode::OK, Json(serde_json::json!({"plugin_id": plugin_id, "cleared": cleared})))
 }
 
+/// `POST /api/scope/reroot` {from, to, plugin_id?, reason, dry_run?, allow_missing_target?} —
+/// move every standing grant at or under one root to another, in ONE act.
+///
+/// THE COST THIS ENDS. Moving the workspace left 27 grants naming the old root while the
+/// configured workspace named the new one, so the member held no effective reach and the only
+/// repair available was 27 revokes plus 27 grants typed by hand. A revoke/add pair is not
+/// merely tedious: between the two calls the member holds neither reach, and the pair
+/// witnesses as two unrelated decisions — so a half-finished migration leaves an inconsistent
+/// scope set with nothing recording that it is half-finished.
+///
+/// `dry_run` returns the plan and touches nothing, because an operator should be able to read
+/// what will move before it moves.
+///
+/// REFUSES A MOVE ONTO A ROOT THAT IS NOT THERE. A re-root onto a mistyped or not-yet-created
+/// target does not fail — it succeeds, and silently leaves every rewritten grant matching
+/// nothing, which is a total revocation wearing the shape of a successful migration. That is
+/// the exact miswire this endpoint exists to end, so producing it by accident is not an
+/// acceptable failure mode; `allow_missing_target` is the deliberate override for granting
+/// ahead of a tree that does not exist yet.
+///
+/// ORDER: intent → commit → terminal, with rollback if the terminal record cannot be
+/// appended — the same order `scope_standing_recursive` and `scope_standing_reassign` use.
+/// The first cut of this endpoint appended its terminal record with `.ok()`, which would let a
+/// committed rewrite of the entire scope set outlive its own evidence.
+async fn scope_reroot(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let str_field = |k: &str| {
+        body.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string()
+    };
+    let (from_raw, to_raw, reason) = (str_field("from"), str_field("to"), str_field("reason"));
+    let member = {
+        let m = str_field("plugin_id");
+        if m.is_empty() { None } else { Some(m) }
+    };
+    let dry_run = body.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    let allow_missing = body
+        .get("allow_missing_target").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if from_raw.is_empty() || to_raw.is_empty() {
+        return (StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "from and to are required"})));
+    }
+    // Same rule as every other widening on this surface: a reach whose rationale is
+    // unrecorded is indistinguishable afterwards from a misconfiguration. A re-root touches
+    // EVERY matching grant at once, so it needs the account more than a single grant does.
+    if reason.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "reason is required — a re-root rewrites every matching grant at once, and \
+                      its rationale is the only account of why the member's whole reach moved"
+        })));
+    }
+
+    let from = crate::server::state::normalize_scope_path(&from_raw);
+    let to = crate::server::state::normalize_scope_path(&to_raw);
+    for p in [&from, &to] {
+        if let Err(msg) = crate::server::state::require_absolute_grant_path(p) {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": msg})));
+        }
+    }
+
+    let target_exists = std::path::Path::new(&to).is_dir();
+    if !target_exists && !allow_missing {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!(
+                "refusing to re-root onto '{to}', which is not a directory on this host. A \
+                 re-root onto a path that is not there does not fail — it leaves every \
+                 rewritten grant matching nothing, which is a silent total revocation. Pass \
+                 allow_missing_target:true if you are deliberately granting ahead of the tree."),
+            "target_exists": false,
+        })));
+    }
+
+    let mut s = state.lock().await;
+
+    // PLAN FIRST, on a clone, so the record can name every path that will move rather than a
+    // count, and so every refusal below is a pure read that writes nothing.
+    let plan = {
+        let mut probe = s.standing_scope.clone();
+        probe.reroot(&from, &to, member.as_deref())
+    };
+    let moved_json: Vec<serde_json::Value> = plan
+        .iter()
+        .map(|(m, old, new)| serde_json::json!({"plugin_id": m, "from": old, "to": new}))
+        .collect();
+
+    if plan.is_empty() {
+        // NOT an error, and deliberately not silent either: a mistyped `from` is the likely
+        // cause, and reporting it as a bland success is how an operator concludes a migration
+        // that never happened.
+        return (StatusCode::OK, Json(serde_json::json!({
+            "ok": true, "moved": [], "matched": 0,
+            "note": format!(
+                "no standing grant is at or under '{from}' — nothing was changed. If a move was \
+                 expected, check the from-prefix: containment is judged at a segment boundary, \
+                 so '/a/b' does not match '/a/b-old'."),
+            "generation": s.standing_scope.generation,
+        })));
+    }
+
+    if dry_run {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "ok": true, "dry_run": true, "matched": plan.len(), "moved": moved_json,
+            "target_exists": target_exists,
+            "generation": s.standing_scope.generation,
+        })));
+    }
+
+    let record = |kind: &str, extra: serde_json::Value| {
+        let mut v = serde_json::json!({
+            "from_root": from,
+            "to_root": to,
+            "plugin_id": member.clone().unwrap_or_else(|| "*".to_string()),
+            "reason": reason,
+            "changed_by": "operator",
+            "via": "operator_session",
+            "matched": plan.len(),
+            "moved": moved_json,
+            "target_exists": target_exists,
+        });
+        v.as_object_mut().unwrap().insert("kind".into(), serde_json::Value::String(kind.into()));
+        if let Some(obj) = extra.as_object() {
+            for (k, val) in obj { v.as_object_mut().unwrap().insert(k.clone(), val.clone()); }
+        }
+        v
+    };
+
+    // INTENT first: the durable effect has not happened and may not.
+    let intent = match s.append_chain("scope_reroot_intent",
+        record("intent", serde_json::json!({"standing_generation": s.standing_scope.generation + 1}))) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("witness append failed, re-root NOT applied: {e}")}))),
+    };
+    let prior = s.standing_scope.clone();
+    let (f, t, m) = (from.clone(), to.clone(), member.clone());
+    if let Err(e) = s.commit_standing_scope(move |st| { st.reroot(&f, &t, m.as_deref()); }) {
+        // `commit_standing_scope` persists a candidate before swapping it live, so the live
+        // store is byte-identical here, generation included. Nothing partial was applied.
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("re-root NOT applied, the scope store is unchanged: {e}"),
+            "state": "the chain holds the INTENT and no scope_rerooted",
+            "intentEntryHash": intent.hash,
+        })));
+    }
+
+    // TERMINAL, only now, with the generation the commit actually produced.
+    let success = match s.append_chain("scope_rerooted",
+        record("terminal", serde_json::json!({
+            "standing_generation": s.standing_scope.generation, "intent": intent.hash}))) {
+        Ok(e) => e,
+        Err(e) => {
+            return match s.commit_standing_scope(|st| *st = prior) {
+                Ok(()) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("re-root NOT applied — the terminal record failed ({e}); \
+                                      rolled back (live store and vault), the chain holds only \
+                                      the intent. Retry."),
+                    "intentEntryHash": intent.hash,
+                }))),
+                Err(rb) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("THE RE-ROOT IS LIVE but its terminal record could not be \
+                                      appended ({e}) AND the rollback failed ({rb}). Repair the \
+                                      chain — do not assume the store is consistent."),
+                    "intentEntryHash": intent.hash,
+                }))),
+            };
+        }
+    };
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true, "matched": plan.len(), "moved": moved_json,
+        "generation": s.standing_scope.generation,
+        "intentEntryHash": intent.hash,
+        "witnessEntryHash": success.hash,
+    })))
+}
+
 fn stamp_gate(
     record: serde_json::Value,
     gate: &Option<axum::Extension<super::operator_auth::GateWitness>>,
@@ -6631,6 +6809,143 @@ mod disposition_tests {
         let s = state.lock().await;
         assert_eq!(MemberAliases::load(&s.vault).unwrap().display("claude-code"), "claude-code");
         assert_eq!(s.recent_chain(200).len(), rows, "clearing an alias writes no chain row");
+    }
+
+    async fn reroot(state: &SharedState, body: serde_json::Value) -> axum::response::Response {
+        scope_reroot(State(state.clone()), Json(body)).await.into_response()
+    }
+
+    /// #920's second falsifier, which the original branch asserted in prose and never pinned:
+    /// a re-root onto a path that is not a directory must REFUSE. It would not error — it
+    /// would succeed and leave every rewritten grant matching nothing, a total revocation
+    /// wearing the shape of a successful migration. `allow_missing_target` is the override.
+    #[tokio::test]
+    async fn reroot_refuses_a_target_that_is_not_there_unless_told_otherwise() {
+        let (dir, state) = test_state().await;
+        seed_grant(&state, "claude-code", "/old/ws/repo", false).await;
+        let before = { let s = state.lock().await; snapshot(&s) };
+        let missing = dir.path().join("not-created").display().to_string();
+
+        let resp = reroot(&state, serde_json::json!({
+            "from": "/old/ws", "to": missing, "reason": "the workspace moved"})).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "a missing target is refused");
+        {
+            let s = state.lock().await;
+            assert_eq!(snapshot(&s), before, "the refusal wrote nothing at all");
+        }
+
+        // The override lands the same request.
+        let resp = reroot(&state, serde_json::json!({
+            "from": "/old/ws", "to": missing, "reason": "granting ahead of the tree",
+            "allow_missing_target": true})).await;
+        assert_eq!(resp.status(), StatusCode::OK, "the deliberate override proceeds");
+        let s = state.lock().await;
+        assert!(s.has_scope_grant("claude-code", &format!("{missing}/repo")),
+                "the grant re-rooted onto the not-yet-existing tree");
+
+        // An existing target needs no override at all.
+        drop(s);
+        let real = dir.path().display().to_string();
+        let resp = reroot(&state, serde_json::json!({
+            "from": &missing, "to": real, "reason": "the tree exists now"})).await;
+        assert_eq!(resp.status(), StatusCode::OK, "an existing directory needs no override");
+    }
+
+    /// The whole rewrite is one act: one generation step, one intent and one terminal record
+    /// naming every path that moved, and a dry run that touches nothing.
+    #[tokio::test]
+    async fn reroot_is_one_witnessed_act_and_dry_run_writes_nothing() {
+        let (dir, state) = test_state().await;
+        let to = dir.path().display().to_string();
+        seed_grant(&state, "claude-code", "/old/ws", false).await;
+        seed_grant(&state, "claude-code", "/old/ws/repo-a", false).await;
+        seed_grant(&state, "codex", "/old/ws-archive/keep", false).await;
+        let (_, gen0, rows0) = { let s = state.lock().await; snapshot(&s) };
+
+        // DRY RUN: the plan, and nothing else.
+        let resp = reroot(&state, serde_json::json!({
+            "from": "/old/ws", "to": &to, "reason": "r", "dry_run": true})).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        {
+            let s = state.lock().await;
+            assert_eq!(snapshot(&s), (s.standing_scope.grants.clone(), gen0, rows0),
+                       "a dry run moves no grant, no generation, no row");
+        }
+
+        let resp = reroot(&state, serde_json::json!({
+            "from": "/old/ws", "to": &to, "reason": "the workspace moved"})).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let s = state.lock().await;
+        assert!(s.has_scope_grant("claude-code", &format!("{to}/repo-a")), "depth preserved");
+        assert!(s.has_scope_grant("codex", "/old/ws-archive/keep"),
+                "the sibling tree is not swept up by a shared string prefix");
+        assert_eq!(s.standing_scope.generation, gen0 + 1, "one act, one generation step");
+        let chain = s.recent_chain(20);
+        let intent = chain.iter().find(|e| e.event_type == "scope_reroot_intent").expect("intent");
+        let term = chain.iter().find(|e| e.event_type == "scope_rerooted").expect("terminal");
+        assert_eq!(term.event_data["intent"], serde_json::json!(intent.hash));
+        assert_eq!(term.event_data["standing_generation"], serde_json::json!(gen0 + 1),
+                   "the generation the commit produced, not a prediction");
+        assert_eq!(term.event_data["moved"].as_array().unwrap().len(), 2,
+                   "the record NAMES every path that moved, not a count");
+        assert_eq!(s.recent_chain(50).len(), rows0 + 2, "exactly the intent and the terminal");
+    }
+
+    /// A prefix that matches nothing reports that it matched nothing, and does not pretend to
+    /// have migrated anything: no generation movement, no chain row.
+    #[tokio::test]
+    async fn reroot_that_matches_nothing_says_so_and_writes_nothing() {
+        let (dir, state) = test_state().await;
+        seed_grant(&state, "claude-code", "/old/ws/repo", false).await;
+        let before = { let s = state.lock().await; snapshot(&s) };
+        let resp = reroot(&state, serde_json::json!({
+            "from": "/old/ws-typo", "to": dir.path().display().to_string(), "reason": "r"})).await;
+        assert_eq!(resp.status(), StatusCode::OK, "not an error — a report");
+        let s = state.lock().await;
+        assert_eq!(snapshot(&s), before, "nothing moved, nothing witnessed");
+    }
+
+    /// A missing reason is refused: a re-root rewrites a member's whole reach, and an
+    /// unrecorded rationale is indistinguishable afterwards from a misconfiguration.
+    #[tokio::test]
+    async fn reroot_without_a_reason_is_refused() {
+        let (dir, state) = test_state().await;
+        seed_grant(&state, "claude-code", "/old/ws/repo", false).await;
+        let before = { let s = state.lock().await; snapshot(&s) };
+        let resp = reroot(&state, serde_json::json!({
+            "from": "/old/ws", "to": dir.path().display().to_string()})).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let s = state.lock().await;
+        assert_eq!(snapshot(&s), before);
+    }
+
+    /// A failed terminal record rolls the whole rewrite back, so a committed re-root of the
+    /// entire scope set never outlives its own evidence. The first cut appended the terminal
+    /// with `.ok()` and would have left exactly that.
+    #[tokio::test]
+    async fn reroot_failed_terminal_witness_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        let to = dir.path().display().to_string();
+        seed_grant(&state, "claude-code", "/old/ws/repo", false).await;
+        let (grants0, gen0, _) = { let s = state.lock().await; snapshot(&s) };
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_reroot_terminal BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'scope_rerooted'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;").unwrap();
+        let resp = reroot(&state, serde_json::json!({
+            "from": "/old/ws", "to": &to, "reason": "r"})).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        conn.execute_batch("DROP TRIGGER fail_reroot_terminal").unwrap();
+        let s = state.lock().await;
+        assert_eq!(s.standing_scope.grants, grants0, "rolled back: the old paths are back");
+        assert_eq!(s.standing_scope.generation, gen0, "generation restored by the rollback");
+        let chain = s.recent_chain(20);
+        assert!(chain.iter().any(|e| e.event_type == "scope_reroot_intent"));
+        assert!(!chain.iter().any(|e| e.event_type == "scope_rerooted"),
+                "no terminal record for a rewrite that is not in force");
     }
 
     /// The operator may choose recursive AT decide time; the member never can.

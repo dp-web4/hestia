@@ -511,6 +511,50 @@ impl StandingScopeStore {
         Ok(moved)
     }
 
+    /// Rewrite every grant at or under `from` to sit under `to`, as ONE mutation.
+    ///
+    /// The repair for a workspace that moved. Before this, the only route was a revoke and a
+    /// re-add per grant: 27 of each, typed by hand, with the member holding neither reach
+    /// between the two calls of each pair, and each pair witnessing as two unrelated
+    /// decisions — so a half-finished migration left an inconsistent scope set with nothing
+    /// on the record saying it was half-finished. Here the whole rewrite is one store
+    /// mutation, one commit, one generation step.
+    ///
+    /// `member` scopes the rewrite to one plugin id; `None` rewrites every member's matching
+    /// grants. Returns `(member, old_path, new_path)` for each grant that MOVED, so the
+    /// witness record can name every path rather than a count — "27 grants re-rooted" cannot
+    /// be checked against anything afterwards.
+    ///
+    /// A grant whose new path equals its old one does not count as moved, so a re-root onto
+    /// the same root is not a mutation and the generation does not step.
+    pub fn reroot(&mut self, from: &str, to: &str, member: Option<&str>) -> Vec<(String, String, String)> {
+        let mut moved = Vec::new();
+        for g in self.grants.iter_mut() {
+            if let Some(m) = member {
+                if g.member != m {
+                    continue;
+                }
+            }
+            let Some(rest) = path_under(&g.path, from) else {
+                continue;
+            };
+            let new_path = if rest.is_empty() {
+                to.to_string()
+            } else {
+                format!("{}/{}", to.trim_end_matches('/'), rest)
+            };
+            if new_path == g.path {
+                continue;
+            }
+            moved.push((g.member.clone(), g.path.clone(), new_path.clone()));
+            g.path = new_path;
+        }
+        if !moved.is_empty() {
+            self.generation += 1;
+        }
+        moved
+    }
+
     /// Remove a grant. Returns whether anything was removed; the generation moves only
     /// when the store actually changed, so the counter never claims a mutation that did
     /// not happen.
@@ -526,6 +570,25 @@ impl StandingScopeStore {
     }
 }
 
+/// Is `path` at or under `prefix`, judged at a SEGMENT BOUNDARY rather than by raw string
+/// prefix?
+///
+/// A bare `starts_with` is wrong here in the direction that silently widens: with
+/// `prefix = "/w/ai-agents"`, a raw prefix test also claims `/w/ai-agents-old/secrets`, and a
+/// re-root built on it would rewrite grants belonging to a DIFFERENT tree and hand the member
+/// a reach nobody granted. The boundary check is the whole safety of this operation.
+///
+/// Returns the remainder after the prefix (empty when `path == prefix`), or `None` when the
+/// path is not under it.
+fn path_under(path: &str, prefix: &str) -> Option<String> {
+    let p = prefix.trim_end_matches('/');
+    if path == p {
+        return Some(String::new());
+    }
+    let with_sep = format!("{p}/");
+    path.strip_prefix(&with_sep).map(|r| r.to_string())
+}
+
 #[cfg(test)]
 mod reach_tests {
     use super::*;
@@ -535,6 +598,105 @@ mod reach_tests {
             member: "m".into(), path: path.into(), granted_at: 1, granted_by: "op".into(),
             reason: "r".into(), expires_at: None, request_id: None, recursive,
         }
+    }
+
+    /// A store holding one grant per `(member, path)` pair given.
+    fn store_with(paths: &[(&str, &str)]) -> StandingScopeStore {
+        let mut st = StandingScopeStore::default();
+        for (member, path) in paths {
+            st.add(StandingGrant {
+                member: (*member).into(), path: (*path).into(), granted_at: 1,
+                granted_by: "op".into(), reason: "r".into(), expires_at: None,
+                request_id: None, recursive: false,
+            });
+        }
+        st
+    }
+
+    /// The workspace moved: every grant under the old root lands under the new one, and the
+    /// generation steps ONCE for the whole rewrite rather than once per grant.
+    #[test]
+    fn reroot_moves_every_grant_under_the_old_root_in_one_generation() {
+        let mut st = store_with(&[
+            ("claude-code", "/old/ws"),
+            ("claude-code", "/old/ws/repo-a"),
+            ("codex", "/old/ws/repo-b/sub"),
+            ("kimi-code", "/elsewhere/keep"),
+        ]);
+        let gen0 = st.generation;
+        let moved = st.reroot("/old/ws", "/new/ws", None);
+        assert_eq!(moved.len(), 3, "the three under the old root moved: {moved:?}");
+        assert_eq!(st.generation, gen0 + 1, "one mutation, one generation step");
+        let paths: Vec<&str> = st.grants.iter().map(|g| g.path.as_str()).collect();
+        assert!(paths.contains(&"/new/ws"), "the root grant itself re-roots: {paths:?}");
+        assert!(paths.contains(&"/new/ws/repo-a"), "{paths:?}");
+        assert!(paths.contains(&"/new/ws/repo-b/sub"), "depth is preserved: {paths:?}");
+        assert!(paths.contains(&"/elsewhere/keep"), "an unrelated grant is untouched: {paths:?}");
+    }
+
+    /// THE FALSIFIER FOR THE WHOLE OPERATION. With `starts_with`, re-rooting `/old/ws` also
+    /// rewrites `/old/ws-archive/secrets` — a SIBLING tree — handing the member reach nobody
+    /// granted, with the grant count unchanged and every path still plausible.
+    #[test]
+    fn reroot_does_not_touch_a_sibling_that_merely_shares_a_string_prefix() {
+        let mut st = store_with(&[
+            ("claude-code", "/old/ws"),
+            ("claude-code", "/old/ws-archive/secrets"),
+            ("claude-code", "/old/wsx"),
+        ]);
+        let moved = st.reroot("/old/ws", "/new/ws", None);
+        assert_eq!(moved.len(), 1, "only the exact root moved: {moved:?}");
+        let paths: Vec<&str> = st.grants.iter().map(|g| g.path.as_str()).collect();
+        assert!(paths.contains(&"/old/ws-archive/secrets"), "sibling untouched: {paths:?}");
+        assert!(paths.contains(&"/old/wsx"), "sibling untouched: {paths:?}");
+    }
+
+    /// Scoped to one member, the peers' matching grants stay where they are.
+    #[test]
+    fn reroot_scoped_to_one_member_leaves_peers_alone() {
+        let mut st = store_with(&[
+            ("claude-code", "/old/ws/a"),
+            ("codex", "/old/ws/a"),
+        ]);
+        let moved = st.reroot("/old/ws", "/new/ws", Some("claude-code"));
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(moved[0].0, "claude-code");
+        let codex = st.grants.iter().find(|g| g.member == "codex").unwrap();
+        assert_eq!(codex.path, "/old/ws/a", "a peer's identical path is not swept up");
+    }
+
+    /// A re-root that matches nothing is NOT a mutation: no generation movement, so a
+    /// mistyped prefix cannot report as a bland success that moved the law hash.
+    #[test]
+    fn reroot_that_matches_nothing_is_not_a_mutation() {
+        let mut st = store_with(&[("claude-code", "/old/ws/a")]);
+        let gen0 = st.generation;
+        let moved = st.reroot("/nowhere", "/new/ws", None);
+        assert!(moved.is_empty());
+        assert_eq!(st.generation, gen0, "no match, no generation step");
+    }
+
+    /// Re-rooting onto the same root changes no path, so it is not a mutation either.
+    #[test]
+    fn reroot_onto_the_same_root_changes_nothing() {
+        let mut st = store_with(&[("claude-code", "/old/ws/a")]);
+        let gen0 = st.generation;
+        let moved = st.reroot("/old/ws", "/old/ws", None);
+        assert!(moved.is_empty(), "{moved:?}");
+        assert_eq!(st.generation, gen0);
+    }
+
+    #[test]
+    fn path_under_judges_at_a_segment_boundary() {
+        assert_eq!(path_under("/a/b", "/a/b"), Some(String::new()));
+        assert_eq!(path_under("/a/b/c", "/a/b"), Some("c".to_string()));
+        assert_eq!(path_under("/a/b/c/d", "/a/b"), Some("c/d".to_string()));
+        // A trailing slash on the prefix must not change the verdict.
+        assert_eq!(path_under("/a/b/c", "/a/b/"), Some("c".to_string()));
+        // The three a raw prefix test gets wrong.
+        assert_eq!(path_under("/a/bc", "/a/b"), None);
+        assert_eq!(path_under("/a/b-old/c", "/a/b"), None);
+        assert_eq!(path_under("/a", "/a/b"), None);
     }
 
     /// EXACT IS THE DEFAULT (dp, 2026-09-08). A grant on /a reaches /a and nothing else
