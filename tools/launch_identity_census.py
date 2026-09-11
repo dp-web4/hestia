@@ -31,6 +31,9 @@ VERDICTS, per actor (several can apply):
   UNTESTED-LAUNCHER a fire script declares a role and ran ZERO times in the window: its
                     role's absence from the chain is evidence of nothing (GPT's hold on
                     #1000 — absence in an actor aggregate is not a launcher's failure)
+  PROVISIONAL-ROLE  a fire script resolves its role from the member's identity file and that
+                    file is ABSENT, so every act it starts rides the launcher's declared-by-
+                    fire fallback rather than a hydrated identity (#1010)
   DECLARED-NOT-OBSERVED
                     a fire script declares a role, the role is absent, and whether the
                     script ran cannot be established (no fire logs readable)
@@ -56,6 +59,9 @@ REPO = Path(__file__).resolve().parent.parent
 # `${HESTIA_ROLE:-default}` spelling the hook lines use; all four are declarations.
 ROLE_RE = re.compile(r"HESTIA_ROLE=\\?\"?\$?\{?(?:HESTIA_ROLE:-)?(role:[a-z:_-]+)")
 PLUGIN_RE = re.compile(r"HESTIA_(?:MESH_)?PLUGIN(?:_ID)?=([a-z0-9-]+)")
+#: A launcher that resolves its role from the member's identity file names that file. When it
+#: does, any literal role in the same script is a FALLBACK, not the declaration (#1010).
+IDENTITY_PATH_RE = re.compile(r'_ident="([^"]*identity\.json)"')
 DEFAULT_ROLE = "role:constellation:member"
 
 
@@ -83,11 +89,40 @@ def parse_launch_line(text: str) -> dict:
     thing it sees is the #975 defect again, in a shell script.
     """
     code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
-    return {
+    facts = {
         "plugin": next(iter(PLUGIN_RE.findall(code)), None),
         "roles": set(ROLE_RE.findall(code)),
         "session_id_flag": "--session-id" in code,
+        "identity_path": None,
+        "fallback_roles": set(),
     }
+    # A LITERAL ROLE INSIDE A FALLBACK IS NOT A DECLARATION (2026-09-10, #1010).
+    #
+    # The fire scripts resolve the role from the member's OWN identity file and fall back to
+    # a literal only when that read fails:
+    #
+    #     if [[ -z "${HESTIA_ROLE:-}" ]]; then
+    #       _ident="~/.<seat>/hestia-instance/identity.json"
+    #       ...                                            # <- the normal path
+    #       [[ -n "$_role" ]] && export HESTIA_ROLE="$_role"
+    #       if [[ -z "${HESTIA_ROLE:-}" ]]; then
+    #         export HESTIA_ROLE="role:constellation:mesh-worker"   # <- only if unreadable
+    #
+    # Collecting every literal made the FALLBACK the launcher's declared role, and
+    # `DECLARED!=SEEN` followed mechanically for two seats whose identity files resolve
+    # something else entirely — a verdict about a declaration that was never made on the path
+    # that runs. Same class as #975/#976: reading what the text says instead of what the code
+    # would execute, this time in the instrument built to catch exactly that.
+    #
+    # So: when a script resolves from an identity file, its declared role is whatever that
+    # file says AT RUNTIME. The census reads the same file (see `fire_scripts`), which turns
+    # an unknowable into a measured fact, and the literal is recorded as the fallback it is.
+    m = IDENTITY_PATH_RE.search(code)
+    if m:
+        facts["identity_path"] = m.group(1)
+        facts["fallback_roles"] = set(facts["roles"])
+        facts["roles"] = set()
+    return facts
 
 
 def units(config_home: Path) -> dict[str, dict]:
@@ -109,6 +144,26 @@ def mesh_dir_from_units(unit_facts: dict[str, dict]) -> Path | None:
     return None
 
 
+def identity_role(path: str | None) -> tuple[str | None, bool]:
+    """`(role, readable)` from a member's identity file — the same read the fire script does.
+
+    The launcher resolves its role at runtime from this file, so the census reads it too
+    rather than reporting the declaration as unknowable. `readable` distinguishes "the file
+    is there and names no usable role" from "the file is absent", because only the second
+    means the script's literal fallback is what actually runs.
+    """
+    if not path:
+        return None, False
+    resolved = Path(os.path.expanduser(path.replace("~", "~/", 1) if path.startswith("~") and not path.startswith("~/") else path))
+    try:
+        data = json.loads(resolved.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None, False
+    role = data.get("role")
+    # Same acceptance test the fire scripts apply: a string beginning `role:`, else omitted.
+    return (role if isinstance(role, str) and role.startswith("role:") else None), True
+
+
 def fire_scripts(mesh_dir: Path | None) -> dict[str, dict]:
     if not mesh_dir:
         return {}
@@ -119,6 +174,16 @@ def fire_scripts(mesh_dir: Path | None) -> dict[str, dict]:
         except OSError:
             continue
         facts = parse_launch_line(text)
+        # RESOLVE THE ROLE THE FIRE WILL ACTUALLY EXPORT, from the same file the fire reads.
+        # `identity_role` is the declaration on the normal path; `identity_readable` says
+        # whether the fallback is what runs instead. Neither is a guess: both come from the
+        # box the census is measuring.
+        facts["identity_role"], facts["identity_readable"] = identity_role(facts.get("identity_path"))
+        if facts["identity_role"]:
+            facts["roles"] = {facts["identity_role"]}
+        elif not facts["identity_readable"]:
+            # The file the launcher names is not there, so the fallback IS the live path.
+            facts["roles"] = set(facts.get("fallback_roles") or set())
         # WHERE THIS LAUNCHER RECORDS ITS OWN RUNS. Every fire script writes one log per
         # invocation, `$LOG_DIR/<prefix>-$STAMP.log`, and names both in its own text. Read
         # from the script rather than assumed, so a box that relocates the state dir is
@@ -323,6 +388,11 @@ def verdicts(declared: dict[str, dict], observed: dict[str, dict]) -> dict[str, 
                 out[actor].append(f"UNTESTED-LAUNCHER:{r}")
             else:
                 out[actor].append(f"DECLARED!=SEEN:{r}")
+        # A launcher running on its PROVISIONAL fallback is its own state, and a loud one: the
+        # member's identity file is absent, so every act it starts rides a declared-by-fire
+        # role rather than a hydrated one (#1010).
+        if d.get("role_source") == "provisional_fallback":
+            out[actor].append(f"PROVISIONAL-ROLE:identity absent at {d.get('identity_path')}")
         if d.get("wake_session") is False:
             out[actor].append("NO-WAKE-SESSION")
         if obs and obs["no_role_kinds"]:
@@ -342,7 +412,8 @@ def fold_declared(unit_facts, fires, hooks) -> dict[str, dict]:
                                                            # role, and how often the fire
                                                            # scripts ran (None = unknown)
                                                            "fire_roles": set(), "hook_roles": set(),
-                                                           "fire_scripts": [], "exercised": None})
+                                                           "fire_scripts": [], "exercised": None,
+                                                           "role_source": None, "identity_path": None})
     for name, f in unit_facts.items():
         if name.startswith("hestia-watch-") and f["plugin"]:
             d[f["plugin"]]["sources"].append(name)
@@ -370,6 +441,14 @@ def fold_declared(unit_facts, fires, hooks) -> dict[str, dict]:
         else:
             d[actor]["undeclared_sources"].append(name)
         d[actor]["wake_session"] = bool(f["session_id_flag"])
+        # How the fire got its role, carried so a verdict can say whether a role came from
+        # the member's own identity file or from the launcher's provisional fallback (#1010).
+        if f.get("identity_path"):
+            d[actor]["role_source"] = (
+                "identity_file" if f.get("identity_role")
+                else "provisional_fallback" if not f.get("identity_readable")
+                else "identity_file_names_no_role")
+            d[actor]["identity_path"] = f["identity_path"]
     for member, lines in hooks.items():
         for ln in lines:
             if not ln.get("present"):

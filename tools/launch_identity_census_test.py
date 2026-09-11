@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 from collections import Counter
@@ -136,6 +137,70 @@ def main() -> int:
           d["codex"]["fire_roles"] == {"role:constellation:mesh-worker"} and d["codex"]["hook_roles"] == set()
           and d["codex"]["fire_scripts"] == ["fire-codex.sh"] and d["codex"]["exercised"] is None,
           str(d["codex"]))
+
+    print("F. a literal role inside a FALLBACK is not the launcher's declaration (#1010)")
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        (home / ".seat" / "hestia-instance").mkdir(parents=True)
+        ident = home / ".seat" / "hestia-instance" / "identity.json"
+        # The real shape: resolve from the member's identity file, fall back to a literal.
+        script = (
+            'if [[ -z "${HESTIA_ROLE:-}" ]]; then\n'
+            f'  _ident="{ident}"\n'
+            '  [[ -n "$_role" ]] && export HESTIA_ROLE="$_role"\n'
+            '  if [[ -z "${HESTIA_ROLE:-}" ]]; then\n'
+            '    export HESTIA_ROLE="role:constellation:mesh-worker"\n'
+            '  fi\n'
+            'fi\n'
+        )
+        facts = c.parse_launch_line(script)
+        check("F1 the literal is recorded as a FALLBACK, not as a declared role",
+              facts["roles"] == set()
+              and facts["fallback_roles"] == {"role:constellation:mesh-worker"}
+              and facts["identity_path"] == str(ident), str(facts))
+
+        mesh = home / "mesh"
+        mesh.mkdir()
+        (mesh / "fire-seat.sh").write_text(script)
+
+        # (a) The identity file resolves a role: THAT is what the fire exports.
+        ident.write_text(json.dumps({"role": "role:constellation:interactive-dev"}))
+        fs = c.fire_scripts(mesh)["fire-seat.sh"]
+        check("F2 an identity file that names a role IS the declaration, not the fallback",
+              fs["roles"] == {"role:constellation:interactive-dev"}
+              and fs["identity_role"] == "role:constellation:interactive-dev", str(fs))
+        d = c.fold_declared({}, {"fire-seat.sh": fs}, {})
+        obs = {"fire-seat.sh": {"rows": 5, "roles": Counter({"role:constellation:interactive-dev": 5}),
+                                "no_role_kinds": Counter(), "host_sessions": set()}}
+        v = c.verdicts(d, obs)
+        check("F2 and the seat is NOT accused of losing the fallback role it never declared",
+              not any(x.startswith("DECLARED!=SEEN") for x in v.get("fire-seat.sh", [])),
+              str(v))
+        check("F2 nor is it called provisional while its identity file is readable",
+              not any(x.startswith("PROVISIONAL-ROLE") for x in v.get("fire-seat.sh", [])), str(v))
+
+        # (b) The identity file is ABSENT: now the fallback really is what runs, and that is
+        #     its own loud state rather than a silent declaration.
+        ident.unlink()
+        fs = c.fire_scripts(mesh)["fire-seat.sh"]
+        check("F3 an absent identity file makes the fallback the live path",
+              fs["roles"] == {"role:constellation:mesh-worker"}
+              and fs["identity_role"] is None and fs["identity_readable"] is False, str(fs))
+        d = c.fold_declared({}, {"fire-seat.sh": fs}, {})
+        obs = {"fire-seat.sh": {"rows": 5, "roles": Counter({"role:constellation:mesh-worker": 5}),
+                                "no_role_kinds": Counter(), "host_sessions": set()}}
+        v = c.verdicts(d, obs)
+        check("F3 and it is reported as PROVISIONAL-ROLE, naming the file that is missing",
+              any(x.startswith("PROVISIONAL-ROLE") and "identity.json" in x
+                  for x in v.get("fire-seat.sh", [])), str(v))
+
+        # (c) A file that exists but names no usable role: readable, no declaration, and the
+        #     census must not silently promote the fallback to a declaration either.
+        ident.write_text(json.dumps({"role": "not-a-role-lct"}))
+        fs = c.fire_scripts(mesh)["fire-seat.sh"]
+        check("F4 a file naming no usable role leaves the declaration empty, not the fallback",
+              fs["roles"] == set() and fs["identity_readable"] is True, str(fs))
 
     print("D. launcher exercise is counted from the fire script's OWN per-run logs")
     import tempfile
