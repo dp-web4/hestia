@@ -447,6 +447,91 @@ def test_bad_budget_env_defaults_not_raises():
 # Explicit list — NOT a globals() comprehension — so every test name is a static reference
 # (tools/ci_selfexec_test.py rejects test functions whose execution cannot be established
 # statically; a dynamic sweep leaves each name un-referenced and reads as inert).
+
+# ── snapshot-fetch telemetry names the cause AND the stage (2026-09-11) ─────────────────────
+# Until this slice every failed snapshot fetch was recorded with cause "unknown", because the
+# helper passed a free-text reason where the three-valued cause goes and the writer
+# normalised it away. Three timeout bursts on nomad were attributable only by reading the
+# exception name out of the detail string, and to no handshake stage at all.
+
+class _CapturedTelemetry:
+    def __init__(self):
+        self.records = []
+
+    def __call__(self, member, tool, cause, detail="", home=None):
+        self.records.append({"member": member, "tool": tool, "cause": cause, "detail": detail})
+        return True
+
+
+def _with_captured_telemetry(fn):
+    import hestia_gate_core as core
+    real = core.record_gate_unavailable
+    cap = _CapturedTelemetry()
+    core.record_gate_unavailable = cap
+    try:
+        fn()
+    finally:
+        core.record_gate_unavailable = real
+    return cap.records
+
+
+def test_snapshot_timeout_is_recorded_as_timeout_at_its_stage():
+    class Starved(FakeClient):
+        def call_tool(self, name, args):
+            if name == "hestia_operating_law":
+                raise TimeoutError("timed out")
+            return super().call_tool(name, args)
+
+    fake = Starved()
+    fake.extra = {"hestia_operating_law": {}, "hestia_scope_status": {}}
+    m._discover_endpoint = lambda: "http://fake/mcp"
+    m._McpHttp = lambda ep, dl: fake
+
+    def run():
+        check("snapshot_is_none_on_timeout",
+              m.fetch_policy_snapshot("kimi-code", use_cache=False) is None)
+
+    recs = _with_captured_telemetry(run)
+    check("timeout_recorded", len(recs) >= 1, repr(recs))
+    last = recs[-1]
+    check("timeout_tool_is_policy_snapshot", last["tool"] == "policy-snapshot", repr(last))
+    check("timeout_cause_is_timeout_not_unknown", last["cause"] == "timeout", repr(last))
+    check("timeout_detail_names_the_stage", last["detail"].startswith("operating_law:"), repr(last))
+    check("timeout_detail_keeps_the_exception", "TimeoutError" in last["detail"], repr(last))
+
+
+def test_snapshot_refused_is_recorded_as_refused_at_initialize():
+    class Absent(FakeClient):
+        def initialize(self):
+            raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+    fake = Absent()
+    m._discover_endpoint = lambda: "http://fake/mcp"
+    m._McpHttp = lambda ep, dl: fake
+
+    def run():
+        check("snapshot_is_none_on_refused",
+              m.fetch_policy_snapshot("kimi-code", use_cache=False) is None)
+
+    recs = _with_captured_telemetry(run)
+    check("refused_recorded", len(recs) >= 1, repr(recs))
+    last = recs[-1]
+    check("refused_cause_is_refused", last["cause"] == "refused", repr(last))
+    check("refused_detail_names_initialize", last["detail"].startswith("initialize:"), repr(last))
+
+
+def test_verdict_and_snapshot_share_one_cause_classifier():
+    """One law for 'why could the daemon not be consulted': the verdict path and the snapshot
+    path must not drift into two answers for the same exception."""
+    check("bare_timeout", m._unavailable_cause(TimeoutError()) == "timeout")
+    check("wrapped_timeout", m._unavailable_cause(urllib.error.URLError(TimeoutError())) == "timeout")
+    check("wrapped_refused",
+          m._unavailable_cause(urllib.error.URLError(ConnectionRefusedError())) == "refused")
+    check("bare_refused", m._unavailable_cause(ConnectionRefusedError()) == "refused")
+    check("other_is_unknown", m._unavailable_cause(ValueError("x")) == "unknown")
+    check("plain_urlerror_is_unknown", m._unavailable_cause(urllib.error.URLError("boom")) == "unknown")
+
+
 ALL = [
     test_allow_proceeds,
     test_deny_enforced_blocks,
@@ -472,6 +557,9 @@ ALL = [
     test_cached_snapshot_refused_after_bounded_horizon,
     test_exhausted_deadline_refuses_request,
     test_bad_budget_env_defaults_not_raises,
+    test_snapshot_timeout_is_recorded_as_timeout_at_its_stage,
+    test_snapshot_refused_is_recorded_as_refused_at_initialize,
+    test_verdict_and_snapshot_share_one_cause_classifier,
 ]
 
 if __name__ == "__main__":
