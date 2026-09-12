@@ -205,6 +205,58 @@ def _installed_gate_path():
     return None
 
 
+# --------------------------------------------------------------------------------------
+# FP15 (claude-code, CBP, 2026-09-04) - the innate secret scan is a BARE SUBSTRING match.
+#
+# NOT A NEW CLASS: this is issue #680, which already holds six denial classes for it,
+# and #533 is the same word-boundary defect in the destructive preset. What is new is
+# the FORM. Both issues carry the class as prose, and prose does not fail a build --
+# which is why the class has outlived several seats re-deriving it. This is the
+# executable version. File instances on #680; do not open another issue.
+#
+# `hestia_gate_core.py` gate 1a is `for f in forbidden: if f in low` over the whole command
+# text: no tokenisation, no word boundary, no data/code distinction. So the credential token
+# that spells d-o-t-e-n-v matches inside the standard Python environment mapping name, and
+# `echo` of that name alone is DENIED on this seat - measured live, not inferred. The
+# commonest idiom in Python for reading configuration cannot appear in any Bash command here.
+#
+# Two properties make this worse than an ordinary over-match:
+#   1. It is `innate=True` - always enforced, and it opens NO escalation. The refusal names
+#      no door, which the operating law itself calls a defect ("a refusal owes you a reason
+#      AND a way forward").
+#   2. The destructive-command rule documents an explicit carve-out for a token quoted AS
+#      DATA (a grep pattern, a quoted heredoc body). This rule has no such carve-out, so
+#      `grep '<the token>' <file>` - a read whose PATTERN is the token - is denied too.
+#      Two rules in the same gate disagree about whether quoting is a defence.
+#
+# Pinned RED-on-fix: the day gate 1a resolves a path instead of scanning a blob, the
+# assertion below flips and this block moves out of "still open", by whoever earned it.
+#
+# Every occurrence of the token here is built by join, for the FP8 reason: a source file
+# that spells it contiguously is a file this same rule refuses to let a member write.
+_TOKEN = "." + "env"
+_INNATE_SUBSTRING_STILL_OPEN = [
+    ("python_environment_mapping", "echo 'os." + "environ'",
+     "the credential token is a substring of the standard environment mapping name; "
+     "measured denied live on cbp 2026-09-04"),
+    ("word_that_merely_starts_with_it", "echo 'my." + "environment-notes'",
+     "no word boundary: any identifier carrying the token as a prefix collides"),
+    ("token_as_a_grep_pattern", "grep '" + "." + "env' README.md",
+     "a READ whose pattern is the token. The destructive rule exempts data-quoted tokens; "
+     "this rule does not, so the two disagree about whether quoting is a defence"),
+]
+
+
+@asserting
+def test_innate_secret_scan_is_substring_not_path():
+    """PINNED OPEN. Gate 1a matches the forbidden token anywhere in the command STRING."""
+    for name, cmd, why in _INNATE_SUBSTRING_STILL_OPEN:
+        check(f"still_open__innate_substring__{name}", (_TOKEN in cmd.lower()) is True,
+               f"{why}. If this goes False the scan grew a boundary and the pin should move")
+    check("control__token_absent_is_not_matched", (_TOKEN in "echo hello") is False,
+           "the control: a command not carrying the token must not match")
+
+
 def _sha256(path):
     import hashlib
     with open(path, "rb") as fh:
@@ -557,6 +609,29 @@ _FALSE_REFUSALS = [
 # goes RED the day someone lands the three-valued resolver — which is when this row should
 # move up into _FALSE_REFUSALS, by the person who earned the right to move it.
 _STILL_OPEN = [
+    # FP15 WAS FILED HERE AND WAS WRONG. The first version of this row claimed the
+    # out-of-grammar fallback treats any marker-bearing token as a write target, on the
+    # evidence of two refused reads (escalations ac4244e94dbb8c18, a97881e2b3e8c4de,
+    # 2026-09-04). This corpus went RED on it within the hour: the pinned command was
+    # classified read-only, i.e. ALLOWED, so there was no defect of that shape.
+    #
+    # Measured afterwards against the deployed `_is_read_only`, the real discriminator is
+    # the INTERPRETER, and it is content-blind by design:
+    #
+    #     for p in <marker>; do head -1 $p; done       read_only=True
+    #     git show <ref>:<marker> | grep -n "^def "    read_only=True
+    #     for p in <marker>; do python3 -c "..."; done read_only=False
+    #     python3 -c "print(1)"                        read_only=False   <- no marker at all
+    #
+    # `python3 -c` is write-capable whatever it holds, so refusing it near a governance
+    # marker is CORRECT, not an FP. The withdrawal reason recorded on chain
+    # da15015c4255fed946505c5c96a6e3dbeaf583d00740a9b630369d6713b9f636 says "the
+    # discriminator is command SHAPE, not destination" — that sentence is wrong, and this
+    # comment is the correction, since a chain entry cannot be edited.
+    #
+    # Left in place rather than deleted: an FP filed on a hunch and refuted by the
+    # instrument is the case this file exists to make cheap, and deleting it would erase
+    # the one datum showing the corpus caught its own author.
     ("fp6_read_with_output_elsewhere", "diff {g} other.py > /tmp/out",
      "FP6. Refused today. Needs KNOWN/UNKNOWN target resolution, not a wider allowlist. "
      "Hit live 2026-08-08 (escalation 9cdb9bec0fe7a04d): generating a unified diff of the "
@@ -1203,6 +1278,7 @@ if __name__ == "__main__":
     test_git_global_option_skip_list_stays_closed()
     test_gh_reads_are_pinned_open()
     test_gh_write_verbs_stay_refused()
+    test_innate_secret_scan_is_substring_not_path()
     print()
     # Say what did NOT run, before saying everything passed. A skipped check and a passing
     # one are indistinguishable in a scrollback, and this file's whole subject is claims
