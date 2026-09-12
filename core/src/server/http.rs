@@ -1083,6 +1083,7 @@ pub async fn serve_with_callback(
     let operator_surface = axum::Router::new()
         .route("/api/dashboard", get(dashboard_json))
         .route("/api/hub/status", get(super::hub_tab::hub_status))
+        .route("/api/hub/memberships", get(super::hub_tab::hub_memberships))
         .route(
             "/api/hub/urls",
             get(super::hub_tab::hub_urls_list)
