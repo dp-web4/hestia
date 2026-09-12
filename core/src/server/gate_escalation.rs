@@ -191,6 +191,29 @@ pub enum Channel {
     /// withdrawal filed as `PeerMember` would read, correctly in every field, as though a
     /// second party had looked at it.
     SelfWithdrawn,
+    /// A ROLE-BOUND REASONER THE PLANE INVOKED for one act — the lean path (cbp,
+    /// `the-lean-path-a-role-invocation-is-not-a-harness`, 2026-09-03). The occupant is a
+    /// FILLER of a role (web4 `RoleAssignment`: authority binds to the role, the filling
+    /// entity rotates), signed custodially by the plane under a durable per-(backend,
+    /// resolved-model) member LCT. It is a factor, never a ruling: `is_sovereign` excludes
+    /// it and `bar_met` counts it toward NO bar, on EITHER arm.
+    ///
+    /// WHICH ARM IS LOAD-BEARING: `SingleApprover`, not `SovereignPlusPeer`. Read `bar_met`
+    /// — the peer conjunct of the two-bar stopped deciding on 2026-08-06, so an invoked
+    /// factor misfiled as `PeerMember` there only corrupts `peer_participation()`. On
+    /// `SingleApprover`, which `bar_for` makes the DEFAULT for everything outside the four
+    /// enforcement-path markers, `peer` alone suffices: the same misfiling CLEARS the bar,
+    /// alone, on an escalation the plane opened, with no human and no peer in the loop —
+    /// the plane approving its own write. This variant is the only thing standing between
+    /// the lean path and that. It is the `LocalCli` hazard one seat over: *"the two-CHANNEL
+    /// requirement becomes one channel wearing two names."*
+    ///
+    /// Three refusals hold the line, all in this module: `decide` refuses this channel as
+    /// `decided_via` (`DecideError::InvokedCannotRule`); `attach_invoked` is the ONLY
+    /// producer and it requires `Invocation` provenance and a computed `Independence`
+    /// (`None` reads as "not computed", and the plane knows exactly who it invoked); and
+    /// `peer_participation` reports it under its own count, never as a peer.
+    Invoked,
 }
 
 /// A stated evidence threshold — the bar an approval must clear, RECORDED on the escalation
@@ -273,6 +296,32 @@ pub struct Factor {
     /// field existed reads as "no argument recorded", which is what it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argument: Option<String>,
+    /// Present on every `Channel::Invoked` factor and on nothing else: the provenance that
+    /// makes an invoked answer READ as invoked wherever a human meets it (cbp's sixth
+    /// insist — model and backend inline, not a field to look up). Defaults None so every
+    /// factor written before this existed reads as "not an invocation", which is what it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation: Option<Invocation>,
+}
+
+/// Where an invoked factor came from. `by` on the `Factor` names the filler's durable
+/// custodial LCT; this names what stood behind it for THIS act. All three are required by
+/// `attach_invoked` — an invoked answer without them is hub's counterexample
+/// (`find_members`: a model's ranking indistinguishable in the record from a substring
+/// match), and a positive obligation cannot be met by an absent field.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Invocation {
+    /// The backend that ran it (`local`, `api:<provider>`, `peer_ask`). Vocabulary is the
+    /// caller's; the record only insists it is named.
+    pub backend: String,
+    /// The model AS THE BACKEND REPORTED IT RESOLVED — an Ollama digest, an API model id —
+    /// never the requested alias. A filler keyed on the alias accrues reputation across a
+    /// silent vendor update; the pinned id keeps the number about one set of weights.
+    pub model: String,
+    /// Digest of the prompt the filler was given. The sixth identity line: actor LCT,
+    /// role, and prompt digest on the act row, so the act is reproducible in principle
+    /// and the framing a human later reads can be traced to what was asked.
+    pub prompt_digest: String,
 }
 
 impl Channel {
@@ -738,8 +787,14 @@ impl Escalation {
             .filter(|p| !self.invited_reader_unknown.contains(p))
             .filter(|p| !answered.contains(p.as_str()))
             .count();
+        let invoked = self
+            .factors
+            .iter()
+            .filter(|f| f.channel == Channel::Invoked)
+            .count();
         PeerParticipation {
             invited: self.invited_peers.clone(),
+            invoked,
             concurred,
             dissented,
             // Absent is derived, never stored: a seat that has not answered YET is not the
@@ -944,6 +999,13 @@ pub enum DecideError {
     /// No decider named. A record whose point is attribution must not carry an anonymous
     /// approval.
     AnonymousDecider,
+    /// `Channel::Invoked` was offered as the channel of a DECISION. An invoked filler is a
+    /// factor and never a ruling; refused before any mutation so the record cannot carry
+    /// `decided_via: invoked` even for a deny.
+    InvokedCannotRule,
+    /// An invoked factor arrived with a blank backend, model, or prompt digest. Provenance is
+    /// the positive obligation that makes the lean path recordable at all.
+    InvokedWithoutProvenance,
 }
 
 impl std::fmt::Display for DecideError {
@@ -965,6 +1027,16 @@ impl std::fmt::Display for DecideError {
                 f,
                 "a decision must name its decider — an anonymous approval in an attribution \
                  record is worse than no record"
+            ),
+            DecideError::InvokedCannotRule => write!(
+                f,
+                "an invoked filler is a factor, never a ruling — `invoked` cannot be the channel \
+                 of a decision"
+            ),
+            DecideError::InvokedWithoutProvenance => write!(
+                f,
+                "an invoked factor must name its backend, resolved model, and prompt digest — \
+                 an unattributed invocation is not evidence"
             ),
         }
     }
@@ -1051,6 +1123,11 @@ pub struct PeerParticipation {
     /// two because it is a finding about the INSTRUMENT — the store could not answer — and a
     /// number that silently joined `absent` would have been a finding about the seat.
     pub invited_reader_unknown: usize,
+    /// `Channel::Invoked` factors present — role-bound reasoners the plane itself ran.
+    /// Reported HERE, beside the peer counts and never inside them, so a reader who asks
+    /// "who looked at this" sees the filler's answer as the plane's own custodial act and
+    /// not as a second party. Zero on every row written before the lean path existed.
+    pub invoked: usize,
 }
 
 #[derive(Default)]
@@ -1971,6 +2048,13 @@ pub fn act_digest_of(act: &str) -> String {
         reason: Option<&str>,
         now: u64,
     ) -> Result<Escalation, DecideError> {
+        // A filler cannot rule. Checked FIRST, before the row is even looked up, so a
+        // refused invocation leaves the store bit-identical (O: the preflight dominates
+        // every side effect). Deny included: a deny `decided_via: invoked` would be a
+        // ruling in the record, and the lean path records answers, not verdicts.
+        if via == Channel::Invoked {
+            return Err(DecideError::InvokedCannotRule);
+        }
         // An anonymous approval in a record whose entire purpose is attribution is worse than
         // no record. Latent today (both channels hardcode a decider) and it must not become
         // reachable when the CLI lands. kimi-code, PR #114 review.
@@ -2003,6 +2087,7 @@ pub fn act_digest_of(act: &str) -> String {
             // decision's own rationale already lives on `reason`.
             dissent: false,
             argument: None,
+            invocation: None,
             at: now,
         });
         Ok(esc.clone())
@@ -2082,6 +2167,70 @@ pub fn act_digest_of(act: &str) -> String {
             argument: argument
                 .map(|a| a.trim().to_string())
                 .filter(|a| !a.is_empty()),
+            invocation: None,
+            at: now,
+        });
+        Ok(esc.clone())
+    }
+
+    /// Attach a role-bound reasoner's answer to an escalation as an INVOKED factor — the
+    /// lean path's one write into this store, and the only producer of `Channel::Invoked`.
+    ///
+    /// What it is not: a decision (`decide` refuses the channel), a peer corroboration (a
+    /// filler is not a NOT-SAME member; it is the plane's own custodial act and
+    /// `peer_participation` keeps it out of the peer counts), or a way to move `bar_met` on
+    /// any surface (pinned by `an_invoked_factor_alone_never_clears_single_approver`, the
+    /// load-bearing arm, and its two-bar sibling).
+    ///
+    /// What it insists on, and refuses without: a named filler (`by` — the durable
+    /// custodial LCT, never per act), a computed `independence` (NOT an `Option`: the plane
+    /// knows exactly who it invoked, and "not computed" here is a bug, not a state), and
+    /// full `Invocation` provenance. A refused-intent answer is the CALLER's refusal; this
+    /// store never sees it, which is the point — an intent that reaches here has already
+    /// been executed somewhere, and nothing below can un-execute it.
+    ///
+    /// Lands on pending AND decided rows, like `corroborate`, for the same reason: a
+    /// classification that arrives after the ruling is inert on the bar and still worth
+    /// having on the record. Expired refuses.
+    #[allow(clippy::too_many_arguments)] // the same shape as `decide`/`corroborate`, on purpose
+    pub fn attach_invoked(
+        &mut self,
+        id: &str,
+        by: &str,
+        role: &str,
+        independence: crate::arbiter::Independence,
+        dissent: bool,
+        argument: Option<&str>,
+        invocation: Invocation,
+        now: u64,
+    ) -> Result<Escalation, DecideError> {
+        if by.trim().is_empty() {
+            return Err(DecideError::AnonymousDecider);
+        }
+        if invocation.backend.trim().is_empty()
+            || invocation.model.trim().is_empty()
+            || invocation.prompt_digest.trim().is_empty()
+        {
+            return Err(DecideError::InvokedWithoutProvenance);
+        }
+        let esc = self.by_id.get_mut(id).ok_or(DecideError::Unknown)?;
+        if esc.status_at(now) == Status::Expired {
+            return Err(DecideError::Expired);
+        }
+        esc.factors.push(Factor {
+            channel: Channel::Invoked,
+            by: by.trim().to_string(),
+            role: Some(role.trim().to_string()).filter(|r| !r.is_empty()),
+            independence: Some(independence),
+            dissent,
+            argument: argument
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty()),
+            invocation: Some(Invocation {
+                backend: invocation.backend.trim().to_string(),
+                model: invocation.model.trim().to_string(),
+                prompt_digest: invocation.prompt_digest.trim().to_string(),
+            }),
             at: now,
         });
         Ok(esc.clone())
@@ -2499,6 +2648,55 @@ mod tests {
             "the argument survives the restart with it"
         );
         assert_eq!(esc.peer_participation().dissented, 1);
+    }
+
+    /// The restart cannot promote a filler. An invoked factor written to the chain restores
+    /// AS invoked — provenance included — and still clears nothing on the default bar, so a
+    /// crash between the classification and the ruling leaves the plane exactly as unable
+    /// to approve its own write as it was before the crash.
+    #[test]
+    fn replay_restores_an_invoked_factor_that_still_clears_nothing() {
+        let mut s = EscalationStore::default();
+        s.rehydrate(
+            &[
+                chain_entry(
+                    "gate_escalation_opened",
+                    serde_json::json!({
+                        "escalation_id": "fff7", "plugin_id": "claude-code",
+                        "role": "role:constellation:member", "tool_name": "Edit",
+                        "marker": "law_inject.py", "opened_at": T0, "expires_at": T0 + 3600,
+                    }),
+                ),
+                chain_entry(
+                    "gate_escalation_corroborated",
+                    serde_json::json!({
+                        "escalation_id": "fff7",
+                        "factors_present": [{
+                            "channel": "invoked", "by": "lct:web4:filler:ollama-qwen3",
+                            "role": "role:constellation:classifier",
+                            "independence": "cross_vendor", "at": T0 + 30,
+                            "dissent": false,
+                            "invocation": {"backend": "local", "model": "qwen3:2b@sha256:8f1c",
+                                           "prompt_digest": "b3:6d0a"},
+                        }],
+                    }),
+                ),
+            ],
+            T0 + 60,
+        );
+        let esc = s.get("fff7").expect("restored as pending");
+        assert_eq!(esc.bar, Bar::SingleApprover);
+        assert_eq!(esc.factors.len(), 1);
+        assert_eq!(esc.factors[0].channel, Channel::Invoked);
+        assert_eq!(
+            esc.factors[0].invocation.as_ref().map(|i| i.model.as_str()),
+            Some("qwen3:2b@sha256:8f1c"),
+            "provenance survives the restart with the factor"
+        );
+        assert!(!esc.bar_met(), "restored, and still not a peer");
+        assert!(!esc.is_claimable(T0 + 60));
+        assert_eq!(esc.peer_participation().invoked, 1);
+        assert_eq!(esc.peer_participation().concurred, 0);
     }
 
     /// #128, the restore half. A `gate_escalation_opened` entry written before `asker_basis`
@@ -4078,6 +4276,131 @@ mod bar_factor_tests {
     }
 
     const T0: u64 = 1_800_000_000;
+
+    fn invocation() -> Invocation {
+        Invocation {
+            backend: "local".into(),
+            model: "qwen3:2b@sha256:8f1c".into(),
+            prompt_digest: "b3:6d0a".into(),
+        }
+    }
+
+    /// THE LOAD-BEARING ARM, FIRST. `law_inject.py` opens `SingleApprover`, which `bar_for`
+    /// makes the default for everything outside the four enforcement-path markers, and on
+    /// which `peer` ALONE clears the bar. An invoked filler misfiled as `PeerMember` here
+    /// would approve the plane's own write with no human and no peer in the loop — cbp's
+    /// refused case, on the common path. So the assertion is on the arm where the variant
+    /// is the only defence, not on the two-bar arm where the peer conjunct stopped deciding
+    /// on 2026-08-06 and a misfiling would only dirty the record.
+    #[test]
+    fn an_invoked_factor_alone_never_clears_single_approver() {
+        let (mut s, id) = open_with("law_inject.py");
+        assert_eq!(s.get(&id).unwrap().bar, Bar::SingleApprover);
+        let e = s
+            .attach_invoked(
+                &id,
+                "lct:web4:filler:ollama-qwen3",
+                "role:constellation:classifier",
+                crate::arbiter::Independence::CrossVendor,
+                false,
+                Some("routine: a doc edit under the marker's own directory"),
+                invocation(),
+                T0 + 3,
+            )
+            .expect("an invoked factor lands on a pending row");
+        assert_eq!(e.factors.len(), 1);
+        assert_eq!(e.factors[0].channel, Channel::Invoked);
+        assert!(!e.bar_met(), "a filler that concurs clears NOTHING on the arm where a peer would");
+        assert!(!e.is_claimable(T0 + 4), "and nothing is claimable off it");
+        assert_eq!(e.stored_status(), Status::Pending, "and nothing was decided");
+        assert!(
+            e.operator_alone_suffices(),
+            "the button's promise is unchanged: the operator still decides alone here"
+        );
+
+        // The control: the SAME answer from a NOT-SAME peer does clear this bar alone.
+        // That is what makes the channel the discriminator rather than the content.
+        let (mut s2, id2) = open_with("law_inject.py");
+        let e2 = s2
+            .corroborate(&id2, "codex", "role:constellation:member", Some(crate::arbiter::Independence::CrossVendor), false, None, T0 + 3)
+            .expect("peer");
+        assert!(e2.bar_met(), "control: a peer factor alone clears SingleApprover");
+    }
+
+    #[test]
+    fn a_decision_cannot_ride_the_invoked_channel_and_the_refusal_leaves_no_trace() {
+        let (mut s, id) = open_with("law_inject.py");
+        let before = s.get(&id).unwrap().clone();
+        for approve in [true, false] {
+            let err = s
+                .decide(&id, approve, "lct:web4:filler:ollama-qwen3", "role:constellation:classifier", Channel::Invoked, Some(crate::arbiter::Independence::CrossVendor), Some("x"), T0 + 5)
+                .expect_err("a filler must not rule, in either direction");
+            assert_eq!(err, DecideError::InvokedCannotRule);
+        }
+        let after = s.get(&id).unwrap();
+        assert_eq!(after.stored_status(), Status::Pending);
+        assert!(after.decided_by.is_none() && after.decided_via.is_none());
+        assert_eq!(after.factors.len(), before.factors.len(), "a refused ruling records no factor");
+    }
+
+    #[test]
+    fn an_invoked_factor_is_not_the_peer_conjunct_and_the_record_says_so() {
+        // The two-bar arm: the sovereign decides alone since 2026-08-06, so the hazard here
+        // is not a cleared bar but a dirtied record — `peer_participation()` is the whole
+        // surviving value of the peer conjunct, and a filler counted as a peer would read as
+        // second-party review that never happened.
+        let (mut s, id) = open_with("witness.py");
+        assert_eq!(s.get(&id).unwrap().bar, Bar::SovereignPlusPeer);
+        s.invite(&id, vec!["codex".into()]);
+        s.attach_invoked(&id, "lct:web4:filler:ollama-qwen3", "role:constellation:classifier", crate::arbiter::Independence::CrossVendor, false, None, invocation(), T0 + 3)
+            .expect("invoked");
+        assert!(!s.get(&id).unwrap().bar_met(), "not a sovereign either");
+        // The button's promise on this arm has been "the operator suffices alone" since
+        // 2026-08-06; a filler present must not change what the surface says either way.
+        assert!(s.get(&id).unwrap().operator_alone_suffices());
+        let e = s
+            .decide(&id, true, "dp", "role:constellation:sovereign", Channel::OperatorSession, None, Some("reviewed"), T0 + 9)
+            .expect("the sovereign rules");
+        assert!(e.bar_met(), "the sovereign conjunct decides, as before");
+        let p = e.peer_participation();
+        assert_eq!(p.concurred, 0, "a filler's concurrence is NOT a peer's");
+        assert_eq!(p.dissented, 0);
+        assert_eq!(p.absent, 1, "codex, invited and silent, is still absent — the filler did not answer FOR it");
+        assert_eq!(p.invoked, 1, "and the record names the filler's answer under its own count");
+        // The provenance rides on the factor itself, inline: what a human reads is the
+        // answer AND who gave it, in one row.
+        let f = e.factors.iter().find(|f| f.channel == Channel::Invoked).unwrap();
+        assert_eq!(f.invocation.as_ref(), Some(&invocation()));
+        assert_eq!(f.independence, Some(crate::arbiter::Independence::CrossVendor));
+    }
+
+    #[test]
+    fn an_invoked_factor_without_provenance_is_refused_before_it_touches_the_row() {
+        let (mut s, id) = open_with("law_inject.py");
+        for blank in [
+            Invocation { backend: " ".into(), ..invocation() },
+            Invocation { model: "".into(), ..invocation() },
+            Invocation { prompt_digest: "".into(), ..invocation() },
+        ] {
+            let err = s
+                .attach_invoked(&id, "lct:web4:filler:x", "r", crate::arbiter::Independence::CrossMember, false, None, blank, T0 + 3)
+                .expect_err("blank provenance");
+            assert_eq!(err, DecideError::InvokedWithoutProvenance);
+        }
+        let err = s
+            .attach_invoked(&id, "  ", "r", crate::arbiter::Independence::CrossMember, false, None, invocation(), T0 + 3)
+            .expect_err("anonymous filler");
+        assert_eq!(err, DecideError::AnonymousDecider);
+        assert!(s.get(&id).unwrap().factors.is_empty(), "every refusal left the row untouched");
+    }
+
+    #[test]
+    fn the_invoked_channel_serialises_under_its_own_name() {
+        // The wire and the censuses key on the snake_case string; a reader filtering
+        // `channel == "peer_member"` must never see a filler, and one looking for the lean
+        // path must have a name to look for.
+        assert_eq!(serde_json::to_value(Channel::Invoked).unwrap(), serde_json::json!("invoked"));
+    }
 
     #[test]
     fn the_promise_shown_before_the_click_predicts_what_the_click_does() {
