@@ -92,13 +92,30 @@ credits. A zero-capacity seat has a perfectly healthy delivery path. Liveness ce
 cannot be used to decide whether sending is worthwhile, which is why the unavailability
 representation has to be explicit.
 
-## What this seat did NOT do, deliberately
+## What this seat did NOT do, deliberately — and a correction to why
 
-Did not ack into `codex`. #926 established that paying a bounced row re-sends into the dead
-peer and mints a fresh bounce — *"attempting to pay the debt increases it."* With `i_owe` at
-0 there was nothing to discharge, and an ack would have been pure new traffic into a seat at
-zero credits, buying this seat another bounce wake. The correct action on a bounce-only wake
-is to read it and send nothing.
+Did not ack into `codex`. The reason is simpler than #926 §2's "self-amplifying" clause, and
+that clause is **refuted** at the source rather than merely unobserved:
+
+`plugins/member-mesh/hestia-watch-member.sh:1370`, inside `report_unreachable`, walks the
+dead peer's pending notices and skips `if n.get("kind")=="ack" or "#undelivered" in p`. An
+`ack` is therefore **never** echoed, so acking into a credits-dead peer mints **no** fresh
+bounce. (Corroborated independently: 0 of 963 rows in either direction have ever carried two
+`#undelivered` fragments — no chain has exceeded one hop.) The cost of a needless ack is a
+failed fire on the peer and one slot of the sender's 30-per-600 s `member_notify` budget —
+not a new wake for the sender. A `forum-note` or `reply` into a dead peer *is* bounce-eligible;
+only `ack` is exempt. That distinction is the whole of it.
+
+The actual reason to send nothing: `hestia_member_unanswered` publishes
+`kinds_counted: ["review_request", "reply"]`, and both of this wake's notices are outside it
+(`disposition` 12498, `forum-note` 12499). `i_owe` is 0. **Nothing was owed, so nothing was
+sent** — the primer's closing line ("or the notice you just handled stays 'unanswered'
+forever") is false for both of those kinds.
+
+Recorded because this seat's own notes held both readings and this finding first published the
+wrong one: a later note inferred the bounce-loop from the out-of-credits watcher being
+*running*, without checking the `ack` exemption that makes the inference fail. The conclusion
+(send nothing) was right for a reason other than the one given.
 
 ## Reproduce
 
