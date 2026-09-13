@@ -4001,6 +4001,22 @@ async fn scope_standing_promote(
                       /api/scope/grant"
         })));
     };
+    // Idempotent: a second press on an already-promoted grant is not a second widening.
+    // Three presses on one grant appended three scope_grant_intent/scope_granted pairs to
+    // the chain (cbp-being's home, 2026-09-12) while the store deduplicated to one row.
+    if let Some(existing) = s.standing_scope.grants.iter()
+        .find(|g| g.member == plugin_id && g.path == path && g.expires_at.is_none_or(|e| now < e))
+    {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "status": "already_standing",
+            "plugin_id": plugin_id,
+            "path": path,
+            "recursive": existing.recursive,
+            "granted_at": existing.granted_at,
+            "standing_generation": s.standing_scope.generation,
+            "note": "this grant is already standing; nothing was appended to the chain",
+        })));
+    }
     let reason = {
         let given = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         if given.is_empty() { live.decision_reason.clone().unwrap_or_default() } else { given }
@@ -6428,6 +6444,49 @@ mod disposition_tests {
         let ok = chain.iter().find(|e| e.event_type == "scope_granted").expect("terminal record");
         assert_eq!(ok.event_data["origin"], "promoted_from_live");
         assert!(chain.iter().any(|e| e.event_type == "scope_grant_intent"), "intent precedes success");
+        let granted_rows = chain.iter().filter(|e| e.event_type == "scope_granted").count();
+        // The dashboard shows ONE row for the reach: the standing one. The live grant it was
+        // promoted from is folded, not listed beside it with its own "make standing" button
+        // (dp, 2026-09-12: pressed it three times on cbp-being's home grant and saw both rows).
+        let rows = s.dashboard_snapshot(20).scope_grants;
+        let tree: Vec<_> = rows.iter().filter(|r| r["path"] == "/x/tree").collect();
+        assert_eq!(tree.len(), 1, "promoted live row folds into its standing row: {rows:?}");
+        assert_eq!(tree[0]["lifetime"], "standing");
+        drop(s);
+
+        // A second press is not a second widening: 200, nothing appended, store unchanged.
+        let resp = scope_standing_promote(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/x/tree"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "already standing answers OK, not an error");
+        let s = state.lock().await;
+        let chain = s.recent_chain(40);
+        assert_eq!(chain.iter().filter(|e| e.event_type == "scope_granted").count(), granted_rows,
+                   "an idempotent press appends no scope_granted row");
+        assert_eq!(s.standing_scope.grants.iter().filter(|g| g.path == "/x/tree").count(), 1);
+    }
+
+    /// The fold is by reach: a live grant that reaches MORE than its standing twin (subtree
+    /// beside an exact standing row) is still a distinct grant and stays listed.
+    #[tokio::test]
+    async fn dashboard_keeps_a_live_grant_whose_reach_exceeds_its_standing_twin() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        let mut s = state.lock().await;
+        let mut wide = live_req("scope-live-3", "/y/tree", now);
+        wide.recursive = true;
+        s.scope_requests.insert("scope-live-3".into(), wide);
+        s.scope_requests.insert("scope-live-4".into(), live_req("scope-live-4", "/y/alone", now));
+        s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+            member: "kimi-code".into(), path: "/y/tree".into(), granted_at: now,
+            granted_by: "operator".into(), reason: "r".into(), expires_at: None,
+            request_id: None, recursive: false,
+        })).unwrap();
+        let rows = s.dashboard_snapshot(20).scope_grants;
+        let tree: Vec<_> = rows.iter().filter(|r| r["path"] == "/y/tree").collect();
+        assert_eq!(tree.len(), 2, "exact standing does not cover a recursive live grant: {rows:?}");
+        let alone: Vec<_> = rows.iter().filter(|r| r["path"] == "/y/alone").collect();
+        assert_eq!(alone.len(), 1, "a live grant with no standing twin is listed as before");
+        assert_eq!(alone[0]["lifetime"], "live");
     }
 
     /// dp's "make recursive" button. Exact is the default; this is the one explicit,

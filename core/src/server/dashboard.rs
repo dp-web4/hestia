@@ -1455,6 +1455,22 @@ impl ServerState {
                         })
                     })
                     .collect();
+                // A live grant that has been PROMOTED is not a second grant: the operator pressed
+                // "make standing" expecting the row to become standing, and saw both rows
+                // instead (dp, 2026-09-12, three presses on cbp-being's home grant). The
+                // standing row for the same (member, path) with reach at least the live one's
+                // supersedes it here, so the list answers "what can this member reach" with
+                // one row per reach, and the live row's "make standing" button goes with it.
+                v.retain(|row| {
+                    let member = row["plugin_id"].as_str().unwrap_or("");
+                    let path = row["path"].as_str().unwrap_or("");
+                    let live_recursive = row["recursive"].as_bool().unwrap_or(false);
+                    !self.standing_scope.grants.iter().any(|g| {
+                        g.member == member && g.path == path
+                            && g.expires_at.is_none_or(|e| now < e)
+                            && (g.recursive || !live_recursive)
+                    })
+                });
                 v.extend(self.standing_scope.grants.iter()
                     .filter(|g| g.expires_at.is_none_or(|e| now < e))
                     .map(|g| {
