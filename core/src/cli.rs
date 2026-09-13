@@ -4189,7 +4189,7 @@ mod serve_guard_tests {
         assert!(!bind_is_loopback("0.0.0.0:7711"));
         assert!(!bind_is_loopback("[::]:7711"));
         assert!(!bind_is_loopback("192.168.1.20:7711"));
-        assert!(!bind_is_loopback("100.75.141.17:7711")); // tailnet IP
+        assert!(!bind_is_loopback("100.64.0.1:7711")); // tailnet-range (CGNAT 100.64.0.0/10)
     }
 }
 
