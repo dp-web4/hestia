@@ -431,14 +431,8 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
         verdict.action_id = action_id  # correlation key for the caller's outcome cache
         return verdict
     except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
-        reason = getattr(e, "reason", None)
-        if isinstance(reason, TimeoutError) or isinstance(e, (TimeoutError, socket.timeout)):
-            cause = "timeout"
-        elif isinstance(reason, ConnectionRefusedError):
-            cause = "refused"
-        else:
-            cause = "unknown"
-        return _no_verdict(plugin_id, tool_name, cause, f"network: {type(e).__name__}")
+        return _no_verdict(plugin_id, tool_name, _unavailable_cause(e),
+                           f"network: {type(e).__name__}")
     except Exception as e:  # noqa: BLE001 — FAIL-CLOSED: any unexpected error is no-verdict, never allow
         return _no_verdict(plugin_id, tool_name, "unknown", f"unexpected: {type(e).__name__}")
 
@@ -681,14 +675,36 @@ def _fetch_policy_snapshot_once(plugin_id: str, *, host_agent: Optional[str] = N
     return snap
 
 
-def _snapshot_unavailable(plugin_id: str, cause: str) -> None:
+def _unavailable_cause(e: BaseException) -> str:
+    """ONE classifier for "why could the daemon not be consulted", shared by the verdict path
+    and the snapshot path: "timeout" (alive but starved: back off and retry), "refused"
+    (nothing listening: stop and escalate), "unknown" (say so rather than guess). The
+    telemetry writer normalises anything else to "unknown", so a caller that passes a
+    free-text reason where the cause goes has silently thrown the diagnosis away — which is
+    exactly what the snapshot path did for a month (every record read "unknown" while the
+    detail said TimeoutError)."""
+    reason = getattr(e, "reason", None)
+    if isinstance(reason, (TimeoutError, socket.timeout)) or isinstance(e, (TimeoutError, socket.timeout)):
+        return "timeout"
+    if isinstance(reason, ConnectionRefusedError) or isinstance(e, ConnectionRefusedError):
+        return "refused"
+    return "unknown"
+
+
+def _snapshot_unavailable(plugin_id: str, detail: str, cause: str = "unknown") -> None:
     """Field telemetry for a failed snapshot fetch (never raises): the 2026-08-14 codex
     dropouts were unreproducible from another seat precisely because every failure path
     collapsed to a causeless None — a 'daemon unreachable' that could be refused/timeout/
-    port-exhaustion/EPERM. Each is a different fix; the log now says which."""
+    port-exhaustion/EPERM. Each is a different fix; the log now says which.
+
+    `detail` is the free text (which STAGE of the handshake failed, and how); `cause` is the
+    three-valued diagnosis the writer keeps verbatim. The two were passed in each other's
+    positions until 2026-09-11, so every snapshot record carried cause "unknown" whatever
+    happened; three timeout bursts on nomad (2026-09-10/11) were attributable only by reading
+    the exception name out of the detail string, and even then not to a stage."""
     try:
         from hestia_gate_core import record_gate_unavailable  # type: ignore
-        record_gate_unavailable(plugin_id, "policy-snapshot", "snapshot-fetch", cause,
+        record_gate_unavailable(plugin_id, "policy-snapshot", cause, detail,
                                 home=str(DEFAULT_HESTIA_HOME))
     except Exception:
         pass
@@ -696,6 +712,11 @@ def _snapshot_unavailable(plugin_id: str, cause: str) -> None:
 
 def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
                                     host_session_id: Optional[str]) -> Optional[dict]:
+    # Which step of the handshake was in flight when it failed. Named in the telemetry so a
+    # timeout on `hestia_operating_law` is distinguishable from one on `initialize`: the
+    # first is the daemon working, the second is the daemon absent, and they are different
+    # fixes. Set BEFORE each step, so an exception raised inside it reads as that step.
+    stage = "endpoint"
     try:
         endpoint = _discover_endpoint()
         if endpoint is None:
@@ -703,9 +724,11 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             return None
         deadline = time.monotonic() + (TOTAL_BUDGET_MS / 1000.0)
         client = _McpHttp(endpoint, deadline)
+        stage = "initialize"
         if "result" not in client.initialize():
             _snapshot_unavailable(plugin_id, "init-no-result")
             return None
+        stage = "initialized"
         client.initialized()
         connect_args: dict = {
             "plugin_id": plugin_id,
@@ -725,6 +748,7 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             connect_args["role"] = role_env
         if host_session_id:
             connect_args["host_session_id"] = host_session_id
+        stage = "connect"
         connect = _unwrap_tool_result(client.call_tool("hestia_connect", connect_args))
         if "_hestia_error" in connect:
             _snapshot_unavailable(plugin_id, "connect-refused:" + str(
@@ -759,6 +783,7 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             "generation": None,
             "expires_at": None,
         }
+        stage = "operating_law"
         law = _unwrap_tool_result(
             client.call_tool("hestia_operating_law", {"session_id": session_id}))
         if isinstance(law, dict) and "_hestia_error" not in law:
@@ -770,6 +795,7 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             grant = law.get("operator_grant")
             if isinstance(grant, dict):
                 snap["operator_grant"] = grant
+        stage = "scope_status"
         scope = _unwrap_tool_result(
             client.call_tool("hestia_scope_status", {"plugin_id": plugin_id}))
         if isinstance(scope, dict) and "_hestia_error" not in scope:
@@ -842,7 +868,9 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
         return snap
     except Exception as e:  # noqa: BLE001 — any failure is "unreachable"; the caller degrades
         _snapshot_unavailable(
-            plugin_id, f"{type(e).__name__}:{getattr(e, 'errno', '')}:{str(e)[:120]}")
+            plugin_id,
+            f"{stage}: {type(e).__name__}:{getattr(e, 'errno', '')}:{str(e)[:110]}",
+            _unavailable_cause(e))
         return None
 
 
