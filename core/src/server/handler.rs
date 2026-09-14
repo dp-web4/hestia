@@ -22159,22 +22159,29 @@ async fn tool_scope_arbitrate(state: &SharedState, args: &Value) -> ToolResult {
     };
     let Some(deleg) = store.scope_decide_authority_for(arbiter_key, &req.path, &req.plugin_id)
     else {
+        // THE MESSAGE CARRIES THE STRING, not a pointer to it. The earlier text said
+        // "`required_action` below is the exact string" and nothing was below it: the field
+        // is in the envelope's `data`, and every caller that renders a refusal renders its
+        // MESSAGE. Measured 2026-09-14 from the legion seat — two probe attempts spent
+        // reconstructing the action by hand from a sentence that said it need not be.
+        let required_action = format!("scope.decide:{}:{}", req.plugin_id, req.path);
         return Ok(hestia_error_envelope(
             "hestia.scope_arbitrate_undelegated",
-            "you hold no live operator delegation covering this path for this member, so this \
-             ruling would be an assertion of authority rather than an exercise of one. The \
-             operator grants it with `hestia delegate grant <your-agent-id> --action \
-             'scope.decide[:<member>]:/abs/prefix' --expires <h>` (`required_action` below is \
-             the exact string; `hestia delegate agent-id <seat>` prints the id). Default \
-             posture is unchanged and fail-closed: with no delegation, scope rulings are \
-             operator-only",
+            &format!(
+                "you hold no live operator delegation covering this path for this member, so \
+                 this ruling would be an assertion of authority rather than an exercise of \
+                 one. The operator grants it with `hestia delegate grant <your-agent-id> \
+                 --action '{required_action}' --expires <h>` (`hestia delegate agent-id \
+                 <seat>` prints the id). Default posture is unchanged and fail-closed: with \
+                 no delegation, scope rulings are operator-only"
+            ),
             Some(json!({
                 "arbiter": arb.plugin_id,
                 "arbiter_lct": arbiter_lct_id,
                 "delegation_agent_key": arbiter_key.to_string(),
                 "path": req.path,
                 "member": req.plugin_id,
-                "required_action": format!("scope.decide:{}:{}", req.plugin_id, req.path),
+                "required_action": required_action,
             })),
         ));
     };
@@ -22515,6 +22522,18 @@ mod delegated_scope_arbitration_tests {
             out["_hestia_error"]["data"]["required_action"],
             "scope.decide:legion-being:/home/x/being",
             "the refusal must spell the delegation that would have authorised it: {out}"
+        );
+        // AND IN THE MESSAGE, because that is the part a caller renders. The text used to
+        // say "`required_action` below is the exact string" with nothing below it; a seat
+        // hitting this on 2026-09-14 rebuilt the action by hand from a sentence promising
+        // it would not have to. Mutation-checked: replacing the interpolation with the
+        // placeholder text turns this red.
+        assert!(
+            out["_hestia_error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("scope.decide:legion-being:/home/x/being"),
+            "the refusal MESSAGE must carry the action, not point at a field: {out}"
         );
         assert!(
             state.lock().await.scope_requests[&rid].granted.is_none(),
