@@ -4004,8 +4004,14 @@ async fn scope_standing_promote(
     // Idempotent: a second press on an already-promoted grant is not a second widening.
     // Three presses on one grant appended three scope_grant_intent/scope_granted pairs to
     // the chain (cbp-being's home, 2026-09-12) while the store deduplicated to one row.
+    // Reach-aware (GPT review of #1021): "already standing" only when the standing grant
+    // reaches at least as far as the live one. An EXACT standing twin beside a RECURSIVE live
+    // grant is not the same grant, the dashboard keeps both rows for exactly that reason, and
+    // pressing "make standing" on the recursive row must widen the standing grant (the store's
+    // add() replaces by (member, path)) instead of answering a no-op.
     if let Some(existing) = s.standing_scope.grants.iter()
-        .find(|g| g.member == plugin_id && g.path == path && g.expires_at.is_none_or(|e| now < e))
+        .find(|g| g.member == plugin_id && g.path == path && g.expires_at.is_none_or(|e| now < e)
+                  && (g.recursive || !live.recursive))
     {
         return (StatusCode::OK, Json(serde_json::json!({
             "status": "already_standing",
@@ -6487,6 +6493,38 @@ mod disposition_tests {
         let alone: Vec<_> = rows.iter().filter(|r| r["path"] == "/y/alone").collect();
         assert_eq!(alone.len(), 1, "a live grant with no standing twin is listed as before");
         assert_eq!(alone[0]["lifetime"], "live");
+        let granted_before = s.recent_chain(50).iter().filter(|e| e.event_type == "scope_granted").count();
+        drop(s);
+
+        // Pressing "make standing" on the surviving RECURSIVE live row widens the exact standing
+        // twin (GPT review of #1021): not a no-op, one grant remains, now recursive, the live row
+        // folds, and the widening is witnessed exactly once.
+        let resp = scope_standing_promote(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/y/tree"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_ne!(body["status"], "already_standing", "exact standing must not swallow a recursive promote: {body}");
+        let s = state.lock().await;
+        let tree_grants: Vec<_> = s.standing_scope.grants.iter().filter(|g| g.path == "/y/tree").collect();
+        assert_eq!(tree_grants.len(), 1, "the store replaces by (member, path)");
+        assert!(tree_grants[0].recursive, "the standing grant now reaches the subtree");
+        let rows = s.dashboard_snapshot(20).scope_grants;
+        let tree: Vec<_> = rows.iter().filter(|r| r["path"] == "/y/tree").collect();
+        assert_eq!(tree.len(), 1, "the recursive live row folds into the now-recursive standing row: {rows:?}");
+        assert_eq!(tree[0]["lifetime"], "standing");
+        let granted_after = s.recent_chain(50).iter().filter(|e| e.event_type == "scope_granted").count();
+        assert_eq!(granted_after, granted_before + 1, "the widening is witnessed once");
+        drop(s);
+
+        // and a second press on it is now the idempotent case
+        let resp = scope_standing_promote(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/y/tree"}))).await.into_response();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["status"], "already_standing");
+        let s = state.lock().await;
+        assert_eq!(s.recent_chain(50).iter().filter(|e| e.event_type == "scope_granted").count(), granted_after);
     }
 
     /// dp's "make recursive" button. Exact is the default; this is the one explicit,
