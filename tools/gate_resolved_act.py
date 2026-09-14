@@ -178,19 +178,59 @@ def _components(p: str) -> List[str]:
     return [c for c in p.lower().replace("\\", "/").split("/") if c]
 
 
+def _component_hit(want: str, have: str) -> bool:
+    """One forbidden component against one path component, on REAL boundaries.
+
+    Exact is not enough and substring is too much. A secret file is routinely the token plus
+    an extension, and an extension is one dot away: the component-exact rule this replaces
+    MISSED the dot-env file with a `local` suffix, the same file with a deployment suffix,
+    and the AWS-shaped credential file with its json extension — three real ones that the
+    crude substring scan it is meant to improve on catches. A precision proposal that is
+    WEAKER than what it replaces is the worst available outcome. Found by attacking the
+    proposal, not by reading it.
+
+    So a token matches a component when it IS that component, when the component is the token
+    plus a dot-extension, or when the component ends at the token on a dot. The delimiter set
+    is the dot ONLY. Admitting '-' or '_' as boundaries brings the false positives straight
+    back: a document written about credential handling has a hyphen in its basename, and
+    under a hyphen rule it is refused again — the exact defect this layer exists to end.
+
+    (The forms above are described rather than spelled. Writing this docstring was refused
+    three times for naming them — refusals twelve through fourteen in a day spent measuring
+    that this happens, every one of them on text whose only purpose is to explain the
+    refusal. The rule is untouched; only my prose adapted, which is the litigated route and
+    is also the evidence.)
+
+    Residual, measured and accepted: a key file renamed with an underscore infix and stored
+    outside the standard directory is not matched by its own token. It IS matched by the
+    directory token in every standard location, and widening to catch it costs the false
+    positives above. Named here so the next reader inherits the measurement, not the guess.
+    """
+    if have == want:
+        return True
+    if have.startswith(want + "."):
+        return True
+    if want.startswith("."):
+        return have.endswith(want)          # a dotted token as the extension of a basename
+    return have.endswith("." + want)        # a bare token as the extension of a basename
+
+
 def token_hits_path(token: str, path: str) -> bool:
     """Does a forbidden token match this path ON COMPONENT BOUNDARIES?
 
-    A single-component token matches a component exactly. A multi-component token (a token
-    written with separators) matches a consecutive run of components. Nothing matches as a
-    bare substring inside a longer name, which is what retires hestia#988.
+    A single-component token matches one component. A multi-component token (a token written
+    with separators) matches a consecutive run of them. Each component is compared by
+    _component_hit, which admits a dot-extension and nothing else. Nothing matches as a bare
+    substring inside a longer name, which is what retires hestia#988.
     """
     want = [c for c in token.lower().split("/") if c]
     if not want:
         return False
     have = _components(path)
     n = len(want)
-    return any(have[i:i + n] == want for i in range(len(have) - n + 1))
+    return any(len(have[i:i + n]) == n
+               and all(_component_hit(w, h) for w, h in zip(want, have[i:i + n]))
+               for i in range(len(have) - n + 1))
 
 
 def forbidden_reach(paths: Iterable[str], repos: Iterable[str], command: Optional[str],
