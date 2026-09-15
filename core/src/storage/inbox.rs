@@ -784,10 +784,73 @@ impl SqliteInboxStore {
         chain_hash: &str,
         in_reply_to: Option<u64>,
     ) -> Result<u64> {
-        let now = Utc::now();
-        let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
+        Self::enqueue_member_on(&conn, to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, in_reply_to)
+    }
+
+    /// Retire an egress row AND queue its author's report in one transaction (#1030 review):
+    /// either both land or neither does. `None` means the row was not pending (already
+    /// forwarded, retired, or never queued), and nothing was written. Before this, a
+    /// transport-fault retirement was three separate writes, so a failure after the first
+    /// could leave a row gone from the queue with its author never told.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retire_egress_with_report(
+        &self,
+        id: u64,
+        report_to: &str,
+        report_from: &str,
+        report_role: &str,
+        report_kind: &str,
+        report_pointer: Option<&str>,
+        chain_hash: &str,
+    ) -> Result<Option<u64>> {
+        let mut conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let tx = conn.transaction().context("starting egress retirement")?;
+        let n = tx
+            .execute(
+                "UPDATE member_notices SET drained_at = ?1
+                  WHERE id = ?2 AND dest_peer IS NOT NULL AND drained_at IS NULL",
+                params![Utc::now().to_rfc3339(), id as i64],
+            )
+            .context("retiring egress row")?;
+        if n != 1 {
+            return Ok(None); // dropping the transaction rolls it back; nothing was written
+        }
+        let report = Self::enqueue_member_on(
+            &tx, report_to, report_from, report_role, report_kind, report_pointer, chain_hash, None,
+        )?;
+        tx.commit().context("committing egress retirement and its report")?;
+        Ok(Some(report))
+    }
+
+    /// Whether an egress row is still waiting to be forwarded.
+    pub fn egress_is_pending(&self, id: u64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM member_notices
+              WHERE id = ?1 AND dest_peer IS NOT NULL AND drained_at IS NULL",
+            params![id as i64],
+            |r| r.get(0),
+        )?;
+        Ok(n == 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_member_on(
+        conn: &Connection,
+        to_plugin: &str,
+        from_plugin: &str,
+        from_role: &str,
+        kind: &str,
+        pointer_uri: Option<&str>,
+        chain_hash: &str,
+        in_reply_to: Option<u64>,
+    ) -> Result<u64> {
+        let now = Utc::now();
+        let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
         // "You may only answer mail addressed to YOU" — enforced HERE, in the
         // store, not only at the call site (Kimi/CBP git-manager thread,
         // 2026-07-28, notice 309). Until this check the guard lived inside

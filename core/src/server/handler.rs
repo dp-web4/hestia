@@ -4870,9 +4870,17 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
             detail["hub_receipt"] = hub_receipt.clone().unwrap_or(Value::Null);
             return retire_and_report_transport(&mut s, row, &who, stamp.as_ref(), event, fragment, detail);
         }
-        s.inbox_store
-            .mark_egress_forwarded(id)
-            .map_err(|e| anyhow::anyhow!("marking egress forwarded: {e}"))?;
+        // A stamped or unbound row that is no longer pending was settled already: re-marking
+        // it must not mint a second forwarded witness.
+        if row.is_some()
+            && !s
+                .inbox_store
+                .egress_is_pending(id)
+                .map_err(|e| anyhow::anyhow!("reading egress row {id}: {e}"))?
+        {
+            return Ok(json!({ "marked": false, "row_id": id, "by": who.plugin_id,
+                              "note": "already settled — nothing marked and nothing witnessed" }));
+        }
         // (c) The destroying disposition now leaves a witness naming the actor. The
         // daemon already knew who it was; it simply never wrote it down.
         let mut record = json!({
@@ -4896,8 +4904,29 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
                 _ => record["transport"] = json!("unbound"),
             }
         }
-        let _ = s.append_chain("egress_forwarded", record);
-        let mut out = json!({ "marked": id, "by": who.plugin_id, "witnessed": true });
+        if row.is_none() {
+            // No row on record: nothing to destroy, so the historical best-effort shape stands.
+            s.inbox_store
+                .mark_egress_forwarded(id)
+                .map_err(|e| anyhow::anyhow!("marking egress forwarded: {e}"))?;
+            let _ = s.append_chain("egress_forwarded", record);
+            return Ok(json!({ "marked": id, "by": who.plugin_id, "witnessed": true }));
+        }
+        // ORDER (GPT review of #1031): the carrier evidence is on the chain BEFORE the row
+        // leaves the queue. A failed append leaves the row pending (the drain is told, and
+        // the row is re-listed); it can no longer be destroyed with its evidence lost.
+        let entry = s.append_chain("egress_forwarded", record).map_err(|e| {
+            anyhow::anyhow!("egress row {id} NOT marked: its forwarded witness could not be written ({e})")
+        })?;
+        s.inbox_store.retire_egress(id).map_err(|e| {
+            anyhow::anyhow!(
+                "egress row {id}: forwarded witness {} written but the row could NOT be retired \
+                 ({e}); it is still pending",
+                entry.hash
+            )
+        })?;
+        let mut out = json!({ "marked": id, "by": who.plugin_id, "witnessed": true,
+                              "witnessEntryHash": entry.hash });
         if row.is_some() {
             out["transport"] = json!(if verdict == ForwardVerdict::Honoured { "honoured" } else { "unbound" });
             out["carrier_lct"] = json!(carrier_lct);
@@ -5103,10 +5132,22 @@ fn retire_and_report_transport(
     detail: Value,
 ) -> ToolResult {
     let id = row.id;
+    // ORDER (GPT review of #1031): the evidence is written BEFORE the row can leave the
+    // queue, and the retirement and the author's report are one store transaction. The
+    // failure arms, in order:
+    //   * not pending: nothing is witnessed or reported a second time;
+    //   * the witness append fails: nothing has changed, the row is still pending and is
+    //     judged again on the next pass;
+    //   * the transaction fails: the witness stands, but the row is still pending and the
+    //     author has no report. The next pass judges the row again, so the obligation is
+    //     recoverable rather than lost.
+    // Invariant a reader can check: every row retired here has a report notice whose
+    // chain_hash is this witness. A witness whose row is still pending means the store write
+    // failed, never that the row vanished.
     if !s
         .inbox_store
-        .retire_egress(id)
-        .map_err(|e| anyhow::anyhow!("retiring egress row {id}: {e}"))?
+        .egress_is_pending(id)
+        .map_err(|e| anyhow::anyhow!("reading egress row {id}: {e}"))?
     {
         return Ok(json!({
             "row_id": id, "retired": false, "by": who.plugin_id, "fault": fragment,
@@ -5126,30 +5167,39 @@ fn retire_and_report_transport(
             "detail": detail,
             "retired_by": who.plugin_id,
             "retired_by_role": who.role_lct,
-            "note": "a transport fault on THIS host, not a claim about the peer",
+            "disposition": "retire_and_report",
+            "note": "a transport fault on THIS host, not a claim about the peer. Written before \
+                     the retirement: the author's report carries this entry's hash",
         }),
     )?;
+    let pointer = format!("hestia://egress/{id}#{fragment}:{}/{}", row.dest_peer, row.to_member);
     let report_id = s
         .inbox_store
-        .enqueue_member(
+        .retire_egress_with_report(
+            id,
             &row.from_plugin,
             "hestia",
             crate::reputation::DEFAULT_CONSTELLATION_ROLE,
             DAEMON_NOTICE_KIND_UNREACHABLE,
-            Some(&format!(
-                "hestia://egress/{id}#{fragment}:{}/{}",
-                row.dest_peer, row.to_member
-            )),
+            Some(&pointer),
             &entry.hash,
-            None,
         )
         .map_err(|e| {
             anyhow::anyhow!(
-                "egress row {id} was retired on a transport fault and witnessed, but the \
-                 author's report could NOT be queued ({e}) — {} does not know",
-                row.from_plugin
+                "transport fault on egress row {id} was witnessed ({}), but retiring it and \
+                 reporting to {} failed together ({e}): the row is STILL PENDING and will be \
+                 judged again on the next pass",
+                entry.hash, row.from_plugin
             )
         })?;
+    let Some(report_id) = report_id else {
+        return Ok(json!({
+            "row_id": id, "retired": false, "by": who.plugin_id, "fault": fragment,
+            "witnessEntryHash": entry.hash,
+            "note": "the row settled between the check and the retirement; the witness stands, \
+                     no report was queued",
+        }));
+    };
     Ok(json!({
         "row_id": id, "retired": true, "by": who.plugin_id, "fault": fragment,
         "forwarded_success": false,
@@ -23368,6 +23418,88 @@ mod transport_binding_tests {
         assert!(s.inbox_store.pending_egress(50).unwrap().is_empty());
         let mail = s.inbox_store.drain_member("cbp-being").unwrap();
         assert!(mail[0].pointer_uri.as_deref().unwrap().contains("carrier-unavailable"), "{mail:?}");
+    }
+
+    fn inject(dir: &TempDir, db: &str, sql: &str) {
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join(db)).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(sql).unwrap();
+    }
+
+    /// GPT review of #1031, arm 1: the witness of a transport fault cannot fail AFTER the row
+    /// is gone. With the append refused, the row is still pending and the author has nothing.
+    #[tokio::test]
+    async fn a_transport_fault_whose_witness_fails_leaves_the_row_pending() {
+        let (dir, state) = test_state().await;
+        bind(&state, "cbp-being", TransportMode::Direct, Some(BEING_LCT)).await;
+        let being = connect(&state, "cbp-being").await;
+        let drain = connect(&state, "hestia-router").await;
+        let id = send(&state, &being, "legion/legion-being").await["queued_id"].as_u64().unwrap();
+        inject(&dir, "witness.db", "CREATE TRIGGER no_fault BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'egress_carrier_mismatch'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;");
+
+        let out = tool_egress_pending(
+            &state,
+            &json!({"session_id": drain, "mark_forwarded": id, "carrier_lct": SEAT_LCT}),
+        )
+        .await;
+        assert!(out.is_err(), "the failure is loud: {out:?}");
+        let s = state.lock().await;
+        assert!(s.inbox_store.egress_is_pending(id).unwrap(), "no evidence, so no retirement");
+        assert!(s.inbox_store.drain_member("cbp-being").unwrap().is_empty());
+    }
+
+    /// Arm 2: the author's report cannot fail after the row is retired. Retirement and report
+    /// are one transaction, so a refused report leaves the row pending (the obligation is
+    /// recoverable), and the retry retires it with a report that carries the witness hash.
+    #[tokio::test]
+    async fn a_transport_fault_whose_report_fails_is_not_retired_and_recovers() {
+        let (dir, state) = test_state().await;
+        bind(&state, "cbp-being", TransportMode::Direct, Some(BEING_LCT)).await;
+        let being = connect(&state, "cbp-being").await;
+        let drain = connect(&state, "hestia-router").await;
+        let id = send(&state, &being, "legion/legion-being").await["queued_id"].as_u64().unwrap();
+        inject(&dir, "inbox.db", "CREATE TRIGGER no_report BEFORE INSERT ON member_notices
+             WHEN NEW.kind = 'unreachable'
+             BEGIN SELECT RAISE(FAIL, 'injected report failure'); END;");
+        let mark = json!({"session_id": drain, "mark_forwarded": id, "carrier_lct": SEAT_LCT});
+
+        assert!(tool_egress_pending(&state, &mark).await.is_err());
+        assert!(state.lock().await.inbox_store.egress_is_pending(id).unwrap(), "the retirement rolled back with the report");
+
+        inject(&dir, "inbox.db", "DROP TRIGGER no_report;");
+        let out = tool_egress_pending(&state, &mark).await.unwrap();
+        assert_eq!(out["retired"], true, "{out}");
+        let s = state.lock().await;
+        let mail = s.inbox_store.drain_member("cbp-being").unwrap();
+        assert_eq!(mail.len(), 1, "one report, not one per attempt");
+        assert_eq!(mail[0].chain_hash, out["witnessEntryHash"].as_str().unwrap(), "the report joins its witness");
+    }
+
+    /// Arm 3, the forwarded path: the carrier evidence is written before the row leaves the
+    /// queue, so a refused `egress_forwarded` append leaves the row pending.
+    #[tokio::test]
+    async fn a_forward_whose_witness_fails_leaves_the_row_pending() {
+        let (dir, state) = test_state().await;
+        bind(&state, "cbp-being", TransportMode::Direct, Some(BEING_LCT)).await;
+        let being = connect(&state, "cbp-being").await;
+        let drain = connect(&state, "hestia-router").await;
+        let id = send(&state, &being, "legion/legion-being").await["queued_id"].as_u64().unwrap();
+        inject(&dir, "witness.db", "CREATE TRIGGER no_fwd BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'egress_forwarded'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;");
+        let mark = json!({"session_id": drain, "mark_forwarded": id, "carrier_lct": BEING_LCT});
+
+        assert!(tool_egress_pending(&state, &mark).await.is_err());
+        assert!(state.lock().await.inbox_store.egress_is_pending(id).unwrap());
+        inject(&dir, "witness.db", "DROP TRIGGER no_fwd;");
+        let out = tool_egress_pending(&state, &mark).await.unwrap();
+        assert_eq!(out["transport"], "honoured", "{out}");
+        let again = tool_egress_pending(&state, &mark).await.unwrap();
+        assert_eq!(again["marked"], false, "a settled row is not witnessed twice: {again}");
+        assert_eq!(events(&state, "egress_forwarded").await.len(), 1);
     }
 
     /// A member reads its own binding and only its own; the read carries no write.

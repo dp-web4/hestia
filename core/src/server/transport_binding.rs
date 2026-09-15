@@ -34,9 +34,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-/// Hub scope for a binding. Phase A forwards through the one hub a host's drain uses, so
-/// bindings are written for `ANY_HUB`; the field exists so a host joined to several hubs can
-/// bind a member differently per hub without a schema change.
+/// Hub scope for a binding. Phase A forwards through the one hub a host's drain uses and
+/// `member_notify` resolves only this wildcard, so `validate` REFUSES any other hub: a
+/// hub-scoped binding would be stored and ignored at send time. The field is kept so a host
+/// joined to several hubs can bind per hub once the send path carries the hub, without a
+/// schema change.
 pub const ANY_HUB: &str = "*";
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -118,6 +120,18 @@ pub fn validate(b: &TransportBinding) -> Result<(), String> {
         return Err("reason is required: a binding decides whose name a member's acts travel \
                     under, so the record has to say why"
             .into());
+    }
+    // Phase A resolves only the wildcard binding: `member_notify` does not know which hub a
+    // routed send will leave through (the drain picks it). A hub-specific binding would be
+    // persisted, read back as authoritative, and ignored at send time, so a
+    // `direct_required` on one hub would fail open. Refused until the send path carries the
+    // hub (GPT review of #1031).
+    if b.hub != ANY_HUB {
+        return Err(format!(
+            "hub must be \"{ANY_HUB}\" in this version: routed sends do not yet know which hub \
+             they leave through, so a binding scoped to one hub would be stored and never \
+             enforced"
+        ));
     }
     let carrier = b.carrier_lct.as_deref().map(str::trim).filter(|c| !c.is_empty());
     match b.mode {
@@ -270,6 +284,9 @@ mod tests {
         let mut no_reason = b("m", TransportMode::DirectRequired, None, None);
         no_reason.reason = " ".into();
         assert!(validate(&no_reason).unwrap_err().contains("reason"));
+        let mut one_hub = b("m", TransportMode::DirectRequired, None, None);
+        one_hub.hub = "hub-lct-1".into();
+        assert!(validate(&one_hub).unwrap_err().contains("never"), "a hub-scoped binding must not be stored and ignored");
     }
 
     #[test]

@@ -7856,6 +7856,8 @@ mod transport_binding_route_tests {
             serde_json::json!({"member": "cbp-being", "mode": "direct", "reason": "r"}),
             serde_json::json!({"member": "cbp-being", "mode": "direct_required"}),
             serde_json::json!({"member": "cbp-being", "mode": "sideways", "reason": "r"}),
+            // GPT review of #1031: a hub-scoped binding would be stored and never enforced.
+            serde_json::json!({"member": "cbp-being", "hub": "hub-lct-1", "mode": "direct_required", "reason": "r"}),
         ] {
             assert_eq!(set(&state, body.clone()).await.status(), StatusCode::BAD_REQUEST, "{body}");
         }
