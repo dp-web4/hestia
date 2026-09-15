@@ -112,6 +112,7 @@ impl ServerHandler for HestiaServer {
             "hestia_member_notify" => tool_member_notify(&self.state, &args).await,
             "hestia_member_inbox" => tool_member_inbox(&self.state, &args).await,
             "hestia_egress_pending" => tool_egress_pending(&self.state, &args).await,
+            "hestia_transport_binding" => tool_transport_binding(&self.state, &args).await,
             "hestia_member_unanswered" => tool_member_unanswered(&self.state, &args).await,
             "hestia_inbox" => tool_inbox(&self.state, &args).await,
             "hestia_pair_inbox" => tool_pair_inbox(&self.state, &args).await,
@@ -519,7 +520,11 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_egress_pending",
-            "Forwarding plane (r6-routing branch 2): list notices addressed `peer/member` awaiting hand-off to the fleet mesh (each row carries the dest_peer_lct to forward on, and the list carries the drain contract), then report the outcome — `mark_forwarded: <id>` if the mesh accepted it, or `mark_failed: <id>` with `reason: <text>` if it did not. Accepted-by-mesh is NOT read-by-recipient. Leaving a failed row unreported is not neutral: the attempt bound never fires and the sender is never told its packet died",
+            "Forwarding plane (r6-routing branch 2): list notices addressed `peer/member` awaiting hand-off to the fleet mesh (each row carries the dest_peer_lct to forward on, and the list carries the drain contract), then report the outcome — `mark_forwarded: <id>` if the mesh accepted it, or `mark_failed: <id>` with `reason: <text>` if it did not. Accepted-by-mesh is NOT read-by-recipient. A row carrying `transport` (#1030) must be signed by its stamped carrier_lct: report `carrier_lct` and `hub_receipt` with mark_forwarded, or `fault: \"carrier_unavailable\"` with mark_failed if you hold no key for that carrier. Leaving a failed row unreported is not neutral: the attempt bound never fires and the sender is never told its packet died",
+        ),
+        t(
+            "hestia_transport_binding",
+            "Read YOUR transport bindings (#1030): which hub identity carries your routed `peer/member` sends off this host, under what mode (direct | relay | direct_required), and where replies belong. Read-only and self-scoped; bindings are written by the operator, never by the member they bind. No binding means the drain chooses the signing identity and replies follow whatever it chose",
         ),
         t(
             "hestia_member_unanswered",
@@ -4502,6 +4507,62 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             None => {}
         }
     }
+    // TRANSPORT BINDING (#1030), resolved for routed sends only, and BEFORE the limiter
+    // records or anything is witnessed as sent. A member bound `direct_required` must sign
+    // its mesh acts as itself and holds no carrier yet, so there is no identity this host may
+    // put on the envelope: the send is refused in the sender's own turn, where it can be
+    // acted on, instead of being queued for a drain that would sign it with somebody else's
+    // key. That silent fallback is the defect this binding exists to end (falsifier 2).
+    let routed = to_plugin.contains('/');
+    let transport_binding = if routed {
+        s.transport_bindings
+            .get(&sender.plugin_id, crate::server::transport_binding::ANY_HUB)
+            .cloned()
+    } else {
+        None
+    };
+    if let Some(b) = transport_binding
+        .as_ref()
+        .filter(|b| b.mode == crate::server::transport_binding::TransportMode::DirectRequired)
+    {
+        let refusal = s.append_chain(
+            "member_notice_refused",
+            json!({
+                "reason": "transport_binding_unmet",
+                "to_plugin_id": to_plugin,
+                "from_plugin_id": sender.plugin_id,
+                "from_role_lct": sender.role_lct,
+                "kind": kind,
+                "transport": b.stamp(),
+                "binding_reason": b.reason,
+            }),
+        )?;
+        return Ok(hestia_error_envelope(
+            "hestia.member_notify_transport_unmet",
+            &format!(
+                "'{}' is bound `direct_required`: its routed sends must be signed by its OWN \
+                 hub identity, and none is bound yet. Nothing was queued and nothing was sent — \
+                 this host will not carry the act under another member's key. The operator \
+                 binds the carrier (`POST /api/transport/binding`, mode `direct`); read your \
+                 binding with hestia_transport_binding. Local (non-routed) notices are \
+                 unaffected.",
+                sender.plugin_id
+            ),
+            Some(json!({
+                "to_plugin_id": to_plugin,
+                "transport": b.stamp(),
+                "refusalEntryHash": refusal.hash,
+            })),
+        ));
+    }
+    // What the act's record and receipt say about how it will travel: the stamp when bound,
+    // the literal "unbound" when routed without a binding, absent when local.
+    let transport_record: Option<Value> = routed.then(|| {
+        transport_binding
+            .as_ref()
+            .map(|b| b.stamp())
+            .unwrap_or_else(|| json!("unbound"))
+    });
     s.member_notify_limiter.record(&sender.plugin_id);
     // What is known about the recipient's reachability, resolved BEFORE the
     // witness so the chain entry carries it (an act's record must include the
@@ -4514,21 +4575,22 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     let (liveness, liveness_evidence) = recipient_liveness(&s.inbox_store, &to_plugin);
     // Witness FIRST (the act is the send; delivery is a consequence), then queue
     // with the chain hash so every parked notice is anchored to its witnessed act.
-    let entry = s.append_chain(
-        "member_notice",
-        json!({
-            "to_plugin_id": to_plugin,
-            "from_plugin_id": sender.plugin_id,
-            "from_role_lct": sender.role_lct,
-            "from_session_id": sender.session_uuid,
-            "kind": kind,
-            "pointer_uri": pointer_uri,
-            "in_reply_to": in_reply_to,
-            "binding_verified": binding_verified,
-            "recipient_liveness": liveness,
-            "recipient_liveness_evidence": liveness_evidence,
-        }),
-    )?;
+    let mut notice_record = json!({
+        "to_plugin_id": to_plugin,
+        "from_plugin_id": sender.plugin_id,
+        "from_role_lct": sender.role_lct,
+        "from_session_id": sender.session_uuid,
+        "kind": kind,
+        "pointer_uri": pointer_uri,
+        "in_reply_to": in_reply_to,
+        "binding_verified": binding_verified,
+        "recipient_liveness": liveness,
+        "recipient_liveness_evidence": liveness_evidence,
+    });
+    if let Some(t) = &transport_record {
+        notice_record["transport"] = t.clone();
+    }
+    let entry = s.append_chain("member_notice", notice_record)?;
     // ---- r6-routing branch 2: is it for someone I know? then forward ------------
     // `peer/member` addresses a member on ANOTHER machine. A bare id stays local,
     // so no existing caller changes. Explicit rather than inferred: the sender
@@ -4566,7 +4628,19 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
                 pointer_uri.as_deref(),
                 &entry.hash,
             ) {
-                Ok(id) => id,
+                Ok(id) => {
+                    // Stamped under the same server lock as the enqueue, so no drainer can
+                    // list the row between the two writes. If the stamp write itself fails
+                    // the row is left unstamped while its sender IS bound, which the list
+                    // arm reads as a changed binding and fails toward the sender, so the
+                    // error below cannot become a seat-signed send.
+                    if let Some(b) = &transport_binding {
+                        s.inbox_store
+                            .set_egress_transport_stamp(id, &b.stamp().to_string())
+                            .map_err(|e| anyhow::anyhow!("stamping egress row {id} with its transport binding: {e}"))?;
+                    }
+                    id
+                }
                 Err(e) => {
                     // The refusal gets its OWN chain entry (McNugget T3 on `17a928d`).
                     // The witness above says `member_notice` and reads, to any third
@@ -4660,6 +4734,19 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     if let Some(note) = liveness_note(liveness, &to_plugin) {
         out["recipient_note"] = json!(note);
     }
+    // How the act will travel, told to the author at the moment it acts (#1030 falsifier 9).
+    // Unbound is reported, not refused: every seat on the fleet mesh is unbound today, and
+    // enforcement arrives per member, by binding.
+    if let Some(t) = transport_record {
+        if t == json!("unbound") {
+            out["transport_note"] = json!(
+                "no transport binding: the forwarding drain chooses which hub identity signs \
+                 this notice, and a reply follows THAT identity, so it may not come back to \
+                 you. See hestia_transport_binding."
+            );
+        }
+        out["transport"] = t;
+    }
     // Nudge, not a gate: for the two kinds whose disposition IS a response, an
     // unbound send is what leaves the sender's notice sitting "unanswered"
     // forever. Refusing it would be worse — a member with something to say and
@@ -4744,22 +4831,78 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
     }
 
     if let Some(id) = args.get("mark_forwarded").and_then(|v| v.as_u64()) {
+        use crate::server::transport_binding::{judge_forward, ForwardVerdict};
+        // #1030: the drainer says which hub identity signed and what the hub returned. Both
+        // are REPORTED, and labelled so (`carrier_proof: "reported"`); phase B replaces the
+        // label with the hub ledger's own record of the send.
+        let carrier_lct = optional_string(args, "carrier_lct")
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty());
+        let hub_receipt = args.get("hub_receipt").cloned().filter(|v| !v.is_null());
+        let row = s
+            .inbox_store
+            .egress_row(id)
+            .map_err(|e| anyhow::anyhow!("reading egress row {id}: {e}"))?;
+        let stamp: Option<Value> = row
+            .as_ref()
+            .and_then(|r| r.transport_stamp.as_deref())
+            .and_then(|t| serde_json::from_str(t).ok());
+        let verdict = judge_forward(stamp.as_ref(), carrier_lct.as_deref());
+        if let (Some(row), ForwardVerdict::CarrierUnreported | ForwardVerdict::CarrierMismatch { .. }) =
+            (&row, &verdict)
+        {
+            // Not a forwarded success, and not left pending either: the send has already
+            // happened, so leaving the row queued would have the drain send it again every
+            // tick. It is retired, witnessed as what it is, and reported to its author.
+            let (event, fragment, detail) = match &verdict {
+                ForwardVerdict::CarrierMismatch { stamped, reported } => (
+                    "egress_carrier_mismatch",
+                    "carrier-mismatch",
+                    json!({"stamped_carrier_lct": stamped, "reported_carrier_lct": reported}),
+                ),
+                _ => (
+                    "egress_carrier_unreported",
+                    "carrier-unreported",
+                    json!({"stamped_carrier_lct": stamp.as_ref().and_then(|t| t.get("carrier_lct")).cloned()}),
+                ),
+            };
+            let mut detail = detail;
+            detail["hub_receipt"] = hub_receipt.clone().unwrap_or(Value::Null);
+            return retire_and_report_transport(&mut s, row, &who, stamp.as_ref(), event, fragment, detail);
+        }
         s.inbox_store
             .mark_egress_forwarded(id)
             .map_err(|e| anyhow::anyhow!("marking egress forwarded: {e}"))?;
         // (c) The destroying disposition now leaves a witness naming the actor. The
         // daemon already knew who it was; it simply never wrote it down.
-        let _ = s.append_chain(
-            "egress_forwarded",
-            json!({
-                "row_id": id,
-                "forwarded_by": who.plugin_id,
-                "role_lct": who.role_lct,
-                "note": "row retired from the egress queue; this is the disposition that \
-                         drops a packet from both admission counts",
-            }),
-        );
-        return Ok(json!({ "marked": id, "by": who.plugin_id, "witnessed": true }));
+        let mut record = json!({
+            "row_id": id,
+            "forwarded_by": who.plugin_id,
+            "role_lct": who.role_lct,
+            "note": "row retired from the egress queue; this is the disposition that \
+                     drops a packet from both admission counts",
+        });
+        // #1030: `forwarded_by` names the DRAINER. The carrier (the hub identity whose key
+        // signed) is a different role and is recorded separately, with its evidence class.
+        if row.is_some() {
+            record["carrier_lct"] = json!(carrier_lct);
+            record["carrier_proof"] = json!(if carrier_lct.is_some() { "reported" } else { "none" });
+            record["hub_receipt"] = hub_receipt.clone().unwrap_or(Value::Null);
+            match (&verdict, &stamp) {
+                (ForwardVerdict::Honoured, Some(t)) => {
+                    record["transport"] = t.clone();
+                    record["binding_version"] = t.get("version").cloned().unwrap_or(Value::Null);
+                }
+                _ => record["transport"] = json!("unbound"),
+            }
+        }
+        let _ = s.append_chain("egress_forwarded", record);
+        let mut out = json!({ "marked": id, "by": who.plugin_id, "witnessed": true });
+        if row.is_some() {
+            out["transport"] = json!(if verdict == ForwardVerdict::Honoured { "honoured" } else { "unbound" });
+            out["carrier_lct"] = json!(carrier_lct);
+        }
+        return Ok(out);
     }
 
     // ---- the other disposition: the hand-off did not land -----------------------
@@ -4778,6 +4921,27 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
     // free was silenced by an access modifier.
     if let Some(id) = args.get("mark_failed").and_then(|v| v.as_u64()) {
         let reason = optional_string(args, "reason").unwrap_or_else(|| "unspecified".into());
+        // #1030: `fault: "carrier_unavailable"` — the drain holds no signing material for the
+        // carrier the row is stamped with, so it sent NOTHING and will not sign under another
+        // identity. Retrying cannot help (the keys on this host do not change between ticks),
+        // and exhausting attempts would end in `member_notice_unreachable`, a claim about a
+        // PEER this host never contacted. So the row is retired now as a local transport
+        // fault and its author is told.
+        if optional_string(args, "fault").as_deref() == Some("carrier_unavailable") {
+            let row = s
+                .inbox_store
+                .egress_row(id)
+                .map_err(|e| anyhow::anyhow!("reading egress row {id}: {e}"))?;
+            let Some(row) = row else {
+                return Ok(json!({"row_id": id, "retired": false, "by": who.plugin_id,
+                                 "note": "no egress row with that id"}));
+            };
+            let stamp: Option<Value> = row.transport_stamp.as_deref().and_then(|t| serde_json::from_str(t).ok());
+            let detail = json!({"reason": reason});
+            return retire_and_report_transport(
+                &mut s, &row, &who, stamp.as_ref(), "egress_carrier_unavailable", "carrier-unavailable", detail,
+            );
+        }
         // G7, consumed as its doc comment asks: `None` means the UPDATE matched no
         // row — already forwarded, already retired, or never existed. Nothing
         // happened, so nothing is claimed. Re-reading the counter unconditionally
@@ -4809,10 +4973,29 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
     }
 
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
-    let rows = s
+    let listed = s
         .inbox_store
         .pending_egress(limit)
         .map_err(|e| anyhow::anyhow!("reading egress queue: {e}"))?;
+    // #1030 falsifier 6, decided HERE because this is the last point before a drain sends
+    // anything: a row whose sender's binding changed while it waited (including bound since
+    // an unbound enqueue, or unbound since a bound one) is not travelling under the contract
+    // it was sent under. It is failed toward its author, never relabelled and never handed out.
+    let mut rows = Vec::with_capacity(listed.len());
+    let mut transport_refused: Vec<Value> = Vec::new();
+    for r in listed {
+        use crate::server::transport_binding::{stamp_is_current, stamped_version, ANY_HUB};
+        let stamp: Option<Value> = r.transport_stamp.as_deref().and_then(|t| serde_json::from_str(t).ok());
+        let current = s.transport_bindings.get(&r.from_plugin, ANY_HUB).map(|b| b.version);
+        let stamped = stamped_version(stamp.as_ref());
+        if stamp_is_current(stamped, current) {
+            rows.push((r, stamp));
+            continue;
+        }
+        let detail = json!({"stamped_version": stamped, "current_version": current});
+        let out = retire_and_report_transport(&mut s, &r, &who, stamp.as_ref(), "egress_transport_stale", "transport-stale", detail)?;
+        transport_refused.push(out);
+    }
     // `dest_peer_lct` is EMPTY on every row this daemon has ever written, and the
     // response says so per row rather than handing back `""` and letting the drain
     // decide what that means.
@@ -4835,7 +5018,7 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
     // not a bug fix.
     let pending: Vec<Value> = rows
         .into_iter()
-        .map(|r| {
+        .map(|(r, stamp)| {
             let lct = (!r.dest_peer_lct.trim().is_empty()).then(|| r.dest_peer_lct.clone());
             json!({ "id": r.id, "dest_peer": r.dest_peer,
                     "dest_peer_lct": lct,
@@ -4843,7 +5026,9 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
                     "forward_on_is_lct": lct.is_some(),
                     "to_member": r.to_member, "from_plugin": r.from_plugin,
                     "kind": r.kind, "pointer_uri": r.pointer_uri,
-                    "attempts": r.attempts, "last_error": r.last_error })
+                    "attempts": r.attempts, "last_error": r.last_error,
+                    // #1030: the contract this row was queued under; null = unbound.
+                    "transport": stamp })
         })
         .collect();
     let unresolved = pending
@@ -4863,8 +5048,18 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
                            hub-notify, so an address on the name changes meaning when an \
                            unrelated member joins the fleet.",
             "on_success": "mark_forwarded:<id> — means the MESH accepted it, not that the \
-                           recipient read it.",
-            "on_failure": "mark_failed:<id> with reason:<text>. Leaving a failed row \
+                           recipient read it. Pass carrier_lct:<the hub member whose key \
+                           signed> and hub_receipt:<what the hub returned>.",
+            "transport": "a row with `transport` set must be signed by its `carrier_lct` and \
+                          nothing else: never fall back to another identity. A mark_forwarded \
+                          on such a row that omits carrier_lct, or names a different one, is \
+                          NOT a forwarded success: the row is retired and its author is told. \
+                          A row with `transport: null` is unbound: sign as you do today and \
+                          still report carrier_lct, which the witness records as reported.",
+            "on_failure": "mark_failed:<id> with reason:<text>. If you hold no signing \
+                           material for a row's stamped carrier_lct, send nothing and add \
+                           fault:\"carrier_unavailable\": the row is retired as THIS host's \
+                           fault and its author told, with no claim against the peer. Leaving a failed row \
                            pending is not neutral: attempts never increments, the bound \
                            never fires, and the sender is never told its packet died.",
             "never": "silence. An empty `pending` list and a refused call must not look \
@@ -4873,6 +5068,9 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
             "max_attempts": crate::storage::inbox::MAX_EGRESS_ATTEMPTS,
         },
     });
+    if !transport_refused.is_empty() {
+        out["transport_refused"] = json!(transport_refused);
+    }
     if unresolved > 0 {
         out["unresolved_note"] = json!(format!(
             "{unresolved} of {} row(s) carry no dest_peer_lct and can only be forwarded on \
@@ -4881,6 +5079,120 @@ async fn tool_egress_pending(state: &SharedState, args: &Value) -> ToolResult {
              hub-notify's prefix resolver does deliver today.",
             out["total"]
         ));
+    }
+    Ok(out)
+}
+
+/// Retire an egress row whose transport did not hold, witness why, and tell its author
+/// (#1030). Deliberately NOT `retire_and_report_egress`: that path writes
+/// `member_notice_unreachable`, a durable claim about the PEER, and nothing here is the
+/// peer's doing. The fault is this host's transport (a stale binding, a carrier nobody
+/// bound), so the chain names it as such and the peer's record is untouched.
+///
+/// Once-per-row by `retire_egress`'s transition check, like its sibling: a lost race is
+/// neither witnessed nor reported again. The report is a daemon `unreachable` notice
+/// because that is the kind every member's rendering path already admits; its pointer
+/// fragment says which transport fault it was.
+fn retire_and_report_transport(
+    s: &mut super::state::ServerState,
+    row: &crate::storage::inbox::EgressRow,
+    who: &CallerWho,
+    stamp: Option<&Value>,
+    event: &str,
+    fragment: &str,
+    detail: Value,
+) -> ToolResult {
+    let id = row.id;
+    if !s
+        .inbox_store
+        .retire_egress(id)
+        .map_err(|e| anyhow::anyhow!("retiring egress row {id}: {e}"))?
+    {
+        return Ok(json!({
+            "row_id": id, "retired": false, "by": who.plugin_id, "fault": fragment,
+            "note": "already settled by another drainer — not witnessed and not reported again",
+        }));
+    }
+    let entry = s.append_chain(
+        event,
+        json!({
+            "row_id": id,
+            "dest_peer": row.dest_peer,
+            "to_member": row.to_member,
+            "from_plugin": row.from_plugin,
+            "kind": row.kind,
+            "pointer_uri": row.pointer_uri,
+            "transport": stamp.cloned().unwrap_or_else(|| json!("unbound")),
+            "detail": detail,
+            "retired_by": who.plugin_id,
+            "retired_by_role": who.role_lct,
+            "note": "a transport fault on THIS host, not a claim about the peer",
+        }),
+    )?;
+    let report_id = s
+        .inbox_store
+        .enqueue_member(
+            &row.from_plugin,
+            "hestia",
+            crate::reputation::DEFAULT_CONSTELLATION_ROLE,
+            DAEMON_NOTICE_KIND_UNREACHABLE,
+            Some(&format!(
+                "hestia://egress/{id}#{fragment}:{}/{}",
+                row.dest_peer, row.to_member
+            )),
+            &entry.hash,
+            None,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "egress row {id} was retired on a transport fault and witnessed, but the \
+                 author's report could NOT be queued ({e}) — {} does not know",
+                row.from_plugin
+            )
+        })?;
+    Ok(json!({
+        "row_id": id, "retired": true, "by": who.plugin_id, "fault": fragment,
+        "forwarded_success": false,
+        "witnessEntryHash": entry.hash,
+        "reported_to": row.from_plugin,
+        "report_notice_id": report_id,
+    }))
+}
+
+/// `hestia_transport_binding` — a member reads its OWN transport bindings (#1030).
+///
+/// Self-scoped by the resolved caller and read-only. The write half is operator-only
+/// (`POST /api/transport/binding`): a member that could pick its own carrier would be picking
+/// whose name its acts travel under.
+async fn tool_transport_binding(state: &SharedState, args: &Value) -> ToolResult {
+    let mut s = state.lock().await;
+    let Some(who) = resolve_attributed_caller(&s, optional_session_id(args).as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.transport_binding_unattributed",
+            "hestia_transport_binding requires the caller's own live session_id (from \
+             hestia_connect): it answers for the member asking, so the member must be known",
+            None,
+        ));
+    };
+    if let Some(denied) =
+        gate_direct_tool(&mut s, &who, "hestia_transport_binding", "member_notify", "transport_binding")
+    {
+        return Ok(denied);
+    }
+    let bindings: Vec<&crate::server::transport_binding::TransportBinding> =
+        s.transport_bindings.for_member(&who.plugin_id);
+    let unbound = bindings.is_empty();
+    let mut out = json!({
+        "member": who.plugin_id,
+        "bindings": bindings,
+        "generation": s.transport_bindings.generation,
+    });
+    if unbound {
+        out["note"] = json!(
+            "no binding: your routed sends are forwarded under whatever hub identity the \
+             drain on this host signs with, and replies follow that identity. Every such send \
+             is witnessed as `transport: \"unbound\"`. A binding is set by the operator."
+        );
     }
     Ok(out)
 }
@@ -22791,5 +23103,290 @@ mod delegated_scope_arbitration_tests {
         .await
         .unwrap();
         assert_eq!(out["_hestia_error"]["code"], "hestia.scope_request_not_pending", "{out}");
+    }
+}
+
+/// #1030 phase A: a member's routed act travels under a transport binding the operator set,
+/// the binding is stamped on the act, and a transport that did not hold reaches the AUTHOR
+/// rather than only the chain. Each test is one falsifier from the issue, named in its doc.
+#[cfg(test)]
+mod transport_binding_tests {
+    use super::*;
+    use crate::server::transport_binding::{TransportBinding, TransportMode, ANY_HUB};
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    const BEING_LCT: &str = "7ba65c0d-0000-4000-8000-000000000001";
+    const SEAT_LCT: &str = "83810b44-0000-4000-8000-000000000002";
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    async fn connect(state: &SharedState, plugin: &str) -> String {
+        let c = tool_connect(state, &json!({"plugin_id": plugin, "host_agent": "t"}))
+            .await
+            .unwrap();
+        c["sessionId"].as_str().unwrap().to_string()
+    }
+
+    async fn bind(state: &SharedState, member: &str, mode: TransportMode, carrier: Option<&str>) -> u64 {
+        let mut s = state.lock().await;
+        s.commit_transport_bindings(|st| {
+            st.set(TransportBinding {
+                member: member.into(),
+                hub: ANY_HUB.into(),
+                mode,
+                carrier_lct: carrier.map(Into::into),
+                reply_to_lct: carrier.map(Into::into),
+                delegation_ref: None,
+                reason: "test".into(),
+                set_by: "operator".into(),
+                set_at: 1,
+                version: 0,
+            })
+        })
+        .unwrap()
+    }
+
+    async fn send(state: &SharedState, sid: &str, to: &str) -> Value {
+        tool_member_notify(
+            state,
+            &json!({"to_plugin_id": to, "kind": "coordination",
+                    "pointer_uri": "shared-context/forum/ask.md", "session_id": sid}),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn events(state: &SharedState, kind: &str) -> Vec<Value> {
+        let s = state.lock().await;
+        s.recent_chain(200)
+            .into_iter()
+            .filter(|e| e.event_type == kind)
+            .map(|e| e.event_data)
+            .collect()
+    }
+
+    /// Falsifier 2: bound `direct_required` with no carrier, a routed send makes no row and
+    /// no hub send, fails visibly in the sender's own turn, and local notices still work.
+    #[tokio::test]
+    async fn direct_required_refuses_a_routed_send_before_anything_is_queued() {
+        let (_dir, state) = test_state().await;
+        bind(&state, "cbp-being", TransportMode::DirectRequired, None).await;
+        let being = connect(&state, "cbp-being").await;
+
+        let out = send(&state, &being, "legion/legion-being").await;
+        assert_eq!(out["_hestia_error"]["code"], "hestia.member_notify_transport_unmet", "{out}");
+        assert!(state.lock().await.inbox_store.pending_egress(50).unwrap().is_empty(), "no row, so no drain can send it");
+        let refused = events(&state, "member_notice_refused").await;
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0]["reason"], "transport_binding_unmet");
+        assert!(events(&state, "member_notice").await.is_empty(), "a refused act is not witnessed as a send");
+
+        let local = send(&state, &being, "kimi-code").await;
+        assert!(local["queued_id"].is_number(), "a local notice needs no carrier: {local}");
+        assert!(local.get("transport").is_none(), "local sends carry no transport: {local}");
+    }
+
+    /// Falsifier 9 at send time, and the stamp the drain consumes: the author's receipt, the
+    /// witness and the listed row all carry the same binding and version.
+    #[tokio::test]
+    async fn a_bound_send_is_stamped_on_its_receipt_witness_and_row() {
+        let (_dir, state) = test_state().await;
+        let v = bind(&state, "cbp-being", TransportMode::Direct, Some(BEING_LCT)).await;
+        let being = connect(&state, "cbp-being").await;
+        let drain = connect(&state, "hestia-router").await;
+
+        let out = send(&state, &being, "legion/legion-being").await;
+        assert_eq!(out["transport"]["mode"], "direct", "{out}");
+        assert_eq!(out["transport"]["carrier_lct"], BEING_LCT);
+        assert_eq!(out["transport"]["version"], v);
+        assert!(out.get("transport_note").is_none());
+        assert_eq!(events(&state, "member_notice").await[0]["transport"]["carrier_lct"], BEING_LCT);
+
+        let listed = tool_egress_pending(&state, &json!({"session_id": drain})).await.unwrap();
+        assert_eq!(listed["pending"][0]["transport"]["carrier_lct"], BEING_LCT, "{listed}");
+        assert_eq!(listed["pending"][0]["transport"]["version"], v);
+        assert!(listed["drain_contract"]["transport"].is_string());
+    }
+
+    /// Rollout: an unbound member keeps today's forwarding, but nothing about it is silent —
+    /// the receipt says unbound, and the witness records the carrier the drain reported as
+    /// REPORTED, next to (not instead of) the drainer.
+    #[tokio::test]
+    async fn an_unbound_routed_send_is_forwarded_and_labelled_unbound() {
+        let (_dir, state) = test_state().await;
+        let being = connect(&state, "cbp-being").await;
+        let drain = connect(&state, "hestia-router").await;
+
+        let out = send(&state, &being, "legion/legion-being").await;
+        assert_eq!(out["transport"], "unbound", "{out}");
+        assert!(out["transport_note"].as_str().unwrap().contains("reply"));
+        let listed = tool_egress_pending(&state, &json!({"session_id": drain})).await.unwrap();
+        assert!(listed["pending"][0]["transport"].is_null(), "{listed}");
+        let id = listed["pending"][0]["id"].as_u64().unwrap();
+
+        let marked = tool_egress_pending(
+            &state,
+            &json!({"session_id": drain, "mark_forwarded": id, "carrier_lct": SEAT_LCT}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(marked["transport"], "unbound", "{marked}");
+        let fwd = events(&state, "egress_forwarded").await;
+        assert_eq!(fwd[0]["forwarded_by"], "hestia-router");
+        assert_eq!(fwd[0]["carrier_lct"], SEAT_LCT);
+        assert_eq!(fwd[0]["carrier_proof"], "reported");
+        assert_eq!(fwd[0]["transport"], "unbound");
+    }
+
+    /// Falsifier 1, hestia's half: the honoured forward names the drainer and the carrier as
+    /// two roles, with the binding version and hub receipt as the evidence, and tells the
+    /// author nothing because nothing went wrong.
+    #[tokio::test]
+    async fn an_honoured_forward_records_the_carrier_apart_from_the_drainer() {
+        let (_dir, state) = test_state().await;
+        let v = bind(&state, "cbp-being", TransportMode::Direct, Some(BEING_LCT)).await;
+        let being = connect(&state, "cbp-being").await;
+        let drain = connect(&state, "hestia-router").await;
+        let id = send(&state, &being, "legion/legion-being").await["queued_id"].as_u64().unwrap();
+
+        let marked = tool_egress_pending(
+            &state,
+            &json!({"session_id": drain, "mark_forwarded": id,
+                    "carrier_lct": BEING_LCT.to_uppercase(), "hub_receipt": {"ledger_id": 42}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(marked["transport"], "honoured", "{marked}");
+        let fwd = events(&state, "egress_forwarded").await;
+        assert_eq!(fwd[0]["forwarded_by"], "hestia-router");
+        assert_eq!(fwd[0]["carrier_proof"], "reported", "phase A cannot prove the carrier and must say so");
+        assert_eq!(fwd[0]["binding_version"], v);
+        assert_eq!(fwd[0]["hub_receipt"]["ledger_id"], 42);
+        let s = state.lock().await;
+        assert!(s.inbox_store.pending_egress(50).unwrap().is_empty());
+        assert!(s.inbox_store.drain_member("cbp-being").unwrap().is_empty());
+    }
+
+    /// Falsifier 4 (and the unreported half of 5): a forward under a carrier the binding does
+    /// not name, or under no named carrier, is not a forwarded success. The row is retired
+    /// (it was sent; re-listing would send it again), the fault is witnessed as THIS host's,
+    /// the PEER is not indicted, the author is told once, and a repeated mark changes nothing.
+    #[tokio::test]
+    async fn a_wrong_or_unreported_carrier_is_not_a_forwarded_success() {
+        let (_dir, state) = test_state().await;
+        bind(&state, "cbp-being", TransportMode::Direct, Some(BEING_LCT)).await;
+        let being = connect(&state, "cbp-being").await;
+        let drain = connect(&state, "hestia-router").await;
+        let wrong = send(&state, &being, "legion/legion-being").await["queued_id"].as_u64().unwrap();
+        let silent = send(&state, &being, "sprout/sprout-being").await["queued_id"].as_u64().unwrap();
+
+        let out = tool_egress_pending(
+            &state,
+            &json!({"session_id": drain, "mark_forwarded": wrong, "carrier_lct": SEAT_LCT}),
+        )
+        .await
+        .unwrap();
+        assert_eq!((out["retired"].clone(), out["forwarded_success"].clone()), (json!(true), json!(false)), "{out}");
+        let out = tool_egress_pending(&state, &json!({"session_id": drain, "mark_forwarded": silent}))
+            .await
+            .unwrap();
+        assert_eq!(out["fault"], "carrier-unreported", "{out}");
+
+        let again = tool_egress_pending(
+            &state,
+            &json!({"session_id": drain, "mark_forwarded": wrong, "carrier_lct": SEAT_LCT}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(again["retired"], false, "a settled row is not reported twice: {again}");
+
+        assert_eq!(events(&state, "egress_carrier_mismatch").await[0]["detail"]["reported_carrier_lct"], SEAT_LCT);
+        assert_eq!(events(&state, "egress_carrier_unreported").await.len(), 1);
+        assert!(events(&state, "egress_forwarded").await.is_empty(), "neither is a forwarded success");
+        assert!(events(&state, "member_notice_unreachable").await.is_empty(), "the peer did nothing wrong");
+        let s = state.lock().await;
+        assert!(s.inbox_store.pending_egress(50).unwrap().is_empty(), "retired, so never re-sent");
+        let mail = s.inbox_store.drain_member("cbp-being").unwrap();
+        let pointers: Vec<String> = mail.iter().filter_map(|n| n.pointer_uri.clone()).collect();
+        assert_eq!(mail.len(), 2, "the author is told once per row: {pointers:?}");
+        assert!(pointers.iter().any(|p| p.contains("carrier-mismatch:legion/legion-being")), "{pointers:?}");
+        assert!(pointers.iter().any(|p| p.contains("carrier-unreported:sprout/sprout-being")), "{pointers:?}");
+    }
+
+    /// Falsifier 6: a binding that changes while a row waits — rebound, removed, or added
+    /// after an unbound send — fails the row toward its author at LIST time, before any
+    /// drain can send it under a contract it was not queued under.
+    #[tokio::test]
+    async fn a_binding_changed_while_queued_fails_toward_the_author_before_the_send() {
+        let (_dir, state) = test_state().await;
+        let being = connect(&state, "cbp-being").await;
+        let drain = connect(&state, "hestia-router").await;
+        send(&state, &being, "legion/legion-being").await; // queued unbound
+        bind(&state, "cbp-being", TransportMode::Direct, Some(BEING_LCT)).await;
+        send(&state, &being, "sprout/sprout-being").await; // queued under v1
+        bind(&state, "cbp-being", TransportMode::DirectRequired, None).await; // v2
+
+        let listed = tool_egress_pending(&state, &json!({"session_id": drain})).await.unwrap();
+        assert_eq!(listed["total"], 0, "neither row may be handed to a drain: {listed}");
+        let refused = listed["transport_refused"].as_array().unwrap();
+        assert_eq!(refused.len(), 2);
+        assert!(refused.iter().all(|r| r["fault"] == "transport-stale" && r["retired"] == true));
+        let stale = events(&state, "egress_transport_stale").await;
+        assert_eq!(stale.len(), 2);
+        assert!(stale.iter().any(|e| e["detail"]["stamped_version"].is_null()));
+        assert_eq!(state.lock().await.inbox_store.drain_member("cbp-being").unwrap().len(), 2);
+    }
+
+    /// Falsifier 2, drain side: a drain with no key for the stamped carrier sends nothing and
+    /// says so. The row is retired at once as a local fault (no attempt budget to burn), the
+    /// author is told, and the peer is not indicted.
+    #[tokio::test]
+    async fn a_drain_without_the_stamped_carrier_retires_the_row_as_a_local_fault() {
+        let (_dir, state) = test_state().await;
+        bind(&state, "cbp-being", TransportMode::Direct, Some(BEING_LCT)).await;
+        let being = connect(&state, "cbp-being").await;
+        let drain = connect(&state, "hestia-router").await;
+        let id = send(&state, &being, "legion/legion-being").await["queued_id"].as_u64().unwrap();
+
+        let out = tool_egress_pending(
+            &state,
+            &json!({"session_id": drain, "mark_failed": id, "fault": "carrier_unavailable",
+                    "reason": "no hub identity file for the stamped carrier"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!((out["retired"].clone(), out["fault"].clone()), (json!(true), json!("carrier-unavailable")), "{out}");
+        assert!(events(&state, "member_notice_unreachable").await.is_empty(), "the peer was never contacted");
+        assert_eq!(events(&state, "egress_carrier_unavailable").await.len(), 1);
+        let s = state.lock().await;
+        assert!(s.inbox_store.pending_egress(50).unwrap().is_empty());
+        let mail = s.inbox_store.drain_member("cbp-being").unwrap();
+        assert!(mail[0].pointer_uri.as_deref().unwrap().contains("carrier-unavailable"), "{mail:?}");
+    }
+
+    /// A member reads its own binding and only its own; the read carries no write.
+    #[tokio::test]
+    async fn a_member_reads_only_its_own_transport_binding() {
+        let (_dir, state) = test_state().await;
+        bind(&state, "cbp-being", TransportMode::Direct, Some(BEING_LCT)).await;
+        bind(&state, "legion-being", TransportMode::DirectRequired, None).await;
+        let being = connect(&state, "cbp-being").await;
+        let seat = connect(&state, "claude-code").await;
+
+        let mine = tool_transport_binding(&state, &json!({"session_id": being})).await.unwrap();
+        let bindings = mine["bindings"].as_array().unwrap();
+        assert_eq!(bindings.len(), 1, "{mine}");
+        assert_eq!(bindings[0]["carrier_lct"], BEING_LCT);
+        let other = tool_transport_binding(&state, &json!({"session_id": seat})).await.unwrap();
+        assert_eq!(other["bindings"], json!([]));
+        assert!(other["note"].as_str().unwrap().contains("unbound"));
+        let anon = tool_transport_binding(&state, &json!({})).await.unwrap();
+        assert_eq!(anon["_hestia_error"]["code"], "hestia.transport_binding_unattributed");
     }
 }

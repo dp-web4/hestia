@@ -418,6 +418,10 @@ pub struct ServerState {
     /// Never persisted: a restart reloads the vault copy, at which point memory and vault
     /// agree again (the grant resurrects, visibly, and a fresh revoke takes the normal path).
     pub standing_scope_dirty: bool,
+    /// Transport bindings (#1030): which hub identity carries each member's routed acts,
+    /// and where the answer belongs. Operator-written through `commit_transport_bindings`,
+    /// vault-persisted, read by `member_notify` at enqueue and by the egress plane.
+    pub transport_bindings: crate::server::transport_binding::TransportBindingStore,
     /// Hub-law gate (consolidation, 2026-07-10): the third fold input.
     /// `None` = no law file at `$HESTIA_HOME/law/hub-law.yaml` (no-op);
     /// `Some(Invalid)` fails closed. See `policy::law_gate`.
@@ -639,6 +643,13 @@ impl ServerState {
         // before the standing-scope feature landed also has no document, and empty is a
         // 24-hour outage wearing the same face. The chain tells them apart: it is this
         // society's history, and a society that has acted has entries.
+        let transport_bindings: crate::server::transport_binding::TransportBindingStore = {
+            use anyhow::Context;
+            crate::vault::load_doc(&vault, "transport", "bindings", "transport-bindings.json").context(
+                "transport-binding store unreadable: failing closed rather than forwarding members' \
+                 acts under carriers nobody bound",
+            )?
+        };
         let standing_doc_present = vault.get_document("scope", "standing").is_some();
         let standing_scope: crate::server::standing_scope::StandingScopeStore = {
             use anyhow::Context;
@@ -700,6 +711,7 @@ impl ServerState {
             standing_projection_audit: None,
             // Memory was just loaded FROM the vault, so the two agree by construction.
             standing_scope_dirty: false,
+            transport_bindings,
             law_gate,
             synthetic_plugins,
             home: home.to_path_buf(),
@@ -1068,6 +1080,20 @@ impl ServerState {
         // committed mutation.
         self.standing_scope_dirty = false;
         Ok(())
+    }
+
+    /// Mutate the transport-binding store through a candidate persisted BEFORE it becomes
+    /// live, the same construction as `commit_standing_scope`: on a persist failure the live
+    /// store, generation included, was never touched.
+    pub fn commit_transport_bindings<F, R>(&mut self, mutate: F) -> Result<R>
+    where
+        F: FnOnce(&mut crate::server::transport_binding::TransportBindingStore) -> R,
+    {
+        let mut candidate = self.transport_bindings.clone();
+        let out = mutate(&mut candidate);
+        crate::vault::save_doc(&mut self.vault, "transport", "bindings", "transport-bindings.json", &candidate)?;
+        self.transport_bindings = candidate;
+        Ok(out)
     }
 
     /// Re-read the authority from the vault and prove the runtime projection still equals it.

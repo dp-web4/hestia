@@ -325,6 +325,12 @@ impl SqliteInboxStore {
             // several notices legitimately share one entry (a multi-peer
             // invitation writes one row per invited seat, all on the open's hash).
             ("disposition_key", "TEXT"),
+            // The transport binding in force for the SENDER when a routed notice was queued
+            // (#1030): JSON {mode, carrier_lct, reply_to_lct, delegation_ref, hub, version},
+            // NULL when the sender had no binding. Stamped at enqueue so the drain forwards
+            // under the contract the act was made under, and so a binding that changes while
+            // the row waits is detected rather than silently applied.
+            ("transport_stamp", "TEXT"),
         ] {
             if !existing.iter().any(|c| c == col) {
                 conn.execute_batch(&format!(
@@ -680,6 +686,21 @@ impl SqliteInboxStore {
         Ok(conn.last_insert_rowid() as u64)
     }
 
+    /// Record the sender's transport binding on a just-queued egress row (#1030). A separate
+    /// write rather than a parameter to [`Self::enqueue_egress`] only to keep that function's
+    /// many callers unchanged; the handler makes both calls under the one server lock, so no
+    /// drainer can read the row between them.
+    pub fn set_egress_transport_stamp(&self, id: u64, stamp: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        conn.execute(
+            "UPDATE member_notices SET transport_stamp = ?1 WHERE id = ?2 AND dest_peer IS NOT NULL",
+            params![stamp, id as i64],
+        )
+        .context("stamping egress transport")?;
+        Ok(())
+    }
+
     /// Undrained forwards currently parked on the egress plane — the number the
     /// admission bound in [`Self::enqueue_egress`] tests. Exposed so a caller can
     /// report the queue depth without provoking the refusal.
@@ -714,7 +735,7 @@ impl SqliteInboxStore {
         Self::ensure_member_schema(&conn)?;
         let mut stmt = conn.prepare(
             "SELECT id, dest_peer, dest_peer_lct, to_plugin, from_plugin, kind, pointer_uri,
-                    attempts, last_error
+                    attempts, last_error, transport_stamp
                FROM member_notices
               WHERE dest_peer IS NOT NULL AND drained_at IS NULL
               ORDER BY id ASC LIMIT ?1",
@@ -730,6 +751,7 @@ impl SqliteInboxStore {
                 pointer_uri: r.get(6)?,
                 attempts: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
                 last_error: r.get(8)?,
+                transport_stamp: r.get(9)?,
             })
         })?;
         let mut out = Vec::new();
@@ -1312,7 +1334,7 @@ impl SqliteInboxStore {
         Self::ensure_member_schema(&conn)?;
         let mut stmt = conn.prepare(
             "SELECT id, dest_peer, dest_peer_lct, to_plugin, from_plugin, kind, pointer_uri,
-                    attempts, last_error
+                    attempts, last_error, transport_stamp
                FROM member_notices WHERE id = ?1 AND dest_peer IS NOT NULL",
         )?;
         let mut rows = stmt.query_map(params![id as i64], |r| {
@@ -1326,6 +1348,7 @@ impl SqliteInboxStore {
                 pointer_uri: r.get(6)?,
                 attempts: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
                 last_error: r.get(8)?,
+                transport_stamp: r.get(9)?,
             })
         })?;
         match rows.next() {
@@ -1590,6 +1613,8 @@ pub struct EgressRow {
     pub pointer_uri: Option<String>,
     pub attempts: i64,
     pub last_error: Option<String>,
+    /// The sender's transport binding when the row was queued (#1030); None = unbound.
+    pub transport_stamp: Option<String>,
 }
 
 #[cfg(test)]

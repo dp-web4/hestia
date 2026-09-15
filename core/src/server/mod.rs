@@ -15,6 +15,7 @@ pub mod operator_auth;
 pub mod seat_config;
 mod public_identity;
 pub mod standing_scope;
+pub mod transport_binding;
 mod state;
 
 pub use dashboard::{
