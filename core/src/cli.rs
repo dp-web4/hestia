@@ -1071,7 +1071,7 @@ fn cmd_init(home: &std::path::Path, force: bool, ai: bool) -> AnyResult<()> {
 
         // A CLEARTEXT, public-only identity artifact so a LOCKED node can self-identify —
         // `info` reads it without the vault passphrase, and it is what a hub needs to answer
-        // `/.well-known` before unlock (the dev-hub "clear tier-0 public-identity.json" wrinkle).
+        // `/.well-known` before unlock (the hub's clear tier-0 `public-identity.json`, web4 #355–357).
         // PUBLIC DATA ONLY: the LCT id is a shareable identifier derived from the public key; the
         // keypair stays sealed in the vault and never touches this file.
         let pub_identity = serde_json::json!({

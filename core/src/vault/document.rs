@@ -2,7 +2,7 @@
 //! to live in plaintext sidecar files, plus the per-item *protection* model
 //! that makes the vault recursive.
 //!
-//! Doctrine (see `dev-hub/design/recursive-vault.md`):
+//! Doctrine (see `web4/docs/best-practices/storage-and-key-management.md`):
 //! - **Total enclosure**: config/metadata/state live here, not in plaintext
 //!   files. A `Document` is one such item.
 //! - **Recursive locking**: a document may be `Master` (readable with the outer
