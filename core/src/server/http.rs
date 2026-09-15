@@ -1187,6 +1187,15 @@ pub async fn serve_with_callback(
         // one direction.
         .route("/api/scope/floor", post(scope_floor_add))
         .route("/api/scope/floor/remove", post(scope_floor_remove))
+        // TRANSPORT BINDINGS (#1030): which hub identity carries a member's routed acts, and
+        // where the answer belongs. Operator-only and deliberately absent from MCP (members
+        // READ theirs through `hestia_transport_binding`): a member that could choose its own
+        // carrier would be choosing whose name its acts travel under.
+        .route(
+            "/api/transport/binding",
+            get(transport_binding_list).post(transport_binding_set),
+        )
+        .route("/api/transport/binding/remove", post(transport_binding_remove))
         .route("/api/policy/preset", put(policy_set_preset))
         .route("/api/policy/override", put(policy_set_override))
         .route(
@@ -3564,6 +3573,218 @@ async fn scope_grant(
 /// the same list — produces N copies that drift the moment one member is granted something the
 /// others are not, and then the law differs per seat while looking identical. Uniformity has
 /// to be structural or it decays. One list cannot drift.
+async fn transport_binding_list(State(state): State<SharedState>) -> impl IntoResponse {
+    let s = state.lock().await;
+    Json(serde_json::json!({
+        "bindings": s.transport_bindings.bindings,
+        "generation": s.transport_bindings.generation,
+    }))
+}
+
+/// Set (insert or replace) a member's transport binding. Witness the intent, persist the
+/// candidate, then witness the terminal fact, rolling the store back if that last append
+/// fails: the same finality construction as `scope_floor_add`, because a binding decides
+/// whose key signs a member's acts and a record that overstates it is the defect #1030 is.
+async fn transport_binding_set(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use crate::server::transport_binding::{validate, TransportBinding, TransportMode, ANY_HUB};
+    let field = |k: &str| {
+        body.get(k)
+            .and_then(|v| v.as_str())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let Some(mode) = field("mode").as_deref().and_then(TransportMode::parse) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "mode is required: direct | relay | direct_required"
+            })),
+        );
+    };
+    let binding = TransportBinding {
+        member: field("member").unwrap_or_default(),
+        hub: field("hub").unwrap_or_else(|| ANY_HUB.to_string()),
+        mode,
+        carrier_lct: field("carrier_lct"),
+        reply_to_lct: field("reply_to_lct"),
+        delegation_ref: field("delegation_ref"),
+        reason: field("reason").unwrap_or_default(),
+        set_by: "operator".to_string(),
+        set_at: crate::server::gate_escalation::now_secs(),
+        version: 0,
+    };
+    if let Err(msg) = validate(&binding) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": msg})));
+    }
+
+    let mut s = state.lock().await;
+    let replaces = s.transport_bindings.get(&binding.member, &binding.hub).filter(|b| b.hub == binding.hub).cloned();
+    let intent = match s.append_chain(
+        "transport_binding_intent",
+        serde_json::json!({
+            "binding": binding,
+            "replaces": replaces,
+            "via": "operator_session",
+            "effect": "rows this member queued under any other binding are failed toward the \
+                       member at the next drain, never relabelled",
+        }),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("witness append failed, binding NOT changed: {e}"),
+                })),
+            );
+        }
+    };
+    let prior = s.transport_bindings.clone();
+    let version = match s.commit_transport_bindings(|st| st.set(binding.clone())) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("binding NOT changed — vault write failed ({e}); the live \
+                                      store is untouched, retry"),
+                    "intentEntryHash": intent.hash,
+                })),
+            );
+        }
+    };
+    let success = match s.append_chain(
+        "transport_binding_set",
+        serde_json::json!({
+            "member": binding.member, "hub": binding.hub, "mode": binding.mode.as_str(),
+            "carrier_lct": binding.carrier_lct, "reply_to_lct": binding.reply_to_lct,
+            "delegation_ref": binding.delegation_ref, "reason": binding.reason,
+            "version": version, "intent": intent.hash,
+        }),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            let restored = s.commit_transport_bindings(|st| *st = prior);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("the terminal transport_binding_set append failed ({e}); \
+                                      rollback: {}", match restored {
+                        Ok(()) => "prior bindings restored in memory and vault — NOT in force".to_string(),
+                        Err(rb) => format!("FAILED ({rb}) — THE BINDING IS LIVE without its success record"),
+                    }),
+                    "intentEntryHash": intent.hash,
+                })),
+            );
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "member": binding.member,
+            "hub": binding.hub,
+            "mode": binding.mode.as_str(),
+            "version": version,
+            "replaced": replaces.is_some(),
+            "successEntryHash": success.hash,
+        })),
+    )
+}
+
+/// Remove a member's transport binding for one hub. The member returns to unbound (the drain
+/// chooses, every forward witnessed `transport: "unbound"`); rows queued under the removed
+/// binding are failed toward the member at the next drain.
+async fn transport_binding_remove(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use crate::server::transport_binding::ANY_HUB;
+    let member = body.get("member").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let hub = body
+        .get("hub")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .unwrap_or(ANY_HUB)
+        .to_string();
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if member.is_empty() || reason.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "member and reason are required"})),
+        );
+    }
+    let mut s = state.lock().await;
+    let Some(existing) = s
+        .transport_bindings
+        .bindings
+        .iter()
+        .find(|b| b.member == member && b.hub == hub)
+        .cloned()
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "no binding for that member and hub", "member": member, "hub": hub})),
+        );
+    };
+    let intent = match s.append_chain(
+        "transport_binding_remove_intent",
+        serde_json::json!({"binding": existing, "reason": reason, "via": "operator_session"}),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("witness append failed, binding NOT removed: {e}")})),
+            );
+        }
+    };
+    let prior = s.transport_bindings.clone();
+    if let Err(e) = s.commit_transport_bindings(|st| st.remove(&member, &hub)) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("binding NOT removed — vault write failed ({e}); retry"),
+                "intentEntryHash": intent.hash,
+            })),
+        );
+    }
+    let generation = s.transport_bindings.generation;
+    match s.append_chain(
+        "transport_binding_removed",
+        serde_json::json!({
+            "member": member, "hub": hub, "reason": reason,
+            "removed_version": existing.version, "generation": generation, "intent": intent.hash,
+        }),
+    ) {
+        Ok(e) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true, "member": member, "hub": hub, "generation": generation,
+                "successEntryHash": e.hash,
+            })),
+        ),
+        Err(e) => {
+            let restored = s.commit_transport_bindings(|st| *st = prior);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("the terminal transport_binding_removed append failed ({e}); \
+                                      rollback: {}", match restored {
+                        Ok(()) => "binding restored in memory and vault — still in force".to_string(),
+                        Err(rb) => format!("FAILED ({rb}) — THE BINDING IS GONE without its success record"),
+                    }),
+                    "intentEntryHash": intent.hash,
+                })),
+            )
+        }
+    }
+}
+
 async fn scope_floor_add(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
@@ -7605,5 +7826,95 @@ mod tests {
         for s in spinners {
             s.await.unwrap();
         }
+    }
+}
+
+/// #1030: the operator writes transport bindings. Validation refuses the incomplete shapes,
+/// a write is durable across restart, and a set whose terminal witness fails is not in force.
+#[cfg(test)]
+mod transport_binding_route_tests {
+    use super::*;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    async fn set(state: &SharedState, body: serde_json::Value) -> axum::response::Response {
+        transport_binding_set(State(state.clone()), Json(body)).await.into_response()
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_binding_is_refused_and_writes_nothing() {
+        let (_dir, state) = test_state().await;
+        for body in [
+            serde_json::json!({"member": "cbp-being", "mode": "relay", "carrier_lct": "seat", "reason": "r"}),
+            serde_json::json!({"member": "cbp-being", "mode": "direct", "reason": "r"}),
+            serde_json::json!({"member": "cbp-being", "mode": "direct_required"}),
+            serde_json::json!({"member": "cbp-being", "mode": "sideways", "reason": "r"}),
+            // GPT review of #1031: a hub-scoped binding would be stored and never enforced.
+            serde_json::json!({"member": "cbp-being", "hub": "hub-lct-1", "mode": "direct_required", "reason": "r"}),
+        ] {
+            assert_eq!(set(&state, body.clone()).await.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+        let s = state.lock().await;
+        assert!(s.transport_bindings.bindings.is_empty());
+        assert!(!s.recent_chain(20).iter().any(|e| e.event_type.starts_with("transport_binding")));
+    }
+
+    #[tokio::test]
+    async fn a_binding_survives_restart_and_removal_moves_the_generation() {
+        let (dir, state) = test_state().await;
+        let body = serde_json::json!({
+            "member": "cbp-being", "mode": "direct", "carrier_lct": "7ba65c0d",
+            "reason": "the being holds its own hub identity",
+        });
+        assert_eq!(set(&state, body).await.status(), StatusCode::OK);
+        drop(state);
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        {
+            let s = state.lock().await;
+            let b = s.transport_bindings.get("cbp-being", "any-hub").expect("restart must reload the binding");
+            assert_eq!((b.carrier_lct.as_deref(), b.version), (Some("7ba65c0d"), 1));
+        }
+        let resp = transport_binding_remove(
+            State(state.clone()),
+            Json(serde_json::json!({"member": "cbp-being", "reason": "test"})),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let s = state.lock().await;
+        assert!(s.transport_bindings.get("cbp-being", "*").is_none());
+        assert_eq!(s.transport_bindings.generation, 2);
+        assert!(s.recent_chain(20).iter().any(|e| e.event_type == "transport_binding_removed"));
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_binding_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_binding_success BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'transport_binding_set'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;",
+        )
+        .unwrap();
+        let body = serde_json::json!({"member": "cbp-being", "mode": "direct_required", "reason": "r"});
+        assert_eq!(set(&state, body.clone()).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        {
+            let s = state.lock().await;
+            assert!(s.transport_bindings.bindings.is_empty(), "not in force without its record");
+            assert_eq!(s.transport_bindings.generation, 0);
+        }
+        conn.execute_batch("DROP TRIGGER fail_binding_success").unwrap();
+        assert_eq!(set(&state, body).await.status(), StatusCode::OK, "the identical retry lands");
     }
 }

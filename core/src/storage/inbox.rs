@@ -325,6 +325,12 @@ impl SqliteInboxStore {
             // several notices legitimately share one entry (a multi-peer
             // invitation writes one row per invited seat, all on the open's hash).
             ("disposition_key", "TEXT"),
+            // The transport binding in force for the SENDER when a routed notice was queued
+            // (#1030): JSON {mode, carrier_lct, reply_to_lct, delegation_ref, hub, version},
+            // NULL when the sender had no binding. Stamped at enqueue so the drain forwards
+            // under the contract the act was made under, and so a binding that changes while
+            // the row waits is detected rather than silently applied.
+            ("transport_stamp", "TEXT"),
         ] {
             if !existing.iter().any(|c| c == col) {
                 conn.execute_batch(&format!(
@@ -680,6 +686,21 @@ impl SqliteInboxStore {
         Ok(conn.last_insert_rowid() as u64)
     }
 
+    /// Record the sender's transport binding on a just-queued egress row (#1030). A separate
+    /// write rather than a parameter to [`Self::enqueue_egress`] only to keep that function's
+    /// many callers unchanged; the handler makes both calls under the one server lock, so no
+    /// drainer can read the row between them.
+    pub fn set_egress_transport_stamp(&self, id: u64, stamp: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        conn.execute(
+            "UPDATE member_notices SET transport_stamp = ?1 WHERE id = ?2 AND dest_peer IS NOT NULL",
+            params![stamp, id as i64],
+        )
+        .context("stamping egress transport")?;
+        Ok(())
+    }
+
     /// Undrained forwards currently parked on the egress plane — the number the
     /// admission bound in [`Self::enqueue_egress`] tests. Exposed so a caller can
     /// report the queue depth without provoking the refusal.
@@ -714,7 +735,7 @@ impl SqliteInboxStore {
         Self::ensure_member_schema(&conn)?;
         let mut stmt = conn.prepare(
             "SELECT id, dest_peer, dest_peer_lct, to_plugin, from_plugin, kind, pointer_uri,
-                    attempts, last_error
+                    attempts, last_error, transport_stamp
                FROM member_notices
               WHERE dest_peer IS NOT NULL AND drained_at IS NULL
               ORDER BY id ASC LIMIT ?1",
@@ -730,6 +751,7 @@ impl SqliteInboxStore {
                 pointer_uri: r.get(6)?,
                 attempts: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
                 last_error: r.get(8)?,
+                transport_stamp: r.get(9)?,
             })
         })?;
         let mut out = Vec::new();
@@ -762,10 +784,73 @@ impl SqliteInboxStore {
         chain_hash: &str,
         in_reply_to: Option<u64>,
     ) -> Result<u64> {
-        let now = Utc::now();
-        let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
+        Self::enqueue_member_on(&conn, to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, in_reply_to)
+    }
+
+    /// Retire an egress row AND queue its author's report in one transaction (#1030 review):
+    /// either both land or neither does. `None` means the row was not pending (already
+    /// forwarded, retired, or never queued), and nothing was written. Before this, a
+    /// transport-fault retirement was three separate writes, so a failure after the first
+    /// could leave a row gone from the queue with its author never told.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retire_egress_with_report(
+        &self,
+        id: u64,
+        report_to: &str,
+        report_from: &str,
+        report_role: &str,
+        report_kind: &str,
+        report_pointer: Option<&str>,
+        chain_hash: &str,
+    ) -> Result<Option<u64>> {
+        let mut conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let tx = conn.transaction().context("starting egress retirement")?;
+        let n = tx
+            .execute(
+                "UPDATE member_notices SET drained_at = ?1
+                  WHERE id = ?2 AND dest_peer IS NOT NULL AND drained_at IS NULL",
+                params![Utc::now().to_rfc3339(), id as i64],
+            )
+            .context("retiring egress row")?;
+        if n != 1 {
+            return Ok(None); // dropping the transaction rolls it back; nothing was written
+        }
+        let report = Self::enqueue_member_on(
+            &tx, report_to, report_from, report_role, report_kind, report_pointer, chain_hash, None,
+        )?;
+        tx.commit().context("committing egress retirement and its report")?;
+        Ok(Some(report))
+    }
+
+    /// Whether an egress row is still waiting to be forwarded.
+    pub fn egress_is_pending(&self, id: u64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM member_notices
+              WHERE id = ?1 AND dest_peer IS NOT NULL AND drained_at IS NULL",
+            params![id as i64],
+            |r| r.get(0),
+        )?;
+        Ok(n == 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_member_on(
+        conn: &Connection,
+        to_plugin: &str,
+        from_plugin: &str,
+        from_role: &str,
+        kind: &str,
+        pointer_uri: Option<&str>,
+        chain_hash: &str,
+        in_reply_to: Option<u64>,
+    ) -> Result<u64> {
+        let now = Utc::now();
+        let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
         // "You may only answer mail addressed to YOU" — enforced HERE, in the
         // store, not only at the call site (Kimi/CBP git-manager thread,
         // 2026-07-28, notice 309). Until this check the guard lived inside
@@ -1312,7 +1397,7 @@ impl SqliteInboxStore {
         Self::ensure_member_schema(&conn)?;
         let mut stmt = conn.prepare(
             "SELECT id, dest_peer, dest_peer_lct, to_plugin, from_plugin, kind, pointer_uri,
-                    attempts, last_error
+                    attempts, last_error, transport_stamp
                FROM member_notices WHERE id = ?1 AND dest_peer IS NOT NULL",
         )?;
         let mut rows = stmt.query_map(params![id as i64], |r| {
@@ -1326,6 +1411,7 @@ impl SqliteInboxStore {
                 pointer_uri: r.get(6)?,
                 attempts: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
                 last_error: r.get(8)?,
+                transport_stamp: r.get(9)?,
             })
         })?;
         match rows.next() {
@@ -1590,6 +1676,8 @@ pub struct EgressRow {
     pub pointer_uri: Option<String>,
     pub attempts: i64,
     pub last_error: Option<String>,
+    /// The sender's transport binding when the row was queued (#1030); None = unbound.
+    pub transport_stamp: Option<String>,
 }
 
 #[cfg(test)]

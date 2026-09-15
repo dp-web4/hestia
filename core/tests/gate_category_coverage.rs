@@ -155,6 +155,7 @@ const CATEGORY_COVERAGE: &[(&str, Coverage, &[&str])] = &[
             "server/handler.rs::tool_member_inbox",
             "server/handler.rs::tool_member_notify",
             "server/handler.rs::tool_member_unanswered",
+            "server/handler.rs::tool_transport_binding",
         ],
     ),
     (
