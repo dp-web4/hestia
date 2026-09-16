@@ -387,6 +387,12 @@ pub fn attach_operator_provenance(
 /// half absent by construction: on this path the daemon writes what it itself proved.
 #[derive(Clone, Debug, Default)]
 pub struct GateWitness {
+    /// The authenticated principal of the admitted session, for EVERY session kind. A
+    /// direct browser session has this and no `provenance` — the dashboard proves one
+    /// operator, not a composition, and must never be dressed up as one. An act that names
+    /// its author reads this; reading `provenance.principal` alone wrote the office literal
+    /// for the dashboard's ordinary signed-in operator (codex review of #1035, finding 1).
+    pub operator: Option<String>,
     pub provenance: Option<OperatorProvenance>,
     pub gate_entry_hash: Option<String>,
 }

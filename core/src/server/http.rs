@@ -505,7 +505,7 @@ async fn operator_gate(
     }
 
     let now = super::state::unix_now();
-    let (outcome, provenance) = {
+    let (outcome, operator, provenance) = {
         let s = state.lock().await;
         let law = s.vault.policy();
         let operator = bearer
@@ -524,6 +524,7 @@ async fn operator_gate(
             .cloned();
         (
             gate_session_request(law, operator.as_deref(), stakes),
+            operator,
             provenance,
         )
     };
@@ -564,6 +565,7 @@ async fn operator_gate(
     // a row saying so rather than a row saying nothing.
     req.extensions_mut()
         .insert(super::operator_auth::GateWitness {
+            operator,
             provenance,
             gate_entry_hash,
         });
@@ -4104,11 +4106,20 @@ async fn scope_live_revoke(
             })),
         );
     }
-    // WHO revoked it, from the session that was actually admitted — not the literal below
-    // (GPT review of #1035, point 1). `stamp_gate` attaches the composed operator provenance
-    // (actor, principal, via_device, office, authority) and the gate entry hash that admitted
-    // this call, so a reader can join the revocation to the authorization rather than trust a
-    // constant. `revoked_by` keeps its human-readable value for the surfaces that print it.
+    // WHO revoked it, from the session that was actually admitted — not a literal (GPT review
+    // of #1035, point 1). `stamp_gate` attaches the composed operator provenance (actor,
+    // principal, via_device, office, authority) when the session has one, and the gate entry
+    // hash that admitted this call, so a reader can join the revocation to the authorization.
+    // The NAME comes from the authenticated operator, which a direct browser session also has
+    // and a composition does not add to (codex review of #1035, finding 1). It is the same
+    // value in the chain event and in the stored row; the office literal is left only for a
+    // call that reached the handler with no session at all (dev override, direct tests).
+    let revoked_by = gate
+        .as_ref()
+        .and_then(|axum::Extension(w)| {
+            w.operator.clone().or_else(|| w.provenance.as_ref().map(|p| p.principal.clone()))
+        })
+        .unwrap_or_else(|| "operator".to_string());
     let record = stamp_gate(
         serde_json::json!({
             "request_id": request_id,
@@ -4117,7 +4128,7 @@ async fn scope_live_revoke(
             "path": req.path,
             "recursive": req.recursive,
             "reason": reason,
-            "revoked_by": "operator",
+            "revoked_by": revoked_by,
             "via": "operator_session",
             "granted_by": req.decided_by,
             "was_expiring_at": req.expires_at,
@@ -4125,7 +4136,6 @@ async fn scope_live_revoke(
         }),
         &gate,
     );
-    let principal = record.get("principal").and_then(|v| v.as_str()).map(str::to_string);
     let entry = match s.append_chain("scope_revoked", record) {
         Ok(e) => e,
         Err(e) => {
@@ -4138,8 +4148,7 @@ async fn scope_live_revoke(
     if let Some(r) = s.scope_requests.get_mut(&request_id) {
         r.revoked = Some(crate::server::state::ScopeRevocation {
             at: now,
-            // the admitted session's principal when it composed one, else the office
-            by: principal.clone().unwrap_or_else(|| "operator".to_string()),
+            by: revoked_by.clone(),
             reason: reason.clone(),
         });
     }
@@ -6356,6 +6365,7 @@ mod disposition_tests {
         // The witness the middleware would have inserted: a composed session's provenance plus
         // the hash of the gate row that admitted this request.
         let witness = crate::server::operator_auth::GateWitness {
+            operator: None,
             provenance: Some(crate::server::operator_auth::OperatorProvenance {
                 actor: "lct:web4:actor:app".into(),
                 principal: "lct:web4:operator:dp".into(),
@@ -6811,6 +6821,7 @@ mod disposition_tests {
             s.scope_requests.insert("scope-prov".into(), live_req("scope-prov", "/x/p.md", now));
         }
         let witness = crate::server::operator_auth::GateWitness {
+            operator: None,
             provenance: Some(crate::server::operator_auth::OperatorProvenance {
                 actor: "lct:web4:harness".into(),
                 principal: "lct:web4:dp".into(),
@@ -6832,6 +6843,50 @@ mod disposition_tests {
         assert_eq!(e.event_data["authority"], "operator-session:nonce-7");
         assert_eq!(s.scope_requests["scope-prov"].revoked.as_ref().unwrap().by, "lct:web4:dp",
                    "the stored revoker is the principal, not the office literal");
+    }
+
+    #[tokio::test]
+    async fn codex_review_direct_browser_revocation_names_authenticated_operator() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        let operator = "lct:web4:review-operator";
+        let token = {
+            let mut s = state.lock().await;
+            let mut law = s.vault.policy().clone();
+            law.operator_access.push(crate::vault::OperatorIdentity {
+                lct_id: operator.into(), public_key_hex: "00".repeat(32),
+                label: "review fixture".into(),
+            });
+            s.vault.set_policy(law).unwrap();
+            s.reload_policy();
+            s.scope_requests.insert("scope-review-browser".into(),
+                live_req("scope-review-browser", "/review/example.txt", now));
+            // Exact session-store path used after successful direct browser authentication.
+            let token = s.operator_sessions.open(operator.to_string(), now);
+            assert_eq!(s.operator_sessions.operator(&token, now, 3600), Some(operator));
+            assert!(s.operator_sessions.provenance(&token, now, 3600).is_none());
+            token
+        };
+        let app = axum::Router::new()
+            .route("/api/scope/revoke", axum::routing::post(scope_live_revoke))
+            .route_layer(axum::middleware::from_fn_with_state(state.clone(), operator_gate))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let resp = reqwest::Client::new().post(format!("http://{addr}/api/scope/revoke"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"request_id": "scope-review-browser", "reason": "done"}))
+            .send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        server.abort();
+        let s = state.lock().await;
+        let rows = s.recent_chain(10);
+        let act = rows.iter().find(|e| e.event_type == "scope_revoked").unwrap();
+        let gate = rows.iter().find(|e| e.event_type == "operator_gate").unwrap();
+        assert_eq!(act.event_data["authorized_by_gate"], gate.hash);
+        assert_eq!(s.scope_requests["scope-review-browser"].revoked.as_ref().unwrap().by,
+            operator, "the admitted direct operator must survive the middleware boundary");
     }
 
     /// GPT review of #1035, point 3: delivery cannot race the revocation into an ambiguous
