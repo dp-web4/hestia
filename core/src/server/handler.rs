@@ -21298,7 +21298,7 @@ mod disposition_durability_tests {
                 "path": "/review/both.txt", "revoked_by": "lct:web4:review-operator",
                 "reason": "done", "was_expiring_at": now + 3600, "lifetime": "live",
             })).unwrap();
-            s.scope_requests.insert("scope-both-arms".into(), ScopeRequest {
+            s.scope_requests.insert("scope-both-arms".into(), crate::server::state::ScopeRequest {
                 id: "scope-both-arms".into(), plugin_id: "codex".into(), role: "member".into(),
                 path: "/review/both.txt".into(), reason: "inspect".into(), requested_at: now,
                 expires_at: now + 3600, granted: Some(true), decided_by: Some("operator".into()),
