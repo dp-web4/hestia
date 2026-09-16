@@ -5488,6 +5488,13 @@ fn disposition_obligation(e: &crate::storage::chain::ChainEntry) -> Option<(Stri
                 None => thin("plugin_id"),
             }
         }
+        "scope_revoked" => {
+            let rid = get("request_id")?;
+            match get("plugin_id") {
+                Some(to) => Some((to.to_string(), format!("hestia://scope/{rid}#revoked"))),
+                None => thin("plugin_id"),
+            }
+        }
         "scope_granted" | "scope_refused" => {
             // `request_id` null/absent = operator-originated grant: not a petition.
             let rid = get("request_id")?;
@@ -11004,6 +11011,7 @@ mod tests {
             decided_at: Some(110),
             decision_reason: Some("yes, that file".into()),
             recursive: false,
+            revoked: None,
         };
         assert!(r.grants("/mnt/c/exe/dpx/notes.md", 150));
         // The sibling, the parent and the child are all OUTSIDE the grant.
@@ -11059,6 +11067,7 @@ mod tests {
             decided_at: None,
             decision_reason: None,
             recursive: false,
+            revoked: None,
         };
         assert_eq!(r.status(50), "pending");
         assert_eq!(r.status(100), "expired");
@@ -17053,6 +17062,7 @@ mod appeal_tests {
                 decided_at: Some(now),
                 decision_reason: Some("yes, that file".into()),
                 recursive: false,
+                revoked: None,
             });
         }
         let body = read_resource_body(&state, "hestia://scope/scope-test459a")
@@ -18938,6 +18948,7 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
         decided_at: None,
         decision_reason: None,
         recursive: false,
+        revoked: None,
     };
     s.scope_requests.insert(id.clone(), req);
 
@@ -19025,6 +19036,12 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
                 "decided_by": r.decided_by,
                 "decided_at": r.decided_at,
                 "decision_reason": r.decision_reason,
+                // A revoked live grant says so, with who and why, so the member learns its
+                // reach narrowed and the reason in the same read (a bare "revoked" is a
+                // refusal with no way forward).
+                "revoked_at": r.revoked.as_ref().map(|v| v.at),
+                "revoked_by": r.revoked.as_ref().map(|v| v.by.clone()),
+                "revoke_reason": r.revoked.as_ref().map(|v| v.reason.clone()),
             })
         })
         .collect();
@@ -19103,7 +19120,9 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
             .map(|a| a.divergence.clone())
             .unwrap_or_default(),
         "snapshot_expires_at": snapshot_expires_at,
-        "lifetime": "live_grants are memory-only — they die with the daemon. standing_grants \
+        "lifetime": "live_grants are memory-only — they die with the daemon, and the operator \
+                     can also withdraw one early: its request then reads status `revoked`, with \
+                     `revoked_by` and `revoke_reason`. standing_grants \
                      are operator-promoted, vault-persisted, and survive restart until they \
                      expire or are revoked. society_floor is the society's own list: it is \
                      durable, applies to EVERY member identically, and is not yours to lose — \
@@ -20205,6 +20224,7 @@ mod standing_scope_surface_tests {
             decided_at: Some(now),
             decision_reason: None,
             recursive: false,
+            revoked: None,
         }
     }
 
@@ -22825,6 +22845,7 @@ mod delegated_scope_arbitration_tests {
                 decided_at: None,
                 decision_reason: None,
                 recursive: false,
+                revoked: None,
             },
         );
         id
