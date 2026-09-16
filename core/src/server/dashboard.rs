@@ -1437,7 +1437,7 @@ impl ServerState {
                 let mut v: Vec<serde_json::Value> = self
                     .scope_requests
                     .values()
-                    .filter(|r| r.granted == Some(true) && now < r.expires_at)
+                    .filter(|r| r.is_live(now))
                     .map(|r| {
                         serde_json::json!({
                             "lifetime": "live",
@@ -1709,6 +1709,7 @@ mod tests {
             decided_at: granted.map(|_| now),
             decision_reason: None,
             recursive: false,
+            revoked: None,
         };
 
         state.scope_requests.insert(

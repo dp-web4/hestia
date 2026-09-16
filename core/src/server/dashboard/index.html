@@ -3394,7 +3394,12 @@
             escapeHtml(String(g.path))}" data-reach-to="${g.recursive ? 'false' : 'true'}" title="${
             g.recursive ? 'narrow this grant back to exactly its path' : 'widen this grant to everything under its path'}">${
             g.recursive ? 'make exact' : 'make recursive'}</button>
-          ${live ? '' : `<button class="grant-revoke" data-revoke-member="${
+          ${live
+            ? (g.request_id ? `<button class="grant-revoke" data-revoke-live="${
+                escapeHtml(String(g.request_id))}" data-revoke-live-member="${
+                escapeHtml(String(g.plugin_id))}" data-revoke-live-path="${
+                escapeHtml(String(g.path))}" title="withdraw this live grant now instead of waiting for it to lapse">revoke</button>` : '')
+            : `<button class="grant-revoke" data-revoke-member="${
             escapeHtml(String(g.plugin_id))}" data-revoke-path="${
             escapeHtml(String(g.path))}">revoke</button>`}
           ${live ? '' : `<button class="grant-act" data-move-member="${
@@ -4454,6 +4459,37 @@
         } catch (e2) {
           err.textContent = `reassign failed: ${e2.message}`;
           err.hidden = false; mv.disabled = false;
+        }
+        return;
+      }
+
+      // Revoke a LIVE grant (dp, 2026-09-15): same prompt, same asymmetry (a reason is
+      // optional to narrow), keyed by the request id the live row carries.
+      const revLive = e.target.closest('[data-revoke-live]');
+      if (revLive) {
+        const rid = revLive.dataset.revokeLive;
+        const why = prompt(`Revoke live scope for ${revLive.dataset.revokeLiveMember}?\n\n${
+          revLive.dataset.revokeLivePath}\n\nReason (optional, shown to the member):`);
+        if (why === null) return;
+        revLive.disabled = true;
+        err.hidden = true;
+        try {
+          const res = await apiFetch('/api/scope/revoke', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ request_id: rid, reason: why }),
+          });
+          const out = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+          if (out.standing_grant_still_covers_path) {
+            err.textContent = out.note;
+            err.hidden = false;
+          }
+          await tick();
+          renderScopeGrants(lastData);
+        } catch (e2) {
+          err.textContent = `revoke failed: ${e2.message}`;
+          err.hidden = false;
+          revLive.disabled = false;
         }
         return;
       }

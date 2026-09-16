@@ -542,6 +542,19 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/http.rs::scope_standing_revoke", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
+    // ADDED 2026-09-15 (dp: "i want to be able to revoke a live grant, right now i can only
+    // revoke standing ones"). The LIVE twin of the site above.
+    //
+    // READING, both questions. (1) Who gets named? The subject of a `scope_revoked` chain
+    // entry — the member whose LIVE, memory-only grant an operator withdrew before it lapsed.
+    // The name is NOT operator-typed here and is tighter than its standing sibling: the call
+    // keys on `request_id`, and the member is read off the stored request, so the entry names
+    // whoever actually held the grant. (2) Compared to decide control flow? No — the
+    // revocation keys on the request id; the derived LCT is serialised into the witness and
+    // read by nothing. Naming, like its sibling.
+    ("server/http.rs::scope_live_revoke", &[
+        "\"subject_instance_lct\": s.member_lct(&req.plugin_id),",
+    ], SiteClass::Naming),
     // ADDED 2026-09-08 (legion-claude, dp's "make standing" / "make recursive" buttons).
     // The census went red on the full `cargo test` after `--lib` was green — the exact
     // trap this file's header describes, and the reason the branch was not pushed on

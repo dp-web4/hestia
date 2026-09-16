@@ -168,16 +168,36 @@ pub struct ScopeRequest {
     /// under it is the operator's explicit choice. Exact by default (dp, 2026-09-08).
     #[serde(default)]
     pub recursive: bool,
+    /// Set when the operator revokes a LIVE grant before it lapses (dp, 2026-09-15: "i want to
+    /// be able to revoke a live grant, right now i can only revoke standing ones"). The row is
+    /// kept, not deleted: a grant that vanished and a grant that was withdrawn are different
+    /// facts, and the member's `hestia_scope_status` must be able to say which.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked: Option<ScopeRevocation>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScopeRevocation {
+    pub at: u64,
+    pub by: String,
+    pub reason: String,
 }
 
 impl ScopeRequest {
+    /// The ONE predicate for "this request is a grant in force": granted, inside its window,
+    /// and not revoked. Every caller that asked `granted == Some(true) && now < expires_at`
+    /// inline now asks this, so a revocation cannot be honoured in one place and missed in
+    /// another.
+    pub fn is_live(&self, now: u64) -> bool {
+        self.granted == Some(true) && now < self.expires_at && self.revoked.is_none()
+    }
+
     /// Live = granted, and not past its window. A refused or expired request grants nothing,
     /// and an unanswered one grants nothing — the default is always the standing MRH.
     /// Reach is by the grant's own rule (`covers_path`): exact unless the operator made it
     /// recursive — the same rule the standing store uses, so the two channels agree.
     pub fn grants(&self, path: &str, now: u64) -> bool {
-        self.granted == Some(true)
-            && now < self.expires_at
+        self.is_live(now)
             && crate::server::standing_scope::covers_path(&self.path, self.recursive, path)
     }
 
@@ -187,6 +207,9 @@ impl ScopeRequest {
     /// channel already rules. Silence has to decide the same way everywhere or members will
     /// learn that waiting is a strategy.
     pub fn status(&self, now: u64) -> &'static str {
+        if self.revoked.is_some() {
+            return "revoked";
+        }
         match self.granted {
             Some(true) if now < self.expires_at => "granted",
             Some(true) => "expired",
@@ -222,6 +245,15 @@ pub const SCOPE_REQUEST_TTL_SECS: u64 = 8 * 3600;
 /// durable — a member restricted for cause must not be freed by a reboot — and a LIVE
 /// permission has to be ephemeral, with the daemon restarting as the backstop that guarantees
 /// a grant nobody remembers to revoke dies on its own.
+///
+/// AMENDED 2026-09-15 (dp: "i want to be able to revoke a live grant, right now i can only
+/// revoke standing ones"). The restart backstop is a FLOOR on how long a live grant can
+/// outlive its need, not a ceiling: until now the only ways to end one early were to wait out
+/// its 8 h window or to make it standing and revoke that — a widening performed in order to
+/// narrow. `POST /api/scope/revoke` withdraws a live grant directly, witnessed as
+/// `scope_revoked` and reported to the member. The row is marked, not deleted, so the member
+/// reads `revoked` rather than inferring an expiry. What is unchanged is the direction of the
+/// asymmetry: the live channel still cannot be made durable by anything but the standing one.
 ///
 /// The third row was added on dp's explicit ruling (2026-08-14, Sprint F R1 "the real fix"):
 /// standing member scope needs a daemon surface, or the only durable widening is a
@@ -1007,7 +1039,7 @@ impl ServerState {
         let mut live: Vec<&ScopeRequest> = self
             .scope_requests
             .values()
-            .filter(|r| r.plugin_id == plugin_id && r.granted == Some(true) && now < r.expires_at)
+            .filter(|r| r.plugin_id == plugin_id && r.is_live(now))
             .collect();
         live.sort_by_key(|r| r.requested_at);
         live
