@@ -645,8 +645,11 @@ def main():
         snapshot = None
         try:
             from hestia_gate_mechanism import fetch_policy_snapshot
+            # This seat HOLDS the review door (chain: 21 corroborations as kimi-code).
+            # The caller asserts it; the shared mechanism must not (#1050).
             snapshot = fetch_policy_snapshot(HESTIA_PLUGIN_ID, host_agent=HESTIA_PLUGIN_ID,
-                                             host_session_id=event.get("session_id"))
+                                             host_session_id=event.get("session_id"),
+                                             declares_review_door=True)
         except Exception:
             snapshot = None   # an unimportable mechanism == an unreachable daemon: degrade below
         if snapshot is not None:

@@ -786,8 +786,14 @@ def main():
         snapshot = None
         try:
             m = _load_mechanism()
+            # This seat HOLDS the review door: codex-cli reaches
+            # `hestia_gate_escalation_corroborate` over MCP, and the chain shows it has used
+            # it 40 times — the most of any member. The assertion is the CALLER's because a
+            # shared gate library cannot know its caller's effectors (#1050, and
+            # findings/review-13031.md for the refuted first cut).
             snapshot = m.fetch_policy_snapshot(HESTIA_PLUGIN_ID, host_agent=HESTIA_PLUGIN_ID,
-                                               host_session_id=event.get("session_id"))
+                                               host_session_id=event.get("session_id"),
+                                               declares_review_door=True)
         except Exception:
             snapshot = None   # an unimportable mechanism == an unreachable daemon: degrade below
         if snapshot is not None:

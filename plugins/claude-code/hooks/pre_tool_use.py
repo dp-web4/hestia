@@ -1824,8 +1824,11 @@ def main() -> int:
     _snapshot = None
     try:
         from hestia_gate_mechanism import fetch_policy_snapshot
+        # This seat HOLDS the review door (chain: 16 corroborations as claude-code).
+        # The caller asserts it; the shared mechanism must not (#1050).
         _snapshot = fetch_policy_snapshot(PLUGIN_ID, host_agent=HOST_AGENT,
-                                          host_session_id=host_session_id)
+                                          host_session_id=host_session_id,
+                                          declares_review_door=True)
     except Exception:  # noqa: BLE001 — an unimportable mechanism IS an unreachable daemon
         _snapshot = None
 

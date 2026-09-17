@@ -68,6 +68,13 @@ MIN_POLL_SLEEP_MS = 50
 PROTOCOL_VERSION = 1
 DEFAULT_HESTIA_HOME = Path.home() / ".hestia"
 
+#: The capability a member names in `gate_capabilities` at `hestia_connect` when it holds
+#: `hestia_gate_escalation_corroborate` — the only door that adds a factor to an escalation.
+#: The daemon's invitation pool reads exactly this string (`handler.rs REVIEW_CAPABILITY`,
+#: #1050); the two spellings are pinned together by
+#: `hestia_gate_mechanism_test.py::the_review_capability_spelling_matches_the_daemons`.
+REVIEW_CAPABILITY = "escalation-review:v1"
+
 _RECOGNIZED_DECISIONS = ("allow", "warn", "deny")
 
 
@@ -641,7 +648,12 @@ def fetch_policy_snapshot(plugin_id, **kw):
     session-start hook herd overlapping the first tool calls — codex, 2026-08-14),
     not a down daemon. A 250ms-backoff second attempt absorbs the blip; a genuinely
     unreachable daemon still returns None inside one extra budget and the ratified
-    degraded mode proceeds. Never raises (same contract as the single attempt)."""
+    degraded mode proceeds. Never raises (same contract as the single attempt).
+
+    `declares_review_door=True` is the CALLER asserting it holds
+    `hestia_gate_escalation_corroborate` — see `_fetch_policy_snapshot_uncached`. Default
+    False: a library cannot know its caller's effectors, and the truthful default for a
+    capability self-report is silence."""
     snap = _fetch_policy_snapshot_once(plugin_id, **kw)
     if snap is not None:
         return snap
@@ -655,7 +667,8 @@ def fetch_policy_snapshot(plugin_id, **kw):
 
 def _fetch_policy_snapshot_once(plugin_id: str, *, host_agent: Optional[str] = None,
                           host_session_id: Optional[str] = None,
-                          use_cache: bool = True) -> Optional[dict]:
+                          use_cache: bool = True,
+                          declares_review_door: bool = False) -> Optional[dict]:
     """Fetch this member's policy snapshot from the daemon, in-process. NEVER raises.
 
     None  -> the daemon is unreachable / did not authenticate the session (no sessionId):
@@ -669,7 +682,8 @@ def _fetch_policy_snapshot_once(plugin_id: str, *, host_agent: Optional[str] = N
              AgentPolicy it returns, and refuses the snapshot outright past its horizon."""
     if use_cache and plugin_id in _POLICY_SNAPSHOT_CACHE:
         return _POLICY_SNAPSHOT_CACHE[plugin_id]
-    snap = _fetch_policy_snapshot_uncached(plugin_id, host_agent, host_session_id)
+    snap = _fetch_policy_snapshot_uncached(plugin_id, host_agent, host_session_id,
+                                           declares_review_door=declares_review_door)
     if use_cache and snap is not None:
         _POLICY_SNAPSHOT_CACHE[plugin_id] = snap
     return snap
@@ -711,7 +725,8 @@ def _snapshot_unavailable(plugin_id: str, detail: str, cause: str = "unknown") -
 
 
 def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
-                                    host_session_id: Optional[str]) -> Optional[dict]:
+                                    host_session_id: Optional[str],
+                                    declares_review_door: bool = False) -> Optional[dict]:
     # Which step of the handshake was in flight when it failed. Named in the telemetry so a
     # timeout on `hestia_operating_law` is distinguishable from one on `initialize`: the
     # first is the daemon working, the second is the daemon absent, and they are different
@@ -741,7 +756,30 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             # session, freshness, or build binding: A1 historical evidence only. It cannot
             # prove which gate is currently loaded; the governed installed-artifact problem
             # remains #481.
-            "gate_capabilities": ["society-floor:v1"],
+            # `escalation-review:v1` is the REVIEW DOOR, and it is the CALLER's assertion,
+            # never this module's. The invitation pool reads it: a member that declares its
+            # doors without this one is not woken to decide something it cannot decide, and is
+            # recorded as ineligible rather than dropped (#1050). Silence still means UNKNOWN
+            # and is still invited — the declaration is what lets a member say the other thing.
+            #
+            # A SHARED GATE LIBRARY CANNOT KNOW ITS CALLER'S EFFECTOR SET. The first cut
+            # declared the door unconditionally here, reasoning "every seat that connects
+            # through this mechanism holds the MCP tool". kimi-code refuted it cross-vendor
+            # (findings/review-13031.md): SAGE's gateway imports this same module as the
+            # being's society-safety client (being_gate_client.py:1009) and fetches with
+            # `member_id="cbp-being"`, whose effector registry has no corroborate and no
+            # arbitrate at all. That call would have declared a door the being does not hold
+            # — inviting the exact member #1050 exists to stop inviting, and recording
+            # `review_basis: "declared"` as the false reason why. It would also have
+            # OVERWRITTEN the being's one accurate declaration (`society-floor:v1` alone),
+            # which is precisely what makes the new filter exclude it correctly.
+            #
+            # So the flag defaults to False and the harnesses that actually hold the tool
+            # (the CLI hooks) pass True. Silence from a caller that holds the door costs one
+            # extra invitation; a lie from a caller that does not costs the wake this issue
+            # exists to prevent.
+            "gate_capabilities": (["society-floor:v1", REVIEW_CAPABILITY]
+                                  if declares_review_door else ["society-floor:v1"]),
         }
         role_env = os.environ.get("HESTIA_ROLE")
         if role_env:
