@@ -1798,6 +1798,29 @@ def main() -> int:
     _ev = _core.NormalizedEvent(tool=tool_name, paths=_paths, command=_cmd,
                                 cwd=event.get("cwd"), raw=event)
 
+    # GATE 1's REFUSALS WERE NEVER RECORDED (#1028). Both `return 2` sites below wrote stderr
+    # and returned — no witness call — so every scope and innate refusal this seat issued
+    # (egress.secret, mrh.path) existed only in the session that received it. The shared
+    # mechanism's header says "every shim now calls witness_decision_unified for refusal
+    # records"; kimi and codex do, at exactly these seams. This shim adopted the common law in
+    # the Sprint F cutover (2026-08-16) and never adopted its recorder, so the one seat whose
+    # false refusals were reported most (#983, #639) was the one whose refusals the chain
+    # could not count. Measured on Legion 2026-09-14: 20 refusals in a day, 0 decision rows;
+    # on CBP 2026-09-17, dp: "the latest denials do NOT show up in the witness chain".
+    #
+    # Best-effort and after the decision: it never raises and never changes the verdict, and
+    # with the daemon unreachable the record lands in the per-shim fallback log instead.
+    def _record_core_refusal(v, *, available: bool) -> None:
+        try:
+            _m = _load_mechanism()
+            _m.witness_decision_unified(
+                None, plugin_id=PLUGIN_ID, decision="deny", rule=v.rule,
+                tool_name=tool_name, target=_m._extract_target(tool_input, tool_name),
+                session_id=host_session_id, verdict_available=available,
+                attempted_summary=_attempted_summary(tool_name, tool_input))
+        except Exception:  # noqa: BLE001 — recording must never turn a deny into a crash
+            pass
+
     _snapshot = None
     try:
         from hestia_gate_mechanism import fetch_policy_snapshot
@@ -1817,6 +1840,8 @@ def main() -> int:
         if _v.blocks:
             sys.stderr.write(f"hestia: deny [{_v.rule}] — {_v.reason}\n")
             debug_log(f"scope deny: {_v.rule} {tool_name}")
+            # A real verdict from the common law: conduct, recorded like every other seat's.
+            _record_core_refusal(_v, available=True)
             return 2
     else:
         # The ratified degraded mode, computed by the core rather than invented here:
@@ -1825,6 +1850,9 @@ def main() -> int:
         if _v.blocks:
             sys.stderr.write(f"hestia: deny [{_v.rule}] — {_v.reason}\n")
             debug_log(f"degraded scope deny: {_v.rule} {tool_name}")
+            # An innate refusal is a real verdict the core reached without the daemon; a
+            # degraded deny-writes is infrastructure, never conduct (kimi's split).
+            _record_core_refusal(_v, available=bool(_v.innate))
             return 2
 
     # Try the daemon first — IN-PROCESS via the shared mechanism (Sprint E, one transport).
