@@ -650,6 +650,67 @@ impl SqliteChainStore {
     /// "ambiguous" or a wrong single hit. Empty would also conflate
     /// *you typed garbage* with *no such entry*, which is the distinction the
     /// caller most needs.
+    /// Every `appeal` and `adjudication` row about one deny, with no recency window (#164).
+    ///
+    /// `ptr` is a deny hash or an appeal entry hash, whole or as a prefix of at least 8 hex
+    /// characters (the convention `resolve_appeal_pointer` already accepts). The query goes
+    /// through `idx_chain_event_type`, so it touches only the appeal-typed rows and parses
+    /// only those — not the 20,000-entry window `APPEAL_CHAIN_WINDOW` used to materialise.
+    ///
+    /// Why the window had to go for READS. Measured 2026-09-17: cbp-being's nine appeals
+    /// were ruled at 04:38Z on 09-16, and by the next evening ~40,000 entries had been
+    /// appended after them. `hestia://appeal/<hash>` then answered `appeal_pointer_not_found`
+    /// for appeals that WERE ruled, so the appellant's only reader reported its rulings as
+    /// nonexistent. A ruling does not stop being true because the fleet was busy (#610).
+    /// The filing and ruling paths keep their window deliberately: acting on an aged-out
+    /// deny is refused. Knowing what happened to one is not.
+    pub fn appeal_rows_for_pointer(&self, ptr: &str) -> Result<Vec<ChainEntry>> {
+        let ptr = validate_hash_pointer(ptr)?;
+        // Hex only (validated), so `%` cannot occur in `ptr` and needs no escaping.
+        let pattern = if ptr.len() >= 8 { format!("{ptr}%") } else { ptr };
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+             FROM chain_entries
+             WHERE event_type IN ('appeal', 'adjudication')
+               AND (json_extract(event_data, '$.deny_hash') LIKE ?1
+                    OR json_extract(event_data, '$.about_deny_hash') LIKE ?1
+                    OR (event_type = 'appeal' AND hash LIKE ?1))
+             ORDER BY chain_position ASC",
+        )?;
+        let rows = stmt.query_map(params![pattern], row_to_entry)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    /// One member's appeals and the rulings on them, oldest first, with no recency window
+    /// (#164): `appeal` rows whose `plugin_id` is the member and `adjudication` rows whose
+    /// `subject_plugin_id` is. Index-restricted to the two event types, like
+    /// `appeal_rows_for_pointer`. `cap` bounds the rows returned (newest kept) so a member with
+    /// a long appeal history cannot drag it all into memory in one read.
+    pub fn appeal_rows_for_member(&self, plugin_id: &str, cap: u64) -> Result<Vec<ChainEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM (
+                SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+                FROM chain_entries
+                WHERE (event_type = 'appeal' AND json_extract(event_data, '$.plugin_id') = ?1)
+                   OR (event_type = 'adjudication' AND json_extract(event_data, '$.subject_plugin_id') = ?1)
+                ORDER BY chain_position DESC
+                LIMIT ?2
+             ) ORDER BY chain_position ASC",
+        )?;
+        let rows = stmt.query_map(params![plugin_id, cap as i64], row_to_entry)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
     pub fn read_by_hash_prefix(&self, prefix: &str, cap: u64) -> Result<Vec<ChainEntry>> {
         validate_hash_pointer(prefix)?;
         let conn = self.conn.lock().unwrap();
