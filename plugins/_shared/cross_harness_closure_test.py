@@ -59,7 +59,13 @@ SHIM_FILES = {
 # $HESTIA_HOME/shared. Point the synthetic cross-harness fixture at the exact shared tree
 # it is testing so the test exercises the new loader contract rather than depending on
 # ambient sys.path behavior.
-os.environ.setdefault("HESTIA_SHARED_DIR", SHARED)
+#
+# ASSIGNED, not defaulted, and HESTIA_HOME dropped: importing the claude-code shim runs
+# _load_projection, which copies $HESTIA_HOME's rendered projection (HESTIA_SHARED_DIR
+# included) into os.environ. On a seat box that rebinds the claude rows to the installed
+# ~/.hestia/shared.builds/<id>/ classifier instead of this tree. CI has no HESTIA_HOME.
+os.environ.pop("HESTIA_HOME", None)
+os.environ["HESTIA_SHARED_DIR"] = SHARED
 
 # The module must be importable BEFORE the shims load (each shim's own sys.path insert
 # also points at a _shared dir; this entry guarantees all three bind the SAME module,
@@ -68,8 +74,7 @@ sys.path.insert(0, SHARED)
 # The shims resolve runtime law ONLY from an explicit HESTIA_SHARED_DIR or an installed
 # $HESTIA_HOME/shared (#742 codex, #747 claude-code); the tree is no longer an implicit
 # fallback. This is a reviewed fixture, named explicitly, not an authority fallback:
-# point the in-process shim imports at the exact shared tree under test.
-os.environ.setdefault("HESTIA_SHARED_DIR", SHARED)
+# point the in-process shim imports at the exact shared tree under test (set above).
 # kimi/codex capture WORKSPACE at import; pin it away from any real workspace.
 os.environ.setdefault("HESTIA_WORKSPACE", os.path.join(BUILD, "ws"))
 os.makedirs(os.environ["HESTIA_WORKSPACE"], exist_ok=True)
