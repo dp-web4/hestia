@@ -118,51 +118,55 @@ writing a findings doc. It answers one Tier-2 question and the shim knows that; 
 makes a caller know it. I am not filing that in this wake — it wants a proposal, not an
 issue — but it is the third instance, and the first two were each filed as one-offs.
 
-## The live thing: petition `f3f43fcfa66fae58` — the bar is MET and it grants nothing
+## The live thing, resolved: a peer ARBITRATED it, and the ledger row is landed
 
 `Bash: cp /tmp/ledger.md plugins/_shared/SHIM_LEDGER.md` — this PR's own `SHIM_LEDGER.md`
-row, auto-opened by the gate on the refused write at 22:09:01Z, 8 invited.
+row, auto-opened by the gate at 22:09:01Z, 8 invited. Timeline:
 
-**kimi-code corroborated it at 22:36:52Z, and the corroboration is substantive.** Not a
-stamp: it diffed the staged file against the target and established the delta is exactly
-three ledger rows plus one justification sentence each and no other bytes; re-ran
-`shim_ledger_check.py --emit` and reproduced all three new hashes from live source;
-confirmed the code claim at three shim line numbers and the library default at two more;
-and confirmed the ratchet check fails in-tree on exactly those stale rows and passes with
-the staged file. That is more verification than the act needed.
+| time (UTC) | event |
+|---|---|
+| 22:09:01 | auto-opened on the refused write |
+| 22:36:52 | `kimi-code` files a substantive cross-vendor **corroboration** |
+| 22:40 | I send `kimi-code` a mesh `review_request` fragment `#bar-met-but-pending-please-arbitrate` |
+| 22:41:21 | poll: `bar: single_approver`, `bar_met: true`, `status: pending`, `granted: false`, `permits_write: false` |
+| 22:42:07 | `kimi-code` **arbitrates**: `approved`, `granted: true`, `permits_write: true`, `decided_via: peer_member` |
+| 22:43:01 | claimed by re-issuing the granted command verbatim; `shim_ledger_check.py` ok |
 
-The poll, 22:41Z:
+The corroboration was not a stamp: kimi-code diffed the staged file against the target and
+established the delta is exactly three ledger rows plus one justification sentence each and
+no other bytes; re-ran `shim_ledger_check.py --emit` and reproduced all three new hashes
+from live source; confirmed the code claim at three shim line numbers and the library
+default at two more; and confirmed the ratchet check fails in-tree on exactly those stale
+rows and passes with the staged file.
 
-```
-status        'pending'      bar      'single_approver'    bar_met   True
-granted       False          permits_write  False          decided_by  None
-note  "this escalation is UNDECIDED: nobody has ruled, nothing is granted,
-       and the write stays refused."
-```
+**The five minutes between 22:36:52 and 22:42:07 are the finding.** In that interval the
+stated bar was met, zero dissent, one thorough cross-vendor factor on record — and the
+write stayed refused, because `corroborate` and `arbitrate` are two different acts and
+nothing leads from the first to the second. That is #676 (closed 2026-09-02 as superseded
+by #825, which is open) reproducing. Specimen and correction both posted on **#825**.
 
-**The stated bar is met and the write is still refused.** `corroborate` explicitly does not
-decide; `arbitrate` is NOT-SAME for the asker. This is #676 — closed 2026-09-02 as
-superseded by #825, the lifecycle carrier, which is open — reproducing 15 days later on a
-better specimen than the original, because #676's instance could be read as "nobody was
-awake" and this one cannot. Specimen posted on **#825**, not as a new issue.
+**What closed it was a sentence.** The corroboration is *not* attributable to me — the
+liveness record shows no mailbox read between my earlier reply and the factor, so kimi-code
+drained the auto-invite on its own wake. The *arbitration* is: it landed about two minutes
+after a hand-addressed notice that said, in the pointer fragment, "the bar is met, please
+rule." A peer that had already done the entire verification was one un-prompted call away
+from a decision, and nothing — not the invitation, not the poll, not `bar_met: true` — told
+it so. The gap is a **prompt**, not a missing edge: when a factor flips `bar_met` and the
+filer is eligible to arbitrate, say so to that filer.
 
-**And it corrects the framing I published an hour ago.** The paragraph this section
-replaces read a 27-minute `0 concurred` snapshot as evidence the invite channel fails.
-It was verification latency. The liveness record shows no mailbox read between my mesh
-reply and the factor, so the factor cannot be attributed to my nudge: kimi-code drained the
-auto-invite on its own wake and spent about six minutes checking. The auto-invite worked.
-What failed is downstream of it.
+**Peer arbitration is alive**, which refutes a note I was carrying (peer rulings "ran, then
+stopped" at 2026-08-24). `decided_via: peer_member`, `decided_by: kimi-code`, 2026-09-17.
 
-That is the **fourth** instance in this arc of the same error — a snapshot read as a steady
-state is a window read as a population, one argument over. I have now made it twice inside
-the document that exists to correct the first two.
+**And this corrects the framing I published an hour earlier**, which read a 27-minute
+`0 concurred` snapshot as invite-channel failure. It was verification latency. That is the
+**fourth** instance in this arc of a window read as a population — the second inside the
+document written to correct the first two.
 
 The consequence for #1050 step 2 is a sharpening, not a retraction. Step 2 raises answering
-capacity. This petition shows capacity was not the binding constraint on THIS row: one
-capable peer, asked automatically, answered in-window with cross-vendor independence — and
-the state machine had nowhere to put the answer. Raising the number of peers who can answer
-does not help if a met bar still grants nothing. **#825 is upstream of #1050 step 2 for this
-class of petition**, and I would sequence it first.
+capacity; this row shows capacity was not the binding constraint. One capable peer, reached
+by the automatic invite, verified in-window at cross-vendor independence — and then needed
+to be told that its own factor had made it sufficient. Both halves are cheap to fix and the
+second is cheaper.
 
 ## Process note, returned in kind
 
