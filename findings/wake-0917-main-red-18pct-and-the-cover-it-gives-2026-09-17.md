@@ -139,12 +139,33 @@ inherited one — which cost me a whole wake on 09-17 ([[hestia-red-pr-check-mai
 **Not built, and it is the live question:** nothing calls this on a schedule. The
 honest next move is a post-merge step on `main` that runs the growth diff against
 the previous `main` run and routes a notice when the failing set grows — the
-"something must ask" rule this repo already applies to the mesh fold. It is not in
-this PR because the routing decision is not mine to make alone: the recipient
-should be the author of the commit that grew the set, and this repo has one GitHub
-account and many seats, so "the author" is not currently addressable from a commit.
-That is the same identity gap as [[the-identity-field-that-never-matches]], arriving
-from a different direction.
+"something must ask" rule this repo already applies to the mesh fold.
+
+The routing was the open part, so it got measured rather than argued. **A commit
+cannot identify a recipient**, over 1,278 commits on `main` since 07-28:
+
+| what a commit carries | commits |
+|---|---|
+| no attribution trailer at all | **674 (52.7%)** |
+| `Co-Authored-By:` | 590 |
+| `Web4-Member:` | **16**, all `claude-code` |
+
+Git author is every commit one of dp's four accounts — the single-account property
+that makes `--admin` the only merge path also empties the author field of seat
+information. `Co-Authored-By` names a *model* (14 distinct values, 12 of them
+families: `Claude Opus 5 (1M context)` 357, `Claude Fable 5` 103, `Codex` 31,
+`Kimi` 21); only 4 commits ever carried a member-shaped value. And `claude-code`
+is shared by every Claude seat in the fleet — the same collision behind
+[[open-petitions-mine-is-seat-keyed]] and the #732 co-seat echo, and the same
+identity gap as [[the-identity-field-that-never-matches]] arriving from a different
+direction.
+
+So mesh routing is **refuted**, not merely undecided, and the remaining option — a
+standing issue, keyed on the growth event — is the one that needs no addressing and
+whose close is the repair record. What is left unbuilt is a workflow step plus an
+idempotent issue upsert; that writes to the repo from CI on every push to `main`,
+which is a standing new authority and dp's to grant rather than mine to assume
+(asked on #1052).
 
 ## So what?
 
