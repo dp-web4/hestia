@@ -6902,12 +6902,19 @@ fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value 
             )
         }
     };
-    let Some(anchor) = decision.as_ref().or(requested.as_ref()) else {
+    // The revocation is an anchor too. It is the YOUNGEST lifecycle event, so it is the one a
+    // bounded newest-first scan is most likely to reach: a live grant can outlive a thousand
+    // unrelated entries before an operator withdraws it, and then the scan finds the terminal
+    // fact but not the grant it ended. Requiring the older records as the anchor turned that
+    // found revocation into UNKNOWN (codex follow-up review of #1035, at edcb547). It is
+    // sufficient on its own: the revoke handler refuses anything that is not a live grant, so
+    // the entry proves the grant existed, and it carries plugin, path, grantor and expiry.
+    let Some(anchor) = decision.as_ref().or(requested.as_ref()).or(revocation.as_ref()) else {
         return hestia_error_envelope(
             "hestia.scope_pointer_not_found",
             &format!(
                 "no scope request with id '{ptr}' on this daemon, and no scope_requested / \
-                 scope_granted / scope_refused naming it in {}. That is UNKNOWN, not \
+                 scope_granted / scope_refused / scope_revoked naming it in {}. That is UNKNOWN, not \
                  refused: scope requests live in memory and do not survive a restart, so \
                  an absent id says nothing about whether any ask was granted or refused",
                 scan_coverage_note(searched, complete),
@@ -6931,30 +6938,58 @@ fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value 
             _ => "pending",
         },
     };
+    // Anchored on the revocation alone: the grant and the ask are older than the scan reached.
+    let only_revocation = decision.is_none() && requested.is_none();
     json!({
         "pointer": ptr,
         "source": "witness_chain",
         "request_id": ptr,
         "plugin_id": anchor.event_data.get("plugin_id"),
         "path": anchor.event_data.get("path"),
-        "requested_because": anchor
-            .event_data
-            .get("requested_because")
-            .or_else(|| anchor.event_data.get("reason")),
+        // A revocation's `reason` is why the grant was WITHDRAWN, not why it was asked for —
+        // it must not be read as the ask's reason. Unknown here, not invented.
+        "requested_because": if only_revocation {
+            None
+        } else {
+            anchor
+                .event_data
+                .get("requested_because")
+                .or_else(|| anchor.event_data.get("reason"))
+        },
         "status": status,
-        "granted": decision.as_ref().map(|e| e.event_type == "scope_granted"),
-        "decided_by": decision.as_ref().and_then(|e| e.event_data.get("granted_by")),
+        // Only a live grant can be revoked, so a revocation with no decision in range still
+        // proves the grant; the grantor and expiry it recorded stand in for the decision's.
+        "granted": decision
+            .as_ref()
+            .map(|e| e.event_type == "scope_granted")
+            .or(revocation.as_ref().map(|_| true)),
+        "decided_by": decision
+            .as_ref()
+            .and_then(|e| e.event_data.get("granted_by"))
+            .or_else(|| revocation.as_ref().and_then(|e| e.event_data.get("granted_by"))),
         "decision_reason": decision.as_ref().and_then(|e| e.event_data.get("decision_reason")),
-        "expires_at": anchor.event_data.get("expires_at"),
+        "expires_at": anchor
+            .event_data
+            .get("expires_at")
+            .or_else(|| anchor.event_data.get("was_expiring_at")),
         "decision_entry": decision.as_ref().map(chain_entry_json),
         "revoked_at": revocation.as_ref().map(|e| e.timestamp.timestamp()),
         "revoked_by": revocation.as_ref().and_then(|e| e.event_data.get("revoked_by")),
         "revoke_reason": revocation.as_ref().and_then(|e| e.event_data.get("reason")),
         "revocation_entry": revocation.as_ref().map(chain_entry_json),
         "searched": searched,
-        "note": "answered from the witness chain — the live store lost this row to a \
-                 restart (scope requests are memory-only by design). The chain is the \
-                 record; the store was a cache of it",
+        "complete": complete,
+        "decision_outside_scan": only_revocation,
+        "note": if only_revocation {
+            "answered from the witness chain's revocation entry — the live store lost this \
+             row to a restart, and the grant it ended is older than the bounded scan read. \
+             The revocation is the terminal fact; the ask's reason and the decision entry \
+             are unknown here, not absent (hestia_query_history pages deeper)"
+        } else {
+            "answered from the witness chain — the live store lost this row to a \
+             restart (scope requests are memory-only by design). The chain is the \
+             record; the store was a cache of it"
+        },
     })
 }
 
@@ -21270,6 +21305,54 @@ mod disposition_durability_tests {
         assert_eq!(body["status"], "revoked", "disposition must resolve its terminal fact: {body}");
         assert_eq!(body["revoked_by"], "operator", "who, from the revocation entry: {body}");
         assert_eq!(body["revoke_reason"], "no longer needed", "why, from the revocation entry: {body}");
+    }
+
+    /// Codex's follow-up review of #1035 (at edcb547), test as submitted plus the fields the fix
+    /// has to get right: a grant, 1,000 unrelated entries, then its revocation, and no live
+    /// row. The bounded scan reaches the revocation and not the grant — it used to answer
+    /// UNKNOWN about a terminal fact it had just read.
+    #[tokio::test]
+    async fn codex_review_recent_revocation_survives_an_older_grant_outside_lookup_cap() {
+        let (_dir, state) = test_state().await;
+        let now = now_secs();
+        {
+            let s = state.lock().await;
+            s.append_chain("scope_granted", json!({
+                "request_id": "scope-review-cap", "plugin_id": "codex",
+                "path": "/review/example.txt", "granted_by": "operator",
+                "expires_at": now + 3600,
+            })).unwrap();
+            for i in 0..POINTER_LOOKUP_MAX {
+                s.append_chain("outcome", json!({"filler": i})).unwrap();
+            }
+            s.append_chain("scope_revoked", json!({
+                "request_id": "scope-review-cap", "plugin_id": "codex",
+                "path": "/review/example.txt", "revoked_by": "lct:web4:review-operator",
+                "reason": "done", "was_expiring_at": now + 3600,
+                "granted_by": "operator", "lifetime": "live",
+            })).unwrap();
+            assert!(!s.has_scope_grant("codex", "/review/example.txt"));
+        }
+        let raw = read_resource_body(&state,
+            "hestia://scope/scope-review-cap#revoked").await.unwrap();
+        let body: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(body["status"], "revoked",
+            "a revocation found inside the scan is known even when its grant is older: {body}");
+        assert_eq!(body["revoked_by"], "lct:web4:review-operator");
+        assert_eq!(body["revoke_reason"], "done");
+        // The grant is out of range, and the answer says so rather than filling it in.
+        assert_eq!(body["decision_outside_scan"], true, "{body}");
+        assert_eq!(body["complete"], false, "{body}");
+        assert!(body["decision_entry"].is_null(), "{body}");
+        // Why it was WITHDRAWN is not why it was ASKED for.
+        assert!(body["requested_because"].is_null(),
+            "the revocation's reason must not be reported as the ask's: {body}");
+        // What the revocation itself proves: a live grant, by whom, until when.
+        assert_eq!(body["granted"], true, "{body}");
+        assert_eq!(body["decided_by"], "operator", "{body}");
+        assert_eq!(body["expires_at"], now + 3600, "{body}");
+        assert_eq!(body["plugin_id"], "codex");
+        assert_eq!(body["path"], "/review/example.txt");
     }
 
     /// The other half of codex's finding 2: the live-store arm of the same reader carries who
