@@ -66,11 +66,23 @@ def test_remove_reads_back_absence():
     assert posts(op)[0][1] == "/api/transport/binding/remove"
 
 
+TESTS = [
+    test_a_plan_sends_nothing,
+    test_apply_sends_the_planned_body_and_reads_it_back,
+    test_a_write_the_store_does_not_reflect_fails,
+    test_remove_reads_back_absence,
+]
+
+
 if __name__ == "__main__":
-    n = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            fn()
-            n += 1
-            print(f"PASS {name}")
-    print(f"\n{n} passed")
+    defined = {k for k in globals() if k.startswith("test_")}
+    listed = {t.__name__ for t in TESTS}
+    if defined != listed:
+        # An explicit list can go stale; make that RED, not a silently smaller run.
+        print(f"FAIL TESTS is stale: defined-not-listed={sorted(defined - listed)} "
+              f"listed-not-defined={sorted(listed - defined)}")
+        raise SystemExit(1)
+    for fn in TESTS:
+        fn()
+        print(f"PASS {fn.__name__}")
+    print(f"\n{len(TESTS)} passed")
