@@ -56,16 +56,18 @@ Re-derived by the shipped instrument over the whole window (`census --json`, whi
 reproduces the hand figures above exactly), **five** commits added a cause to an
 already-red `main`:
 
-| commit | added | spell |
-|---|---|---|
-| `9eb235ea` 08-06 | `ci_selfexec` + `shebang_exec_bit` | 5 (11 commits) |
-| `af364f9f` 08-06 | `citation_number_claim` | 5 |
-| `7877ea83` 09-04 | `shebang_exec_bit` | 9 (5 commits) |
-| `f9f31da7` 09-14 | `public_boundary` | 12 (14 commits) |
-| `a4521973` 09-16 | `ci_selfexec` | 12 |
+| commit | added | spell | visible at job level? |
+|---|---|---|---|
+| `9eb235ea` 08-06 | `ci_selfexec` + `shebang_exec_bit` | 5 (11 commits) | yes — a second job name went red |
+| `af364f9f` 08-06 | `citation_number_claim` | 5 | **no** — same job, one more file |
+| `7877ea83` 09-04 | `shebang_exec_bit` | 9 (5 commits) | yes — a second job name went red |
+| `f9f31da7` 09-14 | `public_boundary` | 12 (14 commits) | **no** |
+| `a4521973` 09-16 | `ci_selfexec` | 12 | **no** |
 
-Two of those five landed in a *single* spell twice over, which is the shape to
-expect: the longer a spell runs, the more authors pass through it.
+**Three of the five were invisible at job level**, and that is the precise claim —
+the other two announced themselves by turning a *second* job red, which a reader
+could in principle have caught. Two spells took two cover-events each, which is
+the shape to expect: the longer a spell runs, the more authors pass through it.
 
 **One guard accounts for most spells.** `tools/shebang_exec_bit_test.py` is the
 breaker in **5 of 12** spells and an added cause in 2 more. That is not a guard
