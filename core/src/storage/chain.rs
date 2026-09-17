@@ -703,6 +703,35 @@ impl SqliteChainStore {
         Ok(out)
     }
 
+    /// Every witnessed entry about ONE gate escalation, oldest first, with no recency window
+    /// (#1014): its `gate_escalation_opened`, any decided / withdrawn / expired settlement, and
+    /// any `gate_escalation_claimed` spend.
+    ///
+    /// The escalation pointer used to page backward over the newest 1,000 chain entries, and
+    /// escalation events are under 1% of the chain, so a real ask became unreadable a median of
+    /// 7.3 hours after it opened (measured on CBP 2026-09-09) while the invitations and
+    /// disposition notices that carry its pointer live for days. Index-restricted to the five
+    /// event types, like `appeal_rows_for_pointer`; on the read connection, so a reader never
+    /// waits on the writer.
+    pub fn escalation_rows(&self, escalation_id: &str) -> Result<Vec<ChainEntry>> {
+        let conn = self.read_conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+             FROM chain_entries
+             WHERE event_type IN ('gate_escalation_opened', 'gate_escalation_decided',
+                                  'gate_escalation_withdrawn', 'gate_escalation_expired',
+                                  'gate_escalation_claimed')
+               AND json_extract(event_data, '$.escalation_id') = ?1
+             ORDER BY chain_position ASC",
+        )?;
+        let rows = stmt.query_map(params![escalation_id], row_to_entry)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
     /// One member's appeals and the rulings on them, oldest first, with no recency window
     /// (#164): `appeal` rows whose `plugin_id` is the member and `adjudication` rows whose
     /// `subject_plugin_id` is. Index-restricted to the two event types, like
