@@ -1,8 +1,10 @@
-//! Event-triggered trust derivation.
+//! Denial-triggered trust derivation.
 //!
 //! dp, 2026-09-17: "trust derivation should be event-triggered not timed. a negative event
 //! would trigger trust derivation for the affected member. all should be derived on start
-//! and maybe once a day."
+//! and maybe once a day." And, on a first cut that also re-derived on rulings, appeals,
+//! aliases and allows near a deny: "is it on any event? because that's continuous. should be
+//! on denials only."
 //!
 //! WHY THIS EXISTS. Every derived trust level was recomputed from scratch on every read:
 //! `derivation::scan_window` decrypts and parses 10,000 outcome rows plus up to 100,000
@@ -11,43 +13,52 @@
 //! daemon's CPU while the operator had the page open (hestia #1040) — to recompute numbers
 //! that had not changed, because nothing that could change them had happened.
 //!
-//! THE RULE. A member's derivation is cached, and it is re-derived when an event lands on
-//! the chain that can change it. [`affected_members`] is that rule, one arm per event type
-//! `derive` folds, and it is applied in `SqliteChainStore::append` — the one path every
-//! chain write takes, so no writer can land evidence without invalidating what it affects.
-//! Everyone is derived on first use after start, and again once a day
-//! ([`EVERYONE_REDERIVE_EVERY`]) so drift the event rule deliberately ignores (volume
-//! windows sliding, ordinary allows accumulating) is bounded.
+//! THE RULE. A member's derivation is cached. It is re-derived when a DENY naming that member
+//! lands on the chain — and once more when that deny's retry window closes, because what the
+//! member did next (retried the act: 0.0; reached the same resource another way: 0.35;
+//! adapted: 0.85) is only fully on the chain then. Both are triggered by the denial; nothing
+//! else the member or anyone else does triggers anything. The rule is applied in
+//! `SqliteChainStore::append`, the one path every chain write takes.
+//!
+//! Everything a deny does not cover — a ruling on an appeal or escalation, an alias, an
+//! exoneration or amnesty, the slow drift of governed volume and of the window itself — is
+//! picked up when everyone is re-derived: at start, and once a day
+//! ([`EVERYONE_REDERIVE_EVERY`]). That is the stated trade: a member whose appeal is upheld
+//! sees the higher number within a day, not within a poll.
 //!
 //! WHAT IS CACHED AND WHAT IS NOT. Only the window half ([`crate::derivation::derive_evidence`]).
-//! The volume half ([`crate::derivation::with_volume`]) is applied at read time from the grain's live lifetime totals, so
-//! routine outcomes — 78% of the chain, and not evidence `derive` scores — never trigger a
+//! The volume half ([`crate::derivation::with_volume`]) is applied at read time from the
+//! grain's live lifetime totals, so routine outcomes — 78% of the chain — never trigger a
 //! re-derivation and never leave the displayed volume stale.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde_json::Value;
 
-use crate::derivation::{
-    aliased_identities, alias_target, DerivedTrust, IDENTITY_ALIAS_EVENT, RETRY_WINDOW_MINUTES,
-};
+use crate::derivation::{aliased_identities, alias_target, DerivedTrust, RETRY_WINDOW_MINUTES};
 use crate::storage::chain::{ChainEntry, SqliteChainStore};
 
-/// Everyone is re-derived at least this often, whatever the event rule says.
+/// Everyone is re-derived at least this often, whatever the denial rule says.
 pub const EVERYONE_REDERIVE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Events arriving in a burst are coalesced into one derivation.
+/// Denials arriving in a burst are coalesced into one derivation.
 ///
 /// A member hitting a boundary repeatedly lands a deny every few seconds, and each one
 /// invalidates it. Re-scanning per deny would put the 1.3 s scan back on every poll for as
 /// long as the burst lasts — the load this module removes. A member whose cached derivation
 /// is invalidated is re-derived at the first read at least this long after the previous
-/// scan; the first event after a quiet spell is re-derived at the next read. A grain with NO
+/// scan; the first deny after a quiet spell is re-derived at the next read. A grain with NO
 /// cached derivation is never held back by this.
 pub const EVENT_COALESCE: Duration = Duration::from_secs(10);
+
+/// How long after a deny its follow-up re-derivation fires: the retry window `derive` scores
+/// against, plus a margin so the window is closed on the chain's clock too.
+fn recheck_after() -> Duration {
+    Duration::from_secs(RETRY_WINDOW_MINUTES as u64 * 60) + Duration::from_secs(5)
+}
 
 /// A cached window-half derivation for one (member, role) grain.
 #[derive(Clone)]
@@ -59,7 +70,7 @@ pub struct CachedDerivation {
     pub aliased_to: Option<String>,
     everyone_epoch: u64,
     /// Every identity whose evidence folded into this grain (itself plus witnessed
-    /// aliases), with the epoch each had when the window was read. An event naming ANY of
+    /// aliases), with the epoch each had when the window was read. A deny naming ANY of
     /// them invalidates the grain — an alias's deny is the member's deny.
     member_epochs: Vec<(String, u64)>,
 }
@@ -69,12 +80,15 @@ struct Inner {
     everyone_epoch: u64,
     everyone_since: Option<Instant>,
     member_epoch: HashMap<String, u64>,
-    /// Latest deny per member, so an allow or outcome inside the retry window — which can
-    /// turn that deny into a retry (0.0) or a recast (0.35) — invalidates the member.
-    last_deny: HashMap<String, DateTime<Utc>>,
+    /// Per member, when its latest deny's retry window closes. One entry per member however
+    /// many denies it lands: a later deny moves the time, it does not add a second recheck.
+    rechecks: HashMap<String, Instant>,
     /// Known grains. `None` = asked for, not yet derived.
     grains: HashMap<(String, String), Option<CachedDerivation>>,
     last_scan: Option<Instant>,
+    /// Whether pending follow-ups have been re-learned from the chain since start. Once only:
+    /// re-learning on every scan would re-schedule a follow-up that has just fired.
+    relearned: bool,
 }
 
 impl Inner {
@@ -85,13 +99,25 @@ impl Inner {
                 .all(|(id, ep)| self.member_epoch.get(id).copied().unwrap_or(0) == *ep)
     }
 
-    fn roll_everyone(&mut self, now: Instant) {
+    /// Start of day, and closed retry windows: the two things besides a deny that make a
+    /// derivation stale, both settled here before anyone asks what is due.
+    fn settle(&mut self, now: Instant) {
         match self.everyone_since {
             Some(t) if now.saturating_duration_since(t) < EVERYONE_REDERIVE_EVERY => {}
             _ => {
                 self.everyone_epoch += 1;
                 self.everyone_since = Some(now);
             }
+        }
+        let closed: Vec<String> = self
+            .rechecks
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(m, _)| m.clone())
+            .collect();
+        for m in closed {
+            self.rechecks.remove(&m);
+            self.bump(&m);
         }
     }
 
@@ -114,15 +140,13 @@ impl Inner {
     fn bump(&mut self, id: &str) {
         *self.member_epoch.entry(id.to_string()).or_insert(0) += 1;
     }
-}
 
-/// Which members an appended event can change the derivation of.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Affects {
-    Nobody,
-    Members(Vec<String>),
-    /// An event whose subject cannot be named from the row itself.
-    Everyone,
+    fn schedule_recheck(&mut self, member: &str, at: Instant) {
+        let slot = self.rechecks.entry(member.to_string()).or_insert(at);
+        if at > *slot {
+            *slot = at;
+        }
+    }
 }
 
 fn flat_or_data<'a>(e: &'a ChainEntry, key: &str) -> Option<&'a str> {
@@ -152,81 +176,23 @@ impl DerivationCache {
     /// `observe` runs inside `SqliteChainStore::append`, after the row has committed. A
     /// panic there would turn a durable write into a failed call, for the sake of a display
     /// cache. Every field here is a counter or a replaceable derivation, so a state left
-    /// behind by a panicking holder is at worst stale, and the next event or the daily
+    /// behind by a panicking holder is at worst stale, and the next deny or the daily
     /// re-derivation corrects it.
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The event rule. One arm per event type `derive` reads; anything else is `Nobody`.
+    /// The trigger: the member a chain entry DENIES, or `None`. Nothing else triggers.
     ///
-    /// The arms mirror the joins in `derive_evidence`, key for key, and each names the
-    /// member the join credits or debits — NOT the author, since several of these are
-    /// written by someone other than the member they change (an adjudicator, the operator,
-    /// the gate).
-    pub fn affected_members(&self, e: &ChainEntry) -> Affects {
-        let inner = self.lock();
-        let within_retry_of_a_deny = |pid: &str| {
-            inner.last_deny.get(pid).is_some_and(|d| {
-                e.timestamp >= *d && e.timestamp - *d <= chrono::Duration::minutes(RETRY_WINDOW_MINUTES)
-            })
-        };
-        let one = |p: Option<&str>| match p {
-            Some(p) if !p.is_empty() => Affects::Members(vec![p.to_string()]),
-            // `derive` ignores a row it cannot attribute, so it changes nobody.
-            _ => Affects::Nobody,
-        };
-        match e.event_type.as_str() {
-            // THE NEGATIVE EVENT. A new temperament observation below the 0.5 prior when it
-            // is a retry, a recast, or simply a deny that stands.
-            "policy_decision" => {
-                let Some(pid) = flat_or_data(e, "plugin_id") else { return Affects::Nobody };
-                if flat_or_data(e, "decision") == Some("deny") {
-                    return one(Some(pid));
-                }
-                // An allow is a governed act, and governed acts only move the level through
-                // the significance ratio — slowly, so the daily re-derivation carries it.
-                // Two exceptions change a verdict: inside a deny's retry window an allow can
-                // make that deny a retry (0.0); and a grain derived with NO governed acts has
-                // no volume baseline at all, so its first governed act can give it a level.
-                let first_governed = inner.grains.iter().any(|((p, _), c)| {
-                    p == pid && c.as_ref().is_some_and(|c| c.evidence.governed_acts == 0)
-                });
-                if within_retry_of_a_deny(pid) || first_governed {
-                    one(Some(pid))
-                } else {
-                    Affects::Nobody
-                }
-            }
-            // An outcome is read at exactly one site: a successful recast inside a deny's
-            // retry window (0.35). Outside that window no outcome changes a derivation.
-            "outcome" => match flat_or_data(e, "plugin_id") {
-                Some(pid) if within_retry_of_a_deny(pid) => one(Some(pid)),
-                _ => Affects::Nobody,
-            },
-            // Rulings and askings: a ruling is what moves an appeal or escalation from 0.85
-            // to 1.0, and a member told its appeal was upheld must not see the old number
-            // until tomorrow.
-            "appeal" | "gate_escalation_opened" | "gate_escalation_decided" | "scope_attestation" => {
-                one(flat_or_data(e, "plugin_id"))
-            }
-            "adjudication" => one(flat_or_data(e, "subject_plugin_id")),
-            // Names the alias and the member it belongs to; both grains change.
-            t if t == IDENTITY_ALIAS_EVENT => {
-                let ids: Vec<String> = ["alias", "alias_of"]
-                    .iter()
-                    .filter_map(|k| flat_or_data(e, k))
-                    .filter(|p| !p.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                if ids.is_empty() { Affects::Nobody } else { Affects::Members(ids) }
-            }
-            // An exoneration names a deny hash, not its member; an amnesty names a class.
-            // Resolving either would need the window this module exists not to read, and both
-            // are rare sovereign-scale acts, so they re-derive everyone.
-            "exoneration" | "amnesty" => Affects::Everyone,
-            _ => Affects::Nobody,
+    /// Deliberately looser than the deny `derive` scores (it also excludes probe sessions,
+    /// no-verdict denies and unenforced ones): a re-derivation that changes nothing costs one
+    /// scan, while a deny the trigger skipped would show the member a number its record has
+    /// already contradicted until tomorrow.
+    pub fn denied_member(e: &ChainEntry) -> Option<&str> {
+        if e.event_type != "policy_decision" || flat_or_data(e, "decision") != Some("deny") {
+            return None;
         }
+        flat_or_data(e, "plugin_id").filter(|p| !p.is_empty())
     }
 
     /// Called by `SqliteChainStore::append` after an entry is durably committed.
@@ -235,20 +201,10 @@ impl DerivationCache {
     /// readable, and [`Self::refresh`] captures epochs BEFORE it scans. So a scan either sees
     /// the row, or its result is recorded under the old epoch and is already stale.
     pub fn observe(&self, e: &ChainEntry) {
-        let affects = self.affected_members(e);
+        let Some(member) = Self::denied_member(e) else { return };
         let mut inner = self.lock();
-        if e.event_type == "policy_decision" && flat_or_data(e, "decision") == Some("deny") {
-            if let Some(pid) = flat_or_data(e, "plugin_id") {
-                inner.last_deny.insert(pid.to_string(), e.timestamp);
-            }
-        }
-        match affects {
-            Affects::Nobody => {}
-            Affects::Members(ids) => ids.iter().for_each(|id| inner.bump(id)),
-            Affects::Everyone => {
-                inner.everyone_epoch += 1;
-            }
-        }
+        inner.bump(member);
+        inner.schedule_recheck(member, Instant::now() + recheck_after());
     }
 
     /// The cached derivation for a grain, current or awaiting its re-derivation. `None` if
@@ -267,7 +223,7 @@ impl DerivationCache {
     pub fn has_due(&self) -> bool {
         let now = Instant::now();
         let mut inner = self.lock();
-        inner.roll_everyone(now);
+        inner.settle(now);
         !inner.due(now).is_empty()
     }
 
@@ -279,7 +235,7 @@ impl DerivationCache {
         let now = Instant::now();
         let (due, everyone_epoch, member_epoch) = {
             let mut inner = self.lock();
-            inner.roll_everyone(now);
+            inner.settle(now);
             let due = inner.due(now);
             if due.is_empty() {
                 return 0;
@@ -309,20 +265,17 @@ impl DerivationCache {
                 ((pid, role), c)
             })
             .collect();
-        // A restart forgets `last_deny`; re-learn it from the window, so a retry landing
-        // just after startup still invalidates the member it penalises.
-        let cutoff = Utc::now() - chrono::Duration::minutes(RETRY_WINDOW_MINUTES);
+        // A restart forgets pending rechecks. Re-learn them from the window on the first scan,
+        // so a deny whose retry window straddles a restart still gets its follow-up.
+        let wall_now = Utc::now();
+        let window_len = chrono::Duration::minutes(RETRY_WINDOW_MINUTES);
         let mut inner = self.lock();
-        for e in window.iter().filter(|e| {
-            e.timestamp >= cutoff
-                && e.event_type == "policy_decision"
-                && flat_or_data(e, "decision") == Some("deny")
-        }) {
-            if let Some(pid) = flat_or_data(e, "plugin_id") {
-                let slot = inner.last_deny.entry(pid.to_string()).or_insert(e.timestamp);
-                if e.timestamp > *slot {
-                    *slot = e.timestamp;
-                }
+        let relearn = !std::mem::replace(&mut inner.relearned, true);
+        for e in window.iter().filter(|_| relearn) {
+            let Some(member) = Self::denied_member(e) else { continue };
+            let closes_in = e.timestamp + window_len - wall_now;
+            if let Ok(left) = closes_in.to_std() {
+                inner.schedule_recheck(member, now + left + Duration::from_secs(5));
             }
         }
         let n = derived.len();
@@ -348,6 +301,7 @@ impl DerivationCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::derivation::IDENTITY_ALIAS_EVENT;
     use serde_json::json;
 
     const ROLE: &str = "role:constellation:member";
@@ -388,10 +342,19 @@ mod tests {
         c.inner.lock().unwrap().last_scan = None;
     }
 
-    /// dp's rule, end to end through the real append path: a negative event re-derives the
-    /// member it is about, and nobody else; routine traffic re-derives nobody.
+    /// The member's retry window, closed now instead of in ten minutes.
+    fn close_retry_windows(c: &DerivationCache) {
+        let mut inner = c.inner.lock().unwrap();
+        let past = Instant::now() - Duration::from_secs(1);
+        for at in inner.rechecks.values_mut() {
+            *at = past;
+        }
+    }
+
+    /// dp's rule, end to end through the real append path: a deny re-derives the member it
+    /// names, and nobody else; everything else re-derives nobody.
     #[test]
-    fn a_deny_rederives_its_member_and_routine_traffic_rederives_nobody() {
+    fn only_a_deny_rederives_and_only_its_member() {
         let (_d, s) = store();
         let cache = s.derivations();
         deny(&s, "kimi-code", "s-k", "/etc/a");
@@ -399,58 +362,98 @@ mod tests {
         assert!(cache.lookup("codex", ROLE).is_none());
         assert_eq!(cache.refresh(&s), 2, "everyone is derived on first use");
         assert_eq!(cache.refresh(&s), 0, "nothing happened: nothing is re-derived");
-        let before = cache.lookup("kimi-code", ROLE).unwrap();
-        assert_eq!(before.evidence.temperament.observations, 1);
+        assert_eq!(cache.lookup("kimi-code", ROLE).unwrap().evidence.temperament.observations, 1);
 
-        // Routine traffic, well away from any deny's retry window for codex.
+        // Everything that is not a deny: routine traffic, allows, the governance acts a first
+        // cut also triggered on. None of it re-derives anyone.
         for _ in 0..50 {
             outcome(&s, "codex");
+            allow(&s, "codex", "s-c", "/tmp/fine");
         }
+        s.append("appeal", json!({"plugin_id": "kimi-code", "deny_hash": "ab"}), "lct:test").unwrap();
+        s.append("adjudication", json!({"subject_plugin_id": "kimi-code", "about_deny_hash": "ab", "upheld": true}), "lct:test").unwrap();
+        s.append("gate_escalation_decided", json!({"plugin_id": "codex", "status": "approved"}), "lct:test").unwrap();
+        s.append(IDENTITY_ALIAS_EVENT, json!({"alias": "codex-cli", "alias_of": "codex"}), "lct:test").unwrap();
+        s.append("amnesty", json!({"data": {"class": "deny", "before_position": 0}}), "lct:test").unwrap();
         past_coalesce(cache);
-        assert_eq!(cache.refresh(&s), 0, "fifty outcomes changed no derivation and scanned nothing");
+        assert_eq!(cache.refresh(&s), 0, "no deny, no derivation — however much else happened");
 
         deny(&s, "kimi-code", "s-k", "/etc/b");
         past_coalesce(cache);
         assert_eq!(cache.refresh(&s), 1, "the deny re-derives exactly its member");
-        let after = cache.lookup("kimi-code", ROLE).unwrap();
-        assert_eq!(after.evidence.temperament.observations, 2, "and the re-derivation sees it");
+        assert_eq!(cache.lookup("kimi-code", ROLE).unwrap().evidence.temperament.observations, 2,
+                   "and the re-derivation sees it");
     }
 
-    /// The retry window: an allow that turns a deny into a retry (0.0) is a negative event
-    /// even though it is an allow. Without this arm the member would keep its comply 0.85
-    /// until the daily re-derivation.
+    /// The trigger itself, per event type.
     #[test]
-    fn an_allow_inside_a_denys_retry_window_is_a_negative_event() {
+    fn the_trigger_is_a_deny_and_nothing_else() {
+        let e = |ty: &str, data: serde_json::Value| ChainEntry {
+            hash: "h".into(), prev_hash: "p".into(), timestamp: Utc::now(),
+            event_type: ty.into(), event_data: data, signer_lct: String::new(), chain_position: 1,
+        };
+        assert_eq!(DerivationCache::denied_member(&e("policy_decision", json!({"plugin_id": "kimi-code", "decision": "deny"}))), Some("kimi-code"));
+        assert_eq!(DerivationCache::denied_member(&e("policy_decision", json!({"data": {"plugin_id": "codex", "decision": "deny"}}))), Some("codex"));
+        for (ty, data) in [
+            ("policy_decision", json!({"plugin_id": "kimi-code", "decision": "allow"})),
+            ("policy_decision", json!({"plugin_id": "kimi-code", "decision": "warn"})),
+            ("policy_decision", json!({"decision": "deny"})),
+            ("outcome", json!({"plugin_id": "kimi-code", "success": false})),
+            ("adjudication", json!({"subject_plugin_id": "kimi-code", "upheld": false})),
+            ("appeal", json!({"plugin_id": "kimi-code"})),
+            ("gate_escalation_decided", json!({"plugin_id": "kimi-code", "status": "denied"})),
+            ("exoneration", json!({"data": {"deny_hash": "ab"}})),
+        ] {
+            assert_eq!(DerivationCache::denied_member(&e(ty, data.clone())), None, "{ty} {data}");
+        }
+    }
+
+    /// What a member does after a deny is scored against the deny — a retry is 0.0 — but
+    /// that act is not itself a trigger. The deny's own follow-up, when its retry window
+    /// closes, is what picks it up.
+    #[test]
+    fn a_retry_is_seen_when_the_denys_retry_window_closes() {
         let (_d, s) = store();
         let cache = s.derivations();
         cache.lookup("kimi-code", ROLE);
         deny(&s, "kimi-code", "s-k", "/etc/shadow-copy");
-        allow(&s, "kimi-code", "s-other", "/elsewhere/entirely"); // first governed act already seen below
         cache.refresh(&s);
         let score = |c: &DerivationCache| c.lookup("kimi-code", ROLE).unwrap().evidence.temperament.score;
         assert!(score(cache).unwrap() > 0.5, "a deny that stands, not yet retried");
 
         allow(&s, "kimi-code", "s-k", "/etc/shadow-copy");
         past_coalesce(cache);
-        assert_eq!(cache.refresh(&s), 1);
-        assert!(score(cache).unwrap() < 0.5, "the retry lowered the member, and the cache shows it");
+        assert_eq!(cache.refresh(&s), 0, "the retry is an allow: not a trigger");
+        assert!(score(cache).unwrap() > 0.5, "so the cached number has not moved yet");
+
+        close_retry_windows(cache);
+        past_coalesce(cache);
+        assert_eq!(cache.refresh(&s), 1, "the deny's window closed: its member is re-derived");
+        assert!(score(cache).unwrap() < 0.5, "and the retry now counts against it");
+        assert!(cache.inner.lock().unwrap().rechecks.is_empty(), "one follow-up, then none");
     }
 
-    /// A ruling is written by the ADJUDICATOR and changes the SUBJECT. Keyed on the author,
-    /// the member told its appeal was upheld would keep the old number for a day.
+    /// Many denies from one member leave ONE pending follow-up, at the latest window.
     #[test]
-    fn a_ruling_invalidates_its_subject_not_its_author() {
-        let cache = DerivationCache::new();
-        let e = ChainEntry {
-            hash: "h".into(),
-            prev_hash: "p".into(),
-            timestamp: Utc::now(),
-            event_type: "adjudication".into(),
-            event_data: json!({"plugin_id": "codex", "subject_plugin_id": "cbp-being", "upheld": true}),
-            signer_lct: String::new(),
-            chain_position: 1,
-        };
-        assert_eq!(cache.affected_members(&e), Affects::Members(vec!["cbp-being".into()]));
+    fn repeated_denies_keep_one_follow_up() {
+        let (_d, s) = store();
+        let cache = s.derivations();
+        for i in 0..20 {
+            deny(&s, "kimi-code", "s-k", &format!("/etc/{i}"));
+        }
+        assert_eq!(cache.inner.lock().unwrap().rechecks.len(), 1);
+    }
+
+    /// A deny whose retry window straddles a restart still gets its follow-up: a fresh cache
+    /// re-learns it from the chain on its first scan.
+    #[test]
+    fn a_restart_relearns_pending_follow_ups() {
+        let (_d, s) = store();
+        deny(&s, "kimi-code", "s-k", "/etc/a");
+        let fresh = DerivationCache::new();
+        fresh.lookup("kimi-code", ROLE);
+        fresh.refresh(&s);
+        assert!(fresh.inner.lock().unwrap().rechecks.contains_key("kimi-code"));
     }
 
     /// An alias's conduct IS the member's: a deny recorded under the alias invalidates the
@@ -485,7 +488,8 @@ mod tests {
         assert_eq!(cache.lookup("kimi-code", ROLE).unwrap().evidence.temperament.observations, 2);
     }
 
-    /// Once a day everyone is re-derived, whatever happened.
+    /// Once a day everyone is re-derived, whatever happened — the path that carries rulings,
+    /// aliases and amnesties.
     #[test]
     fn everyone_is_rederived_daily() {
         let (_d, s) = store();
