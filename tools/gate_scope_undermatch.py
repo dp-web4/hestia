@@ -9,13 +9,15 @@ absolute path that never names the workspace is never a token it sees. Layer 1's
 path_candidates() resolves actual argv path arguments instead. Same commands, both checks.
 """
 import sys, os
-sys.path.insert(0, "/home/dp/ai-workspace/hestia/plugins/_shared")
-sys.path.insert(0, "/home/dp/ai-workspace/hestia/tools")
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "plugins", "_shared"))
+sys.path.insert(0, HERE)
 from hestia_gate_core import command_scope_reach
 from gate_resolved_act import path_candidates
 
-WS = "/home/dp/ai-workspace/SAGE"
-HOME = "/home/dp"
+# Synthetic paths: the check is lexical over argv, so nothing needs to exist on disk.
+WS = "/home/user/ai-workspace/SAGE"
+HOME = "/home/user"
 # one granted repo scope, the shape a member actually carries
 SCOPES = ["sage"]
 
