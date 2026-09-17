@@ -153,7 +153,7 @@ fn level_of(mean: f64) -> String {
     })
     .to_string()
 }
-const RETRY_WINDOW_MINUTES: i64 = 10;
+pub(crate) const RETRY_WINDOW_MINUTES: i64 = 10;
 /// How much chain the derivation scans — SPLIT BUDGETS.
 ///
 /// One global cap starved the evidence trust is EARNED from. Until 2026-08-23 a single
@@ -402,7 +402,7 @@ pub fn alias_target(plugin_id: &str, window: &[ChainEntry]) -> Option<String> {
 /// every identity witnessed as an alias OF it. One level only, deliberately — a chain
 /// of aliases is a rename history nobody has needed yet, and transitive resolution
 /// would let two independent aliases silently join two unrelated members.
-fn aliased_identities<'a>(plugin_id: &'a str, entries: &[&'a ChainEntry]) -> Vec<String> {
+pub(crate) fn aliased_identities<'a>(plugin_id: &'a str, entries: &[&'a ChainEntry]) -> Vec<String> {
     let mut ids = vec![plugin_id.to_string()];
     for e in entries {
         if e.event_type == IDENTITY_ALIAS_EVENT
@@ -453,6 +453,17 @@ pub fn derive_with_volume(
     window: &[ChainEntry],
     volume: Option<WitnessedVolume>,
 ) -> DerivedTrust {
+    with_volume(derive_evidence(plugin_id, role_lct, window), volume)
+}
+
+/// The WINDOW half of a derivation: every dimension, its evidence and the governed count,
+/// with the level stated as if no volume were known.
+///
+/// Split from [`with_volume`] so the expensive half can be cached per member and the cheap
+/// half applied at read time against the grain's live lifetime totals (see
+/// `derivation_cache`). The split is exact: `derive_with_volume` is literally the
+/// composition, so every test above it pins the pair.
+pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -> DerivedTrust {
     let mut entries: Vec<&ChainEntry> = window.iter().collect();
     entries.sort_by_key(|e| e.chain_position);
 
@@ -1069,17 +1080,6 @@ pub fn derive_with_volume(
     let veracity = mk_adj(1, "veracity");
     let valuation = mk_adj(2, "valuation");
 
-    // ---- Display level: from DERIVED evidence only, never the legacy scalar ----
-    let measured: Vec<f64> = [&temperament, &validity, &veracity, &valuation]
-        .iter()
-        .filter_map(|d| d.score)
-        .collect();
-    let conduct = if measured.is_empty() {
-        None
-    } else {
-        Some(measured.iter().sum::<f64>() / measured.len() as f64)
-    };
-
     // Governed coverage, counted from the window. The governance budget is deep (100,000)
     // against ~8,000 governance events on this chain, so this count is complete in
     // practice — unlike `outcome`, which is capped for recency on purpose.
@@ -1090,13 +1090,44 @@ pub fn derive_with_volume(
         }
     }
 
+    let evidence_only = DerivedTrust {
+        derivation_version: DERIVATION_VERSION.to_string(),
+        plugin_id: plugin_id.to_string(),
+        role_lct: role_lct.to_string(),
+        generated_at: Utc::now(),
+        temperament,
+        validity,
+        veracity,
+        valuation,
+        // Placeholders: `with_volume` states the level; it is the only thing that does.
+        level: String::new(),
+        level_basis: String::new(),
+        baseline_acts: 0,
+        governed_acts,
+    };
+    with_volume(evidence_only, None)
+}
+
+/// The VOLUME half of a derivation: the display level, from the dimensions already derived
+/// and the grain's lifetime witnessed totals. Pure and cheap — no window.
+///
+/// Idempotent: it reads only the dimensions and `governed_acts`, and overwrites every field
+/// it states, so applying fresh totals to a cached [`derive_evidence`] result is the same
+/// as deriving again over the same window.
+pub fn with_volume(mut d: DerivedTrust, volume: Option<WitnessedVolume>) -> DerivedTrust {
+    let dims = [&d.temperament, &d.validity, &d.veracity, &d.valuation];
+    // ---- Display level: from DERIVED evidence only, never the legacy scalar ----
+    let measured: Vec<f64> = dims.iter().filter_map(|x| x.score).collect();
+    let conduct = if measured.is_empty() {
+        None
+    } else {
+        Some(measured.iter().sum::<f64>() / measured.len() as f64)
+    };
+
     // A grain whose OWN activity is below the volume floor must not assert a level from a
     // handful of observations — least of all ones that may have leaked in from a sibling
     // role. Narrow by construction: with no volume passed, nothing here changes.
-    let observations: u64 = [&temperament, &validity, &veracity, &valuation]
-        .iter()
-        .map(|d| d.observations)
-        .sum();
+    let observations: u64 = dims.iter().map(|x| x.observations).sum();
     let thin_grain = volume.is_some_and(|v| v.total_acts < BASELINE_MIN_ACTS);
     let conduct = if thin_grain && observations < LEVEL_MIN_OBSERVATIONS {
         None
@@ -1104,6 +1135,7 @@ pub fn derive_with_volume(
         conduct
     };
 
+    let governed_acts = d.governed_acts;
     let baseline = volume.and_then(|v| baseline_score(v.total_acts, governed_acts));
     let level_basis = match (conduct.is_some(), baseline.is_some()) {
         (false, false) => "none",
@@ -1127,20 +1159,10 @@ pub fn derive_with_volume(
         }
     };
 
-    DerivedTrust {
-        derivation_version: DERIVATION_VERSION.to_string(),
-        plugin_id: plugin_id.to_string(),
-        role_lct: role_lct.to_string(),
-        generated_at: Utc::now(),
-        temperament,
-        validity,
-        veracity,
-        valuation,
-        level,
-        level_basis,
-        baseline_acts: volume.map_or(0, |v| v.total_acts),
-        governed_acts,
-    }
+    d.level = level;
+    d.level_basis = level_basis;
+    d.baseline_acts = volume.map_or(0, |v| v.total_acts);
+    d
 }
 
 #[cfg(test)]

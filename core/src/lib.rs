@@ -14,6 +14,7 @@ pub mod callback;
 pub mod constellation;
 pub mod delegation;
 pub mod derivation;
+pub mod derivation_cache;
 pub mod error;
 pub mod evidence;
 pub mod gate_cli;
