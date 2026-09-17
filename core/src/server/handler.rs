@@ -12802,6 +12802,107 @@ mod tests {
     /// known one from recording into sending — a severity change that diff review structurally
     /// cannot catch, because what the diff invalidates is a past risk acceptance rather than
     /// any line of code.
+    /// #1050: an invitation is a wake to DECIDE, and a member that declares its doors without
+    /// the review one cannot decide. Measured on CBP 2026-09-16/17: cbp-being, whose effector
+    /// set has no corroborate and no arbitrate, was invited to review three of claude-code's
+    /// gate edits and spent twenty hours asking dp and HUB to act on ids it could not open.
+    ///
+    /// The exclusion is narrow by construction, and the control arm is the point: a member that
+    /// declares NOTHING is unknown, not doorless, and is still invited.
+    #[tokio::test]
+    async fn an_invitation_skips_a_member_that_declared_no_review_door() {
+        let (_dir, shared) = make_shared_state();
+        // A seat that says it holds the door, a being that says it does not, and a seat that
+        // says nothing at all.
+        //
+        // The being's declaration is the BYTES ITS OWN CLIENT SENDS, not an illustration:
+        // SAGE's gateway fetches its policy snapshot through the same shared mechanism the
+        // seats use (`being_gate_client.py:1104`, `member_id="cbp-being"`), and that
+        // mechanism declares `["society-floor:v1"]` unless the CALLER opts into the review
+        // door. The first cut of this fixture wrote `["being:v1"]` — a plausible string no
+        // member has ever sent — while the same commit made the mechanism declare the review
+        // door unconditionally, so the deployed being would have read `declared` and been
+        // invited while this test watched a fiction be excluded. kimi-code caught that
+        // cross-vendor (findings/review-13031.md); the fixture now carries the real bytes so
+        // the arm cannot pass while the fleet's one gateway member is misfiltered.
+        tool_connect(&shared, &json!({"plugin_id": "claude-code", "host_agent": "h",
+                                      "gate_capabilities": ["society-floor:v1", REVIEW_CAPABILITY]}))
+            .await.unwrap();
+        tool_connect(&shared, &json!({"plugin_id": "cbp-being", "host_agent": "sage-gateway",
+                                      "gate_capabilities": ["society-floor:v1"]}))
+            .await.unwrap();
+        tool_connect(&shared, &json!({"plugin_id": "kimi-code", "host_agent": "h"}))
+            .await.unwrap();
+        let codex = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+
+        let claimed = tool_gate_escalation_claim(&shared, &json!({
+            "plugin_id": "codex", "session_id": codex, "tool_name": "Edit",
+            "marker": "pre_tool_use.py", "reason": "Edit -> a governance file",
+        })).await.unwrap();
+
+        let invited: Vec<String> = claimed["invited_peers"].as_array().unwrap().iter()
+            .map(|v| v.as_str().unwrap().to_string()).collect();
+        assert!(invited.contains(&"claude-code".to_string()), "declared the door: {invited:?}");
+        assert!(invited.contains(&"kimi-code".to_string()),
+                "declared NOTHING, so it is unknown, not doorless — still invited: {invited:?}");
+        assert!(!invited.contains(&"cbp-being".to_string()),
+                "declared its doors and the review one is not among them: {invited:?}");
+
+        // Recorded, not silently dropped — the chain entry carries who and why.
+        let opened = {
+            let s = shared.lock().await;
+            let e = s.chain_store.read_recent(60).unwrap().into_iter()
+                .find(|e| e.event_type == "gate_escalation_opened").expect("the open is witnessed");
+            e.event_data
+        };
+        let ineligible = opened["invitation_ineligible"].as_array().expect("the key exists");
+        assert_eq!(ineligible.len(), 1, "{opened}");
+        assert_eq!(ineligible[0]["peer"], "cbp-being");
+        assert_eq!(ineligible[0]["reason"], "no_review_door");
+        assert!(ineligible[0]["how_to_become_eligible"].as_str().unwrap()
+                    .contains("escalation-review:v1"),
+                "a refusal owes a way forward: {}", ineligible[0]);
+        // And the invitation evidence says WHY each peer was admissible.
+        let bases: std::collections::HashMap<String, String> = opened["invitation_evidence"]
+            .as_array().cloned().unwrap_or_default().iter()
+            .map(|e| (e["peer"].as_str().unwrap_or("?").to_string(),
+                      e["review_basis"].as_str().unwrap_or("?").to_string()))
+            .collect();
+        assert_eq!(bases.get("claude-code").map(String::as_str), Some("declared"), "{opened}");
+        assert_eq!(bases.get("kimi-code").map(String::as_str), Some("undeclared"), "{opened}");
+    }
+
+    /// The durable arm: a member that has corroborated before is invited whatever it declares
+    /// now. `gate_capabilities` is memory-only, so five minutes after a deploy every seat is
+    /// undeclared — a rule that read the chain as silent there would empty the pool fleet-wide.
+    #[tokio::test]
+    async fn a_member_that_corroborated_before_is_still_invited() {
+        let (_dir, shared) = make_shared_state();
+        {
+            let s = shared.lock().await;
+            s.append_chain(
+                "gate_escalation_corroborated",
+                json!({"escalation_id": "old", "plugin_id": "codex",
+                       "corroborated_by": "kimi-code", "stance": "concur"}),
+            ).unwrap();
+        }
+        tool_connect(&shared, &json!({"plugin_id": "kimi-code", "host_agent": "h",
+                                      "gate_capabilities": ["society-floor:v1"]}))
+            .await.unwrap();
+        let codex = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+
+        let claimed = tool_gate_escalation_claim(&shared, &json!({
+            "plugin_id": "codex", "session_id": codex, "tool_name": "Edit",
+            "marker": "pre_tool_use.py", "reason": "Edit -> a governance file",
+        })).await.unwrap();
+        let invited: Vec<String> = claimed["invited_peers"].as_array().unwrap().iter()
+            .map(|v| v.as_str().unwrap().to_string()).collect();
+        assert!(invited.contains(&"kimi-code".to_string()),
+                "its declaration omits the door, but the chain shows it has used one: {invited:?}");
+    }
+
     #[tokio::test]
     async fn an_asserted_asker_wakes_nobody_and_the_record_says_it_was_withheld() {
         let (_dir, shared) = make_shared_state();
@@ -18289,6 +18390,10 @@ struct OpenedInvitation {
     evidence: Vec<Value>,
     withheld: Vec<Value>,
     passed_over: Vec<Value>,
+    /// Members that were admissible on identity but hold no door to answer with (#1050).
+    /// Recorded, never silently dropped: "nobody could answer" and "nobody was asked" are
+    /// different facts, and this subsystem's own rule is that they must not share a row.
+    ineligible: Vec<Value>,
 }
 
 /// Has ANY watcher ever read this candidate's mailbox?
@@ -18318,6 +18423,54 @@ struct OpenedInvitation {
 /// must not be recorded as a specific finding about a peer.
 fn has_mailbox_reader(store: &crate::storage::SqliteInboxStore, plugin_id: &str) -> bool {
     !matches!(store.inbox_touch(plugin_id), Ok(None))
+}
+
+/// The capability a member declares at `hestia_connect` when it holds the review door.
+///
+/// `gate_capabilities` already carries a runtime self-report per member (`society-floor:v1`
+/// today, declared by the shared gate mechanism every seat connects through). This is the
+/// same channel, for the one question the invitation actually turns on.
+pub(crate) const REVIEW_CAPABILITY: &str = "escalation-review:v1";
+
+/// CAN THIS MEMBER ANSWER AN INVITATION? (#1050)
+///
+/// `hestia_gate_escalation_corroborate` is the only door that adds a factor, and until now
+/// nothing checked whether an invitee held it. Measured on CBP 2026-09-16/17: cbp-being, a 4B
+/// model whose effector set has no corroborate and no arbitrate, was invited to review three
+/// of claude-code's gate edits. Unanswerable and (then) unreadable, they became twenty hours
+/// of the being asking dp and HUB to file reconsideration motions about ids it could not open,
+/// including one it invented. Legibility (SAGE #110) stops the misreading; it does not make a
+/// door appear.
+///
+/// SILENCE IS NOT A MISSING DOOR, and this is the whole shape of the rule. A member that has
+/// declared nothing is UNKNOWN, and unknown is invited — the fleet's behaviour until now, and
+/// the direction this surface must fail in: a peer wrongly excluded is a review that never
+/// happens and a bar that cannot be met, while a peer wrongly invited wastes one notice.
+/// `gate_capabilities` is also memory-only, so minutes after a deploy every seat is undeclared;
+/// a rule that read that as "no door" would empty the pool fleet-wide on every restart.
+///
+/// So a member is excluded only when it SAYS what it holds and the review door is not in it,
+/// and the chain shows it has never corroborated:
+///   - `declared` — it named the review capability at connect.
+///   - `corroborated_before` — the chain shows it has added a factor, whatever it declares now.
+///   - `undeclared` — it named nothing. Invited, and the record says the basis was silence.
+///
+/// Ok(basis) when the member can be asked; Err(reason) when it cannot — and the caller RECORDS
+/// the reason rather than dropping the member silently.
+fn review_capability(s: &super::state::ServerState, plugin_id: &str) -> Result<&'static str, &'static str> {
+    let declared = match s.gate_capabilities.get(plugin_id) {
+        None => return Ok("undeclared"),
+        Some(c) => c,
+    };
+    if declared.contains(REVIEW_CAPABILITY) {
+        return Ok("declared");
+    }
+    match s.chain_store.has_corroborated(plugin_id) {
+        Ok(true) => Ok("corroborated_before"),
+        // A failed read is not a missing capability: fail toward inviting, as above.
+        Err(_) => Ok("capability_read_failed"),
+        Ok(false) => Err("no_review_door"),
+    }
 }
 
 /// The same row, read for the CONDUCT question instead of the queueing one.
@@ -18395,7 +18548,7 @@ fn resolve_invitation(
     // empty, so "this box knows no admissible peer" and "we never built the pool" rendered
     // identically. That is the asked-versus-never-asked confusion this writer exists to end —
     // closed for unproven askers, left open for this bar.
-    let (invited, evidence, passed_over) = {
+    let (invited, evidence, passed_over, ineligible) = {
         // Same identity test the appeal router uses, and it has the same measured reach:
         // `member_lct` hashes the trimmed id, so it separates `codex` from `codex-cli` only
         // by whitespace (`state::tests::the_member_lct_alias_guard_reaches_only_whitespace`).
@@ -18417,6 +18570,11 @@ fn resolve_invitation(
         // that declined; see `has_mailbox_reader_within`.
         let ttl_secs = esc.expires_at.saturating_sub(esc.opened_at);
         let now = crate::server::gate_escalation::now_secs();
+        // WHO CAN ANSWER (#1050), before liveness is even consulted: an invitation to a member
+        // with no review door is a wake it cannot act on, and the record says so.
+        let mut ineligible: Vec<Value> = Vec::new();
+        let mut basis_of: std::collections::HashMap<String, &'static str> =
+            std::collections::HashMap::new();
         let mut pool: Vec<(String, crate::arbiter::Liveness, bool, Option<bool>)> = s
             .member_registry
             .iter_sorted()
@@ -18426,6 +18584,23 @@ fn resolve_invitation(
             .filter(|id| match (&asker_lct, s.member_lct(id)) {
                 (Some(a), Some(b)) => a != &b,
                 _ => true,
+            })
+            .filter(|id| match review_capability(s, id) {
+                Ok(basis) => {
+                    basis_of.insert(id.clone(), basis);
+                    true
+                }
+                Err(reason) => {
+                    ineligible.push(json!({
+                        "peer": id,
+                        "reason": reason,
+                        "door": "hestia_gate_escalation_corroborate",
+                        "how_to_become_eligible": "hold hestia_gate_escalation_corroborate, then \
+                                                   name escalation-review:v1 in gate_capabilities \
+                                                   at hestia_connect",
+                    }));
+                    false
+                }
             })
             .map(|id| {
                 let l = actor_liveness(&window, &id);
@@ -18474,12 +18649,16 @@ fn resolve_invitation(
         // were the defect this closes.
         let ev = |(id, l, reachable, reader): &(String, crate::arbiter::Liveness, bool, Option<bool>)| {
             json!({"peer": id, "liveness_at_invite": l, "mailbox_reader": reader,
-                   "mailbox_reader_all_time": reachable})
+                   "mailbox_reader_all_time": reachable,
+                   // WHY this peer was admissible to ask (#1050): declared the review door,
+                   // corroborated before, or declared nothing at all.
+                   "review_basis": basis_of.get(id).copied().unwrap_or("undeclared")})
         };
         (
             pool.iter().map(|(id, _, _, _)| id.clone()).collect::<Vec<String>>(),
             pool.iter().map(ev).collect::<Vec<Value>>(),
             over.iter().map(ev).collect::<Vec<Value>>(),
+            ineligible,
         )
     };
 
@@ -18535,7 +18714,7 @@ fn resolve_invitation(
         },
     );
 
-    OpenedInvitation { invited, evidence, withheld, passed_over }
+    OpenedInvitation { invited, evidence, withheld, passed_over, ineligible }
 }
 
 /// The `gate_escalation_coalesced` payload (#668): a second ask for an act whose first ask
@@ -18694,6 +18873,8 @@ fn opened_payload(
         // Emitted on every open, `session` included, so a census reading payload KEYS
         // cannot mistake "this daemon does not record the basis" for "the basis was fine".
         "invitation_withheld": inv.withheld,
+        // Admissible on identity, no door to answer with (#1050).
+        "invitation_ineligible": inv.ineligible,
         // Admissible peers the cap dropped. Recorded rather than truncated silently: a
         // bounded invitation that reads as an exhaustive one makes "nobody looked"
         // unfalsifiable.

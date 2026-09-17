@@ -686,6 +686,25 @@ impl SqliteChainStore {
         Ok(out)
     }
 
+    /// Has this member ever added a peer factor to someone else's escalation? (#1050)
+    ///
+    /// The capability check's second arm. `gate_capabilities` is a live self-report and is
+    /// memory-only, so a daemon that just restarted knows nothing about a seat that has not
+    /// reconnected yet — and a filter that forgot everyone on restart would invite nobody.
+    /// A corroboration on the chain is durable proof the member holds the door.
+    /// Index-restricted to the one event type; the id is matched exactly.
+    pub fn has_corroborated(&self, plugin_id: &str) -> Result<bool> {
+        let conn = self.read_conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM chain_entries
+             WHERE event_type = 'gate_escalation_corroborated'
+               AND json_extract(event_data, '$.corroborated_by') = ?1
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![plugin_id])?;
+        Ok(rows.next()?.is_some())
+    }
+
     /// One member's appeals and the rulings on them, oldest first, with no recency window
     /// (#164): `appeal` rows whose `plugin_id` is the member and `adjudication` rows whose
     /// `subject_plugin_id` is. Index-restricted to the two event types, like
