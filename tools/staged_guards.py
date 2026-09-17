@@ -78,6 +78,34 @@ def repair_line(offenders):
     return "git update-index --chmod=+x " + " ".join(offenders)
 
 
+def boundary_findings(text):
+    """Parse `tools/public_boundary.py`'s findings into (path, message).
+
+    Its verdict is repo-wide even under `--cached`: it reads the whole INDEX, plus a
+    manifest of binary assets. Measured in a scratch clone -- a `FAIL` there named 60+
+    paths, none of them staged. Treating that rc as "your commit is bad" is the
+    repo-wide-hook failure this tool exists to avoid, committed by the tool itself.
+    """
+    out = []
+    for line in text.splitlines():
+        if not line.startswith("  ") or ":" not in line:
+            continue
+        path, _, msg = line.strip().partition(":")
+        out.append((path.strip(), msg.strip()))
+    return out
+
+
+def findings_on(findings, staged):
+    """Only the findings naming a path in your staged set.
+
+    A finding against the asset MANIFEST (`tools/public_binary_assets.sha256:
+    untracked or missing asset <other path>`) names the manifest, not the asset --
+    so it blocks only the seat that actually staged the manifest, which is correct.
+    """
+    s = set(staged)
+    return [(p, m) for p, m in findings if p in s]
+
+
 def check(repo):
     staged = staged_paths(repo)
     if not staged:
@@ -95,11 +123,21 @@ def check(repo):
         print("\nRepair, then re-commit:\n\n    %s\n" % repair_line(offenders))
     boundary = os.path.join(HERE, "public_boundary.py")
     if os.path.exists(boundary):
-        out = subprocess.run([sys.executable, boundary, "--cached"], cwd=repo)
+        out = subprocess.run([sys.executable, boundary, "--cached"], cwd=repo,
+                             capture_output=True, text=True)
         if out.returncode != 0:
-            rc = 1
-            print("\nstaged-guards FAIL: the public/private boundary scanner refused "
-                  "the staged snapshot (see above).")
+            print(out.stdout.rstrip() or out.stderr.rstrip())
+            mine = findings_on(boundary_findings(out.stdout), staged)
+            if mine:
+                rc = 1
+                print("\nstaged-guards FAIL: the boundary scanner refused %d path(s) "
+                      "YOU staged:" % len(mine))
+                for path, msg in mine:
+                    print("    %s: %s" % (path, msg))
+            else:
+                print("\nstaged-guards: the boundary scanner is red, but on no path you "
+                      "staged -- NOT blocking this commit. That red belongs to main "
+                      "(see tools/ci_red_spell_census.py baseline).")
     if rc == 0:
         print("staged-guards: %d staged path(s) clean" % len(staged))
     return rc

@@ -13,7 +13,8 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from staged_guards import check, exec_bit_offenders, repair_line, staged_paths
+from staged_guards import (boundary_findings, check, exec_bit_offenders,
+                            findings_on, repair_line, staged_paths)
 
 
 def test_a_staged_script_at_100644_is_an_offender():
@@ -51,6 +52,45 @@ def test_the_repair_is_update_index_not_chmod():
     line = repair_line(["tools/a.py", "tools/b.py"])
     assert line == "git update-index --chmod=+x tools/a.py tools/b.py", line
     assert "chmod +x" not in line
+
+
+BOUNDARY_FAIL = """PUBLIC BOUNDARY: FAIL
+  tools/mine.py: non-text blob is absent from reviewed manifest
+  tools/public_binary_assets.sha256: untracked or missing asset app/icons/icon.png
+  plugins/theirs/x.md: leaked installation-local path
+"""
+
+
+def test_boundary_findings_are_parsed_as_path_and_message():
+    f = boundary_findings(BOUNDARY_FAIL)
+    assert [p for p, _ in f] == ["tools/mine.py",
+                                 "tools/public_binary_assets.sha256",
+                                 "plugins/theirs/x.md"], f
+    assert f[0][1] == "non-text blob is absent from reviewed manifest", f
+
+
+def test_a_boundary_red_on_nobody_elses_path_does_not_block_you():
+    """THE arm, second time. `--cached` reads the WHOLE index plus an asset manifest,
+    so its rc is repo-wide: measured in a scratch clone it named 60+ paths, none
+    staged. Blocking on that rc is the repo-wide-hook failure this tool exists to
+    avoid -- committed by the tool itself until an end-to-end install test found it."""
+    assert findings_on(boundary_findings(BOUNDARY_FAIL), ["docs/unrelated.md"]) == []
+
+
+def test_a_boundary_red_on_your_own_staged_path_does_block_you():
+    mine = findings_on(boundary_findings(BOUNDARY_FAIL), ["tools/mine.py", "a.md"])
+    assert [p for p, _ in mine] == ["tools/mine.py"], mine
+
+
+def test_a_manifest_finding_names_the_manifest_not_the_asset():
+    """`tools/public_binary_assets.sha256: untracked or missing asset <path>` blocks
+    only a seat that staged the MANIFEST -- staging the named asset is not enough,
+    and that asymmetry is deliberate: the manifest is the reviewed surface."""
+    assert findings_on(boundary_findings(BOUNDARY_FAIL),
+                       ["app/icons/icon.png"]) == []
+    got = findings_on(boundary_findings(BOUNDARY_FAIL),
+                      ["tools/public_binary_assets.sha256"])
+    assert [p for p, _ in got] == ["tools/public_binary_assets.sha256"], got
 
 
 def _git(repo, *args):
@@ -108,6 +148,10 @@ TESTS = [
     test_somebody_elses_unstaged_offender_does_not_block_your_commit,
     test_offenders_are_sorted_so_the_repair_line_is_stable,
     test_the_repair_is_update_index_not_chmod,
+    test_boundary_findings_are_parsed_as_path_and_message,
+    test_a_boundary_red_on_nobody_elses_path_does_not_block_you,
+    test_a_boundary_red_on_your_own_staged_path_does_block_you,
+    test_a_manifest_finding_names_the_manifest_not_the_asset,
     test_end_to_end_a_staged_script_fails_and_the_repair_clears_it,
     test_end_to_end_an_already_committed_offender_does_not_fail_a_later_commit,
     test_end_to_end_nothing_staged_is_not_a_failure,
