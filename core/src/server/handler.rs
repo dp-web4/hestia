@@ -90,6 +90,7 @@ impl ServerHandler for HestiaServer {
             "hestia_appeal" => tool_appeal(&self.state, &args).await,
             "hestia_arbitrate_appeal" => tool_arbitrate_appeal(&self.state, &args).await,
             "hestia_open_appeals" => tool_open_appeals(&self.state, &args).await,
+            "hestia_my_appeals" => tool_my_appeals(&self.state, &args).await,
             "hestia_request_scope" => tool_request_scope(&self.state, &args).await,
             "hestia_scope_status" => tool_scope_status(&self.state, &args).await,
             "hestia_gate_escalation_open" => tool_gate_escalation_open(&self.state, &args).await,
@@ -310,6 +311,10 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_arbitrate_appeal",
             "Rule on another member's filed appeal (NOT-SAME, enforced: never your own appeal, never a deny your own gate issued). Requires an explicit upheld:true/false and stated reasoning; records the independence of the arbiter so a reader can weigh the ruling",
+        ),
+        t(
+            "hestia_my_appeals",
+            "YOUR OWN appeals and what happened to each: open, ruled, or never ruled and now past the ruling window. A ruled appeal carries the verdict (upheld or deny stands), who ruled it, when, and their rationale verbatim. Self-scoped by your session_id; read-only; no recency window, so a ruling does not disappear because the fleet was busy. This is the poll beside the disposition notice (hestia://appeal/<deny_hash>#ruled) that a ruling sends you. hestia_open_appeals cannot answer this: it lists only unruled appeals",
         ),
         t(
             "hestia_open_appeals",
@@ -3467,6 +3472,90 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
 // this is a strictly narrower projection of entries any connected caller can already read.
 
 /// List appeals that no arbiter has ruled on yet.
+/// `hestia_my_appeals` — a member reads its own appeals and the rulings on them (#164).
+///
+/// THE POLL THE APPEAL PATH NEVER HAD. The notify leg exists (a ruling enqueues a
+/// `hestia://appeal/<deny_hash>#ruled` disposition, since #459), but a notice is a doorbell:
+/// a member whose renderer drops it, or whose session missed it, had no way to ask what
+/// happened. `hestia_open_appeals` lists only UNRULED appeals by construction, and
+/// `hestia_query_history` is capped at 500 rows with its filters ignored (#497). Measured
+/// 2026-09-15/16: cbp-being filed nine appeals, all ruled "deny stands" with substantive
+/// reasons, and never read one; it spent the next day asking why its appeals were
+/// "undelivered".
+///
+/// Self-scoped: the member is the resolved caller, never an argument, so no member can read
+/// another's rulings through this door. No recency window: the rows come from
+/// `appeal_rows_for_member`, index-restricted to the two event types.
+async fn tool_my_appeals(state: &SharedState, args: &Value) -> ToolResult {
+    let session_id_arg = optional_session_id(args);
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20).clamp(1, 100);
+    let s = state.lock().await;
+    let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.my_appeals_unattributed",
+            "hestia_my_appeals answers for the member asking, so it needs your own live \
+             session_id (from hestia_connect). An unattributed caller has no appeals to be shown",
+            None,
+        ));
+    };
+    // Room for every appeal and its ruling, newest kept.
+    let rows = s
+        .chain_store
+        .appeal_rows_for_member(&who.plugin_id, limit * 2 + 50)
+        .map_err(|e| anyhow::anyhow!("reading appeals for {}: {e}", who.plugin_id))?;
+    let chain_len = s.chain_len();
+    let mut appeals: Vec<Value> = Vec::new();
+    for appeal in rows.iter().filter(|e| e.event_type == "appeal").rev() {
+        let deny = appeal.event_data.get("deny_hash").and_then(Value::as_str).unwrap_or_default();
+        let ruling = rows.iter().find(|e| {
+            e.event_type == "adjudication"
+                && e.chain_position > appeal.chain_position
+                && e.event_data.get("about_deny_hash").and_then(Value::as_str) == Some(deny)
+        });
+        let within = appeal.chain_position + APPEAL_CHAIN_WINDOW >= chain_len;
+        let status = match (ruling.is_some(), within) {
+            (true, _) => "ruled",
+            (false, true) => "open",
+            (false, false) => "unruled_past_window",
+        };
+        let mut row = json!({
+            "deny_hash": deny,
+            "appeal_entry": appeal.hash,
+            "filed_at": appeal.timestamp.to_rfc3339(),
+            "your_reason": appeal.event_data.get("reason"),
+            "about_attempted": appeal.event_data.get("about_attempted"),
+            "status": status,
+            "pointer": format!("hestia://appeal/{deny}"),
+        });
+        if let Some(r) = ruling {
+            let upheld = r.event_data.get("upheld").and_then(Value::as_bool).unwrap_or(false);
+            row["ruling"] = json!({
+                "verdict": if upheld { "upheld — the deny was wrong" } else { "deny stands" },
+                "upheld": upheld,
+                "adjudicator": r.event_data.get("adjudicator"),
+                "adjudicator_role": r.event_data.get("adjudicator_role"),
+                "ruled_at": r.timestamp.to_rfc3339(),
+                "rationale": r.event_data.get("rationale"),
+                "adjudication_entry": r.hash,
+            });
+        }
+        appeals.push(row);
+        if appeals.len() as u64 >= limit {
+            break;
+        }
+    }
+    let ruled = appeals.iter().filter(|a| a["status"] == "ruled").count();
+    let open = appeals.iter().filter(|a| a["status"] == "open").count();
+    Ok(json!({
+        "member": who.plugin_id,
+        "appeals": appeals,
+        "counts": {"shown": appeals.len(), "ruled": ruled, "open": open},
+        "note": "newest first. A ruling ends that appeal: filing the same appeal again \
+                 re-asks a question that has been answered. If you still need what was \
+                 denied, ask for it with a reason (hestia_request_scope) or in a conversation.",
+    }))
+}
+
 async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
     let session_id_arg = optional_session_id(args);
     let s = state.lock().await;
@@ -6747,33 +6836,33 @@ fn chain_entry_json(e: &crate::storage::chain::ChainEntry) -> Value {
 /// its reasoning.
 fn resolve_appeal_pointer(s: &super::state::ServerState, pointer: &str) -> Value {
     let ptr = pointer.trim();
-    if ptr.is_empty() {
-        return hestia_error_envelope(
-            "hestia.appeal_pointer_malformed",
-            "hestia://appeal/ needs a hash: either the deny_hash the appeal disputes (what \
-             this daemon mints) or the appeal entry's own chain hash (what hand-written mesh \
-             notices have carried). Both resolve here.",
-            None,
-        );
-    }
-    let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
+    // EXACT, NOT WINDOWED (#164). This used to search the last APPEAL_CHAIN_WINDOW entries,
+    // parsing 20,000 JSON trees per call, and reported a ruled appeal as not found once the
+    // fleet had appended that many entries after it — measured on cbp-being's nine rulings,
+    // ~40,000 entries back by the next evening. A reader of what HAPPENED to an appeal has no
+    // reason to forget; only the acts (filing, ruling) keep a window, and `within_ruling_window`
+    // below says which side of it an open appeal is on.
+    let rows = match s.chain_store.appeal_rows_for_pointer(ptr) {
+        Ok(rows) => rows,
+        Err(e) => {
+            return hestia_error_envelope(
+                "hestia.appeal_pointer_not_found",
+                &format!("'{ptr}' is not a usable appeal pointer: {e}"),
+                Some(json!({"pointer": ptr})),
+            );
+        }
+    };
     let is_prefix_of = |full: &str| full == ptr || (ptr.len() >= 8 && full.starts_with(ptr));
-
-    // Convention 1, the daemon's own: the hash names the DENY under appeal.
-    let found = window
+    // Newest matching appeal: a deny can be appealed again after a ruling.
+    let found = rows
         .iter()
+        .rev()
         .filter(|e| e.event_type == "appeal")
-        .find(|e| {
-            e.event_data
-                .get("deny_hash")
-                .and_then(Value::as_str)
-                .is_some_and(is_prefix_of)
-        })
+        .find(|e| e.event_data.get("deny_hash").and_then(Value::as_str).is_some_and(is_prefix_of))
         .map(|e| (e, "deny_hash"))
-        // Convention 2, what peers actually send: the hash names the APPEAL ENTRY itself.
         .or_else(|| {
-            window
-                .iter()
+            rows.iter()
+                .rev()
                 .find(|e| e.event_type == "appeal" && is_prefix_of(&e.hash))
                 .map(|e| (e, "appeal_entry_hash"))
         });
@@ -6782,21 +6871,30 @@ fn resolve_appeal_pointer(s: &super::state::ServerState, pointer: &str) -> Value
         return hestia_error_envelope(
             "hestia.appeal_pointer_not_found",
             &format!(
-                "no appeal in the last {APPEAL_CHAIN_WINDOW} chain entries matches '{ptr}' as \
-                 either a deny_hash or an appeal entry hash. Note this is the SAME window \
-                 hestia_arbitrate_appeal searches: if an appeal was filed against this hash \
-                 and has aged out, it is unrulable too, and that is a real state — not a \
-                 malformed pointer"
+                "no appeal anywhere on the chain matches '{ptr}' as either a deny_hash or an \
+                 appeal entry hash. This lookup has no recency window, so absence here means no \
+                 such appeal was ever filed — not that one aged out"
             ),
-            Some(json!({"pointer": ptr, "window": APPEAL_CHAIN_WINDOW, "chainLength": s.chain_len()})),
+            Some(json!({"pointer": ptr, "chainLength": s.chain_len()})),
         );
     };
 
     let deny_hash = appeal.event_data.get("deny_hash").and_then(Value::as_str).unwrap_or_default();
-    let ruling = window.iter().find(|e| {
+    let by_deny;
+    let pool: &[crate::storage::chain::ChainEntry] = if matched_as == "deny_hash" {
+        &rows
+    } else {
+        by_deny = s.chain_store.appeal_rows_for_pointer(deny_hash).unwrap_or_default();
+        &by_deny
+    };
+    // The ruling on THIS appeal: the first adjudication about its deny at or after it.
+    let ruling = pool.iter().find(|e| {
         e.event_type == "adjudication"
+            && e.chain_position > appeal.chain_position
             && e.event_data.get("about_deny_hash").and_then(Value::as_str) == Some(deny_hash)
     });
+    let within_ruling_window =
+        appeal.chain_position + APPEAL_CHAIN_WINDOW >= s.chain_len();
 
     json!({
         "pointer": ptr,
@@ -6809,12 +6907,15 @@ fn resolve_appeal_pointer(s: &super::state::ServerState, pointer: &str) -> Value
         "entry": chain_entry_json(appeal),
         "ruled": ruling.is_some(),
         "ruling": ruling.map(chain_entry_json),
-        "next": match &ruling {
-            Some(_) => "already ruled — the adjudication entry is inline above. A second \
+        "within_ruling_window": within_ruling_window,
+        "next": match (&ruling, within_ruling_window) {
+            (Some(_), _) => "already ruled — the adjudication entry is inline above. A second \
                         ruling is refused; there is nothing to do here.",
-            None => "open. If you are not the appellant and not the gate that denied, you may \
+            (None, true) => "open. If you are not the appellant and not the gate that denied, you may \
                      rule it now: hestia_arbitrate_appeal with the deny_hash above. You do not \
                      need to have been routed it — designation is advisory.",
+            (None, false) => "never ruled, and now older than the ruling window, so it can no longer \
+                     be ruled: hestia_arbitrate_appeal refuses an aged-out deny. It stays unruled.",
         },
     })
 }
@@ -17048,6 +17149,133 @@ mod appeal_tests {
             .unwrap_or_else(|e| panic!("the disposition pointer must resolve: {e}"));
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["ruled"], json!(true), "{v}");
+    }
+
+    /// #164, the poll leg: a member reads its own appeals and the rulings on them, verbatim,
+    /// and nobody else's. Measured 2026-09-15/16: cbp-being's nine rulings each carried a
+    /// substantive reason, and it never read one — `hestia_open_appeals` lists only unruled
+    /// appeals by construction, so no door showed a ruling to the member it was about.
+    #[tokio::test]
+    async fn a_member_polls_its_own_rulings_verbatim_and_no_one_elses() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let a_sid = seat(&state, "claude-code").await;
+        let codex_sid = seat(&state, "codex").await;
+        let ruled_deny = seat_deny(&state, "claude-code", a_sid, "hestia-gate").await;
+        let open_deny = seat_deny(&state, "claude-code", a_sid, "hestia-gate").await;
+        for (deny, why) in [(&ruled_deny, "first reason"), (&open_deny, "second reason")] {
+            let out = tool_appeal(&state, &json!({
+                "deny_hash": deny, "session_id": a_sid.to_string(), "reason": why,
+            })).await.unwrap();
+            assert!(out.get("_hestia_error").is_none(), "{out}");
+        }
+        let rationale = "Deny stands. The path you asked for does not exist; the file you want \
+                         is already in your notes.";
+        let ruled = tool_arbitrate_appeal(&state, &json!({
+            "deny_hash": ruled_deny, "session_id": codex_sid.to_string(), "upheld": false,
+            "rationale": rationale,
+        })).await.unwrap();
+        assert!(ruled.get("_hestia_error").is_none(), "{ruled}");
+
+        let mine = tool_my_appeals(&state, &json!({"session_id": a_sid.to_string()})).await.unwrap();
+        assert_eq!(mine["member"], "claude-code");
+        let rows = mine["appeals"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "{mine}");
+        let r = rows.iter().find(|a| a["deny_hash"] == json!(ruled_deny)).unwrap();
+        assert_eq!(r["status"], "ruled");
+        assert_eq!(r["ruling"]["verdict"], "deny stands");
+        assert_eq!(r["ruling"]["rationale"], json!(rationale), "the reason arrives verbatim");
+        assert_eq!(r["ruling"]["adjudicator"], "codex");
+        assert_eq!(r["your_reason"], "first reason");
+        let o = rows.iter().find(|a| a["deny_hash"] == json!(open_deny)).unwrap();
+        assert_eq!(o["status"], "open");
+        assert!(o.get("ruling").is_none());
+        assert_eq!(mine["counts"]["ruled"], 1);
+        assert_eq!(mine["counts"]["open"], 1);
+
+        let theirs = tool_my_appeals(&state, &json!({"session_id": codex_sid.to_string()})).await.unwrap();
+        assert_eq!(theirs["appeals"], json!([]), "a member cannot read another member's appeals");
+        let anon = tool_my_appeals(&state, &json!({})).await.unwrap();
+        assert_eq!(anon["_hestia_error"]["code"], "hestia.my_appeals_unattributed");
+    }
+
+    /// #164 / #610, the reported failure: a ruling is still readable after the fleet has
+    /// appended more than `APPEAL_CHAIN_WINDOW` entries behind it. Before, the disposition
+    /// pointer answered `appeal_pointer_not_found` for an appeal that WAS ruled — cbp-being's
+    /// nine rulings were ~40,000 entries back by the next evening. An open appeal that aged
+    /// out is reported as such, not as open.
+    #[tokio::test]
+    async fn a_ruling_stays_readable_after_the_chain_moves_past_the_window() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let a_sid = seat(&state, "claude-code").await;
+        let codex_sid = seat(&state, "codex").await;
+        let ruled_deny = seat_deny(&state, "claude-code", a_sid, "hestia-gate").await;
+        let stale_deny = seat_deny(&state, "claude-code", a_sid, "hestia-gate").await;
+        for deny in [&ruled_deny, &stale_deny] {
+            let out = tool_appeal(&state, &json!({
+                "deny_hash": deny, "session_id": a_sid.to_string(),
+                "reason": "the matched token was data in a heredoc body, not a command",
+            })).await.unwrap();
+            assert!(out.get("_hestia_error").is_none(), "appeal must land: {out}");
+        }
+        let ruled = tool_arbitrate_appeal(&state, &json!({
+            "deny_hash": ruled_deny, "session_id": codex_sid.to_string(), "upheld": false,
+            "rationale": "still true a day later: the deny was correct and stands",
+        })).await.unwrap();
+        assert!(ruled.get("_hestia_error").is_none(), "ruling must land: {ruled}");
+        {
+            let st = state.lock().await;
+            let before = st.chain_store.appeal_rows_for_pointer(&ruled_deny).unwrap();
+            assert!(before.iter().any(|e| e.event_type == "adjudication"), "setup: ruling findable before filler");
+        }
+
+        // Push the chain past the window with filler rows, written in one transaction on a
+        // second connection (the read path never verifies hashes, so filler needs none).
+        {
+            let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+            let mut conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+            conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+            let start: i64 = conn
+                .query_row("SELECT COALESCE(MAX(chain_position), -1) + 1 FROM chain_entries", [], |r| r.get(0))
+                .unwrap();
+            let tx = conn.transaction().unwrap();
+            {
+                let mut ins = tx.prepare(
+                    "INSERT INTO chain_entries (chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp)
+                     VALUES (?1, ?2, '', 'filler', '{}', '', '2026-09-17T00:00:00Z')",
+                ).unwrap();
+                for i in 0..(APPEAL_CHAIN_WINDOW as i64 + 50) {
+                    ins.execute(rusqlite::params![start + i, format!("{:064x}", start + i + (1i64 << 40))]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        // Reopen, as a restart would: the store's cached length is loaded from the table, so it
+        // counts the filler written on the side connection above. Sessions are memory-only, so
+        // the appellant takes a new one.
+        drop(state);
+        let state = open_state(&dir);
+        let a_sid = seat(&state, "claude-code").await;
+
+        let body = read_resource_body(&state, &format!("hestia://appeal/{ruled_deny}#ruled"))
+            .await
+            .unwrap_or_else(|e| panic!("the pointer must still resolve past the window: {e}"));
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(v.get("_hestia_error").is_none(), "a ruled appeal must not read as not-found: {v}");
+        assert_eq!(v["ruled"], json!(true), "{v}");
+
+        let mine = tool_my_appeals(&state, &json!({"session_id": a_sid.to_string()})).await.unwrap();
+        let rows = mine["appeals"].as_array().unwrap();
+        let r = rows.iter().find(|a| a["deny_hash"] == json!(ruled_deny)).unwrap();
+        assert_eq!(r["status"], "ruled");
+        assert_eq!(r["ruling"]["rationale"], "still true a day later: the deny was correct and stands");
+        let stale = rows.iter().find(|a| a["deny_hash"] == json!(stale_deny)).unwrap();
+        assert_eq!(stale["status"], "unruled_past_window",
+                   "an open appeal older than the ruling window is not reported as open: {stale}");
+        let body = read_resource_body(&state, &format!("hestia://appeal/{stale_deny}")).await.unwrap();
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["within_ruling_window"], json!(false), "{v}");
     }
 
     /// A disposition is terminal: it answers a petition and awaits nothing, so it
