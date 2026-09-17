@@ -1,0 +1,312 @@
+{
+ "commits": 588,
+ "red": 110,
+ "spells": [
+  {
+   "breaker": "224b8261",
+   "started_at": "2026-07-28T00:59:42Z",
+   "commits": [
+    "224b8261",
+    "cd39ed73",
+    "a2483ca0",
+    "ce4afec6",
+    "bc24d821",
+    "e40a5a2a",
+    "7b94eb43",
+    "8a705e81",
+    "490e763e"
+   ],
+   "landed_into_red": 8,
+   "repaired_by": "4e32b1fd",
+   "repaired_at": "2026-07-28T07:39:47Z",
+   "hours": 6.7,
+   "failing_at_breaker": [],
+   "growth": []
+  },
+  {
+   "breaker": "5e156362",
+   "started_at": "2026-07-30T03:28:40Z",
+   "commits": [
+    "5e156362",
+    "1112f455",
+    "f8f8dcab",
+    "ca19fc70",
+    "9570df26",
+    "1126167f",
+    "0b261f70"
+   ],
+   "landed_into_red": 6,
+   "repaired_by": "d38dfbfb",
+   "repaired_at": "2026-07-30T08:06:17Z",
+   "hours": 4.6,
+   "failing_at_breaker": [],
+   "growth": []
+  },
+  {
+   "breaker": "018e1c8a",
+   "started_at": "2026-07-31T05:23:30Z",
+   "commits": [
+    "018e1c8a",
+    "51f83764"
+   ],
+   "landed_into_red": 1,
+   "repaired_by": "7fa9b3f8",
+   "repaired_at": "2026-07-31T06:23:45Z",
+   "hours": 1.0,
+   "failing_at_breaker": [],
+   "growth": []
+  },
+  {
+   "breaker": "3fc50886",
+   "started_at": "2026-07-31T18:55:01Z",
+   "commits": [
+    "3fc50886"
+   ],
+   "landed_into_red": 0,
+   "repaired_by": "0b212b3f",
+   "repaired_at": "2026-07-31T19:30:19Z",
+   "hours": 0.6,
+   "failing_at_breaker": [
+    "tools/shebang_exec_bit_test.py"
+   ],
+   "growth": []
+  },
+  {
+   "breaker": "07efc1e1",
+   "started_at": "2026-08-06T20:42:55Z",
+   "commits": [
+    "07efc1e1",
+    "7cf036f7",
+    "e33db269",
+    "9eb235ea",
+    "af364f9f",
+    "12752dc9",
+    "c8ed9317",
+    "2f5dbc0d",
+    "ae2a0ca5",
+    "0a76fe4d",
+    "b4106aac"
+   ],
+   "landed_into_red": 10,
+   "repaired_by": "26e23496",
+   "repaired_at": "2026-08-07T01:15:20Z",
+   "hours": 4.5,
+   "failing_at_breaker": [],
+   "growth": [
+    {
+     "sha": "9eb235ea",
+     "added": [
+      "tools/ci_selfexec_test.py",
+      "tools/shebang_exec_bit_test.py"
+     ],
+     "fixed": []
+    },
+    {
+     "sha": "af364f9f",
+     "added": [
+      "tools/citation_number_claim_test.py"
+     ],
+     "fixed": []
+    }
+   ]
+  },
+  {
+   "breaker": "5b3cb664",
+   "started_at": "2026-08-12T00:41:52Z",
+   "commits": [
+    "5b3cb664",
+    "f0fd0251"
+   ],
+   "landed_into_red": 1,
+   "repaired_by": "fb382b1f",
+   "repaired_at": "2026-08-12T04:00:37Z",
+   "hours": 3.3,
+   "failing_at_breaker": [
+    "tools/shebang_exec_bit_test.py"
+   ],
+   "growth": []
+  },
+  {
+   "breaker": "643a4a06",
+   "started_at": "2026-08-18T21:37:56Z",
+   "commits": [
+    "643a4a06",
+    "56792c50",
+    "793882d9",
+    "626c1e0b",
+    "165e009f"
+   ],
+   "landed_into_red": 4,
+   "repaired_by": "fcb91abc",
+   "repaired_at": "2026-08-19T05:00:56Z",
+   "hours": 7.4,
+   "failing_at_breaker": [],
+   "growth": []
+  },
+  {
+   "breaker": "a1a25431",
+   "started_at": "2026-09-03T04:47:14Z",
+   "commits": [
+    "a1a25431",
+    "342cc7c8",
+    "8ba5655b",
+    "cbe5c1d6",
+    "25a89700",
+    "db0d099a",
+    "3dbd1f1e",
+    "26050884",
+    "053bdda1",
+    "ff6dbaa2",
+    "719fc7b6",
+    "24a915b7",
+    "1850bc6d",
+    "545753fa",
+    "f6421a75",
+    "a4246b60",
+    "045d1746",
+    "82b1b30d",
+    "c4db3ce8",
+    "43a27fb4",
+    "955f45fb",
+    "35ae3957",
+    "fbf400be",
+    "1f40136e",
+    "9cdda10d",
+    "eb48d574",
+    "06ed708f",
+    "99f2847b",
+    "7fea4f52",
+    "fb9a10cc",
+    "7f64a21e",
+    "b04a0888",
+    "dff286c6",
+    "a173edf5",
+    "5ea4baf8",
+    "bac9241a",
+    "6f688bf0",
+    "88f29b07",
+    "26cb98d8",
+    "82e8cabf",
+    "c6ed57ab",
+    "171bb794",
+    "a36bf3c9",
+    "08d6b719",
+    "a2d5d4d3",
+    "476c2943",
+    "1bc2bb3c",
+    "25a73653",
+    "2dca5499"
+   ],
+   "landed_into_red": 48,
+   "repaired_by": "0d6cfad5",
+   "repaired_at": "2026-09-03T08:17:52Z",
+   "hours": 3.5,
+   "failing_at_breaker": [
+    "tools/public_boundary_test.py",
+    "tools/shebang_exec_bit_test.py"
+   ],
+   "growth": []
+  },
+  {
+   "breaker": "4fa08a38",
+   "started_at": "2026-09-04T20:45:42Z",
+   "commits": [
+    "4fa08a38",
+    "7877ea83",
+    "31ce3275",
+    "cc648647",
+    "6b6909f9"
+   ],
+   "landed_into_red": 4,
+   "repaired_by": "6fb562cb",
+   "repaired_at": "2026-09-05T05:55:07Z",
+   "hours": 9.2,
+   "failing_at_breaker": [],
+   "growth": [
+    {
+     "sha": "7877ea83",
+     "added": [
+      "tools/shebang_exec_bit_test.py"
+     ],
+     "fixed": []
+    }
+   ]
+  },
+  {
+   "breaker": "39eea9b3",
+   "started_at": "2026-09-08T01:01:46Z",
+   "commits": [
+    "39eea9b3",
+    "e3b1112b",
+    "171a3521",
+    "7ea2007d"
+   ],
+   "landed_into_red": 3,
+   "repaired_by": "8f7d010a",
+   "repaired_at": "2026-09-08T16:24:39Z",
+   "hours": 15.4,
+   "failing_at_breaker": [
+    "tools/shebang_exec_bit_test.py"
+   ],
+   "growth": []
+  },
+  {
+   "breaker": "af8e6624",
+   "started_at": "2026-09-10T03:36:52Z",
+   "commits": [
+    "af8e6624"
+   ],
+   "landed_into_red": 0,
+   "repaired_by": "33bf090d",
+   "repaired_at": "2026-09-10T14:21:25Z",
+   "hours": 10.7,
+   "failing_at_breaker": [
+    "plugins/member-mesh/tests/rc124_is_not_unreachable_test.py"
+   ],
+   "growth": []
+  },
+  {
+   "breaker": "ad2380c6",
+   "started_at": "2026-09-14T14:02:57Z",
+   "commits": [
+    "ad2380c6",
+    "722f9c7f",
+    "f9f31da7",
+    "4cb2a8b0",
+    "2f2d72b5",
+    "667b932e",
+    "a76cb21f",
+    "a4521973",
+    "bcd74fd3",
+    "794bdfc0",
+    "64023735",
+    "3f498148",
+    "321ef5e5",
+    "dc8cb62f"
+   ],
+   "landed_into_red": 13,
+   "repaired_by": "b362ff9f",
+   "repaired_at": "2026-09-17T20:58:25Z",
+   "hours": 78.9,
+   "failing_at_breaker": [
+    "tools/shebang_exec_bit_test.py"
+   ],
+   "growth": [
+    {
+     "sha": "f9f31da7",
+     "added": [
+      "tools/public_boundary_test.py"
+     ],
+     "fixed": []
+    },
+    {
+     "sha": "a4521973",
+     "added": [
+      "tools/ci_selfexec_test.py"
+     ],
+     "fixed": []
+    }
+   ]
+  }
+ ]
+}

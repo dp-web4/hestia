@@ -50,10 +50,30 @@ is recoverable per commit. Walking spell 12's set:
 | `794bdfc` … `dc8cb62` | (unchanged) | PR merges |
 
 **Three independent causes, two of them added under cover of the first.** Each
-author saw a job that was already red before they arrived. Job-level growth of the
-same kind shows up twice more in the window — `9eb235ea` (08-06) and `7877ea83`
-(09-04) each added a *second red job* mid-spell, which is the same failure in its
-coarsest possible form.
+author saw a job that was already red before they arrived.
+
+Re-derived by the shipped instrument over the whole window (`census --json`, which
+reproduces the hand figures above exactly), **five** commits added a cause to an
+already-red `main`:
+
+| commit | added | spell |
+|---|---|---|
+| `9eb235ea` 08-06 | `ci_selfexec` + `shebang_exec_bit` | 5 (11 commits) |
+| `af364f9f` 08-06 | `citation_number_claim` | 5 |
+| `7877ea83` 09-04 | `shebang_exec_bit` | 9 (5 commits) |
+| `f9f31da7` 09-14 | `public_boundary` | 12 (14 commits) |
+| `a4521973` 09-16 | `ci_selfexec` | 12 |
+
+Two of those five landed in a *single* spell twice over, which is the shape to
+expect: the longer a spell runs, the more authors pass through it.
+
+**One guard accounts for most spells.** `tools/shebang_exec_bit_test.py` is the
+breaker in **5 of 12** spells and an added cause in 2 more. That is not a guard
+misbehaving — a new script is `100644` unless someone remembers `--chmod=+x`, so
+the guard is correct and the *authoring path* has no way to be reminded before
+landing. Six spells report `(job-level only)`: their failing job prints no
+`FAILED k of n` line (`cargo test`, `app tests`), so per-file attribution is
+structurally unavailable there and the instrument says so rather than guessing.
 
 ## Correction to #1048's own framing
 
