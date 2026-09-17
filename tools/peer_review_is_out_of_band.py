@@ -65,8 +65,13 @@ OPENED = "gate_escalation_opened"
 RE_FILELINE = re.compile(r"\b[\w./-]+\.(?:py|rs|md|sh|toml|json|yml|yaml|txt):\d+\b")
 
 #: A content hash. 8 hex is the fleet's short form (`8c1a5bef`); anything longer is a full
-#: digest. Bounded below at 8 so that ordinary hex-ish words and dates do not qualify.
-RE_HASH = re.compile(r"\b[0-9a-f]{8,64}\b")
+#: digest. Bounded below at 8 so that ordinary hex-ish words do not qualify — but the bound
+#: alone does NOT stop a compact 8-digit date: `20260902` is 8 hex chars, and scored as a
+#: hash in two factors whose only "hash" was a filename date (kimi review of notice 13081:
+#: dc1315dbf755 flipped class on it — its real hash had been correctly discarded by the
+#: invitation control — moving the census 92→91, 64%→63%). The lookahead refuses exactly
+#: 19/20-prefix 8-digit dates; longer digit strings are not dates and still qualify.
+RE_HASH = re.compile(r"\b(?!(?:19|20)\d{6}\b)[0-9a-f]{8,64}\b")
 
 #: A count the reviewer had to compute by running something: diff stats, line counts, row
 #: counts. The invitation carries no numbers about the payload.
