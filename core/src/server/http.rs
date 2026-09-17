@@ -505,7 +505,7 @@ async fn operator_gate(
     }
 
     let now = super::state::unix_now();
-    let (outcome, provenance) = {
+    let (outcome, operator, provenance) = {
         let s = state.lock().await;
         let law = s.vault.policy();
         let operator = bearer
@@ -524,6 +524,7 @@ async fn operator_gate(
             .cloned();
         (
             gate_session_request(law, operator.as_deref(), stakes),
+            operator,
             provenance,
         )
     };
@@ -564,6 +565,7 @@ async fn operator_gate(
     // a row saying so rather than a row saying nothing.
     req.extensions_mut()
         .insert(super::operator_auth::GateWitness {
+            operator,
             provenance,
             gate_entry_hash,
         });
@@ -1133,6 +1135,9 @@ pub async fn serve_with_callback(
         // member that could revoke — or, worse, could NOT be revoked — would hold the
         // control.
         .route("/api/scope/standing/revoke", post(scope_standing_revoke))
+        // The LIVE half (dp, 2026-09-15). Memory-only like the grant it withdraws, so there
+        // is no vault step: witness, then withdraw, then tell the member.
+        .route("/api/scope/revoke", post(scope_live_revoke))
         // dp's two buttons (2026-09-08): a live grant made durable; a grant made to reach
         // its subtree (or back to exact). Exact stays the default everywhere.
         .route("/api/scope/standing/promote", post(scope_standing_promote))
@@ -4063,6 +4068,122 @@ async fn scope_floor_remove(
 /// be recorded is refused, same as the grant), but on a failed PERSIST the in-memory removal
 /// is KEPT rather than rolled back — a failure here may only ever leave the TIGHTER state in
 /// force, and the error says the disk still holds the grant so the operator retries.
+/// `POST /api/scope/revoke` {request_id, reason} — withdraw a LIVE grant before it lapses.
+///
+/// Until this existed a live grant could only be waited out (8 h) or made standing and then
+/// revoked, and the second is a widening performed in order to narrow. Same wall as every
+/// other scope write. ORDER: the `scope_revoked` witness first; a failed append changes
+/// nothing. The row is marked, never deleted, so `hestia_scope_status` reads `revoked` with
+/// who and why. The member is told through the same disposition channel a decision uses,
+/// anchored to the witness hash, and the projector derives the same obligation from the chain
+/// if the direct ensure fails. A STANDING grant for the same path is a separate authority: it
+/// is named in the response, not silently revoked with it.
+async fn scope_live_revoke(
+    State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let request_id = body.get("request_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if request_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "request_id is required"})));
+    }
+    let now = crate::server::gate_escalation::now_secs();
+    let mut s = state.lock().await;
+    let Some(req) = s.scope_requests.get(&request_id).cloned() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "no scope request with that id", "request_id": request_id})),
+        );
+    };
+    if !req.is_live(now) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "not a live grant: nothing to revoke",
+                "request_id": request_id,
+                "status": req.status(now),
+            })),
+        );
+    }
+    // WHO revoked it, from the session that was actually admitted — not a literal (GPT review
+    // of #1035, point 1). `stamp_gate` attaches the composed operator provenance (actor,
+    // principal, via_device, office, authority) when the session has one, and the gate entry
+    // hash that admitted this call, so a reader can join the revocation to the authorization.
+    // The NAME comes from the authenticated operator, which a direct browser session also has
+    // and a composition does not add to (codex review of #1035, finding 1). It is the same
+    // value in the chain event and in the stored row; the office literal is left only for a
+    // call that reached the handler with no session at all (dev override, direct tests).
+    let revoked_by = gate
+        .as_ref()
+        .and_then(|axum::Extension(w)| {
+            w.operator.clone().or_else(|| w.provenance.as_ref().map(|p| p.principal.clone()))
+        })
+        .unwrap_or_else(|| "operator".to_string());
+    let record = stamp_gate(
+        serde_json::json!({
+            "request_id": request_id,
+            "plugin_id": req.plugin_id,
+            "subject_instance_lct": s.member_lct(&req.plugin_id),
+            "path": req.path,
+            "recursive": req.recursive,
+            "reason": reason,
+            "revoked_by": revoked_by,
+            "via": "operator_session",
+            "granted_by": req.decided_by,
+            "was_expiring_at": req.expires_at,
+            "lifetime": "live",
+        }),
+        &gate,
+    );
+    let entry = match s.append_chain("scope_revoked", record) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("witness append failed, grant NOT revoked: {e}")})),
+            );
+        }
+    };
+    if let Some(r) = s.scope_requests.get_mut(&request_id) {
+        r.revoked = Some(crate::server::state::ScopeRevocation {
+            at: now,
+            by: revoked_by.clone(),
+            reason: reason.clone(),
+        });
+    }
+    let disposition_notice_id = super::handler::ensure_disposition(
+        &s,
+        &req.plugin_id,
+        &format!("hestia://scope/{request_id}#revoked"),
+        &entry.hash,
+    );
+    let standing_still_covers = s
+        .standing_scope
+        .grants
+        .iter()
+        .any(|g| g.member == req.plugin_id && crate::server::standing_scope::covers_path(&g.path, g.recursive, &req.path)
+             && g.expires_at.is_none_or(|e| now < e));
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "request_id": request_id,
+            "plugin_id": req.plugin_id,
+            "path": req.path,
+            "witnessEntryHash": entry.hash,
+            "disposition_notice_id": disposition_notice_id,
+            "standing_grant_still_covers_path": standing_still_covers,
+            "note": if standing_still_covers {
+                "the live grant is revoked, but a STANDING grant still covers this path; revoke it \
+                 separately with /api/scope/standing/revoke"
+            } else {
+                "revoked; the member's next gate check for this path is refused"
+            },
+        })),
+    )
+}
+
 async fn scope_standing_revoke(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
@@ -4213,7 +4334,7 @@ async fn scope_standing_promote(
     let Some(live) = s
         .scope_requests
         .values()
-        .find(|r| r.plugin_id == plugin_id && r.path == path && r.granted == Some(true) && now < r.expires_at)
+        .find(|r| r.plugin_id == plugin_id && r.path == path && r.is_live(now))
         .cloned()
     else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({
@@ -4334,7 +4455,8 @@ async fn scope_standing_promote(
         "generation": s.standing_scope.generation,
         "witnessEntryHash": success.hash,
         "durability": "STANDING — written to the vault; survives restart; revocable via \
-                       /api/scope/standing/revoke. The live grant remains until it lapses.",
+                       /api/scope/standing/revoke. The live grant remains until it lapses, or \
+                       until POST /api/scope/revoke withdraws it.",
     })))
 }
 
@@ -4388,7 +4510,7 @@ async fn scope_standing_recursive(
         .find(|g| g.member == plugin_id && g.path == path && g.is_live(now))
         .map(|g| g.recursive);
     let live: Option<(String, bool)> = s.scope_requests.values()
-        .find(|r| r.plugin_id == plugin_id && r.path == path && r.granted == Some(true) && now < r.expires_at)
+        .find(|r| r.plugin_id == plugin_id && r.path == path && r.is_live(now))
         .map(|r| (r.id.clone(), r.recursive));
     if standing_now.is_none() && live.is_none() {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({
@@ -6243,6 +6365,7 @@ mod disposition_tests {
         // The witness the middleware would have inserted: a composed session's provenance plus
         // the hash of the gate row that admitted this request.
         let witness = crate::server::operator_auth::GateWitness {
+            operator: None,
             provenance: Some(crate::server::operator_auth::OperatorProvenance {
                 actor: "lct:web4:actor:app".into(),
                 principal: "lct:web4:operator:dp".into(),
@@ -6475,6 +6598,7 @@ mod disposition_tests {
                     decided_at: None,
                     decision_reason: None,
                     recursive: false,
+                    revoked: None,
                 },
             );
         }
@@ -6636,7 +6760,213 @@ mod disposition_tests {
             decided_at: Some(now),
             decision_reason: Some("watched it used well".into()),
             recursive: false,
+            revoked: None,
         }
+    }
+
+    /// dp, 2026-09-15: "i want to be able to revoke a live grant, right now i can only revoke
+    /// standing ones". The live grant stops granting everywhere (the gate's question, the
+    /// member's live list, the dashboard), the row reads `revoked` rather than vanishing, the
+    /// revocation is witnessed first, and the member is told through its disposition channel.
+    #[tokio::test]
+    async fn an_operator_revokes_a_live_grant_and_the_member_is_told() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-live-r".into(), live_req("scope-live-r", "/var/log/x.log", now));
+            assert!(s.has_scope_grant("kimi-code", "/var/log/x.log"), "setup: the live grant is in force");
+        }
+        let resp = scope_live_revoke(State(state.clone()), None, Json(serde_json::json!({
+            "request_id": "scope-live-r", "reason": "that file does not exist; nothing to diagnose"})))
+            .await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(out["standing_grant_still_covers_path"], false);
+
+        let s = state.lock().await;
+        assert!(!s.has_scope_grant("kimi-code", "/var/log/x.log"), "a revoked grant grants nothing");
+        assert!(s.live_scope_grants("kimi-code").is_empty(), "and is not listed as live");
+        let r = &s.scope_requests["scope-live-r"];
+        assert_eq!(r.status(now), "revoked", "the row says what happened to it");
+        assert_eq!(r.revoked.as_ref().unwrap().reason, "that file does not exist; nothing to diagnose");
+        assert!(!s.dashboard_snapshot(20).scope_grants.iter().any(|g| g["request_id"] == "scope-live-r"));
+        let w = s.recent_chain(10).into_iter().find(|e| e.event_type == "scope_revoked").expect("witnessed");
+        assert_eq!(w.event_data["request_id"], "scope-live-r");
+        assert_eq!(w.hash, out["witnessEntryHash"].as_str().unwrap());
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        let note = mail.iter().find(|n| n.kind == "disposition").expect("the member is told");
+        assert_eq!(note.pointer_uri.as_deref(), Some("hestia://scope/scope-live-r#revoked"));
+        drop(s);
+
+        let again = scope_live_revoke(State(state.clone()), None, Json(serde_json::json!({"request_id": "scope-live-r"})))
+            .await.into_response();
+        assert_eq!(again.status(), StatusCode::CONFLICT, "a revoked grant is not revoked twice");
+        let none = scope_live_revoke(State(state.clone()), None, Json(serde_json::json!({"request_id": "scope-nope"})))
+            .await.into_response();
+        assert_eq!(none.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// GPT review of #1035, point 1: the revocation must name the session that was actually
+    /// admitted, not a constant. The gate's `GateWitness` carries the composed provenance and
+    /// the hash of the gate row that admitted this call; both land on the act, and the stored
+    /// `revoked.by` is the principal rather than the office literal.
+    #[tokio::test]
+    async fn a_revocation_names_the_session_that_was_admitted() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-prov".into(), live_req("scope-prov", "/x/p.md", now));
+        }
+        let witness = crate::server::operator_auth::GateWitness {
+            operator: None,
+            provenance: Some(crate::server::operator_auth::OperatorProvenance {
+                actor: "lct:web4:harness".into(),
+                principal: "lct:web4:dp".into(),
+                via_device: "lct:web4:device".into(),
+                office: "sovereign".into(),
+                authority: "operator-session:nonce-7".into(),
+            }),
+            gate_entry_hash: Some("gate-row-hash".into()),
+        };
+        let resp = scope_live_revoke(State(state.clone()), Some(axum::Extension(witness)),
+            Json(serde_json::json!({"request_id": "scope-prov", "reason": "no longer needed"})))
+            .await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let s = state.lock().await;
+        let e = s.recent_chain(10).into_iter().find(|e| e.event_type == "scope_revoked").unwrap();
+        assert_eq!(e.event_data["principal"], "lct:web4:dp");
+        assert_eq!(e.event_data["actor"], "lct:web4:harness");
+        assert_eq!(e.event_data["office"], "sovereign");
+        assert_eq!(e.event_data["authority"], "operator-session:nonce-7");
+        assert_eq!(s.scope_requests["scope-prov"].revoked.as_ref().unwrap().by, "lct:web4:dp",
+                   "the stored revoker is the principal, not the office literal");
+    }
+
+    #[tokio::test]
+    async fn codex_review_direct_browser_revocation_names_authenticated_operator() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        let operator = "lct:web4:review-operator";
+        let token = {
+            let mut s = state.lock().await;
+            let mut law = s.vault.policy().clone();
+            law.operator_access.push(crate::vault::OperatorIdentity {
+                lct_id: operator.into(), public_key_hex: "00".repeat(32),
+                label: "review fixture".into(),
+            });
+            s.vault.set_policy(law).unwrap();
+            s.reload_policy();
+            s.scope_requests.insert("scope-review-browser".into(),
+                live_req("scope-review-browser", "/review/example.txt", now));
+            // Exact session-store path used after successful direct browser authentication.
+            let token = s.operator_sessions.open(operator.to_string(), now);
+            assert_eq!(s.operator_sessions.operator(&token, now, 3600), Some(operator));
+            assert!(s.operator_sessions.provenance(&token, now, 3600).is_none());
+            token
+        };
+        let app = axum::Router::new()
+            .route("/api/scope/revoke", axum::routing::post(scope_live_revoke))
+            .route_layer(axum::middleware::from_fn_with_state(state.clone(), operator_gate))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let resp = reqwest::Client::new().post(format!("http://{addr}/api/scope/revoke"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"request_id": "scope-review-browser", "reason": "done"}))
+            .send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        server.abort();
+        let s = state.lock().await;
+        let rows = s.recent_chain(10);
+        let act = rows.iter().find(|e| e.event_type == "scope_revoked").unwrap();
+        let gate = rows.iter().find(|e| e.event_type == "operator_gate").unwrap();
+        assert_eq!(act.event_data["authorized_by_gate"], gate.hash);
+        assert_eq!(s.scope_requests["scope-review-browser"].revoked.as_ref().unwrap().by,
+            operator, "the admitted direct operator must survive the middleware boundary");
+    }
+
+    /// GPT review of #1035, point 3: delivery cannot race the revocation into an ambiguous
+    /// state. The tightening and its witness land first; the notice is an obligation derived
+    /// from the chain, so a failed ensure leaves "revoked, witnessed, not yet told" — never
+    /// "told but not revoked" — and the projector completes it from the same entry.
+    #[tokio::test]
+    async fn a_failed_disposition_leaves_the_revocation_applied_and_recoverable() {
+        let (dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-race".into(), live_req("scope-race", "/x/race.md", now));
+        }
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("inbox.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch("CREATE TRIGGER no_disp BEFORE INSERT ON member_notices
+             WHEN NEW.kind = 'disposition' BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+        let resp = scope_live_revoke(State(state.clone()), None,
+            Json(serde_json::json!({"request_id": "scope-race", "reason": "x"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "the tightening still lands");
+        {
+            let s = state.lock().await;
+            assert!(!s.has_scope_grant("kimi-code", "/x/race.md"), "revoked despite the failed notice");
+            assert!(s.recent_chain(10).iter().any(|e| e.event_type == "scope_revoked"));
+            assert!(s.inbox_store.drain_member("kimi-code").unwrap().is_empty(), "nothing delivered yet");
+        }
+        conn.execute_batch("DROP TRIGGER no_disp").unwrap();
+        let s = state.lock().await;
+        let out = super::super::handler::project_dispositions(&s.chain_store, &s.inbox_store).unwrap();
+        assert!(out.projected >= 1, "the projector derives the obligation from the chain: {out:?}");
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        assert!(mail.iter().any(|n| n.pointer_uri.as_deref() == Some("hestia://scope/scope-race#revoked")),
+                "the member is told on the retry: {mail:?}");
+    }
+
+    /// ORDER: a revocation whose witness cannot be written is not applied.
+    #[tokio::test]
+    async fn an_unwitnessed_live_revoke_changes_nothing() {
+        let (dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-live-w".into(), live_req("scope-live-w", "/x/w.md", now));
+        }
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch("CREATE TRIGGER no_revoke BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'scope_revoked' BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+        let resp = scope_live_revoke(State(state.clone()), None, Json(serde_json::json!({"request_id": "scope-live-w"})))
+            .await.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let s = state.lock().await;
+        assert!(s.has_scope_grant("kimi-code", "/x/w.md"), "still in force: nothing was recorded");
+        assert!(s.scope_requests["scope-live-w"].revoked.is_none());
+    }
+
+    /// A standing grant over the same path is a separate authority: revoking the live grant
+    /// does not touch it, and the operator is told it still covers the path.
+    #[tokio::test]
+    async fn revoking_a_live_grant_names_a_standing_grant_that_still_covers_it() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-live-s".into(), live_req("scope-live-s", "/x/tree", now));
+        }
+        let resp = scope_standing_promote(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/x/tree"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = scope_live_revoke(State(state.clone()), None, Json(serde_json::json!({"request_id": "scope-live-s"})))
+            .await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(out["standing_grant_still_covers_path"], true, "{out}");
+        let s = state.lock().await;
+        assert!(s.standing_scope.has_live("kimi-code", "/x/tree", now), "the standing grant is untouched");
     }
 
     /// dp's "make standing" button (2026-09-08). A live grant — memory-only, dies with the
@@ -7307,6 +7637,7 @@ mod disposition_tests {
                     decided_at: None,
                     decision_reason: None,
                     recursive: false,
+                    revoked: None,
                 },
             );
         }

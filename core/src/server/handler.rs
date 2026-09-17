@@ -5488,6 +5488,13 @@ fn disposition_obligation(e: &crate::storage::chain::ChainEntry) -> Option<(Stri
                 None => thin("plugin_id"),
             }
         }
+        "scope_revoked" => {
+            let rid = get("request_id")?;
+            match get("plugin_id") {
+                Some(to) => Some((to.to_string(), format!("hestia://scope/{rid}#revoked"))),
+                None => thin("plugin_id"),
+            }
+        }
         "scope_granted" | "scope_refused" => {
             // `request_id` null/absent = operator-originated grant: not a petition.
             let rid = get("request_id")?;
@@ -6848,6 +6855,11 @@ fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value 
             "decided_by": req.decided_by,
             "decision_reason": req.decision_reason,
             "expires_at": req.expires_at,
+            // A revocation is the terminal fact a `#revoked` disposition announces; the
+            // pointer it carries must be able to show who withdrew the grant and why.
+            "revoked_at": req.revoked.as_ref().map(|r| r.at),
+            "revoked_by": req.revoked.as_ref().map(|r| r.by.clone()),
+            "revoke_reason": req.revoked.as_ref().map(|r| r.reason.clone()),
         });
     }
     // Store miss — a restart forgets every live ask. The chain does not. The
@@ -6864,13 +6876,20 @@ fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value 
             e.event_type == "scope_requested"
                 && e.event_data.get("request_id").and_then(Value::as_str) == Some(ptr)
         },
-        // A scope request has no third lifecycle event to collect.
-        &|_: &crate::storage::chain::ChainEntry| false,
+        // The third lifecycle event: an operator withdrawing a live grant (#1035). It is
+        // younger than the grant, so the ordering argument on `paged_chain_lookup` holds —
+        // when the decision is found, every entry naming the id was read, and a `None`
+        // here is a measured absence. Without it a store miss after a revocation resolved
+        // `#revoked` to the grant it ended (codex review of #1035, finding 2).
+        &|e| {
+            e.event_type == "scope_revoked"
+                && e.event_data.get("request_id").and_then(Value::as_str) == Some(ptr)
+        },
     );
     let PagedLookup {
         primary: decision,
         secondary: requested,
-        tertiary: _,
+        tertiary: revocation,
         searched,
         complete,
     } = match scan {
@@ -6898,6 +6917,7 @@ fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value 
         );
     };
     let status = match &decision {
+        _ if revocation.is_some() => "revoked",
         Some(e) if e.event_type == "scope_granted" => "granted",
         Some(_) => "refused",
         // An ask with no decision yet keeps the store's own clock semantics: past
@@ -6927,6 +6947,10 @@ fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value 
         "decision_reason": decision.as_ref().and_then(|e| e.event_data.get("decision_reason")),
         "expires_at": anchor.event_data.get("expires_at"),
         "decision_entry": decision.as_ref().map(chain_entry_json),
+        "revoked_at": revocation.as_ref().map(|e| e.timestamp.timestamp()),
+        "revoked_by": revocation.as_ref().and_then(|e| e.event_data.get("revoked_by")),
+        "revoke_reason": revocation.as_ref().and_then(|e| e.event_data.get("reason")),
+        "revocation_entry": revocation.as_ref().map(chain_entry_json),
         "searched": searched,
         "note": "answered from the witness chain — the live store lost this row to a \
                  restart (scope requests are memory-only by design). The chain is the \
@@ -11004,6 +11028,7 @@ mod tests {
             decided_at: Some(110),
             decision_reason: Some("yes, that file".into()),
             recursive: false,
+            revoked: None,
         };
         assert!(r.grants("/mnt/c/exe/dpx/notes.md", 150));
         // The sibling, the parent and the child are all OUTSIDE the grant.
@@ -11059,6 +11084,7 @@ mod tests {
             decided_at: None,
             decision_reason: None,
             recursive: false,
+            revoked: None,
         };
         assert_eq!(r.status(50), "pending");
         assert_eq!(r.status(100), "expired");
@@ -17053,6 +17079,7 @@ mod appeal_tests {
                 decided_at: Some(now),
                 decision_reason: Some("yes, that file".into()),
                 recursive: false,
+                revoked: None,
             });
         }
         let body = read_resource_body(&state, "hestia://scope/scope-test459a")
@@ -18938,6 +18965,7 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
         decided_at: None,
         decision_reason: None,
         recursive: false,
+        revoked: None,
     };
     s.scope_requests.insert(id.clone(), req);
 
@@ -19025,6 +19053,12 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
                 "decided_by": r.decided_by,
                 "decided_at": r.decided_at,
                 "decision_reason": r.decision_reason,
+                // A revoked live grant says so, with who and why, so the member learns its
+                // reach narrowed and the reason in the same read (a bare "revoked" is a
+                // refusal with no way forward).
+                "revoked_at": r.revoked.as_ref().map(|v| v.at),
+                "revoked_by": r.revoked.as_ref().map(|v| v.by.clone()),
+                "revoke_reason": r.revoked.as_ref().map(|v| v.reason.clone()),
             })
         })
         .collect();
@@ -19103,7 +19137,9 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
             .map(|a| a.divergence.clone())
             .unwrap_or_default(),
         "snapshot_expires_at": snapshot_expires_at,
-        "lifetime": "live_grants are memory-only — they die with the daemon. standing_grants \
+        "lifetime": "live_grants are memory-only — they die with the daemon, and the operator \
+                     can also withdraw one early: its request then reads status `revoked`, with \
+                     `revoked_by` and `revoke_reason`. standing_grants \
                      are operator-promoted, vault-persisted, and survive restart until they \
                      expire or are revoked. society_floor is the society's own list: it is \
                      durable, applies to EVERY member identically, and is not yours to lose — \
@@ -20205,6 +20241,7 @@ mod standing_scope_surface_tests {
             decided_at: Some(now),
             decision_reason: None,
             recursive: false,
+            revoked: None,
         }
     }
 
@@ -21203,6 +21240,84 @@ mod disposition_durability_tests {
             msg.contains("chain entries"),
             "the not-found arm must name the mechanism it searched: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn codex_review_revoked_scope_pointer_survives_store_loss() {
+        let (_dir, state) = test_state().await;
+        let now = now_secs();
+        {
+            let s = state.lock().await;
+            // The durable records left by a grant followed by its revocation.
+            // No memory row models the state after restart.
+            s.append_chain("scope_granted", json!({
+                "request_id": "scope-review-restart", "plugin_id": "codex",
+                "path": "/review/example.txt", "granted_by": "operator",
+                "expires_at": now + 3600,
+            })).unwrap();
+            s.append_chain("scope_revoked", json!({
+                "request_id": "scope-review-restart", "plugin_id": "codex",
+                "path": "/review/example.txt", "revoked_by": "operator",
+                "reason": "no longer needed", "was_expiring_at": now + 3600,
+                "lifetime": "live",
+            })).unwrap();
+            assert!(!s.has_scope_grant("codex", "/review/example.txt"));
+        }
+        let raw = read_resource_body(&state,
+            "hestia://scope/scope-review-restart#revoked").await.unwrap();
+        let body: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(body["source"], "witness_chain");
+        assert_eq!(body["status"], "revoked", "disposition must resolve its terminal fact: {body}");
+        assert_eq!(body["revoked_by"], "operator", "who, from the revocation entry: {body}");
+        assert_eq!(body["revoke_reason"], "no longer needed", "why, from the revocation entry: {body}");
+    }
+
+    /// The other half of codex's finding 2: the live-store arm of the same reader carries who
+    /// and why, and a restart changes neither the status nor the revoker it reports. The
+    /// chain arm is read from the entries the handler actually wrote for this revocation.
+    #[tokio::test]
+    async fn a_revoked_pointer_reads_the_same_before_and_after_store_loss() {
+        let (_dir, state) = test_state().await;
+        let now = now_secs();
+        let read = |state: SharedState| async move {
+            let raw = read_resource_body(&state, "hestia://scope/scope-both-arms#revoked").await.unwrap();
+            serde_json::from_str::<Value>(&raw).unwrap()
+        };
+        {
+            let mut s = state.lock().await;
+            s.append_chain("scope_requested", json!({
+                "request_id": "scope-both-arms", "plugin_id": "codex",
+                "path": "/review/both.txt", "requested_because": "inspect", "expires_at": now + 3600,
+            })).unwrap();
+            s.append_chain("scope_granted", json!({
+                "request_id": "scope-both-arms", "plugin_id": "codex",
+                "path": "/review/both.txt", "granted_by": "operator", "expires_at": now + 3600,
+            })).unwrap();
+            s.append_chain("scope_revoked", json!({
+                "request_id": "scope-both-arms", "plugin_id": "codex",
+                "path": "/review/both.txt", "revoked_by": "lct:web4:review-operator",
+                "reason": "done", "was_expiring_at": now + 3600, "lifetime": "live",
+            })).unwrap();
+            s.scope_requests.insert("scope-both-arms".into(), crate::server::state::ScopeRequest {
+                id: "scope-both-arms".into(), plugin_id: "codex".into(), role: "member".into(),
+                path: "/review/both.txt".into(), reason: "inspect".into(), requested_at: now,
+                expires_at: now + 3600, granted: Some(true), decided_by: Some("operator".into()),
+                decided_at: Some(now), decision_reason: None, recursive: false,
+                revoked: Some(crate::server::state::ScopeRevocation {
+                    at: now, by: "lct:web4:review-operator".into(), reason: "done".into(),
+                }),
+            });
+        }
+        let live = read(state.clone()).await;
+        assert_eq!(live["source"], "live_store");
+        state.lock().await.scope_requests.clear();
+        let chain = read(state.clone()).await;
+        assert_eq!(chain["source"], "witness_chain");
+        for field in ["status", "revoked_by", "revoke_reason", "granted", "plugin_id", "path"] {
+            assert_eq!(live[field], chain[field], "{field} must not change across a restart: {live} vs {chain}");
+        }
+        assert_eq!(chain["status"], "revoked");
+        assert_eq!(chain["revoked_by"], "lct:web4:review-operator");
     }
 
     /// The escalation not-found arm gets the scope arm's shape: name the mechanism,
@@ -22825,6 +22940,7 @@ mod delegated_scope_arbitration_tests {
                 decided_at: None,
                 decision_reason: None,
                 recursive: false,
+                revoked: None,
             },
         );
         id
