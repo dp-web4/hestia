@@ -5,6 +5,7 @@
 
 mod agents;
 mod dashboard;
+pub mod evidence;
 pub mod gate_escalation;
 pub mod governance_ledger;
 mod handler;
