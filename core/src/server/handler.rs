@@ -12873,11 +12873,13 @@ mod tests {
         assert_eq!(bases.get("kimi-code").map(String::as_str), Some("undeclared"), "{opened}");
     }
 
-    /// The durable arm: a member that has corroborated before is invited whatever it declares
-    /// now. `gate_capabilities` is memory-only, so five minutes after a deploy every seat is
-    /// undeclared — a rule that read the chain as silent there would empty the pool fleet-wide.
+    /// THE PRESENT DECLARATION WINS over history (GPT merge sweep of #1055). A member that
+    /// corroborated in the past but now declares a capability set WITHOUT the review door is
+    /// not invited: otherwise withdrawal is impossible and a seat that loses the door is woken
+    /// forever on its own history. The post-restart case this seemed to protect is handled one
+    /// branch earlier — an undeclared member is UNKNOWN and is invited.
     #[tokio::test]
-    async fn a_member_that_corroborated_before_is_still_invited() {
+    async fn a_present_declaration_beats_a_past_corroboration() {
         let (_dir, shared) = make_shared_state();
         {
             let s = shared.lock().await;
@@ -12899,8 +12901,30 @@ mod tests {
         })).await.unwrap();
         let invited: Vec<String> = claimed["invited_peers"].as_array().unwrap().iter()
             .map(|v| v.as_str().unwrap().to_string()).collect();
-        assert!(invited.contains(&"kimi-code".to_string()),
-                "its declaration omits the door, but the chain shows it has used one: {invited:?}");
+        assert!(!invited.contains(&"kimi-code".to_string()),
+                "it corroborated before, but its CURRENT declaration omits the door: {invited:?}");
+
+        // The control that keeps the exclusion narrow: the same member, having declared
+        // nothing at all, is unknown rather than doorless — and is invited.
+        let (_dir2, shared2) = make_shared_state();
+        {
+            let s = shared2.lock().await;
+            s.append_chain("gate_escalation_corroborated", json!({
+                "escalation_id": "old", "plugin_id": "codex",
+                "corroborated_by": "kimi-code", "stance": "concur",
+            })).unwrap();
+        }
+        tool_connect(&shared2, &json!({"plugin_id": "kimi-code", "host_agent": "h"})).await.unwrap();
+        let codex2 = tool_connect(&shared2, &json!({"plugin_id": "codex", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let claimed2 = tool_gate_escalation_claim(&shared2, &json!({
+            "plugin_id": "codex", "session_id": codex2, "tool_name": "Edit",
+            "marker": "pre_tool_use.py", "reason": "Edit -> a governance file",
+        })).await.unwrap();
+        let invited2: Vec<String> = claimed2["invited_peers"].as_array().unwrap().iter()
+            .map(|v| v.as_str().unwrap().to_string()).collect();
+        assert!(invited2.contains(&"kimi-code".to_string()),
+                "undeclared is UNKNOWN, not doorless: {invited2:?}");
     }
 
     #[tokio::test]
@@ -18458,18 +18482,24 @@ pub(crate) const REVIEW_CAPABILITY: &str = "escalation-review:v1";
 /// Ok(basis) when the member can be asked; Err(reason) when it cannot — and the caller RECORDS
 /// the reason rather than dropping the member silently.
 fn review_capability(s: &super::state::ServerState, plugin_id: &str) -> Result<&'static str, &'static str> {
-    let declared = match s.gate_capabilities.get(plugin_id) {
-        None => return Ok("undeclared"),
-        Some(c) => c,
-    };
-    if declared.contains(REVIEW_CAPABILITY) {
-        return Ok("declared");
-    }
-    match s.chain_store.has_corroborated(plugin_id) {
-        Ok(true) => Ok("corroborated_before"),
-        // A failed read is not a missing capability: fail toward inviting, as above.
-        Err(_) => Ok("capability_read_failed"),
-        Ok(false) => Err("no_review_door"),
+    match s.gate_capabilities.get(plugin_id) {
+        // Said nothing: UNKNOWN, not doorless. Invited, and the basis says why.
+        None => Ok("undeclared"),
+        Some(c) if c.contains(REVIEW_CAPABILITY) => Ok("declared"),
+        // Said what it holds, and the review door is not in it. THE PRESENT DECLARATION WINS,
+        // including over a corroboration this member made months ago (GPT merge sweep of
+        // #1055). A first cut consulted the chain here and invited anyone who had ever
+        // corroborated, which made capability WITHDRAWAL impossible: a seat that loses the
+        // door, reconnects, and truthfully declares a set without it would have been woken
+        // forever on the strength of its own history.
+        //
+        // That arm was also dead for the case it was written for. Its stated purpose was the
+        // post-restart amnesia window — `gate_capabilities` is memory-only, so minutes after a
+        // deploy every live seat has declared nothing — but an undeclared member returns above
+        // and is invited without the chain ever being consulted. The only inputs that reached
+        // the chain arm were declarations that deliberately omitted the door, i.e. precisely
+        // the case this filter exists to honour.
+        Some(_) => Err("no_review_door"),
     }
 }
 
