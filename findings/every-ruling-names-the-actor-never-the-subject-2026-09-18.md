@@ -58,6 +58,17 @@ carried forward.**
 - `decided` / `withdrawn` / `expired` / `coalesced` — the deciding actor is an
   operator or the clock, and nothing names the asker.
 
+**One exception, and it cuts the other way.** `gate_escalation_corroborated` drops
+the *actor's* own proven session, which the rule does not explain.
+`tool_gate_escalation_corroborate` refuses without a live `session_id`
+(`resolve_attributed_caller`) — attribution is a precondition of the door — and the
+row then records `corroborated_by` and `corroborated_role`, both names.
+`CallerWho` carries `session_uuid` but not the wake key; recovering it is the same
+one-line lookup the open door already performs
+(`s.sessions.get(&uuid).host_session_id`). So #1058's "peer review is performed off
+the record" is not a consequence of the actor/subject asymmetry. It is simply
+missing, and it is one lookup from a value the door has already proven.
+
 The store is not missing the data. `EscalationStore`'s own record holds
 `host_session_id`, `session_id` and `gate_path` (`record_seat_keys`, #542), it
 survives a restart (`rehydrate` restores them from the `opened` row), and the
