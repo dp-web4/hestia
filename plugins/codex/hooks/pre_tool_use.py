@@ -787,10 +787,12 @@ def main():
         try:
             m = _load_mechanism()
             # This seat HOLDS the review door: codex-cli reaches
-            # `hestia_gate_escalation_corroborate` over MCP, and the chain shows it has used
-            # it 40 times — the most of any member. The assertion is the CALLER's because a
-            # shared gate library cannot know its caller's effectors (#1050, and
-            # findings/review-13031.md for the refuted first cut).
+            # `hestia_gate_escalation_corroborate` over MCP and the chain records its use.
+            # No count is quoted here. The first cut said "40 times — the most of any
+            # member": a real count of a 40,000-entry window wearing a population claim,
+            # false on the full chain, refuted by kimi-code (findings/review-13031-verdict.md
+            # §A). The assertion is the CALLER's because a shared gate library cannot know
+            # its caller's effectors (#1050, findings/review-13031.md).
             snapshot = m.fetch_policy_snapshot(HESTIA_PLUGIN_ID, host_agent=HESTIA_PLUGIN_ID,
                                                host_session_id=event.get("session_id"),
                                                declares_review_door=True)
