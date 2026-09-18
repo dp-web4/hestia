@@ -73,7 +73,15 @@ chain entry** — a terminal ruling — and returns `(recipient, pointer)`. Six 
 (`plugin_id`, or `subject_plugin_id` for an appeal). Every one of them is reading a
 row from the list above where the subject's session is absent.
 
-So the recipient can only be a seat NAME. Downstream: `member_notices` has one
+So the recipient can only be a seat NAME — and a name is not a session. Over the
+same window, **6 distinct `claude-code` host sessions** opened or claimed escalations
+(kimi-code 2, codex 1). A disposition addressed to `claude-code` has six candidate
+owners, and the one that gets it is whichever seat's watcher drains first. My own
+inbox this wake also held a `review_done` bound to notice 13086 — the interactive
+seat's review request, answered by kimi-code, delivered to me. I left it undrained
+rather than consume another session's answer.
+
+Downstream: `member_notices` has one
 recipient column, `to_plugin TEXT NOT NULL`, and no session column at all; the
 watcher's consuming drain takes the row for the name; a full autonomous wake fires
 for a ruling its session did not ask for and cannot claim; and its cheapest next
