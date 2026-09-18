@@ -5740,6 +5740,25 @@ async fn operator_gate_escalation(
                 serde_json::json!({
                     "escalation_id": esc.id,
                     "plugin_id": esc.plugin_id,
+                    // WHOSE petition this ruling is about, as the asker's PROVEN wake key
+                    // (`Escalation::host_session_id`, #542). Deliberately NOT spelled
+                    // `host_session_id`: on `gate_escalation_claimed` that name means the
+                    // CLAIMANT's session, and one name for two subjects is how an
+                    // attribution record starts lying.
+                    //
+                    // Recorded here because this row is the ONLY row the disposition
+                    // projector reads (`handler::disposition_obligation`), and what it
+                    // derives from it is a RECIPIENT — the asker. With no asker key on the
+                    // ruling, that recipient can only be `plugin_id`, so every seat sharing
+                    // the name is woken and the one that asked is not distinguishable
+                    // (#732, #1060; `docs/PRD_DISPOSITION_DELIVERY.md` R1 "address the
+                    // asker" needs this field to be derivable from the chain, which is what
+                    // the projector's retry path reads). Null when the asker was unproven.
+                    //
+                    // Same remedy class as `bar` on `gate_escalation_expired`: the `opened`
+                    // row has always carried it, the terminal row did not, and answering
+                    // the obvious question meant joining every ruling back to its open.
+                    "asker_host_session_id": esc.host_session_id,
                     "subject_instance_lct": s.member_lct(&esc.plugin_id),
                     "tool_name": esc.tool_name,
                     "marker": esc.marker,

@@ -6063,6 +6063,13 @@ pub(crate) fn record_newly_lapsed(s: &mut super::state::ServerState, now: u64) -
             json!({
                 "escalation_id": esc.id,
                 "plugin_id": esc.plugin_id,
+                // The asker's proven wake key — see the long note at the operator HTTP
+                // decide site (`http.rs`, `gate_escalation_decided`). A lapse mints a
+                // disposition like a decision does, and it is the arm where the
+                // recipient matters most: nobody is in the room, so the notice is the
+                // whole of what the asker gets. Exactly the argument the `bar` comment
+                // below already makes about this same row.
+                "asker_host_session_id": esc.host_session_id,
                 "subject_instance_lct": s.member_lct(&esc.plugin_id),
                 "tool_name": esc.tool_name,
                 "marker": esc.marker,
@@ -16580,6 +16587,19 @@ mod appeal_tests {
         sid
     }
 
+    /// A seat whose session carries a `host_session_id` — i.e. a member fired inside a
+    /// nameable WAKE, which is what every real seat on this fleet is. `seat` deliberately
+    /// leaves the field `None` (an unproven-wake asker is also a real state, and tests of
+    /// the null arm need it), so the two exist side by side rather than one defaulting.
+    pub(super) async fn seat_in_wake(state: &SharedState, plugin_id: &str, wake: &str) -> Uuid {
+        let sid = seat(state, plugin_id).await;
+        let mut s = state.lock().await;
+        if let Some(sess) = s.sessions.get_mut(&sid) {
+            sess.host_session_id = Some(wake.to_string());
+        }
+        sid
+    }
+
     /// Put a deny on the chain, as a gate would, and hand back its hash.
     async fn seat_deny(state: &SharedState, subject: &str, sid: Uuid, adjudicator: &str) -> String {
         let s = state.lock().await;
@@ -17435,6 +17455,106 @@ mod appeal_tests {
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["status"], json!("approved"), "{v}");
         assert_eq!(v["decided_by"], json!("codex"), "{v}");
+    }
+
+    /// The ruling must name WHOSE petition it settles, because the ruling row is the only
+    /// row the return edge is derived from.
+    ///
+    /// `disposition_obligation` reads ONE chain entry — the terminal ruling — and derives a
+    /// RECIPIENT from it. Before this pin the only identity on that entry was `plugin_id`, a
+    /// seat NAME, and on this fleet a name is several concurrent sessions: an interactive seat
+    /// and a mesh wake share `claude-code`. So the notice went to the name, the watcher's
+    /// consuming drain took it, and the session that actually asked was not distinguishable
+    /// from the one that happened to wake (#732; #1060 measured 6 of 6 dispositions delivered
+    /// to a session that had opened none of them). The asker's proven wake key was already on
+    /// the `opened` row (#542) and on the store's own record — it was simply not copied onto
+    /// the row anyone reads later, the same gap the `bar` field closed on the expiry row.
+    ///
+    /// This does not implement addressing (PRD R1, #825): `member_notices` still has one
+    /// recipient column and it is a plugin name. It makes the addressing derivable from the
+    /// chain, which is what the projector — the RETRY path, the one that runs when the
+    /// synchronous ensure failed — has to work from.
+    #[tokio::test]
+    async fn a_ruling_names_the_askers_wake_so_the_return_edge_can_be_addressed() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let asker_sid = seat_in_wake(&state, "claude-code", "wake-asker-9261dc9a").await;
+        let peer_sid = seat(&state, "codex").await;
+
+        let open_one = |sid: Uuid, marker: &'static str| {
+            let state = state.clone();
+            async move {
+                tool_gate_escalation_open(&state, &json!({
+                    "plugin_id": "claude-code", "tool_name": "policy_edit", "marker": marker,
+                    "act": format!("policy_edit -> {marker}"),
+                    "reason": "the deny blocks a legitimate rule addition",
+                    "session_id": sid.to_string(),
+                })).await.unwrap()["escalation_id"].as_str().unwrap().to_string()
+            }
+        };
+
+        // ARM 1 — approved. The decider is a PEER, and the row still names the asker: the
+        // two are different parties and the record must not collapse them.
+        let approved = open_one(asker_sid, "policy.json").await;
+        tool_gate_arbitrate_escalation(&state, &json!({
+            "escalation_id": approved, "approve": true, "session_id": peer_sid.to_string(),
+            "reason": "reviewed the diff; the rule is scoped to the one path",
+        })).await.unwrap();
+
+        // ARM 2 — withdrawn by the asker. Terminal, mints a disposition (#545), and is the
+        // row an auditor asks "who dropped their own ask?" of.
+        let withdrawn = open_one(asker_sid, "policy_two.json").await;
+        tool_gate_arbitrate_escalation(&state, &json!({
+            "escalation_id": withdrawn, "approve": false, "session_id": asker_sid.to_string(),
+            "reason": "reissuing against the narrower path instead",
+        })).await.unwrap();
+
+        // ARM 3 — an UNPROVEN-wake asker. The field must be ABSENT, not defaulted: a
+        // substituted value in an attribution record is worse than a missing one, and a
+        // reader must be able to tell "no proven wake" from "this wake".
+        let unproven_sid = seat(&state, "kimi-code").await;
+        let unproven = tool_gate_escalation_open(&state, &json!({
+            "plugin_id": "kimi-code", "tool_name": "policy_edit", "marker": "policy_three.json",
+            "act": "policy_edit -> policy_three.json",
+            "reason": "the deny blocks a legitimate rule addition",
+            "session_id": unproven_sid.to_string(),
+        })).await.unwrap()["escalation_id"].as_str().unwrap().to_string();
+        tool_gate_arbitrate_escalation(&state, &json!({
+            "escalation_id": unproven, "approve": true, "session_id": peer_sid.to_string(),
+            "reason": "reviewed the diff; the rule is scoped to the one path",
+        })).await.unwrap();
+
+        let st = state.lock().await;
+        let rows = st.recent_chain(60);
+        let find = |id: &str, ty: &str| {
+            rows.iter()
+                .find(|e| e.event_type == ty && e.event_data["escalation_id"] == json!(id))
+                .unwrap_or_else(|| panic!("{ty} for {id} must be witnessed"))
+                .clone()
+        };
+
+        for (id, ty) in [(&approved, "gate_escalation_decided"), (&withdrawn, "gate_escalation_withdrawn")] {
+            let row = find(id, ty);
+            assert_eq!(
+                row.event_data["asker_host_session_id"], json!("wake-asker-9261dc9a"),
+                "{ty} must name the asker's wake, not just its seat name: {:?}", row.event_data
+            );
+            // The whole point: the recipient AND the session are readable from this one row,
+            // which is all `disposition_obligation` ever sees.
+            let (to, _) = disposition_obligation(&row).expect("the ruling must be projectable");
+            assert_eq!(to, "claude-code");
+        }
+
+        let thin = find(&unproven, "gate_escalation_decided");
+        assert!(
+            thin.event_data.get("asker_host_session_id").map_or(true, Value::is_null),
+            "an unproven asker must leave the key NULL, never defaulted: {:?}", thin.event_data
+        );
+        assert!(
+            disposition_obligation(&thin).is_some(),
+            "and the row must still be projectable by name — the null narrows delivery, \
+             it must not withhold the ruling"
+        );
     }
 
     /// The regression that motivated all of this: `limit` is a window over the TAIL, so an
@@ -20187,6 +20307,17 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
                 json!({
                     "escalation_id": decided.id,
                     "plugin_id": decided.plugin_id,
+                    // The asker's proven wake key — see the long note at the operator
+                    // HTTP decide site (`http.rs`, `gate_escalation_decided`). Short
+                    // form: this row is the only row `disposition_obligation` reads,
+                    // and what it derives is the RECIPIENT of the return edge, so
+                    // without the asker's session that recipient can only be a seat
+                    // NAME (#732, #1060, PRD R1). Not spelled `host_session_id`
+                    // because on `gate_escalation_claimed` that name is the
+                    // claimant's. Carried on the withdrawal arm too: a withdrawal is
+                    // terminal, mints a disposition (#545), and is exactly the row an
+                    // auditor asks "who dropped their own ask?" of.
+                    "asker_host_session_id": decided.host_session_id,
                     "subject_instance_lct": s.member_lct(&decided.plugin_id),
                     "tool_name": decided.tool_name,
                     "marker": decided.marker,
