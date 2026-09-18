@@ -418,6 +418,69 @@ def test_pin_a_brace_group_with_a_read_only_body_is_refused():
           f"the group; got {grouped_write}")
 
 
+def test_pin_a_redirect_in_a_loop_body_is_refused():
+    """OPEN DEFECT, pinned at the WRONG verdict. Fourth out-of-grammar class, and the one
+    whose RECORD is hardest to read: a redirect inside a control-flow body.
+
+    #978 strips the loop header and resolves the body, and the brace-group pin above is the
+    residual it left on purpose. This is a different residual and it needs no braces: put a
+    plain redirect inside `do … done` and the remainder stops resolving, so any marker
+    anywhere on the line is read as the write — INCLUDING one sitting in a position that
+    cannot be written to at all.
+
+    Measured live 2026-09-18 on CBP, this wake: a three-iteration loop of `git show`
+    READS of a `<rev>:<path>` revspec, each redirected into an absolute /tmp path carrying
+    no marker, was refused — and the resource the escalation offered the human was the
+    REVSPEC, with the shell variable holding the branch name still unexpanded. A human was
+    asked to approve a write to a thing that is not a file, while the command's only real
+    destination was ungoverned.
+
+    The minimal pair is one token wide and both halves are below: loop + redirect + a marker
+    READ is "write"; drop the redirect and the identical loop is "read". Drop the loop
+    instead and the identical redirect is also "read". Neither alone is the trigger.
+
+    Why the twin below still resolves: when the marker IS the redirect destination the write
+    position is found directly and the grammar fallback is never reached. So this class costs
+    a refusal only when the marker sits where a write cannot happen — i.e. exactly when the
+    command is read-only. Anti-correlated with danger, the same shape as the delete-verb
+    pattern on #533, which convicts a flagged delete and acquits a bare one.
+
+    A RED on the first check means someone repaired it. Invert that arm to assert "read";
+    keep every other row exactly as it is.
+    """
+    redirected = 'for s in a b; do git show HEAD:' + MARK + ' > /tmp/out/$s.py; done'
+    got = verdict(redirected)
+    check("REDIR_loop_body_redirect_is_refused", got[0] == "write",
+          "THE LOOP-BODY REDIRECT OVER-REFUSAL APPEARS FIXED — a loop whose body only reads "
+          f"the closure and writes elsewhere now classifies {got[0]!r}. Invert this pin.")
+    check("REDIR_reason_is_out_of_grammar", got[1] == g.RULE_OUT_OF_GRAMMAR,
+          f"the over-refusal should still be the grammar rule; got {got[1]}")
+    check("REDIR_resource_named_is_not_a_writable_path", got[2] == "HEAD:" + MARK,
+          "the record's whole value is that a human can read what would be written, and here "
+          f"it names a revspec. Got {got[2]!r}. If this row goes red because the resource "
+          "changed, check whether it became the REAL destination (a fix) or merely a "
+          "different token that cannot be written to (not one).")
+
+    no_redirect = cls('for s in a b; do git show HEAD:' + MARK + ' | head -1; done')
+    check("REDIR_same_loop_without_the_redirect_is_a_read", no_redirect == "read",
+          "the PAIRED CONTROL: same loop, same revspec read, pipe instead of redirect, and "
+          f"it is a read — so the loop is not the trigger; got {no_redirect}")
+
+    no_loop = cls('git show HEAD:' + MARK + ' > /tmp/out/x.py')
+    check("REDIR_same_redirect_without_the_loop_is_a_read", no_loop == "read",
+          "the OTHER half of the minimal pair: same redirect, same revspec, no loop, and it "
+          f"is a read — so the redirect is not the trigger either; got {no_loop}")
+
+    benign = cls('for s in a b; do git show HEAD:README.md > /tmp/out/$s.py; done')
+    check("REDIR_benign_twin", benign == "none",
+          f"a loop-body redirect naming no closure vocabulary must stay none; got {benign}")
+
+    real_write = cls('for s in a b; do echo x > ' + MARK + '; done')
+    check("REDIR_loop_body_write_at_the_marker_stays_a_write", real_write == "write",
+          "the hole direction: a repair that resolves loop-body redirects must still see a "
+          f"redirect whose DESTINATION is the marker; got {real_write}")
+
+
 def test_every_case_in_this_file_is_in_ALL():
     """An explicit ALL satisfies tools/ci_selfexec_test.py, which refuses a `def test_*`
     that no Name node references — reflection over globals() is invisible to a static
@@ -448,6 +511,7 @@ ALL = [
     test_a_control_flow_keyword_no_longer_refuses_a_plain_read,
     test_pin_a_variable_in_a_write_position_sweeps_in_a_quoted_body,
     test_pin_a_brace_group_with_a_read_only_body_is_refused,
+    test_pin_a_redirect_in_a_loop_body_is_refused,
     test_every_case_in_this_file_is_in_ALL,
 ]
 
