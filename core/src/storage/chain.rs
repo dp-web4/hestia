@@ -770,6 +770,70 @@ impl SqliteChainStore {
         Ok(n.max(0) as u64)
     }
 
+    /// Every escalation row for one (member, marker), oldest first, with NO recency window.
+    ///
+    /// The prior-decisions half of `PRD_ADJUDICATOR_LADDER` §3.3 — "escalations on the same
+    /// marker, with their outcomes", listed there as *"the thing a human cannot hold in their
+    /// head"*. It is also the thing a WINDOW cannot hold: a marker's history is exactly what
+    /// scrolls out of a tail first, and #610 is what that costs (a member told "no entry in
+    /// the last 20000" concluded, in writing, that its own filings had never happened).
+    ///
+    /// Restricted to the escalation event types so the `idx_chain_event_type` index does the
+    /// work and only those rows are parsed. `cap` keeps the NEWEST rows for a marker with a
+    /// long history, then returns them oldest-first, because a decider reads a history
+    /// forwards but cares most about its recent end.
+    pub fn escalation_rows_for_marker(
+        &self,
+        plugin_id: &str,
+        marker: &str,
+        cap: u64,
+    ) -> Result<Vec<ChainEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM (
+               SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+               FROM chain_entries
+               WHERE event_type IN ('gate_escalation_opened', 'gate_escalation_decided',
+                                    'gate_escalation_claimed', 'gate_escalation_withdrawn')
+                 AND json_extract(event_data, '$.plugin_id') = ?1
+                 AND json_extract(event_data, '$.marker') = ?2
+               ORDER BY chain_position DESC
+               LIMIT ?3
+             ) ORDER BY chain_position ASC",
+        )?;
+        let rows = stmt.query_map(params![plugin_id, marker, cap as i64], row_to_entry)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    /// One member's refusals, newest first — §3.3's "the member's history … including prior
+    /// denies and their rules".
+    ///
+    /// `policy_decision` rows only. A deny is the record of a refusal that ALREADY happened,
+    /// so this is history, never a prediction: the bundle presents it as what the member has
+    /// been refused for, and leaves the inference to whoever is deciding.
+    pub fn denies_for_member(&self, plugin_id: &str, cap: u64) -> Result<Vec<ChainEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+             FROM chain_entries
+             WHERE event_type = 'policy_decision'
+               AND json_extract(event_data, '$.decision') = 'deny'
+               AND json_extract(event_data, '$.plugin_id') = ?1
+             ORDER BY chain_position DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![plugin_id, cap as i64], row_to_entry)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
     pub fn read_failures(&self, limit: u64) -> Result<Vec<ChainEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

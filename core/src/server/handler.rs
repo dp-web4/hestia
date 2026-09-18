@@ -95,6 +95,7 @@ impl ServerHandler for HestiaServer {
             "hestia_scope_status" => tool_scope_status(&self.state, &args).await,
             "hestia_gate_escalation_open" => tool_gate_escalation_open(&self.state, &args).await,
             "hestia_gate_escalation_poll" => tool_gate_escalation_poll(&self.state, &args).await,
+            "hestia_escalation_evidence" => tool_escalation_evidence(&self.state, &args).await,
             "hestia_gate_escalation_claim" => tool_gate_escalation_claim(&self.state, &args).await,
             "hestia_gate_escalation_corroborate" => {
                 tool_gate_escalation_corroborate(&self.state, &args).await
@@ -429,6 +430,24 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_gate_escalation_poll",
             "Read the verdict on an escalation you opened. Read-only and deliberately NOT witnessed — a wait is not an act, and witnessing every poll would bury the opened/decided entries under one member's loop. Only status `approved` permits the write; `pending`, `denied`, `expired` and an UNKNOWN id all refuse, the last two identically on purpose",
+        ),
+        t_args(
+            "hestia_escalation_evidence",
+            "Everything known about ONE pending governance escalation, in one read: what the write would DO (the incoming bytes, their hash, and a diff against the copy now enforcing), the asker's own stated reason and whether its identity was PROVEN or merely asserted, the bar in force when it was opened and the factors filed so far, every prior escalation on the same marker with how each was decided, and the rules this member has been refused under. Read-only and NOT witnessed — reading the case is not acting on it. The point is that a human and an automated reviewer read the SAME object: a reviewer shown less than the operator is a filter wearing a reviewer's clothes (PRD_ADJUDICATOR_LADDER §3.3). It does NOT carry a law_hash: call `hestia_operating_law` yourself and pin the hash IT returns, because that composition is per-caller and a hash minted for someone else proves nothing about what YOU read. An unknown id answers `found: false` rather than an empty bundle — 'no such escalation' and 'an escalation about which nothing is known' are different facts",
+            json!({
+                "type": "object",
+                // `true`, truthfully: this handler ignores unknown keys rather than refusing
+                // them by name, so a strict schema here would advertise a refusal the runtime
+                // does not perform — the inverse of the #962 defect, and just as false.
+                "additionalProperties": true,
+                "required": ["escalation_id"],
+                "properties": {
+                    "escalation_id": {
+                        "type": "string",
+                        "description": "The escalation to read, as `hestia_gate_escalation_open` or an invitation notice gave it to you",
+                    },
+                },
+            }),
         ),
         t(
             "hestia_witness_decision",
@@ -16513,6 +16532,177 @@ mod preamble_tests {
 }
 
 #[cfg(test)]
+mod ladder_evidence_tests {
+    use super::*;
+    use super::inbox_tests::{open_state, seeded_home};
+
+    /// Open through the REAL door, not by poking the store.
+    ///
+    /// The first cut of these tests called `EscalationStore::open` directly and every
+    /// chain-derived field came back empty — because the store does not append the chain row;
+    /// the handler does. A bundle assembled from the chain can only be tested against a chain
+    /// that something actually wrote to, which is the standing lesson about running the real
+    /// path at least once.
+    ///
+    /// `reason` carries the ACT, which is what the gate hook does and the only way the act
+    /// text survives at all (see `act_text_source` in the bundle).
+    async fn open_one(state: &SharedState, marker: &str, act: &str) -> String {
+        open_as(state, marker, act, None).await
+    }
+
+    /// With a live session the asker is PROVEN (#128), which is what a peer needs before it
+    /// can rule: NOT-SAME will not clear an asserted name, because it would be grading a
+    /// forgeable operand.
+    async fn open_as(
+        state: &SharedState,
+        marker: &str,
+        act: &str,
+        session: Option<&str>,
+    ) -> String {
+        let mut args = json!({
+            "plugin_id": "claude-code",
+            "role": "role:constellation:member",
+            "tool_name": "Bash",
+            "marker": marker,
+            "act": act,
+            "reason": act,
+        });
+        if let Some(sid) = session {
+            args["session_id"] = json!(sid);
+        }
+        let r = tool_gate_escalation_open(state, &args).await.unwrap();
+        r["escalation_id"].as_str().unwrap_or_default().to_string()
+    }
+
+    /// AN UNKNOWN ID IS ANSWERED, NOT ERRORED, AND NEVER AS AN EMPTY BUNDLE.
+    ///
+    /// "No such escalation" and "an escalation about which nothing is known" are different
+    /// facts, and a reviewer that cannot tell them apart will reason from the wrong one — it
+    /// would read an empty bundle as "nothing of concern here" and concur. That is the same
+    /// shape as a windowed absence read as a never (#610), arriving through a bundle instead
+    /// of through a census.
+    #[tokio::test]
+    async fn an_unknown_escalation_says_so_rather_than_returning_an_empty_case() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let r = tool_escalation_evidence(&state, &json!({"escalation_id": "deadbeefdeadbeef"}))
+            .await
+            .unwrap();
+        assert_eq!(r["found"], json!(false), "{r}");
+        assert!(r["evidence"].is_null(), "an absent case must not render as a case: {r}");
+        assert!(
+            r["note"].as_str().unwrap_or("").contains("reaped"),
+            "and must say that reaped and never-existed are indistinguishable here: {r}"
+        );
+    }
+
+    /// The bundle carries what §3.3 says a decider gets — including the two fields that are
+    /// about the ASK rather than the act.
+    #[tokio::test]
+    async fn the_bundle_carries_the_ask_its_bar_and_the_askers_basis() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let id = open_one(&state, "plugins/_shared", "Bash: cp /tmp/x plugins/_shared/SHIM_LEDGER.md").await;
+
+        let r = tool_escalation_evidence(&state, &json!({"escalation_id": id})).await.unwrap();
+        assert_eq!(r["found"], json!(true), "{r}");
+        let e = &r["evidence"]["escalation"];
+        assert_eq!(e["marker"], json!("plugins/_shared"));
+        // Caller-asserted, and LABELLED as a claim rather than as an identity.
+        assert_eq!(e["claimed_by"], json!("claude-code"));
+        assert!(e.get("claimed_by").is_some() && e.get("member").is_none(),
+                "the unauthenticated name must not be presented as `member`: {e}");
+        // #128: a reviewer must be able to see whether the asker was proven or asserted,
+        // because that is the clause NOT-SAME reads before it will clear anyone.
+        assert_eq!(e["asker_basis"], json!("Asserted"),
+                   "an open() with no session is asserted, and must say so: {e}");
+        assert!(e["bar"].is_string() || e["bar"].is_object(), "the bar in force: {e}");
+        assert!(e.get("bar_met").is_some(), "and whether it is met: {e}");
+        assert!(r["evidence"]["law"]["society_policy_hash"].is_string(), "{r}");
+        // §3.3 + AC-8: no law_hash is minted here, because that composition is per-caller.
+        assert!(r["evidence"]["law"].get("law_hash").is_none(),
+                "a law_hash minted for someone else proves nothing about what the rung read");
+    }
+
+    /// PRIOR DECISIONS ON THE SAME MARKER — §3.3's "the thing a human cannot hold in their
+    /// head" — and the case's OWN rows are not counted as its own precedent.
+    #[tokio::test]
+    async fn prior_escalations_on_the_marker_are_carried_and_the_subject_is_not_its_own_precedent() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        const MARKER: &str = "plugins/*/hooks";
+
+        // Decided through the REAL door. The first cut called `EscalationStore::decide`
+        // directly and `approved` stayed 0 — the store does not append the chain row, the
+        // ruling path does, and this bundle reads the chain. Same shortcut, same lesson, twice
+        // in one test: a surface assembled from the chain can only be tested against a chain
+        // that something actually wrote to.
+        let asker = super::appeal_tests::seat(&state, "claude-code").await;
+        let peer = super::appeal_tests::seat(&state, "codex").await;
+        let first = open_as(&state, MARKER, "Bash: cp /tmp/a plugins/codex/hooks/pre_tool_use.py",
+                            Some(&asker.to_string())).await;
+        tool_gate_arbitrate_escalation(&state, &json!({
+            "escalation_id": first, "approve": true, "session_id": peer.to_string(),
+            "reason": "read the diff; it is a comment correction inside one file",
+        })).await.unwrap();
+        let subject = open_as(&state, MARKER, "Bash: cp /tmp/b plugins/kimi/hooks/pre_tool_use.py",
+                              Some(&asker.to_string())).await;
+
+        let r = tool_escalation_evidence(&state, &json!({"escalation_id": subject})).await.unwrap();
+        let prior = &r["evidence"]["prior_on_this_marker"];
+        assert!(prior["opened"].as_u64().unwrap() >= 1, "the earlier ask is precedent: {prior}");
+        assert_eq!(prior["approved"], json!(1), "and how it was decided: {prior}");
+        // The control that makes the count mean something: the subject's own rows must not
+        // inflate its own history, or every first-time ask would look like a repeat offender.
+        let rows = prior["rows"].as_array().unwrap();
+        assert!(
+            rows.iter().all(|row| row["escalation_id"] != json!(subject)),
+            "the case must not appear in its own precedent: {prior}"
+        );
+        assert_eq!(prior["truncated"], json!(false), "a short history is not truncated: {prior}");
+    }
+
+    /// THE HUMAN AND THE RUNG MUST READ ONE OBJECT, NOT TWO RENDERINGS OF ONE IDEA.
+    ///
+    /// This is the load-bearing claim of §3.3 — *"if a rung sees less than the human would, it
+    /// is not a rung, it is a filter"* — and it is a claim about a SURFACE, so it is asserted
+    /// here rather than trusted to the fact that both call the same function today. If the
+    /// card and the tool ever diverge, the ladder's promotion measurement is comparing two
+    /// different questions and the agreement rate it produces is meaningless.
+    #[tokio::test]
+    async fn the_operator_card_and_the_reviewers_bundle_show_the_same_write_effect() {
+        use std::io::Write as _;
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let src = dir.path().join("incoming.py");
+        let mut f = std::fs::File::create(&src).unwrap();
+        f.write_all(b"one\ntwo\nthree\n").unwrap();
+        drop(f);
+        let act = format!("Bash: cp {} plugins/codex/hooks/pre_tool_use.py", src.display());
+        let id = open_one(&state, "plugins/*/hooks", &act).await;
+
+        let via_tool = tool_escalation_evidence(&state, &json!({"escalation_id": id}))
+            .await
+            .unwrap();
+        let bundle_effect = via_tool["evidence"]["write_effect"].clone();
+
+        // The card's value, built the way the dashboard builds it.
+        let card_effect = serde_json::to_value(
+            crate::server::evidence::write_effect_cached(&act),
+        )
+        .unwrap();
+
+        assert!(!bundle_effect.is_null(), "the bundle must carry the effect: {via_tool}");
+        assert_eq!(
+            bundle_effect, card_effect,
+            "the operator's card and the reviewer's bundle must be the SAME object"
+        );
+        assert_eq!(bundle_effect["source_lines"], json!(3), "{bundle_effect}");
+        assert!(bundle_effect["payload_sha256"].is_string(),
+                "and must carry the hash the approval binds: {bundle_effect}");
+    }
+}
+
 mod appeal_tests {
     use super::*;
     use super::inbox_tests::{open_state, seeded_home};
@@ -19678,6 +19868,30 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
                      effective(you) = society_floor ∪ your grants, additive only. None of the \
                      three is ever written to your identity file.",
     }))
+}
+
+/// The evidence bundle for one escalation — `PRD_ADJUDICATOR_LADDER` §3.3.
+///
+/// READ-ONLY AND NOT WITNESSED, for the same reason `tool_gate_escalation_poll` is not:
+/// reading a case is not acting on it, and witnessing every read would bury the opened and
+/// decided rows under one reviewer's inspection. A rung that must consult the evidence twice
+/// before forming a view should not thereby look twice as busy as one that guessed.
+async fn tool_escalation_evidence(state: &SharedState, args: &Value) -> ToolResult {
+    let escalation_id = require_string(args, "escalation_id")?;
+    let s = state.lock().await;
+    match crate::server::evidence::bundle(&s, &escalation_id) {
+        Some(b) => Ok(json!({"found": true, "evidence": b})),
+        // An unknown id is answered, not errored: the caller's only safe reading of an error
+        // is "try again", while the safe reading of `found: false` is "there is nothing here
+        // to decide". Same discipline as `status_of` answering Expired for an unknown id.
+        None => Ok(json!({
+            "found": false,
+            "escalation_id": escalation_id,
+            "note": "no escalation with that id is live on this daemon. An id that has been \
+                     reaped is indistinguishable here from one that never existed — read the \
+                     chain by id if you need to tell those apart",
+        })),
+    }
 }
 
 async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolResult {
