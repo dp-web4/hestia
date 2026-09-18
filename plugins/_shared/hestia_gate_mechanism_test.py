@@ -612,6 +612,62 @@ def test_the_review_capability_spelling_matches_the_daemons():
           f"daemon={found[0]!r} mechanism={m.REVIEW_CAPABILITY!r}")
 
 
+def test_the_review_door_comment_names_the_seats_own_identity():
+    """The sentence that declares the door must name the id the seat actually acts under.
+
+    kimi-code's second-seat review of the comment-truth fix (notice 13150, 2026-09-18) found
+    the codex shim's declaration sentence naming `codex-cli` while that same file's
+    HESTIA_PLUGIN_ID asserts `codex`. `codex-cli` is a real witnessed alias (the operator's
+    2026-07-26 `identity_alias`), but it carries ZERO `gate_escalation_corroborated` rows on
+    the full chain against codex's 142 — so a reader who checks this comment against the
+    chain the way the census does counts the named id, finds nothing, and holds a false
+    refutation of the very claim the comment exists to support.
+
+    Two things make it worth a test rather than a re-read. The drift re-entered inside the
+    one file that already names the hazard — its HESTIA_PLUGIN_ID exists because "codex
+    spent days reporting as both `codex` and `codex-cli`" — and it re-entered through a
+    commit whose whole subject was comment truth: that correction rewrote five lines of this
+    comment and left the identifier on the first one. Prose cannot fail a build; this can.
+
+    Measured over all three shims when this was written: 2 correct, 1 wrong. A singleton,
+    not a class, which is why this is a six-line predicate and not a repo-wide lint.
+    """
+    import re
+    here = os.path.dirname(os.path.abspath(__file__))
+    declaring = 0
+    for seat in ("claude-code", "codex", "kimi"):
+        path = os.path.join(here, "..", seat, "hooks", "pre_tool_use.py")
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            shim = fh.read()
+        if "declares_review_door=True" not in shim:
+            continue          # this seat does not claim the door; it has nothing to name
+        declaring += 1
+        # The seat's asserted identity: the LAST string literal on its identity assignment.
+        # That is the bare literal in one spelling and the environment default in the other,
+        # and it is what every witness call on the seat passes.
+        own = []
+        for line in shim.splitlines():
+            head = re.match(r'^(?:HESTIA_)?PLUGIN_ID\s*=\s*(.+)$', line)
+            if head:
+                lits = re.findall(r'"([^"]+)"', head.group(1))
+                if lits:
+                    own.append(lits[-1])
+        check(f"{seat}_asserts_exactly_one_identity", len(set(own)) == 1, repr(own))
+        named = re.findall(r"This seat HOLDS the review door:\s*([A-Za-z0-9_-]+)\s+reaches",
+                           shim)
+        check(f"{seat}_declaration_sentence_is_findable", len(named) == 1,
+              f"expected one 'This seat HOLDS the review door: <id> reaches', got {named!r}")
+        check(f"{seat}_comment_names_its_own_id", named[0] == own[0],
+              f"comment says {named[0]!r}; this shim acts as {own[0]!r}")
+    # Never render "every declaration is honest" out of "found no shim to read" — the
+    # agent-inventory rule, and the same fail direction the certification suite uses.
+    check("at_least_one_shim_declares_the_door", declaring > 0,
+          "no shim beside this test declares the review door — a check that cannot look "
+          "certifies nothing")
+
+
 ALL = [
     test_allow_proceeds,
     test_deny_enforced_blocks,
@@ -642,6 +698,7 @@ ALL = [
     test_verdict_and_snapshot_share_one_cause_classifier,
     test_the_review_door_is_the_callers_assertion_not_the_librarys,
     test_the_review_capability_spelling_matches_the_daemons,
+    test_the_review_door_comment_names_the_seats_own_identity,
 ]
 
 if __name__ == "__main__":

@@ -786,8 +786,16 @@ def main():
         snapshot = None
         try:
             m = _load_mechanism()
-            # This seat HOLDS the review door: codex-cli reaches
+            # This seat HOLDS the review door: codex reaches
             # `hestia_gate_escalation_corroborate` over MCP and the chain records its use.
+            # The id is `codex`, the one HESTIA_PLUGIN_ID asserts above — NOT the
+            # `codex-cli` spelling this sentence carried until 2026-09-18. That alias is
+            # real (the operator's 2026-07-26 `identity_alias`) but holds ZERO
+            # `gate_escalation_corroborated` rows full-chain against codex's 142, so a
+            # reader checking this comment the way the census does would count the named id,
+            # find nothing, and hold a false refutation (kimi-code's second-seat review,
+            # notice 13150). Pinned by hestia_gate_mechanism_test.py's door-comment
+            # identity test, so the drift cannot re-enter as prose again.
             # No count is quoted here. The first cut said "40 times — the most of any
             # member": a real count of a 40,000-entry window wearing a population claim,
             # false on the full chain, refuted by kimi-code (findings/review-13031-verdict.md
