@@ -645,7 +645,11 @@ def main():
         snapshot = None
         try:
             from hestia_gate_mechanism import fetch_policy_snapshot
-            # This seat HOLDS the review door (chain: 21 corroborations as kimi-code).
+            # This seat HOLDS the review door: kimi-code reaches
+            # `hestia_gate_escalation_corroborate` and the chain records its use. No count
+            # is quoted — the counts these three comments first carried were of a
+            # 40,000-entry window, published as chain totals, and kimi-code's own review
+            # is what caught it (findings/review-13031-verdict.md §A).
             # The caller asserts it; the shared mechanism must not (#1050).
             snapshot = fetch_policy_snapshot(HESTIA_PLUGIN_ID, host_agent=HESTIA_PLUGIN_ID,
                                              host_session_id=event.get("session_id"),

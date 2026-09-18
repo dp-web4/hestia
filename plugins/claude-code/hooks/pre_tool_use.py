@@ -1824,7 +1824,10 @@ def main() -> int:
     _snapshot = None
     try:
         from hestia_gate_mechanism import fetch_policy_snapshot
-        # This seat HOLDS the review door (chain: 16 corroborations as claude-code).
+        # This seat HOLDS the review door: claude-code reaches
+        # `hestia_gate_escalation_corroborate` and the chain records its use. No count is
+        # quoted — the counts these three comments first carried were of a 40,000-entry
+        # window, published as chain totals (findings/review-13031-verdict.md §A).
         # The caller asserts it; the shared mechanism must not (#1050).
         _snapshot = fetch_policy_snapshot(PLUGIN_ID, host_agent=HOST_AGENT,
                                           host_session_id=host_session_id,
