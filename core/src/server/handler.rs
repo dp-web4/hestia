@@ -18679,6 +18679,7 @@ fn coalesced_payload(
         "tool_name": twin.tool_name,
         "marker": twin.marker,
         "act_digest": twin.act_digest,
+        "payload_sha256": twin.payload_sha256,
         // WHICH DOOR asked again — same discriminator `opened_payload` carries.
         "opened_via": opened_via,
         "first_opened_at": twin.opened_at,
@@ -18773,6 +18774,12 @@ fn opened_payload(
         // Explicit null when the opener stated no act, so a census can count that class
         // rather than confuse it with a row that predates the field.
         "act_digest": esc.act_digest,
+        // WHICH BYTES this approval is being asked for (#1056), when the act named a source
+        // the daemon could read. On the chain for the same reason the act digest is: the
+        // binding must survive a restart. Explicit null when nothing was measurable, so a
+        // census can separate "bound nothing" from "predates the field" — and so an operator
+        // reading the ask can see which of the two they are being asked to approve.
+        "payload_sha256": esc.payload_sha256,
         // WHICH DOOR. See the doc comment: the key-set accident that used to answer this is
         // gone as of this change, deliberately.
         "opened_via": opened_via,
@@ -18881,6 +18888,10 @@ fn opened_payload(
                     // member re-issues a different write, is refused, and reads the refusal
                     // as the approval having lapsed.
                     "act_digest": c.act_digest,
+                    // And WHICH BYTES it was rendered for, so a member holding a permit can
+                    // tell before re-issuing whether the file it is about to copy is still
+                    // the one that was approved (#1056).
+                    "payload_sha256": c.payload_sha256,
                     // The CLAIM clock, never the record clock: measured 2026-08-08, three
                     // permits reported ~1500s of record life while ~24 minutes past their
                     // grant horizon — that is how a spent permit publishes as live.
@@ -19043,6 +19054,16 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // struct field's doc). A member-initiated open through a plain session usually
     // supplies nothing, and null is the explicit record of that.
     let gate_path = optional_string(args, "gate_path");
+    // The BYTES this act would write, when the caller can name them (#1056). Caller-asserted
+    // like every other field here; what it buys is that the same value must come back at
+    // claim, so the approval cannot be spent on a payload the approver never saw.
+    let payload_sha256 = optional_string(args, "payload_sha256").or_else(|| {
+        // MEASURED when the caller states nothing. A stated hash is kept as stated, because
+        // silently replacing a member's assertion with the daemon's own reading would hide a
+        // disagreement between them — and a disagreement is exactly the interesting case.
+        act.as_deref()
+            .and_then(super::gate_escalation::EscalationStore::measured_payload_for_act)
+    });
     let now = now_secs();
 
     let mut s = state.lock().await;
@@ -19067,10 +19088,11 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     let proven_session_uuid = proven_asker.as_ref().and_then(|who| who.session_uuid);
     let opened = match s
         .gate_escalations
-        .open_or_coalesce(&plugin_id, &role, &tool_name, &marker,
+        .open_or_coalesce_with_payload(&plugin_id, &role, &tool_name, &marker,
               // The act, from its own field. No fallback to `reason` on this door.
               act.as_deref(),
-              stated_reason.as_deref(), stated_detail.as_deref(), now, DEFAULT_TTL_SECS)
+              stated_reason.as_deref(), stated_detail.as_deref(),
+              payload_sha256.as_deref(), now, DEFAULT_TTL_SECS)
     {
         Ok(o) => o,
         // A refusal to OPEN is itself a deny of the write, so it is witnessed rather than
@@ -19673,6 +19695,14 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // the claim hashed and recorded `reason`. An approval could therefore be correct in the
     // store and permanently unspendable by the member-door caller that created it.
     let attempted_act = act.clone().or_else(|| stated_reason.clone());
+    // The bytes about to be written, when the gate could hash them (#1056). A shim that does
+    // not send this claims exactly as before; the binding only engages on approvals that
+    // recorded one.
+    let attempted_payload = optional_string(args, "payload_sha256").or_else(|| {
+        attempted_act
+            .as_deref()
+            .and_then(super::gate_escalation::EscalationStore::measured_payload_for_act)
+    });
     let stated_detail = optional_string(args, "detail");
     // The durable per-wake key the daemon's own outcome rows carry — the value that joins a
     // spent approval to the act that consumed it. ACCEPTED HERE ONLY TO BE CHECKED, NEVER TO
@@ -19784,9 +19814,13 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // `reason`; the member door carries an explicit `act` plus a distinct rationale. The
     // explicit field wins when both are present, exactly as it does on the open fallback.
     // A caller that states neither cannot claim: an unnamed act matches no approval.
-    if let Some(esc) =
-        s.gate_escalations
-            .claim(&plugin_id, &marker, attempted_act.as_deref(), now)
+    if let Some(esc) = s.gate_escalations.claim_bound(
+        &plugin_id,
+        &marker,
+        attempted_act.as_deref(),
+        attempted_payload.as_deref(),
+        now,
+    )
     {
         // Spending an approval is an ACT and is witnessed. The approval itself was already
         // recorded when it was decided; this entry is what ties it to the write it authorised,
@@ -19869,15 +19903,61 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
         }));
     }
 
+    // AN APPROVAL EXISTS FOR THIS ACT AND IT BOUND DIFFERENT BYTES (#1056).
+    //
+    // Falling through to the open below would be correct in outcome — the write stays refused
+    // — and wrong in every other way: the member would read "no approval found", ask again,
+    // and a human would rule a second time on a petition whose first ruling is sitting right
+    // there, unspendable, for a reason nobody was told. So the drift gets its own answer and
+    // its own row. This is the case the field exists to make visible, and an invisible
+    // instance of it is the same silence #1056 measured.
+    if let Some((esc, bound)) = s.gate_escalations.payload_drift(
+        &plugin_id,
+        &marker,
+        attempted_act.as_deref(),
+        attempted_payload.as_deref(),
+        now,
+    ) {
+        let esc_id = esc.id.clone();
+        let presented = attempted_payload.clone();
+        let entry = s.append_chain(
+            "gate_escalation_payload_drift",
+            json!({
+                "plugin_id": plugin_id,
+                "tool_name": tool_name,
+                "marker": marker,
+                "escalation_id": esc_id,
+                "bound_payload_sha256": bound,
+                // Explicit null when the caller presented nothing: "the bytes changed" and
+                // "the caller stopped naming the bytes" are different failures, and a census
+                // that cannot tell them apart would read the second as the first.
+                "presented_payload_sha256": presented,
+            }),
+        );
+        return Ok(json!({
+            "claimed": false,
+            "refused": "payload_drift",
+            "escalation_id": esc_id,
+            "bound_payload_sha256": bound,
+            "presented_payload_sha256": presented,
+            "note": "An approval for this exact act exists, but it was rendered for DIFFERENT \
+bytes. The approval is not spent and stays claimable by the payload it named. If the new bytes \
+are the ones you mean to write, they are a new ask: say so and open one, rather than spending a \
+permit for something the approver did not see.",
+            "witnessEntryHash": entry.ok().map(|e| e.hash),
+        }));
+    }
+
     // Nothing to claim, so this write is REFUSED. Opening an escalation is not a maybe — it is
     // the paperwork attached to a refusal that already happened.
     match s
         .gate_escalations
-        .open_or_coalesce(&plugin_id, &role, &tool_name, &marker,
+        .open_or_coalesce_with_payload(&plugin_id, &role, &tool_name, &marker,
               // The gate hook composes `reason` AS the act, and has always done so, so it is
               // the act here. `act` still wins if a caller sends both.
               attempted_act.as_deref(),
-              stated_reason.as_deref(), stated_detail.as_deref(), now, DEFAULT_TTL_SECS)
+              stated_reason.as_deref(), stated_detail.as_deref(),
+              attempted_payload.as_deref(), now, DEFAULT_TTL_SECS)
     {
         // ONE ACT, ONE RULING (#668). This is the door the gate hook calls, and the hook
         // re-trips on the same refused act — 25 of 49 same-digest re-opens in the
