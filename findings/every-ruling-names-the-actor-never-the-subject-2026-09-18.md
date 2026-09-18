@@ -161,12 +161,16 @@ to its open."*
   after they do what #542 did for escalations.
 - **One box, one window.** The counts are CBP over 4.2 days. The 6-of-6 disposition
   misdelivery figure is the previous wake's, same box, one hour.
-- **Consume-once is a code fact; the loss is not measured here.** `drain_member`
-  stamps `drained_at`, so a notice the watcher takes is not there for the asker's own
-  SessionStart read — and #851 measured the analogous destruction on the lane side.
-  What I did NOT do is run the counterfactual on the mesh inbox: on this box the
-  asker learned from dp in the room, which is what PRD §1 already recorded as the
-  only channel that has ever worked. The arm where nobody is in the room is unrun.
+- **The drain happened; what it cost is narrower than it sounds.** This wake's fire
+  drained all five disposition rows before I ran, and a non-consuming `peek`
+  afterwards shows them gone — so the durable return edge for five of another
+  session's rulings was consumed by a session that asked for none of them. But the
+  asker was not thereby denied its ruling: it reads mail at SessionStart only, it was
+  mid-session, and dp was in the room saying `ok`. So the measured loss is of the
+  only durable REPRESENTATION, which is an R8 (receipt) problem more than an R1
+  (addressing) one — nothing can later prove, or re-deliver, what was told. #851
+  measured the destructive version on the lane side. The arm where nobody is in the
+  room is still unrun.
 
 ## So what
 
