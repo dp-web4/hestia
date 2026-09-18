@@ -127,6 +127,24 @@ enum Command {
     #[command(subcommand)]
     Scope(ScopeCmd),
 
+    /// Member registry governance (#990): retire a residue name from the
+    /// invitation pool, or reinstate it. Operator-signed against the daemon's
+    /// challenge surface — adds no authority the daemon does not already enforce.
+    Member {
+        #[command(subcommand)]
+        cmd: MemberCmd,
+
+        /// Daemon URL
+        #[arg(long, default_value = "http://127.0.0.1:7711", global = true)]
+        endpoint: String,
+
+        /// Operator credential file (JSON `{lct_id, secret_key_hex}`) whose public
+        /// half is law-listed in `operator_access`. Read, never printed; supplied
+        /// here or via HESTIA_OPERATOR_KEY, never guessed.
+        #[arg(long, global = true, env = "HESTIA_OPERATOR_KEY")]
+        key: PathBuf,
+    },
+
     /// Governance-surface escalations — the remedy every gate deny already names.
     ///
     /// Stage 2 (#114) prints `hestia gate approve <id>` on every refusal; the
@@ -216,6 +234,26 @@ enum GateCmd {
         /// evidence)
         #[arg(long)]
         argument: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MemberCmd {
+    /// Retire a member name: tombstone it so no governance-selection pool spends a
+    /// slot on it again (#990). Reversible — see `reinstate`.
+    Retire {
+        /// The member id to retire (e.g. a probe-residue name)
+        plugin_id: String,
+        /// WHY — required, single line; carried on the tombstone and the witnessed
+        /// event. A prune without a stated basis cannot be challenged.
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Reinstate a retired member name: clear the tombstone, return it to the pool.
+    Reinstate {
+        /// The member id to reinstate
+        plugin_id: String,
     },
 }
 
@@ -818,6 +856,14 @@ pub fn run() -> AnyResult<()> {
                 }
             }
         }
+        Command::Member { cmd, endpoint, key } => match cmd {
+            MemberCmd::Retire { plugin_id, reason } => {
+                hestia::member_cli::retire(&endpoint, &key, &plugin_id, &reason)
+            }
+            MemberCmd::Reinstate { plugin_id } => {
+                hestia::member_cli::reinstate(&endpoint, &key, &plugin_id)
+            }
+        },
         Command::Vault(v) => match v {
             VaultCmd::List => cmd_vault_list(&home),
             VaultCmd::Get { name } => cmd_vault_get(&home, &name),

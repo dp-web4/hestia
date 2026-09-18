@@ -1180,6 +1180,11 @@ pub async fn serve_with_callback(
         )
         .route("/api/operator/alias", post(operator_alias))
         .route("/api/operator/amnesty", post(operator_amnesty))
+        .route("/api/operator/member/retire", post(operator_member_retire))
+        .route(
+            "/api/operator/member/reinstate",
+            post(operator_member_reinstate),
+        )
         .route("/api/failures", get(failures_json))
         .route("/api/vault", get(vault_list).post(vault_add))
         .route("/api/vault/:name", delete(vault_delete))
@@ -1657,6 +1662,231 @@ async fn operator_alias(
         })),
     )
         .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct OperatorMemberRetire {
+    plugin_id: String,
+    /// WHY this name is retired — required, and carried on both the tombstone and
+    /// the witnessed event. Retirement without a stated basis is an unaccountable
+    /// prune: the next operator must be able to challenge the judgement, not guess it.
+    reason: String,
+}
+
+#[derive(serde::Deserialize)]
+struct OperatorMemberReinstate {
+    plugin_id: String,
+}
+
+/// `POST /api/operator/member/retire` — the registry's one administrative REMOVE
+/// (#990): tombstone a member name so no governance-selection pool spends a
+/// rivalrous slot on it again. Written for the fleet's standing residue class —
+/// probe names, impostor probes, typo'd connects, one-touch gates — which the
+/// append-only registry (`#63`'s free entry side) could never shed: measured
+/// 1,074 of 1,291 `review_request`s (83.2%) going to names with no mailbox reader.
+///
+/// A TOMBSTONE, never a delete: the row's sealed keypair verifies the member's
+/// historical witnessed acts, and deleting it would make that record unverifiable
+/// AND make the act irreversible — the quorum tier. Retirement is high-consequence
+/// but undoable (`/api/operator/member/reinstate`), so a single challenge-signed
+/// operator session authorizes it, which is the tier the judgement belongs to.
+/// `retired_by` comes from the GateWitness provenance (the operator principal the
+/// middleware authenticated), never from the request body: WHO retired is
+/// evidence, and a caller-supplied string is a claim.
+///
+/// surface: operator member-retire   act: exclude a member name from governance-selection pools
+/// S: high/reversible [construct: tombstone; `reinstate_member` undoes it, nothing is deleted]
+/// R: n/a [construct: no reachability-based authority]
+/// W: pass [construct: operator_gate — challenge-signed session; author taken from GateWitness, not the body]
+/// O: pass [construct: all validation precedes `retire_member`, the first side effect]
+/// A: pass [construct: tombstone + `member_retired` append carry member, retired_by, at, reason]
+/// V: n/a [construct: reversible by design; the irreversible tier was the rejected delete]
+/// verdict: PASS
+async fn operator_member_retire(
+    State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
+    Json(a): Json<OperatorMemberRetire>,
+) -> impl IntoResponse {
+    let member = a.plugin_id.trim().to_string();
+    if member.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "plugin_id is required"})),
+        )
+            .into_response();
+    }
+    if a.reason.trim().is_empty()
+        || a.reason.len() > 512
+        || a.reason.chars().any(char::is_control)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "'reason' is required — a single line (<=512 bytes) naming the basis; \
+                          a prune without a stated basis cannot be challenged"})),
+        )
+            .into_response();
+    }
+    // The author is the operator the challenge-signed session resolved. A session
+    // always carries a principal, so the fallback names the degradation rather than
+    // inventing an operator.
+    let retired_by = match &gate {
+        Some(axum::Extension(w)) => match &w.provenance {
+            Some(p) => p.principal.clone(),
+            None => "operator (direct session)".to_string(),
+        },
+        None => "operator (session not recorded on this path)".to_string(),
+    };
+    let now = super::state::unix_now();
+    let mut s = state.lock().await;
+    // Split the disjoint field borrows explicitly, the same way `tool_connect` does
+    // for `ensure_member` — the checker cannot see them through the guard.
+    let crate::server::state::ServerState {
+        vault,
+        member_registry,
+        ..
+    } = &mut *s;
+    let outcome = crate::member_registry::retire_member(
+        vault,
+        member_registry,
+        &member,
+        &retired_by,
+        a.reason.trim(),
+        now,
+    );
+    use crate::member_registry::RetireOutcome as O;
+    match outcome {
+        O::Retired => {
+            let entry = match s.append_chain(
+                "member_retired",
+                stamp_gate(
+                    serde_json::json!({
+                        "member": member,
+                        "retired_by": retired_by,
+                        "reason": a.reason.trim(),
+                    }),
+                    &gate,
+                ),
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("witnessing: {e}")})),
+                    )
+                        .into_response();
+                }
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "retired": member,
+                    "witnessEntryHash": entry.hash,
+                    "note": "tombstoned, not deleted: the LCT still verifies this name's \
+                             historical acts; reinstate at /api/operator/member/reinstate"
+                })),
+            )
+                .into_response()
+        }
+        O::UnknownId => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("no member named '{member}' in the registry")})),
+        )
+            .into_response(),
+        O::AlreadyRetired => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("'{member}' is already retired")})),
+        )
+            .into_response(),
+        O::FillerIsNotAMember => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": format!("'{member}' is a filler — typed never-a-member at mint; the \
+                                  invitation pool excludes it by type, so there is nothing to retire")})),
+        )
+            .into_response(),
+        O::PersistFailed(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("persisting the tombstone: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/operator/member/reinstate` — undo a retirement: clear the tombstone
+/// and return the name to the invitation pool. The existence of this door is what
+/// keeps the pair inside `HighReversible` (a single operator session), never the
+/// quorum tier an irreversible removal would demand. Witnessed as
+/// `member_reinstated`.
+///
+/// surface: operator member-reinstate   act: restore a retired name to governance-selection pools
+/// S: high/reversible [construct: clears a tombstone; a later retire re-applies it]
+/// R: n/a [construct: no reachability-based authority]
+/// W: pass [construct: operator_gate — challenge-signed session]
+/// O: pass [construct: validation precedes `reinstate_member`, the first side effect]
+/// A: pass [construct: tombstone clear + `member_reinstated` append name the member]
+/// V: n/a [construct: reversible]
+/// verdict: PASS
+async fn operator_member_reinstate(
+    State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
+    Json(a): Json<OperatorMemberReinstate>,
+) -> impl IntoResponse {
+    let member = a.plugin_id.trim().to_string();
+    if member.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "plugin_id is required"})),
+        )
+            .into_response();
+    }
+    let mut s = state.lock().await;
+    use crate::member_registry::ReinstateOutcome as O;
+    let crate::server::state::ServerState {
+        vault,
+        member_registry,
+        ..
+    } = &mut *s;
+    match crate::member_registry::reinstate_member(vault, member_registry, &member) {
+        O::Reinstated => {
+            let entry = match s.append_chain(
+                "member_reinstated",
+                stamp_gate(serde_json::json!({ "member": member }), &gate),
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("witnessing: {e}")})),
+                    )
+                        .into_response();
+                }
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "reinstated": member,
+                    "witnessEntryHash": entry.hash,
+                })),
+            )
+                .into_response()
+        }
+        O::UnknownId => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("no member named '{member}' in the registry")})),
+        )
+            .into_response(),
+        O::NotRetired => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("'{member}' is not retired")})),
+        )
+            .into_response(),
+        O::PersistFailed(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("clearing the tombstone: {e}")})),
+        )
+            .into_response(),
+    }
 }
 
 async fn operator_adjudicate(
@@ -8346,5 +8576,166 @@ mod transport_binding_route_tests {
         }
         conn.execute_batch("DROP TRIGGER fail_binding_success").unwrap();
         assert_eq!(set(&state, body).await.status(), StatusCode::OK, "the identical retry lands");
+    }
+}
+
+/// #990: the registry's one administrative REMOVE, driven through its operator door.
+/// These drive `operator_member_retire` / `operator_member_reinstate` directly (the
+/// `operator_gate` middleware is pinned elsewhere) and assert the three facts the
+/// issue requires the record to carry — WHO retired, WHEN, WHY — plus the one that
+/// makes the act honest: a refusal mints nothing.
+#[cfg(test)]
+mod member_retire_route_tests {
+    use super::*;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    fn clone_retire(b: &OperatorMemberRetire) -> OperatorMemberRetire {
+        OperatorMemberRetire { plugin_id: b.plugin_id.clone(), reason: b.reason.clone() }
+    }
+
+    async fn seed_member(state: &SharedState, id: &str) {
+        let mut s = state.lock().await;
+        let crate::server::state::ServerState {
+            vault,
+            member_registry,
+            ..
+        } = &mut *s;
+        crate::member_registry::ensure_member(
+            vault,
+            member_registry,
+            id,
+            false,
+            "sid",
+            "anchor",
+        )
+        .expect("the member mints");
+    }
+
+    async fn chain_has(state: &SharedState, event: &str) -> Vec<serde_json::Value> {
+        let s = state.lock().await;
+        s.recent_chain(30)
+            .into_iter()
+            .filter(|e| e.event_type == event)
+            .map(|e| e.event_data.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn retire_tombstones_and_witnesses_who_and_why() {
+        let (_dir, state) = test_state().await;
+        seed_member(&state, "attest-probe").await;
+        let body = OperatorMemberRetire {
+            plugin_id: "attest-probe".into(),
+            reason: "probe residue — never a real seat (#990)".into(),
+        };
+        let resp = operator_member_retire(State(state.clone()), None, Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        {
+            let s = state.lock().await;
+            let t = s
+                .member_registry
+                .retirement("attest-probe")
+                .expect("tombstoned in memory");
+            assert!(t.reason.contains("probe residue"));
+            assert!(t.retired_at > 0, "the WHEN is on the tombstone");
+            // The LCT still resolves: history stays verifiable.
+            assert!(s.member_registry.get("attest-probe").is_some());
+        }
+        let rows = chain_has(&state, "member_retired").await;
+        assert_eq!(rows.len(), 1, "one witnessed retirement: {rows:?}");
+        assert_eq!(rows[0]["member"], "attest-probe");
+        assert!(rows[0]["reason"].as_str().unwrap().contains("probe residue"));
+        assert!(
+            rows[0]["retired_by"].as_str().is_some(),
+            "WHO is recorded from the session side, not the request body: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unstated_reason_is_refused_and_mints_nothing() {
+        let (_dir, state) = test_state().await;
+        seed_member(&state, "attest-probe").await;
+        for body in [
+            OperatorMemberRetire { plugin_id: "attest-probe".into(), reason: String::new() },
+            OperatorMemberRetire { plugin_id: "attest-probe".into(), reason: "   ".into() },
+            OperatorMemberRetire { plugin_id: "attest-probe".into(), reason: "x".repeat(513) },
+        ] {
+            let resp = operator_member_retire(State(state.clone()), None, Json(body))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+        let s = state.lock().await;
+        assert!(
+            !s.member_registry.is_retired("attest-probe"),
+            "a refused prune leaves no tombstone"
+        );
+        drop(s);
+        assert!(
+            chain_has(&state, "member_retired").await.is_empty(),
+            "and no witnessed row — a prune without a basis cannot be challenged"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_and_already_retired_are_distinct_refusals() {
+        let (_dir, state) = test_state().await;
+        seed_member(&state, "attest-probe").await;
+        let ghost = OperatorMemberRetire { plugin_id: "ghost".into(), reason: "r".into() };
+        let resp = operator_member_retire(State(state.clone()), None, Json(ghost))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = OperatorMemberRetire { plugin_id: "attest-probe".into(), reason: "r".into() };
+        let first = operator_member_retire(State(state.clone()), None, Json(clone_retire(&body)))
+            .await
+            .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = operator_member_retire(State(state.clone()), None, Json(body))
+            .await
+            .into_response();
+        assert_eq!(
+            second.status(),
+            StatusCode::CONFLICT,
+            "a second retire mints no second tombstone"
+        );
+        assert_eq!(chain_has(&state, "member_retired").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reinstate_clears_the_tombstone_and_witnesses_the_return() {
+        let (_dir, state) = test_state().await;
+        seed_member(&state, "attest-probe").await;
+        let body = OperatorMemberRetire { plugin_id: "attest-probe".into(), reason: "probe residue".into() };
+        operator_member_retire(State(state.clone()), None, Json(body))
+            .await
+            .into_response();
+
+        let reinstate = || OperatorMemberReinstate { plugin_id: "attest-probe".into() };
+        let resp = operator_member_reinstate(State(state.clone()), None, Json(reinstate()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        {
+            let s = state.lock().await;
+            assert!(!s.member_registry.is_retired("attest-probe"));
+        }
+        assert_eq!(chain_has(&state, "member_reinstated").await.len(), 1);
+        // A member that was never retired is a reported conflict, not a silent no-op.
+        let again = operator_member_reinstate(State(state.clone()), None, Json(reinstate()))
+            .await
+            .into_response();
+        assert_eq!(again.status(), StatusCode::CONFLICT);
+        assert_eq!(chain_has(&state, "member_reinstated").await.len(), 1);
     }
 }
