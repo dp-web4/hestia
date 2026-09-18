@@ -175,3 +175,45 @@ row. Here: `resolve_escalation_pointer` serves `plugin_id` and not the session k
 less than the `opened` row it resolves. **Decision-side and read-side projections drop the
 provenance field their open-side sibling carries** — and each time, a join that should be
 free becomes a chain walk.
+
+---
+
+## Addendum, same wake: 6 of 6, and a correction to the remedy ranking
+
+Peeking the inbox before ending the wake turned one specimen into six. Every disposition
+delivered to `claude-code` during this wake, resolved fuse-safe and attributed by chain join:
+
+| notice | escalation | status | claimed | owner |
+|---|---|---|---|---|
+| 13108 | `5d83efeaf20d91c6` | approved | yes | `9261dc9a…` |
+| 13109 | `17c7f028d808c7a0` | approved | — | `9261dc9a…` |
+| 13110 | `06fc06c11927bfd5` | approved | — | `9261dc9a…` |
+| 13125 | `b98f92ec0814287b` | approved | yes | `9261dc9a…` |
+| 13142 | `ab77a3239c2d96bf` | approved | **no** | `9261dc9a…` |
+| 13143 | `32dfe9defeac2956` | approved | yes | `9261dc9a…` |
+
+**6/6 misrouted, 0 mine.** `ab77a3239c2d96bf` is an approved, unclaimed, live grant whose
+owner is still connected — the exact object a bystander's status check destroys. Left alone.
+
+Ownership surfaced once without a chain walk, by accident: `32dfe9defeac2956`'s
+`stated_reason` is a `cp` whose source path is
+`/tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-…/scratchpad/…`. The owner's session id was
+legible in a free-text field describing an unrelated file operation, and in no field designed
+to carry it.
+
+### Correcting the ranking
+
+The writeup above ranks the derived boolean first. `hestia://session/siblings` this wake:
+**232 live local sessions, 5 carrying a `host_session_id`**. The boolean is computed against
+the *caller's* proven session, so a caller with none gets `null` — back where it started.
+
+That denominator is not the fair one for askers (most of the 232 are short-lived watcher and
+CLI connects that never petition; #732's 22.4% over `gate_escalation_opened` is the right
+figure there). It is the fair one for **callers**, and callers are who the boolean serves. So
+it is still worth having and still needs no ruling — just weaker than written above.
+
+**The digest annotation is the one demonstrated to work, on this wake's data.** The primer's
+`open-petitions.py` fold bucketed `06fc06c1…` and `17c7f028…` as `co_seat` correctly, using
+the watcher's own ledger of host sessions it fired — not the daemon projection. The ledger
+had the answer for the open rows and was never consulted for the decided ones. Revised order:
+**digest annotation from the watcher ledger → derived boolean → raw field.**
