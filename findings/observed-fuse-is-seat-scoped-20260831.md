@@ -167,6 +167,18 @@ could authorise.
    member-mesh pointer contract (content lives at the pointer). Replaced by: **route
    pointer dereference through `resources/read`**, which already does not observe. Tool:
    `tools/escalation_read.py`.
+
+   **Stated limit (2026-09-18, specimen `5d83efeaf20d91c6`): this route does not tell the
+   reader whose petition it is.** `resolve_escalation_pointer` serves `plugin_id` — which on
+   a shared box is the bystander's OWN name, and so reads affirmatively as "yours" — and
+   omits `host_session_id`, the discriminator this finding identifies two sections up as
+   already being on the record. So the route created for non-asker readers cannot establish
+   that its reader is a non-asker. Determining ownership instead costs a chain join, and
+   `hestia_query_history` is clamped to 500 entries regardless of the requested `limit`, so
+   for anything older than that window it costs a `prevHash` cursor walk. Remedy is
+   read-side and needs no Guard B ruling (a derived `asker_is_this_session` against the
+   caller's `?session_id=`); see
+   `findings/fuse-safe-reader-cannot-tell-whose-petition-2026-09-18.md`.
 3. **Reconsider what "unclaimed" measures.** With give-up at 21s and act-binding to a
    superseded string, unclaimed is the expected outcome of a working system, not a
    failure rate to drive down.
