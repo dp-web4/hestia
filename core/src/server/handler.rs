@@ -18593,11 +18593,13 @@ pub(crate) const REVIEW_CAPABILITY: &str = "escalation-review:v1";
 /// `gate_capabilities` is also memory-only, so minutes after a deploy every seat is undeclared;
 /// a rule that read that as "no door" would empty the pool fleet-wide on every restart.
 ///
-/// So a member is excluded only when it SAYS what it holds and the review door is not in it,
-/// and the chain shows it has never corroborated:
-///   - `declared` — it named the review capability at connect.
-///   - `corroborated_before` — the chain shows it has added a factor, whatever it declares now.
+/// So a member is excluded only when it SAYS what it holds and the review door is not in it.
+/// The PRESENT declaration decides; history does not override it, or withdrawal is impossible
+/// (see the inline note below for why the chain arm this comment once described was both
+/// harmful and dead):
+///   - `declared` — it named the review capability at connect. Invited.
 ///   - `undeclared` — it named nothing. Invited, and the record says the basis was silence.
+///   - `no_review_door` — it named its set and the door is not in it. NOT invited, recorded.
 ///
 /// Ok(basis) when the member can be asked; Err(reason) when it cannot — and the caller RECORDS
 /// the reason rather than dropping the member silently.
