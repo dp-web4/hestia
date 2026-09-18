@@ -4593,7 +4593,7 @@
     // Governance coverage is the safety signal that replaced the agents drawer — fetch it on
     // load and on a slow clock (install/wiring changes are rare), plus after a connect.
     loadGovernance();
-    setInterval(loadGovernance, 20000);
+    setInterval(() => { if (!document.hidden) loadGovernance(); }, 20000);
 
     // Harness aggregate rows (the All trust view) drill into that harness's role trust.
     // One delegated listener survives the 2s innerHTML re-renders; keyboard-activatable too.
@@ -4620,7 +4620,12 @@
   })();
 
   tick();
-  setInterval(tick, REFRESH_MS);
+  // A tab nobody is looking at does not poll. Each poll asks the daemon to refresh its
+  // dashboard projection, and a forgotten background tab was a steady share of the daemon's
+  // CPU (measured 2026-09-17). Coming back to the tab refreshes at once, so nothing is stale
+  // when it is actually read.
+  setInterval(() => { if (!document.hidden) tick(); }, REFRESH_MS);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
 
   // Display alias editor (#998). Set and clear are operator acts on the console's own
   // presentation store; neither is witnessed, by ruling. The picker's value is the id.

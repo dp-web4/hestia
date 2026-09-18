@@ -96,6 +96,13 @@ pub struct SqliteChainStore {
     /// invariant against the real `COUNT(*)`, so the cache cannot drift silently if a
     /// deletion path is ever added.
     len: AtomicU64,
+    /// Cached trust derivations, invalidated HERE, on append.
+    ///
+    /// The store is the one path every chain write takes. An invalidation hook anywhere else
+    /// — a handler, the witness helper — is one a future writer can land evidence without
+    /// passing, and a cache that silently misses an invalidation shows a member a trust level
+    /// its own record has already contradicted. See `derivation_cache`.
+    derivations: crate::derivation_cache::DerivationCache,
 }
 
 const GENESIS_PREV_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -260,7 +267,13 @@ impl SqliteChainStore {
             read_conn: Mutex::new(read_conn),
             path,
             len: AtomicU64::new(n as u64),
+            derivations: crate::derivation_cache::DerivationCache::new(),
         })
+    }
+
+    /// The event-triggered trust derivation cache over this chain.
+    pub fn derivations(&self) -> &crate::derivation_cache::DerivationCache {
+        &self.derivations
     }
 
     pub fn path(&self) -> &Path {
@@ -341,7 +354,7 @@ impl SqliteChainStore {
         // hold, so no two appends race; `Release` pairs with the `Acquire` in `len()`.
         self.len.fetch_add(1, Ordering::Release);
 
-        Ok(ChainEntry {
+        let entry = ChainEntry {
             hash,
             prev_hash,
             timestamp,
@@ -349,7 +362,11 @@ impl SqliteChainStore {
             event_data,
             signer_lct: signer_lct.to_string(),
             chain_position,
-        })
+        };
+        // After the commit, still under the writer mutex: the row is readable before any
+        // derivation it affects is marked stale, and appends invalidate in chain order.
+        self.derivations.observe(&entry);
+        Ok(entry)
     }
 
     /// Most recent `limit` entries in descending chain_position order.

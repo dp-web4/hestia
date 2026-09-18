@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use web4_core::oid4vc::{CredentialIssuerMetadata, CredentialRequest, verify_holder_proof};
 use web4_core::sd_jwt_vc::SdJwtVc;
 
-use super::dashboard::{DashboardChainProjection, DashboardSnapshot};
+use super::dashboard::{refresh_derivations, DashboardChainProjection, DashboardSnapshot};
 use super::handler::HestiaServer;
 use super::state::SharedState;
 use crate::callback::{CallbackState, callback_router};
@@ -218,37 +218,105 @@ impl DashboardReadModel {
     }
 }
 
+/// How long a cached live read may be served on a chain that has not moved.
+///
+/// Time-bounded ranges (`hour`, `day`, `week`) still change on a quiet chain — entries age
+/// out of them — so reuse is capped rather than unbounded. Thirty seconds of staleness in an
+/// operator's rolling-window counts is invisible; re-reading the chain every two seconds to
+/// avoid it was not. Trust derivation is not governed by this: it is event-triggered
+/// (`derivation_cache`).
+const DASHBOARD_PROJECTION_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The live feed (stats + range) is re-read when the chain has moved, or when it is old.
+fn live_read_is_current(
+    cached_chain_len: u64,
+    cached_at: std::time::Instant,
+    chain_len: u64,
+    now: std::time::Instant,
+) -> bool {
+    cached_chain_len == chain_len
+        && now.saturating_duration_since(cached_at) < DASHBOARD_PROJECTION_MAX_AGE
+}
+
 async fn dashboard_read_model_worker(
     state: SharedState,
     model: DashboardReadModel,
     mut refresh_rx: mpsc::Receiver<DashboardRange>,
 ) {
+    // THE DASHBOARD WAS THE DAEMON'S LOAD. The page polls `/api/dashboard` every 2 s and
+    // every poll queued a refresh, and every refresh re-read the chain: the trust derivation
+    // window (10,000 outcome rows, plus the governance rows — budget 100,000), a 2,000-row
+    // stats window and the range's feed, each row decrypted from SQLCipher and parsed from
+    // JSON on the blocking pool, and then re-derived every member's trust from it. Measured
+    // 2026-09-17 on CBP: the daemon used 1h53m of CPU over 4h24m (43% of a core) while the
+    // operator was approving requests in this page; a fresh daemon with the page closed sat
+    // at 0.1%. Benched on a 150,000-row chain of CBP's shape, one refresh read the chain for
+    // 1.40–1.70 s — back-to-back, since the next poll was already queued.
+    //
+    // Now: trust derivations are re-derived only when an event that can change them lands
+    // (`derivation_cache`), and the live feed is re-read per range when the chain moves. The
+    // in-memory fold still runs on every refresh, so sessions, grants and escalations are
+    // never shown stale.
+    let mut live: HashMap<DashboardRange, (u64, std::time::Instant, DashboardChainProjection)> =
+        HashMap::new();
+    // Derive everyone at start, not at the first operator poll.
+    model.request_refresh(DashboardRange::Hour);
     while let Some(range) = refresh_rx.recv().await {
         let (cutoff, cap, label) = range.projection();
         // Clone the store handle under the authoritative lock; perform every
         // SQLCipher read after releasing it. The store serializes its own
         // connection and the blocking pool keeps SQLite off Tokio's workers.
-        let chain_store = { state.lock().await.chain_store.clone() };
-        let projection = tokio::task::spawn_blocking(move || {
-            DashboardChainProjection::read(&chain_store, cap, cutoff)
-        })
-        .await;
-        let projection = match projection {
-            Ok(projection) => projection,
-            Err(error) => {
-                tracing::warn!("dashboard projection worker failed: {error}");
-                model.failed(range);
-                continue;
+        let (chain_store, chain_len) = {
+            let s = state.lock().await;
+            (s.chain_store.clone(), s.chain_len())
+        };
+        let now = std::time::Instant::now();
+        let cached = live
+            .get(&range)
+            .filter(|(len, at, _)| live_read_is_current(*len, *at, chain_len, now))
+            .map(|(_, _, p)| p.clone());
+        let fresh = cached.is_none();
+        let derivations_due = chain_store.derivations().has_due();
+        let projection = if !fresh && !derivations_due {
+            cached.expect("checked above")
+        } else {
+            let store = chain_store.clone();
+            let read = tokio::task::spawn_blocking(move || {
+                refresh_derivations(&store);
+                cached.unwrap_or_else(|| DashboardChainProjection::read(&store, cap, cutoff))
+            })
+            .await;
+            match read {
+                Ok(p) => p,
+                Err(error) => {
+                    tracing::warn!("dashboard projection worker failed: {error}");
+                    model.failed(range);
+                    continue;
+                }
             }
         };
+        if fresh {
+            if projection.reusable() {
+                live.insert(range, (chain_len, now, projection.clone()));
+            } else {
+                live.remove(&range);
+            }
+        }
 
-        // This remaining lock covers only the in-memory presentation fold. It
-        // never covers chain I/O; the immutable result is then published into
-        // the read model used by every GET.
-        let snapshot = {
+        let mut snapshot = {
             let s = state.lock().await;
-            s.dashboard_snapshot_from_projection(projection, cutoff, label)
+            s.dashboard_snapshot_from_projection(projection.clone(), cutoff, label)
         };
+        // The fold registers any grain it had no derivation for — at start, all of them.
+        // Derive those off the lock and fold once more, so no snapshot is published with a
+        // member's trust missing.
+        if chain_store.derivations().has_due() {
+            let store = chain_store.clone();
+            if tokio::task::spawn_blocking(move || refresh_derivations(&store)).await.is_ok() {
+                let s = state.lock().await;
+                snapshot = s.dashboard_snapshot_from_projection(projection, cutoff, label);
+            }
+        }
         model.publish(range, snapshot);
     }
 }
@@ -1768,6 +1836,25 @@ async fn operator_amnesty(
     }
 }
 
+/// One grain's derived trust for the API: the window half from the event-triggered cache
+/// (derived now if it has never been, or an event has invalidated it), the volume half from
+/// the grain's live totals.
+fn cached_derivation(
+    s: &super::state::ServerState,
+    plugin_id: &str,
+    role: &str,
+) -> crate::derivation::DerivedTrust {
+    let cached = s.chain_store.derivations().get(&s.chain_store, plugin_id, role);
+    let vol = s.trust_for_role(plugin_id, role);
+    crate::derivation::with_volume(
+        (*cached.evidence).clone(),
+        Some(crate::derivation::WitnessedVolume {
+            total_acts: vol.action_count,
+            success_acts: vol.success_count,
+        }),
+    )
+}
+
 async fn trust_derivation_json(
     State(state): State<SharedState>,
     Query(q): Query<DerivationQuery>,
@@ -1779,17 +1866,7 @@ async fn trust_derivation_json(
     // One shared window for every derivation surface: split budgets, so sparse
     // governance evidence is not crowded out by routine outcomes. See
     // `derivation::scan_window` for why the three call sites must not diverge.
-    let window = crate::derivation::scan_window(&s.chain_store);
-    let vol = s.trust_for_role(&q.plugin_id, &role);
-    let derived = crate::derivation::derive_with_volume(
-        &q.plugin_id,
-        &role,
-        &window,
-        Some(crate::derivation::WitnessedVolume {
-            total_acts: vol.action_count,
-            success_acts: vol.success_count,
-        }),
-    );
+    let derived = cached_derivation(&s, &q.plugin_id, &role);
     drop(s);
     Json(serde_json::to_value(derived).unwrap_or_default())
 }
@@ -1813,17 +1890,7 @@ async fn trust_graph_turtle(
     // One shared window for every derivation surface: split budgets, so sparse
     // governance evidence is not crowded out by routine outcomes. See
     // `derivation::scan_window` for why the three call sites must not diverge.
-    let window = crate::derivation::scan_window(&s.chain_store);
-    let vol = s.trust_for_role(&q.plugin_id, &role);
-    let derived = crate::derivation::derive_with_volume(
-        &q.plugin_id,
-        &role,
-        &window,
-        Some(crate::derivation::WitnessedVolume {
-            total_acts: vol.action_count,
-            success_acts: vol.success_count,
-        }),
-    );
+    let derived = cached_derivation(&s, &q.plugin_id, &role);
     // The DURABLE member LCT, never the caller-supplied plugin_id — emitting the label here
     // would encode the attribution gap into the graph this projection exists to close.
     // Unmappable (synthetic / malformed) grains get an explicit urn rather than a guess.
@@ -7982,6 +8049,19 @@ mod tests {
         .expect("a cached display read must not wait for authoritative state")
         .into_response();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A dashboard poll re-reads the live feed only when the chain has moved or the read is
+    /// old. Measured 2026-09-17: an open dashboard re-read the chain every two seconds and was
+    /// most of the daemon's CPU. (Trust derivation's rule is tested in `derivation_cache`.)
+    #[test]
+    fn a_quiet_chain_is_not_reread_on_every_poll() {
+        let t0 = std::time::Instant::now();
+        let two = t0 + std::time::Duration::from_secs(2);
+        assert!(live_read_is_current(100, t0, 100, two), "quiet chain, fresh read: reuse");
+        assert!(!live_read_is_current(100, t0, 101, two), "the chain moved: re-read");
+        assert!(!live_read_is_current(100, t0, 100, t0 + DASHBOARD_PROJECTION_MAX_AGE),
+                "rolling windows still roll: a 30 s old live read is re-read on a quiet chain");
     }
 
     #[test]
