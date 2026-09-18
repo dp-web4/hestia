@@ -58,6 +58,21 @@ The command is hook-manager agnostic so it can be composed into an existing pre-
 without replacing security or governance hooks. CI runs the same scanner through its regression
 suite. Other formatting hooks will be added during Phase 0.
 
+To run that scanner *and* the shebang exec-bit guard automatically against your staged
+snapshot:
+
+```bash
+python3 tools/staged_guards.py            # check now
+python3 tools/staged_guards.py --install  # as this clone's pre-commit hook
+```
+
+It judges **only the paths you staged**, so a violation already on `main` never blocks your
+unrelated commit, and it refuses to overwrite a pre-commit hook it did not write. Why it
+exists: measured over 2026-07-28..09-17, `main`'s CI was red for 110 of 588 commits, and
+`tools/shebang_exec_bit_test.py` was the breaker in 5 of the 12 red spells — a new script is
+`100644` unless someone remembers `git update-index --chmod=+x`, and nothing said so until
+CI had already landed it (`tools/ci_red_spell_census.py`, #1052).
+
 ## Licensing of contributions
 
 By contributing, you agree your contribution is licensed under the same terms as the project: **AGPL-3.0-or-later**. We do not require a CLA. The AGPL terms apply to the project; if you contribute, your contribution becomes part of the AGPL-licensed work.
