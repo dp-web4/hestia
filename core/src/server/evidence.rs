@@ -293,6 +293,174 @@ pub fn write_effect(act: &str) -> Option<Value> {
     Some(out)
 }
 
+/// How much of a marker's escalation history the bundle carries.
+///
+/// Not a performance knob. A decider reading "this member has asked for this marker 40 times"
+/// needs the SHAPE of that history, not all of it — and a bundle large enough to skim past is
+/// a bundle that gets skimmed past, which is the failure this whole module exists to fix.
+pub const PRIOR_DECISIONS_CAP: u64 = 20;
+
+/// How many of the member's refusals to carry. Same reasoning, and §3.3 asks for the rules
+/// that fired rather than a transcript.
+pub const MEMBER_DENIES_CAP: u64 = 20;
+
+/// The evidence bundle for one pending escalation — `PRD_ADJUDICATOR_LADDER` §3.3.
+///
+/// > **If a rung sees less than the human would, it is not a rung. It is a filter.**
+///
+/// This is the on-demand half. The dashboard card carries the cheap part (the write effect,
+/// memoised); everything here needs chain reads, and putting a chain read on a render tick is
+/// #1040 — a projection rebuilt per poll, measured at most of a core with the page open. So
+/// the rule for this module is: the card gets what is free, the TOOL gets what costs, and
+/// both read the same builder.
+///
+/// Returns `None` for an unknown id rather than an empty bundle, because "no such escalation"
+/// and "an escalation about which nothing is known" are different answers and a rung that
+/// cannot tell them apart will reason from the wrong one.
+pub fn bundle(s: &crate::server::state::ServerState, escalation_id: &str) -> Option<Value> {
+    let esc = s.gate_escalations.get(escalation_id.trim())?;
+    let now = crate::server::gate_escalation::now_secs();
+
+    // PRIOR DECISIONS ON THE SAME MARKER — §3.3's "the thing a human cannot hold in their
+    // head". Summarised AND listed: the counts are what a decider uses, the rows are what
+    // makes the counts checkable rather than asserted.
+    let prior_rows = s
+        .chain_store
+        .escalation_rows_for_marker(&esc.plugin_id, &esc.marker, PRIOR_DECISIONS_CAP)
+        .unwrap_or_default();
+    let mut opened = 0usize;
+    let mut approved = 0usize;
+    let mut denied = 0usize;
+    let mut prior: Vec<Value> = Vec::new();
+    for e in &prior_rows {
+        let d = &e.event_data;
+        let id = d.get("escalation_id").and_then(Value::as_str).unwrap_or("");
+        if id == esc.id {
+            continue; // this escalation's own rows are the subject, not its precedent
+        }
+        match e.event_type.as_str() {
+            "gate_escalation_opened" => opened += 1,
+            "gate_escalation_decided" => {
+                match d.get("status").and_then(Value::as_str) {
+                    Some("approved") => approved += 1,
+                    Some("denied") => denied += 1,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        prior.push(json!({
+            "event": e.event_type,
+            "escalation_id": id,
+            "at": e.timestamp,
+            "status": d.get("status"),
+            "decided_by": d.get("decided_by"),
+            "reason": d.get("reason"),
+        }));
+    }
+
+    // THE MEMBER'S REFUSALS, by rule. A decider weighing "has this member been refused for
+    // this before" is asking about the RULE, not the prose, so the rules are tallied.
+    let deny_rows = s
+        .chain_store
+        .denies_for_member(&esc.plugin_id, MEMBER_DENIES_CAP)
+        .unwrap_or_default();
+    let mut rule_counts: HashMap<String, usize> = HashMap::new();
+    for e in &deny_rows {
+        let rule = e
+            .event_data
+            .get("rule")
+            .and_then(Value::as_str)
+            .unwrap_or("<unnamed>")
+            .to_string();
+        *rule_counts.entry(rule).or_insert(0) += 1;
+    }
+    let mut rules: Vec<Value> = rule_counts
+        .into_iter()
+        .map(|(rule, n)| json!({"rule": rule, "count": n}))
+        .collect();
+    rules.sort_by(|a, b| {
+        b["count"].as_u64().cmp(&a["count"].as_u64()).then_with(|| {
+            a["rule"].as_str().unwrap_or("").cmp(b["rule"].as_str().unwrap_or(""))
+        })
+    });
+
+    Some(json!({
+        "escalation": {
+            "id": esc.id,
+            // CALLER-ASSERTED, and labelled so (HST-005). The same string the dashboard
+            // renders as `claimed_by` rather than `member`, for the same reason: a decider
+            // is deciding partly ON this name and it is not authenticated.
+            "claimed_by": esc.plugin_id,
+            "role": esc.role,
+            "tool_name": esc.tool_name,
+            "marker": esc.marker,
+            // The member's own account of itself — and for a gate-auto-opened escalation the
+            // member wrote neither, which is a fact about the ASK worth seeing as such.
+            "stated_reason": esc.stated_reason,
+            "stated_detail": esc.stated_detail,
+            "opened_at": esc.opened_at,
+            "expires_at": esc.expires_at,
+            "secs_remaining": esc.expires_at.saturating_sub(now),
+            "status": format!("{:?}", esc.status_at(now)),
+            // The criterion in force WHEN IT WAS OPENED, never today's: a decider must be
+            // judged against the bar the ask was filed under.
+            "bar": esc.bar,
+            "bar_met": esc.bar_met(),
+            "factors": esc.factors,
+            // #128: whether the asker was proven against a live session or merely asserted.
+            // `arbiter::eligibility` clause 0 reads this, and §3.3 says a rung must too.
+            "asker_basis": format!("{:?}", esc.asker_basis),
+            "act_digest": esc.act_digest,
+            // #1056: the bytes the approval BINDS, when the daemon could measure them.
+            "payload_sha256": esc.payload_sha256,
+        },
+        // THE ACT ITSELF — §3.3's first element, and the one this surface cannot always
+        // supply. `open()` hashes the act into `act_digest` and DISCARDS the text, so the only
+        // place it survives is `stated_reason`, and only on the gate-hook door, which composes
+        // `reason` AS the act. A member-opened escalation therefore has an act that no reader
+        // can see: a digest proves which act was authorised and tells a human nothing about
+        // what it was. Reported as unavailable rather than silently rendered as "no effect",
+        // because those are different facts and only one of them is about the act.
+        "act_text": esc.stated_reason,
+        "act_text_source": if esc.stated_reason.is_some() {
+            "stated_reason — the gate door composes `reason` AS the act"
+        } else {
+            "UNAVAILABLE: only act_digest is retained, and a hash is not readable evidence"
+        },
+        // What the act would DO. Same builder the operator's card uses, so the human and the
+        // rung are provably looking at one object rather than two renderings of one idea.
+        "write_effect": esc.stated_reason.as_deref().and_then(write_effect_cached),
+        "prior_on_this_marker": {
+            "opened": opened,
+            "approved": approved,
+            "denied": denied,
+            "cap": PRIOR_DECISIONS_CAP,
+            // Says whether the reader is seeing all of it. A truncated history that does not
+            // announce itself is the windowed-census defect wearing a different hat.
+            "truncated": prior_rows.len() as u64 >= PRIOR_DECISIONS_CAP,
+            "rows": prior,
+        },
+        "member_refusals": {
+            "counted": deny_rows.len(),
+            "cap": MEMBER_DENIES_CAP,
+            "truncated": deny_rows.len() as u64 >= MEMBER_DENIES_CAP,
+            "by_rule": rules,
+        },
+        "law": {
+            // The society policy in force, which is cheap and caller-independent.
+            "society_policy_hash": s.policy_engine.content_hash(),
+            // DELIBERATELY NOT A law_hash COMPUTED HERE. `tool_operating_law` composes the law
+            // PER CALLER and hashes that composition, and its own doc records that the reply
+            // is an allowlist re-projection of the hashed body — so a hash minted here would
+            // be a second, subtly different spelling of the same idea, and §3.3's whole point
+            // is that the rung records the hash IT consulted. The rung calls the law tool and
+            // pins what it was actually shown.
+            "consult": "hestia_operating_law — and record the law_hash IT returns to you",
+        },
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
