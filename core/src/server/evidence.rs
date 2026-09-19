@@ -63,6 +63,13 @@ pub fn copy_operands(act: &str) -> Option<(PathBuf, String)> {
 /// the daemon DOES know unambiguously is its own deploy tree — the copy that actually enforces
 /// — and "how would this differ from what is enforcing right now" is the more decision-relevant
 /// comparison anyway. The bundle labels it as exactly that.
+/// IN A TEST THIS READS THE HOST, NOT THE FIXTURE. `default_hestia_home()` resolves the
+/// PROCESS's home, which in production is the daemon's own home and is exactly right — but a
+/// test that builds its state in a TempDir still diffs against whatever this machine has
+/// installed under `~/.hestia/deploy`. Two consequences, both paid for on 2026-09-18: an
+/// assertion about the diff's numbers passes locally for an accidental reason and goes red on
+/// CI, and it goes red HERE too the moment another test sets `HOME` for its own purposes
+/// (`hub.rs` does). Assert on what the rung READ, never on what the host happens to hold.
 pub fn enforcing_copy(dest_token: &str) -> Option<PathBuf> {
     let root = crate::vault::storage::default_hestia_home().ok()?;
     enforcing_copy_under(&root, dest_token)
