@@ -191,6 +191,75 @@ def test_verdict(tmp: Path):
           inventory.has_tag(e["findings"], "DEAD_HOOK"), True)
 
 
+# --- unit: where the atlas is, and what a descriptor says ---------------------------
+# The atlas used to be one place, `<workspace>/agent-atlas/talk-to`, and the only way a
+# machine had it was for someone to remember to clone it. McNugget ran two months on the
+# narrower fallback because nobody had (measured 2026-09-19). The deploy now keeps its own
+# pinned checkout and points the inventory at it; these pin the precedence that makes that
+# safe -- explicit beats pinned beats default, and the default is unchanged.
+def test_resolve_atlas(tmp: Path):
+    ws = tmp / "ws"
+    saved = os.environ.pop("HESTIA_ATLAS_DIR", None)
+    try:
+        check("atlas: default is the workspace clone",
+              inventory.resolve_atlas([], ws), (ws / "agent-atlas" / "talk-to", "workspace"))
+        os.environ["HESTIA_ATLAS_DIR"] = str(tmp / "pinned")
+        check("atlas: the deploy's pin wins over the default",
+              inventory.resolve_atlas([], ws), (tmp / "pinned", "env"))
+        check("atlas: --atlas X beats the pin",
+              inventory.resolve_atlas(["--atlas", str(tmp / "cli")], ws), (tmp / "cli", "argv"))
+        check("atlas: --atlas=X beats the pin",
+              inventory.resolve_atlas(["--brief", f"--atlas={tmp / 'cli'}"], ws),
+              (tmp / "cli", "argv"))
+        # An empty pin is what a unit template with an unfilled placeholder produces
+        # (`Environment=HESTIA_ATLAS_DIR=`). Path("") is the CURRENT DIRECTORY, so treating
+        # it as set would enumerate whatever the trigger happened to be standing in.
+        os.environ["HESTIA_ATLAS_DIR"] = ""
+        check("atlas: an EMPTY pin is no pin, not the current directory",
+              inventory.resolve_atlas([], ws), (ws / "agent-atlas" / "talk-to", "workspace"))
+    finally:
+        os.environ.pop("HESTIA_ATLAS_DIR", None)
+        if saved is not None:
+            os.environ["HESTIA_ATLAS_DIR"] = saved
+
+
+# `fails_open` is the field a caller ACTS on: a gate that assumes fail-open mis-gates the
+# five harnesses that fail closed. So both failure directions matter -- a missing descriptor
+# must not yield a default, and a malformed one must not raise and take the whole inventory
+# down from inside a SessionStart hook.
+def test_atlas_frontmatter(tmp: Path):
+    atlas = tmp / "atlas"
+    good = atlas / "goodone"
+    good.mkdir(parents=True)
+    (good / "descriptor.md").write_text(
+        "---\nharness: Good One\nvendor: Acme\nblocking_capable: true\n"
+        "blocking_events: [PreToolUse, Stop]\nfails_open: false\nfidelity: documented\n"
+        "sources:\n  - https://example.invalid/docs\nnot_a_field: nope\n---\n\n# body\n"
+        "fails_open: true\n")
+    bad = atlas / "nofront"
+    bad.mkdir()
+    (bad / "descriptor.md").write_text("# no frontmatter at all\nfails_open: true\n")
+    saved = inventory.ATLAS
+    inventory.ATLAS = atlas
+    try:
+        got = inventory.atlas_frontmatter("goodone")
+        check("frontmatter: scalars",
+              (got.get("harness"), got.get("vendor"), got.get("fidelity")),
+              ("Good One", "Acme", "documented"))
+        check("frontmatter: booleans are booleans",
+              (got.get("blocking_capable"), got.get("fails_open")), (True, False))
+        check("frontmatter: inline list", got.get("blocking_events"), ["PreToolUse", "Stop"])
+        check("frontmatter: fields outside ATLAS_FIELDS are dropped", "not_a_field" in got, False)
+        check("frontmatter: a `fails_open:` line in the BODY does not override the header",
+              got.get("fails_open"), False)
+        check("frontmatter: no frontmatter -> absent, not defaulted",
+              inventory.atlas_frontmatter("nofront"), {})
+        check("frontmatter: missing descriptor -> absent, not raised",
+              inventory.atlas_frontmatter("ghost"), {})
+    finally:
+        inventory.ATLAS = saved
+
+
 # --- unit: the fallback enumeration ------------------------------------------------
 # The atlas guard used to be a hard `return` before search_roots(), so an atlas-less
 # machine got no findings at all — including the ones that never needed atlas. What it
@@ -1015,6 +1084,10 @@ if __name__ == "__main__":
         test_verdict(Path(d))
     with tempfile.TemporaryDirectory() as d:
         test_periodic_trigger(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        test_resolve_atlas(Path(d))
+    with tempfile.TemporaryDirectory() as d:
+        test_atlas_frontmatter(Path(d))
     for f in FAILS:
         print("FAIL", f)
     print(f"{'FAILED' if FAILS else 'ok'}: {len(FAILS)} failure(s)")
