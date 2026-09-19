@@ -38,6 +38,9 @@ pub enum Decision {
     /// pass the case up without the escalation entering a failure state. Today a rung that
     /// timed out and a rung that abstained would be indistinguishable, and the second most
     /// dangerous thing this interface could do is let silence read as assent.
+    ///
+    /// Falsifier: `a_verdict_refuses_the_four_shapes_that_would_make_it_unreadable` — a
+    /// decline without a named reason is refused at construction.
     Decline,
 }
 
@@ -87,6 +90,10 @@ pub struct Verdict {
     /// — "recorded, never thresholded here". A rung that decided its own sufficiency would be
     /// the `satisfied_by` inversion CLAUDE.md names: the surface smuggling in a verdict that
     /// belongs to the relying party.
+    ///
+    /// Falsifier: the threshold lives in `promotion_verdict`, and
+    /// `promotion_refuses_below_threshold_and_quotes_what_it_measured` holds it there — a
+    /// verdict carrying its own cutoff would make that function's argument redundant.
     pub confidence: f64,
     /// WHAT IT ACTUALLY READ — not what it was offered. This is the whole auditability of a
     /// rung, and the only field that separates a rung from a filter wearing an adjudicator's
@@ -212,6 +219,11 @@ pub trait Adjudicator {
 /// It NEVER approves. An approval from a rung that cannot read the act would be exactly the
 /// filter-wearing-adjudicator's-clothes failure §3.1 warns about, and a baseline that could
 /// approve would also make the control arm dangerous rather than merely uninformative.
+///
+/// Falsifier: `the_baseline_separates_unreadable_evidence_from_an_abstention_and_never_approves`
+/// asserts the decision on every arm, and
+/// `the_baseline_rung_can_actually_read_a_bundle_this_daemon_produces` pins it against a
+/// bundle this daemon really emits.
 pub struct BaselineRung;
 
 pub const BASELINE_RUNG_ID: &str = "baseline:v1";
