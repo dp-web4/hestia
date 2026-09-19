@@ -7186,58 +7186,52 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
             "expires_at": esc.expires_at,
         });
     }
-    // Store miss. Before saying UNKNOWN, look where the record actually lives —
-    // BOUNDED (revised #480 review, defect 3): newest-first pages, at most
-    // POINTER_LOOKUP_MAX entries, never the 20k full-window materialization the
-    // first shape ran on this read path.
-    fn id_of<'a>(e: &'a crate::storage::chain::ChainEntry) -> Option<&'a str> {
-        e.event_data.get("escalation_id").and_then(Value::as_str)
-    }
-    let scan = paged_chain_lookup(
-        &s.chain_store,
-        &|e| e.event_type == "gate_escalation_opened" && id_of(e) == Some(ptr),
-        &|e| {
-            matches!(
-                e.event_type.as_str(),
-                "gate_escalation_decided" | "gate_escalation_withdrawn" | "gate_escalation_expired"
-            ) && id_of(e) == Some(ptr)
-        },
-        // THE SPEND, which is not a settlement and must not be mistaken for one:
-        // feeding `gate_escalation_claimed` to the `secondary` predicate would make
-        // the newest event win and `status` read its absent `status` field as
-        // `denied`. It is its own slot for that reason.
-        &|e| e.event_type == "gate_escalation_claimed" && id_of(e) == Some(ptr),
-    );
-    let PagedLookup {
-        primary: opened,
-        secondary: settled,
-        tertiary: claimed,
-        searched,
-        complete,
-    } = match scan {
-        Ok(l) => l,
+    // Store miss. Before saying UNKNOWN, look where the record actually lives: the chain,
+    // by EXACT lookup (#1014). This was a newest-first page capped at POINTER_LOOKUP_MAX
+    // entries — bounded, which was right, but denominated in traffic, which was not:
+    // escalation events are ~1% of the chain, so the horizon was hours, while the
+    // invitations and disposition notices carrying this pointer live for days. Measured on
+    // CBP 2026-09-17: cbp-being was invited to review three escalations, got "not found" for
+    // all three twelve hours later, and concluded the seat had fabricated them.
+    let rows = match s.chain_store.escalation_rows(ptr) {
+        Ok(rows) => rows,
         Err(e) => {
             return hestia_error_envelope(
                 "hestia.pointer_lookup_failed",
-                &format!("the bounded chain scan for '{ptr}' failed: {e}"),
+                &format!("the chain lookup for escalation '{ptr}' failed: {e}"),
                 Some(json!({"pointer": ptr})),
             )
         }
     };
+    let newest = |kinds: &[&str]| {
+        rows.iter()
+            .rev()
+            .find(|e| kinds.contains(&e.event_type.as_str()))
+            .cloned()
+    };
+    let opened = newest(&["gate_escalation_opened"]);
+    let settled = newest(&[
+        "gate_escalation_decided",
+        "gate_escalation_withdrawn",
+        "gate_escalation_expired",
+    ]);
+    // THE SPEND, which is not a settlement and must not be mistaken for one: a claimed entry
+    // carries no `status`, and reading it as the settlement would render it `denied`.
+    let claimed = newest(&["gate_escalation_claimed"]);
+    // The lookup covers the whole chain through the event-type index.
+    let searched = s.chain_len();
     let Some(opened) = opened else {
         return hestia_error_envelope(
             "hestia.escalation_pointer_not_found",
             &format!(
                 "no escalation with id '{ptr}' in this daemon's live store, and no \
-                 gate_escalation_opened entry naming it in {}. That is UNKNOWN, not \
-                 denied: the store is memory-only and reaps settled rows about two hours \
-                 after they open, so an absent id says nothing about how a real ask was \
-                 ruled. The witnessed record of a real ask is on the chain as \
-                 gate_escalation_opened / gate_escalation_decided",
-                scan_coverage_note(searched, complete),
+                 gate_escalation_opened entry naming it anywhere on the witness chain \
+                 ({searched} entries, by exact lookup rather than a recent window). No ask \
+                 with this id was ever witnessed by this daemon: check the id, or whether it \
+                 belongs to another machine's daemon"
             ),
-            Some(json!({"pointer": ptr, "searched": searched, "complete": complete,
-                        "chainLength": s.chain_len()})),
+            Some(json!({"pointer": ptr, "searched": searched, "complete": true,
+                        "lookup": "exact", "chainLength": searched})),
         );
     };
     // The same body, sourced from the entries rather than the row. `status` keeps
@@ -7281,10 +7275,8 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
         "asker_basis": get("asker_basis"),
         // Shape parity with the live arm on the SPEND too — see there for why this
         // is not a fuse field. `claimed: false` is a measured absence here, not an
-        // unsearched one: reaching this arm means `opened` was found, and every
-        // entry naming this escalation is younger than its open, so the scan read
-        // all of them (the ordering argument is spelled out on
-        // `paged_chain_lookup`). `consumed_at` is null on `gate_escalation_claimed`
+        // unsearched one: the exact lookup returns every entry naming this escalation
+        // (#1014). `consumed_at` is null on `gate_escalation_claimed`
         // entries — the payload carries `decided_at` and `secs_from_decision_to_use`
         // but never the consume instant, the same gap `rehydrate` works around — so
         // the entry's own append timestamp is the daemon's witness of the spend.
@@ -7309,8 +7301,10 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
         "reason": settled_get("reason"),
         "settled_entry": settled.as_ref().map(chain_entry_json),
         "searched": searched,
-        "note": "answered from the witness chain — the live store has reaped this row \
-                 (settled rows are dropped about two hours after open). The chain is \
+        "complete": true,
+        "lookup": "exact",
+        "note": "answered from the witness chain by exact lookup — the live store has reaped \
+                 this row (settled rows are dropped about two hours after open). The chain is \
                  the record; the store was a cache of it",
     })
 }
@@ -22326,47 +22320,48 @@ mod disposition_durability_tests {
         assert!(mail.is_empty(), "nothing to notify: {mail:?}");
     }
 
-    /// Defect 3 (revised review): the fallback scan is BOUNDED. A record deeper
-    /// than POINTER_LOOKUP_MAX is reported as not-searched — the arm says what
-    /// was scanned and what was not — never as a flat "no such ask".
+    /// #1014, which this test used to pin as correct: an escalation deeper in the chain than
+    /// any page a scan would read still RESOLVES, with its settlement and its spend; and an
+    /// id that was never opened is reported absent over the WHOLE chain, not "not searched".
+    /// Measured on CBP 2026-09-17: cbp-being's three review invitations read as not found
+    /// twelve hours after they opened, and the being concluded they had been fabricated.
     #[tokio::test]
-    async fn a_record_deeper_than_the_lookup_cap_is_unsearched_not_absent() {
+    async fn an_escalation_deeper_than_any_page_still_resolves() {
         let (_dir, state) = test_state().await;
         let real_now = now_secs();
         let mut s = state.lock().await;
-        // A reaped, clock-expired escalation: live store misses, chain has it.
+        // A reaped escalation, decided and then spent, with the chain moved far past it.
         let id = witness_open(&mut s, "kimi-code", Some("deep record"), real_now - 3 * 3600, 3600);
+        s.append_chain("gate_escalation_decided", json!({
+            "escalation_id": id, "plugin_id": "kimi-code", "status": "approved",
+            "decided_by": "operator", "reason": "the act matches the ask",
+        })).unwrap();
+        s.append_chain("gate_escalation_claimed", json!({
+            "escalation_id": id, "plugin_id": "kimi-code",
+        })).unwrap();
         s.gate_escalations.reap(real_now, REAP_KEEP_SECS);
         assert!(s.gate_escalations.get(&id).is_none());
-        // Push it beyond the hard cap.
         for i in 0..(POINTER_LOOKUP_MAX + 100) {
             s.append_chain("outcome", json!({"filler": i})).unwrap();
         }
 
         let body = resolve_escalation_pointer(&s, &id);
-        assert_eq!(
-            body["_hestia_error"]["code"],
-            "hestia.escalation_pointer_not_found"
-        );
-        assert_eq!(
-            body["_hestia_error"]["data"]["searched"],
-            json!(POINTER_LOOKUP_MAX),
-            "the scan stopped at the cap: {body}"
-        );
-        assert_eq!(body["_hestia_error"]["data"]["complete"], json!(false));
-        let msg = body["_hestia_error"]["message"].as_str().unwrap();
-        assert!(
-            msg.contains("older history was NOT searched"),
-            "the arm must say what it did NOT search: {msg}"
-        );
+        assert!(body.get("_hestia_error").is_none(), "a real ask must not read as absent: {body}");
+        assert_eq!(body["source"], "witness_chain", "{body}");
+        assert_eq!(body["escalation_id"], id);
+        assert_eq!(body["status"], "approved", "the settlement is found, however deep: {body}");
+        assert_eq!(body["decided_by"], "operator");
+        assert_eq!(body["claimed"], true, "and the spend: {body}");
+        assert_eq!(body["stated_reason"], "deep record");
+        assert_eq!(body["complete"], true);
 
-        // The control, one id over: a record INSIDE the cap resolves from the
-        // chain even this deep in fillers.
-        let id2 = witness_open(&mut s, "kimi-code", Some("shallow record"), real_now - 3 * 3600, 3600);
-        s.gate_escalations.reap(real_now, REAP_KEEP_SECS);
-        let found = resolve_escalation_pointer(&s, &id2);
-        assert_eq!(found["source"], "witness_chain", "{found}");
-        assert_eq!(found["escalation_id"], id2);
+        // An id nobody ever opened: absent over the whole chain, and the envelope says so.
+        let none = resolve_escalation_pointer(&s, "0123456789abcdef");
+        assert_eq!(none["_hestia_error"]["code"], "hestia.escalation_pointer_not_found");
+        assert_eq!(none["_hestia_error"]["data"]["complete"], json!(true), "{none}");
+        assert_eq!(none["_hestia_error"]["data"]["searched"], json!(s.chain_len()), "{none}");
+        let msg = none["_hestia_error"]["message"].as_str().unwrap();
+        assert!(msg.contains("anywhere on the witness chain"), "{msg}");
     }
 
     /// A SPENT grant and a grant that LAPSED UNCLAIMED must not render identically,
