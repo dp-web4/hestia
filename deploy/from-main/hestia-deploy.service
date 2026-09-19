@@ -6,6 +6,10 @@ After=hestia.service
 [Service]
 Type=oneshot
 Environment=HESTIA_HOME=%h/.hestia
+# The seat's workspace (the directory holding its repos), handed to the agent inventory so
+# the deploy can install discovery. Render it from explicit operator configuration. Empty
+# means the deploy says so and skips the step; it never guesses one.
+Environment=HESTIA_WORKSPACE=
 Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=%h/.local/bin/hestia-deploy
 # A release build at normal priority pins the CPU and the daemon's /mcp gate round-trip times

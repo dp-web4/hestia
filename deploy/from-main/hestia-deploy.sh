@@ -615,6 +615,10 @@ install_inventory() {
   # from THIS checkout is ~/.hestia/deploy -- a directory with no harness plugins a seat uses
   # and no working repos, pinned into three triggers as if somebody had chosen it.
   [ -n "${HESTIA_WORKSPACE:-}" ] || { inventory="skipped(no HESTIA_WORKSPACE in the deploy unit)"; return 0; }
+  # Set but not a directory: an unrendered template placeholder, a typo, or an unmounted
+  # volume. install.sh would pin it regardless, and every trigger would then answer UNKNOWN
+  # about a place that is not there.
+  [ -d "$HESTIA_WORKSPACE" ] || { inventory="skipped(HESTIA_WORKSPACE is not a directory)"; return 0; }
   [ -d "$at" ] || at=""
   if [ -f "$bin.py" ] && cmp -s "$src/inventory.py" "$bin.py" && grep -qxF "AT_PIN='$at'" "$bin" 2>/dev/null; then
     inventory="ok(current)"; return 0

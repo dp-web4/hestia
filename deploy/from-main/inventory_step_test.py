@@ -177,7 +177,9 @@ def test_install_inventory(fn: str, tmp: Path) -> None:
         return f.read_text().strip() if f.exists() else ""
 
     prelude = 'inventory=""\n'
-    ws = "/seat/workspace"
+    wsdir = tmp / "seat-workspace"
+    wsdir.mkdir()
+    ws = str(wsdir)
 
     # F/G. A governed session must not edit the config of the harness it runs in. Same two
     #      markers the members' installer refuses on -- and the installer must NOT have run.
@@ -196,6 +198,18 @@ def test_install_inventory(fn: str, tmp: Path) -> None:
     check("H no workspace: rc", rc, 0)
     check("H no workspace: says what is missing and where", st, "skipped(no HESTIA_WORKSPACE in the deploy unit)")
     check("H no workspace: the installer did not run", ran(home), "")
+
+    # H2. Set, but not a directory. The unit templates ship the key EMPTY, but an installer that
+    #     renders placeholders and misses one leaves `__HESTIA_WORKSPACE__` behind, and a typo
+    #     or an unmounted volume looks the same. install.sh would pin any of them into three
+    #     triggers, each of which would then answer UNKNOWN about a place that is not there.
+    for bogus in ("__HESTIA_WORKSPACE__", str(tmp / "not" / "here")):
+        root, home = seat(f"bogus-{len(bogus)}")
+        rc, st = run(prelude + fn, "install_inventory", root,
+                     clean_env(HOME=str(home), HESTIA_WORKSPACE=bogus), "inventory")
+        check(f"H2 {bogus[:22]}: rc", rc, 0)
+        check(f"H2 {bogus[:22]}: refused, not pinned", st, "skipped(HESTIA_WORKSPACE is not a directory)")
+        check(f"H2 {bogus[:22]}: the installer did not run", ran(home), "")
 
     # J. Nothing installed yet -> the installer runs, scoped to the seat's workspace and the
     #    DEPLOY's atlas, and the status reports the enumeration actually achieved.
