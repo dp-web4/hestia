@@ -342,6 +342,23 @@
     cursor: help;
   }
   .alias-add .pol-hint { opacity: 0.7; font-size: 0.85em; margin-left: 0.5rem; }
+  /* Discover pane (agent-lifecycle PRD R2) */
+  .disc-scope { font-size: 0.78rem; color: var(--fg-dim); margin: 0.4rem 0 0.8rem; }
+  .disc-group { margin-bottom: 1rem; padding-left: 0.6rem; border-left: 3px solid var(--fg-faint); }
+  .disc-group-red   { border-left-color: var(--red, #cc241d); }
+  .disc-group-amber { border-left-color: var(--amber, #d79921); }
+  .disc-group-green { border-left-color: var(--green, #98971a); }
+  .disc-count { opacity: 0.6; font-weight: normal; margin-left: 0.3rem; }
+  .disc-row { display: flex; flex-wrap: wrap; gap: 0.35rem 0.6rem; align-items: baseline;
+              padding: 0.35rem 0; border-top: 1px solid var(--bg-elev-2); font-size: 0.85rem; }
+  .disc-name { font-weight: 600; }
+  .disc-ids  { font-size: 0.78rem; color: var(--fg-dim); }
+  .disc-path { font-family: var(--mono); font-size: 0.72rem; color: var(--fg-dim); }
+  .disc-badge { font-size: 0.68rem; padding: 0.05rem 0.4rem; border-radius: 0.6rem;
+                border: 1px solid var(--fg-faint); white-space: nowrap; }
+  .disc-badge.disc-amber { border-color: var(--amber, #d79921); color: var(--amber, #d79921); }
+  .disc-badge.disc-green { border-color: var(--green, #98971a); color: var(--green, #98971a); }
+  .disc-badge.disc-red   { border-color: var(--red, #cc241d);   color: var(--red, #cc241d); }
   .trust-list, .tool-list { overflow-y: auto; min-height: 0; }
   .live-grid .trust-list { max-height: 10.5rem; }   /* ≈ 3 trust rows */
   .live-grid .tool-list  { max-height: 7rem; }      /* ≈ 3 tool rows  */
@@ -1251,6 +1268,7 @@
         <button type="button" class="govern-chip" data-gov="acts">acts</button>
         <button type="button" class="govern-chip" data-gov="policy">policy</button>
         <button type="button" class="govern-chip" data-gov="config">runtime config</button>
+        <button type="button" class="govern-chip" data-gov="discover">discover</button>
       </nav>
 
       <div class="govern-body">
@@ -1549,6 +1567,29 @@
               <div class="cfg-err" id="cfg-err" hidden></div>
               <div class="cfg-saved" id="cfg-saved" hidden></div>
             </div>
+          </div>
+        </section>
+
+        <!-- DISCOVER (agent-lifecycle PRD R2). READ-ONLY by construction: this pane issues one
+             GET and nothing else. What is on this machine, which of it hestia governs, and what
+             the remedy is for the rest. Registration is a later, separate, operator act. -->
+        <section class="govern-pane" id="govern-discover" hidden>
+          <div class="govern-pane-head">
+            <h2>Discover <span class="pol-mode" id="disc-status"></span></h2>
+            <button type="button" class="pol-btn" id="disc-rescan">rescan</button>
+          </div>
+          <div class="govern-scroll">
+            <div class="grant-note">
+              hestia sees only what routes through hestia, so an agent that is installed but
+              ungoverned is <strong>invisible from inside</strong>. This is the outside view: the
+              agent-atlas registry says what <em>could</em> be here, the filesystem says what
+              <em>is</em>, and the difference is below &mdash; grouped by what to do about it,
+              worst first. Each agent shows two names on purpose: its <strong>atlas id</strong>
+              and its <strong>governance id</strong>. A grant must name the second.
+            </div>
+            <div class="esc-err" id="disc-unknown" hidden></div>
+            <div class="disc-scope" id="disc-scope"></div>
+            <div id="disc-groups"><div class="empty">Loading&hellip;</div></div>
           </div>
         </section>
       </div>
@@ -3968,6 +4009,145 @@
   // scheme (§6.0.2) so an operator who learned one screen has learned both.
   // Declared list, same reasoning as VIEWS: a half-added pane should be a missing entry, not
   // a chip that silently falls back to the ledger.
+  // ── Discover (agent-lifecycle PRD R2) ───────────────────────────────────────────────────
+  //
+  // WORST FIRST, because the order is the message. `miswired` leads: a gate is registered
+  // and its target is gone, so the harness reads as governed while failing OPEN -- the one
+  // state that is worse than having no gate, since nobody goes looking. `dormant` is last
+  // and quiet: a plugin ready for a harness that is not here is the fleet working.
+  const DISCOVER_GROUPS = [
+    { key: 'miswired', tone: 'red', title: 'Miswired — reads as governed and is NOT',
+      remedy: 'A gate is registered but its target is missing, so this harness fails open while looking covered. Reinstall its hestia plugin.' },
+    { key: 'partial', tone: 'amber', title: 'Partial — observed but not gated',
+      remedy: 'hestia witnesses what this harness does and cannot stop any of it. Wire the gate hook, not only the observer.' },
+    { key: 'ungoverned', tone: 'amber', title: 'Ungoverned — installed, a plugin exists, nothing is wired',
+      remedy: 'The cheapest gap to close: the adapter is already built.' },
+    { key: 'ungovernable', tone: 'amber', title: 'Ungovernable here — installed, and no hestia plugin exists for it',
+      remedy: 'Someone has to build the adapter. Its failure mode below says what that adapter must assume.' },
+    { key: 'miswired_3p', tone: 'amber', title: "A third party's gate is dead",
+      remedy: 'Not hestia’s gate and not ours to rewrite, but the harness is failing open on it.' },
+    { key: 'governed', tone: 'green', title: 'Governed', remedy: '' },
+    { key: 'dormant_plugin', tone: 'grey', title: 'Not installed here — a plugin is ready if it arrives', remedy: '' },
+  ];
+
+  // PURE, so it can be run under node by tools/discover_pane_contract_test.py: report in,
+  // view-model out, no DOM. Three answers must stay three (PRD P4): the scan could not run
+  // (`unknown`, with the reason); it ran and found nothing in a group (an empty group is
+  // simply omitted); and an agent the report names that no group claimed, which is kept
+  // under `unclassified` rather than dropped -- a row that vanishes is the defect.
+  function discoverModel(report) {
+    const r = report || {};
+    const detail = Array.isArray(r.detail) ? r.detail : [];
+    const byAgent = {};
+    for (const d of detail) if (d && d.agent) byAgent[d.agent] = d;
+    const gaps = r.gaps || {};
+    const placed = new Set();
+    const groups = [];
+    for (const g of DISCOVER_GROUPS) {
+      const ids = (g.key === 'governed' ? r.governed : gaps[g.key]) || [];
+      if (!ids.length) continue;
+      ids.forEach(id => placed.add(id));
+      groups.push({ key: g.key, tone: g.tone, title: g.title, remedy: g.remedy,
+                    rows: ids.map(id => discoverRow(id, byAgent[id])) });
+    }
+    const stray = detail.filter(d => d && d.agent && d.installed && !placed.has(d.agent));
+    if (stray.length) groups.unshift({ key: 'unclassified', tone: 'amber',
+      title: 'Installed, and the report did not classify it',
+      remedy: 'Shown rather than dropped. This is a finding about the inventory, not about the agent.',
+      rows: stray.map(d => discoverRow(d.agent, d)) });
+    const sc = r.scope || {};
+    return {
+      unknown: r.status === 'UNKNOWN' || !r.status,
+      reason: r.reason || sc.agent_enumeration_gap || (r.status ? '' : 'the inventory returned no status'),
+      scope: { workspace: sc.workspace || '', enumeration: sc.agent_enumeration || '',
+               complete: sc.agent_enumeration_complete !== false,
+               atlas: sc.atlas || '', atlasSource: sc.atlas_source || '' },
+      groups,
+    };
+  }
+
+  function discoverRow(id, d) {
+    const x = d || {};
+    const a = x.atlas || {};
+    // Undefined is not false. A descriptor that does not say how the harness fails must not
+    // be rendered as one that fails closed, nor as one that fails open.
+    const failure = a.fails_open === true ? 'open' : a.fails_open === false ? 'closed' : 'unknown';
+    return {
+      atlasId: id,
+      governanceId: x.plugin || '',
+      name: a.harness || id,
+      installed: !!x.installed,
+      executable: x.executable || '',
+      configs: Array.isArray(x.configs_read) ? x.configs_read.length : 0,
+      failure,
+      blocking: Array.isArray(a.blocking_events) ? a.blocking_events : [],
+      fidelity: a.fidelity || '',
+      findings: Array.isArray(x.findings) ? x.findings.length : 0,
+    };
+  }
+
+  function discoverRender(model) {
+    const unk = $('disc-unknown'), scope = $('disc-scope'), root = $('disc-groups'), st = $('disc-status');
+    if (!unk || !scope || !root) return;
+    unk.hidden = !model.unknown;
+    unk.innerHTML = model.unknown
+      ? `<strong>UNKNOWN — this is not "nothing found".</strong> The inventory could not establish
+         the whole picture${model.reason ? ': ' + escapeHtml(model.reason) : '.'} What it could
+         still see is listed below; read an absence here as unexamined, not as clean.`
+      : '';
+    if (st) st.textContent = model.unknown ? 'unknown' : 'scanned ' + new Date().toLocaleTimeString();
+    const s = model.scope;
+    scope.innerHTML = `workspace <code>${escapeHtml(s.workspace || '—')}</code>
+      · enumerated from <strong>${escapeHtml(s.enumeration || '—')}</strong>${s.complete ? '' : ' <span class="disc-badge disc-amber">incomplete</span>'}
+      ${s.atlas ? `· atlas <code>${escapeHtml(s.atlas)}</code>${s.atlasSource ? ' (' + escapeHtml(s.atlasSource) + ')' : ''}` : ''}`;
+    if (!model.groups.length) {
+      root.innerHTML = model.unknown
+        ? '<div class="empty">Nothing could be listed. That is a failed look, not an empty machine.</div>'
+        : '<div class="empty">The scan ran and reported no agents in any group.</div>';
+      return;
+    }
+    const badge = (tone, text, title) =>
+      `<span class="disc-badge disc-${tone}"${title ? ` title="${escapeHtml(title)}"` : ''}>${escapeHtml(text)}</span>`;
+    root.innerHTML = model.groups.map(g => `
+      <div class="disc-group disc-group-${g.tone}">
+        <div class="pol-section-label">${escapeHtml(g.title)} <span class="disc-count">${g.rows.length}</span></div>
+        ${g.remedy ? `<div class="grant-note">${escapeHtml(g.remedy)}</div>` : ''}
+        ${g.rows.map(r => `
+          <div class="disc-row">
+            <span class="disc-name">${escapeHtml(r.name)}</span>
+            <span class="disc-ids">atlas <code>${escapeHtml(r.atlasId)}</code>${
+              r.governanceId ? ` → governance id <code>${escapeHtml(r.governanceId)}</code>`
+                             : ' → <em>no hestia plugin, so no governance id</em>'}</span>
+            ${r.failure === 'open' ? badge('amber', 'fails open', 'if its gate hook errors or times out, the action is ALLOWED')
+              : r.failure === 'closed' ? badge('green', 'fails closed', 'if its gate hook errors or times out, the action is DENIED — a slow gate halts this agent')
+              : badge('grey', 'failure mode unknown', 'the atlas descriptor does not say; do not assume either')}
+            ${r.blocking.length ? badge('grey', 'blocks on ' + r.blocking.join(', ')) : ''}
+            ${r.fidelity ? badge('grey', 'atlas: ' + r.fidelity, 'how well the descriptor itself has been checked') : ''}
+            ${r.findings ? badge('amber', r.findings + ' finding' + (r.findings === 1 ? '' : 's')) : ''}
+            ${r.executable ? `<span class="disc-path" title="resolved executable">${escapeHtml(r.executable)}</span>` : ''}
+            ${r.configs ? `<span class="disc-path">${r.configs} config${r.configs === 1 ? '' : 's'} read</span>` : ''}
+          </div>`).join('')}
+      </div>`).join('');
+  }
+
+  let discoverBusy = false;
+  async function discoverLoad() {
+    if (discoverBusy) return;
+    discoverBusy = true;
+    const btn = $('disc-rescan'); if (btn) btn.disabled = true;
+    try {
+      const res = await apiFetch('/api/agents', { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      discoverRender(discoverModel(await res.json()));
+    } catch (e) {
+      // A failed look is reported as a failed look, never as an empty machine.
+      discoverRender({ unknown: true, reason: `could not reach the inventory (${e.message})`,
+                       scope: { workspace: '', enumeration: '', complete: false, atlas: '', atlasSource: '' }, groups: [] });
+    } finally {
+      discoverBusy = false; if (btn) btn.disabled = false;
+    }
+  }
+
   const GOVERN_PANES = {
     ledger: { el: 'govern-ledger', mount: () => loadLedger() },
     // Grants render from the snapshot, which the page polls anyway, so mounting costs nothing
@@ -3979,6 +4159,9 @@
     policy: { el: 'govern-policy', mount: () => fetchPolicy() },
     // The list is the mount: keys and health only. Values are fetched by an explicit open.
     config: { el: 'govern-config', mount: () => cfgLoadList() },
+    // One GET of the inventory report. The report is a live filesystem walk, so it is fetched
+    // when the pane is SHOWN and on an explicit rescan, never on a timer of its own.
+    discover: { el: 'govern-discover', mount: () => discoverLoad() },
   };
   let governSection = 'ledger';
   function governShow(section) {
@@ -3995,6 +4178,7 @@
     try { GOVERN_PANES[section].mount?.(); } catch (_) { /* never strand the sub-nav */ }
   }
   function governMount() { governShow(governSection); }
+  document.addEventListener('click', e => { if (e.target && e.target.id === 'disc-rescan') discoverLoad(); });
 
   (function wireGovernNav() {
     const nav = $('govern-nav');
