@@ -16662,6 +16662,64 @@ mod ladder_evidence_tests {
         assert_eq!(prior["truncated"], json!(false), "a short history is not truncated: {prior}");
     }
 
+    /// THE RUNG MUST READ THE REAL BUNDLE, NOT A FIXTURE THAT RESEMBLES IT.
+    ///
+    /// `adjudicator`'s own tests hand `BaselineRung` a bundle built by hand, which proves the
+    /// rung's logic and NOTHING about whether it can read what `evidence::bundle` actually
+    /// emits. If a field were renamed on one side, every verdict would quietly become
+    /// `EvidenceInsufficient` — a rung that declines everything looks exactly like a rung
+    /// being careful, and the agreement measurement would report an honest-looking zero
+    /// forever. So the two are joined here, against a real escalation opened through the real
+    /// door.
+    #[tokio::test]
+    async fn the_baseline_rung_can_actually_read_a_bundle_this_daemon_produces() {
+        use crate::server::adjudicator::{Adjudicator, BaselineRung, Decision, Decline};
+        use std::io::Write as _;
+
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let src = dir.path().join("incoming.py");
+        let mut f = std::fs::File::create(&src).unwrap();
+        f.write_all(b"alpha\nbeta\n").unwrap();
+        drop(f);
+        let act = format!("Bash: cp {} plugins/codex/hooks/pre_tool_use.py", src.display());
+        let id = open_one(&state, "plugins/*/hooks", &act).await;
+
+        let bundle = {
+            let s = state.lock().await;
+            crate::server::evidence::bundle(&s, &id).expect("a real bundle")
+        };
+        let v = BaselineRung.adjudicate(&bundle);
+
+        // The load-bearing assertion: it did NOT fall through to "I cannot see the act".
+        assert_ne!(
+            v.declined_because,
+            Some(Decline::EvidenceInsufficient),
+            "the rung could not read the daemon's own bundle — the field names have drifted              apart, and every verdict would silently become an evidence failure: {v:?}"
+        );
+        assert_eq!(v.decision, Decision::Decline, "the baseline still never decides");
+        // And it read real fields, not just the ones that happened to exist in a fixture.
+        for field in ["act_text_source", "write_effect", "escalation.asker_basis"] {
+            assert!(
+                v.consulted.iter().any(|c| c == field),
+                "consulted must name {field}, or the record overstates what was read: {:?}",
+                v.consulted
+            );
+        }
+        // NOT asserted: the diff's numbers.
+        //
+        // `enforcing_copy` resolves the PROCESS home, which in production is the daemon's home
+        // and is correct, but in a test means the bundle diffs against whatever this MACHINE
+        // has installed under ~/.hestia/deploy. The first cut asserted "+2" and passed here for
+        // that accidental reason — it would have gone red on CI, where no such tree exists, and
+        // it DID go red in the full suite the moment `hub.rs` set HOME for its own test.
+        // A rung-reads-the-bundle test must not depend on the host's filesystem.
+        assert!(
+            v.rationale.as_deref().unwrap_or("").starts_with("diff vs the enforcing copy"),
+            "it must report what it read, in the shape the rung composes: {:?}", v.rationale
+        );
+    }
+
     /// THE HUMAN AND THE RUNG MUST READ ONE OBJECT, NOT TWO RENDERINGS OF ONE IDEA.
     ///
     /// This is the load-bearing claim of §3.3 — *"if a rung sees less than the human would, it
@@ -16703,6 +16761,7 @@ mod ladder_evidence_tests {
     }
 }
 
+#[cfg(test)]
 mod appeal_tests {
     use super::*;
     use super::inbox_tests::{open_state, seeded_home};

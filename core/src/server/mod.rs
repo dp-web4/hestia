@@ -4,6 +4,7 @@
 //! tool / resource specification this server exposes.
 
 mod agents;
+pub mod adjudicator;
 mod dashboard;
 pub mod evidence;
 pub mod gate_escalation;
