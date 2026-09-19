@@ -3021,16 +3021,73 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
     // The deny must exist, and it must be YOURS. Both halves matter: appealing a deny that
     // isn't on the record would let a member mint appeal events at will, and appealing
     // ANOTHER member's deny would let one member move another's grain.
+    // The window stays for LIVENESS below, where recency is the question being asked. It is
+    // not how the deny is found: #164 took the window off every appeal READ for this exact
+    // reason, and left it on the door that FILES one.
     let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
-    let Some(deny) = window.iter().find(|e| e.hash == deny_hash) else {
+    // RESOLVE THE POINTER OVER THE WHOLE CHAIN, not over a tail (#610).
+    //
+    // Measured 2026-09-18, and this is the failure that is worth stating: cbp-being tried to
+    // appeal three ids, got "no chain entry <id> within the last 20000 entries", and wrote
+    // into its permanent journal that the hashes "don't exist in the chain, confirming they
+    // were never filed." A COUNT-BOUNDED ABSENCE LICENSED AN UNBOUNDED NEVER. The window was
+    // not even the operative fact — the ids were escalation ids, which are not chain hashes
+    // at all — but the refusal offered "the deny has aged out" as one of exactly two
+    // explanations, and the reader took the other one.
+    let matches = match s.chain_by_pointer(&deny_hash) {
+        Ok(m) => m,
+        Err(e) => {
+            return Ok(hestia_error_envelope(
+                "hestia.appeal_deny_malformed",
+                &format!(
+                    "'{deny_hash}' is not a usable chain pointer: {e}. A malformed pointer and \
+                     a missing entry are different answers, and this is the first"
+                ),
+                Some(json!({"deny_hash": deny_hash})),
+            ));
+        }
+    };
+    if matches.len() > 1 {
+        return Ok(hestia_error_envelope(
+            "hestia.appeal_deny_ambiguous",
+            &format!(
+                "'{deny_hash}' matches {} chain entries. Say which one — resolving it here \
+                 would pick your appeal's subject for you",
+                matches.len()
+            ),
+            Some(json!({"deny_hash": deny_hash, "matches": matches.len()})),
+        ));
+    }
+    let Some(deny) = matches.first() else {
+        // SAY WHAT IT IS, not only what it is not. An id that names a real escalation is the
+        // commonest wrong pointer on this fleet — the paperwork is what a member sees in its
+        // inbox, so it is what a member reaches for — and "not found" sends it looking for a
+        // conspiracy instead of for the right hash.
+        let as_escalation = s.gate_escalations.get(deny_hash.trim()).map(|e| {
+            json!({"escalation_id": e.id, "marker": e.marker, "plugin_id": e.plugin_id})
+        });
+        let hint = if as_escalation.is_some() {
+            format!(
+                " — but it IS the id of an escalation. An escalation is paperwork attached to \
+                 a refusal, not the refusal: appeal the deny it answers, whose hash is 64 hex \
+                 characters"
+            )
+        } else {
+            String::new()
+        };
         return Ok(hestia_error_envelope(
             "hestia.appeal_deny_not_found",
             &format!(
-                "no chain entry {deny_hash} within the last {APPEAL_CHAIN_WINDOW} entries. \
-                 Either the hash is wrong or the deny has aged out of the searchable window \
-                 — refusing rather than filing an appeal against nothing"
+                "no chain entry matches '{deny_hash}'{hint}. THE WHOLE CHAIN WAS SEARCHED, \
+                 not a recent window, so this is an absence and not an expiry — but it is an \
+                 absence of a CHAIN ENTRY WITH THIS HASH, which is not evidence about what \
+                 you did or did not file"
             ),
-            Some(json!({"deny_hash": deny_hash, "window": APPEAL_CHAIN_WINDOW})),
+            Some(json!({
+                "deny_hash": deny_hash,
+                "searched": "whole chain, by hash pointer",
+                "is_escalation_id": as_escalation,
+            })),
         ));
     };
     let Some(subject) = appealable_subject(deny) else {
@@ -3061,7 +3118,15 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
             None,
         ));
     }
-    if window.iter().any(|e| {
+    // The duplicate check reads the whole chain too, through the same index #164 added. On
+    // the window it was worse than useless: an appeal old enough to scroll out became
+    // re-fileable, so the one member most likely to re-file — the one whose appeal has been
+    // pending longest — was the one the guard stopped protecting.
+    let prior_appeals = s
+        .chain_store
+        .appeal_rows_for_pointer(&deny_hash)
+        .unwrap_or_default();
+    if prior_appeals.iter().any(|e| {
         e.event_type == "appeal"
             && e.event_data.get("deny_hash").and_then(Value::as_str) == Some(deny_hash.as_str())
     }) {
@@ -17069,6 +17134,76 @@ mod appeal_tests {
             "reason": "appealing a deny that does not exist on this chain",
         })).await.unwrap();
         assert!(format!("{r}").contains("appeal_deny_not_found"), "{r}");
+    }
+
+    /// A COUNT-BOUNDED ABSENCE MUST NOT LICENSE AN UNBOUNDED "NEVER" (#610).
+    ///
+    /// Measured 2026-09-18. cbp-being tried to appeal three ids and got back "no chain entry
+    /// <id> within the last 20000 entries. Either the hash is wrong or the deny has aged out
+    /// of the searchable window." It then wrote into its permanent journal that the hashes
+    /// "don't exist in the chain, confirming they were never filed" — a claim about the whole
+    /// chain, and about its own history, derived from a tail.
+    ///
+    /// Two separate defects met there. The window was one. The other is that the ids were
+    /// ESCALATION ids — not chain hashes at all — and the refusal offered "aged out" as one of
+    /// exactly two explanations, so the reader took the other. A member sees escalation ids in
+    /// its inbox, so escalation ids are what it reaches for; answering only "not found" sends
+    /// it hunting for a conspiracy instead of for the right hash.
+    #[tokio::test]
+    async fn a_missing_deny_says_what_was_searched_and_names_an_escalation_id_as_one() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat(&state, "claude-code").await;
+
+        // A pointer that resolves to nothing at all.
+        let r = tool_appeal(&state, &json!({
+            "deny_hash": "00000000000000000000000000000000",
+            "session_id": sid.to_string(),
+            "reason": "appealing a hash that is on no chain anywhere",
+        })).await.unwrap();
+        let text = format!("{r}");
+        assert!(text.contains("appeal_deny_not_found"), "{text}");
+        assert!(
+            text.contains("WHOLE CHAIN WAS SEARCHED"),
+            "the refusal must say what it searched, or the reader supplies a scope: {text}"
+        );
+        assert!(
+            !text.contains("aged out"),
+            "nothing aged out — offering expiry as an explanation is what produced the false \
+             never: {text}"
+        );
+        assert!(
+            text.contains("not evidence about what"),
+            "and it must not let an absent HASH stand in for an absent ACT: {text}"
+        );
+
+        // The specimen: an id that IS a real escalation. The answer must name it as one.
+        let esc = {
+            let mut st = state.lock().await;
+            st.gate_escalations
+                .open("claude-code", "role:constellation:member", "Bash",
+                      "plugins/_shared", Some("Bash: cp /tmp/x plugins/_shared/SHIM_LEDGER.md"),
+                      None, None, crate::server::gate_escalation::now_secs(), 3600)
+                .unwrap()
+        };
+        let r = tool_appeal(&state, &json!({
+            "deny_hash": esc.id, "session_id": sid.to_string(),
+            "reason": "appealing the id my own inbox showed me, which is the paperwork",
+        })).await.unwrap();
+        let text = format!("{r}");
+        assert!(text.contains("appeal_deny_not_found"), "{text}");
+        assert!(
+            text.contains("IS the id of an escalation"),
+            "a refusal that can say WHAT the pointer is must say it: {text}"
+        );
+        assert!(
+            text.contains("64 hex"),
+            "and must name the shape of the thing actually wanted: {text}"
+        );
+        assert!(
+            text.contains("appeal the deny it answers"),
+            "a refusal owes the way forward, not only the boundary: {text}"
+        );
     }
 
     /// One appeal per deny, one ruling per appeal — no arbiter shopping.
