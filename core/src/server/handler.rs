@@ -17388,6 +17388,71 @@ mod appeal_tests {
         );
     }
 
+    /// A DISAGREEMENT ON A COALESCED ASK STAYS ON THE RECORD (GPT's note on #1063).
+    ///
+    /// Coalescing keys on the MEASURED bytes, so a second ask for the same act with the same
+    /// bytes folds into the pending row. The caller's contradicting assertion on that second
+    /// ask was being dropped along with the ask: permit safety was never at risk — the twin
+    /// binds what the daemon read — but the claim "a member naming bytes not on disk becomes
+    /// durable evidence" was false on exactly this path. It was false *in the commit that
+    /// made the claim*, which is why it gets a test rather than a correction to the prose.
+    #[tokio::test]
+    async fn a_coalesced_ask_does_not_take_its_payload_disagreement_with_it() {
+        use std::io::Write as _;
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat(&state, "claude-code").await;
+
+        let src = dir.path().join("payload.txt");
+        let mut f = std::fs::File::create(&src).unwrap();
+        f.write_all(b"the bytes actually on disk").unwrap();
+        drop(f);
+        let act = format!("Bash: cp {} plugins/_shared/SHIM_LEDGER.md", src.display());
+        const LIE: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+        // First ask: honest, so it mints and nothing is in dispute.
+        let first = tool_gate_escalation_open(&state, &json!({
+            "plugin_id": "claude-code", "tool_name": "Bash", "marker": "plugins/_shared",
+            "act": act, "reason": act, "session_id": sid.to_string(),
+        })).await.unwrap();
+        assert_eq!(first["coalesced"].as_bool(), None, "the first ask mints: {first}");
+
+        // Second ask: same act, same bytes — so it COALESCES — but now the caller names a
+        // hash that is not what is there.
+        let second = tool_gate_escalation_open(&state, &json!({
+            "plugin_id": "claude-code", "tool_name": "Bash", "marker": "plugins/_shared",
+            "act": act, "reason": act, "session_id": sid.to_string(),
+            "payload_sha256": LIE,
+        })).await.unwrap();
+        assert_eq!(second["coalesced"], json!(true), "it must still fold: {second}");
+
+        let s = state.lock().await;
+        let rows = s.recent_chain(40);
+        let mismatch = rows
+            .iter()
+            .find(|e| e.event_type == "gate_escalation_payload_assertion_mismatch")
+            .unwrap_or_else(|| panic!("the coalesced ask's disagreement vanished: {rows:?}"));
+        assert_eq!(mismatch.event_data["stated_payload_sha256"], json!(LIE));
+        assert_eq!(mismatch.event_data["door"], json!("open_coalesced"));
+        // BOTH SIDES on the row: an accusation without the measurement it contradicts cannot
+        // be checked by a later reader.
+        assert!(
+            mismatch.event_data["measured_payload_sha256"].as_str().is_some_and(|m| m != LIE),
+            "the row must carry what the daemon read, not only what the caller said: {:?}",
+            mismatch.event_data
+        );
+
+        // AND THE CONTROL: an honest ask mints no accusation. Without this the test would
+        // pass against code that witnessed a mismatch on every coalesce.
+        assert_eq!(
+            rows.iter()
+                .filter(|e| e.event_type == "gate_escalation_payload_assertion_mismatch")
+                .count(),
+            1,
+            "the honest first ask must not have produced one"
+        );
+    }
+
     /// Minting site C, the peer-ruling path (#459): a member ruling on an escalation
     /// tells the ASKER. Minted at the tool handler, the layer that holds
     /// `SharedState` — the store's `decide` has no inbox access.
@@ -19004,6 +19069,37 @@ mod how_to_decide_tests {
     }
 }
 
+/// Witness a caller assertion that contradicts what the daemon measured.
+///
+/// The disagreement is ALSO carried on a minted escalation's own row, where the approver reads
+/// it. This event exists so a census has one place to count them: the ask-row field serves the
+/// operator deciding a single case, the event serves anyone asking "how often does this member
+/// name bytes that are not there". Two readers, two needs — and without the event the
+/// coalesced path had no record at all.
+fn witness_payload_disagreement(
+    s: &mut crate::server::state::ServerState,
+    escalation_id: &str,
+    binding: &crate::server::gate_escalation::PayloadBinding,
+    door: &str,
+) -> anyhow::Result<()> {
+    let Some(stated) = binding.stated_but_not_measured.as_deref() else {
+        return Ok(());
+    };
+    s.append_chain(
+        "gate_escalation_payload_assertion_mismatch",
+        json!({
+            "escalation_id": escalation_id,
+            "door": door,
+            "stated_payload_sha256": stated,
+            // BOTH SIDES ON ONE ROW. A record carrying only the accusation and not the
+            // measurement cannot be checked by a later reader.
+            "measured_payload_sha256": binding.sha256,
+            "basis": binding.basis,
+        }),
+    )?;
+    Ok(())
+}
+
 async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::{now_secs, Bar, DEFAULT_TTL_SECS};
 
@@ -19134,11 +19230,22 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // this seat: witness the fold, tell the asker which id to wait on, and mint nothing —
     // no second `gate_escalation_opened`, no second wake for the peers.
     if let crate::server::gate_escalation::Opened::Coalesced(twin) = &opened {
-        let entry = s.append_chain(
-            "gate_escalation_coalesced",
-            coalesced_payload(&s, twin, "open", now),
-        )?;
-        return Ok(coalesced_response(twin, &entry.hash, now));
+        // A DISAGREEMENT ON A COALESCED ASK MUST NOT EVAPORATE (GPT's non-blocking note on
+        // #1063). Coalescing keys on the MEASURED bytes, so a second ask for the same act with
+        // the same bytes folds into the pending row — and a caller assertion contradicting the
+        // measurement on THAT ask went with it. Permit safety was never affected (the twin
+        // binds what the daemon read), but this change's own claim — that a member naming
+        // bytes not on disk becomes durable evidence — was not true on this path.
+        //
+        // Worth stating plainly, because it is the second instance in one change set: the
+        // comment asserted a property one step stronger than the code had. That is the exact
+        // failure the rule proposed alongside this review names, committed inside the commit
+        // that introduced the rule.
+        let twin = twin.clone();
+        let payload = coalesced_payload(&s, &twin, "open", now);
+        let entry = s.append_chain("gate_escalation_coalesced", payload)?;
+        witness_payload_disagreement(&mut s, &twin.id, &binding, "open_coalesced")?;
+        return Ok(coalesced_response(&twin, &entry.hash, now));
     }
     let esc = opened.into_escalation();
     // THE SEAT KEYS (#542), recorded before the witness so the entry records what
@@ -19989,10 +20096,12 @@ permit for something the approver did not see.",
         // after the prior ask, each costing the operator a ruling that bought nothing. Fold, witness,
         // and answer with the id that is already waiting.
         Ok(crate::server::gate_escalation::Opened::Coalesced(twin)) => {
-            let entry = s.append_chain(
-                "gate_escalation_coalesced",
-                coalesced_payload(&s, &twin, "claim", now),
-            )?;
+            let payload = coalesced_payload(&s, &twin, "claim", now);
+            let entry = s.append_chain("gate_escalation_coalesced", payload)?;
+            // Same reason as the member door: a folded ask must not take its disagreement
+            // with it. This door is the one the gate hook drives, so it is where a shim that
+            // has started asserting hashes would surface first.
+            witness_payload_disagreement(&mut s, &twin.id, &attempted_binding, "claim_coalesced")?;
             Ok(coalesced_response(&twin, &entry.hash, now))
         }
         Ok(crate::server::gate_escalation::Opened::Minted(esc)) => {
