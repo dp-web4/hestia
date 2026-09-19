@@ -18780,6 +18780,16 @@ fn opened_payload(
         // census can separate "bound nothing" from "predates the field" — and so an operator
         // reading the ask can see which of the two they are being asked to approve.
         "payload_sha256": esc.payload_sha256,
+        // HOW it was established: `measured` (the daemon read the file the act names),
+        // `asserted` (only the caller's word — a weaker permit, and the record says so rather
+        // than letting the two look alike) or `unbound`. An approver weighing a permit is
+        // entitled to know whether anyone but the asker has seen the bytes.
+        "payload_basis": esc.payload_basis,
+        // THE MEMBER NAMED BYTES THAT ARE NOT ON DISK. Null in the ordinary case. This field
+        // exists because the first cut claimed to preserve exactly this disagreement while
+        // making it unobservable: the caller's hash suppressed the measurement that would have
+        // contradicted it.
+        "payload_stated_but_not_measured": esc.payload_stated_but_not_measured,
         // WHICH DOOR. See the doc comment: the key-set accident that used to answer this is
         // gone as of this change, deliberately.
         "opened_via": opened_via,
@@ -19057,13 +19067,23 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // The BYTES this act would write, when the caller can name them (#1056). Caller-asserted
     // like every other field here; what it buys is that the same value must come back at
     // claim, so the approval cannot be spent on a payload the approver never saw.
-    let payload_sha256 = optional_string(args, "payload_sha256").or_else(|| {
-        // MEASURED when the caller states nothing. A stated hash is kept as stated, because
-        // silently replacing a member's assertion with the daemon's own reading would hide a
-        // disagreement between them — and a disagreement is exactly the interesting case.
-        act.as_deref()
-            .and_then(super::gate_escalation::EscalationStore::measured_payload_for_act)
-    });
+    // MEASUREMENT IS AUTHORITATIVE WHEREVER IT IS POSSIBLE (GPT convergence sweep, #1063).
+    //
+    // The first cut wrote `stated.or_else(|| measured)`, which means the daemon never measures
+    // when the caller speaks — and that recreates #1056 exactly: open with an arbitrary hash
+    // H, let the source change, claim while repeating H, and `claim_bound` sees H == H and
+    // spends the permit. A wired shim would have been LESS trustworthy than an unwired one, on
+    // the path built to secure it. Worse, the comment there justified the fallback by saying a
+    // member/daemon disagreement "is the interesting case" while guaranteeing no disagreement
+    // could ever be observed.
+    //
+    // So: measure unconditionally when the act allows it, keep the caller's assertion as
+    // separate evidence, bind the MEASURED value, and say which basis was used. A stated hash
+    // now earns exactly what a self-report is worth — it is corroboration, never a substitute.
+    let binding = super::gate_escalation::EscalationStore::bind_payload(
+        act.as_deref(),
+        optional_string(args, "payload_sha256").as_deref(),
+    );
     let now = now_secs();
 
     let mut s = state.lock().await;
@@ -19092,7 +19112,7 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
               // The act, from its own field. No fallback to `reason` on this door.
               act.as_deref(),
               stated_reason.as_deref(), stated_detail.as_deref(),
-              payload_sha256.as_deref(), now, DEFAULT_TTL_SECS)
+              Some(&binding), now, DEFAULT_TTL_SECS)
     {
         Ok(o) => o,
         // A refusal to OPEN is itself a deny of the write, so it is witnessed rather than
@@ -19698,11 +19718,15 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // The bytes about to be written, when the gate could hash them (#1056). A shim that does
     // not send this claims exactly as before; the binding only engages on approvals that
     // recorded one.
-    let attempted_payload = optional_string(args, "payload_sha256").or_else(|| {
-        attempted_act
-            .as_deref()
-            .and_then(super::gate_escalation::EscalationStore::measured_payload_for_act)
-    });
+    // Same rule at claim, and here it is the load-bearing half: REPEATING A CALLER ASSERTION
+    // MUST NEVER SATISFY A MEASURED PERMIT. The daemon re-measures and compares its own
+    // reading to what the approval bound, so a source rewritten between approval and claim is
+    // caught no matter what the caller says about it.
+    let attempted_binding = super::gate_escalation::EscalationStore::bind_payload(
+        attempted_act.as_deref(),
+        optional_string(args, "payload_sha256").as_deref(),
+    );
+    let attempted_payload = attempted_binding.sha256.clone();
     let stated_detail = optional_string(args, "detail");
     // The durable per-wake key the daemon's own outcome rows carry — the value that joins a
     // spent approval to the act that consumed it. ACCEPTED HERE ONLY TO BE CHECKED, NEVER TO
@@ -19957,7 +19981,7 @@ permit for something the approver did not see.",
               // the act here. `act` still wins if a caller sends both.
               attempted_act.as_deref(),
               stated_reason.as_deref(), stated_detail.as_deref(),
-              attempted_payload.as_deref(), now, DEFAULT_TTL_SECS)
+              Some(&attempted_binding), now, DEFAULT_TTL_SECS)
     {
         // ONE ACT, ONE RULING (#668). This is the door the gate hook calls, and the hook
         // re-trips on the same refused act — 25 of 49 same-digest re-opens in the

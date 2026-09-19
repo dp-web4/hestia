@@ -411,16 +411,38 @@ pub struct Escalation {
     /// could not tell, and a permit that cannot say what it permitted is a permit for anything
     /// at that path.
     ///
-    /// CALLER-ASSERTED, like every other field a member supplies: the daemon cannot read the
-    /// member's filesystem, so this is the member's statement about bytes it has seen. What it
-    /// buys is not proof but BINDING — the same value must be presented again at claim, so the
-    /// member cannot substitute bytes between the approval and the write without saying so.
+    /// MEASURED WHEREVER MEASUREMENT IS POSSIBLE, and the row says which (`payload_basis`).
+    ///
+    /// The first cut of this field was caller-asserted with a measurement only as fallback,
+    /// and that was the defect rather than the design: a caller could name any hash, the
+    /// assertion suppressed the daemon's reading, and repeating it at claim spent the permit
+    /// while the bytes moved underneath (GPT convergence sweep on #1063). A wired shim was
+    /// thereby LESS trustworthy than an unwired one on the path built to secure it.
+    ///
+    /// Now the daemon reads the file the act names whenever the act names one it can read, and
+    /// that value binds. A caller's assertion is kept as independent evidence and a mismatch
+    /// is recorded — it is the member naming bytes that are not on disk, which is worth a row
+    /// of its own. Only where the daemon genuinely cannot measure does a stated hash bind, and
+    /// the basis field marks that permit as the weaker class it is.
     ///
     /// `None` is the legacy and pre-wiring case, and it binds NOTHING: such an escalation
     /// claims exactly as it did before this field existed. That is deliberate — the field
     /// ships as a no-op and only starts refusing once a shim actually sends it.
     #[serde(default)]
     pub payload_sha256: Option<String>,
+    /// How `payload_sha256` was established — `measured`, `asserted` or `unbound`. Durable,
+    /// because the STRENGTH of a permit must survive a restart exactly as the permit does: a
+    /// row restored without it would present an asserted binding as though the daemon had
+    /// seen the bytes. `None` for rows written before the field existed, which reads as
+    /// "unknown basis" and is the honest answer for them.
+    #[serde(default)]
+    pub payload_basis: Option<String>,
+    /// The hash the CALLER named when it is not the hash the daemon read. Durable and shown
+    /// on the ask, because it is the approver who needs it: a member naming bytes that are not
+    /// on disk is a fact about the asker, and burying it in a side channel would repeat the
+    /// original defect in a quieter register.
+    #[serde(default)]
+    pub payload_stated_but_not_measured: Option<String>,
     /// Invited seats whose mailbox could not be READ at invite time — the store errored, so
     /// no measurement exists. Distinct from `invited_without_reader`, which is a measurement
     /// that came back negative. Held out of BOTH populations by `peer_participation`: an
@@ -1207,6 +1229,19 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// How an escalation's payload hash was established, and what the caller said about it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PayloadBinding {
+    /// The value that BINDS. Measured wherever measurement was possible.
+    pub sha256: Option<String>,
+    /// `measured` | `asserted` | `unbound`. An approver weighing a permit is entitled to know
+    /// whether anyone other than the asker has seen the bytes.
+    pub basis: &'static str,
+    /// Set when the caller named a hash that is not what the daemon read. The member named
+    /// bytes that are not on disk, which is worth recording on its own.
+    pub stated_but_not_measured: Option<String>,
+}
+
 impl EscalationStore {
     /// Rebuild this store from the witness chain (dp, 2026-08-01).
     ///
@@ -1263,6 +1298,8 @@ impl EscalationStore {
                             // field existed restores as `None`, which binds nothing — the
                             // same pre-wiring behaviour it had when it was written.
                             payload_sha256: s(d, "payload_sha256"),
+                            payload_basis: s(d, "payload_basis"),
+                            payload_stated_but_not_measured: s(d, "payload_stated_but_not_measured"),
                             // RESTORE THE INVITATION, not just the ask. Exactly the defect
                             // `factors_present` below was written to close, one field over: an
                             // escalation restored with an empty invitation reads `absent: 0`
@@ -1527,7 +1564,7 @@ impl EscalationStore {
         act: Option<&str>,
         stated_reason: Option<&str>,
         stated_detail: Option<&str>,
-        payload_sha256: Option<&str>,
+        binding: Option<&PayloadBinding>,
         now: u64,
         ttl_secs: u64,
     ) -> Result<Escalation, OpenError> {
@@ -1599,7 +1636,10 @@ impl EscalationStore {
             // Bound at OPEN, from the same text every decision surface renders (#539).
             // From `act`, never from `stated_reason` — see the note on this fn.
             act_digest: act.map(Self::act_digest_of),
-            payload_sha256: Self::normalize_payload(payload_sha256),
+            payload_sha256: binding.and_then(|b| b.sha256.clone()),
+            payload_basis: binding.map(|b| b.basis.to_string()),
+            payload_stated_but_not_measured: binding
+                .and_then(|b| b.stated_but_not_measured.clone()),
             invited_reader_unknown: Vec::new(),
             plugin_id: plugin_id.to_string(),
             // Fail closed: every `open` caller is unproven until the handler records
@@ -1726,20 +1766,21 @@ impl EscalationStore {
         act: Option<&str>,
         stated_reason: Option<&str>,
         stated_detail: Option<&str>,
-        payload_sha256: Option<&str>,
+        binding: Option<&PayloadBinding>,
         now: u64,
         ttl_secs: u64,
     ) -> Result<Opened, OpenError> {
         if let Some(a) = act.map(str::trim).filter(|v| !v.is_empty()) {
             let digest = Self::act_digest_of(a);
             if let Some(twin) = self.pending_twin_bound(
-                plugin_id.trim(), marker.trim(), &digest, payload_sha256, now)
+                plugin_id.trim(), marker.trim(), &digest,
+                binding.and_then(|b| b.sha256.as_deref()), now)
             {
                 return Ok(Opened::Coalesced(twin.clone()));
             }
         }
         self.open_with_payload(plugin_id, role, tool_name, marker, act, stated_reason,
-                               stated_detail, payload_sha256, now, ttl_secs)
+                               stated_detail, binding, now, ttl_secs)
             .map(Opened::Minted)
     }
 
@@ -2092,6 +2133,33 @@ impl EscalationStore {
         h.update(&bytes);
         Some(format!("{:x}", h.finalize()))
     }
+
+/// THE RULE, IN ONE PLACE: measurement is authoritative wherever it is possible.
+///
+/// It lives here rather than at the two handler doors because the first cut implemented it
+/// twice and got it wrong twice, in the same way — `stated.or_else(|| measured)`, which means
+/// the daemon never measures when the caller speaks. That recreated #1056 in full: open with
+/// an arbitrary hash H, let the source change, claim repeating H, and the permit spends while
+/// the bytes moved. A wired shim was LESS trustworthy than an unwired one, on the path built
+/// to secure it (GPT convergence sweep, #1063).
+///
+/// A caller's assertion is kept as independent evidence and never as a substitute. That is
+/// what a self-report is worth: it can corroborate a measurement, and it can disagree with one
+/// — which is the interesting case, and is now observable instead of merely promised.
+pub fn bind_payload(act: Option<&str>, stated: Option<&str>) -> PayloadBinding {
+    let measured = act.and_then(Self::measured_payload_for_act);
+    let stated = Self::normalize_payload(stated);
+    let stated_but_not_measured = match (&measured, &stated) {
+        (Some(m), Some(s)) if m != s => Some(s.clone()),
+        _ => None,
+    };
+    let (sha256, basis) = match (measured, stated) {
+        (Some(m), _) => (Some(m), "measured"),
+        (None, Some(s)) => (Some(s), "asserted"),
+        (None, None) => (None, "unbound"),
+    };
+    PayloadBinding { sha256, basis, stated_but_not_measured }
+}
 
 pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         v.map(str::trim)
@@ -3312,7 +3380,7 @@ mod tests {
         let mut s = EscalationStore::default();
         let e = s
             .open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(ACT),
-                               Some(ACT), None, Some(APPROVED_BYTES), T0, DEFAULT_TTL_SECS)
+                               Some(ACT), None, Some(&stated(APPROVED_BYTES)), T0, DEFAULT_TTL_SECS)
             .unwrap();
         s.decide(&e.id, true, "operator", "role:constellation:sovereign",
                  Channel::OperatorSession, None, Some("ook"), T0 + 5)
@@ -3393,6 +3461,99 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A caller-ASSERTED binding, for the arms that use synthetic hashes against acts the
+    /// daemon cannot measure. Built through the same struct the doors use, so these tests
+    /// cannot drift into asserting a shape production never produces.
+    fn stated(h: &str) -> PayloadBinding {
+        PayloadBinding {
+            sha256: Some(h.to_string()),
+            basis: "asserted",
+            stated_but_not_measured: None,
+        }
+    }
+
+    /// GPT'S DECISIVE FALSIFIER (#1063 convergence sweep): a caller's assertion must never
+    /// substitute for a measurement, and repeating it must never satisfy a measured permit.
+    ///
+    /// The defect this pins: the first cut wrote `stated.or_else(|| measured)`, so a caller
+    /// supplying any hash H suppressed the daemon's reading entirely. Open with H, let the
+    /// source change, claim repeating H, and `claim_bound` compares H to H and spends the
+    /// permit — #1056 reproduced in full, on the code written to close it. GPT's summary is
+    /// the one worth keeping: a wired shim would have been LESS trustworthy than an unwired
+    /// caller on this exact path.
+    #[test]
+    fn a_stated_hash_never_substitutes_for_the_measurement_or_satisfies_a_measured_permit() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("hestia-bind-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("payload.txt");
+        let mut f = std::fs::File::create(&src).unwrap();
+        f.write_all(b"bytes A, which the approver would be shown").unwrap();
+        drop(f);
+        let act = format!("Bash: cp {} plugins/codex/hooks/pre_tool_use.py", src.display());
+        const LIE: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+        // 1+2. The caller names a hash that is NOT the bytes on disk.
+        let b1 = EscalationStore::bind_payload(Some(&act), Some(LIE));
+        let measured_a = EscalationStore::measured_payload_for_act(&act).unwrap();
+
+        // 3. The measurement binds, never the assertion — and the lie is KEPT as evidence
+        //    rather than discarded, because a member naming bytes that are not on disk is a
+        //    fact about the asker that the approver is entitled to.
+        assert_eq!(b1.sha256.as_deref(), Some(measured_a.as_str()),
+                   "the daemon's reading must bind, not the caller's claim");
+        assert_eq!(b1.basis, "measured");
+        assert_eq!(b1.stated_but_not_measured.as_deref(), Some(LIE),
+                   "and the disagreement must be observable — the whole point");
+
+        let mut s = EscalationStore::default();
+        let e = s.open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(&act),
+                                    Some(&act), None, Some(&b1), T0, DEFAULT_TTL_SECS)
+            .unwrap();
+        s.decide(&e.id, true, "operator", "role:constellation:sovereign",
+                 Channel::OperatorSession, None, Some("ook"), T0 + 5).unwrap();
+
+        // 4. The source changes under the approval.
+        std::fs::write(&src, b"bytes B, which nobody approved").unwrap();
+
+        // 5+6. The caller repeats its assertion. It must NOT claim: the daemon re-measures and
+        //      compares its own reading to what was bound.
+        let b2 = EscalationStore::bind_payload(Some(&act), Some(LIE));
+        assert!(
+            s.claim_bound("claude-code", "pre_tool_use.py", Some(&act), b2.sha256.as_deref(),
+                          T0 + 10).is_none(),
+            "repeating a caller assertion satisfied a measured permit — the bytes moved and \
+             the permit spent anyway"
+        );
+        // And the drift is legible rather than looking like "no approval".
+        let (_, bound) = s.payload_drift("claude-code", "pre_tool_use.py", Some(&act),
+                                         b2.sha256.as_deref(), T0 + 10)
+            .expect("the substitution must be reported as drift");
+        assert_eq!(bound, measured_a);
+
+        // THE AGREEING ARM: a caller that tells the truth is not punished for it, and the
+        // basis still records that the daemon saw the bytes itself.
+        std::fs::write(&src, b"bytes A, which the approver would be shown").unwrap();
+        let honest = EscalationStore::bind_payload(Some(&act), Some(&measured_a));
+        assert_eq!(honest.stated_but_not_measured, None, "agreement is not a disagreement");
+        assert_eq!(honest.basis, "measured");
+        assert!(
+            s.claim_bound("claude-code", "pre_tool_use.py", Some(&act), honest.sha256.as_deref(),
+                          T0 + 11).is_some(),
+            "the approved bytes still claim the permit"
+        );
+
+        // THE UNMEASURABLE ARM: a relative source the daemon cannot resolve falls back to the
+        // assertion, and the record marks that permit as the weaker class it is rather than
+        // letting it look like a measured one.
+        let rel = "Bash: cp relative/src.txt plugins/codex/hooks/pre_tool_use.py";
+        let weak = EscalationStore::bind_payload(Some(rel), Some(LIE));
+        assert_eq!(weak.sha256.as_deref(), Some(LIE));
+        assert_eq!(weak.basis, "asserted", "an unverified permit must say so");
+        assert_eq!(EscalationStore::bind_payload(Some(rel), None).basis, "unbound");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The binding SHIPS AS A NO-OP, and this is the arm that proves it.
     ///
     /// Every escalation in flight when this lands bound no payload, and so does every seat
@@ -3434,17 +3595,17 @@ mod tests {
         let mut s = EscalationStore::default();
         let first = s
             .open_or_coalesce_with_payload("claude-code", "r", "Bash", "pre_tool_use.py",
-                                           Some(ACT), Some(ACT), None, Some("aaaa1111"),
+                                           Some(ACT), Some(ACT), None, Some(&stated("aaaa1111")),
                                            T0, DEFAULT_TTL_SECS)
             .unwrap();
         let same = s
             .open_or_coalesce_with_payload("claude-code", "r", "Bash", "pre_tool_use.py",
-                                           Some(ACT), Some(ACT), None, Some("aaaa1111"),
+                                           Some(ACT), Some(ACT), None, Some(&stated("aaaa1111")),
                                            T0 + 9, DEFAULT_TTL_SECS)
             .unwrap();
         let moved = s
             .open_or_coalesce_with_payload("claude-code", "r", "Bash", "pre_tool_use.py",
-                                           Some(ACT), Some(ACT), None, Some("bbbb2222"),
+                                           Some(ACT), Some(ACT), None, Some(&stated("bbbb2222")),
                                            T0 + 18, DEFAULT_TTL_SECS)
             .unwrap();
         // CONTROL FIRST: identical bytes still coalesce, or this test would pass on a store
@@ -3479,7 +3640,7 @@ mod tests {
         let mut s = EscalationStore::default();
         let e = s
             .open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(ACT),
-                               Some(ACT), None, Some("aaaa1111"), T0, DEFAULT_TTL_SECS)
+                               Some(ACT), None, Some(&stated("aaaa1111")), T0, DEFAULT_TTL_SECS)
             .unwrap();
         s.decide(&e.id, true, "operator", "role:constellation:sovereign",
                  Channel::OperatorSession, None, Some("ook"), T0 + 5)
