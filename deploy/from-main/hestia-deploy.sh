@@ -545,6 +545,94 @@ install_hooks() {
   fi
 }
 
+# ---- the agent-atlas sibling: OPTIONAL, which web4 is not ------------------------------------
+# web4 is a build input, so its absence is a `die`. The atlas is what the agent inventory
+# ENUMERATES against, and discovery must never be able to stop a daemon deploy -- so every
+# failure here sets `atlas` to a word that says what happened and returns 0.
+#
+# WHY THE DEPLOY KEEPS ITS OWN CLONE. The inventory used to read <workspace>/agent-atlas and
+# nothing else, and the only way a machine had one was for somebody to remember to clone it.
+# McNugget ran two months on the narrower fallback enumeration because nobody had (measured
+# 2026-09-19). Pinning that WORKING clone from here is not the fix: seats add descriptors to
+# it, and a tool that hard-resets a tree people commit to is how ten raising sessions were
+# lost on that same seat. This clone is touched by nothing else, which is what makes the
+# reset below safe. Pinned by deploy/agent-atlas.pin so the universe a seat enumerates
+# against changes when hestia main says so, not when a registry commit happens to land.
+ATLAS_URL="${HESTIA_ATLAS_URL:-https://github.com/dp-web4/agent-atlas.git}"
+atlas="none"
+sync_atlas() {
+  local dir="$DEPLOY_ROOT/agent-atlas" want
+  if [ ! -d "$dir/.git" ]; then
+    git clone -q "$ATLAS_URL" "$dir" >>"$LOG" 2>&1 || { atlas="unavailable(clone failed)"; return 0; }
+  fi
+  if ! git -C "$dir" fetch -q origin >>"$LOG" 2>&1; then
+    atlas="$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo unknown)(stale: fetch failed)"; return 0
+  fi
+  # ONE process, no pipeline, and only if the file is there. The first draft of this line was
+  # `grep ... "$pin" 2>/dev/null | head -1`: on a checkout with no pin file grep exits 2, the
+  # script is `set -euo pipefail`, and the WHOLE DEPLOY died silently with rc=2 -- from inside
+  # the one function whose stated purpose is that it can never stop a deploy. Caught by
+  # running it (McNugget, 2026-09-19), not by reading it. `sed ... p; q` prints the first
+  # line that is not blank or a comment and stops, so there is no reader to SIGPIPE either.
+  local pinf="$DEPLOY_ROOT/hestia/deploy/agent-atlas.pin"
+  want=""
+  if [ -f "$pinf" ]; then want="$(sed -nE '/^[[:space:]]*(#|$)/d; p; q' "$pinf" 2>/dev/null || true)"; fi
+  if [ -n "$want" ]; then
+    git -C "$dir" reset -q --hard "$want" >>"$LOG" 2>&1 || { atlas="unpinned(pin ${want:0:9} is not in the clone)"; return 0; }
+  else
+    git -C "$dir" reset -q --hard origin/main >>"$LOG" 2>&1 || { atlas="unavailable(reset failed)"; return 0; }
+  fi
+  git -C "$dir" clean -qfd
+  atlas="$(git -C "$dir" rev-parse --short HEAD)${want:+(pinned)}"
+}
+
+# ---- the agent inventory: installed by the thing that installs things ----------------------
+# plugins/agent-inventory/install.sh has existed since 2026-07-26 with all three triggers
+# (SessionStart, PATH, hourly unit), and NOTHING RAN IT. The daemon's /api/agents looks for
+# ~/.local/bin/hestia-agent-inventory, which this deploy never created, so on every seat
+# where nobody had installed it by hand the dashboard's discovery answered UNKNOWN and its
+# governance dots had nothing to draw from (McNugget, 2026-09-19). Same shape as SAGE's
+# update_fleet_models.py: built, correct, and wired to nothing.
+#
+# REFUSES INSIDE A GOVERNED SESSION, by the members' installer's own test. It writes a
+# SessionStart hook into the harness config, and a session that edits the config of the
+# harness it runs in is the thing rule 0 exists to stop. The timer is not a session.
+#
+# THE POST-CONDITION IS THE BYTES, NOT THE EXIT CODE -- the rule `install_hooks` learned the
+# hard way. The wrapper runs a COPY ($bin.py), so an installed inventory can go stale while
+# the checkout moves on; `cmp` against the checkout is the only thing that says it did not.
+inventory=""
+install_inventory() {
+  inventory="skipped"
+  [ "${HESTIA_DEPLOY_INVENTORY:-1}" = "1" ] || { inventory="skipped(HESTIA_DEPLOY_INVENTORY=0)"; return 0; }
+  if [ -n "${CLAUDECODE:-}" ] || [ -n "${HESTIA_ROLE:-}" ]; then
+    inventory="refused(governed session)"; return 0
+  fi
+  local src="$DEPLOY_ROOT/hestia/plugins/agent-inventory" bin="$HOME/.local/bin/hestia-agent-inventory"
+  local at="$DEPLOY_ROOT/agent-atlas/talk-to" enum
+  [ -f "$src/install.sh" ] || { inventory="skipped(no installer in the checkout)"; return 0; }
+  # No guess. Without it install.sh derives the workspace from `git --git-common-dir`, which
+  # from THIS checkout is ~/.hestia/deploy -- a directory with no harness plugins a seat uses
+  # and no working repos, pinned into three triggers as if somebody had chosen it.
+  [ -n "${HESTIA_WORKSPACE:-}" ] || { inventory="skipped(no HESTIA_WORKSPACE in the deploy unit)"; return 0; }
+  [ -d "$at" ] || at=""
+  if [ -f "$bin.py" ] && cmp -s "$src/inventory.py" "$bin.py" && grep -qxF "AT_PIN='$at'" "$bin" 2>/dev/null; then
+    inventory="ok(current)"; return 0
+  fi
+  if HESTIA_WORKSPACE="$HESTIA_WORKSPACE" HESTIA_ATLAS_DIR="$at" bash "$src/install.sh" >>"$LOG" 2>&1; then
+    if cmp -s "$src/inventory.py" "$bin.py"; then
+      # `|| true`: a report with no such key makes grep exit 1, pipefail makes that the
+      # substitution's status, and `set -e` would end the deploy over a missing label.
+      enum="$("$bin" --no-witness --json 2>/dev/null | grep -oE '"agent_enumeration": *"[^"]+"' | cut -d'"' -f4 || true)"
+      inventory="ok(${enum:-enumeration unreadable})"
+    else
+      inventory="FAILED(installer rc=0, but the installed copy is not the checkout's)"
+    fi
+  else
+    inventory="FAILED(rc=$?)"
+  fi
+}
+
 # The manifest the members' installer writes; empty when it is absent or unreadable. The
 # -r guard is load-bearing under `set -e -o pipefail`: sed on a missing file exits 2, and
 # that took the whole cycle down at rc=2 with no log line at all (measured, 2026-08-28,
@@ -667,13 +755,14 @@ git -C "$DEPLOY_ROOT/hestia" clean -qfd
 git -C "$DEPLOY_ROOT/web4" fetch -q origin || die "fetch web4"
 git -C "$DEPLOY_ROOT/web4" reset -q --hard origin/main || die "reset web4"
 git -C "$DEPLOY_ROOT/web4" clean -qfd
+sync_atlas
 
 target="$(git -C "$DEPLOY_ROOT/hestia" describe --tags --always)"
 target_sha="$(git -C "$DEPLOY_ROOT/hestia" rev-parse --short HEAD)"
 web4_sha="$(git -C "$DEPLOY_ROOT/web4" rev-parse --short HEAD)"
 running="$(running_version)"
 ondisk="$("$BIN" --version 2>/dev/null | describe_of || true)"
-log "target=$target ($target_sha, web4 $web4_sha) running=${running:-none} ondisk=${ondisk:-none} bin=$BIN"
+log "target=$target ($target_sha, web4 $web4_sha, atlas $atlas) running=${running:-none} ondisk=${ondisk:-none} bin=$BIN"
 
 # Claim a dashboard request only now: lock and hold have both passed, and `target` is the
 # supervisor's actual synced target rather than the old current-build authority record.
@@ -721,7 +810,8 @@ if [ "$MODE" = "--hooks-only" ]; then
     die "--hooks-only refuses: checkout is now '$target' but running='${running:-none}' ondisk='${ondisk:-none}'; a manifest written here would not match the binary. Run a full cycle."
   fi
   install_hooks
-  log "HOOKS-ONLY $target hooks=$hooks"
+  install_inventory
+  log "HOOKS-ONLY $target hooks=$hooks inventory=$inventory"
   [ "$hooks" = "ok" ] || { log "manifest not written; $(hooks_repair_hint)"; exit 1; }
   exit 0
 fi
@@ -737,13 +827,17 @@ if [ "$running" = "$target" ] && [ "$ondisk" = "$target" ]; then
   if [ "$MODE" = "full" ] && [ "${HESTIA_DEPLOY_HOOKS:-1}" = "1" ] && [ "$manifest" != "$target" ]; then
     log "CURRENT $target but manifest says '${manifest:-none}'; re-running the members' install"
     install_hooks
-    log "CURRENT $target manifest-repair hooks=$hooks"
+    install_inventory
+    log "CURRENT $target manifest-repair hooks=$hooks inventory=$inventory"
     case "$hooks" in
       ok) exit 0 ;;
       *)  log "HALF-DEPLOYED $target: binary current, manifest still '${manifest:-none}' (hooks=$hooks); $(hooks_repair_hint)"; exit 1 ;;
     esac
   fi
-  log "CURRENT $target"
+  # The ordinary cycle is where a stale inventory copy gets noticed: most cycles are this
+  # one, and the inventory's source moves without the daemon's binary moving with it.
+  if [ "$MODE" = "full" ]; then install_inventory; fi
+  log "CURRENT $target${inventory:+ inventory=$inventory}"
   exit 0
 fi
 if [ "$MODE" = "--check" ]; then
@@ -797,13 +891,14 @@ log "daemon up on $newv after $(( $(date +%s) - T0 ))s"
 
 # ---- members' governance surface, from the SAME checkout -----------------------------------------
 install_hooks
+install_inventory
 
 # ---- prune old backups (newest KEEP_BACKUPS stay) -----------------------------------------------------
 ls -1t "$HESTIA_HOME"/hestia.prev-* 2>/dev/null | tail -n +"$(( KEEP_BACKUPS + 1 ))" | while read -r f; do
   rm -f -- "$f"
 done
 
-log "DEPLOYED ${running:-none} -> $newv (hestia $target_sha, web4 $web4_sha) hooks=$hooks in $(( $(date +%s) - T0 ))s"
+log "DEPLOYED ${running:-none} -> $newv (hestia $target_sha, web4 $web4_sha, atlas $atlas) hooks=$hooks inventory=$inventory in $(( $(date +%s) - T0 ))s"
 
 # A DEPLOYED line with hooks != ok is HALF a deploy: the binary is current, the manifest is not,
 # and the dashboard reads stale (or unknown) until someone runs --hooks-only. Until 2026-08-27
