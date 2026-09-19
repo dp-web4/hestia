@@ -566,6 +566,26 @@ def test_wrapper_shell_quoting():
     check("an inherited HESTIA_WORKSPACE still overrides the pin", back.stdout,
           "/tmp/from-env")
 
+    # The atlas pin (McNugget, 2026-09-19) is the same construct with one more case: it is
+    # OPTIONAL, so the wrapper carries AT_PIN='' on every seat that pinned nothing, and that
+    # empty string is passed to inventory.py unconditionally. Round-trip all three.
+    env = {k: v for k, v in os.environ.items() if k != "HESTIA_ATLAS_DIR"}
+    expr = 'printf %s "${HESTIA_ATLAS_DIR:-$AT_PIN}"'
+    back = subprocess.run(["/bin/sh", "-c", f"AT_PIN={r.stdout}\n{expr}"],
+                          capture_output=True, text=True, env=env)
+    check("the pinned atlas survives /bin/sh unchanged", back.stdout, probe)
+    empty = subprocess.run(["bash", "-c", m.group(0) + '\nsh_pin ""'],
+                           capture_output=True, text=True)
+    back = subprocess.run(["/bin/sh", "-c", f"AT_PIN={empty.stdout}\n{expr}"],
+                          capture_output=True, text=True, env=env)
+    check("no pinned atlas round-trips to EMPTY, which inventory.py reads as no pin",
+          (empty.stdout, back.stdout, back.returncode), ("''", "", 0))
+    env["HESTIA_ATLAS_DIR"] = "/tmp/atlas-from-env"
+    back = subprocess.run(["/bin/sh", "-c", f"AT_PIN={r.stdout}\n{expr}"],
+                          capture_output=True, text=True, env=env)
+    check("an inherited HESTIA_ATLAS_DIR still overrides the pin", back.stdout,
+          "/tmp/atlas-from-env")
+
 
 def test_unit_specifier_escaping():
     """A systemd unit is the THIRD syntax, not a second copy of the shell one.
@@ -704,7 +724,9 @@ _MAY_EXPAND = {
     # is a value reaching a syntax that cannot hold it — measured, a workspace path with a
     # backtick in it became command substitution in the shipped wrapper, run on every fire.
     # See the sh_pin block in install.sh.
-    "WRAP": frozenset({"SH_PYTHON", "SH_BIN", "SH_WORKSPACE"}),
+    # SH_ATLAS (McNugget, 2026-09-19): the deploy's pinned agent-atlas checkout, which is a
+    # path exactly as hostile as the workspace one and goes through sh_pin for the same reason.
+    "WRAP": frozenset({"SH_PYTHON", "SH_BIN", "SH_WORKSPACE", "SH_ATLAS"}),
     # The systemd --user unit: what to run and where from — and SD_*, because a unit file
     # is the third syntax, not a second copy of the shell one. `%` is legal in a path and
     # is a SPECIFIER here; measured, `50%off` reached ExecStart as `50ubuntuff` with the
