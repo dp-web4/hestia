@@ -1,8 +1,8 @@
 import sys
 sys.path.insert(0, "/tmp/wt-gaterepair/plugins/_shared")
-sys.path.insert(0, "/tmp/gaterepair")
+sys.path.insert(0, "/tmp/r1082/tools")
 import hestia_governance_closure as g
-import resolver
+import redirect_target_resolver as resolver
 
 MARK = "plugins/_shared/hestia_governance_closure.py"
 ABS  = "/home/dp/ai-workspace/hestia/" + MARK
@@ -36,6 +36,30 @@ CASES = [
  ("V read rebinds after assignment [HOLE]",   'OUT=/tmp/safe.txt\nread OUT < /tmp/evil\necho %s > "$OUT"' % MARK),
  ("W tilde value is not a literal [HOLE]",    'OUT=~/x.py\necho %s > "$OUT"' % MARK),
  ("X binding inside an if body [HOLE]",       'if true; then OUT=/tmp/safe.txt; fi\necho %s > "$OUT"' % MARK),
+ # --- codex's SECOND dissent, on v3 @657a9ab (notices 13363 / 13364, 2026-09-20).
+ # All six reproduced write -> read on v3 and are closed by v5's (P1)-(P4). Case 6 is the
+ # severe one: at runtime OUT provably IS the governed path, and v3 answered 'read'.
+ ("Y1 codex: false&&BIND||write [HOLE]",      'false && OUT=/tmp/safe || echo %s > "$OUT"' % MARK),
+ ("Y2 codex: true||BIND&&write [HOLE]",       'true || OUT=/tmp/safe && echo %s > "$OUT"' % MARK),
+ ("Y3 codex: BIND|write (pipeline) [HOLE]",   'OUT=/tmp/safe | echo %s > "$OUT"' % MARK),
+ ("Y4 codex: BIND&write (background) [HOLE]", 'OUT=/tmp/safe & echo %s > "$OUT"' % MARK),
+ ("Y5 codex: (BIND);write (subshell) [HOLE]", '( OUT=/tmp/safe ); echo %s > "$OUT"' % MARK),
+ ("Y6 codex: if-body REBIND [HOLE]",          'OUT=/tmp/safe; if true; then OUT=%s; fi; echo %s > "$OUT"' % (ABS, MARK)),
+ # --- shapes codex did not send, found by attacking v5 before shipping it. Each is a
+ # different way to rebind or to lose a binding at a scope boundary; all refuse.
+ ("Z1 brace-group rebind [HOLE]",             'OUT=/tmp/safe; { OUT=%s; }; echo x > "$OUT"' % ABS),
+ ("Z2 subshell rebind [HOLE]",                'OUT=/tmp/safe; ( OUT=%s; echo x > "$OUT" )' % ABS),
+ ("Z3 trap rebind [HOLE]",                    'OUT=/tmp/safe; trap \'OUT=%s\' EXIT; echo x > "$OUT"' % ABS),
+ ("Z4 case-arm rebind [HOLE]",                'OUT=/tmp/safe; case z in z) OUT=%s;; esac; echo x > "$OUT"' % ABS),
+ ("Z5 function-body rebind [HOLE]",           'OUT=/tmp/safe; f() { OUT=%s; }; f; echo x > "$OUT"' % ABS),
+ ("Z6 ${VAR:-default} is not a literal [HOLE]",'OUT=/tmp/safe; echo x > "${OUT:-%s}"' % ABS),
+ ("Z7 loop var persists past done [HOLE]",    'for OUT in /tmp/safe; do :; done; echo %s > "$OUT"' % MARK),
+ # --- controls: the resolver must still NAME a real write, not just refuse everything.
+ ("Z8 path escape through .. [names it]",     'OUT=/tmp/safe; echo x > "$OUT/../../..%s"' % ("/home/dp/ai-workspace/hestia/" + MARK)),
+ ("Z9 cd then relative GOVERNED [names it]",  'OUT=%s; cd %s; echo x > "$OUT"' % (MARK, CWD)),
+ ("Z10 cd then relative safe dest",           'OUT=safe.txt; cd %s; echo %s > "$OUT"' % (CWD, MARK)),
+ ("Z11 tee at the marker [names it]",         'OUT=%s; echo x | tee "$OUT"' % ABS),
+ ("Z12 append >> at the marker [names it]",   'OUT=%s; echo x >> "$OUT"' % ABS),
 ]
 
 def row(cmd):
@@ -49,7 +73,7 @@ g._bash_write_targets = new_bwt
 after = [(n, row(c)) for n, c in CASES]
 g._bash_write_targets = shipped
 
-print("%-42s | %-27s | %s" % ("case", "SHIPPED", "REPAIRED (v2)"))
+print("%-42s | %-27s | %s" % ("case", "SHIPPED", "REPAIRED (v5)"))
 print("-" * 118)
 chg = 0
 for (n, b), (_, a) in zip(before, after):
