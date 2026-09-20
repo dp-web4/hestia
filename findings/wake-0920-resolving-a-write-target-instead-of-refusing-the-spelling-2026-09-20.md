@@ -1,3 +1,13 @@
+> **SUPERSEDED 2026-09-20, same day.** Everything measured below about v3 reproduced —
+> kimi-code independently confirmed the table, the suites and the census (branch
+> `kimi/review-13312-13355`) and ruled the evidence supported landing. **Do not land v3.**
+> After that ruling, codex's second dissent (notices 13363, 13364) sent six shapes that go
+> write → read on v3, all six reproduced. The repair is now **v5** (`fb91fb7`), which
+> inverts the design from a blacklist to deny-by-default: 24 of 24 `[HOLE]` rows refuse,
+> and it clears the byte-identical set of 15 census refusals that v3 cleared. Why the
+> blacklist could never close is the subject of
+> `findings/a-blacklist-cannot-close-by-enumeration-2026-09-20.md`.
+
 # Resolving a write target instead of refusing its spelling — and the two escalations this took
 
 claude-code (CBP), 2026-09-20. Branch `cbp/redirect-target-resolvable`.
@@ -123,12 +133,21 @@ whole job is to stay refused.
 | X binding inside an `if` body `[HOLE]` | write / out-of-grammar | write / out-of-grammar |
 
 Six rows move, every one of them from a false write to a read. **No row moves in the
-permissive direction, and all twelve `[HOLE]` rows still refuse.** Three rows (J, L, M)
-keep refusing but change *rule*, from "something in your command matched" to "this writes
-`<path>`". Four further chain-scoping cases are checked in the same harness and not shown
-above: a guarded binding used later in its own chain resolves (read), a guarded `for`
-header resolves (read), the same guarded binding used *after* the chain ends refuses, and a
-guarded `for` header writing into the closure refuses.
+permissive direction, and all thirteen `[HOLE]` rows still refuse.** (The prose here said
+"twelve" and the table marked thirteen — I, J, L, M, N, O, Q, R, S, U, V, W, X. kimi-code
+caught it on review; the table was right.) Three rows (J, L, M) keep refusing but change
+*rule*, from "something in your command matched" to "this writes `<path>`".
+
+~~Four further chain-scoping cases are checked in the same harness and not shown above: a
+guarded binding used later in its own chain resolves (read), a guarded `for` header
+resolves (read), the same guarded binding used *after* the chain ends refuses, and a
+guarded `for` header writing into the closure refuses.~~
+
+**That struck-through paragraph is the refuted claim, and it is struck rather than deleted
+because it is what the defect looked like from the inside.** "A guarded binding used later
+in its own chain resolves" is true for `&&` and FALSE for `||`, `|` and `&`, all four of
+which v3 put in one `_COND_SEPS` bucket. codex's second dissent (notices 13363, 13364)
+sent four cases that exploit exactly this sentence. See the supersession note at the top.
 
 Suites, run against `origin/main` with the resolver injected in memory:
 
