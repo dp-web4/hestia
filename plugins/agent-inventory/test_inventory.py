@@ -197,7 +197,13 @@ def test_verdict(tmp: Path):
 # narrower fallback because nobody had (measured 2026-09-19). The deploy now keeps its own
 # pinned checkout and points the inventory at it; these pin the precedence that makes that
 # safe -- explicit beats pinned beats default, and the default is unchanged.
-def test_resolve_atlas(tmp: Path):
+def test_resolve_atlas():
+    # No `tmp` parameter: pytest reads one as a fixture and errors before the body runs.
+    with tempfile.TemporaryDirectory() as d:
+        _resolve_atlas_cases(Path(d))
+
+
+def _resolve_atlas_cases(tmp: Path):
     ws = tmp / "ws"
     saved = os.environ.pop("HESTIA_ATLAS_DIR", None)
     try:
@@ -227,7 +233,12 @@ def test_resolve_atlas(tmp: Path):
 # five harnesses that fail closed. So both failure directions matter -- a missing descriptor
 # must not yield a default, and a malformed one must not raise and take the whole inventory
 # down from inside a SessionStart hook.
-def test_atlas_frontmatter(tmp: Path):
+def test_atlas_frontmatter():
+    with tempfile.TemporaryDirectory() as d:
+        _atlas_frontmatter_cases(Path(d))
+
+
+def _atlas_frontmatter_cases(tmp: Path):
     atlas = tmp / "atlas"
     good = atlas / "goodone"
     good.mkdir(parents=True)
@@ -1074,6 +1085,24 @@ def test_no_raw_path_in_printed_output():
         del RAW_OK["WORKSPACE"]
 
 
+def test_generation_stamp_brackets_the_install():
+    """hestia-deploy reruns this installer when `$BIN.installed-by` differs from the checkout's
+    install.sh (GPT, PR #1071: a fix to the wrapper, unit, plist or hook registration changes
+    no byte of inventory.py, so the deploy would call the seat current forever). That only
+    means "this installer FINISHED here" if the stamp is dropped before anything is rewritten
+    and written after everything is. Both halves are positions, so both are pinned as such."""
+    src = (Path(__file__).parent / "install.sh").read_text()
+    code = [ln for ln in src.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    drop, write = 'rm -f "$BIN.installed-by"', 'install -m 0644 "$SRC_DIR/install.sh" "$BIN.installed-by"'
+    check("stamp: written by the LAST command in the file", code[-1], write)
+    check("stamp: written exactly once", code.count(write), 1)
+    check("stamp: dropped exactly once", code.count(drop), 1)
+    first_write = min(i for i, ln in enumerate(code)
+                      if ln.startswith(("install -m 0755", 'cat > "$BIN"')))
+    check("stamp: dropped before the first byte of the surface is rewritten",
+          drop in code and code.index(drop) < first_write, True)
+
+
 def teardown_module(module):
     """Deliver this file's accumulated failures to a harness that reads exceptions.
 
@@ -1101,15 +1130,14 @@ if __name__ == "__main__":
     test_printed_advice_is_pasteable()
     test_helpers_are_defined_before_first_use()
     test_no_raw_path_in_printed_output()
+    test_generation_stamp_brackets_the_install()
     test_unit_verdict()
     with tempfile.TemporaryDirectory() as d:
         test_verdict(Path(d))
     with tempfile.TemporaryDirectory() as d:
         test_periodic_trigger(Path(d))
-    with tempfile.TemporaryDirectory() as d:
-        test_resolve_atlas(Path(d))
-    with tempfile.TemporaryDirectory() as d:
-        test_atlas_frontmatter(Path(d))
+    test_resolve_atlas()
+    test_atlas_frontmatter()
     for f in FAILS:
         print("FAIL", f)
     print(f"{'FAILED' if FAILS else 'ok'}: {len(FAILS)} failure(s)")

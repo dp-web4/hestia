@@ -100,7 +100,12 @@ def make_atlas_origin(tmp: Path) -> tuple[Path, str, str]:
     return origin, first, git(origin, "rev-parse", "HEAD")
 
 
-def test_sync_atlas(fn: str, tmp: Path) -> None:
+def test_sync_atlas() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        _sync_atlas_cases(extract_function(SCRIPT.read_text(), "sync_atlas"), Path(d))
+
+
+def _sync_atlas_cases(fn: str, tmp: Path) -> None:
     origin, first, second = make_atlas_origin(tmp)
     url = {"HESTIA_ATLAS_URL": str(origin)}
     prelude = 'ATLAS_URL="${HESTIA_ATLAS_URL}"\natlas="none"\n'
@@ -157,11 +162,18 @@ AT_PIN='${HESTIA_ATLAS_DIR:-}'
 echo '{"${FAKE_KEY:-agent_enumeration}": "${FAKE_ENUM:-agent-atlas}"}'
 W
 chmod +x "$bin"
+echo "${FAKE_BEHAVIOUR:-behaviour 1}" > "$HOME/trigger-surface"   # stands in for plist/unit/hook
 [ "${FAKE_RC:-0}" = 0 ] || exit "$FAKE_RC"
+[ "${FAKE_SKIP_STAMP:-}" = 1 ] || cp "$0" "$bin.installed-by"   # the real one's LAST act too
 """
 
 
-def test_install_inventory(fn: str, tmp: Path) -> None:
+def test_install_inventory() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        _install_inventory_cases(extract_function(SCRIPT.read_text(), "install_inventory"), Path(d))
+
+
+def _install_inventory_cases(fn: str, tmp: Path) -> None:
     def seat(name: str, with_atlas: bool = True) -> tuple[Path, Path]:
         root, home = tmp / name / "deploy", tmp / name / "home"
         src = root / "hestia" / "plugins" / "agent-inventory"
@@ -231,6 +243,27 @@ def test_install_inventory(fn: str, tmp: Path) -> None:
     rc, st = run(prelude + fn, "install_inventory", root, env, "inventory")
     check("I stale copy: reinstalled", (st, ran(home).count("ran ")), ("ok(agent-atlas)", 2))
 
+    # M. GPT's falsifier (PR #1071 HOLD). ONLY the installer changes: inventory.py and the atlas
+    #    pin are byte-identical, which was everything the fast path looked at -- so a repaired
+    #    plist, unit, hook registration or wrapper body answered ok(current) on every seat,
+    #    forever. The installed surface now carries the installer that produced it.
+    inst = root / "hestia" / "plugins" / "agent-inventory" / "install.sh"
+    inst.write_text(FAKE_INSTALLER.replace("behaviour 1", "behaviour 2"))
+    rc, st = run(prelude + fn, "install_inventory", root, env, "inventory")
+    check("M installer-only change: the installer reran", (st, ran(home).count("ran ")), ("ok(agent-atlas)", 3))
+    check("M installer-only change: the artifact carries the new behaviour",
+          (home / "trigger-surface").read_text().strip(), "behaviour 2")
+    rc, st = run(prelude + fn, "install_inventory", root, env, "inventory")
+    check("M then unchanged: converged again", (st, ran(home).count("ran ")), ("ok(current)", 3))
+
+    # M2. The stamp is the installer's LAST act, so one that lands the bytes and the wrapper
+    #     and then does not finish has not converged, whatever its rc says.
+    root, home = seat("unfinished")
+    rc, st = run(prelude + fn, "install_inventory", root,
+                 clean_env(HOME=str(home), HESTIA_WORKSPACE=ws, FAKE_SKIP_STAMP="1"), "inventory")
+    check("M2 rc=0, bytes landed, never finished: FAILED, not ok",
+          st, "FAILED(installer rc=0, but it did not record finishing: no current .installed-by)")
+
     # K. rc=0 is not evidence. An installer that exits 0 without landing the bytes is a FAILURE.
     root, home = seat("liar")
     rc, st = run(prelude + fn, "install_inventory", root,
@@ -268,14 +301,25 @@ def test_install_inventory(fn: str, tmp: Path) -> None:
     check("L switched off", (rc, st, ran(home)), (0, "skipped(HESTIA_DEPLOY_INVENTORY=0)", ""))
 
 
-def main() -> int:
-    text = SCRIPT.read_text()
+def test_script_is_strict() -> None:
     check("the script is strict, which is the condition the regression needs",
-          bool(re.search(r"^set -[a-z]*e[a-z]*u?[a-z]* *-?o? *pipefail|^set -euo pipefail", text, re.M)), True)
-    with tempfile.TemporaryDirectory() as d:
-        test_sync_atlas(extract_function(text, "sync_atlas"), Path(d))
-    with tempfile.TemporaryDirectory() as d:
-        test_install_inventory(extract_function(text, "install_inventory"), Path(d))
+          bool(re.search(r"^set -[a-z]*e[a-z]*u?[a-z]* *-?o? *pipefail|^set -euo pipefail",
+                         SCRIPT.read_text(), re.M)), True)
+
+
+def teardown_module() -> None:
+    """pytest's channel. `check()` records instead of raising so that one run names every
+    failure; under pytest nothing read that record, and the tests returned normally on a red
+    file (GPT, PR #1071 review; tools/ci_selfexec_test.py names the shape). They also took
+    (fn, tmp) parameters, which pytest reads as fixtures -- unrunnable there as well as
+    unfailable. They take none now."""
+    assert not FAILS, "\n".join(FAILS)
+
+
+def main() -> int:
+    test_script_is_strict()
+    test_sync_atlas()
+    test_install_inventory()
     for f in FAILS:
         print("FAIL", f)
     print(f"{'FAILED' if FAILS else 'ok'}: {len(FAILS)} failure(s)")

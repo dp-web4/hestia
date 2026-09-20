@@ -620,17 +620,27 @@ install_inventory() {
   # about a place that is not there.
   [ -d "$HESTIA_WORKSPACE" ] || { inventory="skipped(HESTIA_WORKSPACE is not a directory)"; return 0; }
   [ -d "$at" ] || at=""
-  if [ -f "$bin.py" ] && cmp -s "$src/inventory.py" "$bin.py" && grep -qxF "AT_PIN='$at'" "$bin" 2>/dev/null; then
+  # Current means the WHOLE installed surface is this checkout's, not just inventory.py: the
+  # wrapper body, the launchd plist / systemd unit and the SessionStart registration are all
+  # written by install.sh, and a fix to any of them changes no byte of inventory.py (GPT,
+  # PR #1071 review). install.sh copies itself to $bin.installed-by as its LAST act, after
+  # every trigger surface, and removes that copy as its first -- so a matching copy means
+  # "this installer ran here, to the end". cmp, not a digest: no sha tool to go missing.
+  if [ -f "$bin.py" ] && cmp -s "$src/inventory.py" "$bin.py" \
+     && cmp -s "$src/install.sh" "$bin.installed-by" \
+     && grep -qxF "AT_PIN='$at'" "$bin" 2>/dev/null; then
     inventory="ok(current)"; return 0
   fi
   if HESTIA_WORKSPACE="$HESTIA_WORKSPACE" HESTIA_ATLAS_DIR="$at" bash "$src/install.sh" >>"$LOG" 2>&1; then
-    if cmp -s "$src/inventory.py" "$bin.py"; then
+    if ! cmp -s "$src/inventory.py" "$bin.py"; then
+      inventory="FAILED(installer rc=0, but the installed copy is not the checkout's)"
+    elif ! cmp -s "$src/install.sh" "$bin.installed-by"; then
+      inventory="FAILED(installer rc=0, but it did not record finishing: no current .installed-by)"
+    else
       # `|| true`: a report with no such key makes grep exit 1, pipefail makes that the
       # substitution's status, and `set -e` would end the deploy over a missing label.
       enum="$("$bin" --no-witness --json 2>/dev/null | grep -oE '"agent_enumeration": *"[^"]+"' | cut -d'"' -f4 || true)"
       inventory="ok(${enum:-enumeration unreadable})"
-    else
-      inventory="FAILED(installer rc=0, but the installed copy is not the checkout's)"
     fi
   else
     inventory="FAILED(rc=$?)"

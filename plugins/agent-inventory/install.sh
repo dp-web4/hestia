@@ -229,6 +229,10 @@ fi
 # Not `[ ... ] && mkdir`: under `set -e` a false test IS the list's exit status and takes
 # the script down. The bug class this whole section is about, in one line of its own fix.
 mkdir -p "$(dirname "$BIN")"
+# GENERATION STAMP, part 1 of 2 (part 2 is the last command in this file). Whatever the
+# previous run recorded stops being true the moment this one starts rewriting the surface:
+# an abort anywhere below must leave NO claim of a finished install behind.
+rm -f "$BIN.installed-by"
 if [ "$PERIODIC" = systemd ]; then mkdir -p "$UNIT_DIR"; fi
 if [ "$PERIODIC" = launchd ]; then mkdir -p "$AGENT_DIR" "$LOG_DIR"; fi
 echo "periodic:   ${PERIODIC}${PERIODIC_WHY:+  ($PERIODIC_WHY)}"
@@ -981,3 +985,10 @@ elif [ "$PERIODIC" = launchd ]; then
 else
   echo "next fire:  never on its own — no periodic trigger on this platform ($PERIODIC_WHY)"
 fi
+
+# GENERATION STAMP, part 2 of 2 -- KEEP THIS THE LAST COMMAND. hestia-deploy decides whether
+# to re-run this installer by comparing the checkout's install.sh with this copy, because a
+# fix to the wrapper, the unit, the plist or the hook registration changes no byte of
+# inventory.py and would otherwise never reach a seat that already has one (GPT, hestia
+# PR #1071). Last, under `set -e`: its presence means every step above survived.
+install -m 0644 "$SRC_DIR/install.sh" "$BIN.installed-by"
