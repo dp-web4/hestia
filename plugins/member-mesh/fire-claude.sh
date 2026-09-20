@@ -64,9 +64,39 @@ LOG_DIR="$HOME/.local/state/hestia-mesh/logs"; mkdir -p "$LOG_DIR"
 # it was the only notice in the batch, the `exit 70` above meant the member was
 # not woken at all. Yesterday's repair could not catch this: its invariant is
 # derived from the fire templates, and the daemon has no fire template.
-DIGEST=$(python3 - "$PRIMER" <<'PY'
+# AND THEN A MEMBER JOINED THAT THIS WALL COULD NOT BE TAUGHT ABOUT (CBP, 2026-09-20).
+# `cbp-being` has held a mailbox since 2026-09-13 and no template named it, so 10 of its
+# 10 notices were withheld — nine of them `review_request`s pointing at its own appeals.
+# It appealed nine times in eleven hours, read the silence as a ruling, and reasoned on.
+# The 2026-07-27 repair could not catch it: Property A derives the member census from the
+# fire templates, and a being has none — it is woken by its own heartbeat. So the census
+# now lives in MEMBERS, beside this file, and each template takes "the roster minus me".
+# Adding a member is one edit there; Property C makes the test demand the rest.
+#
+# A ROSTER THAT CANNOT BE READ MUST NOT SILENTLY EMPTY THE ALLOWLIST. An unreadable file
+# would withhold every notice, which is the exact failure this wall keeps producing. So
+# the resolver raises, the fire aborts non-zero, and the primer is RETAINED for a retry
+# rather than drained into a prompt that was never told what it lost.
+MESH_ROSTER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/MEMBERS"
+DIGEST=$(python3 - "$PRIMER" "$MESH_ROSTER" "claude-code" <<'PY'
 import json,re,sys
-ALLOW={"kimi-code","codex","codex-cli"}
+ROSTER, ME = sys.argv[2], sys.argv[3]
+def _roster(path, me):
+    """The declared mesh minus this member. Never derived from who has sent."""
+    names = set()
+    with open(path, encoding="utf-8") as fh:          # raises -> fire aborts, primer kept
+        for line in fh:
+            line = line.split("#", 1)[0].strip()
+            if line:
+                names.add(line)
+    if me not in names:
+        # This member is not on its own roster: the file is for another mesh, or the id
+        # moved. Refusing is the only safe read — "everyone is a stranger" and "I am a
+        # stranger here" are the same byte pattern downstream, and one of them is a bug.
+        raise SystemExit(f"[fire] {ME}: not on the roster at {path} — refusing to filter "
+                         f"mail against a roster that does not know this member")
+    return names - {me}
+ALLOW = _roster(ROSTER, ME)
 # The daemon is admitted as a (sender, kind) PAIR, never as a bare name. `plugin_id`
 # is caller-supplied at hestia_connect and rejected only for "/" (handler.rs:345),
 # so "hestia" is a claimable id — and unlike every peer name above, one no real
@@ -124,7 +154,20 @@ for x in live:
         # already in the prompt, so the session can go read the full record.
         print(f"! WITHHELD id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} from={clean(x.get('from_plugin',''))} — sender not on this member's allowlist; pointer withheld, full record in the primer JSON")
 PY
-)
+) || {
+  # THE SCRIPTS RUN UNDER `set -u`, NOT `set -e` (found while writing this, 2026-09-20).
+  # So a resolver that raises leaves DIGEST empty and falls into the `ack-only` line
+  # below — `exit 0`, which hestia-watch-member.sh reads as success and which DELETES
+  # the consume-once primer. That is bit-for-bit the 2026-07-27 destruction this file
+  # exists to prevent, and moving the allowlist into a file would have re-opened it.
+  # The status of the substitution is therefore branched on EXPLICITLY, and the two
+  # empty-DIGEST causes — "nothing to say" and "could not decide what to say" — are
+  # never again spelled with the same exit code.
+  echo "[fire-claude] REFUSING: could not resolve the sender roster ($MESH_ROSTER) — the
+  primer is RETAINED unfiltered rather than drained into a prompt that was never told
+  what it lost. Fix the roster, or the member id this template declares." >&2
+  exit 70
+}
 [ -n "$DIGEST" ] || { echo "[fire-claude] ack-only batch — not firing"; exit 0; }
 # FIREWORTHINESS IS DERIVED BY EXCLUSION (2026-08-06, kimi review of PR #216).
 # This counted `^- `: an enumeration of the line prefixes that existed the day it was

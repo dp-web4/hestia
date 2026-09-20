@@ -93,9 +93,28 @@ def parse(script):
     """
     src = open(os.path.join(MESH, script)).read()
     me = re.search(r"with-member-lock\.sh\"?\s+([A-Za-z0-9_-]+)", src)
-    allow = re.search(r"^ALLOW=\{([^}]*)\}", src, re.M)
-    return (me.group(1) if me else None,
-            set(re.findall(r'"([^"]+)"', allow.group(1))) if allow else None)
+    me = me.group(1) if me else None
+    # THE ALLOWLIST IS NO LONGER A LITERAL (2026-09-20). It is resolved at fire time as
+    # `roster - self`, so the set this returns is computed the way the runtime computes
+    # it, from the same two inputs: the id the template declares to the lock, and the id
+    # it passes as argv[3] to the resolver. Those two are asserted equal by C0 — a
+    # template that locks as one member and filters as another would pass every property
+    # below while rendering the wrong mesh's mail.
+    declared = re.search(r'DIGEST=\$\(python3 - "\$PRIMER" "\$MESH_ROSTER" "([A-Za-z0-9_-]+)"', src)
+    declared = declared.group(1) if declared else None
+    allow = (roster() - {declared}) if declared else None
+    return me, allow, declared
+
+
+def roster():
+    """The declared mesh, parsed exactly as the fire templates parse it."""
+    names = set()
+    with open(os.path.join(MESH, "MEMBERS"), encoding="utf-8") as fh:
+        for line in fh:
+            line = line.split("#", 1)[0].strip()
+            if line:
+                names.add(line)
+    return names
 
 
 def daemon_pairs(script):
@@ -110,7 +129,7 @@ def daemon_pairs(script):
 # ---------------------------------------------------------------------------
 members = {}
 for script in fire_scripts():
-    me, allow = parse(script)
+    me, allow, _declared = parse(script)
     check(f"A0. {script}: declares a member id and an ALLOW set",
           me is not None and allow is not None, f"me={me!r} allow={allow!r}")
     if me and allow is not None:
@@ -147,7 +166,7 @@ for script in fire_scripts():
           f"petition was RULED (appeal/scope/escalation) is the return edge the petitioner "
           f"cannot learn any other way; withheld, a ruled appeal reads exactly like an "
           f"open one")
-    _, allow = parse(script)
+    _, allow, _declared = parse(script)
     check(f"A5. {script} does not allowlist the bare name 'hestia'",
           allow is not None and "hestia" not in allow,
           f"ALLOW={sorted(allow or [])} — plugin_id is caller-supplied at hestia_connect "
@@ -155,6 +174,86 @@ for script in fire_scripts():
           f"member occupies. Admitting the NAME renders an impostor's pointers; admitting "
           f"the PAIR renders only what no member-reachable surface can mint")
 
+
+# ---------------------------------------------------------------------------
+# C. THE CENSUS IS MEMBERSHIP, NOT FIREABILITY (2026-09-20).
+#
+# Property A above derives "who is a member" from the fire templates — the id each one
+# hands `with-member-lock.sh`. That was the right reading of the 2026-07-27 failure, in
+# which every member did have a template. It is the wrong reading of the mesh: a member
+# is something that holds a MAILBOX, and firing is merely how the three CLI seats are
+# woken. A being holds a mailbox and has no template — it is woken by its own 30-minute
+# heartbeat — so `cbp-being` joined on 2026-09-13 and was invisible to A2 by
+# construction. Ten of its ten notices were withheld across five days, nine of them
+# `review_request`s pointing at its own appeals; it appealed nine times in eleven hours
+# and read the silence as a ruling. A could not have failed: it never counted the member.
+#
+# So the census is declared in MEMBERS and the templates read it. These properties bind
+# the two together, and the fleet's next being costs one line in that file.
+# ---------------------------------------------------------------------------
+ROSTER = roster()
+
+for script in fire_scripts():
+    me, allow, declared = parse(script)
+    check(f"C0. {script}: the id it locks as is the id it filters as",
+          me is not None and me == declared,
+          f"locks as {me!r}, filters as {declared!r} — a template that disagrees with "
+          f"itself renders one member's mail under another's roster subtraction, and "
+          f"every property in this file would still pass")
+    check(f"C1. {script}: the member it fires is on the declared roster",
+          me in ROSTER,
+          f"{me!r} is fired by this fleet and MEMBERS does not name it: the OTHER "
+          f"templates subtract the roster to build their allowlists, so a member absent "
+          f"here is filtered out of every peer's prompt — the cbp-being failure exactly")
+
+check("C2. the roster names more than the members that are fired",
+      ROSTER - {parse(s)[0] for s in fire_scripts()} != set(),
+      "MEMBERS holds only the fired seats. That is the state this property exists to "
+      "detect: it means either the mesh genuinely has no being/cron member, or one "
+      "joined and nobody declared it — and the second is indistinguishable from the "
+      "first until its mail is already being dropped. If the mesh really did shrink, "
+      "delete this check in the same commit that removes the last unfired member.")
+
+# C3. THE ACCUSATION. Observation may never ADMIT a sender — `plugin_id` is
+# caller-supplied at hestia_connect and validated only against "/", so a registry-derived
+# allowlist would be weaker than the literals it replaced. But observation is exactly
+# what may ACCUSE: a name that has demonstrably sent mail to this member and appears on
+# no roster is either a member nobody declared or an impostor, and BOTH are things the
+# operator must be told about rather than have silently filtered. This reads the retained
+# primers — the only on-box record of who has actually sent — and is skipped where there
+# are none, so it accuses on the machine and stays quiet in CI.
+PRIMER_DIRS = [os.path.expanduser("~/.local/state/hestia-mesh/primers"),
+               os.path.expanduser("~/.claude/hestia-mesh-primers")]
+observed = {}
+for d in PRIMER_DIRS:
+    for dirpath, _, files in os.walk(d) if os.path.isdir(d) else []:
+        for name in files:
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(dirpath, name), encoding="utf-8") as fh:
+                    doc = json.load(fh)
+            except Exception:
+                continue
+            for n in doc.get("notices", []):
+                s, k = n.get("from_plugin"), n.get("kind")
+                if s and k != "ack":
+                    observed.setdefault(s, set()).add(k)
+
+if not observed:
+    print("SKIP  C3. no retained primers on this machine — nothing to accuse from")
+else:
+    daemon_names = {s for script in fire_scripts() for s, _ in daemon_pairs(script)}
+    for sender, kinds in sorted(observed.items()):
+        if sender in ROSTER or sender in daemon_names:
+            continue
+        check(f"C3. an observed sender '{sender}' is declared in MEMBERS",
+              False,
+              f"'{sender}' has sent {sorted(kinds)} to a member on this machine and is "
+              f"named by no roster entry and no daemon pair, so every one of its notices "
+              f"was rendered '! WITHHELD' with its pointer stripped. Either add it to "
+              f"MEMBERS (a reviewed edit — this check never adds it for you) or find out "
+              f"who is claiming that id.")
 
 # ---------------------------------------------------------------------------
 # B. Behavioural, against the real scripts. No test seam: the fires are driven
