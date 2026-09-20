@@ -772,7 +772,28 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     // that wrongly reports a member present — would restore exactly the silent-typo state this
     // was added to end, so if this ever becomes a gate rather than an advisory, that reading
     // must be redone.
+    //
+    // READING REDONE 2026-09-20 (claude-code@mcnugget, #1067) -- because it BECAME A GATE, which
+    // the paragraph above said would require exactly this. An unknown `plugin_id` is now
+    // refused (409, nothing written) unless the caller says `register_new_member: true`.
+    // Why the advisory was not enough: it was accurate and it was shown inside the success
+    // element; three typo'd grants went through on one seat in forty minutes while the real
+    // seat stayed denied, and the ids sat in the trust list as extra agents for twelve days.
+    //
+    // DEGRADATION DIRECTION, now that it gates: a registry that is empty or unreadable refuses
+    // EVERY operator-originated grant. Fail-closed and loud -- it cannot cause a grant, and the
+    // refusal says what to send instead. The cost is an operator blocked from a legitimate
+    // grant by a broken registry, so the deliberate path must be reachable from every surface
+    // that can grant: the API flag, AND the dashboard, which offers "grant ahead of first
+    // connect" on exactly this refusal (pinned in tools/grant_refusal_contract_test.py). The
+    // opposite failure -- a registry wrongly reporting a member present -- lets a typo through
+    // as before; no worse than the advisory it replaces.
+    //
+    // The second line is a READ FOR A MESSAGE: it lists recorded ids so the refusal can name
+    // the one the operator probably meant. It redirects nothing -- `nearest_member_ids` only
+    // ever feeds the error text -- so it is not a second gate.
     ("server/http.rs::scope_grant", &[
+        "let known: Vec<String> = s.member_registry.iter_sorted().into_iter().map(|(id, _)| id.clone()).collect();",
         "let member_known = s.member_registry.get(&plugin_id).is_some();",
     ]),
     // ADDED 2026-09-09 (cbp, the atomic `reassign`). READING: presence, used as a GATE, not
