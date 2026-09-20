@@ -150,6 +150,28 @@ def behaviour() -> None:
     check("agent-unknown: ...and the report's other filing survives as a claim, not a group",
           urow.get("alsoFiledUnder"), ["dormant_plugin"])
     check("agent-unknown: drawn exactly once", sum(r["atlasId"] == "claude" for g in m["groups"] for r in g["rows"]), 1)
+    # A BEING (atlas `kind: being`). Its gap is its own; its governance id is per seat and comes
+    # from its launcher, so an unprovisioned one has none -- and must not be told "no hestia
+    # plugin" (it needs none), nor be dropped because no older group claims it.
+    being = {"status": "GAP", "governed": ["claude"],
+             "gaps": {"unprovisioned_being": ["sage"]},
+             "detail": [agent("claude", "claude-code", True),
+                        agent("sage", None, True, {"harness": "SAGE", "kind": "being", "fails_open": False},
+                              kind="being", launchers=[])]}
+    mb = run_model(being)
+    bk = {g["key"]: g for g in mb["groups"]}
+    brow = ((bk.get("unprovisioned_being") or {}).get("rows") or [{}])[0]
+    check("being: an unprovisioned being is drawn in its own group", brow.get("atlasId"), "sage")
+    check("being: tagged as a being, with no governance id invented for it",
+          (brow.get("being"), brow.get("governanceId")), (True, ""))
+    check("being: never 'unclassified' -- the report DID classify it", "unclassified" in bk, False)
+    gov = dict(being, governed=["claude", "sage"], gaps={},
+               detail=[being["detail"][0], agent("sage", "legion-being", True, {"harness": "SAGE", "kind": "being"},
+                                                 kind="being", launchers=[{"unit": "u", "member": "legion-being"}])])
+    grow = [r for g in run_model(gov)["groups"] if g["key"] == "governed" for r in g["rows"] if r["atlasId"] == "sage"]
+    check("being: a governed one shows its PER-SEAT id, not `sage`",
+          [(r["governanceId"], r["launchers"]) for r in grow], [("legion-being", 1)])
+
     # GAP outranks UNKNOWN in the inventory's status, so status alone cannot raise the banner.
     m = run_model(dict(amb, status="GAP"))
     check("agent-unknown under status=GAP: banner still up, row still there",

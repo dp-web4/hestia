@@ -1085,6 +1085,89 @@ def test_no_raw_path_in_printed_output():
         del RAW_OK["WORKSPACE"]
 
 
+# --- beings (atlas `kind: being`) ---------------------------------------------------
+# A being has no hook config, so every question `inspect` asks of a harness has no answer
+# for it -- and the answer it would give is "ungovernable here, no plugin exists", which is
+# wrong in the dangerous direction. What evidences a governed being is its LAUNCHER unit.
+_BEING_ATLAS = {"kind": "being", "blocking_capable": True, "fails_open": False}
+_SYSTEMD = """[Service]
+Environment=HESTIA_HOME=%h/.hestia
+ExecStart=/usr/bin/python3 -m sage.gateway.heartbeat --member legion-being --model qwen --instance x
+"""
+_PLIST = """<plist><dict><key>ProgramArguments</key><array>
+<string>/usr/bin/python3</string><string>-m</string><string>sage.gateway.heartbeat</string>
+<string>--member</string>
+<string>mcnugget-being</string></array></dict></plist>"""
+
+
+def test_a_being_is_found_by_its_launcher_not_by_a_hook():
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        units = {"sd": (d / "sage-heartbeat.service", _SYSTEMD), "pl": (d / "being.plist", _PLIST),
+                 "other": (d / "unrelated.service", "[Service]\nExecStart=/bin/true --member nobody\n"),
+                 "anon": (d / "anon.service", "ExecStart=python3 -m sage.gateway.heartbeat --gate-only\n")}
+        for path, text in units.values():
+            path.write_text(text)
+        U = lambda *k: [units[x][0] for x in k]
+        being = lambda us: inventory.inspect_being("sage", [], dict(_BEING_ATLAS), units=us)
+        # The being path also looks for a from-source binary under the WORKSPACE. Point it at
+        # the fixture, or this test reads the machine it runs on (it did: the first run found
+        # McNugget's real sage-daemon and called the fixture "unprovisioned").
+        saved_ws, inventory.WORKSPACE = inventory.WORKSPACE, d / "ws"
+        (d / "ws").mkdir()
+        try:
+            _being_cases(d, U, being)
+        finally:
+            inventory.WORKSPACE = saved_ws
+
+
+def _being_cases(d, U, being):
+
+    r = being(U("sd", "other"))
+    check("being/systemd: the member id is read off the launcher", r["members"], ["legion-being"])
+    check("being/systemd: that id IS the governance id -- per seat, not `sage`", r["plugin"], "legion-being")
+    check("being/systemd: launched through its gateway = governed", (r["installed"], r["governed"]), (True, True))
+    check("being/systemd: a unit that merely says --member is not a launcher", len(r["launchers"]), 1)
+    check("being/systemd: HESTIA_* set -> no law-source finding", inventory.has_tag(r["findings"], "LAW-SOURCE"), False)
+
+    r = being(U("pl"))
+    check("being/launchd: sibling <string> args parse to the same id", r["members"], ["mcnugget-being"])
+    # Replicated on Sprout and CBP (agent-atlas PR #1): no HESTIA_* in the unit, so the gate
+    # client resolves the law from a source checkout, not the installed copy.
+    check("being/launchd: no HESTIA_* in the unit is a finding", inventory.has_tag(r["findings"], "LAW-SOURCE"), True)
+
+    r = being(U("anon"))
+    check("being: a launcher with no --member is UNKNOWN, never governed",
+          (r["governed"], bool(r["unknown"]), r["plugin"]), (False, True, None))
+
+    r = being(U("sd", "pl"))
+    check("being: two ids on one seat -> no id is picked", (r["plugin"], r["governed"], len(r["members"])), (None, False, 2))
+
+    r = being(U("other"))
+    check("being: no launcher, no executable -> not installed, and silent",
+          (r["installed"], r["unprovisioned"], r["findings"]), (False, False, []))
+
+    # The atlas must SAY the gate blocks and fails closed; a launcher alone is not enough.
+    r = inventory.inspect_being("sage", [], {"kind": "being"}, units=U("sd"))
+    check("being: launcher + an atlas that does not vouch for the gate -> unknown, not governed",
+          (r["governed"], bool(r["unknown"])), (False, True))
+
+    # A being the atlas names and this file has no launcher row for.
+    r = inventory.inspect_being("some_other_being", [], dict(_BEING_ATLAS), units=U("sd"))
+    check("being with no BEING_LAUNCHERS row says it cannot tell", (r["governed"], bool(r["unknown"])), (False, True))
+
+    # THIS SEAT'S STATE, 2026-09-20: the daemon binary exists and nothing launches a being.
+    exe = d / "bin" / "sage-daemon"; exe.parent.mkdir(); exe.write_text("#!/bin/sh\n"); exe.chmod(0o755)
+    r = inventory.inspect_being("sage", [str(exe.parent)], dict(_BEING_ATLAS), units=U("other"))
+    check("being: daemon present, no launcher -> installed, NOT governed, and named",
+          (r["installed"], r["governed"], r["unprovisioned"], inventory.has_tag(r["findings"], "UNPROVISIONED")),
+          (True, False, True, True))
+    gaps = inventory.classify([r])
+    check("classify: an unprovisioned being has its OWN gap", gaps["unprovisioned_being"], ["sage"])
+    check("classify: and is never 'ungovernable -- no plugin exists'; it needs none",
+          (gaps["ungovernable"], gaps["ungoverned"], gaps["dormant_plugin"]), ([], [], []))
+
+
 def test_generation_stamp_brackets_the_install():
     """hestia-deploy reruns this installer when `$BIN.installed-by` differs from the checkout's
     install.sh (GPT, PR #1071: a fix to the wrapper, unit, plist or hook registration changes
@@ -1131,6 +1214,7 @@ if __name__ == "__main__":
     test_helpers_are_defined_before_first_use()
     test_no_raw_path_in_printed_output()
     test_generation_stamp_brackets_the_install()
+    test_a_being_is_found_by_its_launcher_not_by_a_hook()
     test_unit_verdict()
     with tempfile.TemporaryDirectory() as d:
         test_verdict(Path(d))
