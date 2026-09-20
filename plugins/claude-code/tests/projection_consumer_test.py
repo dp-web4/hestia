@@ -146,6 +146,66 @@ def test_the_projection_wins_and_role_is_launch_context() -> None:
         check("configured_hook_no_traceback", "Traceback" not in r.stderr, r.stderr[-300:])
 
 
+def test_a_launch_role_outside_the_vaults_permitted_set_is_a_miswire() -> None:
+    """Arm 6. Role stays launch context (arm 4), but launch context is not a blank cheque.
+
+    The role decides WHICH LAW APPLIES, and until now the launcher could name any string:
+    an unpublished one is silently normalised to `member` by the daemon, splitting a
+    member's acts across two trust grains (PR #66). When the vault names the set this seat
+    may launch under, a role outside it is refused here rather than normalised downstream.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        write_projection(home, env={
+            "HESTIA_ROLE_PERMITTED": "role:constellation:interactive-dev,role:constellation:mesh-worker",
+        })
+        env = projection_env(home, HESTIA_ROLE="role:constellation:sovereign")
+        r = run_hook(env)
+        check("role_outside_set_rc2", r.returncode == 2, f"rc {r.returncode}: {r.stderr[-300:]!r}")
+        check("role_outside_set_names_rule", "[config.miswired]" in r.stderr, r.stderr[-300:])
+        check("role_outside_set_names_the_role", "sovereign" in r.stderr, r.stderr[-300:])
+        check("role_outside_set_no_traceback", "Traceback" not in r.stderr, r.stderr[-300:])
+
+
+def test_a_permitted_role_passes_and_an_unbounded_one_says_it_is_unbounded() -> None:
+    """Arm 7, the control for arm 6 — without it the change could be "refuse every role".
+
+    Two halves. A role IN the declared set runs and is marked verified. A projection that
+    declares NO set leaves today's behaviour exactly as it is and records that it did:
+    tamper-EVIDENT, which is the honest limit `seat_config.rs` sets for this mechanism.
+    A reader must be able to tell a verified role from an unbounded one; if both looked the
+    same, silence would mean nothing.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        write_projection(home, env={
+            "HESTIA_ROLE_PERMITTED": "role:constellation:interactive-dev,role:constellation:mesh-worker",
+        })
+        env = projection_env(home, HESTIA_ROLE="role:constellation:mesh-worker")
+        got = probe_env(env, ["HESTIA_ROLE", "HESTIA_ROLE_VERIFIED", "HESTIA_ROLE_PERMITTED"])
+        check("permitted_role_loads", got["err"] is None, str(got["err"]))
+        check("permitted_role_survives", got["env"].get("HESTIA_ROLE") == "role:constellation:mesh-worker",
+              f"the bound overrode the launch role: {got['env']}")
+        check("permitted_role_marked_verified", got["env"].get("HESTIA_ROLE_VERIFIED") == "1",
+              f"a bounded role must be legible as bounded: {got['env']}")
+        check("the_bound_is_not_exported_as_config",
+              got["env"].get("HESTIA_ROLE_PERMITTED") in (None, ""),
+              f"the permitted set leaked into the seat's environment: {got['env']}")
+        r = run_hook(env)
+        check("permitted_role_passes_config_check", "[config." not in r.stderr, r.stderr[-300:])
+
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        write_projection(home, env={})          # no set declared: today's behaviour, unchanged
+        env = projection_env(home, HESTIA_ROLE="role:anything:at:all")
+        got = probe_env(env, ["HESTIA_ROLE", "HESTIA_ROLE_VERIFIED"])
+        check("unbounded_role_still_runs", got["err"] is None, str(got["err"]))
+        check("unbounded_role_survives", got["env"].get("HESTIA_ROLE") == "role:anything:at:all",
+              f"an undeclared set must not start refusing roles: {got['env']}")
+        check("unbounded_role_marked_unverified", got["env"].get("HESTIA_ROLE_VERIFIED") == "0",
+              f"silence must mean something: {got['env']}")
+
+
 def test_the_witness_hook_shares_the_contract() -> None:
     with tempfile.TemporaryDirectory() as raw:
         home = stage_home(Path(raw))

@@ -136,9 +136,44 @@ def _load_projection(plugin_id):
     if projected.get("HESTIA_PLUGIN_ID", plugin_id) != plugin_id:
         return ("config.miswired", f"projection {path} says HESTIA_PLUGIN_ID="
                 f"{projected['HESTIA_PLUGIN_ID']!r} but this seat is {plugin_id!r}")
+    # THE ROLE IS LAUNCH CONTEXT, AND LAUNCH CONTEXT IS NOT A BLANK CHEQUE.
+    #
+    # Role stays out of the export loop below, for the reason given at the top of this file:
+    # which role a seat runs under (interactive vs mesh-worker) is decided by whoever launched
+    # it, and the vault cannot know that. That reasoning is sound and this does not change it.
+    # A 2026-09-20 audit read the carve-out as config escaping vault authority; re-reading it,
+    # the carve-out is right and the hole is next to it.
+    #
+    # What "launch context" never established is a BOUND. Today the launcher supplies any
+    # string it likes; an unpublished one is silently normalised to `member` by the daemon,
+    # splitting that member's acts across two trust grains (the 1140-outcomes split, PR #66);
+    # and on this machine the value arrives from a hook line reading
+    # `${HESTIA_ROLE:-role:constellation:interactive-dev}` — a default in a host file the
+    # governed seat can write, which is #943's pattern one layer further out. The role decides
+    # WHICH LAW APPLIES, so it is the one value where an unchecked default is not a
+    # convenience.
+    #
+    # So: the vault declares which roles this seat MAY launch under; the launcher still
+    # chooses among them. A projection naming the set makes an out-of-set role a miswire. A
+    # projection that names none leaves today's behaviour exactly as it is and records that it
+    # did — tamper-EVIDENT, the honest limit `seat_config.rs` sets for this whole mechanism.
+    #
+    # An absent role is deliberately NOT refused here. Making it fail closed would deny every
+    # seat whose launcher never set one, and an early refusal reorders every later one; that
+    # belongs in a change that converts the launchers first.
+    live_role = os.environ.get("HESTIA_ROLE", "")
+    permitted = [r.strip() for r in projected.get("HESTIA_ROLE_PERMITTED", "").split(",") if r.strip()]
+    if permitted and live_role not in permitted:
+        shown = repr(live_role) if live_role else "(unset)"
+        return ("config.miswired", f"this seat was launched as HESTIA_ROLE={shown} but projection "
+                f"{path} permits only {permitted}; the role decides which law applies, so an "
+                "unlisted one is refused here rather than normalised downstream")
+    # Silence means something: a reader can tell a verified role from an unbounded one.
+    os.environ["HESTIA_ROLE_VERIFIED"] = "1" if permitted else "0"
+
     for k, v in projected.items():
-        if k == "HESTIA_ROLE":
-            continue   # launch context, never config
+        if k in ("HESTIA_ROLE", "HESTIA_ROLE_PERMITTED"):
+            continue   # launch context and its bound, checked above — never exported as config
         os.environ[k] = v
     os.environ["HESTIA_PROJECTION_SHA256"] = digest
     os.environ["HESTIA_PROJECTION_PATH"] = path
