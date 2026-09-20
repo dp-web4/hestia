@@ -2794,7 +2794,11 @@ async fn scope_decide(
     )
 }
 
-/// `POST /api/scope/grant` {plugin_id, path, reason, expires_in_secs?}
+/// `POST /api/scope/grant` {plugin_id, path, reason, expires_in_secs?, grant_ahead_of_connect?}
+///
+/// An unknown `plugin_id` is refused (409, nothing written) unless `grant_ahead_of_connect` is
+/// the boolean `true` (#1067). The flag registers NOTHING: no member is minted, and the 200
+/// still says `member_known: false`. It only says the operator meant it.
 ///
 /// THE OPERATOR'S OWN GRANT — no `request_id`, because no member asked.
 ///
@@ -3549,17 +3553,19 @@ async fn scope_grant(
     // as a success.
     //
     // Granting ahead of a first connect is still legitimate, so it is still possible: say so,
-    // with `register_new_member: true`. What changes is which of the two outcomes needs a
+    // with `grant_ahead_of_connect: true`. What changes is which of the two outcomes needs a
     // deliberate extra word -- it used to be the safe one.
     let ahead_of_connect = body
-        .get("register_new_member")
+        .get("grant_ahead_of_connect")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     if !member_known && !ahead_of_connect {
         // One line on purpose: tests/member_presence_census.rs pins registry reads by line, and
         // a chain split across five lines pins as a bare field access -- a pin that says nothing.
         #[rustfmt::skip]
-        let known: Vec<String> = s.member_registry.iter_sorted().into_iter().map(|(id, _)| id.clone()).collect();
+        // Fillers are left out: a custodial id the plane invokes is nobody to grant to, so the
+        // refusal must not suggest one (cbp's review of #1078).
+        let known: Vec<String> = s.member_registry.iter_sorted().into_iter().filter(|(id, _)| !s.member_registry.is_filler(id)).map(|(id, _)| id.clone()).collect();
         let nearest = nearest_member_ids(&plugin_id, &known);
         let hint = match nearest.as_slice() {
             [] => "No recorded member resembles it.".to_string(),
@@ -3572,7 +3578,7 @@ async fn scope_grant(
                 "error": format!(
                     "no member '{plugin_id}' has ever connected to this daemon, so this grant \
                      would reach nothing. {hint} Nothing was written. To grant ahead of a \
-                     member's first connect, resend with \"register_new_member\": true."
+                     member's first connect, resend with \"grant_ahead_of_connect\": true."
                 ),
                 "member_known": false,
                 "nearest": nearest,
@@ -7439,12 +7445,19 @@ mod disposition_tests {
         // Granting ahead of a first connect is still possible -- deliberately.
         let (status, body) = grant(&state, serde_json::json!({
             "plugin_id": "nomad-being", "path": "/w/nomad", "reason": "provisioning tomorrow",
-            "register_new_member": true})).await;
+            "grant_ahead_of_connect": true})).await;
         assert_eq!((status, &body["member_known"]), (StatusCode::OK, &serde_json::json!(false)), "{body}");
+        // The deliberate word REGISTERS NOTHING -- which is why it is not called `register_*`.
+        // The grant is recorded; the member is still nobody until it connects.
+        {
+            let s = state.lock().await;
+            assert!(s.has_scope_grant("nomad-being", "/w/nomad"));
+            assert!(s.member_registry.get("nomad-being").is_none(), "granting ahead mints no member");
+        }
         // ...and `false`, or a non-boolean, is not the deliberate word.
         for v in [serde_json::json!(false), serde_json::json!("true"), serde_json::json!(1)] {
             let (status, _) = grant(&state, serde_json::json!({
-                "plugin_id": "thor-being", "path": "/w/t", "reason": "r", "register_new_member": v})).await;
+                "plugin_id": "thor-being", "path": "/w/t", "reason": "r", "grant_ahead_of_connect": v})).await;
             assert_eq!(status, StatusCode::CONFLICT);
         }
     }

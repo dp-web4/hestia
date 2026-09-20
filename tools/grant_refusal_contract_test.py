@@ -11,8 +11,11 @@ unreadable would otherwise block every grant from the dashboard. So the dashboar
 deliberate path on exactly that refusal. What has to stay true of that offer:
 
   * it appears ONLY on a 409 that says `member_known: false`;
-  * the first send never carries `register_new_member` -- the flag is not a default;
+  * the first send never carries `grant_ahead_of_connect` -- the flag is not a default;
   * pressing the offered button re-sends the SAME form once, with the flag;
+  * the offer is about the form the daemon refused: once the member id, path or TTL says
+    anything else the press sends nothing and the offer leaves the screen, so an id the daemon
+    never refused cannot go out with the deliberate word (a reason edit keeps the offer);
   * the flag is one-shot: the next ordinary grant does not carry it -- INCLUDING when the
     press itself never reached the daemon (the form failed its own path check).
 
@@ -24,6 +27,7 @@ Run: python3 tools/grant_refusal_contract_test.py     (exit 1 on failure)
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -58,19 +62,41 @@ BLOCK
   const fill = () => { el('sg-plugin').value = 'Claude-code'; el('sg-path').value = '/w/repos'; el('sg-reason').value = 'r'; };
   fill();
   await el('sg-grant-btn').click();
-  log.push({ step: 'first send', sent: sent.length, flag: sent[0].body.register_new_member,
+  log.push({ step: 'first send', sent: sent.length, flag: sent[0].body.grant_ahead_of_connect,
              offered: el('sg-err').innerHTML.includes('sg-ahead-btn'), errShown: !el('sg-err').hidden });
   const script = JSON.parse(process.argv[2]);
   if (script === 'press') {
     await el('sg-err').fire('click', { target: { id: 'sg-ahead-btn' } });
-    log.push({ step: 'pressed', sent: sent.length, flag: sent[1] && sent[1].body.register_new_member,
+    log.push({ step: 'pressed', sent: sent.length, flag: sent[1] && sent[1].body.grant_ahead_of_connect,
                same: sent[1] && sent[1].body.plugin_id === 'Claude-code' && sent[1].body.path === '/w/repos' });
     fill();
     await el('sg-grant-btn').click();
-    log.push({ step: 'next ordinary grant', sent: sent.length, flag: sent[2] && sent[2].body.register_new_member });
+    log.push({ step: 'next ordinary grant', sent: sent.length, flag: sent[2] && sent[2].body.grant_ahead_of_connect });
   } else if (script === 'stray-click') {
     await el('sg-err').fire('click', { target: { id: 'something-else' } });
     log.push({ step: 'stray click in the error box', sent: sent.length });
+  } else if (script === 'edit-then-press' || script === 'edit-then-press-no-input-event') {
+    // The offer was made about the form the daemon refused. The operator reads "Did you mean
+    // 'claude-code'?", retypes the id, fumbles the retype -- and the offer is still sitting
+    // beside the stale message. Pressing it must NOT send an id the daemon never refused
+    // (cbp's review of #1078). The second variant changes the field with no `input` event at
+    // all (autofill, a script, the TTL <select>): the press itself must still compare.
+    el('sg-plugin').value = 'Xlaude-code';
+    if (script === 'edit-then-press') await el('sg-plugin').fire('input');
+    log.push({ step: 'after the edit', errShown: !el('sg-err').hidden,
+               offered: !el('sg-err').hidden && el('sg-err').innerHTML.includes('sg-ahead-btn') });
+    await el('sg-err').fire('click', { target: { id: 'sg-ahead-btn' } });
+    log.push({ step: 'pressed after the edit', sent: sent.length, errShown: !el('sg-err').hidden });
+    await el('sg-grant-btn').click();
+    log.push({ step: 'the edited form, sent ordinarily', sent: sent.length,
+               id: sent[1] && sent[1].body.plugin_id, flag: sent[1] && sent[1].body.grant_ahead_of_connect });
+  } else if (script === 'reason-edit-then-press') {
+    // The reason is not what was refused: improving it must not cost the operator the offer.
+    el('sg-reason').value = 'a better reason';
+    await el('sg-reason').fire('input');
+    await el('sg-err').fire('click', { target: { id: 'sg-ahead-btn' } });
+    log.push({ step: 'pressed after a reason edit', sent: sent.length,
+               flag: sent[1] && sent[1].body.grant_ahead_of_connect, reason: sent[1] && sent[1].body.reason });
   } else if (script === 'spent-by-a-failed-press') {
     // The press that does NOT reach the daemon: the form now fails its own path check. The flag
     // must be spent by that click anyway, or it rides along on the next ordinary grant.
@@ -79,7 +105,7 @@ BLOCK
     log.push({ step: 'press with a bad path', sent: sent.length });
     fill();
     await el('sg-grant-btn').click();
-    log.push({ step: 'the ordinary grant after it', sent: sent.length, flag: sent[1] && sent[1].body.register_new_member });
+    log.push({ step: 'the ordinary grant after it', sent: sent.length, flag: sent[1] && sent[1].body.grant_ahead_of_connect });
   }
   process.stdout.write(JSON.stringify(log));
 })();
@@ -114,8 +140,8 @@ GRANTED = {"status": 200, "body": {"ok": True, "member_known": False, "plugin_id
 def source_contract() -> None:
     blk = block()
     check("the flag is written in exactly one place, under the one-shot",
-          blk.count("register_new_member"), 2)   # the assignment + the comment naming it
-    check("...and that place is guarded by `ahead`", "if (ahead) body.register_new_member = true;" in blk)
+          blk.count("grant_ahead_of_connect"), 2)   # the assignment + the comment naming it
+    check("...and that place is guarded by `ahead`", "if (ahead) body.grant_ahead_of_connect = true;" in blk)
     check("the offer warns what a typo granted this way becomes", "shows up as a phantom agent" in blk)
 
 
@@ -141,6 +167,24 @@ def behaviour() -> None:
 
     log = run([REFUSED], "stray-click")
     check("a click elsewhere in the error box sends nothing", (log or [{}])[-1].get("sent"), 1)
+    for script in ("edit-then-press", "edit-then-press-no-input-event"):
+        log = run([REFUSED, REFUSED, GRANTED], script)
+        step = {s["step"]: s for s in log}
+        if script == "edit-then-press":
+            check("EDIT-THEN-PRESS: an edit to what was refused takes the offer off the screen",
+                  step.get("after the edit", {}).get("offered"), False)
+        check(f"{script}: a press after the edit sends NOTHING, and leaves no stale offer up",
+              (step.get("pressed after the edit", {}).get("sent"), step.get("pressed after the edit", {}).get("errShown")),
+              (1, False))
+        check(f"{script}: the edited id then goes out ordinarily -- no flag, so the daemon gets to refuse IT",
+              (step.get("the edited form, sent ordinarily", {}).get("sent"),
+               step.get("the edited form, sent ordinarily", {}).get("id"),
+               step.get("the edited form, sent ordinarily", {}).get("flag")), (2, "Xlaude-code", None))
+    log = run([REFUSED, GRANTED], "reason-edit-then-press")
+    check("a reason edit keeps the offer, and the press sends the new reason",
+          ((log or [{}])[-1].get("sent"), (log or [{}])[-1].get("flag"), (log or [{}])[-1].get("reason")),
+          (2, True, "a better reason"))
+
     log = run([REFUSED, GRANTED, GRANTED], "spent-by-a-failed-press")
     step = {s["step"]: s for s in log}
     check("a press that fails the form's own path check reaches no daemon",
@@ -156,6 +200,10 @@ def test_grant_refusal_contract() -> None:
     source_contract()
     if shutil.which("node"):
         behaviour()
+    elif os.getenv("CI"):
+        # Absence is not OK where it counts: on CI a missing node would skip every behavioural
+        # check and still exit 0 -- the shape ci.yml's own header names as the defect.
+        FAILS.append("no node on PATH under CI: the behaviour half did not run")
     assert not FAILS, "\n".join(FAILS)
 
 
@@ -166,7 +214,7 @@ def main() -> int:
         test_grant_refusal_contract()
     except AssertionError:
         pass
-    if not shutil.which("node"):
+    if not shutil.which("node") and not os.getenv("CI"):
         print("SKIPPED: behaviour -- no node on PATH (the source contract above still ran)")
     for f in FAILS:
         print("FAIL", f)

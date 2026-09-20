@@ -775,7 +775,7 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     //
     // READING REDONE 2026-09-20 (claude-code@mcnugget, #1067) -- because it BECAME A GATE, which
     // the paragraph above said would require exactly this. An unknown `plugin_id` is now
-    // refused (409, nothing written) unless the caller says `register_new_member: true`.
+    // refused (409, nothing written) unless the caller says `grant_ahead_of_connect: true`.
     // Why the advisory was not enough: it was accurate and it was shown inside the success
     // element; three typo'd grants went through on one seat in forty minutes while the real
     // seat stayed denied, and the ids sat in the trust list as extra agents for twelve days.
@@ -793,7 +793,7 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     // the one the operator probably meant. It redirects nothing -- `nearest_member_ids` only
     // ever feeds the error text -- so it is not a second gate.
     ("server/http.rs::scope_grant", &[
-        "let known: Vec<String> = s.member_registry.iter_sorted().into_iter().map(|(id, _)| id.clone()).collect();",
+        "let known: Vec<String> = s.member_registry.iter_sorted().into_iter().filter(|(id, _)| !s.member_registry.is_filler(id)).map(|(id, _)| id.clone()).collect();",
         "let member_known = s.member_registry.get(&plugin_id).is_some();",
     ]),
     // ADDED 2026-09-09 (cbp, the atomic `reassign`). READING: presence, used as a GATE, not
