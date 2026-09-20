@@ -285,6 +285,7 @@ MEMBER_ARG = re.compile(r"--member[ =]+[\"']?([A-Za-z0-9][A-Za-z0-9_.-]*)")
 # `being_gate_client._resolve_hestia_shared`). Any other HESTIA_* -- HESTIA_ROLE, say -- does
 # not move law resolution, so it must not quiet LAW-SOURCE.
 LAW_ENV_NAMES = ("HESTIA_GATE_SHARED", "HESTIA_SHARED_DIR", "HESTIA_HOME")
+ETC_SYSTEMD, LIB_SYSTEMD = Path("/etc/systemd"), Path("/usr/lib/systemd")
 UNIT_GLOBS = (
     ".config/systemd/user/*.service", ".local/share/systemd/user/*.service",
     "Library/LaunchAgents/*.plist",
@@ -331,6 +332,27 @@ def _env_names(assignments: str) -> set[str]:
     return {w.partition("=")[0] for w in words if "=" in w}
 
 
+def scope_config_dirs(u: Path) -> list[Path]:
+    """The dirs of `u`'s OWN manager scope that can hold its drop-ins, timers and enablement
+    links, lowest precedence first. A unit outside every known scope has only its own dir."""
+    user = [LIB_SYSTEMD / "user", HOME / ".local/share/systemd/user", ETC_SYSTEMD / "user",
+            HOME / ".config/systemd/user"]
+    system = [LIB_SYSTEMD / "system", ETC_SYSTEMD / "system"]
+    for dirs in (user, system):
+        if u.parent in dirs:
+            return dirs
+    return [u.parent]
+
+
+def _timer_fires(timer: Path, service: str) -> bool:
+    """Same-named, or says `Unit=<service>`. An unreadable timer fires nothing we can see."""
+    try:
+        named = [v for k, v in systemd_directives(timer.read_text(errors="replace")) if k == "Unit"]
+    except OSError:
+        return False
+    return service in named if named else timer.stem == service.rpartition(".")[0]
+
+
 def read_unit(u: Path) -> dict:
     """What one unit STARTS and what environment it starts it in. Raises OSError/ValueError.
 
@@ -352,7 +374,10 @@ def read_unit(u: Path) -> dict:
         env |= set(pl.get("EnvironmentVariables") or {})
         return {"commands": commands, "env": env, "outside": outside,
                 "enabled": False if pl.get("Disabled") is True else None}
-    dropins = sorted((u.parent / (u.name + ".d")).glob("*.conf"))
+    scope = scope_config_dirs(u)
+    # One drop-in per file NAME; the later dir in `scope` wins, as /etc does over /usr/lib.
+    dropins = sorted({f.name: f for d in scope for f in sorted((d / (u.name + ".d")).glob("*.conf"))}.values(),
+                     key=lambda f: f.name)
     installable = False
     for f in [u, *dropins]:
         for key, val in systemd_directives(f.read_text(errors="replace")):
@@ -374,14 +399,15 @@ def read_unit(u: Path) -> dict:
                 installable = True
     # File present != launched (Sprout: a oneshot fired by a same-named .timer). A fired session
     # has no user bus, so no `systemctl is-enabled` -- but enablement IS symlinks on disk.
-    timer = u.with_suffix(".timer")
-    names = [u.name] + ([timer.name] if timer.is_file() else [])
-    # The link may live in another dir of the same scope (unit in /usr/lib, link in /etc).
-    dirs = {u.parent, HOME / ".config/systemd/user", Path("/etc/systemd/user"), Path("/etc/systemd/system")}
+    timers = [t for d in scope for t in sorted(d.glob("*.timer")) if _timer_fires(t, u.name)]
+    names = {u.name} | {t.name for t in timers}
+    # The link may live in another dir of the SAME scope (unit in /usr/lib, link in /etc) -- and
+    # only there: a user-scope link enables nothing in the system manager (Sprout, PR #1076: the
+    # real ~/.config/systemd/user/timers.target.wants answered for a same-named unit elsewhere).
     linked = any((w / n).is_symlink() or (w / n).exists()
-                 for d in dirs for pat in ("*.wants", "*.requires") for w in d.glob(pat) for n in names)
+                 for d in scope for pat in ("*.wants", "*.requires") for w in d.glob(pat) for n in names)
     # No [Install] and no timer = a static unit something else may start: cannot tell -> None.
-    enabled = True if linked else (False if installable or timer.is_file() else None)
+    enabled = True if linked else (False if installable or timers else None)
     return {"commands": commands, "env": env, "outside": outside, "enabled": enabled}
 
 
@@ -398,6 +424,9 @@ def find_launchers(launcher_re: str, units: list[Path]) -> tuple[list[dict], lis
         if not starts:
             continue
         # The id comes from the SAME command that matched the launcher, nowhere else in the file.
+        # `ExecStart=/usr/bin/env HESTIA_HOME=/x python3 -m ...` sets it too: assignments standing
+        # BEFORE the entry point are environment; after it they are the being's own arguments.
+        cmd_env = set().union(*(_env_names(c[:re.search(launcher_re, c).start()]) for c in starts))
         members = sorted({m.group(1) for c in starts for m in [MEMBER_ARG.search(c)] if m})
         found.append({"unit": str(u), "member": members[0] if len(members) == 1 else None,
                       "members_in_unit": members,
@@ -405,7 +434,7 @@ def find_launchers(launcher_re: str, units: list[Path]) -> tuple[list[dict], lis
                       # LAW_ENV_NAMES makes the gate client fall through to a SOURCE CHECKOUT of
                       # the law instead of the installed copy the deploy maintains and attests.
                       # None = environment set somewhere this could not read: cannot tell.
-                      "sets_hestia_env": (True if unit["env"] & set(LAW_ENV_NAMES)
+                      "sets_hestia_env": (True if (unit["env"] | cmd_env) & set(LAW_ENV_NAMES)
                                           else None if unit["outside"] else False),
                       "env_outside_unit": unit["outside"],
                       "enabled_on_disk": unit["enabled"]})

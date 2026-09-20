@@ -1228,6 +1228,39 @@ def _being_parse_cases(d, being):
     (u.parent / "timers.target.wants" / u.with_suffix(".timer").name).symlink_to(u.with_suffix(".timer"))
     check("being/enabled: the .wants symlink IS enablement, readable with no bus", quiet(being([u])), True)
 
+    # Sprout, re-review: the lookup crossed scopes, so on the one seat that RUNS the being its real
+    # ~/.config/systemd/user/timers.target.wants/sage-heartbeat.timer answered for the fixture above.
+    saved = inventory.HOME, inventory.ETC_SYSTEMD, inventory.LIB_SYSTEMD
+    inventory.HOME, inventory.ETC_SYSTEMD, inventory.LIB_SYSTEMD = d / "home", d / "etc", d / "lib"
+    try:
+        def place(where, name, text):
+            where.mkdir(parents=True, exist_ok=True); (where / name).write_text(text); return where / name
+        TIMER = "[Timer]\nOnCalendar=hourly\n[Install]\nWantedBy=timers.target\n"
+        enabled_of = lambda u: being([u])["launchers"][0]["enabled_on_disk"]
+        user_cfg, user_lib = d / "home/.config/systemd/user", d / "lib/user"
+        place(user_cfg / "timers.target.wants", "sage-heartbeat.timer", "")
+        u = unit("[Service]\n" + LAUNCH); u.with_suffix(".timer").write_text(TIMER)
+        check("being/enabled: a seat's REAL user-scope link does not answer for a unit elsewhere", enabled_of(u), False)
+        s = place(d / "etc/system", "sage-heartbeat.service", "[Service]\n" + LAUNCH); place(s.parent, "sage-heartbeat.timer", TIMER)
+        check("being/enabled: nor for a same-named SYSTEM unit -- a user link enables nothing there", enabled_of(s), False)
+        l = place(user_lib, "sage-heartbeat.service", "[Service]\n" + LAUNCH); place(user_lib, "sage-heartbeat.timer", TIMER)
+        check("being/enabled: another dir of the SAME scope does (unit in lib, link in ~/.config)", enabled_of(l), True)
+        place(d / "etc/user" / (l.name + ".d"), "10-law.conf", "[Service]\nEnvironment=HESTIA_HOME=/h\n")
+        check("being/law: a drop-in in another dir of the same scope is part of the unit", law(being([l])), False)
+        o = place(user_lib, "other-being.service", "[Service]\n" + LAUNCH)
+        check("being/enabled: static, and no timer names it -> cannot tell", enabled_of(o), None)
+        place(user_lib, "hourly.timer", "[Timer]\nOnCalendar=hourly\nUnit=other-being.service\n[Install]\nWantedBy=timers.target\n")
+        check("being/enabled: a timer that names it with Unit= is followed", enabled_of(o), False)
+        place(user_cfg / "timers.target.wants", "hourly.timer", "")
+        check("being/enabled: and that timer's link is the enable", enabled_of(o), True)
+    finally:
+        inventory.HOME, inventory.ETC_SYSTEMD, inventory.LIB_SYSTEMD = saved
+
+    r = being([unit("[Service]\nExecStart=/usr/bin/env HESTIA_HOME=/x python3 -m sage.gateway.heartbeat --member legion-being\n")])
+    check("being/law: set on the launcher's own command line (env NAME=v ...) counts", (law(r), r["plugin"]), (False, "legion-being"))
+    r = being([unit("[Service]\n" + LAUNCH.rstrip() + " --note HESTIA_HOME=/x\n")])
+    check("being/law: AFTER the entry point it is an argument, not environment", law(r), True)
+
     hidden = _PLIST.replace("<plist>", "<plist><!-- <string>sage.gateway.heartbeat</string> -->").replace(
         "sage.gateway.heartbeat</string>\n", "not.the.gateway</string>\n")
     check("being/launchd: an XML comment is not a ProgramArgument", being([unit(hidden, "c.plist")])["launchers"], [])
