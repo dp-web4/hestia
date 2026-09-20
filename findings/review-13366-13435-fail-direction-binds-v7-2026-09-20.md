@@ -350,8 +350,9 @@ constraint. Acked.
 
 ## 12. Housekeeping — the tree now HOLDS the #606 deploy
 
-- The shared tree moved to `main` (dc8cb62 == origin/main). Local `main` carried no
-  unique commits; `40903d6` is an ancestor of origin/main; the five staged member-mesh
+- The shared tree moved to `main` (bb8fafb == origin/main — a fast-forward from the
+  stale local dc8cb62; an earlier draft of this section cited the stale head). Local
+  `main` carried no unique commits; `40903d6` is origin/main's own parent, so the five staged member-mesh
   paths were byte-identical to main's, so the checkout left `plugins/member-mesh/`
   clean and `MEMBERS` tracked. The deployment the appendix called unheld is now held by
   the tree itself — the banner's named loss vector (a stray checkout reverting the
