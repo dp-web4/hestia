@@ -191,6 +191,86 @@ def test_verdict(tmp: Path):
           inventory.has_tag(e["findings"], "DEAD_HOOK"), True)
 
 
+# --- unit: where the atlas is, and what a descriptor says ---------------------------
+# The atlas used to be one place, `<workspace>/agent-atlas/talk-to`, and the only way a
+# machine had it was for someone to remember to clone it. McNugget ran two months on the
+# narrower fallback because nobody had (measured 2026-09-19). The deploy now keeps its own
+# pinned checkout and points the inventory at it; these pin the precedence that makes that
+# safe -- explicit beats pinned beats default, and the default is unchanged.
+def test_resolve_atlas():
+    # No `tmp` parameter: pytest reads one as a fixture and errors before the body runs.
+    with tempfile.TemporaryDirectory() as d:
+        _resolve_atlas_cases(Path(d))
+
+
+def _resolve_atlas_cases(tmp: Path):
+    ws = tmp / "ws"
+    saved = os.environ.pop("HESTIA_ATLAS_DIR", None)
+    try:
+        check("atlas: default is the workspace clone",
+              inventory.resolve_atlas([], ws), (ws / "agent-atlas" / "talk-to", "workspace"))
+        os.environ["HESTIA_ATLAS_DIR"] = str(tmp / "pinned")
+        check("atlas: the deploy's pin wins over the default",
+              inventory.resolve_atlas([], ws), (tmp / "pinned", "env"))
+        check("atlas: --atlas X beats the pin",
+              inventory.resolve_atlas(["--atlas", str(tmp / "cli")], ws), (tmp / "cli", "argv"))
+        check("atlas: --atlas=X beats the pin",
+              inventory.resolve_atlas(["--brief", f"--atlas={tmp / 'cli'}"], ws),
+              (tmp / "cli", "argv"))
+        # An empty pin is what a unit template with an unfilled placeholder produces
+        # (`Environment=HESTIA_ATLAS_DIR=`). Path("") is the CURRENT DIRECTORY, so treating
+        # it as set would enumerate whatever the trigger happened to be standing in.
+        os.environ["HESTIA_ATLAS_DIR"] = ""
+        check("atlas: an EMPTY pin is no pin, not the current directory",
+              inventory.resolve_atlas([], ws), (ws / "agent-atlas" / "talk-to", "workspace"))
+    finally:
+        os.environ.pop("HESTIA_ATLAS_DIR", None)
+        if saved is not None:
+            os.environ["HESTIA_ATLAS_DIR"] = saved
+
+
+# `fails_open` is the field a caller ACTS on: a gate that assumes fail-open mis-gates the
+# five harnesses that fail closed. So both failure directions matter -- a missing descriptor
+# must not yield a default, and a malformed one must not raise and take the whole inventory
+# down from inside a SessionStart hook.
+def test_atlas_frontmatter():
+    with tempfile.TemporaryDirectory() as d:
+        _atlas_frontmatter_cases(Path(d))
+
+
+def _atlas_frontmatter_cases(tmp: Path):
+    atlas = tmp / "atlas"
+    good = atlas / "goodone"
+    good.mkdir(parents=True)
+    (good / "descriptor.md").write_text(
+        "---\nharness: Good One\nvendor: Acme\nblocking_capable: true\n"
+        "blocking_events: [PreToolUse, Stop]\nfails_open: false\nfidelity: documented\n"
+        "sources:\n  - https://example.invalid/docs\nnot_a_field: nope\n---\n\n# body\n"
+        "fails_open: true\n")
+    bad = atlas / "nofront"
+    bad.mkdir()
+    (bad / "descriptor.md").write_text("# no frontmatter at all\nfails_open: true\n")
+    saved = inventory.ATLAS
+    inventory.ATLAS = atlas
+    try:
+        got = inventory.atlas_frontmatter("goodone")
+        check("frontmatter: scalars",
+              (got.get("harness"), got.get("vendor"), got.get("fidelity")),
+              ("Good One", "Acme", "documented"))
+        check("frontmatter: booleans are booleans",
+              (got.get("blocking_capable"), got.get("fails_open")), (True, False))
+        check("frontmatter: inline list", got.get("blocking_events"), ["PreToolUse", "Stop"])
+        check("frontmatter: fields outside ATLAS_FIELDS are dropped", "not_a_field" in got, False)
+        check("frontmatter: a `fails_open:` line in the BODY does not override the header",
+              got.get("fails_open"), False)
+        check("frontmatter: no frontmatter -> absent, not defaulted",
+              inventory.atlas_frontmatter("nofront"), {})
+        check("frontmatter: missing descriptor -> absent, not raised",
+              inventory.atlas_frontmatter("ghost"), {})
+    finally:
+        inventory.ATLAS = saved
+
+
 # --- unit: the fallback enumeration ------------------------------------------------
 # The atlas guard used to be a hard `return` before search_roots(), so an atlas-less
 # machine got no findings at all — including the ones that never needed atlas. What it
@@ -497,6 +577,26 @@ def test_wrapper_shell_quoting():
     check("an inherited HESTIA_WORKSPACE still overrides the pin", back.stdout,
           "/tmp/from-env")
 
+    # The atlas pin (McNugget, 2026-09-19) is the same construct with one more case: it is
+    # OPTIONAL, so the wrapper carries AT_PIN='' on every seat that pinned nothing, and that
+    # empty string is passed to inventory.py unconditionally. Round-trip all three.
+    env = {k: v for k, v in os.environ.items() if k != "HESTIA_ATLAS_DIR"}
+    expr = 'printf %s "${HESTIA_ATLAS_DIR:-$AT_PIN}"'
+    back = subprocess.run(["/bin/sh", "-c", f"AT_PIN={r.stdout}\n{expr}"],
+                          capture_output=True, text=True, env=env)
+    check("the pinned atlas survives /bin/sh unchanged", back.stdout, probe)
+    empty = subprocess.run(["bash", "-c", m.group(0) + '\nsh_pin ""'],
+                           capture_output=True, text=True)
+    back = subprocess.run(["/bin/sh", "-c", f"AT_PIN={empty.stdout}\n{expr}"],
+                          capture_output=True, text=True, env=env)
+    check("no pinned atlas round-trips to EMPTY, which inventory.py reads as no pin",
+          (empty.stdout, back.stdout, back.returncode), ("''", "", 0))
+    env["HESTIA_ATLAS_DIR"] = "/tmp/atlas-from-env"
+    back = subprocess.run(["/bin/sh", "-c", f"AT_PIN={r.stdout}\n{expr}"],
+                          capture_output=True, text=True, env=env)
+    check("an inherited HESTIA_ATLAS_DIR still overrides the pin", back.stdout,
+          "/tmp/atlas-from-env")
+
 
 def test_unit_specifier_escaping():
     """A systemd unit is the THIRD syntax, not a second copy of the shell one.
@@ -635,7 +735,9 @@ _MAY_EXPAND = {
     # is a value reaching a syntax that cannot hold it — measured, a workspace path with a
     # backtick in it became command substitution in the shipped wrapper, run on every fire.
     # See the sh_pin block in install.sh.
-    "WRAP": frozenset({"SH_PYTHON", "SH_BIN", "SH_WORKSPACE"}),
+    # SH_ATLAS (McNugget, 2026-09-19): the deploy's pinned agent-atlas checkout, which is a
+    # path exactly as hostile as the workspace one and goes through sh_pin for the same reason.
+    "WRAP": frozenset({"SH_PYTHON", "SH_BIN", "SH_WORKSPACE", "SH_ATLAS"}),
     # The systemd --user unit: what to run and where from — and SD_*, because a unit file
     # is the third syntax, not a second copy of the shell one. `%` is legal in a path and
     # is a SPECIFIER here; measured, `50%off` reached ExecStart as `50ubuntuff` with the
@@ -983,6 +1085,24 @@ def test_no_raw_path_in_printed_output():
         del RAW_OK["WORKSPACE"]
 
 
+def test_generation_stamp_brackets_the_install():
+    """hestia-deploy reruns this installer when `$BIN.installed-by` differs from the checkout's
+    install.sh (GPT, PR #1071: a fix to the wrapper, unit, plist or hook registration changes
+    no byte of inventory.py, so the deploy would call the seat current forever). That only
+    means "this installer FINISHED here" if the stamp is dropped before anything is rewritten
+    and written after everything is. Both halves are positions, so both are pinned as such."""
+    src = (Path(__file__).parent / "install.sh").read_text()
+    code = [ln for ln in src.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    drop, write = 'rm -f "$BIN.installed-by"', 'install -m 0644 "$SRC_DIR/install.sh" "$BIN.installed-by"'
+    check("stamp: written by the LAST command in the file", code[-1], write)
+    check("stamp: written exactly once", code.count(write), 1)
+    check("stamp: dropped exactly once", code.count(drop), 1)
+    first_write = min(i for i, ln in enumerate(code)
+                      if ln.startswith(("install -m 0755", 'cat > "$BIN"')))
+    check("stamp: dropped before the first byte of the surface is rewritten",
+          drop in code and code.index(drop) < first_write, True)
+
+
 def teardown_module(module):
     """Deliver this file's accumulated failures to a harness that reads exceptions.
 
@@ -1010,11 +1130,14 @@ if __name__ == "__main__":
     test_printed_advice_is_pasteable()
     test_helpers_are_defined_before_first_use()
     test_no_raw_path_in_printed_output()
+    test_generation_stamp_brackets_the_install()
     test_unit_verdict()
     with tempfile.TemporaryDirectory() as d:
         test_verdict(Path(d))
     with tempfile.TemporaryDirectory() as d:
         test_periodic_trigger(Path(d))
+    test_resolve_atlas()
+    test_atlas_frontmatter()
     for f in FAILS:
         print("FAIL", f)
     print(f"{'FAILED' if FAILS else 'ok'}: {len(FAILS)} failure(s)")

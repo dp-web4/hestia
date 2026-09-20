@@ -170,8 +170,74 @@ def resolve_workspace(argv: list[str]) -> tuple[Path, str]:
 WORKSPACE = resolve_workspace([])[0]
 WORKSPACE_SOURCE = "cwd-unverified"
 ATLAS = WORKSPACE / "agent-atlas" / "talk-to"
+ATLAS_SOURCE = "workspace"
 PLUGINS = WORKSPACE / "hestia" / "plugins"
 HOME = Path.home()
+
+
+def resolve_atlas(argv: list[str], workspace: Path) -> tuple[Path, str]:
+    """Where the agent-atlas `talk-to/` registry is, and how we know.
+
+    It used to be one place: `<workspace>/agent-atlas/talk-to`. That is a WORKING clone --
+    seats add descriptors to it -- and the only way to guarantee a machine had one was for
+    someone to remember to clone it. Measured on McNugget 2026-09-19: no clone, so every run
+    for two months took the narrower fallback enumeration, and nothing said the clone was the
+    fix. A deploy cannot repair that by pinning the working clone: a tool that hard-resets a
+    tree people commit to is how ten raising sessions were lost on this seat. So the deploy
+    keeps its OWN pinned checkout and points the inventory at it here. An explicit location
+    wins; the workspace clone remains the default, so a seat with no deploy is unchanged.
+    """
+    for i, a in enumerate(argv):
+        if a == "--atlas" and i + 1 < len(argv):
+            return Path(argv[i + 1]), "argv"
+        if a.startswith("--atlas="):
+            return Path(a.split("=", 1)[1]), "argv"
+    pinned = os.getenv("HESTIA_ATLAS_DIR")
+    if pinned:
+        return Path(pinned), "env"
+    return workspace / "agent-atlas" / "talk-to", "workspace"
+
+
+# What a caller needs to know about a harness BEFORE wiring a gate into it, straight from
+# its atlas descriptor. `fails_open` is the one that matters most: a gate that assumes
+# "exit 2, fail-open" silently mis-gates the five harnesses that fail CLOSED.
+ATLAS_FIELDS = ("harness", "vendor", "lineage", "hook_engine", "blocking_capable",
+                "blocking_events", "fails_open", "config_path", "fidelity")
+
+
+def atlas_frontmatter(atlas_id: str) -> dict:
+    """The descriptor's YAML frontmatter, reduced to ATLAS_FIELDS. {} if unreadable.
+
+    Hand-parsed on purpose. Every descriptor in the registry is `key: value`, `key:` or
+    `  - item` (checked across all 45 on 2026-09-19), and this check runs from a
+    SessionStart hook under a pinned interpreter that may have no PyYAML. A dependency
+    that can be missing turns "could not read one descriptor" into "the inventory did not
+    run", which is the worse failure. Anything it cannot parse is simply absent.
+    """
+    try:
+        text = (ATLAS / atlas_id / "descriptor.md").read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    out: dict = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if ":" not in line or line.startswith((" ", "\t", "-")):
+            continue
+        key, _, val = line.partition(":")
+        key, val = key.strip(), val.strip()
+        if key not in ATLAS_FIELDS or not val:
+            continue
+        if val.startswith("[") and val.endswith("]"):
+            out[key] = [x.strip() for x in val[1:-1].split(",") if x.strip()]
+        elif val.lower() in ("true", "false"):
+            out[key] = val.lower() == "true"
+        else:
+            out[key] = val.strip("\"'")
+    return out
 
 # Plugin dirs that are shared machinery, not harness adapters.
 NOT_A_HARNESS_PLUGIN = {"lib", "member-mesh", "agent-inventory"}
@@ -1106,6 +1172,10 @@ def inspect(atlas_id: str, roots: list[str]) -> dict:
         "installed": exe is not None,
         "executable": exe,
         "config_dirs": [str(h) for h in homes],
+        # From the atlas descriptor, not inferred here: whether this harness can block at
+        # all, on which events, and above all whether it FAILS OPEN. Empty when the atlas is
+        # unreadable -- absent, never guessed.
+        "atlas": atlas_frontmatter(atlas_id),
         "configs_read": [],
         "wired": False,
         "roles_wired": {},
@@ -1439,7 +1509,7 @@ def emit(report: dict, brief: bool) -> int:
 
 
 def main() -> int:
-    global WORKSPACE, WORKSPACE_SOURCE, ATLAS, PLUGINS, REGISTRY
+    global WORKSPACE, WORKSPACE_SOURCE, ATLAS, ATLAS_SOURCE, PLUGINS, REGISTRY
     argv = sys.argv[1:]
     # Answered before anything else is resolved: install.sh calls this to derive the
     # SessionStart timeout instead of keeping a second copy of the number, so it must
@@ -1450,7 +1520,7 @@ def main() -> int:
     brief = "--brief" in argv
 
     WORKSPACE, WORKSPACE_SOURCE = resolve_workspace(argv)
-    ATLAS = WORKSPACE / "agent-atlas" / "talk-to"
+    ATLAS, ATLAS_SOURCE = resolve_atlas(argv, WORKSPACE)
     PLUGINS = WORKSPACE / "hestia" / "plugins"
     REGISTRY = Registry()
 
@@ -1499,6 +1569,7 @@ def main() -> int:
         "agent_enumeration": enumeration,
         "agent_enumeration_complete": enumeration_gap is None,
         "atlas": str(ATLAS),
+        "atlas_source": ATLAS_SOURCE,
         "exe_search_roots": roots,
         "config_scopes_read": sorted({c["path"] for r in recs
                                       for c in r["configs_read"]}),

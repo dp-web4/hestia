@@ -515,6 +515,8 @@ step_service_macos() {
   <key>EnvironmentVariables</key>
   <dict>
     <key>HESTIA_HOME</key><string>${HESTIA_HOME}</string>
+    <key>HESTIA_CURRENT_BUILD_FILE</key><string>${HESTIA_HOME}/current-build.json</string>
+    <key>HESTIA_WORKSPACE</key><string>${HESTIA_WORKSPACE:-}</string>
     <key>HOME</key><string>${HOME}</string>
     <key>RUST_LOG</key><string>warn</string>
   </dict>

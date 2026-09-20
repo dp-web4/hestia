@@ -275,3 +275,29 @@ hestia against; `web4.pin` is a release property and is not consulted here.
 | Legion | adopted; 65s cold at nice 15; found the mode-parser hole and the `enable --now` race |
 | mcnugget (macOS) | adopted via its port (`806f620`): `DEPLOYED 478 -> 484` (95s cold, `hooks=FAILED` on bash 3.2) then `484 -> 485 hooks=ok` in 40s through the launchd agent; found flock/stat/restart/BIN and the bash ≥ 4 prerequisite. The merged script here has not yet run on that seat. |
 | sprout, thor | unmeasured — check `command -v flock` (the fallback covers its absence, but say which path you run) |
+
+## Agent discovery: the atlas sibling and the inventory step
+
+Every cycle also keeps agent discovery installed, so a seat does not depend on somebody
+remembering to clone agent-atlas and run `plugins/agent-inventory/install.sh` by hand.
+
+- **`$DEPLOY_ROOT/agent-atlas`** — an OPTIONAL third sibling, cloned on first use from
+  `HESTIA_ATLAS_URL` (default: the public `dp-web4/agent-atlas`) and reset each cycle to the sha
+  in `deploy/agent-atlas.pin`. Unlike `web4` it is not a build input, so no failure here can stop
+  a deploy: the summary line reports `atlas <sha>(pinned)`, `unavailable(clone failed)`,
+  `<sha>(stale: fetch failed)` or `unpinned(pin … is not in the clone)` and the cycle continues.
+  It is the deploy's own clone on purpose — `<workspace>/agent-atlas` is a working tree that
+  seats add descriptors to, and this script hard-resets what it owns.
+- **The inventory step** runs wherever the members' install runs, and on the ordinary
+  `CURRENT` cycle. It reports `inventory=ok(current)`, `ok(<enumeration>)`, `skipped(<why>)`,
+  `refused(governed session)` or `FAILED(<why>)`. Its post-condition is the installed bytes
+  matching the checkout's `inventory.py`, not the installer's exit code.
+- **It needs `HESTIA_WORKSPACE` in the deploy unit** — the directory holding the seat's repos.
+  Both unit templates carry the key EMPTY: render it from explicit operator configuration. With
+  it empty the step says `skipped(no HESTIA_WORKSPACE in the deploy unit)`; set to something
+  that is not a directory it says so too. It never guesses one, because `install.sh` would pin
+  the guess into three triggers. `HESTIA_DEPLOY_INVENTORY=0` switches the step off.
+
+`inventory_step_test.py` runs both functions under `set -euo pipefail` through every failure
+above; `unit_templates_test.py` holds the launchd and systemd copies of each unit to the same
+environment keys and to a strict XML parse.

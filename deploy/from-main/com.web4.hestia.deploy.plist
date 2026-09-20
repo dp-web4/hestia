@@ -43,6 +43,12 @@
         <!-- The binary the service manager actually invokes. Not always ~/.local/bin/hestia. -->
         <key>HESTIA_BIN</key>
         <string>__HESTIA_BIN__</string>
+        <!-- The seat's workspace (the directory holding its repos), handed to the agent
+             inventory so the deploy can install discovery. Render it from explicit operator
+             configuration. Empty means the deploy says so and skips the step; it never
+             guesses one, because the guess would be pinned into three triggers. -->
+        <key>HESTIA_WORKSPACE</key>
+        <string></string>
         <!-- cargo first, then homebrew (git-lfs, gh, bash>=4), then the base system (git, curl). -->
         <key>PATH</key>
         <string>__HOME__/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
@@ -62,7 +68,7 @@
     <key>Nice</key>
     <integer>15</integer>
 
-    <!-- The analogue of `journalctl --user -u hestia-deploy`: the same lines the script
+    <!-- The analogue of journalctl on the hestia-deploy user unit: the same lines the script
          appends to ~/.hestia/deploy.log, plus cargo's tail on a build cycle. -->
     <key>StandardOutPath</key>
     <string>__HOME__/Library/Logs/hestia/deploy-agent.log</string>
