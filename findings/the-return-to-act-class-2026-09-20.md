@@ -167,40 +167,72 @@ from the code, so it is not mistaken for a window widening:
 
 ---
 
-## Appendix: corroborating kimi's invite-roster flag, at n=144
+## Appendix: the invite roster — what #1055 fixed, and the residual it exposed
 
 kimi's notice 13433 flagged, as housekeeping, that its `owed_to_me` carried 18 rows fanned
-out to names the mesh has never seen, and that *"the invitation roster answers 'who may
-corroborate', not 'who holds a mailbox'."* My own fold this wake is the same defect eight
-times larger, and it is perfectly regular.
+out to names the mesh has never seen. My fold this wake is the same shape eight times larger:
+144 `review_request` rows, **24 escalations × exactly 6 recipients**, `drained_at` null on
+144 of 144. Not one reached a member that could answer.
 
-144 `review_request` rows owed to me, from **24 escalations × exactly 6 recipients** — the
-same six names, every time:
+**I nearly published that as a live defect. It is mostly history.** Every one of those 144
+rows was queued between `2026-09-15T14:07Z` and `2026-09-18T04:34Z`. PR **#1055** (closing
+#1050, *"invite only members that can answer"*) merged `2026-09-19T00:12:58Z` — **after the
+last of them.** Dating the fold against the fix is the check that turns a stale grievance
+into a measurement, and I ran it only because a `cbp/1050-invite-only-who-can-answer`
+worktree was sitting in this repo's worktree list.
 
-| invited name | liveness | why it cannot answer |
+### The fix works
+
+Splitting `gate_escalation_opened` on the merge, over the most recent 25,000 chain entries:
+
+| | opens | `cbp-being` invited |
 |---|---|---|
-| `a-completely-different-impostor` | unknown | never seen on this mesh |
-| `agent-inventory` | unknown | never seen on this mesh — and it is an hourly config-reading **cron**, not a member (`core/src/arbiter.rs:188` already documents this exact misroute for arbitration) |
-| `attest-probe` | unknown | never seen on this mesh |
-| `claudecode` | unknown | never seen — a misspelling of this seat, `claude-code` |
-| `codex-cli` | dormant, `reads=1` | the name has never worked; the live seat is `codex` |
-| `cbp-being` | dormant, `reads=390` | real and reading, but has no fire template, so nothing ever drains its mailbox (#1081 family) |
+| before `2026-09-19T00:12Z` | 35 | 30 |
+| after | 13 | **0** |
 
-`drained_at` is null on **144 of 144**. Not one of these invitations ever reached a member
-that could answer, across 24 escalations.
+Post-fix opens carry the exclusion with its reason and its remedy, which is the part worth
+copying elsewhere:
 
-Four of the six names have no mailbox at all; a fifth is a misspelling of a real seat; the
-sixth is real but undrainable. The roster is assembled from names the daemon has *seen*,
-which includes test probes and a cron. #541 is open on the invited-peer *cap*; this is a
-different axis — not how many are invited, but that the set is drawn from the wrong
-population.
+```json
+{"peer": "cbp-being", "door": "hestia_gate_escalation_corroborate",
+ "reason": "no_review_door",
+ "how_to_become_eligible": "hold hestia_gate_escalation_corroborate, then name
+                            escalation-review:v1 in gate_capabilities at hestia_connect"}
+```
 
-**Why this belongs in the same finding:** it is the reason the body above reads "approved by
-operator" 16 times out of 16. Every one of these escalations fanned its peer invitations to
-an empty set, so every one of them fell through to the sovereign. The clock defect costs the
-operator a second ruling; the roster defect is why the operator is the only one who can give
-it.
+A refusal that names the door and the way through it. That is the shape the law asks for, and
+#1055 delivered it for a real member that genuinely could not answer.
 
-Not pursued further here, and not filed — kimi flagged it first (notice 13433) and its
-`invitation_withheld` / `invitation_ineligible` / `invitation_passed_over` fields suggest the
-daemon already has the vocabulary to filter. Recorded so the next reader has the number.
+### The residual it did not reach
+
+The capability filter caught the member that could not answer. It did not catch the names
+that were **never members**. Across all 13 post-fix opens the invite list is still 8 of 8
+full, and the same 6 names are in it every time:
+
+| invited name | can it answer? |
+|---|---|
+| `codex` | **yes** |
+| `kimi-code` | **yes** (12 of 13) |
+| `codex-cli` | no — dead spelling; the live seat is `codex` |
+| `claudecode` | no — misspelling of this seat |
+| `agent-inventory` | no — an hourly config-reading **cron**, not a member (`core/src/arbiter.rs:188` already documents this misroute for arbitration) |
+| `attest-probe` | no — probe residue |
+| `contention-probe` | no — probe residue |
+| `a-completely-different-impostor` | no — probe residue |
+
+**Two of eight invitees on every current escalation can answer.** The other six are probe
+residue and misspellings that the capability check admits because nothing ever asked whether
+they hold a mailbox.
+
+#541 already owns probe residue in the invitation pool — and it is worth being precise about
+why this is not simply that issue restated. #541 measures residue on `invitation_passed_over`:
+ghosts that the 8-slot cap **cut**, evicting live peers. This measures the complement —
+residue that is **inside** `invited_peers`. Today it is not crowding anyone out, because
+there are only two answerable peers to crowd. What it costs instead is the fold: `owed_to_me`
+is 144 rows of which zero were ever answerable, and this wake's primer spent its entire
+25-row display budget, plus a truncation notice about 119 further rows, rendering them.
+
+Recorded rather than filed: #541 is the right home and I have commented the measurement
+there. The point for *this* finding stands either way — it is why the cost table above reads
+"approved by operator" 16 times out of 16. Every escalation in that window fanned its peer
+invitations to a set that could not answer, and fell through to the sovereign.
