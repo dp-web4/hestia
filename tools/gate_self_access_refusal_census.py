@@ -34,7 +34,7 @@ for root in ROOTS:
 print(f"{len(denied)} results that ARE a gate-self-access refusal (anchored), "
       f"{len(calls)} tool_use indexed")
 shipped = g._bash_write_targets
-_, _, new_bwt, _ = resolver.make(g)
+new_bwt, _ = resolver.make(g)
 rows, seen = [], set()
 for tid, txt in denied:
     if tid not in calls: continue

@@ -26,26 +26,40 @@ CASES = [
  ("N var from env, never bound [HOLE]",       'echo hi > "$UNBOUND"; touch %s' % MARK),
  ("O cd $VAR then relative write [HOLE]",     'D=/home/dp/ai-workspace/hestia\ncd $D\necho x > %s' % MARK),
  ("P dest is ${BRACED}",                      'OUT=/tmp/safe.txt\ngit show HEAD:%s > "${OUT}"' % MARK),
- ("Q fanout over 32 loop words",              'for s in %s; do git show HEAD:%s > /tmp/o/$s; done' % (" ".join("w%d"%i for i in range(40)), MARK)),
+ ("Q fanout over 40 loop words [HOLE]",       'for s in %s; do git show HEAD:%s > /tmp/o/$s; done' % (" ".join("w%d"%i for i in range(40)), MARK)),
+ # --- codex's dissent on 22d1e3f55fde5acc, 2026-09-20 ---
+ ("R codex: binding is LATER [HOLE]",         'echo %s > "$OUT"; OUT=/tmp/safe.txt' % MARK),
+ ("S codex: binding is GUARDED [HOLE]",       'false && OUT=/tmp/safe.txt; echo %s > "$OUT"' % MARK),
+ ("T codex: prior binding control",           'OUT=/tmp/safe.txt; echo %s > "$OUT"' % MARK),
+ # --- three more binder holes, found while fixing codex's ---
+ ("U glob in the for words [HOLE]",           'for f in /home/dp/ai-workspace/hestia/plugins/_shared/*.py; do echo x > $f; done'),
+ ("V read rebinds after assignment [HOLE]",   'OUT=/tmp/safe.txt\nread OUT < /tmp/evil\necho %s > "$OUT"' % MARK),
+ ("W tilde value is not a literal [HOLE]",    'OUT=~/x.py\necho %s > "$OUT"' % MARK),
+ ("X binding inside an if body [HOLE]",       'if true; then OUT=/tmp/safe.txt; fi\necho %s > "$OUT"' % MARK),
 ]
 
 def row(cmd):
     v = g.classify("Bash", {"command": cmd}, cwd=CWD)
     return (v.classification, v.rule, v.resource)
 
+shipped = g._bash_write_targets
 before = [(n, row(c)) for n, c in CASES]
-_, _, new_bwt, _ = resolver.make(g)
+new_bwt, _ = resolver.make(g)
 g._bash_write_targets = new_bwt
 after = [(n, row(c)) for n, c in CASES]
+g._bash_write_targets = shipped
 
-print("%-42s | %-27s | %s" % ("case", "SHIPPED", "REPAIRED"))
-print("-" * 120)
+print("%-42s | %-27s | %s" % ("case", "SHIPPED", "REPAIRED (v2)"))
+print("-" * 118)
 chg = 0
 for (n, b), (_, a) in zip(before, after):
-    mark = "" if b[0] == a[0] else "   <== CHANGED"
+    mark = ""
     if b[0] != a[0]:
         chg += 1
+        mark = "   <== CHANGED"
+        if a[0] != "read" or b[0] != "write":
+            mark = "   <== !!! PERMISSIVE MOVE !!!"
     print("%-42s | %-9s %-17s | %-9s %-17s%s" % (n, b[0], (b[1] or "-")[-17:], a[0], (a[1] or "-")[-17:], mark))
-    if a[0] == "write":
-        print("%-42s |%28s| resource=%s" % ("", "", a[2]))
-print("\n%d of %d cases changed classification" % (chg, len(CASES)))
+    if a[0] == "write" and a[1] != b[1]:
+        print("%-42s |%28s| rule now %s, resource=%s" % ("", "", a[1], a[2]))
+print("\n%d of %d cases changed classification; every [HOLE] row must still read 'write'" % (chg, len(CASES)))

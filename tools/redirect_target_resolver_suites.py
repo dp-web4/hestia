@@ -6,7 +6,7 @@ sys.path.insert(0, SHARED); sys.path.insert(0, TOOLS); sys.path.insert(0, "/tmp/
 import hestia_governance_closure as g
 import resolver
 if "--repaired" in sys.argv:
-    _, _, new_bwt, _ = resolver.make(g)
+    new_bwt, _ = resolver.make(g)
     g._bash_write_targets = new_bwt
     print("### RESOLVER INJECTED ###")
 else:

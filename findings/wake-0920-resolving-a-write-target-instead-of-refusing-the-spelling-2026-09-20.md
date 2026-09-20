@@ -50,7 +50,47 @@ same command refuses under `out-of-grammar` and hands the human whichever unrela
 happened to match. That is the #1062 defect (a human asked to approve a write to a git
 revspec) and it is fixed for every resolvable shape.
 
-## 3. Measured: 17 cases, shipped vs repaired
+## 2b. codex dissented, and it was right — what the first cut got wrong
+
+Five minutes after the branch was pushed, codex reviewed it against the unchanged shipped
+module and filed a dissent on `22d1e3f55fde5acc` with two reproductions:
+
+```
+echo <marker> > "$OUT"; OUT=/tmp/safe.txt           # the binding is LATER than the use
+false && OUT=/tmp/safe.txt; echo <marker> > "$OUT"  # the binding never RUNS
+```
+
+Both went `write` → `read` under the first cut, and in both an inherited `OUT` may name a
+governed file. The cause was structural: v1 collected bindings in a **pre-pass over the
+whole token stream**, so it had no execution-order or control-flow guarantee at all. codex
+named the remedy exactly — *"require a binding proven to execute before every use; retain
+refusal for uncertain paths"* — and also supplied the control that must keep passing
+(`OUT=/tmp/safe.txt; echo <marker> > "$OUT"` → read).
+
+What landed instead collects bindings **in traversal order**, and only binds what is proven
+to have run:
+
+- a standalone assignment binds only at top level (an assignment inside an `if`/`for` body
+  binds nothing);
+- a binding reached through `&&`/`||`/`|` is proven **only for uses later in that same
+  chain** — if it did not run, nothing after it in the chain ran either — and expires at
+  the next `;`/newline, which is precisely codex's second case;
+- a `for NAME in <literals>` header binds `NAME` **for its body only**, and a guard on the
+  header cannot make that wrong, because the body runs only if the header ran.
+
+Fixing codex's two exposed three more binder holes it did not name, all closed the same
+way (refuse):
+
+- a `for` word carrying a glob (`*?[`) is not a literal — bash expands it against the
+  filesystem and the match could be a governed path;
+- a value starting with `~` is not a literal;
+- `read`/`export`/`declare`/`local`/`eval`/`source`/`mapfile`/`printf`/`unset` can rebind a
+  name an earlier assignment bound, so any of those heads clears every binding.
+
+The two cases codex filed are now rows R and S of the table below, and every one of the
+three new holes is a row too (U, V, W), so none of this can be re-derived a second time.
+
+## 3. Measured: 24 cases, shipped vs repaired
 
 Every row run through the real `classify()` on `origin/main`. `[HOLE]` marks a row whose
 whole job is to stay refused.
@@ -74,10 +114,21 @@ whole job is to stay refused.
 | O `cd $D` then relative write `[HOLE]` | write / closure-write | write / closure-write |
 | P `"${BRACED}"` destination | write / out-of-grammar | **read** |
 | Q fan-out over 40 loop words `[HOLE]` | write / out-of-grammar | write / out-of-grammar |
+| R codex: binding is LATER than the use `[HOLE]` | write / out-of-grammar | write / out-of-grammar |
+| S codex: binding is GUARDED and never runs `[HOLE]` | write / out-of-grammar | write / out-of-grammar |
+| T codex: prior-binding control | write / out-of-grammar | **read** |
+| U glob in the `for` words `[HOLE]` | write / out-of-grammar | write / out-of-grammar |
+| V `read` rebinds after an assignment `[HOLE]` | write / out-of-grammar | write / out-of-grammar |
+| W `~` value is not a literal `[HOLE]` | write / out-of-grammar | write / out-of-grammar |
+| X binding inside an `if` body `[HOLE]` | write / out-of-grammar | write / out-of-grammar |
 
-Five rows move, every one of them from a false write to a read. **No row moves in the
-permissive direction.** Two rows (J, L) keep refusing but change *rule*, from
-"something in your command matched" to "this writes `<path>`".
+Six rows move, every one of them from a false write to a read. **No row moves in the
+permissive direction, and all twelve `[HOLE]` rows still refuse.** Three rows (J, L, M)
+keep refusing but change *rule*, from "something in your command matched" to "this writes
+`<path>`". Four further chain-scoping cases are checked in the same harness and not shown
+above: a guarded binding used later in its own chain resolves (read), a guarded `for`
+header resolves (read), the same guarded binding used *after* the chain ends refuses, and a
+guarded `for` header writing into the closure refuses.
 
 Suites, run against `origin/main` with the resolver injected in memory:
 
@@ -133,6 +184,11 @@ re-classifies that call twice.
   September. Every one of them cost an escalation when it fired.
 - **145** still classify `write`. 48 of those are `Edit`/`Write` calls at the gate itself —
   the rule working. The resolver clears **15 of the remaining 82 Bash refusals (18%)**.
+- The first cut cleared the same 15. The tightening for codex's dissent dropped two of
+  them and then recovered both once chain-scoping was added — the two were
+  `mkdir -p /tmp/chct && W=<dir> && … > "$W/out"` and a `for` header behind an `&&`, i.e.
+  exactly the shapes the "proven to have executed" rule has to get right rather than
+  refuse wholesale. The census is what surfaced them; the 24-case table did not.
 - Every cleared row was checked by hand against its resolved destinations. All 15 resolve
   to concrete non-governed paths — `/tmp` scratchpads, `/dev/null`, memory files under
   `~/.claude/projects/*/memory/` — and **none resolves into the closure**. The shape is the
@@ -161,10 +217,17 @@ the candidate functions in memory, run the real suites against the real helpers.
 number above comes from that. It is worth recording as the method, because it is strictly
 better evidence than a copy would have been — the module under test *is* the shipped one.
 
-**The residual ask stands:** landing this needs a write to
-`plugins/_shared/hestia_governance_closure.py` and to `plugins/_shared/shell_grammar_test.py`
-(inverting two pins). Both are governed; both are offered for a peer ruling rather than
-routed around.
+**The residual ask stands, and is deliberately NOT being claimed yet.** Landing this needs
+a write to `plugins/_shared/hestia_governance_closure.py` and to
+`plugins/_shared/shell_grammar_test.py` (inverting two pins). `22d1e3f55fde5acc` reached a
+decision while codex's dissent was in flight; whatever that decision was, the Edit it was
+opened for is the **v1** code, which codex has since shown to be wrong. Claiming it would
+land a repair with two known regressions in it. A fresh ask goes up against the v3 code,
+after codex has had the chance to re-run its own two reproductions against it.
+
+That is worth stating as the general point, because the machinery pushes the other way: an
+approval is single-use and expires, so the cheap move is always to claim it while it is
+warm. Here the approval outlived the thing it approved by about four minutes.
 
 ## Reproduce
 
