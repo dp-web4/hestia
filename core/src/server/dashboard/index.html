@@ -1546,7 +1546,7 @@
             </div>
             <div id="cfg-seat-list"><div class="empty">Loading…</div></div>
             <div class="pol-add cfg-new">
-              <input class="pol-input" id="cfg-new-id" placeholder="seat id not listed (e.g. gemini)" size="24">
+              <select class="pol-input member-pick" id="cfg-new-id" data-empty="a member with no seat config yet"></select>
               <button type="button" class="pol-btn" id="cfg-new-open" disabled>configure</button>
             </div>
             <div id="cfg-editor" class="cfg-editor" hidden>
@@ -2269,9 +2269,15 @@
     // where the agents-drawer safety signal now lives, at the per-harness grain. MISWIRED
     // (fails open) reads loudest; a clean harness reads 'governed'.
     const gcov = govByAgent[selectedOrch];
-    if (hint) hint.innerHTML = gcov
+    // The way from an AGENT to what it connects as and the environment it runs in. Both were
+    // manageable all along, under govern → runtime config, reachable only by knowing that;
+    // dp, 2026-09-19: "we already list them ... but i can't inspect or manage roles or their
+    // environments". Opening a seat is a witnessed read, so this is a button, not a preview.
+    const seatLink = `<button type="button" class="pol-btn" data-open-seat="${escapeHtml(selectedOrch)}"
+      title="What this agent connects AS (its capacity role) and the environment it runs in. Opening it is witnessed.">role &amp; environment →</button>`;
+    if (hint) hint.innerHTML = (gcov
       ? `<span class="gov-badge gov-${GOV_SEVERITY[gcov] || 'grey'}" title="${escapeHtml(GOV_NOTE[gcov] || '')}">${escapeHtml(GOV_LABEL[gcov] || gcov)}</span>`
-      : 'click a role’s detail for the full tensor and its receipts';
+      : 'click a role’s detail for the full tensor and its receipts') + ' ' + seatLink;
     let filtered = trust.filter(t => t.plugin_id === selectedOrch);
     if (!filtered.length) {
       root.innerHTML = `<div class="empty">No trust data for ${escapeHtml(selectedOrch)}.</div>`;
@@ -4291,11 +4297,45 @@
     } catch (e) { if (status) status.textContent = '⚠ ' + e.message; }
   }
 
+  // THE CAPACITY ROLE IS A CLOSED SET, SO IT IS A PICKER (agent-lifecycle PRD R5).
+  // `HESTIA_ROLE` is what a seat connects AS. The daemon matches it against exactly these five
+  // strings and normalises ANYTHING else to `member`, the fail-closed floor
+  // (reputation.rs::normalize_constellation_role) -- correct for the gate, and invisible to the
+  // operator: `role:constellation:interactive_dev` saves cleanly, renders as configured, and the
+  // seat is silently a `member`. A text box for a five-value field is how that happens.
+  // Pinned equal to reputation.rs::KNOWN_CONSTELLATION_ROLES by
+  // tools/capacity_role_picker_contract_test.py, so this list cannot drift from the law.
+  const CAPACITY_ROLES = [
+    'role:constellation:interactive-dev',
+    'role:constellation:mesh-worker',
+    'role:constellation:reviewer',
+    'role:constellation:autonomous-timer',
+    'role:constellation:member',
+  ];
+  // PURE (run under node by the contract test). A stored value outside the set is KEPT and
+  // labelled, never silently replaced: opening a seat must not change it, and the operator has
+  // to see that what is stored is not what the daemon is using.
+  function capacityRoleOptions(current) {
+    const cur = String(current == null ? '' : current);
+    const opts = CAPACITY_ROLES.map(r => ({ value: r, label: r.replace('role:constellation:', ''), selected: r === cur }));
+    if (!cur) opts.unshift({ value: '', label: '— choose a capacity role —', selected: true });
+    else if (!CAPACITY_ROLES.includes(cur))
+      opts.unshift({ value: cur, label: `${cur}  ⚠ not a known role — the daemon treats this seat as "member"`, selected: true });
+    return opts;
+  }
+  function cfgValueCell(r) {
+    if (String(r.key).trim() !== 'HESTIA_ROLE')
+      return `<input class="pol-input cfg-value" value="${cfgEsc(r.value)}">`;
+    return `<select class="pol-input cfg-value" title="what this seat connects AS; anything outside this list is treated as member">${
+      capacityRoleOptions(r.value).map(o =>
+        `<option value="${cfgEsc(o.value)}"${o.selected ? ' selected' : ''}>${cfgEsc(o.label)}</option>`).join('')}</select>`;
+  }
+
   function cfgRenderRows() {
     $('cfg-env-rows').innerHTML = cfgRows.map((r, i) => `
       <tr data-i="${i}">
         <td><input class="pol-input cfg-key" value="${cfgEsc(r.key)}" placeholder="HESTIA_WORKSPACE"></td>
-        <td><input class="pol-input cfg-value" value="${cfgEsc(r.value)}"></td>
+        <td>${cfgValueCell(r)}</td>
         <td><button type="button" class="pol-btn pol-remove cfg-remove" title="remove this variable">×</button></td>
       </tr>`).join('');
   }
@@ -4385,6 +4425,21 @@
     finally { btn.disabled = false; }
   }
 
+  // From an agent to its seat. `cfgSeats` may not be loaded yet (the pane mounts lazily), so
+  // load the list first: opening an unconfigured seat as if configured would 404, and the
+  // reverse would show an empty draft over a real config.
+  async function openSeatFor(member) {
+    setView('govern', true);
+    governShow('config');
+    await cfgLoadList();
+    cfgOpen(member, cfgSeats.some(s => s.member === member && s.configured));
+    const ed = $('cfg-editor'); if (ed && ed.scrollIntoView) ed.scrollIntoView({ block: 'start' });
+  }
+  document.addEventListener('click', e => {
+    const b = e.target && e.target.closest && e.target.closest('[data-open-seat]');
+    if (b) openSeatFor(b.dataset.openSeat);
+  });
+
   (function wireRuntimeConfig() {
     const pane = $('govern-config');
     if (!pane) return;
@@ -4405,6 +4460,10 @@
     $('cfg-env-rows').addEventListener('click', (e) => {
       const b = e.target.closest('.cfg-remove'); if (!b) return;
       cfgReadRows(); cfgRows.splice(Number(b.closest('tr').dataset.i), 1); cfgRenderRows();
+    });
+    // Naming a row HESTIA_ROLE turns its value into the picker (and un-naming it, back).
+    $('cfg-env-rows').addEventListener('change', (e) => {
+      if (e.target && e.target.classList.contains('cfg-key')) { cfgReadRows(); cfgRenderRows(); }
     });
     $('cfg-save').addEventListener('click', () => cfgSave());
     $('cfg-discard').addEventListener('click', () => {
