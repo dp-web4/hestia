@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -164,6 +165,8 @@ W
 chmod +x "$bin"
 echo "${FAKE_BEHAVIOUR:-behaviour 1}" > "$HOME/trigger-surface"   # stands in for plist/unit/hook
 [ "${FAKE_RC:-0}" = 0 ] || exit "$FAKE_RC"
+# The inputs as supplied -- the same printf the real install.sh carries (case N2 holds the pair).
+printf 'workspace=%s\\natlas=%s\\n' "${FAKE_RECORD_WS:-${HESTIA_WORKSPACE:-}}" "${HESTIA_ATLAS_DIR:-}" > "$bin.installed-with"
 [ "${FAKE_SKIP_STAMP:-}" = 1 ] || cp "$0" "$bin.installed-by"   # the real one's LAST act too
 """
 
@@ -255,6 +258,45 @@ def _install_inventory_cases(fn: str, tmp: Path) -> None:
           (home / "trigger-surface").read_text().strip(), "behaviour 2")
     rc, st = run(prelude + fn, "install_inventory", root, env, "inventory")
     check("M then unchanged: converged again", (st, ran(home).count("ran ")), ("ok(current)", 3))
+
+    # N. cbp's falsifier (PR #1071 post-merge review). ONLY the workspace changes: installer,
+    #    inventory.py and atlas are identical, which was everything the fast path compared, so
+    #    an operator who corrected a wrong HESTIA_WORKSPACE in the deploy unit was told
+    #    ok(current) while the timer and the SessionStart hook -- which do not inherit that
+    #    unit's environment -- kept enumerating the old place. Current = installer AND inputs.
+    wsb = tmp / "seat-workspace-b"
+    wsb.mkdir()
+    env_b = clean_env(HOME=str(home), HESTIA_WORKSPACE=str(wsb))
+    rc, st = run(prelude + fn, "install_inventory", root, env_b, "inventory")
+    check("N workspace-only change: the installer reran", (st, ran(home).count("ran ")), ("ok(agent-atlas)", 4))
+    check("N workspace-only change: it ran FOR the new workspace",
+          ran(home).splitlines()[-1], f"ran ws={wsb} atlas={root}/agent-atlas/talk-to")
+    rc, st = run(prelude + fn, "install_inventory", root, env_b, "inventory")
+    check("N then unchanged: converged again", (st, ran(home).count("ran ")), ("ok(current)", 4))
+    # The atlas is an input too. It was the one the old grep did cover; it is now covered by
+    # the same record, so losing the sibling must still be noticed.
+    shutil.rmtree(root / "agent-atlas")
+    rc, st = run(prelude + fn, "install_inventory", root, env_b, "inventory")
+    check("N atlas-only change: the installer reran, unpinned",
+          (st, ran(home).splitlines()[-1]), ("ok(agent-atlas)", f"ran ws={wsb} atlas="))
+
+    # N2. The record has two writers that must agree byte for byte: install.sh and the deploy's
+    #     expectation. The fake above stands in for one of them, so without this a drift in the
+    #     REAL installer's line would reinstall every cycle on every seat with this file green.
+    fmt = r"""printf 'workspace=%s\natlas=%s\n'"""
+    real = (SCRIPT.parent.parent.parent / "plugins" / "agent-inventory" / "install.sh").read_text()
+    check("N2 install.sh records its inputs with the deploy's format",
+          fmt + r''' "${HESTIA_WORKSPACE:-}" "${HESTIA_ATLAS_DIR:-}" > "$BIN.installed-with"''' in real, True)
+    check("N2 the deploy compares with that format, on the fast path and after the run",
+          fn.count(fmt + r''' "$HESTIA_WORKSPACE" "$at" | cmp -s - "$bin.installed-with"'''), 2)
+
+    # N3. An installer that records other inputs than it was given would reinstall every cycle
+    #     and say ok every time. rc=0 is not evidence here either.
+    root, home = seat("misrecords")
+    rc, st = run(prelude + fn, "install_inventory", root,
+                 clean_env(HOME=str(home), HESTIA_WORKSPACE=ws, FAKE_RECORD_WS="/somewhere/else"), "inventory")
+    check("N3 records the wrong inputs: FAILED, not ok",
+          st, "FAILED(installer rc=0, but .installed-with does not record the inputs it was given)")
 
     # M2. The stamp is the installer's LAST act, so one that lands the bytes and the wrapper
     #     and then does not finish has not converged, whatever its rc says.
