@@ -626,9 +626,16 @@ install_inventory() {
   # PR #1071 review). install.sh copies itself to $bin.installed-by as its LAST act, after
   # every trigger surface, and removes that copy as its first -- so a matching copy means
   # "this installer ran here, to the end". cmp, not a digest: no sha tool to go missing.
+  # And the INPUTS it ran with, which install.sh records in $bin.installed-with: the same
+  # installer run for another workspace writes a different surface. This was a grep for the
+  # atlas pin in the wrapper and nothing for the workspace, so a HESTIA_WORKSPACE corrected
+  # in the deploy unit answered ok(current) forever while every trigger kept the old pin --
+  # they do not inherit this unit's environment (cbp, PR #1071 post-merge review, measured on
+  # this file's own harness). The printf must stay byte-identical to install.sh's;
+  # inventory_step_test.py holds the pair together.
   if [ -f "$bin.py" ] && cmp -s "$src/inventory.py" "$bin.py" \
      && cmp -s "$src/install.sh" "$bin.installed-by" \
-     && grep -qxF "AT_PIN='$at'" "$bin" 2>/dev/null; then
+     && printf 'workspace=%s\natlas=%s\n' "$HESTIA_WORKSPACE" "$at" | cmp -s - "$bin.installed-with"; then
     inventory="ok(current)"; return 0
   fi
   if HESTIA_WORKSPACE="$HESTIA_WORKSPACE" HESTIA_ATLAS_DIR="$at" bash "$src/install.sh" >>"$LOG" 2>&1; then
@@ -636,6 +643,10 @@ install_inventory() {
       inventory="FAILED(installer rc=0, but the installed copy is not the checkout's)"
     elif ! cmp -s "$src/install.sh" "$bin.installed-by"; then
       inventory="FAILED(installer rc=0, but it did not record finishing: no current .installed-by)"
+    elif ! printf 'workspace=%s\natlas=%s\n' "$HESTIA_WORKSPACE" "$at" | cmp -s - "$bin.installed-with"; then
+      # Without this an installer that records other inputs than it was given reinstalls
+      # every cycle and says ok every time.
+      inventory="FAILED(installer rc=0, but .installed-with does not record the inputs it was given)"
     else
       # `|| true`: a report with no such key makes grep exit 1, pipefail makes that the
       # substitution's status, and `set -e` would end the deploy over a missing label.
