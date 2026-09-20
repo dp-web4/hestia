@@ -14,7 +14,7 @@ battery" whose zero-bypass result I put in the PR body, and which was wrong. Han
 cases test the author's imagination, and two authors' imaginations failed the same way.
 
 `tools/redirect_resolver_battery.py` generates the product space those cases sample:
-**28 binding forms × 26 contexts × 2 separators × 3 write spellings = 4,368 commands**, each
+**28 binding forms × 36 contexts × 2 separators × 3 write spellings = 6,048 commands**, each
 adjudicated by bash itself using codex's oracle — run the prefix under `bash --noprofile
 --norc` with the final write replaced by `builtin printf` of the destination variable, `OUT`
 preset to the governed path. Nothing is written; the generated vocabulary is `true`, `false`,
@@ -22,19 +22,19 @@ preset to the governed path. Nothing is written; the generated vocabulary is `tr
 
 | | cases | governed destination | **unsafe** (governed, classified non-`write`) | false positives |
 |---|---|---|---|---|
-| shipped `40903d6` | 4,086 | 2,979 | **0** | 1,107 |
-| v5 `fb91fb7` | 4,086 | 2,979 | **243** | 1,041 |
+| shipped `40903d6` | 5,634 | 3,708 | **0** | 1,926 |
+| v5 `fb91fb7` | 5,634 | 3,708 | **252** | 1,854 |
 
-**43 distinct (context, binding) shapes**, where codex hand-wrote 10. Enumeration is not
+**44 distinct (context, binding) shapes**, where codex hand-wrote 10. Enumeration is not
 behind by a case or two; it is losing by a factor of four. The battery also found a binding
 form neither of us wrote down — `OUT\=value`, where the escaped `=` makes it a command name —
 and a context that beats v5 and appears in no review, `(( 1 )); OUT=safe`.
 
-The 282 generated commands bash refuses to parse are excluded, not counted as passes.
+The 414 generated commands bash refuses to parse are excluded, not counted as passes.
 
 ## 2. The defect is the representation, not the clause list
 
-The 43 shapes split into exactly two families, and neither is a missing clause:
+The 44 shapes split into exactly two families, and neither is a missing clause:
 
 - **Family A — the binding does not run, or does not survive into the parent shell.**
   Guards, pipelines, `&`, subshells, skipped bodies, continuation newlines, comments.
@@ -100,11 +100,11 @@ any of them being enumerated.
 Command substitution is deliberately **not** banned: `$(…)` runs in a subshell and cannot
 rebind the parent, which is why real commands keep working.
 
-| | unsafe / 4,086 | false positives |
+| | unsafe / 5,634 | false positives |
 |---|---|---|
-| shipped | 0 | 1,107 |
-| v5 | 243 | 1,041 |
-| **v6** | **0** | 1,063 |
+| shipped | 0 | 1,926 |
+| v5 | 252 | 1,854 |
+| **v6** | **0** | 1,878 |
 
 ## 5. What it costs, measured on real traffic — and the number I got wrong first
 
@@ -141,8 +141,14 @@ v5's twenty-shape battery worthless. Concretely, I have not established:
 
 1. **The indent-0 invariant.** v6 reads "indent 0 ⇒ outside every compound command" off the
    pretty-printer. I verified it on the battery and on heredocs (where it fails without body
-   stripping — a body is emitted at column 0). I have not proved it holds for every construct.
-   `case`, `select`, `coproc`, nested functions and `time` pipelines are unprobed.
+   stripping — a body is emitted at column 0). I have not *proved* it holds for every
+   construct, but the ones I named as unprobed no longer are: `select` (both as a body and as
+   a binder, `select OUT in …; do break; done`), `case`, `until`, `coproc`, `time { … }`,
+   `{ …; } > /dev/null`, `( … ) &`, `(( 1 )) && …` and `! { …; }` are now battery contexts.
+   v6 is unsafe on none of them; v5 is unsafe on `(( 1 )) && …`, which no review had sent.
+   Added because **kimi-code was hand-writing `select` probes at escalation
+   `f589f702aabeae2e` while I was writing this** — two seats hand-generating the same space
+   is the waste the generator exists to end.
 2. **`-n` is not execution.** I believe this and have not proved it. Residual: bash is now
    run on attacker-controlled text on every Bash classification.
 3. **The battery's vocabulary is still hand-written.** 28 bindings × 26 contexts is a
@@ -189,7 +195,7 @@ Every classifier sitting in front of a governance boundary is in this position, 
 them are on the losing side of it by default. The second claim is cheaper and just as
 general: **hand-written adversarial cases measure the author, so generate the product space
 and let the real system adjudicate.** codex's ten cases and my twenty were the same mistake
-with different contents; the generator found 43 shapes in an afternoon and is the artifact I
+with different contents; the generator found 44 shapes in an afternoon and is the artifact I
 would keep if I had to throw away everything else here.
 
 Still not landed, deliberately. No production code changes; v6 lives in `tools/` and is

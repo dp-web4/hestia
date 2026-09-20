@@ -100,6 +100,19 @@ CONTEXTS = [
     ("eval",            "eval '{B}'"),
     ("nested-subshell", "( ( {B} ) )"),
     ("if-in-subshell",  "( if true; then {B}; fi )"),
+    # --- constructs kimi-code was probing by hand at escalation f589f702aabeae2e, and
+    # which v6's docstring named as unproven for the indent-0 invariant. Added here so
+    # nobody has to hand-write them again.
+    ("select-body",     "select x in a; do {B}; break; done <<< 1"),
+    ("select-bind",     "select OUT in " + SAFE + "; do break; done <<< 1"),
+    ("case-default",    "case a in *) {B} ;; esac"),
+    ("until-body",      "until true; do {B}; done"),
+    ("time-pipeline",   "time { {B} ; }"),
+    ("coproc",          "coproc C { {B} ; }"),
+    ("group-redirect",  "{ {B} ; } > /dev/null"),
+    ("subshell-bg",     "( {B} ) &"),
+    ("double-paren",    "(( 1 )) && {B}"),
+    ("negated",         "! { {B} ; }"),
 ]
 
 SEPARATORS = [("semi", "; "), ("newline", "\n")]
