@@ -1014,6 +1014,52 @@ def test_a_forbidden_token_inside_a_longer_word_is_pinned_open():
               "this no longer denies — the matcher was narrowed and nobody moved the row. "
               "If that was earned, the red arms below must pass in the same commit")
 
+    # THIS RULE HAS NO DATA POSITION. The published law's carve-out -- "quoting the token
+    # as data (a grep pattern, a quoted heredoc body under cat/tee, a non-expanding
+    # double-quoted string) does not trip it" -- is written about the destructive preset,
+    # which lives in the Rust core. `egress.secret` is implemented HERE, and it has no such
+    # carve-out of its own: the token matches in every data position. Measured, not argued.
+    #
+    # Deliberately NOT claimed: that the two rules are inconsistent. The destructive rows
+    # come back ALLOW from this module because this module does not implement that preset at
+    # all, so this layer cannot see the comparison. What is measured is one rule's behaviour
+    # in five positions.
+    for name, cmd in (
+        ("single_quoted_span", "grep '" + tok + "' notes.txt"),
+        ("quoted_heredoc_body", "cat <<'EOF' > /tmp/x\nfoo " + tok + " bar\nEOF"),
+        ("inside_a_longer_identifier", "python3 -c 'import os; print(os" + tok + "iron)'"),
+        ("in_a_shell_comment", "true  # note: " + tok),
+    ):
+        v = verdict(cmd)
+        check("fp_no_data_position__" + name,
+              v.blocks and v.rule == "egress.secret",
+              "this position is now treated as data — if that was earned, the red arms "
+              "below must pass in the same commit")
+
+    # AND THE DOOR THE LAW OFFERS IS CLOSED BY THE SAME MATCHER, for any seat without the
+    # hestia MCP surface. Such a seat reaches `hestia_appeal` by raw JSON-RPC from a Bash
+    # call, so the appeal's `reason` is Bash command text and goes through this matcher. An
+    # appeal against a token-substring deny has to QUOTE the token to explain it -- that is
+    # what an appeal IS -- so the appeal is denied by the rule it appeals.
+    #
+    # PRIOR ART: this is #617, filed 2026-08-26 against the DESTRUCTIVE preset and closed
+    # 2026-09-09 by PR #640, which gave that preset the data carve-out quoted above. The fix
+    # was per-rule. The rows above are why it did not reach here, and why the shape recurred
+    # on CBP / claude-code 2026-09-20: four denies in one wake -- a read-only census script,
+    # the appeal against that deny, the commit adding these arms, and that commit's own
+    # message. Filed (deny e51f634b0eca2f0d, witness 6161a777d1fa94d9) only by putting the
+    # reason in a file through a non-Bash tool, a route documented nowhere.
+    #
+    # This row outlives a narrowing of any single token: ANY token-substring rule with no
+    # data position has it. The law says a refusal that gives no working next step is a
+    # defect in the law rather than a failure of the member. This is that clause, executable.
+    v = verdict("python3 /tmp/appeal.py  # reason must quote the denied token: " + tok)
+    check("fp_token_substring_still_open__appeal_blocked_by_the_rule_it_appeals",
+          v.blocks and v.rule == "egress.secret",
+          "the appeal route is no longer blocked by its own rule — if a narrowing earned "
+          "that, the red arms below must pass in the same commit; if a carve-out for appeal "
+          "text earned it, that carve-out is a new haystack and needs its own red arm")
+
     # THE RED ARMS. A narrowing that greens the rows above and ANY of these is a hole, not a
     # fix: each names a real secret, and only the first carries a leading separator.
     for name, cmd in (
