@@ -115,11 +115,60 @@ CONTEXTS = [
     ("negated",         "! { {B} ; }"),
 ]
 
+
+# --- the ORDER dimension ------------------------------------------------------------
+# Every case above places the binding BEFORE the write, so the generator could not
+# falsify the one invariant every version has carried since v1: "the binding precedes
+# every use" (v6's V5). A dimension a battery cannot vary is a dimension it cannot test,
+# and 5,634 green rows against v6 said nothing about this one.
+#
+# v6 proves its invariants over bash's RENDERING but enforces the ordering over the RAW
+# token stream, mapping the two by searching the raw tokens for the binding's text. The
+# pretty-printer strips comments; `g._tokenize` does not. So any text the renderer drops
+# and the tokeniser keeps can plant the binding's needle EARLIER in the raw stream than
+# the write, and the name is released before the write it is supposed to follow.
+DECOY = "OUT=" + SAFE
+
+
+def _bind_first(prefix, sep, write):
+    return prefix + sep + write
+
+
+def _write_first(prefix, sep, write):
+    """The write runs while OUT still holds the governed value; the binding is after it."""
+    return write + sep + prefix
+
+
+def _write_first_comment(prefix, sep, write):
+    """Same, with the binding's own text planted in a comment ahead of the write."""
+    return "# " + DECOY + "\n" + write + sep + prefix
+
+
+ORDERS = [("bind-first", _bind_first),
+          ("write-first", _write_first),
+          ("write-first-comment", _write_first_comment)]
+
 SEPARATORS = [("semi", "; "), ("newline", "\n")]
 WRITES = [
     ("dquoted",  'echo ' + MARK + ' > "$OUT"'),
     ("braced",   'echo ' + MARK + ' > "${OUT}"'),
     ("bare-var", 'echo ' + MARK + ' > $OUT'),
+]
+
+# The write shape is a dimension too, and the three above are all the same shape: one
+# top-level `>` on a simple command. A resolver that reads its bindings out of bash's
+# RENDERING rather than the raw text is re-deciding where every target sits, so the
+# spellings that reach `_command_write_targets` by a different route -- append, tee, a
+# heredoc'd cat, a destination that is an argument rather than a redirect, two writes in
+# one command -- are exactly where that change could go wrong. `--extra-writes` crosses
+# them with the context/order space; nothing here is ever executed, only classified.
+EXTRA_WRITES = [
+    ("append",    'echo ' + MARK + ' >> "$OUT"'),
+    ("tee",       'echo ' + MARK + ' | tee "$OUT"'),
+    ("heredoc",   'cat > "$OUT" <<EOF\n' + MARK + '\nEOF'),
+    ("cp-arg",    'cp /dev/null "$OUT"'),
+    ("two-writes",'echo a > "$OUT" ; echo ' + MARK + ' > "$OUT"'),
+    ("fd-dup",    'echo ' + MARK + ' 1> "$OUT" 2>&1'),
 ]
 
 
@@ -133,14 +182,17 @@ def load(name, revision, path, src=None):
     return module
 
 
-def generate():
+def generate(orders=None):
+    orders = orders or ORDERS
     for bname, btext in BINDINGS:
         for cname, ctext in CONTEXTS:
             prefix = ctext.replace("{B}", btext)
             for sname, sep in SEPARATORS:
-                for wname, wtext in WRITES:
-                    yield (f"{cname}/{bname}/{sname}/{wname}", prefix + sep + wtext,
-                           prefix + sep + ORACLE)
+                for oname, build in orders:
+                    for wname, wtext in WRITES:
+                        yield (f"{cname}/{bname}/{sname}/{oname}/{wname}",
+                               build(prefix, sep, wtext),
+                               build(prefix, sep, ORACLE))
 
 
 def bash_destinations(oracle_command, timeout=5):
@@ -164,6 +216,10 @@ def main():
     ap.add_argument("--rev", default=os.environ.get("HESTIA_CANDIDATE_REV", "fb91fb7"))
     ap.add_argument("--file", default=None, help="resolver source on disk instead of a rev")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--extra-writes", action="store_true",
+                    help="cross the context/order space with more write spellings")
+    ap.add_argument("--only-binding", default=None,
+                    help="restrict BINDINGS to one form, to keep the extra cross cheap")
     ap.add_argument("--json", default="/tmp/resolver_battery.json")
     args = ap.parse_args()
 
@@ -175,11 +231,19 @@ def main():
     shipped = g._bash_write_targets
     candidate, _ = r.make(g)
 
+    global BINDINGS, WRITES
+    if args.only_binding:
+        BINDINGS = [b for b in BINDINGS if b[0] == args.only_binding]
+        if not BINDINGS:
+            sys.exit(f"no such binding form: {args.only_binding}")
+    if args.extra_writes:
+        WRITES = WRITES + EXTRA_WRITES
     rows, cases = [], list(generate())
     if args.limit:
         cases = cases[:args.limit]
     print(f"battery: {len(BINDINGS)} bindings x {len(CONTEXTS)} contexts x "
-          f"{len(SEPARATORS)} separators x {len(WRITES)} writes = {len(cases)} cases")
+          f"{len(SEPARATORS)} separators x {len(ORDERS)} orders x {len(WRITES)} writes "
+          f"= {len(cases)} cases")
     print(f"resolver under test: {label}\n")
 
     unparsable = 0
@@ -228,6 +292,11 @@ def main():
     if by:
         print("\n  new-unsafe by context:")
         for k, n in by.most_common():
+            print(f"    {k:18s} {n}")
+    byo = collections.Counter(x["case"].split("/")[3] for x in regress)
+    if byo:
+        print("  new-unsafe by order:")
+        for k, n in byo.most_common():
             print(f"    {k:18s} {n}")
     byb = collections.Counter(x["case"].split("/")[1] for x in regress)
     if byb:

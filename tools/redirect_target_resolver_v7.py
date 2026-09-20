@@ -1,11 +1,7 @@
-"""v6: REFUTED 2026-09-20. Kept as the measured record; the candidate is v7.
+"""v7: v6, scanning the rendering it proves over.
 
-The battery that cleared v6 had no ORDER dimension -- every generated case put the
-binding before the write, so (V5) was the one invariant it could not vary. With that
-dimension added, v6 has 48 unsafe rows of 17,490: v6 enforces (V5) over the RAW token
-stream while proving (V2)-(V4) over bash's rendering, and the pretty-printer strips
-comments that `_tokenize` keeps. See tools/redirect_target_resolver_v7.py and
-findings/v6-is-refuted-the-order-dimension-2026-09-20.md.
+v6 is REFUTED -- see (V6) below. Everything from here to (V5) is v6's docstring and
+still holds; v7 changes exactly one thing, and it is not an added clause.
 
 v6: ask bash for its parse, then require the name to be single-assignment in it.
 
@@ -316,11 +312,37 @@ def make(g):
 
     def _bash_write_targets(command):
         proved, rendering = resolvable_bindings(command)
-        toks = g._tokenize(g._strip_heredoc_bodies(command))
-        # (V5) a binding becomes visible only once the scan has passed it. Offsets are in
-        # the RENDERING, token indices are in the raw stream, so map by the order the names
-        # were proved: a name proved at rendering offset k is released after the raw token
-        # whose text is the binding. Conservative fallback: release nothing we cannot place.
+        # (V6) SCAN THE REPRESENTATION THE PROOF WAS STATED OVER.
+        #
+        # This one line is what v6 got wrong and it cost the whole design. v6 proved
+        # (V2)-(V4) over bash's rendering and then enforced (V5) over `_tokenize` of the
+        # RAW command, mapping the two by searching the raw token stream for the binding's
+        # text. The two representations do not agree, and the disagreement is a feature v6
+        # advertised: the pretty-printer STRIPS COMMENTS and `_tokenize` does not. So
+        #
+        #     # OUT=/tmp/safe
+        #     echo x > $OUT
+        #     OUT=/tmp/safe
+        #
+        # renders as two lines with one bare `OUT`, passes (V2)/(V3), and then releases the
+        # name at the COMMENT's raw token index -- ahead of the write it is required to
+        # follow. bash writes to the governed path; v6 answers `none`. Measured by the
+        # `write-first-comment` arm of tools/redirect_resolver_battery.py.
+        #
+        # (V2)'s uniqueness -- exactly one bare occurrence of the name -- is what makes a
+        # needle search for `NAME=value` sound. That property was only ever measured in the
+        # rendering, so the search is only sound there. Scanning the rendering makes the
+        # proof and its enforcement the same text, and closes the class rather than the case.
+        #
+        # When bash cannot parse the command, `rendering` is None, nothing is proved, and
+        # the raw scan is the shipped behaviour: every substitution unresolvable, every
+        # such destination a `write`.
+        toks = g._tokenize(rendering if rendering is not None
+                           else g._strip_heredoc_bodies(command))
+        # (V5) a binding becomes visible only once the scan has passed it. Offsets and
+        # token indices are now in the same representation, and (V2) guarantees the
+        # binding's text occurs there exactly once. Conservative fallback: release nothing
+        # we cannot place.
         release = {}
         for name, (offset, values) in proved.items():
             needle = name + "=" + values[0]
