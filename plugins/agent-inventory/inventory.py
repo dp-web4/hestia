@@ -278,13 +278,22 @@ ALIASES = {
 BEING_LAUNCHERS = {
     "sage": r"sage\.gateway\.heartbeat",
 }
-# systemd writes `--member legion-being`; a launchd plist writes the two as sibling
-# <string> elements. One pattern, both spellings.
-MEMBER_ARG = re.compile(r"--member(?:\s*</string>\s*<string>|[ =]+)[\"']?([A-Za-z0-9][A-Za-z0-9_.-]*)")
+# Read off the launcher's OWN command line, never off the file: a unit's ExecStartPre, a
+# comment, or an unrelated unit can all say `--member` (Sprout, PR #1076 review, each reproduced).
+MEMBER_ARG = re.compile(r"--member[ =]+[\"']?([A-Za-z0-9][A-Za-z0-9_.-]*)")
+# Exactly the names the being's gate client reads to find the shared law (SAGE
+# `being_gate_client._resolve_hestia_shared`). Any other HESTIA_* -- HESTIA_ROLE, say -- does
+# not move law resolution, so it must not quiet LAW-SOURCE.
+LAW_ENV_NAMES = ("HESTIA_GATE_SHARED", "HESTIA_SHARED_DIR", "HESTIA_HOME")
 UNIT_GLOBS = (
-    ".config/systemd/user/*.service", "Library/LaunchAgents/*.plist",
+    ".config/systemd/user/*.service", ".local/share/systemd/user/*.service",
+    "Library/LaunchAgents/*.plist",
 )
-SYSTEM_UNIT_GLOBS = ("/etc/systemd/system/*.service", "/Library/LaunchDaemons/*.plist")
+SYSTEM_UNIT_GLOBS = (
+    "/etc/systemd/system/*.service", "/etc/systemd/user/*.service",
+    "/usr/lib/systemd/system/*.service", "/usr/lib/systemd/user/*.service",
+    "/Library/LaunchDaemons/*.plist", "/Library/LaunchAgents/*.plist",
+)
 # Built from source, so not on PATH. Relative to the workspace, for the named executable only.
 WORKSPACE_BIN_GLOBS = ("*/target/release", "*/*/target/release")
 
@@ -297,23 +306,109 @@ def unit_files() -> list[Path]:
     return out
 
 
+def systemd_directives(text: str) -> list[tuple[str, str]]:
+    """LIVE `Key=value` directives: comments dropped, `\\` continuations joined."""
+    out, buf = [], ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line[0] in "#;":
+            continue
+        if line.endswith("\\"):
+            buf += line[:-1] + " "
+            continue
+        line, buf = buf + line, ""
+        key, sep, val = line.partition("=")
+        if sep:
+            out.append((key.strip(), val.strip()))
+    return out
+
+
+def _env_names(assignments: str) -> set[str]:
+    try:
+        words = shlex.split(assignments)
+    except ValueError:
+        words = assignments.split()
+    return {w.partition("=")[0] for w in words if "=" in w}
+
+
+def read_unit(u: Path) -> dict:
+    """What one unit STARTS and what environment it starts it in. Raises OSError/ValueError.
+
+    `outside` is environment this function could not read. A caller must then say "cannot
+    tell", not "sets none": an EnvironmentFile IS the correct wiring (the seat projection),
+    and asserting LAW-SOURCE over it is the wrong-direction answer.
+    """
+    commands: list[str] = []
+    env: set[str] = set()
+    outside: list[str] = []
+    if u.suffix == ".plist":
+        raw = u.read_bytes()
+        try:
+            pl = plistlib.loads(raw)
+        except Exception as e:          # plistlib raises expat/Invalid*/ValueError by format
+            raise ValueError(f"not a parseable plist ({type(e).__name__})") from e
+        args = pl.get("ProgramArguments") or ([pl["Program"]] if pl.get("Program") else [])
+        commands.append(" ".join(str(a) for a in args))
+        env |= set(pl.get("EnvironmentVariables") or {})
+        return {"commands": commands, "env": env, "outside": outside,
+                "enabled": False if pl.get("Disabled") is True else None}
+    dropins = sorted((u.parent / (u.name + ".d")).glob("*.conf"))
+    installable = False
+    for f in [u, *dropins]:
+        for key, val in systemd_directives(f.read_text(errors="replace")):
+            if key == "ExecStart":
+                # systemd's own rule: an empty assignment resets the list (how a drop-in replaces it).
+                commands = commands + [val] if val else []
+            elif key == "Environment":
+                env |= _env_names(val)
+            elif key == "EnvironmentFile":
+                path = val.lstrip("-").replace("%h", str(HOME))
+                try:
+                    if "%" in path:
+                        raise OSError("unexpanded specifier")
+                    # NAMES only. The values are none of an inventory's business.
+                    env |= {k for k, _ in systemd_directives(Path(path).read_text(errors="replace"))}
+                except OSError as e:
+                    outside.append(f"EnvironmentFile={val} ({type(e).__name__})")
+            elif key in ("WantedBy", "RequiredBy"):
+                installable = True
+    # File present != launched (Sprout: a oneshot fired by a same-named .timer). A fired session
+    # has no user bus, so no `systemctl is-enabled` -- but enablement IS symlinks on disk.
+    timer = u.with_suffix(".timer")
+    names = [u.name] + ([timer.name] if timer.is_file() else [])
+    # The link may live in another dir of the same scope (unit in /usr/lib, link in /etc).
+    dirs = {u.parent, HOME / ".config/systemd/user", Path("/etc/systemd/user"), Path("/etc/systemd/system")}
+    linked = any((w / n).is_symlink() or (w / n).exists()
+                 for d in dirs for pat in ("*.wants", "*.requires") for w in d.glob(pat) for n in names)
+    # No [Install] and no timer = a static unit something else may start: cannot tell -> None.
+    enabled = True if linked else (False if installable or timer.is_file() else None)
+    return {"commands": commands, "env": env, "outside": outside, "enabled": enabled}
+
+
 def find_launchers(launcher_re: str, units: list[Path]) -> tuple[list[dict], list[str]]:
     """Units that start this being's gateway entry point. (launchers, unreadable)."""
     found, unreadable = [], []
     for u in units:
         try:
-            text = u.read_text(errors="replace")
-        except OSError as e:
-            unreadable.append(f"{u}: {type(e).__name__}")
+            unit = read_unit(u)
+        except (OSError, ValueError) as e:
+            unreadable.append(f"{u}: {e if isinstance(e, ValueError) else type(e).__name__}")
             continue
-        if not re.search(launcher_re, text):
+        starts = [c for c in unit["commands"] if re.search(launcher_re, c)]
+        if not starts:
             continue
-        m = MEMBER_ARG.search(text)
-        found.append({"unit": str(u), "member": m.group(1) if m else None,
-                      # Replicated on two seats (agent-atlas PR #1): a launcher that sets no
-                      # HESTIA_* makes the gate client fall through to a SOURCE CHECKOUT of the
-                      # law instead of the installed copy the deploy maintains and attests.
-                      "sets_hestia_env": bool(re.search(r"\bHESTIA_[A-Z_]+", text))})
+        # The id comes from the SAME command that matched the launcher, nowhere else in the file.
+        members = sorted({m.group(1) for c in starts for m in [MEMBER_ARG.search(c)] if m})
+        found.append({"unit": str(u), "member": members[0] if len(members) == 1 else None,
+                      "members_in_unit": members,
+                      # Replicated on two seats (agent-atlas PR #1): a launcher that sets none of
+                      # LAW_ENV_NAMES makes the gate client fall through to a SOURCE CHECKOUT of
+                      # the law instead of the installed copy the deploy maintains and attests.
+                      # None = environment set somewhere this could not read: cannot tell.
+                      "sets_hestia_env": (True if unit["env"] & set(LAW_ENV_NAMES)
+                                          else None if unit["outside"] else False),
+                      "env_outside_unit": unit["outside"],
+                      "enabled_on_disk": unit["enabled"]})
     return found, unreadable
 
 
@@ -337,25 +432,37 @@ def inspect_being(atlas_id: str, roots: list[str], atlas: dict, units: list[Path
         return rec
     launchers, unreadable = find_launchers(launcher_re, unit_files() if units is None else units)
     rec["launchers"] = launchers
-    rec["members"] = sorted({l["member"] for l in launchers if l["member"]})
+    rec["members"] = sorted({m for l in launchers for m in l["members_in_unit"]})
     rec["installed"] = exe is not None or bool(launchers)
     rec["wired"] = bool(launchers)
     # One being per machine by fleet convention; if a seat runs two, say so rather than pick.
     rec["plugin"] = rec["members"][0] if len(rec["members"]) == 1 else None
     for l in launchers:
         if not l["member"]:
-            rec["unknown"].append(f"launcher {l['unit']} names no --member: the being's governance id is unreadable")
-        if not l["sets_hestia_env"]:
+            rec["unknown"].append(
+                f"launcher {l['unit']} names " + ("more than one --member" if l["members_in_unit"] else "no --member")
+                + ": the being's governance id is unreadable")
+        if l["sets_hestia_env"] is False:
             rec["findings"].append(
-                f"LAW-SOURCE: {l['unit']} sets no HESTIA_* -- the being's gate client will resolve the "
-                "shared law from a source checkout, not the installed copy hestia-deploy attests")
+                f"LAW-SOURCE: {l['unit']} sets none of {'/'.join(LAW_ENV_NAMES)} -- the being's gate "
+                "client will resolve the shared law from a source checkout, not the installed copy "
+                "hestia-deploy attests")
+        elif l["sets_hestia_env"] is None:
+            rec["unknown"].append(
+                f"launcher {l['unit']} takes environment from outside the unit and it could not be "
+                f"read ({'; '.join(l['env_outside_unit'])}) -- cannot tell which copy of the law it resolves")
+        if l["enabled_on_disk"] is False:
+            rec["findings"].append(
+                f"LAUNCHER-NOT-ENABLED: {l['unit']} is installed, and nothing on disk enables it or a "
+                "same-named timer -- `governed` here means the launcher is INSTALLED, not that it runs")
     if len(rec["members"]) > 1:
         rec["unknown"].append(f"more than one being id launched here: {', '.join(rec['members'])}")
     for u in unreadable:
         rec["unknown"].append(f"unit not readable, so a launcher may be hidden in it: {u}")
     # Built-in gate, fails closed (atlas): a being launched through its gateway IS gated. The
     # registration of `<id>` as a hestia member is NOT visible from here -- that is the
-    # operator plane -- so `governed` means "launched the governed way", and says so.
+    # operator plane -- and neither is whether the unit is RUNNING (no bus in a fired session).
+    # So `governed` means "a governed launcher is installed", and says so.
     gated = atlas.get("blocking_capable") is True and atlas.get("fails_open") is False
     rec["governed"] = bool(launchers) and gated and not rec["unknown"]
     if launchers and not gated:
@@ -1457,6 +1564,16 @@ def inspect(atlas_id: str, roots: list[str]) -> dict:
     return rec
 
 
+def status_of(gaps: dict, unknowns: list) -> str:
+    if gaps["miswired"]:
+        return "MISWIRED"
+    if gaps["partial"]:
+        return "PARTIAL"
+    if gaps["ungoverned"] or gaps["ungovernable"] or gaps.get("unprovisioned_being"):
+        return "UNGOVERNED_PRESENT"
+    return "UNKNOWN" if unknowns else "OK"
+
+
 def classify(recs: list[dict]) -> dict:
     """The gaps, each with its own remedy. This is the actionable part."""
     gaps: dict[str, list[str]] = {
@@ -1786,15 +1903,11 @@ def main() -> int:
     # both are real, both are loud in `gaps`/`fragile` and in the brief line, and neither
     # is a gap in hestia's coverage of this machine. Making it a status rung would restore
     # exactly the property the split removes — a headline no hestia work can clear.
-    status = "OK"
-    if gaps["miswired"]:
-        status = "MISWIRED"
-    elif gaps["partial"]:
-        status = "PARTIAL"
-    elif gaps["ungoverned"] or gaps["ungovernable"]:
-        status = "UNGOVERNED_PRESENT"
-    elif unknowns:
-        status = "UNKNOWN"
+    #
+    # `unprovisioned_being` IS on it (Sprout, PR #1076): unlike `miswired_3p` it is exactly a gap
+    # in hestia's coverage of this machine, with a hestia remedy -- cognition present, nothing
+    # launching it as a governed member. It shares the ungoverned rung; `gaps` names which.
+    status = status_of(gaps, unknowns)
 
     report = {
         "status": status,

@@ -1117,6 +1117,7 @@ def test_a_being_is_found_by_its_launcher_not_by_a_hook():
         (d / "ws").mkdir()
         try:
             _being_cases(d, U, being)
+            _being_parse_cases(d, being)
         finally:
             inventory.WORKSPACE = saved_ws
 
@@ -1166,6 +1167,79 @@ def _being_cases(d, U, being):
     check("classify: an unprovisioned being has its OWN gap", gaps["unprovisioned_being"], ["sage"])
     check("classify: and is never 'ungovernable -- no plugin exists'; it needs none",
           (gaps["ungovernable"], gaps["ungoverned"], gaps["dormant_plugin"]), ([], [], []))
+
+
+def _being_parse_cases(d, being):
+    """Sprout's review of PR #1076: four holes, each reproduced there against the first cut, which
+    searched the whole FILE for the launcher, for --member and for HESTIA_*."""
+    n = [0]
+
+    def unit(text, name=None):
+        n[0] += 1
+        sub = d / f"case{n[0]}"; sub.mkdir()
+        path = sub / (name or "sage-heartbeat.service"); path.write_text(text)
+        return path
+    LAUNCH = "ExecStart=/usr/bin/python3 -m sage.gateway.heartbeat --member legion-being\n"
+    law = lambda r: inventory.has_tag(r["findings"], "LAW-SOURCE")
+
+    r = being([unit("[Service]\n# ExecStart=python3 -m sage.gateway.heartbeat --member old-being\nExecStart=/bin/true\n")])
+    check("being/parse: a COMMENTED-OUT launcher launches nothing", (r["governed"], r["plugin"], r["launchers"]), (False, None, []))
+    r = being([unit("[Service]\nExecStartPre=python3 -m sage.gateway.heartbeat --member pre-being\nExecStart=/bin/true\n")])
+    check("being/parse: only ExecStart starts the being -- an ExecStartPre is not its launcher", r["launchers"], [])
+
+    r = being([unit("[Service]\nEnvironment=HESTIA_HOME=/h\nExecStartPre=/usr/bin/notify --member ops\n" + LAUNCH)])
+    check("being/parse: --member is read off the LAUNCHER's line, not the first one in the file",
+          (r["plugin"], r["members"], r["governed"]), ("legion-being", ["legion-being"], True))
+    r = being([unit("[Service]\nEnvironment=HESTIA_HOME=/h\nExecStart=/usr/bin/python3 -m sage.gateway.heartbeat \\\n    --member legion-being\n")])
+    check("being/parse: a continued ExecStart is one command", r["plugin"], "legion-being")
+
+    r = being([unit("[Service]\n# no HESTIA_HOME here on purpose\n" + LAUNCH)])
+    check("being/law: a COMMENT naming HESTIA_HOME does not quiet LAW-SOURCE", law(r), True)
+    r = being([unit("[Service]\nEnvironment=HESTIA_ROLE=member\n" + LAUNCH)])
+    check("being/law: a HESTIA_* the resolver never reads does not quiet it either", law(r), True)
+    r = being([unit('[Service]\nEnvironment="FOO=a b" HESTIA_SHARED_DIR=/s\n' + LAUNCH)])
+    check("being/law: any one of the three names the resolver reads does", law(r), False)
+
+    # The CORRECT wiring -- the seat projection -- is an EnvironmentFile. Asserting LAW-SOURCE
+    # over it is the wrong-direction answer.
+    proj = d / "legion-being.conf"; proj.write_text("# seat projection\nHESTIA_HOME=/h\nHESTIA_ROLE=member\n")
+    r = being([unit(f"[Service]\nEnvironmentFile=-{proj}\n" + LAUNCH)])
+    check("being/law: an EnvironmentFile that sets it is READ (names only): no finding, governed",
+          (law(r), r["governed"], r["unknown"]), (False, True, []))
+    r = being([unit(f"[Service]\nEnvironmentFile={d / 'absent.conf'}\n" + LAUNCH)])
+    check("being/law: one that cannot be read -> 'cannot tell', NOT an asserted LAW-SOURCE",
+          (law(r), bool(r["unknown"]), r["governed"]), (False, True, False))
+    u = unit("[Service]\n" + LAUNCH)
+    (u.parent / (u.name + ".d")).mkdir()
+    (u.parent / (u.name + ".d") / "10-law.conf").write_text("[Service]\nEnvironment=HESTIA_GATE_SHARED=/s\n")
+    check("being/law: a drop-in is part of the unit", law(being([u])), False)
+    (u.parent / (u.name + ".d") / "20-off.conf").write_text("[Service]\nExecStart=\nExecStart=/bin/true\n")
+    check("being/parse: a drop-in that RESETS ExecStart un-launches it", being([u])["launchers"], [])
+
+    # File present != launched: on Sprout the launcher is a oneshot fired by a same-named timer.
+    quiet = lambda r: not inventory.has_tag(r["findings"], "LAUNCHER-NOT-ENABLED")
+    u = unit("[Service]\nEnvironment=HESTIA_HOME=/h\n" + LAUNCH)
+    check("being/enabled: a static unit -> cannot tell, so silent", (quiet(being([u])), being([u])["launchers"][0]["enabled_on_disk"]), (True, None))
+    u.with_suffix(".timer").write_text("[Timer]\nOnCalendar=hourly\n[Install]\nWantedBy=timers.target\n")
+    r = being([u])
+    check("being/enabled: a timer nothing enables is a finding -- and `governed` still means INSTALLED",
+          (quiet(r), r["governed"]), (False, True))
+    (u.parent / "timers.target.wants").mkdir()
+    (u.parent / "timers.target.wants" / u.with_suffix(".timer").name).symlink_to(u.with_suffix(".timer"))
+    check("being/enabled: the .wants symlink IS enablement, readable with no bus", quiet(being([u])), True)
+
+    hidden = _PLIST.replace("<plist>", "<plist><!-- <string>sage.gateway.heartbeat</string> -->").replace(
+        "sage.gateway.heartbeat</string>\n", "not.the.gateway</string>\n")
+    check("being/launchd: an XML comment is not a ProgramArgument", being([unit(hidden, "c.plist")])["launchers"], [])
+    envd = _PLIST.replace("<dict>", "<dict><key>EnvironmentVariables</key><dict><key>HESTIA_HOME</key><string>/h</string></dict>")
+    check("being/launchd: EnvironmentVariables is where a plist sets it", law(being([unit(envd, "e.plist")])), False)
+    r = being([unit("<plist><dict><key>ProgramArguments", "broken.plist")])
+    check("being/launchd: an unparseable plist may hide a launcher -> unknown", bool(r["unknown"]), True)
+
+    gaps = dict.fromkeys(("miswired", "partial", "ungoverned", "ungovernable"), [])
+    check("status: an unprovisioned being is hestia-coverage work -> a rung, never OK",
+          (inventory.status_of(dict(gaps, unprovisioned_being=["sage"]), []), inventory.status_of(gaps, [])),
+          ("UNGOVERNED_PRESENT", "OK"))
 
 
 def test_generation_stamp_brackets_the_install():
