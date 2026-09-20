@@ -354,6 +354,7 @@
   .disc-name { font-weight: 600; }
   .disc-ids  { font-size: 0.78rem; color: var(--fg-dim); }
   .disc-path { font-family: var(--mono); font-size: 0.72rem; color: var(--fg-dim); }
+  .disc-why { flex-basis: 100%; margin: 0.15rem 0 0 1.1rem; padding: 0; font-size: 0.78rem; color: var(--fg-dim); }
   .disc-badge { font-size: 0.68rem; padding: 0.05rem 0.4rem; border-radius: 0.6rem;
                 border: 1px solid var(--fg-faint); white-space: nowrap; }
   .disc-badge.disc-amber { border-color: var(--amber, #d79921); color: var(--amber, #d79921); }
@@ -4015,7 +4016,16 @@
   // and its target is gone, so the harness reads as governed while failing OPEN -- the one
   // state that is worse than having no gate, since nobody goes looking. `dormant` is last
   // and quiet: a plugin ready for a harness that is not here is the fleet working.
+  //
+  // `unknown` sits ABOVE worst-first, because it is not a rank: it is the agents whose rank
+  // could not be established. It CLAIMS its agents exclusively (GPT, PR #1073 review). The
+  // inventory's real producer -- config present and hestia-wired, no executable found in the
+  // searched roots -- leaves `installed` false, so the same agent also lands in
+  // `dormant_plugin`, and drawing it there would relabel "could not tell whether it is
+  // installed" as "not installed here": the exact collapse this pane exists to prevent.
   const DISCOVER_GROUPS = [
+    { key: 'unknown', tone: 'amber', title: 'Could not be established — read these as unexamined, not as clean',
+      remedy: 'The inventory refused to guess about these. Each row says what it could not determine; any other group the report also filed it under is shown as a claim, not a finding.' },
     { key: 'miswired', tone: 'red', title: 'Miswired — reads as governed and is NOT',
       remedy: 'A gate is registered but its target is missing, so this harness fails open while looking covered. Reinstall its hestia plugin.' },
     { key: 'partial', tone: 'amber', title: 'Partial — observed but not gated',
@@ -4041,14 +4051,25 @@
     const byAgent = {};
     for (const d of detail) if (d && d.agent) byAgent[d.agent] = d;
     const gaps = r.gaps || {};
+    const listed = key => { const v = key === 'governed' ? r.governed : gaps[key]; return Array.isArray(v) ? v : []; };
+    // Unknown is read from BOTH places that can say it: the gap list, and any detail record
+    // carrying reasons. A report that disagrees with itself is still not a reason to drop a row.
+    const unknownIds = [...new Set([...listed('unknown'),
+      ...detail.filter(d => d && d.agent && Array.isArray(d.unknown) && d.unknown.length).map(d => d.agent)])];
+    const isUnknown = new Set(unknownIds);
     const placed = new Set();
     const groups = [];
     for (const g of DISCOVER_GROUPS) {
-      const ids = (g.key === 'governed' ? r.governed : gaps[g.key]) || [];
+      const ids = g.key === 'unknown' ? unknownIds : listed(g.key).filter(id => !isUnknown.has(id));
       if (!ids.length) continue;
       ids.forEach(id => placed.add(id));
       groups.push({ key: g.key, tone: g.tone, title: g.title, remedy: g.remedy,
-                    rows: ids.map(id => discoverRow(id, byAgent[id])) });
+                    rows: ids.map(id => {
+                      const row = discoverRow(id, byAgent[id]);
+                      if (g.key === 'unknown') row.alsoFiledUnder = DISCOVER_GROUPS.map(o => o.key)
+                        .filter(k => k !== 'unknown' && listed(k).includes(id));
+                      return row;
+                    }) });
     }
     const stray = detail.filter(d => d && d.agent && d.installed && !placed.has(d.agent));
     if (stray.length) groups.unshift({ key: 'unclassified', tone: 'amber',
@@ -4057,7 +4078,10 @@
       rows: stray.map(d => discoverRow(d.agent, d)) });
     const sc = r.scope || {};
     return {
-      unknown: r.status === 'UNKNOWN' || !r.status,
+      // Not status alone: the inventory lets GAP outrank UNKNOWN, so a report can say GAP
+      // while holding agents it could not classify. The banner says "incomplete"; the
+      // unknown rows say where and why. They coexist.
+      unknown: r.status === 'UNKNOWN' || !r.status || unknownIds.length > 0,
       reason: r.reason || sc.agent_enumeration_gap || (r.status ? '' : 'the inventory returned no status'),
       scope: { workspace: sc.workspace || '', enumeration: sc.agent_enumeration || '',
                complete: sc.agent_enumeration_complete !== false,
@@ -4083,6 +4107,9 @@
       blocking: Array.isArray(a.blocking_events) ? a.blocking_events : [],
       fidelity: a.fidelity || '',
       findings: Array.isArray(x.findings) ? x.findings.length : 0,
+      // The inventory's own words for what it could not determine about THIS agent.
+      unknownReasons: Array.isArray(x.unknown) ? x.unknown.filter(u => typeof u === 'string' && u) : [],
+      alsoFiledUnder: [],
     };
   }
 
@@ -4126,6 +4153,10 @@
             ${r.findings ? badge('amber', r.findings + ' finding' + (r.findings === 1 ? '' : 's')) : ''}
             ${r.executable ? `<span class="disc-path" title="resolved executable">${escapeHtml(r.executable)}</span>` : ''}
             ${r.configs ? `<span class="disc-path">${r.configs} config${r.configs === 1 ? '' : 's'} read</span>` : ''}
+            ${r.alsoFiledUnder.map(k => badge('grey', 'report also says: ' + k, 'a claim the inventory could not stand behind for this agent — see the reasons on this row')).join('')}
+            ${g.key === 'unknown' ? `<ul class="disc-why">${(r.unknownReasons.length ? r.unknownReasons
+                : ['the report lists this agent as unknown and gives no reason — that is itself a finding about the inventory'])
+                .map(u => `<li>${escapeHtml(u)}</li>`).join('')}</ul>` : ''}
           </div>`).join('')}
       </div>`).join('');
   }

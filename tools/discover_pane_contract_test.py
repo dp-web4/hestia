@@ -126,6 +126,43 @@ def behaviour() -> None:
     check("UNKNOWN still lists what it saw", sum(len(g["rows"]) for g in m["groups"]), 5)
     check("an incomplete enumeration is flagged", m["scope"]["complete"], False)
 
+    # THE OTHER DIRECTION (GPT, PR #1073 HOLD): an agent the inventory could not classify.
+    # Shaped like the real producer in inventory.py -- config present and hestia-wired, no
+    # executable in the searched roots -- which leaves installed=false and therefore ALSO files
+    # the agent under dormant_plugin. The first cut had no `unknown` group and a fallback that
+    # required `installed`, so the agent that CAUSED the UNKNOWN was the one row not drawn.
+    why = "config dir present and hestia-wired, but no executable found in the searched roots"
+    amb = {"status": "UNKNOWN", "governed": [],
+           "gaps": {"unknown": ["claude"], "dormant_plugin": ["claude", "gemini"], "miswired": []},
+           "detail": [agent("claude", "claude-code", False, {"harness": "Claude Code"}, unknown=[why]),
+                      agent("gemini", "gemini-cli", False)]}
+    m = run_model(amb)
+    by_key = {g["key"]: g for g in m["groups"]}
+    # .get throughout: a missing group must be a NAMED failure, not a KeyError that hides the rest.
+    urow = ((by_key.get("unknown") or {}).get("rows") or [{}])[0]
+    check("agent-unknown: the banner is up", m["unknown"], True)
+    check("agent-unknown: a visible group holds the agent, and it leads",
+          (m["groups"][0]["key"], [r["atlasId"] for r in m["groups"][0]["rows"]]), ("unknown", ["claude"]))
+    check("agent-unknown: the row keeps the inventory's specific reason",
+          urow.get("unknownReasons"), [why])
+    check("agent-unknown: NOT relabelled dormant -- the unknown group claims it exclusively",
+          [r["atlasId"] for r in (by_key.get("dormant_plugin") or {}).get("rows", [])], ["gemini"])
+    check("agent-unknown: ...and the report's other filing survives as a claim, not a group",
+          urow.get("alsoFiledUnder"), ["dormant_plugin"])
+    check("agent-unknown: drawn exactly once", sum(r["atlasId"] == "claude" for g in m["groups"] for r in g["rows"]), 1)
+    # GAP outranks UNKNOWN in the inventory's status, so status alone cannot raise the banner.
+    m = run_model(dict(amb, status="GAP"))
+    check("agent-unknown under status=GAP: banner still up, row still there",
+          (m["unknown"], m["groups"][0]["key"]), (True, "unknown"))
+    # A report that disagrees with itself: reasons on the record, id missing from gaps.unknown.
+    m = run_model(dict(amb, gaps={"dormant_plugin": ["claude", "gemini"]}))
+    check("agent-unknown named only by its detail record is still claimed",
+          [(g["key"], g["rows"][0]["atlasId"]) for g in m["groups"]][:1], [("unknown", "claude")])
+    # ...and listed with no record at all: a row by id, and the absence of a reason is visible.
+    m = run_model({"status": "UNKNOWN", "gaps": {"unknown": ["ghost"]}})
+    check("agent-unknown with no detail record: drawn, with no invented reason",
+          [(r["atlasId"], r["unknownReasons"]) for g in m["groups"] for r in g["rows"]], [("ghost", [])])
+
     # The daemon's own UNKNOWN when the inventory is not installed: status + reason, nothing else.
     m = run_model({"status": "UNKNOWN", "reason": "agent-inventory is not installed on this machine"})
     check("not-installed: unknown, with the daemon's reason, no invented rows",
@@ -165,10 +202,14 @@ def live() -> None:
         return
     m = run_model(report)
     listed = {row["atlasId"] for g in m["groups"] for row in g["rows"]}
-    expected = set(report.get("governed") or []) | {i for ids in (report.get("gaps") or {}).values() for i in ids
-                                                    if isinstance(ids, list)} - set((report.get("gaps") or {}).get("unknown") or [])
+    # EVERY gap list, `unknown` included. The first cut of this line subtracted gaps.unknown from
+    # what it expected to see drawn -- the test was written to permit the very drop it should
+    # have caught (GPT, PR #1073 review).
+    gaps = report.get("gaps") or {}
+    expected = set(report.get("governed") or []) | {i for ids in gaps.values() if isinstance(ids, list) for i in ids}
     check("live: every agent the report groups is drawn", sorted(expected - listed), [])
-    check("live: the model's unknown flag agrees with the report", m["unknown"], report.get("status") == "UNKNOWN")
+    check("live: the banner is up whenever the report, or any agent in it, is unknown",
+          m["unknown"], report.get("status") == "UNKNOWN" or bool(gaps.get("unknown")))
     print(f"live report: status={report.get('status')} groups={[ (g['key'], len(g['rows'])) for g in m['groups'] ]}")
 
 
