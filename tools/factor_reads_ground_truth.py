@@ -39,6 +39,28 @@ INSTRUMENT DEFECT, MEASURED. The first version read `payload["arguments"]` on
 Caught only because zero was implausible for a seat whose factors say "I inspected the
 named worktree". Fourth instrument defect in this thread, same class every time.
 
+THREE MORE, SAME CLASS (kimi-code, review of notice 13083, 2026-09-20). The shipped
+matcher confirmed 17 of 64; the repaired matcher confirms 17 of 64 -- and the membership
+differs by one in each direction:
+  5. THE FILING COMMAND IS AN ECHO. `corroborate --argument '<factor>'` carries every
+     path the factor names, in-window, and reads nothing. Three of the 17 had the echo as
+     their only hit. Two of the three (c83eccb2dc98, 2d4bbddf48b2) have genuine reads
+     once defects 6-7 are repaired; the third (5b60cefa1ce5) does not -- its named path
+     is the record's marker field quoted back, and it leaves the confirmed set.
+  6. SENTENCE PUNCTUATION RIDES THE PATH. `.` is in RE_PATH's charset, so a sentence-final
+     path keeps its stop and never substring-matches. Hid 8cc6499312b7's genuine grep over
+     plugins/_shared/hestia_gate_mechanism.py (0.7-0.9 min before filing) -- that factor
+     JOINS the confirmed set, and only because defect 5 is also repaired: after the strip,
+     its filing echo would otherwise have matched the same path.
+  7. THE WORKDIR IS NOT JOINED. A factor names the absolute path; the command held the
+     relative path plus workdir=<the worktree>. Hid 2d4bbddf48b2's git status/diff/sed
+     over /tmp/wt-gemini (1.2 min before filing).
+The cross-claims are invariant under the membership swap: both moved factors sit in the
+same prose cell (hash-only/record-only, not local-disk, not declared-insufficient), so
+5/12, 12/17 and 5/16 all stand. named-not-read keeps its count at 3 with a changed
+composition: all three are record-content quotes (two truncated stated_reason fragments,
+one marker echo), so no codex factor names a real filesystem path it did not read.
+
 Usage:
     python3 tools/factor_reads_ground_truth.py --max 60000 --window 30
 """
@@ -68,6 +90,55 @@ RE_NOISE = re.compile(r"hestia-mesh-primers|notice-\w+\.json")
 #: worktree is exactly the dereference this asks about.
 RE_READER = re.compile(r"\b(?:cat|head|tail|sed|nl|wc|grep|rg|ls|stat|find|diff|"
                        r"md5sum|sha256sum|cmp|git)\b")
+#: An exec command's working directory, recovered from the rollout's JS-call text.
+RE_WORKDIR = re.compile(r'workdir[":\s]+"([^"]+)"')
+
+def _norm(s: str) -> str:
+    """Backslash-stripped comparison form: rollout input JSON-escapes quotes."""
+    return s.replace("\\", "")
+
+
+def is_echo(argument: str, txt: str) -> bool:
+    """The filing command is not a read.
+
+    `hestia gate corroborate --argument '<the factor>'` embeds the factor's own text --
+    including every path it names -- in a command that runs in the match window. Counting
+    it READ-CONFIRMS the factor on its own say-so: measured 2026-09-20, three of the
+    shipped matcher's 17 confirmations (c83eccb2dc98, 2d4bbddf48b2, 5b60cefa1ce5) had the
+    filing echo as their ONLY hit. 80 chars of verbatim prose appears in no genuine read.
+    """
+    probe = _norm((argument or "")[:80])
+    return bool(probe) and probe in _norm(txt)
+
+
+def extract_paths(argument: str) -> set[str]:
+    """Paths a factor names, minus sentence punctuation the regex cannot exclude.
+
+    `.` is in RE_PATH's charset (file extensions need it), so a path at the end of a
+    sentence keeps its full stop: `plugins/_shared/hestia_gate_mechanism.py.` then never
+    substring-matches the same path without the dot in a command line. Measured: this one
+    trailing byte hid every genuine read behind 8cc6499312b7 and c83eccb2dc98.
+    """
+    return {p.rstrip(".") for p in RE_PATH.findall(argument)
+            if not RE_NOISE.search(p)}
+
+
+def path_in_command(p: str, txt: str) -> bool:
+    """Substring match, plus the workdir join for commands that cd via `workdir=`.
+
+    A factor names the ABSOLUTE path; codex often runs `git status -- <relative>` with
+    `workdir` set to the worktree root. Without the join the read is invisible:
+    2d4bbddf48b2 named /tmp/wt-gemini/plugins/_shared/test_gate_core.py while the command
+    held only the relative path and workdir=/tmp/wt-gemini.
+    """
+    if p in txt:
+        return True
+    m = RE_WORKDIR.search(txt)
+    if m:
+        wd = m.group(1).rstrip("/")
+        if p.startswith(wd + "/") and p[len(wd) + 1:] in txt:
+            return True
+    return False
 
 
 def T(s: str) -> datetime.datetime:
@@ -139,7 +210,7 @@ def main() -> int:
     rows = []
     for f in factors:
         ts = T(f["ts"])
-        paths = {p for p in RE_PATH.findall(f["argument"]) if not RE_NOISE.search(p)}
+        paths = extract_paths(f["argument"])
         if not paths:
             verdict["no-path-named"] += 1
             continue
@@ -153,8 +224,10 @@ def main() -> int:
                 lag = (ts - T(cts)).total_seconds() / 60.0
                 if not (0 <= lag <= args.window) or not RE_READER.search(txt):
                     continue
+                if is_echo(f["argument"], txt):
+                    continue
                 for p in paths:
-                    if p in txt:
+                    if path_in_command(p, txt):
                         hits.append((round(lag, 1), p, " ".join(txt.split())[:160]))
         verdict["READ-CONFIRMED" if hits else "named-not-read"] += 1
         if hits:
