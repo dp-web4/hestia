@@ -183,6 +183,55 @@ dead grant, and the 21s self-withdrawal with a named reason is the clean termina
 One wording correction to the withdrawal reason: the original is not "still unruled" —
 it is ruled-approved; what lapsed is the grant. The operational conclusion is identical.
 
+## 6. Notice 13446 — escalation `d2bfb4cab736f56a`: corroborated (the thread completes)
+
+Third issuance of the `7073c1df` Edit act, and the clean one: opened 22:03:48Z,
+operator-approved +20s, **claimed and spent 57s after open** (`consumed_at`
+1789941885 is the store's own claim instant). Verified end to end:
+
+- The opened entry's `act_digest` (`dc868c1a…`) is what the approval bound; the claimed
+  entry records `stated_attempted_act` byte-equal to the petition and
+  `secs_from_decision_to_use: 37`.
+- The outcome stream shows the spent act: `Edit` on the same scratchpad
+  `wt-role/plugins/claude-code/hooks/pre_tool_use.py`, `success=True`, at the claim
+  instant — followed by two `projection_consumer_test.py` runs (the edit is
+  test-driven scratchpad work, exactly what the scratchpad-spelled gate copy is for).
+- Lineage measured in §5 and review-13298-13303 §1 is now complete: approved-lapsed
+  (7073c1df, fuse died on the poll door) → duplicate refused and self-withdrawn
+  (ac58c702) → approved-claimed-spent (d2bfb4ca). The re-issue loop ended the way the
+  protocol intends once a live approval exists.
+- Independence note: codex's invitation bounced (`fire-rc=1; out-of-credits`), so this
+  corroboration is the only peer review this petition gets.
+
+## 7. Notice 13454 — escalation `5a63db0705c2f968`: corroborated, with the storage cap noted
+
+Bash append of `../verify-block.sh` to `deploy/install-members.sh` in scratchpad
+`wt-ratify` (+ `bash -n` syntax gate + `git d…`). Approved +9s, claimed +48s, spent at
+1789941891 with `success=True` on the outcome stream — spent act matches the stated
+act. Two record notes:
+
+- `stated_attempted_act` is again storage-truncated at 228 chars (literal U+2026 after
+  `git d`). Unlike 5b558882c4703f52 (§1), the cut here falls **after** the write and
+  its syntax check are fully visible — reviewability is intact for this record; the
+  cap remains the known limitation, measured twice now in one evening.
+- Marker `deploy/install-members.sh` on a scratchpad worktree path is the same
+  governed-name spelling-tax family as §1 and 13312/13334: the destination is a /tmp
+  worktree, the marker matches by name. Operator saw the full command; single_approver
+  bar met; nothing about the spend is anomalous.
+- Codex's invitation bounced here too (out-of-credits) — single-seat peer review again.
+
+## Appendix: correction absorbed — the deploy is STAGED now
+
+My ack of notice 13431 (queued_id 13471) repeated claude-code's "the changes are
+UNSTAGED" claim. Notice 13444 corrects it, and the tree confirms: at 22:05Z the five
+member-mesh paths are staged (`A` MEMBERS, `M` fire-*.sh ×3 + allowlist test), while
+`tools/mesh_deploy_vintage.py` (== 94ec160 on `claude/mesh-deploy-vintage-bytes`)
+remains unstaged. The asymmetry that motivated the correction is real: with MEMBERS
+untracked, `git clean -fd` in the shared tree would have deleted the roster the
+deployment exists to execute. Staging survives `clean`; it does not survive
+`checkout`/`reset --hard` — the deployment is still unheld until #606 moves the tree
+to main, but the loss vector is now the one the banner names, not a silent clean.
+
 ---
 
 ### Artifacts and reproduction
