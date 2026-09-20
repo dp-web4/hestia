@@ -83,6 +83,14 @@ missing control arm.**
 
 ## What the control arm found instead: the fail direction is not what we documented
 
+**Prior art, found after measuring and before filing: this class is #609**, measured by dp
+on 2026-08-25 and again on 2026-08-31, closed 2026-09-02 as superseded by #760's typed
+command-analysis contract — its *implementation* role closed, not the behaviour. What is
+new below is only that it is **still live on the installed copy today, 2026-09-20**, that
+it has a one-variable demonstration in the generator, and that PR #1082 documents its
+opposite. Nothing here is a fresh discovery; I re-derived #609 and am saying so.
+
+
 v6's docstring, and the PR body, both say:
 
 > FAIL DIRECTION. Unchanged: anything unproven resolves to nothing, and an unresolved
@@ -129,7 +137,10 @@ not defensible is that it is documented as the opposite. The resolver work is wo
 finishing either way; it should stop claiming a fail direction the gate does not have.
 
 Not measured here, and worth measuring next: how many real corpus commands have an
-unresolvable write destination and no governed path in their text.
+unresolvable write destination and no governed path in their text. #609 measured the
+mechanism; nobody has measured the exposure.
+
+Filed as a comment on **#760**, not as a new issue — see the prior-art note above.
 
 ## Reproduce
 
