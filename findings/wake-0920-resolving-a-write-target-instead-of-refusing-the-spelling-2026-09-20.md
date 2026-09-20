@@ -108,7 +108,38 @@ So the repair clears the *class* kimi isolated but not the *specimen* it was iso
 That is worth saying plainly, because the natural next move — partially resolving a prefix
 and trusting it — is the unsound one.
 
-## 5. What the two escalations cost, and what they show
+## 5. How much it buys: 15 of the 145 refusals still standing
+
+`tools/gate_self_access_refusal_census.py` walks 1,528 claude-code transcripts across
+three project keys, keeps every `tool_result` that **is** a gate-self-access refusal
+(anchored on the hook's own envelope — an unanchored substring search for
+`gate-self-access` returns 477, and 226 of those are grep output, file contents and past
+transcripts that merely *mention* it), pairs each with the call it refused, and
+re-classifies that call twice.
+
+251 distinct refused calls, 2026-08-26 → 2026-09-18:
+
+| tool | today's classifier | with the resolver | n |
+|---|---|---|---|
+| Bash | read | read | 105 |
+| Edit | write | write | 47 |
+| Bash | write | write | 82 |
+| Bash | write | **read** | **15** |
+| Write | write | write | 1 |
+| Bash | none | none | 1 |
+
+- **106 of 251** recorded refusals are not reproduced by today's classifier at all. That is
+  the last month of FP repairs, visible as a corpus: 64 of them are August refusals, 42
+  September. Every one of them cost an escalation when it fired.
+- **145** still classify `write`. 48 of those are `Edit`/`Write` calls at the gate itself —
+  the rule working. The resolver clears **15 of the remaining 82 Bash refusals (18%)**.
+- Every cleared row was checked by hand against its resolved destinations. All 15 resolve
+  to concrete non-governed paths — `/tmp` scratchpads, `/dev/null`, memory files under
+  `~/.claude/projects/*/memory/` — and **none resolves into the closure**. The shape is the
+  same every time: a findings or memory file written by a heredoc to `$VAR/name.md`, with
+  the governance marker appearing only inside the body or in an earlier read.
+
+## 6. What the two escalations cost, and what they show
 
 Developing this took two gate refusals, both `gate-self-access`, neither one about an act:
 
@@ -138,10 +169,17 @@ routed around.
 ## Reproduce
 
 ```
-python3 /tmp/gaterepair/table.py            # the 17-case table (worktree at origin/main)
-python3 /tmp/gaterepair/run_suites.py            # baseline
-python3 /tmp/gaterepair/run_suites.py --repaired # with the resolver injected
+python3 tools/redirect_target_resolver_table.py     # the 17-case table
+python3 tools/redirect_target_resolver_suites.py            # suites, baseline
+python3 tools/redirect_target_resolver_suites.py --repaired # suites, resolver injected
+python3 tools/gate_self_access_refusal_census.py    # the 251-refusal census
 ```
+
+The three harnesses read the closure from `/tmp/wt-gaterepair/plugins/_shared` (a worktree
+at `origin/main`); point them at any checkout to re-run. **Do not point them at
+`/home/dp/ai-workspace/hestia`** without checking that tree's branch first — it was on
+`kimi/review-13155-13187` throughout this wake, and the first run of these suites against
+it silently measured a pre-`#1062` vintage (14 arms there, 13 here).
 
 The candidate implementation is `tools/redirect_target_resolver.py` on this branch — the
 exact functions injected above, unmodified.
