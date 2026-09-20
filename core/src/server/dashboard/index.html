@@ -4526,7 +4526,40 @@
     [plugin, path, reason].forEach(el => el.addEventListener('input', sync));
     sync();
 
+    // THE OFFER IS ABOUT A FORM, so it carries that form (#1067; cbp's review of #1078).
+    // `offeredFor` is what the daemon refused -- the fields that decide who gets what, for how
+    // long -- and the offer holds only while the form still says exactly that. Without it the
+    // button outlived its message: read "Did you mean 'claude-code'?", retype, fumble the
+    // retype, press the offer still sitting there, and an id the daemon never refused went out
+    // with the deliberate word attached. The reason is left out on purpose: it is not what was
+    // refused, and improving it should not cost the operator the offer.
+    let grantAheadOnce = false, offeredFor = null;
+    const formKey = () => JSON.stringify([plugin.value.trim(), path.value.trim(), ttl.value]);
+    const withdrawOffer = () => {
+      if (offeredFor === null) return;
+      offeredFor = null;
+      err.hidden = true; err.textContent = '';
+    };
+    err.addEventListener('click', e => {
+      if (!e.target || e.target.id !== 'sg-ahead-btn') return;
+      // Compared HERE, not only on `input`: a field can change with no event this page hears.
+      if (offeredFor === null || offeredFor !== formKey()) { withdrawOffer(); return; }
+      grantAheadOnce = true;
+      btn.disabled = false;
+      btn.click();
+    });
+    // An edit to what was refused takes the offer off the screen, so nothing stale is pressable.
+    [plugin, path, ttl].forEach(el => ['input', 'change'].forEach(t => el.addEventListener(t, () => {
+      if (offeredFor !== null && offeredFor !== formKey()) withdrawOffer();
+    })));
+
     btn.addEventListener('click', async () => {
+      // Set ONLY by the button the unknown-member refusal renders, and spent by THIS click
+      // whatever happens to it (#1067). Read first, before any early return: spent lower down,
+      // a press that failed the path check below left it armed, and it then rode along on the
+      // operator's next ordinary grant (found by sabotaging this block's own contract test).
+      const ahead = grantAheadOnce; grantAheadOnce = false;
+      offeredFor = null;
       err.hidden = true; ok.hidden = true;
       btn.disabled = true;
       try {
@@ -4551,11 +4584,27 @@
           reason: reason.value.trim(),
         };
         if (ttl.value) body.expires_in_secs = Number(ttl.value);
+        if (ahead) body.grant_ahead_of_connect = true;
         const res = await apiFetch('/api/scope/grant', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
         const out = await res.json().catch(() => ({}));
+        // THE UNKNOWN-MEMBER REFUSAL (#1067) is not a dead end. The daemon now refuses a grant
+        // to an id that has never connected, because the warning it used to return was read as
+        // success. Granting ahead of a first connect is still legitimate, and a registry that
+        // is empty or unreadable would otherwise block every grant from this screen -- so the
+        // deliberate path is offered HERE, on exactly this refusal, as its own button. It
+        // re-sends the same form once with `grant_ahead_of_connect`; nothing is remembered.
+        if (res.status === 409 && out && out.member_known === false && !ahead) {
+          err.innerHTML = `${escapeHtml(out.error || 'no member by that id has connected')}
+            <button type="button" class="pol-btn-add" id="sg-ahead-btn"
+              title="Only if this member is real and simply has not connected yet. A typo granted this way reaches nothing, and shows up as a phantom agent.">grant ahead of first connect</button>`;
+          err.hidden = false;
+          offeredFor = formKey();
+          sync();
+          return;
+        }
         if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
         // The daemon reports whether that plugin_id has ever connected. A grant to a member
         // nobody has seen is legitimate (granting ahead of a first connect) and is ALSO what

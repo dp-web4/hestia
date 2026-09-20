@@ -2794,7 +2794,11 @@ async fn scope_decide(
     )
 }
 
-/// `POST /api/scope/grant` {plugin_id, path, reason, expires_in_secs?}
+/// `POST /api/scope/grant` {plugin_id, path, reason, expires_in_secs?, grant_ahead_of_connect?}
+///
+/// An unknown `plugin_id` is refused (409, nothing written) unless `grant_ahead_of_connect` is
+/// the boolean `true` (#1067). The flag registers NOTHING: no member is minted, and the 200
+/// still says `member_known: false`. It only says the operator meant it.
 ///
 /// THE OPERATOR'S OWN GRANT — no `request_id`, because no member asked.
 ///
@@ -3432,6 +3436,40 @@ async fn config_get_seat(
     )
 }
 
+/// Recorded member ids a mistyped `asked` most plausibly meant: equal ignoring case and
+/// punctuation first, else within two edits. At most three, best first. Pure, so its refusals
+/// can be tested without a daemon. It only ever NAMES candidates in an error message -- it
+/// never redirects a grant, because guessing the target of an authority change is the
+/// operator's job, not a string distance's.
+fn nearest_member_ids(asked: &str, known: &[String]) -> Vec<String> {
+    let fold = |s: &str| -> Vec<char> {
+        s.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_lowercase()).collect()
+    };
+    let a = fold(asked);
+    if a.is_empty() {
+        return Vec::new();
+    }
+    let dist = |x: &[char], y: &[char]| -> usize {
+        let mut prev: Vec<usize> = (0..=y.len()).collect();
+        for (i, cx) in x.iter().enumerate() {
+            let mut cur = vec![i + 1];
+            for (j, cy) in y.iter().enumerate() {
+                let sub = prev[j] + usize::from(cx != cy);
+                cur.push(sub.min(prev[j + 1] + 1).min(cur[j] + 1));
+            }
+            prev = cur;
+        }
+        prev[y.len()]
+    };
+    let mut scored: Vec<(usize, &String)> = known
+        .iter()
+        .map(|k| (dist(&a, &fold(k)), k))
+        .filter(|(d, _)| *d <= 2)
+        .collect();
+    scored.sort_by(|x, y| x.0.cmp(&y.0).then_with(|| x.1.cmp(y.1)));
+    scored.into_iter().take(3).map(|(_, k)| k.clone()).collect()
+}
+
 async fn scope_grant(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
@@ -3506,6 +3544,47 @@ async fn scope_grant(
     // is a claim, not a check. `member_registry` is the store of members actually recorded, so
     // asking it can return false.
     let member_known = s.member_registry.get(&plugin_id).is_some();
+    // AND NOW REFUSED BY DEFAULT (#1067). The paragraph above chose "reported, not refused",
+    // and the report was accurate, well worded, and defeated by where it was shown: inside the
+    // SUCCESS element, after the word "Granted". Measured on McNugget 2026-09-08: three grants
+    // across forty minutes to `Claude-code` and `Claude-Code`, each witnessed and durable, while
+    // `claude-code` -- the seat that needed them -- stayed denied. The ids then sat in the trust
+    // list as two extra agents until 2026-09-20. A warning that arrives with a success is read
+    // as a success.
+    //
+    // Granting ahead of a first connect is still legitimate, so it is still possible: say so,
+    // with `grant_ahead_of_connect: true`. What changes is which of the two outcomes needs a
+    // deliberate extra word -- it used to be the safe one.
+    let ahead_of_connect = body
+        .get("grant_ahead_of_connect")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !member_known && !ahead_of_connect {
+        // One line on purpose: tests/member_presence_census.rs pins registry reads by line, and
+        // a chain split across five lines pins as a bare field access -- a pin that says nothing.
+        #[rustfmt::skip]
+        // Fillers are left out: a custodial id the plane invokes is nobody to grant to, so the
+        // refusal must not suggest one (cbp's review of #1078).
+        let known: Vec<String> = s.member_registry.iter_sorted().into_iter().filter(|(id, _)| !s.member_registry.is_filler(id)).map(|(id, _)| id.clone()).collect();
+        let nearest = nearest_member_ids(&plugin_id, &known);
+        let hint = match nearest.as_slice() {
+            [] => "No recorded member resembles it.".to_string(),
+            [one] => format!("Did you mean '{one}'?"),
+            many => format!("Closest recorded members: {}.", many.join(", ")),
+        };
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "no member '{plugin_id}' has ever connected to this daemon, so this grant \
+                     would reach nothing. {hint} Nothing was written. To grant ahead of a \
+                     member's first connect, resend with \"grant_ahead_of_connect\": true."
+                ),
+                "member_known": false,
+                "nearest": nearest,
+            })),
+        );
+    }
     let replaces = s
         .standing_scope
         .grants
@@ -7321,6 +7400,80 @@ mod disposition_tests {
     async fn register_member(state: &SharedState, id: &str) {
         super::super::handler::tool_connect(state, &serde_json::json!({
             "plugin_id": id, "host_agent": "test"})).await.unwrap();
+    }
+
+    async fn grant(state: &SharedState, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let resp = scope_grant(State(state.clone()), Json(body)).await.into_response();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// #1067, measured on McNugget: a grant to `Claude-code` succeeded, was witnessed, was
+    /// durable, and reached nothing, three times, while `claude-code` stayed denied. The
+    /// refusal must leave NOTHING behind -- no row, no generation move, no chain entry -- or
+    /// the typo still mints the phantom it was refused for.
+    #[tokio::test]
+    async fn a_grant_to_a_member_nobody_has_seen_is_refused_and_names_the_one_you_meant() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "claude-code").await;
+        register_member(&state, "kimi-code").await;
+        let before = snapshot(&*state.lock().await);
+
+        let (status, body) = grant(&state, serde_json::json!({
+            "plugin_id": "Claude-code", "path": "/w/repos", "reason": "dp's typo", "recursive": true})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["nearest"], serde_json::json!(["claude-code"]));
+        assert!(body["error"].as_str().unwrap().contains("Did you mean 'claude-code'?"), "{body}");
+        assert!(body["error"].as_str().unwrap().contains("Nothing was written"), "{body}");
+        let (status, body) = grant(&state, serde_json::json!({
+            "plugin_id": "caude-code", "path": "/w/repos", "reason": "and the other one"})).await;
+        assert_eq!((status, &body["nearest"]), (StatusCode::CONFLICT, &serde_json::json!(["claude-code"])));
+        {
+            let s = state.lock().await;
+            assert_eq!(snapshot(&s), before, "a refused grant leaves no row, no generation, no chain entry");
+            assert!(!s.has_scope_grant("Claude-code", "/w/repos/x"));
+            assert!(s.member_registry.get("Claude-code").is_none(), "and mints no member");
+        }
+
+        // The real id goes through, unchanged.
+        let (status, body) = grant(&state, serde_json::json!({
+            "plugin_id": "claude-code", "path": "/w/repos", "reason": "the seat that needed it", "recursive": true})).await;
+        assert_eq!((status, &body["member_known"]), (StatusCode::OK, &serde_json::json!(true)), "{body}");
+        assert!(state.lock().await.has_scope_grant("claude-code", "/w/repos/x"));
+
+        // Granting ahead of a first connect is still possible -- deliberately.
+        let (status, body) = grant(&state, serde_json::json!({
+            "plugin_id": "nomad-being", "path": "/w/nomad", "reason": "provisioning tomorrow",
+            "grant_ahead_of_connect": true})).await;
+        assert_eq!((status, &body["member_known"]), (StatusCode::OK, &serde_json::json!(false)), "{body}");
+        // The deliberate word REGISTERS NOTHING -- which is why it is not called `register_*`.
+        // The grant is recorded; the member is still nobody until it connects.
+        {
+            let s = state.lock().await;
+            assert!(s.has_scope_grant("nomad-being", "/w/nomad"));
+            assert!(s.member_registry.get("nomad-being").is_none(), "granting ahead mints no member");
+        }
+        // ...and `false`, or a non-boolean, is not the deliberate word.
+        for v in [serde_json::json!(false), serde_json::json!("true"), serde_json::json!(1)] {
+            let (status, _) = grant(&state, serde_json::json!({
+                "plugin_id": "thor-being", "path": "/w/t", "reason": "r", "grant_ahead_of_connect": v})).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+        }
+    }
+
+    #[test]
+    fn nearest_member_ids_names_candidates_and_never_stretches() {
+        let known: Vec<String> = ["claude-code", "codex", "kimi-code", "gemini"].iter().map(|s| s.to_string()).collect();
+        let near = |a: &str| nearest_member_ids(a, &known);
+        assert_eq!(near("Claude-code"), vec!["claude-code"], "case");
+        assert_eq!(near("claude_code"), vec!["claude-code"], "punctuation");
+        assert_eq!(near("caude-code"), vec!["claude-code"], "a dropped letter");
+        assert_eq!(near("kimi-cod"), vec!["kimi-code"]);
+        assert_eq!(near("legion-being"), Vec::<String>::new(), "far from everything: say so, do not reach");
+        assert_eq!(near(""), Vec::<String>::new());
+        assert_eq!(near("---"), Vec::<String>::new(), "nothing left after folding");
+        assert_eq!(nearest_member_ids("codex", &[]), Vec::<String>::new());
     }
 
     async fn reassign(state: &SharedState, body: serde_json::Value) -> axum::response::Response {
