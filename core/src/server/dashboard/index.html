@@ -354,6 +354,8 @@
   .disc-name { font-weight: 600; }
   .disc-ids  { font-size: 0.78rem; color: var(--fg-dim); }
   .disc-path { font-family: var(--mono); font-size: 0.72rem; color: var(--fg-dim); }
+  .trust-alike { flex-basis: 100%; grid-column: 1 / -1; font-size: 0.78rem; color: var(--fg-dim); margin-top: 0.2rem; }
+  .trust-alike .pol-btn-add { margin-left: 0.5rem; }
   .disc-why { flex-basis: 100%; margin: 0.15rem 0 0 1.1rem; padding: 0; font-size: 0.78rem; color: var(--fg-dim); }
   .disc-badge { font-size: 0.68rem; padding: 0.05rem 0.4rem; border-radius: 0.6rem;
                 border: 1px solid var(--fg-faint); white-space: nowrap; }
@@ -2225,6 +2227,77 @@
     return Object.values(byId).filter(v => v.roles > 0);
   }
 
+  // ── Look-alike members (agent-lifecycle PRD R6) ────────────────────────────────────────
+  //
+  // A member id is caller-asserted text, so a typo in a grant form mints a member (#1067): dp's
+  // trust list showed `claude-code` (5,415 actions), `Claude-code` (0) and `caude-code` (0) as
+  // three agents. The remedy already exists -- the operator's alias act -- but reaching it meant
+  // noticing the typo, finding the form, and picking both ids again by hand.
+  //
+  // PURE, run under node by tools/lookalike_merge_contract_test.py. DELIBERATELY NARROW, because
+  // a wrong suggestion is an invitation to join two real members' evidence:
+  //   * only an id that has NEVER ACTED is ever suggested as the alias -- a phantom's signature.
+  //     Two ids that both act are two things that act, however alike their names;
+  //   * the survivor must have acted, and must be the ONLY candidate, or nothing is offered;
+  //   * alike means equal ignoring case and punctuation, or ONE edit apart (insert, delete,
+  //     substitute, or a swap of neighbours) on ids long enough for that to mean something.
+  // It SUGGESTS and PRE-FILLS. It never posts: the act stays the operator's, with its own button.
+  const LOOKALIKE_MIN_LEN = 6;
+  function lookalikeKey(id) { return String(id || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
+  function withinOneEdit(a, b) {
+    if (a === b) return true;
+    const la = a.length, lb = b.length;
+    if (Math.abs(la - lb) > 1) return false;
+    let i = 0;
+    while (i < la && i < lb && a[i] === b[i]) i++;
+    if (la === lb) {
+      if (a.slice(i + 1) === b.slice(i + 1)) return true;                       // substitute
+      return a[i] === b[i + 1] && a[i + 1] === b[i] && a.slice(i + 2) === b.slice(i + 2);  // swap
+    }
+    const [shorter, longer] = la < lb ? [a, b] : [b, a];
+    return shorter.slice(i) === longer.slice(i + 1);                            // insert / delete
+  }
+  function lookalikeSuggestions(rows) {
+    const list = (rows || []).filter(r => r && r.plugin_id);
+    const acted = list.filter(r => (r.action_count || 0) > 0);
+    const out = {};
+    for (const r of list) {
+      if ((r.action_count || 0) > 0) continue;
+      const k = lookalikeKey(r.plugin_id);
+      if (k.length < LOOKALIKE_MIN_LEN) continue;
+      const hits = acted.filter(s => {
+        const ks = lookalikeKey(s.plugin_id);
+        return ks.length >= LOOKALIKE_MIN_LEN && withinOneEdit(k, ks);
+      });
+      if (hits.length !== 1) continue;   // none, or ambiguous: say nothing rather than guess
+      const of = hits[0];
+      const how = lookalikeKey(of.plugin_id) === k ? 'differs only in case or punctuation' : 'one character apart';
+      out[r.plugin_id] = { alias: r.plugin_id, of: of.plugin_id, how,
+        ref: `dashboard look-alike: '${r.plugin_id}' ${how} from '${of.plugin_id}'; 0 actions vs ${of.action_count}` };
+    }
+    return out;
+  }
+  // Fill the operator's alias form and take them to it. Does not submit.
+  function prepareMerge(alias, of, ref) {
+    setView('govern', true);
+    governShow('acts');
+    refreshMemberPickers();
+    for (const [id, v] of [['ali-of', of], ['ali-alias', alias], ['ali-ref', ref]]) {
+      const el = $(id);
+      if (!el) continue;
+      el.value = v;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    const f = $('ali-reason'); if (f) { f.scrollIntoView({ block: 'center' }); f.focus(); }
+  }
+  document.addEventListener('click', e => {
+    const b = e.target && e.target.closest && e.target.closest('[data-merge-alias]');
+    if (!b) return;
+    e.stopPropagation();
+    prepareMerge(b.dataset.mergeAlias, b.dataset.mergeOf, b.dataset.mergeRef);
+  }, true);
+
   function renderHarnessTrust(trust, orchs) {
     const root = $('trust-list'), title = $('trust-title'), hint = $('trust-hint');
     title.textContent = 'Plugin trust';
@@ -2233,6 +2306,7 @@
     const connected = new Set(orchs.filter(o => o.connected).map(o => o.id));
     const rows = aggregateHarnessTrust(trust).sort((a, b) => b.action_count - a.action_count);
     noteMembers(rows);   // keep the member pickers backed by real evidence
+    const alike = lookalikeSuggestions(rows);
     if (!rows.length) {
       root.innerHTML = '<div class="empty">No plugins recorded yet. Connect one to start building trust.</div>';
       return;
@@ -2258,6 +2332,11 @@
         <span class="tr-val"></span>
         <span class="trust-level">${escapeHtml(r.level)}</span>
         <span class="tr-drill">${drillable ? 'roles →' : ''}</span>
+        ${alike[r.plugin_id] ? `<div class="trust-alike">never acted, and ${escapeHtml(alike[r.plugin_id].how)} from
+          <strong>${escapeHtml(alike[r.plugin_id].of)}</strong> — probably a mistyped id.
+          <button type="button" class="pol-btn-add" data-merge-alias="${escapeHtml(r.plugin_id)}"
+            data-merge-of="${escapeHtml(alike[r.plugin_id].of)}" data-merge-ref="${escapeHtml(alike[r.plugin_id].ref)}"
+            title="Fills the alias form under govern → acts. Nothing is recorded until you press its button.">prepare merge</button></div>` : ''}
       </div>`;
     }).join('');
   }

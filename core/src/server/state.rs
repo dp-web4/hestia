@@ -1258,6 +1258,55 @@ impl ServerState {
         Some(format!("lct:web4:member:{hex}"))
     }
 
+    /// Are these two plugin ids ONE member, on the record? True when they hash to the same
+    /// member LCT (equal after trimming), or when the operator's witnessed `identity_alias`
+    /// records join them: one is an alias of the other, or both are aliases of one target.
+    ///
+    /// ONE LEVEL, like `derivation::aliased_identities` and for its reason: following chains
+    /// would let two independent aliases silently join two unrelated members.
+    ///
+    /// Reads every alias record, with no window -- the measured reason the four guards that
+    /// call this were inert (`the_member_lct_alias_guard_reaches_only_whitespace`): the
+    /// resolver existed, but over a window the record had already left. Type-indexed, so the
+    /// cost is the number of alias records, not the length of the chain.
+    ///
+    /// FAILS TOWARD "SAME". Every caller uses a `true` to EXCLUDE a party from ruling on, or
+    /// reviewing, an act of its own. An unmappable (synthetic/empty) id stays `false`, as
+    /// `member_lct` has always had it: identity that was never established is not asserted.
+    pub fn same_entity(&self, a: &str, b: &str) -> bool {
+        let (la, lb) = (self.member_lct(a), self.member_lct(b));
+        if la.is_none() || lb.is_none() {
+            return false;
+        }
+        if la == lb {
+            return true;
+        }
+        let aliases = match self.chain_store.scan_recent(
+            None,
+            Some(&[crate::derivation::IDENTITY_ALIAS_EVENT]),
+            crate::derivation::ALIAS_SCAN,
+            crate::derivation::project_row,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                // A failed read is not evidence of independence. Say so, and do not guess:
+                // the string compare above already answered what can be known without it.
+                tracing::error!("same_entity: alias read failed ({e}); answering on ids alone");
+                return false;
+            }
+        };
+        // Stated as the relations themselves, not as "compare canonical forms": canonicalising
+        // both sides silently breaks the DIRECT relation whenever the target is itself an
+        // alias (cc -> bb, bb -> aa: canon(cc)=bb, canon(bb)=aa, and the pair the operator
+        // explicitly joined reads as two members). Caught by this function's own test.
+        let (a, b) = (a.trim(), b.trim());
+        let (ta, tb) = (
+            crate::derivation::alias_target(a, &aliases),
+            crate::derivation::alias_target(b, &aliases),
+        );
+        ta.as_deref() == Some(b) || tb.as_deref() == Some(a) || (ta.is_some() && ta == tb)
+    }
+
     /// Append a chain entry under the sovereign LCT.
     pub fn append_chain(
         &self,
@@ -1782,6 +1831,50 @@ mod tests {
         assert!(!same_entity("kimi-code", "kimi"));
         // What it DOES add over clause 1's `p.arbiter == p.appellant` string compare.
         assert!(same_entity("codex", " codex "), "trim is the guard's whole reach");
+    }
+
+    /// The repair `the_member_lct_alias_guard_reaches_only_whitespace` asked for. That test
+    /// still stands, unchanged: `member_lct` equality alone is exactly as inert as it says.
+    /// `same_entity` adds the operator's alias records, read without a window.
+    #[test]
+    fn same_entity_follows_the_operators_alias_and_does_not_forget_it() {
+        let (_dir, state) = make_state();
+        let alias = crate::derivation::IDENTITY_ALIAS_EVENT;
+        assert!(!state.same_entity("codex", "codex-cli"), "no record yet: two members");
+        assert!(state.same_entity("codex", " codex "), "what the old guard did reach");
+
+        state
+            .append_chain(alias, serde_json::json!({"alias": "codex-cli", "alias_of": "codex", "ref": "t"}))
+            .unwrap();
+        assert!(state.same_entity("codex", "codex-cli"));
+        assert!(state.same_entity("codex-cli", "codex"), "symmetric");
+        assert!(!state.same_entity("codex", "claude-code"), "an alias joins two ids, not everyone");
+
+        // Two typos of one id are each other, through their shared target.
+        for typo in ["Claude-code", "caude-code"] {
+            state
+                .append_chain(alias, serde_json::json!({"alias": typo, "alias_of": "claude-code", "ref": "t"}))
+                .unwrap();
+        }
+        assert!(state.same_entity("Claude-code", "caude-code"));
+
+        // ONE level. b -> a and c -> b does not make c the same entity as a.
+        state.append_chain(alias, serde_json::json!({"alias": "bb", "alias_of": "aa", "ref": "t"})).unwrap();
+        state.append_chain(alias, serde_json::json!({"alias": "cc", "alias_of": "bb", "ref": "t"})).unwrap();
+        assert!(state.same_entity("cc", "bb") && state.same_entity("bb", "aa"));
+        assert!(!state.same_entity("cc", "aa"), "alias chains are not followed, by design");
+
+        // An id that maps to no member is never asserted to be anyone.
+        assert!(!state.same_entity("", "codex") && !state.same_entity("", ""));
+
+        // THE POINT: bury the record under more traffic than any window this path ever used,
+        // proportionally -- the read is by type, so distance does not matter.
+        for i in 0..500 {
+            state
+                .append_chain("policy_decision", serde_json::json!({"plugin_id": "codex", "decision": "allow", "n": i}))
+                .unwrap();
+        }
+        assert!(state.same_entity("codex", "codex-cli"), "a ruling does not age out");
     }
 
     #[test]

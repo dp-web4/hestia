@@ -252,17 +252,34 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/handler.rs::gate_direct_tool", &[
         "let instance_lct = s.member_lct(&who.plugin_id);",
     ], SiteClass::Naming),
+    // RE-READ 2026-09-20 (claude-code@mcnugget, agent-lifecycle PRD R6). The three appeal sites
+    // below and `resolve_invitation` no longer compare two `member_lct`s themselves: they call
+    // `AppState::same_entity`, which is that comparison PLUS the operator's `identity_alias`
+    // records read without a window. This census went red on the change, as built -- four
+    // Predicate sites left its only symbol. Rather than let four name-gates drop out of view,
+    // the census now also keys on `.same_entity(`, and each site stays tagged Predicate with
+    // its call pinned. The comparison itself lives once, in `server/state.rs::same_entity`,
+    // pinned below: the header's "a future repair to the alias reach lands on both [pools] or
+    // is visibly missing from one" is this repair, landing on all four at once.
+    // DIRECTION, per site, unchanged in kind and now reachable: `true` EXCLUDES. At the three
+    // appeal sites a newly-true answer removes an arbiter who is the appellant under another
+    // name (the safe direction). At `resolve_invitation` it withholds an invitation from the
+    // asker's own alias -- the header's "opposite failure" -- which is correct here for the
+    // same reason: a member is not a peer reviewer of itself.
     ("server/handler.rs::tool_appeal", &[
-        "let appellant_lct = s.member_lct(&appellant.plugin_id);",
-        "match (&appellant_lct, s.member_lct(id)) {",
+        "!s.same_entity(&appellant.plugin_id, id)",
     ], SiteClass::Predicate),
     ("server/handler.rs::tool_arbitrate_appeal", &[
-        "let a = s.member_lct(&arbiter.plugin_id);",
-        "let b = s.member_lct(appellant);",
+        "let same_entity = s.same_entity(&arbiter.plugin_id, appellant);",
     ], SiteClass::Predicate),
     ("server/handler.rs::tool_open_appeals", &[
-        "let a = s.member_lct(&c.plugin_id);",
-        "let b = s.member_lct(appellant);",
+        "let same_entity = s.same_entity(&c.plugin_id, appellant);",
+    ], SiteClass::Predicate),
+    // The one place the name comparison now lives. Predicate: `la == lb` decides, and so do
+    // the alias relations beside it. A `None` on either side answers "not the same" -- an id
+    // that maps to no member is never asserted to be anyone, as `member_lct` always had it.
+    ("server/state.rs::same_entity", &[
+        "let (la, lb) = (self.member_lct(a), self.member_lct(b));",
     ], SiteClass::Predicate),
     // THIRD LINE ADDED 2026-08-07 (claude-code, #268 — the `policy_unevaluable` entry). The
     // census went red on it the moment it was written, which is the instrument working.
@@ -463,9 +480,10 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     // still NOT a refusal, still fails OPEN, still the whitespace-only alias reach
     // (`state::tests::the_member_lct_alias_guard_reaches_only_whitespace`), so
     // over-inviting remains the safe direction it errs in.
+    // (2026-09-20: now via `same_entity`, so the alias reach is no longer whitespace-only.
+    // Still a pool filter, still not a refusal. See the re-read note at `tool_appeal`.)
     ("server/handler.rs::resolve_invitation", &[
-        ".filter(|id| match (&asker_lct, s.member_lct(id)) {",
-        "let asker_lct = s.member_lct(&esc.plugin_id);",
+        "!s.same_entity(&esc.plugin_id, id)",
     ], SiteClass::Predicate),
     // The shared attribution line, now emitted once for BOTH doors. Naming, unchanged in
     // class from when it sat inline in each. The HST-005 caveat is load-bearing here and
@@ -655,11 +673,11 @@ const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
     // appellant's is dropped. Documents its own reach in `handler.rs`
     // (whitespace only — `the_member_lct_alias_guard_reaches_only_whitespace`).
     ("server/handler.rs::tool_appeal", &[
-        "(Some(a), Some(b)) => a != &b,",
+        "!s.same_entity(&appellant.plugin_id, id)",
     ]),
     // The `same_entity` arm feeding `hestia.arbitration_self`.
     ("server/handler.rs::tool_arbitrate_appeal", &[
-        "a.is_some() && a == b",
+        "let same_entity = s.same_entity(&arbiter.plugin_id, appellant);",
     ]),
     // The escalation INVITATION pool filter (#226's missing writer): a candidate whose
     // member LCT equals the asker's is not invited. Byte-identical to `tool_appeal`'s
@@ -669,13 +687,22 @@ const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
     // who should not rule; here a false "same" withholds an invitation and the peer then
     // reads as absent. Same line, opposite failure — which is why the pin is per site.
     ("server/handler.rs::resolve_invitation", &[
-        "(Some(a), Some(b)) => a != &b,",
+        "!s.same_entity(&esc.plugin_id, id)",
     ]),
     // The same arm, advisory here (`you_may_rule: false`). An advisory
     // predicate is still a predicate: it is the answer a member acts on when
     // deciding whether to file a ruling.
     ("server/handler.rs::tool_open_appeals", &[
-        "a.is_some() && a == b",
+        "let same_entity = s.same_entity(&c.plugin_id, appellant);",
+    ]),
+    // THE comparison, since 2026-09-20. Three lines, because weakening any one of them is a
+    // different defect: drop the first and an unmappable id can be "the same" as another;
+    // drop the second and the whitespace reach goes; change the third and the alias relation
+    // (direct either way, or a shared target -- ONE level, never a chain) changes meaning.
+    ("server/state.rs::same_entity", &[
+        "if la.is_none() || lb.is_none() {",
+        "if la == lb {",
+        "ta.as_deref() == Some(b) || tb.as_deref() == Some(a) || (ta.is_some() && ta == tb)",
     ]),
     // The `hestia.adjudication_self` refusal. The first conjunct compares
     // plugin_id strings (not this census's symbol); the second is the
@@ -1362,7 +1389,7 @@ fn a() {
 
 #[test]
 fn member_lct_consumer_census_is_exact() {
-    let found = census(&[".member_lct("], false);
+    let found = census(&[".member_lct(", ".same_entity("], false);
     let projected: Vec<(&str, &[&str])> = MEMBER_LCT_CENSUS
         .iter()
         .map(|(k, v, _)| (*k, *v))

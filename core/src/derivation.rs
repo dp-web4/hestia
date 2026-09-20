@@ -325,9 +325,27 @@ pub fn scan_window_with(
         "governance",
     );
     out.extend(scan(DERIVATION_HOT_EVENT_TYPES, hot_scan, "outcome"));
+    // ALIASES ARE READ WITHOUT A WINDOW. An `identity_alias` is not evidence that ages; it is
+    // a standing operator ruling about WHO an id is, and every fold below resolves identity
+    // through it (`aliased_identities`, `alias_target`). Riding in the governance budget it
+    // shared that budget with `policy_decision` -- one per gated tool call -- so the ruling
+    // scrolled out while the traffic it was meant to join kept arriving: measured 2026-08-06,
+    // the 07-26 `codex-cli -> codex` record was already unreachable eleven days later
+    // (state.rs, `the_member_lct_alias_guard_reaches_only_whitespace`), and a merge the
+    // operator performed silently un-merged itself. Same repair, same reason, as the appeal
+    // and escalation pointers (#610, #1014): type-indexed, so the cost is the number of alias
+    // records that exist -- a handful per seat, ever -- not the length of the chain.
+    out.extend(scan(&[IDENTITY_ALIAS_EVENT], ALIAS_SCAN, "alias"));
     out.sort_by(|a, b| b.chain_position.cmp(&a.chain_position));
+    // The governance scan returns the recent aliases too; one entry, one vote.
+    out.dedup_by_key(|e| e.chain_position);
     out
 }
+
+/// Every alias record on the chain. A bound, because sqlite wants one and "unbounded" should be
+/// a decision someone can find -- not because any seat will approach it: each record is a
+/// deliberate operator act with a stated evidence pointer.
+pub const ALIAS_SCAN: u64 = 1_000_000;
 
 /// Build a `ChainEntry` carrying ONLY the keys in [`DERIVATION_KEYS`].
 ///
@@ -1399,6 +1417,72 @@ mod tests {
         let mut desc = positions.clone();
         desc.sort_by(|a, b| b.cmp(a));
         assert_eq!(positions, desc, "merged window must stay chain_position DESC");
+    }
+
+    /// A merge the operator performed must STAY performed (agent-lifecycle PRD R6).
+    ///
+    /// The alias rode in the governance budget, which it shares with `policy_decision` -- one
+    /// per gated tool call -- so it aged out in days and the two ids quietly became two members
+    /// again. ARM A is the old read and must LOSE the alias, or arm B proves nothing.
+    #[test]
+    fn an_alias_survives_being_buried_by_governance_traffic() {
+        use crate::storage::chain::SqliteChainStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), [7u8; 32]).unwrap();
+        let signer = "lct:web4:hestia:sovereign:test";
+
+        store
+            .append(
+                IDENTITY_ALIAS_EVENT,
+                json!({"alias": "Claude-code", "alias_of": "claude-code", "ref": "dp typo 2026-09-08"}),
+                signer,
+            )
+            .unwrap();
+        for i in 0..40 {
+            store
+                .append(
+                    "policy_decision",
+                    json!({"plugin_id": "claude-code", "decision": "allow", "n": i}),
+                    signer,
+                )
+                .unwrap();
+        }
+
+        let old = store
+            .scan_recent(None, Some(DERIVATION_GOVERNANCE_EVENT_TYPES), 10, project_row)
+            .unwrap();
+        assert_eq!(
+            alias_target("Claude-code", &old),
+            None,
+            "CONTROL IS INERT: the fixture no longer buries the alias, so arm B proves nothing."
+        );
+
+        // Same budgets as arm A. Only the dedicated alias read differs.
+        let new = scan_window_with(&store, 10, 10);
+        assert_eq!(
+            alias_target("Claude-code", &new).as_deref(),
+            Some("claude-code"),
+            "REGRESSION: an operator's merge un-merged itself once enough traffic followed it."
+        );
+        let refs: Vec<&ChainEntry> = new.iter().collect();
+        assert_eq!(
+            aliased_identities("claude-code", &refs),
+            vec!["claude-code".to_string(), "Claude-code".to_string()],
+            "the fold must reach the alias's evidence, not only display the arrow"
+        );
+
+        // A RECENT alias is returned by both reads; it must still count once.
+        store
+            .append(IDENTITY_ALIAS_EVENT, json!({"alias": "caude-code", "alias_of": "claude-code"}), signer)
+            .unwrap();
+        let w = scan_window_with(&store, 10, 10);
+        let n = w.iter().filter(|e| e.event_type == IDENTITY_ALIAS_EVENT).count();
+        assert_eq!(n, 2, "two alias records exist; a duplicate here double-counts an entry");
+        let positions: Vec<u64> = w.iter().map(|e| e.chain_position).collect();
+        let mut desc = positions.clone();
+        desc.sort_by(|a, b| b.cmp(a));
+        desc.dedup();
+        assert_eq!(positions, desc, "merged window must stay DESC and free of duplicates");
     }
 
     fn entry(pos: u64, ts_offset_min: i64, event_type: &str, data: Value) -> ChainEntry {

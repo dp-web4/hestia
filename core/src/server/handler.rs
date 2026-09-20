@@ -3166,7 +3166,12 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
     // one-liner it looks like — that resolver scans a window, and `APPEAL_CHAIN_WINDOW`
     // (20_000) had already scrolled past 07-26 by 08-01. See the test above for the
     // measurement and the shape of a real repair (a durable index rebuilt at load).
-    let appellant_lct = s.member_lct(&appellant.plugin_id);
+    //
+    // REPAIRED 2026-09-20 (agent-lifecycle PRD R6). `SharedState::same_entity` is LCT equality
+    // OR the alias records, read type-indexed with NO window -- the repair the paragraph above
+    // asked for, without a second copy of the chain to keep in step. The history is left
+    // standing because the lesson is the comment, not the fix: this filter was cited as entity
+    // resolution for six weeks by three call sites, and resolved nothing.
     let pool: Vec<String> = s
         .member_registry
         .iter_sorted()
@@ -3177,10 +3182,10 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
             // None for synthetic ids, and select_arbiter refuses unrecognised reasoners
             // separately — an unmappable candidate must not be silently dropped here as if
             // identity had been established.
-            match (&appellant_lct, s.member_lct(id)) {
-                (Some(a), Some(b)) => a != &b,
-                _ => true,
-            }
+            // `same_entity` since 2026-09-20: LCT equality OR the operator's alias records,
+            // read without a window -- so this now reaches the `codex`/`codex-cli` case the
+            // comment above spent six weeks explaining it could not.
+            !s.same_entity(&appellant.plugin_id, id)
         })
         .collect();
     // Reachability is resolved per candidate and fed to routing — an arbiter that cannot
@@ -3365,11 +3370,8 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
     // (it costs nothing and catches the whitespace variant clause 1 misses), but it supplies
     // no independence evidence beyond the string compare, and the `why` it renders below
     // should not be read as "two names resolved to one entity".
-    let same_entity = {
-        let a = s.member_lct(&arbiter.plugin_id);
-        let b = s.member_lct(appellant);
-        a.is_some() && a == b
-    };
+    // (Since 2026-09-20 it may be: `same_entity` reads the operator's alias records too.)
+    let same_entity = s.same_entity(&arbiter.plugin_id, appellant);
     let independence = match crate::arbiter::eligibility(&parties) {
         _ if same_entity => {
             return Ok(hestia_error_envelope(
@@ -3674,12 +3676,9 @@ async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
         // `why` it renders — "different plugin_ids, same entity" — can only ever fire on ids
         // that differ by whitespace. Measured 2026-08-06,
         // `state::tests::the_member_lct_alias_guard_reaches_only_whitespace`.
+        // Since 2026-09-20 `same_entity` also follows the alias records, windowless.
         let eligibility = caller.as_ref().map(|c| {
-            let same_entity = {
-                let a = s.member_lct(&c.plugin_id);
-                let b = s.member_lct(appellant);
-                a.is_some() && a == b
-            };
+            let same_entity = s.same_entity(&c.plugin_id, appellant);
             if same_entity {
                 return json!({
                     "you_may_rule": false,
@@ -18901,7 +18900,6 @@ fn resolve_invitation(
         // Kept because it fails CLOSED — an unmappable candidate is invited rather than
         // dropped — but this receipt must not be read as evidence that entity resolution
         // happened. An invitation is cheap to over-issue and expensive to under-issue.
-        let asker_lct = s.member_lct(&esc.plugin_id);
         // Liveness is read from the member's own ACTS, never from its mailbox: a watcher
         // queues notices under a member's id whether or not the member ever woke, so a
         // mailbox signal would let the doorbell certify the member. Same window as the appeal
@@ -18927,9 +18925,8 @@ fn resolve_invitation(
             .into_iter()
             .map(|(id, _)| id.clone())
             .filter(|id| id != &esc.plugin_id)
-            .filter(|id| match (&asker_lct, s.member_lct(id)) {
-                (Some(a), Some(b)) => a != &b,
-                _ => true,
+            .filter(|id| {
+                !s.same_entity(&esc.plugin_id, id)
             })
             .filter(|id| match review_capability(s, id) {
                 Ok(basis) => {
