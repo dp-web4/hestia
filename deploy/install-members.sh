@@ -483,3 +483,86 @@ log ""
 log "The daemon reads this via HESTIA_CURRENT_BUILD_FILE. If the dashboard still says"
 log "'deployment authority is not configured', the INSTALLED unit is missing that"
 log "Environment= line — deploy/templates/hestia.service carries it, so the unit is stale."
+
+# --------------------------------------------------------------------------------
+# CERTIFY THE INSTALLED GATES AGAINST THE VAULT — or say plainly that we did not.
+#
+# dp, 2026-09-20: "we must have an audit mechanism vs vault reference to check for
+# drift ... the whole shim hashed on release with hash stored in vault on deploy."
+#
+# The mechanism already exists and had ZERO callers: `vault::gate_integrity` plus
+# `/api/gates/verify` and `/api/gates/ratify`, built 2026-07-27 and never wired to
+# anything. This is the deploy-side caller. It VERIFIES; it deliberately does not
+# ratify.
+#
+# WHY NOT RATIFY HERE, though a one-line `curl` to /api/gates/ratify was the obvious
+# move: ratification is the operator asserting "this build is the one I trust", and
+# the handler's own doc says so — "nothing here can tell a good build from a bad one;
+# the operator must ratify from a state they believe correct." An installer that
+# ratified whatever it had just written would bless a tampered build automatically
+# and convert a human judgement into a no-op. The whole point of hashing on release
+# is lost if the release hashes itself.
+#
+# The daemon hashes the files itself rather than trusting anything reported here, and
+# refuses both an empty gate set and an unreadable gate, so this caller cannot launder
+# a bad state by lying about it.
+#
+# THREE OUTCOMES, AND NONE OF THEM IS SILENT:
+#   VERIFIED - installed gates match what the operator ratified.
+#   DRIFT    - they do not. Loud, and a non-zero exit: this is the event the whole
+#              mechanism exists to surface.
+#   UNKNOWN  - the daemon could not establish the set, nothing is ratified yet, or we
+#              could not reach/authenticate to it. Reported as UNKNOWN and never as
+#              success. `gates_verify` already refuses to answer VERIFIED over an
+#              empty denominator (http.rs) after thor measured a host reporting
+#              "VERIFIED, findings: 0, gates: []" while its gate pointed at a missing
+#              file and was failing open. This block must not re-introduce that
+#              inversion one level up by reading a failed check as a passed one.
+#
+# The endpoints are operator-gated by design, so on a run without operator
+# credentials this lands on UNKNOWN. That is correct and is not a reason to weaken
+# the wall: an install that could not be certified should say so.
+verify_installed_gates() {
+    local ep="${HESTIA_ENDPOINT_HTTP:-http://127.0.0.1:7711}"
+    local body http
+    # `set -e` is in force here (unlike plugins/member-mesh/fire-*.sh, which run under
+    # `set -u` ONLY — there a failing substitution leaves the variable empty and falls
+    # through to `exit 0`, and the watcher then deletes a consume-once primer). Branch
+    # on the status explicitly regardless, so this block is safe to copy elsewhere.
+    if ! body=$(curl -fsS --max-time 10 -w '\n%{http_code}' "$ep/api/gates/verify" 2>/dev/null); then
+        log "gate certification: UNKNOWN — could not reach or authenticate to $ep/api/gates/verify."
+        log "  This install is NOT certified. It is not a failure of the gates; it is an"
+        log "  absence of evidence about them, and it is recorded as such."
+        return 0
+    fi
+    http=$(printf '%s' "$body" | tail -n 1)
+    body=$(printf '%s' "$body" | sed '$d')
+    if [ "$http" != "200" ]; then
+        log "gate certification: UNKNOWN — /api/gates/verify answered HTTP $http."
+        return 0
+    fi
+    local status
+    status=$(printf '%s' "$body" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("status", "UNPARSEABLE"))
+except Exception: print("UNPARSEABLE")' 2>/dev/null || printf 'UNPARSEABLE')
+    case "$status" in
+        VERIFIED)
+            log "gate certification: VERIFIED — installed gates match the vault's ratified hashes."
+            ;;
+        UNKNOWN|UNPARSEABLE)
+            log "gate certification: UNKNOWN — the daemon could not establish a gate set, or"
+            log "  nothing has been ratified yet. Ratify from a state you trust:"
+            log "    curl -X POST $ep/api/gates/ratify   (operator-gated, witnessed to the chain)"
+            ;;
+        *)
+            log "gate certification: $status — the installed gates DO NOT match the vault."
+            log "  Response: $body"
+            log "  Either this build is not the one that was ratified, or a gate changed"
+            log "  underneath it. Re-ratify only from a state you believe correct."
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+verify_installed_gates || exit 1
