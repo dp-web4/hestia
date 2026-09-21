@@ -8,8 +8,8 @@ asker come BACK to the same act -- and if so, how long after? A return inside th
 decided-anchored horizon that still opened a NEW record is a claim-path failure; a return
 after it is a member whose attention was demonstrably on the act, refused by the clock alone.
 """
-import sys, json, collections
-sys.path.insert(0, '/home/dp/ai-workspace/hestia/tools')
+import os, sys, json, collections
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from chain_walk import ChainWalker, payload
 
 MAX = int(sys.argv[1]) if len(sys.argv) > 1 else 40000
