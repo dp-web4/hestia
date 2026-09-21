@@ -324,6 +324,40 @@ pub const MEMBER_DENIES_CAP: u64 = 20;
 /// Returns `None` for an unknown id rather than an empty bundle, because "no such escalation"
 /// and "an escalation about which nothing is known" are different answers and a rung that
 /// cannot tell them apart will reason from the wrong one.
+/// Where the bundle's `act_text` came from, in words a decider can check. The `UNAVAILABLE`
+/// prefix is a contract: `adjudicator::BaselineRung` keys on it to decline for insufficient
+/// evidence rather than abstain.
+fn act_text_source(esc: &crate::server::gate_escalation::Escalation) -> &'static str {
+    use crate::server::gate_escalation::OpenedVia;
+    match (esc.act_text.is_some(), esc.opened_via) {
+        (false, _) => "UNAVAILABLE: this escalation predates act-text retention (#1066); only \
+                       act_digest survives, and a hash is not readable evidence",
+        (true, OpenedVia::Open) => "retained at open — the member door's `act` argument, the \
+                                    exact text act_digest binds (its `reason` is a rationale \
+                                    and is never read as the act)",
+        (true, OpenedVia::Claim) => "retained at open — the claim door's act (its `act` \
+                                     argument, or `reason` taken as the act when none was \
+                                     sent), the exact text act_digest binds",
+        (true, OpenedVia::Unknown) => "retained at open — the exact text act_digest binds; the \
+                                       door that opened it was not recorded",
+    }
+}
+
+/// Tools whose act the gate hook composes from the destination alone (#1091, #600): their
+/// payload (`new_string`, `content`, ...) never reaches the act text or its digest.
+const PATH_KEYED_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+fn act_text_covers(esc: &crate::server::gate_escalation::Escalation) -> &'static str {
+    if esc.act_text.is_none() {
+        "nothing — no act text is retained"
+    } else if PATH_KEYED_TOOLS.contains(&esc.tool_name.as_str()) {
+        "destination only — for Edit/Write the act and its digest name the target file, not \
+         the content to be written; the approval does not bind the content (#1091)"
+    } else {
+        "the command as stated"
+    }
+}
+
 pub fn bundle(s: &crate::server::state::ServerState, escalation_id: &str) -> Option<Value> {
     let esc = s.gate_escalations.get(escalation_id.trim())?;
     let now = crate::server::gate_escalation::now_secs();
@@ -419,25 +453,33 @@ pub fn bundle(s: &crate::server::state::ServerState, escalation_id: &str) -> Opt
             // `arbiter::eligibility` clause 0 reads this, and §3.3 says a rung must too.
             "asker_basis": format!("{:?}", esc.asker_basis),
             "act_digest": esc.act_digest,
+            // #1066: which door opened it, which is what says what `stated_reason` means.
+            "opened_via": esc.opened_via.as_str(),
             // #1056: the bytes the approval BINDS, when the daemon could measure them.
             "payload_sha256": esc.payload_sha256,
         },
-        // THE ACT ITSELF — §3.3's first element, and the one this surface cannot always
-        // supply. `open()` hashes the act into `act_digest` and DISCARDS the text, so the only
-        // place it survives is `stated_reason`, and only on the gate-hook door, which composes
-        // `reason` AS the act. A member-opened escalation therefore has an act that no reader
-        // can see: a digest proves which act was authorised and tells a human nothing about
-        // what it was. Reported as unavailable rather than silently rendered as "no effect",
-        // because those are different facts and only one of them is about the act.
-        "act_text": esc.stated_reason,
-        "act_text_source": if esc.stated_reason.is_some() {
-            "stated_reason — the gate door composes `reason` AS the act"
-        } else {
-            "UNAVAILABLE: only act_digest is retained, and a hash is not readable evidence"
-        },
-        // What the act would DO. Same builder the operator's card uses, so the human and the
-        // rung are provably looking at one object rather than two renderings of one idea.
-        "write_effect": esc.stated_reason.as_deref().and_then(write_effect_cached),
+        // THE ACT ITSELF — §3.3's first element. Read ONLY from `act_text`, the exact string
+        // `act_digest` was computed from and retained at the mint (#1066), so what the decider
+        // reads is provably what the permit binds.
+        //
+        // NEVER FROM `stated_reason`. That was the first cut: `open()` discarded the act, and
+        // the text was recovered from the reason on the grounds that the gate door composes
+        // `reason` AS the act. Presence of a reason proves no such door. On the member door the
+        // reason is a rationale, and a rationale containing some other valid `cp` was shown as
+        // the act, with a measured write effect for a write the approval does not bind (GPT,
+        // review of #1064). A row with no retained text predates the field; it is reported
+        // unavailable, never reconstructed.
+        "act_text": esc.act_text,
+        "act_text_source": act_text_source(esc),
+        // WHAT THE TEXT COVERS. Retained is not the same as complete: for a path-keyed tool
+        // (Edit/Write/...) the gate hook composes the act from the TARGET alone, so the text —
+        // and the digest the approval binds — name WHERE the write goes and nothing about
+        // what it writes (#1091; same class as #600). A decider must not read a path as the
+        // content it approved, so this says which one it is holding.
+        "act_text_covers": act_text_covers(esc),
+        // What the act would DO — from the same retained text, never from the reason. Same
+        // builder the operator's card uses, so the human and the rung look at one object.
+        "write_effect": esc.act_text.as_deref().and_then(write_effect_cached),
         "prior_on_this_marker": {
             "opened": opened,
             "approved": approved,

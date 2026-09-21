@@ -16728,8 +16728,9 @@ mod ladder_evidence_tests {
     /// that something actually wrote to, which is the standing lesson about running the real
     /// path at least once.
     ///
-    /// `reason` carries the ACT, which is what the gate hook does and the only way the act
-    /// text survives at all (see `act_text_source` in the bundle).
+    /// `reason` is set equal to the act here only because these tests are about other fields.
+    /// Since #1066 the act text is retained from `act` itself, and a reason that DIFFERS from
+    /// the act is pinned by `a_member_rationale_containing_another_copy_is_never_shown_as_the_act`.
     async fn open_one(state: &SharedState, marker: &str, act: &str) -> String {
         open_as(state, marker, act, None).await
     }
@@ -16942,6 +16943,148 @@ mod ladder_evidence_tests {
         assert_eq!(bundle_effect["source_lines"], json!(3), "{bundle_effect}");
         assert!(bundle_effect["payload_sha256"].is_string(),
                 "and must carry the hash the approval binds: {bundle_effect}");
+    }
+
+    fn write_src(dir: &std::path::Path, name: &str, body: &[u8]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    /// GPT's required falsifier on #1064 (#1066). The member door documents `reason` as a
+    /// RATIONALE, distinct from the act. Here the rationale itself contains a DIFFERENT,
+    /// syntactically valid `cp` whose source exists — so a bundle that reads the act out of
+    /// `stated_reason` shows the decider a real, measurable write that is NOT the one the
+    /// approval binds. The act text shown, and the effect derived, must be the bound act's.
+    #[tokio::test]
+    async fn a_member_rationale_containing_another_copy_is_never_shown_as_the_act() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let bound = write_src(dir.path(), "bound.py", b"bound\n");
+        let decoy = write_src(dir.path(), "decoy.py", b"decoy\nwith\nfour\nlines\n");
+        let act = format!("Bash: cp {} plugins/codex/hooks/pre_tool_use.py", bound.display());
+        let reason = format!("because the old gate is wrong; compare: cp {} plugins/kimi/hooks/pre_tool_use.py",
+                             decoy.display());
+        assert!(crate::server::evidence::write_effect_cached(&reason).is_some(),
+                "precondition: the rationale must itself be a measurable copy, or this proves nothing");
+
+        let r = tool_gate_escalation_open(&state, &json!({
+            "plugin_id": "claude-code", "role": "role:constellation:member", "tool_name": "Bash",
+            "marker": "plugins/*/hooks", "act": act, "reason": reason,
+        })).await.unwrap();
+        let id = r["escalation_id"].as_str().unwrap().to_string();
+        let b = tool_escalation_evidence(&state, &json!({"escalation_id": id})).await.unwrap();
+        let ev = &b["evidence"];
+
+        assert_ne!(ev["act_text"], json!(reason), "the rationale was presented as the act: {ev}");
+        assert_eq!(ev["act_text"], json!(act), "the bound act must be what is shown: {ev}");
+        assert_eq!(ev["act_text_source"].as_str().map(|s| s.starts_with("retained")), Some(true),
+                   "and labelled as retained from the act, not inferred: {ev}");
+        let from_reason = serde_json::to_value(crate::server::evidence::write_effect_cached(&reason)).unwrap();
+        let from_act = serde_json::to_value(crate::server::evidence::write_effect_cached(&act)).unwrap();
+        assert_ne!(ev["write_effect"], from_reason, "the effect was derived from the rationale: {ev}");
+        assert_eq!(ev["write_effect"], from_act, "the effect must be the bound act's: {ev}");
+        // The object the approval binds and the object the evidence describes are ONE object.
+        assert_eq!(
+            json!(crate::server::gate_escalation::EscalationStore::act_digest_of(ev["act_text"].as_str().unwrap())),
+            ev["escalation"]["act_digest"],
+            "digest(act_text) must equal the bound act_digest: {ev}"
+        );
+        assert_eq!(ev["escalation"]["opened_via"], json!("open"), "{ev}");
+    }
+
+    /// A row that predates retention carries only a digest. Its `stated_reason` may still hold a
+    /// valid copy (the claim door always put the act there, and a member may put anything
+    /// there) — and nothing proves which. So nothing is inferred: null act, UNAVAILABLE, null
+    /// effect. The legacy half of the same falsifier.
+    #[tokio::test]
+    async fn a_legacy_row_without_retained_act_text_infers_nothing_from_its_reason() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let decoy = write_src(dir.path(), "decoy.py", b"decoy\n");
+        let reason = format!("Bash: cp {} plugins/kimi/hooks/pre_tool_use.py", decoy.display());
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            let entry = crate::storage::chain::ChainEntry {
+                chain_position: 0, hash: String::new(), prev_hash: String::new(),
+                event_type: "gate_escalation_opened".into(),
+                event_data: json!({
+                    "escalation_id": "legacy0000000001", "plugin_id": "claude-code",
+                    "role": "role:constellation:member", "tool_name": "Bash",
+                    "marker": "plugins/*/hooks", "act_digest": "d", "stated_reason": reason,
+                    "opened_via": "claim", "opened_at": now, "expires_at": now + 3600,
+                    "ttl_secs": 3600,
+                }),
+                signer_lct: "test".into(),
+                timestamp: chrono::Utc::now(),
+            };
+            assert_eq!(s.gate_escalations.rehydrate(&[entry], now), 1);
+        }
+        let b = tool_escalation_evidence(&state, &json!({"escalation_id": "legacy0000000001"}))
+            .await.unwrap();
+        let ev = &b["evidence"];
+        assert!(ev["act_text"].is_null(), "a legacy reason was promoted to the act: {ev}");
+        assert!(ev["act_text_source"].as_str().unwrap_or("").starts_with("UNAVAILABLE"), "{ev}");
+        assert!(ev["write_effect"].is_null(), "an effect was derived from a legacy reason: {ev}");
+    }
+
+    /// CONTROL — without it the fix could be "never show an act". The gate hook's door takes
+    /// `reason` AS the act when no `act` is sent; that string is what the digest binds, so it
+    /// IS the act, and the bundle must show it and measure it.
+    #[tokio::test]
+    async fn the_claim_door_act_is_retained_shown_and_measured() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let src = write_src(dir.path(), "incoming.py", b"one\ntwo\n");
+        let act = format!("Bash: cp {} plugins/codex/hooks/pre_tool_use.py", src.display());
+        let _ = tool_gate_escalation_claim(&state, &json!({
+            "plugin_id": "claude-code", "role": "role:constellation:member", "tool_name": "Bash",
+            "marker": "plugins/*/hooks", "reason": act,
+        })).await;
+        let id = {
+            let s = state.lock().await;
+            s.chain_store.read_recent(60).unwrap().into_iter()
+                .find(|e| e.event_type == "gate_escalation_opened")
+                .and_then(|e| e.event_data["escalation_id"].as_str().map(str::to_string))
+                .expect("the claim door opened and witnessed an escalation")
+        };
+        let b = tool_escalation_evidence(&state, &json!({"escalation_id": id})).await.unwrap();
+        let ev = &b["evidence"];
+        assert_eq!(ev["act_text"], json!(act), "{ev}");
+        assert!(!ev["write_effect"].is_null(), "the bound act is a measurable copy: {ev}");
+        assert_eq!(ev["escalation"]["opened_via"], json!("claim"), "{ev}");
+        assert_eq!(
+            json!(crate::server::gate_escalation::EscalationStore::act_digest_of(&act)),
+            ev["escalation"]["act_digest"], "{ev}"
+        );
+        assert_eq!(ev["act_text_covers"], json!("the command as stated"), "{ev}");
+    }
+
+    /// #1091: for Edit/Write the gate hook's act is the TARGET PATH, so the retained text is
+    /// true and incomplete. The bundle must say it names the destination only — a decider
+    /// reading a path as the content it approved is the failure this field prevents.
+    #[tokio::test]
+    async fn an_edit_act_is_labelled_as_naming_the_destination_not_the_content() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let path = "/repo/deploy/install-members.sh";
+        let _ = tool_gate_escalation_claim(&state, &json!({
+            "plugin_id": "claude-code", "role": "role:constellation:member", "tool_name": "Edit",
+            "marker": "deploy/install-members.sh", "reason": path,
+        })).await;
+        let id = {
+            let s = state.lock().await;
+            s.chain_store.read_recent(60).unwrap().into_iter()
+                .find(|e| e.event_type == "gate_escalation_opened")
+                .and_then(|e| e.event_data["escalation_id"].as_str().map(str::to_string))
+                .expect("opened")
+        };
+        let b = tool_escalation_evidence(&state, &json!({"escalation_id": id})).await.unwrap();
+        let ev = &b["evidence"];
+        assert_eq!(ev["act_text"], json!(path), "{ev}");
+        assert!(ev["act_text_covers"].as_str().unwrap_or("").starts_with("destination only"),
+                "an Edit's act is its target; the bundle must not let it read as content: {ev}");
     }
 }
 
@@ -19415,7 +19558,6 @@ fn opened_payload(
     inv: &OpenedInvitation,
     asker_is_proven: bool,
     answers_deny: Option<&str>,
-    opened_via: &'static str,
     ttl_secs: u64,
 ) -> Value {
     json!({
@@ -19428,6 +19570,11 @@ fn opened_payload(
         // Explicit null when the opener stated no act, so a census can count that class
         // rather than confuse it with a row that predates the field.
         "act_digest": esc.act_digest,
+        // THE ACT ITSELF (#1066) — the exact text the digest above was computed from. On the
+        // chain because the struct is restored from here: without it a restart would turn
+        // every pending ask back into a digest nobody can read. `rehydrate` restores it only
+        // if it still hashes to `act_digest`.
+        "act_text": esc.act_text,
         // WHICH BYTES this approval is being asked for (#1056), when the act named a source
         // the daemon could read. On the chain for the same reason the act digest is: the
         // binding must survive a restart. Explicit null when nothing was measurable, so a
@@ -19445,8 +19592,9 @@ fn opened_payload(
         // contradicted it.
         "payload_stated_but_not_measured": esc.payload_stated_but_not_measured,
         // WHICH DOOR. See the doc comment: the key-set accident that used to answer this is
-        // gone as of this change, deliberately.
-        "opened_via": opened_via,
+        // gone as of this change, deliberately. Read from the struct (#1066), which each door
+        // records before it witnesses, so the row and the record cannot name different doors.
+        "opened_via": esc.opened_via.as_str(),
         // Clause A: the record commits the evidence it relied on, not just the claim.
         // `session` means the asker was resolved through `resolve_attributed_caller` and
         // equals the session's own member; `asserted` means it is a bare string this
@@ -19854,6 +20002,9 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
         proven_host_session_id.as_deref(),
         proven_session_id.as_deref(),
     );
+    // THE DOOR (#1066): the member door, where `reason` is a rationale and never the act.
+    s.gate_escalations
+        .record_opened_via(&esc.id, crate::server::gate_escalation::OpenedVia::Open);
     // Re-read AFTER the recording: `open` returned a clone taken before it, and
     // the payload below is built from the struct — the store is the record.
     let esc = s
@@ -19887,7 +20038,6 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
             &inv,
             asker_is_proven,
             answers_deny.as_deref(),
-            "open",
             DEFAULT_TTL_SECS,
         ),
     )?;
@@ -20735,6 +20885,9 @@ permit for something the approver did not see.",
                     .map(|uuid| uuid.to_string())
                     .as_deref(),
             );
+            // THE DOOR (#1066): claim-or-open, where `reason` may BE the act.
+            s.gate_escalations
+                .record_opened_via(&esc.id, crate::server::gate_escalation::OpenedVia::Claim);
             // Re-read AFTER the recording, same reason as the member door: `open`
             // returned a pre-recording clone and the payload is built from it.
             let esc = s
@@ -20763,7 +20916,6 @@ permit for something the approver did not see.",
                 &inv,
                 asker_is_proven,
                 answers_deny.as_deref(),
-                "claim",
                 DEFAULT_TTL_SECS,
             );
             // WHAT THIS MEMBER CAN ALREADY SPEND, told to the member. `opened_payload` has
