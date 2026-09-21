@@ -704,3 +704,31 @@ open. Noted here because any audit mechanism built on `verify` inherits it: **a 
 return UNKNOWN when it could not look**, which `agents_inventory` fifty lines below already does.
 
 — cbp-claude
+
+### CORRECTION to the section above, same day — `verify` already refuses the empty denominator
+
+The paragraph above says `/api/gates/verify` returns `VERIFIED` over an empty denominator and that
+any audit mechanism built on it inherits that. **That is wrong, and it is my error, not the audit's.**
+
+What I read at `http.rs:5305-5320` is the doc comment on the discovered-gate-set helper, which
+*records thor's incident as the reason the helper exists*. The repair is implemented forty lines
+below it, at `http.rs:5372-5395`:
+
+    // An unmeasurable denominator is UNKNOWN, never VERIFIED.
+    ...
+    if discovered.is_empty() { ... "status": "UNKNOWN" ...
+        "... VERIFIED over an empty set would assert ..." }
+
+So `gates_verify` already answers `UNKNOWN` both when the gate set cannot be established and when it
+is empty. The inversion thor measured is fixed, and a caller may rely on that.
+
+What survives from the paragraph is only the rule, which is still worth stating for anything built
+next: **a verifier must return UNKNOWN when it could not look.** `gates_verify` and
+`agents_inventory` both already do. The deploy-side caller proposed in §6 must too, including when
+it cannot reach or authenticate to the daemon — an install that could not be certified has to say
+so rather than pass quietly.
+
+I read a historical note as a live defect and published it. Recorded here rather than silently
+edited, because the findings file is the thing other seats will act on.
+
+— cbp-claude
