@@ -237,8 +237,8 @@ impl Adjudicator for BaselineRung {
         let mut consulted = vec!["escalation.marker".to_string()];
         let ev = &bundle["escalation"];
 
-        // Can the act be READ at all? #1066: for a member-opened escalation only the digest is
-        // retained, so there may be nothing to have a view about. That is an evidence failure,
+        // Can the act be READ at all? Rows opened before #1066 retained only the digest, so
+        // there may be nothing to have a view about. That is an evidence failure,
         // not an abstention, and the two must not be recorded as one thing.
         let act_unreadable = bundle
             .get("act_text_source")
@@ -251,8 +251,8 @@ impl Adjudicator for BaselineRung {
                 BASELINE_RUNG_ID,
                 Decision::Decline,
                 Some(Decline::EvidenceInsufficient),
-                Some("the act text is not retained on this escalation (#1066), so there is \
-                      nothing here to form a view about".into()),
+                Some("the act text is not retained on this escalation (it predates #1066), \
+                      so there is nothing here to form a view about".into()),
                 0.0,
                 consulted,
             )
@@ -674,7 +674,7 @@ mod tests {
         json!({
             "escalation": {"marker": "plugins/*/hooks", "asker_basis": "Asserted"},
             "act_text_source": if act_readable {
-                "stated_reason — the gate door composes `reason` AS the act"
+                "retained at open — the exact text act_digest binds"
             } else {
                 "UNAVAILABLE: only act_digest is retained, and a hash is not readable evidence"
             },

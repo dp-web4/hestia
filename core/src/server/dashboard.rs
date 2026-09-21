@@ -1410,8 +1410,15 @@ impl ServerState {
                             // bytes, their hash, and the diff against the copy currently
                             // enforcing. Null when the act is not copy-shaped, which is honest
                             // rather than helpful — see `evidence::write_effect`.
-                            "write_effect": e.stated_reason.as_deref()
+                            //
+                            // FROM THE RETAINED ACT, never from `stated_reason` (#1066): on the
+                            // member door the reason is a rationale, and one containing another
+                            // valid `cp` rendered an effect the approval does not bind. Same
+                            // source as the reviewer's bundle, so card and bundle agree.
+                            "write_effect": e.act_text.as_deref()
                                 .and_then(crate::server::evidence::write_effect_cached),
+                            "act_text": e.act_text,
+                            "opened_via": e.opened_via.as_str(),
                             "opened_at": e.opened_at,
                             "expires_at": e.expires_at,
                             "secs_remaining": e.expires_at.saturating_sub(now),
