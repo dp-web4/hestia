@@ -108,7 +108,11 @@ FALSE_DENIES = [
      'grep -n "SECRET\\|\\' + TOK + '" plugins/_shared/hestia_gate_core.py'),
 ]
 RED_ARMS = [
-    ("absolute_path", "cat /home/dp/" + TOK),
+    # Neutral home, not this box's: `tools/public_boundary_test.py` refuses a runtime
+    # mechanism that bakes a local home path, and the arm tests the leading-separator
+    # shape -- it is insensitive to WHICH home. The suite's own literal differs here
+    # and nowhere else; the positive control below still reproduces the pinned state.
+    ("absolute_path", "cat /home/u/" + TOK),
     ("bare_filename_at_word_start", "cat " + TOK),
     ("relative_path", "cat ../service/" + TOK),
     ("dotted_suffix", "cat " + TOK + ".production"),
