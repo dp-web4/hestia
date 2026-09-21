@@ -519,48 +519,43 @@ log "Environment= line — deploy/templates/hestia.service carries it, so the un
 #              file and was failing open. This block must not re-introduce that
 #              inversion one level up by reading a failed check as a passed one.
 #
-# The endpoints are operator-gated by design, so on a run without operator
-# credentials this lands on UNKNOWN. That is correct and is not a reason to weaken
-# the wall: an install that could not be certified should say so.
+# HOW IT READS THE VERDICT (reworked after GPT's HOLD on #1085). The first version
+# called /api/gates/verify, which sits behind the operator gate; the installer carries
+# no operator session, so against a real daemon every run landed on UNKNOWN and the
+# VERIFIED/DRIFT arms were unreachable. dp ruled 2026-09-21 (option 1): the DAEMON
+# verifies its own gates — at startup and on its maintenance tick, witnessing each
+# finding and resolution to the chain (core/src/server/gate_watch.rs) — and writes a
+# readable projection, $HESTIA_HOME/status/gate-integrity.json. This reads that file
+# through tools/gate_verdict.py. No operator session, no chain walk, and the operator
+# wall is untouched.
+#
+# THE VERDICT IS BOUND TO BYTES. The file lists the hash the daemon judged for each
+# gate; a verdict counts only if the bytes on disk still match. A gate this install just
+# rewrote has not been judged yet, so it reads PENDING until the daemon's next pass —
+# never the stale verdict about the bytes it replaced.
+#
+# NO OUTCOME FAILS THE INSTALL. Installing new hook bytes makes them differ from the
+# ratified ones by construction, so MODIFIED after a deploy is the normal state before
+# the operator ratifies; exiting non-zero on it would make every hook deploy read as
+# failed. Every outcome is reported loudly, and none is reported as success unless it is.
 verify_installed_gates() {
-    local ep="${HESTIA_ENDPOINT_HTTP:-http://127.0.0.1:7711}"
-    local body http
-    # `set -e` is in force here (unlike plugins/member-mesh/fire-*.sh, which run under
-    # `set -u` ONLY — there a failing substitution leaves the variable empty and falls
-    # through to `exit 0`, and the watcher then deletes a consume-once primer). Branch
-    # on the status explicitly regardless, so this block is safe to copy elsewhere.
-    if ! body=$(curl -fsS --max-time 10 -w '\n%{http_code}' "$ep/api/gates/verify" 2>/dev/null); then
-        log "gate certification: UNKNOWN — could not reach or authenticate to $ep/api/gates/verify."
-        log "  This install is NOT certified. It is not a failure of the gates; it is an"
-        log "  absence of evidence about them, and it is recorded as such."
-        return 0
-    fi
-    http=$(printf '%s' "$body" | tail -n 1)
-    body=$(printf '%s' "$body" | sed '$d')
-    if [ "$http" != "200" ]; then
-        log "gate certification: UNKNOWN — /api/gates/verify answered HTTP $http."
-        return 0
-    fi
-    local status
-    status=$(printf '%s' "$body" | python3 -c 'import json,sys
-try: print(json.load(sys.stdin).get("status", "UNPARSEABLE"))
-except Exception: print("UNPARSEABLE")' 2>/dev/null || printf 'UNPARSEABLE')
-    case "$status" in
-        VERIFIED)
-            log "gate certification: VERIFIED — installed gates match the vault's ratified hashes."
-            ;;
-        UNKNOWN|UNPARSEABLE)
-            log "gate certification: UNKNOWN — the daemon could not establish a gate set, or"
-            log "  nothing has been ratified yet. Ratify from a state you trust:"
-            log "    curl -X POST $ep/api/gates/ratify   (operator-gated, witnessed to the chain)"
-            ;;
-        *)
-            log "gate certification: $status — the installed gates DO NOT match the vault."
-            log "  Response: $body"
-            log "  Either this build is not the one that was ratified, or a gate changed"
-            log "  underneath it. Re-ratify only from a state you believe correct."
-            return 1
-            ;;
+    local out rc=0
+    # Branch on the status explicitly: `set -e` must not turn a finding into an abort.
+    out=$(python3 "$REPO_ROOT/tools/gate_verdict.py" --home "$HESTIA_HOME" 2>&1) || rc=$?
+    printf '%s\n' "$out" | while IFS= read -r line; do log "$line"; done
+    case "$rc" in
+        0) log "gate certification: VERIFIED — the daemon judged exactly these bytes against the vault." ;;
+        2) log "gate certification: PENDING — this install changed gate bytes the daemon has not"
+           log "  judged yet. Re-check after its next pass:"
+           log "    python3 $REPO_ROOT/tools/gate_verdict.py --home $HESTIA_HOME --wait 330" ;;
+        3) log "gate certification: the installed gates DO NOT match what the operator ratified."
+           log "  After a deploy of new hooks this is expected until the operator ratifies the"
+           log "  build (POST /api/gates/ratify, operator-gated, witnessed). If this install did"
+           log "  not change hooks, a gate changed underneath it: read the chain rows named above." ;;
+        4) log "gate certification: UNKNOWN — the daemon could not establish the gate set." ;;
+        *) log "gate certification: NOT CERTIFIED — no usable gate status (reader exit $rc): an"
+           log "  older daemon, one not restarted since the upgrade, or the reader itself failed."
+           log "  Absence of evidence, not a pass." ;;
     esac
     return 0
 }
