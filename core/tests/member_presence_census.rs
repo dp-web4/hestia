@@ -699,11 +699,25 @@ const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
     // different defect: drop the first and an unmappable id can be "the same" as another;
     // drop the second and the whitespace reach goes; change the third and the alias relation
     // (direct either way, or a shared target -- ONE level, never a chain) changes meaning.
+    //
+    // SPLIT 2026-09-20 (GPT seat, PR #1075). The comparison now lives in two halves and BOTH
+    // are pinned, because the defect was in the seam: `same_entity` documented "fails toward
+    // same" and returned `false` when the alias record could not be READ, and `false` is the
+    // permissive answer at every call site -- an unreadable chain would have admitted a party
+    // as its own arbiter. The unreadable arm is now `alias_relates`'s, and pinned as its own
+    // line; it has a test (`an_unreadable_alias_record_excludes_rather_than_admits`) because a
+    // working store cannot reach it.
     ("server/state.rs::same_entity", &[
         "if la.is_none() || lb.is_none() {",
         "if la == lb {",
-        "ta.as_deref() == Some(b) || tb.as_deref() == Some(a) || (ta.is_some() && ta == tb)",
     ]),
+    // The relation itself moved with the split, to `state.rs::alias_relates`, and is NOT
+    // pinned here -- deliberately. That fn consumes neither of this file's two symbols, so it
+    // is not a census site, and listing it would make this table a general-purpose pin board
+    // rather than the enumeration of `member_lct`/`same_entity` consumers it is. What carries
+    // it instead is stronger than a textual pin: `alias_relates` is pure, and
+    // `state::tests::an_unreadable_alias_record_excludes_rather_than_admits` exercises the
+    // unreadable arm directly (verified by sabotage -- restore the old `false` and it fails).
     // The `hestia.adjudication_self` refusal. The first conjunct compares
     // plugin_id strings (not this census's symbol); the second is the
     // name-gate, pinned.

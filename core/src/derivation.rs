@@ -334,7 +334,8 @@ pub fn scan_window_with(
     // (state.rs, `the_member_lct_alias_guard_reaches_only_whitespace`), and a merge the
     // operator performed silently un-merged itself. Same repair, same reason, as the appeal
     // and escalation pointers (#610, #1014): type-indexed, so the cost is the number of alias
-    // records that exist -- a handful per seat, ever -- not the length of the chain.
+    // records that exist -- a handful per seat, ever -- not the length of the chain. (A read
+    // still takes a finite bound, ALIAS_SCAN; "no window" means no RECENCY window.)
     out.extend(scan(&[IDENTITY_ALIAS_EVENT], ALIAS_SCAN, "alias"));
     out.sort_by(|a, b| b.chain_position.cmp(&a.chain_position));
     // The governance scan returns the recent aliases too; one entry, one vote.
@@ -342,9 +343,14 @@ pub fn scan_window_with(
     out
 }
 
-/// Every alias record on the chain. A bound, because sqlite wants one and "unbounded" should be
-/// a decision someone can find -- not because any seat will approach it: each record is a
-/// deliberate operator act with a stated evidence pointer.
+/// How many alias records a read takes: a FINITE BOUND, not "all of them".
+///
+/// Said plainly because the prose around this repair says "no window", and that means no
+/// RECENCY window -- the read is by event type and does not age out, which was the defect.
+/// It is not mathematical unboundedness: the millionth-and-first alias record on one chain
+/// would not be read (GPT seat, PR #1075). Nothing will approach it -- each record is a
+/// deliberate operator act carrying a stated evidence pointer, and this fleet has single
+/// digits of them -- but the number is here to be found rather than assumed away.
 pub const ALIAS_SCAN: u64 = 1_000_000;
 
 /// Build a `ChainEntry` carrying ONLY the keys in [`DERIVATION_KEYS`].
