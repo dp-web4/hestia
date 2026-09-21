@@ -206,6 +206,30 @@ def test_a_permitted_role_passes_and_an_unbounded_one_says_it_is_unbounded() -> 
               f"silence must mean something: {got['env']}")
 
 
+def test_a_declared_set_does_not_refuse_an_absent_role() -> None:
+    """Arm 8 — the case the migration promise is about, and the one arms 6-7 left out.
+
+    GPT's review of #1084: the prose said an absent role is deliberately not refused, but the
+    check compared "" against the permitted set and refused it (rc 2) whenever a set was
+    declared, so publishing a set would have denied every seat whose launcher sets no role.
+    An absent role runs as today, and is marked unverified, not verified: it was not checked
+    against anything.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        write_projection(home, env={
+            "HESTIA_ROLE_PERMITTED": "role:constellation:interactive-dev,role:constellation:mesh-worker",
+        })
+        env = projection_env(home)
+        env.pop("HESTIA_ROLE", None)
+        got = probe_env(env, ["HESTIA_ROLE", "HESTIA_ROLE_VERIFIED"])
+        check("absent_role_still_runs", got["err"] is None, str(got["err"]))
+        check("absent_role_marked_unverified", got["env"].get("HESTIA_ROLE_VERIFIED") == "0",
+              f"an absent role was not checked, so it must not read as verified: {got['env']}")
+        r = run_hook(env)
+        check("absent_role_not_refused", "[config.miswired]" not in r.stderr, r.stderr[-300:])
+
+
 def test_the_witness_hook_shares_the_contract() -> None:
     with tempfile.TemporaryDirectory() as raw:
         home = stage_home(Path(raw))
@@ -233,6 +257,11 @@ def teardown_module(module):
 
 TESTS = [test_no_locator_refuses_before_stdin, test_no_projection_refuses_and_says_where,
          test_miswired_locator_refuses, test_the_projection_wins_and_role_is_launch_context,
+         # Arms 6-8. CI runs this file as a script, so a test missing from this list never
+         # runs there: arms 6-7 shipped in #1084 unlisted and its green CI covered neither.
+         test_a_launch_role_outside_the_vaults_permitted_set_is_a_miswire,
+         test_a_permitted_role_passes_and_an_unbounded_one_says_it_is_unbounded,
+         test_a_declared_set_does_not_refuse_an_absent_role,
          test_the_witness_hook_shares_the_contract]
 
 if __name__ == "__main__":

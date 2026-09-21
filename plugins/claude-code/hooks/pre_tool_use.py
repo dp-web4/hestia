@@ -161,15 +161,18 @@ def _load_projection(plugin_id):
     # An absent role is deliberately NOT refused here. Making it fail closed would deny every
     # seat whose launcher never set one, and an early refusal reorders every later one; that
     # belongs in a change that converts the launchers first.
+    # (The first cut compared an absent role, "", against the set and refused it — the promise
+    # above, broken by the code under it, and untested because the arms that would have caught
+    # it were not in the file's TESTS list. GPT, #1084 review; arm 8 pins it.)
     live_role = os.environ.get("HESTIA_ROLE", "")
     permitted = [r.strip() for r in projected.get("HESTIA_ROLE_PERMITTED", "").split(",") if r.strip()]
-    if permitted and live_role not in permitted:
-        shown = repr(live_role) if live_role else "(unset)"
-        return ("config.miswired", f"this seat was launched as HESTIA_ROLE={shown} but projection "
-                f"{path} permits only {permitted}; the role decides which law applies, so an "
-                "unlisted one is refused here rather than normalised downstream")
-    # Silence means something: a reader can tell a verified role from an unbounded one.
-    os.environ["HESTIA_ROLE_VERIFIED"] = "1" if permitted else "0"
+    if permitted and live_role and live_role not in permitted:
+        return ("config.miswired", f"this seat was launched as HESTIA_ROLE={live_role!r} but "
+                f"projection {path} permits only {permitted}; the role decides which law "
+                "applies, so an unlisted one is refused here rather than normalised downstream")
+    # Silence means something: a reader can tell a verified role from an unbounded or absent
+    # one. Verified means a role was present AND checked against a declared set.
+    os.environ["HESTIA_ROLE_VERIFIED"] = "1" if (permitted and live_role) else "0"
 
     for k, v in projected.items():
         if k in ("HESTIA_ROLE", "HESTIA_ROLE_PERMITTED"):
