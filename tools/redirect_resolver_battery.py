@@ -10,8 +10,9 @@ GROUND TRUTH. For each generated command we run the PREFIX (everything before th
 write) under `bash --noprofile --norc`, with the final write replaced by a builtin printf
 of the destination variable -- codex's oracle. `OUT` is preset to the governed path, so a
 prefix that fails to rebind it leaves the governed value in place. Nothing is written: the
-generated vocabulary contains only `true`, `false`, `:`, `echo`, `cat` and assignments, so
-running a prefix has no effect outside the subshell.
+generated vocabulary includes shell builtins, assignments and bounded compound commands.
+The final file write is never executed. Review any vocabulary extension before running:
+prefixes ARE executed, including computed command names in the v6 review cases.
 
 VERDICT. A classifier FAILS a case when bash's destination is the governed file and the
 classifier answers anything other than `write`. The opposite direction (bash's destination
@@ -69,6 +70,23 @@ BINDINGS = [
     ("subst-value",    "OUT=$(builtin echo " + SAFE + ")"),    # value we cannot prove
     ("tilde-value",    "OUT=~/battery-safe"),
     ("brace-value",    "OUT=${UNSET:-" + SAFE + "}"),
+    # Independent v6 review: the initial literal is real, but a later command
+    # computes the destination variable's name. Surface single-assignment is
+    # insufficient when command-position recognition misses wrappers/quoting.
+    *[("rebind-printf-" + label,
+       'OUT=' + SAFE + '; n=OU; ' + head + ' -v "${n}T" %s ' + MARK)
+      for label, head in [
+          ("builtin", "builtin printf"),
+          ("command", "command printf"),
+          ("quoted", '"printf"'),
+          ("escaped", r"pr\intf"),
+          ("ansi", "$'printf'"),
+          ("expanded", "p=printf; $p"),
+      ]],
+    ("rebind-read-builtin", 'OUT=' + SAFE +
+     '; n=OU; builtin read -r "${n}T" <<< ' + MARK),
+    ("rebind-declare-builtin", 'OUT=' + SAFE +
+     '; n=OU; builtin declare "${n}T=' + MARK + '"'),
 ]
 
 # Every context the binding can sit in. `{B}` is replaced by the binding text. A context
@@ -100,6 +118,15 @@ CONTEXTS = [
     ("eval",            "eval '{B}'"),
     ("nested-subshell", "( ( {B} ) )"),
     ("if-in-subshell",  "( if true; then {B}; fi )"),
+    ("case-skipped",    "case a in b) {B} ;; esac"),
+    ("case-fallthrough", "case a in a) : ;& b) {B} ;; esac"),
+    ("select-empty",    "select item in; do {B}; done"),
+    ("coproc-body",     "coproc { {B}; }; wait"),
+    ("time-binding",    "time {B}"),
+    ("time-pipeline",   "time {B} | cat"),
+    ("negated",         "! {B}"),
+    ("process-subst",   "cat <( {B}; )"),
+    ("nested-function", "f() { g() { {B}; }; }; f"),
 ]
 
 SEPARATORS = [("semi", "; "), ("newline", "\n")]
@@ -202,7 +229,8 @@ def main():
     cand_fp = [x for x in rows if falsepos(x, "candidate")]
     regress = [x for x in rows if unsafe(x, "candidate") and not unsafe(x, "shipped")]
 
-    print(f"{len(rows)} cases adjudicated by bash ({unparsable} unparsable, skipped)")
+    print(f"{len(rows)} cases adjudicated by bash "
+          f"({unparsable} syntax errors, timeouts or missing destinations, skipped)")
     print(f"  bash destination IS the governed file : "
           f"{sum(1 for x in rows if x['governed'])}")
     print(f"  UNSAFE (governed, classified non-write) shipped={len(ship_unsafe):4d}  "
