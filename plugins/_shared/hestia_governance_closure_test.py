@@ -722,6 +722,7 @@ ALL = [
     test_chmod_truncate_ln_targets_are_write,
     test_fd_dup_is_not_a_file_target,
     test_heredoc_body_naming_gate_is_read_not_write,
+    test_here_string_is_not_a_heredoc_13545,
     test_substring_sibling_dir_does_not_match,
     test_member_a_writing_member_b_gate_is_write,
     test_registration_config_write_is_write,
