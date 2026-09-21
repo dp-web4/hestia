@@ -1327,6 +1327,52 @@ def teardown_module(module):
 
 
 @asserting
+def test_a_help_call_to_a_patch_writer_is_refused_as_opaque_is_pinned_open():
+    """PINNED OPEN: #1094. A help or version call to `git apply` / `git am` / `patch` names
+    no patch, so `_command_write_targets` raises _OpaqueWriter. `classify()` then returns
+    `write / governance-closure-opaque-writer` before any closure match. There is no
+    governed path and no cwd dependence, and the resource is `stdin`.
+
+    Hit live twice on 2026-09-21: codex (escalation e0e3d60b…, `git apply -h; rg …`) and
+    claude-code (ce2e83e9…, a bare `patch --version`). git itself was measured in a scratch
+    repo: `git apply -h P` and `git apply P -h` both exit 129 and leave the tree unchanged.
+
+    Goes red when #1094 closes. Invert the rows then. The controls must stay refused: a
+    fix keyed on "no patch named" instead of on the help flag would open stdin."""
+    mod = _load_gate()
+    if getattr(mod, "_closure_classify", None) is None:
+        skip("help_call_to_patch_writer",
+             "this copy could not load hestia_governance_closure")
+        return
+
+    def verdict(cmd):
+        v = mod._closure_classify("Bash", {"command": cmd})
+        return v.classification, v.rule
+
+    opaque = ("write", "governance-closure-opaque-writer")
+    for name, cmd in (
+        ("git_apply_dash_h", "git apply -h"),
+        ("git_apply_long_help", "git apply --help"),
+        ("git_am_long_help", "git am --help"),
+        ("patch_version", "patch --version"),
+        ("codex_live_shape", f"git apply -h; rg -n opaque {HOOK}"),
+    ):
+        got = verdict(cmd)
+        check(f"help_call_still_opaque__{name}", got == opaque,
+              f"now {got!r}. If not opaque-writer, #1094 closed: invert this row")
+
+    # CONTROLS: a patch arriving on stdin, and a patch file that cannot be read, are the
+    # opaque writers the rule exists for. Both must survive the fix.
+    for name, cmd in (
+        ("bare_git_apply_reads_stdin", "git apply"),
+        ("bare_patch_reads_stdin", "patch -p1"),
+        ("unreadable_patch_file", "git apply /nonexistent/dir/x.patch"),
+    ):
+        got = verdict(cmd)
+        check(f"control__{name}", got == opaque,
+              f"{cmd!r} classifies {got!r}; an opaque patch must stay refused")
+
+
 def test_a_variable_redirect_binds_to_an_unrelated_governed_mention_is_pinned_open():
     """PINNED OPEN — #1092, the discriminator of FP6's class, measured to a minimal pair.
 
@@ -1398,6 +1444,7 @@ if __name__ == "__main__":
     test_git_global_option_skip_list_stays_closed()
     test_gh_reads_are_pinned_open()
     test_gh_write_verbs_stay_refused()
+    test_a_help_call_to_a_patch_writer_is_refused_as_opaque_is_pinned_open()
     print()
     # Say what did NOT run, before saying everything passed. A skipped check and a passing
     # one are indistinguishable in a scrollback, and this file's whole subject is claims
