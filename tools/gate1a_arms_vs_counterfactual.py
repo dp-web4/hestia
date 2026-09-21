@@ -4,7 +4,7 @@
 WHY THIS EXISTS. Two artifacts have sat one directory apart for 17 days without ever being
 pointed at each other:
 
-  * `plugins/_shared/test_gate_core.py::test_fp_token_substring_is_a_known_open_defect`
+  * `plugins/_shared/test_gate_core.py::test_a_forbidden_token_inside_a_longer_word_is_pinned_open`
     pins NINE arms -- two false denies (held red "as it behaves TODAY") and seven true
     refusals it calls "what any narrowing must keep". Its docstring sets the earning
     condition in one sentence: "This row goes red the day someone earns the narrowing --
