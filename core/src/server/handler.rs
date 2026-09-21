@@ -16847,6 +16847,42 @@ mod ladder_evidence_tests {
         assert_eq!(prior["truncated"], json!(false), "a short history is not truncated: {prior}");
     }
 
+    /// STAGE A IS RUNNING, NOT MERELY DEFINED: opening an escalation through the real door
+    /// leaves a witnessed advisory verdict on the chain, and changes nothing else.
+    ///
+    /// Both halves matter. Without the row, the agreement measurement has nothing to read and
+    /// the rung sits at stage A forever (§4.3). Without the "changes nothing" half, advisory
+    /// is a word — so this asserts the escalation is still PENDING and still unpermitted after
+    /// the rung has spoken.
+    #[tokio::test]
+    async fn a_minted_escalation_gets_a_witnessed_advisory_verdict_and_stays_pending() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let id = open_one(&state, "plugins/*/hooks",
+                          "Bash: cp /nonexistent/x.py plugins/codex/hooks/pre_tool_use.py").await;
+
+        let s = state.lock().await;
+        let rows = s.recent_chain(20);
+        let v = rows
+            .iter()
+            .find(|e| e.event_type == "ladder_advisory_verdict"
+                  && e.event_data["escalation_id"] == json!(id))
+            .unwrap_or_else(|| panic!("the rung was never asked — stage A is not running: {:?}",
+                                      rows.iter().map(|e| &e.event_type).collect::<Vec<_>>()));
+        assert_eq!(v.event_data["rung"], json!("baseline:v1"));
+        assert_eq!(v.event_data["permits_write"], json!(false),
+                   "the row must disclaim authority on its face");
+        assert!(v.event_data["consulted"].as_array().is_some_and(|a| !a.is_empty()),
+                "and say what it read: {:?}", v.event_data);
+
+        // THE OTHER HALF: the rung spoke and nothing moved.
+        let esc = s.gate_escalations.get(&id).expect("still live");
+        assert_eq!(format!("{:?}", esc.status_at(crate::server::gate_escalation::now_secs())),
+                   "Pending", "an advisory verdict must not decide");
+        assert!(esc.factors.is_empty(), "nor mint a factor nobody filed");
+        assert!(esc.consumed_at.is_none());
+    }
+
     /// THE RUNG MUST READ THE REAL BUNDLE, NOT A FIXTURE THAT RESEMBLES IT.
     ///
     /// `adjudicator`'s own tests hand `BaselineRung` a bundle built by hand, which proves the
@@ -20041,6 +20077,7 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
             DEFAULT_TTL_SECS,
         ),
     )?;
+    shadow_adjudicate(&mut s, &esc.id);
 
     let invited = inv.invited;
     let invitations = deliver_invitations(&mut s, &esc, &invited, &entry.hash);
@@ -20419,6 +20456,56 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
                      effective(you) = society_floor ∪ your grants, additive only. None of the \
                      three is ever written to your identity file.",
     }))
+}
+
+/// The ladder generation the shadow rows carry. The ladder is not yet a stored config (§2.2);
+/// until it is, this constant is the generation, and it moves when the shadow route does.
+const SHADOW_LADDER_GENERATION: u64 = 1;
+
+/// STAGE A, RUNNING (§4.1–4.2): ask the advisory rung about every newly minted escalation and
+/// witness what it said. Computed, recorded, verdict unchanged.
+///
+/// This exists because a routing function nobody calls is a function that exists, not one
+/// that runs — and §4.3 is blunt about what that costs: an advisory rung that is never
+/// measured sits at stage A forever. The measurement needs rows, and rows only accumulate if
+/// the rung is actually asked. Today the rung is `BaselineRung`, the control arm: its
+/// verdicts are weak ON PURPOSE, and the record of them is the denominator any future
+/// reasoner's agreement rate will be read against.
+///
+/// IT CANNOT FAIL THE OPEN. The escalation is already minted and witnessed when this runs;
+/// every error here is swallowed, because a broken advisory path that could refuse or delay a
+/// governance ask would make "advisory" a lie. It cannot DECIDE either: the row says
+/// `permits_write: false` on its face, the route is advisory-only, and the outcome is
+/// discarded — only the trail is kept. Falsifier:
+/// `a_minted_escalation_gets_a_witnessed_advisory_verdict_and_stays_pending`.
+fn shadow_adjudicate(s: &mut crate::server::state::ServerState, escalation_id: &str) {
+    use crate::server::adjudicator::{
+        run_ladder, Adjudicator, BaselineRung, Consequence, RungMode, RungSpec, BASELINE_RUNG_ID,
+    };
+    let Some(bundle) = crate::server::evidence::bundle(s, escalation_id) else {
+        return;
+    };
+    let baseline = BaselineRung;
+    let route: Vec<(RungSpec, &dyn Adjudicator)> = vec![(
+        RungSpec {
+            id: BASELINE_RUNG_ID.to_string(),
+            threshold: 0.0,
+            // Every governance-closure write is treated as High until a stored table says
+            // otherwise — an unclassified surface defaults to high-consequence (CLAUDE.md, S).
+            max_consequence: Consequence::High,
+            mode: RungMode::Advisory,
+        },
+        &baseline,
+    )];
+    let outcome = run_ladder(&route, &bundle, Consequence::High, true);
+    for rec in outcome.trail() {
+        if let Some(v) = &rec.verdict {
+            let _ = s.append_chain(
+                "ladder_advisory_verdict",
+                v.to_row(escalation_id, SHADOW_LADDER_GENERATION),
+            );
+        }
+    }
 }
 
 /// The evidence bundle for one escalation — `PRD_ADJUDICATOR_LADDER` §3.3.
@@ -20934,6 +21021,7 @@ permit for something the approver did not see.",
                 .cloned()
                 .unwrap_or_else(|| json!([]));
             let entry = s.append_chain("gate_escalation_opened", payload)?;
+            shadow_adjudicate(&mut s, &esc.id);
             let invitations = deliver_invitations(&mut s, &esc, &inv.invited, &entry.hash);
             Ok(json!({
                 "claimed": false,
