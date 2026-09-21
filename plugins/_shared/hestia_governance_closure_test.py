@@ -153,6 +153,16 @@ def test_heredoc_body_naming_gate_is_read_not_write():
     check("heredoc_not_write", v.classification == "read", str(v))
 
 
+def test_here_string_is_not_a_heredoc_13545():
+    # `<<<` is a here-string: one word, no body. Read as a heredoc, its word became a
+    # delimiter and the governed write on the next line was stripped as body -> "read".
+    for sep in ("\n", "; "):
+        for word in ("EOF", "'EOF'", "plugins"):
+            v = cls("Bash", {"command":
+                             f"cat <<< {word}{sep}echo x > plugins/kimi/hooks/pre_tool_use.py"})
+            check("herestring_write", v.classification == "write", f"{sep!r} {word}: {v}")
+
+
 def test_substring_sibling_dir_does_not_match():
     # Segment matching, not substring: hooks-backup is NOT hooks.
     v = cls("Bash", {"command": "echo x > plugins/kimi/hooks-backup/pre_tool.txt"})
