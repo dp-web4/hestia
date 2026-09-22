@@ -14,15 +14,18 @@
 //! rebuilt from the vault, the same construction as the member and role registries.
 //!
 //! It removes AUTHORITY and it removes the id from the default view. Concretely:
-//!   * every standing grant the id holds is revoked in the SAME commit that retires it, so
-//!     there is no window in which a retired id still reaches a path;
-//!   * a new grant to it is refused (the `scope_grant` gate, beside the unknown-member one);
+//!   * every grant the id holds -- standing AND live -- is revoked in the same act that retires
+//!     it, so there is no window in which a retired id still reaches a path;
+//!   * authority reaches it through NO door afterwards: `scope_grant`, `scope_decide`,
+//!     `standing/promote` and `standing/reassign` all refuse it through one helper
+//!     (`http::refuse_if_retired`) -- one per route was how a reviewer found the gap;
 //!   * the agent list hides it unless the operator asks to see retired ids.
 //!
 //! IT DOES NOT REFUSE A CONNECT, and that is a decision rather than an omission. Retiring an id
 //! that is actually running would then lock a live seat out of its own machine, and the phantom
 //! case -- the one this exists for -- can never connect at all. So a retired id that DOES connect
-//! is treated as news: it is witnessed as `retired_member_connected` and the row reappears, marked.
+//! is treated as news: `tool_connect` witnesses `retired_member_connected`, and the agents view
+//! keeps the row visible -- marked -- while the id is connected or has acted.
 //! Hiding a retired agent that is demonstrably alive is the one direction that would be dangerous,
 //! because it hides a live agent.
 //!

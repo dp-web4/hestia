@@ -68,27 +68,44 @@ def source_contract() -> None:
     for verb in ("'DELETE'", '"DELETE"'):
         check(f"no {verb} in the retire block", verb in blk, False)
 
-    # The daemon's half, pinned where the claim lives.
-    check("the route refuses without reason and ref",
-          "reason and ref are required" in RS)
-    # PIN THE USE, NOT THE DECLARATION. The first cut of these two pinned the constant and the
-    # response literal, both of which survive the sabotage that matters: pointing the scan at
-    # every event type again, and removing the retired lookup. Both slipped through green. The
-    # Rust tests catch them either way (`retiring_a_phantom_...`); these now at least point at
-    # the lines that decide.
+    # The daemon's half, pinned where each claim lives. The Rust suite exercises every one of
+    # these; the pins here point at the lines that decide, not at declarations or literals --
+    # the first cut pinned a constant and a response literal, both of which survived the
+    # sabotage that mattered.
+    check("the route refuses without reason and ref", "reason and ref are required" in RS)
     check("the guard's scan is RESTRICTED to the agent's own act types",
           "scan_recent(Some(cutoff), Some(AGENT_ACT_EVENTS), 50_000" in RS)
-    check("...and the types are the ones the operator's own act count is built from",
+    check("...the types the operator's own act count is built from",
           'const AGENT_ACT_EVENTS: &[&str] = &["policy_decision", "outcome"];' in RS)
-    check("the grant route actually looks the id up in the retired store",
-          "if let Some(r) = s.retired_members.get(&plugin_id).cloned() {" in RS)
-    check("...and register_new_member does not escape that refusal",
-          RS.index("was RETIRED on this seat") < RS.index("let member_known ="))
+    # The guard must not fail open (cbp, PR #1100, finding 4): unmeasurable is a refusal.
+    check("an unreadable chain is Err, never zero", "-> Result<usize, String> {" in RS and ".map_err(|e| e.to_string())" in RS)
+    check("...and the guard names it", '"unmeasurable": true' in RS)
+    # ONE refusal, FOUR doors (finding 1: the first cut guarded only scope_grant, and reassign's
+    # `to` -- one keystroke from `claude-code` -- handed a retired id a grant).
+    for via in ("an operator grant", "a decided request", "promotion of a live grant", "a reassign"):
+        check(f"authority is refused to a retired id via {via}", f'"{via}")' in RS and "refuse_if_retired(&s, &" in RS)
+    check("reassign checks RETIRED before UNKNOWN: retirement leaves the id in the registry",
+          RS.index('refuse_if_retired(&s, &to, "a reassign")') < RS.index("if s.member_registry.get(&to).is_none() {"))
+    check("the grant route's retired refusal comes before its unknown-member check",
+          RS.index('refuse_if_retired(&s, &plugin_id, "an operator grant")') < RS.index("let member_known ="))
     check("retirement is witnessed intent-then-commit",
           '"member_retire_intent"' in RS and '"member_retired"' in RS)
     check("the per-seat scope is stated in the record itself", "this seat only" in RS)
+    # Live grants go with the standing ones (finding 2), and memory is swapped the moment each
+    # save succeeds so it is never looser than the vault (finding 3).
+    ST = (ROOT / "core/src/server/state.rs").read_text()
+    body = ST[ST.index("pub fn commit_retirement"):ST.index("/// Append a chain entry under the sovereign LCT.")]
+    check("live grants are revoked in the same act", "r.revoked = Some(ScopeRevocation {" in body)
+    # .find, not .index: a sabotage that REMOVES the swap must be a named failure, not a
+    # traceback that hides every other finding (this check first died on exactly that).
+    swap, save = body.find("self.standing_scope = scope;"), body.find("crate::server::retirement::save(")
+    check("the standing store is swapped into memory at all", swap >= 0)
+    check("...and BEFORE the retirement is saved", swap >= 0 and save >= 0 and swap < save)
+    check("a half-landed commit is named as such", "HALF landed" in body)
+    # A retired id that connects is witnessed (finding 5: documented before it existed).
+    HANDLER = (ROOT / "core/src/server/handler.rs").read_text()
+    check("a retired id connecting is witnessed", '"retired_member_connected"' in HANDLER)
     check("the module says what retirement is not", "It is not deletion." in RETIREMENT)
-
 
 def run(expr: str, arg) -> object:
     blk = block()
@@ -96,9 +113,9 @@ def run(expr: str, arg) -> object:
     prog = (
         "const showRetiredArg = JSON.parse(process.argv[1]);\n"
         "const A = showRetiredArg;\n"
-        "function visible(allRows, retired, showRetired) {\n"
-        "  const retiredSet = new Set(retired);\n"
-        "  const rows = allRows.filter(r => !retiredSet.has(r.plugin_id) || showRetired || r.action_count > 0);\n"
+        "function visible(allRows, retired, showRetired, connectedIds) {\n"
+        "  const retiredSet = new Set(retired); const connected = new Set(connectedIds || []);\n"
+        "  const rows = allRows.filter(r => !retiredSet.has(r.plugin_id) || showRetired || r.action_count > 0 || connected.has(r.plugin_id));\n"
         "  return { shown: rows.map(r => r.plugin_id), hidden: allRows.length - rows.length };\n"
         "}\n"
         f"process.stdout.write(JSON.stringify({expr}));"
@@ -114,7 +131,7 @@ def behaviour() -> None:
     # The filter's source of truth is the render block; assert the lifted copy is the same line,
     # or this whole arm is testing a paraphrase.
     check("the lifted filter is the dashboard's own line",
-          "const rows = allRows.filter(r => !retiredSet.has(r.plugin_id) || showRetired || r.action_count > 0);" in UI)
+          "const rows = allRows.filter(r => !retiredSet.has(r.plugin_id) || showRetired || r.action_count > 0 || connected.has(r.plugin_id));" in UI)
 
     dp = [{"plugin_id": "claude-code", "action_count": 5415},
           {"plugin_id": "Claude-code", "action_count": 0},
@@ -131,6 +148,9 @@ def behaviour() -> None:
     got = run("visible(A[0], A[1], false)", [live, ["kimi-code"]])
     check("a retired id that is still acting stays visible", got, {"shown": ["claude-code", "kimi-code"], "hidden": 0})
     check("nothing retired: nothing hidden", run("visible(A[0], A[1], false)", [dp, []])["hidden"], 0)
+    # A retired id that is CONNECTED (never acted) stays visible: it is news, not something to hide.
+    got = run("visible(A[0], A[1], false, A[2])", [dp, ["Claude-code", "caude-code"], ["caude-code"]])
+    check("a retired id that is connected right now stays visible", got, {"shown": ["claude-code", "caude-code"], "hidden": 1})
 
 
 def test_retire_control_contract() -> None:

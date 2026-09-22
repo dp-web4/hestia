@@ -2371,7 +2371,7 @@
     // `showRetired`, and an id that is retired and STILL ACTING -- hiding a live agent is the
     // one direction here that would be dangerous, so it stays visible and says so.
     const retiredSet = new Set((lastData && lastData.retired) || []);
-    const rows = allRows.filter(r => !retiredSet.has(r.plugin_id) || showRetired || r.action_count > 0);
+    const rows = allRows.filter(r => !retiredSet.has(r.plugin_id) || showRetired || r.action_count > 0 || connected.has(r.plugin_id));
     const hidden = allRows.length - rows.length;
     if (!rows.length) {
       root.innerHTML = '<div class="empty">No plugins recorded yet. Connect one to start building trust.</div>';
@@ -2399,7 +2399,8 @@
         <span class="trust-level">${escapeHtml(r.level)}</span>
         <span class="tr-drill">${drillable ? 'roles →' : ''}</span>
         ${retiredSet.has(r.plugin_id) ? `<div class="trust-alike"><strong>retired</strong> on this seat — its standing grants were revoked and it is hidden from this list by default.${
-            r.action_count > 0 ? ' <strong>It is still acting</strong>, which is why it is shown: a live agent is not hidden.' : ''}
+            connected.has(r.plugin_id) ? ' <strong>It is connected right now</strong>, which is why it is shown: a live agent is not hidden.'
+            : r.action_count > 0 ? ' <strong>It has acted</strong>, which is why it is shown: a live agent is not hidden.' : ''}
           <button type="button" class="pol-btn-add" data-reinstate="${escapeHtml(r.plugin_id)}"
             title="Undo the retirement. The standing grants revoked at retirement are NOT restored.">reinstate</button></div>`
           : `<div class="trust-retire"><button type="button" class="pol-btn pol-remove" data-retire="${escapeHtml(r.plugin_id)}"
