@@ -1801,8 +1801,21 @@ def main() -> int:
     # none of which need atlas — and a payload of `{status, machine, reason}` with no
     # `scope` key, in the one case where scope IS the whole story. See fallback_agent_ids.
     if ATLAS.is_dir():
-        known = sorted(p.name for p in ATLAS.iterdir() if p.is_dir())
-        enumeration, enumeration_gap = "agent-atlas", None
+        # THE ATLAS IS A SOURCE, NOT THE ONLY ONE. This was `known = <atlas dirs>`, so the
+        # presence of an atlas SUPPRESSED hestia's own knowledge: `ALIASES` is this file's
+        # record of "this is a harness, and here is how to find it on disk", and an id named
+        # there but not yet described in agent-atlas was never looked for. Measured 2026-09-21:
+        # `sage` sits in ALIASES and the being on this machine could not appear in the
+        # inventory -- not because anything was undetectable, but because a descriptor was
+        # unmerged in a DIFFERENT REPOSITORY. A registry hestia does not control must not be
+        # able to veto hestia looking for a harness hestia already knows about.
+        #
+        # ALIASES only, deliberately, NOT `fallback_agent_ids`: that set is the right
+        # degradation when there is no atlas at all, and it draws on the plugin registry,
+        # which on this box also yields `_shared` and `reviewer` -- a seat-config pseudo-member
+        # and a role. Unioning those in would invent two agents to fix the omission of one.
+        known = sorted(set(p.name for p in ATLAS.iterdir() if p.is_dir()) | set(ALIASES))
+        enumeration, enumeration_gap = "agent-atlas + built-in ALIASES", None
     else:
         known = fallback_agent_ids(REGISTRY)
         enumeration = "built-in ALIASES + plugin registry"
@@ -1838,6 +1851,13 @@ def main() -> int:
         # from "McNugget never looked for one".
         "agent_enumeration": enumeration,
         "agent_enumeration_complete": enumeration_gap is None,
+        # WHICH ids, not only where the list came from. The comment above says a reader must
+        # be able to tell "McNugget has no codex" from "McNugget never looked for one" -- and
+        # the source label alone cannot answer that for any PARTICULAR id, because an id that
+        # is enumerated, found absent and has nothing to report is (correctly) quiet in
+        # `detail`. So the look itself is published: `agents_looked_for` is the whole list
+        # this run inspected, silent ones included.
+        "agents_looked_for": known,
         "atlas": str(ATLAS),
         "atlas_source": ATLAS_SOURCE,
         "exe_search_roots": roots,

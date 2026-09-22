@@ -1100,6 +1100,47 @@ _PLIST = """<plist><dict><key>ProgramArguments</key><array>
 <string>mcnugget-being</string></array></dict></plist>"""
 
 
+def test_an_atlas_does_not_veto_hestias_own_agent_ids():
+    """An id in ALIASES but not in the atlas is still looked for. END TO END, through the real
+    CLI, because the defect lived in one line of `main` and a unit test of a helper would have
+    passed while the product stayed broken.
+
+    Measured 2026-09-21: `sage` is in ALIASES, and the being on this machine could not appear in
+    the inventory -- not because anything was undetectable, but because a descriptor was unmerged
+    in a DIFFERENT REPOSITORY. A registry hestia does not control must not be able to veto
+    hestia looking for a harness hestia already knows about."""
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        atlas, ws = d / "talk-to", d / "ws"
+        (atlas / "claude").mkdir(parents=True)
+        (atlas / "claude" / "descriptor.md").write_text("---\nharness: Claude Code\n---\n")
+        # A plugin registry that CONTAINS the two non-harnesses, so the "does not conjure"
+        # check below can fail. Without them the fixture made that check inert: unioning the
+        # registry in (the wrong fix) passed clean, because the fixture had no registry to
+        # pull them from. A sabotage that cannot apply proves nothing.
+        for plug in ("_shared", "reviewer", "claude-code"):
+            (ws / "hestia" / "plugins" / plug).mkdir(parents=True)
+        out = subprocess.run(
+            [sys.executable, str(Path(__file__).parent / "inventory.py"),
+             "--no-witness", "--json", f"--atlas={atlas}", f"--workspace={ws}"],
+            capture_output=True, text=True, timeout=180)
+        rep = json.loads(out.stdout)
+        # The look ITSELF, not the findings: an id that is enumerated, found absent, and has
+        # nothing to report is correctly quiet in `detail`, so `detail` cannot answer "was it
+        # looked for". That is why the report publishes the list.
+        looked = set(rep["scope"]["agents_looked_for"])
+        check("the atlas's own id is still enumerated", "claude" in looked, True)
+        # The atlas names exactly one id; every OTHER id hestia knows about must survive.
+        check("an id hestia knows about is enumerated though the atlas lacks a descriptor",
+              sorted(set(inventory.ALIASES) - looked), [])
+        check("...and the report says BOTH sources were used, so the reader can tell",
+              rep["scope"]["agent_enumeration"], "agent-atlas + built-in ALIASES")
+        # ...without inventing agents: the plugin registry's `_shared`/`reviewer` are a
+        # seat-config pseudo-member and a role, and unioning THEM in would fix one omission
+        # by manufacturing two harnesses.
+        check("and no non-harness is conjured", sorted(looked & {"_shared", "reviewer"}), [])
+
+
 def test_a_being_is_found_by_its_launcher_not_by_a_hook():
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
@@ -1321,6 +1362,7 @@ if __name__ == "__main__":
     test_helpers_are_defined_before_first_use()
     test_no_raw_path_in_printed_output()
     test_generation_stamp_brackets_the_install()
+    test_an_atlas_does_not_veto_hestias_own_agent_ids()
     test_a_being_is_found_by_its_launcher_not_by_a_hook()
     test_unit_verdict()
     with tempfile.TemporaryDirectory() as d:
