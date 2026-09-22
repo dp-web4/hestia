@@ -434,6 +434,10 @@ pub struct ServerState {
     /// decision. Mutated ONLY from the operator-gated HTTP surface; no MCP tool reaches it
     /// (`no_mcp_tool_can_mutate_standing_scope`). See `server::standing_scope`.
     pub standing_scope: crate::server::standing_scope::StandingScopeStore,
+    /// Ids the operator has retired on THIS seat: no longer parties, their standing grants
+    /// revoked in the same commit, hidden from the default agent view. Rebuilt from the vault
+    /// at load like `member_registry`. Never deletion -- see `server::retirement`.
+    pub retired_members: crate::server::retirement::RetirementStore,
     /// What was found where the standing authority should be, at launch. Set once during
     /// construction and served beside the envelope so an unmigrated society is legible
     /// rather than silently empty.
@@ -618,6 +622,7 @@ impl ServerState {
         );
         // Custodial member LCTs, loaded from the vault (minted lazily on connect).
         let member_registry = crate::member_registry::load_members(&vault);
+        let retired_members = crate::server::retirement::load(&vault);
         // Resolve the active policy from the vault. Falls back to the
         // safety preset if the vault's named preset isn't built-in.
         let policy_config = vault
@@ -723,6 +728,7 @@ impl ServerState {
             sovereign,
             role_registry,
             member_registry,
+            retired_members,
             shared_context: serde_json::Map::new(),
             policy_engine,
             role_policy_engines,
@@ -1337,6 +1343,50 @@ impl ServerState {
             crate::derivation::alias_target(b, aliases),
         );
         ta.as_deref() == Some(b) || tb.as_deref() == Some(a) || (ta.is_some() && ta == tb)
+    }
+
+    /// Retire or reinstate an id, and revoke its standing grants, as ONE persisted step.
+    ///
+    /// Same construction as `commit_standing_scope`: both candidates are built, BOTH are
+    /// written, and the live stores are swapped only after. The two must move together --
+    /// a retirement that lands while the grants survive leaves an id that is hidden from the
+    /// operator's view and still reaches paths, which is worse than either state alone.
+    ///
+    /// The scope document is written FIRST: if that write fails nothing is retired, and if the
+    /// retirement write then fails the seat is left with authority REMOVED and the id still
+    /// visible. Of the two orders that is the one whose failure is safe and legible.
+    pub fn commit_retirement<F>(&mut self, mutate: F) -> Result<Vec<String>>
+    where
+        F: FnOnce(&mut crate::server::retirement::RetirementStore) -> Option<String>,
+    {
+        let mut retired = self.retired_members.clone();
+        let revoke_for = mutate(&mut retired);
+        let mut scope = self.standing_scope.clone();
+        let mut revoked: Vec<String> = Vec::new();
+        if let Some(member) = revoke_for.as_deref() {
+            for path in scope
+                .grants
+                .iter()
+                .filter(|g| g.member == member)
+                .map(|g| g.path.clone())
+                .collect::<Vec<_>>()
+            {
+                if scope.revoke(member, &path) {
+                    revoked.push(path);
+                }
+            }
+        }
+        if !revoked.is_empty() {
+            crate::vault::save_doc(&mut self.vault, "scope", "standing", "standing-scope.json", &scope)?;
+        }
+        crate::server::retirement::save(&mut self.vault, &retired)?;
+        if !revoked.is_empty() {
+            self.standing_scope = scope;
+            self.standing_scope_dirty = false;
+        }
+        self.retired_members = retired;
+        revoked.sort();
+        Ok(revoked)
     }
 
     /// Append a chain entry under the sovereign LCT.

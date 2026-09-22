@@ -354,6 +354,7 @@
   .disc-name { font-weight: 600; }
   .disc-ids  { font-size: 0.78rem; color: var(--fg-dim); }
   .disc-path { font-family: var(--mono); font-size: 0.72rem; color: var(--fg-dim); }
+  .trust-retire { grid-column: 1 / -1; margin-top: 0.15rem; }
   .trust-alike { flex-basis: 100%; grid-column: 1 / -1; font-size: 0.78rem; color: var(--fg-dim); margin-top: 0.2rem; }
   .trust-alike .pol-btn-add { margin-left: 0.5rem; }
   .disc-why { flex-basis: 100%; margin: 0.15rem 0 0 1.1rem; padding: 0; font-size: 0.78rem; color: var(--fg-dim); }
@@ -2227,6 +2228,65 @@
     return Object.values(byId).filter(v => v.roles > 0);
   }
 
+  let showRetired = false;
+
+  // RETIRE / REINSTATE. The one act on this screen that removes authority, so it is the one
+  // that asks twice: a reason and an evidence pointer are required by the daemon (a retirement
+  // that revokes grants must not be an unexplained row itself), and a member that has ACTED
+  // recently is refused until the operator confirms it -- the three look-alike ids differ by one
+  // character, and the live one is the seat the operator is typing from.
+  async function retireAgent(id) {
+    const reason = prompt(`Retire "${id}" on this seat?\n\nIts standing grants are revoked and the row is hidden. Not deletion: the chain keeps every act it made, and this is reversible.\n\nWhy?`);
+    if (!reason) return;
+    const ref = prompt(`Evidence pointer for retiring "${id}" (required — where the reason is recorded):`);
+    if (!ref) return;
+    const send = async (confirm_active) => {
+      const res = await apiFetch(`/api/agents/${encodeURIComponent(id)}/retire`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason, ref, ...(confirm_active ? { confirm_active: true } : {}) }),
+      });
+      return [res, await res.json().catch(() => ({}))];
+    };
+    try {
+      let [res, out] = await send(false);
+      // The guard, surfaced with its evidence rather than as a bare refusal: the act count is
+      // what tells the operator which of three look-alikes they have hold of.
+      if (res.status === 409 && out && out.acts_recently) {
+        if (!confirm(`"${id}" has taken ${out.acts_recently} act(s) in the last ${out.window_hours}h — this is a LIVE member, not a phantom.\n\nRetiring it revokes its standing grants. Continue?`)) return;
+        [res, out] = await send(true);
+      }
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      await tick();
+      rerender(lastData);
+    } catch (e) { alert(`retire failed: ${e.message}`); }
+  }
+
+  async function reinstateAgent(id) {
+    const reason = prompt(`Reinstate "${id}"?\n\nThe standing grants revoked at retirement are NOT restored — re-grant any that are still wanted, deliberately.\n\nWhy?`);
+    if (!reason) return;
+    try {
+      const res = await apiFetch(`/api/agents/${encodeURIComponent(id)}/reinstate`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason }),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      await tick();
+      rerender(lastData);
+    } catch (e) { alert(`reinstate failed: ${e.message}`); }
+  }
+
+  document.addEventListener('click', e => {
+    const t = e.target && e.target.closest && e.target.closest('[data-retire],[data-reinstate],#trust-show-retired,#trust-hide-retired');
+    if (!t) return;
+    e.stopPropagation();
+    if (t.id === 'trust-show-retired' || t.id === 'trust-hide-retired') {
+      showRetired = t.id === 'trust-show-retired';
+      rerender(lastData);
+    } else if (t.dataset.retire) { retireAgent(t.dataset.retire); }
+    else { reinstateAgent(t.dataset.reinstate); }
+  }, true);
+
   // ── Look-alike members (agent-lifecycle PRD R6) ────────────────────────────────────────
   //
   // A member id is caller-asserted text, so a typo in a grant form mints a member (#1067): dp's
@@ -2304,9 +2364,15 @@
     if (hint) hint.textContent = 'click a harness to see its role trust';
     trustShown = [];   // no per-grain detail buttons in the aggregate view
     const connected = new Set(orchs.filter(o => o.connected).map(o => o.id));
-    const rows = aggregateHarnessTrust(trust).sort((a, b) => b.action_count - a.action_count);
-    noteMembers(rows);   // keep the member pickers backed by real evidence
-    const alike = lookalikeSuggestions(rows);
+    const allRows = aggregateHarnessTrust(trust).sort((a, b) => b.action_count - a.action_count);
+    noteMembers(allRows);   // keep the member pickers backed by real evidence
+    const alike = lookalikeSuggestions(allRows);
+    // RETIRED IDS ARE HIDDEN, NOT DROPPED (agent-lifecycle R1). Two exceptions, both deliberate:
+    // `showRetired`, and an id that is retired and STILL ACTING -- hiding a live agent is the
+    // one direction here that would be dangerous, so it stays visible and says so.
+    const retiredSet = new Set((lastData && lastData.retired) || []);
+    const rows = allRows.filter(r => !retiredSet.has(r.plugin_id) || showRetired || r.action_count > 0);
+    const hidden = allRows.length - rows.length;
     if (!rows.length) {
       root.innerHTML = '<div class="empty">No plugins recorded yet. Connect one to start building trust.</div>';
       return;
@@ -2332,6 +2398,12 @@
         <span class="tr-val"></span>
         <span class="trust-level">${escapeHtml(r.level)}</span>
         <span class="tr-drill">${drillable ? 'roles →' : ''}</span>
+        ${retiredSet.has(r.plugin_id) ? `<div class="trust-alike"><strong>retired</strong> on this seat — its standing grants were revoked and it is hidden from this list by default.${
+            r.action_count > 0 ? ' <strong>It is still acting</strong>, which is why it is shown: a live agent is not hidden.' : ''}
+          <button type="button" class="pol-btn-add" data-reinstate="${escapeHtml(r.plugin_id)}"
+            title="Undo the retirement. The standing grants revoked at retirement are NOT restored.">reinstate</button></div>`
+          : `<div class="trust-retire"><button type="button" class="pol-btn pol-remove" data-retire="${escapeHtml(r.plugin_id)}"
+            title="Stop this id being a party on this seat: revokes its standing grants and hides the row. Not deletion — the chain keeps every act it made, and it is reversible.">retire…</button></div>`}
         ${alike[r.plugin_id] ? `<div class="trust-alike">never acted, and ${escapeHtml(alike[r.plugin_id].how)} from
           <strong>${escapeHtml(alike[r.plugin_id].of)}</strong> — probably a mistyped id.
           <button type="button" class="pol-btn-add" data-merge-alias="${escapeHtml(r.plugin_id)}"
@@ -2400,7 +2472,9 @@
         <button type="button" class="tr-detail" onclick="showTrustDetail(${i})"
                 title="Full tensor, every dimension, and the chain receipts behind it">detail</button>
       </div>`;
-    }).join('');
+    }).join('') + (hidden ? `<div class="grant-note">${hidden} retired id${hidden === 1 ? '' : 's'} hidden.
+      <button type="button" class="pol-btn" id="trust-show-retired">show retired</button></div>`
+      : (showRetired && retiredSet.size ? `<div class="grant-note"><button type="button" class="pol-btn" id="trust-hide-retired">hide retired</button></div>` : ''));
   }
 
   // Drill from the harness aggregate into that harness's role trust — the same selection

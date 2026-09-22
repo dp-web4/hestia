@@ -1282,6 +1282,10 @@ pub async fn serve_with_callback(
         .route("/api/gates/verify", get(gates_verify))
         .route("/api/gates/ratify", post(gates_ratify))
         .route("/api/agents/:id/ungovern", post(agent_ungovern))
+        // Retire / reinstate a member on THIS seat (agent-lifecycle PRD R1). Operator-gated
+        // like every other authority change: retiring revokes the id's standing grants.
+        .route("/api/agents/:id/retire", post(agent_retire))
+        .route("/api/agents/:id/reinstate", post(agent_reinstate))
         .route("/api/chain", get(chain_query))
         // The admin ledger — governance history with status facets. Operator-gated for the same
         // reason /api/chain is: it is the society's whole record of who ruled on what.
@@ -3543,6 +3547,24 @@ async fn scope_grant(
     // by running the negative case rather than the happy one; a guard nobody has watched FAIL
     // is a claim, not a check. `member_registry` is the store of members actually recorded, so
     // asking it can return false.
+    // A RETIRED id is not a party here any more (agent-lifecycle R1). Refused BEFORE the
+    // unknown-member check below, and not escapable by `register_new_member`: that flag says
+    // "this member is real and has not connected yet", which is a different claim from "this
+    // member was deliberately retired". Granting to a retired id would also be silently undone
+    // by nothing -- retirement revokes grants once, at retirement; it is not a standing filter.
+    if let Some(r) = s.retired_members.get(&plugin_id).cloned() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "'{plugin_id}' was RETIRED on this seat ({}). Nothing was written. \
+                     Reinstate it first if it should hold authority again.", r.reason),
+                "retired": true,
+                "retired_at": r.retired_at,
+                "reinstate_with": format!("POST /api/agents/{plugin_id}/reinstate"),
+            })),
+        );
+    }
     let member_known = s.member_registry.get(&plugin_id).is_some();
     // AND NOW REFUSED BY DEFAULT (#1067). The paragraph above chose "reported, not refused",
     // and the report was accurate, well worded, and defeated by where it was shown: inside the
@@ -5417,6 +5439,188 @@ async fn agents_inventory() -> impl IntoResponse {
 /// Ungoverning is deliberately louder than governing. Governing adds a gate and a bad
 /// outcome is a blocked tool call; ungoverning REMOVES one, and its bad outcome is an
 /// agent running unwatched while the dashboard still lists it as known.
+/// Acts THIS ID TOOK since `cutoff` (RFC3339) -- the retire guard's evidence. A phantom, the
+/// case retirement exists for, has none ever; a live seat has thousands.
+///
+/// THE EVENT TYPES ARE THE WHOLE POINT. The first cut counted every entry carrying a
+/// `plugin_id`, which includes entries the OPERATOR wrote ABOUT an id: a scope grant names its
+/// subject. So the two ids dp wants retired -- minted by his own mistyped grants, `0 actions`
+/// on his screen -- read as LIVE members and the guard refused exactly the case it exists to
+/// permit. Caught by this function's own test before it shipped.
+///
+/// `policy_decision` and `outcome` are the agent's own record: the gate ruling on a tool call
+/// it attempted, and the result. They are also what the trust list's `action_count` is built
+/// from, so the number in a refusal is the number on the operator's screen -- a guard that
+/// argued with the column next to it would be worse than none.
+const AGENT_ACT_EVENTS: &[&str] = &["policy_decision", "outcome"];
+
+fn agent_acts_since(s: &crate::server::state::ServerState, plugin_id: &str, cutoff: &str) -> usize {
+    let want = plugin_id.trim().to_string();
+    s.chain_store
+        .scan_recent(Some(cutoff), Some(AGENT_ACT_EVENTS), 50_000, |row| {
+            serde_json::from_str::<serde_json::Value>(row.event_data)
+                .ok()
+                .and_then(|v| v.get("plugin_id").and_then(|p| p.as_str()).map(str::to_string))
+        })
+        .map(|ids| ids.into_iter().filter(|id| *id == want).count())
+        .unwrap_or(0)
+}
+
+const RETIRE_ACTIVE_WINDOW_HOURS: i64 = 24;
+
+/// Retire an id on THIS seat: revoke its standing grants and take it out of the default view.
+/// Never deletion; see `server::retirement` for what it is and is deliberately not.
+async fn agent_retire(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let plugin_id = id.trim().to_string();
+    let field = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let (reason, evidence_ref) = (field("reason"), field("ref"));
+    if plugin_id.is_empty() || reason.is_empty() || evidence_ref.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "reason and ref are required — a retirement revokes authority and \
+                          removes a party from the default view, so it must not be an \
+                          unexplained row itself"
+            })),
+        );
+    }
+    let confirm_active = body.get("confirm_active").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut s = state.lock().await;
+
+    // THE GUARD. Retiring a phantom is the point; retiring the seat you are typing from is the
+    // accident, and the three ids differ by one character. A member that has ACTED recently is
+    // refused unless the operator says the word — and the refusal reports the evidence rather
+    // than just objecting, because "5,415 acts in 24h" is what identifies which of the three
+    // look-alikes is the real one.
+    let cutoff = (chrono::Utc::now() - chrono::Duration::hours(RETIRE_ACTIVE_WINDOW_HOURS))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let recent = agent_acts_since(&s, &plugin_id, &cutoff);
+    if recent > 0 && !confirm_active {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "'{plugin_id}' has taken {recent} act(s) in the last \
+                     {RETIRE_ACTIVE_WINDOW_HOURS}h, so it is a LIVE member, not a phantom. \
+                     Retiring it revokes its standing grants. If that is what you mean, \
+                     resend with \"confirm_active\": true."),
+                "acts_recently": recent,
+                "window_hours": RETIRE_ACTIVE_WINDOW_HOURS,
+            })),
+        );
+    }
+
+    let now = crate::server::gate_escalation::now_secs();
+    let held: Vec<String> = s.standing_scope.grants.iter()
+        .filter(|g| g.member == plugin_id).map(|g| g.path.clone()).collect();
+    let record = serde_json::json!({
+        "plugin_id": plugin_id,
+        "subject_instance_lct": s.member_lct(&plugin_id),
+        "reason": reason,
+        "ref": evidence_ref,
+        "revokes_standing_paths": held,
+        "acts_in_window": recent,
+        "window_hours": RETIRE_ACTIVE_WINDOW_HOURS,
+        "confirmed_active": confirm_active,
+        "retired_by": "operator",
+        "scope": "this seat only — a retirement is not published to the hub and does not reach \
+                  another seat's registry",
+    });
+    // INTENT -> COMMIT -> SUCCESS, the ordering `witness_and_commit_standing_grant` exists to
+    // keep: a failed commit must not leave the chain asserting an authority change that never
+    // took effect.
+    let intent = match s.append_chain("member_retire_intent", record.clone()) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("witnessing intent: {e}")}))),
+    };
+    let rec = crate::server::retirement::RetiredMember {
+        plugin_id: plugin_id.clone(), retired_at: now, reason: reason.clone(),
+        evidence_ref: evidence_ref.clone(), revoked_paths: held.clone(), was_active: recent > 0,
+    };
+    let revoked = match s.commit_retirement(|st| { st.retire(rec); Some(plugin_id.clone()) }) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("nothing was retired and no grant was revoked: {e}"),
+            "intentEntryHash": intent.hash,
+        }))),
+    };
+    // The success record is the intent's, plus what actually happened -- so the pair reads as
+    // one act on the chain and a reader never has to join two shapes.
+    let mut done = record.clone();
+    if let Some(m) = done.as_object_mut() {
+        m.insert("revoked_standing_paths".into(), serde_json::json!(revoked));
+        m.insert("intent".into(), serde_json::json!(intent.hash));
+    }
+    let entry = s.append_chain("member_retired", done).ok();
+    let gen = s.retired_members.generation;
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true, "plugin_id": plugin_id, "retired": true,
+        "revoked_standing_paths": revoked,
+        "generation": gen,
+        "intentEntryHash": intent.hash,
+        "witnessEntryHash": entry.map(|e| e.hash),
+        "note": "not deleted: the chain keeps every act this id made, and `show retired` in the \
+                 agents view still lists it. Reversible with /reinstate, which does NOT restore \
+                 the revoked grants.",
+    })))
+}
+
+/// Undo a retirement. Deliberately does NOT restore the revoked grants: re-granting authority is
+/// an authority decision of its own, and silently handing back a path because an id came out of
+/// retirement would make reinstate a grant route wearing another name. The response names what
+/// was revoked so the operator can re-grant deliberately.
+async fn agent_reinstate(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let plugin_id = id.trim().to_string();
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if reason.is_empty() {
+        return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "reason is required"})));
+    }
+    let mut s = state.lock().await;
+    let Some(existing) = s.retired_members.get(&plugin_id).cloned() else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": format!("'{plugin_id}' is not retired on this seat; nothing to undo"),
+        })));
+    };
+    let record = serde_json::json!({
+        "plugin_id": plugin_id,
+        "subject_instance_lct": s.member_lct(&plugin_id),
+        "reason": reason,
+        "was_retired_at": existing.retired_at,
+        "was_retired_because": existing.reason,
+        "paths_revoked_then_and_NOT_restored_now": existing.revoked_paths,
+        "reinstated_by": "operator",
+    });
+    let intent = match s.append_chain("member_reinstate_intent", record.clone()) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("witnessing intent: {e}")}))),
+    };
+    if let Err(e) = s.commit_retirement(|st| { st.reinstate(&plugin_id); None }) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("still retired: {e}"), "intentEntryHash": intent.hash })));
+    }
+    let entry = s.append_chain("member_reinstated", record).ok();
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true, "plugin_id": plugin_id, "retired": false,
+        "generation": s.retired_members.generation,
+        "grants_not_restored": existing.revoked_paths,
+        "intentEntryHash": intent.hash,
+        "witnessEntryHash": entry.map(|e| e.hash),
+        "note": "the standing grants revoked at retirement were NOT restored — re-grant any that \
+                 are still wanted, deliberately.",
+    })))
+}
+
 async fn agent_ungovern(
     State(state): State<SharedState>,
     Path(id): Path<String>,
@@ -7407,6 +7611,121 @@ mod disposition_tests {
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn retire(state: &SharedState, id: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let resp = agent_retire(State(state.clone()), Path(id.to_string()), Json(body)).await.into_response();
+        let st = resp.status();
+        let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (st, serde_json::from_slice(&b).unwrap())
+    }
+
+    async fn reinstate(state: &SharedState, id: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let resp = agent_reinstate(State(state.clone()), Path(id.to_string()), Json(body)).await.into_response();
+        let st = resp.status();
+        let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (st, serde_json::from_slice(&b).unwrap())
+    }
+
+    /// dp, 2026-09-08 and again on 09-19 and 09-21: three `claude-code` ids in the trust list,
+    /// "no way of managing them". This is the whole act, on the real shape of that problem: two
+    /// phantoms that have never acted beside the seat with every act.
+    #[tokio::test]
+    async fn retiring_a_phantom_revokes_its_authority_and_refuses_to_touch_the_live_seat() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "claude-code").await;
+        register_member(&state, "Claude-code").await;
+
+        // The phantom holds the grant dp typed at it by mistake.
+        let (st, _) = grant(&state, serde_json::json!({
+            "plugin_id": "Claude-code", "path": "/w/repos", "reason": "dp's typo, 2026-09-08",
+            "recursive": true, "register_new_member": true})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(state.lock().await.has_scope_grant("Claude-code", "/w/repos/x"));
+
+        // Retiring it: authority gone in the same act, and the account is required.
+        let (st, b) = retire(&state, "Claude-code", serde_json::json!({"reason": "a typo of claude-code"})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "no ref: {b}");
+        let (st, b) = retire(&state, "Claude-code", serde_json::json!({
+            "reason": "a typo of claude-code", "ref": "dp 2026-09-08"})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["revoked_standing_paths"], serde_json::json!(["/w/repos"]));
+        {
+            let s = state.lock().await;
+            assert!(s.retired_members.is_retired("Claude-code"));
+            assert!(!s.has_scope_grant("Claude-code", "/w/repos/x"),
+                    "a retired id must not still reach a path");
+            assert!(s.dashboard_snapshot(10).retired.contains(&"Claude-code".to_string()),
+                    "the view needs to know, to be able to hide it");
+        }
+
+        // ...and a NEW grant to it is refused, not escapable by the ahead-of-connect flag:
+        // "real but not yet connected" is a different claim from "deliberately retired".
+        for extra in [serde_json::json!({}), serde_json::json!({"register_new_member": true})] {
+            let mut body = serde_json::json!({
+                "plugin_id": "Claude-code", "path": "/w/other", "reason": "again"});
+            body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let (st, b) = grant(&state, body).await;
+            assert_eq!(st, StatusCode::CONFLICT, "{b}");
+            assert_eq!(b["retired"], serde_json::json!(true));
+        }
+
+        // THE GUARD. `claude-code` is the seat with the acts; the two differ by one character.
+        // The acts have to be REAL for the guard to have anything to measure -- connecting is
+        // not acting, and a fixture where the "live" seat has taken no action would let this
+        // assertion pass for the wrong reason (it did, on the first run).
+        {
+            let s = state.lock().await;
+            for i in 0..3 {
+                s.append_chain("outcome", serde_json::json!({
+                    "plugin_id": "claude-code", "success": true, "tool_name": "Read", "n": i})).unwrap();
+            }
+        }
+        let (st, b) = retire(&state, "claude-code", serde_json::json!({
+            "reason": "wrong one of the three", "ref": "x"})).await;
+        assert_eq!(st, StatusCode::CONFLICT, "a live member must not retire by one keystroke: {b}");
+        assert!(b["acts_recently"].as_u64().unwrap() > 0, "{b}");
+        assert!(state.lock().await.retired_members.get("claude-code").is_none());
+        // ...and the operator can still mean it.
+        let (st, _) = retire(&state, "claude-code", serde_json::json!({
+            "reason": "meant it", "ref": "x", "confirm_active": true})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(state.lock().await.retired_members.get("claude-code").unwrap().was_active);
+
+        // Reinstate: reversible, and it does NOT hand authority back silently.
+        let (st, b) = reinstate(&state, "Claude-code", serde_json::json!({"reason": "mistake"})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["grants_not_restored"], serde_json::json!(["/w/repos"]));
+        {
+            let s = state.lock().await;
+            assert!(!s.retired_members.is_retired("Claude-code"));
+            assert!(!s.has_scope_grant("Claude-code", "/w/repos/x"),
+                    "reinstate is not a grant route wearing another name");
+        }
+        let (st, _) = reinstate(&state, "never-retired", serde_json::json!({"reason": "x"})).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    /// The chain must carry the pair, in order, with the authority change named -- so the act is
+    /// auditable without trusting the response that reported it.
+    #[tokio::test]
+    async fn a_retirement_is_witnessed_as_intent_then_commit() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "caude-code").await;
+        let (st, b) = retire(&state, "caude-code", serde_json::json!({
+            "reason": "typo", "ref": "dp 2026-09-08"})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let s = state.lock().await;
+        let chain = s.recent_chain(50);
+        let pos = |t: &str| chain.iter().find(|e| e.event_type == t).map(|e| e.chain_position);
+        let (intent, done) = (pos("member_retire_intent"), pos("member_retired"));
+        assert!(intent.is_some() && done.is_some(), "both halves are witnessed");
+        assert!(intent < done, "intent precedes the commit");
+        let rec = chain.iter().find(|e| e.event_type == "member_retired").unwrap();
+        assert_eq!(rec.event_data["plugin_id"], serde_json::json!("caude-code"));
+        assert!(rec.event_data["scope"].as_str().unwrap().contains("this seat only"),
+                "the record states it is per-seat, so a later fleet-wide ruling changes a stated \
+                 decision rather than discovering an accident");
     }
 
     /// #1067, measured on McNugget: a grant to `Claude-code` succeeded, was witnessed, was
