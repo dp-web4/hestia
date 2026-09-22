@@ -278,7 +278,14 @@ def verify_rendered(hestia_home: Path, documents: list[tuple[str, dict]]) -> lis
         except OSError:
             missing.append(f"{member}: {rendered} did not render")
             continue
-        absent = [k for k in list(shared) + list(env) if f"\n{k}=" not in body]
+        # Design A: a line the seat OWNS renders as `TOKEN__KEY` (seat_config::seat_token), a
+        # shared line stays bare. The loader strips its own token, so either spelling of a seat
+        # key is the key; checking only the bare one reported every correct projection as
+        # unrendered (pub, 2026-09-21).
+        token = "".join(ch.upper() if ch.isalnum() else "_" for ch in member)
+        absent = [k for k in shared if f"\n{k}=" not in body]
+        absent += [k for k in env
+                   if f"\n{k}=" not in body and f"\n{token}__{k}=" not in body]
         if absent:
             missing.append(f"{member}: rendered without {absent}")
     return missing
