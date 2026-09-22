@@ -53,13 +53,32 @@ def source_contract() -> None:
     check("rescan is wired", "e.target.id === 'disc-rescan'" in UI)
 
     block = discover_block()
+    # ONE READ AND ONE WRITE, changed deliberately on 2026-09-21 and narrowed in the same move.
+    #
+    # This pane was pinned READ-ONLY, and the pin did its job: adding the Register action turned
+    # it red on four checks at once, which is the review this file exists to force. Registration
+    # is the act the old pin's own comment called "a later, separate, operator act" (R4), and the
+    # Discover row is where the operator is looking at the thing being registered -- putting the
+    # button anywhere else would mean re-identifying the agent by hand, which is the defect
+    # (#1067). So the allowance is singular and spelled out, rather than the rule being dropped:
+    # exactly two requests, exactly one of them a write, only POST, only to that one route, and
+    # carrying no `plugin_id`. A third request, another verb, or a typed id turns this red again.
     fetches = re.findall(r"apiFetch\(\s*'([^']+)'\s*(?:,\s*\{([^}]*)\})?", block)
-    check("READ-ONLY: exactly one request in the Discover block", len(fetches), 1)
-    if fetches:
-        check("READ-ONLY: and it is the inventory read", fetches[0][0], "/api/agents")
-        check("READ-ONLY: with no method override", "method" in fetches[0][1], False)
-    for verb in ("'POST'", "'PUT'", "'DELETE'", "'PATCH'", '"POST"', '"PUT"', '"DELETE"', '"PATCH"'):
-        check(f"READ-ONLY: no {verb} anywhere in the Discover block", verb in block, False)
+    check("exactly two requests in the Discover block: the read and the one write", len(fetches), 2)
+    reads = [f for f in fetches if "method" not in f[1]]
+    writes = [f for f in fetches if "method" in f[1]]
+    check("the read is the inventory read, with no method override",
+          [f[0] for f in reads], ["/api/agents"])
+    check("there is exactly ONE write, and it is the register route",
+          [f[0] for f in writes], ["/api/agents/register"])
+    check("...and it is a POST", all("'POST'" in f[1] for f in writes), True)
+    for verb in ("'PUT'", "'DELETE'", "'PATCH'", '"PUT"', '"DELETE"', '"PATCH"'):
+        check(f"no {verb} anywhere in the Discover block", verb in block, False)
+    # The BODY, pinned whole, rather than "the string plugin_id is absent from the block": the
+    # response's derived id is SHOWN to the operator (`out.plugin_id`), and that is the point of
+    # deriving it. What must not happen is sending one.
+    check("the write's body is the clicked row's atlas id and a reason, and nothing else",
+          "body: JSON.stringify({ atlas_id: atlasId, reason })" in block)
     check("no timer of its own -- a filesystem walk is fetched on show and on rescan only",
           "setInterval" in block, False)
 
@@ -150,6 +169,24 @@ def behaviour() -> None:
     check("agent-unknown: ...and the report's other filing survives as a claim, not a group",
           urow.get("alsoFiledUnder"), ["dormant_plugin"])
     check("agent-unknown: drawn exactly once", sum(r["atlasId"] == "claude" for g in m["groups"] for r in g["rows"]), 1)
+    # WHO IS OFFERED REGISTRATION. Not everyone: the button must not appear where it would be a
+    # no-op (already a member) or where the daemon could not derive an id without inventing one.
+    # Added after a sabotage -- "offer it on an already-governed agent" -- passed clean, because
+    # this file pinned the request's shape and nothing about who may send it.
+    reg = {"status": "OK", "governed": ["claude"],
+           "gaps": {"ungoverned": ["codex"], "ungovernable": ["aider"], "unprovisioned_being": ["sage"]},
+           "detail": [agent("claude", "claude-code", True, governed=True),
+                      agent("codex", "codex", True),
+                      agent("aider", None, True),
+                      agent("sage", None, True, {"harness": "SAGE", "kind": "being"}, kind="being")]}
+    rows = {r["atlasId"]: r for g in run_model(reg)["groups"] for r in g["rows"]}
+    check("a governed agent is already a member: no button", rows["claude"]["registerable"], False)
+    check("an installed, ungoverned harness with a plugin id: offered", rows["codex"]["registerable"], True)
+    check("a being with no launcher yet: offered (its id comes from the <machine>-being convention)",
+          rows["sage"]["registerable"], True)
+    check("no plugin and not a being: NOT offered, because registering would mean inventing an id",
+          rows["aider"]["registerable"], False)
+
     # GAP outranks UNKNOWN in the inventory's status, so status alone cannot raise the banner.
     m = run_model(dict(amb, status="GAP"))
     check("agent-unknown under status=GAP: banner still up, row still there",

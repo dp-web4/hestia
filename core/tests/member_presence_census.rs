@@ -859,6 +859,25 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
         "let known: Vec<String> = s.member_registry.iter_sorted().into_iter().filter(|(id, _)| !s.member_registry.is_filler(id)).map(|(id, _)| id.clone()).collect();",
         "let member_known = s.member_registry.get(&plugin_id).is_some();",
     ]),
+    // ADDED 2026-09-21 (claude-code@mcnugget, agent-lifecycle R4 -- register). The census went
+    // red on the route the moment it was written.
+    //
+    // READING: this is a PRODUCER, the second after `tool_connect`'s mint and the first that is
+    // an operator act rather than a consequence of a member showing up. Both reads are in the
+    // safety direction:
+    //   * `get(..).is_some()` -> already a member: return 200 having minted NOTHING and
+    //     witnessed nothing. Idempotent, so a double-click cannot make two records of one id.
+    //   * `ensure_member(..)` -> the mint itself. Fail-CLOSED where it can be: a synthetic or
+    //     empty id yields None and the route answers 409 with nothing registered.
+    // What makes a producer safe here is upstream of the registry and NOT visible in this
+    // table: the id is DERIVED from the inventory record and never taken from the caller (a
+    // body carrying `plugin_id` is refused outright), and an atlas id absent from this
+    // machine's report registers nothing. That is the property to re-read if this route ever
+    // accepts an id -- at which point it becomes #1067 with a mint attached.
+    ("server/http.rs::agent_register", &[
+        "crate::member_registry::ensure_member(",
+        "if s.member_registry.get(&plugin_id).is_some() {",
+    ]),
     // ADDED 2026-09-09 (cbp, the atomic `reassign`). READING: presence, used as a GATE, not
     // an advisory — the one thing the `scope_grant` reading above said would need its own
     // reading if it ever happened. An unknown destination is refused with 400 before any
