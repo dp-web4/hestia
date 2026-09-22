@@ -79,6 +79,12 @@ def test_a_pass_whose_rows_did_not_land_says_so():
         check("unwitnessed_is_flagged", "did NOT land" in r["reason"], r)
 
 
+def teardown_module(_module=None):
+    """Under pytest the tests record into FAILS and return normally; this is what makes a
+    recorded failure go red there too (tools/ci_selfexec_test.py, GPT on #1085)."""
+    assert not FAILS, FAILS
+
+
 TESTS = [test_a_verdict_about_these_bytes_applies,
          test_a_gate_rewritten_after_the_pass_is_pending_not_the_old_verdict,
          test_no_status_file_is_not_success,
