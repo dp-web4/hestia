@@ -402,7 +402,7 @@ jobs:
           # not absorbed: the alternative was a second connect-args builder outside
           # the debt function, which is more shim, not less.
           #
-          # claude-code 29.0 -> 29.7 (#1084, the vault-bounded launch role). The LAW is in the
+          # claude-code 29.0 -> 29.9 (#1084, the vault-bounded launch role). The LAW is in the
           # shared engine: `hestia_gate_core.launch_role_verdict` owns the predicate, the
           # unset-role exemption and the refusal's words (dp 2026-09-22: "all law goes into
           # shared engine"; the first cut had it in the shim at 30.0). What stays in the seat is
@@ -412,9 +412,16 @@ jobs:
           # counts it as law lexically ("gate" in the module name it loads); it decides nothing.
           # Adjudicated, not absorbed, the same reading as the 28.9 -> 29.0 entry above: the
           # alternative was renaming things to dodge the vocabulary, which is optimising the gauge.
+          # 29.9, not 29.7: codex's P1 review found the first cut called the core's verdict OUTSIDE
+          # its try, so a new hook against an old installed core raised at import and exited 1 --
+          # which Claude Code treats as non-blocking, i.e. fail-OPEN. The catch-all that fixes it
+          # is a few more lines in the same wiring function, and the meter counts them the same
+          # lexical way. Worth saying plainly: this number barely moved (30.0 in-shim -> 29.9),
+          # because the meter measures vocabulary in the seat, not where decisions live. What
+          # moved is in SHIM_LEDGER: the predicate, exemption and refusal words are the core's.
           python3 tools/gate_collapse_meter.py \
             --max-divergent-forked 0 --max-verbatim-forked 0 \
-            --max-seat-pct claude-code=29.7 --max-seat-pct codex=20.6 \
+            --max-seat-pct claude-code=29.9 --max-seat-pct codex=20.6 \
             --max-seat-pct gemini=10.3 --max-seat-pct kimi=16.8
 
       - name: Do the forked predicates actually disagree with the engine?

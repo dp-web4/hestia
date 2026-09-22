@@ -1665,26 +1665,34 @@ def emit_decision(verdict) -> int:
 def _apply_launch_role():
     """Hand the projection's permitted launch roles to the shared engine, record its answer.
 
-    Wiring only: the verdict and its words are `hestia_gate_core.launch_role_verdict`'s
-    (hestia #1084). With no declared set there is nothing to check, the core is not loaded, and
-    the role reads unverified -- today's behaviour. The core failing to load when a set IS
-    declared is reported, not skipped: a bound that cannot be evaluated is not a pass.
+    The role verdict -- the predicate, the unset-role exemption, the refusal's words -- is
+    `hestia_gate_core.launch_role_verdict`'s (hestia #1084). This function owns exactly two
+    things, both narrow:
+
+    - NO DECLARED SET: the core is not consulted. Nothing is decided by skipping it: the core's
+      own answer for an empty set is (None, False), which is what this records.
+    - A DECLARED SET THAT CANNOT BE EVALUATED fails closed. Anything that goes wrong reaching or
+      calling the verdict -- the core missing, or an OLD core without the function (deploy skew:
+      new hook, old shared; codex's P1 on a188cde) -- becomes gate.core_unavailable. That has to
+      be here, not in the core, and it has to catch everything: this runs at import, and a hook
+      that raises exits 1, which Claude Code treats as NON-BLOCKING -- the tool would run ungated.
     """
     if not _ROLE_PERMITTED.strip():
         os.environ["HESTIA_ROLE_VERIFIED"] = "0"
         return None
     try:
         core = _load_shared_module("hestia_gate_core")
-    except Exception as e:  # noqa: BLE001
+        miswire, verified = core.launch_role_verdict(
+            _ROLE_PERMITTED, os.environ.get("HESTIA_ROLE", ""),
+            f"projection {os.environ.get('HESTIA_PROJECTION_PATH', '')}")
+    except Exception as e:  # noqa: BLE001 -- any failure here must deny, never exit 1
+        os.environ["HESTIA_ROLE_VERIFIED"] = "0"
         return ("gate.core_unavailable",
-                f"the projection declares permitted launch roles, and the shared law core that "
-                f"evaluates them could not be imported ({type(e).__name__})")
-    miswire, verified = core.launch_role_verdict(
-        _ROLE_PERMITTED, os.environ.get("HESTIA_ROLE", ""),
-        f"projection {os.environ.get('HESTIA_PROJECTION_PATH', '')}")
+                f"the projection declares permitted launch roles, and the shared law core could "
+                f"not evaluate them ({type(e).__name__}: {str(e)[:120]}); a bound that cannot be "
+                f"evaluated is not a pass")
     os.environ["HESTIA_ROLE_VERIFIED"] = "1" if verified else "0"
     return miswire
-
 
 if _PROJECTION_ERROR is None:
     _PROJECTION_ERROR = _apply_launch_role()

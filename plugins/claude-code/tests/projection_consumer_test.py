@@ -206,6 +206,40 @@ def test_a_permitted_role_passes_and_an_unbounded_one_says_it_is_unbounded() -> 
               f"silence must mean something: {got['env']}")
 
 
+def test_an_old_core_without_the_verdict_fails_closed_not_open() -> None:
+    """Arm 9 -- codex's P1 on a188cde. Deploy skew: the new hook, an OLD installed core that has
+    no `launch_role_verdict`. The call raised AttributeError at import, the hook exited 1, and
+    Claude Code treats exit 1 as non-blocking: the tool ran UNGATED. A declared set that cannot
+    be evaluated must be a deny (rc 2, gate.core_unavailable), never a crash."""
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        core = home / "shared" / "hestia_gate_core.py"
+        src = core.read_text()
+        if "def launch_role_verdict" in src:     # make it the OLD core: the function is absent
+            core.write_text(src[:src.index("def launch_role_verdict")])
+        write_projection(home, env={
+            "HESTIA_ROLE_PERMITTED": "role:constellation:interactive-dev,role:constellation:mesh-worker",
+        })
+        env = projection_env(home, HESTIA_ROLE="role:constellation:mesh-worker")
+        r = run_hook(env)
+        check("old_core_is_not_exit_1", r.returncode != 1,
+              f"rc 1 is fail-OPEN in Claude Code: {r.stderr[-300:]!r}")
+        check("old_core_denies_rc2", r.returncode == 2, f"rc {r.returncode}: {r.stderr[-300:]!r}")
+        check("old_core_names_the_rule", "[gate.core_unavailable]" in r.stderr, r.stderr[-300:])
+        check("old_core_no_traceback", "Traceback" not in r.stderr, r.stderr[-300:])
+    # CONTROL: with no declared set, the same old core is not consulted at import, so this
+    # check cannot be what refuses (whatever main later does with a stale core is its own path).
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        core = home / "shared" / "hestia_gate_core.py"
+        src = core.read_text()
+        if "def launch_role_verdict" in src:
+            core.write_text(src[:src.index("def launch_role_verdict")])
+        write_projection(home, env={})
+        got = probe_env(projection_env(home, HESTIA_ROLE="role:anything"), ["HESTIA_ROLE_VERIFIED"])
+        check("no_set_does_not_consult_the_core", got["err"] is None, str(got["err"]))
+
+
 def test_a_declared_set_does_not_refuse_an_absent_role() -> None:
     """Arm 8 — the case the migration promise is about, and the one arms 6-7 left out.
 
@@ -262,6 +296,7 @@ TESTS = [test_no_locator_refuses_before_stdin, test_no_projection_refuses_and_sa
          test_a_launch_role_outside_the_vaults_permitted_set_is_a_miswire,
          test_a_permitted_role_passes_and_an_unbounded_one_says_it_is_unbounded,
          test_a_declared_set_does_not_refuse_an_absent_role,
+         test_an_old_core_without_the_verdict_fails_closed_not_open,
          test_the_witness_hook_shares_the_contract]
 
 if __name__ == "__main__":
