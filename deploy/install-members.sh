@@ -221,9 +221,22 @@ activate_shared_engine() {
   # engine.py. Every name this body binds is local.
   local base i stale staging current_target flip
   if [ "$DRY_RUN" = "1" ]; then
-    for base in "${engine_names[@]}"; do
-      log "  would $base -> $shared_link (build $build_digest)"
-    done
+    # Answer the same question the real pass answers — is the ENGINE current? — instead of
+    # always printing the plan. The flip below decides currency by comparing the symlink
+    # target to this build, and that comparison costs nothing and writes nothing, so a dry
+    # run can make it too. It could not before, so these four files printed `would` on a
+    # box that was exactly current, and DEPLOY.md's verify step ("every member should
+    # report already current") was unachievable for them: a reader following it concludes
+    # the deploy failed and runs it again. Measured on HUB 2026-09-21, minutes after a
+    # successful install.
+    current_target="$(readlink "$shared_link" 2>/dev/null || true)"
+    if [ "$current_target" = "shared.builds/$build_digest" ]; then
+      log "  ok    shared -> $current_target (already current)"
+    else
+      for base in "${engine_names[@]}"; do
+        log "  would $base -> $shared_link (build $build_digest)"
+      done
+    fi
   else
     mkdir -p "$builds_dir"
     # Staging dirs from an interrupted run are inert — nothing points at them. Sweep them.

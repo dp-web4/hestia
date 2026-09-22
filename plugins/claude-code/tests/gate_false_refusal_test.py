@@ -1326,6 +1326,106 @@ def teardown_module(module):
         warnings.warn(f"check not run on this host: {s}", stacklevel=1)
 
 
+@asserting
+def test_a_help_call_to_a_patch_writer_is_refused_as_opaque_is_pinned_open():
+    """PINNED OPEN: #1094. A help or version call to `git apply` / `git am` / `patch` names
+    no patch, so `_command_write_targets` raises _OpaqueWriter. `classify()` then returns
+    `write / governance-closure-opaque-writer` before any closure match. There is no
+    governed path and no cwd dependence, and the resource is `stdin`.
+
+    Hit live twice on 2026-09-21: codex (escalation e0e3d60b…, `git apply -h; rg …`) and
+    claude-code (ce2e83e9…, a bare `patch --version`). git itself was measured in a scratch
+    repo: `git apply -h P` and `git apply P -h` both exit 129 and leave the tree unchanged.
+
+    Goes red when #1094 closes. Invert the rows then. The controls must stay refused: a
+    fix keyed on "no patch named" instead of on the help flag would open stdin."""
+    mod = _load_gate()
+    if getattr(mod, "_closure_classify", None) is None:
+        skip("help_call_to_patch_writer",
+             "this copy could not load hestia_governance_closure")
+        return
+
+    def verdict(cmd):
+        v = mod._closure_classify("Bash", {"command": cmd})
+        return v.classification, v.rule
+
+    opaque = ("write", "governance-closure-opaque-writer")
+    for name, cmd in (
+        ("git_apply_dash_h", "git apply -h"),
+        ("git_apply_long_help", "git apply --help"),
+        ("git_am_long_help", "git am --help"),
+        ("patch_version", "patch --version"),
+        ("codex_live_shape", f"git apply -h; rg -n opaque {HOOK}"),
+    ):
+        got = verdict(cmd)
+        check(f"help_call_still_opaque__{name}", got == opaque,
+              f"now {got!r}. If not opaque-writer, #1094 closed: invert this row")
+
+    # CONTROLS: a patch arriving on stdin, and a patch file that cannot be read, are the
+    # opaque writers the rule exists for. Both must survive the fix.
+    for name, cmd in (
+        ("bare_git_apply_reads_stdin", "git apply"),
+        ("bare_patch_reads_stdin", "patch -p1"),
+        ("unreadable_patch_file", "git apply /nonexistent/dir/x.patch"),
+    ):
+        got = verdict(cmd)
+        check(f"control__{name}", got == opaque,
+              f"{cmd!r} classifies {got!r}; an opaque patch must stay refused")
+
+
+def test_a_variable_redirect_binds_to_an_unrelated_governed_mention_is_pinned_open():
+    """PINNED OPEN — #1092, the discriminator of FP6's class, measured to a minimal pair.
+
+    NOT A NEW CLASS. FP6 above (`diff {g} other.py > /tmp/out`) and #765 (a governance path
+    anywhere in the text binds to a redirect that targets somewhere else) are this. What
+    these rows add is the exact trigger, because the working note on it was wrong: it said
+    "a curly-brace group", and braces are irrelevant. The trigger is a `$VAR` in ANY redirect
+    destination, plus a governance path mentioned ANYWHERE in the command, even as a grep
+    argument. A literal destination with the same mention reads correctly.
+
+    Hit twice live on 2026-09-21 (claude-code, CBP; escalations ec297a03…, 33ba52cf…) while
+    testing the installer for #1085. Both commands had assigned the variable a literal `/tmp`
+    path at the start of the SAME command, so the destination was knowable without
+    executing anything; the classifier does not resolve in-command assignments.
+
+    Asserted at `classify()`, the layer that decided both denies
+    (`governance-closure-out-of-grammar`). Goes red when #1092 closes; invert the rows then.
+
+    THE OTHER SIGN is already pinned: `test_marker_evasion_by_path_assembly_is_pinned_open`
+    holds `D=…; F=…; cp evil.py $D$F`. Resolving in-command assignments would close that row
+    and these together, which is why #1092 argues they are one fix."""
+    mod = _load_gate()
+    if getattr(mod, "_closure_classify", None) is None:
+        skip("variable_redirect_binds_to_mention",
+             "this copy could not load hestia_governance_closure")
+        return
+
+    def classified(cmd):
+        return mod._closure_classify("Bash", {"command": cmd}).classification
+
+    for name, cmd in (
+        ("var_dest_then_grep", f"echo hi > $S/f; grep -c x {HOOK}"),
+        ("var_assigned_tmp_literal_in_command", f"S=/tmp/x; echo hi > $S/f; grep -c x {HOOK}"),
+        ("var_dest_then_cat", f"echo hi > $S/f; cat {HOOK}"),
+        ("sed_read_into_var_dest", f"sed -n '1,5p' {HOOK} > $S/copy.py"),
+    ):
+        got = classified(cmd)
+        check(f"var_redirect_still_refused__{name}", got == "write",
+              f"now {got!r}. If 'read', #1092 closed: invert this row and name the fix")
+
+    # CONTROLS: the same mention with a LITERAL destination reads, and the same variable
+    # destination with no mention is not governed at all. Together they make the pair the
+    # discriminator, rather than "this marker refuses everything".
+    for name, cmd, want in (
+        ("literal_dest_then_grep", f"echo hi > /tmp/f; grep -c x {HOOK}", "read"),
+        ("sed_read_into_literal_dest", f"sed -n '1,5p' {HOOK} > /tmp/x/copy.py", "read"),
+        ("braces_are_not_the_trigger", f"sed -n '/^f() {{/,/^}}/p' {HOOK} > /tmp/x/c.py", "read"),
+        ("var_dest_without_mention", "S=/tmp/x; echo hi > $S/f", "none"),
+    ):
+        got = classified(cmd)
+        check(f"control__{name}", got == want, f"{cmd!r} classifies {got!r}, expected {want!r}")
+
+
 if __name__ == "__main__":
     _BARE = True
     print("gate false refusals")
@@ -1338,11 +1438,13 @@ if __name__ == "__main__":
     test_multiedit_nested_edits_were_never_in_the_haystack()
     test_marker_evasion_by_path_assembly_is_pinned_open()
     test_the_write_verb_allowlist_lets_interpreters_through_and_is_pinned_open()
+    test_a_variable_redirect_binds_to_an_unrelated_governed_mention_is_pinned_open()
     test_this_file_certifies_the_enforcing_copy()
     test_git_global_options_are_pinned_open()
     test_git_global_option_skip_list_stays_closed()
     test_gh_reads_are_pinned_open()
     test_gh_write_verbs_stay_refused()
+    test_a_help_call_to_a_patch_writer_is_refused_as_opaque_is_pinned_open()
     print()
     # Say what did NOT run, before saying everything passed. A skipped check and a passing
     # one are indistinguishable in a scrollback, and this file's whole subject is claims
