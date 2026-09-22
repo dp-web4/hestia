@@ -401,9 +401,20 @@ jobs:
           # attribution; the wiring itself has no legislative content. Adjudicated,
           # not absorbed: the alternative was a second connect-args builder outside
           # the debt function, which is more shim, not less.
+          #
+          # claude-code 29.0 -> 29.7 (#1084, the vault-bounded launch role). The LAW is in the
+          # shared engine: `hestia_gate_core.launch_role_verdict` owns the predicate, the
+          # unset-role exemption and the refusal's words (dp 2026-09-22: "all law goes into
+          # shared engine"; the first cut had it in the shim at 30.0). What stays in the seat is
+          # `_apply_launch_role`, ledgered as wiring: it loads the core, hands it the projection's
+          # set, and records the answer, plus the essential fail-closed when a declared set cannot
+          # be evaluated because the core is unreachable (which cannot live in the core). The meter
+          # counts it as law lexically ("gate" in the module name it loads); it decides nothing.
+          # Adjudicated, not absorbed, the same reading as the 28.9 -> 29.0 entry above: the
+          # alternative was renaming things to dodge the vocabulary, which is optimising the gauge.
           python3 tools/gate_collapse_meter.py \
             --max-divergent-forked 0 --max-verbatim-forked 0 \
-            --max-seat-pct claude-code=29.0 --max-seat-pct codex=20.6 \
+            --max-seat-pct claude-code=29.7 --max-seat-pct codex=20.6 \
             --max-seat-pct gemini=10.3 --max-seat-pct kimi=16.8
 
       - name: Do the forked predicates actually disagree with the engine?

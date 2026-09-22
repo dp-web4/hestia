@@ -144,45 +144,24 @@ def _load_projection(plugin_id):
     # A 2026-09-20 audit read the carve-out as config escaping vault authority; re-reading it,
     # the carve-out is right and the hole is next to it.
     #
-    # What "launch context" never established is a BOUND. Today the launcher supplies any
-    # string it likes; an unpublished one is silently normalised to `member` by the daemon,
-    # splitting that member's acts across two trust grains (the 1140-outcomes split, PR #66);
-    # and on this machine the value arrives from a hook line reading
-    # `${HESTIA_ROLE:-role:constellation:interactive-dev}` — a default in a host file the
-    # governed seat can write, which is #943's pattern one layer further out. The role decides
-    # WHICH LAW APPLIES, so it is the one value where an unchecked default is not a
-    # convenience.
-    #
-    # So: the vault declares which roles this seat MAY launch under; the launcher still
-    # chooses among them. A projection naming the set makes an out-of-set role a miswire. A
-    # projection that names none leaves today's behaviour exactly as it is and records that it
-    # did — tamper-EVIDENT, the honest limit `seat_config.rs` sets for this whole mechanism.
-    #
-    # An absent role is deliberately NOT refused here. Making it fail closed would deny every
-    # seat whose launcher never set one, and an early refusal reorders every later one; that
-    # belongs in a change that converts the launchers first.
-    # (The first cut compared an absent role, "", against the set and refused it — the promise
-    # above, broken by the code under it, and untested because the arms that would have caught
-    # it were not in the file's TESTS list. GPT, #1084 review; arm 8 pins it.)
-    live_role = os.environ.get("HESTIA_ROLE", "")
-    permitted = [r.strip() for r in projected.get("HESTIA_ROLE_PERMITTED", "").split(",") if r.strip()]
-    if permitted and live_role and live_role not in permitted:
-        return ("config.miswired", f"this seat was launched as HESTIA_ROLE={live_role!r} but "
-                f"projection {path} permits only {permitted}; the role decides which law "
-                "applies, so an unlisted one is refused here rather than normalised downstream")
-    # Silence means something: a reader can tell a verified role from an unbounded or absent
-    # one. Verified means a role was present AND checked against a declared set.
-    os.environ["HESTIA_ROLE_VERIFIED"] = "1" if (permitted and live_role) else "0"
+    # THE BOUND IS KEPT ASIDE, NOT JUDGED HERE. Which launch roles pass, the unset-role exemption
+    # and the refusal's words are law, and live in the shared engine
+    # (hestia_gate_core.launch_role_verdict, hestia #1084; dp 2026-09-22: "all law goes into
+    # shared engine"). This loader runs before shared authority is findable, so it only keeps
+    # the declared set for `_apply_launch_role`, which hands it over once it is.
+    global _ROLE_PERMITTED
+    _ROLE_PERMITTED = projected.get("HESTIA_ROLE_PERMITTED", "")
 
     for k, v in projected.items():
         if k in ("HESTIA_ROLE", "HESTIA_ROLE_PERMITTED"):
-            continue   # launch context and its bound, checked above — never exported as config
+            continue   # launch context and its bound — never exported as config
         os.environ[k] = v
     os.environ["HESTIA_PROJECTION_SHA256"] = digest
     os.environ["HESTIA_PROJECTION_PATH"] = path
     return None
 
 
+_ROLE_PERMITTED = ""   # set by _load_projection; judged by the shared engine
 _PROJECTION_ERROR = _load_projection(PLUGIN_ID)
 
 # Total time budget across all daemon round-trips + re-polls.
@@ -1681,6 +1660,34 @@ def emit_decision(verdict) -> int:
         sys.stderr.write(verdict.message + "\n")
         return 0
     return 0
+
+
+def _apply_launch_role():
+    """Hand the projection's permitted launch roles to the shared engine, record its answer.
+
+    Wiring only: the verdict and its words are `hestia_gate_core.launch_role_verdict`'s
+    (hestia #1084). With no declared set there is nothing to check, the core is not loaded, and
+    the role reads unverified -- today's behaviour. The core failing to load when a set IS
+    declared is reported, not skipped: a bound that cannot be evaluated is not a pass.
+    """
+    if not _ROLE_PERMITTED.strip():
+        os.environ["HESTIA_ROLE_VERIFIED"] = "0"
+        return None
+    try:
+        core = _load_shared_module("hestia_gate_core")
+    except Exception as e:  # noqa: BLE001
+        return ("gate.core_unavailable",
+                f"the projection declares permitted launch roles, and the shared law core that "
+                f"evaluates them could not be imported ({type(e).__name__})")
+    miswire, verified = core.launch_role_verdict(
+        _ROLE_PERMITTED, os.environ.get("HESTIA_ROLE", ""),
+        f"projection {os.environ.get('HESTIA_PROJECTION_PATH', '')}")
+    os.environ["HESTIA_ROLE_VERIFIED"] = "1" if verified else "0"
+    return miswire
+
+
+if _PROJECTION_ERROR is None:
+    _PROJECTION_ERROR = _apply_launch_role()
 
 
 def main() -> int:
