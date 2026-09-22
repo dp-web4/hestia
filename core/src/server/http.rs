@@ -1284,6 +1284,9 @@ pub async fn serve_with_callback(
         .route("/api/agents/:id/ungovern", post(agent_ungovern))
         // Retire / reinstate a member on THIS seat (agent-lifecycle PRD R1). Operator-gated
         // like every other authority change: retiring revokes the id's standing grants.
+        // Register a DISCOVERED harness as a member. No `plugin_id` in the body: the id is
+        // derived from the inventory record, because an id that can be typed can be mistyped.
+        .route("/api/agents/register", post(agent_register))
         .route("/api/agents/:id/retire", post(agent_retire))
         .route("/api/agents/:id/reinstate", post(agent_reinstate))
         .route("/api/chain", get(chain_query))
@@ -5453,6 +5456,149 @@ async fn agents_inventory() -> impl IntoResponse {
 /// Ungoverning is deliberately louder than governing. Governing adds a gate and a bad
 /// outcome is a blocked tool call; ungoverning REMOVES one, and its bad outcome is an
 /// agent running unwatched while the dashboard still lists it as known.
+/// Register a harness the inventory DISCOVERED as a member of this society (agent-lifecycle R4).
+///
+/// dp's third ask, 2026-09-19: *"the ability to actually register a newly discovered (or
+/// previously unregistered) harness"* -- and dp's first, from 09-08, was that the agent field be
+/// **a dropdown from actual available agents, not something i type**. So the id is DERIVED here
+/// and the caller cannot supply one: the body names an `atlas_id`, this reads the SAME inventory
+/// report the Discover pane renders, and takes the governance id off that record. What gets
+/// registered is what the operator was looking at.
+///
+/// That is the other half of #1067. Refusing a grant to an unknown id closed the door; this is
+/// the door that should have been there instead -- a deliberate, witnessed act that makes an id
+/// known, rather than a typo making one by accident.
+///
+/// A BEING's id is per-seat by fleet convention (`<machine>-being`). Its launcher is where that
+/// id is written down, so a provisioned being registers under the id its own unit names. One
+/// that has no launcher yet -- this seat, today -- has no id on disk, so the convention supplies
+/// it from the report's own machine name. Derived either way, never typed.
+async fn agent_register(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let field = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let (atlas_id, reason) = (field("atlas_id"), field("reason"));
+    if atlas_id.is_empty() || reason.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "atlas_id and reason are required"})),
+        );
+    }
+    // No `plugin_id` is accepted, and saying so is load-bearing: a caller that could pass one
+    // would re-open exactly the hole #1067 closed, from a route whose whole purpose is to be the
+    // safe way in.
+    if body.get("plugin_id").is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "plugin_id is not accepted — it is derived from the discovered record, \
+                          because an id that can be typed is an id that can be mistyped (#1067). \
+                          Send atlas_id and let this route resolve it."
+            })),
+        );
+    }
+    let report = match crate::server::agents::inventory() {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "error": format!("cannot register what was not discovered: the inventory did not run ({e})")}))),
+    };
+    let detail = report.get("detail").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+    let Some(rec) = detail.into_iter()
+        .find(|r| r.get("agent").and_then(|a| a.as_str()) == Some(atlas_id.as_str())) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": format!("'{atlas_id}' is not in this machine's inventory, so there is \
+                              nothing here to register. Open Discover to see what is."),
+        })));
+    };
+    let is_being = rec.get("kind").and_then(|k| k.as_str()) == Some("being");
+    let machine = report.get("machine").and_then(|m| m.as_str()).unwrap_or("").to_lowercase();
+    let from_record = rec.get("plugin").and_then(|p| p.as_str()).map(str::trim)
+        .filter(|p| !p.is_empty()).map(str::to_string);
+    // The record's own governance id first -- for a harness that is its hestia plugin id, for a
+    // provisioned being the `--member` its launcher names. Only then the convention.
+    let plugin_id = match from_record.clone() {
+        Some(p) => p,
+        None if is_being && !machine.is_empty() => format!("{machine}-being"),
+        None => return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!("'{atlas_id}' was discovered but carries no governance id, and none \
+                              can be derived: it has no hestia plugin and is not a being. \
+                              Registering it would mean inventing an id, which is the mistake \
+                              this route exists to avoid."),
+        }))),
+    };
+    let mut s = state.lock().await;
+    if let Some(r) = s.retired_members.get(&plugin_id).cloned() {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!("'{plugin_id}' is RETIRED on this seat ({}). Reinstate it rather \
+                              than registering it again, so its history stays one thread.", r.reason),
+            "retired": true,
+        })));
+    }
+    if s.member_registry.get(&plugin_id).is_some() {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "ok": true, "plugin_id": plugin_id, "already_a_member": true,
+            "note": "already registered; nothing was minted and nothing was witnessed",
+        })));
+    }
+    let record = serde_json::json!({
+        "atlas_id": atlas_id,
+        "plugin_id": plugin_id,
+        "derived_from": if from_record.is_some()
+            { "the discovered record's governance id" } else { "the <machine>-being convention" },
+        "kind": if is_being { "being" } else { "harness" },
+        "installed": rec.get("installed").cloned().unwrap_or(serde_json::Value::Null),
+        "governed_at_registration": rec.get("governed").cloned().unwrap_or(serde_json::Value::Null),
+        "reason": reason,
+        "ref": field("ref"),
+        "registered_by": "operator",
+    });
+    let intent = match s.append_chain("member_register_intent", record.clone()) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("witnessing intent: {e}")}))),
+    };
+    let (sovereign_id, sovereign_anchor) = (s.sovereign.lct_id(), s.sovereign_lct.clone());
+    let is_syn = s.is_synthetic(&plugin_id);
+    let minted = {
+        let crate::server::state::ServerState { vault, member_registry, .. } = &mut *s;
+        crate::member_registry::ensure_member(
+            vault, member_registry, &plugin_id, is_syn, &sovereign_id, &sovereign_anchor)
+    };
+    let Some(lct_id) = minted else {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!("'{plugin_id}' could not be minted (synthetic or empty id); \
+                              nothing was registered"),
+            "intentEntryHash": intent.hash,
+        })));
+    };
+    let mut done = record;
+    if let Some(m) = done.as_object_mut() {
+        m.insert("member_lct".into(), serde_json::json!(lct_id.clone()));
+        m.insert("intent".into(), serde_json::json!(intent.hash.clone()));
+    }
+    let entry = s.append_chain("member_registered", done).ok();
+    // What registration does NOT do, said here because the row will look registered and a being
+    // in particular still cannot act: minting a member gives an id presence in this society. A
+    // being additionally needs its own identity minted on the SAGE side, a hub admission, and a
+    // launcher -- none of which hestia can do from here.
+    let next = if is_being {
+        "registered. A being still needs its own LCT minted on this host, admission at the hub, \
+         and a heartbeat unit naming this id before it can act — Discover will keep reporting it \
+         as unprovisioned until a launcher exists."
+    } else {
+        "registered. Installing its hestia plugin and wiring the gate is a separate act; \
+         Discover reports which of those are missing."
+    };
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true, "plugin_id": plugin_id, "atlas_id": atlas_id,
+        "member_lct": lct_id, "kind": if is_being { "being" } else { "harness" },
+        "intentEntryHash": intent.hash,
+        "witnessEntryHash": entry.map(|e| e.hash),
+        "note": next,
+    })))
+}
+
 /// Acts THIS ID TOOK since `cutoff` (RFC3339) -- the retire guard's evidence. A phantom, the
 /// case retirement exists for, has none ever; a live seat has thousands.
 ///
@@ -7673,6 +7819,76 @@ mod disposition_tests {
         let st = resp.status();
         let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         (st, serde_json::from_slice(&b).unwrap())
+    }
+
+    async fn register(state: &SharedState, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let resp = agent_register(State(state.clone()), Json(body)).await.into_response();
+        let st = resp.status();
+        let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (st, serde_json::from_slice(&b).unwrap())
+    }
+
+    /// dp's third ask: register a DISCOVERED harness. The property that matters is what the
+    /// route refuses to take from the caller -- dp, 09-08: the agent field must be "a dropdown
+    /// from actual available agents not something i type". An id that can be typed can be
+    /// mistyped, and three mistyped ids are the reason this whole sprint exists.
+    ///
+    /// The inventory is a separate installed program, so a unit test cannot make it report a
+    /// chosen fixture. What IS testable here, and is the whole security property, is that no
+    /// caller-supplied id can reach the registry: a body carrying `plugin_id` is refused
+    /// outright, and an atlas id absent from this machine's report registers nothing.
+    #[tokio::test]
+    async fn register_never_takes_an_id_from_the_caller() {
+        let (_dir, state) = test_state().await;
+        let before = state.lock().await.member_registry.iter_sorted().len();
+
+        for body in [
+            serde_json::json!({"atlas_id": "claude", "reason": "r", "plugin_id": "Claude-code"}),
+            serde_json::json!({"atlas_id": "claude", "reason": "r", "plugin_id": ""}),
+        ] {
+            let (st, b) = register(&state, body).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "a typed id must be refused outright: {b}");
+            assert!(b["error"].as_str().unwrap().contains("plugin_id is not accepted"), "{b}");
+        }
+        // The account is required, like every other act that changes who is a party.
+        for body in [
+            serde_json::json!({"atlas_id": "claude"}),
+            serde_json::json!({"reason": "r"}),
+        ] {
+            assert_eq!(register(&state, body).await.0, StatusCode::BAD_REQUEST);
+        }
+        // An id this machine did not discover registers nothing -- "cannot register what was
+        // not discovered" is the rule that makes the derivation trustworthy.
+        let (st, b) = register(&state, serde_json::json!({
+            "atlas_id": "no-such-harness-xyz", "reason": "r"})).await;
+        assert!(
+            st == StatusCode::NOT_FOUND || st == StatusCode::SERVICE_UNAVAILABLE,
+            "either 'not in the inventory' or 'the inventory did not run' -- never a mint: {st} {b}");
+        assert_eq!(state.lock().await.member_registry.iter_sorted().len(), before,
+                   "no refusal above may have minted a member");
+    }
+
+    /// A retired id is not re-registered into existence: it is reinstated, so its history stays
+    /// one thread rather than becoming two records of the same id.
+    #[tokio::test]
+    async fn registering_a_retired_id_is_refused_in_favour_of_reinstating_it() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "claude-code").await;
+        let (st, _) = retire(&state, "claude-code", serde_json::json!({
+            "reason": "test", "ref": "x", "confirm_active": true})).await;
+        assert_eq!(st, StatusCode::OK);
+        // `claude` is the atlas id whose governance id is `claude-code` (the ALIASES mapping),
+        // so this is the retired member arriving by its discovered route. Skipped rather than
+        // asserted when the inventory is not installed on the machine running the test: the
+        // refusal being probed is downstream of a real report.
+        let (st, b) = register(&state, serde_json::json!({"atlas_id": "claude", "reason": "again"})).await;
+        if st == StatusCode::SERVICE_UNAVAILABLE || st == StatusCode::NOT_FOUND {
+            eprintln!("SKIPPED the retired-register arm: no inventory report here ({st})");
+            return;
+        }
+        assert_eq!(st, StatusCode::CONFLICT, "{b}");
+        assert_eq!(b["retired"], serde_json::json!(true));
+        assert!(b["error"].as_str().unwrap().contains("Reinstate it"), "{b}");
     }
 
     /// dp, 2026-09-08 and again on 09-19 and 09-21: three `claude-code` ids in the trust list,

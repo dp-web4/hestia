@@ -1574,9 +1574,16 @@
           </div>
         </section>
 
-        <!-- DISCOVER (agent-lifecycle PRD R2). READ-ONLY by construction: this pane issues one
-             GET and nothing else. What is on this machine, which of it hestia governs, and what
-             the remedy is for the rest. Registration is a later, separate, operator act. -->
+        <!-- DISCOVER (agent-lifecycle PRD R2). What is on this machine, which of it hestia
+             governs, and what the remedy is for the rest.
+             ONE GET AND ONE WRITE. The write arrived 2026-09-21 and is exactly the "later,
+             separate, operator act" the read-only version of this comment promised: per-row
+             Register (R4). The pin was there because the easiest way for an operator act to
+             reach a screen unreviewed is as a convenient button on the one that already lists
+             the agents -- so the allowance is SINGULAR and pinned as such in
+             tools/discover_pane_contract_test.py: exactly one POST, only to
+             /api/agents/register, carrying NO plugin_id (the id is derived from the record being
+             looked at, #1067). A second write here turns that test red. -->
         <section class="govern-pane" id="govern-discover" hidden>
           <div class="govern-pane-head">
             <h2>Discover <span class="pol-mode" id="disc-status"></span></h2>
@@ -4320,6 +4327,13 @@
       blocking: Array.isArray(a.blocking_events) ? a.blocking_events : [],
       fidelity: a.fidelity || '',
       findings: Array.isArray(x.findings) ? x.findings.length : 0,
+      // Offered only where there IS something to register: a governance id the daemon can
+      // derive -- the record's own, or a being's `<machine>-being` convention -- and no
+      // membership yet. `governed` implies it is already a member, so a button there is a no-op.
+      // Reads `x.kind` off the record rather than a field of this view: the being rows come
+      // from the INSTALLED inventory, which the deploy updates independently of this page.
+      registerable: !x.governed && (!!(x.plugin && String(x.plugin).trim())
+                                    || x.kind === 'being' || a.kind === 'being'),
       // The inventory's own words for what it could not determine about THIS agent.
       unknownReasons: Array.isArray(x.unknown) ? x.unknown.filter(u => typeof u === 'string' && u) : [],
       alsoFiledUnder: [],
@@ -4391,6 +4405,8 @@
                   title="Undo the retirement. The authority revoked at retirement is NOT restored.">reinstate</button>`
               : `<button type="button" class="pol-btn pol-remove" data-retire="${escapeHtml(r.governanceId)}"
                   title="Stop this id being a party on this seat: revokes its standing, live and delegated authority. Not deletion — the chain keeps every act it made, and it is reversible.">retire…</button>`}
+            ${r.registerable ? `<button type="button" class="pol-btn-add disc-register" data-register="${escapeHtml(r.atlasId)}"
+              title="Make this a member of this society, under an id derived from THIS record — not typed. Witnessed.">register…</button>` : ''}
             ${r.alsoFiledUnder.map(k => badge('grey', 'report also says: ' + k, 'a claim the inventory could not stand behind for this agent — see the reasons on this row')).join('')}
             ${g.key === 'unknown' ? `<ul class="disc-why">${(r.unknownReasons.length ? r.unknownReasons
                 : ['the report lists this agent as unknown and gives no reason — that is itself a finding about the inventory'])
@@ -4398,6 +4414,30 @@
           </div>`).join('')}
       </div>`).join('') + toggle;
   }
+
+  // REGISTER a discovered harness. The id is NOT typed and NOT passed: the route derives it
+  // from the same record this row was drawn from, which is the whole point (#1067 -- dp, 09-08:
+  // "a dropdown from actual available agents not something i type").
+  async function registerDiscovered(atlasId) {
+    const reason = prompt(`Register "${atlasId}" as a member of this society?\n\nIts governance id is derived from what was discovered here — you are not typing one.\n\nWhy?`);
+    if (!reason) return;
+    try {
+      const res = await apiFetch('/api/agents/register', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ atlas_id: atlasId, reason }),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      alert(`${out.already_a_member ? 'Already a member' : 'Registered'}: ${out.plugin_id}\n\n${out.note || ''}`);
+      discoverLoad();
+    } catch (e) { alert(`register failed: ${e.message}`); }
+  }
+  document.addEventListener('click', e => {
+    const b = e.target && e.target.closest && e.target.closest('[data-register]');
+    if (!b) return;
+    e.stopPropagation();
+    registerDiscovered(b.dataset.register);
+  }, true);
 
   let discoverBusy = false;
   async function discoverLoad() {
