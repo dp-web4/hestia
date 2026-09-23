@@ -169,6 +169,73 @@ def test_prd_enumeration_matches_the_permitted_tuple():
         f"only in template={sorted(permitted - set(rows))}")
 
 
+def _template_tuples():
+    import ast
+    repo = Path(__file__).resolve().parents[1]
+    tmpl = repo / "plugins" / "_template" / "shim_template.py"
+    out = {}
+    for node in ast.parse(tmpl.read_text(encoding="utf-8")).body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            name = getattr(target, "id", None)
+            if name in ("PERMITTED_FUNCTIONS", "BYTE_IDENTICAL_FUNCTIONS",
+                        "ADAPTER_FUNCTIONS"):
+                out[name] = {e.value for e in ast.walk(node)
+                             if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+    return out, repo
+
+
+def test_prd_kinds_match_the_byte_identical_tuple():
+    """The names drifted, and the KIND column drifted a step longer — correcting the names
+    alone left `_emergency_block` and `main` marked per-seat, which inverts C4's split from
+    5/3 to 3/5. C4 is the normative certification rule, so the classification is pinned as
+    hard as the enumeration."""
+    import re
+    tup, repo = _template_tuples()
+    identical, adapters = tup["BYTE_IDENTICAL_FUNCTIONS"], tup["ADAPTER_FUNCTIONS"]
+    assert identical | adapters == tup["PERMITTED_FUNCTIONS"], \
+        "the template's own two tuples do not partition PERMITTED_FUNCTIONS"
+    assert not (identical & adapters), "a function is declared both byte-identical and adapter"
+
+    prd = (repo / "docs" / "PRD_SHIM_CERTIFICATION.md").read_text(encoding="utf-8")
+    claimed = {}
+    for name, kind in re.findall(
+            r"^\|\s*\d+\s*\|\s*`([A-Za-z_][A-Za-z0-9_]*)`\s*\|([^|]*)\|", prd, re.M):
+        claimed[name] = "byte-identical" in kind
+    for fn in sorted(identical):
+        assert claimed.get(fn) is True, \
+            f"PRD calls {fn} per-seat; the template declares it byte-identical"
+    for fn in sorted(adapters):
+        assert claimed.get(fn) is False, \
+            f"PRD calls {fn} byte-identical; the template declares it an adapter"
+
+
+def test_c4_counts_match_the_template():
+    """C4 states the split in words ('Five of them ... The other three'). Words and tuples
+    are two copies of one fact, so they are checked against each other."""
+    import re
+    tup, repo = _template_tuples()
+    prd = (repo / "docs" / "PRD_SHIM_CERTIFICATION.md").read_text(encoding="utf-8")
+    section = prd.split("### C4")[1].split("###")[0]
+    words = {"three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8}
+
+    m = re.search(r"\*\*(\w+)\*\* of them", section) or re.search(r"(\w+) of them", section)
+    assert m, "C4 no longer states how many functions are byte-identical"
+    assert words.get(m.group(1).lower()) == len(tup["BYTE_IDENTICAL_FUNCTIONS"]), (
+        f"C4 says {m.group(1)!r} byte-identical; the template declares "
+        f"{len(tup['BYTE_IDENTICAL_FUNCTIONS'])}")
+
+    m = re.search(r"other \*\*(\w+)\*\*", section) or re.search(r"other (\w+)", section)
+    assert m, "C4 no longer states how many functions are adapters"
+    assert words.get(m.group(1).lower()) == len(tup["ADAPTER_FUNCTIONS"]), (
+        f"C4 says {m.group(1)!r} adapters; the template declares "
+        f"{len(tup['ADAPTER_FUNCTIONS'])}")
+
+    for fn in tup["BYTE_IDENTICAL_FUNCTIONS"]:
+        assert f"`{fn}`" in section, f"C4 does not name {fn} among the byte-identical set"
+
+
 TESTS = [
     test_identical_repo_and_deployed_subject_match,
     test_runtime_mutation_invalidates_every_seat_without_changing_shim,
@@ -177,6 +244,8 @@ TESTS = [
     test_home_override_is_used_when_the_environment_is_unset,
     test_scalars_come_from_the_template_not_a_second_copy,
     test_prd_enumeration_matches_the_permitted_tuple,
+    test_prd_kinds_match_the_byte_identical_tuple,
+    test_c4_counts_match_the_template,
 ]
 
 if __name__ == "__main__":

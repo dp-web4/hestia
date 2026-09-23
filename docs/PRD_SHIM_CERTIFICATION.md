@@ -61,20 +61,27 @@ each other and with the code.)
 | 1 | `_authority_dir` | bootstrap, **byte-identical** |
 | 2 | `_load_gate` | bootstrap, **byte-identical** |
 | 3 | `_load_projection` | bootstrap, **byte-identical** |
-| 4 | `_emergency_block` | adapter, per-seat |
-| 5 | `to_event` | adapter, per-seat |
-| 6 | `emit` | adapter, per-seat |
-| 7 | `read_harness_event` | harness I/O, per-seat |
-| 8 | `main` | harness entry, per-seat |
+| 4 | `_emergency_block` | bootstrap, **byte-identical** |
+| 5 | `main` | harness entry, **byte-identical** |
+| 6 | `to_event` | adapter, per-seat |
+| 7 | `emit` | adapter, per-seat |
+| 8 | `read_harness_event` | adapter, per-seat |
 
 This table was itself stale when harvested, which is the point the paragraph above is
 making a second time: it still named `_shared_runtime_dir`, `_load_shared_module`,
 `_emergency_refuse` and `_read_harness_input`. Three were renamed (`_shared_runtime_dir` →
 `_authority_dir`, `_load_shared_module` → `_load_gate`, `_read_harness_input` →
 `read_harness_event`) and one was replaced (`_emergency_refuse` → `_load_projection`, the
-#944 projection consumer). Prose that enumerates a tuple will drift from it every time, so
-the agreement is now a test rather than a promise: `tools/shim_certification_test.py`
-parses this table and `PERMITTED_FUNCTIONS` and fails when they disagree.
+#944 projection consumer).
+
+And the **kind** column was stale a step longer than the names were: correcting the names
+first left `_emergency_block` and `main` marked per-seat when the template declares both
+byte-identical, which flipped C4's split from its true 5/3 to 3/5. Fixing an enumeration
+without fixing what it classifies is half a fix, and it is why the check below covers both
+columns. Prose that restates a tuple will drift from it every time, so the agreement is a
+test rather than a promise: `tools/shim_certification_test.py` parses this table,
+`PERMITTED_FUNCTIONS`, `BYTE_IDENTICAL_FUNCTIONS` and `ADAPTER_FUNCTIONS`, and fails when
+the names, the kinds, or C4's counts disagree.
 
 Plus one profile, as data. Anything else is a finding.
 
@@ -156,17 +163,30 @@ profile cannot express, the profile gains a field; the shim does not gain a func
 
 ### C4 — The adapter surface is closed and enumerated
 
-The permitted set is the eight names in §1, fixed by the template. Three of them
-(`_shared_runtime_dir`, `_load_shared_module`, `_emergency_refuse`) MUST be byte-identical
-across every certified shim; a diff in those is a C1 failure, not a permitted variant. The
-other five are per-seat, and each per-seat difference MUST be justified in the shim's own
-header against this document. That justification is part of what is certified (§3.1), which
-is why the digest covers comments.
+The permitted set is the eight names in §1, fixed by the template. **Five** of them —
+`_authority_dir`, `_load_gate`, `_load_projection`, `_emergency_block` and `main` — MUST be
+byte-identical across every certified shim; a diff in those is a C1 failure, not a permitted
+variant. The other **three** (`to_event`, `emit`, `read_harness_event`) are the adapters:
+per-seat, and each per-seat difference MUST be justified in the shim's own header against
+this document. That justification is part of what is certified (§3.1), which is why the
+digest covers comments.
 
-> **Justified today, and expected to remain so:** `main` (4 variants, 22–279 lines),
-> `command_of` (6–9 lines) and `deny` (14–19 lines). The harnesses genuinely differ in
-> event shape and in how a call is blocked. Note the size: at 6–19 lines these are closer
-> to adapter *data* than code, and the template treats them accordingly.
+As with §1's table, prose must not be the authority here. The template states the split in
+two machine-readable tuples, `BYTE_IDENTICAL_FUNCTIONS` and `ADAPTER_FUNCTIONS`, and
+`tools/shim_certification_test.py` fails when this section's counts, this section's names,
+or §1's *kind* column disagree with them.
+
+> **Justified today, and expected to remain so:** the three adapters. The harnesses
+> genuinely differ in event shape and in how a call is blocked, and nothing else does.
+> Measured on the collapsed shims: the only functions that were not identical across all
+> four seats were exactly `to_event`, `emit` and `read_harness_event` (plus one gemini-local
+> helper), 133 of 139 template code lines identical everywhere.
+>
+> This block previously named `main` (4 variants, 22–279 lines), `command_of` and `deny`.
+> That is out of date in the direction of progress: `main` is byte-identical under the
+> template, and `command_of` and `deny` are not in the permitted set at all — they were
+> per-seat helpers in the pre-template shims. A document that lists yesterday's exceptions
+> as today's expectations makes convergence look further away than it is.
 
 ### C5 — One decision vocabulary, and no per-seat law
 
