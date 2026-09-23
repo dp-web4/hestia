@@ -26,6 +26,16 @@ def fixture():
     shared.mkdir(parents=True)
     deployed.mkdir(parents=True)
     (shared / "RUNTIME_MANIFEST.txt").write_text("\n".join(RUNTIME) + "\n", encoding="utf-8")
+    # The tool reads its three certification scalars out of the canonical template rather
+    # than redeclaring them, so a fixture repo needs one. Deliberately NOT the production
+    # values: a test that reuses them would pass even if the binding were removed.
+    template = root / "plugins" / "_template" / "shim_template.py"
+    template.parent.mkdir(parents=True, exist_ok=True)
+    template.write_text(
+        'SHIM_CERTIFICATION_SCHEMA = "fixture-schema/v9"\n'
+        'CERTIFICATION_CRITERIA = "FIXTURE_CRITERIA.md@1970-01-01"\n'
+        'REQUIRED_GATE_API = "fixture/0"\n'
+        'PERMITTED_FUNCTIONS = ("main",)\n', encoding="utf-8")
     for name in RUNTIME:
         payload = f"# {name}\nVALUE = 1\n"
         (shared / name).write_text(payload, encoding="utf-8")
@@ -89,10 +99,84 @@ def test_missing_runtime_is_unknown_not_a_shorter_hash():
     with_fixture(run)
 
 
+def test_unset_home_is_unknown_not_a_guessed_root():
+    """The verifier must never invent an installation root. It used to default to
+    `~/.hestia`, which lets it report MATCHED about a tree the caller never named — the
+    #944 class, and worse here than in a seat, because this tool's entire product is the
+    claim that a SPECIFIC installation is the certified one."""
+    def run(_root, _home, _user):
+        os.environ.pop("HESTIA_HOME", None)
+        sc._HOME_OVERRIDE = None
+        try:
+            sc.certification("codex", True)
+        except sc.Unknown as exc:
+            assert "no default" in str(exc), exc
+            return
+        raise AssertionError("unset HESTIA_HOME produced a certification instead of UNKNOWN")
+    with_fixture(run)
+
+
+def test_home_override_is_used_when_the_environment_is_unset():
+    def run(_root, home, _user):
+        os.environ.pop("HESTIA_HOME", None)
+        sc._HOME_OVERRIDE = str(home)
+        try:
+            assert sc.certification("codex", True)["runtime_dir"] == str(home / "shared")
+        finally:
+            sc._HOME_OVERRIDE = None
+    with_fixture(run)
+
+
+def test_scalars_come_from_the_template_not_a_second_copy():
+    """Binding, not duplication: change the template's scalars and the subject must move.
+    If the tool re-declared them, this assertion could not fail."""
+    def run(root, _home, _user):
+        assert sc.canonical_scalars()["SCHEMA"] == "fixture-schema/v9"
+        before = sc.certification("codex", False)["certification_sha256"]
+        tmpl = root / "plugins" / "_template" / "shim_template.py"
+        tmpl.write_text(tmpl.read_text(encoding="utf-8")
+                        .replace("fixture-schema/v9", "fixture-schema/v10"), encoding="utf-8")
+        after = sc.certification("codex", False)
+        assert after["schema"] == "fixture-schema/v10"
+        assert after["certification_sha256"] != before, \
+            "the certification subject ignored a change to the canonical schema"
+    with_fixture(run)
+
+
+def test_prd_enumeration_matches_the_permitted_tuple():
+    """The PRD says 'the tuple decides' and then enumerates the tuple in prose. It has
+    drifted twice: once before harvest (its own note) and once at harvest, where it still
+    named _shared_runtime_dir, _load_shared_module, _emergency_refuse and
+    _read_harness_input. Prose cannot be kept in step by intention, so it is pinned here."""
+    import ast
+    import re
+    repo = Path(__file__).resolve().parents[1]
+    tmpl = repo / "plugins" / "_template" / "shim_template.py"
+    permitted = set()
+    for node in ast.parse(tmpl.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign) and any(
+                getattr(t, "id", None) == "PERMITTED_FUNCTIONS" for t in node.targets):
+            permitted = {e.value for e in ast.walk(node)
+                         if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+    assert permitted, "template declares no PERMITTED_FUNCTIONS"
+
+    prd = (repo / "docs" / "PRD_SHIM_CERTIFICATION.md").read_text(encoding="utf-8")
+    rows = re.findall(r"^\|\s*\d+\s*\|\s*`([A-Za-z_][A-Za-z0-9_]*)`\s*\|", prd, re.M)
+    assert rows, "PRD has no numbered function table to check"
+    assert set(rows) == permitted, (
+        f"PRD table and PERMITTED_FUNCTIONS disagree: "
+        f"only in PRD={sorted(set(rows) - permitted)}, "
+        f"only in template={sorted(permitted - set(rows))}")
+
+
 TESTS = [
     test_identical_repo_and_deployed_subject_match,
     test_runtime_mutation_invalidates_every_seat_without_changing_shim,
     test_missing_runtime_is_unknown_not_a_shorter_hash,
+    test_unset_home_is_unknown_not_a_guessed_root,
+    test_home_override_is_used_when_the_environment_is_unset,
+    test_scalars_come_from_the_template_not_a_second_copy,
+    test_prd_enumeration_matches_the_permitted_tuple,
 ]
 
 if __name__ == "__main__":

@@ -58,14 +58,23 @@ each other and with the code.)
 
 | # | function | kind |
 |---|---|---|
-| 1 | `_shared_runtime_dir` | bootstrap, **byte-identical** |
-| 2 | `_load_shared_module` | bootstrap, **byte-identical** |
-| 3 | `_emergency_refuse` | bootstrap, **byte-identical** |
+| 1 | `_authority_dir` | bootstrap, **byte-identical** |
+| 2 | `_load_gate` | bootstrap, **byte-identical** |
+| 3 | `_load_projection` | bootstrap, **byte-identical** |
 | 4 | `_emergency_block` | adapter, per-seat |
 | 5 | `to_event` | adapter, per-seat |
 | 6 | `emit` | adapter, per-seat |
-| 7 | `_read_harness_input` | harness I/O, per-seat |
+| 7 | `read_harness_event` | harness I/O, per-seat |
 | 8 | `main` | harness entry, per-seat |
+
+This table was itself stale when harvested, which is the point the paragraph above is
+making a second time: it still named `_shared_runtime_dir`, `_load_shared_module`,
+`_emergency_refuse` and `_read_harness_input`. Three were renamed (`_shared_runtime_dir` →
+`_authority_dir`, `_load_shared_module` → `_load_gate`, `_read_harness_input` →
+`read_harness_event`) and one was replaced (`_emergency_refuse` → `_load_projection`, the
+#944 projection consumer). Prose that enumerates a tuple will drift from it every time, so
+the agreement is now a test rather than a promise: `tools/shim_certification_test.py`
+parses this table and `PERMITTED_FUNCTIONS` and fails when they disagree.
 
 Plus one profile, as data. Anything else is a finding.
 

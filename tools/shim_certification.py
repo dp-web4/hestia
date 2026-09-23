@@ -19,10 +19,47 @@ import json
 import os
 from pathlib import Path
 import sys
+from typing import Optional
 
-SCHEMA = "hestia-shim-cert/v1"
-CRITERIA = "PRD_SHIM_CERTIFICATION.md@2026-09-04"
-GATE_API = "decide/1"
+# The certification scalars are NOT redeclared here. They are read out of the canonical
+# template, which is the artifact the criteria are about, so this tool cannot certify
+# against a schema/criteria/API the template does not actually claim. Re-typing them was a
+# third copy of the same three strings (template, shim, tool) with nothing keeping them
+# equal -- the identical shape as the enumeration drift the PRD documents about itself.
+_TEMPLATE_SCALARS = {
+    "SCHEMA": "SHIM_CERTIFICATION_SCHEMA",
+    "CRITERIA": "CERTIFICATION_CRITERIA",
+    "GATE_API": "REQUIRED_GATE_API",
+}
+
+
+def canonical_scalars() -> dict:
+    """Read the three certification scalars from the template by parsing it.
+
+    Parsed, not imported: the template is a reference artifact that expects a harness
+    around it, and importing it to read three constants would run its module body.
+    """
+    import ast
+
+    path = repo_root() / "plugins" / "_template" / "shim_template.py"
+    try:
+        tree = ast.parse(read_bytes(path).decode("utf-8"))
+    except SyntaxError as exc:
+        raise Unknown(f"canonical template {path} does not parse: {exc}") from exc
+    found = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            name = getattr(target, "id", None)
+            for key, want in _TEMPLATE_SCALARS.items():
+                if name == want and isinstance(node.value, ast.Constant):
+                    found[key] = node.value.value
+    missing = sorted(set(_TEMPLATE_SCALARS) - set(found))
+    if missing:
+        raise Unknown(f"canonical template {path} declares no "
+                      f"{', '.join(_TEMPLATE_SCALARS[m] for m in missing)}")
+    return found
 
 _HOOK = "pre_" + "tool_" + "use.py"
 _GEM = "before_" + "tool.py"
@@ -48,8 +85,27 @@ def repo_root() -> Path:
     return Path(os.getenv("HESTIA_REPO_ROOT") or Path(__file__).resolve().parents[1])
 
 
+_HOME_OVERRIDE: Optional[str] = None
+
+
 def hestia_home() -> Path:
-    return Path(os.path.expanduser(os.getenv("HESTIA_HOME", "~/.hestia")))
+    """The installation root to verify against. THERE IS NO DEFAULT.
+
+    A verifier that guesses `~/.hestia` when HESTIA_HOME is unset can certify a tree
+    nobody asked about and report MATCHED for it. That is worse than the same defect in a
+    seat (#944, "there is no default, by design"), because the whole product of this tool
+    is the claim that a specific installation is the certified one. Unset is UNKNOWN, and
+    UNKNOWN is a result: `report` exits non-zero rather than inventing a root.
+
+    This PRD names the hazard in its own drift table -- "which home | `$HESTIA_HOME`,
+    default `~/.hestia` | hardcoded `~`" -- and this function used to be an instance of it.
+    """
+    home = _HOME_OVERRIDE or os.getenv("HESTIA_HOME")
+    if not home:
+        raise Unknown("HESTIA_HOME is not set and --home was not given; refusing to guess "
+                      "an installation root (there is no default, by design). Pass --home "
+                      "or export HESTIA_HOME.")
+    return Path(os.path.expanduser(home))
 
 
 def read_bytes(path: Path) -> bytes:
@@ -99,7 +155,8 @@ def certification(seat: str, deployed: bool) -> dict:
     runtime = [(name, read_bytes(rdir / name)) for name in names]
 
     h = hashlib.sha256()
-    for scalar in (SCHEMA, CRITERIA, GATE_API):
+    scalars = canonical_scalars()
+    for scalar in (scalars["SCHEMA"], scalars["CRITERIA"], scalars["GATE_API"]):
         h.update(scalar.encode("utf-8")); h.update(b"\0")
     h.update(shim); h.update(b"\0")
     for name, payload in runtime:
@@ -110,9 +167,9 @@ def certification(seat: str, deployed: bool) -> dict:
     return {
         "seat": seat,
         "scope": "deployed" if deployed else "repo",
-        "schema": SCHEMA,
-        "criteria": CRITERIA,
-        "gate_api": GATE_API,
+        "schema": scalars["SCHEMA"],
+        "criteria": scalars["CRITERIA"],
+        "gate_api": scalars["GATE_API"],
         "certification_sha256": h.hexdigest(),
         "shim_path": str(shim_file),
         "shim_sha256_raw": hashlib.sha256(shim).hexdigest(),
@@ -157,7 +214,11 @@ def cmd_report(_args: argparse.Namespace) -> int:
 
 
 def main(argv=None) -> int:
+    global _HOME_OVERRIDE
     parser = argparse.ArgumentParser()
+    parser.add_argument("--home", default=None,
+                        help="installation root to verify (else $HESTIA_HOME; there is no "
+                             "default — an unset root is UNKNOWN, not a guess)")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("preimage")
     p.add_argument("--seat", required=True, choices=sorted(REPO_SHIMS))
@@ -166,6 +227,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("report")
     p.set_defaults(run=cmd_report)
     args = parser.parse_args(argv)
+    _HOME_OVERRIDE = args.home
     return args.run(args)
 
 
