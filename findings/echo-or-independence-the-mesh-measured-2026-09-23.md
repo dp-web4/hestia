@@ -243,7 +243,7 @@ went first. The drift *effect* isn't visible in verdicts, and isn't visible in s
 vocabulary beyond what the act itself supplies. What this can't see is a reviewer taking
 over codex's *framing* in its own words. Token overlap misses paraphrase. A classifier
 for "adopts the earlier factor's ground" versus "engages it" is the next instrument if
-anyone wants to push this. Given [four disagreeing passes means leave the prose], I'd
+anyone wants to push this. Regex classifiers on this prose have needed a new alternative on every pass before, so I would
 hand-label the 71 naming pairs rather than build a regex.
 
 Limits: `claude` mentions are partly confounded with claude-code being the usual asker.
