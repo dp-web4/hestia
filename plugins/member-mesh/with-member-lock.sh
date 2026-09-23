@@ -51,12 +51,65 @@ LOCK="$LOCK_DIR/fire-$PLUGIN.lock"
 HOLDER="$LOCK_DIR/fire-$PLUGIN.holder"
 WAIT="${HESTIA_FIRE_LOCK_WAIT:-1830}"
 
-# Fail CLOSED. A missing flock must not degrade to "run it anyway, unbounded" —
-# that is exactly the pre-amendment state, and it would be invisible.
-command -v flock >/dev/null 2>&1 || {
-  echo "[mesh-lock] flock(1) not available — refusing to fire $PLUGIN unbounded" >&2
-  exit 69
-}
+# Fail CLOSED. A missing lock must not degrade to "run it anyway, unbounded".
+# macOS has no flock(1). python3 fcntl.flock is the same exclusive lock, held
+# until the command exits. A PATH with neither tool still refuses.
+if ! command -v flock >/dev/null 2>&1; then
+  command -v python3 >/dev/null 2>&1 || {
+    echo "[mesh-lock] flock(1) not available — refusing to fire $PLUGIN unbounded" >&2
+    exit 69
+  }
+  exec python3 - "$LOCK" "$WAIT" "$HOLDER" "$PLUGIN" "$@" <<'PY'
+import os
+import sys
+import time
+
+try:
+    import fcntl
+except ImportError:
+    sys.stderr.write("[mesh-lock] flock(1) not available — refusing to fire unbounded\n")
+    sys.exit(69)
+
+path, wait_s, holder, plugin = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
+cmd = sys.argv[5:]
+fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+started = time.time()
+told = False
+while True:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except OSError:
+        if not told:
+            sys.stderr.write("[mesh-lock] %s is already firing; waiting up to %ss\n" % (plugin, wait_s))
+            try:
+                with open(holder) as handle:
+                    for line in handle:
+                        if line.strip():
+                            sys.stderr.write("[mesh-lock]   holder: " + line)
+            except OSError:
+                pass
+            told = True
+        if time.time() - started >= wait_s:
+            sys.stderr.write("[mesh-lock] REFUSED: %s still locked after %ss — the holder has\n" % (plugin, wait_s))
+            sys.stderr.write("[mesh-lock] outlived its own 1800s timeout. Not starting a second session.\n")
+            sys.exit(75)
+        time.sleep(0.05)
+with open(holder, "w") as handle:
+    handle.write("pid=%s started=%s cmd=%s\n" % (
+        os.getpid(),
+        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        " ".join(cmd),
+    ))
+proc = __import__("subprocess").Popen(cmd, close_fds=False)
+rc = proc.wait()
+try:
+    os.remove(holder)
+except OSError:
+    pass
+sys.exit(rc)
+PY
+fi
 
 # Append, never truncate: `9>` would blank the file at open() — i.e. BEFORE the
 # lock is taken — so a waiter would erase state while the holder still runs.
