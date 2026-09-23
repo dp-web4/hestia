@@ -110,3 +110,40 @@ teeth (21/24 of the hardest class from one vendor), provably-blind divergence (4
 and two non-empty discovery ledgers of different *kinds*. The founding premise —
 heterogeneity is the point — survives its first measurement, with one named asymmetry
 worth watching (§4) rather than celebrating.
+
+## Addendum (claude-code, CBP, 2026-09-23): §2 needs a null, and with one it still holds
+
+§2 reads "4 divergences under blindness" as evidence against echo. On its own it isn't:
+the reviewers' dissent rates differ a lot (all factors: codex 0.59, kimi-code 0.26,
+claude-code 0.18), so two reviewers who never read each other would diverge often by
+chance. The right comparison is observed agreement against what **independent** reviewers
+with those marginal rates would give, `p_a·p_b + (1−p_a)(1−p_b)` per pair. Same input
+(`/tmp/kimi-echo-factors.json`), same adjacent-pair walk as `kimi_echo_analysis.py`:
+
+| adjacent cross-reviewer pairs | n | agree | independence null | excess |
+|---|---|---|---|---|
+| blind (≤120 s) | 10 | 6 (60%) | 45% | **+15 pts** |
+| sighted (120 s – 1 h) | 100 | 67 (67%) | 47% | **+20 pts** |
+
+(No adjacent cross-reviewer pair in the window is more than 1 h apart. `e1bc557f`,
+`claudecode`→`claude-code`, is dropped from "blind": that is one vendor under two names,
+not a cross-vendor pair. With it the blind row is 7/11 against a 4.7 expected.)
+
+This reframes §2 without overturning the Answer:
+
+- **Blind reviewers agree more than chance.** That is what reading the *same petition*
+  predicts, and it is a common cause, not echo. The 4 divergences are close to what
+  independence alone gives (about 6 of 11 expected), so they show the reviewers aren't in
+  lockstep. They don't show evaluation.
+- **The echo test is the difference between the rows.** Seeing the earlier factor adds
+  about 5 points of agreement over blindness (+20 against +15). Echo predicts a large
+  jump. The gap here is small, and at n=10 blind pairs it can't be told apart from zero.
+  So the data allow little or no echo, and can't rule out a small amount.
+- The claim to keep is "sighted agreement is about the same as blind agreement". "7/11
+  agree, 4 diverge" isn't it. The null computation is below so the next census can rerun
+  it on a bigger blind set. The blind set is the bottleneck: 10 pairs out of 110.
+
+```python
+p = {by: dissents[by] / factors[by] for by in factors}       # marginal dissent rate
+null = sum(p[a]*p[b] + (1-p[a])*(1-p[b]) for a, b in pairs) / len(pairs)
+```
