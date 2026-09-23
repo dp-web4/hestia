@@ -6,7 +6,12 @@ falsifier for the exact same subject: shim bytes plus the active common runtime 
 A raw shim hash is insufficient because the shim delegates every decision to the shared
 gate. The certified subject is therefore:
 
-    sha256(schema || criteria || api || shim bytes || runtime-name/runtime-bytes ...)
+    sha256(schema || criteria-label || criteria-BYTES || api || shim bytes
+           || runtime-name/runtime-bytes ...)
+
+The criteria enter as the hash of the normative document's contents, not as the label
+naming it: the label is hand-maintained and has already failed to move when the criteria
+did.
 
 The runtime set is read from RUNTIME_MANIFEST.txt. There is no second hard-coded list.
 Missing or unreadable inputs are errors, never an empty/clean result.
@@ -31,6 +36,30 @@ _TEMPLATE_SCALARS = {
     "CRITERIA": "CERTIFICATION_CRITERIA",
     "GATE_API": "REQUIRED_GATE_API",
 }
+
+
+def canonical_criteria() -> tuple:
+    """The criteria the digest actually commits to: (label, path, bytes).
+
+    Hashing the LABEL alone was a hole. `CERTIFICATION_CRITERIA` is a hand-maintained
+    string, and on 2026-09-22 the criteria it names changed four times in one day -- the
+    permitted-function names, their byte-identical/adapter kinds, C4's 5/3 split and its
+    worked example -- while the label stayed `...@2026-09-04` and every certification digest
+    stayed byte-for-byte identical. A certification that survives a material change to the
+    standard it certifies against is not evidence of anything.
+
+    The PRD's own formula is `sha256(criteria_version + shim bytes + runtime set + gate API
+    version + justified difference declaration)`, and its vault record carries a
+    `criteria_version` field. A hand-typed label is a criteria *name*; a version has to
+    follow the contents. The label's filename must resolve under `docs/`, and the file's
+    bytes are what enter the preimage.
+    """
+    label = canonical_scalars()["CRITERIA"]
+    filename = str(label).split("@", 1)[0].strip()
+    if not filename:
+        raise Unknown(f"CERTIFICATION_CRITERIA {label!r} names no document before '@'")
+    path = repo_root() / "docs" / filename
+    return label, path, read_bytes(path)
 
 
 def canonical_scalars() -> dict:
@@ -156,7 +185,9 @@ def certification(seat: str, deployed: bool) -> dict:
 
     h = hashlib.sha256()
     scalars = canonical_scalars()
-    for scalar in (scalars["SCHEMA"], scalars["CRITERIA"], scalars["GATE_API"]):
+    crit_label, crit_path, crit_bytes = canonical_criteria()
+    crit_digest = hashlib.sha256(crit_bytes).hexdigest()
+    for scalar in (scalars["SCHEMA"], crit_label, crit_digest, scalars["GATE_API"]):
         h.update(scalar.encode("utf-8")); h.update(b"\0")
     h.update(shim); h.update(b"\0")
     for name, payload in runtime:
@@ -168,7 +199,9 @@ def certification(seat: str, deployed: bool) -> dict:
         "seat": seat,
         "scope": "deployed" if deployed else "repo",
         "schema": scalars["SCHEMA"],
-        "criteria": scalars["CRITERIA"],
+        "criteria": crit_label,
+        "criteria_sha256": crit_digest,
+        "criteria_path": str(crit_path),
         "gate_api": scalars["GATE_API"],
         "certification_sha256": h.hexdigest(),
         "shim_path": str(shim_file),

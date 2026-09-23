@@ -36,6 +36,11 @@ def fixture():
         'CERTIFICATION_CRITERIA = "FIXTURE_CRITERIA.md@1970-01-01"\n'
         'REQUIRED_GATE_API = "fixture/0"\n'
         'PERMITTED_FUNCTIONS = ("main",)\n', encoding="utf-8")
+    # The criteria document the label names. Its BYTES are in the preimage, so the fixture
+    # needs a real one -- the label alone is not what the digest commits to.
+    criteria = root / "docs" / "FIXTURE_CRITERIA.md"
+    criteria.parent.mkdir(parents=True, exist_ok=True)
+    criteria.write_text("# fixture criteria\nrule one\n", encoding="utf-8")
     for name in RUNTIME:
         payload = f"# {name}\nVALUE = 1\n"
         (shared / name).write_text(payload, encoding="utf-8")
@@ -169,6 +174,41 @@ def test_prd_enumeration_matches_the_permitted_tuple():
         f"only in template={sorted(permitted - set(rows))}")
 
 
+def test_changing_only_the_criteria_moves_the_certification():
+    """The hole this closes: the preimage used to carry the criteria LABEL and nothing
+    else, so the normative document could be rewritten while every certification digest
+    stayed byte-for-byte identical. It demonstrably did -- the criteria changed four times
+    on 2026-09-22 under a label reading `@2026-09-04`, and no digest moved.
+
+    Certification means review against *this version of these criteria*. If the criteria
+    can change without the subject changing, the digest certifies against a name, not a
+    standard."""
+    def run(root, _home, _user):
+        before = {s: sc.certification(s, False)["certification_sha256"] for s in SEATS}
+        doc = root / "docs" / "FIXTURE_CRITERIA.md"
+        doc.write_text(doc.read_text(encoding="utf-8") + "rule two\n", encoding="utf-8")
+        after = {s: sc.certification(s, False) for s in SEATS}
+        for seat in SEATS:
+            assert after[seat]["certification_sha256"] != before[seat], (
+                f"{seat}: the criteria document changed and the certification did not")
+        # The label did NOT change, which is exactly the case that used to slip through.
+        assert after["codex"]["criteria"] == "FIXTURE_CRITERIA.md@1970-01-01"
+    with_fixture(run)
+
+
+def test_missing_criteria_document_is_unknown():
+    """A label naming a document that is not there must not certify. Silence here would
+    reintroduce the same hole by a different route."""
+    def run(root, _home, _user):
+        (root / "docs" / "FIXTURE_CRITERIA.md").unlink()
+        try:
+            sc.certification("codex", False)
+        except sc.Unknown:
+            return
+        raise AssertionError("a missing criteria document still produced a certification")
+    with_fixture(run)
+
+
 def _template_tuples():
     import ast
     repo = Path(__file__).resolve().parents[1]
@@ -234,6 +274,11 @@ def test_c4_counts_match_the_template():
 
     for fn in tup["BYTE_IDENTICAL_FUNCTIONS"]:
         assert f"`{fn}`" in section, f"C4 does not name {fn} among the byte-identical set"
+    # GPT's cleanup on #1104: the first version of this arm checked the five identical
+    # names and left the three adapter names unchecked -- half the split unpinned, which is
+    # the same half-a-fix shape as the kind column.
+    for fn in tup["ADAPTER_FUNCTIONS"]:
+        assert f"`{fn}`" in section, f"C4 does not name {fn} among the adapters"
 
 
 TESTS = [
@@ -246,6 +291,8 @@ TESTS = [
     test_prd_enumeration_matches_the_permitted_tuple,
     test_prd_kinds_match_the_byte_identical_tuple,
     test_c4_counts_match_the_template,
+    test_changing_only_the_criteria_moves_the_certification,
+    test_missing_criteria_document_is_unknown,
 ]
 
 if __name__ == "__main__":
