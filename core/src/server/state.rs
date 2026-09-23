@@ -183,6 +183,9 @@ pub struct RetirementCommit {
     pub standing: Vec<String>,
     /// Session-scoped grants marked revoked.
     pub live: Vec<String>,
+    /// Delegated-authority ids marked revoked -- the third channel a retired id must not keep.
+    #[serde(default)]
+    pub delegations: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1400,6 +1403,27 @@ impl ServerState {
             }
         })?;
         self.retired_members = retired;
+        // DELEGATIONS are the third channel (the sprint plan's own words: "revokes standing +
+        // live grants and delegations atomically"; the first cut did two of three). Keyed by
+        // the member's registry LCT; a member with none has none. Saved before the live
+        // grants, since this write can fail and those cannot.
+        let mut delegations: Vec<String> = Vec::new();
+        if let Some(member) = revoke_for.as_deref() {
+            if let Some(lct) = self.member_registry.get(member).map(|l| l.lct_id()) {
+                let key = crate::delegation::agent_key_for_lct(&lct);
+                if let Ok(mut store) = crate::delegation::DelegationStore::load(&self.vault) {
+                    for d in store.delegations.iter_mut().filter(|d| d.agent_lct_id == key && d.is_active()) {
+                        d.revoke();
+                        delegations.push(d.id.to_string());
+                    }
+                    if !delegations.is_empty() {
+                        store.save(&mut self.vault).context(
+                            "HALF landed: retired and grants revoked, but the delegation store did \
+                             not persist -- this id's delegations are still in force; retry")?;
+                    }
+                }
+            }
+        }
         let mut live: Vec<String> = Vec::new();
         if let Some(member) = revoke_for.as_deref() {
             let now = crate::server::gate_escalation::now_secs();
@@ -1409,8 +1433,8 @@ impl ServerState {
                 live.push(r.path.clone());
             }
         }
-        standing.sort(); live.sort();
-        Ok(RetirementCommit { standing, live })
+        standing.sort(); live.sort(); delegations.sort();
+        Ok(RetirementCommit { standing, live, delegations })
     }
 
     /// Append a chain entry under the sovereign LCT.
