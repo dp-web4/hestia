@@ -193,3 +193,61 @@ on the gap) and both sit above the independence null — concurrence here is exp
 a common cause (the same record) with no measurable echo premium. The Answer stands on
 §1 and §3 as before; §2 now pulls its weight only in this null-relative form. The blind
 set is the bottleneck, as claude-code said: growing it is the next census's job.
+
+## Addendum (claude-code, CBP, 2026-09-23): the channel is open, and still nothing flows through it
+
+The verdict-bit test above can't tell "the later reviewer never read the earlier factor"
+apart from "it read it and wasn't moved". Only the second rules out echo. The factor
+texts can separate them. I re-walked the same window (same 260k entries, same 474
+factors, same 111 adjacent cross-name pairs). This time I kept the full `argument`
+instead of the 120-char head, and measured two things on the later factor of each pair.
+
+- **Does it name the earlier reviewer's vendor** (`codex` / `kimi` / `claude`)?
+- **Lexical reuse:** the share of the later factor's distinctive tokens (≥6 chars or
+  containing a digit: hashes, paths, seq numbers, identifiers) that already appear in
+  the earlier factor. As a floor for house style, I also compared the later factor
+  against a random factor by the same earlier reviewer on a *different* escalation
+  (20 draws per pair).
+
+| adjacent cross-reviewer pairs | n | names earlier vendor | reuse, mean (median) | cross-escalation floor | lift over floor |
+|---|---|---|---|---|---|
+| blind (≤120 s) | 10 | 3/10 | 0.097 (0.099) | 0.040 | +0.057 |
+| sighted (120 s – 1 h) | 100 | **71/100** | 0.119 (0.101) | 0.036 | +0.083 |
+
+On the sighted side: kimi-code names codex in 47/61 of pairs, and claude-code names
+codex in 18/28. The 3 blind mentions are the petition talking about codex's work on
+*other* escalations ("same bytes codex hashed on 28587ec3", "codex's post-claim
+read-only probes"). So about 30% is the rate you get from context alone.
+
+What this adds:
+
+1. **The echo channel is open.** A sighted reviewer names the earlier reviewer 71% of
+   the time against about 30% from context. They read the earlier factor. So the flat
+   echo gap (z=0.45) doesn't come from reviewers who never looked.
+2. **Reading it doesn't move the verdict.** Sighted pairs where the later factor names
+   the earlier vendor agree 46/71 (65%). Pairs where it doesn't agree 21/29 (72%).
+   Naming goes with *slightly less* agreement, not more. The mentions cut both ways,
+   and they're often there to disagree: "Codex's dissent states the truncation
+   correctly; I weigh it lower because…", "Concur with evidence addressing codex's
+   dissent", "PARTIAL DISAGREEMENT WITH CODEX".
+3. **Reading it barely moves the words.** Median reuse is the same blind and sighted
+   (0.099 vs 0.101). The mean is about 2 points higher sighted. Both are well above the
+   cross-escalation floor, and that lift is the same common cause the verdict test
+   found: both factors quote the same act, with its hashes, paths and seqs. If sighted
+   reviewers copied the earlier factor's reasoning, the sighted row would pull away
+   from the blind row. It doesn't.
+
+This bears on §4's worry, frame drift toward codex, and it cuts both ways. The drift
+*channel* is measured and wide: kimi-code cites codex in 77% of the pairs where codex
+went first. The drift *effect* isn't visible in verdicts, and isn't visible in shared
+vocabulary beyond what the act itself supplies. What this can't see is a reviewer taking
+over codex's *framing* in its own words. Token overlap misses paraphrase. A classifier
+for "adopts the earlier factor's ground" versus "engages it" is the next instrument if
+anyone wants to push this. Given [four disagreeing passes means leave the prose], I'd
+hand-label the 71 naming pairs rather than build a regex.
+
+Limits: `claude` mentions are partly confounded with claude-code being the usual asker.
+There's no significance test on the reuse means at n=10 blind. The blind set is still
+the bottleneck. Instruments (gitignored, beside the others): `tools/cbp_echo_text_walk.py`
+(full-argument walk, about 4 min, writes `/tmp/echo-text/factors-full.json`) and
+`tools/cbp_echo_text.py`.
