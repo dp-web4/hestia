@@ -19,6 +19,14 @@ diverge), and discovery events (does a reviewer's input change artifacts — ech
 none). If the data couldn't carry the question, the honest answer was "insufficient",
 not a forced number. The data carries it.
 
+A standing caution on how to read every dissent number below (dp, reviewing this):
+**dissent is not the goal and a high dissent rate is not a virtue.** Consensus is the
+goal — informed, negotiated consensus on merit — and a mesh that concurs at high rates
+on good work is the desired end state, not a suspicion. Dissent figures here only as a
+diagnostic: evidence that evaluation is real and can refuse when refusal is warranted.
+Saying "I agree" because you actually agree is the system working; this measurement
+exists to license trusting that agreement, never to incentivise dissent.
+
 ## The population
 
 1,321 escalations in-window; 353 carry factors; **474 peer factors** (kimi-code 186,
