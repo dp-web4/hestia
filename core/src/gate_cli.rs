@@ -287,6 +287,28 @@ pub fn pending(
             }
         }
     }
+    // The OTHER queue: scope requests, which a daemon restart drops (SAGE #180). Printed so a
+    // person about to restart for maintenance sees them without `--json`; an older daemon
+    // that does not serve the field is named as such rather than read as "none".
+    match r.get("pending_scope_count").and_then(Value::as_u64) {
+        None => println!("pending scope requests: (this daemon does not report them)"),
+        Some(0) => println!("no pending scope requests"),
+        Some(n) => {
+            println!("{n} pending scope request(s) — a daemon restart would drop them:");
+            if let Some(list) = r.get("pending_scope_requests").and_then(Value::as_array) {
+                for q in list {
+                    let s = |k: &str| q.get(k).and_then(Value::as_str).unwrap_or("-").to_string();
+                    println!(
+                        "  {:<24} {:<16} {:>6}s  {}",
+                        s("request_id"),
+                        s("claimed_by"),
+                        q.get("secs_remaining").and_then(Value::as_u64).unwrap_or(0),
+                        s("path")
+                    );
+                }
+            }
+        }
+    }
     // The daemon ships a caveat with this answer explaining that `you_may_rule` reflects
     // NOT-SAME only. Swallowing it would let a reader mistake NOT-SAME for a boundary.
     if let Some(c) = r.get("caveat").and_then(Value::as_str) {
