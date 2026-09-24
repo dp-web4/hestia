@@ -2290,11 +2290,16 @@
         ${d.active ? `<button type="button" class="pol-btn pol-remove" data-deleg-revoke="${escapeHtml(String(d.id))}" data-deleg-agent="${escapeHtml(pluginId)}" title="Revoke this delegation. Witnessed; the record stays.">revoke…</button>` : ''}
       </div>`;
     };
+    // A RETIRED agent's panel is readable -- that is the point, its history is what retirement
+    // just revoked -- but it must not look like one that may be granted to, so the form goes
+    // and the reason is on screen (cbp, PR #1106).
+    const retired = out.retired === true;
     return `<div class="pol-section-label">Delegated authority <span class="disc-count">${rows.length}</span></div>
       <div class="grant-note">What <strong>${escapeHtml(pluginId)}</strong> may do on this society's behalf, signed by the operator's key.
         Its delegation key is derived from its registry identity — <code>${escapeHtml(String(out.agent_key || '')).slice(0, 8)}…</code> — not typed.</div>
+      ${retired ? `<div class="grant-note"><strong>This id is retired on this seat.</strong> Its delegations were revoked when it was retired and are listed below as history. Reinstate it before delegating to it again.</div>` : ''}
       ${rows.length ? rows.map(row).join('') : '<div class="empty">No delegations.</div>'}
-      <div class="pol-add grant-add deleg-add">
+      ${retired ? '' : `<div class="pol-add grant-add deleg-add">
         <select class="pol-input" id="deleg-roles" multiple size="4" title="society roles (pick one or more)">
           ${roles.map(r => `<option value="${escapeHtml(r)}">${escapeHtml(r)}</option>`).join('')}
         </select>
@@ -2302,7 +2307,7 @@
         <input class="pol-input" id="deleg-hours" type="number" min="1" placeholder="hours (blank = no expiry)" size="10">
         <input class="pol-input" id="deleg-reason" placeholder="reason (required)" size="22">
         <button type="button" class="pol-btn-add" id="deleg-grant" data-deleg-agent="${escapeHtml(pluginId)}">delegate</button>
-      </div>
+      </div>`}
       <div class="esc-err" id="deleg-err" hidden></div>`;
   }
   async function delegationGrant(pluginId) {

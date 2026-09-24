@@ -3656,6 +3656,29 @@ fn cmd_delegate_grant(
 
 
     let mut vault = open_vault(home)?;
+    // THE SAME REFUSAL AS THE HTTP DOOR. #1106 said a retired id is "refused through this door
+    // as through every other", and that was true of the three routes only: this command takes
+    // the agent KEY, so nothing here had ever mapped it back to a member to ask (cbp, #1106
+    // review, finding 5). The registry is small and the map is one way -- key = f(lct) -- so
+    // the reverse is a scan, done once, here.
+    {
+        let retired = hestia::server::retirement::load(&vault);
+        if !retired.retired.is_empty() {
+            let registry = hestia::member_registry::load_members(&vault);
+            let who = registry.iter_sorted().into_iter().find(|(_, lct)| {
+                delegation::agent_key_for_lct(&lct.lct_id()) == agent_id
+            }).map(|(id, _)| id.clone());
+            if let Some(plugin_id) = who {
+                if let Some(r) = retired.get(&plugin_id) {
+                    anyhow::bail!(
+                        "'{plugin_id}' was RETIRED on this seat ({}). Nothing was delegated: a \
+                         retired id receives no authority through this door either. Reinstate it \
+                         first — the dashboard's agent view, or POST /api/agents/{plugin_id}/reinstate.",
+                        r.reason);
+                }
+            }
+        }
+    }
     let mut store = DelegationStore::load(&vault)?;
     let (delegator_id, delegator_kp) = delegation::operator_delegator(&vault, home)?;
     let deleg = store.create_delegation(

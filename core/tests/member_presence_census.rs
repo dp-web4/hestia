@@ -783,6 +783,23 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("cli.rs::cmd_delegate_agent_id", &[
         "let registry = hestia::member_registry::load_members(&vault);",
     ]),
+    // ADDED 2026-09-23 (claude-code@mcnugget, #1106 review, cbp finding 5). READING: presence,
+    // read to answer "which member is this agent KEY?" so the command can refuse a retired one.
+    // The map is one-way -- key = f(lct) -- so the reverse is a scan of the registry, done once.
+    // The HTTP doors all refused a retired id and this one did not, which made the PR's claim
+    // ("refused through this door as through every other") true of HTTP only.
+    //
+    // DEGRADATION DIRECTION: an unreadable or empty registry yields no match, and an unmatched
+    // key is DELEGATED TO rather than refused. That is the permissive direction, and it is the
+    // right one here: the key may legitimately belong to no member of this seat (a filler, a
+    // peer's agent), and refusing every key this registry cannot name would break the command
+    // for its normal use. The refusal it adds is exact -- this key IS this retired member --
+    // and the authority it gates is bounded by the delegation's own scope. If this ever becomes
+    // the only check on a consequential path, that reading must be redone.
+    ("cli.rs::cmd_delegate_grant", &[
+        "let registry = hestia::member_registry::load_members(&vault);",
+        "let who = registry.iter_sorted().into_iter().find(|(_, lct)| {",
+    ]),
     ("cli.rs::cmd_lct_publish", &[
         "let members = hestia::member_registry::load_members(&vault);",
     ]),

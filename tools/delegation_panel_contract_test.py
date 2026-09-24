@@ -70,12 +70,31 @@ def source_contract() -> None:
           'for k in ["agent", "agent_id", "agent_lct_id", "plugin_id"] {' in RS)
     check("the daemon refuses a free-text role", "is not one of the society roles" in RS)
     check("the daemon derives the key from the registry LCT", "crate::delegation::agent_key_for_lct(&lct.lct_id())" in RS)
-    check("a retired id is refused a delegation", 'refuse_if_retired(s, plugin_id, "a delegation")' in RS)
+    # GRANTING is authority; READING is not. The refusal sits at the grant's call site, not in
+    # the shared derivation -- there, it answered 409 to a plain GET, so the one agent whose
+    # delegations retirement had just revoked was the one whose history could not be read
+    # (cbp, PR #1106). Pinned both ways.
+    check("a retired id is refused a GRANT", 'refuse_if_retired(&s, &plugin_id, "a delegation")' in RS)
+    check("...and the shared key derivation does NOT refuse, so reading still works",
+          "refuse_if_retired" not in RS[RS.index("fn delegation_key_for("):RS.index("async fn agent_delegations_list(")])
+    check("the listing says whether the agent is retired", '"retired": s.retired_members.is_retired(&plugin_id),' in RS)
+    # An unreadable delegation store is not "this member had none" (the fail-open cbp probed).
+    check("retirement propagates a delegation-store read failure",
+          "crate::delegation::DelegationStore::load(&self.vault)\n                    .context(" in ST)
+    check("...and leaves the id UN-retired, so nothing reads as finished",
+          ST.index("let mut store = crate::delegation::DelegationStore::load(&self.vault)")
+          < ST.index("crate::server::retirement::save(&mut self.vault, &retired)"))
+    # The CLI is the fourth door and had no check at all.
+    CLI = (ROOT / "core/src/cli.rs").read_text()
+    check("the delegate CLI refuses a retired id too",
+          "was RETIRED on this seat" in CLI and "hestia::server::retirement::load(&vault)" in CLI)
     check("a revoke through the wrong agent's panel is refused", "does not belong to" in RS)
     check("grant is witnessed intent-then-commit", '"delegation_grant_intent"' in RS and '"delegation_granted"' in RS)
     check("the delegator is the operator's own key, never a throwaway",
           "crate::delegation::operator_delegator(&s.vault, &s.home)" in RS)
     check("retiring revokes delegations", "delegations.push(d.id.to_string());" in ST)
+    check("a half-landed retirement names only what landed",
+          "the retirement did not persist, and this id's live grants" in ST and "are untouched; retry" in ST)
 
 
 def run(expr: str, arg) -> object:
@@ -107,6 +126,14 @@ def behaviour() -> None:
     check("the picker offers exactly the daemon's roles, in order",
           re.findall(r'<option value="([^"]+)">', html), law)
     check("the derived key is shown, not asked for", "0f1e2d3c" in html and 'id="deleg-agent"' not in html)
+    # A retired agent's panel is readable (its history is what retirement revoked) and must not
+    # look like one that may be granted to.
+    ret = run("delegationsHtml(A.plugin_id, A)", dict(out, retired=True)) or ""
+    check("a retired agent's delegations are still listed", "aaaaaaaa" in ret)
+    check("...and say why they are history", "retired on this seat" in ret)
+    check("...and the grant form is gone", 'id="deleg-grant"' in ret, False)
+    check("a live agent keeps the form", 'id="deleg-grant"' in html, True)
+
     empty = run("delegationsHtml(A.plugin_id, A)", {"plugin_id": "x", "agent_key": "k", "roles": law, "delegations": []}) or ""
     check("no delegations renders as an honest empty, with the form", "No delegations." in empty and 'id="deleg-grant"' in empty)
     garbage = run("delegationsHtml('x', A)", {}) or ""

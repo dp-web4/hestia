@@ -1393,37 +1393,49 @@ impl ServerState {
                 self.standing_scope_dirty = false;
             }
         }
-        crate::server::retirement::save(&mut self.vault, &retired).with_context(|| {
-            if standing.is_empty() {
-                "NOTHING changed: the retirement did not persist".to_string()
-            } else {
-                format!("HALF landed: {} standing grant(s) are revoked (vault and memory) but the \
-                         retirement itself did not persist -- the id still shows and holds no \
-                         authority; retry, or reinstate is a no-op", standing.len())
-            }
-        })?;
-        self.retired_members = retired;
-        // DELEGATIONS are the third channel (the sprint plan's own words: "revokes standing +
-        // live grants and delegations atomically"; the first cut did two of three). Keyed by
-        // the member's registry LCT; a member with none has none. Saved before the live
-        // grants, since this write can fail and those cannot.
+        // DELEGATIONS BEFORE THE RETIREMENT IS RECORDED. Authority first, bookkeeping last:
+        // every channel this id holds is revoked before it is marked retired, so no failure can
+        // leave the state "retired, and possibly still empowered" -- the one shape an operator
+        // would read as finished. The earlier order recorded the retirement first, and this
+        // function's own test caught it. Keyed by the member's registry LCT; none, none.
         let mut delegations: Vec<String> = Vec::new();
         if let Some(member) = revoke_for.as_deref() {
             if let Some(lct) = self.member_registry.get(member).map(|l| l.lct_id()) {
                 let key = crate::delegation::agent_key_for_lct(&lct);
-                if let Ok(mut store) = crate::delegation::DelegationStore::load(&self.vault) {
-                    for d in store.delegations.iter_mut().filter(|d| d.agent_lct_id == key && d.is_active()) {
-                        d.revoke();
-                        delegations.push(d.id.to_string());
-                    }
-                    if !delegations.is_empty() {
-                        store.save(&mut self.vault).context(
-                            "HALF landed: retired and grants revoked, but the delegation store did \
-                             not persist -- this id's delegations are still in force; retry")?;
-                    }
+                // `?`, NOT `if let Ok(..)`. `load_doc` answers Ok(default) for a MISSING
+                // document, so an Err here means the store exists and cannot be read -- and
+                // swallowing it produced `200 OK, revoked_delegations: []`, which is exactly
+                // what "this member had none" looks like, over a delegation still in force
+                // (cbp, PR #1106 review, probed). The same fail-open class as #1100's
+                // `unwrap_or(0)`: a channel that cannot be read has not been revoked.
+                let mut store = crate::delegation::DelegationStore::load(&self.vault)
+                    .context("NOT RETIRED: the standing grants are revoked, but the delegation \
+                              store could not be READ, so this id's delegations are in an unknown \
+                              state -- nothing was marked retired; retry")?;
+                for d in store.delegations.iter_mut().filter(|d| d.agent_lct_id == key && d.is_active()) {
+                    d.revoke();
+                    delegations.push(d.id.to_string());
+                }
+                if !delegations.is_empty() {
+                    store.save(&mut self.vault).context(
+                        "NOT RETIRED: the standing grants are revoked, but the delegation store \
+                         did not persist, so this id's delegations are still in force -- nothing \
+                         was marked retired; retry")?;
                 }
             }
         }
+        crate::server::retirement::save(&mut self.vault, &retired).with_context(|| {
+            if standing.is_empty() && delegations.is_empty() {
+                "NOTHING changed: the retirement did not persist".to_string()
+            } else {
+                // Names ONLY what landed. The live grants are revoked further down and have not
+                // been reached from here (cbp, #1106, finding 3).
+                format!("HALF landed: {} standing grant(s) and {} delegation(s) are revoked, and \
+                         nothing else -- the retirement did not persist, and this id's live grants \
+                         are untouched; retry", standing.len(), delegations.len())
+            }
+        })?;
+        self.retired_members = retired;
         let mut live: Vec<String> = Vec::new();
         if let Some(member) = revoke_for.as_deref() {
             let now = crate::server::gate_escalation::now_secs();

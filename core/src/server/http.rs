@@ -5618,12 +5618,16 @@ pub const DELEGATION_ROLES: &[&str] = &[
 /// recorded has no key -- a delegation binds to an identity derived from a public key, never
 /// to a name (#952) -- and a retired one is refused authority through this door like every
 /// other (cbp, #1100).
+/// READING IS NOT AUTHORITY, so this does not refuse a retired id -- only the GRANT path does
+/// (`refuse_if_retired`, at its call site). The first cut put the refusal here, which every
+/// caller shares, so a plain GET of a retired agent's delegations answered 409: the one agent
+/// whose delegations retirement had just revoked was the one whose panel showed nothing, and
+/// this PR's own claim that revoked delegations stay listed was false for exactly that case
+/// (cbp, PR #1106 review, probed). `revoke` already skipped the check for the same reason --
+/// taking authority away from a retired id is the safe direction; so is looking.
 fn delegation_key_for(
     s: &crate::server::state::ServerState, plugin_id: &str,
 ) -> std::result::Result<uuid::Uuid, (StatusCode, Json<serde_json::Value>)> {
-    if let Some(refusal) = refuse_if_retired(s, plugin_id, "a delegation") {
-        return Err(refusal);
-    }
     let Some(lct) = s.member_registry.get(plugin_id) else {
         return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
             "error": format!("'{plugin_id}' has no LCT in this society's member registry, so no \
@@ -5654,6 +5658,8 @@ async fn agent_delegations_list(
         .collect();
     (StatusCode::OK, Json(serde_json::json!({
         "plugin_id": plugin_id, "agent_key": key, "delegations": rows, "roles": DELEGATION_ROLES,
+        // Readable, and said plainly: the panel must not look like an agent that may be granted to.
+        "retired": s.retired_members.is_retired(&plugin_id),
     })))
 }
 
@@ -5691,6 +5697,11 @@ async fn agent_delegation_grant(
     }
     let expires_hours = body.get("expires_hours").and_then(|v| v.as_u64()).filter(|h| *h > 0);
     let mut s = state.lock().await;
+    // GRANTING is authority; reading is not. The refusal lives here rather than in the shared
+    // derivation, so a retired agent's history stays readable (cbp, #1106).
+    if let Some(refusal) = refuse_if_retired(&s, &plugin_id, "a delegation") {
+        return refusal;
+    }
     let key = match delegation_key_for(&s, &plugin_id) { Ok(k) => k, Err(r) => return r };
     let roles: Vec<web4_core::SocietyRole> = match role_names.iter()
         .map(|r| crate::delegation::parse_role(r)).collect::<std::result::Result<Vec<_>, _>>() {
@@ -8382,6 +8393,53 @@ mod disposition_tests {
         assert_eq!(st, StatusCode::OK);
         let (st, b) = deleg(&state, "codex", Some(serde_json::json!({"roles": ["witness"], "reason": "r"}))).await;
         assert_eq!((st, &b["retired"]), (StatusCode::CONFLICT, &serde_json::json!(true)), "{b}");
+    }
+
+    /// cbp, PR #1106 review, both blocking findings. Probed there with a throwaway test; kept
+    /// here so neither can come back.
+    #[tokio::test]
+    async fn a_retired_agents_delegations_stay_readable_and_an_unreadable_store_is_not_silence() {
+        let (_dir, state) = test_state().await;
+        seed_operator_key(&state).await;
+        register_member(&state, "kimi-code").await;
+        let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({
+            "roles": ["witness"], "reason": "before retirement"}))).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let (st, _) = retire(&state, "kimi-code", serde_json::json!({"reason": "t", "ref": "x"})).await;
+        assert_eq!(st, StatusCode::OK);
+
+        // FINDING 2: reading is not authority. The one agent whose delegations retirement just
+        // revoked is the one whose history most needs reading.
+        let (st, b) = deleg(&state, "kimi-code", None).await;
+        assert_eq!(st, StatusCode::OK, "a retired agent's delegations must stay readable: {b}");
+        assert_eq!(b["delegations"].as_array().unwrap().len(), 1);
+        assert_eq!(b["delegations"][0]["active"], serde_json::json!(false), "revoked by the retirement");
+        assert_eq!(b["retired"], serde_json::json!(true), "...and the panel says so");
+        // Granting is still refused.
+        let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({
+            "roles": ["witness"], "reason": "after"}))).await;
+        assert_eq!((st, &b["retired"]), (StatusCode::CONFLICT, &serde_json::json!(true)), "{b}");
+
+        // FINDING 1: an UNREADABLE delegation store is not "this member had none". Corrupt the
+        // document (a missing one is Ok(default), which is a real answer; a non-object is not).
+        register_member(&state, "codex").await;
+        let (st, b) = deleg(&state, "codex", Some(serde_json::json!({"roles": ["auditor"], "reason": "r"}))).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        {
+            let mut s = state.lock().await;
+            s.vault.put_document("presence", "delegations", b"[\"not the store's shape\"]".to_vec()).unwrap();
+        }
+        let (st, b) = retire(&state, "codex", serde_json::json!({"reason": "t", "ref": "x"})).await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR,
+                   "an unreadable delegation store must not report a clean retirement: {b}");
+        let err = b["error"].as_str().unwrap();
+        assert!(err.contains("NOT RETIRED") && err.contains("unknown state"), "{err}");
+        // AUTHORITY FIRST, BOOKKEEPING LAST: the id is NOT marked retired, so no operator reads
+        // this as finished while a delegation may still be in force. The first cut recorded the
+        // retirement before touching delegations and this assertion is what caught it.
+        assert!(!state.lock().await.retired_members.is_retired("codex"),
+                "a failure in any authority channel must leave the id un-retired, and a retry \
+                 re-runs the whole act");
     }
 
     /// The third channel: retirement revokes delegations along with the grants.
