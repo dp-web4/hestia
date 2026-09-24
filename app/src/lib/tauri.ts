@@ -11,6 +11,23 @@ import type {
   SeatConfigPutResult,
 } from "./types";
 
+/**
+ * Decide one governance-surface escalation as the signed-in operator.
+ *
+ * Reaches `POST /api/operator/gate-escalation` — the channel behind a proved
+ * operator LCT — and never the CLI path, which is authenticated only by
+ * filesystem access to HESTIA_HOME. Returns the daemon's own answer: whether an
+ * approval actually permits the write depends on the bar, and this must not
+ * claim more than the daemon said.
+ */
+export async function decideGateEscalation(
+  id: string,
+  approve: boolean,
+  reason: string | null,
+): Promise<unknown> {
+  return invoke("decide_gate_escalation", { id, approve, reason });
+}
+
 export async function getDashboard(): Promise<DashboardSnapshot> {
   return invoke("get_dashboard");
 }

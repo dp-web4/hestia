@@ -1,5 +1,6 @@
 import { BrowserRouter, Routes, Route, NavLink } from "react-router";
 import { Dashboard } from "./pages/Dashboard";
+import { Decide } from "./pages/Decide";
 import { Vault } from "./pages/Vault";
 import { Chain } from "./pages/Chain";
 import { Policy } from "./pages/Policy";
@@ -21,6 +22,7 @@ export default function App() {
           </div>
           <div className="nav-links">
             <NavLink to="/" end>Dashboard</NavLink>
+            <NavLink to="/decide">Decide</NavLink>
             <NavLink to="/vault">Vault</NavLink>
             <NavLink to="/chain">Chain</NavLink>
             <NavLink to="/delegations">Delegations</NavLink>
@@ -37,6 +39,7 @@ export default function App() {
         <main className="main-content">
           <Routes>
             <Route path="/" element={<Dashboard />} />
+            <Route path="/decide" element={<Decide />} />
             <Route path="/vault" element={<Vault />} />
             <Route path="/chain" element={<Chain />} />
             <Route path="/delegations" element={<Delegations />} />
