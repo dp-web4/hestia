@@ -1,0 +1,884 @@
+{
+  "coverage": {
+    "findings_preregistration": {
+      "bytes_read": 1088445,
+      "files_read": 140,
+      "read_errors": 0
+    },
+    "history": {
+      "bytes_scanned": 166968,
+      "current_wake_records_excluded": 0,
+      "files_read": 1,
+      "filtered_sha256": "5785fc1917a89af40df97a0856ea612914e05475904279731dac1107c7d1fee6",
+      "malformed_lines_retained": 0,
+      "read_errors": 0,
+      "records_scanned": 426
+    },
+    "identity": {
+      "bytes_read": 13901,
+      "files_read": 1,
+      "read_errors": 0
+    },
+    "observations": {
+      "bytes_scanned": 175909659,
+      "current_wake_records_excluded": 26,
+      "files_read": 1,
+      "filtered_sha256": "184f95209208174d3614e32d5f0f7c959b796575eb14268ce8f30265a97b0737",
+      "malformed_lines_retained": 4,
+      "read_errors": 0,
+      "records_scanned": 22651
+    },
+    "sessions": {
+      "bytes_read": 509633759,
+      "files_read": 1605,
+      "read_errors": 0
+    }
+  },
+  "draw_body_sha256": "f9c55c18d1f69cef7c7e7161f5a92610c49d0f6a74f2e200edbe4bff692ec243",
+  "exclusions": [
+    "current wake session and its history/observation records",
+    "post-preregistration findings, including draw/exposure publications"
+  ],
+  "findings_ref": "2937716",
+  "method": "Case-sensitive full ID and 8-character prefix substrings; count each matched file once; no context displayed. Whole prior transcripts scanned conservatively, not only displayed-output fields.",
+  "notice": 14565,
+  "probes": [
+    {
+      "eid": "01fecedaee4756a5",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "0bc3fe051b7916a5",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "0bf24c23e8b2d074",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "0fc745a34eca2ede",
+      "hits": {
+        "history": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        },
+        "observations": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 3,
+          "prefix8_files": 3
+        }
+      },
+      "picked": false,
+      "screen": "exclude",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "125627b3fccda90f",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "13369ce430e0e9a1",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "2012be8e2bbc5076",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "2231965a791ccf8e",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "236a43ae3e687a6a",
+      "hits": {
+        "observations": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 2,
+          "prefix8_files": 2
+        }
+      },
+      "picked": true,
+      "screen": "exclude",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "24c9646ee0ad0b8f",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "25465beba8d8de19",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "27c0fdd7c9d45ffd",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "2a63f1b650e6512e",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "2c49a8fda5f57938",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "3264fc8d95ffdb19",
+      "hits": {},
+      "picked": true,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "35bd54bc8318b69a",
+      "hits": {},
+      "picked": true,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "3949051127605e9b",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "3a246a3c76cb4d29",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "3c4e8cd8af69e962",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "3c9fd7b8b274ad05",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "3cd127ba1daaf7b4",
+      "hits": {},
+      "picked": true,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "3d68d03aa092a32d",
+      "hits": {},
+      "picked": true,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "3f44ef51f7f234c3",
+      "hits": {},
+      "picked": true,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "411bf87aae962911",
+      "hits": {
+        "observations": {
+          "full_id_files": 0,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 0,
+          "prefix8_files": 36
+        }
+      },
+      "picked": true,
+      "screen": "exclude",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "43984a25fea12918",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "461123fe9cd5b10e",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "473d7d53275f8ea7",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "49496a5cc5381e00",
+      "hits": {
+        "history": {
+          "full_id_files": 0,
+          "prefix8_files": 1
+        },
+        "observations": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        }
+      },
+      "picked": false,
+      "screen": "exclude",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "499a3ae14ee26b00",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "4b81193e097d39c9",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "4e80bf851a1ce759",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "555cc0eca8858669",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "56bb7e964d5e79e7",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "575ab47badfcbc56",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "5bed9845f99375bf",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "5fcd801bf6d0add1",
+      "hits": {},
+      "picked": true,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "5fe84094017ba0dc",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "60d8f6653604a331",
+      "hits": {
+        "observations": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 2,
+          "prefix8_files": 3
+        }
+      },
+      "picked": false,
+      "screen": "exclude",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "688d0de3264f5b4c",
+      "hits": {
+        "observations": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        }
+      },
+      "picked": false,
+      "screen": "exclude",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "697fc654ab746811",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "6c3e9fa2379a280f",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "6d080b5f4b1e319d",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "71e6cdadbdc4dcd9",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "729e4489a1863a7a",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "72c623b87e540cc0",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "75cbb6c1607ac72b",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "76c56b19a3f4583e",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "797ac6cf7a484cc7",
+      "hits": {
+        "observations": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 3,
+          "prefix8_files": 11
+        }
+      },
+      "picked": false,
+      "screen": "exclude",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "7bc68acc8fc56a60",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "8098baa5146494c9",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "83f5781883dce929",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "84a6ea5d24edbd71",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "86c4fbf3a6aa4ee8",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "88559ba7416a0f34",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "8e1f5235909cc789",
+      "hits": {},
+      "picked": true,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "908198c8e63a9f07",
+      "hits": {
+        "observations": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 3,
+          "prefix8_files": 3
+        }
+      },
+      "picked": false,
+      "screen": "exclude",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "9620eb115faa1259",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "9bc47120e9921f24",
+      "hits": {
+        "observations": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 17,
+          "prefix8_files": 17
+        }
+      },
+      "picked": false,
+      "screen": "exclude",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "9c9ca907117d6d58",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "a2183d5c9040544f",
+      "hits": {},
+      "picked": true,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "a32897c140448501",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "a5b74c98d0a513fe",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "a75adadaaed7e1be",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "abbe8f6a90fbc4be",
+      "hits": {
+        "observations": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 8,
+          "prefix8_files": 8
+        }
+      },
+      "picked": false,
+      "screen": "exclude",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "ad14f490f9b4fe1a",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "af39a53154de1510",
+      "hits": {
+        "observations": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 1,
+          "prefix8_files": 4
+        }
+      },
+      "picked": false,
+      "screen": "exclude",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "b0785079221b64e6",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "b2943c2f2ed3fbcf",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "bd3993b56ce49cff",
+      "hits": {
+        "observations": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 5,
+          "prefix8_files": 5
+        }
+      },
+      "picked": false,
+      "screen": "exclude",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "c148d0502883d634",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "c56655fb07feba81",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "c58abb17e24ffcd4",
+      "hits": {
+        "observations": {
+          "full_id_files": 0,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 0,
+          "prefix8_files": 9
+        }
+      },
+      "picked": false,
+      "screen": "exclude",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "c7884b4b2fc9764a",
+      "hits": {
+        "observations": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 4,
+          "prefix8_files": 4
+        }
+      },
+      "picked": false,
+      "screen": "exclude",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "c87a56f8080355aa",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "cc3d2cc97e43fd43",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "cef77a0ec878e262",
+      "hits": {
+        "observations": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        }
+      },
+      "picked": false,
+      "screen": "exclude",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "d1f1bbe090af1029",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "d4a668ee48373d1e",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "d91fcc97f79859e7",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "da3ea9542c71052b",
+      "hits": {
+        "observations": {
+          "full_id_files": 0,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 0,
+          "prefix8_files": 9
+        }
+      },
+      "picked": false,
+      "screen": "exclude",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "da5fe86a97791c9b",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "db10e17813b487d5",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "dd26280d0b2f925f",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "dd72cbef90477932",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "e6a8e6a428b5fd80",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "e96f87efae0312d8",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "ec7b025c66fb0ed3",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "ef97afb5fd4e6bee",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "f0cda5bc180b2625",
+      "hits": {
+        "observations": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 3,
+          "prefix8_files": 5
+        }
+      },
+      "picked": false,
+      "screen": "exclude",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "f53e11c62ace76b6",
+      "hits": {
+        "observations": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 4,
+          "prefix8_files": 4
+        }
+      },
+      "picked": false,
+      "screen": "exclude",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "f7201beb93956855",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "f8e04b89378dcff8",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    },
+    {
+      "eid": "fbf5791f3aa078f5",
+      "hits": {
+        "observations": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        },
+        "sessions": {
+          "full_id_files": 1,
+          "prefix8_files": 1
+        }
+      },
+      "picked": false,
+      "screen": "exclude",
+      "stratum": "unattributed/shell"
+    },
+    {
+      "eid": "fc20735fdf8de291",
+      "hits": {},
+      "picked": false,
+      "screen": "no_observed_hit",
+      "stratum": "unattributed/non-shell"
+    }
+  ]
+}
