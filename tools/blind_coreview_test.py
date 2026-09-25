@@ -50,6 +50,11 @@ bc = importlib.util.module_from_spec(_spec)
 sys.modules["blind_coreview"] = bc
 _spec.loader.exec_module(bc)
 
+_spec_pkt = importlib.util.spec_from_file_location(
+    "blind_coreview_packet", os.path.join(_HERE, "blind_coreview_packet.py"))
+bpkt = importlib.util.module_from_spec(_spec_pkt)
+_spec_pkt.loader.exec_module(bpkt)
+
 _RECORD = b"# probe packet\nattempted act, rule that fired, the record as the decider saw it\n"
 
 
@@ -203,6 +208,47 @@ def test_verify_freezes_the_per_probe_pair_and_encoding():
     check("manifest missing the question refused", not bc.verify(doc, reveal, no_q))
     check("manifest without the verdict encoding refused",
           not bc.verify(doc, reveal, _manifest(verdicts=[])))
+
+
+def test_pilot_freeze_manifest_binds_packets_and_pairs():
+    """The pilot's frozen round (findings/blind-coreview-pilot/, drawn 2026-09-25):
+    the committed manifest and packets are ONE frozen artifact — packet bytes hash to
+    the manifest's record_sha256; the builder's config is the manifest minus digests;
+    each pair is two seats in sorted order; verify --manifest accepts a seal from a
+    pair member and refuses the bystanding seat; the builder's outcome-key guard
+    finds nothing in any committed packet."""
+    pilot = os.path.join(_HERE, "..", "findings", "blind-coreview-pilot")
+    manifest = json.load(open(os.path.join(pilot, "manifest-2026-09-25.json")))
+    cfg = bpkt.load_config(os.path.join(pilot, "round-config-2026-09-25.json"))
+    check("the frozen config is the manifest minus digests",
+          all(manifest[k] == cfg[k]
+              for k in ("round", "seats", "question", "verdicts"))
+          and [p["eid"] for p in manifest["probes"]]
+          == [p["eid"] for p in cfg["probes"]])
+    seats = manifest["seats"]
+    check("ten probes froze", len(manifest["probes"]) == 10)
+    for p in manifest["probes"]:
+        eid, pair = p["eid"], p["reviewers"]
+        with open(os.path.join(pilot, "packets", f"{eid}.json"), "rb") as f:
+            blob = f.read()
+        check(f"{eid}: packet bytes hash to the frozen digest",
+              bc.record_digest(blob) == p["record_sha256"])
+        check(f"{eid}: pair is two seats, sorted",
+              len(pair) == 2 and pair == sorted(pair)
+              and all(r in seats for r in pair))
+        check(f"{eid}: no outcome-named field in the packet",
+              not [k for k in json.loads(blob)["opened"]
+                   if bpkt.OUTCOME_KEY.search(k)])
+        doc, reveal = bc.seal(pair[0], eid, "concur", "freeze pin", blob,
+                              manifest["round"])
+        check(f"{eid}: pair member {pair[0]} verifies",
+              bc.verify(doc, reveal, manifest),
+              f"{bc.check(doc, reveal, manifest)}")
+        bystander = next(s for s in seats if s not in pair)
+        bdoc, breveal = bc.seal(bystander, eid, "concur", "freeze pin", blob,
+                                manifest["round"])
+        check(f"{eid}: bystander {bystander} refused",
+              not bc.verify(bdoc, breveal, manifest))
 
 
 def test_stats_reproduces_the_arcs_blind_set():
@@ -387,6 +433,7 @@ def test_stats_empty():
 # staleness check in main() makes a missing entry RED rather than a silently smaller
 # run — the idiom is tools/claimable_test.py's.
 TESTS = [
+    test_pilot_freeze_manifest_binds_packets_and_pairs,
     test_seal_doc_never_carries_the_reveal,
     test_seal_verify_roundtrip,
     test_stats_abstention_is_recorded_not_coerced,
