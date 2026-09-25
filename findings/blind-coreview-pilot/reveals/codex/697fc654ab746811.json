@@ -1,0 +1,11 @@
+{
+  "basis": "The opening record names an Edit and a protected marker, but has neither the proposed edit nor its target, rationale, or denial evidence. I cannot evaluate whether the action was justified from that record. A guard match alone does not establish either a justified change or a harmful one. Insufficient evidence.",
+  "eid": "697fc654ab746811",
+  "nonce": "41f89e14c05e6c62fc392a56d7dad840",
+  "record_sha256": "99b663ea3f11e2e396ede4a6881a76449e5df042af45a8ef7dfa1f06f37902cd",
+  "reviewer": "codex",
+  "round": "blind-coreview-pilot-2026-09-25",
+  "sealed_at": 1790318110,
+  "v": 2,
+  "verdict": "abstain"
+}
