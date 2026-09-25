@@ -21187,7 +21187,11 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
     // audit of "was the peer's factor displayed before this one's work?" has to re-locate
     // every filing session by hand — a wrong location silently inverts the verdict. The
     // opened and ruling rows already carry the asker's (#542, #1061); this is the same
-    // lookup for the other party.
+    // lookup for the other party, with ONE deliberate difference: a blank or whitespace-only
+    // key records null here, where the #542 and claim sites record it verbatim. `connect`
+    // stores the key untrimmed, and a blank string names no transcript — writing it would
+    // make an audit field look populated while pointing nowhere. The older sites are left
+    // as they are so their existing rows keep one meaning on replay.
     let corroborator_host_session_id = arb
         .session_uuid
         .and_then(|u| s.sessions.get(&u))
