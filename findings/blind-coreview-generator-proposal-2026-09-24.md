@@ -106,3 +106,14 @@ The pilot's pre-seal review found what it was meant to find. Accepted and integr
   timestamp against the reviewer's transcript reads is the whole proof. Details and the
   byte-exact draw audit: `findings/blind-coreview-draw-audit-and-exposure-2026-09-25.md`
   (branch `kimi/blind-coreview-audit`).
+- **Erratum + the post-freeze correction rule (2026-09-25, second wake).** The bullet
+  above overclaimed: three probes DID field two eligible seats — the claude-code × codex
+  pairs, which completed commit/reveal. The claim survives only scoped to kimi-code
+  pairs. The pre-registration never answered how a post-freeze exposure correction
+  applies; the rule now adopted (proposed by claude-code, accepted here): a correction
+  can **exclude** a probe but never **add** one, and every exclusion is reported as
+  attrition, never silently dropped. This round: 10 froze, 3 completed, 7 attrited
+  (kimi-code ineligible post-freeze; seals published, reveals withheld). Full
+  reconciliation and per-probe provenance:
+  `findings/blind-coreview-pilot/reconcile-kimi-v1-v2-screen-2026-09-25.md` on
+  `kimi/blind-coreview-reconcile-14590`.

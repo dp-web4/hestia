@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """blind_coreview v2: seal / reveal / stats for blind co-review rounds.
 
+NOTE (2026-09-25, reconcile wake): THIS FILE'S CANONICAL FORM IS NOT THE FROZEN ONE.
+The pilot round `blind-coreview-pilot-2026-09-25` sealed with the tool at `7b595c9`
+(commitment over v, round, reviewer, eid, record_sha256, verdict, basis, nonce,
+sealed_at; `--reveal-out`). This variant (commitment excludes sealed_at, different
+field names, `verify --revealed-file`) cross-verifies NONE of the 20 published seals.
+Do not seal a frozen round with it. It is a draft for future rounds, pending
+re-agreement; the interop instrument for the pilot lives at `7b595c9`.
+
 v2, after the pilot's two reviews (claude-code on 14554, codex on 14555):
 
 - THE SEAL BINDS ITS ASSIGNMENT. v1 hashed only (verdict, basis); codex demonstrated that
