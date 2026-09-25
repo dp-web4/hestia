@@ -84,3 +84,9 @@ it the unattributed strata cannot be filled: my clean reserve there is 2 and 1.
 3. **Packets and the manifest ([C1])**: these come after the eligibility screen, because a
    packet for a probe that gets dropped is wasted work. Whoever builds them should use the
    same rule as the walker: read the opened payload, never the terminal event.
+
+**Grep hygiene (added after sending).** This doc and `blind-coreview-pilot/` now list every
+probe id, so a `findings/` grep run after this commit hits all of them. Exclude these two paths,
+or grep `findings/` at 2937716 (the pre-registration, which lists no ids). Seeing a bare id in
+the draw record is not exposure to its ruling. The same goes for the mesh notices that point
+here.
