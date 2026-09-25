@@ -1179,3 +1179,8 @@ input::placeholder {
 .decide-actions { display: flex; align-items: flex-end; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
 .decide-actions label { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 240px; font-size: 0.85rem; }
 .decide-actions input { padding: 6px 8px; }
+
+/* Two queues, two questions: a stopped act vs an asked-for reach. */
+.queue-heading { margin: 22px 0 8px; font-size: 1rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.scope-request { border-left: 3px solid var(--accent, #6aa9ff); }
+.decide-actions label.check { flex: 0 0 auto; min-width: 0; flex-direction: row; align-items: center; gap: 6px; }

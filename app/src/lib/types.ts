@@ -130,7 +130,31 @@ export interface DashboardSnapshot {
    * operator that the button lies.
    */
   pending_escalations: PendingEscalation[];
+  /**
+   * Scope requests awaiting a ruling — a member asking for reach on one path.
+   * Like the escalations, sent every tick (#1109) and discarded by this type
+   * until Sprint 2. Expired requests are dropped daemon-side.
+   */
+  pending_scope_requests: PendingScopeRequest[];
   generated_at: string;
+}
+
+/**
+ * A member's ask for reach on a path. Field names mirror the daemon payload
+ * (`core/src/server/dashboard.rs`) exactly.
+ */
+export interface PendingScopeRequest {
+  request_id: string;
+  /** Caller-asserted, not authenticated — the same caveat as an escalation's asker. */
+  claimed_by: string;
+  role: string;
+  /** Exactly one path. Recursion is the operator's choice at decide time, never the asker's. */
+  path: string;
+  /** The asker's own words. Shown whole: truncation is how a request gets ruled on its summary. */
+  reason: string;
+  requested_at: number;
+  expires_at: number;
+  secs_remaining: number;
 }
 
 /**
