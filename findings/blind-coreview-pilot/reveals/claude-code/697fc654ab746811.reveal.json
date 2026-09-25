@@ -1,0 +1,11 @@
+{
+ "v": 2,
+ "round": "blind-coreview-pilot-2026-09-25",
+ "reviewer": "claude-code",
+ "eid": "697fc654ab746811",
+ "record_sha256": "99b663ea3f11e2e396ede4a6881a76449e5df042af45a8ef7dfa1f06f37902cd",
+ "verdict": "abstain",
+ "basis": "The record carries no act: tool Edit, marker plugins/claude-code/hooks, stated_reason null, stated_detail null, no subject, unattributed. There is no target file, no old/new text, nothing to weigh. A decider shown only this could not judge whether the edit was justified, and neither can I. Recording insufficient evidence rather than guessing either way; the defect worth noting is that this era's opened payload did not carry the act at all.",
+ "nonce": "0e535659346347ebf0b387692e5b7805",
+ "sealed_at": 1790318035
+}

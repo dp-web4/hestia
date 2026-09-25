@@ -1,0 +1,11 @@
+{
+ "v": 2,
+ "round": "blind-coreview-pilot-2026-09-25",
+ "reviewer": "claude-code",
+ "eid": "88559ba7416a0f34",
+ "record_sha256": "d4deebecca04d1d8a8fae11f18e95f0a8352acda6f64ba05b74accfb9d8eb1b1",
+ "verdict": "concur",
+ "basis": "Write of a markdown forum note to /tmp/sc-organ-arc/forum/cbp-to-thor-...-2026-08-06.md. The marker is plugins/claude-code/hooks but the target path contains no hooks segment and is a scratch clone under /tmp; nothing in the record connects the write to a governed file. A forum note in a throwaway clone is exactly the kind of write a member should be able to make. Justified; the refusal itself looks like a matcher false positive (possibly cwd- or self-keyed).",
+ "nonce": "8e151c28ffc918c9c90810a695753589",
+ "sealed_at": 1790318035
+}
