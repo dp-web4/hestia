@@ -5,42 +5,61 @@ The mesh's echo measurement (findings/echo-or-independence-the-mesh-measured-202
 bottomed out at n=10 provably-blind pairs in five weeks of chain. Retrospective mining is
 exhausted; this instrument manufactures blindness prospectively:
 
-  seal   — a reviewer commits sha256(verdict + basis) BEFORE reading any peer factor
-  reveal — both seals published; the texts follow; nothing can be revised after
+  seal   — a reviewer commits sha256(verdict + basis + nonce) BEFORE reading any peer
+           factor. The nonce is generated at seal time, kept OUT of the published seal
+           doc, and revealed with the text: a terse basis ("sound, concur") is otherwise
+           brute-forceable from the published hash before the reveal (claude-code's
+           pre-seal review, reproduced: recovered in a 40-candidate search)
+  reveal — both seals published; the texts and nonces follow; nothing can be revised after
   stats  — agreement vs the independence null (the arc's own formula), with PABAK
            alongside Cohen's kappa because the marginals here are prevalence-lopsided
            (constraint 1 of the labeling protocol, written before the reveal, proved
-           load-bearing at it)
+           load-bearing at it). Two nulls are reported: `independence_null` from the
+           reviewers' LIVE-work marginals, and `round_internal_null` (kappa's pe) from
+           the round's own marginals. On a stratified probe set the first is the one
+           with the sampling caveat; the second is the pre-registered headline.
 
 Probe records are terminal historical escalations — nothing to authorize, so the probe
-is cheap and safe, and a reviewer's seal cannot leak into a ruling.
+is cheap and safe, and a reviewer's seal cannot leak into a ruling. The probe PACKET
+carries the attempted act, the rule that fired, and the record as the decider saw it —
+never the ruling: a seal settles order, not source, and two reviewers who can both see
+the outcome anchor on it (same review, change 1).
 
 Usage:
   blind_coreview.py seal  --reviewer kimi-code --eid <id> --verdict concur --basis-file f.md
-  blind_coreview.py verify --seal-file s.json --verdict concur --basis-file f.md
-  blind_coreview.py stats --pairs pairs.json   # pairs.json: [{a_dissent: bool, b_dissent: bool,
+                          # seal JSON on stdout (publishable); REVEAL-NONCE on stderr (keep
+                          # private until both seals are published)
+  blind_coreview.py verify --seal-file s.json --verdict concur --basis-file f.md --nonce <hex>
+  blind_coreview.py stats --pairs pairs.json   # pairs.json: [{a_name: str, b_name: str,
+                                              #   a_dissent: bool, b_dissent: bool,
                                               #   marginals: {name: dissent_rate}}]
 """
 import argparse
 import hashlib
 import json
+import secrets
 import sys
 import time
 
 
-def canonical(verdict: str, basis: str) -> bytes:
-    return (verdict.strip().lower() + "\n---\n" + basis.strip()).encode()
+def canonical(verdict: str, basis: str, nonce: str) -> bytes:
+    return (verdict.strip().lower() + "\n---\n" + basis.strip() + "\n---\n" + nonce).encode()
 
 
-def seal(reviewer: str, eid: str, verdict: str, basis: str) -> dict:
-    blob = canonical(verdict, basis)
+def seal(reviewer: str, eid: str, verdict: str, basis: str) -> tuple:
+    """Returns (public seal doc, nonce). The nonce never enters the doc: the doc is what
+    gets published before the reveal, and a low-entropy basis must not be recoverable
+    from it."""
+    nonce = secrets.token_hex(16)
+    blob = canonical(verdict, basis, nonce)
     return {"reviewer": reviewer, "eid": eid, "sha256": hashlib.sha256(blob).hexdigest(),
             "sealed_at": time.time(),
-            "note": "commitment over (verdict, basis); text revealed only after both seals"}
+            "note": "commitment over (verdict, basis, nonce); nonce and text revealed only "
+                    "after both seals"}, nonce
 
 
-def verify(seal_doc: dict, verdict: str, basis: str) -> bool:
-    return hashlib.sha256(canonical(verdict, basis)).hexdigest() == seal_doc["sha256"]
+def verify(seal_doc: dict, verdict: str, basis: str, nonce: str) -> bool:
+    return hashlib.sha256(canonical(verdict, basis, nonce)).hexdigest() == seal_doc["sha256"]
 
 
 def stats(pairs: list) -> dict:
@@ -64,6 +83,7 @@ def stats(pairs: list) -> dict:
     pabak = 2 * po - 1
     return {"n": n, "agree": agree, "raw_agreement": round(po, 4),
             "independence_null": round(null, 4), "excess_pts": round(100 * (po - null), 1),
+            "round_internal_null": round(pe, 4), "round_excess_pts": round(100 * (po - pe), 1),
             "kappa": round(kappa, 3) if kappa is not None else None,
             "pabak": round(pabak, 3),
             "marginals": {"a_dissent": round(a_d, 3), "b_dissent": round(b_d, 3)}}
@@ -81,13 +101,17 @@ def main() -> int:
     v.add_argument("--seal-file", required=True)
     v.add_argument("--verdict", required=True)
     v.add_argument("--basis-file", required=True)
+    v.add_argument("--nonce", required=True)
     st = sub.add_parser("stats")
     st.add_argument("--pairs", required=True)
     a = ap.parse_args()
     if a.cmd == "seal":
-        print(json.dumps(seal(a.reviewer, a.eid, a.verdict, open(a.basis_file).read()), indent=1))
+        doc, nonce = seal(a.reviewer, a.eid, a.verdict, open(a.basis_file).read())
+        print(json.dumps(doc, indent=1))
+        print(f"REVEAL-NONCE (private until both seals publish; reveal with the basis): {nonce}",
+              file=sys.stderr)
     elif a.cmd == "verify":
-        ok = verify(json.load(open(a.seal_file)), a.verdict, open(a.basis_file).read())
+        ok = verify(json.load(open(a.seal_file)), a.verdict, open(a.basis_file).read(), a.nonce)
         print("VERIFIED" if ok else "SEAL MISMATCH")
         return 0 if ok else 1
     else:
