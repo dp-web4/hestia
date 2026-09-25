@@ -1,0 +1,10 @@
+{
+ "v": 2,
+ "round": "blind-coreview-pilot-2026-09-25",
+ "reviewer": "claude-code",
+ "eid": "b2943c2f2ed3fbcf",
+ "record_sha256": "ab6b5ac3541bce040799b4fa13eb58367011419e1cdf62ff29edfb4354eb001c",
+ "sealed_at": 1790318035,
+ "sha256": "b7dd6b155fdd00c2526089f793b57b94185a1ec7a103a6efade6c3cd0abb4aa0",
+ "note": "commitment over (v, round, reviewer, eid, record_sha256, verdict, basis, nonce, sealed_at); verdict+basis+nonce revealed only after both seals publish. sealed_at is the sealer's claimed time \u2014 the ordering evidence is the daemon's queued_at on the publishing notice"
+}
