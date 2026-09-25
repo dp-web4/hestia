@@ -1085,6 +1085,237 @@ def test_no_raw_path_in_printed_output():
         del RAW_OK["WORKSPACE"]
 
 
+# --- beings (atlas `kind: being`) ---------------------------------------------------
+# A being has no hook config, so every question `inspect` asks of a harness has no answer
+# for it -- and the answer it would give is "ungovernable here, no plugin exists", which is
+# wrong in the dangerous direction. What evidences a governed being is its LAUNCHER unit.
+_BEING_ATLAS = {"kind": "being", "blocking_capable": True, "fails_open": False}
+_SYSTEMD = """[Service]
+Environment=HESTIA_HOME=%h/.hestia
+ExecStart=/usr/bin/python3 -m sage.gateway.heartbeat --member legion-being --model qwen --instance x
+"""
+_PLIST = """<plist><dict><key>ProgramArguments</key><array>
+<string>/usr/bin/python3</string><string>-m</string><string>sage.gateway.heartbeat</string>
+<string>--member</string>
+<string>mcnugget-being</string></array></dict></plist>"""
+
+
+def test_an_atlas_does_not_veto_hestias_own_agent_ids():
+    """An id in ALIASES but not in the atlas is still looked for. END TO END, through the real
+    CLI, because the defect lived in one line of `main` and a unit test of a helper would have
+    passed while the product stayed broken.
+
+    Measured 2026-09-21: `sage` is in ALIASES, and the being on this machine could not appear in
+    the inventory -- not because anything was undetectable, but because a descriptor was unmerged
+    in a DIFFERENT REPOSITORY. A registry hestia does not control must not be able to veto
+    hestia looking for a harness hestia already knows about."""
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        atlas, ws = d / "talk-to", d / "ws"
+        (atlas / "claude").mkdir(parents=True)
+        (atlas / "claude" / "descriptor.md").write_text("---\nharness: Claude Code\n---\n")
+        # A plugin registry that CONTAINS the two non-harnesses, so the "does not conjure"
+        # check below can fail. Without them the fixture made that check inert: unioning the
+        # registry in (the wrong fix) passed clean, because the fixture had no registry to
+        # pull them from. A sabotage that cannot apply proves nothing.
+        for plug in ("_shared", "reviewer", "claude-code"):
+            (ws / "hestia" / "plugins" / plug).mkdir(parents=True)
+        out = subprocess.run(
+            [sys.executable, str(Path(__file__).parent / "inventory.py"),
+             "--no-witness", "--json", f"--atlas={atlas}", f"--workspace={ws}"],
+            capture_output=True, text=True, timeout=180)
+        rep = json.loads(out.stdout)
+        # The look ITSELF, not the findings: an id that is enumerated, found absent, and has
+        # nothing to report is correctly quiet in `detail`, so `detail` cannot answer "was it
+        # looked for". That is why the report publishes the list.
+        looked = set(rep["scope"]["agents_looked_for"])
+        check("the atlas's own id is still enumerated", "claude" in looked, True)
+        # The atlas names exactly one id; every OTHER id hestia knows about must survive.
+        check("an id hestia knows about is enumerated though the atlas lacks a descriptor",
+              sorted(set(inventory.ALIASES) - looked), [])
+        check("...and the report says BOTH sources were used, so the reader can tell",
+              rep["scope"]["agent_enumeration"], "agent-atlas + built-in ALIASES")
+        # ...without inventing agents: the plugin registry's `_shared`/`reviewer` are a
+        # seat-config pseudo-member and a role, and unioning THEM in would fix one omission
+        # by manufacturing two harnesses.
+        check("and no non-harness is conjured", sorted(looked & {"_shared", "reviewer"}), [])
+
+
+def test_a_being_is_found_by_its_launcher_not_by_a_hook():
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        units = {"sd": (d / "sage-heartbeat.service", _SYSTEMD), "pl": (d / "being.plist", _PLIST),
+                 "other": (d / "unrelated.service", "[Service]\nExecStart=/bin/true --member nobody\n"),
+                 "anon": (d / "anon.service", "ExecStart=python3 -m sage.gateway.heartbeat --gate-only\n")}
+        for path, text in units.values():
+            path.write_text(text)
+        U = lambda *k: [units[x][0] for x in k]
+        being = lambda us: inventory.inspect_being("sage", [], dict(_BEING_ATLAS), units=us)
+        # The being path also looks for a from-source binary under the WORKSPACE. Point it at
+        # the fixture, or this test reads the machine it runs on (it did: the first run found
+        # McNugget's real sage-daemon and called the fixture "unprovisioned").
+        saved_ws, inventory.WORKSPACE = inventory.WORKSPACE, d / "ws"
+        (d / "ws").mkdir()
+        try:
+            _being_cases(d, U, being)
+            _being_parse_cases(d, being)
+        finally:
+            inventory.WORKSPACE = saved_ws
+
+
+def _being_cases(d, U, being):
+
+    r = being(U("sd", "other"))
+    check("being/systemd: the member id is read off the launcher", r["members"], ["legion-being"])
+    check("being/systemd: that id IS the governance id -- per seat, not `sage`", r["plugin"], "legion-being")
+    check("being/systemd: launched through its gateway = governed", (r["installed"], r["governed"]), (True, True))
+    check("being/systemd: a unit that merely says --member is not a launcher", len(r["launchers"]), 1)
+    check("being/systemd: HESTIA_* set -> no law-source finding", inventory.has_tag(r["findings"], "LAW-SOURCE"), False)
+
+    r = being(U("pl"))
+    check("being/launchd: sibling <string> args parse to the same id", r["members"], ["mcnugget-being"])
+    # Replicated on Sprout and CBP (agent-atlas PR #1): no HESTIA_* in the unit, so the gate
+    # client resolves the law from a source checkout, not the installed copy.
+    check("being/launchd: no HESTIA_* in the unit is a finding", inventory.has_tag(r["findings"], "LAW-SOURCE"), True)
+
+    r = being(U("anon"))
+    check("being: a launcher with no --member is UNKNOWN, never governed",
+          (r["governed"], bool(r["unknown"]), r["plugin"]), (False, True, None))
+
+    r = being(U("sd", "pl"))
+    check("being: two ids on one seat -> no id is picked", (r["plugin"], r["governed"], len(r["members"])), (None, False, 2))
+
+    r = being(U("other"))
+    check("being: no launcher, no executable -> not installed, and silent",
+          (r["installed"], r["unprovisioned"], r["findings"]), (False, False, []))
+
+    # The atlas must SAY the gate blocks and fails closed; a launcher alone is not enough.
+    r = inventory.inspect_being("sage", [], {"kind": "being"}, units=U("sd"))
+    check("being: launcher + an atlas that does not vouch for the gate -> unknown, not governed",
+          (r["governed"], bool(r["unknown"])), (False, True))
+
+    # A being the atlas names and this file has no launcher row for.
+    r = inventory.inspect_being("some_other_being", [], dict(_BEING_ATLAS), units=U("sd"))
+    check("being with no BEING_LAUNCHERS row says it cannot tell", (r["governed"], bool(r["unknown"])), (False, True))
+
+    # THIS SEAT'S STATE, 2026-09-20: the daemon binary exists and nothing launches a being.
+    exe = d / "bin" / "sage-daemon"; exe.parent.mkdir(); exe.write_text("#!/bin/sh\n"); exe.chmod(0o755)
+    r = inventory.inspect_being("sage", [str(exe.parent)], dict(_BEING_ATLAS), units=U("other"))
+    check("being: daemon present, no launcher -> installed, NOT governed, and named",
+          (r["installed"], r["governed"], r["unprovisioned"], inventory.has_tag(r["findings"], "UNPROVISIONED")),
+          (True, False, True, True))
+    gaps = inventory.classify([r])
+    check("classify: an unprovisioned being has its OWN gap", gaps["unprovisioned_being"], ["sage"])
+    check("classify: and is never 'ungovernable -- no plugin exists'; it needs none",
+          (gaps["ungovernable"], gaps["ungoverned"], gaps["dormant_plugin"]), ([], [], []))
+
+
+def _being_parse_cases(d, being):
+    """Sprout's review of PR #1076: four holes, each reproduced there against the first cut, which
+    searched the whole FILE for the launcher, for --member and for HESTIA_*."""
+    n = [0]
+
+    def unit(text, name=None):
+        n[0] += 1
+        sub = d / f"case{n[0]}"; sub.mkdir()
+        path = sub / (name or "sage-heartbeat.service"); path.write_text(text)
+        return path
+    LAUNCH = "ExecStart=/usr/bin/python3 -m sage.gateway.heartbeat --member legion-being\n"
+    law = lambda r: inventory.has_tag(r["findings"], "LAW-SOURCE")
+
+    r = being([unit("[Service]\n# ExecStart=python3 -m sage.gateway.heartbeat --member old-being\nExecStart=/bin/true\n")])
+    check("being/parse: a COMMENTED-OUT launcher launches nothing", (r["governed"], r["plugin"], r["launchers"]), (False, None, []))
+    r = being([unit("[Service]\nExecStartPre=python3 -m sage.gateway.heartbeat --member pre-being\nExecStart=/bin/true\n")])
+    check("being/parse: only ExecStart starts the being -- an ExecStartPre is not its launcher", r["launchers"], [])
+
+    r = being([unit("[Service]\nEnvironment=HESTIA_HOME=/h\nExecStartPre=/usr/bin/notify --member ops\n" + LAUNCH)])
+    check("being/parse: --member is read off the LAUNCHER's line, not the first one in the file",
+          (r["plugin"], r["members"], r["governed"]), ("legion-being", ["legion-being"], True))
+    r = being([unit("[Service]\nEnvironment=HESTIA_HOME=/h\nExecStart=/usr/bin/python3 -m sage.gateway.heartbeat \\\n    --member legion-being\n")])
+    check("being/parse: a continued ExecStart is one command", r["plugin"], "legion-being")
+
+    r = being([unit("[Service]\n# no HESTIA_HOME here on purpose\n" + LAUNCH)])
+    check("being/law: a COMMENT naming HESTIA_HOME does not quiet LAW-SOURCE", law(r), True)
+    r = being([unit("[Service]\nEnvironment=HESTIA_ROLE=member\n" + LAUNCH)])
+    check("being/law: a HESTIA_* the resolver never reads does not quiet it either", law(r), True)
+    r = being([unit('[Service]\nEnvironment="FOO=a b" HESTIA_SHARED_DIR=/s\n' + LAUNCH)])
+    check("being/law: any one of the three names the resolver reads does", law(r), False)
+
+    # The CORRECT wiring -- the seat projection -- is an EnvironmentFile. Asserting LAW-SOURCE
+    # over it is the wrong-direction answer.
+    proj = d / "legion-being.conf"; proj.write_text("# seat projection\nHESTIA_HOME=/h\nHESTIA_ROLE=member\n")
+    r = being([unit(f"[Service]\nEnvironmentFile=-{proj}\n" + LAUNCH)])
+    check("being/law: an EnvironmentFile that sets it is READ (names only): no finding, governed",
+          (law(r), r["governed"], r["unknown"]), (False, True, []))
+    r = being([unit(f"[Service]\nEnvironmentFile={d / 'absent.conf'}\n" + LAUNCH)])
+    check("being/law: one that cannot be read -> 'cannot tell', NOT an asserted LAW-SOURCE",
+          (law(r), bool(r["unknown"]), r["governed"]), (False, True, False))
+    u = unit("[Service]\n" + LAUNCH)
+    (u.parent / (u.name + ".d")).mkdir()
+    (u.parent / (u.name + ".d") / "10-law.conf").write_text("[Service]\nEnvironment=HESTIA_GATE_SHARED=/s\n")
+    check("being/law: a drop-in is part of the unit", law(being([u])), False)
+    (u.parent / (u.name + ".d") / "20-off.conf").write_text("[Service]\nExecStart=\nExecStart=/bin/true\n")
+    check("being/parse: a drop-in that RESETS ExecStart un-launches it", being([u])["launchers"], [])
+
+    # File present != launched: on Sprout the launcher is a oneshot fired by a same-named timer.
+    quiet = lambda r: not inventory.has_tag(r["findings"], "LAUNCHER-NOT-ENABLED")
+    u = unit("[Service]\nEnvironment=HESTIA_HOME=/h\n" + LAUNCH)
+    check("being/enabled: a static unit -> cannot tell, so silent", (quiet(being([u])), being([u])["launchers"][0]["enabled_on_disk"]), (True, None))
+    u.with_suffix(".timer").write_text("[Timer]\nOnCalendar=hourly\n[Install]\nWantedBy=timers.target\n")
+    r = being([u])
+    check("being/enabled: a timer nothing enables is a finding -- and `governed` still means INSTALLED",
+          (quiet(r), r["governed"]), (False, True))
+    (u.parent / "timers.target.wants").mkdir()
+    (u.parent / "timers.target.wants" / u.with_suffix(".timer").name).symlink_to(u.with_suffix(".timer"))
+    check("being/enabled: the .wants symlink IS enablement, readable with no bus", quiet(being([u])), True)
+
+    # Sprout, re-review: the lookup crossed scopes, so on the one seat that RUNS the being its real
+    # ~/.config/systemd/user/timers.target.wants/sage-heartbeat.timer answered for the fixture above.
+    saved = inventory.HOME, inventory.ETC_SYSTEMD, inventory.LIB_SYSTEMD
+    inventory.HOME, inventory.ETC_SYSTEMD, inventory.LIB_SYSTEMD = d / "home", d / "etc", d / "lib"
+    try:
+        def place(where, name, text):
+            where.mkdir(parents=True, exist_ok=True); (where / name).write_text(text); return where / name
+        TIMER = "[Timer]\nOnCalendar=hourly\n[Install]\nWantedBy=timers.target\n"
+        enabled_of = lambda u: being([u])["launchers"][0]["enabled_on_disk"]
+        user_cfg, user_lib = d / "home/.config/systemd/user", d / "lib/user"
+        place(user_cfg / "timers.target.wants", "sage-heartbeat.timer", "")
+        u = unit("[Service]\n" + LAUNCH); u.with_suffix(".timer").write_text(TIMER)
+        check("being/enabled: a seat's REAL user-scope link does not answer for a unit elsewhere", enabled_of(u), False)
+        s = place(d / "etc/system", "sage-heartbeat.service", "[Service]\n" + LAUNCH); place(s.parent, "sage-heartbeat.timer", TIMER)
+        check("being/enabled: nor for a same-named SYSTEM unit -- a user link enables nothing there", enabled_of(s), False)
+        l = place(user_lib, "sage-heartbeat.service", "[Service]\n" + LAUNCH); place(user_lib, "sage-heartbeat.timer", TIMER)
+        check("being/enabled: another dir of the SAME scope does (unit in lib, link in ~/.config)", enabled_of(l), True)
+        place(d / "etc/user" / (l.name + ".d"), "10-law.conf", "[Service]\nEnvironment=HESTIA_HOME=/h\n")
+        check("being/law: a drop-in in another dir of the same scope is part of the unit", law(being([l])), False)
+        o = place(user_lib, "other-being.service", "[Service]\n" + LAUNCH)
+        check("being/enabled: static, and no timer names it -> cannot tell", enabled_of(o), None)
+        place(user_lib, "hourly.timer", "[Timer]\nOnCalendar=hourly\nUnit=other-being.service\n[Install]\nWantedBy=timers.target\n")
+        check("being/enabled: a timer that names it with Unit= is followed", enabled_of(o), False)
+        place(user_cfg / "timers.target.wants", "hourly.timer", "")
+        check("being/enabled: and that timer's link is the enable", enabled_of(o), True)
+    finally:
+        inventory.HOME, inventory.ETC_SYSTEMD, inventory.LIB_SYSTEMD = saved
+
+    r = being([unit("[Service]\nExecStart=/usr/bin/env HESTIA_HOME=/x python3 -m sage.gateway.heartbeat --member legion-being\n")])
+    check("being/law: set on the launcher's own command line (env NAME=v ...) counts", (law(r), r["plugin"]), (False, "legion-being"))
+    r = being([unit("[Service]\n" + LAUNCH.rstrip() + " --note HESTIA_HOME=/x\n")])
+    check("being/law: AFTER the entry point it is an argument, not environment", law(r), True)
+
+    hidden = _PLIST.replace("<plist>", "<plist><!-- <string>sage.gateway.heartbeat</string> -->").replace(
+        "sage.gateway.heartbeat</string>\n", "not.the.gateway</string>\n")
+    check("being/launchd: an XML comment is not a ProgramArgument", being([unit(hidden, "c.plist")])["launchers"], [])
+    envd = _PLIST.replace("<dict>", "<dict><key>EnvironmentVariables</key><dict><key>HESTIA_HOME</key><string>/h</string></dict>")
+    check("being/launchd: EnvironmentVariables is where a plist sets it", law(being([unit(envd, "e.plist")])), False)
+    r = being([unit("<plist><dict><key>ProgramArguments", "broken.plist")])
+    check("being/launchd: an unparseable plist may hide a launcher -> unknown", bool(r["unknown"]), True)
+
+    gaps = dict.fromkeys(("miswired", "partial", "ungoverned", "ungovernable"), [])
+    check("status: an unprovisioned being is hestia-coverage work -> a rung, never OK",
+          (inventory.status_of(dict(gaps, unprovisioned_being=["sage"]), []), inventory.status_of(gaps, [])),
+          ("UNGOVERNED_PRESENT", "OK"))
+
+
 def test_generation_stamp_brackets_the_install():
     """hestia-deploy reruns this installer when `$BIN.installed-by` differs from the checkout's
     install.sh (GPT, PR #1071: a fix to the wrapper, unit, plist or hook registration changes
@@ -1136,6 +1367,8 @@ if __name__ == "__main__":
     test_helpers_are_defined_before_first_use()
     test_no_raw_path_in_printed_output()
     test_generation_stamp_brackets_the_install()
+    test_an_atlas_does_not_veto_hestias_own_agent_ids()
+    test_a_being_is_found_by_its_launcher_not_by_a_hook()
     test_unit_verdict()
     with tempfile.TemporaryDirectory() as d:
         test_verdict(Path(d))

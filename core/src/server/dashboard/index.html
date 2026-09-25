@@ -4197,6 +4197,11 @@
       remedy: 'The cheapest gap to close: the adapter is already built.' },
     { key: 'ungovernable', tone: 'amber', title: 'Ungovernable here — installed, and no hestia plugin exists for it',
       remedy: 'Someone has to build the adapter. Its failure mode below says what that adapter must assume.' },
+    // A being (atlas `kind: being`) needs no hestia plugin and has no hook to wire: its gate is
+    // built into its launcher. So its one gap is its own, and filing it under "ungovernable --
+    // no plugin exists" would send the operator to build an adapter nobody needs.
+    { key: 'unprovisioned_being', tone: 'amber', title: 'A being’s daemon is here, and nothing launches it as a member',
+      remedy: 'Cognition may be running; nothing acts under governance. Provision it: mint its identity on this host, join, have the operator admit it, then install the heartbeat unit that starts its gateway with --member <machine>-being.' },
     { key: 'miswired_3p', tone: 'amber', title: "A third party's gate is dead",
       remedy: 'Not hestia’s gate and not ours to rewrite, but the harness is failing open on it.' },
     { key: 'governed', tone: 'green', title: 'Governed', remedy: '' },
@@ -4321,6 +4326,9 @@
       fidelity: a.fidelity || '',
       findings: Array.isArray(x.findings) ? x.findings.length : 0,
       // The inventory's own words for what it could not determine about THIS agent.
+      // Provenance only (atlas SCHEMA.md): shown, and nothing here decides on it.
+      being: x.kind === 'being' || a.kind === 'being',
+      launchers: Array.isArray(x.launchers) ? x.launchers.length : 0,
       unknownReasons: Array.isArray(x.unknown) ? x.unknown.filter(u => typeof u === 'string' && u) : [],
       alsoFiledUnder: [],
       // Only the unaccounted group sets these; every other row carries them as "not applicable"
@@ -4373,10 +4381,13 @@
               ? `governance id <code>${escapeHtml(r.governanceId)}</code> → <em>no atlas id, because nothing on this machine was found to carry it</em>`
               : `atlas <code>${escapeHtml(r.atlasId)}</code>${
                 r.governanceId ? ` → governance id <code>${escapeHtml(r.governanceId)}</code>`
+                               : r.being ? ' → <em>no governance id yet — a being’s id is set by its launcher</em>'
                                : ' → <em>no hestia plugin, so no governance id</em>'}`}</span>
             ${r.failure === 'open' ? badge('amber', 'fails open', 'if its gate hook errors or times out, the action is ALLOWED')
               : r.failure === 'closed' ? badge('green', 'fails closed', 'if its gate hook errors or times out, the action is DENIED — a slow gate halts this agent')
               : badge('grey', 'failure mode unknown', 'the atlas descriptor does not say; do not assume either')}
+            ${r.being ? badge('grey', 'being', 'a locally hosted model with its own identity, woken by a heartbeat — governed like any harness; the tag is provenance') : ''}
+            ${r.being && r.launchers ? badge('grey', r.launchers + ' launcher' + (r.launchers === 1 ? '' : 's'), 'service units that start its gateway; the governance id is read from their --member argument') : ''}
             ${r.blocking.length ? badge('grey', 'blocks on ' + r.blocking.join(', ')) : ''}
             ${r.fidelity ? badge('grey', 'atlas: ' + r.fidelity, 'how well the descriptor itself has been checked') : ''}
             ${r.findings ? badge('amber', r.findings + ' finding' + (r.findings === 1 ? '' : 's')) : ''}
