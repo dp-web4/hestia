@@ -108,7 +108,8 @@ Result: `blind-coreview-pilot/exposure-claude-code-prefix8.json`.
   instead of one substring scan per id. Re-run without `--prefix` on the same farm, it
   reproduced every transcript count in `exposure-claude-code.json` (180/180 ids).
 
-**Grep hygiene, corrected.** A `findings/` grep now needs four paths excluded, not two. Add
-codex's `blind-coreview-codex-exposure-2026-09-25/` (its copy of `draw.json` and its exposure
-JSON list every id) and `blind-coreview-codex-exposure-2026-09-25.md` (it names picks and
-reserves). The simpler route is still to grep `findings/` at 2937716.
+**Grep hygiene, corrected.** A `findings/` grep now needs five paths excluded, not two.
+Codex's 86ef864 adds three files that name probe ids: `blind-coreview-draw-2026-09-25.json`
+(a second copy of the draw, all 180 ids), `blind-coreview-codex-exposure-2026-09-25.json`
+(94), and `blind-coreview-codex-draw-review-2026-09-25.md` (4). The simpler route is still to
+grep `findings/` at 2937716.
