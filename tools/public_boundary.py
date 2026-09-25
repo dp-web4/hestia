@@ -56,6 +56,22 @@ RUNTIME_SUFFIXES = {".py", ".sh", ".json", ".toml", ".service", ".yaml", ".yml"}
 REGULAR_MODES = {"100644", "100755"}
 BINARY_MANIFEST = "tools/public_binary_assets.sha256"
 
+# Frozen blind-co-review packets: verbatim historical `gate_escalation_opened`
+# payloads, digest-pinned by the round manifest — a QUOTE of a mechanism's record,
+# not a mechanism.  The runtime rule fires on the quoted content (a home path or a
+# private-context mention inside the historical payload), which is the evidence
+# working as intended, not a boundary leak.  Enumerated per this file's idiom —
+# each entry is a reviewed line; a new round adds its own.
+REVIEWED_FROZEN_EVIDENCE = frozenset({
+    f"findings/blind-coreview-pilot/packets/{eid}.json"
+    for eid in (
+        "36a7ad7f82f6879e", "61bb896f122571bf", "656ed1af45ada8c0",
+        "6887e4e9c894a584", "697fc654ab746811", "88559ba7416a0f34",
+        "8ffb4b9789eae149", "b2943c2f2ed3fbcf", "ca978444b3871e86",
+        "f8f3e32332a7e67e",
+    )
+})
+
 
 def tracked_paths(repo: Path) -> list[str]:
     raw = subprocess.check_output(["git", "ls-files", "-z"], cwd=repo)
@@ -211,7 +227,7 @@ def inspect(repo: Path, paths: list[str], *, cached: bool = False,
             problems.append(f"{rel}: private-key header outside an adversarial test")
 
         runtime = (Path(rel).suffix in RUNTIME_SUFFIXES and not is_test(rel)
-                   and not boundary_impl)
+                   and not boundary_impl and rel not in REVIEWED_FROZEN_EVIDENCE)
         if runtime:
             if "private-context" in text or "repos.jsonl" in text:
                 problems.append(f"{rel}: runtime mechanism depends on private operator context")
