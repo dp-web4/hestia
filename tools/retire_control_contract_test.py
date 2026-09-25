@@ -16,6 +16,19 @@ here is mostly the ways it must refuse to be easy:
     direction;
   * reinstate exists, and it must NOT restore the revoked grants.
 
+WHERE THE CONTROL LIVES, AND WHY IT MOVED (dp, 2026-09-25): *"i would rather move that
+functionality into govern->discover specifically, rather than have it prominently in the live
+monitoring channel."* The trust list is a screen people glance at; the act that revokes an
+agent's authority is not a glanceable one. It now sits in govern -> discover, the lifecycle pane,
+in a group Discover had to grow in order to hold it: the ids hestia records as members that
+nothing on this machine accounts for. That group IS the phantom class, so the control and the
+rows it exists for finally share a screen -- and the trust list keeps saying that a row is
+retired, because a monitoring view that silently omitted one would be lying about the machine.
+
+Both halves are pinned below: the controls are absent from the trust render and present on the
+Discover rows. A move that only half landed would leave the act in two places, which is how it
+got reviewed in the wrong place to begin with.
+
 The pure filter is lifted out and run under node. The rest is pinned at source, in the house
 idiom: a control that removes authority is checked for what it must not contain.
 
@@ -47,6 +60,17 @@ def block() -> str:
     return UI[a:UI.index("  const LOOKALIKE_MIN_LEN", a)]
 
 
+def trust_render() -> str:
+    """The live monitoring channel: the harness trust list's own render."""
+    a = UI.index("  function renderHarnessTrust(")
+    return UI[a:UI.index("  // Drill from the harness aggregate", a)]
+
+
+def discover_render() -> str:
+    a = UI.index("  function discoverRender(model)")
+    return UI[a:UI.index("  let discoverBusy = false;", a)]
+
+
 def source_contract() -> None:
     blk = block()
     check("both halves of the account are required before anything is sent",
@@ -67,6 +91,23 @@ def source_contract() -> None:
     # It must not offer to delete anything, here or anywhere near it.
     for verb in ("'DELETE'", '"DELETE"'):
         check(f"no {verb} in the retire block", verb in blk, False)
+
+    # THE MOVE, pinned from both ends. Either half alone would pass while the act sat in two
+    # places -- the state that put a grant-revoking button in a glanceable view in the first cut.
+    tr, disc = trust_render(), discover_render()
+    for control in ("data-retire=", "data-reinstate=", "trust-show-retired", "trust-hide-retired"):
+        check(f"the live trust list no longer carries {control}", control in tr, False)
+    check("...and it still SAYS a row is retired -- hiding that would misreport the machine",
+          "<strong>retired</strong> on this seat" in tr)
+    check("...and points at where the act went, rather than leaving a dead end",
+          tr.count("govern → discover"), 2)
+    check("discover carries retire", "data-retire=" in disc)
+    check("discover carries reinstate", "data-reinstate=" in disc)
+    check("the toggle moved with them", "disc-show-retired" in disc and "disc-hide-retired" in disc)
+    check("the toggle drives the pane that now owns the hiding",
+          "showRetired = t.id === 'disc-show-retired';" in blk and "discoverLoad();" in blk)
+    check("retire is offered on the phantom class only, not on an installed agent's row",
+          disc.count("data-retire=") == 1 and "g.key !== 'unaccounted' ? ''" in disc)
 
     # The daemon's half, pinned where each claim lives. The Rust suite exercises every one of
     # these; the pins here point at the lines that decide, not at declarations or literals --
@@ -107,15 +148,18 @@ def source_contract() -> None:
     check("a retired id connecting is witnessed", '"retired_member_connected"' in HANDLER)
     check("the module says what retirement is not", "It is not deletion." in RETIREMENT)
 
+# The two filters that now decide visibility, one per view. The trust list's is unconditional
+# (it no longer has a toggle); Discover's is the pure model, lifted whole.
+TRUST_FILTER = ("  const rows = allRows.filter(r => !retiredSet.has(r.plugin_id) "
+                "|| r.action_count > 0 || connected.has(r.plugin_id));")
+
+
 def run(expr: str, arg) -> object:
-    blk = block()
-    # The pure filter lives in renderHarnessTrust; lift the two lines that decide visibility.
     prog = (
-        "const showRetiredArg = JSON.parse(process.argv[1]);\n"
-        "const A = showRetiredArg;\n"
-        "function visible(allRows, retired, showRetired, connectedIds) {\n"
+        "const A = JSON.parse(process.argv[1]);\n"
+        "function visible(allRows, retired, connectedIds) {\n"
         "  const retiredSet = new Set(retired); const connected = new Set(connectedIds || []);\n"
-        "  const rows = allRows.filter(r => !retiredSet.has(r.plugin_id) || showRetired || r.action_count > 0 || connected.has(r.plugin_id));\n"
+        f"{TRUST_FILTER}\n"
         "  return { shown: rows.map(r => r.plugin_id), hidden: allRows.length - rows.length };\n"
         "}\n"
         f"process.stdout.write(JSON.stringify({expr}));"
@@ -127,30 +171,76 @@ def run(expr: str, arg) -> object:
     return json.loads(r.stdout)
 
 
+DP_ROWS = [{"plugin_id": "claude-code", "action_count": 5415},
+           {"plugin_id": "Claude-code", "action_count": 0},
+           {"plugin_id": "caude-code", "action_count": 0}]
+
+
 def behaviour() -> None:
-    # The filter's source of truth is the render block; assert the lifted copy is the same line,
-    # or this whole arm is testing a paraphrase.
-    check("the lifted filter is the dashboard's own line",
-          "const rows = allRows.filter(r => !retiredSet.has(r.plugin_id) || showRetired || r.action_count > 0 || connected.has(r.plugin_id));" in UI)
+    # The filter's source of truth is the render; assert the lifted copy is the same line, or
+    # this whole arm is testing a paraphrase.
+    check("the lifted filter is the dashboard's own line", TRUST_FILTER in UI)
 
-    dp = [{"plugin_id": "claude-code", "action_count": 5415},
-          {"plugin_id": "Claude-code", "action_count": 0},
-          {"plugin_id": "caude-code", "action_count": 0}]
     retired = ["Claude-code", "caude-code"]
-    got = run("visible(A[0], A[1], false)", [dp, retired])
-    check("dp's case: retiring the two phantoms leaves ONE Claude Code",
+    got = run("visible(A[0], A[1])", [DP_ROWS, retired])
+    check("dp's case: retiring the two phantoms leaves ONE Claude Code in the monitoring view",
           got, {"shown": ["claude-code"], "hidden": 2})
-    got = run("visible(A[0], A[1], true)", [dp, retired])
-    check("show retired: all three, nothing lost", got["shown"], ["claude-code", "Claude-code", "caude-code"])
 
-    # A retired id that is STILL ACTING is shown even when hiding: a live agent is not hidden.
+    # A retired id that is STILL ACTING is shown: a live agent is not hidden, and there is no
+    # longer a toggle here that could hide it either.
     live = [{"plugin_id": "claude-code", "action_count": 5415}, {"plugin_id": "kimi-code", "action_count": 12}]
-    got = run("visible(A[0], A[1], false)", [live, ["kimi-code"]])
+    got = run("visible(A[0], A[1])", [live, ["kimi-code"]])
     check("a retired id that is still acting stays visible", got, {"shown": ["claude-code", "kimi-code"], "hidden": 0})
-    check("nothing retired: nothing hidden", run("visible(A[0], A[1], false)", [dp, []])["hidden"], 0)
+    check("nothing retired: nothing hidden", run("visible(A[0], A[1])", [DP_ROWS, []])["hidden"], 0)
     # A retired id that is CONNECTED (never acted) stays visible: it is news, not something to hide.
-    got = run("visible(A[0], A[1], false, A[2])", [dp, ["Claude-code", "caude-code"], ["caude-code"]])
+    got = run("visible(A[0], A[1], A[2])", [DP_ROWS, retired, ["caude-code"]])
     check("a retired id that is connected right now stays visible", got, {"shown": ["claude-code", "caude-code"], "hidden": 1})
+
+
+def reachability() -> None:
+    """THE MOVE'S ONE REAL RISK: the phantoms become unreachable. The trust list could hide them
+    before, but it could also retire them. Discover could always show agents -- but only ones
+    found ON DISK, which a phantom by definition is not. A straight move would have left dp's two
+    ids with no screen that both shows them and can act on them. So the group Discover grew is
+    pinned here, from THIS test, as the thing that makes the move safe rather than as a feature."""
+    pure_src = UI[UI.index("const DISCOVER_GROUPS"):UI.index("function discoverRender(")]
+    prog = pure_src + ("\nconst A = JSON.parse(process.argv[1]);"
+                       "\nprocess.stdout.write(JSON.stringify(discoverModel(A[0], A[1], A[2], A[3])));")
+
+    def model(report, members, retired=(), show=False):
+        r = subprocess.run(["node", "-e", prog, json.dumps([report, members, list(retired), show])],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            FAILS.append(f"node failed: {r.stderr.strip()[-300:]}")
+            return {"groups": []}
+        return json.loads(r.stdout)
+
+    # This machine's real shape: the inventory names one governed harness; the registry holds three.
+    report = {"status": "OK", "governed": ["claude"], "gaps": {},
+              "detail": [{"agent": "claude", "plugin": "claude-code", "installed": True, "atlas": {},
+                          "configs_read": [], "findings": []}]}
+    both = ["Claude-code", "caude-code"]
+    m = model(report, DP_ROWS)
+    orphans = [r for g in m["groups"] for r in g["rows"] if g["key"] == "unaccounted"]
+    check("dp's two phantoms are REACHABLE in the pane that now owns retire",
+          [r["governanceId"] for r in orphans], ["Claude-code", "caude-code"])
+    check("...and the live id is not among them, so the dangerous one is not offered up",
+          "claude-code" not in [r["governanceId"] for r in orphans])
+    check("...and they lead the pane, because they are the reason to open it",
+          m["groups"][0]["key"], "unaccounted")
+    check("retiring both empties the group, and the hidden count survives so the toggle remains",
+          (any(g["key"] == "unaccounted" for g in model(report, DP_ROWS, both).get("groups", [])),
+           model(report, DP_ROWS, both)["hiddenRetired"]), (False, 2))
+    check("show retired brings them back, marked, which is what offers reinstate",
+          [(r["governanceId"], r["retired"]) for g in model(report, DP_ROWS, both, True)["groups"]
+           for r in g["rows"] if g["key"] == "unaccounted"],
+          [("Claude-code", True), ("caude-code", True)])
+    # The failure that would strand them quietly: the inventory walk dies and the pane renders
+    # empty. The registry half comes from the snapshot, so it must survive that.
+    m = model({"status": "UNKNOWN", "reason": "could not reach the inventory (boom)"}, DP_ROWS)
+    check("the inventory unreachable: the orphans are STILL listed and still actionable",
+          [r["governanceId"] for g in m["groups"] for r in g["rows"] if g["key"] == "unaccounted"],
+          ["claude-code", "Claude-code", "caude-code"])
 
 
 def test_retire_control_contract() -> None:
@@ -159,6 +249,7 @@ def test_retire_control_contract() -> None:
     source_contract()
     if shutil.which("node"):
         behaviour()
+        reachability()
     assert not FAILS, "\n".join(FAILS)
 
 
