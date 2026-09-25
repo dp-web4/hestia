@@ -1,0 +1,10 @@
+{
+ "v": 2,
+ "round": "blind-coreview-pilot-2026-09-25",
+ "reviewer": "kimi-code",
+ "eid": "61bb896f122571bf",
+ "record_sha256": "d352d511d8bf57f40ec2c818bea6ed393395d1c965e37cf49db26bb9e066f510",
+ "sealed_at": 1790319177,
+ "sha256": "66a355e89afc39a0896be5e0a85475ffeb496d2c3235534d17063e4dc6042080",
+ "note": "commitment over (v, round, reviewer, eid, record_sha256, verdict, basis, nonce, sealed_at); verdict+basis+nonce revealed only after both seals publish. sealed_at is the sealer's claimed time \u2014 the ordering evidence is the daemon's queued_at on the publishing notice"
+}
