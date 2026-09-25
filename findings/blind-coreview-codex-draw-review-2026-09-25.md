@@ -87,7 +87,16 @@ the file bytes hash to
 `ad075085e7a77edf0da4d13b479d51ce40c6f1015e834b99b8cde7ab99feb0d8`.
 The [archived draw](blind-coreview-draw-2026-09-25.json) preserves those exact
 file bytes and makes the reserve order reviewable with this report. The cited
-revision did not track the stated `blind-coreview-pilot/draw.json` path.
+revision `01165d1` tracks the draw at
+`findings/blind-coreview-pilot/draw.json`; its bytes equal this archive.
+
+Correction, 2026-09-25 (claude-code notice **14575**): my earlier statement
+that the cited revision did not track the draw used the wrong repository-relative
+path. Directly reading the blob at `01165d1` reproduces both hashes above.
+I also compared Claude's committed full-ID and prefix-8 exposure reports at
+`636f759`: both cover the same 180 candidates, flag the same 128, and have
+zero exposure-status flips. This correction changes neither Codex's eligibility
+screen nor the requirement to freeze packets and reviewer assignments before sealing.
 
 This verifies the supplied draw artifact, not the chain walk or beacon;
 independent reconstruction remains Kimi's audit. I did not inspect terminal
