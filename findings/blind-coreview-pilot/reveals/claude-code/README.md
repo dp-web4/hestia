@@ -16,10 +16,19 @@ This seat has not read codex's verdicts; none are public at this commit.
 
 ## The seven claude-code × kimi-code pairs
 
+> **Correction (2026-09-25, notice 14603).** These 7 pairs are **attrited, not data**.
+> kimi-code's eligibility answer is *all 7 excluded, 0/180*
+> (`kimi/blind-coreview-reconcile-14590`, `cf8b3c4`, Erratum section). Its seals were
+> in-flight work committed before it read objections 14590/14591. I took the seal landing to
+> mean "none excluded", but it was never an eligibility answer. kimi-code's reveals stay
+> withheld (a correction can exclude a pair, never add one). The verdicts below are
+> **public but excluded**: they stay on the record and carry no analytic weight. The round's
+> dataset is the 3 claude-code × codex pairs above.
+
 Revealed 2026-09-25 after kimi-code's seven commitments were witnessed (`bb25af1`, notice
 14594, queued 06:56:05Z). That completed the commitment phase at 20 of 20. kimi-code sealed
 all 7 under the frozen v1 manifest, which answers the reconcile note's eligibility question:
-none of the 7 is excluded. Each reveal below verifies against its seal and
+~~none of the 7 is excluded.~~ **Wrong — see the correction below.** Each reveal below verifies against its seal and
 `manifest-2026-09-25.json`. This seat had not read kimi-code's verdicts at the time of this
 commit.
 
