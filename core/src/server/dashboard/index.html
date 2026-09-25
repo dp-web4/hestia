@@ -2323,7 +2323,15 @@
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       const out = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
-      delegationsLoad(pluginId);
+      await delegationsLoad(pluginId);
+      // SAID, not implied (#1110): a verb this daemon does not interpret was stored as given and
+      // checked for nothing. The panel re-rendered above, so look the note line up again.
+      const unv = Array.isArray(out.unvalidated_actions) ? out.unvalidated_actions : [];
+      const note = $('deleg-err');
+      if (unv.length && note) {
+        note.textContent = `delegated — but not validated: ${unv.join(', ')} ${unv.length === 1 ? 'is not a verb' : 'are not verbs'} this daemon interprets, so ${unv.length === 1 ? 'it was' : 'they were'} stored as given and checked for nothing.`;
+        note.hidden = false;
+      }
     } catch (e) { if (err) { err.textContent = `delegate failed: ${e.message}`; err.hidden = false; } }
   }
   async function delegationRevoke(pluginId, delegId) {

@@ -3661,10 +3661,12 @@ fn cmd_delegate_grant(
     // the agent KEY, so nothing here had ever mapped it back to a member to ask (cbp, #1106
     // review, finding 5). The registry is small and the map is one way -- key = f(lct) -- so
     // the reverse is a scan, done once, here.
+    // Loaded once, for both refusals below: the retired-member check (#1106) and the action
+    // check (#1110). Two loads would be two readings of the registry that could disagree.
+    let registry = hestia::member_registry::load_members(&vault);
     {
         let retired = hestia::server::retirement::load(&vault);
         if !retired.retired.is_empty() {
-            let registry = hestia::member_registry::load_members(&vault);
             let who = registry.iter_sorted().into_iter().find(|(_, lct)| {
                 delegation::agent_key_for_lct(&lct.lct_id()) == agent_id
             }).map(|(id, _)| id.clone());
@@ -3679,6 +3681,14 @@ fn cmd_delegate_grant(
             }
         }
     }
+    // THE SAME ACTION CHECK AS THE HTTP DOOR (#1110), from the same function, so the two cannot
+    // drift -- this door is where #1106's retirement refusal was missing the first time. An
+    // action whose member segment names no recorded member, or a `scope.decide` shape that binds
+    // nothing, is refused before anything is signed.
+    #[rustfmt::skip]
+    let suggest: Vec<String> = registry.iter_sorted().into_iter().filter(|(id, _)| !registry.is_filler(id)).map(|(id, _)| id.clone()).collect();
+    let unvalidated = delegation::check_actions(&actions, &|m| registry.get(m).is_some(), &suggest)
+        .map_err(anyhow::Error::msg)?;
     let mut store = DelegationStore::load(&vault)?;
     let (delegator_id, delegator_kp) = delegation::operator_delegator(&vault, home)?;
     let deleg = store.create_delegation(
@@ -3700,6 +3710,10 @@ fn cmd_delegate_grant(
     println!("  id:      {id}");
     println!("  agent:   {agent_id}");
     println!("  expires: {exp}");
+    // SAID, not implied: accepted is not the same as checked.
+    for a in &unvalidated {
+        println!("  note:    '{a}' is not a verb this daemon interprets -- stored as given, NOT validated");
+    }
     Ok(())
 }
 
