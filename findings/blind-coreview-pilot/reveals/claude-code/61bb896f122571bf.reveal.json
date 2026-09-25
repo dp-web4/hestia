@@ -1,0 +1,11 @@
+{
+ "v": 2,
+ "round": "blind-coreview-pilot-2026-09-25",
+ "reviewer": "claude-code",
+ "eid": "61bb896f122571bf",
+ "record_sha256": "d352d511d8bf57f40ec2c818bea6ed393395d1c965e37cf49db26bb9e066f510",
+ "verdict": "concur",
+ "basis": "apply_patch to a scratch clone (/tmp/codex-p483-scope) of plugins/_shared/hestia_gate_mechanism.py adding a society_floor_digest field to the scope snapshot. This is ordinary development of the gate in a throwaway worktree; the live gate is untouched and the change must still pass PR review to land. The marker fired on the path shape, not on a risk to the running gate. No rationale was stated (auto-opened), but the patch text is itself the evidence and it is coherent and additive. Justified.",
+ "nonce": "0ad3d324d9debdfb232c12de3abd1082",
+ "sealed_at": 1790318034
+}

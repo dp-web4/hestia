@@ -1,0 +1,11 @@
+{
+ "v": 2,
+ "round": "blind-coreview-pilot-2026-09-25",
+ "reviewer": "claude-code",
+ "eid": "6887e4e9c894a584",
+ "record_sha256": "10b03c505a58fd83b55c6e79a1e5568fc7ab196b43ec61592d912f9fbe1ac63f",
+ "verdict": "concur",
+ "basis": "`git diff origin/main...HEAD -- core/src/server/dashboard/index.html | git apply --reverse` reverts the branch's own changes to one dashboard HTML file, then runs status and diff --check. The marker is the opaque-writer closure: git apply is a writer whose target the gate cannot resolve from the text. But the target is fully determined by the pathspec in the same command (one non-governance file), and the effect is to restore main's version. Justified; this is the known opaque-writer false-positive shape.",
+ "nonce": "d52980fde804cc4c7b2f0bd043d0b033",
+ "sealed_at": 1790318035
+}

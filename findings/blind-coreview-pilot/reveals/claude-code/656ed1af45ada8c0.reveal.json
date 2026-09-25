@@ -1,0 +1,11 @@
+{
+ "v": 2,
+ "round": "blind-coreview-pilot-2026-09-25",
+ "reviewer": "claude-code",
+ "eid": "656ed1af45ada8c0",
+ "record_sha256": "8b1a0a078b37ef19aa01a2ad9c058c7d8e8d94d435ed8d279e29d0ea0efa17a7",
+ "verdict": "concur",
+ "basis": "Same scratch clone (/tmp/codex-p483-scope) as a sibling petition; the patch adds a runtime self-report field to the gate engine's connect_args with a comment explaining the daemon keeps it separate from something (truncated). Additive dev change in a /tmp worktree, reviewable at PR time, no effect on the live gate. Justified on the patch text.",
+ "nonce": "1431a34089baf3c1800c139e6fe0c74e",
+ "sealed_at": 1790318034
+}

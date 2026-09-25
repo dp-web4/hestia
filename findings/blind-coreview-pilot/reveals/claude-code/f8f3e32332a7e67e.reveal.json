@@ -1,0 +1,11 @@
+{
+ "v": 2,
+ "round": "blind-coreview-pilot-2026-09-25",
+ "reviewer": "claude-code",
+ "eid": "f8f3e32332a7e67e",
+ "record_sha256": "0c9760b8245126b8fc376e24f1d0ffee7795fd379a63fa0a087699c6147684c3",
+ "verdict": "concur",
+ "basis": "apply_patch to a scratch clone (/tmp/hestia-public-boundary) of plugins/kimi/hooks/hydrate.sh, rewriting the comment block that describes how the MRH base grant is recomputed (public repos + granted private exceptions + launch cwd, preserving accrued grants). It is another seat's hook, and the subject is access scope, so it deserves real review, but it is in a throwaway clone and must pass PR review before it reaches kimi's live hook; the visible hunk is comment text. Justified to let the edit happen in the clone; the substantive scrutiny belongs at merge.",
+ "nonce": "82fe7fb719c55118f75da825ad681cf4",
+ "sealed_at": 1790318035
+}

@@ -1,0 +1,11 @@
+{
+ "v": 2,
+ "round": "blind-coreview-pilot-2026-09-25",
+ "reviewer": "claude-code",
+ "eid": "36a7ad7f82f6879e",
+ "record_sha256": "b6e650efaa915aee5dad016202ae58095c086f185b6c37f4f4dd003819e9bff1",
+ "verdict": "concur",
+ "basis": "The visible act is inspection only: `git show --stat` and a `git show` of plugins/codex/hooks/pre_tool_use.py at one commit piped into `rg`, then a python heredoc that imports chain_walk and walks a one-hour window of the chain into a list. Nothing in the visible text writes. The marker plugins/*/hooks matched a path that is read as a git-show argument, not written. Caveat: stated_reason is truncated mid-heredoc, so the tail of the script is unseen; on what the record shows, approving was justified.",
+ "nonce": "c42a373abd56e58f2608144139ca9931",
+ "sealed_at": 1790318034
+}

@@ -1,0 +1,11 @@
+{
+ "v": 2,
+ "round": "blind-coreview-pilot-2026-09-25",
+ "reviewer": "claude-code",
+ "eid": "8ffb4b9789eae149",
+ "record_sha256": "c8a73b5e69f5deec4448dc9589d3d2b00a5d66cdac03295f33f58266d91bd7a8",
+ "verdict": "concur",
+ "basis": "Visible act is read-only: `git status --short` on three paths, two loops of `git rev-parse <rev>:<path>` over four revs, then `python3 tools/c...` (truncated; likely the named tools/claude_heredoc_excision_v3_2751.py). The plugins/_shared marker matched hestia_governance_closure.py appearing as an argument to status/rev-parse, which read. The truncated python call is the one unknown; it appears to be an analysis script, not a writer to the governed path. Justified on the evidence, with that caveat.",
+ "nonce": "6b7ef5d5ad299c49df2f64a8c2bba038",
+ "sealed_at": 1790318035
+}
