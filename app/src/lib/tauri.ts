@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   DashboardSnapshot,
+  DecideOutcome,
   DaemonStatus,
   AppConfig,
   RemoteEntry,
@@ -24,7 +25,7 @@ export async function decideGateEscalation(
   id: string,
   approve: boolean,
   reason: string | null,
-): Promise<unknown> {
+): Promise<DecideOutcome> {
   return invoke("decide_gate_escalation", { id, approve, reason });
 }
 

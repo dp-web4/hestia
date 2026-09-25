@@ -32,8 +32,19 @@ and discarded. This sprint spends its effort on the decision path, not on plumbi
 - an approve with an empty reason is refused **by the app**, before the daemon sees it;
 - with no operator session, no decide control exists in the DOM.
 
+**Conflict management (PRD §1a), in this sprint because escalations are the single-shot case:**
+- a 409 from the engine renders as *already decided elsewhere*, not as an error;
+- the queue is re-read on window focus as well as on the tick;
+- the view re-reads after every decision instead of patching local state.
+
+Each is covered by a test that fails when the behaviour is reverted — measured, not asserted.
+
 **Non-goal:** scope requests. They share the pane later (Sprint 2), and mixing them here would
 couple two daemon contracts in one change.
+
+**Ruling owed before Sprint 4:** scope grants and config writes are **not** single-shot, so the 409
+story does not cover them. Last-writer-wins may be right for some and wrong for others, and the app
+must not pick silently. Sprint 4 is blocked on that ruling.
 
 ---
 

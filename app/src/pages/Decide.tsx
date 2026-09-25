@@ -43,8 +43,14 @@ function EscalationCard({
     setErr(null);
     try {
       const out = await decideGateEscalation(esc.id, approve, reason || null);
-      onDecided(esc.id, approve ? "approved" : "denied");
-      void out;
+      if (out.outcome === "already_decided") {
+        // Another view of this same engine got there first — the dashboard on
+        // this machine, the CLI, or a peer. The operator's click did not fail;
+        // the question was already answered. Say that, and re-read the queue.
+        onDecided(esc.id, "already decided elsewhere");
+      } else {
+        onDecided(esc.id, approve ? "approved" : "denied");
+      }
     } catch (e) {
       // The app's own refusal (an approve with no reason) and the daemon's are
       // shown the same way: the operator needs the sentence, not its origin.
@@ -150,7 +156,17 @@ export function Decide() {
   useEffect(() => {
     refresh();
     const t = setInterval(refresh, 10_000);
-    return () => clearInterval(t);
+    // The dashboard and the CLI act on the same engine, so this window can be
+    // stale the moment it loses focus. Re-read on focus as well as on the tick:
+    // a queue that offers a button for something already decided teaches the
+    // operator that the button lies, and switching windows is exactly when that
+    // happens.
+    const onFocus = () => refresh();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      clearInterval(t);
+      window.removeEventListener("focus", onFocus);
+    };
   }, [refresh]);
 
   return (
@@ -163,6 +179,12 @@ export function Decide() {
           <span className="muted">signed out</span>
         )}
       </header>
+
+      <p className="muted">
+        One engine, several views: this app, the daemon's own dashboard on this machine, and the
+        CLI all act on the same queue. The daemon decides, and a decision is single-shot — if one
+        is settled in another window it leaves here on the next read.
+      </p>
 
       {error && <div className="error-banner">could not read the queue: {error}</div>}
 
@@ -185,7 +207,12 @@ export function Decide() {
             <EscalationCard
               esc={esc}
               signedIn={!!status?.signed_in}
-              onDecided={(id, result) => setDecided((d) => ({ ...d, [id]: result }))}
+              onDecided={(id, result) => {
+                setDecided((d) => ({ ...d, [id]: result }));
+                // Whatever happened, the engine is now the only thing that knows
+                // the queue. Ask it rather than mutating a local copy.
+                refresh();
+              }}
             />
           )}
         </div>

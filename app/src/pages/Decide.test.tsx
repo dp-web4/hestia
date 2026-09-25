@@ -92,6 +92,46 @@ describe("Decide", () => {
     expect(screen.queryByText(/Nothing is waiting on you/)).toBeNull();
   });
 
+  it("treats a decision another view already made as an outcome, not an error", async () => {
+    // One engine, several views: the daemon's dashboard and the CLI act on the
+    // same queue. Losing that race means the question was already answered —
+    // rendering it in the error banner would teach the operator that the app
+    // failed when in fact the engine worked.
+    getDashboard.mockResolvedValue({ pending_escalations: [escalation()] });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+    decideGateEscalation.mockResolvedValue({
+      outcome: "already_decided",
+      detail: "Already approved or denied. Decisions are single-shot.",
+    });
+
+    render(<Decide />);
+    (await screen.findByRole("button", { name: /deny/i })).click();
+
+    await waitFor(() => expect(screen.getByText(/already decided elsewhere/i)).toBeTruthy());
+    expect(screen.queryByText(/error-banner/)).toBeNull();
+    expect(document.querySelector(".error-banner")).toBeNull();
+  });
+
+  it("re-reads the queue from the engine after any decision", async () => {
+    // The local view must not become the authority on what is still pending.
+    getDashboard.mockResolvedValue({ pending_escalations: [escalation()] });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+    decideGateEscalation.mockResolvedValue({ outcome: "decided", result: {} });
+
+    render(<Decide />);
+    (await screen.findByRole("button", { name: /deny/i })).click();
+
+    await waitFor(() => expect(getDashboard.mock.calls.length).toBeGreaterThan(1));
+  });
+
+  it("says out loud that other views act on the same queue", async () => {
+    getDashboard.mockResolvedValue({ pending_escalations: [] });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+
+    render(<Decide />);
+    expect(await screen.findByText(/One engine, several views/)).toBeTruthy();
+  });
+
   it("shows the asker as claimed, not as a proved identity", async () => {
     getDashboard.mockResolvedValue({ pending_escalations: [escalation()] });
     operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });

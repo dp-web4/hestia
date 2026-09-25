@@ -40,6 +40,62 @@ convenient one.
 
 ---
 
+## 1a. One engine, several views — and what that obliges
+
+**This is a standing constraint on every surface in this document, not a feature of one.**
+
+On a machine running hestia there is exactly one engine — the daemon — and at least three views
+onto it:
+
+| view | how it acts | authenticated by |
+|---|---|---|
+| this app | `/api/*` with an operator bearer | a proved operator LCT |
+| the daemon's own web dashboard | the same `/api/*` routes | operator session in the browser |
+| `hestia` CLI | the same store, in process | filesystem access to `HESTIA_HOME` |
+
+They are not peers negotiating. **The daemon is the arbiter and the only thing that knows the
+truth**, and the app must never behave as though its last read is authoritative. Two consequences,
+both already visible in the engine's own design:
+
+1. **Single-shot acts are already serialized.** `EscalationStore::decide` answers
+   `DecideError::AlreadyDecided` and the route returns **409**. The app does not improve on this and
+   must not try: no client-side locking, no "claim" before deciding, no optimistic local mutation
+   that assumes it won.
+
+2. **Losing a race is an outcome, not an error.** A 409 means the operator's intent was already
+   settled — by their own other window, or by a peer. Rendering that in an error banner teaches
+   them the app is unreliable at the exact moment the engine is working correctly. The app's
+   transport therefore keeps the status (`daemon::send_checked` → `Refused::Conflict`) where the
+   ordinary path flattens every refusal to a sentence.
+
+### The rules every surface follows
+
+- **Report the engine's answer, never a synthesised one.** A command returns what the daemon said;
+  it does not claim success the daemon did not grant. (For escalations this matters twice over:
+  whether an approval *permits* the write depends on the bar, so even a 200 is not "done".)
+- **A stale view must not offer an action.** The daemon already drops expired escalations from the
+  payload so that a button never outlives its decidability; the app extends the same principle
+  across views by re-reading **on focus** as well as on the tick, because switching windows is
+  precisely when another view has just acted.
+- **Re-read after acting; never patch local state and trust it.** Whatever happened, the engine is
+  now the only thing that knows the queue.
+- **Say it in the UI.** The Decide view states that the dashboard and CLI act on the same queue and
+  that decisions are single-shot. An operator who does not know there are several views cannot
+  interpret an item vanishing.
+
+### What is NOT in scope here
+
+- **Locking the other views out.** The CLI path exists and is used by scripts; the dashboard is
+  what dp uses today. The app earns primacy by being the only surface that can prove an operator
+  key (§1), not by excluding the others.
+- **Cross-view session sharing.** The app holds its own operator session; signing in here does not
+  sign in the dashboard and must not appear to.
+- **Conflict resolution for non-single-shot writes** (config, scope grants). Those are not
+  single-shot and need a per-surface answer — last-writer-wins is acceptable for some and not for
+  others. Each later sprint states which it is; Sprint 4 (Grant) cannot land without that ruling.
+
+---
+
 ## 2. What exists — measured 2026-09-24
 
 ### 2.1 The app runs, and is a monitor

@@ -8,10 +8,24 @@
 //!
 //! The app holds the operator key in its own encrypted vault (Sprint A, #298), so
 //! this is the one surface that can drive that channel as designed. Every call
-//! here goes through `daemon::send`, which attaches the operator bearer token and
-//! re-authenticates once from the unlocked vault if the session lapsed — so a
-//! decision never silently degrades to the weaker path. There is deliberately no
-//! CLI fallback in this file.
+//! here goes through the authed transport, which attaches the operator bearer
+//! token and re-authenticates once from the unlocked vault if the session
+//! lapsed — so a decision never silently degrades to the weaker path. There is
+//! deliberately no CLI fallback in this file.
+//!
+//! # Racing the machine's other views
+//!
+//! The daemon serves its own web dashboard and the CLI drives the same state.
+//! All three are views onto ONE engine, and the engine is the arbiter: a
+//! decision is single-shot (`DecideError::AlreadyDecided`) and the loser of a
+//! race gets 409. That is correct and this file does not try to improve on it.
+//!
+//! What this file must get right is the REPORT. A 409 means the operator's
+//! intent was already settled — by their own other window, or by a peer — and
+//! calling that "error" teaches them that the app is unreliable when it is the
+//! engine working. So the outcome is typed: `decided` when this call ruled,
+//! `already_decided` when another view did, with the daemon's own sentence
+//! carried through. Only a real failure is an `Err`.
 
 use tauri::State;
 
@@ -60,6 +74,9 @@ fn check_reason(approve: bool, reason: Option<&str>) -> Result<Option<String>, S
 /// Returns the daemon's own answer rather than a synthesised success: whether an
 /// approval actually permits the write depends on the bar the escalation was
 /// filed under, and this command must not claim more than the daemon said.
+///
+/// `{ outcome: "decided", result }` when this call ruled;
+/// `{ outcome: "already_decided", detail }` when another view got there first.
 #[tauri::command]
 pub async fn decide_gate_escalation(
     state: State<'_, AppState>,
@@ -77,13 +94,22 @@ pub async fn decide_gate_escalation(
     if let Some(r) = reason {
         body["reason"] = serde_json::Value::String(r);
     }
-    daemon::send(
+    match daemon::send_checked(
         &state,
         reqwest::Method::POST,
         "/api/operator/gate-escalation",
         Some(body),
     )
     .await
+    {
+        Ok(result) => Ok(serde_json::json!({ "outcome": "decided", "result": result })),
+        // Not an error: the engine settled this already, on this machine or
+        // another view of it. The caller re-reads the queue and shows what is.
+        Err(daemon::Refused::Conflict(detail)) => {
+            Ok(serde_json::json!({ "outcome": "already_decided", "detail": detail }))
+        }
+        Err(daemon::Refused::Other(e)) => Err(e),
+    }
 }
 
 #[cfg(test)]

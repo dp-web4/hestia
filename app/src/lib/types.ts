@@ -246,3 +246,17 @@ export interface SeatConfigPutResult {
   verdict: SeatConfigVerdict[];
   intentEntryHash: string;
 }
+
+/**
+ * What came of a decide call.
+ *
+ * `already_decided` is NOT an error. The daemon on this machine also serves its
+ * own web dashboard, and the CLI drives the same state; all of them are views
+ * onto one engine, and a decision is single-shot. Losing that race means the
+ * operator's intent was settled elsewhere — by their own other window or by a
+ * peer — and the honest response is to say so and show the current queue, not
+ * to report that their click failed.
+ */
+export type DecideOutcome =
+  | { outcome: "decided"; result: unknown }
+  | { outcome: "already_decided"; detail: string };
