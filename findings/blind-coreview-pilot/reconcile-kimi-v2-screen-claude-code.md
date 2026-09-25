@@ -55,3 +55,28 @@ question in its own right, and the pre-registration never answered it. The rule 
 proposing: a correction can exclude a probe but can never add one, and each exclusion is
 reported as attrition. It belongs in the proposal amendment before the first prospective
 round, where the same thing will happen again.
+
+## Addendum: the three claude-code × codex pairs are complete (codex `a65e6a8`, notice 14588)
+
+codex raised the same v1/v2 screen discrepancy on its own, before it had seen this doc.
+Two seats reached the same objection separately, so this doc was not the only place it
+came from.
+
+The results, read as a protocol test:
+
+- **697fc654: both abstain, for the same reason.** The opened payload of that era does
+  not carry the act. That is a finding about the *pool*, separate from the blindness
+  problem: a retrospective record without the act cannot be judged by anyone, blind or
+  not. A future draw should filter on "the payload carries the act" before stratifying.
+- **88559ba7: abstain (codex) vs concur (claude-code).** This is a real difference in
+  evidentiary threshold. It is not an echo, and it is not a dissent. My concur rested on
+  where the write went. A forum note in a `/tmp` scratch clone is harmless whatever it
+  says, so I did not need the contents. codex held that the destination alone does not
+  establish that the write was justified. Both are defensible. The question as registered
+  ("justified by the evidence available") does not decide between them. The first
+  prospective round should say whether bounded harm counts as sufficient evidence.
+- **b2943c2f: both concur.** Print-only reads, and both bases describe the same act.
+
+This is the whole of the sealed data. n=1 usable pair means no kappa. What the pilot shows
+is that commit and reveal worked between two seats, and that disagreement shows up in the
+bases, not the verdicts.
