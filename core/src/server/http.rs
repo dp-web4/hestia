@@ -1394,6 +1394,13 @@ pub async fn serve_with_callback(
                 if drifted > 0 {
                     tracing::warn!(drifted, "seat config: rendered artifacts do not match the vault");
                 }
+                // Gate bytes on the same cadence, and at startup (an interval's first tick is
+                // immediate). Before this the daemon checked its gates only when an operator
+                // asked (#1085); dp, 2026-09-21: the daemon verifies, the installer reads.
+                let gates = super::gate_watch::check(&mut s);
+                if gates["status"] != "VERIFIED" {
+                    tracing::warn!(status = %gates["status"], "gate integrity: not verified");
+                }
                 n
             };
             match super::handler::project_dispositions(&chain_handle, &inbox_handle) {
@@ -5713,7 +5720,7 @@ async fn agent_ungovern(
 /// So coverage now comes from the inventory, which already stats every hook target on the
 /// machine across the full scope chain and simply kept the list to itself. One discovery
 /// path, measured once, consumed by both surfaces.
-fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
+pub(crate) fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
     let inv = crate::server::agents::inventory().map_err(|e| e.to_string())?;
     if inv.get("status").and_then(|v| v.as_str()) == Some("UNKNOWN") {
         return Err(inv

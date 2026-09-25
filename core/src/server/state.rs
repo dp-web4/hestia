@@ -320,6 +320,10 @@ pub struct ServerState {
     /// findings on one member are two events, and a map that only knew the member folded the
     /// second into the first.
     pub config_findings_open: HashMap<String, crate::server::seat_config::OpenConfigFinding>,
+    /// Gate path → the integrity finding open against it (`gate_watch`). Rebuilt from the chain
+    /// at startup for the same reason as `config_findings_open`: a restart that forgot an open
+    /// finding would re-witness it, and lose the duration of its eventual resolution.
+    pub gate_findings_open: HashMap<String, crate::server::gate_watch::OpenGateFinding>,
     /// Member → the projection digest it PRESENTED on its last connect, against what the vault
     /// expected at that moment (#944 liveness). RAM-only and rebuilt by the next connect: a
     /// seat that has not connected since the restart has no liveness claim, which is the truth.
@@ -725,6 +729,7 @@ impl ServerState {
             // also repaired the artifact — so the next pass sees clean, has nothing to close,
             // and the chain keeps asserting an open finding forever.
             config_findings_open: crate::server::seat_config::rehydrate_open_findings(&chain_store),
+            gate_findings_open: crate::server::gate_watch::rehydrate(&chain_store),
             seat_live: HashMap::new(),
             scope_tally: std::collections::HashMap::new(),
             vault,

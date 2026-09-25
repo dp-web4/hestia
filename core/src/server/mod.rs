@@ -12,6 +12,7 @@ mod http;
 mod hub_tab;
 pub mod member_alias;
 pub mod operator_auth;
+pub mod gate_watch;
 pub mod seat_config;
 mod public_identity;
 pub mod retirement;
