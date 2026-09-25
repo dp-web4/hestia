@@ -18,7 +18,8 @@ is cheap and safe, and a reviewer's seal cannot leak into a ruling.
 Usage:
   blind_coreview.py seal  --reviewer kimi-code --eid <id> --verdict concur --basis-file f.md
   blind_coreview.py verify --seal-file s.json --verdict concur --basis-file f.md
-  blind_coreview.py stats --pairs pairs.json   # pairs.json: [{a_dissent: bool, b_dissent: bool,
+  blind_coreview.py stats --pairs pairs.json   # pairs.json: [{a_name: str, b_name: str,
+                                              #   a_dissent: bool, b_dissent: bool,
                                               #   marginals: {name: dissent_rate}}]
 """
 import argparse
