@@ -104,6 +104,18 @@ def source_contract() -> None:
     check("discover carries retire", "data-retire=" in disc)
     check("discover carries reinstate", "data-reinstate=" in disc)
     check("the toggle moved with them", "disc-show-retired" in disc and "disc-hide-retired" in disc)
+
+    # EVERY LIST, NOT TWO (dp, 2026-09-25: a retired `caude-code` "still shows up as a
+    # registered harness in the witness and other displays"). The agents bar is fixed on the
+    # daemon side (http.rs `a_retired_phantom_leaves_the_agents_bar_too`); the member pickers
+    # here. Retired ids leave every picker except the two MERGE pickers, where folding a
+    # phantom into the real id stays possible and the option says RETIRED.
+    keepers = re.findall(r'<select[^>]*data-keep-retired="1"[^>]*>', UI)
+    check("exactly the two merge pickers keep retired ids",
+          sorted(re.search(r'id="([^"]+)"', k).group(1) for k in keepers), ["ali-alias", "ali-of"])
+    check("every other picker drops them",
+          "ids.filter(([id]) => !retiredNow.has(id))" in UI and "sel.dataset.keepRetired" in UI)
+    check("...and where one is kept, it says so", "if (m.retired) bits.unshift('RETIRED');" in UI)
     check("the toggle drives the pane that now owns the hiding",
           "showRetired = t.id === 'disc-show-retired';" in blk and "discoverLoad();" in blk)
     check("retire is offered on the phantom class only, not on an installed agent's row",
