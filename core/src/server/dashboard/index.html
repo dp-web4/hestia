@@ -355,6 +355,11 @@
   .disc-ids  { font-size: 0.78rem; color: var(--fg-dim); }
   .disc-path { font-family: var(--mono); font-size: 0.72rem; color: var(--fg-dim); }
   .trust-retire { grid-column: 1 / -1; margin-top: 0.15rem; }
+  .deleg-panel { padding: 0.5rem 1.25rem 0.75rem; }
+  .deleg-row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: baseline; padding: 0.3rem 0; }
+  .deleg-row.deleg-off { opacity: 0.55; }
+  .deleg-scope { flex: 1 1 12rem; min-width: 8rem; }
+  .deleg-add { flex-wrap: wrap; }
   .trust-alike { flex-basis: 100%; grid-column: 1 / -1; font-size: 0.78rem; color: var(--fg-dim); margin-top: 0.2rem; }
   .trust-alike .pol-btn-add { margin-left: 0.5rem; }
   .disc-why { flex-basis: 100%; margin: 0.15rem 0 0 1.1rem; padding: 0; font-size: 0.78rem; color: var(--fg-dim); }
@@ -2235,6 +2240,111 @@
     return Object.values(byId).filter(v => v.roles > 0);
   }
 
+  // ── Delegated authority, from the agent (agent-lifecycle PRD R5, the half #1079 left) ──
+  //
+  // `hestia delegate grant/list/revoke` existed as a CLI writing the vault directly and the
+  // snapshot already carried `delegations`; no screen rendered them and there was no route.
+  // dp, 2026-09-19: "i can't inspect or manage roles or their environments". This panel is
+  // that CLI's three verbs, keyed by the agent the operator is looking at. NOTHING HERE TYPES
+  // AN AGENT: the agent is the selected one, the delegation key is derived server-side from
+  // its registry LCT, and the roles are a picker over the daemon's closed list.
+  let delegLoadedFor = null;
+  function delegationsMount(pluginId) {
+    let el = $('deleg-panel');
+    if (!el) {
+      el = document.createElement('div'); el.id = 'deleg-panel'; el.className = 'deleg-panel';
+      const list = $('trust-list'); if (list && list.parentNode) list.parentNode.insertBefore(el, list.nextSibling);
+    }
+    el.hidden = !pluginId;
+    if (!pluginId) { delegLoadedFor = null; return; }
+    if (delegLoadedFor !== pluginId) { delegLoadedFor = pluginId; delegationsLoad(pluginId); }
+  }
+  async function delegationsLoad(pluginId) {
+    const el = $('deleg-panel'); if (!el) return;
+    el.innerHTML = '<div class="pol-section-label">Delegated authority</div><div class="empty">Loading…</div>';
+    try {
+      const res = await apiFetch(`/api/agents/${encodeURIComponent(pluginId)}/delegations`);
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      el.innerHTML = delegationsHtml(pluginId, out);
+    } catch (e) {
+      el.innerHTML = `<div class="pol-section-label">Delegated authority</div><div class="esc-err">${escapeHtml(e.message)}</div>`;
+    }
+  }
+  // PURE (run under node by tools/delegation_panel_contract_test.py): the daemon's answer in,
+  // markup out. Revoked delegations stay listed and marked -- a delegation that vanished when
+  // revoked would leave the history unreadable from the screen that made it.
+  function delegationsHtml(pluginId, out) {
+    const rows = Array.isArray(out.delegations) ? out.delegations : [];
+    const roles = Array.isArray(out.roles) ? out.roles : [];
+    const row = d => {
+      const sc = d.scope || {};
+      const rl = Array.isArray(sc.roles) ? sc.roles.map(r => typeof r === 'string' ? r : (r.Custom || JSON.stringify(r))) : [];
+      const ac = Array.isArray(sc.actions) ? sc.actions : [];
+      const scope = (rl.length || ac.length) ? [...rl, ...ac].map(escapeHtml).join(', ') : '<em>unrestricted</em>';
+      const when = d.expires_at ? 'until ' + escapeHtml(String(d.expires_at).slice(0, 16)) : 'no expiry';
+      return `<div class="deleg-row${d.active ? '' : ' deleg-off'}">
+        <code title="${escapeHtml(String(d.id))}">${escapeHtml(String(d.id).slice(0, 8))}</code>
+        <span class="deleg-scope">${scope}</span>
+        <span class="tr-dim">${d.active ? when : (d.revoked ? 'revoked' : 'expired')}</span>
+        ${d.active ? `<button type="button" class="pol-btn pol-remove" data-deleg-revoke="${escapeHtml(String(d.id))}" data-deleg-agent="${escapeHtml(pluginId)}" title="Revoke this delegation. Witnessed; the record stays.">revoke…</button>` : ''}
+      </div>`;
+    };
+    // A RETIRED agent's panel is readable -- that is the point, its history is what retirement
+    // just revoked -- but it must not look like one that may be granted to, so the form goes
+    // and the reason is on screen (cbp, PR #1106).
+    const retired = out.retired === true;
+    return `<div class="pol-section-label">Delegated authority <span class="disc-count">${rows.length}</span></div>
+      <div class="grant-note">What <strong>${escapeHtml(pluginId)}</strong> may do on this society's behalf, signed by the operator's key.
+        Its delegation key is derived from its registry identity — <code>${escapeHtml(String(out.agent_key || '')).slice(0, 8)}…</code> — not typed.</div>
+      ${retired ? `<div class="grant-note"><strong>This id is retired on this seat.</strong> Its delegations were revoked when it was retired and are listed below as history. Reinstate it before delegating to it again.</div>` : ''}
+      ${rows.length ? rows.map(row).join('') : '<div class="empty">No delegations.</div>'}
+      ${retired ? '' : `<div class="pol-add grant-add deleg-add">
+        <select class="pol-input" id="deleg-roles" multiple size="4" title="society roles (pick one or more)">
+          ${roles.map(r => `<option value="${escapeHtml(r)}">${escapeHtml(r)}</option>`).join('')}
+        </select>
+        <input class="pol-input" id="deleg-actions" placeholder="actions, comma-separated (e.g. scope.decide:codex:/abs/prefix)" size="34">
+        <input class="pol-input" id="deleg-hours" type="number" min="1" placeholder="hours (blank = no expiry)" size="10">
+        <input class="pol-input" id="deleg-reason" placeholder="reason (required)" size="22">
+        <button type="button" class="pol-btn-add" id="deleg-grant" data-deleg-agent="${escapeHtml(pluginId)}">delegate</button>
+      </div>`}
+      <div class="esc-err" id="deleg-err" hidden></div>`;
+  }
+  async function delegationGrant(pluginId) {
+    const err = $('deleg-err'); if (err) err.hidden = true;
+    const roles = [...(($('deleg-roles') || {}).selectedOptions || [])].map(o => o.value);
+    const actions = (($('deleg-actions') || {}).value || '').split(',').map(x => x.trim()).filter(Boolean);
+    const hours = Number((($('deleg-hours') || {}).value || '').trim());
+    const reason = (($('deleg-reason') || {}).value || '').trim();
+    const body = { roles, actions, reason };
+    if (hours > 0) body.expires_hours = hours;
+    try {
+      const res = await apiFetch(`/api/agents/${encodeURIComponent(pluginId)}/delegations`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      delegationsLoad(pluginId);
+    } catch (e) { if (err) { err.textContent = `delegate failed: ${e.message}`; err.hidden = false; } }
+  }
+  async function delegationRevoke(pluginId, delegId) {
+    const reason = prompt(`Revoke delegation ${delegId.slice(0, 8)}… from "${pluginId}"?\n\nWhy?`);
+    if (!reason) return;
+    try {
+      const res = await apiFetch(`/api/agents/${encodeURIComponent(pluginId)}/delegations/${encodeURIComponent(delegId)}/revoke`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason }) });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      delegationsLoad(pluginId);
+    } catch (e) { alert(`revoke failed: ${e.message}`); }
+  }
+  document.addEventListener('click', e => {
+    const t = e.target && e.target.closest && e.target.closest('#deleg-grant,[data-deleg-revoke]');
+    if (!t) return;
+    e.stopPropagation();
+    if (t.id === 'deleg-grant') delegationGrant(t.dataset.delegAgent);
+    else delegationRevoke(t.dataset.delegAgent, t.dataset.delegRevoke);
+  }, true);
+
   let showRetired = false;
 
   // RETIRE / REINSTATE. The one act on this screen that removes authority, so it is the one
@@ -2367,6 +2477,7 @@
 
   function renderHarnessTrust(trust, orchs) {
     const root = $('trust-list'), title = $('trust-title'), hint = $('trust-hint');
+    delegationsMount(null);
     title.textContent = 'Plugin trust';
     if (hint) hint.textContent = 'click a harness to see its role trust';
     trustShown = [];   // no per-grain detail buttons in the aggregate view
@@ -2438,6 +2549,10 @@
       ? `<span class="gov-badge gov-${GOV_SEVERITY[gcov] || 'grey'}" title="${escapeHtml(GOV_NOTE[gcov] || '')}">${escapeHtml(GOV_LABEL[gcov] || gcov)}</span>`
       : 'click a role’s detail for the full tensor and its receipts') + ' ' + seatLink;
     let filtered = trust.filter(t => t.plugin_id === selectedOrch);
+    // The delegations panel rides below the role list, loaded on demand -- one GET per open,
+    // like a seat config. Rendered into its own element so a rerender of the list does not
+    // wipe a form the operator is filling in.
+    delegationsMount(selectedOrch);
     if (!filtered.length) {
       root.innerHTML = `<div class="empty">No trust data for ${escapeHtml(selectedOrch)}.</div>`;
       trustShown = [];
