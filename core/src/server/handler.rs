@@ -797,6 +797,19 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
         );
     }
 
+    // A RETIRED id that connects is not refused (retiring the seat you are typing from must not
+    // lock you out) and is not hidden either: it is news. Witnessed here so the fact is on the
+    // record, and the agents view keeps the row visible while it is connected (cbp, PR #1100
+    // review, finding 5 -- this event was documented before it existed).
+    if let Some(r) = s.retired_members.get(&plugin_id).cloned() {
+        let _ = s.append_chain("retired_member_connected", serde_json::json!({
+            "plugin_id": plugin_id,
+            "retired_at": r.retired_at,
+            "retired_because": r.reason,
+            "note": "a retired id connected; it holds no standing authority, and the operator \
+                     should decide whether to reinstate it or find out what is running under it",
+        }));
+    }
     s.sessions.insert(session_id, session);
     // Fresh-connect success boundary: synthetic persistence/member setup has completed and
     // the session now exists. Recording before this point would let a refused connect claim
@@ -3166,7 +3179,12 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
     // one-liner it looks like — that resolver scans a window, and `APPEAL_CHAIN_WINDOW`
     // (20_000) had already scrolled past 07-26 by 08-01. See the test above for the
     // measurement and the shape of a real repair (a durable index rebuilt at load).
-    let appellant_lct = s.member_lct(&appellant.plugin_id);
+    //
+    // REPAIRED 2026-09-20 (agent-lifecycle PRD R6). `SharedState::same_entity` is LCT equality
+    // OR the alias records, read type-indexed with NO window -- the repair the paragraph above
+    // asked for, without a second copy of the chain to keep in step. The history is left
+    // standing because the lesson is the comment, not the fix: this filter was cited as entity
+    // resolution for six weeks by three call sites, and resolved nothing.
     let pool: Vec<String> = s
         .member_registry
         .iter_sorted()
@@ -3177,10 +3195,10 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
             // None for synthetic ids, and select_arbiter refuses unrecognised reasoners
             // separately — an unmappable candidate must not be silently dropped here as if
             // identity had been established.
-            match (&appellant_lct, s.member_lct(id)) {
-                (Some(a), Some(b)) => a != &b,
-                _ => true,
-            }
+            // `same_entity` since 2026-09-20: LCT equality OR the operator's alias records,
+            // read without a window -- so this now reaches the `codex`/`codex-cli` case the
+            // comment above spent six weeks explaining it could not.
+            !s.same_entity(&appellant.plugin_id, id)
         })
         .collect();
     // Reachability is resolved per candidate and fed to routing — an arbiter that cannot
@@ -3365,11 +3383,8 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
     // (it costs nothing and catches the whitespace variant clause 1 misses), but it supplies
     // no independence evidence beyond the string compare, and the `why` it renders below
     // should not be read as "two names resolved to one entity".
-    let same_entity = {
-        let a = s.member_lct(&arbiter.plugin_id);
-        let b = s.member_lct(appellant);
-        a.is_some() && a == b
-    };
+    // (Since 2026-09-20 it may be: `same_entity` reads the operator's alias records too.)
+    let same_entity = s.same_entity(&arbiter.plugin_id, appellant);
     let independence = match crate::arbiter::eligibility(&parties) {
         _ if same_entity => {
             return Ok(hestia_error_envelope(
@@ -3674,12 +3689,9 @@ async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
         // `why` it renders — "different plugin_ids, same entity" — can only ever fire on ids
         // that differ by whitespace. Measured 2026-08-06,
         // `state::tests::the_member_lct_alias_guard_reaches_only_whitespace`.
+        // Since 2026-09-20 `same_entity` also follows the alias records, windowless.
         let eligibility = caller.as_ref().map(|c| {
-            let same_entity = {
-                let a = s.member_lct(&c.plugin_id);
-                let b = s.member_lct(appellant);
-                a.is_some() && a == b
-            };
+            let same_entity = s.same_entity(&c.plugin_id, appellant);
             if same_entity {
                 return json!({
                     "you_may_rule": false,
@@ -18901,7 +18913,6 @@ fn resolve_invitation(
         // Kept because it fails CLOSED — an unmappable candidate is invited rather than
         // dropped — but this receipt must not be read as evidence that entity resolution
         // happened. An invitation is cheap to over-issue and expensive to under-issue.
-        let asker_lct = s.member_lct(&esc.plugin_id);
         // Liveness is read from the member's own ACTS, never from its mailbox: a watcher
         // queues notices under a member's id whether or not the member ever woke, so a
         // mailbox signal would let the doorbell certify the member. Same window as the appeal
@@ -18927,9 +18938,8 @@ fn resolve_invitation(
             .into_iter()
             .map(|(id, _)| id.clone())
             .filter(|id| id != &esc.plugin_id)
-            .filter(|id| match (&asker_lct, s.member_lct(id)) {
-                (Some(a), Some(b)) => a != &b,
-                _ => true,
+            .filter(|id| {
+                !s.same_entity(&esc.plugin_id, id)
             })
             .filter(|id| match review_capability(s, id) {
                 Ok(basis) => {
@@ -20679,9 +20689,41 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
         })
         .collect();
 
+    // THE OTHER QUEUE A RESTART DROPS. Scope requests (hestia_request_scope) are a separate,
+    // memory-only table from gate escalations, and a daemon restart loses every pending one
+    // (measured on Sprout 2026-09-22). Until now the only all-members view of them was the
+    // operator dashboard, so a seat about to restart the daemon for maintenance (SAGE #180,
+    // delegation renewal needs the vault writer lease) could not CHECK "nothing pending" — it
+    // could only guess an hour. Served here, beside the escalations, on the surface every seat
+    // already reaches, so the precondition is machine-checked, not scheduled around.
+    let pending_scope: Vec<Value> = {
+        let mut v: Vec<&crate::server::state::ScopeRequest> = s
+            .scope_requests
+            .values()
+            .filter(|r| r.status(now) == "pending")
+            .collect();
+        v.sort_by_key(|r| r.requested_at);
+        v.into_iter()
+            .map(|r| {
+                json!({
+                    "request_id": r.id,
+                    // Caller-asserted (HST-005), as the dashboard labels it.
+                    "claimed_by": r.plugin_id,
+                    "path": r.path,
+                    "reason": r.reason,
+                    "requested_at": r.requested_at,
+                    "expires_at": r.expires_at,
+                    "secs_remaining": r.expires_at.saturating_sub(now),
+                })
+            })
+            .collect()
+    };
+
     Ok(json!({
         "pending": items,
         "count": items.len(),
+        "pending_scope_requests": pending_scope,
+        "pending_scope_count": pending_scope.len(),
         "you": caller.as_ref().map(|c| json!({"plugin_id": c.plugin_id, "role": c.role_lct})),
         "caveat": if caller.is_none() {
             "UNATTRIBUTED caller — pass your session_id from hestia_connect and each entry will \
@@ -21756,6 +21798,47 @@ mod standing_scope_surface_tests {
             s.standing_scope.generation, 2,
             "grant + revoke: the persisted generation carries both mutations"
         );
+    }
+
+    /// (SAGE #180, GPT review) A seat about to restart the daemon must be able to CHECK that
+    /// no member's scope request is pending — the restart drops them all. Both directions:
+    /// a pending request from ANY member (not the seat's own being) is listed with its id
+    /// and claimant; decided and lapsed ones are not; and the count is zero when the table is
+    /// empty, so a script can refuse on `pending_scope_count != 0` and proceed on `== 0`.
+    #[tokio::test]
+    async fn pending_escalations_also_serve_every_members_pending_scope_requests() {
+        let (_d, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        let out = tool_gate_pending_escalations(&state, &json!({})).await.unwrap();
+        assert_eq!(out["pending_scope_count"], 0, "empty table reads as zero, not absent: {out}");
+        assert!(out["pending_scope_requests"].as_array().unwrap().is_empty());
+        {
+            let mut s = state.lock().await;
+            let mut pending = live_request("cbp-being", "/w/cbp/notes/x.md", now);
+            pending.id = "scope-pending-1".into();
+            pending.granted = None;
+            pending.decided_by = None;
+            pending.decided_at = None;
+            s.scope_requests.insert(pending.id.clone(), pending);
+            let mut decided = live_request("sprout-being", "/w/sprout/journal.md", now);
+            decided.id = "scope-decided-1".into();
+            s.scope_requests.insert(decided.id.clone(), decided);
+            let mut lapsed = live_request("legion-being", "/w/legion/todo.md", now - 7200);
+            lapsed.id = "scope-lapsed-1".into();
+            lapsed.granted = None;
+            lapsed.decided_by = None;
+            lapsed.decided_at = None;
+            lapsed.expires_at = now - 3600;
+            s.scope_requests.insert(lapsed.id.clone(), lapsed);
+        }
+        let out = tool_gate_pending_escalations(&state, &json!({})).await.unwrap();
+        assert_eq!(out["pending_scope_count"], 1, "{out}");
+        let row = &out["pending_scope_requests"][0];
+        assert_eq!(row["request_id"], "scope-pending-1");
+        assert_eq!(row["claimed_by"], "cbp-being", "another member's ask is visible to the seat");
+        assert_eq!(row["path"], "/w/cbp/notes/x.md");
+        assert!(row["secs_remaining"].as_u64().unwrap() > 0);
+        assert_eq!(out["count"], 0, "the escalation queue itself is untouched by this");
     }
 
     /// (GPT #431 blocker 3) `snapshot_expires_at` never outlives a grant the snapshot

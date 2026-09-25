@@ -126,6 +126,11 @@ pub struct DashboardSnapshot {
     #[serde(default = "default_policy_view")]
     pub policy: PolicyView,
     pub trust: Vec<TrustView>,
+    /// Ids the operator retired on this seat. The rows STAY in `trust` -- hiding them here
+    /// would make "show retired" impossible and would hide a retired id that is still acting,
+    /// which is the one case worth seeing. The view filters; the snapshot reports.
+    #[serde(default)]
+    pub retired: Vec<String>,
     pub recent: Vec<RecentEntry>,
     /// Policy decisions (warn + deny) across the wider stats window — backs the
     /// warn/deny feed filters (the `recent` window may not include older denies).
@@ -1124,6 +1129,7 @@ impl ServerState {
                 .filter(|(_key, (_ts, pid, _role))| !self.is_synthetic(pid))
                 .collect();
         active_sorted.sort_by(|a, b| (&a.1.1, &a.1.2).cmp(&(&b.1.1, &b.1.2)));
+        let retired_ids = self.retired_members.ids();
         let trust: Vec<TrustView> = active_sorted
             .into_iter()
             .map(|(key, (_ts, pid, _role_ts))| {
@@ -1361,6 +1367,7 @@ impl ServerState {
             },
             stats_by_plugin,
             trust,
+            retired: retired_ids,
             // Shared with the worker's cache, so this copies the feed rather than re-reading it.
             recent: Arc::unwrap_or_clone(recent),
             policy_decisions,

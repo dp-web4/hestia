@@ -354,6 +354,9 @@
   .disc-name { font-weight: 600; }
   .disc-ids  { font-size: 0.78rem; color: var(--fg-dim); }
   .disc-path { font-family: var(--mono); font-size: 0.72rem; color: var(--fg-dim); }
+  .trust-retire { grid-column: 1 / -1; margin-top: 0.15rem; }
+  .trust-alike { flex-basis: 100%; grid-column: 1 / -1; font-size: 0.78rem; color: var(--fg-dim); margin-top: 0.2rem; }
+  .trust-alike .pol-btn-add { margin-left: 0.5rem; }
   .disc-why { flex-basis: 100%; margin: 0.15rem 0 0 1.1rem; padding: 0; font-size: 0.78rem; color: var(--fg-dim); }
   .disc-badge { font-size: 0.68rem; padding: 0.05rem 0.4rem; border-radius: 0.6rem;
                 border: 1px solid var(--fg-faint); white-space: nowrap; }
@@ -1546,7 +1549,7 @@
             </div>
             <div id="cfg-seat-list"><div class="empty">Loading…</div></div>
             <div class="pol-add cfg-new">
-              <input class="pol-input" id="cfg-new-id" placeholder="seat id not listed (e.g. gemini)" size="24">
+              <select class="pol-input member-pick" id="cfg-new-id" data-empty="a member with no seat config yet"></select>
               <button type="button" class="pol-btn" id="cfg-new-open" disabled>configure</button>
             </div>
             <div id="cfg-editor" class="cfg-editor" hidden>
@@ -2225,14 +2228,158 @@
     return Object.values(byId).filter(v => v.roles > 0);
   }
 
+  let showRetired = false;
+
+  // RETIRE / REINSTATE. The one act on this screen that removes authority, so it is the one
+  // that asks twice: a reason and an evidence pointer are required by the daemon (a retirement
+  // that revokes grants must not be an unexplained row itself), and a member that has ACTED
+  // recently is refused until the operator confirms it -- the three look-alike ids differ by one
+  // character, and the live one is the seat the operator is typing from.
+  async function retireAgent(id) {
+    const reason = prompt(`Retire "${id}" on this seat?\n\nIts standing grants are revoked and the row is hidden. Not deletion: the chain keeps every act it made, and this is reversible.\n\nWhy?`);
+    if (!reason) return;
+    const ref = prompt(`Evidence pointer for retiring "${id}" (required — where the reason is recorded):`);
+    if (!ref) return;
+    const send = async (confirm_active) => {
+      const res = await apiFetch(`/api/agents/${encodeURIComponent(id)}/retire`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason, ref, ...(confirm_active ? { confirm_active: true } : {}) }),
+      });
+      return [res, await res.json().catch(() => ({}))];
+    };
+    try {
+      let [res, out] = await send(false);
+      // The guard, surfaced with its evidence rather than as a bare refusal: the act count is
+      // what tells the operator which of three look-alikes they have hold of.
+      if (res.status === 409 && out && out.acts_recently) {
+        if (!confirm(`"${id}" has taken ${out.acts_recently} act(s) in the last ${out.window_hours}h — this is a LIVE member, not a phantom.\n\nRetiring it revokes its standing grants. Continue?`)) return;
+        [res, out] = await send(true);
+      }
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      await tick();
+      rerender(lastData);
+    } catch (e) { alert(`retire failed: ${e.message}`); }
+  }
+
+  async function reinstateAgent(id) {
+    const reason = prompt(`Reinstate "${id}"?\n\nThe standing grants revoked at retirement are NOT restored — re-grant any that are still wanted, deliberately.\n\nWhy?`);
+    if (!reason) return;
+    try {
+      const res = await apiFetch(`/api/agents/${encodeURIComponent(id)}/reinstate`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason }),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      await tick();
+      rerender(lastData);
+    } catch (e) { alert(`reinstate failed: ${e.message}`); }
+  }
+
+  document.addEventListener('click', e => {
+    const t = e.target && e.target.closest && e.target.closest('[data-retire],[data-reinstate],#disc-show-retired,#disc-hide-retired');
+    if (!t) return;
+    e.stopPropagation();
+    if (t.id === 'disc-show-retired' || t.id === 'disc-hide-retired') {
+      showRetired = t.id === 'disc-show-retired';
+      discoverLoad();
+    } else if (t.dataset.retire) { retireAgent(t.dataset.retire); }
+    else { reinstateAgent(t.dataset.reinstate); }
+  }, true);
+
+  // ── Look-alike members (agent-lifecycle PRD R6) ────────────────────────────────────────
+  //
+  // A member id is caller-asserted text, so a typo in a grant form mints a member (#1067): dp's
+  // trust list showed `claude-code` (5,415 actions), `Claude-code` (0) and `caude-code` (0) as
+  // three agents. The remedy already exists -- the operator's alias act -- but reaching it meant
+  // noticing the typo, finding the form, and picking both ids again by hand.
+  //
+  // PURE, run under node by tools/lookalike_merge_contract_test.py. DELIBERATELY NARROW, because
+  // a wrong suggestion is an invitation to join two real members' evidence:
+  //   * only an id that has NEVER ACTED is ever suggested as the alias -- a phantom's signature.
+  //     Two ids that both act are two things that act, however alike their names;
+  //   * the survivor must have acted, and must be the ONLY candidate, or nothing is offered;
+  //   * alike means equal ignoring case and punctuation, or ONE edit apart (insert, delete,
+  //     substitute, or a swap of neighbours) on ids long enough for that to mean something.
+  // It SUGGESTS and PRE-FILLS. It never posts: the act stays the operator's, with its own button.
+  const LOOKALIKE_MIN_LEN = 6;
+  function lookalikeKey(id) { return String(id || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
+  function withinOneEdit(a, b) {
+    if (a === b) return true;
+    const la = a.length, lb = b.length;
+    if (Math.abs(la - lb) > 1) return false;
+    let i = 0;
+    while (i < la && i < lb && a[i] === b[i]) i++;
+    if (la === lb) {
+      if (a.slice(i + 1) === b.slice(i + 1)) return true;                       // substitute
+      return a[i] === b[i + 1] && a[i + 1] === b[i] && a.slice(i + 2) === b.slice(i + 2);  // swap
+    }
+    const [shorter, longer] = la < lb ? [a, b] : [b, a];
+    return shorter.slice(i) === longer.slice(i + 1);                            // insert / delete
+  }
+  function lookalikeSuggestions(rows) {
+    const list = (rows || []).filter(r => r && r.plugin_id);
+    const acted = list.filter(r => (r.action_count || 0) > 0);
+    const out = {};
+    for (const r of list) {
+      if ((r.action_count || 0) > 0) continue;
+      const k = lookalikeKey(r.plugin_id);
+      if (k.length < LOOKALIKE_MIN_LEN) continue;
+      const hits = acted.filter(s => {
+        const ks = lookalikeKey(s.plugin_id);
+        return ks.length >= LOOKALIKE_MIN_LEN && withinOneEdit(k, ks);
+      });
+      if (hits.length !== 1) continue;   // none, or ambiguous: say nothing rather than guess
+      const of = hits[0];
+      const how = lookalikeKey(of.plugin_id) === k ? 'differs only in case or punctuation' : 'one character apart';
+      out[r.plugin_id] = { alias: r.plugin_id, of: of.plugin_id, how,
+        ref: `dashboard look-alike: '${r.plugin_id}' ${how} from '${of.plugin_id}'; 0 actions vs ${of.action_count}` };
+    }
+    return out;
+  }
+  // Fill the operator's alias form and take them to it. Does not submit.
+  function prepareMerge(alias, of, ref) {
+    setView('govern', true);
+    governShow('acts');
+    refreshMemberPickers();
+    for (const [id, v] of [['ali-of', of], ['ali-alias', alias], ['ali-ref', ref]]) {
+      const el = $(id);
+      if (!el) continue;
+      el.value = v;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    const f = $('ali-reason'); if (f) { f.scrollIntoView({ block: 'center' }); f.focus(); }
+  }
+  document.addEventListener('click', e => {
+    const b = e.target && e.target.closest && e.target.closest('[data-merge-alias]');
+    if (!b) return;
+    e.stopPropagation();
+    prepareMerge(b.dataset.mergeAlias, b.dataset.mergeOf, b.dataset.mergeRef);
+  }, true);
+
   function renderHarnessTrust(trust, orchs) {
     const root = $('trust-list'), title = $('trust-title'), hint = $('trust-hint');
     title.textContent = 'Plugin trust';
     if (hint) hint.textContent = 'click a harness to see its role trust';
     trustShown = [];   // no per-grain detail buttons in the aggregate view
     const connected = new Set(orchs.filter(o => o.connected).map(o => o.id));
-    const rows = aggregateHarnessTrust(trust).sort((a, b) => b.action_count - a.action_count);
-    noteMembers(rows);   // keep the member pickers backed by real evidence
+    const allRows = aggregateHarnessTrust(trust).sort((a, b) => b.action_count - a.action_count);
+    noteMembers(allRows);   // keep the member pickers backed by real evidence
+    const alike = lookalikeSuggestions(allRows);
+    // RETIRED IDS ARE HIDDEN, NOT DROPPED (agent-lifecycle R1). Two exceptions, both deliberate:
+    // an id that is retired and STILL ACTING, or one CONNECTED right now -- hiding a live agent
+    // is the one direction here that would be dangerous, so it stays visible and says so.
+    //
+    // THIS VIEW NO LONGER RETIRES ANYTHING (dp, 2026-09-25). It is the live monitoring channel,
+    // and a control that revokes authority does not belong in a screen people glance at. Retire,
+    // reinstate and `show retired` moved to govern -> discover, which is the lifecycle pane and
+    // already holds register -- retire's inverse. What stays here is the FACT that a row is
+    // retired, because a monitoring view that silently omitted one would be lying about the
+    // machine. See `discoverModel`'s `unaccounted` group for where the act lives now.
+    const retiredSet = new Set((lastData && lastData.retired) || []);
+    const rows = allRows.filter(r => !retiredSet.has(r.plugin_id) || r.action_count > 0 || connected.has(r.plugin_id));
+    const hidden = allRows.length - rows.length;
     if (!rows.length) {
       root.innerHTML = '<div class="empty">No plugins recorded yet. Connect one to start building trust.</div>';
       return;
@@ -2258,6 +2405,15 @@
         <span class="tr-val"></span>
         <span class="trust-level">${escapeHtml(r.level)}</span>
         <span class="tr-drill">${drillable ? 'roles →' : ''}</span>
+        ${retiredSet.has(r.plugin_id) ? `<div class="trust-alike"><strong>retired</strong> on this seat — its standing grants were revoked.${
+            connected.has(r.plugin_id) ? ' <strong>It is connected right now</strong>, which is why it is shown: a live agent is not hidden.'
+            : r.action_count > 0 ? ' <strong>It has acted</strong>, which is why it is shown: a live agent is not hidden.' : ''}
+          Manage it under <strong>govern → discover</strong>.</div>` : ''}
+        ${alike[r.plugin_id] ? `<div class="trust-alike">never acted, and ${escapeHtml(alike[r.plugin_id].how)} from
+          <strong>${escapeHtml(alike[r.plugin_id].of)}</strong> — probably a mistyped id.
+          <button type="button" class="pol-btn-add" data-merge-alias="${escapeHtml(r.plugin_id)}"
+            data-merge-of="${escapeHtml(alike[r.plugin_id].of)}" data-merge-ref="${escapeHtml(alike[r.plugin_id].ref)}"
+            title="Fills the alias form under govern → acts. Nothing is recorded until you press its button.">prepare merge</button></div>` : ''}
       </div>`;
     }).join('');
   }
@@ -2269,9 +2425,15 @@
     // where the agents-drawer safety signal now lives, at the per-harness grain. MISWIRED
     // (fails open) reads loudest; a clean harness reads 'governed'.
     const gcov = govByAgent[selectedOrch];
-    if (hint) hint.innerHTML = gcov
+    // The way from an AGENT to what it connects as and the environment it runs in. Both were
+    // manageable all along, under govern → runtime config, reachable only by knowing that;
+    // dp, 2026-09-19: "we already list them ... but i can't inspect or manage roles or their
+    // environments". Opening a seat is a witnessed read, so this is a button, not a preview.
+    const seatLink = `<button type="button" class="pol-btn" data-open-seat="${escapeHtml(selectedOrch)}"
+      title="What this agent connects AS (its capacity role) and the environment it runs in. Opening it is witnessed.">role &amp; environment →</button>`;
+    if (hint) hint.innerHTML = (gcov
       ? `<span class="gov-badge gov-${GOV_SEVERITY[gcov] || 'grey'}" title="${escapeHtml(GOV_NOTE[gcov] || '')}">${escapeHtml(GOV_LABEL[gcov] || gcov)}</span>`
-      : 'click a role’s detail for the full tensor and its receipts';
+      : 'click a role’s detail for the full tensor and its receipts') + ' ' + seatLink;
     let filtered = trust.filter(t => t.plugin_id === selectedOrch);
     if (!filtered.length) {
       root.innerHTML = `<div class="empty">No trust data for ${escapeHtml(selectedOrch)}.</div>`;
@@ -2315,7 +2477,8 @@
         <button type="button" class="tr-detail" onclick="showTrustDetail(${i})"
                 title="Full tensor, every dimension, and the chain receipts behind it">detail</button>
       </div>`;
-    }).join('');
+    }).join('') + (hidden ? `<div class="grant-note">${hidden} retired id${hidden === 1 ? '' : 's'} hidden —
+      listed, with the controls, under <strong>govern → discover</strong>.</div>` : '');
   }
 
   // Drill from the harness aggregate into that harness's role trust — the same selection
@@ -4045,12 +4208,37 @@
     { key: 'dormant_plugin', tone: 'grey', title: 'Not installed here — a plugin is ready if it arrives', remedy: '' },
   ];
 
+  // THE OTHER HALF OF THIS PANE'S OWN QUESTION (dp, 2026-09-25). Every group above is read from
+  // the inventory, which walks disk and the atlas, and answers "what is installed on this
+  // machine, and is it governed?". This one answers the inverse, which the inventory cannot see
+  // at all: "what does hestia already call a member here, that nothing on this machine accounts
+  // for?" Those ids live in the member registry. They have no executable, no config dir, nothing
+  // on disk -- which is precisely why the pane that lists agents never listed them.
+  //
+  // That is the shape of dp's three `claude-code` rows: two were minted by mistyped grants
+  // (#1067), and were invisible here while being the whole reason this pane was built. RETIRE
+  // lives on these rows. It is the placement dp asked for -- the lifecycle pane, beside the
+  // gaps and their remedies, rather than in the live trust list people glance at.
+  const UNACCOUNTED_GROUP = {
+    key: 'unaccounted', tone: 'amber',
+    title: 'Recorded as a member here — and nothing on this machine accounts for it',
+    remedy: 'A member id hestia has recorded, with no harness on disk behind it. A grant made ' +
+            'before the agent first connected looks like this, and so does a typo. If it is a ' +
+            'typo, merge it into the real id first (Agents → prepare merge) so its acts are not ' +
+            'orphaned, then retire it. Retiring revokes its standing, live and delegated ' +
+            'authority on this seat; it is not deletion, and it is reversible.',
+  };
+
   // PURE, so it can be run under node by tools/discover_pane_contract_test.py: report in,
   // view-model out, no DOM. Three answers must stay three (PRD P4): the scan could not run
   // (`unknown`, with the reason); it ran and found nothing in a group (an empty group is
   // simply omitted); and an agent the report names that no group claimed, which is kept
   // under `unclassified` rather than dropped -- a row that vanishes is the defect.
-  function discoverModel(report) {
+  //
+  // `members` is the trust snapshot the page already polls, `retiredIds` the seat's retirement
+  // list, `showRetiredNow` the toggle. All three are optional: called with the report alone --
+  // as the older fixtures do -- the pane behaves exactly as it did before this group existed.
+  function discoverModel(report, members, retiredIds, showRetiredNow) {
     const r = report || {};
     const detail = Array.isArray(r.detail) ? r.detail : [];
     const byAgent = {};
@@ -4081,8 +4269,33 @@
       title: 'Installed, and the report did not classify it',
       remedy: 'Shown rather than dropped. This is a finding about the inventory, not about the agent.',
       rows: stray.map(d => discoverRow(d.agent, d)) });
+    // What the INVENTORY accounts for: every governance id it could name, whether or not that
+    // agent is installed. A member id absent from this set has nothing on disk behind it.
+    // `plugin` only -- NOT the atlas id, which is a different namespace and would silently
+    // account for a member it has no relation to.
+    const accounted = new Set(detail.map(d => d && d.plugin).filter(Boolean).map(String));
+    const retiredSet = new Set(Array.isArray(retiredIds) ? retiredIds : []);
+    const orphans = (Array.isArray(members) ? members : [])
+      .filter(m => m && m.plugin_id && !accounted.has(String(m.plugin_id)));
+    const shownOrphans = orphans.filter(m => showRetiredNow || !retiredSet.has(m.plugin_id));
+    const hiddenRetired = orphans.length - shownOrphans.length;
+    if (shownOrphans.length) groups.unshift({
+      key: UNACCOUNTED_GROUP.key, tone: UNACCOUNTED_GROUP.tone, title: UNACCOUNTED_GROUP.title,
+      remedy: UNACCOUNTED_GROUP.remedy,
+      rows: shownOrphans.map(m => Object.assign(discoverRow(String(m.plugin_id), null), {
+        // It IS a governance id -- that is the only thing it is -- so the row says so rather
+        // than rendering "no hestia plugin", which would be a claim about the wrong namespace.
+        governanceId: String(m.plugin_id),
+        actionCount: typeof m.action_count === 'number' ? m.action_count : 0,
+        retired: retiredSet.has(m.plugin_id),
+      })),
+    });
     const sc = r.scope || {};
     return {
+      // Kept even when the group is empty, so `hide retired` can be offered after the last
+      // visible orphan is retired away -- otherwise the toggle disappears with the rows and
+      // the operator cannot get back to what they just did.
+      hiddenRetired, retiredOrphans: orphans.filter(m => retiredSet.has(m.plugin_id)).length,
       // Not status alone: the inventory lets GAP outrank UNKNOWN, so a report can say GAP
       // while holding agents it could not classify. The banner says "incomplete"; the
       // unknown rows say where and why. They coexist.
@@ -4118,6 +4331,10 @@
       launchers: Array.isArray(x.launchers) ? x.launchers.length : 0,
       unknownReasons: Array.isArray(x.unknown) ? x.unknown.filter(u => typeof u === 'string' && u) : [],
       alsoFiledUnder: [],
+      // Only the unaccounted group sets these; every other row carries them as "not applicable"
+      // rather than undefined, so a render that reads them cannot silently draw `undefined`.
+      actionCount: 0,
+      retired: false,
     };
   }
 
@@ -4135,10 +4352,20 @@
     scope.innerHTML = `workspace <code>${escapeHtml(s.workspace || '—')}</code>
       · enumerated from <strong>${escapeHtml(s.enumeration || '—')}</strong>${s.complete ? '' : ' <span class="disc-badge disc-amber">incomplete</span>'}
       ${s.atlas ? `· atlas <code>${escapeHtml(s.atlas)}</code>${s.atlasSource ? ' (' + escapeHtml(s.atlasSource) + ')' : ''}` : ''}`;
+    // The toggle is offered whenever there is something on the other side of it, INCLUDING
+    // after the last visible orphan was retired away -- a control that vanishes with the rows
+    // it acted on leaves the operator no way back to what they just did.
+    const toggle = model.hiddenRetired
+      ? `<div class="grant-note">${model.hiddenRetired} retired member id${model.hiddenRetired === 1 ? '' : 's'} hidden.
+         <button type="button" class="pol-btn" id="disc-show-retired">show retired</button></div>`
+      : (showRetired && model.retiredOrphans
+        ? `<div class="grant-note">Showing ${model.retiredOrphans} retired member id${model.retiredOrphans === 1 ? '' : 's'}.
+           <button type="button" class="pol-btn" id="disc-hide-retired">hide retired</button></div>`
+        : '');
     if (!model.groups.length) {
-      root.innerHTML = model.unknown
+      root.innerHTML = (model.unknown
         ? '<div class="empty">Nothing could be listed. That is a failed look, not an empty machine.</div>'
-        : '<div class="empty">The scan ran and reported no agents in any group.</div>';
+        : '<div class="empty">The scan ran and reported no agents in any group.</div>') + toggle;
       return;
     }
     const badge = (tone, text, title) =>
@@ -4150,10 +4377,12 @@
         ${g.rows.map(r => `
           <div class="disc-row">
             <span class="disc-name">${escapeHtml(r.name)}</span>
-            <span class="disc-ids">atlas <code>${escapeHtml(r.atlasId)}</code>${
-              r.governanceId ? ` → governance id <code>${escapeHtml(r.governanceId)}</code>`
-                             : r.being ? ' → <em>no governance id yet — a being’s id is set by its launcher</em>'
-                             : ' → <em>no hestia plugin, so no governance id</em>'}</span>
+            <span class="disc-ids">${g.key === 'unaccounted'
+              ? `governance id <code>${escapeHtml(r.governanceId)}</code> → <em>no atlas id, because nothing on this machine was found to carry it</em>`
+              : `atlas <code>${escapeHtml(r.atlasId)}</code>${
+                r.governanceId ? ` → governance id <code>${escapeHtml(r.governanceId)}</code>`
+                               : r.being ? ' → <em>no governance id yet — a being’s id is set by its launcher</em>'
+                               : ' → <em>no hestia plugin, so no governance id</em>'}`}</span>
             ${r.failure === 'open' ? badge('amber', 'fails open', 'if its gate hook errors or times out, the action is ALLOWED')
               : r.failure === 'closed' ? badge('green', 'fails closed', 'if its gate hook errors or times out, the action is DENIED — a slow gate halts this agent')
               : badge('grey', 'failure mode unknown', 'the atlas descriptor does not say; do not assume either')}
@@ -4164,12 +4393,21 @@
             ${r.findings ? badge('amber', r.findings + ' finding' + (r.findings === 1 ? '' : 's')) : ''}
             ${r.executable ? `<span class="disc-path" title="resolved executable">${escapeHtml(r.executable)}</span>` : ''}
             ${r.configs ? `<span class="disc-path">${r.configs} config${r.configs === 1 ? '' : 's'} read</span>` : ''}
+            ${g.key === 'unaccounted' ? `<span class="tr-dim">${r.actionCount
+                ? r.actionCount + ' act' + (r.actionCount === 1 ? '' : 's') + ' recorded'
+                : 'never acted'}</span>` : ''}
+            ${g.key !== 'unaccounted' ? ''
+              : r.retired ? `${badge('grey', 'retired', 'retired on this seat: its standing, live and delegated authority was revoked')}
+                <button type="button" class="pol-btn-add" data-reinstate="${escapeHtml(r.governanceId)}"
+                  title="Undo the retirement. The authority revoked at retirement is NOT restored.">reinstate</button>`
+              : `<button type="button" class="pol-btn pol-remove" data-retire="${escapeHtml(r.governanceId)}"
+                  title="Stop this id being a party on this seat: revokes its standing, live and delegated authority. Not deletion — the chain keeps every act it made, and it is reversible.">retire…</button>`}
             ${r.alsoFiledUnder.map(k => badge('grey', 'report also says: ' + k, 'a claim the inventory could not stand behind for this agent — see the reasons on this row')).join('')}
             ${g.key === 'unknown' ? `<ul class="disc-why">${(r.unknownReasons.length ? r.unknownReasons
                 : ['the report lists this agent as unknown and gives no reason — that is itself a finding about the inventory'])
                 .map(u => `<li>${escapeHtml(u)}</li>`).join('')}</ul>` : ''}
           </div>`).join('')}
-      </div>`).join('');
+      </div>`).join('') + toggle;
   }
 
   let discoverBusy = false;
@@ -4180,11 +4418,20 @@
     try {
       const res = await apiFetch('/api/agents', { cache: 'no-store' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      discoverRender(discoverModel(await res.json()));
+      // The members come from the snapshot the page already polls, so this pane still issues
+      // exactly ONE request of its own. Registry state and disk state are different sources,
+      // and reconciling the two is this pane's whole job.
+      discoverRender(discoverModel(await res.json(),
+                                   aggregateHarnessTrust(((lastData || {}).trust) || []),
+                                   ((lastData || {}).retired) || [], showRetired));
     } catch (e) {
       // A failed look is reported as a failed look, never as an empty machine.
-      discoverRender({ unknown: true, reason: `could not reach the inventory (${e.message})`,
-                       scope: { workspace: '', enumeration: '', complete: false, atlas: '', atlasSource: '' }, groups: [] });
+      // ...and the registry half still answers, because it comes from the snapshot rather than
+      // from the walk that just failed. An operator who came here to retire a phantom is not
+      // told the machine is empty because a filesystem scan died.
+      discoverRender(discoverModel({ status: 'UNKNOWN', reason: `could not reach the inventory (${e.message})` },
+                                   aggregateHarnessTrust(((lastData || {}).trust) || []),
+                                   ((lastData || {}).retired) || [], showRetired));
     } finally {
       discoverBusy = false; if (btn) btn.disabled = false;
     }
@@ -4302,11 +4549,45 @@
     } catch (e) { if (status) status.textContent = '⚠ ' + e.message; }
   }
 
+  // THE CAPACITY ROLE IS A CLOSED SET, SO IT IS A PICKER (agent-lifecycle PRD R5).
+  // `HESTIA_ROLE` is what a seat connects AS. The daemon matches it against exactly these five
+  // strings and normalises ANYTHING else to `member`, the fail-closed floor
+  // (reputation.rs::normalize_constellation_role) -- correct for the gate, and invisible to the
+  // operator: `role:constellation:interactive_dev` saves cleanly, renders as configured, and the
+  // seat is silently a `member`. A text box for a five-value field is how that happens.
+  // Pinned equal to reputation.rs::KNOWN_CONSTELLATION_ROLES by
+  // tools/capacity_role_picker_contract_test.py, so this list cannot drift from the law.
+  const CAPACITY_ROLES = [
+    'role:constellation:interactive-dev',
+    'role:constellation:mesh-worker',
+    'role:constellation:reviewer',
+    'role:constellation:autonomous-timer',
+    'role:constellation:member',
+  ];
+  // PURE (run under node by the contract test). A stored value outside the set is KEPT and
+  // labelled, never silently replaced: opening a seat must not change it, and the operator has
+  // to see that what is stored is not what the daemon is using.
+  function capacityRoleOptions(current) {
+    const cur = String(current == null ? '' : current);
+    const opts = CAPACITY_ROLES.map(r => ({ value: r, label: r.replace('role:constellation:', ''), selected: r === cur }));
+    if (!cur) opts.unshift({ value: '', label: '— choose a capacity role —', selected: true });
+    else if (!CAPACITY_ROLES.includes(cur))
+      opts.unshift({ value: cur, label: `${cur}  ⚠ not a known role — the daemon treats this seat as "member"`, selected: true });
+    return opts;
+  }
+  function cfgValueCell(r) {
+    if (String(r.key).trim() !== 'HESTIA_ROLE')
+      return `<input class="pol-input cfg-value" value="${cfgEsc(r.value)}">`;
+    return `<select class="pol-input cfg-value" title="what this seat connects AS; anything outside this list is treated as member">${
+      capacityRoleOptions(r.value).map(o =>
+        `<option value="${cfgEsc(o.value)}"${o.selected ? ' selected' : ''}>${cfgEsc(o.label)}</option>`).join('')}</select>`;
+  }
+
   function cfgRenderRows() {
     $('cfg-env-rows').innerHTML = cfgRows.map((r, i) => `
       <tr data-i="${i}">
         <td><input class="pol-input cfg-key" value="${cfgEsc(r.key)}" placeholder="HESTIA_WORKSPACE"></td>
-        <td><input class="pol-input cfg-value" value="${cfgEsc(r.value)}"></td>
+        <td>${cfgValueCell(r)}</td>
         <td><button type="button" class="pol-btn pol-remove cfg-remove" title="remove this variable">×</button></td>
       </tr>`).join('');
   }
@@ -4396,6 +4677,21 @@
     finally { btn.disabled = false; }
   }
 
+  // From an agent to its seat. `cfgSeats` may not be loaded yet (the pane mounts lazily), so
+  // load the list first: opening an unconfigured seat as if configured would 404, and the
+  // reverse would show an empty draft over a real config.
+  async function openSeatFor(member) {
+    setView('govern', true);
+    governShow('config');
+    await cfgLoadList();
+    cfgOpen(member, cfgSeats.some(s => s.member === member && s.configured));
+    const ed = $('cfg-editor'); if (ed && ed.scrollIntoView) ed.scrollIntoView({ block: 'start' });
+  }
+  document.addEventListener('click', e => {
+    const b = e.target && e.target.closest && e.target.closest('[data-open-seat]');
+    if (b) openSeatFor(b.dataset.openSeat);
+  });
+
   (function wireRuntimeConfig() {
     const pane = $('govern-config');
     if (!pane) return;
@@ -4416,6 +4712,10 @@
     $('cfg-env-rows').addEventListener('click', (e) => {
       const b = e.target.closest('.cfg-remove'); if (!b) return;
       cfgReadRows(); cfgRows.splice(Number(b.closest('tr').dataset.i), 1); cfgRenderRows();
+    });
+    // Naming a row HESTIA_ROLE turns its value into the picker (and un-naming it, back).
+    $('cfg-env-rows').addEventListener('change', (e) => {
+      if (e.target && e.target.classList.contains('cfg-key')) { cfgReadRows(); cfgRenderRows(); }
     });
     $('cfg-save').addEventListener('click', () => cfgSave());
     $('cfg-discard').addEventListener('click', () => {
@@ -4537,7 +4837,40 @@
     [plugin, path, reason].forEach(el => el.addEventListener('input', sync));
     sync();
 
+    // THE OFFER IS ABOUT A FORM, so it carries that form (#1067; cbp's review of #1078).
+    // `offeredFor` is what the daemon refused -- the fields that decide who gets what, for how
+    // long -- and the offer holds only while the form still says exactly that. Without it the
+    // button outlived its message: read "Did you mean 'claude-code'?", retype, fumble the
+    // retype, press the offer still sitting there, and an id the daemon never refused went out
+    // with the deliberate word attached. The reason is left out on purpose: it is not what was
+    // refused, and improving it should not cost the operator the offer.
+    let grantAheadOnce = false, offeredFor = null;
+    const formKey = () => JSON.stringify([plugin.value.trim(), path.value.trim(), ttl.value]);
+    const withdrawOffer = () => {
+      if (offeredFor === null) return;
+      offeredFor = null;
+      err.hidden = true; err.textContent = '';
+    };
+    err.addEventListener('click', e => {
+      if (!e.target || e.target.id !== 'sg-ahead-btn') return;
+      // Compared HERE, not only on `input`: a field can change with no event this page hears.
+      if (offeredFor === null || offeredFor !== formKey()) { withdrawOffer(); return; }
+      grantAheadOnce = true;
+      btn.disabled = false;
+      btn.click();
+    });
+    // An edit to what was refused takes the offer off the screen, so nothing stale is pressable.
+    [plugin, path, ttl].forEach(el => ['input', 'change'].forEach(t => el.addEventListener(t, () => {
+      if (offeredFor !== null && offeredFor !== formKey()) withdrawOffer();
+    })));
+
     btn.addEventListener('click', async () => {
+      // Set ONLY by the button the unknown-member refusal renders, and spent by THIS click
+      // whatever happens to it (#1067). Read first, before any early return: spent lower down,
+      // a press that failed the path check below left it armed, and it then rode along on the
+      // operator's next ordinary grant (found by sabotaging this block's own contract test).
+      const ahead = grantAheadOnce; grantAheadOnce = false;
+      offeredFor = null;
       err.hidden = true; ok.hidden = true;
       btn.disabled = true;
       try {
@@ -4562,11 +4895,27 @@
           reason: reason.value.trim(),
         };
         if (ttl.value) body.expires_in_secs = Number(ttl.value);
+        if (ahead) body.grant_ahead_of_connect = true;
         const res = await apiFetch('/api/scope/grant', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
         const out = await res.json().catch(() => ({}));
+        // THE UNKNOWN-MEMBER REFUSAL (#1067) is not a dead end. The daemon now refuses a grant
+        // to an id that has never connected, because the warning it used to return was read as
+        // success. Granting ahead of a first connect is still legitimate, and a registry that
+        // is empty or unreadable would otherwise block every grant from this screen -- so the
+        // deliberate path is offered HERE, on exactly this refusal, as its own button. It
+        // re-sends the same form once with `grant_ahead_of_connect`; nothing is remembered.
+        if (res.status === 409 && out && out.member_known === false && !ahead) {
+          err.innerHTML = `${escapeHtml(out.error || 'no member by that id has connected')}
+            <button type="button" class="pol-btn-add" id="sg-ahead-btn"
+              title="Only if this member is real and simply has not connected yet. A typo granted this way reaches nothing, and shows up as a phantom agent.">grant ahead of first connect</button>`;
+          err.hidden = false;
+          offeredFor = formKey();
+          sync();
+          return;
+        }
         if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
         // The daemon reports whether that plugin_id has ever connected. A grant to a member
         // nobody has seen is legitimate (granting ahead of a first connect) and is ALSO what

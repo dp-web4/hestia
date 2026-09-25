@@ -176,6 +176,15 @@ pub struct ScopeRequest {
     pub revoked: Option<ScopeRevocation>,
 }
 
+/// What a retirement actually removed, by channel.
+#[derive(Debug, Default, Clone, serde::Serialize, PartialEq)]
+pub struct RetirementCommit {
+    /// Durable, vault-held rows revoked.
+    pub standing: Vec<String>,
+    /// Session-scoped grants marked revoked.
+    pub live: Vec<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ScopeRevocation {
     pub at: u64,
@@ -311,6 +320,10 @@ pub struct ServerState {
     /// findings on one member are two events, and a map that only knew the member folded the
     /// second into the first.
     pub config_findings_open: HashMap<String, crate::server::seat_config::OpenConfigFinding>,
+    /// Gate path → the integrity finding open against it (`gate_watch`). Rebuilt from the chain
+    /// at startup for the same reason as `config_findings_open`: a restart that forgot an open
+    /// finding would re-witness it, and lose the duration of its eventual resolution.
+    pub gate_findings_open: HashMap<String, crate::server::gate_watch::OpenGateFinding>,
     /// Member → the projection digest it PRESENTED on its last connect, against what the vault
     /// expected at that moment (#944 liveness). RAM-only and rebuilt by the next connect: a
     /// seat that has not connected since the restart has no liveness claim, which is the truth.
@@ -434,6 +447,10 @@ pub struct ServerState {
     /// decision. Mutated ONLY from the operator-gated HTTP surface; no MCP tool reaches it
     /// (`no_mcp_tool_can_mutate_standing_scope`). See `server::standing_scope`.
     pub standing_scope: crate::server::standing_scope::StandingScopeStore,
+    /// Ids the operator has retired on THIS seat: no longer parties, their standing grants
+    /// revoked in the same commit, hidden from the default agent view. Rebuilt from the vault
+    /// at load like `member_registry`. Never deletion -- see `server::retirement`.
+    pub retired_members: crate::server::retirement::RetirementStore,
     /// What was found where the standing authority should be, at launch. Set once during
     /// construction and served beside the envelope so an unmigrated society is legible
     /// rather than silently empty.
@@ -618,6 +635,7 @@ impl ServerState {
         );
         // Custodial member LCTs, loaded from the vault (minted lazily on connect).
         let member_registry = crate::member_registry::load_members(&vault);
+        let retired_members = crate::server::retirement::load(&vault);
         // Resolve the active policy from the vault. Falls back to the
         // safety preset if the vault's named preset isn't built-in.
         let policy_config = vault
@@ -711,6 +729,7 @@ impl ServerState {
             // also repaired the artifact — so the next pass sees clean, has nothing to close,
             // and the chain keeps asserting an open finding forever.
             config_findings_open: crate::server::seat_config::rehydrate_open_findings(&chain_store),
+            gate_findings_open: crate::server::gate_watch::rehydrate(&chain_store),
             seat_live: HashMap::new(),
             scope_tally: std::collections::HashMap::new(),
             vault,
@@ -723,6 +742,7 @@ impl ServerState {
             sovereign,
             role_registry,
             member_registry,
+            retired_members,
             shared_context: serde_json::Map::new(),
             policy_engine,
             role_policy_engines,
@@ -1258,6 +1278,146 @@ impl ServerState {
         Some(format!("lct:web4:member:{hex}"))
     }
 
+    /// Are these two plugin ids ONE member, on the record? True when they hash to the same
+    /// member LCT (equal after trimming), or when the operator's witnessed `identity_alias`
+    /// records join them: one is an alias of the other, or both are aliases of one target.
+    ///
+    /// Reads the alias records with no recency window -- the measured reason the four guards
+    /// that call this were inert (`the_member_lct_alias_guard_reaches_only_whitespace`): the
+    /// resolver existed, but over a window the record had already left. Type-indexed, so the
+    /// cost is the number of alias records, not the length of the chain.
+    ///
+    /// An unmappable (synthetic/empty) id is `false`, as `member_lct` has always had it:
+    /// identity that was never established is not asserted. Which way an UNREADABLE record
+    /// falls, and why, is on `alias_relates` -- the half that decides it.
+    pub fn same_entity(&self, a: &str, b: &str) -> bool {
+        let (la, lb) = (self.member_lct(a), self.member_lct(b));
+        if la.is_none() || lb.is_none() {
+            return false;
+        }
+        if la == lb {
+            return true;
+        }
+        // The alias relation needs the record, and a read that FAILS is not an answer. It is
+        // passed through as `None` rather than resolved here, because resolving it here is
+        // what went wrong the first time: this function documented "fails toward same" and
+        // returned `false` on a read error, which at all four call sites is the PERMISSIVE
+        // answer -- an unreadable chain would have admitted a party as its own arbiter (GPT
+        // seat review, PR #1075).
+        let aliases = match self.chain_store.scan_recent(
+            None,
+            Some(&[crate::derivation::IDENTITY_ALIAS_EVENT]),
+            crate::derivation::ALIAS_SCAN,
+            crate::derivation::project_row,
+        ) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::error!(
+                    "same_entity: alias read failed ({e}); until the chain is readable every \
+                     pair of distinct ids reads as ONE member, so no party can rule on or \
+                     review another's act"
+                );
+                None
+            }
+        };
+        Self::alias_relates(a, b, aliases.as_deref())
+    }
+
+    /// The relation itself: pure, so the arm that cannot be reached with a live store has a
+    /// test. `aliases` is `None` when the record could not be READ -- distinct from an empty
+    /// slice, which means the record was read and holds no aliases.
+    ///
+    /// UNREADABLE FAILS TOWARD "SAME". Every caller uses a `true` to EXCLUDE a party from
+    /// ruling on, or reviewing, an act of its own, so `true` is the conservative answer and
+    /// `false` is the permissive one. The cost is real and worth naming: while the chain is
+    /// unreadable every distinct pair reads as one member, the arbiter and reviewer pools
+    /// empty, and appeals cannot be routed at all. That is the right direction anyway. The
+    /// chain is the store the ruling itself must be written to, so a read failing there is
+    /// trouble in the one place accountability lives; routing an appeal on the strength of a
+    /// failed look would risk an unwitnessed ruling, which is the outcome this whole surface
+    /// exists to prevent. Refusing to route reaches the same conclusion one step earlier, and
+    /// LOUDLY -- the appellant is told no arbiter is eligible -- rather than silently.
+    /// (The read and the append use different sqlite connections, so a failed read does not
+    /// PROVE the append would fail. It is evidence, not a proof, and the direction follows
+    /// from which error is recoverable.)
+    ///
+    /// ONE LEVEL, like `derivation::aliased_identities` and for its reason: following chains
+    /// would let two independent aliases silently join two unrelated members.
+    fn alias_relates(a: &str, b: &str, aliases: Option<&[ChainEntry]>) -> bool {
+        let Some(aliases) = aliases else {
+            return true;
+        };
+        // Stated as the relations themselves, not as "compare canonical forms": canonicalising
+        // both sides silently breaks the DIRECT relation whenever the target is itself an
+        // alias (cc -> bb, bb -> aa: canon(cc)=bb, canon(bb)=aa, and the pair the operator
+        // explicitly joined reads as two members). Caught by this function's own test.
+        let (a, b) = (a.trim(), b.trim());
+        let (ta, tb) = (
+            crate::derivation::alias_target(a, aliases),
+            crate::derivation::alias_target(b, aliases),
+        );
+        ta.as_deref() == Some(b) || tb.as_deref() == Some(a) || (ta.is_some() && ta == tb)
+    }
+
+    /// Retire or reinstate an id and revoke EVERY grant it holds -- standing and live -- as one
+    /// step, with memory never looser than the vault.
+    ///
+    /// ORDER, and why (cbp, PR #1100 review, finding 3). The first cut saved the scope document,
+    /// then the retirement, and only then swapped BOTH into memory. A retirement save that
+    /// failed left the vault with the grants revoked and memory still enforcing them; the next
+    /// `commit_standing_scope` would have cloned memory and written the grants straight back.
+    /// And the 500 said "no grant was revoked", which was false on disk. So each store is swapped
+    /// into memory the moment ITS save succeeds -- the `apply_standing_revoke` rule: memory may
+    /// only ever be the tighter side -- and a failure names which half landed.
+    ///
+    /// Live grants (cbp, finding 2) are the session-scoped `ScopeRequest`s. They are memory-only
+    /// and lapse on their own, but "no window in which a retired id still reaches a path" is the
+    /// claim, so they are marked revoked in the same act, last, after everything that can fail.
+    pub fn commit_retirement<F>(&mut self, reason: &str, mutate: F) -> Result<RetirementCommit>
+    where
+        F: FnOnce(&mut crate::server::retirement::RetirementStore) -> Option<String>,
+    {
+        use anyhow::Context;
+        let mut retired = self.retired_members.clone();
+        let revoke_for = mutate(&mut retired);
+        let mut standing: Vec<String> = Vec::new();
+        if let Some(member) = revoke_for.as_deref() {
+            let mut scope = self.standing_scope.clone();
+            for path in scope.grants.iter().filter(|g| g.member == member)
+                .map(|g| g.path.clone()).collect::<Vec<_>>()
+            {
+                if scope.revoke(member, &path) { standing.push(path); }
+            }
+            if !standing.is_empty() {
+                crate::vault::save_doc(&mut self.vault, "scope", "standing", "standing-scope.json", &scope)
+                    .context("NOTHING changed: the standing-scope document did not persist")?;
+                self.standing_scope = scope;
+                self.standing_scope_dirty = false;
+            }
+        }
+        crate::server::retirement::save(&mut self.vault, &retired).with_context(|| {
+            if standing.is_empty() {
+                "NOTHING changed: the retirement did not persist".to_string()
+            } else {
+                format!("HALF landed: {} standing grant(s) are revoked (vault and memory) but the \
+                         retirement itself did not persist -- the id still shows and holds no \
+                         authority; retry, or reinstate is a no-op", standing.len())
+            }
+        })?;
+        self.retired_members = retired;
+        let mut live: Vec<String> = Vec::new();
+        if let Some(member) = revoke_for.as_deref() {
+            let now = crate::server::gate_escalation::now_secs();
+            for r in self.scope_requests.values_mut().filter(|r| r.plugin_id == member && r.is_live(now)) {
+                r.revoked = Some(ScopeRevocation {
+                    at: now, by: "operator".into(), reason: format!("retired: {reason}") });
+                live.push(r.path.clone());
+            }
+        }
+        standing.sort(); live.sort();
+        Ok(RetirementCommit { standing, live })
+    }
+
     /// Append a chain entry under the sovereign LCT.
     pub fn append_chain(
         &self,
@@ -1782,6 +1942,95 @@ mod tests {
         assert!(!same_entity("kimi-code", "kimi"));
         // What it DOES add over clause 1's `p.arbiter == p.appellant` string compare.
         assert!(same_entity("codex", " codex "), "trim is the guard's whole reach");
+    }
+
+    /// The repair `the_member_lct_alias_guard_reaches_only_whitespace` asked for. That test
+    /// still stands, unchanged: `member_lct` equality alone is exactly as inert as it says.
+    /// `same_entity` adds the operator's alias records, read without a window.
+    #[test]
+    fn same_entity_follows_the_operators_alias_and_does_not_forget_it() {
+        let (_dir, state) = make_state();
+        let alias = crate::derivation::IDENTITY_ALIAS_EVENT;
+        assert!(!state.same_entity("codex", "codex-cli"), "no record yet: two members");
+        assert!(state.same_entity("codex", " codex "), "what the old guard did reach");
+
+        state
+            .append_chain(alias, serde_json::json!({"alias": "codex-cli", "alias_of": "codex", "ref": "t"}))
+            .unwrap();
+        assert!(state.same_entity("codex", "codex-cli"));
+        assert!(state.same_entity("codex-cli", "codex"), "symmetric");
+        assert!(!state.same_entity("codex", "claude-code"), "an alias joins two ids, not everyone");
+
+        // Two typos of one id are each other, through their shared target.
+        for typo in ["Claude-code", "caude-code"] {
+            state
+                .append_chain(alias, serde_json::json!({"alias": typo, "alias_of": "claude-code", "ref": "t"}))
+                .unwrap();
+        }
+        assert!(state.same_entity("Claude-code", "caude-code"));
+
+        // ONE level. b -> a and c -> b does not make c the same entity as a.
+        state.append_chain(alias, serde_json::json!({"alias": "bb", "alias_of": "aa", "ref": "t"})).unwrap();
+        state.append_chain(alias, serde_json::json!({"alias": "cc", "alias_of": "bb", "ref": "t"})).unwrap();
+        assert!(state.same_entity("cc", "bb") && state.same_entity("bb", "aa"));
+        assert!(!state.same_entity("cc", "aa"), "alias chains are not followed, by design");
+
+        // An id that maps to no member is never asserted to be anyone.
+        assert!(!state.same_entity("", "codex") && !state.same_entity("", ""));
+
+        // THE POINT: bury the record under more traffic than any window this path ever used,
+        // proportionally -- the read is by type, so distance does not matter.
+        for i in 0..500 {
+            state
+                .append_chain("policy_decision", serde_json::json!({"plugin_id": "codex", "decision": "allow", "n": i}))
+                .unwrap();
+        }
+        assert!(state.same_entity("codex", "codex-cli"), "a ruling does not age out");
+    }
+
+    /// THE ARM A LIVE STORE CANNOT REACH: the alias record could not be READ.
+    ///
+    /// The first cut of `same_entity` documented "fails toward same" and returned `false`
+    /// there. At all four call sites `false` is the PERMISSIVE answer -- it says "independent,
+    /// eligible" -- so an unreadable chain would have admitted a party as the arbiter of its
+    /// own appeal, or as the reviewer of its own escalation. A docstring claiming one
+    /// direction over code taking the other, which is the defect class this module's census
+    /// exists to make visible. Caught by the GPT seat on PR #1075; the happy-path tests above
+    /// cannot see it, because a working store never takes the branch.
+    #[test]
+    fn an_unreadable_alias_record_excludes_rather_than_admits() {
+        use crate::derivation::IDENTITY_ALIAS_EVENT;
+        let entry = |alias: &str, of: &str| ChainEntry {
+            chain_position: 1,
+            hash: "h".into(),
+            prev_hash: "p".into(),
+            event_type: IDENTITY_ALIAS_EVENT.into(),
+            event_data: serde_json::json!({"alias": alias, "alias_of": of}),
+            signer_lct: "lct:test".into(),
+            timestamp: chrono::Utc::now(),
+        };
+        let relates = ServerState::alias_relates;
+
+        // READ, and holds nothing: these two ids are two members. `false` is an ANSWER here.
+        assert!(!relates("codex", "codex-cli", Some(&[])));
+        // READ, and joins them.
+        assert!(relates("codex", "codex-cli", Some(&[entry("codex-cli", "codex")])));
+
+        // NOT READ. Every pair reads as one member -- including pairs no operator ever joined,
+        // which is the whole point: the answer is unknown, and unknown must not read as
+        // independent.
+        for (a, b) in [("codex", "codex-cli"), ("claude-code", "kimi-code"), ("x", "y")] {
+            assert!(
+                relates(a, b, None),
+                "an unreadable alias record must EXCLUDE ({a}, {b}) from judging each other, \
+                 not admit them: every caller's `true` is the conservative branch"
+            );
+        }
+
+        // ...and the id that maps to no member is still nobody, decided before the read is
+        // even attempted -- an unreadable chain must not conjure an identity for a synthetic.
+        let (_dir, state) = make_state();
+        assert!(!state.same_entity("", "codex"));
     }
 
     #[test]

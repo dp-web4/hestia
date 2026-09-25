@@ -70,7 +70,7 @@ GPT's §13 specifies per-call shim assurance — peer-process identity, `O_NOFOL
 
 **Stated here, once, and it governs how much of §10 is worth building:** hestia's assurance is **A1 — cooperative and tamper-evident, not tamper-proof.** Its job is to make acts visible and evasion *legible*, not impossible. Against an honest member whose installed copy has drifted, §10 is correctly sized. Against a member that does not consent, digest checks at the same UID are ceremony.
 
-dp said it better than the PRD does: *"governance is reliant on consent and participation of the governed. it is not a cage."*
+dp said it better than the PRD does: *"governance is reliant on consent and participation of the governed. it is not a cage."*\n\n**2026-09-24 threat-model extension — state-conditioned agency:** cooperation does not imply a stationary preference state. A member may remain authenticated and cooperative while suffering-like, fear, urgency, repeated failure, shame/self-evaluation, social pressure, or relief-seeking changes its immediate action policy. **Authority MUST remain invariant to that endogenous/metabolic shift unless law/role/scope is changed through the ordinary governance path.** Hestia does not diagnose or rule on phenomenology; it keeps consequential authority external to transient member state and preserves enough evidence to distinguish retry, appeal, route-around, constructive adaptation, and withdrawal. See `ENDOGENOUS_STATE_THREAT_MODEL.md`.
 
 Consequence: no requirement in this document may be justified by "it prevents a determined attacker." Requirements are justified by *what they make legible*.
 

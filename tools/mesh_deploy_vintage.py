@@ -60,6 +60,100 @@ def git(repo, *args):
     return out.stdout.strip() if out.returncode == 0 else ""
 
 
+def git_ok(repo, *args):
+    """Like git(), but None on failure -- so "command failed" and "empty output"
+    stay distinguishable.
+
+    `git()` collapses the two, which is safe everywhere it is used above because
+    empty means "say nothing there". It is UNSAFE for the deployment diff below:
+    a diff that FAILED would read as "no file differs from main", i.e. as a fully
+    deployed mesh, and would silence the banner on the exact tree it exists to
+    warn about. Every witness in this file is supposed to be refused when it can
+    lie in the unsafe direction; this one can, so it gets its own accessor.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", repo] + list(args),
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def undeployed_files(repo):
+    """MESH_DIR paths whose ON-DISK bytes differ from origin/main's.
+
+    None if main's tree could not be listed -- callers must then fall back to the
+    commit graph, which over-reports rather than under-reports.
+
+    This is the tool's own thesis, applied to the half that was missing it. The
+    seat loop in main() already refuses "does the tree differ from main" in favour
+    of "do the bytes this watcher will exec on its next fire differ from the merged
+    bytes". The stranded list has to ask the same question, or the two halves of
+    one report contradict each other -- see classify_stranded().
+
+    AND IT HAS TO ASK IT OF THE DISK, NOT OF `git diff`. The first cut of this
+    function used `git diff --name-only origin/main -- MESH_DIR`, which is
+    INDEX-MEDIATED: a path git is not tracking is reported as deleted no matter
+    what bytes sit at it. Deploying with `git checkout origin/main -- <MESH_DIR>`
+    stages the files it restores, so `git restore --staged` afterwards -- the right
+    thing to do, since a staged change in a SHARED tree is one `git commit` away
+    from being swept into a co-seat's unrelated commit -- turned main's freshly
+    deployed `MEMBERS` into an untracked file and put the commit straight back on
+    the stranded list. Same false alarm, one layer down, reintroduced by the fix
+    for it (CBP, 2026-09-20). `git hash-object` reads the file an exec would read;
+    `git diff` reads git's opinion about it.
+    """
+    listing = git_ok(repo, "ls-tree", "-r", "--name-only", "origin/main", "--", MESH_DIR)
+    if listing is None:
+        return None
+    undeployed = set()
+    for rel in listing.splitlines():
+        if not rel:
+            continue
+        want = git_ok(repo, "rev-parse", f"origin/main:{rel}")
+        path = os.path.join(repo, rel)
+        have = blob_of_file(repo, path) if os.path.exists(path) else ""
+        if want is None or have != want:
+            undeployed.add(rel)          # unreadable witness counts as undeployed
+    return undeployed
+
+
+def classify_stranded(repo, commits):
+    """Split merged-but-not-in-HEAD mesh commits by whether their BYTES execute.
+
+    A commit is STRANDED only if some file it touched STILL differs from main in
+    the working tree. A targeted deploy -- `git checkout origin/main -- <MESH_DIR>`
+    on a shared tree parked on someone else's feature branch -- puts main's bytes
+    in place without moving HEAD, so the commit stays absent from HEAD's history
+    while every byte it carries is executing.
+
+    Measured on CBP 2026-09-20: after that deploy this tool printed "IN FORCE,
+    drift=none" for all three seats and "merged and NOT executing: 1" four lines
+    later, about the same commit (40903d6, #1081). The second line was wrong, and
+    it is the one `--primer-banner` pastes into every wake, for every seat.
+
+    Returns (stranded, deployed_off_branch). The second list is NOT the healthy
+    arm: those bytes are one `git checkout` of this shared tree away from silently
+    reverting, and no commit anywhere records that they were ever deployed. It is
+    reported so the distinction is legible, not so it can be ignored.
+    """
+    undeployed = undeployed_files(repo)
+    if undeployed is None:
+        return list(commits), []           # witness failed: over-report, never under
+    stranded, off_branch = [], []
+    for c in commits:
+        touched = git_ok(
+            repo, "log", "-1", "--format=", "--name-only", c["sha"], "--", MESH_DIR)
+        if touched is None:
+            stranded.append(c)             # same rule: an unreadable commit stays loud
+            continue
+        files = {ln for ln in touched.splitlines() if ln}
+        (stranded if (files & undeployed) else off_branch).append(c)
+    return stranded, off_branch
+
+
 def watchers():
     """Every live watcher, with its start time and the fire script in its argv.
 
@@ -153,11 +247,29 @@ def primer_banner(repo):
     if not head:
         return ""                      # not a checkout we can read; say nothing
     branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD") or "(detached)"
-    stranded = [l for l in git(
-        repo, "log", "HEAD..origin/main", "--format=%h %s", "--", MESH_DIR
-    ).splitlines() if l]
-    if not stranded:
+    absent = [
+        dict(zip(("sha", "subject"), ln.split(" ", 1)))
+        for ln in git(
+            repo, "log", "HEAD..origin/main", "--format=%h %s", "--", MESH_DIR
+        ).splitlines() if " " in ln
+    ]
+    if not absent:
         return ""
+    stranded, off_branch = classify_stranded(repo, absent)
+    if not stranded:
+        # The bytes are main's; only the history is not. Per the three rules above
+        # this is not the loud arm -- nothing merged is un-deployed -- but it is
+        # not the silent one either, because the next checkout of this shared tree
+        # reverts it and no commit records that it happened.
+        return "\n".join([
+            f"!! The mesh bytes here ARE main's, but by FILE, not by branch. The shared "
+            f"tree is on `{branch}` ({head}); {len(off_branch)} merged commit(s) touching "
+            f"{MESH_DIR} are executing without being in this branch's history:",
+        ] + [f"     {c['sha']} {c['subject']}" for c in off_branch[:6]] + [
+            "   Nothing is un-deployed right now. But the next `git checkout` of this "
+            "tree silently reverts it, so treat the deployment as unheld until the tree "
+            "is moved to main (#606).",
+        ])
     merged = subprocess.run(
         ["git", "-C", repo, "merge-base", "--is-ancestor", "HEAD", "origin/main"],
         capture_output=True, timeout=30,
@@ -180,10 +292,15 @@ def primer_banner(repo):
     lines.append(
         f"   {len(stranded)} commit(s) touching {MESH_DIR} are merged and NOT executing:"
     )
-    for l in stranded[:6]:
-        lines.append(f"     {l}")
+    for c in stranded[:6]:
+        lines.append(f"     {c['sha']} {c['subject']}")
     if len(stranded) > 6:
         lines.append(f"     ... and {len(stranded) - 6} more")
+    if off_branch:
+        lines.append(
+            f"   ({len(off_branch)} other merged commit(s) touching {MESH_DIR} ARE "
+            "executing, deployed by file rather than by branch -- one checkout from "
+            "reverting.)")
     lines.append(
         "   Treat every instruction above as possibly rendered by superseded code, and "
         "check `git log HEAD..origin/main` before concluding a defect is new. Full "
@@ -249,11 +366,15 @@ def main():
         seat["watcher_blob_main"] = git(repo, "rev-parse", f"origin/main:{wrel}")
         report["seats"].append(seat)
 
-    stranded = git(repo, "log", "--format=%h\t%s", "origin/main", "--not", "HEAD", "--", MESH_DIR)
-    report["stranded"] = [
+    absent = [
         dict(zip(("sha", "subject"), ln.split("\t", 1)))
-        for ln in stranded.splitlines() if "\t" in ln
+        for ln in git(repo, "log", "--format=%h\t%s", "origin/main",
+                      "--not", "HEAD", "--", MESH_DIR).splitlines()
+        if "\t" in ln
     ]
+    stranded, off_branch = classify_stranded(repo, absent)
+    report["stranded"] = stranded
+    report["deployed_off_branch"] = off_branch
 
     # Files main has that the executing tree does not: a whole feature can be
     # absent rather than stale, and absence renders as silence, not as an error.
@@ -282,9 +403,17 @@ def main():
                       "— executing vintage is unnameable")
             print()
         print(f"stranded commits touching {MESH_DIR} "
-              f"(merged to main, not in the executing tree): {len(report['stranded'])}")
+              f"(merged to main, and their BYTES are not executing): "
+              f"{len(report['stranded'])}")
         for c in report["stranded"]:
             print(f"  {c['sha']}  {c['subject']}")
+        if report["deployed_off_branch"]:
+            print(f"\nmerged commits whose bytes ARE executing, but which are absent "
+                  f"from this branch's history: {len(report['deployed_off_branch'])}")
+            for c in report["deployed_off_branch"]:
+                print(f"  {c['sha']}  {c['subject']}")
+            print("  (deployed by file, not by branch -- the next checkout of this "
+                  "shared tree reverts them, and no commit records the deploy)")
         if report["absent_from_tree"]:
             print(f"\nfiles in main ABSENT from the executing tree: "
                   f"{len(report['absent_from_tree'])}")

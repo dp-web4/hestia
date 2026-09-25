@@ -221,9 +221,22 @@ activate_shared_engine() {
   # engine.py. Every name this body binds is local.
   local base i stale staging current_target flip
   if [ "$DRY_RUN" = "1" ]; then
-    for base in "${engine_names[@]}"; do
-      log "  would $base -> $shared_link (build $build_digest)"
-    done
+    # Answer the same question the real pass answers — is the ENGINE current? — instead of
+    # always printing the plan. The flip below decides currency by comparing the symlink
+    # target to this build, and that comparison costs nothing and writes nothing, so a dry
+    # run can make it too. It could not before, so these four files printed `would` on a
+    # box that was exactly current, and DEPLOY.md's verify step ("every member should
+    # report already current") was unachievable for them: a reader following it concludes
+    # the deploy failed and runs it again. Measured on HUB 2026-09-21, minutes after a
+    # successful install.
+    current_target="$(readlink "$shared_link" 2>/dev/null || true)"
+    if [ "$current_target" = "shared.builds/$build_digest" ]; then
+      log "  ok    shared -> $current_target (already current)"
+    else
+      for base in "${engine_names[@]}"; do
+        log "  would $base -> $shared_link (build $build_digest)"
+      done
+    fi
   else
     mkdir -p "$builds_dir"
     # Staging dirs from an interrupted run are inert — nothing points at them. Sweep them.
@@ -483,3 +496,81 @@ log ""
 log "The daemon reads this via HESTIA_CURRENT_BUILD_FILE. If the dashboard still says"
 log "'deployment authority is not configured', the INSTALLED unit is missing that"
 log "Environment= line — deploy/templates/hestia.service carries it, so the unit is stale."
+
+# --------------------------------------------------------------------------------
+# CERTIFY THE INSTALLED GATES AGAINST THE VAULT — or say plainly that we did not.
+#
+# dp, 2026-09-20: "we must have an audit mechanism vs vault reference to check for
+# drift ... the whole shim hashed on release with hash stored in vault on deploy."
+#
+# The mechanism already exists and had ZERO callers: `vault::gate_integrity` plus
+# `/api/gates/verify` and `/api/gates/ratify`, built 2026-07-27 and never wired to
+# anything. This is the deploy-side caller. It VERIFIES; it deliberately does not
+# ratify.
+#
+# WHY NOT RATIFY HERE, though a one-line `curl` to /api/gates/ratify was the obvious
+# move: ratification is the operator asserting "this build is the one I trust", and
+# the handler's own doc says so — "nothing here can tell a good build from a bad one;
+# the operator must ratify from a state they believe correct." An installer that
+# ratified whatever it had just written would bless a tampered build automatically
+# and convert a human judgement into a no-op. The whole point of hashing on release
+# is lost if the release hashes itself.
+#
+# The daemon hashes the files itself rather than trusting anything reported here, and
+# refuses both an empty gate set and an unreadable gate, so this caller cannot launder
+# a bad state by lying about it.
+#
+# THREE OUTCOMES, AND NONE OF THEM IS SILENT:
+#   VERIFIED - installed gates match what the operator ratified.
+#   DRIFT    - they do not. Loud, and a non-zero exit: this is the event the whole
+#              mechanism exists to surface.
+#   UNKNOWN  - the daemon could not establish the set, nothing is ratified yet, or we
+#              could not reach/authenticate to it. Reported as UNKNOWN and never as
+#              success. `gates_verify` already refuses to answer VERIFIED over an
+#              empty denominator (http.rs) after thor measured a host reporting
+#              "VERIFIED, findings: 0, gates: []" while its gate pointed at a missing
+#              file and was failing open. This block must not re-introduce that
+#              inversion one level up by reading a failed check as a passed one.
+#
+# HOW IT READS THE VERDICT (reworked after GPT's HOLD on #1085). The first version
+# called /api/gates/verify, which sits behind the operator gate; the installer carries
+# no operator session, so against a real daemon every run landed on UNKNOWN and the
+# VERIFIED/DRIFT arms were unreachable. dp ruled 2026-09-21 (option 1): the DAEMON
+# verifies its own gates — at startup and on its maintenance tick, witnessing each
+# finding and resolution to the chain (core/src/server/gate_watch.rs) — and writes a
+# readable projection, $HESTIA_HOME/status/gate-integrity.json. This reads that file
+# through tools/gate_verdict.py. No operator session, no chain walk, and the operator
+# wall is untouched.
+#
+# THE VERDICT IS BOUND TO BYTES. The file lists the hash the daemon judged for each
+# gate; a verdict counts only if the bytes on disk still match. A gate this install just
+# rewrote has not been judged yet, so it reads PENDING until the daemon's next pass —
+# never the stale verdict about the bytes it replaced.
+#
+# NO OUTCOME FAILS THE INSTALL. Installing new hook bytes makes them differ from the
+# ratified ones by construction, so MODIFIED after a deploy is the normal state before
+# the operator ratifies; exiting non-zero on it would make every hook deploy read as
+# failed. Every outcome is reported loudly, and none is reported as success unless it is.
+verify_installed_gates() {
+    local out rc=0
+    # Branch on the status explicitly: `set -e` must not turn a finding into an abort.
+    out=$(python3 "$REPO_ROOT/tools/gate_verdict.py" --home "$HESTIA_HOME" 2>&1) || rc=$?
+    printf '%s\n' "$out" | while IFS= read -r line; do log "$line"; done
+    case "$rc" in
+        0) log "gate certification: VERIFIED — the daemon judged exactly these bytes against the vault." ;;
+        2) log "gate certification: PENDING — this install changed gate bytes the daemon has not"
+           log "  judged yet. Re-check after its next pass:"
+           log "    python3 $REPO_ROOT/tools/gate_verdict.py --home $HESTIA_HOME --wait 330" ;;
+        3) log "gate certification: the installed gates DO NOT match what the operator ratified."
+           log "  After a deploy of new hooks this is expected until the operator ratifies the"
+           log "  build (POST /api/gates/ratify, operator-gated, witnessed). If this install did"
+           log "  not change hooks, a gate changed underneath it: read the chain rows named above." ;;
+        4) log "gate certification: UNKNOWN — the daemon could not establish the gate set." ;;
+        *) log "gate certification: NOT CERTIFIED — no usable gate status (reader exit $rc): an"
+           log "  older daemon, one not restarted since the upgrade, or the reader itself failed."
+           log "  Absence of evidence, not a pass." ;;
+    esac
+    return 0
+}
+
+verify_installed_gates || exit 1

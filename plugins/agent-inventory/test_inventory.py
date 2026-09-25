@@ -1328,6 +1328,11 @@ def test_generation_stamp_brackets_the_install():
     check("stamp: written by the LAST command in the file", code[-1], write)
     check("stamp: written exactly once", code.count(write), 1)
     check("stamp: dropped exactly once", code.count(drop), 1)
+    # The inputs record is only ever read beside the stamp, so it has no drop of its own --
+    # which holds only while it is written AFTER the surface and BEFORE the stamp: a stamp
+    # that can exist without it, or beside the previous run's, is the claim cbp falsified.
+    check("stamp: the inputs record is written immediately before it", code[-2],
+          """printf 'workspace=%s\\natlas=%s\\n' "${HESTIA_WORKSPACE:-}" "${HESTIA_ATLAS_DIR:-}" > "$BIN.installed-with\"""")
     first_write = min(i for i, ln in enumerate(code)
                       if ln.startswith(("install -m 0755", 'cat > "$BIN"')))
     check("stamp: dropped before the first byte of the surface is rewritten",

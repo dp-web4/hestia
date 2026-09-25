@@ -7,11 +7,22 @@ Source-level where the claim is about what EXISTS or is ABSENT, in the house idi
 where the claim is about what the pane DOES: `discoverModel` and `discoverRow` are pure -- report
 in, view-model out, no DOM -- so they are lifted out of the dashboard and run under node.
 
-WHY READ-ONLY IS PINNED AS AN ABSENCE. This pane is the first sprint of work whose later sprints
-register and retire agents. Those are operator acts with their own review. The easiest way for
-one to arrive unreviewed is as a convenient button on the screen that already lists the agents,
-and no test of present behaviour notices a request that was not there yesterday. So the Discover
-block is checked for what it must NOT contain: any request but one GET.
+WHAT USED TO BE PINNED HERE, AND WHY IT CHANGED (dp, 2026-09-25). The first cut pinned this pane
+as READ-ONLY by absence: the Discover block must contain no request but one GET. The reason was
+drift -- an operator act arriving as a convenient button on the screen that already lists the
+agents, which no test of present behaviour would notice.
+
+RETIRE HAS NOW ARRIVED HERE DELIBERATELY, because dp asked for it: it was in the live trust list,
+which is a monitoring view people glance at, and a control that revokes authority does not belong
+there. So the absence-pin would now have to be either deleted or kept as a lie -- and kept, it
+would be a lie that still PASSES, because `retireAgent`/`reinstateAgent` are lexically outside
+this block. A pin that cannot fail is worse than no pin.
+
+It is replaced by an enumeration, which is the same guard stated positively: the pane's own
+fetch is still exactly one GET, and the only write-capable controls it renders are the two named,
+separately-reviewed operator acts -- so a THIRD one still cannot arrive unnoticed. The absence
+checks that remain (no DELETE, no method override on the read, no timer) are the ones the move
+did not touch.
 
 THE THREE ANSWERS THAT MUST STAY THREE (PRD P4), each of which this fleet has shipped as the
 wrong one at least once: the scan could not run (UNKNOWN, with its reason -- never an empty
@@ -54,28 +65,47 @@ def source_contract() -> None:
 
     block = discover_block()
     fetches = re.findall(r"apiFetch\(\s*'([^']+)'\s*(?:,\s*\{([^}]*)\})?", block)
-    check("READ-ONLY: exactly one request in the Discover block", len(fetches), 1)
+    check("the pane's OWN request is exactly one", len(fetches), 1)
     if fetches:
-        check("READ-ONLY: and it is the inventory read", fetches[0][0], "/api/agents")
-        check("READ-ONLY: with no method override", "method" in fetches[0][1], False)
-    for verb in ("'POST'", "'PUT'", "'DELETE'", "'PATCH'", '"POST"', '"PUT"', '"DELETE"', '"PATCH"'):
-        check(f"READ-ONLY: no {verb} anywhere in the Discover block", verb in block, False)
+        check("...and it is the inventory read", fetches[0][0], "/api/agents")
+        check("...with no method override", "method" in fetches[0][1], False)
+    for verb in ("'PUT'", "'DELETE'", "'PATCH'", '"PUT"', '"DELETE"', '"PATCH"'):
+        check(f"no {verb} anywhere in the Discover block", verb in block, False)
+    check("no request is built inline here at all -- the operator acts are reviewed functions",
+          "'POST'" in block or '"POST"' in block, False)
+    # THE ENUMERATION that replaced the absence-pin. Any write-capable control the render grows
+    # must be added here with a reason, which is the review step the old absence-pin provided.
+    WRITE_CONTROLS = {"data-retire": "retire (#1100)", "data-reinstate": "reinstate (#1100)"}
+    found = set(re.findall(r"\bdata-(?:retire|reinstate|register|delete|revoke|grant|merge-alias)\b", block))
+    check("the write-capable controls in this pane are exactly the reviewed two",
+          sorted(found), sorted(WRITE_CONTROLS))
+    # ...and they dispatch to the separately-reviewed handlers rather than to anything local.
+    check("the controls are dispatched by the retire block's own delegated handler",
+          "closest('[data-retire],[data-reinstate],#disc-show-retired,#disc-hide-retired')" in UI)
+    check("retire is offered ONLY on the unaccounted group, never on an installed agent's row",
+          block.count("data-retire=") == 1
+          and "g.key !== 'unaccounted' ? ''" in block)
     check("no timer of its own -- a filesystem walk is fetched on show and on rescan only",
           "setInterval" in block, False)
 
     check("a fetch failure is rendered as UNKNOWN, not as an empty machine",
-          "could not reach the inventory" in block and "unknown: true" in block)
+          "could not reach the inventory" in block and "status: 'UNKNOWN'" in block)
+    # ...and it must still list the registry half, which does not come from the walk that died.
+    check("a fetch failure still passes the members through, so the orphans stay reachable",
+          block.count("aggregateHarnessTrust(((lastData || {}).trust) || [])"), 2)
     check("UNKNOWN says it is not 'nothing found'", 'this is not "nothing found"' in block)
     check("undefined failure mode is its own state", "failure mode unknown" in block)
     check("both names are shown, and the grant-relevant one is labelled",
           "governance id" in block and "atlas <code>" in block)
 
 
-def run_model(report) -> dict:
+def run_model(report, members=None, retired=None, show_retired=False) -> dict:
     block = discover_block()
     pure = block[block.index("const DISCOVER_GROUPS"):block.index("function discoverRender(")]
-    prog = pure + "\nprocess.stdout.write(JSON.stringify(discoverModel(JSON.parse(process.argv[1]))));"
-    r = subprocess.run(["node", "-e", prog, json.dumps(report)], capture_output=True, text=True, timeout=30)
+    prog = pure + ("\nconst A = JSON.parse(process.argv[1]);"
+                   "\nprocess.stdout.write(JSON.stringify(discoverModel(A[0], A[1], A[2], A[3])));")
+    arg = json.dumps([report, members, retired, show_retired])
+    r = subprocess.run(["node", "-e", prog, arg], capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
         FAILS.append(f"node failed: {r.stderr.strip()[:300]}")
         return {"groups": [], "unknown": None}
@@ -210,6 +240,75 @@ def behaviour() -> None:
     check("a NOT-installed unclassified agent is not noise", run_model(quiet)["groups"][0]["key"], "miswired")
 
 
+def unaccounted() -> None:
+    """THE REGISTRY HALF (dp, 2026-09-25): ids hestia records as members that the inventory --
+    which walks disk and the atlas -- cannot see, and therefore never listed. dp's three
+    `claude-code` rows are the case: two were minted by mistyped grants (#1067) and were
+    invisible in the pane built to find exactly that."""
+    # The live shape on this machine: the inventory names `claude` (plugin `claude-code`) and
+    # nothing else; the registry also holds the two phantoms.
+    report = {"status": "OK", "governed": ["claude"], "gaps": {},
+              "detail": [agent("claude", "claude-code", True, {"harness": "Claude Code"})]}
+    members = [{"plugin_id": "claude-code", "action_count": 5415},
+               {"plugin_id": "Claude-code", "action_count": 0},
+               {"plugin_id": "caude-code", "action_count": 0}]
+
+    m = run_model(report, members, [])
+    by_key = {g["key"]: g for g in m["groups"]}
+    check("the phantoms get a group, and it LEADS -- they are the reason to open this pane",
+          m["groups"][0]["key"], "unaccounted")
+    check("...holding exactly the ids no inventory record accounts for",
+          [r["governanceId"] for r in by_key["unaccounted"]["rows"]], ["Claude-code", "caude-code"])
+    check("the live id is NOT an orphan: the inventory's `plugin` field accounts for it",
+          "claude-code" not in [r["governanceId"] for r in by_key["unaccounted"]["rows"]])
+    check("governed still holds the real one", [r["atlasId"] for r in by_key["governed"]["rows"]], ["claude"])
+    check("the act count rides along -- it is what tells two look-alikes apart",
+          [r["actionCount"] for r in by_key["unaccounted"]["rows"]], [0, 0])
+
+    # ACCOUNTED-FOR MEANS THE GOVERNANCE ID, NOT THE ATLAS ID. They are different namespaces;
+    # matching on the atlas id would silently account for a member it has no relation to.
+    m = run_model({"status": "OK", "detail": [agent("claude-code", None, True)]},
+                  [{"plugin_id": "claude-code", "action_count": 1}], [])
+    check("an atlas id that merely LOOKS like the member id does not account for it",
+          [r["governanceId"] for g in m["groups"] for r in g["rows"] if g["key"] == "unaccounted"],
+          ["claude-code"])
+
+    # Retired orphans: hidden by default, revealed by the toggle, and counted either way.
+    m = run_model(report, members, ["Claude-code", "caude-code"])
+    check("retiring both empties the group rather than leaving empty rows",
+          "unaccounted" in [g["key"] for g in m["groups"]], False)
+    check("...and the count of what is hidden survives, so the toggle can be offered",
+          (m["hiddenRetired"], m["retiredOrphans"]), (2, 2))
+    m = run_model(report, members, ["Claude-code", "caude-code"], True)
+    rows = {r["governanceId"]: r for g in m["groups"] for r in g["rows"] if g["key"] == "unaccounted"}
+    check("show retired: both are back", sorted(rows), ["Claude-code", "caude-code"])
+    check("...marked retired, which is what swaps retire for reinstate in the render",
+          [rows[k]["retired"] for k in sorted(rows)], [True, True])
+    m = run_model(report, members, ["Claude-code"])
+    check("one retired, one not: only the retired one is hidden",
+          ([r["governanceId"] for g in m["groups"] for r in g["rows"] if g["key"] == "unaccounted"],
+           m["hiddenRetired"]), (["caude-code"], 1))
+
+    # THE OLD FIXTURES STILL HOLD. Called with the report alone, this pane is what it was.
+    m = run_model(report)
+    check("no members passed: no group, and no invented rows",
+          ("unaccounted" in [g["key"] for g in m["groups"]], m["hiddenRetired"]), (False, 0))
+    for label, junk in (("null members", None), ("not a list", 7), ("rows are not objects", [None, 3, "x"]),
+                        ("no plugin_id", [{"action_count": 1}]), ("retired is not a list", 7)):
+        arg = junk if label != "retired is not a list" else members
+        ret = junk if label == "retired is not a list" else []
+        m = run_model(report, arg, ret)
+        check(f"garbage ({label}): survives, and does not read as a clean machine",
+              isinstance(m.get("groups"), list) and isinstance(m.get("hiddenRetired"), int))
+
+    # A FAILED SCAN MUST NOT STRAND THEM. The walk is what died; the registry came from the
+    # snapshot. An operator who came here to retire a phantom still finds it.
+    m = run_model({"status": "UNKNOWN", "reason": "could not reach the inventory (boom)"}, members, [])
+    check("the inventory unreachable: UNKNOWN is up AND all three orphans are listed",
+          (m["unknown"], [r["governanceId"] for g in m["groups"] for r in g["rows"]]),
+          (True, ["claude-code", "Claude-code", "caude-code"]))
+
+
 def live() -> None:
     """The real report from this machine, when there is one. It is the only fixture nobody wrote."""
     inv = Path.home() / ".local/bin/hestia-agent-inventory"
@@ -239,6 +338,7 @@ def main() -> int:
     source_contract()
     if shutil.which("node"):
         behaviour()
+        unaccounted()
         live()
     else:
         print("SKIPPED: behaviour -- no node on PATH (the source contract above still ran)")
