@@ -176,6 +176,15 @@ pub struct ScopeRequest {
     pub revoked: Option<ScopeRevocation>,
 }
 
+/// What a retirement actually removed, by channel.
+#[derive(Debug, Default, Clone, serde::Serialize, PartialEq)]
+pub struct RetirementCommit {
+    /// Durable, vault-held rows revoked.
+    pub standing: Vec<String>,
+    /// Session-scoped grants marked revoked.
+    pub live: Vec<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ScopeRevocation {
     pub at: u64,
@@ -434,6 +443,10 @@ pub struct ServerState {
     /// decision. Mutated ONLY from the operator-gated HTTP surface; no MCP tool reaches it
     /// (`no_mcp_tool_can_mutate_standing_scope`). See `server::standing_scope`.
     pub standing_scope: crate::server::standing_scope::StandingScopeStore,
+    /// Ids the operator has retired on THIS seat: no longer parties, their standing grants
+    /// revoked in the same commit, hidden from the default agent view. Rebuilt from the vault
+    /// at load like `member_registry`. Never deletion -- see `server::retirement`.
+    pub retired_members: crate::server::retirement::RetirementStore,
     /// What was found where the standing authority should be, at launch. Set once during
     /// construction and served beside the envelope so an unmigrated society is legible
     /// rather than silently empty.
@@ -618,6 +631,7 @@ impl ServerState {
         );
         // Custodial member LCTs, loaded from the vault (minted lazily on connect).
         let member_registry = crate::member_registry::load_members(&vault);
+        let retired_members = crate::server::retirement::load(&vault);
         // Resolve the active policy from the vault. Falls back to the
         // safety preset if the vault's named preset isn't built-in.
         let policy_config = vault
@@ -723,6 +737,7 @@ impl ServerState {
             sovereign,
             role_registry,
             member_registry,
+            retired_members,
             shared_context: serde_json::Map::new(),
             policy_engine,
             role_policy_engines,
@@ -1337,6 +1352,65 @@ impl ServerState {
             crate::derivation::alias_target(b, aliases),
         );
         ta.as_deref() == Some(b) || tb.as_deref() == Some(a) || (ta.is_some() && ta == tb)
+    }
+
+    /// Retire or reinstate an id and revoke EVERY grant it holds -- standing and live -- as one
+    /// step, with memory never looser than the vault.
+    ///
+    /// ORDER, and why (cbp, PR #1100 review, finding 3). The first cut saved the scope document,
+    /// then the retirement, and only then swapped BOTH into memory. A retirement save that
+    /// failed left the vault with the grants revoked and memory still enforcing them; the next
+    /// `commit_standing_scope` would have cloned memory and written the grants straight back.
+    /// And the 500 said "no grant was revoked", which was false on disk. So each store is swapped
+    /// into memory the moment ITS save succeeds -- the `apply_standing_revoke` rule: memory may
+    /// only ever be the tighter side -- and a failure names which half landed.
+    ///
+    /// Live grants (cbp, finding 2) are the session-scoped `ScopeRequest`s. They are memory-only
+    /// and lapse on their own, but "no window in which a retired id still reaches a path" is the
+    /// claim, so they are marked revoked in the same act, last, after everything that can fail.
+    pub fn commit_retirement<F>(&mut self, reason: &str, mutate: F) -> Result<RetirementCommit>
+    where
+        F: FnOnce(&mut crate::server::retirement::RetirementStore) -> Option<String>,
+    {
+        use anyhow::Context;
+        let mut retired = self.retired_members.clone();
+        let revoke_for = mutate(&mut retired);
+        let mut standing: Vec<String> = Vec::new();
+        if let Some(member) = revoke_for.as_deref() {
+            let mut scope = self.standing_scope.clone();
+            for path in scope.grants.iter().filter(|g| g.member == member)
+                .map(|g| g.path.clone()).collect::<Vec<_>>()
+            {
+                if scope.revoke(member, &path) { standing.push(path); }
+            }
+            if !standing.is_empty() {
+                crate::vault::save_doc(&mut self.vault, "scope", "standing", "standing-scope.json", &scope)
+                    .context("NOTHING changed: the standing-scope document did not persist")?;
+                self.standing_scope = scope;
+                self.standing_scope_dirty = false;
+            }
+        }
+        crate::server::retirement::save(&mut self.vault, &retired).with_context(|| {
+            if standing.is_empty() {
+                "NOTHING changed: the retirement did not persist".to_string()
+            } else {
+                format!("HALF landed: {} standing grant(s) are revoked (vault and memory) but the \
+                         retirement itself did not persist -- the id still shows and holds no \
+                         authority; retry, or reinstate is a no-op", standing.len())
+            }
+        })?;
+        self.retired_members = retired;
+        let mut live: Vec<String> = Vec::new();
+        if let Some(member) = revoke_for.as_deref() {
+            let now = crate::server::gate_escalation::now_secs();
+            for r in self.scope_requests.values_mut().filter(|r| r.plugin_id == member && r.is_live(now)) {
+                r.revoked = Some(ScopeRevocation {
+                    at: now, by: "operator".into(), reason: format!("retired: {reason}") });
+                live.push(r.path.clone());
+            }
+        }
+        standing.sort(); live.sort();
+        Ok(RetirementCommit { standing, live })
     }
 
     /// Append a chain entry under the sovereign LCT.

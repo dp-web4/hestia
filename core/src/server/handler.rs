@@ -797,6 +797,19 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
         );
     }
 
+    // A RETIRED id that connects is not refused (retiring the seat you are typing from must not
+    // lock you out) and is not hidden either: it is news. Witnessed here so the fact is on the
+    // record, and the agents view keeps the row visible while it is connected (cbp, PR #1100
+    // review, finding 5 -- this event was documented before it existed).
+    if let Some(r) = s.retired_members.get(&plugin_id).cloned() {
+        let _ = s.append_chain("retired_member_connected", serde_json::json!({
+            "plugin_id": plugin_id,
+            "retired_at": r.retired_at,
+            "retired_because": r.reason,
+            "note": "a retired id connected; it holds no standing authority, and the operator \
+                     should decide whether to reinstate it or find out what is running under it",
+        }));
+    }
     s.sessions.insert(session_id, session);
     // Fresh-connect success boundary: synthetic persistence/member setup has completed and
     // the session now exists. Recording before this point would let a refused connect claim
