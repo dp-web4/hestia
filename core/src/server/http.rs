@@ -1287,6 +1287,10 @@ pub async fn serve_with_callback(
         // Register a DISCOVERED harness as a member. No `plugin_id` in the body: the id is
         // derived from the inventory record, because an id that can be typed can be mistyped.
         .route("/api/agents/register", post(agent_register))
+        // Delegated authority, keyed by the agent in the URL; the delegation key is derived from
+        // the registry, never typed. The three verbs of `hestia delegate`, on the operator plane.
+        .route("/api/agents/:id/delegations", get(agent_delegations_list).post(agent_delegation_grant))
+        .route("/api/agents/:id/delegations/:deleg/revoke", post(agent_delegation_revoke))
         .route("/api/agents/:id/retire", post(agent_retire))
         .route("/api/agents/:id/reinstate", post(agent_reinstate))
         .route("/api/chain", get(chain_query))
@@ -5599,6 +5603,221 @@ async fn agent_register(
     })))
 }
 
+// ── Delegated authority, from the agent (agent-lifecycle PRD R5, the half #1079 left) ──────
+//
+// `hestia delegate grant/list/revoke` existed as a CLI that writes the vault directly, and the
+// dashboard snapshot already carried `delegations` -- and no screen rendered them, and there was
+// no route. dp, 2026-09-19: "we already list them ... but i can't inspect or manage roles or
+// their environments". These three routes are that CLI's three verbs on the operator plane,
+// keyed by the AGENT the operator is looking at: the delegation key is DERIVED from the
+// member's registry LCT (`agent_key_for_lct`), never typed -- the same rule as register.
+
+/// The nine society roles a delegation may carry, spelled as `parse_role` accepts them. A
+/// closed set, offered as a picker: `parse_role` maps any other string to `Custom(..)`, which
+/// is a free-text role by another name, and this surface takes no free-text identity of any
+/// kind. tools/delegation_panel_contract_test.py pins the picker to this list.
+pub const DELEGATION_ROLES: &[&str] = &[
+    "sovereign", "law_oracle", "policy_entity", "treasurer", "administrator",
+    "archivist", "citizen", "witness", "auditor",
+];
+
+/// The delegation key for a member, from its registry LCT. A member the registry has not
+/// recorded has no key -- a delegation binds to an identity derived from a public key, never
+/// to a name (#952) -- and a retired one is refused authority through this door like every
+/// other (cbp, #1100).
+/// READING IS NOT AUTHORITY, so this does not refuse a retired id -- only the GRANT path does
+/// (`refuse_if_retired`, at its call site). The first cut put the refusal here, which every
+/// caller shares, so a plain GET of a retired agent's delegations answered 409: the one agent
+/// whose delegations retirement had just revoked was the one whose panel showed nothing, and
+/// this PR's own claim that revoked delegations stay listed was false for exactly that case
+/// (cbp, PR #1106 review, probed). `revoke` already skipped the check for the same reason --
+/// taking authority away from a retired id is the safe direction; so is looking.
+fn delegation_key_for(
+    s: &crate::server::state::ServerState, plugin_id: &str,
+) -> std::result::Result<uuid::Uuid, (StatusCode, Json<serde_json::Value>)> {
+    let Some(lct) = s.member_registry.get(plugin_id) else {
+        return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": format!("'{plugin_id}' has no LCT in this society's member registry, so no \
+                              delegation can be keyed to it. Register it, or connect it once."),
+        }))));
+    };
+    Ok(crate::delegation::agent_key_for_lct(&lct.lct_id()))
+}
+
+async fn agent_delegations_list(
+    State(state): State<SharedState>, Path(id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let plugin_id = id.trim().to_string();
+    let s = state.lock().await;
+    let key = match delegation_key_for(&s, &plugin_id) { Ok(k) => k, Err(r) => return r };
+    let store = match crate::delegation::DelegationStore::load(&s.vault) {
+        Ok(st) => st,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("the delegation store could not be read: {e}")}))),
+    };
+    let rows: Vec<serde_json::Value> = store.delegations.iter()
+        .filter(|d| d.agent_lct_id == key)
+        .map(|d| {
+            let mut v = serde_json::to_value(d).unwrap_or_default();
+            if let Some(m) = v.as_object_mut() { m.insert("active".into(), serde_json::json!(d.is_active())); }
+            v
+        })
+        .collect();
+    (StatusCode::OK, Json(serde_json::json!({
+        "plugin_id": plugin_id, "agent_key": key, "delegations": rows, "roles": DELEGATION_ROLES,
+        // Readable, and said plainly: the panel must not look like an agent that may be granted to.
+        "retired": s.retired_members.is_retired(&plugin_id),
+    })))
+}
+
+async fn agent_delegation_grant(
+    State(state): State<SharedState>, Path(id): Path<String>, Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let plugin_id = id.trim().to_string();
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let strs = |k: &str| -> Vec<String> {
+        body.get(k).and_then(|v| v.as_array()).map(|a| a.iter()
+            .filter_map(|x| x.as_str()).map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+            .unwrap_or_default()
+    };
+    let (role_names, actions) = (strs("roles"), strs("actions"));
+    if reason.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "reason is required"})));
+    }
+    if role_names.is_empty() && actions.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "a delegation with no roles and no actions is full authority; name what is delegated"})));
+    }
+    // The body may name the agent only through the URL. A typed agent id in the body is the
+    // #1067 hole again, so it is refused rather than ignored.
+    for k in ["agent", "agent_id", "agent_lct_id", "plugin_id"] {
+        if body.get(k).is_some() {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": format!("'{k}' is not accepted: the agent is the one in the URL, and its \
+                                  delegation key is derived from the registry, never typed")})));
+        }
+    }
+    if let Some(bad) = role_names.iter().find(|r| !DELEGATION_ROLES.contains(&r.to_lowercase().as_str())) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("'{bad}' is not one of the society roles; a free-text role is a typed \
+                              identity by another name"), "roles": DELEGATION_ROLES })));
+    }
+    let expires_hours = body.get("expires_hours").and_then(|v| v.as_u64()).filter(|h| *h > 0);
+    let mut s = state.lock().await;
+    // GRANTING is authority; reading is not. The refusal lives here rather than in the shared
+    // derivation, so a retired agent's history stays readable (cbp, #1106).
+    if let Some(refusal) = refuse_if_retired(&s, &plugin_id, "a delegation") {
+        return refusal;
+    }
+    let key = match delegation_key_for(&s, &plugin_id) { Ok(k) => k, Err(r) => return r };
+    let roles: Vec<web4_core::SocietyRole> = match role_names.iter()
+        .map(|r| crate::delegation::parse_role(r)).collect::<std::result::Result<Vec<_>, _>>() {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))),
+    };
+    let record = serde_json::json!({
+        "plugin_id": plugin_id, "agent_key": key,
+        "subject_instance_lct": s.member_lct(&plugin_id),
+        "roles": role_names, "actions": actions, "expires_hours": expires_hours,
+        "reason": reason, "delegated_by": "operator",
+    });
+    let intent = match s.append_chain("delegation_grant_intent", record.clone()) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("witnessing intent: {e}")}))),
+    };
+    // Signed by the operator's own key -- the vault's identity, never a throwaway (#952).
+    let (delegator_id, kp) = match crate::delegation::operator_delegator(&s.vault, &s.home) {
+        Ok(x) => x,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("nothing was delegated: {e}"), "intentEntryHash": intent.hash }))),
+    };
+    let mut store = match crate::delegation::DelegationStore::load(&s.vault) {
+        Ok(st) => st,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("nothing was delegated: the store could not be read: {e}"),
+            "intentEntryHash": intent.hash }))),
+    };
+    let (deleg_id, expires_at) = {
+        let d = store.create_delegation(delegator_id, key, roles, actions.clone(), expires_hours, &kp);
+        (d.id, d.expires_at)
+    };
+    if let Err(e) = store.save(&mut s.vault) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("nothing was delegated: the store did not persist: {e}"),
+            "intentEntryHash": intent.hash })));
+    }
+    let mut done = record;
+    if let Some(m) = done.as_object_mut() {
+        m.insert("delegation_id".into(), serde_json::json!(deleg_id));
+        m.insert("expires_at".into(), serde_json::json!(expires_at));
+        m.insert("intent".into(), serde_json::json!(intent.hash));
+    }
+    let entry = s.append_chain("delegation_granted", done).ok();
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true, "plugin_id": plugin_id, "delegation_id": deleg_id, "expires_at": expires_at,
+        "intentEntryHash": intent.hash, "witnessEntryHash": entry.map(|e| e.hash),
+    })))
+}
+
+async fn agent_delegation_revoke(
+    State(state): State<SharedState>, Path((id, deleg)): Path<(String, String)>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let plugin_id = id.trim().to_string();
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if reason.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "reason is required"})));
+    }
+    let Ok(deleg_id) = uuid::Uuid::parse_str(deleg.trim()) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "delegation id is not a UUID"})));
+    };
+    let mut s = state.lock().await;
+    // No retired check here: revoking authority from a retired id is the safe direction.
+    let Some(lct) = s.member_registry.get(&plugin_id).map(|l| l.lct_id()) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": format!("'{plugin_id}' is not in the member registry")})));
+    };
+    let key = crate::delegation::agent_key_for_lct(&lct);
+    let mut store = match crate::delegation::DelegationStore::load(&s.vault) {
+        Ok(st) => st,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("the delegation store could not be read: {e}")}))),
+    };
+    // The delegation must be THIS agent's: a revoke reached through one agent's panel must not
+    // silently strike another's, however the id came to be pasted.
+    match store.delegations.iter().find(|d| d.id == deleg_id) {
+        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": format!("delegation {deleg_id} not found")}))),
+        Some(d) if d.agent_lct_id != key => return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!("delegation {deleg_id} does not belong to '{plugin_id}'; nothing was revoked")}))),
+        Some(d) if d.revoked => return (StatusCode::OK, Json(serde_json::json!({
+            "ok": true, "already_revoked": true, "delegation_id": deleg_id }))),
+        Some(_) => {}
+    }
+    let record = serde_json::json!({
+        "plugin_id": plugin_id, "agent_key": key, "delegation_id": deleg_id,
+        "subject_instance_lct": s.member_lct(&plugin_id),
+        "reason": reason, "revoked_by": "operator",
+    });
+    let intent = match s.append_chain("delegation_revoke_intent", record.clone()) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("witnessing intent: {e}")}))),
+    };
+    if let Err(e) = store.revoke(deleg_id).and_then(|_| store.save(&mut s.vault)) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("still in force: {e}"), "intentEntryHash": intent.hash })));
+    }
+    let mut done = record;
+    if let Some(m) = done.as_object_mut() { m.insert("intent".into(), serde_json::json!(intent.hash)); }
+    let entry = s.append_chain("delegation_revoked", done).ok();
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true, "plugin_id": plugin_id, "delegation_id": deleg_id,
+        "intentEntryHash": intent.hash, "witnessEntryHash": entry.map(|e| e.hash),
+    })))
+}
+
 /// Acts THIS ID TOOK since `cutoff` (RFC3339) -- the retire guard's evidence. A phantom, the
 /// case retirement exists for, has none ever; a live seat has thousands.
 ///
@@ -5747,6 +5966,7 @@ async fn agent_retire(
     if let Some(m) = done.as_object_mut() {
         m.insert("revoked_standing_paths".into(), serde_json::json!(revoked.standing));
         m.insert("revoked_live_paths".into(), serde_json::json!(revoked.live));
+        m.insert("revoked_delegations".into(), serde_json::json!(revoked.delegations));
         m.insert("intent".into(), serde_json::json!(intent.hash));
     }
     let entry = s.append_chain("member_retired", done).ok();
@@ -5755,6 +5975,7 @@ async fn agent_retire(
         "ok": true, "plugin_id": plugin_id, "retired": true,
         "revoked_standing_paths": revoked.standing,
         "revoked_live_paths": revoked.live,
+        "revoked_delegations": revoked.delegations,
         "generation": gen,
         "intentEntryHash": intent.hash,
         "witnessEntryHash": entry.map(|e| e.hash),
@@ -8092,6 +8313,157 @@ mod disposition_tests {
         assert_eq!(after.len(), before + 1, "the connect is witnessed as news");
         assert_eq!(after[0].event_data["plugin_id"], serde_json::json!("caude-code"));
         assert!(s.retired_members.is_retired("caude-code"), "connecting does not un-retire it");
+    }
+
+    /// A delegation is signed by the operator's own key, and the test daemon has none -- the
+    /// route correctly refused with 500 until this existed. Any 32 bytes are a valid ed25519
+    /// seed; the file is the shape `operator_delegator` reads first.
+    async fn seed_operator_key(state: &SharedState) {
+        let home = state.lock().await.home.clone();
+        std::fs::write(home.join("operator.key"),
+            serde_json::json!({"secret_key_hex": hex::encode([7u8; 32])}).to_string()).unwrap();
+    }
+
+    async fn deleg(state: &SharedState, id: &str, body: Option<serde_json::Value>) -> (StatusCode, serde_json::Value) {
+        let (st, b) = match body {
+            None => agent_delegations_list(State(state.clone()), Path(id.to_string())).await,
+            Some(body) => agent_delegation_grant(State(state.clone()), Path(id.to_string()), Json(body)).await,
+        };
+        (st, b.0)
+    }
+
+    /// dp's fourth ask, the half #1079 left: manage an agent's delegated authority from the
+    /// agent. The key is DERIVED from the registry; the body may not name an agent at all.
+    #[tokio::test]
+    async fn delegations_are_keyed_to_the_agent_in_the_url_and_never_typed() {
+        let (_dir, state) = test_state().await;
+        seed_operator_key(&state).await;
+        register_member(&state, "kimi-code").await;
+        register_member(&state, "codex").await;
+
+        // Nothing yet, and the picker's vocabulary rides along.
+        let (st, b) = deleg(&state, "kimi-code", None).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["delegations"], serde_json::json!([]));
+        assert_eq!(b["roles"], serde_json::json!(DELEGATION_ROLES));
+        // An unregistered member has no key to bind to.
+        assert_eq!(deleg(&state, "nobody", None).await.0, StatusCode::NOT_FOUND);
+
+        // The body may not carry the agent: that is #1067's hole, refused not ignored.
+        for k in ["agent", "agent_id", "agent_lct_id", "plugin_id"] {
+            let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({
+                "roles": ["witness"], "reason": "r", k: "codex"}))).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{k}: {b}");
+        }
+        // A free-text role is a typed identity by another name.
+        let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({"roles": ["grand-vizier"], "reason": "r"}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["roles"], serde_json::json!(DELEGATION_ROLES), "the refusal offers the real list");
+        // Empty scope is full authority; say what is delegated.
+        assert_eq!(deleg(&state, "kimi-code", Some(serde_json::json!({"reason": "r"}))).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(deleg(&state, "kimi-code", Some(serde_json::json!({"roles": ["witness"]}))).await.0, StatusCode::BAD_REQUEST);
+
+        // The real thing: witnessed, signed by the operator key, and read back BY THE AGENT.
+        let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({
+            "roles": ["witness", "auditor"], "actions": ["scope.decide:codex:/w"], "expires_hours": 24, "reason": "test"}))).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let did = b["delegation_id"].as_str().unwrap().to_string();
+        let (_, mine) = deleg(&state, "kimi-code", None).await;
+        assert_eq!(mine["delegations"].as_array().unwrap().len(), 1);
+        assert_eq!(mine["delegations"][0]["active"], serde_json::json!(true));
+        let (_, theirs) = deleg(&state, "codex", None).await;
+        assert_eq!(theirs["delegations"], serde_json::json!([]), "another agent's panel does not show it");
+        {
+            let s = state.lock().await;
+            let chain = s.recent_chain(50);
+            let pos = |t: &str| chain.iter().find(|e| e.event_type == t).map(|e| e.chain_position);
+            assert!(pos("delegation_grant_intent") < pos("delegation_granted"), "intent precedes commit");
+        }
+
+        // Revoke: through the wrong agent's panel it is refused; through the right one it lands.
+        let rv = |id: &'static str, d: String, body: serde_json::Value| {
+            let st = state.clone();
+            async move { let (c, b) = agent_delegation_revoke(State(st), Path((id.to_string(), d)), Json(body)).await; (c, b.0) }
+        };
+        let (st, b) = rv("codex", did.clone(), serde_json::json!({"reason": "r"})).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{b}");
+        assert_eq!(rv("kimi-code", did.clone(), serde_json::json!({})).await.0, StatusCode::BAD_REQUEST, "reason required");
+        let (st, b) = rv("kimi-code", did.clone(), serde_json::json!({"reason": "done"})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let (_, mine) = deleg(&state, "kimi-code", None).await;
+        assert_eq!(mine["delegations"][0]["active"], serde_json::json!(false), "revoked, still listed");
+        let (st, b) = rv("kimi-code", did, serde_json::json!({"reason": "again"})).await;
+        assert_eq!((st, &b["already_revoked"]), (StatusCode::OK, &serde_json::json!(true)));
+
+        // A retired id gets authority through this door no more than any other.
+        let (st, _) = retire(&state, "codex", serde_json::json!({"reason": "t", "ref": "x"})).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, b) = deleg(&state, "codex", Some(serde_json::json!({"roles": ["witness"], "reason": "r"}))).await;
+        assert_eq!((st, &b["retired"]), (StatusCode::CONFLICT, &serde_json::json!(true)), "{b}");
+    }
+
+    /// cbp, PR #1106 review, both blocking findings. Probed there with a throwaway test; kept
+    /// here so neither can come back.
+    #[tokio::test]
+    async fn a_retired_agents_delegations_stay_readable_and_an_unreadable_store_is_not_silence() {
+        let (_dir, state) = test_state().await;
+        seed_operator_key(&state).await;
+        register_member(&state, "kimi-code").await;
+        let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({
+            "roles": ["witness"], "reason": "before retirement"}))).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let (st, _) = retire(&state, "kimi-code", serde_json::json!({"reason": "t", "ref": "x"})).await;
+        assert_eq!(st, StatusCode::OK);
+
+        // FINDING 2: reading is not authority. The one agent whose delegations retirement just
+        // revoked is the one whose history most needs reading.
+        let (st, b) = deleg(&state, "kimi-code", None).await;
+        assert_eq!(st, StatusCode::OK, "a retired agent's delegations must stay readable: {b}");
+        assert_eq!(b["delegations"].as_array().unwrap().len(), 1);
+        assert_eq!(b["delegations"][0]["active"], serde_json::json!(false), "revoked by the retirement");
+        assert_eq!(b["retired"], serde_json::json!(true), "...and the panel says so");
+        // Granting is still refused.
+        let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({
+            "roles": ["witness"], "reason": "after"}))).await;
+        assert_eq!((st, &b["retired"]), (StatusCode::CONFLICT, &serde_json::json!(true)), "{b}");
+
+        // FINDING 1: an UNREADABLE delegation store is not "this member had none". Corrupt the
+        // document (a missing one is Ok(default), which is a real answer; a non-object is not).
+        register_member(&state, "codex").await;
+        let (st, b) = deleg(&state, "codex", Some(serde_json::json!({"roles": ["auditor"], "reason": "r"}))).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        {
+            let mut s = state.lock().await;
+            s.vault.put_document("presence", "delegations", b"[\"not the store's shape\"]".to_vec()).unwrap();
+        }
+        let (st, b) = retire(&state, "codex", serde_json::json!({"reason": "t", "ref": "x"})).await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR,
+                   "an unreadable delegation store must not report a clean retirement: {b}");
+        let err = b["error"].as_str().unwrap();
+        assert!(err.contains("NOT RETIRED") && err.contains("unknown state"), "{err}");
+        // AUTHORITY FIRST, BOOKKEEPING LAST: the id is NOT marked retired, so no operator reads
+        // this as finished while a delegation may still be in force. The first cut recorded the
+        // retirement before touching delegations and this assertion is what caught it.
+        assert!(!state.lock().await.retired_members.is_retired("codex"),
+                "a failure in any authority channel must leave the id un-retired, and a retry \
+                 re-runs the whole act");
+    }
+
+    /// The third channel: retirement revokes delegations along with the grants.
+    #[tokio::test]
+    async fn retiring_revokes_delegations_too() {
+        let (_dir, state) = test_state().await;
+        seed_operator_key(&state).await;
+        register_member(&state, "kimi-code").await;
+        let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({"roles": ["witness"], "reason": "r"}))).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let did = b["delegation_id"].as_str().unwrap().to_string();
+        let (st, b) = retire(&state, "kimi-code", serde_json::json!({"reason": "t", "ref": "x"})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["revoked_delegations"], serde_json::json!([did]));
+        let s = state.lock().await;
+        let store = crate::delegation::DelegationStore::load(&s.vault).unwrap();
+        assert!(store.active().is_empty(), "no delegation of a retired id is in force");
     }
 
     /// The chain must carry the pair, in order, with the authority change named -- so the act is
