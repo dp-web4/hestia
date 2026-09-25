@@ -91,8 +91,14 @@ change — the shape is the daemon's, which is the point of building against the
 | 4.2 | grant / revoke / promote-to-standing / floor adjust, each an operator act |
 | 4.3 | Every write names the operator's LCT in the chain entry, not the daemon's |
 
+**Conflict policy — ruled 2026-09-25: last edit wins.** Unblocked. Because the engine will not stop
+an overwrite, the view must make it visible: 4.4 below.
+
+| 4.4 | Every write re-reads first and **shows the value it replaces** at the moment of the write; re-reads after it lands |
+
 **Acceptance, measured:** a grant issued in the app is honoured by the member's next gate call, and
-the chain entry names the operator.
+the chain entry names the operator; a write over a value another view changed since the last read
+shows that value before it is replaced (tested against a stale read).
 
 ---
 
