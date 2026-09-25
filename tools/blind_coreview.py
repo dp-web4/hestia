@@ -21,18 +21,18 @@ exhausted; this instrument manufactures blindness prospectively:
            follows; nothing can be revised or reassigned after. verify recomputes the
            commitment AND checks the revealed assignment against the published doc and,
            when given, the frozen round manifest (round id, seats, probe digests)
-  stats  — agreement vs the independence null (the arc's own formula), with PABAK
-           alongside Cohen's kappa because the marginals here are prevalence-lopsided
-           (constraint 1 of the labeling protocol, written before the reveal, proved
-           load-bearing at it). Two nulls are reported and labeled separately (codex's
-           review, point 3): `independence_null` from the reviewers' LIVE-work marginals
-           (external rates; their source window is echoed as `marginals_source`), and
-           `round_internal_null` (kappa's pe, the within-sample expected agreement) from
-           the round's own marginals. On a stratified probe set the first carries the
-           sampling caveat; the second is the pre-registered headline. The full 2-by-2
-           verdict counts are reported (`cells`), and round marginals are keyed by
-           reviewer NAME, never pooled positionally — when seats vary by pair, a
-           `seat_note` says so.
+  stats  — counts, raw agreement and missingness overall; the 2-by-2 table, the
+           within-sample null and Cohen's kappa PER FIXED REVIEWER PAIR (by_pair);
+           the external-rate independence null overall. There is deliberately NO
+           pooled positional kappa: when a round rotates seats, pooling the a/b
+           positions makes kappa a statistic of the ENCODING, not of any reviewer
+           pair — codex's follow-up, reproduced: the same three named reviews
+           encode to kappa 0.0 or -1.0 depending only on which seat is written
+           first. Undefined kappa (pe == 1) is preserved as null, never coerced.
+           The independence null comes from the reviewers' LIVE-work marginals
+           (external rates; their source window is echoed as `marginals_source`).
+           On a stratified probe set it carries the sampling caveat. Round
+           marginals are keyed by reviewer NAME, never pooled positionally.
 
 Canonical form (so any seat can reimplement): json.dumps(payload, sort_keys=True,
 separators=(",", ":"), ensure_ascii=True), UTF-8 encoded.
@@ -51,16 +51,30 @@ Usage:
                           # (verdict+basis+nonce) written mode-0600 to --reveal-out —
                           # keep private until both seals are published
   blind_coreview.py verify --seal-file s.json --reveal-file r.json [--manifest m.json]
-                          # m.json (the frozen round manifest):
+                          # m.json (the frozen round manifest — frozen before the first
+                          # seal; when given, every piece is enforced):
                           #   {"round": str, "seats": [name, ...],
-                          #    "probes": [{"eid": str, "record_sha256": hex}, ...]}
+                          #    "question": str,        # the question as presented
+                          #    "verdicts": [str, ...], # the frozen encoding; an
+                          #                            # abstention / insufficient-
+                          #                            # evidence mark is a verdict of
+                          #                            # its own, never coerced boolean
+                          #    "probes": [{"eid": str, "record_sha256": hex,
+                          #                "reviewers": [name, name]}, ...]}
+                          #                            # the TWO eligible reviewers for
+                          #                            # THIS probe — eligibility is
+                          #                            # per-probe, not round-wide
   blind_coreview.py stats --pairs pairs.json
                           # pairs.json: {"round": str, "marginals_source": str,   (both
                           #              optional, echoed into the output)
                           #              "pairs": [{a_name: str, b_name: str,
-                          #                         a_dissent: bool, b_dissent: bool,
+                          #                         a_dissent: bool | null,
+                          #                         b_dissent: bool | null,
                           #                         marginals: {name: live-work
                           #                                     dissent_rate in [0,1]}}]}
+                          # null dissent bit = abstain / insufficient evidence /
+                          # missing reveal: counted in missingness, excluded from
+                          # agreement and kappa — recorded, never coerced.
 """
 import argparse
 import hashlib
@@ -132,15 +146,49 @@ def check(seal_doc: dict, reveal: dict, manifest: dict = None) -> list:
         if reveal.get("round") != manifest.get("round"):
             failures.append(f"manifest: round {reveal.get('round')!r} is not the "
                             f"frozen round {manifest.get('round')!r}")
-        if reveal.get("reviewer") not in manifest.get("seats", []):
+        seats = manifest.get("seats", [])
+        if reveal.get("reviewer") not in seats:
             failures.append(f"manifest: {reveal.get('reviewer')!r} holds no seat in "
                             f"this round")
+        # The frozen question and verdict encoding (codex's follow-up, notice 14563):
+        # a manifest that does not freeze them is not the manifest this round seals
+        # against. An abstention / insufficient-evidence mark is a verdict of its own
+        # in the encoding — recorded, never coerced into a boolean.
+        if not isinstance(manifest.get("question"), str) or not manifest["question"]:
+            failures.append("manifest: the frozen round must carry the question as "
+                            "presented (a non-empty \"question\")")
+        verdicts = manifest.get("verdicts")
+        if (not isinstance(verdicts, list) or not verdicts
+                or not all(isinstance(v, str) and v for v in verdicts)):
+            failures.append("manifest: the frozen round must carry the verdict "
+                            "encoding (a non-empty \"verdicts\" list, including how "
+                            "abstention is recorded)")
+        elif reveal.get("verdict") not in verdicts:
+            failures.append(f"manifest: verdict {reveal.get('verdict')!r} is not in "
+                            f"the frozen encoding {verdicts!r}")
         probe = (reveal.get("eid"), reveal.get("record_sha256"))
-        probes = {(p.get("eid"), p.get("record_sha256")) for p in manifest.get("probes", [])}
-        if probe not in probes:
+        entry = next((p for p in manifest.get("probes", [])
+                      if (p.get("eid"), p.get("record_sha256")) == probe), None)
+        if entry is None:
             failures.append(f"manifest: probe {reveal.get('eid')!r} with record digest "
                             f"{reveal.get('record_sha256')!r} is not in the frozen "
                             f"manifest — not the packet this round presented")
+        else:
+            reviewers = entry.get("reviewers")
+            if (not isinstance(reviewers, list) or len(reviewers) != 2
+                    or not all(isinstance(r, str) and r for r in reviewers)):
+                failures.append(f"manifest: probe {reveal.get('eid')!r} names no "
+                                f"eligible reviewer PAIR — the manifest freezes the "
+                                f"two eligible reviewers per probe")
+            else:
+                if any(r not in seats for r in reviewers):
+                    failures.append(f"manifest: probe {reveal.get('eid')!r} names a "
+                                    f"reviewer holding no seat in this round")
+                if reveal.get("reviewer") not in reviewers:
+                    failures.append(f"manifest: {reveal.get('reviewer')!r} holds a "
+                                    f"round seat but is not eligible for probe "
+                                    f"{reveal.get('eid')!r} — eligibility is "
+                                    f"per-probe, not round-wide")
     return failures
 
 
@@ -150,14 +198,22 @@ def verify(seal_doc: dict, reveal: dict, manifest: dict = None) -> bool:
 
 def _validate_pair(i: int, p: dict) -> None:
     """Refuse invalid inputs before calculating (codex's review, point 3): literal
-    booleans for the dissent bits, finite rates in [0,1], names as non-empty strings."""
+    booleans for the dissent bits — or null, the abstention / insufficient-evidence /
+    missing-reveal mark that is recorded rather than coerced to a boolean (codex's
+    follow-up, notice 14563); finite rates in [0,1]; names as non-empty strings; a
+    pair is two DISTINCT reviewers."""
     where = f"pairs[{i}]"
     for key in ("a_name", "b_name"):
         if not isinstance(p.get(key), str) or not p[key]:
             raise ValueError(f"{where}.{key}: want a non-empty string, got {p.get(key)!r}")
+    if p["a_name"] == p["b_name"]:
+        raise ValueError(f"{where}: a pair is two distinct reviewers, got "
+                         f"{p['a_name']!r} twice")
     for key in ("a_dissent", "b_dissent"):
-        if type(p.get(key)) is not bool:
-            raise ValueError(f"{where}.{key}: want a literal boolean, got {p.get(key)!r}")
+        if type(p.get(key)) is not bool and p.get(key) is not None:
+            raise ValueError(f"{where}.{key}: want a literal boolean or null "
+                             f"(abstain / insufficient evidence / missing reveal), "
+                             f"got {p.get(key)!r}")
     marginals = p.get("marginals")
     if not isinstance(marginals, dict):
         raise ValueError(f"{where}.marginals: want an object, got {marginals!r}")
@@ -173,12 +229,22 @@ def _validate_pair(i: int, p: dict) -> None:
 
 
 def stats(round_doc) -> dict:
-    """agreement, the two labeled nulls, excess; kappa and PABAK on the dissent bit;
-    full 2x2 cells; per-name round marginals.
+    """counts, raw agreement and missingness overall; the 2x2 table, within-sample
+    null and Cohen's kappa per FIXED reviewer pair; the external-rate null overall.
 
     Input is the round envelope {"pairs": [...]}; each pair carries its seats' names,
-    the two dissent bits, and the reviewers' live-work marginals (the external rates
-    the independence null is built from)."""
+    the two dissent bits (true/false, or null — abstain / insufficient evidence /
+    missing reveal, recorded and counted, never coerced), and the reviewers' live-work
+    marginals (the external rates the independence null is built from).
+
+    There is deliberately no pooled positional kappa: when a round rotates seats,
+    pooling the a/b positions makes the number a statistic of the ENCODING — codex's
+    follow-up, reproduced as test_stats_kappa_is_not_a_statistic_of_the_encoding: the
+    same named reviews encode to kappa 0.0 or -1.0 depending only on which seat is
+    written first. Chance-corrected numbers live in by_pair, keyed by the pair's
+    sorted names, with a consistent orientation inside each block. An aggregate
+    chance-corrected statistic across varying pairs wants its own specified estimand
+    and weighting, which relabeling a pooled output is not (codex, ibid.)."""
     if isinstance(round_doc, list):
         raise ValueError("pairs.json is a round envelope: {\"pairs\": [...], ...}, "
                          "not a bare list — the envelope is what carries "
@@ -194,15 +260,18 @@ def stats(round_doc) -> dict:
     if not n:
         return {"n": 0}
 
-    agree = sum(1 for p in pairs if p["a_dissent"] == p["b_dissent"])
-    cells = {"both_dissent": sum(1 for p in pairs if p["a_dissent"] and p["b_dissent"]),
-             "a_only": sum(1 for p in pairs if p["a_dissent"] and not p["b_dissent"]),
-             "b_only": sum(1 for p in pairs if not p["a_dissent"] and p["b_dissent"]),
-             "neither": sum(1 for p in pairs if not p["a_dissent"] and not p["b_dissent"])}
+    complete = [p for p in pairs
+                if p["a_dissent"] is not None and p["b_dissent"] is not None]
+    nc = len(complete)
+    missing = n - nc
+    agree = sum(1 for p in complete if p["a_dissent"] == p["b_dissent"])
+    po = agree / nc if nc else None
 
     # External null: the reviewers' live-work marginals, as supplied per pair. One rate
     # per reviewer per round — a name with two rates across pairs is a provenance
-    # conflict, refused rather than silently averaged.
+    # conflict, refused rather than silently averaged. Keyed by NAME, so it is
+    # representation-independent; computed over the complete pairs, the same
+    # denominator raw agreement carries.
     external = {}
     for i, p in enumerate(pairs):
         for name in (p["a_name"], p["b_name"]):
@@ -213,51 +282,80 @@ def stats(round_doc) -> dict:
                                  f"reviewer per round; per-stratum rates want per-stratum "
                                  f"runs")
             external[name] = rate
-    null = 0.0
+    null = None
+    if nc:
+        null = sum(external[p["a_name"]] * external[p["b_name"]]
+                   + (1 - external[p["a_name"]]) * (1 - external[p["b_name"]])
+                   for p in complete) / nc
+
+    # Per fixed unordered pair: sorted names are the key, the orientation inside each
+    # block is those names in sorted order, and the 2x2 / within-sample null / kappa
+    # are computed inside the block only. Kappa stays null when pe == 1 (undefined),
+    # never coerced.
+    groups = {}
     for p in pairs:
-        pa, pb = external[p["a_name"]], external[p["b_name"]]
-        null += pa * pb + (1 - pa) * (1 - pb)
-    null /= n
+        (n1, b1), (n2, b2) = sorted(((p["a_name"], p["a_dissent"]),
+                                     (p["b_name"], p["b_dissent"])))
+        g = groups.setdefault(f"{n1}+{n2}", {"orientation": [n1, n2], "bits": []})
+        g["bits"].append((b1, b2))
+    by_pair = {}
+    for key in sorted(groups):
+        g = groups[key]
+        bits = [(b1, b2) for b1, b2 in g["bits"] if b1 is not None and b2 is not None]
+        m, mc = len(g["bits"]), len(bits)
+        block = {"n": m, "complete": mc, "missing": m - mc,
+                 "orientation": g["orientation"]}
+        if mc:
+            ga = sum(1 for b1, b2 in bits if b1 == b2)
+            gpo = ga / mc
+            d1 = sum(b1 for b1, _ in bits) / mc
+            d2 = sum(b2 for _, b2 in bits) / mc
+            pe = d1 * d2 + (1 - d1) * (1 - d2)
+            kappa = (gpo - pe) / (1 - pe) if pe < 1 else None
+            block.update({
+                "agree": ga, "raw_agreement": round(gpo, 4),
+                "cells": {"both_dissent": sum(1 for b1, b2 in bits if b1 and b2),
+                          "a_only": sum(1 for b1, b2 in bits if b1 and not b2),
+                          "b_only": sum(1 for b1, b2 in bits if not b1 and b2),
+                          "neither": sum(1 for b1, b2 in bits if not b1 and not b2)},
+                "round_internal_null": round(pe, 4),
+                "round_excess_pts": round(100 * (gpo - pe), 1),
+                "kappa": round(kappa, 3) if kappa is not None else None,
+                "pabak": round(2 * gpo - 1, 3)})
+        else:
+            block.update({"agree": 0, "raw_agreement": None, "cells": None,
+                          "round_internal_null": None, "round_excess_pts": None,
+                          "kappa": None, "pabak": None})
+        by_pair[key] = block
 
-    # Round-internal null (kappa's pe) on the dissent bit.
-    a_d = sum(p["a_dissent"] for p in pairs) / n
-    b_d = sum(p["b_dissent"] for p in pairs) / n
-    po = agree / n
-    pe = a_d * b_d + (1 - a_d) * (1 - b_d)
-    kappa = (po - pe) / (1 - pe) if pe < 1 else None
-    pabak = 2 * po - 1
-
-    # Round marginals keyed by NAME (each reviewer's whole round, either seat) — never
-    # pooled positionally. kappa's pe is still the positional pe; when seats vary by
-    # pair, that is stated, not hidden.
+    # Round marginals keyed by NAME (each reviewer's whole round, either seat, complete
+    # pairs only) — never pooled positionally.
     dissents, appearances = {}, {}
-    for p in pairs:
+    for p in complete:
         for name, bit in ((p["a_name"], p["a_dissent"]), (p["b_name"], p["b_dissent"])):
             dissents[name] = dissents.get(name, 0) + int(bit)
             appearances[name] = appearances.get(name, 0) + 1
     round_marginals = {name: round(dissents[name] / appearances[name], 4)
                        for name in appearances}
-    seat_note = None
-    if len({p["a_name"] for p in pairs}) > 1 or len({p["b_name"] for p in pairs}) > 1:
-        seat_note = ("seats vary by pair: marginals are per-name across a reviewer's "
-                     "whole round, and kappa's pe pools non-fixed seats — read it as "
-                     "the within-sample expected agreement, not one fixed pair's")
 
-    out = {"n": n, "agree": agree, "raw_agreement": round(po, 4), "cells": cells,
-           "independence_null": round(null, 4),
-           "excess_pts": round(100 * (po - null), 1),
-           "round_internal_null": round(pe, 4),
-           "round_excess_pts": round(100 * (po - pe), 1),
-           "kappa": round(kappa, 3) if kappa is not None else None,
-           "pabak": round(pabak, 3),
+    out = {"n": n, "complete": nc, "missing": missing,
+           "agree": agree,
+           "raw_agreement": round(po, 4) if po is not None else None,
+           "independence_null": round(null, 4) if null is not None else None,
+           "excess_pts": round(100 * (po - null), 1) if nc else None,
+           "pabak": round(2 * po - 1, 3) if po is not None else None,
            "round_marginals": round_marginals,
-           "external_marginals": {k: round(v, 4) for k, v in sorted(external.items())}}
+           "external_marginals": {k: round(v, 4) for k, v in sorted(external.items())},
+           "by_pair": by_pair}
     if round_doc.get("marginals_source"):
         out["marginals_source"] = round_doc["marginals_source"]
     if round_doc.get("round"):
         out["round"] = round_doc["round"]
-    if seat_note:
-        out["seat_note"] = seat_note
+    if len(by_pair) > 1:
+        out["seat_note"] = ("seats vary by pair: chance-corrected statistics are per "
+                            "fixed reviewer pair (by_pair); a pooled positional kappa "
+                            "is a statistic of the encoding, not of any pair, and is "
+                            "deliberately not reported")
     return out
 
 

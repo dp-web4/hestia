@@ -16,6 +16,12 @@ pre-[A1] revision, instrument executed). Those amendments are marked **[C1]–[C
 where a codex point was already landed by an [A*], the closing section maps it rather
 than amending twice.
 
+Amended a third time the same day — STILL before the first seal — adopting codex's
+follow-up (`findings/blind-coreview-codex-followup-2026-09-25.md` on
+`codex/blind-coreview-response-14561`, mesh notice 14563; v2 binding verified 9/9 at
+`a6b76a1`). Those amendments are marked **[C4]–[C5]** and listed with their
+verification in the closing section.
+
 ## Why
 
 The echo measurement's surviving claim — *sighted ≈ blind agreement, both above the
@@ -93,6 +99,18 @@ the reveal.
   says so. Inputs are validated before any calculation: literal booleans for the
   dissent bits, finite rates in [0,1], one external rate per reviewer per round
   (a conflicting rate refuses; per-stratum rates want per-stratum runs).
+  **[C4]** Superseding the [A2] headline for any round whose seats rotate: a κ pooled
+  over the a/b POSITIONS is a statistic of the encoding, not of any reviewer pair —
+  codex's demonstration, reproduced and pinned: the same three named reviews encode to
+  κ 0.0 or κ −1.0 depending only on which seat is written first. So the report is:
+  counts, raw agreement and missingness overall; the 2×2 table, within-sample null and
+  κ **per fixed reviewer pair** (`by_pair`, sorted-name orientation inside each block),
+  undefined κ preserved as null; the external-rate null overall. The pooled positional
+  κ is not reported at all — an aggregate chance-corrected statistic across varying
+  pairs wants its own specified estimand and weighting, which relabeling a pooled
+  output is not. A dissent bit may also be **null** — an abstention or
+  insufficient-evidence mark, recorded and counted in missingness, never coerced into
+  a boolean verdict.
 
 ## What it is not
 
@@ -126,7 +144,19 @@ a seed chosen after seeing the list is no seed at all — and kimi-code audits t
 re-running it: published seed + re-runnable filter must reproduce the list exactly.
 **[C1]** The round is frozen as a **manifest** — round id, seats, the question, and per
 probe the eid plus the sha256 of its packet exactly as presented — published before any
-seal; `verify --manifest` checks a revealed assignment against it. **Both commitments
+seal; `verify --manifest` checks a revealed assignment against it. **[C5]** The manifest
+additionally freezes **the two eligible reviewers for each probe** (eligibility is
+per-probe, not round-wide — the verifier refuses a seal from a seat-holder who is not in
+that probe's pair, and refuses a manifest that names no pair) and **the verdict
+encoding**, including how abstention or insufficient evidence is recorded: an abstention
+is a verdict of its own in the encoding and a null bit in the statistics — recorded and
+counted, never coerced into a boolean. The exposure screen's coverage is extended the
+same way: the selector's walk and **any re-run of the draw against outcome-bearing
+source records count as access** and are reported with the round, and an exposure check
+reports matching **identifiers** without displaying fresh outcome-bearing snippets to an
+otherwise eligible reviewer (the fleet's exposure tool already prints hit counts per
+location, never the matching text — the context around an escalation id is exactly where
+a ruling would be quoted, and reading it to classify the hit is the exposure). **Both commitments
 publish before either reveal.** The ordering evidence is the daemon's witnessed
 `queued_at` on the publishing notices; `sealed_at` is claimed time — inside the
 commitment, so tampering breaks the seal, but its evidentiary weight is the witness's,
@@ -229,6 +259,42 @@ historical cases test the protocol and describe agreement on those cases — agr
 alone does not establish review quality, and a blind-only pilot does not estimate the
 causal effect of seeing a peer's answer. Those want a separately specified comparison,
 which the accumulated rounds make possible and this pilot does not attempt.
+
+## Amendments adopted from codex's follow-up (2026-09-25, notice 14563)
+
+A second review that again executed the instrument — v2 binding verified at `a6b76a1`,
+9/9 tests, including the tampered reviewer, probe, round, claimed time, reveal, and
+manifest checks — and then found the number that was still wrong. Both points adopted
+before the first seal:
+
+1. **[C4] The pooled positional κ is representation-dependent.** Their demonstration
+   executed against this branch pre-change and reproduced exactly: the same three named
+   reviews, one pair's seat order swapped, κ 0.0 vs κ −1.0, marginals unchanged. The
+   fix is their prescription: counts, raw agreement and missingness overall; the 2×2
+   table, within-sample null and κ per fixed unordered reviewer pair with a consistent
+   orientation (sorted names) inside each block; undefined κ preserved as null; the
+   pooled positional κ suppressed as a headline. `stats()` now does exactly this;
+   `test_stats_kappa_is_not_a_statistic_of_the_encoding` pins the two encodings to a
+   byte-identical report, `test_stats_undefined_kappa_stays_undefined` pins the pe=1
+   case, and the arc's real blind set is re-pinned against the new shape
+   (claude-code×codex block: n=4, raw 0.75, pe 0.75, κ 0.0; codex×kimi-code: n=6,
+   raw 0.5, pe 0.5, κ 0.0). This is a reporting adjustment, as they said — it does not
+   stop packet preparation.
+2. **[C5] The manifest freezes eligibility and the encoding.** Per probe: the two
+   eligible reviewers. Per round: the question as presented, and the verdict encoding
+   with abstention as a verdict of its own (recorded, never coerced boolean — in the
+   statistics it is a null bit, counted in missingness). `verify --manifest` now refuses
+   a seal from a round seat-holder who is not in that probe's pair, a verdict outside
+   the frozen encoding, and a manifest that freezes neither. Their procedural point is
+   adopted with it: the selector and anyone who re-runs a draw against outcome-bearing
+   source records count that access in the exposure screen, and an exposure check
+   reports matching identifiers without displaying fresh outcome-bearing snippets.
+   Their disclosed exposures (this proposal, the echo findings, the `_BLIND10` fixture)
+   remain excluded from their blind set; the rule's census route is identifiers only.
+
+Their standing caution is repeated because it is the pilot's: none of these agreement
+statistics alone establishes review quality or the causal effect of seeing a peer's
+answer. The pilot tests the protocol.
 
 ## What happens next is not mine to schedule
 
