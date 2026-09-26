@@ -6,7 +6,8 @@ foreground, so nothing could start a second session. Nothing enforced it and
 nothing tested it, so appending `&` anywhere on the path removed it silently.
 This test fails if that is true again.
 
-Six cases. 1-5 drive `with-member-lock.sh` directly (the law). Case 6 drives the
+Cases 1-5 and 8 drive `with-member-lock.sh` directly (the law); 8 does so with flock(1)
+hidden, so the python3 fcntl fallback (#1105) runs on Linux too. Case 6 drives the
 REAL `fire-claude.sh` and `fire-kimi.sh` with a stubbed CLI on PATH and a stubbed
 HOME — no test seam in the fire scripts, so the test cannot pass by exercising a
 code path only the test uses.
@@ -145,9 +146,9 @@ with tempfile.TemporaryDirectory() as tmp:
             os.symlink(p, os.path.join(bindir, tool))
     env = base_env(tmp); env["PATH"] = bindir
     r = run([LOCKER, "claude-code"] + payload(ev, 0.1), env)
-    check("5. missing flock(1) refuses with EX_UNAVAILABLE(69)",
+    check("5. neither flock(1) nor python3 refuses with EX_UNAVAILABLE(69)",
           r.returncode == EX_UNAVAILABLE, f"rc={r.returncode} stderr={r.stderr.strip()!r}")
-    check("5b. missing flock(1) did NOT run the payload",
+    check("5b. neither flock(1) nor python3: the payload did NOT run",
           not os.path.exists(ev), "payload ran unbounded — fail-open")
 
 # ---------------------------------------------------------------------------
@@ -208,6 +209,83 @@ for script, stub in (("fire-claude.sh", "claude"), ("fire-kimi.sh", "kimi")):
         check(f"7. {script}: a failed CLI makes the fire exit non-zero (primer retained)",
               r.returncode == 3, f"rc={r.returncode} — the watcher would DELETE the "
                                  f"consume-once primer on this rc")
+
+# ---------------------------------------------------------------------------
+# 8. The python3 fcntl fallback (#1105), exercised on a box that HAS flock(1).
+#    Cases 1-4 only reach it on a machine without flock(1) (macOS), so on Linux CI
+#    the fallback was never run. Here flock(1) is hidden and python3 is not.
+# ---------------------------------------------------------------------------
+def fallback_path(tmp):
+    """A PATH with everything the locker and payloads need EXCEPT flock(1)."""
+    bindir = os.path.join(tmp, "bin-noflock"); os.makedirs(bindir, exist_ok=True)
+    for tool in ("mkdir", "chmod", "bash", "sleep", "echo", "sed", "date", "rm", "python3", "cat"):
+        p = shutil.which(tool)
+        if p and not os.path.exists(os.path.join(bindir, tool)):
+            os.symlink(p, os.path.join(bindir, tool))
+    assert not os.path.exists(os.path.join(bindir, "flock"))
+    return bindir
+
+with tempfile.TemporaryDirectory() as tmp:
+    ev = os.path.join(tmp, "ev8")
+    env = base_env(tmp); env["PATH"] = fallback_path(tmp)
+    a = subprocess.Popen([LOCKER, "claude-code"] + payload(ev, 1.0), env=env,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(0.3)
+    b = run([LOCKER, "claude-code"] + payload(ev, 0.1), env)
+    a.wait()
+    ov, seq = overlapped(ev)
+    check("8. python3 fallback: two same-member fires never overlap", not ov and a.returncode == 0,
+          f"seq={seq!r} rc_a={a.returncode} rc_b={b.returncode}")
+    check("8b. python3 fallback: the waiter still runs (serialized, not dropped)",
+          seq == "SESE" and b.returncode == 0, f"seq={seq!r} rc_b={b.returncode}")
+
+with tempfile.TemporaryDirectory() as tmp:
+    ev = os.path.join(tmp, "ev8c")
+    env = base_env(tmp, wait="0.5"); env["PATH"] = fallback_path(tmp)
+    a = subprocess.Popen([LOCKER, "claude-code"] + payload(ev, 2.0), env=env,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(0.3)
+    b = run([LOCKER, "claude-code"] + payload(ev, 0.1), env)
+    a.wait()
+    seq = "".join(open(ev).read().split())
+    check("8c. python3 fallback: contended past the wait refuses with EX_TEMPFAIL(75), payload not run",
+          b.returncode == EX_TEMPFAIL and seq == "SE", f"rc={b.returncode} seq={seq!r}")
+
+# 8d. The two lockers take ONE lock. A fire through flock(1) and a concurrent fire through
+#     the fallback (another seat's PATH) must still serialize: flock(1) and fcntl.flock are
+#     both flock(2) on the same file.
+with tempfile.TemporaryDirectory() as tmp:
+    ev = os.path.join(tmp, "ev8d")
+    env_flock = base_env(tmp)
+    env_py = base_env(tmp); env_py["PATH"] = fallback_path(tmp)
+    a = subprocess.Popen([LOCKER, "claude-code"] + payload(ev, 1.0), env=env_flock,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(0.3)
+    b = run([LOCKER, "claude-code"] + payload(ev, 0.1), env_py)
+    a.wait()
+    ov, seq = overlapped(ev)
+    check("8d. flock(1) and the python3 fallback exclude each other (one lock, two tools)",
+          not ov and seq == "SESE", f"seq={seq!r}")
+
+# 8e. PARITY on the documented clause: "anything <cmd> leaves running that inherits the lock
+#     fd holds the member busy". Under flock(1) a leaked background grandchild keeps the lock.
+#     The fallback must do the same, not release the member while its process still runs.
+def leaked_grandchild_holds(env_fire):
+    with tempfile.TemporaryDirectory() as tmp:
+        env = base_env(tmp, wait="0.5")
+        env["PATH"] = env_fire(tmp)
+        # The payload returns at once but leaves `sleep 2` running in the background.
+        r1 = run([LOCKER, "claude-code", "bash", "-c", "sleep 2 >/dev/null 2>&1 &"], env)
+        r2 = run([LOCKER, "claude-code", "bash", "-c", "true"], env)
+        time.sleep(2.2)  # let the leaked sleep finish before the tempdir goes away
+        return r1.returncode, r2.returncode
+
+rc_flock = leaked_grandchild_holds(lambda tmp: os.environ["PATH"])
+rc_py = leaked_grandchild_holds(fallback_path)
+check("8e. baseline: under flock(1) a leaked grandchild keeps the member busy",
+      rc_flock == (0, EX_TEMPFAIL), f"rc={rc_flock}")
+check("8f. python3 fallback matches: a leaked grandchild keeps the member busy",
+      rc_py == (0, EX_TEMPFAIL), f"rc={rc_py} — the fallback released the lock while a child of the fire still ran")
 
 print(f"\nfailures={len(failures)}")
 for f in failures:
