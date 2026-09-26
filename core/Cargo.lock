@@ -908,7 +908,6 @@ dependencies = [
  "globset",
  "hestia-wire",
  "hex",
- "hub-plugin",
  "rand 0.8.6",
  "ratatui",
  "regex",
@@ -928,6 +927,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "web4-core",
+ "web4-hub-plugin",
  "web4-policy",
  "web4-trust-core",
  "x25519-dalek",
@@ -1006,16 +1006,6 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
-
-[[package]]
-name = "hub-plugin"
-version = "0.1.0-alpha.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "serde_json",
- "uuid",
-]
 
 [[package]]
 name = "hyper"
@@ -2945,6 +2935,16 @@ dependencies = [
  "uuid",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "web4-hub-plugin"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
