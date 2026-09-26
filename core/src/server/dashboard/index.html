@@ -2433,7 +2433,12 @@
             data-merge-of="${escapeHtml(alike[r.plugin_id].of)}" data-merge-ref="${escapeHtml(alike[r.plugin_id].ref)}"
             title="Fills the alias form under govern → acts. Nothing is recorded until you press its button.">prepare merge</button></div>` : ''}
       </div>`;
-    }).join('');
+    // #1113 moved this trailer to renderRoleTrust, where `hidden` is not declared. Selecting any
+    // agent then threw "hidden is not defined" out of the tick, the header read "offline (hidden
+    // is not defined)", and the witness chain was never re-rendered for the selection (dp,
+    // 2026-09-25). It belongs here, in the aggregate view that computes `hidden`.
+    }).join('') + (hidden ? `<div class="grant-note">${hidden} retired id${hidden === 1 ? '' : 's'} hidden —
+      listed, with the controls, under <strong>govern → discover</strong>.</div>` : '');
   }
 
   function renderRoleTrust(trust, orchs) {
@@ -2495,8 +2500,7 @@
         <button type="button" class="tr-detail" onclick="showTrustDetail(${i})"
                 title="Full tensor, every dimension, and the chain receipts behind it">detail</button>
       </div>`;
-    }).join('') + (hidden ? `<div class="grant-note">${hidden} retired id${hidden === 1 ? '' : 's'} hidden —
-      listed, with the controls, under <strong>govern → discover</strong>.</div>` : '');
+    }).join('');
   }
 
   // Drill from the harness aggregate into that harness's role trust — the same selection
@@ -5217,7 +5221,9 @@
     tmodal.addEventListener('click', (e) => { if (e.target.dataset.close) tmodal.hidden = true; });
     document.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape') return;
-      if (!modal.hidden) modal.hidden = true;
+      // A `modal.hidden` line sat above this from 512d7c2 (2026-07-26). No element or variable
+      // named `modal` exists, so Escape threw a ReferenceError before reaching this line and
+      // never closed the trust-detail modal. Found by ESLint no-undef, 2026-09-25.
       if (!tmodal.hidden) tmodal.hidden = true;
     });
   })();
