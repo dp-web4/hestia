@@ -32,7 +32,7 @@
 #
 # Exit codes on refusal are deliberately non-zero and deliberately distinct:
 #   75 EX_TEMPFAIL   lock not acquired within the wait — retryable
-#   69 EX_UNAVAILABLE  flock(1) missing — fail CLOSED, command NOT run
+#   69 EX_UNAVAILABLE  no lock tool: neither flock(1) nor python3 (fcntl) — fail CLOSED, command NOT run
 #   64 EX_USAGE      no command given
 # Any non-zero rc reaches hestia-watch-member.sh, which retains the primer rather
 # than deleting it — the drain is consume-once, so a refused fire must not eat it.
@@ -56,7 +56,7 @@ WAIT="${HESTIA_FIRE_LOCK_WAIT:-1830}"
 # until the command exits. A PATH with neither tool still refuses.
 if ! command -v flock >/dev/null 2>&1; then
   command -v python3 >/dev/null 2>&1 || {
-    echo "[mesh-lock] flock(1) not available — refusing to fire $PLUGIN unbounded" >&2
+    echo "[mesh-lock] no lock tool (neither flock(1) nor python3) — refusing to fire $PLUGIN unbounded" >&2
     exit 69
   }
   exec python3 - "$LOCK" "$WAIT" "$HOLDER" "$PLUGIN" "$@" <<'PY'
@@ -67,7 +67,7 @@ import time
 try:
     import fcntl
 except ImportError:
-    sys.stderr.write("[mesh-lock] flock(1) not available — refusing to fire unbounded\n")
+    sys.stderr.write("[mesh-lock] no lock tool (flock(1) missing, python3 has no fcntl) — refusing to fire unbounded\n")
     sys.exit(69)
 
 path, wait_s, holder, plugin = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
@@ -101,13 +101,25 @@ with open(holder, "w") as handle:
         time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         " ".join(cmd),
     ))
-proc = __import__("subprocess").Popen(cmd, close_fds=False)
-rc = proc.wait()
+# The lock must outlive this wrapper in anything <cmd> leaves running, as `exec 9>>` gives the
+# flock(1) path: a leaked background grandchild holds the member busy (header, "Usage"). Python
+# opens fds NON-inheritable (PEP 446), and close_fds=False does not change that, so without this
+# line the fallback released the member while a child of the fire still ran
+# (fire_concurrency_test 8f).
+os.set_inheritable(fd, True)
+try:
+    proc = __import__("subprocess").Popen(cmd, close_fds=False)
+    rc = proc.wait()
+except FileNotFoundError:
+    # bash reports a command it cannot find as 127; do the same instead of a traceback.
+    sys.stderr.write("[mesh-lock] %s: command not found\n" % cmd[0])
+    rc = 127
 try:
     os.remove(holder)
 except OSError:
     pass
-sys.exit(rc)
+# A signal death is -N from Popen; report 128+N as bash does, so the watcher sees the same rc.
+sys.exit(128 - rc if rc < 0 else rc)
 PY
 fi
 
