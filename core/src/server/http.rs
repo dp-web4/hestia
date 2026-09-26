@@ -2020,16 +2020,31 @@ async fn vault_add(
     let mut s = state.lock().await;
     match s.vault.add(entry) {
         Ok(()) => {
-            // Witness the operator's write: the name and its policy, never the value (the
-            // MCP `vault_set` records the same way).
-            let _ = s.append_chain(
+            // Witness the operator's write: the name and its policy, never the value. FAIL CLOSED
+            // (GPT review of #1123): a credential must not be in the vault without its record. If
+            // the append fails, the add is undone, and the response says whether the undo worked.
+            // That is the same terminal-append-or-rollback order as transport_binding_set.
+            match s.append_chain(
                 "vault_entry_added",
                 serde_json::json!({
                     "name": name, "scope": scope, "tags": tags,
                     "allowed_consumers": consumers, "via": "operator",
                 }),
-            );
-            (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+            ) {
+                Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
+                Err(e) => {
+                    let undone = s.vault.remove(name);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!(
+                            "the vault_entry_added record could not be appended ({e}); rollback: {}",
+                            match undone {
+                                Ok(_) => format!("'{name}' removed again — NOT stored"),
+                                Err(rb) => format!("FAILED ({rb}) — '{name}' IS STORED without its record"),
+                            })})),
+                    )
+                }
+            }
         }
         Err(crate::error::CoreError::CredentialAlreadyExists(_)) => (
             StatusCode::CONFLICT,
@@ -2061,14 +2076,30 @@ async fn vault_delete(
     let mut s = state.lock().await;
     match s.vault.remove(&name) {
         Ok(removed) => {
-            let _ = s.append_chain(
+            // FAIL CLOSED, as in vault_add: no deletion without its record. If the append fails,
+            // the removed entry goes back exactly as it was (same id, dates and policy), and the
+            // response says whether that worked.
+            match s.append_chain(
                 "vault_entry_removed",
                 serde_json::json!({
                     "name": name, "scope": removed.scope, "tags": removed.tags,
                     "allowed_consumers": removed.allowed_consumers, "via": "operator",
                 }),
-            );
-            (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+            ) {
+                Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
+                Err(e) => {
+                    let restored = s.vault.add(removed);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!(
+                            "the vault_entry_removed record could not be appended ({e}); rollback: {}",
+                            match restored {
+                                Ok(()) => format!("'{name}' restored — NOT deleted"),
+                                Err(rb) => format!("FAILED ({rb}) — '{name}' IS DELETED without its record"),
+                            })})),
+                    )
+                }
+            }
         }
         Err(crate::error::CoreError::CredentialNotFound(_)) => (
             StatusCode::NOT_FOUND,
@@ -9152,6 +9183,54 @@ mod operator_vault_tests {
             .expect("an operator delete must be on the chain");
         assert_eq!(e.event_data["name"], "p0-004-cred");
         assert!(!e.event_data.to_string().contains("sk-test-1234"));
+    }
+
+    /// Make the next chain append of `event_type` fail, the way the transport-binding and
+    /// scope rollback tests do: a trigger on the encrypted witness DB.
+    fn fail_appends_of(dir: &std::path::Path, event_type: &str) -> rusqlite::Connection {
+        let key = crate::storage::storage_key(dir, "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER fail_vault_witness BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = '{event_type}'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;")).unwrap();
+        conn
+    }
+
+    /// GPT review of #1123: a delete must not stand without its record. With the append
+    /// failing, the entry is restored exactly (same id and value) and the answer is a 500.
+    #[tokio::test]
+    async fn delete_whose_witness_fails_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        state.lock().await.vault.upsert(VaultEntry::new("p0-004-cred", "sk-test-1234")).unwrap();
+        let id0 = state.lock().await.vault.get("p0-004-cred").unwrap().id;
+        let conn = fail_appends_of(dir.path(), "vault_entry_removed");
+        let r = vault_delete(State(state.clone()), Path("p0-004-cred".into())).await.into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(r).await;
+        assert!(body["error"].as_str().unwrap().contains("NOT deleted"), "{body}");
+        conn.execute_batch("DROP TRIGGER fail_vault_witness").unwrap();
+        let s = state.lock().await;
+        let e = s.vault.get("p0-004-cred").expect("rolled back: the entry is still there");
+        assert_eq!((e.id, e.secret.as_str()), (id0, "sk-test-1234"), "restored exactly");
+        assert!(!s.recent_chain(10).iter().any(|e| e.event_type == "vault_entry_removed"));
+    }
+
+    /// And an add must not stand without its record: the entry is removed again, 500.
+    #[tokio::test]
+    async fn add_whose_witness_fails_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        let conn = fail_appends_of(dir.path(), "vault_entry_added");
+        let r = vault_add(State(state.clone()), Json(serde_json::json!(
+            {"name": "openai-key", "value": "SECRET-V", "allowed_consumers": ["kimi-code"]}))).await.into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(r).await;
+        assert!(body["error"].as_str().unwrap().contains("NOT stored"), "{body}");
+        conn.execute_batch("DROP TRIGGER fail_vault_witness").unwrap();
+        let s = state.lock().await;
+        assert!(s.vault.get("openai-key").is_none(), "rolled back: nothing stored");
+        assert!(!s.recent_chain(10).iter().any(|e| e.event_type == "vault_entry_added"));
     }
 
     #[tokio::test]
