@@ -798,6 +798,11 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     // the only check on a consequential path, that reading must be redone.
     ("cli.rs::cmd_delegate_grant", &[
         "let registry = hestia::member_registry::load_members(&vault);",
+        // ADDED 2026-09-25 (#1110): a READ FOR A MESSAGE, feeding the refusal's "did you mean"
+        // exactly as the HTTP door's does. The presence check itself (`registry.get(m)`) sits
+        // in the next line and gates in the fail-closed direction -- an unreadable registry
+        // refuses every member-bound action, never mints one.
+        "let suggest: Vec<String> = registry.iter_sorted().into_iter().filter(|(id, _)| !registry.is_filler(id)).map(|(id, _)| id.clone()).collect();",
         "let who = registry.iter_sorted().into_iter().find(|(_, lct)| {",
     ]),
     ("cli.rs::cmd_lct_publish", &[
@@ -887,6 +892,23 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("server/http.rs::scope_grant", &[
         "let known: Vec<String> = s.member_registry.iter_sorted().into_iter().filter(|(id, _)| !s.member_registry.is_filler(id)).map(|(id, _)| id.clone()).collect();",
         "let member_known = s.member_registry.get(&plugin_id).is_some();",
+    ]),
+    // ADDED 2026-09-25 (claude-code@mcnugget, #1110 -- cbp's finding 4 on #1106). READING: the
+    // member segment INSIDE a delegated action (`scope.decide:<member>:/prefix`) is checked for
+    // presence before anything is signed. A segment naming no recorded member used to be stored,
+    // signed and witnessed as a delegation that enforced against no one (`action_covers`
+    // compares it to the asker by string equality) -- #1067's silent inertness, one layer in.
+    //
+    // DEGRADATION DIRECTION: an empty or unreadable registry REFUSES every member-bound action.
+    // Fail-closed and loud; it cannot cause a delegation, and the member-free forms
+    // (`scope.decide:/prefix`) are unaffected. A registry wrongly reporting a member present
+    // lets a typo through as before -- no worse than the silence it replaces.
+    //
+    // The first line is a READ FOR A MESSAGE, exactly as in `scope_grant`: it feeds
+    // `nearest_member_ids` for the refusal's "did you mean", and redirects nothing.
+    ("server/http.rs::agent_delegation_grant", &[
+        "let suggest: Vec<String> = s.member_registry.iter_sorted().into_iter().filter(|(id, _)| !s.member_registry.is_filler(id)).map(|(id, _)| id.clone()).collect();",
+        "let unvalidated = match crate::delegation::check_actions(&actions, &|m| s.member_registry.get(m).is_some(), &suggest) {",
     ]),
     // ADDED 2026-09-21 (claude-code@mcnugget, agent-lifecycle R4 -- register). The census went
     // red on the route the moment it was written.

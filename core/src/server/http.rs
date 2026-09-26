@@ -5,6 +5,7 @@
 //!   /                — embedded HTML dashboard (operator path)
 //!   /api/dashboard   — JSON snapshot consumed by the dashboard + TUI
 
+use crate::member_registry::nearest_member_ids;
 use anyhow::{Context, Result};
 use axum::{
     Extension,
@@ -3462,39 +3463,6 @@ async fn config_get_seat(
     )
 }
 
-/// Recorded member ids a mistyped `asked` most plausibly meant: equal ignoring case and
-/// punctuation first, else within two edits. At most three, best first. Pure, so its refusals
-/// can be tested without a daemon. It only ever NAMES candidates in an error message -- it
-/// never redirects a grant, because guessing the target of an authority change is the
-/// operator's job, not a string distance's.
-fn nearest_member_ids(asked: &str, known: &[String]) -> Vec<String> {
-    let fold = |s: &str| -> Vec<char> {
-        s.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_lowercase()).collect()
-    };
-    let a = fold(asked);
-    if a.is_empty() {
-        return Vec::new();
-    }
-    let dist = |x: &[char], y: &[char]| -> usize {
-        let mut prev: Vec<usize> = (0..=y.len()).collect();
-        for (i, cx) in x.iter().enumerate() {
-            let mut cur = vec![i + 1];
-            for (j, cy) in y.iter().enumerate() {
-                let sub = prev[j] + usize::from(cx != cy);
-                cur.push(sub.min(prev[j + 1] + 1).min(cur[j] + 1));
-            }
-            prev = cur;
-        }
-        prev[y.len()]
-    };
-    let mut scored: Vec<(usize, &String)> = known
-        .iter()
-        .map(|k| (dist(&a, &fold(k)), k))
-        .filter(|(d, _)| *d <= 2)
-        .collect();
-    scored.sort_by(|x, y| x.0.cmp(&y.0).then_with(|| x.1.cmp(y.1)));
-    scored.into_iter().take(3).map(|(_, k)| k.clone()).collect()
-}
 
 async fn scope_grant(
     State(state): State<SharedState>,
@@ -5709,6 +5677,16 @@ async fn agent_delegation_grant(
     if let Some(refusal) = refuse_if_retired(&s, &plugin_id, "a delegation") {
         return refusal;
     }
+    // READ EVERY ACTION THE WAY THE ENFORCER WILL, before anything is signed (#1110). A member
+    // segment naming no recorded member, or a `scope.decide` shape that binds nothing, would be
+    // stored, signed and witnessed as a grant that enforces against no one. Unknown verbs pass
+    // -- the vocabulary is open -- and are named in the answer as unvalidated.
+    #[rustfmt::skip]
+    let suggest: Vec<String> = s.member_registry.iter_sorted().into_iter().filter(|(id, _)| !s.member_registry.is_filler(id)).map(|(id, _)| id.clone()).collect();
+    let unvalidated = match crate::delegation::check_actions(&actions, &|m| s.member_registry.get(m).is_some(), &suggest) {
+        Ok(u) => u,
+        Err(e) => return (StatusCode::CONFLICT, Json(serde_json::json!({"error": e, "actions": actions}))),
+    };
     let key = match delegation_key_for(&s, &plugin_id) { Ok(k) => k, Err(r) => return r };
     let roles: Vec<web4_core::SocietyRole> = match role_names.iter()
         .map(|r| crate::delegation::parse_role(r)).collect::<std::result::Result<Vec<_>, _>>() {
@@ -5757,6 +5735,9 @@ async fn agent_delegation_grant(
     (StatusCode::OK, Json(serde_json::json!({
         "ok": true, "plugin_id": plugin_id, "delegation_id": deleg_id, "expires_at": expires_at,
         "intentEntryHash": intent.hash, "witnessEntryHash": entry.map(|e| e.hash),
+        // SAID, not implied: an accepted verb this daemon does not interpret was stored as
+        // given and checked for nothing. Empty when every action was read (#1110).
+        "unvalidated_actions": unvalidated,
     })))
 }
 
@@ -8404,6 +8385,37 @@ mod disposition_tests {
 
     /// cbp, PR #1106 review, both blocking findings. Probed there with a throwaway test; kept
     /// here so neither can come back.
+    /// #1110 (cbp, finding 4 on #1106): `actions` is free text, and `scope.decide:<member>:…`
+    /// carries a member id inside it. cbp's exact case -- `codx` for `codex` -- was stored,
+    /// signed and witnessed as a delegation that enforced against no one.
+    #[tokio::test]
+    async fn a_delegated_action_must_name_a_member_this_seat_has_recorded() {
+        let (_dir, state) = test_state().await;
+        seed_operator_key(&state).await;
+        register_member(&state, "kimi-code").await;
+        register_member(&state, "codex").await;
+        let before = crate::delegation::DelegationStore::load(&state.lock().await.vault).unwrap().delegations.len();
+
+        let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({
+            "actions": ["scope.decide:codx:/w"], "reason": "r"}))).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{b}");
+        let e = b["error"].as_str().unwrap();
+        assert!(e.contains("no member 'codx'") && e.contains("Did you mean 'codex'?"), "{e}");
+        // A shape that binds nothing is refused too, with the reason.
+        let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({
+            "actions": ["scope.decide:codex"], "reason": "r"}))).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{b}");
+        assert!(b["error"].as_str().unwrap().contains("no path"), "{b}");
+        // NOTHING was signed or stored by either refusal.
+        assert_eq!(crate::delegation::DelegationStore::load(&state.lock().await.vault).unwrap().delegations.len(), before);
+
+        // The real member is accepted, and an uninterpreted verb rides through -- NAMED.
+        let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({
+            "actions": ["scope.decide:codex:/w", "ledger.read"], "reason": "r"}))).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["unvalidated_actions"], serde_json::json!(["ledger.read"]));
+    }
+
     #[tokio::test]
     async fn a_retired_agents_delegations_stay_readable_and_an_unreadable_store_is_not_silence() {
         let (_dir, state) = test_state().await;
