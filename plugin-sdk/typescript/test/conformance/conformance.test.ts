@@ -240,6 +240,13 @@ describe("Presence Protocol v0 conformance — TypeScript SDK", () => {
       // P0-001 is the connect scenario — captured above; skip its steps
       // since we've already invoked them via client.connect().
       if (scenario.id === "P0-001") continue;
+      // KNOWN SKIP (loud, by id): the harness runs every step through the one
+      // client connected above, and cannot execute a second hestia_connect.
+      if (scenario.id === "P1-003") {
+        // eslint-disable-next-line no-console
+        console.log("KNOWN SKIP P1-003: harness cannot run a second hestia_connect");
+        continue;
+      }
 
       // Run setup. Setup steps may have `capture` that writes into this
       // scenario's bucket — that lets the steps refer to setup state via
@@ -296,7 +303,10 @@ describe("Presence Protocol v0 conformance — TypeScript SDK", () => {
         }
       }
     }
-  });
+    // Every scenario runs inside this one test against a real daemon. Against a debug-built
+    // daemon (as CI builds it), hestia_vault_set alone takes ~4 s of unoptimized Argon2 and
+    // the run totals ~10 s, which is the suite-wide 10 s testTimeout. Measured 2026-09-25.
+  }, 60_000);
 });
 
 async function invokeStep(
@@ -377,8 +387,15 @@ async function invokeStep(
         tags: (input.tags as string[]) ?? [],
         allowedConsumers: (input.allowed_consumers as string[]) ?? [],
       });
-    case "hestia_query_history":
-      return await client.queryHistory((input.filter as Record<string, unknown>) ?? {});
+    case "hestia_query_history": {
+      // Vectors carry the wire spelling; the SDK takes camelCase.
+      const f = (input.filter as Record<string, unknown>) ?? {};
+      return await client.queryHistory({
+        ...(f.tool_name !== undefined ? { toolName: f.tool_name as string } : {}),
+        ...(f.limit !== undefined ? { limit: f.limit as number } : {}),
+        ...(f.hash !== undefined ? { hash: f.hash as string } : {}),
+      });
+    }
     case "hestia_request_witness":
       return await client.requestWitness(
         String(input.event_type),

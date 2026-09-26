@@ -258,13 +258,11 @@ class HestiaClient:
     async def query_history(self, filter: HistoryFilter) -> HistoryResult:
         # Send only the fields the caller set. The daemon refuses a filter key it cannot
         # honour rather than silently dropping it, and a key sent as null counts as sent,
-        # so `{"limit": 10}` must not travel as `{"since": null, ...}`.
+        # so `{"limit": 10}` must not travel as `{"tool_name": null, ...}`.
         fields = {
             "tool_name": filter.tool_name,
-            "target_pattern": filter.target_pattern,
-            "since": filter.since,
             "limit": filter.limit,
-            "outcome": filter.outcome,
+            "hash": filter.hash,
         }
         result = await self._call_tool(
             "hestia_query_history",

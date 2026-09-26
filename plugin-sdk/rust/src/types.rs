@@ -288,18 +288,17 @@ pub struct WitnessEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct HistoryFilter {
-    // Unset fields are omitted, not sent as null: the daemon refuses a filter key it
-    // cannot honour, and a null-valued key counts as sent.
+    // Exactly the keys the daemon honours (QUERY_FILTER_KEYS: limit, hash, tool_name).
+    // It refuses any other key rather than serve an unfiltered window, so target_pattern,
+    // since and outcome were removed in 0.0.3: every call that set them failed. Unset
+    // fields are omitted, not sent as null, because a null-valued key counts as sent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_pattern: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub since: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// Reach one entry by chain hash; short-circuits the window.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub outcome: Option<String>,
+    pub hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -171,14 +171,20 @@ export interface WitnessEntry {
   chainPosition: number;
 }
 
-/** Filter for `hestia_query_history`. */
+/**
+ * Filter for `hestia_query_history`. These are exactly the keys the daemon honours
+ * (`QUERY_FILTER_KEYS`: limit, hash, tool_name). The daemon refuses any other key
+ * rather than silently serving an unfiltered window, so the SDK offers no others.
+ * `targetPattern`, `since` and `outcome` were removed in 0.0.3: the daemon refused
+ * them outright, and every call that set them failed.
+ */
 export interface HistoryFilter {
+  /** Only entries for this tool. Sent as `tool_name`. */
   toolName?: string;
-  targetPattern?: string;
-  /** ISO-8601 timestamp or relative ("1h", "30m", "2d"). */
-  since?: string;
+  /** Window depth (daemon default 50, max 500). */
   limit?: number;
-  outcome?: "success" | "failure" | "abandoned";
+  /** Reach one entry by chain hash; short-circuits the window. */
+  hash?: string;
 }
 
 export interface HistoryResult {
