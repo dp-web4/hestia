@@ -90,9 +90,38 @@ both already visible in the engine's own design:
   key (§1), not by excluding the others.
 - **Cross-view session sharing.** The app holds its own operator session; signing in here does not
   sign in the dashboard and must not appear to.
-- **Conflict resolution for non-single-shot writes** (config, scope grants). Those are not
-  single-shot and need a per-surface answer — last-writer-wins is acceptable for some and not for
-  others. Each later sprint states which it is; Sprint 4 (Grant) cannot land without that ruling.
+### Ruled 2026-09-25 (dp)
+
+**Non-single-shot writes: last edit wins.** Config and scope grants are not single-shot, so the 409
+story does not cover them; dp ruled *"last-edit-wins seems reasonable."* That settles the engine
+side — the daemon applies writes in arrival order and the latest stands. It does **not** relax the
+view-side rules above, and one of them becomes load-bearing here: under last-edit-wins an operator
+who edits from a stale read silently overwrites whatever another view wrote since. So every write
+surface re-reads before it offers the edit, re-reads after it lands, and **shows the value it is
+replacing** at the moment of the write — the operator must be able to see that they are overwriting,
+because the engine will not stop them. Sprint 4 is unblocked on this basis.
+
+**Operator key custody: keep the plaintext, use the vault copy only.** dp: *"for now we can keep the
+key but should be resilient to manual delete (do not re-project, use vault copy only)."* In the app
+(`identity_vault::open_or_import`):
+
+| | before the ruling | now |
+|---|---|---|
+| first sign-in, no vault | import, then **delete** `operator.key` | import, **keep** `operator.key` byte-identical |
+| vault exists, plaintext present | re-read the plaintext every sign-in; **refuse** on mismatch | vault only — plaintext **not read** |
+| plaintext changed / corrupt / deleted | could block sign-in | **no effect** |
+| anything writes `operator.key` | no | no — and a test asserts a deleted file stays deleted |
+
+**Resilience to a manual delete, measured across the engine rather than only the app:**
+- operator **sessions** survive: the daemon verifies challenge/response against the operator
+  *public* key seeded into law at genesis (`state.rs::bootstrap_operator_if_genesis`), not against
+  the file, and that genesis window is ratcheted shut — nothing re-mints the file;
+- the **app** survives: it reads only its own vault once one exists;
+- **not yet resilient — the daemon's delegation signer.** `delegation::operator_delegator` prefers
+  `operator.key` and falls back to the vault's `ai_identity_secret`, which is a *different* key. After
+  a delete, delegations would be signed by a different identity with no error. `scope_arbitrate`
+  refuses outright (`hestia.scope_arbitrate_no_operator_key`). Both are daemon behaviour and outside
+  this app; recorded here so the delete is not assumed safe before they are addressed.
 
 ---
 
