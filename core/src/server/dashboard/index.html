@@ -2084,6 +2084,17 @@
     return `<span class="gov-dot gov-${GOV_SEVERITY[g] || 'grey'}" title="governance: ${escapeHtml(GOV_LABEL[g] || g)} — ${escapeHtml(GOV_NOTE[g] || '')}"></span>`;
   }
 
+  // Is `id` still something a bar offers for selection? The agents bar lists every
+  // orchestrator in the snapshot (connected or not). The govern bar also offers members that
+  // hold grants. A selection is dropped only when neither offers it: the member is GONE.
+  // Whether it is connected or quiet has nothing to do with it.
+  function selectionStillOffered(data, id) {
+    if ((data?.orchestrators || []).some(o => o.id === id)) return true;
+    if ((data?.scope_grants || []).some(g => g.plugin_id === id)) return true;
+    if ((data?.instance_grants || []).some(g => g.plugin_id === id)) return true;
+    return false;
+  }
+
   function renderOrchBar(data) {
     const root = $('orch-bar');
     const orchs = data.orchestrators || [];
@@ -2101,7 +2112,14 @@
     // moment a member idled past an hour, collapsing its history view; the chip stayed
     // clickable (below), so the data was there and the selection had been thrown away.
     // Same ruling dp already gave for trust rows: staleness is shown, not hidden.
-    if (selectedOrch && !orchs.some(o => o.connected && o.id === selectedOrch)) selectedOrch = null;
+    // IT READ `o.connected` UNTIL 2026-09-25, contradicting the rule above. `connected` is
+    // active-in-the-window OR a detected running process, and a seat that runs as mesh wakes
+    // is usually neither. So a selection made on either bar was revoked on the next tick,
+    // BEFORE renderFeed ran. dp: "chain display does not seem to be filtered by agent when a
+    // specific agent is selected — it shows all regardless of selection." The selection now
+    // survives while ANY bar still offers the id (selectionStillOffered), and never on
+    // connectivity.
+    if (selectedOrch && !selectionStillOffered(data, selectedOrch)) selectedOrch = null;
 
     // The aggregate ("All") view is the default and a first-class destination, not just the
     // absence of a selection. Clicking a harness filters to it; there was no signposted way
@@ -2415,7 +2433,12 @@
             data-merge-of="${escapeHtml(alike[r.plugin_id].of)}" data-merge-ref="${escapeHtml(alike[r.plugin_id].ref)}"
             title="Fills the alias form under govern → acts. Nothing is recorded until you press its button.">prepare merge</button></div>` : ''}
       </div>`;
-    }).join('');
+    // #1113 moved this trailer to renderRoleTrust, where `hidden` is not declared. Selecting any
+    // agent then threw "hidden is not defined" out of the tick, the header read "offline (hidden
+    // is not defined)", and the witness chain was never re-rendered for the selection (dp,
+    // 2026-09-25). It belongs here, in the aggregate view that computes `hidden`.
+    }).join('') + (hidden ? `<div class="grant-note">${hidden} retired id${hidden === 1 ? '' : 's'} hidden —
+      listed, with the controls, under <strong>govern → discover</strong>.</div>` : '');
   }
 
   function renderRoleTrust(trust, orchs) {
@@ -2477,8 +2500,7 @@
         <button type="button" class="tr-detail" onclick="showTrustDetail(${i})"
                 title="Full tensor, every dimension, and the chain receipts behind it">detail</button>
       </div>`;
-    }).join('') + (hidden ? `<div class="grant-note">${hidden} retired id${hidden === 1 ? '' : 's'} hidden —
-      listed, with the controls, under <strong>govern → discover</strong>.</div>` : '');
+    }).join('');
   }
 
   // Drill from the harness aggregate into that harness's role trust — the same selection
@@ -5199,7 +5221,9 @@
     tmodal.addEventListener('click', (e) => { if (e.target.dataset.close) tmodal.hidden = true; });
     document.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape') return;
-      if (!modal.hidden) modal.hidden = true;
+      // A `modal.hidden` line sat above this from 512d7c2 (2026-07-26). No element or variable
+      // named `modal` exists, so Escape threw a ReferenceError before reaching this line and
+      // never closed the trust-detail modal. Found by ESLint no-undef, 2026-09-25.
       if (!tmodal.hidden) tmodal.hidden = true;
     });
   })();
