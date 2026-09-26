@@ -73,7 +73,10 @@ web4-core = { path = "../../web4/web4-core", version = "0.4" }
 hestia-wire = { path = "../wire", version = "0.1" }
 # The generic plugin seam — shared with the hub (public open-core crate) instead
 # of maintaining a near-identical copy here. `crate::plugin` re-exports it.
-# Published as web4-hub-plugin; the hub-plugin key keeps `hub_plugin` for the code.
+# `package =` because web4 renamed the PACKAGE for crates.io publishability
+# (web4 69fa2a0, 2026-09-26) while keeping `[lib] name = "hub_plugin"`: the path
+# and the Rust identifier are unchanged, only the registry-facing name moved.
+# `version =` because crates.io refuses a path-only dependency when this crate publishes.
 hub-plugin = { package = "web4-hub-plugin", path = "../../web4/hub/hub-plugin", version = "=0.1.0-alpha.0" }
 # P3b: consume the sibling web4 checkout by path (matching web4-core / hub-plugin
 # above) so hestia builds in lockstep against the migrated EntityTrust, whose T3/V3
