@@ -3,6 +3,10 @@ name = "hestia-app"
 version = "0.2.0"
 edition = "2021"
 rust-version = "1.80"
+# The app is a Tauri application (built by ci.yml / app-android.yml), not a library for
+# crates.io. It has no license field and path deps into hestia/web4 by design;
+# publish = false keeps a `cargo publish` sweep from trying.
+publish = false
 
 [lib]
 name = "hestia_app_lib"

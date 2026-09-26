@@ -1,5 +1,5 @@
 /**
- * @hestia/plugin-openclaw — Hestia plugin for OpenClaw (FKA Moltbot).
+ * @hestia-tools/plugin-openclaw — Hestia plugin for OpenClaw (FKA Moltbot).
  *
  * Refactor of `moltbot/extensions/web4-governance` (6,511 lines incl. tests)
  * into a thin observer (~140 lines incl. comments) that emits R6/R7 records

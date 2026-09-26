@@ -195,13 +195,18 @@ Queries the witness chain.
 {
   "filter": {
     "tool_name": "string (optional)",
-    "target_pattern": "string (optional)",
-    "since": "ISO-8601 timestamp or relative ('1h', '30m', '2d')",
     "limit": "number (default 50, max 500)",
-    "outcome": "string (optional) — 'success' | 'failure' | 'abandoned'"
+    "hash": "string (optional) — reach one entry by chain hash; short-circuits the window"
   }
 }
 ```
+
+> **Amended 2026-09-25 (hestia#1122).** This ADR originally also specified `target_pattern`,
+> `since` and `outcome`. The daemon never honoured them. It now refuses every key outside
+> `QUERY_FILTER_KEYS` (`limit`, `hash`, `tool_name`) with `hestia.query_filter_unknown_key`,
+> because a dropped filter would return an unfiltered window that looks filtered (#648). The
+> three plugin SDKs exposed the unhonoured filters until 0.0.3, so every call that set one
+> failed. They now offer exactly the three keys above.
 
 **Returns:**
 ```json

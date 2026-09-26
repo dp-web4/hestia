@@ -33,7 +33,6 @@ pub struct HestiaClient {
 
 struct ConnectedState {
     service: RunningService<RoleClient, ClientInfo>,
-    #[allow(dead_code)]
     connect: ConnectResult,
 }
 
@@ -284,6 +283,17 @@ impl HestiaClient {
     ) -> Result<Value> {
         let guard = self.state.lock().await;
         let state = guard.as_ref().ok_or(HestiaError::NotConnected)?;
+        // Stamp the session_id so the daemon can authoritatively resolve the caller,
+        // as the TypeScript and Python SDKs do. Some tools refuse without it
+        // (hestia_vault_set: "hestia.vault_set_unattributed"). connect() calls
+        // invoke_tool directly, before any session exists, so it is not stamped.
+        let mut args = args;
+        if !args.contains_key("session_id") {
+            args.insert(
+                "session_id".into(),
+                Value::String(state.connect.session_id.clone()),
+            );
+        }
         invoke_tool_raw(&state.service, name, args).await
     }
 
