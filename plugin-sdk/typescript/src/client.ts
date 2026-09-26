@@ -191,7 +191,24 @@ export class HestiaClient {
   /** Query the witness chain. */
   async queryHistory(filter: HistoryFilter): Promise<HistoryResult> {
     this.requireSession();
-    return this.callTool<HistoryResult>("hestia_query_history", { filter });
+    // Plain-JS callers can pass keys the type does not have. Refuse them here with
+    // the same code the daemon uses, so a caller cannot mistake the refusal for a
+    // transport fault. Send the wire spelling (tool_name), and send only the keys
+    // that are set.
+    const allowed = new Set(["toolName", "limit", "hash"]);
+    const unknown = Object.keys(filter ?? {}).filter((k) => !allowed.has(k));
+    if (unknown.length > 0) {
+      throw new HestiaError(
+        "hestia.query_filter_unknown_key",
+        `${unknown.join(", ")} is not a history filter the daemon honours (toolName, limit, hash)`,
+        { unknownKeys: unknown },
+      );
+    }
+    const wire: Record<string, unknown> = {};
+    if (filter.toolName !== undefined) wire.tool_name = filter.toolName;
+    if (filter.limit !== undefined) wire.limit = filter.limit;
+    if (filter.hash !== undefined) wire.hash = filter.hash;
+    return this.callTool<HistoryResult>("hestia_query_history", { filter: wire });
   }
 
   /** Add a custom witness chain entry (for non-tool events). */

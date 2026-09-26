@@ -11,8 +11,11 @@ Requires:
   - $WEB4_STANDARD_CONFORMANCE pointing at the JSON vector file, or the
     default relative path resolves.
 
-Skipped automatically if the daemon isn't reachable. Use
-`RUN_CONFORMANCE=1 pytest` to require it.
+OPT-IN: runs only when HESTIA_ENDPOINT is set or RUN_CONFORMANCE=1. The
+scenarios write sessions, actions, a witness marker and a vault entry. The
+default endpoint is the live daemon on a dev box, so the suite no longer picks
+it up just because it answered. Use a sandbox daemon, e.g.
+`HESTIA_ENDPOINT=http://127.0.0.1:7799/mcp pytest`.
 """
 from __future__ import annotations
 
@@ -224,6 +227,9 @@ async def invoke_step(client, step, captures):
             "policyId": result.policy_id,
             "enforced": result.enforced,
             "constraints": result.constraints,
+            # Wait-protocol fields (P1-004). The SDK parses them; the harness dropped them.
+            "status": result.status,
+            "nextPollMs": result.next_poll_ms,
         }
     if tool == "hestia_vault_get":
         try:
@@ -250,10 +256,8 @@ async def invoke_step(client, step, captures):
         result = await client.query_history(
             HistoryFilter(
                 tool_name=filt.get("tool_name"),
-                target_pattern=filt.get("target_pattern"),
-                since=filt.get("since"),
                 limit=int(filt.get("limit", 50)),
-                outcome=filt.get("outcome"),
+                hash=filt.get("hash"),
             )
         )
         return {
@@ -286,6 +290,8 @@ def vectors():
 
 
 async def test_conformance_scenarios(vectors):
+    if os.environ.get("RUN_CONFORMANCE") != "1" and "HESTIA_ENDPOINT" not in os.environ:
+        pytest.skip("not opted in: set HESTIA_ENDPOINT (a sandbox daemon) or RUN_CONFORMANCE=1")
     if not daemon_reachable():
         if os.environ.get("RUN_CONFORMANCE") == "1":
             pytest.fail(f"Daemon not reachable at {ENDPOINT}")
@@ -309,6 +315,11 @@ async def test_conformance_scenarios(vectors):
 
         for scenario in vectors["scenarios"]:
             if scenario["id"] == "P0-001":
+                continue
+            # KNOWN SKIP (loud, by id): the harness runs every step through the one
+            # client connected above, and cannot execute a second hestia_connect.
+            if scenario["id"] == "P1-003":
+                print("KNOWN SKIP P1-003: harness cannot run a second hestia_connect")
                 continue
             # Setup
             for step in scenario.get("setup", []):

@@ -29,6 +29,27 @@ export async function decideGateEscalation(
   return invoke("decide_gate_escalation", { id, approve, reason });
 }
 
+/**
+ * Grant or refuse one scope request as the signed-in operator, via
+ * `POST /api/scope/decide`. A grant needs a reason; a refusal does not; a
+ * standing refusal is not a thing; exact unless the operator chooses recursion.
+ * A request already ruled elsewhere comes back as `already_decided`.
+ */
+export async function ruleScopeRequest(
+  requestId: string,
+  granted: boolean,
+  reason: string | null,
+  opts: { standing?: boolean; recursive?: boolean } = {},
+): Promise<DecideOutcome> {
+  return invoke("rule_scope_request", {
+    requestId,
+    granted,
+    reason,
+    standing: opts.standing ?? false,
+    recursive: opts.recursive ?? false,
+  });
+}
+
 export async function getDashboard(): Promise<DashboardSnapshot> {
   return invoke("get_dashboard");
 }

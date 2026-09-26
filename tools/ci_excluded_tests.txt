@@ -25,14 +25,19 @@
 tools/gate_lock_contention_test.py
 
 # Needs the SDK importable (`pip install -e plugin-sdk/python`). Bare python3
-# gives ModuleNotFoundError: hestia_plugin_sdk. Wiring it means adding an
-# install step to a job that deliberately has no dependencies -- worth doing,
-# but as its own job, not by widening a glob until it goes red.
+# gives ModuleNotFoundError: hestia_plugin_sdk. It has its own job now: the
+# `sdk-conformance` job in ci.yml installs the SDK with [dev] and runs every file
+# under plugin-sdk/python/tests with pytest (2026-09-25, #1122).
 plugin-sdk/python/tests/test_smoke.py
+
+# pytest-style, needing pytest plus the SDK. Under bare python3 it fails with
+# ModuleNotFoundError: pytest. It runs under pytest in the `sdk-conformance` job.
+plugin-sdk/python/tests/test_history_filter.py
 
 # pytest-style (pytestmark = pytest.mark.asyncio, test functions never called at
 # module scope) AND needs a live daemon to connect to. Under bare `python3` it
 # exits 0 having run ZERO assertions -- the exact no-op that
-# tools/ci_selfexec_test.py exists to refuse. Running it needs pytest, asyncio
-# and a daemon; until then it is honestly declared dark rather than falsely green.
+# tools/ci_selfexec_test.py exists to refuse. It runs in the `sdk-conformance`
+# job, which builds the daemon from the commit, starts it on a throwaway home at
+# :7799 and sets HESTIA_ENDPOINT / RUN_CONFORMANCE=1 (2026-09-25, #1122).
 plugin-sdk/python/tests/conformance/test_conformance.py

@@ -1,7 +1,8 @@
 # The exact dp-web4/web4 commit hestia releases build against.
-# hestia/core has unversioned PATH deps into ../../web4 (web4-core, hub-plugin,
-# web4-trust-core, web4-policy), so without this pin a release is not reproducible:
+# hestia/core has PATH deps into ../../web4 (web4-core, hub-plugin, web4-trust-core,
+# web4-policy). They also carry crates.io versions so the crate can be published, but
+# a source build uses the path, so without this pin a release is not reproducible:
 # rebuilding the same tag against a moved web4 main yields a different binary.
 # release.yml checks out THIS rev (not web4 main). Bump it deliberately when
 # integrating a new web4 — that bump is the record of the integration.
-6b6e30bda2f8fc2b590079a5e939233cd7370d06
+69fa2a0166d255158fd846837017ff4e81fcda15

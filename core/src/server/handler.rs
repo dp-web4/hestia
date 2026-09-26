@@ -15629,6 +15629,49 @@ mod tests {
         );
     }
 
+    /// #1058: the corroborate row names the corroborator's WAKE, not only its seat. The
+    /// door refuses without a proven live session, so the key is in hand at write time; before
+    /// this the row dropped it, and tying a factor to the transcript that produced it meant a
+    /// seat-and-clock join (kimi-code re-located 30 filing sessions by hand for one order
+    /// audit, 2026-09-24). Control: a session connected with no wake key records null, never
+    /// a borrowed one.
+    #[tokio::test]
+    async fn the_corroborate_row_names_the_corroborators_wake() {
+        async fn corroborated_row(host_session_id: Option<&str>) -> Value {
+            let (dir, shared) = make_shared_state();
+            let asker = tool_connect(&shared, &json!({"plugin_id": "claude-code", "host_agent": "h",
+                                                      "host_session_id": "asker-wake"}))
+                .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+            let mut peer_args = json!({"plugin_id": "codex", "host_agent": "h"});
+            if let Some(h) = host_session_id {
+                peer_args["host_session_id"] = json!(h);
+            }
+            let peer = tool_connect(&shared, &peer_args)
+                .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+            let opened = tool_gate_escalation_open(&shared, &json!({
+                "plugin_id": "claude-code", "session_id": asker, "tool_name": "Bash",
+                "marker": "witness.py", "act": "Bash -> witness.py",
+            })).await.unwrap();
+            tool_gate_escalation_corroborate(&shared, &json!({
+                "escalation_id": opened["escalation_id"], "session_id": peer,
+                "stance": "concur", "argument": "checked",
+            })).await.unwrap();
+            let s = shared.lock().await;
+            let row = s.chain_store.read_recent(60).unwrap().into_iter()
+                .find(|e| e.event_type == "gate_escalation_corroborated")
+                .expect("the factor is witnessed").event_data;
+            drop(dir);
+            row
+        }
+
+        let row = corroborated_row(Some("peer-wake-7")).await;
+        assert_eq!(row["corroborator_host_session_id"], "peer-wake-7",
+                   "the corroborator's proven wake must be on its own row: {row}");
+        let row = corroborated_row(None).await;
+        assert!(row["corroborator_host_session_id"].is_null(),
+                "no wake key means null — never the asker's or a guess: {row}");
+    }
+
     /// Refuse-don't-default, the missing-input arm. The silent path — a call that names no
     /// stance — is exactly how the specimen's dissent became concurrence, so it dies:
     /// an absent stance refuses and mints NO factor.
@@ -21139,6 +21182,22 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
     // dp's invitation-semantics ruling a dissent is evidence surfaced for review, never a
     // veto: it lands here as a factor, shows on the pending view and dashboard, and the
     // sovereign decides over the whole set.
+    // The corroborator's wake, from the session this door just PROVED (#1058). Without it a
+    // factor can only be tied to the transcript that produced it by seat and clock, and an
+    // audit of "was the peer's factor displayed before this one's work?" has to re-locate
+    // every filing session by hand — a wrong location silently inverts the verdict. The
+    // opened and ruling rows already carry the asker's (#542, #1061); this is the same
+    // lookup for the other party, with ONE deliberate difference: a blank or whitespace-only
+    // key records null here, where the #542 and claim sites record it verbatim. `connect`
+    // stores the key untrimmed, and a blank string names no transcript — writing it would
+    // make an audit field look populated while pointing nowhere. The older sites are left
+    // as they are so their existing rows keep one meaning on replay.
+    let corroborator_host_session_id = arb
+        .session_uuid
+        .and_then(|u| s.sessions.get(&u))
+        .and_then(|sess| sess.host_session_id.clone())
+        .filter(|v| !v.trim().is_empty());
+
     match s.gate_escalations.corroborate(
         &escalation_id,
         &arb.plugin_id,
@@ -21157,6 +21216,7 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                     "plugin_id": updated.plugin_id,
                     "corroborated_by": arb.plugin_id,
                     "corroborated_role": arb.role_lct,
+                    "corroborator_host_session_id": corroborator_host_session_id,
                     "independence": independence,
                     // The peer's stance and argument, first-class on the event — a chain
                     // reader must never have to dig the only dissent out of a factor list
