@@ -844,6 +844,12 @@
   .cfg-verdict.bad { background: #f8717118; color: var(--coral); }
   .cfg-verdict.none { background: var(--bg-elev-2); color: var(--fg-faint); }
   .cfg-new { margin: 0.4rem 0 0.8rem; }
+  /* --- govern -> vault --- */
+  .vault-row { display: flex; align-items: center; gap: 0.6rem; padding: 0.35rem 0.5rem; border: 1px solid var(--border); border-radius: 4px; margin-bottom: 0.3rem; flex-wrap: wrap; }
+  .vault-row.system { background: var(--bg-elev); }
+  .vault-name { font-weight: 600; min-width: 9rem; font-size: 0.85rem; font-family: var(--mono); }
+  .vault-meta { flex: 1; color: var(--fg-dim); font-size: 0.74rem; }
+  .vault-dates { color: var(--fg-faint); font-size: 0.7rem; white-space: nowrap; }
   .cfg-editor { border: 1px solid var(--border); border-radius: 4px; padding: 0.6rem; margin-top: 0.6rem; }
   .cfg-editor-head { display: flex; align-items: center; gap: 0.6rem; }
   .cfg-digest { font-family: var(--mono); font-size: 0.7rem; color: var(--fg-faint); }
@@ -1277,6 +1283,7 @@
         <button type="button" class="govern-chip" data-gov="acts">acts</button>
         <button type="button" class="govern-chip" data-gov="policy">policy</button>
         <button type="button" class="govern-chip" data-gov="config">runtime config</button>
+        <button type="button" class="govern-chip" data-gov="vault">vault</button>
         <button type="button" class="govern-chip" data-gov="discover">discover</button>
       </nav>
 
@@ -1576,6 +1583,41 @@
               <div class="cfg-err" id="cfg-err" hidden></div>
               <div class="cfg-saved" id="cfg-saved" hidden></div>
             </div>
+          </div>
+        </section>
+
+        <!-- VAULT (2026-09-25, before the 0.0.4 release). The operator's view of the credentials the
+             vault holds, over the same GET/POST /api/vault and DELETE /api/vault/:name the desktop
+             app's Vault screen uses, through the same apiFetch wrapper. It exists because on a running
+             box nothing else could remove an entry: the CLI is locked out by the daemon's writer
+             lease. The LIST carries names, policy and dates and NEVER a value. There is no reveal:
+             releasing a secret is the gate's irreversible tier. Daemon-owned entries (identity, device
+             keys, hub config) are listed so the operator sees everything, but the daemon refuses to
+             delete them, so they carry no delete button. Adds and deletes are witnessed on the chain. -->
+        <section class="govern-pane" id="govern-vault" hidden>
+          <div class="govern-pane-head">
+            <h2>Vault <span class="pol-mode" id="vault-status"></span></h2>
+            <button type="button" class="pol-btn" id="vault-refresh">refresh</button>
+          </div>
+          <div class="govern-scroll">
+            <div class="grant-note">
+              Credentials held in this daemon's vault. Values are never shown here. An entry with
+              no allowed consumers is readable by <strong>any</strong> member (marked
+              <em>exposed</em>). Entries marked <em>daemon</em> belong to hestia itself and cannot be
+              deleted while it runs. Every add and delete is recorded on the witness chain, by name only.
+            </div>
+            <div id="vault-list"><div class="empty">Loading…</div></div>
+            <div class="pol-section-label">Add a credential</div>
+            <div class="pol-add vault-add">
+              <input class="pol-input" id="vault-new-name" placeholder="name" size="18" autocomplete="off">
+              <input class="pol-input" id="vault-new-value" type="password" placeholder="value" size="22" autocomplete="new-password">
+              <input class="pol-input" id="vault-new-consumers" placeholder="allowed consumers (comma-separated member ids)" size="34">
+              <input class="pol-input" id="vault-new-scope" placeholder="scope (e.g. publish, infer)" size="18">
+              <input class="pol-input" id="vault-new-tags" placeholder="tags" size="12">
+              <button type="button" class="pol-btn cfg-save" id="vault-add-btn">add to vault</button>
+            </div>
+            <div class="cfg-err" id="vault-err" hidden></div>
+            <div class="cfg-saved" id="vault-ok" hidden></div>
           </div>
         </section>
 
@@ -2096,6 +2138,17 @@
     return `<span class="gov-dot gov-${GOV_SEVERITY[g] || 'grey'}" title="governance: ${escapeHtml(GOV_LABEL[g] || g)} — ${escapeHtml(GOV_NOTE[g] || '')}"></span>`;
   }
 
+  // Is `id` still something a bar offers for selection? The agents bar lists every
+  // orchestrator in the snapshot (connected or not). The govern bar also offers members that
+  // hold grants. A selection is dropped only when neither offers it: the member is GONE.
+  // Whether it is connected or quiet has nothing to do with it.
+  function selectionStillOffered(data, id) {
+    if ((data?.orchestrators || []).some(o => o.id === id)) return true;
+    if ((data?.scope_grants || []).some(g => g.plugin_id === id)) return true;
+    if ((data?.instance_grants || []).some(g => g.plugin_id === id)) return true;
+    return false;
+  }
+
   function renderOrchBar(data) {
     const root = $('orch-bar');
     const orchs = data.orchestrators || [];
@@ -2113,7 +2166,14 @@
     // moment a member idled past an hour, collapsing its history view; the chip stayed
     // clickable (below), so the data was there and the selection had been thrown away.
     // Same ruling dp already gave for trust rows: staleness is shown, not hidden.
-    if (selectedOrch && !orchs.some(o => o.connected && o.id === selectedOrch)) selectedOrch = null;
+    // IT READ `o.connected` UNTIL 2026-09-25, contradicting the rule above. `connected` is
+    // active-in-the-window OR a detected running process, and a seat that runs as mesh wakes
+    // is usually neither. So a selection made on either bar was revoked on the next tick,
+    // BEFORE renderFeed ran. dp: "chain display does not seem to be filtered by agent when a
+    // specific agent is selected — it shows all regardless of selection." The selection now
+    // survives while ANY bar still offers the id (selectionStillOffered), and never on
+    // connectivity.
+    if (selectedOrch && !selectionStillOffered(data, selectedOrch)) selectedOrch = null;
 
     // The aggregate ("All") view is the default and a first-class destination, not just the
     // absence of a selection. Clicking a harness filters to it; there was no signposted way
@@ -2541,7 +2601,12 @@
             data-merge-of="${escapeHtml(alike[r.plugin_id].of)}" data-merge-ref="${escapeHtml(alike[r.plugin_id].ref)}"
             title="Fills the alias form under govern → acts. Nothing is recorded until you press its button.">prepare merge</button></div>` : ''}
       </div>`;
-    }).join('');
+    // #1113 moved this trailer to renderRoleTrust, where `hidden` is not declared. Selecting any
+    // agent then threw "hidden is not defined" out of the tick, the header read "offline (hidden
+    // is not defined)", and the witness chain was never re-rendered for the selection (dp,
+    // 2026-09-25). It belongs here, in the aggregate view that computes `hidden`.
+    }).join('') + (hidden ? `<div class="grant-note">${hidden} retired id${hidden === 1 ? '' : 's'} hidden —
+      listed, with the controls, under <strong>govern → discover</strong>.</div>` : '');
   }
 
   function renderRoleTrust(trust, orchs) {
@@ -2607,8 +2672,7 @@
         <button type="button" class="tr-detail" onclick="showTrustDetail(${i})"
                 title="Full tensor, every dimension, and the chain receipts behind it">detail</button>
       </div>`;
-    }).join('') + (hidden ? `<div class="grant-note">${hidden} retired id${hidden === 1 ? '' : 's'} hidden —
-      listed, with the controls, under <strong>govern → discover</strong>.</div>` : '');
+    }).join('');
   }
 
   // Drill from the harness aggregate into that harness's role trust — the same selection
@@ -4621,6 +4685,8 @@
     policy: { el: 'govern-policy', mount: () => fetchPolicy() },
     // The list is the mount: keys and health only. Values are fetched by an explicit open.
     config: { el: 'govern-config', mount: () => cfgLoadList() },
+    // Names and policy only; the list never carries a value.
+    vault:  { el: 'govern-vault',  mount: () => vaultLoad() },
     // One GET of the inventory report. The report is a live filesystem walk, so it is fetched
     // when the pane is SHOWN and on an explicit rescan, never on a timer of its own.
     discover: { el: 'govern-discover', mount: () => discoverLoad() },
@@ -4647,6 +4713,97 @@
     if (nav) nav.addEventListener('click', (e) => {
       const chip = e.target.closest('.govern-chip');
       if (chip) governShow(chip.dataset.gov);
+    });
+  })();
+
+  // ---- VAULT pane ----------------------------------------------------------------------------
+  // Three calls, shared with the desktop app: GET /api/vault (names + policy, no values),
+  // POST /api/vault (add), DELETE /api/vault/<name>. The daemon refuses daemon-owned entries
+  // (409) and witnesses both writes; this pane only renders that authority.
+  const vaultEsc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const vaultList = (s) => String(s || '').split(',').map(x => x.trim()).filter(Boolean);
+  function vaultMsg(err, ok) {
+    const e = $('vault-err'), o = $('vault-ok');
+    if (e) { e.hidden = !err; e.textContent = err || ''; }
+    if (o) { o.hidden = !ok; o.textContent = ok || ''; }
+  }
+  async function vaultLoad() {
+    const status = $('vault-status');
+    try {
+      const res = await apiFetch('/api/vault');
+      if (!res.ok) throw new Error((await res.text()) || ('HTTP ' + res.status));
+      const entries = ((await res.json()).entries || []);
+      const list = $('vault-list');
+      if (!entries.length) { list.innerHTML = '<div class="empty">The vault holds no entries.</div>'; }
+      else {
+        // Credentials first, then the daemon's own entries.
+        entries.sort((a, b) => (!!a.system - !!b.system) || String(a.name).localeCompare(String(b.name)));
+        list.innerHTML = entries.map(e => {
+          const consumers = (e.allowed_consumers || []);
+          const meta = [
+            consumers.length ? 'readable by ' + consumers.join(', ') : '',
+            (e.scope || []).length ? 'scope ' + e.scope.join(', ') : '',
+            (e.tags || []).length ? 'tags ' + e.tags.join(', ') : '',
+          ].filter(Boolean).join(' · ');
+          const day = (t) => t ? String(t).slice(0, 10) : '';
+          return `
+          <div class="vault-row${e.system ? ' system' : ''}" data-name="${vaultEsc(e.name)}">
+            <span class="vault-name">${vaultEsc(e.name)}</span>
+            ${e.system ? `<span class="cfg-verdict none" title="${vaultEsc(e.system)}">daemon</span>`
+                       : (e.exposed ? '<span class="cfg-verdict bad" title="no allowed consumers: any member can read it">exposed</span>' : '')}
+            <span class="vault-meta">${e.system ? vaultEsc(e.system) : vaultEsc(meta)}</span>
+            <span class="vault-dates">${vaultEsc(day(e.created_at))}${e.last_rotated ? ' · rotated ' + vaultEsc(day(e.last_rotated)) : ''}</span>
+            ${e.system ? '' : '<button type="button" class="grant-revoke vault-del">delete</button>'}
+          </div>`;
+        }).join('');
+      }
+      if (status) status.textContent = `${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}`;
+    } catch (e) { if (status) status.textContent = '⚠ ' + e.message; }
+  }
+  async function vaultDelete(name) {
+    // Typing the name back is the confirmation: a deleted value cannot be recovered from here.
+    const typed = window.prompt(`Delete '${name}' from the vault? Its value cannot be recovered.\nType the name to confirm:`);
+    if (typed === null) return;
+    if (typed.trim() !== name) { vaultMsg('Name did not match — nothing was deleted.', null); return; }
+    try {
+      const res = await apiFetch('/api/vault/' + encodeURIComponent(name), { method: 'DELETE' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok || body.error) throw new Error(body.error || ('HTTP ' + res.status));
+      vaultMsg(null, `Deleted '${name}' (witnessed on the chain).`);
+    } catch (e) { vaultMsg(e.message, null); }
+    vaultLoad();
+  }
+  async function vaultAdd() {
+    const name = ($('vault-new-name').value || '').trim();
+    const value = $('vault-new-value').value || '';
+    if (!name || !value) { vaultMsg('Name and value are both required.', null); return; }
+    const consumers = vaultList($('vault-new-consumers').value);
+    if (!consumers.length && !window.confirm(`'${name}' has no allowed consumers, so ANY member could read it. Add it anyway?`)) return;
+    try {
+      const res = await apiFetch('/api/vault', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, value, allowed_consumers: consumers,
+          scope: vaultList($('vault-new-scope').value), tags: vaultList($('vault-new-tags').value) }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok || body.error) throw new Error(body.error || ('HTTP ' + res.status));
+      // Clear the value field at once: it should not sit in the DOM after the write.
+      ['vault-new-name', 'vault-new-value', 'vault-new-consumers', 'vault-new-scope', 'vault-new-tags']
+        .forEach(id => { $(id).value = ''; });
+      vaultMsg(null, `Added '${name}' (witnessed on the chain, name only).`);
+    } catch (e) { vaultMsg(e.message, null); }
+    vaultLoad();
+  }
+  (function wireVaultPane() {
+    document.addEventListener('click', (e) => {
+      const t = e.target;
+      if (!t) return;
+      if (t.id === 'vault-refresh') { vaultMsg(null, null); vaultLoad(); }
+      else if (t.id === 'vault-add-btn') vaultAdd();
+      else if (t.classList && t.classList.contains('vault-del')) {
+        const row = t.closest('.vault-row');
+        if (row) vaultDelete(row.dataset.name);
+      }
     });
   })();
 
@@ -5362,7 +5519,9 @@
     tmodal.addEventListener('click', (e) => { if (e.target.dataset.close) tmodal.hidden = true; });
     document.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape') return;
-      if (!modal.hidden) modal.hidden = true;
+      // A `modal.hidden` line sat above this from 512d7c2 (2026-07-26). No element or variable
+      // named `modal` exists, so Escape threw a ReferenceError before reaching this line and
+      // never closed the trust-detail modal. Found by ESLint no-undef, 2026-09-25.
       if (!tmodal.hidden) tmodal.hidden = true;
     });
   })();

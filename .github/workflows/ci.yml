@@ -181,6 +181,24 @@ jobs:
         if: failure()
         run: tail -100 "$SBX_HOME/serve.log" || true
 
+  # The dashboard's inline JS, checked for identifiers nothing declares (ESLint no-undef). An
+  # undeclared name parses fine and throws only when its line runs. Two shipped: `hidden`
+  # (selecting any agent threw "hidden is not defined" out of the tick, and the witness chain
+  # never filtered) and `modal` (Escape never closed the trust modal, for two months).
+  # See tools/dashboard_no_undef.mjs.
+  dashboard-js:
+    name: dashboard js (no-undef)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+      - name: Undeclared identifiers in the dashboard's inline scripts
+        run: |
+          npm install --silent --no-audit --no-fund --prefix "$RUNNER_TEMP/lint" eslint@10 globals
+          NODE_PATH="$RUNNER_TEMP/lint/node_modules" node tools/dashboard_no_undef.mjs
+
   # The app is a separate Rust crate plus a TypeScript frontend. Core green says
   # nothing about either: Sprint A demonstrated the gap when an app-only helper
   # passed its tests while the production sign-in path never called it.
