@@ -4194,6 +4194,16 @@ mod serve_guard_tests {
 }
 
 #[cfg(test)]
+mod device_key_classification_tests {
+    /// Device keys are daemon-owned: the operator vault screen must not offer to delete one.
+    #[test]
+    fn device_key_names_are_system_entries() {
+        let name = super::device_key_name(uuid::Uuid::new_v4());
+        assert!(hestia::vault::system_entry_role(&name).is_some(), "{name}");
+    }
+}
+
+#[cfg(test)]
 mod member_key_source_tests {
     use super::member_signing_keypair;
     use hestia::hub::MemberKeySource;

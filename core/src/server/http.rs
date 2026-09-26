@@ -1965,6 +1965,9 @@ async fn vault_list(State(state): State<SharedState>) -> impl IntoResponse {
                     "exposed": e.allowed_consumers.is_empty(),
                     "created_at": e.created_at,
                     "last_rotated": e.last_rotated,
+                    // Daemon-owned (identity, device keys, hub config): shown so the operator
+                    // sees everything the vault holds, but locked. Delete refuses it below.
+                    "system": crate::vault::system_entry_role(name),
                 })
             })
         })
@@ -1984,6 +1987,18 @@ async fn vault_add(
             Json(serde_json::json!({"error": "name and value required"})),
         );
     }
+    // A daemon-owned name is not a credential slot. Today `add` only fails if the entry
+    // exists, so an absent identity entry could be CREATED here and the daemon would then
+    // sign with the operator's text.
+    if let Some(role) = crate::vault::system_entry_role(name) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("'{name}' is reserved for the daemon ({role}); choose another name"),
+                "system": role,
+            })),
+        );
+    }
     let scope: Vec<String> = body
         .get("scope")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -1998,13 +2013,28 @@ async fn vault_add(
         .unwrap_or_default();
 
     let entry = crate::vault::VaultEntry::new(name, value)
-        .with_scope(scope)
-        .with_tags(tags)
-        .with_consumers(consumers);
+        .with_scope(scope.clone())
+        .with_tags(tags.clone())
+        .with_consumers(consumers.clone());
 
     let mut s = state.lock().await;
     match s.vault.add(entry) {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
+        Ok(()) => {
+            // Witness the operator's write: the name and its policy, never the value (the
+            // MCP `vault_set` records the same way).
+            let _ = s.append_chain(
+                "vault_entry_added",
+                serde_json::json!({
+                    "name": name, "scope": scope, "tags": tags,
+                    "allowed_consumers": consumers, "via": "operator",
+                }),
+            );
+            (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+        }
+        Err(crate::error::CoreError::CredentialAlreadyExists(_)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("'{name}' already exists; delete it first to replace it")})),
+        ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -2012,14 +2042,42 @@ async fn vault_add(
     }
 }
 
+/// Remove one credential. Refuses daemon-owned entries: from a running surface, deleting
+/// `ai_identity_secret` would destroy this daemon's signing identity in one click. The
+/// break-glass path for those is `hestia vault remove` with the daemon stopped.
 async fn vault_delete(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(role) = crate::vault::system_entry_role(&name) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("'{name}' belongs to the daemon ({role}) and cannot be deleted from a running surface"),
+                "system": role,
+            })),
+        );
+    }
     let mut s = state.lock().await;
     match s.vault.remove(&name) {
-        Ok(_) => Json(serde_json::json!({"ok": true})),
-        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+        Ok(removed) => {
+            let _ = s.append_chain(
+                "vault_entry_removed",
+                serde_json::json!({
+                    "name": name, "scope": removed.scope, "tags": removed.tags,
+                    "allowed_consumers": removed.allowed_consumers, "via": "operator",
+                }),
+            );
+            (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+        }
+        Err(crate::error::CoreError::CredentialNotFound(_)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("no vault entry named '{name}'")})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
     }
 }
 
@@ -9031,5 +9089,93 @@ mod transport_binding_route_tests {
         }
         conn.execute_batch("DROP TRIGGER fail_binding_success").unwrap();
         assert_eq!(set(&state, body).await.status(), StatusCode::OK, "the identical retry lands");
+    }
+}
+
+#[cfg(test)]
+mod operator_vault_tests {
+    //! The operator vault surface (Govern -> vault, and the desktop app's Vault screen) over
+    //! GET/POST /api/vault and DELETE /api/vault/:name. Before these pins, DELETE removed any
+    //! entry, the daemon's identity keypair included, wrote nothing to the chain, and answered
+    //! a missing name with 200 + an error body.
+    use super::*;
+    use crate::vault::{Vault, VaultEntry};
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    async fn body_json(r: axum::response::Response) -> serde_json::Value {
+        let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&b).unwrap()
+    }
+
+    #[tokio::test]
+    async fn list_marks_system_entries_and_carries_no_values() {
+        let (_dir, state) = test_state().await;
+        {
+            let mut s = state.lock().await;
+            s.vault.upsert(VaultEntry::new("ai_identity_secret", "SIGNING-KEY")).unwrap();
+            s.vault.upsert(VaultEntry::new("github-pat", "TOKEN-VALUE")).unwrap();
+        }
+        let r = vault_list(State(state.clone())).await.into_response();
+        let text = serde_json::to_string(&body_json(r).await).unwrap();
+        assert!(!text.contains("SIGNING-KEY") && !text.contains("TOKEN-VALUE"), "{text}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let by = |n: &str| v["entries"].as_array().unwrap().iter().find(|e| e["name"] == n).unwrap().clone();
+        assert!(by("ai_identity_secret")["system"].is_string());
+        assert!(by("github-pat")["system"].is_null());
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_system_entries_and_keeps_them() {
+        let (_dir, state) = test_state().await;
+        state.lock().await.vault.upsert(VaultEntry::new("ai_identity_secret", "K")).unwrap();
+        let r = vault_delete(State(state.clone()), Path("ai_identity_secret".into())).await.into_response();
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+        assert!(state.lock().await.vault.get("ai_identity_secret").is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_a_credential_and_witnesses_it_without_the_value() {
+        let (_dir, state) = test_state().await;
+        state.lock().await.vault.upsert(VaultEntry::new("p0-004-cred", "sk-test-1234")).unwrap();
+        let r = vault_delete(State(state.clone()), Path("p0-004-cred".into())).await.into_response();
+        assert_eq!(r.status(), StatusCode::OK);
+        let s = state.lock().await;
+        assert!(s.vault.get("p0-004-cred").is_none());
+        let e = s.recent_chain(10).into_iter().find(|e| e.event_type == "vault_entry_removed")
+            .expect("an operator delete must be on the chain");
+        assert_eq!(e.event_data["name"], "p0-004-cred");
+        assert!(!e.event_data.to_string().contains("sk-test-1234"));
+    }
+
+    #[tokio::test]
+    async fn delete_of_a_missing_name_is_404_not_a_green_error() {
+        let (_dir, state) = test_state().await;
+        let r = vault_delete(State(state.clone()), Path("nope".into())).await.into_response();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn add_refuses_system_names_and_duplicates_and_witnesses_a_write() {
+        let (_dir, state) = test_state().await;
+        let add = |b: serde_json::Value| { let st = state.clone(); async move { vault_add(State(st), Json(b)).await.into_response() } };
+        let r = add(serde_json::json!({"name":"hub_urls","value":"x"})).await;
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+        assert!(state.lock().await.vault.get("hub_urls").is_none());
+        let r = add(serde_json::json!({"name":"openai-key","value":"SECRET-V","allowed_consumers":["kimi-code"]})).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let r = add(serde_json::json!({"name":"openai-key","value":"other"})).await;
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+        let s = state.lock().await;
+        let e = s.recent_chain(10).into_iter().find(|e| e.event_type == "vault_entry_added")
+            .expect("an operator add must be on the chain");
+        assert_eq!(e.event_data["name"], "openai-key");
+        assert!(!e.event_data.to_string().contains("SECRET-V"));
     }
 }
