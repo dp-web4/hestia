@@ -60,10 +60,20 @@ carries the ruler's own words to the asker, which an escalation decision does no
 | 2.3 | The two kinds share one Decide view and stay visually distinct — an escalation is a refused act, a scope request is an asked-for reach |
 | 2.4 | The asker's stated reason is shown **in full**; truncation here is how a request gets ruled on its summary |
 
+| 2.5 | Recursion is the operator's explicit choice, **off by default** (a request names one path); *standing* is offered only with a grant — a standing refusal is not a thing |
+
 **Acceptance, measured:**
 - a request ruled in the app reaches the asker with the ruler's words attached (verified against a
   live member — HUB has a being that files these);
-- a refusal with no reason is refused by the app.
+- **a grant with no reason is refused by the app; a refusal with no reason is SENT.**
+
+**Correction (2026-09-25, while building it):** the first draft of this line said *"a refusal with
+no reason is refused by the app."* That inverts the daemon's own rule — `scope_decide`: *"widening
+needs a stated why, narrowing does not. Refusing is the safe direction and must never carry more
+friction than approving."* The real concern behind the draft was sound: the asker reads the ruler's
+words, and a being given a bare "no" tends to appeal it. The answer is to **invite** words on a
+refusal and say who will read them, never to **require** them. A test pins it: clicking Refuse with
+an empty reason must call the daemon.
 
 ---
 
