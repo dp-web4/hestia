@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   DashboardSnapshot,
+  DecideOutcome,
   DaemonStatus,
   AppConfig,
   RemoteEntry,
@@ -10,6 +11,44 @@ import type {
   SeatConfigInspect,
   SeatConfigPutResult,
 } from "./types";
+
+/**
+ * Decide one governance-surface escalation as the signed-in operator.
+ *
+ * Reaches `POST /api/operator/gate-escalation` — the channel behind a proved
+ * operator LCT — and never the CLI path, which is authenticated only by
+ * filesystem access to HESTIA_HOME. Returns the daemon's own answer: whether an
+ * approval actually permits the write depends on the bar, and this must not
+ * claim more than the daemon said.
+ */
+export async function decideGateEscalation(
+  id: string,
+  approve: boolean,
+  reason: string | null,
+): Promise<DecideOutcome> {
+  return invoke("decide_gate_escalation", { id, approve, reason });
+}
+
+/**
+ * Grant or refuse one scope request as the signed-in operator, via
+ * `POST /api/scope/decide`. A grant needs a reason; a refusal does not; a
+ * standing refusal is not a thing; exact unless the operator chooses recursion.
+ * A request already ruled elsewhere comes back as `already_decided`.
+ */
+export async function ruleScopeRequest(
+  requestId: string,
+  granted: boolean,
+  reason: string | null,
+  opts: { standing?: boolean; recursive?: boolean } = {},
+): Promise<DecideOutcome> {
+  return invoke("rule_scope_request", {
+    requestId,
+    granted,
+    reason,
+    standing: opts.standing ?? false,
+    recursive: opts.recursive ?? false,
+  });
+}
 
 export async function getDashboard(): Promise<DashboardSnapshot> {
   return invoke("get_dashboard");

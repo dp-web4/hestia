@@ -173,6 +173,8 @@ pub fn run() {
             commands::operator::operator_sign_out,
             commands::trust::get_derivation,
             commands::dashboard::get_dashboard,
+            commands::decide::decide_gate_escalation,
+            commands::scope::rule_scope_request,
             commands::dashboard::get_failures,
             commands::dashboard::get_daemon_status,
             commands::vault::vault_list,

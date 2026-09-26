@@ -1422,3 +1422,38 @@ def needs_society_gate(tool: str) -> bool:
     """Read-class is fully covered above, so only write/exec-class needs the daemon's verdict.
     This is what keeps a down daemon from bricking reads while still failing closed on writes."""
     return tool not in READ_CLASS
+
+
+def launch_role_verdict(permitted, live_role, source: str) -> tuple:
+    """Whether a seat may act under the launch role it was given, against the permitted set its
+    vault projection declares. Returns ``(miswire, verified)``: ``miswire`` is ``None`` or
+    ``(rule, why)`` for the seat to render; ``verified`` is True only when a role was present AND
+    checked against a declared set, so a reader can tell a verified role from an unbounded one.
+
+    LAW, AND THEREFORE HERE (hestia #1084). The first cut put this inside the claude-code hook's
+    projection loader and ledgered it as wiring; codex and kimi dissented that the predicate, the
+    exemption and the refusal's words are law wherever they are rendered, and dp ruled
+    2026-09-22: "only absolutely essential things go into shims. all law goes into shared engine."
+    A seat hands this its projection's set and its launch role, and renders what comes back.
+
+    Why a bound at all: the role decides WHICH LAW APPLIES. A launcher could supply any string, an
+    unpublished one was silently normalised to `member` by the daemon (the 1140-outcomes split,
+    PR #66), and on one machine the value came from a `${HESTIA_ROLE:-...}` default in a host file
+    the governed seat can write (#943's pattern). The vault declares which roles a seat MAY launch
+    under; the launcher still chooses among them.
+
+    An absent role is deliberately NOT refused. Refusing it would deny every seat whose launcher
+    never set one; converting the launchers belongs in its own change. It reads as unverified.
+    (The first cut compared an absent role, "", against the set and refused it -- GPT on #1084.)
+    No declared set: nothing to check, unverified, today's behaviour unchanged.
+    """
+    if isinstance(permitted, str):
+        permitted = permitted.split(",")
+    allowed = [str(r).strip() for r in (permitted or []) if str(r).strip()]
+    role = str(live_role or "")
+    if allowed and role and role not in allowed:
+        return (("config.miswired",
+                 f"this seat was launched as HESTIA_ROLE={role!r} but {source} permits only "
+                 f"{allowed}; the role decides which law applies, so an unlisted one is refused "
+                 f"here rather than normalised downstream"), False)
+    return (None, bool(allowed and role))

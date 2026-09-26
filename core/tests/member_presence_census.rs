@@ -637,6 +637,28 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/http.rs::scope_grant", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
+    // ADDED 2026-09-21 (claude-code@mcnugget, agent-lifecycle R1 -- retire/reinstate). The
+    // census went red the moment the routes were written, which is the instrument working.
+    //
+    // READING, both questions. (1) Who gets named? The subject of a `member_retire_intent` /
+    // `member_retired` (and the reinstate pair) -- the member whose standing on this seat the
+    // operator just ended or restored. Weakly corroborated like `scope_grant`'s: `plugin_id`
+    // arrives in the URL path, typed or clicked by the operator, with no member ask to confirm
+    // the spelling. Unlike `scope_grant` it is not a widening -- retiring a MISSPELLED id is
+    // inert rather than dangerous, because it retires a member nobody has heard of; the
+    // dangerous misspelling is the one that hits a REAL neighbouring id, and that is what the
+    // recently-acted guard (`agent_acts_since`, 409 + `confirm_active`) exists to catch. The
+    // guard does not use this symbol: it counts the id's own `policy_decision`/`outcome`
+    // entries, so it is not a Predicate site.
+    // (2) Compared to decide control flow? No. The derived LCT is serialised into the witness
+    // record and read by nothing; the retirement store keys on the `plugin_id` STRING, and the
+    // refusals (retired-id grant, not-retired reinstate) compare that string. Naming.
+    ("server/http.rs::agent_retire", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
+    ("server/http.rs::agent_reinstate", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
     ("server/state.rs::trust_entity_key", &[
         "match self.member_lct(plugin_id) {",
     ], SiteClass::Naming),

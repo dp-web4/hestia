@@ -1,9 +1,11 @@
 pub mod chain;
 pub mod config;
 pub mod dashboard;
+pub mod decide;
 pub mod operator;
 pub mod policy;
 pub mod remote;
+pub mod scope;
 pub mod settings;
 pub mod trust;
 pub mod vault;

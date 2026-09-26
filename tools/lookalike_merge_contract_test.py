@@ -52,7 +52,7 @@ def source_contract() -> None:
     check("prefill does not press the act's button", "ali-btn" in blk, False)
     check("the row says nothing is recorded until the operator presses the button",
           "Nothing is recorded until you press its button" in UI)
-    check("the trust list asks for suggestions", "const alike = lookalikeSuggestions(rows);" in UI)
+    check("the trust list asks for suggestions", "const alike = lookalikeSuggestions(allRows);" in UI)
 
 
 def run(expr: str, arg) -> object:

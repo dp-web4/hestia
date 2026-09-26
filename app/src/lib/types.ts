@@ -119,7 +119,80 @@ export interface DashboardSnapshot {
   stats: ActivityStats;
   trust: TrustView[];
   recent: RecentEntry[];
+  /**
+   * Governance-surface escalations awaiting a decision, newest first.
+   *
+   * The daemon has sent these on every tick since the field was added; this type
+   * declared five fields and dropped them, so the owner's most consequential
+   * decision arrived in the app and was discarded before render.
+   * `pending()` drops expired entries daemon-side, so anything here is decidable
+   * right now — a queue offering a button the daemon would refuse teaches the
+   * operator that the button lies.
+   */
+  pending_escalations: PendingEscalation[];
+  /**
+   * Scope requests awaiting a ruling — a member asking for reach on one path.
+   * Like the escalations, sent every tick (#1109) and discarded by this type
+   * until Sprint 2. Expired requests are dropped daemon-side.
+   */
+  pending_scope_requests: PendingScopeRequest[];
   generated_at: string;
+}
+
+/**
+ * A member's ask for reach on a path. Field names mirror the daemon payload
+ * (`core/src/server/dashboard.rs`) exactly.
+ */
+export interface PendingScopeRequest {
+  request_id: string;
+  /** Caller-asserted, not authenticated — the same caveat as an escalation's asker. */
+  claimed_by: string;
+  role: string;
+  /** Exactly one path. Recursion is the operator's choice at decide time, never the asker's. */
+  path: string;
+  /** The asker's own words. Shown whole: truncation is how a request gets ruled on its summary. */
+  reason: string;
+  requested_at: number;
+  expires_at: number;
+  secs_remaining: number;
+}
+
+/**
+ * One escalation awaiting the operator. Field names mirror the daemon payload
+ * (`core/src/server/dashboard.rs`) exactly, so a shape change upstream breaks a
+ * typed read here rather than rendering stale.
+ */
+export interface PendingEscalation {
+  id: string;
+  /**
+   * CALLER-ASSERTED, not authenticated (HST-005). Named `claimed_by` daemon-side
+   * so a UI cannot present a claim as an identity — the operator decides partly
+   * on this string and it is not proof of who asked.
+   */
+  claimed_by: string;
+  role: string;
+  tool_name: string;
+  marker: string;
+  /** The basis for deciding. Without these the operator approves a governance write knowing only a tool name. */
+  stated_reason: string;
+  stated_detail: string;
+  opened_at: number;
+  expires_at: number;
+  secs_remaining: number;
+  /** The criterion in force when this was OPENED, not today's. */
+  bar: string;
+  factors: string[];
+  /**
+   * Whether this operator's approval is sufficient, or merely necessary.
+   * Derived daemon-side from the predicate itself. Approving a
+   * `sovereign_plus_peer` escalation and watching nothing happen is the
+   * strongest possible teacher that the button is decorative; it is not, and
+   * this field is the discriminator that says so.
+   */
+  operator_alone_suffices: boolean;
+  /** What else the bar still requires when this operator alone does not suffice. */
+  still_needs: string[] | null;
+  request_id: string | null;
 }
 
 export interface DaemonStatus {
@@ -197,3 +270,17 @@ export interface SeatConfigPutResult {
   verdict: SeatConfigVerdict[];
   intentEntryHash: string;
 }
+
+/**
+ * What came of a decide call.
+ *
+ * `already_decided` is NOT an error. The daemon on this machine also serves its
+ * own web dashboard, and the CLI drives the same state; all of them are views
+ * onto one engine, and a decision is single-shot. Losing that race means the
+ * operator's intent was settled elsewhere — by their own other window or by a
+ * peer — and the honest response is to say so and show the current queue, not
+ * to report that their click failed.
+ */
+export type DecideOutcome =
+  | { outcome: "decided"; result: unknown }
+  | { outcome: "already_decided"; detail: string };

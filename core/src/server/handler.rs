@@ -797,6 +797,19 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
         );
     }
 
+    // A RETIRED id that connects is not refused (retiring the seat you are typing from must not
+    // lock you out) and is not hidden either: it is news. Witnessed here so the fact is on the
+    // record, and the agents view keeps the row visible while it is connected (cbp, PR #1100
+    // review, finding 5 -- this event was documented before it existed).
+    if let Some(r) = s.retired_members.get(&plugin_id).cloned() {
+        let _ = s.append_chain("retired_member_connected", serde_json::json!({
+            "plugin_id": plugin_id,
+            "retired_at": r.retired_at,
+            "retired_because": r.reason,
+            "note": "a retired id connected; it holds no standing authority, and the operator \
+                     should decide whether to reinstate it or find out what is running under it",
+        }));
+    }
     s.sessions.insert(session_id, session);
     // Fresh-connect success boundary: synthetic persistence/member setup has completed and
     // the session now exists. Recording before this point would let a refused connect claim
@@ -15616,6 +15629,49 @@ mod tests {
         );
     }
 
+    /// #1058: the corroborate row names the corroborator's WAKE, not only its seat. The
+    /// door refuses without a proven live session, so the key is in hand at write time; before
+    /// this the row dropped it, and tying a factor to the transcript that produced it meant a
+    /// seat-and-clock join (kimi-code re-located 30 filing sessions by hand for one order
+    /// audit, 2026-09-24). Control: a session connected with no wake key records null, never
+    /// a borrowed one.
+    #[tokio::test]
+    async fn the_corroborate_row_names_the_corroborators_wake() {
+        async fn corroborated_row(host_session_id: Option<&str>) -> Value {
+            let (dir, shared) = make_shared_state();
+            let asker = tool_connect(&shared, &json!({"plugin_id": "claude-code", "host_agent": "h",
+                                                      "host_session_id": "asker-wake"}))
+                .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+            let mut peer_args = json!({"plugin_id": "codex", "host_agent": "h"});
+            if let Some(h) = host_session_id {
+                peer_args["host_session_id"] = json!(h);
+            }
+            let peer = tool_connect(&shared, &peer_args)
+                .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+            let opened = tool_gate_escalation_open(&shared, &json!({
+                "plugin_id": "claude-code", "session_id": asker, "tool_name": "Bash",
+                "marker": "witness.py", "act": "Bash -> witness.py",
+            })).await.unwrap();
+            tool_gate_escalation_corroborate(&shared, &json!({
+                "escalation_id": opened["escalation_id"], "session_id": peer,
+                "stance": "concur", "argument": "checked",
+            })).await.unwrap();
+            let s = shared.lock().await;
+            let row = s.chain_store.read_recent(60).unwrap().into_iter()
+                .find(|e| e.event_type == "gate_escalation_corroborated")
+                .expect("the factor is witnessed").event_data;
+            drop(dir);
+            row
+        }
+
+        let row = corroborated_row(Some("peer-wake-7")).await;
+        assert_eq!(row["corroborator_host_session_id"], "peer-wake-7",
+                   "the corroborator's proven wake must be on its own row: {row}");
+        let row = corroborated_row(None).await;
+        assert!(row["corroborator_host_session_id"].is_null(),
+                "no wake key means null — never the asker's or a guess: {row}");
+    }
+
     /// Refuse-don't-default, the missing-input arm. The silent path — a call that names no
     /// stance — is exactly how the specimen's dissent became concurrence, so it dies:
     /// an absent stance refuses and mints NO factor.
@@ -20676,9 +20732,41 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
         })
         .collect();
 
+    // THE OTHER QUEUE A RESTART DROPS. Scope requests (hestia_request_scope) are a separate,
+    // memory-only table from gate escalations, and a daemon restart loses every pending one
+    // (measured on Sprout 2026-09-22). Until now the only all-members view of them was the
+    // operator dashboard, so a seat about to restart the daemon for maintenance (SAGE #180,
+    // delegation renewal needs the vault writer lease) could not CHECK "nothing pending" — it
+    // could only guess an hour. Served here, beside the escalations, on the surface every seat
+    // already reaches, so the precondition is machine-checked, not scheduled around.
+    let pending_scope: Vec<Value> = {
+        let mut v: Vec<&crate::server::state::ScopeRequest> = s
+            .scope_requests
+            .values()
+            .filter(|r| r.status(now) == "pending")
+            .collect();
+        v.sort_by_key(|r| r.requested_at);
+        v.into_iter()
+            .map(|r| {
+                json!({
+                    "request_id": r.id,
+                    // Caller-asserted (HST-005), as the dashboard labels it.
+                    "claimed_by": r.plugin_id,
+                    "path": r.path,
+                    "reason": r.reason,
+                    "requested_at": r.requested_at,
+                    "expires_at": r.expires_at,
+                    "secs_remaining": r.expires_at.saturating_sub(now),
+                })
+            })
+            .collect()
+    };
+
     Ok(json!({
         "pending": items,
         "count": items.len(),
+        "pending_scope_requests": pending_scope,
+        "pending_scope_count": pending_scope.len(),
         "you": caller.as_ref().map(|c| json!({"plugin_id": c.plugin_id, "role": c.role_lct})),
         "caveat": if caller.is_none() {
             "UNATTRIBUTED caller — pass your session_id from hestia_connect and each entry will \
@@ -21094,6 +21182,22 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
     // dp's invitation-semantics ruling a dissent is evidence surfaced for review, never a
     // veto: it lands here as a factor, shows on the pending view and dashboard, and the
     // sovereign decides over the whole set.
+    // The corroborator's wake, from the session this door just PROVED (#1058). Without it a
+    // factor can only be tied to the transcript that produced it by seat and clock, and an
+    // audit of "was the peer's factor displayed before this one's work?" has to re-locate
+    // every filing session by hand — a wrong location silently inverts the verdict. The
+    // opened and ruling rows already carry the asker's (#542, #1061); this is the same
+    // lookup for the other party, with ONE deliberate difference: a blank or whitespace-only
+    // key records null here, where the #542 and claim sites record it verbatim. `connect`
+    // stores the key untrimmed, and a blank string names no transcript — writing it would
+    // make an audit field look populated while pointing nowhere. The older sites are left
+    // as they are so their existing rows keep one meaning on replay.
+    let corroborator_host_session_id = arb
+        .session_uuid
+        .and_then(|u| s.sessions.get(&u))
+        .and_then(|sess| sess.host_session_id.clone())
+        .filter(|v| !v.trim().is_empty());
+
     match s.gate_escalations.corroborate(
         &escalation_id,
         &arb.plugin_id,
@@ -21112,6 +21216,7 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                     "plugin_id": updated.plugin_id,
                     "corroborated_by": arb.plugin_id,
                     "corroborated_role": arb.role_lct,
+                    "corroborator_host_session_id": corroborator_host_session_id,
                     "independence": independence,
                     // The peer's stance and argument, first-class on the event — a chain
                     // reader must never have to dig the only dissent out of a factor list
@@ -21753,6 +21858,47 @@ mod standing_scope_surface_tests {
             s.standing_scope.generation, 2,
             "grant + revoke: the persisted generation carries both mutations"
         );
+    }
+
+    /// (SAGE #180, GPT review) A seat about to restart the daemon must be able to CHECK that
+    /// no member's scope request is pending — the restart drops them all. Both directions:
+    /// a pending request from ANY member (not the seat's own being) is listed with its id
+    /// and claimant; decided and lapsed ones are not; and the count is zero when the table is
+    /// empty, so a script can refuse on `pending_scope_count != 0` and proceed on `== 0`.
+    #[tokio::test]
+    async fn pending_escalations_also_serve_every_members_pending_scope_requests() {
+        let (_d, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        let out = tool_gate_pending_escalations(&state, &json!({})).await.unwrap();
+        assert_eq!(out["pending_scope_count"], 0, "empty table reads as zero, not absent: {out}");
+        assert!(out["pending_scope_requests"].as_array().unwrap().is_empty());
+        {
+            let mut s = state.lock().await;
+            let mut pending = live_request("cbp-being", "/w/cbp/notes/x.md", now);
+            pending.id = "scope-pending-1".into();
+            pending.granted = None;
+            pending.decided_by = None;
+            pending.decided_at = None;
+            s.scope_requests.insert(pending.id.clone(), pending);
+            let mut decided = live_request("sprout-being", "/w/sprout/journal.md", now);
+            decided.id = "scope-decided-1".into();
+            s.scope_requests.insert(decided.id.clone(), decided);
+            let mut lapsed = live_request("legion-being", "/w/legion/todo.md", now - 7200);
+            lapsed.id = "scope-lapsed-1".into();
+            lapsed.granted = None;
+            lapsed.decided_by = None;
+            lapsed.decided_at = None;
+            lapsed.expires_at = now - 3600;
+            s.scope_requests.insert(lapsed.id.clone(), lapsed);
+        }
+        let out = tool_gate_pending_escalations(&state, &json!({})).await.unwrap();
+        assert_eq!(out["pending_scope_count"], 1, "{out}");
+        let row = &out["pending_scope_requests"][0];
+        assert_eq!(row["request_id"], "scope-pending-1");
+        assert_eq!(row["claimed_by"], "cbp-being", "another member's ask is visible to the seat");
+        assert_eq!(row["path"], "/w/cbp/notes/x.md");
+        assert!(row["secs_remaining"].as_u64().unwrap() > 0);
+        assert_eq!(out["count"], 0, "the escalation queue itself is untouched by this");
     }
 
     /// (GPT #431 blocker 3) `snapshot_expires_at` never outlives a grant the snapshot

@@ -1,4 +1,6 @@
 # The agent-atlas commit a deploy enumerates against. One sha per line; first wins.
 # Bump it in a hestia commit when the registry gains something a seat should discover --
 # so the universe changes when main says so, not when a registry commit happens to land.
-157c8f463c488aea8c6c4e83feb68439c10dc45c
+# Bumped 2026-09-21: agent-atlas #1 merged -- talk-to/sage, the registry's first
+# `kind: being`. Until this line moved, no seat enumerated `sage` FROM THE ATLAS.
+67184decafe5809b9e36a170fb5a23c6ab429602

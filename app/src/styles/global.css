@@ -1167,3 +1167,20 @@ input::placeholder {
 .cfg-actions .cfg-note { flex: 1; }
 .cfg-saved { margin-top: 12px; padding: 10px; border-left: 3px solid var(--accent, #6aa9ff); font-size: 0.9rem; }
 .cfg-saved-verdicts { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+
+/* --- Decide: governance escalations awaiting the operator --- */
+.muted { color: var(--text-muted); }
+/* The escalation's own words, shown whole. Truncating the asker's detail is how
+   a governance write gets approved on its summary rather than its substance. */
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 10px 0; }
+.kv dt { color: var(--text-muted); font-size: 0.85rem; }
+.kv dd { margin: 0; }
+.kv dd.pre { white-space: pre-wrap; font-family: monospace; font-size: 0.85rem; }
+.decide-actions { display: flex; align-items: flex-end; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+.decide-actions label { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 240px; font-size: 0.85rem; }
+.decide-actions input { padding: 6px 8px; }
+
+/* Two queues, two questions: a stopped act vs an asked-for reach. */
+.queue-heading { margin: 22px 0 8px; font-size: 1rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.scope-request { border-left: 3px solid var(--accent, #6aa9ff); }
+.decide-actions label.check { flex: 0 0 auto; min-width: 0; flex-direction: row; align-items: center; gap: 6px; }
