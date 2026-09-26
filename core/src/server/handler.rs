@@ -1977,6 +1977,22 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
 async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
     let name = require_string(args, "name")?;
     let value = require_string(args, "value")?;
+    // A member stores CREDENTIALS here; it never writes the daemon's own entries. This write
+    // is an upsert, so before this check any connected agent could replace the identity
+    // pubkey, the identity LCT id, a device key or the hub URL config. Measured 2026-09-25 on
+    // a sandbox daemon: all four accepted. `ai_identity_secret` was refused only because the
+    // law's credential-file rule matched the word "secret" in its name. The refusal lives here,
+    // with the one classifier, and does not rely on that coincidence.
+    if let Some(role) = crate::vault::system_entry_role(&name) {
+        return Ok(hestia_error_envelope(
+            "hestia.vault_name_reserved",
+            &format!(
+                "'{name}' is reserved for the daemon ({role}); a member cannot write it. \
+                 Store the credential under another name."
+            ),
+            Some(json!({ "name": name, "system": role })),
+        ));
+    }
     let scope: Vec<String> = args
         .get("scope")
         .and_then(Value::as_array)
@@ -2064,14 +2080,18 @@ async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
         .with_tags(tags)
         .with_consumers(allowed_consumers);
     let entry_id = entry.id;
+    // The write is an upsert, so the rollback below needs what was there before.
+    let prior = s.vault.get(&name).cloned();
 
     s.vault
         .upsert(entry)
         .map_err(|e| anyhow::anyhow!("vault write: {}", e))?;
 
     // Audit the mutation in the chain (the secret is never written; only the
-    // name), attributed to the writing WHO.
-    let _ = s.append_chain(
+    // name), attributed to the writing WHO. FAIL CLOSED, as the operator vault routes do
+    // (GPT review of #1123): a credential write must not stand without its record. On a failed
+    // append the prior entry is restored (or the new one removed), and the caller is told.
+    if let Err(e) = s.append_chain(
         "vault_set",
         json!({
             "name": name,
@@ -2081,7 +2101,23 @@ async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
             "session_id": who.session_uuid,
             "defaulted_consumers_to_creator": defaulted_consumers,
         }),
-    );
+    ) {
+        let rollback = match prior {
+            Some(p) => s.vault.upsert(p).map(|_| "the previous entry is restored"),
+            None => s.vault.remove(&name).map(|_| "the new entry is removed"),
+        };
+        return Ok(hestia_error_envelope(
+            "hestia.vault_set_unwitnessed",
+            &format!(
+                "the vault_set record could not be appended ({e}); rollback: {}",
+                match rollback {
+                    Ok(done) => format!("{done} — NOT stored"),
+                    Err(rb) => format!("FAILED ({rb}) — '{name}' IS STORED without its record"),
+                }
+            ),
+            Some(json!({ "name": name })),
+        ));
+    }
 
     Ok(json!({"stored": true, "entryId": entry_id, "boundToCreator": defaulted_consumers}))
 }
@@ -8124,6 +8160,86 @@ mod accountability_tests {
         let err = res.expect_err("vault URI must no longer resolve");
         assert!(err.contains("unknown resource"), "got: {err}");
         assert!(!err.contains("s3cret"));
+    }
+
+    /// A member's vault_set must not stand without its chain record. With the append failing,
+    /// an overwrite is rolled back to the previous value, and a new name is not stored.
+    #[tokio::test]
+    async fn vault_set_whose_witness_fails_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        state.lock().await.vault.upsert(crate::vault::VaultEntry::new("github-pat", "OLD")).unwrap();
+        let m = tool_connect(
+            &state,
+            &json!({"plugin_id":"claude-code","host_agent":"t","role":"role:constellation:member"}),
+        )
+        .await
+        .unwrap();
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_vault_set BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'vault_set'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;").unwrap();
+        for (name, value) in [("github-pat", "NEW"), ("brand-new", "V")] {
+            let r = tool_vault_set(
+                &state,
+                &json!({"name": name, "value": value, "session_id": m["sessionId"]}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(r["_hestia_error"]["code"], "hestia.vault_set_unwitnessed", "{name}: {r}");
+        }
+        conn.execute_batch("DROP TRIGGER fail_vault_set").unwrap();
+        let s = state.lock().await;
+        assert_eq!(s.vault.get("github-pat").unwrap().secret, "OLD", "overwrite rolled back");
+        assert!(s.vault.get("brand-new").is_none(), "new name not stored");
+    }
+
+    /// A member cannot write the daemon's own entries through hestia_vault_set. The write is an
+    /// upsert, and measured on a sandbox daemon 2026-09-25 it accepted ai_identity_pubkey,
+    /// ai_identity_lct_id, hub_urls and a device key from a plain member session. Each is now
+    /// refused before the law runs, the stored value is untouched, and an ordinary credential
+    /// still writes.
+    #[tokio::test]
+    async fn vault_set_refuses_daemon_owned_names() {
+        let (_dir, state) = test_state().await;
+        {
+            let mut s = state.lock().await;
+            s.vault
+                .upsert(crate::vault::VaultEntry::new("ai_identity_pubkey", "ORIGINAL"))
+                .unwrap();
+        }
+        let m = tool_connect(
+            &state,
+            &json!({"plugin_id":"claude-code","host_agent":"t","role":"role:constellation:member"}),
+        )
+        .await
+        .unwrap();
+        for name in [
+            "ai_identity_secret", "ai_identity_pubkey", "ai_identity_lct_id", "hub_urls",
+            "constellation_device_key:00000000-0000-0000-0000-000000000001",
+        ] {
+            let r = tool_vault_set(
+                &state,
+                &json!({"name": name, "value": "EVIL", "session_id": m["sessionId"]}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(r["_hestia_error"]["code"], "hestia.vault_name_reserved", "{name}: {r}");
+        }
+        {
+            let s = state.lock().await;
+            assert_eq!(s.vault.get("ai_identity_pubkey").unwrap().secret, "ORIGINAL");
+            assert!(s.vault.get("hub_urls").is_none(), "a refused name must not be created");
+        }
+        let ok = tool_vault_set(
+            &state,
+            &json!({"name":"ordinary-cred","value":"v","session_id": m["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok["stored"], true, "{ok}");
     }
 
     /// Regression pin for GPT 3rd-pass HST-002: credential WRITES hit the same
