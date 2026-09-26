@@ -102,6 +102,23 @@ pub struct SqliteInboxStore {
     path: PathBuf,
 }
 
+/// The debt-clearing kinds (`reply`, `ack`, `review_done`), matched fractally —
+/// `reply.thread` is a reply — the way the send gate matches its kinds (#977).
+/// A bound send of one of these kinds DISCHARGES the notice it names, so it is
+/// the set whose addressee must be the notice's asker (#1115).
+pub(crate) fn is_disposition_kind(kind: &str) -> bool {
+    ["reply", "ack", "review_done"]
+        .iter()
+        .any(|d| kind == *d || kind.starts_with(&format!("{d}.")))
+}
+
+/// Bare member id of a possibly-routed address (`peer/member` → `member`).
+/// Binding comparisons happen on the member name: the same peer's member
+/// reached directly or through a route is the same party for debt purposes.
+pub(crate) fn bare_member(address: &str) -> &str {
+    address.rsplit('/').next().unwrap_or(address)
+}
+
 impl SqliteInboxStore {
     /// Open or create the SQLCipher-encrypted inbox. `key` is the stable
     /// storage key (see [`crate::storage::storage_key`]) — the same key that
@@ -896,6 +913,36 @@ impl SqliteInboxStore {
                     "notice {rid} was addressed to '{addressee}', not to '{from_plugin}' — \
                      a member can only answer its own mail"
                 );
+                // #1115: the addressee side of the same binding. A disposition
+                // (`reply`/`ack`/`review_done`, fractally) DISCHARGES the notice it
+                // names in `member_unanswered` — so a disposition addressed to anyone
+                // but the notice's asker pays a debt the asker never sees paid. Measured
+                // live 2026-09-25: notice 14574, a reply bound to codex's 14567 but
+                // addressed to the dead name `codex-cli`, cleared codex's row; nothing
+                // told codex. Check the asker, not only the answerer, and name the right
+                // addressee in the refusal — the sender holding the typo is awake.
+                // Non-disposition kinds skip this: a bound `forum-note` FYI to a third
+                // party answers nothing and clears nothing (the query side agrees —
+                // `member_unanswered` only clears when the response addresses the asker).
+                // Comparison is on bare member ids: a member reached directly or via a
+                // route is the same party.
+                if is_disposition_kind(kind) {
+                    let asked_by: Option<String> = conn
+                        .query_row(
+                            "SELECT from_plugin FROM member_notices WHERE id = ?1",
+                            params![rid as i64],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .context("resolving in_reply_to asker")?;
+                    if let Some(asker) = asked_by {
+                        anyhow::ensure!(
+                            bare_member(&asker) == bare_member(to_plugin),
+                            "notice {rid} came from '{asker}' — a {kind} answers it only if \
+                             addressed back to '{asker}', not to '{to_plugin}'"
+                        );
+                    }
+                }
             }
         }
         // `dest_peer IS NULL` = the LOCAL plane. Every statement in this function
@@ -1076,7 +1123,20 @@ impl SqliteInboxStore {
         })
     }
 
-    /// Consume-once drain of the notices addressed to `to_plugin` ONLY —
+    /// The ASKER of a stored notice (`from_plugin`, bare as written) — the second
+    /// half of reply binding (#1115): a disposition answers a notice only when it is
+    /// addressed back to this party. `None` when the id is not on record (aged out:
+    /// unverifiable, not forged — same posture as `member_notice_recipient`).
+    pub fn member_notice_sender(&self, id: u64) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let mut stmt = conn.prepare("SELECT from_plugin FROM member_notices WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id as i64])?;
+        Ok(match rows.next()? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        })
+    }
     /// recipient-scoped (a member can never drain another member's mail).
     /// Same at-least-once failure bias as the hub-notice drain.
     ///
@@ -1330,7 +1390,17 @@ impl SqliteInboxStore {
                AND NOT EXISTS (SELECT 1 FROM member_notices r
                                WHERE r.in_reply_to = n.id
                                  AND (r.pointer_uri IS NULL
-                                      OR r.pointer_uri NOT LIKE '%#undelivered:%'))
+                                      OR r.pointer_uri NOT LIKE '%#undelivered:%')
+                                 -- #1115: a response discharges the debt only when it is
+                                 -- addressed back to the ASKER. Bare-member comparison on
+                                 -- routed forms (`peer/member`): the same member reached
+                                 -- through a route is the same party. A misaddressed
+                                 -- reply stays a misroute, visible as unanswered — the
+                                 -- one kind of misroute that used to erase its own
+                                 -- evidence (14574 cleared codex's row from 'codex-cli').
+                                 AND (CASE WHEN r.dest_peer IS NULL THEN r.to_plugin
+                                           ELSE r.dest_peer || '/' || r.to_plugin
+                                      END) = n.from_plugin)
              ORDER BY n.id ASC"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -2036,6 +2106,102 @@ mod tests {
             store.member_unanswered("kimi-code", &["review_request"], -1).unwrap().len(),
             1,
             "kimi still owes the answer: a third party must not be able to clear the debt"
+        );
+    }
+
+    /// #1115: a disposition addressed to anyone but the asker is refused at the
+    /// store, naming the right addressee — the answerer-side guard alone let 14574
+    /// clear codex's row from the dead name `codex-cli`.
+    #[test]
+    fn a_disposition_addressed_to_someone_other_than_the_asker_is_refused() {
+        let (_tmp, store) = fresh();
+        let asked = store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "review_request",
+                            Some("pr/1"), "h1", None)
+            .unwrap();
+        // kimi-code answers — but addresses the reply to codex-cli, not claude-code.
+        let misaddressed = store.enqueue_member(
+            "codex-cli", "kimi-code", "role:r", "review_done",
+            Some("forum/v.md"), "h2", Some(asked),
+        );
+        let err = misaddressed.expect_err("a misaddressed disposition must not land");
+        assert!(err.to_string().contains("came from 'claude-code'"), "{err}");
+        assert_eq!(
+            store.member_unanswered("claude-code", &["review_request"], -1).unwrap().len(),
+            1,
+            "the asker's row must not clear when the answer never reaches them"
+        );
+        // Fractally: a specialized reply is still a disposition.
+        let dotted = store.enqueue_member(
+            "codex-cli", "kimi-code", "role:r", "reply.thread",
+            Some("forum/v.md"), "h3", Some(asked),
+        );
+        assert!(dotted.is_err(), "reply.thread is a reply for the addressee check");
+        // Addressed back to the asker, it lands and clears.
+        store
+            .enqueue_member("claude-code", "kimi-code", "role:r", "review_done",
+                            Some("forum/v.md"), "h4", Some(asked))
+            .unwrap();
+        assert!(store
+            .member_unanswered("claude-code", &["review_request"], -1)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// #1115, query side: a misaddressed bound reply already ON the books (written
+    /// before the store guard, or by a future writer that bypasses it) still does
+    /// not clear the asker's row — the unanswered query itself is addressee-aware.
+    #[test]
+    fn a_misaddressed_disposition_already_stored_does_not_discharge() {
+        let (_tmp, store) = fresh();
+        let asked = store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "review_request",
+                            Some("pr/1"), "h1", None)
+            .unwrap();
+        // Simulate the pre-guard row: bound, disposition kind, wrong addressee.
+        let ok = store
+            .enqueue_member("claude-code", "kimi-code", "role:r", "reply",
+                            Some("forum/v.md"), "h2", Some(asked))
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("UPDATE member_notices SET to_plugin = 'codex-cli' WHERE id = ?1",
+                         params![ok as i64])
+                .unwrap();
+        }
+        assert_eq!(
+            store.member_unanswered("claude-code", &["review_request"], -1).unwrap().len(),
+            1,
+            "a bound reply addressed to someone else is not the asker's answer"
+        );
+        // The corrected re-send (the live repro's 14575) clears it.
+        store
+            .enqueue_member("claude-code", "kimi-code", "role:r", "reply",
+                            Some("forum/v.md"), "h3", Some(asked))
+            .unwrap();
+        assert!(store
+            .member_unanswered("claude-code", &["review_request"], -1)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// #1115, the FYI carve-out: a bound `forum-note` to a third party is not a
+    /// disposition — it must land (closure rides forum-note) and must not clear.
+    #[test]
+    fn a_third_party_forum_note_binds_without_refusing_or_clearing() {
+        let (_tmp, store) = fresh();
+        let asked = store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "review_request",
+                            Some("pr/1"), "h1", None)
+            .unwrap();
+        store
+            .enqueue_member("codex", "kimi-code", "role:r", "forum-note",
+                            Some("forum/fyi.md"), "h2", Some(asked))
+            .unwrap();
+        assert_eq!(
+            store.member_unanswered("claude-code", &["review_request"], -1).unwrap().len(),
+            1,
+            "an FYI to a third party is not the asker's answer"
         );
     }
 
