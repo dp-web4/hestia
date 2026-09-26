@@ -14,8 +14,9 @@ use hestia_plugin_sdk::{
 use serde_json::{json, Value};
 
 #[test]
-fn protocol_version_is_zero() {
-    assert_eq!(HESTIA_PROTOCOL_VERSION, 0);
+fn protocol_version_is_one() {
+    // Presence protocol v1 since 35b51bf; matches the TypeScript and Python SDKs.
+    assert_eq!(HESTIA_PROTOCOL_VERSION, 1);
 }
 
 #[test]
