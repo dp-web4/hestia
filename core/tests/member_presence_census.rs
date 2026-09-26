@@ -928,7 +928,41 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     // check that prevents it. The unclosed half: nothing distinguishes "registry holds
     // no other member" from "registry failed to load", because `state::open` fails open
     // to an empty registry. If that distinction ever matters, it is measured HERE.
+    //
+    // AMENDED 2026-09-15 (kimi-code, #990 — the registry's one administrative REMOVE).
+    // The census went red the moment the two filter lines were written — the instrument
+    // working again, on the integration binary `cargo test --lib` never runs.
+    //
+    // READING of the two new sites, against the question this table schedules — **is
+    // this a safety use of presence?** It is the first site in this entry that EXCLUDES
+    // rather than enumerates: until now every line here built a candidate list and the
+    // only subtraction was the asker itself. Both new lines gate on registry STATE:
+    // `is_retired` reads the operator's tombstone (#990's administrative remove), and
+    // `is_filler` reads the type mark set at mint (never-a-member). Both are SELECTION
+    // gates on a rivalrous slot, and both are the direction the record has always
+    // wanted said out loud: the names they drop are exactly the ones that could never
+    // answer — residue the append-only registry could not shed, and fillers that were
+    // never members at all.
+    //
+    // Why this does not violate the rule recorded above ("presence decides WHO IS
+    // ASKED" is fail-open, never an exclusion): the rule governs EVIDENCE (liveness,
+    // mailbox rows — dp: *"it reorders routing, it never excludes"*), and these two
+    // lines read no evidence. A tombstone is an administrative ACT — witnessed as
+    // `member_retired` with who/when/why, reversible by `member_reinstated` — and the
+    // filler mark is a TYPE decided at mint. The narrowing the reading above warns
+    // about was dangerous because it was SILENT; this narrowing is witnessed and
+    // undoable, which is precisely the property that makes an exclusion admissible
+    // where a silent shrink was not. The `probe_residue_no_longer_evicts...` test one
+    // module over pins the evidence half and passes unmodified.
+    //
+    // DEGRADATION DIRECTION, the question this table really asks: a WRONG tombstone
+    // excludes a real seat — visible, attributable (`retired_by`), and undone by one
+    // operator command; a registry that fails to load still yields the empty pool the
+    // reading above already measures. Neither failure is silent, and neither can mint
+    // an invitation to a name that cannot receive.
     ("server/handler.rs::resolve_invitation", &[
+        ".filter(|id| !s.member_registry.is_filler(id))",
+        ".filter(|id| !s.member_registry.is_retired(id))",
         ".iter_sorted()",
         ".member_registry",
     ]),

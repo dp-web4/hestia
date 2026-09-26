@@ -13693,6 +13693,163 @@ mod tests {
         );
     }
 
+    /// #990's remedy at the pool: a RETIRED name is excluded by administrative act,
+    /// and the exclusion stands until an operator lifts it.
+    ///
+    /// This is NOT the evidence-based exclusion dp's rule forbids ("it reorders
+    /// routing, it never excludes" — pinned one test above). The tombstone is not
+    /// evidence: it is an operator's witnessed judgement (`retire_member`), the
+    /// administrative remove the append-only registry never had. The two halves
+    /// pinned here: the retired name takes no slot WHILE the tombstone stands, and
+    /// `reinstate_member` returns it to the pool — the reversibility that keeps the
+    /// act a single-operator call rather than a quorum one.
+    #[tokio::test]
+    async fn a_retired_member_holds_no_invitation_slot_until_reinstated() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "kimi-code", "attest-probe", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+        // The operator act, applied directly to the state (the HTTP door is tested
+        // beside it in http.rs): tombstone the probe name.
+        {
+            let mut s = shared.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            let crate::server::state::ServerState {
+                vault,
+                member_registry,
+                ..
+            } = &mut *s;
+            let out = crate::member_registry::retire_member(
+                vault,
+                member_registry,
+                "attest-probe",
+                "lct:web4:operator:test",
+                "probe residue — never a real seat",
+                now,
+            );
+            assert_eq!(out, crate::member_registry::RetireOutcome::Retired);
+        }
+
+        let claim = |act: &str| {
+            let shared = shared.clone();
+            let sid = session_of["codex"].clone();
+            let act = act.to_string();
+            async move {
+                tool_gate_escalation_claim(
+                    &shared,
+                    &json!({
+                        "plugin_id": "codex",
+                        "session_id": sid,
+                        "tool_name": "Edit",
+                        "marker": "pre_tool_use.py",
+                        "reason": act,
+                    }),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let invited_of = |claimed: serde_json::Value| -> Vec<String> {
+            claimed["invited_peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let invited = invited_of(claim("Edit -> file one").await);
+        assert!(
+            !invited.contains(&"attest-probe".to_string()),
+            "the tombstoned name holds no slot: {invited:?}"
+        );
+        assert!(
+            invited.contains(&"kimi-code".to_string())
+                && invited.contains(&"claude-code".to_string()),
+            "the live seats are untouched: {invited:?}"
+        );
+
+        // Reversibility, visible at the pool: reinstated, the name is invited again.
+        {
+            let mut s = shared.lock().await;
+            let crate::server::state::ServerState {
+                vault,
+                member_registry,
+                ..
+            } = &mut *s;
+            assert_eq!(
+                crate::member_registry::reinstate_member(vault, member_registry, "attest-probe"),
+                crate::member_registry::ReinstateOutcome::Reinstated
+            );
+        }
+        let invited = invited_of(claim("Edit -> file two").await);
+        assert!(
+            invited.contains(&"attest-probe".to_string()),
+            "a reinstated name returns to the pool: {invited:?}"
+        );
+    }
+
+    /// The same exclusion by TYPE: a filler is minted never-a-member, so the pool
+    /// never spends a slot on it — the residue defect one field over, caught at the
+    /// type mark rather than waiting for an operator to prune each filler by hand.
+    #[tokio::test]
+    async fn a_filler_is_never_spent_an_invitation_slot() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+        {
+            let mut s = shared.lock().await;
+            let crate::server::state::ServerState {
+                vault,
+                member_registry,
+                ..
+            } = &mut *s;
+            crate::member_registry::ensure_filler(
+                vault,
+                member_registry,
+                "ollama:test-model@sha256:ff",
+                "sid",
+                "anchor",
+            )
+            .expect("the filler mints");
+        }
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "session_id": session_of["codex"],
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "reason": "Edit -> a governance file",
+            }),
+        )
+        .await
+        .unwrap();
+        let invited: Vec<String> = claimed["invited_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            invited.contains(&"claude-code".to_string()),
+            "the real peer is invited: {invited:?}"
+        );
+        assert!(
+            !invited.contains(&"ollama:test-model@sha256:ff".to_string()),
+            "the filler holds no slot, even with slots free: {invited:?}"
+        );
+    }
+
     /// THE BAR A PEER CAN CLEAR ALONE IS THE BAR THAT MUST INVITE. `resolve_invitation` built
     /// its pool only under `SovereignPlusPeer`, reasoning that `SingleApprover` "names no peer
     /// conjunct". But `SingleApprover` is defined as one sovereign-channel decision OR a
@@ -19001,6 +19158,23 @@ fn resolve_invitation(
                     false
                 }
             })
+            // The two names that can never answer, excluded by TYPE rather than by
+            // rank (#990). A slot on this list is RIVALROUS (top `MAX_INVITED_PEERS`
+            // of a pool that only grew), and every ranking fix left the residue in
+            // place underneath the cap:
+            //   * RETIRED — the registry's one administrative remove, the operator's
+            //     tombstone (`retire_member`). dp's standing call is that evidence
+            //     (liveness, mailbox rows) may ORDER the pool but never shrink it —
+            //     a legitimate new member has no rows yet — so the shrink is an
+            //     administrative act, and this filter is where it takes effect.
+            //   * FILLER — typed never-a-member at mint (`ensure_filler`): it cannot
+            //     connect, witness, or answer, so a slot spent on it is dead by
+            //     construction. Same defect class as probe residue, one field over.
+            // Both stay in the registry (presence, history) — this is a SELECTION
+            // exclusion, not an erasure; the tombstone and the type mark are the
+            // record.
+            .filter(|id| !s.member_registry.is_retired(id))
+            .filter(|id| !s.member_registry.is_filler(id))
             .map(|id| {
                 let l = actor_liveness(&window, &id);
                 let reachable = has_mailbox_reader(&s.inbox_store, &id);
