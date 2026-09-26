@@ -7675,6 +7675,47 @@ mod disposition_tests {
         (st, serde_json::from_slice(&b).unwrap())
     }
 
+    /// dp, 2026-09-25: "i tried retiring 'caude-code' through the ui, and it shows as retired in
+    /// the explore screen, but still shows up as a registered harness in the witness and other
+    /// displays." The agents bar above the witness feed drew a chip for every trust grain the
+    /// built-in registry does not know, with `connected: true`, and never asked about
+    /// retirement. dp's exact id, so the pin is the complaint.
+    #[tokio::test]
+    async fn a_retired_phantom_leaves_the_agents_bar_too() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "claude-code").await;
+        register_member(&state, "caude-code").await;
+        // How dp's `caude-code` came to exist in the first place: a mistyped grant (#1067),
+        // witnessed under that id -- which is what gives it a trust grain, and so a chip.
+        let (st, b) = grant(&state, serde_json::json!({
+            "plugin_id": "caude-code", "path": "/w/repos", "reason": "dp's typo",
+            "recursive": true, "register_new_member": true})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let chips = |s: &crate::server::state::ServerState| -> Vec<String> {
+            s.dashboard_snapshot(10).orchestrators.iter()
+                .filter_map(|o| o.get("id").and_then(|v| v.as_str()).map(String::from)).collect()
+        };
+        // NOT VACUOUS: the phantom must be a chip before retirement, or this test cannot see
+        // the defect it is here for.
+        let before = chips(&*state.lock().await);
+        assert!(before.contains(&"caude-code".to_string()),
+                "fixture: the phantom must have a chip to lose: {before:?}");
+
+        let (st, b) = retire(&state, "caude-code", serde_json::json!({
+            "reason": "a typo of claude-code", "ref": "dp 2026-09-25"})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let s = state.lock().await;
+        let after = chips(&s);
+        assert!(!after.contains(&"caude-code".to_string()),
+                "a retired id is not a harness on this seat: {after:?}");
+        // The snapshot still REPORTS it retired -- the view filters, the snapshot reports.
+        assert!(s.dashboard_snapshot(10).retired.contains(&"caude-code".to_string()));
+        // ...and it removed THAT chip and nothing else: every other id drawn before is drawn
+        // after, so retirement cannot quietly thin the bar of a live seat.
+        let expected: Vec<String> = before.into_iter().filter(|c| c != "caude-code").collect();
+        assert_eq!(after, expected);
+    }
+
     /// dp, 2026-09-08 and again on 09-19 and 09-21: three `claude-code` ids in the trust list,
     /// "no way of managing them". This is the whole act, on the real shape of that problem: two
     /// phantoms that have never acted beside the seat with every act.

@@ -1319,6 +1319,18 @@ impl ServerState {
                 continue; // one chip per identity, however many role grains it has
             }
             let running_now = running.contains(t.plugin_id.as_str());
+            // A RETIRED ID IS NOT A HARNESS ON THIS SEAT (dp, 2026-09-25: "i tried retiring
+            // 'caude-code' through the ui, and it shows as retired in the explore screen, but
+            // still shows up as a registered harness in the witness and other displays").
+            // This loop drew a chip for every trust grain the registry does not know -- and a
+            // retired phantom still HAS a grain -- with `connected: true`, so the one id the
+            // operator had just removed sat in the agents bar above the witness feed, reading
+            // as connected. Retirement is consulted here now, with the trust list's exception:
+            // a retired id that is RUNNING is drawn, because a retired member reconnecting is
+            // news (it is witnessed as `retired_member_connected`), not something to hide.
+            if !running_now && retired_ids.iter().any(|r| r == &t.plugin_id) {
+                continue;
+            }
             orchestrators.push(serde_json::json!({
                 "id": t.plugin_id,
                 "name": t.plugin_id,

@@ -1429,8 +1429,8 @@
               and refused without a pointer: no evidence, no join.
             </div>
             <div class="pol-add grant-add">
-              <select class="pol-input member-pick" id="ali-of" data-empty="alias_of — the SURVIVING id"></select>
-              <select class="pol-input member-pick" id="ali-alias" data-empty="alias — folds INTO it"></select>
+              <select class="pol-input member-pick" id="ali-of" data-empty="alias_of — the SURVIVING id" data-keep-retired="1"></select>
+              <select class="pol-input member-pick" id="ali-alias" data-empty="alias — folds INTO it" data-keep-retired="1"></select>
               <input class="pol-input" id="ali-ref" placeholder="evidence pointer (required)" size="26">
               <input class="pol-input" id="ali-reason" placeholder="reason" size="20">
               <button class="pol-btn-add" id="ali-btn" disabled>join identities</button>
@@ -2979,6 +2979,7 @@
     if (m.measured) bits.push(`${m.measured} measured`);
     // The important case: a member that exists only because someone typed it.
     if (!bits.length) bits.push('no evidence — typed, never acted');
+    if (m.retired) bits.unshift('RETIRED');
     // The picker's VALUE is always the id; only the label carries the alias, id beside it.
     const shown = memberAliases[id] ? `${memberAliases[id]} (${id})` : id;
     return `${shown} — ${bits.join(' · ')}`;
@@ -2991,14 +2992,23 @@
       const d = score(b[1]) - score(a[1]);
       return d !== 0 ? d : a[0].localeCompare(b[0]);
     });
+    // RETIRED IDS ARE NOT OFFERED (dp, 2026-09-25: a retired `caude-code` "still shows up as a
+    // registered harness in the witness and other displays"). Every picker that grants, adjusts
+    // or configures leaves them out -- the daemon refuses authority to a retired id through every
+    // door, so offering one is offering a refusal. The two MERGE pickers keep them, labelled:
+    // folding a typo into the real id is the right thing to do with a phantom, retired or not.
+    const retiredNow = new Set((lastData && lastData.retired) || []);
     for (const sel of document.querySelectorAll('select.member-pick')) {
       const keep = sel.value;
+      const offered = sel.dataset.keepRetired
+        ? ids.map(([id, m]) => [id, Object.assign({}, m, { retired: retiredNow.has(id) })])
+        : ids.filter(([id]) => !retiredNow.has(id));
       sel.innerHTML = `<option value="">${escapeHtml(sel.dataset.empty || 'member…')}</option>` +
-        ids.map(([id, m]) =>
+        offered.map(([id, m]) =>
           `<option value="${escapeHtml(id)}"${m.actions || m.installed ? '' : ' class="member-phantom"'}>${escapeHtml(memberLabel(id, m))}</option>`
         ).join('');
       // Preserve an in-progress selection across refreshes; drop it if the id vanished.
-      if (keep && ids.some(([id]) => id === keep)) sel.value = keep;
+      if (keep && offered.some(([id]) => id === keep)) sel.value = keep;
       sel.dispatchEvent(new Event('input', { bubbles: true }));
     }
   }
