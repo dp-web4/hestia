@@ -64,23 +64,45 @@ def source_contract() -> None:
     check("rescan is wired", "e.target.id === 'disc-rescan'" in UI)
 
     block = discover_block()
+    # ONE READ AND ONE WRITE, changed deliberately on 2026-09-21 and narrowed in the same move.
+    #
+    # This pane was pinned READ-ONLY, and the pin did its job: adding the Register action turned
+    # it red on four checks at once, which is the review this file exists to force. Registration
+    # is the act the old pin's own comment called "a later, separate, operator act" (R4), and the
+    # Discover row is where the operator is looking at the thing being registered -- putting the
+    # button anywhere else would mean re-identifying the agent by hand, which is the defect
+    # (#1067). So the allowance is singular and spelled out, rather than the rule being dropped:
+    # exactly two requests, exactly one of them a write, only POST, only to that one route, and
+    # carrying no `plugin_id`. A third request, another verb, or a typed id turns this red again.
     fetches = re.findall(r"apiFetch\(\s*'([^']+)'\s*(?:,\s*\{([^}]*)\})?", block)
-    check("the pane's OWN request is exactly one", len(fetches), 1)
-    if fetches:
-        check("...and it is the inventory read", fetches[0][0], "/api/agents")
-        check("...with no method override", "method" in fetches[0][1], False)
+    # TWO requests of the pane's own: the inventory read, and register (#1101), which is the one
+    # write built inline here -- retire and reinstate go through the retire block's reviewed
+    # functions instead. Pinned by route and method, not by count alone.
+    check("exactly two requests in the Discover block: the read and the one write", len(fetches), 2)
+    reads = [f for f in fetches if "method" not in f[1]]
+    writes = [f for f in fetches if "method" in f[1]]
+    check("the read is the inventory read, with no method override",
+          [f[0] for f in reads], ["/api/agents"])
+    check("there is exactly ONE write built here, and it is the register route",
+          [f[0] for f in writes], ["/api/agents/register"])
+    check("...and it is a POST", all("'POST'" in f[1] for f in writes), True)
     for verb in ("'PUT'", "'DELETE'", "'PATCH'", '"PUT"', '"DELETE"', '"PATCH"'):
         check(f"no {verb} anywhere in the Discover block", verb in block, False)
-    check("no request is built inline here at all -- the operator acts are reviewed functions",
-          "'POST'" in block or '"POST"' in block, False)
-    # THE ENUMERATION that replaced the absence-pin. Any write-capable control the render grows
-    # must be added here with a reason, which is the review step the old absence-pin provided.
-    WRITE_CONTROLS = {"data-retire": "retire (#1100)", "data-reinstate": "reinstate (#1100)"}
+    # The BODY, pinned whole, rather than "the string plugin_id is absent from the block": the
+    # response's derived id is SHOWN to the operator (`out.plugin_id`), and that is the point of
+    # deriving it. What must not happen is sending one.
+    check("the write's body is the clicked row's atlas id and a reason, and nothing else",
+          "body: JSON.stringify({ atlas_id: atlasId, reason })" in block)
+    # THE ENUMERATION that replaced the absence-pin (#1113). Any write-capable control the render
+    # grows must be added here with a reason, which is the review step the absence-pin provided.
+    # It grew by one when register (#1101) and retire (#1113) landed in the same pane.
+    WRITE_CONTROLS = {"data-retire": "retire (#1100, moved here by #1113)",
+                      "data-reinstate": "reinstate (#1100, moved here by #1113)",
+                      "data-register": "register a discovered harness (#1101)"}
     found = set(re.findall(r"\bdata-(?:retire|reinstate|register|delete|revoke|grant|merge-alias)\b", block))
-    check("the write-capable controls in this pane are exactly the reviewed two",
+    check("the write-capable controls in this pane are exactly the reviewed three",
           sorted(found), sorted(WRITE_CONTROLS))
-    # ...and they dispatch to the separately-reviewed handlers rather than to anything local.
-    check("the controls are dispatched by the retire block's own delegated handler",
+    check("retire and reinstate are dispatched by the retire block's own delegated handler",
           "closest('[data-retire],[data-reinstate],#disc-show-retired,#disc-hide-retired')" in UI)
     check("retire is offered ONLY on the unaccounted group, never on an installed agent's row",
           block.count("data-retire=") == 1
@@ -180,6 +202,23 @@ def behaviour() -> None:
     check("agent-unknown: ...and the report's other filing survives as a claim, not a group",
           urow.get("alsoFiledUnder"), ["dormant_plugin"])
     check("agent-unknown: drawn exactly once", sum(r["atlasId"] == "claude" for g in m["groups"] for r in g["rows"]), 1)
+    # WHO IS OFFERED REGISTRATION. Not everyone: the button must not appear where it would be a
+    # no-op (already a member) or where the daemon could not derive an id without inventing one.
+    # Added after a sabotage -- "offer it on an already-governed agent" -- passed clean, because
+    # this file pinned the request's shape and nothing about who may send it.
+    reg = {"status": "OK", "governed": ["claude"],
+           "gaps": {"ungoverned": ["codex"], "ungovernable": ["aider"], "unprovisioned_being": ["sage"]},
+           "detail": [agent("claude", "claude-code", True, governed=True),
+                      agent("codex", "codex", True),
+                      agent("aider", None, True),
+                      agent("sage", None, True, {"harness": "SAGE", "kind": "being"}, kind="being")]}
+    rows = {r["atlasId"]: r for g in run_model(reg)["groups"] for r in g["rows"]}
+    check("a governed agent is already a member: no button", rows["claude"]["registerable"], False)
+    check("an installed, ungoverned harness with a plugin id: offered", rows["codex"]["registerable"], True)
+    check("a being with no launcher yet: offered (its id comes from the <machine>-being convention)",
+          rows["sage"]["registerable"], True)
+    check("no plugin and not a being: NOT offered, because registering would mean inventing an id",
+          rows["aider"]["registerable"], False)
     # A BEING (atlas `kind: being`). Its gap is its own; its governance id is per seat and comes
     # from its launcher, so an unprovisioned one has none -- and must not be told "no hestia
     # plugin" (it needs none), nor be dropped because no older group claims it.
@@ -264,6 +303,12 @@ def unaccounted() -> None:
     check("governed still holds the real one", [r["atlasId"] for r in by_key["governed"]["rows"]], ["claude"])
     check("the act count rides along -- it is what tells two look-alikes apart",
           [r["actionCount"] for r in by_key["unaccounted"]["rows"]], [0, 0])
+    # REGISTER AND RETIRE MUST NEVER MEET ON ONE ROW. An unaccounted id is by definition already
+    # a member, so offering to register it would mint a second record for the same id -- the
+    # #1067 failure from the other side. Held today only by discoverRow(id, null) computing
+    # registerable=false from an empty record; pinned so a change there cannot quietly undo it.
+    check("an unaccounted row is never offered register -- it is already a member",
+          [r["registerable"] for r in by_key["unaccounted"]["rows"]], [False, False])
 
     # ACCOUNTED-FOR MEANS THE GOVERNANCE ID, NOT THE ATLAS ID. They are different namespaces;
     # matching on the atlas id would silently account for a member it has no relation to.

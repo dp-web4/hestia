@@ -3656,6 +3656,39 @@ fn cmd_delegate_grant(
 
 
     let mut vault = open_vault(home)?;
+    // THE SAME REFUSAL AS THE HTTP DOOR. #1106 said a retired id is "refused through this door
+    // as through every other", and that was true of the three routes only: this command takes
+    // the agent KEY, so nothing here had ever mapped it back to a member to ask (cbp, #1106
+    // review, finding 5). The registry is small and the map is one way -- key = f(lct) -- so
+    // the reverse is a scan, done once, here.
+    // Loaded once, for both refusals below: the retired-member check (#1106) and the action
+    // check (#1110). Two loads would be two readings of the registry that could disagree.
+    let registry = hestia::member_registry::load_members(&vault);
+    {
+        let retired = hestia::server::retirement::load(&vault);
+        if !retired.retired.is_empty() {
+            let who = registry.iter_sorted().into_iter().find(|(_, lct)| {
+                delegation::agent_key_for_lct(&lct.lct_id()) == agent_id
+            }).map(|(id, _)| id.clone());
+            if let Some(plugin_id) = who {
+                if let Some(r) = retired.get(&plugin_id) {
+                    anyhow::bail!(
+                        "'{plugin_id}' was RETIRED on this seat ({}). Nothing was delegated: a \
+                         retired id receives no authority through this door either. Reinstate it \
+                         first — the dashboard's agent view, or POST /api/agents/{plugin_id}/reinstate.",
+                        r.reason);
+                }
+            }
+        }
+    }
+    // THE SAME ACTION CHECK AS THE HTTP DOOR (#1110), from the same function, so the two cannot
+    // drift -- this door is where #1106's retirement refusal was missing the first time. An
+    // action whose member segment names no recorded member, or a `scope.decide` shape that binds
+    // nothing, is refused before anything is signed.
+    #[rustfmt::skip]
+    let suggest: Vec<String> = registry.iter_sorted().into_iter().filter(|(id, _)| !registry.is_filler(id)).map(|(id, _)| id.clone()).collect();
+    let unvalidated = delegation::check_actions(&actions, &|m| registry.get(m).is_some(), &suggest)
+        .map_err(anyhow::Error::msg)?;
     let mut store = DelegationStore::load(&vault)?;
     let (delegator_id, delegator_kp) = delegation::operator_delegator(&vault, home)?;
     let deleg = store.create_delegation(
@@ -3677,6 +3710,10 @@ fn cmd_delegate_grant(
     println!("  id:      {id}");
     println!("  agent:   {agent_id}");
     println!("  expires: {exp}");
+    // SAID, not implied: accepted is not the same as checked.
+    for a in &unvalidated {
+        println!("  note:    '{a}' is not a verb this daemon interprets -- stored as given, NOT validated");
+    }
     Ok(())
 }
 
