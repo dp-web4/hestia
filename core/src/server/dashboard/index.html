@@ -937,6 +937,15 @@
   .esc-what { font-family: var(--mono, monospace); font-size: 0.74rem; color: var(--fg-dim);
     background: var(--bg-elev); border-radius: 3px; padding: 0.3rem 0.5rem; margin-bottom: 0.4rem;
     white-space: pre-wrap; word-break: break-word; max-height: 8rem; overflow-y: auto; }
+  .esc-effect { font-size: 0.74rem; margin-bottom: 0.45rem; }
+  .esc-effect summary { cursor: pointer; color: var(--fg); }
+  .esc-effect .esc-effect-sum { font-family: var(--mono, monospace); }
+  .esc-effect .add { color: var(--ok, #6c6); }
+  .esc-effect .del { color: var(--danger, #d66); }
+  .esc-effect .esc-effect-note { color: var(--warning); font-style: italic; }
+  .esc-effect pre { font-family: var(--mono, monospace); font-size: 0.7rem; margin: 0.3rem 0 0;
+    background: var(--bg-elev); border-radius: 3px; padding: 0.35rem 0.5rem;
+    max-height: 18rem; overflow: auto; white-space: pre; }
   .esc-meta { font-size: 0.72rem; color: var(--fg-dim); margin-bottom: 0.5rem; }
   .esc-actions { display: flex; gap: 0.4rem; align-items: center; }
   .esc-reason { flex: 1; min-width: 0; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px;
@@ -3770,6 +3779,7 @@
         <div class="esc-marker"></div>
         <div class="esc-why"></div>
         <div class="esc-what"></div>
+        <div class="esc-effect"></div>
         <div class="esc-meta"></div>
         <div class="esc-actions">
           <input class="esc-reason" placeholder="reason (required to approve)">
@@ -3804,6 +3814,56 @@
         const d = (e.stated_detail || '').trim();
         what.textContent = d ? `what: ${d}` : '';
         what.hidden = !d;
+      }
+      // WHAT THE BYTES WOULD DO. The `why:` line above tells an operator to "decide on the
+      // payload alone" when the member stated nothing — which, until this block existed, was
+      // advice the card made impossible to follow: nothing on it described the payload.
+      // Measured by the daemon from the act (see `evidence::write_effect`), never asserted by
+      // the member, and absent rather than guessed when the act is not copy-shaped.
+      const eff = row.querySelector('.esc-effect'), fx = e.write_effect;
+      if (eff) {
+        eff.hidden = !fx;
+        eff.innerHTML = '';
+        if (fx) {
+          if (fx.source_readable === false) {
+            eff.innerHTML = `<div class="esc-effect-note">${escapeHtml(fx.note || '')}` +
+              ` (${escapeHtml(fx.source || '')})</div>`;
+          } else {
+            const sha = (fx.payload_sha256 || '').slice(0, 12);
+            const cmp = fx.compared_against;
+            const head = document.createElement('div');
+            head.className = 'esc-effect-sum';
+            if (cmp) {
+              const a = fx.added_lines | 0, d = fx.removed_lines | 0;
+              head.innerHTML = fx.identical_to_enforcing
+                // A no-op write is worth SAYING, not leaving to be inferred from two zeros:
+                // it is the cheapest approval an operator will ever give and the one most
+                // likely to be a mistake somewhere upstream.
+                ? `no change vs the enforcing copy \u2014 ${escapeHtml(fx.source_lines + '')} lines, sha ${escapeHtml(sha)}`
+                : `<span class="add">+${a}</span> <span class="del">-${d}</span>` +
+                  ` vs the copy now ENFORCING \u2014 sha ${escapeHtml(sha)}`;
+            } else {
+              head.innerHTML = `${escapeHtml((fx.source_lines | 0) + '')} lines, sha ${escapeHtml(sha)}` +
+                ` \u2014 <span class="esc-effect-note">${escapeHtml(fx.note || 'no enforcing copy to compare')}</span>`;
+            }
+            eff.appendChild(head);
+            const lines = Array.isArray(fx.diff) ? fx.diff : [];
+            if (lines.length) {
+              const det = document.createElement('details');
+              const sum = document.createElement('summary');
+              sum.textContent = fx.diff_truncated
+                // A diff that stops without saying so manufactures false confidence: the
+                // reader reaches the end and concludes they have seen the change.
+                ? `diff (first ${lines.length} lines \u2014 TRUNCATED, open the file for the rest)`
+                : `diff (${lines.length} lines)`;
+              det.appendChild(sum);
+              const pre = document.createElement('pre');
+              pre.textContent = lines.join('\n');
+              det.appendChild(pre);
+              eff.appendChild(det);
+            }
+          }
+        }
       }
       const bar = typeof e.bar === 'string' ? e.bar : JSON.stringify(e.bar ?? '');
       const nf = Array.isArray(e.factors) ? e.factors.length : 0;

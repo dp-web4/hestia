@@ -1414,6 +1414,30 @@ impl ServerState {
                             // name and a path fragment (dp, 2026-08-02).
                             "stated_reason": e.stated_reason,
                             "stated_detail": e.stated_detail,
+                            // WHAT THE WRITE WOULD DO (PRD_ADJUDICATOR_LADDER §3.3).
+                            //
+                            // dp, 2026-08-02, got `stated_reason`/`stated_detail` onto this
+                            // card because approving a governance write off a tool name and a
+                            // path fragment is not deciding. Both fields are the MEMBER'S
+                            // account of itself, and for a gate-auto-opened escalation the
+                            // member wrote neither: the detail says, in the gate's own words,
+                            // that the member "stated no rationale because it did not choose
+                            // to escalate". So the most common governance ask on this fleet
+                            // arrives with its two evidence fields structurally empty.
+                            //
+                            // This one is measured by the daemon from the act itself: the
+                            // bytes, their hash, and the diff against the copy currently
+                            // enforcing. Null when the act is not copy-shaped, which is honest
+                            // rather than helpful — see `evidence::write_effect`.
+                            //
+                            // FROM THE RETAINED ACT, never from `stated_reason` (#1066): on the
+                            // member door the reason is a rationale, and one containing another
+                            // valid `cp` rendered an effect the approval does not bind. Same
+                            // source as the reviewer's bundle, so card and bundle agree.
+                            "write_effect": e.act_text.as_deref()
+                                .and_then(crate::server::evidence::write_effect_cached),
+                            "act_text": e.act_text,
+                            "opened_via": e.opened_via.as_str(),
                             "opened_at": e.opened_at,
                             "expires_at": e.expires_at,
                             "secs_remaining": e.expires_at.saturating_sub(now),

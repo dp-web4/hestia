@@ -338,6 +338,40 @@ impl Channel {
 }
 
 
+/// The door an escalation was opened through. Spelled exactly as the `gate_escalation_opened`
+/// chain row has spelled `opened_via` since the doors' payloads were unified, so the struct and
+/// the chain use one vocabulary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenedVia {
+    /// Not recorded: a row restored from before the field, or a mint whose door said nothing.
+    #[default]
+    Unknown,
+    /// `hestia_gate_escalation_open` — the member door. `reason` is a rationale here.
+    Open,
+    /// `hestia_gate_escalation_claim` — the gate hook's claim-or-open door, which takes
+    /// `reason` as the act when no `act` is sent.
+    Claim,
+}
+
+impl OpenedVia {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OpenedVia::Unknown => "unknown",
+            OpenedVia::Open => "open",
+            OpenedVia::Claim => "claim",
+        }
+    }
+
+    pub fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some("open") => OpenedVia::Open,
+            Some("claim") => OpenedVia::Claim,
+            _ => OpenedVia::Unknown,
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Escalation {
     pub id: String,
@@ -400,6 +434,26 @@ pub struct Escalation {
     /// one TTL, and failing closed for that hour is the safe direction for a permit.
     #[serde(default)]
     pub act_digest: Option<String>,
+    /// THE ACT ITSELF — the exact (trimmed) text `act_digest` was computed from (#1066).
+    ///
+    /// Before this field `open` hashed the act and discarded the text, so the only place it
+    /// survived was `stated_reason`, and only on the claim door, which takes `reason` AS the
+    /// act. The evidence bundle read it from there — and on the member door, where `reason` is
+    /// a RATIONALE, a rationale containing some other valid `cp` was shown to the decider as
+    /// the act, with a measured write effect for a write the approval does not bind (GPT,
+    /// review of #1064). Retained at the mint from the same string the digest is computed
+    /// from, so `act_digest_of(act_text) == act_digest` holds by construction: the evidence
+    /// and the permit are about one object. `None` only on rows restored from before this
+    /// field; a reader must render that as unavailable, never recover it from the reason.
+    #[serde(default)]
+    pub act_text: Option<String>,
+    /// WHICH DOOR opened this row, on the struct and not only on the chain row (#1066). The
+    /// door says what `stated_reason` MEANS — a rationale on `open`, possibly the act itself on
+    /// `claim` — so a reader of the struct must not have to guess it from which fields happen
+    /// to be filled. `Unknown` on rows restored from before the chain carried `opened_via`,
+    /// and on any mint whose door did not record itself.
+    #[serde(default)]
+    pub opened_via: OpenedVia,
     /// The sha256 of the BYTES the act would read, when the opener can name them.
     ///
     /// `act_digest` hashes the command TEXT, which for the commonest governed write on this
@@ -1376,6 +1430,16 @@ impl EscalationStore {
                             // Restored from the entry, so a restart keeps the binding.
                             // Absent on legacy rows opened before #539 -> None -> unspendable.
                             act_digest: s(d, "act_digest"),
+                            // The act text (#1066), restored ONLY if it hashes to the row's
+                            // own digest. A text that does not is evidence about some other
+                            // object, and the one property this field exists for is that
+                            // what a decider reads is what the permit binds. Rows written
+                            // before the field restore None -> rendered UNAVAILABLE.
+                            act_text: s(d, "act_text").filter(|t| {
+                                s(d, "act_digest").as_deref()
+                                    == Some(Self::act_digest_of(t).as_str())
+                            }),
+                            opened_via: OpenedVia::parse(s(d, "opened_via").as_deref()),
                             stated_reason: s(d, "stated_reason"),
                             stated_detail: s(d, "stated_detail"),
                             // The seat keys (#542), restored from the entry when present.
@@ -1636,6 +1700,10 @@ impl EscalationStore {
             // Bound at OPEN, from the same text every decision surface renders (#539).
             // From `act`, never from `stated_reason` — see the note on this fn.
             act_digest: act.map(Self::act_digest_of),
+            // The same string, kept (#1066). Not re-derived anywhere: one source for both.
+            act_text: act.map(str::to_string),
+            // The door records itself via `record_opened_via`; `open` takes no view of it.
+            opened_via: OpenedVia::Unknown,
             payload_sha256: binding.and_then(|b| b.sha256.clone()),
             payload_basis: binding.map(|b| b.basis.to_string()),
             payload_stated_but_not_measured: binding
@@ -1987,6 +2055,20 @@ impl EscalationStore {
     /// registry, and `open`'s existing callers — every one a test with no session to prove
     /// anything by — keep the fail-closed default without a signature change. Returns false
     /// only for an unknown id, which cannot happen from the handler's own flow.
+    /// Record which door opened this escalation (#1066). Separate from `open` for the same
+    /// reason `record_asker_basis` is: `open` is the pure mint and every test that pins it
+    /// still pins it. Each production door calls this before it witnesses the open, so the
+    /// chain row is built from the struct and cannot disagree with it.
+    pub fn record_opened_via(&mut self, id: &str, via: OpenedVia) -> bool {
+        match self.by_id.get_mut(id) {
+            Some(e) => {
+                e.opened_via = via;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn record_asker_basis(&mut self, id: &str, basis: crate::arbiter::AskerBasis) -> bool {
         match self.by_id.get_mut(id) {
             Some(e) => {
