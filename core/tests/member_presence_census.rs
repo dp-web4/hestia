@@ -659,6 +659,18 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/http.rs::agent_reinstate", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
+    // ADDED 2026-09-22 (claude-code@mcnugget, agent-lifecycle R5 -- delegations from the agent).
+    // READING: the subject of a `delegation_grant_intent`/`delegation_granted` (and the revoke
+    // pair). Same corroboration as retire's: the id arrives in the URL path. NOT the key the
+    // delegation binds to -- that is `agent_key_for_lct` over the registry LCT, derived one
+    // line earlier, and this derived label is serialised beside it for the reader and read by
+    // nothing. Naming.
+    ("server/http.rs::agent_delegation_grant", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
+    ("server/http.rs::agent_delegation_revoke", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
     ("server/state.rs::trust_entity_key", &[
         "match self.member_lct(plugin_id) {",
     ], SiteClass::Naming),
@@ -771,6 +783,28 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("cli.rs::cmd_delegate_agent_id", &[
         "let registry = hestia::member_registry::load_members(&vault);",
     ]),
+    // ADDED 2026-09-23 (claude-code@mcnugget, #1106 review, cbp finding 5). READING: presence,
+    // read to answer "which member is this agent KEY?" so the command can refuse a retired one.
+    // The map is one-way -- key = f(lct) -- so the reverse is a scan of the registry, done once.
+    // The HTTP doors all refused a retired id and this one did not, which made the PR's claim
+    // ("refused through this door as through every other") true of HTTP only.
+    //
+    // DEGRADATION DIRECTION: an unreadable or empty registry yields no match, and an unmatched
+    // key is DELEGATED TO rather than refused. That is the permissive direction, and it is the
+    // right one here: the key may legitimately belong to no member of this seat (a filler, a
+    // peer's agent), and refusing every key this registry cannot name would break the command
+    // for its normal use. The refusal it adds is exact -- this key IS this retired member --
+    // and the authority it gates is bounded by the delegation's own scope. If this ever becomes
+    // the only check on a consequential path, that reading must be redone.
+    ("cli.rs::cmd_delegate_grant", &[
+        "let registry = hestia::member_registry::load_members(&vault);",
+        // ADDED 2026-09-25 (#1110): a READ FOR A MESSAGE, feeding the refusal's "did you mean"
+        // exactly as the HTTP door's does. The presence check itself (`registry.get(m)`) sits
+        // in the next line and gates in the fail-closed direction -- an unreadable registry
+        // refuses every member-bound action, never mints one.
+        "let suggest: Vec<String> = registry.iter_sorted().into_iter().filter(|(id, _)| !registry.is_filler(id)).map(|(id, _)| id.clone()).collect();",
+        "let who = registry.iter_sorted().into_iter().find(|(_, lct)| {",
+    ]),
     ("cli.rs::cmd_lct_publish", &[
         "let members = hestia::member_registry::load_members(&vault);",
     ]),
@@ -858,6 +892,59 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("server/http.rs::scope_grant", &[
         "let known: Vec<String> = s.member_registry.iter_sorted().into_iter().filter(|(id, _)| !s.member_registry.is_filler(id)).map(|(id, _)| id.clone()).collect();",
         "let member_known = s.member_registry.get(&plugin_id).is_some();",
+    ]),
+    // ADDED 2026-09-25 (claude-code@mcnugget, #1110 -- cbp's finding 4 on #1106). READING: the
+    // member segment INSIDE a delegated action (`scope.decide:<member>:/prefix`) is checked for
+    // presence before anything is signed. A segment naming no recorded member used to be stored,
+    // signed and witnessed as a delegation that enforced against no one (`action_covers`
+    // compares it to the asker by string equality) -- #1067's silent inertness, one layer in.
+    //
+    // DEGRADATION DIRECTION: an empty or unreadable registry REFUSES every member-bound action.
+    // Fail-closed and loud; it cannot cause a delegation, and the member-free forms
+    // (`scope.decide:/prefix`) are unaffected. A registry wrongly reporting a member present
+    // lets a typo through as before -- no worse than the silence it replaces.
+    //
+    // The first line is a READ FOR A MESSAGE, exactly as in `scope_grant`: it feeds
+    // `nearest_member_ids` for the refusal's "did you mean", and redirects nothing.
+    ("server/http.rs::agent_delegation_grant", &[
+        "let suggest: Vec<String> = s.member_registry.iter_sorted().into_iter().filter(|(id, _)| !s.member_registry.is_filler(id)).map(|(id, _)| id.clone()).collect();",
+        "let unvalidated = match crate::delegation::check_actions(&actions, &|m| s.member_registry.get(m).is_some(), &suggest) {",
+    ]),
+    // ADDED 2026-09-21 (claude-code@mcnugget, agent-lifecycle R4 -- register). The census went
+    // red on the route the moment it was written.
+    //
+    // READING: this is a PRODUCER, the second after `tool_connect`'s mint and the first that is
+    // an operator act rather than a consequence of a member showing up. Both reads are in the
+    // safety direction:
+    //   * `get(..).is_some()` -> already a member: return 200 having minted NOTHING and
+    //     witnessed nothing. Idempotent, so a double-click cannot make two records of one id.
+    //   * `ensure_member(..)` -> the mint itself. Fail-CLOSED where it can be: a synthetic or
+    //     empty id yields None and the route answers 409 with nothing registered.
+    // What makes a producer safe here is upstream of the registry and NOT visible in this
+    // table: the id is DERIVED from the inventory record and never taken from the caller (a
+    // body carrying `plugin_id` is refused outright), and an atlas id absent from this
+    // machine's report registers nothing. That is the property to re-read if this route ever
+    // accepts an id -- at which point it becomes #1067 with a mint attached.
+    ("server/http.rs::agent_register", &[
+        "crate::member_registry::ensure_member(",
+        "if s.member_registry.get(&plugin_id).is_some() {",
+    ]),
+    // ADDED 2026-09-22 (claude-code@mcnugget, agent-lifecycle R5 -- delegations). READING:
+    // presence, used to DERIVE the delegation key (`agent_key_for_lct` over the registry LCT)
+    // -- so a member the registry has not recorded gets 404 and no delegation, which is #952's
+    // rule: a delegation binds to an identity derived from a public key, never to a name.
+    // Fail-CLOSED: no registry entry, no key, no grant. The revoke route reads it for the same
+    // derivation, to check the delegation being struck belongs to THIS agent. And
+    // `commit_retirement` reads it to find which delegations a retiring member holds -- a
+    // member with no LCT has none, so the absent case is correctly a no-op there.
+    ("server/http.rs::delegation_key_for", &[
+        "let Some(lct) = s.member_registry.get(plugin_id) else {",
+    ]),
+    ("server/http.rs::agent_delegation_revoke", &[
+        "let Some(lct) = s.member_registry.get(&plugin_id).map(|l| l.lct_id()) else {",
+    ]),
+    ("server/state.rs::commit_retirement", &[
+        "if let Some(lct) = self.member_registry.get(member).map(|l| l.lct_id()) {",
     ]),
     // ADDED 2026-09-09 (cbp, the atomic `reassign`). READING: presence, used as a GATE, not
     // an advisory — the one thing the `scope_grant` reading above said would need its own
