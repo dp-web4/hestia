@@ -136,6 +136,11 @@ export interface DashboardSnapshot {
    * until Sprint 2. Expired requests are dropped daemon-side.
    */
   pending_scope_requests: PendingScopeRequest[];
+  /**
+   * Ids the operator retired on this seat. Their rows stay in the data — hiding them would
+   * make "show retired" impossible and would hide a retired id that is still acting.
+   */
+  retired?: string[];
   generated_at: string;
 }
 
@@ -284,3 +289,44 @@ export interface SeatConfigPutResult {
 export type DecideOutcome =
   | { outcome: "decided"; result: unknown }
   | { outcome: "already_decided"; detail: string };
+
+/** A being's launcher, as the inventory found it (hestia #1076). */
+export interface BeingLauncher {
+  unit: string;
+  member: string | null;
+  members_in_unit: string[];
+  sets_hestia_env: boolean;
+  enabled_on_disk: boolean;
+}
+
+/** One agent row of `GET /api/agents`. Only the fields this app reads are typed. */
+export interface AgentRow {
+  agent: string;
+  /** "being" for SAGE-style beings; absent means a harness. */
+  kind?: string;
+  /** The governance id — for a being, taken from its launcher's `--member`. */
+  plugin: string;
+  plugin_available: boolean;
+  installed: boolean;
+  governed: boolean;
+  wired: boolean;
+  partial: boolean;
+  miswired: boolean;
+  unprovisioned?: boolean;
+  /** The inventory's own sentences. Shown in full: they say what is missing and where. */
+  findings: string[];
+  launchers?: BeingLauncher[];
+}
+
+/** `GET /api/agents`. UNKNOWN carries a reason and must never render as an empty, clean list. */
+export interface AgentInventory {
+  status: "GOVERNED" | "UNGOVERNED_PRESENT" | "UNKNOWN" | string;
+  reason?: string;
+  machine?: string;
+  installed?: string[];
+  governed?: string[];
+  plugins_available?: string[];
+  registry_known?: number;
+  gaps?: Record<string, string[]>;
+  detail?: AgentRow[];
+}

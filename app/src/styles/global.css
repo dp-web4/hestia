@@ -1184,3 +1184,13 @@ input::placeholder {
 .queue-heading { margin: 22px 0 8px; font-size: 1rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
 .scope-request { border-left: 3px solid var(--accent, #6aa9ff); }
 .decide-actions label.check { flex: 0 0 auto; min-width: 0; flex-direction: row; align-items: center; gap: 6px; }
+
+/* Tables shared by the integrity and inventory views. */
+.gate-table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 0.9rem; }
+.gate-table th { text-align: left; color: var(--text-muted); font-weight: normal; padding: 4px 8px; }
+.gate-table td { padding: 6px 8px; border-top: 1px solid var(--border, #222); vertical-align: top; }
+.gate-table td.pre { font-family: monospace; font-size: 0.8rem; word-break: break-all; }
+.gate-differs { color: #e06c6c; }
+
+.findings { margin: 0; padding-left: 16px; font-size: 0.85rem; }
+.findings li { margin: 2px 0; }
