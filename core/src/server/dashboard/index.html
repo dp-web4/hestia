@@ -4534,7 +4534,10 @@
       // membership yet. `governed` implies it is already a member, so a button there is a no-op.
       // Reads `x.kind` off the record rather than a field of this view: the being rows come
       // from the INSTALLED inventory, which the deploy updates independently of this page.
-      registerable: !x.governed && (!!(x.plugin && String(x.plugin).trim())
+      // INSTALLED HERE, and nothing less (dp, 2026-09-27): the atlas knows harnesses this machine
+      // does not have, and registering one mints a member for something absent. The route refuses
+      // it too (register_refusal_not_here); the button just does not offer it.
+      registerable: x.installed === true && !x.governed && (!!(x.plugin && String(x.plugin).trim())
                                     || x.kind === 'being' || a.kind === 'being'),
       // The inventory's own words for what it could not determine about THIS agent.
       // Provenance only (atlas SCHEMA.md): shown, and nothing here decides on it.

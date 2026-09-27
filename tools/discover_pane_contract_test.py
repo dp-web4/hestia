@@ -219,6 +219,13 @@ def behaviour() -> None:
           rows["sage"]["registerable"], True)
     check("no plugin and not a being: NOT offered, because registering would mean inventing an id",
           rows["aider"]["registerable"], False)
+    # NOT INSTALLED HERE (dp, 2026-09-27): the atlas knows harnesses this machine lacks, and the
+    # first cut offered register on all of them -- five buttons on McNugget, none installed.
+    dormant = dict(reg, gaps={"dormant_plugin": ["cursor"]},
+                   detail=reg["detail"] + [agent("cursor", "cursor", False)])
+    drow = {r["atlasId"]: r for g in run_model(dormant)["groups"] for r in g["rows"]}
+    check("a harness NOT INSTALLED here is not offered: registering it mints an absent member",
+          drow["cursor"]["registerable"], False)
     # A BEING (atlas `kind: being`). Its gap is its own; its governance id is per seat and comes
     # from its launcher, so an unprovisioned one has none -- and must not be told "no hestia
     # plugin" (it needs none), nor be dropped because no older group claims it.
