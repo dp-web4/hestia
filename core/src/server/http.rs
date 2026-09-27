@@ -5501,6 +5501,26 @@ async fn agents_inventory() -> impl IntoResponse {
     }
 }
 
+/// REGISTER ONLY WHAT IS HERE (dp, 2026-09-27, the first time the button was on screen). The
+/// inventory reports every harness the atlas KNOWS, installed or not, and #1101 offered register
+/// on all of them -- five buttons on McNugget for Codex, Cursor, Gemini, Kimi and OpenClaw, none
+/// of which is installed there. Registering one mints a member for something absent: a phantom
+/// by the front door, which then sits in Discover's "nothing on this machine accounts for it"
+/// group waiting to be retired. dp's ask for this act was "a dropdown from actual available
+/// agents". `installed` must be TRUE; the inventory's could-not-establish rows (installed false,
+/// config present) are refused too -- unknown is not here.
+fn register_refusal_not_here(atlas_id: &str, rec: &serde_json::Value) -> Option<serde_json::Value> {
+    if rec.get("installed").and_then(|v| v.as_bool()) == Some(true) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "error": format!("'{atlas_id}' is known to the atlas but is not installed on this machine, \
+                          so there is nothing here to register. Register it when it arrives; \
+                          Discover will offer it then."),
+        "installed": rec.get("installed").cloned().unwrap_or(serde_json::Value::Null),
+    }))
+}
+
 /// `POST /api/agents/:id/ungovern` → remove hestia's hook wiring from an agent's config.
 ///
 /// surface: agent_ungovern   act: remove enforcement from a governed agent
@@ -5572,6 +5592,9 @@ async fn agent_register(
                               nothing here to register. Open Discover to see what is."),
         })));
     };
+    if let Some(refusal) = register_refusal_not_here(&atlas_id, &rec) {
+        return (StatusCode::CONFLICT, Json(refusal));
+    }
     let is_being = rec.get("kind").and_then(|k| k.as_str()) == Some("being");
     let machine = report.get("machine").and_then(|m| m.as_str()).unwrap_or("").to_lowercase();
     let from_record = rec.get("plugin").and_then(|p| p.as_str()).map(str::trim)
@@ -8128,6 +8151,20 @@ mod disposition_tests {
     /// chosen fixture. What IS testable here, and is the whole security property, is that no
     /// caller-supplied id can reach the registry: a body carrying `plugin_id` is refused
     /// outright, and an atlas id absent from this machine's report registers nothing.
+    /// dp, 2026-09-27: Discover offered register on five harnesses not installed on McNugget.
+    #[test]
+    fn register_refuses_what_is_not_installed_here() {
+        let rec = |v: serde_json::Value| serde_json::json!({"agent": "codex", "plugin": "codex", "installed": v});
+        assert!(register_refusal_not_here("codex", &rec(serde_json::json!(true))).is_none());
+        for absent in [serde_json::json!(false), serde_json::Value::Null, serde_json::json!("yes")] {
+            let r = register_refusal_not_here("codex", &rec(absent.clone()))
+                .unwrap_or_else(|| panic!("registered a harness with installed={absent}"));
+            assert!(r["error"].as_str().unwrap().contains("not installed on this machine"), "{r}");
+        }
+        // A record with no `installed` at all is not evidence of presence either.
+        assert!(register_refusal_not_here("x", &serde_json::json!({"agent": "x"})).is_some());
+    }
+
     #[tokio::test]
     async fn register_never_takes_an_id_from_the_caller() {
         let (_dir, state) = test_state().await;
