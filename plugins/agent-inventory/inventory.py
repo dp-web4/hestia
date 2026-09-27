@@ -1372,7 +1372,16 @@ class Registry:
             data = json.loads(raw)
         except ValueError:
             return {}
-        return {k: list(v) for k, v in data.items() if isinstance(v, list)}
+        out = {k: list(v) for k, v in data.items() if isinstance(v, list)}
+        # `targets` (#1133): the FILE a role must be served by, per role, as basenames. A
+        # role declared by event alone cannot tell a hook that reaches the daemon from one
+        # that appends to a private file on the same event — codex's `observe` role was
+        # "wired" by observe.sh for 14 days while the witness that reaches the chain was
+        # never registered. Optional: a plugin that declares no target keeps event-only.
+        t = data.get("targets")
+        if isinstance(t, dict):
+            out["targets"] = {r: [str(x) for x in v] for r, v in t.items() if isinstance(v, list)}
+        return out
 
 
 REGISTRY: Registry | None = None  # built in main(), once WORKSPACE is known
@@ -1538,22 +1547,54 @@ def inspect(atlas_id: str, roots: list[str]) -> dict:
 
     live_events = {h["event"] for h in hestia_hooks}
     rec["wired"] = bool(hestia_hooks)
-    if declared:
-        for role, events in declared.items():
-            rec["roles_wired"][role] = sorted(e for e in events if e in live_events)
-        missing = {role: [e for e in events if e not in live_events]
-                   for role, events in declared.items()}
+    role_targets = declared.get("targets") if isinstance(declared.get("targets"), dict) else {}
+    roles = {r: ev for r, ev in declared.items() if r != "targets" and isinstance(ev, list)}
+
+    def served(role: str, event: str) -> bool:
+        """A role's event is served when a live hestia hook sits on it AND, when the plugin
+        names the file that role needs (`targets`), one of those hooks IS that file.
+
+        #1133: on thor codex read `observe: [PostToolUse]` as wired because observe.sh sat
+        there — a hook whose whole output is a local file nobody reads — while witness.py,
+        the hook that reaches the chain, was never registered. 9,284 act rows on the chain
+        under claude-code, 0 under codex, and every report green. By event alone the two
+        hooks are the same thing; by target they are not."""
+        want = role_targets.get(role) or []
+        for h in hestia_hooks:
+            if h["event"] != event:
+                continue
+            if not want or any(Path(t).name in want for t in h["targets"]):
+                return True
+        return False
+
+    if roles:
+        for role, events in roles.items():
+            rec["roles_wired"][role] = sorted(e for e in events if served(role, e))
+        missing = {role: [e for e in events if not served(role, e)]
+                   for role, events in roles.items()}
         for role, events in missing.items():
             # Only meaningful for a harness that is actually here. A dormant plugin has
             # no roles to be absent from, and saying so for every uninstalled harness
             # buries the one machine where enforcement really is missing.
             if events and exe is not None:
-                rec["findings"].append(
-                    f"ROLE ABSENT: no live hestia hook on {role} event(s) "
-                    f"{', '.join(events)} — {'enforcement' if role == 'gate' else role} "
-                    "is not present on this machine")
+                want = role_targets.get(role) or []
+                if want and all(e in live_events for e in events):
+                    rec["findings"].append(
+                        f"ROLE ABSENT: {role} event(s) {', '.join(events)} carry a hestia "
+                        f"hook, but not {' / '.join(want)} — the file this role is declared "
+                        "to need. What that hook records stays on this machine; the "
+                        "society never sees it")
+                else:
+                    rec["findings"].append(
+                        f"ROLE ABSENT: no live hestia hook on {role} event(s) "
+                        f"{', '.join(events)} — {'enforcement' if role == 'gate' else role} "
+                        "is not present on this machine")
         rec["gate_wired"] = not missing.get("gate")
-        rec["partial"] = bool(hestia_hooks) and not rec["gate_wired"]
+        # A declared role that is not served is a gap whichever role it is (#902, #1133).
+        # `partial` used to mean only "gate absent"; a member witnessed by nothing is as
+        # partial as one gated by nothing, and reading it as governed is how codex sat
+        # unwitnessed for 14 days while every report was green.
+        rec["partial"] = bool(hestia_hooks) and any(missing.values())
     else:
         rec["gate_wired"] = None
         rec["partial"] = False

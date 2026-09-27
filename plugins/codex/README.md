@@ -34,11 +34,13 @@ So governance is **defense in depth**, each layer covering different acts:
 | NETWORK egress | **sandbox** `network_access = false` | strong (structural) |
 | Secret/credential access, unsafe shell | **PreToolUse gate** (fail-closed, innate denylist + society-safety) | strong for explicit; shell-scoped |
 | READ of out-of-scope repo | **PreToolUse gate** shell command-scope + launch-in-task-repo | weak (string-parse; relative-traversal escapes) |
-| Witness / continuity | **observe.sh** (PostToolUse) + **hydrate.sh** (SessionEnd) | fail-open by design |
+| Witness (acts reach the chain) | **witness.py** (PostToolUse) — `hestia_begin_action` + `hestia_record_outcome` against the daemon | fail-open by design |
+| Local observation / continuity | **observe.sh** (SessionStart/PostToolUse) + **hydrate.sh** (SessionEnd) — observe.sh appends the raw event to `~/.codex/hestia-observe/observe.jsonl`, a LOCAL file; it is not a witness | fail-open by design |
 
 ## Files
 - `hooks/pre_tool_use.py` — the fail-closed shell gate (scope + egress + society-safety).
-- `hooks/observe.sh` — fire-and-forget witness (SessionStart/PostToolUse/SessionEnd), always exit 0.
+- `hooks/witness.py` — the witness: fire-and-forget PostToolUse hook that records each act on the daemon's chain under the codex LCT. Until #1133 it shipped but was registered nowhere, so no codex act ever reached the chain while the inventory read the member as governed.
+- `hooks/observe.sh` — fire-and-forget LOCAL observation (SessionStart/PostToolUse), always exit 0. Appends to `~/.codex/hestia-observe/observe.jsonl`; nothing forwards that file to the daemon.
 - `hooks/hydrate.sh` — SessionEnd continuity hydration. It never writes authorization.
 - `hooks/hooks.json` — an installation template; the installer must render absolute runtime paths.
 - `instance/identity.seed.json` — the foreign-Codex identity seed (SAGE pattern).
@@ -53,6 +55,28 @@ So governance is **defense in depth**, each layer covering different acts:
    codex_hooks = true
    # + the [[hooks.*]] blocks (see hooks/hooks.json for the event structure)
    ```
+   The PostToolUse table MUST carry **witness.py**, not only observe.sh — this is the one
+   line that makes codex's acts reach the chain (#1133). Two hooks on one event is how the
+   template is shaped; the block reads:
+   ```toml
+   [[hooks.PostToolUse]]
+   matcher = ".*"
+
+   [[hooks.PostToolUse.hooks]]
+   type    = "command"
+   command = "/home/<user>/.codex/hooks/observe.sh"
+   timeout = 10
+
+   [[hooks.PostToolUse.hooks]]
+   type          = "command"
+   command       = "python3 /home/<user>/.codex/hooks/witness.py"
+   statusMessage = "hestia: witness (acts reach the chain)"
+   timeout       = 10
+   ```
+   `install-members.sh` deploys only files the host config registers, so an unregistered
+   witness.py is skipped every cycle ("not registered on this host") and the inventory —
+   which since #1133 checks the observe role against its declared file — reports the member
+   PARTIAL until the block above is in place.
 2. Deploy the standing-law + seed:
    ```
    cp AGENTS.md                    ~/.codex/AGENTS.md
