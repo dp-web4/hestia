@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   DashboardSnapshot,
   DecideOutcome,
+  GateReport,
   DaemonStatus,
   AppConfig,
   RemoteEntry,
@@ -48,6 +49,19 @@ export async function ruleScopeRequest(
     standing: opts.standing ?? false,
     recursive: opts.recursive ?? false,
   });
+}
+
+/** Gate verdicts plus the evidence to ratify against. */
+export async function gatesVerify(): Promise<GateReport> {
+  return invoke("gates_verify");
+}
+
+/**
+ * Ratify every discovered gate's CURRENT bytes as the trusted build. Replaces the
+ * previous expectations (last edit wins) — callers show what is replaced first.
+ */
+export async function gatesRatify(reason: string): Promise<unknown> {
+  return invoke("gates_ratify", { reason });
 }
 
 export async function getDashboard(): Promise<DashboardSnapshot> {

@@ -5851,6 +5851,94 @@ pub(crate) fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
     Ok(out)
 }
 
+/// The deployment authority's own record of what it installed, per file, read from
+/// `HESTIA_CURRENT_BUILD_FILE` (written by `deploy/install-members.sh` on full success).
+///
+/// This is the evidence an operator ratifies AGAINST. The ratify handler's own doc says
+/// "nothing here can tell a good build from a bad one; the operator must ratify from a
+/// state they believe correct" — and this is what makes that belief checkable: whether the
+/// installed bytes are exactly what the deploy wrote from a named main commit, or have
+/// changed since. It is evidence, not a verdict: nothing is refused on it (web4 LCT spec
+/// §1.2 — produce checkable evidence and let the relying party decide).
+fn deployed_gate_digests_from(path: &std::path::Path) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let mut files = serde_json::Map::new();
+    let file_rows = v
+        .get("members")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.get("files").and_then(|f| f.as_array()))
+        .flatten()
+        .chain(v.get("shared_engine").and_then(|f| f.as_array()).into_iter().flatten());
+    for f in file_rows {
+        if let (Some(p), Some(h)) = (
+            f.get("path").and_then(|x| x.as_str()),
+            f.get("sha256").and_then(|x| x.as_str()),
+        ) {
+            files.insert(p.to_string(), serde_json::Value::String(h.to_string()));
+        }
+    }
+    Some(serde_json::json!({
+        "build_id": v.get("build_id"),
+        "head_sha": v.get("head_sha"),
+        "installed_at_iso": v.get("installed_at_iso"),
+        "files": files,
+    }))
+}
+
+fn deployed_gate_digests() -> Option<serde_json::Value> {
+    let p = std::env::var_os("HESTIA_CURRENT_BUILD_FILE")?;
+    deployed_gate_digests_from(std::path::Path::new(&p))
+}
+
+/// Ratifying is the approve direction of the most consequential decision on a box — it
+/// defines what a correct gate is — so it carries a stated why, like every other
+/// permitting act here (`operator_gate_escalation`, `scope_decide`). Same bounds.
+fn ratify_reason(body: &serde_json::Value) -> Result<String, String> {
+    let r = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if r.is_empty() {
+        return Err("reason is required to ratify: it records why these bytes are the ones \
+                    you trust, and the chain entry is what makes that judgement reviewable"
+            .into());
+    }
+    if r.len() > 512 || r.chars().any(char::is_control) {
+        return Err("reason must be at most 512 bytes with no control characters".into());
+    }
+    Ok(r.to_string())
+}
+
+/// Install `next` and record it, or leave the vault exactly as it was.
+///
+/// Until 2026-09-27 the handler wrote the vault and then called
+/// `let _ = s.append_chain(..)` — the record's result discarded. A failed append left a
+/// new trust baseline in force with no record of who set it or why, while the handler's
+/// own RWOA block claimed `A: pass`. The sibling `operator_gate_escalation` already undoes
+/// its decision when the append fails; this is that order, for ratification. `record` is
+/// a parameter so the failure arm is testable without breaking a real chain store.
+fn apply_ratification(
+    s: &mut crate::server::state::ServerState,
+    previous: crate::vault::gate_integrity::GateExpectations,
+    next: crate::vault::gate_integrity::GateExpectations,
+    record: impl FnOnce(&crate::server::state::ServerState) -> anyhow::Result<()>,
+) -> Result<(), String> {
+    s.vault
+        .set_gate_expectations(next)
+        .map_err(|e| format!("could not store the ratification: {e}"))?;
+    if let Err(e) = record(s) {
+        return match s.vault.set_gate_expectations(previous) {
+            Ok(()) => Err(format!(
+                "ratification was not recorded ({e}); the previous expectations are restored"
+            )),
+            Err(re) => Err(format!(
+                "ratification was not recorded ({e}) AND could not be undone ({re}): the \
+                 stored expectations are unwitnessed — re-ratify"
+            )),
+        };
+    }
+    Ok(())
+}
+
 /// `GET /api/gates/verify` — hash every known gate and compare to the vault's ratified
 /// expectation. The DAEMON hashes the file; it never asks a gate about itself.
 async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
@@ -5886,6 +5974,17 @@ async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
         );
     }
     let wired: Vec<String> = discovered.iter().map(|(_, f)| f.clone()).collect();
+    // The daemon hashes every discovered gate itself — an unratified gate included, which
+    // `verify` does not hash — so an operator can see which bytes a ratify would bless.
+    let current_digests: serde_json::Map<String, serde_json::Value> = wired
+        .iter()
+        .map(|p| {
+            let h = crate::vault::gate_integrity::hash_file(std::path::Path::new(p))
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null);
+            (p.clone(), h)
+        })
+        .collect();
     let verdicts = crate::vault::gate_integrity::verify(&exp, &wired);
     let findings = verdicts.iter().filter(|v| v.is_finding()).count();
     (
@@ -5901,6 +6000,13 @@ async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
             // covers, which is the fact the previous version silently omitted.
             "discovered": discovered.len(),
             "coverage_source": "agent-inventory hook_targets (full scope chain), gate-role only",
+            // What an operator needs to ratify responsibly, stated beside the verdicts:
+            // the bytes installed NOW, per discovered gate, and what the deployment
+            // authority recorded installing. Evidence only; nothing is refused on it.
+            "evidence": {
+                "current": current_digests,
+                "deployed": deployed_gate_digests(),
+            },
             "gates": verdicts,
             "note": "Tamper-EVIDENT, not tamper-proof. The agent can rewrite its gate; it \
                      cannot rewrite this expectation, which lives in the operator-gated vault. \
@@ -5926,8 +6032,20 @@ async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
 /// attack. Nothing here can tell a good build from a bad one; the operator must ratify
 /// from a state they believe correct. The chain entry is what makes that judgement
 /// reviewable afterwards.
-async fn gates_ratify(State(state): State<SharedState>) -> impl IntoResponse {
+async fn gates_ratify(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
     use crate::vault::gate_integrity::{GateExpectation, GateExpectations};
+    // Refused before the lock and before any hashing: an unexplained ratification never
+    // starts.
+    let reason = match ratify_reason(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e })))
+                .into_response()
+        }
+    };
     let mut s = state.lock().await;
     let mut exp: GateExpectations = GateExpectations::new();
     let mut recorded = Vec::new();
@@ -5965,7 +6083,7 @@ async fn gates_ratify(State(state): State<SharedState>) -> impl IntoResponse {
                         sha256,
                         plugin_id,
                         ratified_at: chrono::Utc::now(),
-                        note: "operator ratification".into(),
+                        note: reason.clone(),
                     },
                 );
             }
@@ -5982,17 +6100,35 @@ async fn gates_ratify(State(state): State<SharedState>) -> impl IntoResponse {
             }
         }
     }
-    if let Err(e) = s.vault.set_gate_expectations(exp) {
+    // Last edit wins (dp, 2026-09-25) — so the record names what it replaced.
+    let previous = s.vault.gate_expectations();
+    let replaced: serde_json::Map<String, serde_json::Value> = previous
+        .iter()
+        .map(|(p, e)| (p.clone(), serde_json::Value::String(e.sha256.clone())))
+        .collect();
+    let deployed = deployed_gate_digests();
+    let entry = serde_json::json!({
+        "gates": recorded,
+        "reason": reason,
+        "replaced": replaced,
+        // Provenance the operator ratified against, when the authority file was readable.
+        "deployment": deployed.as_ref().map(|d| serde_json::json!({
+            "build_id": d.get("build_id"),
+            "head_sha": d.get("head_sha"),
+        })),
+    });
+    if let Err(e) = apply_ratification(&mut s, previous, exp, |st| {
+        st.append_chain("gate_ratified", entry).map(|_| ())
+    }) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+            Json(serde_json::json!({ "error": e })),
         )
             .into_response();
     }
-    let _ = s.append_chain("gate_ratified", serde_json::json!({"gates": recorded}));
     (
         StatusCode::OK,
-        Json(serde_json::json!({"ok": true, "ratified": recorded})),
+        Json(serde_json::json!({"ok": true, "ratified": recorded, "replaced": replaced})),
     )
         .into_response()
 }
@@ -6350,6 +6486,101 @@ mod disposition_tests {
         let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
         let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
         (dir, state)
+    }
+
+    // ---- gate ratification (the app's gate-integrity surface, 2026-09-27) ----
+
+    fn one_expectation(path: &str, sha: &str) -> crate::vault::gate_integrity::GateExpectations {
+        let mut m = crate::vault::gate_integrity::GateExpectations::new();
+        m.insert(
+            path.to_string(),
+            crate::vault::gate_integrity::GateExpectation {
+                sha256: sha.to_string(),
+                plugin_id: "claude-code".into(),
+                ratified_at: chrono::Utc::now(),
+                note: "test".into(),
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn ratify_requires_a_bounded_reason() {
+        use serde_json::json;
+        assert!(ratify_reason(&json!({})).is_err());
+        assert!(ratify_reason(&json!({"reason": "   "})).is_err());
+        assert!(ratify_reason(&json!({"reason": "x".repeat(513)})).is_err());
+        assert!(ratify_reason(&json!({"reason": "bad\u{7}bell"})).is_err());
+        assert_eq!(
+            ratify_reason(&json!({"reason": "  deploy 4d59496 installed these bytes  "})).unwrap(),
+            "deploy 4d59496 installed these bytes"
+        );
+    }
+
+    /// The defect this replaces: the vault was written and the chain append's result was
+    /// discarded, so a failed record left an unwitnessed trust baseline in force.
+    #[tokio::test]
+    async fn a_ratification_that_cannot_be_recorded_is_undone() {
+        let (_dir, state) = test_state().await;
+        let mut s = state.lock().await;
+        let previous = one_expectation("/h/pre_tool_use.py", "aaaa");
+        s.vault.set_gate_expectations(previous.clone()).unwrap();
+        let next = one_expectation("/h/pre_tool_use.py", "bbbb");
+
+        let err = apply_ratification(&mut s, previous.clone(), next, |_| {
+            Err(anyhow::anyhow!("chain store refused the append"))
+        })
+        .unwrap_err();
+        assert!(err.contains("not recorded") && err.contains("restored"), "{err}");
+        assert_eq!(
+            s.vault.gate_expectations(),
+            previous,
+            "an unrecorded ratification stayed in force"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recorded_ratification_stands() {
+        let (_dir, state) = test_state().await;
+        let mut s = state.lock().await;
+        let previous = one_expectation("/h/pre_tool_use.py", "aaaa");
+        s.vault.set_gate_expectations(previous.clone()).unwrap();
+        let next = one_expectation("/h/pre_tool_use.py", "bbbb");
+
+        apply_ratification(&mut s, previous, next.clone(), |_| Ok(())).unwrap();
+        assert_eq!(s.vault.gate_expectations(), next);
+    }
+
+    #[test]
+    fn deployment_evidence_reads_every_installed_file_and_nothing_else() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("current-build.json");
+        std::fs::write(
+            &p,
+            serde_json::json!({
+                "build_id": "v0.0.4-898-g4d59496",
+                "head_sha": "4d59496fabc",
+                "installed_at_iso": "2026-09-27T19:17:39Z",
+                "members": [{"member": "claude-code", "files": [
+                    {"file": "pre_tool_use.py", "path": "/h/pre_tool_use.py", "sha256": "1111"},
+                    {"file": "witness.py", "path": "/h/witness.py", "sha256": "2222"}
+                ]}],
+                "shared_engine": [{"file": "core.py", "path": "/s/core.py", "sha256": "3333"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let d = deployed_gate_digests_from(&p).unwrap();
+        assert_eq!(d["build_id"], "v0.0.4-898-g4d59496");
+        assert_eq!(d["files"]["/h/pre_tool_use.py"], "1111");
+        assert_eq!(d["files"]["/h/witness.py"], "2222");
+        assert_eq!(d["files"]["/s/core.py"], "3333");
+        assert_eq!(d["files"].as_object().unwrap().len(), 3);
+
+        // Absent or unparseable authority is "no evidence", never an invented one.
+        assert!(deployed_gate_digests_from(&dir.path().join("absent.json")).is_none());
+        std::fs::write(&p, b"not json").unwrap();
+        assert!(deployed_gate_digests_from(&p).is_none());
     }
 
     /// A member id becomes a FILENAME, so it is validated as one.

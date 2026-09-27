@@ -174,6 +174,8 @@ pub fn run() {
             commands::trust::get_derivation,
             commands::dashboard::get_dashboard,
             commands::decide::decide_gate_escalation,
+            commands::gates::gates_verify,
+            commands::gates::gates_ratify,
             commands::scope::rule_scope_request,
             commands::dashboard::get_failures,
             commands::dashboard::get_daemon_status,

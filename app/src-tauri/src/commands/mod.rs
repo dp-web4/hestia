@@ -2,6 +2,7 @@ pub mod chain;
 pub mod config;
 pub mod dashboard;
 pub mod decide;
+pub mod gates;
 pub mod operator;
 pub mod policy;
 pub mod remote;

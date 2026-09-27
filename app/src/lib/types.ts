@@ -284,3 +284,43 @@ export interface SeatConfigPutResult {
 export type DecideOutcome =
   | { outcome: "decided"; result: unknown }
   | { outcome: "already_decided"; detail: string };
+
+/**
+ * One gate's verdict, as `GET /api/gates/verify` serializes it (tagged on `status`).
+ * Mirrors `vault::gate_integrity::GateVerdict`.
+ */
+export type GateVerdict =
+  | { status: "verified"; path: string; plugin_id: string; sha256: string }
+  | { status: "modified"; path: string; plugin_id: string; expected: string; actual: string; ratified_at: string }
+  | { status: "missing"; path: string; plugin_id: string; expected: string }
+  | { status: "unratified"; path: string }
+  | { status: "unreadable"; path: string; error: string };
+
+/** What the deployment authority (`current-build.json`) recorded installing. */
+export interface DeployedDigests {
+  build_id: string | null;
+  head_sha: string | null;
+  installed_at_iso: string | null;
+  files: Record<string, string>;
+}
+
+/**
+ * `GET /api/gates/verify`. `UNKNOWN` carries a reason and no gates — it means the daemon
+ * could not establish the set, and must never be rendered as "all fine".
+ */
+export interface GateReport {
+  status: "VERIFIED" | "FINDINGS" | "MODIFIED" | "UNKNOWN";
+  reason?: string;
+  findings?: number;
+  discovered?: number;
+  gates?: GateVerdict[];
+  /**
+   * The evidence to ratify against: bytes installed now per discovered gate (null when
+   * unreadable), and the deploy's own record. Evidence, not a verdict — nothing is
+   * refused on it.
+   */
+  evidence?: {
+    current: Record<string, string | null>;
+    deployed: DeployedDigests | null;
+  };
+}
