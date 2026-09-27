@@ -79,11 +79,16 @@ an empty reason must call the daemon.
 
 ## Sprint 3 — Who is governed here
 
+Split on 2026-09-27: the daemon grew `retire` / `reinstate` (#1100, #1113) after this plan was
+written, and a retire revokes standing grants — consequential, with its own recent-activity guard.
+So **3a** is the read surface and **3b** the actions, the same caution as decide-before-grant.
+
 | # | deliverable |
 |---|---|
-| 3.1 | `GET /api/agents` surfaced: installed / adapter-available / governed, plus gaps |
-| 3.2 | **`UNKNOWN` renders as its reason string, never as an empty list** — the one forbidden rendering |
-| 3.3 | `ungovern` / `connect` offered only where the daemon says they apply |
+| 3.1 | **3a** — `GET /api/agents` surfaced: installed / adapter-available / governed, plus gaps; beings shown with the launcher and `--member` that make them governed |
+| 3.2 | **3a** — **`UNKNOWN` renders as its reason string, never as an empty list** — the one forbidden rendering |
+| 3.3 | **3a** — a retired id that is still governed or wired is called out, not merely hidden |
+| 3.4 | **3b** — `connect` / `ungovern` / `retire` / `reinstate`, each offered only where the daemon says it applies; retire carries its reason, ref and the recent-activity guard |
 
 **Acceptance, measured:** with `agent-inventory` uninstalled, the app shows the daemon's reason. The
 test asserts on the reason text, so a regression to an empty list fails it.
