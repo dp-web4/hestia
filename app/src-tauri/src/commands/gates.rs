@@ -47,13 +47,18 @@ pub async fn gates_verify(state: State<'_, AppState>) -> Result<serde_json::Valu
 pub async fn gates_ratify(
     state: State<'_, AppState>,
     reason: Option<String>,
+    expected: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let reason = check_reason(reason.as_deref())?;
+    // The bytes the operator reviewed (`evidence.current` from verify). The daemon refuses
+    // the ratify unless the installed gates still match them, so the binding holds for
+    // every caller, not only this app.
+    let expected = expected.ok_or("ratifying requires the reviewed gate digests (evidence.current)")?;
     daemon::send(
         &state,
         reqwest::Method::POST,
         "/api/gates/ratify",
-        Some(serde_json::json!({ "reason": reason })),
+        Some(serde_json::json!({ "reason": reason, "expected": expected })),
     )
     .await
 }

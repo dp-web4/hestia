@@ -100,7 +100,7 @@ export function Gates() {
         );
         return;
       }
-      await gatesRatify(reason.trim());
+      await gatesRatify(reason.trim(), report?.evidence?.current ?? {});
       setReason("");
       setNotice("Ratified. The expectations above were replaced; re-reading.");
       await refresh();

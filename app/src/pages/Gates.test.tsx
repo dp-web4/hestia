@@ -8,7 +8,7 @@ const operatorStatus = vi.fn();
 
 vi.mock("../lib/tauri", () => ({
   gatesVerify: () => gatesVerify(),
-  gatesRatify: (reason: string) => gatesRatify(reason),
+  gatesRatify: (reason: string, expected: Record<string, string | null>) => gatesRatify(reason, expected),
   operatorStatus: () => operatorStatus(),
 }));
 
@@ -121,7 +121,10 @@ describe("Gates", () => {
     input.dispatchEvent(new Event("input", { bubbles: true }));
     screen.getByRole("button", { name: /ratify/i }).click();
 
-    await waitFor(() => expect(gatesRatify).toHaveBeenCalledWith("matches deploy 4d59496"));
+    // The reviewed bytes travel with the reason, so the daemon can refuse if they moved.
+    await waitFor(() =>
+      expect(gatesRatify).toHaveBeenCalledWith("matches deploy 4d59496", { [HOOK]: "aaaa1111" }),
+    );
   });
 
   it("shows the digest being replaced", async () => {

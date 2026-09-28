@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod chain;
 pub mod config;
 pub mod dashboard;

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AgentInventory,
   DashboardSnapshot,
   DecideOutcome,
   GateReport,
@@ -60,8 +61,18 @@ export async function gatesVerify(): Promise<GateReport> {
  * Ratify every discovered gate's CURRENT bytes as the trusted build. Replaces the
  * previous expectations (last edit wins) — callers show what is replaced first.
  */
-export async function gatesRatify(reason: string): Promise<unknown> {
-  return invoke("gates_ratify", { reason });
+export async function gatesRatify(
+  reason: string,
+  expected: Record<string, string | null>,
+): Promise<unknown> {
+  // `expected` binds the ratification to the bytes the operator reviewed: the daemon
+  // refuses (409) when the installed gates no longer match it.
+  return invoke("gates_ratify", { reason, expected });
+}
+
+/** Who is on this box and whether it is governed. Read-only. */
+export async function agentsInventory(): Promise<AgentInventory> {
+  return invoke("agents_inventory");
 }
 
 export async function getDashboard(): Promise<DashboardSnapshot> {

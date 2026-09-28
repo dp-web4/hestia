@@ -1186,6 +1186,7 @@ input::placeholder {
 .decide-actions label.check { flex: 0 0 auto; min-width: 0; flex-direction: row; align-items: center; gap: 6px; }
 
 /* --- Gates: integrity of the installed gates --- */
+/* Tables shared by the integrity and inventory views. */
 .gate-table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 0.9rem; }
 .gate-table th { text-align: left; color: var(--text-muted); font-weight: normal; padding: 4px 8px; }
 .gate-table td { padding: 6px 8px; border-top: 1px solid var(--border, #222); vertical-align: top; }
@@ -1195,3 +1196,7 @@ input::placeholder {
 .gate-findings, .gate-unknown { background: rgba(220, 170, 60, 0.2); }
 .gate-modified, .gate-differs { color: #e06c6c; }
 .gate-modified { background: rgba(220, 90, 90, 0.2); }
+.gate-differs { color: #e06c6c; }
+
+.findings { margin: 0; padding-left: 16px; font-size: 0.85rem; }
+.findings li { margin: 2px 0; }
