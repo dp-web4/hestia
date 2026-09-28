@@ -49,6 +49,8 @@ class GateProfile:
     gate_path: str = ""
     observe_dir: str = ""
     attest_every: int = 200
+    # Harness capability, not law: only seats that actually expose the review effector may advertise it.
+    declares_review_door: bool = False
 
     def core_profile(self) -> core.HarnessProfile:
         return core.HarnessProfile(
@@ -380,25 +382,14 @@ def _egress_precheck(event: GateEvent, cprofile: core.HarnessProfile) -> Optiona
 
 
 def _fetch_snapshot(profile: GateProfile, event: GateEvent, deadline: float) -> Optional[dict]:
-    """At most two attempts, both inside the one common deadline."""
-    snap = mechanism._fetch_policy_snapshot_once(
+    """Fetch through the public shared mechanism; its retry stays inside _one_deadline()."""
+    if _remaining(deadline) <= 0:
+        return None
+    return mechanism.fetch_policy_snapshot(
         profile.member_id,
         host_agent=profile.host_agent or profile.member_id,
         host_session_id=event.session_id,
-    )
-    if snap is not None:
-        return snap
-    remaining = _remaining(deadline)
-    if remaining <= 0.30:
-        return None
-    time.sleep(min(0.25, max(0.0, remaining - 0.05)))
-    if _remaining(deadline) <= 0.05:
-        return None
-    return mechanism._fetch_policy_snapshot_once(
-        profile.member_id,
-        host_agent=profile.host_agent or profile.member_id,
-        host_session_id=event.session_id,
-        use_cache=False,
+        declares_review_door=profile.declares_review_door,
     )
 
 
