@@ -10,6 +10,13 @@
       "path": [
         ".codex",
         "config.toml"
+      ],
+      "ensure": [
+        {
+          "table": "features",
+          "key": "codex_hooks",
+          "line": "codex_hooks = true"
+        }
       ]
     },
     "files": [

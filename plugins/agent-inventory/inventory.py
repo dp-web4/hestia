@@ -1576,24 +1576,34 @@ def inspect(atlas_id: str, roots: list[str]) -> dict:
             # Only meaningful for a harness that is actually here. A dormant plugin has
             # no roles to be absent from, and saying so for every uninstalled harness
             # buries the one machine where enforcement really is missing.
+            # dp, 2026-09-27 (#1133): "when something isn't properly registered, it MUST read
+            # as miswired. currently it does not." A declared role with no live hook — or a
+            # hook that is not the file the role needs — is a registration defect, the same
+            # class as a dead gate: MISWIRED, so `governed` drops and the machine pins. It was
+            # filed as `partial` (gate) or nothing at all (observe), which is how codex sat
+            # unwitnessed for 14 days while every report read green. The remedy is named in
+            # the finding: registration is the installer's job (deploy/register-members.py),
+            # never a hand edit.
             if events and exe is not None:
                 want = role_targets.get(role) or []
                 if want and all(e in live_events for e in events):
                     rec["findings"].append(
-                        f"ROLE ABSENT: {role} event(s) {', '.join(events)} carry a hestia "
-                        f"hook, but not {' / '.join(want)} — the file this role is declared "
-                        "to need. What that hook records stays on this machine; the "
-                        "society never sees it")
+                        f"MISWIRED: {role} event(s) {', '.join(events)} carry a hestia hook, "
+                        f"but not {' / '.join(want)} — the file this role is declared to "
+                        "need; what that hook records stays on this machine and the society "
+                        "never sees it. Re-run deploy/install-members.sh (it registers, then "
+                        "installs)")
                 else:
                     rec["findings"].append(
-                        f"ROLE ABSENT: no live hestia hook on {role} event(s) "
+                        f"MISWIRED: no live hestia hook on {role} event(s) "
                         f"{', '.join(events)} — {'enforcement' if role == 'gate' else role} "
-                        "is not present on this machine")
+                        "is not registered on this machine. Re-run deploy/install-members.sh "
+                        "(it registers, then installs)")
         rec["gate_wired"] = not missing.get("gate")
-        # A declared role that is not served is a gap whichever role it is (#902, #1133).
-        # `partial` used to mean only "gate absent"; a member witnessed by nothing is as
-        # partial as one gated by nothing, and reading it as governed is how codex sat
-        # unwitnessed for 14 days while every report was green.
+        # `partial` keeps its meaning (some declared role unserved) for readers that key on
+        # it, but it no longer carries the verdict: the MISWIRED finding above does, via
+        # `has_tag` below, so an unserved role demotes `governed` and lands in
+        # gaps["miswired"] — the loud bucket — not in gaps["partial"].
         rec["partial"] = bool(hestia_hooks) and any(missing.values())
     else:
         rec["gate_wired"] = None
