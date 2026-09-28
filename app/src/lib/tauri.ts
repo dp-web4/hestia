@@ -3,6 +3,7 @@ import type {
   AgentInventory,
   DashboardSnapshot,
   DecideOutcome,
+  GateReport,
   DaemonStatus,
   AppConfig,
   RemoteEntry,
@@ -49,6 +50,24 @@ export async function ruleScopeRequest(
     standing: opts.standing ?? false,
     recursive: opts.recursive ?? false,
   });
+}
+
+/** Gate verdicts plus the evidence to ratify against. */
+export async function gatesVerify(): Promise<GateReport> {
+  return invoke("gates_verify");
+}
+
+/**
+ * Ratify every discovered gate's CURRENT bytes as the trusted build. Replaces the
+ * previous expectations (last edit wins) — callers show what is replaced first.
+ */
+export async function gatesRatify(
+  reason: string,
+  expected: Record<string, string | null>,
+): Promise<unknown> {
+  // `expected` binds the ratification to the bytes the operator reviewed: the daemon
+  // refuses (409) when the installed gates no longer match it.
+  return invoke("gates_ratify", { reason, expected });
 }
 
 /** Who is on this box and whether it is governed. Read-only. */

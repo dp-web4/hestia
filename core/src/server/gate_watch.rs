@@ -107,27 +107,25 @@ pub fn observe(
         Ok(w) => w,
     };
     let mut out = Vec::new();
-    // Expectations are keyed by path; `verify` reports some verdicts by plugin, so walk them
-    // together. `verify` emits one verdict per expectation, in map order, then the unratified.
-    let paths: Vec<&String> = expectations.keys().collect();
-    for (i, v) in crate::vault::gate_integrity::verify(expectations, &wired).into_iter().enumerate() {
+    // Every verdict names its path (since 2026-09-27), so no index coupling to the map order.
+    for v in crate::vault::gate_integrity::verify(expectations, &wired) {
         let obs = match v {
-            GateVerdict::Verified { plugin_id, sha256 } => Observation {
-                key: paths[i].clone(),
+            GateVerdict::Verified { path, plugin_id, sha256 } => Observation {
+                key: path,
                 status: "verified".into(),
                 found_sha256: Some(sha256),
                 plugin_id: Some(plugin_id),
                 detail: json!({}),
             },
-            GateVerdict::Modified { plugin_id, expected, actual, ratified_at } => Observation {
-                key: paths[i].clone(),
+            GateVerdict::Modified { path, plugin_id, expected, actual, ratified_at } => Observation {
+                key: path,
                 status: "modified".into(),
                 found_sha256: Some(actual),
                 plugin_id: Some(plugin_id),
                 detail: json!({"expected_sha256": expected, "ratified_at": ratified_at}),
             },
-            GateVerdict::Missing { plugin_id, expected } => Observation {
-                key: paths[i].clone(),
+            GateVerdict::Missing { path, plugin_id, expected } => Observation {
+                key: path,
                 status: "missing".into(),
                 found_sha256: None,
                 plugin_id: Some(plugin_id),
