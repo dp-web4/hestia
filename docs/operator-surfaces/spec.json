@@ -507,6 +507,38 @@
       }
     },
     {
+      "id": "agent-gate-bypass",
+      "title": "Bypass / restore a member's gate: a fail-OPEN recovery switch for a member its own gate has locked out",
+      "place": "activity",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "POST /api/agents/:id/bypass",
+        "POST /api/agents/:id/restore"
+      ],
+      "rules": [
+        "reason-to-permit",
+        "member-id",
+        "signed-in-only"
+      ],
+      "obligations": [
+        "offered per member whose harness registers a hestia gate, keyed by MEMBER id (the daemon derives the gate and its registration from the inventory, never from the surface)",
+        "bypass carries a stated reason; the confirm says the member then acts UNGOVERNED (no gate, no scope, no safety preset, no escalations) until restored, that a running harness may keep its old hook until it restarts, and that the act is recorded on the chain",
+        "while a bypass is active (GET /api/agents `bypassed`) the member shows a persistent BYPASSED badge with when and why, and its control is Restore",
+        "a restore the daemon refuses (the registration changed since the bypass) is shown with the daemon's reason and is not retried",
+        "no surface labels a bypassed member miswired on its own: the inventory's verdict is shown unchanged (dp: a bypassed harness should be flagged miswired by the existing detection, and this is the test of it)"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "required"
+        }
+      },
+      "notes": "dp, 2026-09-28: \"this is useful for instances when an update locks out a member that we need to be active to fix the issues. happens frequently still\". Restore is the refusing direction and needs no reason."
+    },
+    {
       "id": "orchestrator-connect",
       "title": "Govern a harness (install its hooks)",
       "place": "activity",
