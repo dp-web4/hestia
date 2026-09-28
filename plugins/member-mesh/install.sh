@@ -61,7 +61,7 @@ FILES="hestia-mesh.py session-mesh-inbox.sh prompt-disposition-watch.sh"
 # prompt-disposition-watch.sh (UserPromptSubmit, #366) was built by kimi-code for itself and
 # upstreamed 2026-09-28. Shipping the FILE is this script's job; REGISTERING it is the
 # operator's, like the SessionStart line (this script greps configs, it never writes them).
-# So --check reports watch=wired|UNWIRED per member and a sync prints the line to add. That
+# So --check reports watch=wired|MISWIRED|UNWIRED per member and a sync prints the line to add. That
 # column is informational and does not fail --check: a member without the watch is where
 # every member was before this landed, and a red check on every seat the day this merges
 # would train operators to read the check as noise.
@@ -159,13 +159,11 @@ while IFS=: read -r member hooks config; do
   # it would mask a genuine loss of exactly the variable this script exists to protect.
   # The config line is the only place that counts, because it is the only place that
   # survives the copy.
-  # Is the watch REGISTERED (a live, non-comment config line naming it)? Shipping the file
-  # without this is a hook nothing invokes -- the codex witness.py shape (#1133).
-  watch="watch=UNWIRED"
-  if [ -f "$config" ] && sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*\/\//d' "$config" \
-       | grep -qF 'prompt-disposition-watch.sh'; then
-    watch="watch=wired"
-  fi
+  # Is the watch REGISTERED? Shipping the file without it is a hook nothing invokes (the codex
+  # witness.py shape, #1133). A filename in the config is not enough (GPT, #1148): the line
+  # must sit under UserPromptSubmit and pin THIS member. watch-registration.py parses each
+  # config format and answers wired / MISWIRED (named, wrong event or pin) / UNWIRED.
+  watch="watch=$(python3 "$SRC/watch-registration.py" "$config" "$member" 2>/dev/null || echo UNWIRED)"
 
   lost=""
   case "$state" in
@@ -243,8 +241,8 @@ while IFS=: read -r member hooks config; do
     chmod +x "$hooks/$f"
   done
   echo "      synced (previous copies kept as *.pre-sync.bak)"
-  if [ "$watch" = "watch=UNWIRED" ]; then
-    echo "      NOTE: prompt-disposition-watch.sh is installed but not registered. To surface"
+  if [ "$watch" != "watch=wired" ]; then
+    echo "      NOTE: prompt-disposition-watch.sh is installed but ${watch#watch=}. To surface"
     echo "      rulings mid-session (#366), add a UserPromptSubmit hook to $config running:"
     echo "        HESTIA_MESH_PLUGIN=$member $hooks/prompt-disposition-watch.sh"
   fi
