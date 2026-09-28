@@ -37,6 +37,27 @@ import inventory
 FAILS: list[str] = []
 
 
+# Hook providers are agent-atlas data (agent-atlas/hooks/*/descriptor.md). The suite runs without
+# an atlas checkout, so it carries the descriptors it relies on -- claude-flow's match_paths are the
+# ones agent-atlas/hooks/claude-flow/descriptor.md declares. test_hook_providers_load_from_the_atlas
+# exercises the real loader against a temporary hooks/ directory.
+FIXTURE_PROVIDERS = [
+    {"provider": "hestia", "kind": "hook-provider", "match": "provenance", "can_block": True,
+     "gate_events": ["PreToolUse", "BeforeTool"]},
+    {"provider": "claude-flow", "kind": "hook-provider", "match": "paths",
+     "match_paths": ["*claude-flow*", "*/hook-handler.cjs", "*/auto-memory-hook.mjs", "*ruv-swarm*"],
+     "can_block": False, "gate_events": []},
+]
+inventory._HOOK_PROVIDERS = FIXTURE_PROVIDERS
+
+
+def own(*paths) -> None:
+    """Declare fixture files hestia's the way a real machine does: as installed paths
+    (what expects.json declares). Ownership is provenance, never a file's text."""
+    inventory._PROVENANCE = {"declared": {os.path.realpath(str(x)) for x in paths},
+                             "deployed": set(), "plugins_root": "", "shipped": set()}
+
+
 def check(name: str, got, want) -> None:
     if got != want:
         FAILS.append(f"{name}: got {got!r}, want {want!r}")
@@ -146,9 +167,14 @@ def build(tmp: Path, extra_hooks: list[tuple[str, str]], *,
     inventory.REGISTRY = _FakeRegistry(
         declared if declared is not None
         else {"gate": ["PreToolUse"], "witness": ["PostToolUse"]})
+    # The live fixture hooks at the tmp root (gate, witness, an observe.sh a case writes) are
+    # hestia's by declared install path; the `gone/` ones are dead and must be judged by the
+    # attribution rules, so they are NOT declared.
+    own(gate, witness, *sorted(tmp.glob("*.sh")))
     try:
         return inventory.inspect("claude", [])
     finally:
+        inventory._PROVENANCE = None
         (inventory.PLUGINS, inventory.config_scopes,
          inventory.real_executable, inventory.REGISTRY) = orig
 
@@ -344,31 +370,71 @@ def test_member_states():
     check("worst of two rows for one member", both.get("m"), "miswired")
 
 
-def test_ownership_is_by_identifier_or_install_path_not_by_mention():
-    """dp, 2026-09-28: snarc's observe-only PreToolUse hook showed as one of this box's GATES,
-    labelled "claude". Its only tie to hestia is prose in a comment -- "(hestia owns that)" -- and
-    ownership was `"hestia" in the file's text`."""
+def test_ownership_is_provenance_never_text():
+    """dp and GPT, 2026-09-28 (#1144): three text rules each claimed a stranger's hook -- a mention
+    of hestia in the file (snarc's comment), "hestia" in the path or command (a foreign hook under a
+    hestia-named directory), and a hestia identifier anywhere in the text (a comment naming
+    HESTIA_ENDPOINT). Ownership is now provenance only."""
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
+        own()                                   # nothing declared
         stranger = tmp / "pre-tool-use.js"
-        stranger.write_text("/**\n * the reasoning text since the last tool call), not tool telemetry "
-                            "(hestia owns that). Deduped via a per-session hash\n */\nprocess.exit(0);\n")
+        stranger.write_text("/** not tool telemetry (hestia owns that) */\nprocess.exit(0);\n")
         check("a stranger that MENTIONS hestia is not hestia's",
               inventory.owned_by_hestia(f"node {stranger}", [str(stranger)]), False)
-        ours = tmp / "gate.py"
-        ours.write_text("import os\nEP = os.environ.get('HESTIA_ENDPOINT')\n")
-        check("a hook that uses a hestia identifier is hestia's",
-              inventory.owned_by_hestia(f"python3 {ours}", [str(ours)]), True)
-        # A DELETED hook at a path hestia's installer declares is still hestia's: ownership by
-        # declared install path holds where content cannot be asked.
+        nested = tmp / "hestia" / "node_modules" / "snarc" / "pre-tool-use.js"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("process.exit(0);\n")
+        check("a foreign hook under a hestia-named directory is not hestia's",
+              inventory.owned_by_hestia(f"node {nested}", [str(nested)]), False)
+        commented = tmp / "observer.js"
+        commented.write_text("// HESTIA_ENDPOINT is handled by another hook, not this observer.\nprocess.exit(0);\n")
+        check("a comment naming a hestia identifier is not provenance",
+              inventory.owned_by_hestia(f"node {commented}", [str(commented)]), False)
         gone = tmp / "hooks" / "pre_tool_use.py"
-        orig = inventory._declared_install_paths
-        inventory._declared_install_paths = lambda: {str(gone)}
+        own(gone)
+        check("a missing file at a declared install path is hestia's",
+              inventory.owned_by_hestia(f"python3 {gone}", [str(gone)]), True)
+        shipped = tmp / "copy.sh"
+        shipped.write_text("#!/bin/sh\necho shipped\n")
+        inventory._PROVENANCE = {"declared": set(), "deployed": set(), "plugins_root": "",
+                                 "shipped": {inventory._git_blob_id(shipped)}}
+        check("bytes identical to a file hestia ships are hestia's",
+              inventory.owned_by_hestia(f"sh {shipped}", [str(shipped)]), True)
+        gen = tmp / "wrapper"
+        gen.write_text("#!/bin/sh\n# generated, pins paths\n")
+        receipt = tmp / "wrapper.installed-by"
+        receipt.write_text("#!/bin/sh\n# install.sh\n")
+        inventory._PROVENANCE = {"declared": set(), "deployed": set(), "plugins_root": "",
+                                 "shipped": {inventory._git_blob_id(receipt)}}
+        check("a generated file whose installer receipt is shipped is hestia's",
+              inventory.owned_by_hestia(f"{gen}", [str(gen)]), True)
+    inventory._PROVENANCE = None
+
+
+def test_hook_providers_load_from_the_atlas():
+    """Qualification reads agent-atlas/hooks/<provider>/descriptor.md beside talk-to/."""
+    with tempfile.TemporaryDirectory() as d:
+        atlas = Path(d) / "talk-to"
+        atlas.mkdir()
+        snarc = Path(d) / "hooks" / "snarc"
+        snarc.mkdir(parents=True)
+        (snarc / "descriptor.md").write_text(
+            "---\nprovider: snarc\nkind: hook-provider\nmatch: paths\n"
+            "match_paths: [*/snarc/dist/hooks/handlers/*]\ngate_events: []\ncan_block: false\n---\n# snarc\n")
+        orig_atlas, orig_prov = inventory.ATLAS, inventory._HOOK_PROVIDERS
+        inventory.ATLAS, inventory._HOOK_PROVIDERS = atlas, None
         try:
-            check("a missing file at a declared install path is hestia's",
-                  inventory.owned_by_hestia(f"python3 {gone}", [str(gone)]), True)
+            provs = inventory.hook_providers()
+            check("the atlas descriptor is loaded", [p.get("provider") for p in provs], ["snarc"])
+            hit = inventory.match_provider("node /w/snarc/dist/hooks/handlers/pre-tool-use.js",
+                                           ["/w/snarc/dist/hooks/handlers/pre-tool-use.js"], False)
+            check("snarc's hook is qualified as snarc's", (hit or {}).get("provider"), "snarc")
+            check("snarc cannot block", (hit or {}).get("can_block"), False)
+            check("an undescribed hook is unqualified",
+                  inventory.match_provider("node /w/other/x.js", ["/w/other/x.js"], False), None)
         finally:
-            inventory._declared_install_paths = orig
+            inventory.ATLAS, inventory._HOOK_PROVIDERS = orig_atlas, orig_prov
 
 
 def test_role_target():
@@ -1475,7 +1541,8 @@ def teardown_module(module):
 
 if __name__ == "__main__":
     test_attribute()
-    test_ownership_is_by_identifier_or_install_path_not_by_mention()
+    test_ownership_is_provenance_never_text()
+    test_hook_providers_load_from_the_atlas()
     test_member_states()
     test_has_tag()
     test_role_target()
