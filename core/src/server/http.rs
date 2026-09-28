@@ -5558,6 +5558,17 @@ async fn agent_gate_bypass(
             })));
         }
     };
+    // An ACTIVE bypass answers first. Measured live on the isolated daemon: asked again while
+    // bypassed, the inventory (correctly) lists no hestia gate for the member any more, so the
+    // target lookup refused with "no registered hestia gate to bypass" -- true, and the wrong
+    // answer. The truth is "already bypassed", and 409 like every other already-decided act.
+    let home = state.lock().await.home.clone();
+    if let Some(r) = crate::server::gate_bypass::active(&home, &id) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!("member '{id}' is already bypassed (since {}, reason: {}); restore it first",
+                             r.bypassed_at, r.reason),
+        })));
+    }
     let inv = match crate::server::agents::inventory() {
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
