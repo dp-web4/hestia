@@ -181,7 +181,7 @@ else                                   mtime_of() { stat -f %m "$1"; }; fi
 # This never fails a cycle -- a deploy that refuses to run because of an old plist would stop
 # delivering the fix -- but it says it where the operator already reads gate warnings.
 secret_hygiene() {
-  local home="${HESTIA_HOME:-$HOME/.hestia}" f m=""
+  local home="$HESTIA_HOME" f m=""   # resolved once, at the top of this script
   case "$OS" in
     Darwin)
       f="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
