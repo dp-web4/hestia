@@ -34,13 +34,28 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// One registration file edit: every whole-token occurrence of `original` became `replacement`.
+/// One gate's edit: in `config`, the command string(s) registered on `event` that named `original`
+/// now name `replacement` -- the shell-quoted path of a stub UNIQUE to this original (its filename
+/// carries a hash of the original path), so the reverse swap is unambiguous per entry even when one
+/// config registers several gates (GPT, #1158 review).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Swap {
     pub config: String,
+    #[serde(default)]
+    pub event: String,
     pub original: String,
     pub replacement: String,
+    #[serde(default)]
+    pub stub_file: String,
     pub occurrences: usize,
+}
+
+/// A gate the inventory found: which config registers it, on which event, at which path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateTarget {
+    pub config: String,
+    pub event: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,8 +89,31 @@ pub fn record_path(home: &Path, member: &str) -> PathBuf {
     bypass_dir(home).join(format!("{member}.json"))
 }
 
-pub fn stub_path(home: &Path, member: &str) -> PathBuf {
-    bypass_dir(home).join(member).join("gate_bypass.py")
+/// One stub per ORIGINAL gate path: `gate_bypass-<sha256(original)[..12]>.py`.
+pub fn stub_path(home: &Path, member: &str, original: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let h = hex::encode(Sha256::digest(original.as_bytes()));
+    bypass_dir(home).join(member).join(format!("gate_bypass-{}.py", &h[..12]))
+}
+
+/// The stub's path as it must appear inside a registered command: bare when it is one shell
+/// word, else single-quoted. Refused when it cannot be carried safely through BOTH layers -- the
+/// shell word, and the config string that holds the command (a JSON or TOML basic string, where a
+/// double quote or backslash would need escaping, and a TOML literal string, where a single quote
+/// cannot appear at all).
+pub fn command_word(path: &str, delim: char) -> Result<String> {
+    if path.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+:@%,=".contains(c)) {
+        return Ok(path.to_string());
+    }
+    if path.chars().any(|c| c.is_control() || matches!(c, '\'' | '"' | '\\')) {
+        bail!("the bypass stub path {path:?} cannot be quoted safely into a hook command; \
+               move HESTIA_HOME to a path without quotes or backslashes");
+    }
+    if delim == '\'' {
+        bail!("the gate's command is a TOML literal string ('...'), which cannot hold the quotes the \
+               stub path {path:?} needs; nothing was changed");
+    }
+    Ok(format!("'{path}'"))
 }
 
 /// The stub: read the event (so the harness never blocks on a full pipe), print nothing, exit 0 —
@@ -147,7 +185,7 @@ fn write_atomic(path: &Path, text: &str) -> Result<()> {
 }
 
 /// The member's registered hestia gate(s): `(config file, gate path)` from the inventory report.
-pub fn gate_targets(inv: &serde_json::Value, member: &str) -> Result<Vec<(String, String)>> {
+pub fn gate_targets(inv: &serde_json::Value, member: &str) -> Result<Vec<GateTarget>> {
     if inv.get("status").and_then(|v| v.as_str()) == Some("UNKNOWN") {
         bail!(
             "the inventory could not look ({}); refusing to edit a registration it cannot see",
@@ -164,22 +202,23 @@ pub fn gate_targets(inv: &serde_json::Value, member: &str) -> Result<Vec<(String
     if recs.is_empty() {
         bail!("no harness on this machine is registered as member '{member}'");
     }
-    let mut out: Vec<(String, String)> = Vec::new();
+    let mut out: Vec<GateTarget> = Vec::new();
     for r in recs {
         for t in r.get("hook_targets").and_then(|v| v.as_array()).into_iter().flatten() {
             let yes = |k: &str| t.get(k).and_then(|v| v.as_bool()) == Some(true);
             if !(yes("is_gate") && yes("owned_by_hestia")) {
                 continue;
             }
-            let (Some(path), Some(cfg)) = (
+            let (Some(path), Some(cfg), Some(event)) = (
                 t.get("path").and_then(|v| v.as_str()),
                 t.get("config").and_then(|v| v.as_str()),
+                t.get("event").and_then(|v| v.as_str()),
             ) else {
                 continue;
             };
-            let pair = (cfg.to_string(), path.to_string());
-            if !out.contains(&pair) {
-                out.push(pair);
+            let g = GateTarget { config: cfg.into(), event: event.into(), path: path.into() };
+            if !out.contains(&g) {
+                out.push(g);
             }
         }
     }
@@ -190,6 +229,135 @@ pub fn gate_targets(inv: &serde_json::Value, member: &str) -> Result<Vec<(String
         );
     }
     Ok(out)
+}
+
+/// A command string value in a hook config: the EVENT it is registered on, and the byte span of
+/// its raw contents (between the delimiters), plus the delimiter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandSpan {
+    pub event: String,
+    pub start: usize,
+    pub end: usize,
+    pub delim: char,
+}
+
+/// Every hook command in `text`, bound STRUCTURALLY to its event -- never by searching the whole
+/// file, so a gate script also referenced on PostToolUse or SessionStart is not touched (GPT,
+/// #1158 review). JSON (`hooks.<Event>[].hooks[].command`, claude/gemini) is read by a key-path
+/// scanner; TOML by table: codex's `[[hooks.<Event>...]]` headers, and kimi's flat `[[hooks]]`
+/// tables carrying `event = "X"` in either key order.
+pub fn command_spans(config: &Path, text: &str) -> Vec<CommandSpan> {
+    if config.extension().and_then(|e| e.to_str()) == Some("json") {
+        json_command_spans(text)
+    } else {
+        toml_command_spans(text)
+    }
+}
+
+fn json_command_spans(text: &str) -> Vec<CommandSpan> {
+    enum Fr { Obj { key: Option<String>, want_key: bool }, Arr }
+    let b = text.as_bytes();
+    let mut st: Vec<Fr> = Vec::new();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'{' => st.push(Fr::Obj { key: None, want_key: true }),
+            b'[' => st.push(Fr::Arr),
+            b'}' | b']' => { st.pop(); }
+            b',' => if let Some(Fr::Obj { want_key, .. }) = st.last_mut() { *want_key = true; },
+            b':' => if let Some(Fr::Obj { want_key, .. }) = st.last_mut() { *want_key = false; },
+            b'"' => {
+                let start = i + 1;
+                let mut j = start;
+                while j < b.len() && b[j] != b'"' {
+                    j += if b[j] == b'\\' { 2 } else { 1 };
+                }
+                let j = j.min(b.len());
+                if let Some(Fr::Obj { key, want_key: true }) = st.last_mut() {
+                    *key = Some(text[start..j].to_string());
+                } else {
+                    let keys: Vec<&str> = st.iter().filter_map(|f| match f {
+                        Fr::Obj { key: Some(k), .. } => Some(k.as_str()),
+                        _ => None,
+                    }).collect();
+                    if keys.len() == 4 && keys[0] == "hooks" && keys[2] == "hooks" && keys[3] == "command" {
+                        out.push(CommandSpan { event: keys[1].to_string(), start, end: j, delim: '"' });
+                    }
+                }
+                i = j;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+fn toml_command_spans(text: &str) -> Vec<CommandSpan> {
+    let mut out = Vec::new();
+    let mut header_event: Option<String> = None;
+    let mut flat = false;
+    let mut flat_event: Option<String> = None;
+    let mut pending: Vec<(usize, usize, char)> = Vec::new();
+    let flush = |out: &mut Vec<CommandSpan>, ev: &Option<String>, p: &mut Vec<(usize, usize, char)>| {
+        if let Some(e) = ev {
+            out.extend(p.iter().map(|&(s, t, d)| CommandSpan { event: e.clone(), start: s, end: t, delim: d }));
+        }
+        p.clear();
+    };
+    // `(key, value span, delim)` of a `key = "v"` / `key = 'v'` line, offsets absolute.
+    let kv = |line: &str, off: usize| -> Option<(String, usize, usize, char)> {
+        let (k, rest) = line.split_once('=')?;
+        let k = k.trim().to_string();
+        let lead = line.len() - rest.len();
+        let r = rest.trim_start();
+        let q = r.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let vs = off + lead + (rest.len() - r.len()) + 1;
+        let close = r[1..].rfind(q)?;
+        Some((k, vs, vs + close, q))
+    };
+    let mut off = 0;
+    for line in text.split_inclusive('\n') {
+        let t = line.trim();
+        if t.starts_with('[') {
+            flush(&mut out, &flat_event, &mut pending);
+            let name = t.trim_start_matches('[').trim_end_matches(']').trim();
+            flat = name == "hooks";
+            flat_event = None;
+            header_event = name.strip_prefix("hooks.").map(|r| r.split('.').next().unwrap_or("").to_string());
+        } else if let Some((k, s, e, d)) = kv(line.trim_end_matches(['\n', '\r']), off) {
+            if k == "event" && flat {
+                flat_event = Some(text[s..e].to_string());
+            } else if k == "command" {
+                if flat {
+                    pending.push((s, e, d));
+                } else if let Some(ev) = &header_event {
+                    out.push(CommandSpan { event: ev.clone(), start: s, end: e, delim: d });
+                }
+            }
+        }
+        off += line.len();
+    }
+    flush(&mut out, &flat_event, &mut pending);
+    out
+}
+
+/// Whole-token occurrences of `tok` inside [start, end) of `text`, as absolute offsets.
+fn token_positions(text: &str, start: usize, end: usize, tok: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let hay = &text[start..end];
+    let mut i = 0;
+    while let Some(o) = hay[i..].find(tok) {
+        let at = i + o;
+        let before = hay[..at].chars().next_back();
+        let after = hay[at + tok.len()..].chars().next();
+        if is_boundary(before) && is_boundary(after) {
+            out.push(start + at);
+        }
+        i = at + tok.len();
+    }
+    out
 }
 
 pub fn active(home: &Path, member: &str) -> Option<BypassRecord> {
@@ -210,41 +378,81 @@ pub fn all_active(home: &Path) -> Vec<BypassRecord> {
     out
 }
 
-/// Apply swaps in order; if one fails, put back the ones already applied and fail.
-fn apply_swaps(swaps: &[Swap], reverse: bool) -> Result<()> {
-    let mut done: Vec<&Swap> = Vec::new();
-    for s in swaps {
-        let (from, to) = if reverse { (&s.replacement, &s.original) } else { (&s.original, &s.replacement) };
-        let r = (|| -> Result<()> {
-            let text = std::fs::read_to_string(&s.config)
-                .with_context(|| format!("read {}", s.config))?;
-            let (next, n) = swap_token(&text, from, to);
-            if n == 0 {
-                bail!("{} no longer registers {from}", s.config);
+/// Write several configs as ONE act: each file written once, re-read and verified; on any
+/// failure every file already written goes back to the exact bytes it had before this call.
+fn commit_configs(next: &[(String, String, String)]) -> Result<()> {
+    let mut done: Vec<&(String, String, String)> = Vec::new();
+    for item in next {
+        let (cfg, before, after) = item;
+        let r = write_atomic(Path::new(cfg), after).and_then(|_| {
+            if std::fs::read_to_string(cfg)? != *after {
+                bail!("{cfg} did not read back as written");
             }
-            write_atomic(Path::new(&s.config), &next)
-        })();
+            Ok(())
+        });
         if let Err(e) = r {
-            for d in done.into_iter().rev() {
-                let (f, t) = if reverse { (&d.original, &d.replacement) } else { (&d.replacement, &d.original) };
-                if let Ok(text) = std::fs::read_to_string(&d.config) {
-                    let (back, _) = swap_token(&text, f, t);
-                    let _ = write_atomic(Path::new(&d.config), &back);
-                }
+            for (c, b, _) in done.into_iter().rev() {
+                let _ = write_atomic(Path::new(c), b);
             }
+            let _ = write_atomic(Path::new(cfg), before);
             return Err(e);
         }
-        done.push(s);
+        done.push(item);
     }
     Ok(())
 }
 
-/// Swap the member's gate for the fail-open stub and record it. Refuses while a bypass is active.
+/// Reverse (or re-apply) recorded swaps, one write per config. Every replacement is unique to its
+/// original, so the direction is unambiguous per entry; a token that is no longer present refuses
+/// the whole act, naming the file, before anything is written.
+fn swap_back(swaps: &[Swap], to_original: bool) -> Result<()> {
+    let mut configs: Vec<String> = Vec::new();
+    for s in swaps {
+        if !configs.contains(&s.config) {
+            configs.push(s.config.clone());
+        }
+    }
+    let mut next = Vec::new();
+    for cfg in configs {
+        let before = std::fs::read_to_string(&cfg).with_context(|| format!("read {cfg}"))?;
+        let mut text = before.clone();
+        for s in swaps.iter().filter(|s| s.config == cfg) {
+            let (from, to) = if to_original { (&s.replacement, &s.original) } else { (&s.original, &s.replacement) };
+            let (t, n) = if to_original {
+                swap_token(&text, from, to)
+            } else {
+                // Re-applying binds to the gate's event again, as the bypass did.
+                let spans: Vec<CommandSpan> = command_spans(Path::new(&cfg), &text)
+                    .into_iter().filter(|c| c.event == s.event).collect();
+                let mut pos: Vec<usize> = spans.iter()
+                    .flat_map(|c| token_positions(&text, c.start, c.end, from)).collect();
+                pos.sort_unstable();
+                let mut t = text.clone();
+                for p in pos.iter().rev() {
+                    t.replace_range(*p..*p + from.len(), to);
+                }
+                (t, pos.len())
+            };
+            if n == 0 {
+                bail!(
+                    "{cfg} no longer registers {} ({}): it was edited or re-registered since the \
+                     bypass. Nothing was changed",
+                    if to_original { "the bypass stub" } else { "the gate" }, from
+                );
+            }
+            text = t;
+        }
+        next.push((cfg, before, text));
+    }
+    commit_configs(&next)
+}
+
+/// Swap the member's gate(s) for fail-open stubs and record it. Refuses while a bypass is active.
 pub fn bypass(
     home: &Path,
     member: &str,
     reason: &str,
-    targets: &[(String, String)],
+    targets: &[GateTarget],
     at: &str,
 ) -> Result<BypassRecord> {
     let member = checked_member(member)?;
@@ -254,37 +462,75 @@ pub fn bypass(
             r.bypassed_at, r.reason
         );
     }
-    let stub = stub_path(home, member);
-    let stub_s = stub.display().to_string();
-    // Plan every swap before touching anything, so a config that does not carry its gate verbatim
-    // (an escaped path, a relative spelling) refuses the whole act rather than half of it.
-    let mut swaps = Vec::new();
-    for (cfg, gate) in targets {
-        let text = std::fs::read_to_string(cfg).with_context(|| format!("read {cfg}"))?;
-        let (_, n) = swap_token(&text, gate, &stub_s);
-        if n == 0 {
-            bail!("{cfg} does not spell the gate path {gate} as a command token; nothing was changed");
+    // Plan EVERY edit before writing anything: a gate the config does not register on its event,
+    // or a stub path that cannot be quoted into it, refuses the whole act.
+    let mut configs: Vec<String> = Vec::new();
+    for t in targets {
+        if !configs.contains(&t.config) {
+            configs.push(t.config.clone());
         }
-        swaps.push(Swap { config: cfg.clone(), original: gate.clone(), replacement: stub_s.clone(), occurrences: n });
     }
-    std::fs::create_dir_all(stub.parent().expect("stub has a parent"))?;
-    std::fs::write(&stub, stub_source(member, at))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))?;
+    let mut swaps = Vec::new();
+    let mut next = Vec::new();
+    for cfg in &configs {
+        let before = std::fs::read_to_string(cfg).with_context(|| format!("read {cfg}"))?;
+        let spans = command_spans(Path::new(cfg), &before);
+        let mut edits: Vec<(usize, usize, String)> = Vec::new();
+        for t in targets.iter().filter(|t| &t.config == cfg) {
+            let stub = stub_path(home, member, &t.path);
+            let stub_s = stub.display().to_string();
+            let mut n = 0;
+            for c in spans.iter().filter(|c| c.event == t.event) {
+                let word = command_word(&stub_s, c.delim)?;
+                for p in token_positions(&before, c.start, c.end, &t.path) {
+                    edits.push((p, p + t.path.len(), word.clone()));
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                bail!(
+                    "{cfg} does not register {} as a command token on {}; nothing was changed",
+                    t.path, t.event
+                );
+            }
+            swaps.push(Swap {
+                config: cfg.clone(),
+                event: t.event.clone(),
+                original: t.path.clone(),
+                replacement: command_word(&stub_s, '"').unwrap_or_else(|_| stub_s.clone()),
+                stub_file: stub_s,
+                occurrences: n,
+            });
+        }
+        edits.sort_by_key(|e| e.0);
+        edits.dedup_by_key(|e| e.0);
+        let mut text = before.clone();
+        for (s, e, w) in edits.iter().rev() {
+            text.replace_range(*s..*e, w);
+        }
+        next.push((cfg.clone(), before, text));
+    }
+    let dir = bypass_dir(home).join(member);
+    std::fs::create_dir_all(&dir)?;
+    for s in &swaps {
+        std::fs::write(&s.stub_file, stub_source(member, at))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&s.stub_file, std::fs::Permissions::from_mode(0o755))?;
+        }
     }
     let rec = BypassRecord {
         member: member.to_string(),
         reason: reason.to_string(),
         bypassed_at: at.to_string(),
-        stub: stub_s,
+        stub: dir.display().to_string(),
         swaps,
     };
     // The record lands BEFORE the configs change: a crash in between leaves a record of a swap
     // that did not happen (restore then says so) rather than a swap nobody recorded.
     write_atomic_new(&record_path(home, member), &serde_json::to_string_pretty(&rec)?)?;
-    if let Err(e) = apply_swaps(&rec.swaps, false) {
+    if let Err(e) = commit_configs(&next) {
         let _ = std::fs::remove_file(record_path(home, member));
         return Err(e);
     }
@@ -304,38 +550,26 @@ fn write_atomic_new(path: &Path, text: &str) -> Result<()> {
 
 /// Undo a bypass that was applied but could not be recorded on the chain.
 pub fn undo_bypass(home: &Path, rec: &BypassRecord) -> Result<()> {
-    apply_swaps(&rec.swaps, true)?;
+    swap_back(&rec.swaps, true)?;
     let _ = std::fs::remove_file(record_path(home, &rec.member));
     Ok(())
 }
 
 /// Put the member's gate back exactly. Refuses (naming the file) when a config no longer carries
-/// the stub — someone re-registered or edited it since, and swapping blind would guess.
+/// its stub -- someone re-registered or edited it since, and swapping blind would guess.
 pub fn restore(home: &Path, member: &str) -> Result<BypassRecord> {
     let member = checked_member(member)?;
     let rec = active(home, member).ok_or_else(|| anyhow!("member '{member}' is not bypassed"))?;
-    for s in &rec.swaps {
-        let text = std::fs::read_to_string(&s.config).with_context(|| format!("read {}", s.config))?;
-        let (_, n) = swap_token(&text, &s.replacement, &s.original);
-        if n == 0 {
-            bail!(
-                "{} no longer registers the bypass stub ({}): it was edited or re-registered since \
-                 the bypass. Nothing was restored; put the gate back with the member's installer, \
-                 or restore the registration by hand, then retire the record at {}",
-                s.config,
-                s.replacement,
-                record_path(home, member).display()
-            );
-        }
-    }
-    apply_swaps(&rec.swaps, true)?;
+    swap_back(&rec.swaps, true).map_err(|e| anyhow!(
+        "{e}. Put the gate back with the member's installer, or restore the registration by hand, \
+         then retire the record at {}", record_path(home, member).display()))?;
     let _ = std::fs::remove_file(record_path(home, member));
     Ok(rec)
 }
 
 /// Undo a restore that could not be recorded on the chain: the member goes back to bypassed.
 pub fn undo_restore(home: &Path, rec: &BypassRecord) -> Result<()> {
-    apply_swaps(&rec.swaps, false)?;
+    swap_back(&rec.swaps, false)?;
     write_atomic_new(&record_path(home, &rec.member), &serde_json::to_string_pretty(rec)?)
 }
 
@@ -343,19 +577,26 @@ pub fn undo_restore(home: &Path, rec: &BypassRecord) -> Result<()> {
 mod tests {
     use super::*;
 
+    const G: &str = "/g/hooks/pre_tool_use.py";
+    const G2: &str = "/g/hooks/second_gate.py";
+
+    // The gate script ALSO referenced on PostToolUse, and a sibling path that merely ends with it:
+    // neither may be touched (GPT #1158, finding 2).
     const CLAUDE: &str = r#"{
   "hooks": {
     "PreToolUse": [
       { "hooks": [ { "type": "command", "command": "HESTIA_HOME=/h python3 /g/hooks/pre_tool_use.py", "timeout": 15 } ] }
     ],
     "PostToolUse": [
-      { "hooks": [ { "type": "command", "command": "python3 /g/hooks/pre_tool_use.py.bak" } ] }
+      { "hooks": [ { "type": "command", "command": "python3 /g/hooks/pre_tool_use.py --post" },
+                   { "type": "command", "command": "python3 /g/hooks/pre_tool_use.py.bak" } ] }
     ]
   }
 }
 "#;
-    const CODEX: &str = "[[hooks.PreToolUse]]\nmatcher = \".*\"\n\n[[hooks.PreToolUse.hooks]]\ntype = \"command\"\ncommand = \"HESTIA_WORKSPACE=/w python3 /g/hooks/pre_tool_use.py\"\ntimeout = 15\n";
-    const KIMI: &str = "# keep me\n[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"HESTIA_ROLE=r python3 /g/hooks/pre_tool_use.py\"\ntimeout = 15\n\n[[hooks]]\nevent = \"PostToolUse\"\ncommand = \"python3 /g/hooks/witness.py\"\n";
+    const CODEX: &str = "[[hooks.PreToolUse]]\nmatcher = \".*\"\n\n[[hooks.PreToolUse.hooks]]\ntype = \"command\"\ncommand = \"HESTIA_WORKSPACE=/w python3 /g/hooks/pre_tool_use.py\"\ntimeout = 15\n\n[[hooks.PostToolUse]]\n\n[[hooks.PostToolUse.hooks]]\ntype = \"command\"\ncommand = \"python3 /g/hooks/pre_tool_use.py --post\"\n";
+    // kimi's flat layout, with `event` AFTER `command` in one table.
+    const KIMI: &str = "# keep me\n[[hooks]]\ncommand = \"HESTIA_ROLE=r python3 /g/hooks/pre_tool_use.py\"\nevent = \"PreToolUse\"\ntimeout = 15\n\n[[hooks]]\nevent = \"PostToolUse\"\ncommand = \"python3 /g/hooks/pre_tool_use.py --post\"\n";
 
     fn setup(body: &str, name: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
         let d = tempfile::tempdir().unwrap();
@@ -365,34 +606,109 @@ mod tests {
         (d, home, cfg)
     }
 
+    fn gt(cfg: &Path, event: &str, path: &str) -> GateTarget {
+        GateTarget { config: cfg.display().to_string(), event: event.into(), path: path.into() }
+    }
+
     #[test]
     fn swap_is_whole_token_only() {
-        let (s, n) = swap_token(CLAUDE, "/g/hooks/pre_tool_use.py", "/stub.py");
-        assert_eq!(n, 1, "the .bak sibling must not match");
-        assert!(s.contains("HESTIA_HOME=/h python3 /stub.py\""));
-        assert!(s.contains("/g/hooks/pre_tool_use.py.bak"));
-        let (_, n) = swap_token("python3 /x/g/hooks/pre_tool_use.py", "/g/hooks/pre_tool_use.py", "/s");
+        let (s, n) = swap_token("python3 /g/hooks/pre_tool_use.py.bak x", G, "/stub.py");
+        assert_eq!(n, 0, "the .bak sibling must not match");
+        assert!(s.contains(".bak"));
+        let (_, n) = swap_token("python3 /x/g/hooks/pre_tool_use.py", G, "/s");
         assert_eq!(n, 0, "a path that merely ENDS with the gate path is someone else's");
     }
 
     #[test]
-    fn bypass_then_restore_is_byte_exact_on_all_three_layouts() {
+    fn commands_are_bound_to_their_event_on_all_three_layouts() {
+        for (body, name) in [(CLAUDE, "settings.json"), (CODEX, "config.toml"), (KIMI, "kimi.toml")] {
+            let spans = command_spans(Path::new(name), body);
+            let pre: Vec<&str> = spans.iter().filter(|c| c.event == "PreToolUse").map(|c| &body[c.start..c.end]).collect();
+            assert_eq!(pre.len(), 1, "{name}: {spans:?}");
+            assert!(pre[0].ends_with(G), "{name}: {pre:?}");
+            assert!(spans.iter().any(|c| c.event == "PostToolUse"), "{name}: PostToolUse is seen, as its own event");
+        }
+    }
+
+    #[test]
+    fn only_the_gate_event_changes_and_restore_is_byte_exact() {
         for (body, name) in [(CLAUDE, "settings.json"), (CODEX, "config.toml"), (KIMI, "kimi.toml")] {
             let (_d, home, cfg) = setup(body, name);
-            let c = cfg.display().to_string();
-            let rec = bypass(&home, "m1", "locked out by a broken gate", &[(c.clone(), "/g/hooks/pre_tool_use.py".into())], "T").unwrap();
+            let rec = bypass(&home, "m1", "locked out", &[gt(&cfg, "PreToolUse", G)], "T").unwrap();
             let during = std::fs::read_to_string(&cfg).unwrap();
-            assert!(during.contains(&rec.stub), "{name}: the stub is registered");
-            assert!(!during.contains("python3 /g/hooks/pre_tool_use.py\""), "{name}: the gate is not");
-            assert_eq!(during.len() as isize - body.len() as isize,
-                       rec.stub.len() as isize - "/g/hooks/pre_tool_use.py".len() as isize,
-                       "{name}: only the one token moved");
-            assert!(Path::new(&rec.stub).is_file());
-            assert!(active(&home, "m1").is_some());
+            assert_eq!(rec.swaps[0].occurrences, 1, "{name}");
+            assert!(during.contains(&rec.swaps[0].replacement), "{name}: the stub is registered");
+            assert!(during.contains("python3 /g/hooks/pre_tool_use.py --post"),
+                    "{name}: the PostToolUse reference to the same script is untouched");
+            assert!(Path::new(&rec.swaps[0].stub_file).is_file());
             restore(&home, "m1").unwrap();
             assert_eq!(std::fs::read_to_string(&cfg).unwrap(), body, "{name}: restore is exact");
             assert!(active(&home, "m1").is_none());
         }
+    }
+
+    const TWO: &str = r#"{
+  "hooks": {
+    "PreToolUse": [
+      { "hooks": [ { "type": "command", "command": "python3 /g/hooks/pre_tool_use.py" },
+                   { "type": "command", "command": "python3 /g/hooks/second_gate.py" } ] }
+    ]
+  }
+}
+"#;
+
+    #[test]
+    fn two_gates_in_one_config_get_distinct_stubs_and_restore_exactly() {
+        let (_d, home, cfg) = setup(TWO, "settings.json");
+        let t = [gt(&cfg, "PreToolUse", G), gt(&cfg, "PreToolUse", G2)];
+        let rec = bypass(&home, "m", "r", &t, "T").unwrap();
+        assert_eq!(rec.swaps.len(), 2);
+        assert_ne!(rec.swaps[0].replacement, rec.swaps[1].replacement, "one stub per original");
+        let during = std::fs::read_to_string(&cfg).unwrap();
+        assert!(!during.contains(G) && !during.contains(G2));
+        restore(&home, "m").unwrap();
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), TWO, "each original back in its own place");
+        // and the chain-append-failure path: undo is the same exact, per-entry reversal
+        let rec = bypass(&home, "m", "r", &t, "T").unwrap();
+        undo_bypass(&home, &rec).unwrap();
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), TWO);
+        assert!(active(&home, "m").is_none());
+        // and a restore that could not be witnessed goes back to bypassed, per entry
+        bypass(&home, "m", "r", &t, "T").unwrap();
+        let restored = restore(&home, "m").unwrap();
+        undo_restore(&home, &restored).unwrap();
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), during, "both gates re-bypassed, each by its own stub");
+        assert!(active(&home, "m").is_some());
+    }
+
+    #[test]
+    fn a_spaced_home_is_quoted_for_the_shell_and_restores_exactly() {
+        for (body, name) in [(CLAUDE, "settings.json"), (CODEX, "config.toml"), (KIMI, "kimi.toml")] {
+            let d = tempfile::tempdir().unwrap();
+            let home = d.path().join("hestia home");
+            let cfg = d.path().join(name);
+            std::fs::write(&cfg, body).unwrap();
+            let rec = bypass(&home, "m", "r", &[gt(&cfg, "PreToolUse", G)], "T").unwrap();
+            let w = &rec.swaps[0].replacement;
+            assert!(w.starts_with('\'') && w.ends_with('\'') && w.contains("hestia home"), "{name}: {w}");
+            let during = std::fs::read_to_string(&cfg).unwrap();
+            if name.ends_with(".json") {
+                let v: serde_json::Value = serde_json::from_str(&during).unwrap();
+                let cmd = v["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str().unwrap();
+                assert!(cmd.ends_with(&format!("python3 {w}")), "{cmd}");
+            }
+            restore(&home, "m").unwrap();
+            assert_eq!(std::fs::read_to_string(&cfg).unwrap(), body, "{name}");
+        }
+        // A TOML literal string cannot carry the quotes: refused before anything is written.
+        let lit = "[[hooks.PreToolUse.hooks]]\ncommand = 'python3 /g/hooks/pre_tool_use.py'\n";
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("config.toml");
+        std::fs::write(&cfg, lit).unwrap();
+        let e = bypass(&d.path().join("sp ace"), "m", "r", &[gt(&cfg, "PreToolUse", G)], "T").unwrap_err();
+        assert!(e.to_string().contains("literal string"), "{e}");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), lit);
+        assert!(command_word("/a'b", '"').is_err());
     }
 
     #[test]
@@ -406,36 +722,19 @@ mod tests {
     #[test]
     fn refusals() {
         let (_d, home, cfg) = setup(CODEX, "config.toml");
-        let c = cfg.display().to_string();
-        let t = vec![(c.clone(), "/g/hooks/pre_tool_use.py".to_string())];
+        let t = vec![gt(&cfg, "PreToolUse", G)];
         assert!(bypass(&home, "../x", "r", &t, "T").is_err(), "a non-id is refused");
-        assert!(bypass(&home, "m", "r", &[(c.clone(), "/elsewhere.py".into())], "T").is_err(),
-                "a gate the config does not spell is refused, and nothing changes");
-        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), CODEX);
+        assert!(bypass(&home, "m", "r", &[gt(&cfg, "PreToolUse", "/elsewhere.py")], "T").is_err());
+        assert!(bypass(&home, "m", "r", &[gt(&cfg, "SessionStart", G)], "T").is_err(),
+                "a gate not registered on the named event is refused");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), CODEX, "and nothing changed");
         bypass(&home, "m", "r", &t, "T").unwrap();
         let e = bypass(&home, "m", "r", &t, "T").unwrap_err().to_string();
         assert!(e.contains("already bypassed"), "{e}");
-        // Someone re-registers the gate by hand meanwhile: restore must refuse, not guess.
-        std::fs::write(&cfg, CODEX).unwrap();
+        std::fs::write(&cfg, CODEX).unwrap(); // re-registered by hand meanwhile
         let e = restore(&home, "m").unwrap_err().to_string();
         assert!(e.contains("no longer registers the bypass stub"), "{e}");
         assert!(restore(&home, "nobody").is_err());
-    }
-
-    #[test]
-    fn undo_puts_everything_back() {
-        let (_d, home, cfg) = setup(KIMI, "kimi.toml");
-        let c = cfg.display().to_string();
-        let rec = bypass(&home, "m", "r", &[(c, "/g/hooks/pre_tool_use.py".into())], "T").unwrap();
-        undo_bypass(&home, &rec).unwrap();
-        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), KIMI);
-        assert!(active(&home, "m").is_none());
-        // and a restore that could not be witnessed goes back to bypassed
-        let rec = bypass(&home, "m", "r", &rec.swaps.iter().map(|s| (s.config.clone(), s.original.clone())).collect::<Vec<_>>(), "T").unwrap();
-        let restored = restore(&home, "m").unwrap();
-        undo_restore(&home, &restored).unwrap();
-        assert!(std::fs::read_to_string(&rec.swaps[0].config).unwrap().contains(&rec.stub));
-        assert!(active(&home, "m").is_some());
     }
 
     #[test]
@@ -443,18 +742,18 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let (_d, home, cfg) = setup(CODEX, "config.toml");
         std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
-        bypass(&home, "m", "r", &[(cfg.display().to_string(), "/g/hooks/pre_tool_use.py".into())], "T").unwrap();
+        bypass(&home, "m", "r", &[gt(&cfg, "PreToolUse", G)], "T").unwrap();
         assert_eq!(std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]
     fn targets_come_from_the_inventory_gate_rows_only() {
         let inv = serde_json::json!({"status":"GAP","detail":[{"member":"kimi-code","hook_targets":[
-            {"path":"/k/pre_tool_use.py","config":"/k/config.toml","is_gate":true,"owned_by_hestia":true},
-            {"path":"/k/witness.py","config":"/k/config.toml","is_gate":false,"owned_by_hestia":true},
-            {"path":"/snarc/pre.js","config":"/k/config.toml","is_gate":true,"owned_by_hestia":false}]}]});
-        assert_eq!(gate_targets(&inv, "kimi-code").unwrap(),
-                   vec![("/k/config.toml".to_string(), "/k/pre_tool_use.py".to_string())]);
+            {"path":"/k/pre_tool_use.py","config":"/k/config.toml","event":"PreToolUse","is_gate":true,"owned_by_hestia":true},
+            {"path":"/k/witness.py","config":"/k/config.toml","event":"PostToolUse","is_gate":false,"owned_by_hestia":true},
+            {"path":"/snarc/pre.js","config":"/k/config.toml","event":"PreToolUse","is_gate":true,"owned_by_hestia":false}]}]});
+        assert_eq!(gate_targets(&inv, "kimi-code").unwrap(), vec![GateTarget {
+            config: "/k/config.toml".into(), event: "PreToolUse".into(), path: "/k/pre_tool_use.py".into() }]);
         assert!(gate_targets(&inv, "codex").is_err());
         assert!(gate_targets(&serde_json::json!({"status":"UNKNOWN","reason":"x"}), "kimi-code").is_err());
     }
