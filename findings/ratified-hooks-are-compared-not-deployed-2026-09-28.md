@@ -75,3 +75,21 @@ measures four things:
 - how long live drift detection takes.
 
 A prediction here that the measurement contradicts is a correction to this document.
+
+## Measured (#1158, isolated daemon, 2026-09-28): one prediction was wrong, and in the worse direction
+
+| prediction | measured |
+|---|---|
+| verify reports FINDINGS: original gate `verified` and the stub `unratified` | **wrong.** `status: VERIFIED, findings: 0`. The bypassed gate reads `verified, discovered: false`; the stub is not discovered as a gate at all. With no other gated member, verify answers `UNKNOWN` ("no gate-role hooks discovered"). The `gate_watch` tick 2m50s later wrote VERIFIED, with no chain row. (#1156) |
+| a restart re-projects nothing | **confirmed.** After a restart the stub is still registered. (#1157) |
+| register-members cannot undo a re-pointed entry | **confirmed, and worse for codex.** It appended a second gate block beside the stub. For claude-code there is no template yet (#1142), so it skipped. (#1157, #330) |
+| actions are still logged while bypassed | **confirmed.** The member's real witness landed an outcome row. |
+| the vault holds location + sha | **confirmed.** |
+
+Why my prediction was wrong: `gate_integrity::verify` hashes each ratified PATH and never asks
+whether that path is still the one REGISTERED. The stub is not hestia's, so it never enters the
+discovered gate set. So the cheapest bypass there is (leave the ratified file on disk and re-point
+the registration) is invisible to every gate-integrity surface. Only agent-inventory's MISWIRED
+verdict catches it, and that verdict reaches neither the chain nor the tick. This is point 3 above,
+measured: **the registration edge is the thing the vault does not hold, so it is the thing nobody
+checks.**
