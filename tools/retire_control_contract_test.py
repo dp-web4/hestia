@@ -73,8 +73,17 @@ def discover_render() -> str:
 
 def source_contract() -> None:
     blk = block()
-    check("both halves of the account are required before anything is sent",
-          blk.count("if (!reason) return;") == 2 and "if (!ref) return;" in blk)
+    # PER FUNCTION, not by count: a count of 2 broke the day a third retiring function (the bulk
+    # cleanup) arrived, and a count cannot say WHICH function lost its guard.
+    def fn(name, nxt):
+        a = blk.index(f"async function {name}(")
+        return blk[a:blk.index(f"async function {nxt}(", a)]
+    for name, nxt in (("retireAgent", "retireNeverActed"), ("retireNeverActed", "reinstateAgent")):
+        body = fn(name, nxt)
+        check(f"{name}: both halves of the account are required before anything is sent",
+              "if (!reason) return;" in body and "if (!ref) return;" in body)
+    check("reinstateAgent: a reason is required",
+          "if (!reason) return;" in blk[blk.index("async function reinstateAgent("):])
     # Line-based, not a regex over the whole block: the confirm's own message contains ")"
     # characters ("act(s)"), which defeated the first pattern -- and a pattern that cannot match
     # is a check that cannot fail.
