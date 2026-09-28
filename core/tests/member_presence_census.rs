@@ -828,6 +828,11 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
         "for (plugin_id, lct) in members.iter_sorted() {",
     ]),
     ("server/dashboard.rs::dashboard_snapshot_from_projection", &[
+        // ADDED 2026-09-28 (claude-code@mcnugget). READING: presence, for DISPLAY -- every registry
+        // id the dashboard lists, so a member that never acted (a being awaiting its heartbeat, a
+        // phantom awaiting retirement) is visible at all. It gates nothing: an unreadable or empty
+        // registry lists fewer rows, never grants or refuses anything.
+        "let member_ids: Vec<String> = self.member_registry.iter_sorted().into_iter().map(|(id, _)| id.clone()).filter(|id| !self.member_registry.is_filler(id) && !self.is_synthetic(id)).collect();",
         "member_entities: self.member_registry.len(),",
     ]),
     // Added 2026-08-17 (codex, PR #490 NOT-SAME pass). READING, answering the question
