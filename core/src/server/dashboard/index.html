@@ -4589,6 +4589,15 @@
         accounted.add(id);
       }
     }
+    // AN ACTIVE GATE BYPASS (dp, 2026-09-28), keyed by MEMBER id and drawn on its row wherever
+    // the inventory filed it. Nothing here moves the row or relabels it: whether the inventory
+    // reads a bypassed member as miswired is ITS verdict, and that is exactly what dp asked the
+    // bypass to test ("don't add any new code for that").
+    const bypassed = (r.bypassed && typeof r.bypassed === 'object') ? r.bypassed : {};
+    for (const g of groups) for (const row of g.rows) {
+      const b = row.governanceId ? bypassed[row.governanceId] : null;
+      if (b) row.bypass = { at: String(b.bypassed_at || ''), reason: String(b.reason || '') };
+    }
     const retiredSet = new Set(Array.isArray(retiredIds) ? retiredIds : []);
     const own = (Array.isArray(members) ? members : [])
       .filter(m => m && m.plugin_id && HESTIA_OWN_CLIENTS[m.plugin_id]);
@@ -4668,6 +4677,11 @@
       // rather than undefined, so a render that reads them cannot silently draw `undefined`.
       actionCount: 0,
       retired: false,
+      // A gate to bypass: the inventory lists a HESTIA gate hook for this member (the daemon
+      // derives the same set itself and refuses otherwise; this only decides whether to offer).
+      bypassable: !!(x.member || x.plugin) && (Array.isArray(x.hook_targets) ? x.hook_targets : [])
+        .some(t => t && t.is_gate === true && t.owned_by_hestia === true),
+      bypass: null,
     };
   }
 
@@ -4744,6 +4758,11 @@
                   title="Undo the retirement. The authority revoked at retirement is NOT restored.">reinstate</button>`
               : `<button type="button" class="pol-btn pol-remove" data-retire="${escapeHtml(r.governanceId)}"
                   title="Stop this id being a party on this seat: revokes its standing, live and delegated authority. Not deletion — the chain keeps every act it made, and it is reversible.">retire…</button>`}
+            ${r.bypass ? `${badge('red', 'BYPASSED', 'gate bypassed by the operator at ' + r.bypass.at + ' — ' + r.bypass.reason + '. This member acts UNGOVERNED until restored.')}
+              <button type="button" class="pol-btn-add" data-gate-restore="${escapeHtml(r.governanceId)}"
+                title="Put this member's gate back exactly as it was registered. Witnessed.">restore gate</button>`
+              : r.bypassable ? `<button type="button" class="pol-btn pol-remove" data-gate-bypass="${escapeHtml(r.governanceId)}"
+                title="Recovery switch: replace this member's gate with a stub that ALLOWS every call, so a member its own gate has locked out can act to fix it. It is then ungoverned until you restore.">bypass gate…</button>` : ''}
             ${r.registerable ? `<button type="button" class="pol-btn-add disc-register" data-register="${escapeHtml(r.atlasId)}"
               title="Make this a member of this society, under an id derived from THIS record — not typed. Witnessed.">register…</button>` : ''}
             ${r.alsoFiledUnder.map(k => badge('grey', 'report also says: ' + k, 'a claim the inventory could not stand behind for this agent — see the reasons on this row')).join('')}
@@ -4776,6 +4795,52 @@
     if (!b) return;
     e.stopPropagation();
     registerDiscovered(b.dataset.register);
+  }, true);
+
+  // BYPASS / RESTORE a member's gate (dp, 2026-09-28): "useful for instances when an update locks
+  // out a member that we need to be active to fix the issues". Fail OPEN by design -- the point is
+  // to let the member act -- so the confirm says plainly what is switched off.
+  async function gateBypass(member) {
+    if (!confirm(`BYPASS the gate for "${member}"?\n\n` +
+        `Its PreToolUse gate is replaced by a stub that ALLOWS every tool call. Until you restore it, ` +
+        `${member} acts UNGOVERNED: no gate, no scope, no safety preset, no escalations.\n\n` +
+        `A harness that is already running may keep its old hook until it restarts.\n` +
+        `The bypass is recorded on the chain, and the rest of hestia should now read this member ` +
+        `as miswired -- that is expected.\n\nRestore it as soon as the fix is in.`)) return;
+    const reason = prompt(`Why may ${member} act ungoverned? (recorded on the chain)`);
+    if (!reason || !reason.trim()) return;
+    try {
+      const res = await apiFetch(`/api/agents/${encodeURIComponent(member)}/bypass`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason }),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      alert(`Bypassed: ${member}\n\n${out.warning || ''}`);
+      discoverLoad();
+    } catch (e) { alert(`bypass refused: ${e.message}`); }
+  }
+  async function gateRestore(member) {
+    if (!confirm(`Restore ${member}'s gate? Its registration goes back exactly as it was before the bypass.`)) return;
+    try {
+      const res = await apiFetch(`/api/agents/${encodeURIComponent(member)}/restore`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const out = await res.json().catch(() => ({}));
+      // A refused restore is shown with the daemon's reason and not retried: the registration
+      // changed since the bypass, and swapping blind would guess.
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      alert(`Restored: ${member}. A running harness may need a restart to pick its gate back up.`);
+      discoverLoad();
+    } catch (e) { alert(`restore refused: ${e.message}`); }
+  }
+  document.addEventListener('click', e => {
+    const b = e.target && e.target.closest && e.target.closest('[data-gate-bypass],[data-gate-restore]');
+    if (!b) return;
+    e.stopPropagation();
+    if (b.dataset.gateBypass) gateBypass(b.dataset.gateBypass);
+    else gateRestore(b.dataset.gateRestore);
   }, true);
 
   let discoverBusy = false;
