@@ -1284,6 +1284,7 @@
         <button type="button" class="govern-chip" data-gov="policy">policy</button>
         <button type="button" class="govern-chip" data-gov="config">runtime config</button>
         <button type="button" class="govern-chip" data-gov="vault">vault</button>
+        <button type="button" class="govern-chip" data-gov="gates">gates</button>
         <button type="button" class="govern-chip" data-gov="discover">discover</button>
       </nav>
 
@@ -1618,6 +1619,36 @@
             </div>
             <div class="cfg-err" id="vault-err" hidden></div>
             <div class="cfg-saved" id="vault-ok" hidden></div>
+          </div>
+        </section>
+
+        <!-- GATES (2026-09-28). The web half of #1132, which put its Gates screen only in the desktop
+             app -- and on the boxes where the operator reads this dashboard no app build exists, so the
+             ratify endpoint was reachable only by a hand-signed POST. Same two calls as the app:
+             GET /api/gates/verify (verdicts + evidence) and POST /api/gates/ratify, which the daemon
+             binds to the bytes shown here: `expected` is the evidence.current this pane rendered, and
+             the daemon refuses (409, nothing ratified) if the installed gates differ from it. -->
+        <section class="govern-pane" id="govern-gates" hidden>
+          <div class="govern-pane-head">
+            <h2>Gates <span class="pol-mode" id="gates-status"></span></h2>
+            <button type="button" class="pol-btn" id="gates-refresh">refresh</button>
+          </div>
+          <div class="govern-scroll">
+            <div class="grant-note">
+              The installed hook files that enforce this box's law, hashed by the daemon and compared to
+              the expectations you last ratified. <strong>Ratifying records the bytes installed now as the
+              trusted build</strong> and replaces the previous expectations. Nothing here can tell a good
+              build from a tampered one: compare the installed hash with what the deploy recorded
+              installing before you ratify. The ratification is witnessed on the chain with your reason.
+            </div>
+            <div id="gates-list"><div class="empty">Loading…</div></div>
+            <div class="pol-section-label">Ratify the installed build</div>
+            <div class="pol-add">
+              <input class="pol-input" id="gates-reason" placeholder="why these bytes are trusted (e.g. matches deploy 6d78d87)" size="56" maxlength="512" autocomplete="off">
+              <button type="button" class="pol-btn cfg-save" id="gates-ratify-btn">ratify</button>
+            </div>
+            <div class="cfg-err" id="gates-err" hidden></div>
+            <div class="cfg-saved" id="gates-ok" hidden></div>
           </div>
         </section>
 
@@ -4690,6 +4721,8 @@
     config: { el: 'govern-config', mount: () => cfgLoadList() },
     // Names and policy only; the list never carries a value.
     vault:  { el: 'govern-vault',  mount: () => vaultLoad() },
+    // One GET of the verdicts; the daemon hashes on each request, so it is fetched when shown.
+    gates:  { el: 'govern-gates',  mount: () => gatesLoad() },
     // One GET of the inventory report. The report is a live filesystem walk, so it is fetched
     // when the pane is SHOWN and on an explicit rescan, never on a timer of its own.
     discover: { el: 'govern-discover', mount: () => discoverLoad() },
@@ -4807,6 +4840,95 @@
         const row = t.closest('.vault-row');
         if (row) vaultDelete(row.dataset.name);
       }
+    });
+  })();
+
+  // ---- GATES pane ----------------------------------------------------------------------------
+  // GET /api/gates/verify and POST /api/gates/ratify, as the desktop app's Gates screen uses them.
+  // The ratify carries `expected` = the evidence.current THIS pane rendered: the daemon recomputes
+  // it under its lock and refuses (409) if any gate moved since, so a ratification can only ever
+  // bless bytes the operator was shown (#1132).
+  let gatesReport = null;
+  const gatesEsc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const gatesShort = (h) => h ? String(h).slice(0, 12) : '—';
+  function gatesMsg(err, ok) {
+    const e = $('gates-err'), o = $('gates-ok');
+    if (e) { e.hidden = !err; e.textContent = err || ''; }
+    if (o) { o.hidden = !ok; o.textContent = ok || ''; }
+  }
+  async function gatesLoad() {
+    const status = $('gates-status'), list = $('gates-list');
+    try {
+      const res = await apiFetch('/api/gates/verify', { cache: 'no-store' });
+      if (!res.ok) throw new Error((await res.text()) || ('HTTP ' + res.status));
+      const r = await res.json();
+      gatesReport = r;
+      if (status) status.textContent = r.status + (r.discovered != null ? ` · ${r.discovered} gate${r.discovered === 1 ? '' : 's'}` : '');
+      if (r.status === 'UNKNOWN') {
+        // An unmeasurable set is never rendered as "all fine", and cannot be ratified.
+        list.innerHTML = `<div class="empty">${gatesEsc(r.reason || 'the gate set could not be established')}</div>`;
+        $('gates-ratify-btn').disabled = true;
+        return;
+      }
+      $('gates-ratify-btn').disabled = false;
+      const cur = (r.evidence && r.evidence.current) || {};
+      const dep = (r.evidence && r.evidence.deployed) || null;
+      const depFiles = (dep && dep.files) || {};
+      const rows = (r.gates || []).map(g => {
+        const path = g.path || '';
+        const now = cur[path];
+        const deployed = depFiles[path];
+        // Evidence, not a verdict: say whether the installed bytes are what the deploy wrote.
+        const vsDeploy = !deployed ? '<span class="cfg-verdict none" title="the deploy recorded no digest for this file">no deploy record</span>'
+          : (now === deployed ? '<span class="cfg-verdict ok" title="installed bytes are exactly what the deploy wrote">matches deploy</span>'
+             : '<span class="cfg-verdict bad" title="installed bytes differ from what the deploy wrote — review before ratifying">differs from deploy</span>');
+        const cls = g.status === 'verified' ? 'ok' : (g.status === 'modified' ? 'bad' : 'none');
+        return `
+          <div class="vault-row">
+            <span class="cfg-verdict ${cls}">${gatesEsc(g.status)}</span>
+            <span class="vault-name" title="${gatesEsc(path)}">${gatesEsc(g.plugin_id || path.split('/').pop())}</span>
+            <span class="vault-meta">${gatesEsc(path)}</span>
+            <span class="vault-dates" title="installed now${g.expected ? ' · ratified ' + gatesEsc(g.expected) : ''}">now ${gatesEsc(gatesShort(now))}${g.expected ? ' · ratified ' + gatesEsc(gatesShort(g.expected)) : ''}</span>
+            ${vsDeploy}
+          </div>`;
+      });
+      const depLine = dep ? `<div class="grant-note">Deploy record: build ${gatesEsc(dep.build_id || '?')} · ${gatesEsc((dep.head_sha || '').slice(0, 9))} · installed ${gatesEsc(dep.installed_at_iso || '?')}</div>` : '';
+      list.innerHTML = depLine + (rows.join('') || '<div class="empty">No gates discovered.</div>');
+    } catch (e) {
+      gatesReport = null;
+      if (status) status.textContent = '⚠ ' + e.message;
+      if (list) list.innerHTML = '<div class="empty">Could not read the gates.</div>';
+    }
+  }
+  async function gatesRatify() {
+    const reason = ($('gates-reason').value || '').trim();
+    if (!reason) { gatesMsg('A reason is required: it is what makes this judgement reviewable on the chain.', null); return; }
+    const expected = gatesReport && gatesReport.evidence && gatesReport.evidence.current;
+    if (!expected || !Object.keys(expected).length) { gatesMsg('Nothing to ratify: refresh and review the gates first.', null); return; }
+    const n = Object.keys(expected).length;
+    if (!window.confirm(`Ratify the ${n} installed gate file${n === 1 ? '' : 's'} shown as the trusted build?\nThis replaces the previous expectations (last edit wins).`)) return;
+    try {
+      const res = await apiFetch('/api/gates/ratify', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason, expected }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (res.status === 409) {
+        const d = (body.differs || []).map(x => `${x.path}: saw ${gatesShort(x.saw)}, now ${gatesShort(x.now)}`).join('; ');
+        throw new Error((body.error || 'The installed gates changed since you looked; nothing was ratified.') + (d ? ' — ' + d : ''));
+      }
+      if (!res.ok || body.error) throw new Error(body.error || ('HTTP ' + res.status));
+      $('gates-reason').value = '';
+      gatesMsg(null, `Ratified ${(body.ratified || []).length} gate file(s) (witnessed on the chain with your reason).`);
+    } catch (e) { gatesMsg(e.message, null); }
+    gatesLoad();
+  }
+  (function wireGatesPane() {
+    document.addEventListener('click', (e) => {
+      const t = e.target;
+      if (!t) return;
+      if (t.id === 'gates-refresh') { gatesMsg(null, null); gatesLoad(); }
+      else if (t.id === 'gates-ratify-btn') gatesRatify();
     });
   })();
 
