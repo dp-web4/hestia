@@ -2108,15 +2108,17 @@
   // a gate wired to a target that does not exist reads as covered and fails OPEN. Fetched on
   // its own slow clock (install/wiring changes are rare) rather than on every 2s snapshot.
   const GOV_NOTE = {
-    miswired:       'a gate is wired to a target that does not exist — reads as covered, fails OPEN',
+    miswired:       'a declared role is not served by its hook (a gate at a missing target, or a witness that never reaches the daemon) — reads as covered, fails OPEN',
     partial:        'observation wired, enforcement absent',
     ungoverned:     'installed, adapter exists, not wired',
     ungovernable:   'installed, no hestia adapter exists yet',
     governed:       'installed, wired, and the wiring resolves',
     dormant_plugin: 'adapter ready; this harness is not installed here',
+    unprovisioned_being: 'a being is here, but no launcher this inventory can read runs it as a member',
+    unknown:        'the inventory could not establish this member\'s coverage',
   };
-  const GOV_SEVERITY = { miswired: 'red', partial: 'amber', ungoverned: 'amber', ungovernable: 'amber', governed: 'green', dormant_plugin: 'grey' };
-  const GOV_LABEL = { miswired: 'MISWIRED — fails open', partial: 'partial — not enforced', ungoverned: 'not wired', ungovernable: 'no adapter yet', governed: 'governed', dormant_plugin: 'not installed here' };
+  const GOV_SEVERITY = { miswired: 'red', partial: 'amber', ungoverned: 'amber', ungovernable: 'amber', unprovisioned_being: 'amber', unknown: 'amber', governed: 'green', dormant_plugin: 'grey' };
+  const GOV_LABEL = { miswired: 'MISWIRED — fails open', partial: 'partial — not enforced', ungoverned: 'not wired', ungovernable: 'no adapter yet', unprovisioned_being: 'being not provisioned', unknown: 'coverage unknown', governed: 'governed', dormant_plugin: 'not installed here' };
   let govByAgent = {};   // plugin_id -> coverage state, from /api/agents
   async function loadGovernance() {
     try {
@@ -2124,9 +2126,19 @@
       if (!r.ok) return;
       const inv = await r.json();
       if (!inv || inv.status === 'UNKNOWN') return;   // keep last known rather than blanking the dots
-      const st = {};
-      for (const [k, ids] of Object.entries(inv.gaps || {})) for (const id of ids || []) st[id] = k === 'unknown' ? 'ungovernable' : k;
-      for (const id of inv.governed || []) if (!st[id]) st[id] = 'governed';
+      // `members` is keyed by MEMBER id — the id these chips carry — with one state per member,
+      // worst first. `gaps`/`governed` are keyed by ATLAS id (`kimi_code_cli`, not `kimi-code`),
+      // which matched a chip only where the two are spelled alike: `codex`, and nothing else,
+      // on every machine (dp, 2026-09-28). And walking `gaps` let a later bucket overwrite an
+      // earlier one, so MISWIRED plus any `unknown` note rendered amber. The fallback below is
+      // only for an inventory that predates `members`.
+      let st = {};
+      if (inv.members && typeof inv.members === 'object') {
+        st = { ...inv.members };
+      } else {
+        for (const [k, ids] of Object.entries(inv.gaps || {})) for (const id of ids || []) st[id] = k === 'unknown' ? 'ungovernable' : k;
+        for (const id of inv.governed || []) if (!st[id]) st[id] = 'governed';
+      }
       govByAgent = st;
         noteMembers([]);   // fold installed-agent coverage into the pickers
       if (lastData) rerender(lastData);   // repaint chips with fresh dots
@@ -4477,7 +4489,11 @@
     // agent is installed. A member id absent from this set has nothing on disk behind it.
     // `plugin` only -- NOT the atlas id, which is a different namespace and would silently
     // account for a member it has no relation to.
-    const accounted = new Set(detail.map(d => d && d.plugin).filter(Boolean).map(String));
+    // A member is accounted for by its MEMBER id (agent-inventory `member`), with the plugin
+    // directory kept as the fallback for an older inventory. Matching member ids against plugin
+    // DIRECTORIES alone left `kimi-code` (directory `kimi`) in the "nothing on this machine
+    // accounts for it" group, with a Retire button, while it was running and governed.
+    const accounted = new Set(detail.flatMap(d => d ? [d.member, d.plugin] : []).filter(Boolean).map(String));
     const retiredSet = new Set(Array.isArray(retiredIds) ? retiredIds : []);
     const orphans = (Array.isArray(members) ? members : [])
       .filter(m => m && m.plugin_id && !accounted.has(String(m.plugin_id)));
@@ -4520,7 +4536,7 @@
     const failure = a.fails_open === true ? 'open' : a.fails_open === false ? 'closed' : 'unknown';
     return {
       atlasId: id,
-      governanceId: x.plugin || '',
+      governanceId: x.member || x.plugin || '',
       name: a.harness || id,
       installed: !!x.installed,
       executable: x.executable || '',
