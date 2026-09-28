@@ -6189,6 +6189,42 @@ async fn agent_ungovern(
 /// path, measured once, consumed by both surfaces.
 pub(crate) fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
     let inv = crate::server::agents::inventory().map_err(|e| e.to_string())?;
+    discovered_gate_paths_from(&inv)
+}
+
+/// The discovered gates AND the ids of installed members that declare a gate role, from ONE
+/// inventory read. The second list is what separates a stale expectation from a de-registered
+/// gate (#1156): a member that still declares a gate but has none registered was bypassed or
+/// miswired, and its ratified expectation is the only record that a gate belongs there.
+fn gate_inventory() -> Result<(Vec<(String, String)>, Vec<String>), String> {
+    let inv = crate::server::agents::inventory().map_err(|e| e.to_string())?;
+    Ok((discovered_gate_paths_from(&inv)?, members_declaring_a_gate(&inv)))
+}
+
+/// Ids (member id and atlas id, since an expectation's plugin_id may be either) of every
+/// INSTALLED record whose plugin declares a `gate` role -- `roles_wired` carries a key per
+/// declared role, whether or not any event is served.
+fn members_declaring_a_gate(inv: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for rec in inv.get("detail").and_then(|d| d.as_array()).into_iter().flatten() {
+        if rec.get("installed").and_then(|v| v.as_bool()) != Some(true) {
+            continue;
+        }
+        if rec.get("roles_wired").and_then(|r| r.get("gate")).is_none() {
+            continue;
+        }
+        for k in ["member", "agent"] {
+            if let Some(id) = rec.get(k).and_then(|v| v.as_str()) {
+                out.push(id.to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn discovered_gate_paths_from(inv: &serde_json::Value) -> Result<Vec<(String, String)>, String> {
     if inv.get("status").and_then(|v| v.as_str()) == Some("UNKNOWN") {
         return Err(inv
             .get("reason")
@@ -6582,10 +6618,37 @@ fn plan_ratification(
 /// A DISCOVERED gate cannot be forgotten: forgetting a live gate turns MODIFIED (the loud
 /// verdict, a rewritten gate) into UNRATIFIED (merely unexamined) -- a way to quiet a tamper
 /// finding without re-examining anything. A live gate is re-ratified per gate instead.
+/// Why this expectation may NOT be forgotten, or None. `declaring` = installed members that
+/// declare a gate, retired ones already removed.
+fn forget_blocked_reason(
+    path: &str,
+    plugin_id: Option<&str>,
+    discovered: &[(String, String)],
+    declaring: &[String],
+) -> Option<String> {
+    if discovered.iter().any(|(_, d)| d == path) {
+        return Some("this gate is still wired here: forgetting it would turn a MODIFIED finding \
+                     into a merely unratified one. Re-ratify it per gate instead.".into());
+    }
+    match plugin_id {
+        Some(m) if declaring.iter().any(|d| d == m) => Some(format!(
+            "{m} still declares a gate; a ratified gate that is no longer registered is a bypass \
+             or a miswire, not a stale row -- restore the registration, or retire the member first"
+        )),
+        _ => None,
+    }
+}
+
+/// A retired member is genuinely gone: its stale expectation may be forgotten.
+fn not_retired(ids: Vec<String>, retired: &crate::server::retirement::RetirementStore) -> Vec<String> {
+    ids.into_iter().filter(|m| !retired.is_retired(m)).collect()
+}
+
 fn plan_forget(
     body: &serde_json::Value,
     reason: &str,
     discovered: &[(String, String)],
+    declaring: &[String],
     previous: &crate::vault::gate_integrity::GateExpectations,
 ) -> Result<(crate::vault::gate_integrity::GateExpectations, serde_json::Value), (StatusCode, serde_json::Value)> {
     let paths = match requested_gate_paths(body) {
@@ -6605,6 +6668,25 @@ fn plan_forget(
         })));
     }
     let live: Vec<&String> = paths.iter().filter(|p| discovered.iter().any(|(_, d)| d == *p)).collect();
+    // #1156: a de-registered gate (bypass: registration re-pointed, ratified file untouched)
+    // reads exactly like a stale row. The member still declaring a gate is what tells them apart.
+    let unregistered: Vec<serde_json::Value> = paths
+        .iter()
+        .filter(|p| !live.contains(p))
+        .filter_map(|p| {
+            let m = previous.get(p).map(|e| e.plugin_id.as_str());
+            forget_blocked_reason(p, m, discovered, declaring)
+                .map(|why| serde_json::json!({"path": p, "plugin_id": m, "why": why}))
+        })
+        .collect();
+    if !unregistered.is_empty() {
+        return Err((StatusCode::CONFLICT, serde_json::json!({
+            "error": "refusing to forget: this member still declares a gate; a ratified gate that is \
+                      no longer registered is a bypass or a miswire, not a stale row -- restore the \
+                      registration, or retire the member first",
+            "not_registered": unregistered,
+        })));
+    }
     if !live.is_empty() {
         return Err((StatusCode::CONFLICT, serde_json::json!({
             "error": "refusing to forget a gate this machine still wires: that would turn a \
@@ -6631,6 +6713,7 @@ fn plan_forget(
 fn annotate_gate_verdicts(
     verdicts: &[crate::vault::gate_integrity::GateVerdict],
     discovered: &[(String, String)],
+    declaring: &[String],
     current: &serde_json::Map<String, serde_json::Value>,
     deployed: Option<&serde_json::Value>,
 ) -> (Vec<serde_json::Value>, serde_json::Value) {
@@ -6646,6 +6729,20 @@ fn annotate_gate_verdicts(
         });
         if let Some(obj) = row.as_object_mut() {
             obj.insert("discovered".into(), serde_json::Value::Bool(is_discovered));
+            // The daemon's judgement, rendered by the UIs as-is (#1156). Only a ratified
+            // expectation can be forgotten at all.
+            let plugin_id = obj.get("plugin_id").and_then(|v| v.as_str()).map(str::to_string);
+            let held = obj.get("status").and_then(|v| v.as_str()) != Some("unratified");
+            let blocked = if held {
+                forget_blocked_reason(&path, plugin_id.as_deref(), discovered, declaring)
+            } else {
+                Some("nothing is ratified at this path".into())
+            };
+            let not_registered = held && !is_discovered && blocked.is_some();
+            obj.insert("forgettable".into(), serde_json::Value::Bool(blocked.is_none()));
+            obj.insert("forget_blocked_reason".into(),
+                blocked.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+            obj.insert("not_registered".into(), serde_json::Value::Bool(not_registered));
             obj.insert("deployment".into(),
                 serde_json::Value::String(gate_deployment_status(&path, now.as_ref(), deployed).into()));
         }
@@ -6673,8 +6770,8 @@ async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
     let s = state.lock().await;
     let exp = s.vault.gate_expectations();
     // An unmeasurable denominator is UNKNOWN, never VERIFIED.
-    let discovered = match discovered_gate_paths() {
-        Ok(d) => d,
+    let (discovered, declaring) = match gate_inventory() {
+        Ok((d, decl)) => (d, not_retired(decl, &s.retired_members)),
         Err(reason) => {
             return (
                 StatusCode::OK,
@@ -6708,7 +6805,7 @@ async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
     let deployed = deployed_gate_digests();
     let verdicts = crate::vault::gate_integrity::verify(&exp, &wired);
     let findings = verdicts.iter().filter(|v| v.is_finding()).count();
-    let (rows, bulk) = annotate_gate_verdicts(&verdicts, &discovered, &current_digests, deployed.as_ref());
+    let (rows, bulk) = annotate_gate_verdicts(&verdicts, &discovered, &declaring, &current_digests, deployed.as_ref());
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -6831,8 +6928,8 @@ async fn gates_forget(
         }
     };
     let mut s = state.lock().await;
-    let discovered = match discovered_gate_paths() {
-        Ok(d) => d,
+    let (discovered, declaring) = match gate_inventory() {
+        Ok((d, decl)) => (d, not_retired(decl, &s.retired_members)),
         Err(reason) => {
             // Without the discovered set this cannot tell a stale expectation from a live gate.
             return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
@@ -6841,7 +6938,7 @@ async fn gates_forget(
         }
     };
     let previous = s.vault.gate_expectations();
-    let (next, entry) = match plan_forget(&body, &reason, &discovered, &previous) {
+    let (next, entry) = match plan_forget(&body, &reason, &discovered, &declaring, &previous) {
         Ok(p) => p,
         Err((code, refusal)) => return (code, Json(refusal)).into_response(),
     };
@@ -7495,7 +7592,7 @@ mod disposition_tests {
         let mut previous = one_expectation("/h/cc.py", "aaaa");
         previous.extend(one_expectation("/stale/snarc.js", "ssss"));
         previous.extend(one_expectation("/stale/other.js", "oooo"));
-        let (next, entry) = plan_forget(&json!({"paths": ["/stale/snarc.js"]}), "not a gate", &discovered, &previous).unwrap();
+        let (next, entry) = plan_forget(&json!({"paths": ["/stale/snarc.js"]}), "not a gate", &discovered, &[], &previous).unwrap();
         assert_eq!(next.len(), 2);
         assert!(!next.contains_key("/stale/snarc.js"));
         assert_eq!(next["/h/cc.py"], previous["/h/cc.py"]);
@@ -7503,12 +7600,71 @@ mod disposition_tests {
         assert_eq!(entry["forgotten"][0]["path"], "/stale/snarc.js");
         assert_eq!(entry["forgotten"][0]["sha256"], "ssss");
         // a live gate cannot be forgotten: that would quiet a MODIFIED finding
-        let (code, refusal) = plan_forget(&json!({"paths": ["/h/cc.py"]}), "r", &discovered, &previous).unwrap_err();
+        let (code, refusal) = plan_forget(&json!({"paths": ["/h/cc.py"]}), "r", &discovered, &[], &previous).unwrap_err();
         assert_eq!(code, StatusCode::CONFLICT);
         assert_eq!(refusal["live"][0], "/h/cc.py");
         // nothing held there / no paths at all
-        assert!(plan_forget(&json!({"paths": ["/nope"]}), "r", &discovered, &previous).is_err());
-        assert!(plan_forget(&json!({}), "r", &discovered, &previous).is_err());
+        assert!(plan_forget(&json!({"paths": ["/nope"]}), "r", &discovered, &[], &previous).is_err());
+        assert!(plan_forget(&json!({}), "r", &discovered, &[], &previous).is_err());
+    }
+
+    /// #1156's shape: claude-code's registration was re-pointed (a bypass); its ratified gate file
+    /// is still on disk, so verify reads it verified + discovered:false -- and #1150 offered
+    /// FORGET, which would delete the only record that a gate belongs there.
+    #[test]
+    fn a_de_registered_gate_whose_member_still_declares_one_cannot_be_forgotten() {
+        use crate::vault::gate_integrity::GateVerdict;
+        use serde_json::json;
+        let discovered = vec![("codex".to_string(), "/h/codex.py".to_string())];
+        let mut previous = one_expectation("/h/cc.py", "aaaa");          // plugin_id claude-code
+        previous.extend(one_expectation("/stale/snarc.js", "ssss"));
+        previous.get_mut("/stale/snarc.js").unwrap().plugin_id = "retired-seat".into();
+        let declaring = vec!["claude-code".to_string(), "codex".to_string()];
+
+        let (code, refusal) = plan_forget(&json!({"paths": ["/h/cc.py"]}), "r", &discovered, &declaring, &previous)
+            .unwrap_err();
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(refusal["error"].as_str().unwrap().contains("bypass or a miswire"), "{refusal}");
+        assert_eq!(refusal["not_registered"][0]["path"], "/h/cc.py");
+        // a member that no longer declares a gate (retired, uninstalled): the stale row goes
+        let (next, _) = plan_forget(&json!({"paths": ["/stale/snarc.js"]}), "r", &discovered, &declaring, &previous)
+            .unwrap();
+        assert!(!next.contains_key("/stale/snarc.js") && next.contains_key("/h/cc.py"));
+        // retiring claude-code is what makes its row forgettable
+        let retired = not_retired(declaring.clone(), &{
+            let mut st = crate::server::retirement::RetirementStore::default();
+            st.retired.push(serde_json::from_value(json!({"plugin_id": "claude-code",
+                "retired_at": 1_u64, "reason": "r"})).unwrap());
+            st
+        });
+        assert_eq!(retired, vec!["codex".to_string()]);
+        assert!(plan_forget(&json!({"paths": ["/h/cc.py"]}), "r", &discovered, &retired, &previous).is_ok());
+
+        // verify renders the daemon's judgement per row
+        let verdicts = vec![
+            GateVerdict::Verified { path: "/h/cc.py".into(), plugin_id: "claude-code".into(), sha256: "aaaa".into() },
+            GateVerdict::Verified { path: "/stale/snarc.js".into(), plugin_id: "retired-seat".into(), sha256: "ssss".into() },
+            GateVerdict::Unratified { path: "/h/codex.py".into() },
+        ];
+        let (rows, _) = annotate_gate_verdicts(&verdicts, &discovered, &declaring, &serde_json::Map::new(), None);
+        assert_eq!(rows[0]["forgettable"], false);
+        assert_eq!(rows[0]["not_registered"], true);
+        assert!(rows[0]["forget_blocked_reason"].as_str().unwrap().contains("still declares a gate"));
+        assert_eq!(rows[1]["forgettable"], true);
+        assert_eq!(rows[1]["not_registered"], false);
+        assert_eq!(rows[1]["forget_blocked_reason"], serde_json::Value::Null);
+        assert_eq!(rows[2]["forgettable"], false, "nothing ratified at an unratified row");
+        assert_eq!(rows[2]["not_registered"], false);
+    }
+
+    #[test]
+    fn only_installed_members_that_declare_a_gate_count() {
+        let inv = serde_json::json!({"detail": [
+            {"agent": "claude", "member": "claude-code", "installed": true, "roles_wired": {"gate": [], "observe": ["PostToolUse"]}},
+            {"agent": "gemini", "member": "gemini", "installed": false, "roles_wired": {"gate": []}},
+            {"agent": "sage", "member": "cbp-being", "installed": true, "roles_wired": {}},
+        ]});
+        assert_eq!(members_declaring_a_gate(&inv), vec!["claude".to_string(), "claude-code".to_string()]);
     }
 
     #[test]
@@ -7520,7 +7676,7 @@ mod disposition_tests {
             GateVerdict::Unratified { path: "/h/codex.py".into() },
             GateVerdict::Missing { path: "/stale/snarc.js".into(), plugin_id: "claude-code".into(), expected: "ssss".into() },
         ];
-        let (rows, bulk) = annotate_gate_verdicts(&verdicts, &discovered, &current, Some(&deployed));
+        let (rows, bulk) = annotate_gate_verdicts(&verdicts, &discovered, &[], &current, Some(&deployed));
         assert_eq!(rows[0]["discovered"], true);
         assert_eq!(rows[0]["deployment"], "match");
         assert_eq!(rows[1]["deployment"], "differs");

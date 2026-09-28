@@ -45,6 +45,11 @@ def main() -> int:
           "paths.map(p => [p, all[p] ?? null])" in g)
     check("every discovered row has its own ratify control, stale rows a forget",
           "gates-ratify-one" in g and "gates-forget-one" in g and "g.discovered === false" in g)
+    check("forget is offered only where the daemon says forgettable (#1156)",
+          "g.forgettable === true" in g and "gates-forget-one" in g)
+    check("a de-registered gate is badged, not offered for forget (#1156)",
+          "g.not_registered === true" in g and "NOT REGISTERED — possible bypass" in g
+          and "forget_blocked_reason" in g)
     check("ratify-all is enabled only when the daemon says every gate matches the deploy",
           "r.bulk_ratify.allowed" in g and "bulkBtn.disabled = false" in g)
     check("no ratify control is offered to a daemon without per-gate support",

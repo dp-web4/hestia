@@ -214,6 +214,9 @@ export function Gates() {
             {report.gates.map((g, i) => {
               const path = g.path;
               const stale = g.discovered === false;
+              // #1156: the daemon's judgement, rendered as-is. A ratified gate whose member still
+              // declares one but has none registered is a bypass or a miswire, not a stale row.
+              const notRegistered = g.not_registered === true;
               // The daemon's per-row status (spec v3): the same five values the dashboard shows.
               const dep = g.deployment;
               return (
@@ -223,7 +226,12 @@ export function Gates() {
                   <td className="pre">{short(current[path])}</td>
                   <td className="pre">{short(ratifiedDigest(g))}</td>
                   <td>
-                    {stale && <span className="muted">not a gate on this machine any more</span>}
+                    {notRegistered && (
+                      <strong className="gate-differs" title={g.forget_blocked_reason ?? undefined}>
+                        NOT REGISTERED — possible bypass
+                      </strong>
+                    )}
+                    {stale && !notRegistered && <span className="muted">not a gate on this machine any more</span>}
                     {!stale && dep === "match" && (
                       <span className="muted">matches what {deployed?.build_id} installed</span>
                     )}
@@ -243,9 +251,13 @@ export function Gates() {
                   {canAct && (
                     <td>
                       {stale ? (
-                        <button disabled={busy} aria-label={`forget ${path}`} onClick={() => forget(path)}>
-                          Forget
-                        </button>
+                        g.forgettable === true ? (
+                          <button disabled={busy} aria-label={`forget ${path}`} onClick={() => forget(path)}>
+                            Forget
+                          </button>
+                        ) : (
+                          <span className="muted">{g.forget_blocked_reason ?? "not forgettable"}</span>
+                        )
                       ) : (
                         <button
                           disabled={busy || dep === "unreadable"}
