@@ -112,13 +112,6 @@ pub(crate) fn is_disposition_kind(kind: &str) -> bool {
         .any(|d| kind == *d || kind.starts_with(&format!("{d}.")))
 }
 
-/// Bare member id of a possibly-routed address (`peer/member` → `member`).
-/// Binding comparisons happen on the member name: the same peer's member
-/// reached directly or through a route is the same party for debt purposes.
-pub(crate) fn bare_member(address: &str) -> &str {
-    address.rsplit('/').next().unwrap_or(address)
-}
-
 impl SqliteInboxStore {
     /// Open or create the SQLCipher-encrypted inbox. `key` is the stable
     /// storage key (see [`crate::storage::storage_key`]) — the same key that
@@ -924,8 +917,12 @@ impl SqliteInboxStore {
                 // Non-disposition kinds skip this: a bound `forum-note` FYI to a third
                 // party answers nothing and clears nothing (the query side agrees —
                 // `member_unanswered` only clears when the response addresses the asker).
-                // Comparison is on bare member ids: a member reached directly or via a
-                // route is the same party.
+                // Comparison is EXACT, on the address as sent: `member_unanswered` clears
+                // only when the reply's routed form (`dest_peer/to_plugin`, or the bare
+                // local id) equals the asker's `from_plugin`, so a bare-member test here
+                // accepted a reply to local `claude-code` sent to `legion/claude-code` —
+                // delivered to another machine, and the debt left standing with no refusal
+                // (review of #1126). Gate and query now agree by construction.
                 if is_disposition_kind(kind) {
                     let asked_by: Option<String> = conn
                         .query_row(
@@ -937,7 +934,7 @@ impl SqliteInboxStore {
                         .context("resolving in_reply_to asker")?;
                     if let Some(asker) = asked_by {
                         anyhow::ensure!(
-                            bare_member(&asker) == bare_member(to_plugin),
+                            asker == to_plugin,
                             "notice {rid} came from '{asker}' — a {kind} answers it only if \
                              addressed back to '{asker}', not to '{to_plugin}'"
                         );
@@ -1137,6 +1134,8 @@ impl SqliteInboxStore {
             None => None,
         })
     }
+
+    /// Consume-once drain of the notices addressed to `to_plugin` ONLY —
     /// recipient-scoped (a member can never drain another member's mail).
     /// Same at-least-once failure bias as the hub-notice drain.
     ///
@@ -1392,9 +1391,9 @@ impl SqliteInboxStore {
                                  AND (r.pointer_uri IS NULL
                                       OR r.pointer_uri NOT LIKE '%#undelivered:%')
                                  -- #1115: a response discharges the debt only when it is
-                                 -- addressed back to the ASKER. Bare-member comparison on
-                                 -- routed forms (`peer/member`): the same member reached
-                                 -- through a route is the same party. A misaddressed
+                                 -- addressed back to the ASKER, compared EXACTLY on the
+                                 -- routed form (`peer/member` for a forward, the bare id
+                                 -- locally): the same rule the send gate enforces. A misaddressed
                                  -- reply stays a misroute, visible as unanswered — the
                                  -- one kind of misroute that used to erase its own
                                  -- evidence (14574 cleared codex's row from 'codex-cli').
