@@ -6195,6 +6195,12 @@ pub(crate) fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
             .unwrap_or("inventory could not establish its scope")
             .to_string());
     }
+    Ok(gate_paths_from(&inv))
+}
+
+/// The gate set from an inventory report: gate-event hooks that are HESTIA'S, labelled by member
+/// id. Pure, so the ownership and labelling rules are testable without running the inventory.
+pub(crate) fn gate_paths_from(inv: &serde_json::Value) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for rec in inv
         .get("detail")
@@ -6202,9 +6208,14 @@ pub(crate) fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
         .into_iter()
         .flatten()
     {
+        // Labelled by MEMBER id (agent-inventory `member`, #1136) -- the id the operator sees on
+        // every chip and grant -- with the atlas id only as the fallback for an older inventory.
+        // The atlas id is why the Gates pane read `claude` and `kimi_code_cli`.
         let agent = rec
-            .get("agent")
+            .get("member")
             .and_then(|v| v.as_str())
+            .filter(|m| !m.is_empty())
+            .or_else(|| rec.get("agent").and_then(|v| v.as_str()))
             .unwrap_or("?")
             .to_string();
         for t in rec
@@ -6218,6 +6229,14 @@ pub(crate) fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
             if t.get("is_gate").and_then(|v| v.as_bool()) != Some(true) {
                 continue;
             }
+            // HESTIA'S gates only. `is_gate` means "on a gate event"; another tool's hook on
+            // PreToolUse (snarc's observe-only handler, measured 2026-09-28) is not a gate that
+            // enforces this box's law, and ratifying it would record a stranger's build as ours.
+            // `owned_by_hestia` is by declared install path or hestia identifier since the same
+            // change -- by a mere mention of "hestia" it had claimed snarc's hook.
+            if t.get("owned_by_hestia").and_then(|v| v.as_bool()) != Some(true) {
+                continue;
+            }
             if let Some(p) = t.get("path").and_then(|v| v.as_str()) {
                 out.push((agent.clone(), p.to_string()));
             }
@@ -6225,7 +6244,7 @@ pub(crate) fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
     }
     out.sort();
     out.dedup();
-    Ok(out)
+    out
 }
 
 /// The deployment authority's own record of what it installed, per file, read from
@@ -6986,6 +7005,30 @@ mod disposition_tests {
         // unreadable (null) is only bound to null, never to a digest
         now.insert("/g/a.py".into(), serde_json::Value::Null);
         assert!(ratify_binding(Some(&json!({"/g/a.py": "aaa"})), &now).is_err());
+    }
+
+    #[test]
+    fn the_gate_set_is_hestias_gates_labelled_by_member_id() {
+        use serde_json::json;
+        // dp, 2026-09-28: snarc's observe-only PreToolUse hook sat in the Gates pane as a gate
+        // owned by "claude". Only a gate-event hook that is hestia's belongs in the set, and it is
+        // labelled by member id.
+        let inv = json!({"detail": [
+            {"agent": "claude", "member": "claude-code", "hook_targets": [
+                {"path": "/h/.claude/hooks/hestia/pre_tool_use.py", "is_gate": true, "owned_by_hestia": true},
+                {"path": "/w/snarc/dist/hooks/handlers/pre-tool-use.js", "is_gate": true, "owned_by_hestia": false},
+                {"path": "/h/.claude/hooks/hestia/witness.py", "is_gate": false, "owned_by_hestia": true}]},
+            {"agent": "kimi_code_cli", "member": "kimi-code", "hook_targets": [
+                {"path": "/h/.kimi-code/hooks/pre_tool_use.py", "is_gate": true, "owned_by_hestia": true}]},
+            {"agent": "codex", "hook_targets": [
+                {"path": "/h/.codex/hooks/pre_tool_use.py", "is_gate": true, "owned_by_hestia": true}]}
+        ]});
+        assert_eq!(gate_paths_from(&inv), vec![
+            ("claude-code".to_string(), "/h/.claude/hooks/hestia/pre_tool_use.py".to_string()),
+            // no `member` (an older inventory): the atlas id is the fallback
+            ("codex".to_string(), "/h/.codex/hooks/pre_tool_use.py".to_string()),
+            ("kimi-code".to_string(), "/h/.kimi-code/hooks/pre_tool_use.py".to_string()),
+        ]);
     }
 
     #[test]
