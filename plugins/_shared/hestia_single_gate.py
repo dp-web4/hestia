@@ -549,5 +549,4 @@ def decide(event: GateEvent, profile: GateProfile) -> GateDecision:
             with _one_deadline(deadline):
                 return _finalize(profile, event, d, deadline)
         except BaseException:
-            try:
             return d
