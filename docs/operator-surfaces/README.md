@@ -32,8 +32,12 @@ this file makes it checkable.
   They are not pattern-matched.
 - **`unsurfaced`**: daemon routes that deliberately have no UI, each with the reason. Examples:
   ungovern, until it is hardened; the scope floor; wallet endpoints.
-- **`known_gaps`**: `required` pairs that are missing today. **This list only shrinks.** Closing
-  a gap without removing it from here fails CI, so the spec cannot silently go stale.
+- **`known_gaps`**: `required` pairs that are missing today. **This list only shrinks, and that
+  is enforced, not promised.** The checker holds a frozen baseline per spec `version`
+  (`KNOWN_GAPS_BASELINE`), and `known_gaps` must be a subset of it. So a PR cannot add a gap
+  quietly alongside a new missing surface. Adding one is a migration: bump `version` and add that
+  version's baseline, two deliberate edits a reviewer sees. Closing a gap without removing it also
+  fails CI, so the spec cannot silently go stale in either direction.
 
 ## What the checker fails on
 
@@ -42,7 +46,9 @@ this file makes it checkable.
 2. A spec route that no longer exists in the router.
 3. A surface missing a capability it is `required` to carry (unless listed in `known_gaps`).
    Also, a surface calling a capability it is `excluded` from.
-4. A gap that has been closed but is still listed in `known_gaps`.
+4. A gap that has been closed but is still listed in `known_gaps`; a gap that is not in its
+   version's baseline; a version that has no baseline.
+5. A route named by two capabilities, or an `unsurfaced` route without a `why`.
 
 `python3 tools/operator_surfaces_spec_test.py --matrix` prints the capability × surface table.
 `--discover` prints what each surface actually calls.

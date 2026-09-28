@@ -37,6 +37,15 @@ ROUTER = REPO / "core" / "src" / "server" / "http.rs"
 DASHBOARD = REPO / "core" / "src" / "server" / "dashboard" / "index.html"
 APP_SRC = REPO / "app" / "src-tauri" / "src"
 METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH")
+
+# THE RATCHET, BOUND IN CODE (GPT review of #1138). `known_gaps` may only shrink -- but a gap list
+# that lives only in spec.json can grow in the same PR that introduces the missing surface, and CI
+# would accept it. So each spec `version` has a frozen baseline HERE, and the spec's gaps must be a
+# SUBSET of it. Adding a gap is therefore a migration: bump `version` in spec.json and add that
+# version's baseline below -- two deliberate, reviewable edits, never a quiet one.
+KNOWN_GAPS_BASELINE = {
+    1: frozenset({("gates-verify", "dashboard"), ("gates-ratify", "dashboard")}),
+}
 FAILS: list[str] = []
 
 
@@ -194,9 +203,25 @@ def main(argv: list[str]) -> int:
     spec_routes: dict[tuple[str, str], str] = {}
     for c in caps:
         for r in c["routes"]:
-            spec_routes[parse_route(r)] = c["id"]
-    unsurfaced = {parse_route(u["route"]): u for u in spec.get("unsurfaced", [])}
+            pr = parse_route(r)
+            # one route, one capability: a dict would silently let the later capability win
+            check(f"route {r} is named by two capabilities: {spec_routes.get(pr)} and {c['id']}",
+                  pr not in spec_routes)
+            spec_routes.setdefault(pr, c["id"])
+    unsurfaced = {}
+    for u in spec.get("unsurfaced", []):
+        check(f"unsurfaced {u.get('route')} states why (the README promises it)",
+              isinstance(u.get("why"), str) and u["why"].strip() != "")
+        check(f"unsurfaced route {u.get('route')} is listed twice", parse_route(u["route"]) not in unsurfaced)
+        unsurfaced[parse_route(u["route"])] = u
     gaps = {(g["capability"], g["surface"]) for g in spec.get("known_gaps", [])}
+    version = spec.get("version")
+    baseline = KNOWN_GAPS_BASELINE.get(version)
+    check(f"spec version {version} has a known-gaps baseline in KNOWN_GAPS_BASELINE "
+          f"(a version bump must add one)", baseline is not None)
+    for g in sorted(gaps - (baseline or frozenset())):
+        check(f"known_gaps adds {g[0]}/{g[1]}, which is not in version {version}'s baseline: the "
+              f"list only shrinks -- a new gap is a migration (bump version, add its baseline)", False)
 
     if "--matrix" in argv:
         print("| capability | kind | risk | " + " | ".join(surfaces) + " | routes |")
