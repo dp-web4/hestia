@@ -155,7 +155,7 @@ def member_home(pin_claude=True, pin_kimi=False, stale=True,
     }
     for member, (hooks, config, pinned) in layout.items():
         os.makedirs(hooks, exist_ok=True)
-        for f in ("hestia-mesh.py", "session-mesh-inbox.sh"):
+        for f in ("hestia-mesh.py", "session-mesh-inbox.sh", "prompt-disposition-watch.sh"):
             dest = os.path.join(hooks, f)
             if stale:
                 body = "#!/bin/sh\n# stale pre-#108 copy\n"
@@ -220,7 +220,7 @@ check(not os.path.exists(kimi_hook + ".pre-sync.bak"),
 print("D. sync of a pinned member is byte-exact and keeps the old copy")
 p = run(["claude-code"], home)
 check(p.returncode == 0, f"D1. sync of a pinned member succeeds (got {p.returncode})", p.stdout)
-for f in ("hestia-mesh.py", "session-mesh-inbox.sh"):
+for f in ("hestia-mesh.py", "session-mesh-inbox.sh", "prompt-disposition-watch.sh"):
     dep = os.path.join(layout["claude-code"][0], f)
     with open(dep, "rb") as a, open(os.path.join(SRC, f), "rb") as b:
         check(a.read() == b.read(), f"D2. {f} now byte-identical to the repo")
@@ -297,7 +297,27 @@ check(p.returncode == 2,
 with open(kimi_hook, "rb") as fh:
     check(fh.read() == commented_before, "H3. leaving the file untouched")
 
-for d in (fix, home, clean, drifted, unpinned, lossy, kept, noroleh, withrole, commented):
+print("I. the disposition watch (#366): shipped by sync, registration reported, never failed on")
+wired, wlay = member_home(pin_claude=True, pin_kimi=True, stale=False)
+with open(wlay["kimi-code"][1], "a") as fh:
+    fh.write(f'command = "HESTIA_MESH_PLUGIN=kimi-code {wlay["kimi-code"][0]}/prompt-disposition-watch.sh"\n')
+with open(wlay["claude-code"][1], "a") as fh:
+    fh.write(f'# command = "{wlay["claude-code"][0]}/prompt-disposition-watch.sh"\n')
+p = run(["--check"], wired)
+check("watch=wired" in member_line(p.stdout, "kimi-code"),
+      "I1. a config line naming the watch reads as wired", repr(member_line(p.stdout, "kimi-code")))
+check("watch=UNWIRED" in member_line(p.stdout, "claude-code"),
+      "I2. a commented-out line is not a registration", repr(member_line(p.stdout, "claude-code")))
+check(p.returncode == 0,
+      f"I3. an unwired watch is informational: a clean tree still exits 0 (got {p.returncode})", p.stdout)
+os.remove(os.path.join(wlay["claude-code"][0], "prompt-disposition-watch.sh"))
+p = run(["claude-code"], wired)
+check(p.returncode == 0 and os.path.exists(os.path.join(wlay["claude-code"][0], "prompt-disposition-watch.sh")),
+      f"I4. sync ships the watch to a member that lacks it (got {p.returncode})", p.stdout)
+check("UserPromptSubmit" in p.stdout and "HESTIA_MESH_PLUGIN=claude-code" in p.stdout,
+      "I5. and prints the registration line to add, pinned", p.stdout)
+
+for d in (fix, home, clean, drifted, unpinned, lossy, kept, noroleh, withrole, commented, wired):
     shutil.rmtree(d, ignore_errors=True)
 
 print()
