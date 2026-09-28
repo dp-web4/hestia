@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "adopted": "2026-09-28",
   "about": "Canonical ground truth for what the operator can see and do, independent of any one surface. Both the daemon's web dashboard and the desktop app are checked against it by tools/operator_surfaces_spec_test.py. Change THIS first, in the same PR as the route or the screen. See README.md.",
   "surfaces": [

@@ -38,14 +38,20 @@ DASHBOARD = REPO / "core" / "src" / "server" / "dashboard" / "index.html"
 APP_SRC = REPO / "app" / "src-tauri" / "src"
 METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH")
 
-# THE RATCHET, BOUND IN CODE (GPT review of #1138). `known_gaps` may only shrink -- but a gap list
-# that lives only in spec.json can grow in the same PR that introduces the missing surface, and CI
-# would accept it. So each spec `version` has a frozen baseline HERE, and the spec's gaps must be a
-# SUBSET of it. Adding a gap is therefore a migration: bump `version` in spec.json and add that
-# version's baseline below -- two deliberate, reviewable edits, never a quiet one.
+# THE RATCHET, BOUND IN CODE (GPT reviews of #1138). `known_gaps` may only shrink.
+#  - Each spec `version` has a frozen gap set here, and the spec's `known_gaps` must EQUAL the set of
+#    the version it declares -- no slack. (A subset rule let a gap closed on v1 be quietly reopened:
+#    remove the surface, restore the exception, version unchanged, PASS.)
+#  - The spec must declare the LATEST version here, so rolling `version` back to reuse an older,
+#    larger set fails.
+#  - Each version's set must be a subset of the previous version's: gaps shrink across versions.
+#    Growing them is a migration that must be named in GAP_GROWTH_MIGRATIONS with a reason.
+# Closing a gap: remove it from spec.json, bump `version`, add the smaller set here.
 KNOWN_GAPS_BASELINE = {
     1: frozenset({("gates-verify", "dashboard"), ("gates-ratify", "dashboard")}),
+    2: frozenset(),   # #1137 closed both dashboard gates gaps
 }
+GAP_GROWTH_MIGRATIONS: dict[int, str] = {}   # {version: why this version may ADD gaps}
 FAILS: list[str] = []
 
 
@@ -216,12 +222,21 @@ def main(argv: list[str]) -> int:
         unsurfaced[parse_route(u["route"])] = u
     gaps = {(g["capability"], g["surface"]) for g in spec.get("known_gaps", [])}
     version = spec.get("version")
-    baseline = KNOWN_GAPS_BASELINE.get(version)
-    check(f"spec version {version} has a known-gaps baseline in KNOWN_GAPS_BASELINE "
-          f"(a version bump must add one)", baseline is not None)
-    for g in sorted(gaps - (baseline or frozenset())):
-        check(f"known_gaps adds {g[0]}/{g[1]}, which is not in version {version}'s baseline: the "
-              f"list only shrinks -- a new gap is a migration (bump version, add its baseline)", False)
+    latest = max(KNOWN_GAPS_BASELINE)
+    check(f"spec version {version} is the latest in KNOWN_GAPS_BASELINE ({latest}): an older "
+          f"version's gap set cannot be reused", version == latest)
+    baseline = KNOWN_GAPS_BASELINE.get(version, frozenset())
+    for g in sorted(gaps - baseline):
+        check(f"known_gaps adds {g[0]}/{g[1]}, which version {version}'s baseline does not hold: the "
+              f"list only shrinks -- a new gap is a migration (new version + GAP_GROWTH_MIGRATIONS)", False)
+    for g in sorted(baseline - gaps):
+        check(f"version {version}'s baseline still holds {g[0]}/{g[1]}, which spec.json no longer lists: "
+              f"record the closure (bump version, add the smaller set) so it cannot be reopened", False)
+    versions = sorted(KNOWN_GAPS_BASELINE)
+    for prev, cur in zip(versions, versions[1:]):
+        grown = KNOWN_GAPS_BASELINE[cur] - KNOWN_GAPS_BASELINE[prev]
+        check(f"version {cur} adds gaps {sorted(grown)} over version {prev} without a named "
+              f"migration in GAP_GROWTH_MIGRATIONS", not grown or cur in GAP_GROWTH_MIGRATIONS)
 
     if "--matrix" in argv:
         print("| capability | kind | risk | " + " | ".join(surfaces) + " | routes |")

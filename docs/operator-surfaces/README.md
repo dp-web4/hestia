@@ -33,11 +33,15 @@ this file makes it checkable.
 - **`unsurfaced`**: daemon routes that deliberately have no UI, each with the reason. Examples:
   ungovern, until it is hardened; the scope floor; wallet endpoints.
 - **`known_gaps`**: `required` pairs that are missing today. **This list only shrinks, and that
-  is enforced, not promised.** The checker holds a frozen baseline per spec `version`
-  (`KNOWN_GAPS_BASELINE`), and `known_gaps` must be a subset of it. So a PR cannot add a gap
-  quietly alongside a new missing surface. Adding one is a migration: bump `version` and add that
-  version's baseline, two deliberate edits a reviewer sees. Closing a gap without removing it also
-  fails CI, so the spec cannot silently go stale in either direction.
+  is enforced, not promised** (`KNOWN_GAPS_BASELINE` in the checker):
+  - `known_gaps` must EQUAL the gap set frozen for the spec's `version`, with no slack;
+  - the spec must be at the LATEST version, so an older, larger set cannot be reused;
+  - each version's set must be a subset of the previous version's. Growing it requires a migration
+    named in `GAP_GROWTH_MIGRATIONS` with a reason.
+
+  To close a gap, remove it from spec.json, bump `version`, and add the smaller set in the checker.
+  A closed gap therefore cannot quietly reopen. `tools/operator_surfaces_ratchet_test.py` pins this,
+  including the reopening that GPT's review of #1138 reproduced.
 
 ## What the checker fails on
 
@@ -46,8 +50,9 @@ this file makes it checkable.
 2. A spec route that no longer exists in the router.
 3. A surface missing a capability it is `required` to carry (unless listed in `known_gaps`).
    Also, a surface calling a capability it is `excluded` from.
-4. A gap that has been closed but is still listed in `known_gaps`; a gap that is not in its
-   version's baseline; a version that has no baseline.
+4. The ratchet: a closed gap still listed; a gap outside its version's set; slack between
+   `known_gaps` and that set; a spec not at the latest version; a version that grows the set
+   without a named migration.
 5. A route named by two capabilities, or an `unsurfaced` route without a `why`.
 
 `python3 tools/operator_surfaces_spec_test.py --matrix` prints the capability × surface table.
