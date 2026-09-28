@@ -58,16 +58,23 @@ export async function gatesVerify(): Promise<GateReport> {
 }
 
 /**
- * Ratify every discovered gate's CURRENT bytes as the trusted build. Replaces the
- * previous expectations (last edit wins) — callers show what is replaced first.
+ * Ratify named gates' CURRENT bytes (`paths`), merging into the other gates' expectations;
+ * or, with no `paths`, every discovered gate — which the daemon accepts only when every gate
+ * is the bytes the deploy installed.
  */
 export async function gatesRatify(
   reason: string,
   expected: Record<string, string | null>,
+  paths?: string[],
 ): Promise<unknown> {
   // `expected` binds the ratification to the bytes the operator reviewed: the daemon
   // refuses (409) when the installed gates no longer match it.
-  return invoke("gates_ratify", { reason, expected });
+  return invoke("gates_ratify", { reason, expected, paths: paths ?? null });
+}
+
+/** Remove the expectations for gates this machine no longer wires, per path. */
+export async function gatesForget(reason: string, paths: string[]): Promise<unknown> {
+  return invoke("gates_forget", { reason, paths });
 }
 
 /** Who is on this box and whether it is governed. Read-only. */
