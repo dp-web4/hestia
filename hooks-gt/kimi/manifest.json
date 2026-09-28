@@ -1,0 +1,25 @@
+{
+  "unit": "kimi",
+  "member": "kimi-code",
+  "gt_version": "a9e780567babd8721dbadb85c33c6739c667aadc638aa14e997e819ffcd6ae3d",
+  "digest_rule": "sha256 over the file bytes with the 64-hex value on its `hestia-gt-sha256:` header line replaced by 64 zeros; files without a header (JSON) are plain sha256",
+  "registration": null,
+  "registration_note": "this member ships no registration template yet; its registration edge is NOT ground truth until it does",
+  "files": [
+    {
+      "path": "hooks/hydrate.sh",
+      "sha256": "4a475aa2baa0e00f4fd4091dbeff269ae93d38f587c45a13d29d44cc1296b0d0",
+      "source": "plugins/kimi/hooks/hydrate.sh"
+    },
+    {
+      "path": "hooks/observe.sh",
+      "sha256": "5820c3ce4f02ed0aba51bf89254d942e6933189e12b790ee638b6344adb578c5",
+      "source": "plugins/kimi/hooks/observe.sh"
+    },
+    {
+      "path": "hooks/pre_tool_use.py",
+      "sha256": "4a29b23902e43ed53a7fc3b53fad45ac69cf085d0bcfd4d5f2cd720a2a0dbb4d",
+      "source": "plugins/kimi/hooks/pre_tool_use.py"
+    }
+  ]
+}

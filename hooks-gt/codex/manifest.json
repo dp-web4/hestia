@@ -1,0 +1,35 @@
+{
+  "unit": "codex",
+  "member": "codex",
+  "gt_version": "57b511ed144baa95610668279cdf7aee8dd0c693b1a850fa7d4d330eb0622455",
+  "digest_rule": "sha256 over the file bytes with the 64-hex value on its `hestia-gt-sha256:` header line replaced by 64 zeros; files without a header (JSON) are plain sha256",
+  "registration": "hooks/hooks.json",
+  "registration_note": null,
+  "files": [
+    {
+      "path": "hooks/hooks.json",
+      "sha256": "a3ea58218d823ebdb203879a26edfa4134bc08ceab25aa587ae1140faf95a240",
+      "source": "plugins/codex/hooks/hooks.json"
+    },
+    {
+      "path": "hooks/hydrate.sh",
+      "sha256": "9a38550200d5e42bbcbb5d3b5100944186c06a601166d88147ae420a495c6819",
+      "source": "plugins/codex/hooks/hydrate.sh"
+    },
+    {
+      "path": "hooks/observe.sh",
+      "sha256": "ced8c660198bd6d4579e11f98f668eca4228a7b1eb2574ad00481b93c97d4fb5",
+      "source": "plugins/codex/hooks/observe.sh"
+    },
+    {
+      "path": "hooks/pre_tool_use.py",
+      "sha256": "6977c193525f3c6d41f7f2e49ed571cb6fe1759a87ae98d4f60c3caf5809b984",
+      "source": "plugins/codex/hooks/pre_tool_use.py"
+    },
+    {
+      "path": "hooks/witness.py",
+      "sha256": "084c8035b245e4d75025c77e7c3c45d2379aea6ba1dae3d37a7e50857cce061f",
+      "source": "plugins/codex/hooks/witness.py"
+    }
+  ]
+}
