@@ -300,6 +300,54 @@ def test_a_write_keeps_the_config_file_mode():
         assert r.returncode == 0 and "REGISTERED codex" in r.stdout, r.stdout + r.stderr
         assert (os.stat(cfg).st_mode & 0o777) == 0o600, oct(os.stat(cfg).st_mode & 0o777)
 
+def test_claude_code_template_registers_the_gate_and_law_inject_beside_an_existing_witness():
+    """thor 2026-09-28: settings.json carried only the PostToolUse witness (the daemon's merge) plus the
+    inventory on SessionStart; the gate and law_inject were hand edits. The shipped template must add
+    exactly those two, by basename, and leave the witness, the inventory line and unrelated keys alone."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)          # copies the REAL claude-code template
+        assert (plugins / "claude-code" / "hooks" / "hooks.json").exists(), "the claude-code template must ship"
+        cfg = tmp / ".claude" / "settings.json"
+        cfg.parent.mkdir()
+        existing = {"permissions": {"allow": ["Bash(ls:*)"]},
+                    "hooks": {"PostToolUse": [{"matcher": "*", "hooks": [
+                                  {"type": "command", "command": "python3 /elsewhere/hestia/witness.py", "timeout": 3}]}],
+                              "SessionStart": [{"hooks": [
+                                  {"type": "command", "command": "/home/u/.local/bin/hestia-agent-inventory --workspace /w --brief", "timeout": 20}]}]}}
+        cfg.write_text(json.dumps(existing, indent=2))
+        r = _run(tmp, plugins, "--member", "claude-code")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "REGISTERED claude-code: PreToolUse/pre_tool_use.py" in r.stdout, r.stdout
+        assert "REGISTERED claude-code: SessionStart/law_inject.py" in r.stdout, r.stdout
+        assert "PostToolUse/witness.py" not in r.stdout, "the witness was already registered (at another path) and must not be duplicated"
+        data = json.loads(cfg.read_text())
+        assert data["permissions"] == existing["permissions"]
+        dest = tmp / ".claude" / "hooks" / "hestia"
+        pre = [h["command"] for g in data["hooks"]["PreToolUse"] for h in g["hooks"]]
+        assert pre == [f"python3 {dest}/pre_tool_use.py"], pre
+        assert data["hooks"]["PreToolUse"][0]["matcher"] == "*"
+        posts = [h["command"] for g in data["hooks"]["PostToolUse"] for h in g["hooks"]]
+        assert posts == ["python3 /elsewhere/hestia/witness.py"], posts
+        starts = [h["command"] for g in data["hooks"]["SessionStart"] for h in g["hooks"]]
+        assert starts[0].startswith("/home/u/.local/bin/hestia-agent-inventory") and starts[1] == f"python3 {dest}/law_inject.py", starts
+        assert "@HESTIA" not in cfg.read_text()
+        r2 = _run(tmp, plugins, "--member", "claude-code")
+        assert "ok    claude-code" in r2.stdout and json.loads(cfg.read_text()) == data
+
+
+def test_claude_code_template_on_an_empty_settings_registers_all_three():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        (tmp / ".claude").mkdir()
+        r = _run(tmp, plugins, "--member", "claude-code")
+        assert r.returncode == 0, r.stdout + r.stderr
+        data = json.loads((tmp / ".claude" / "settings.json").read_text())
+        got = {ev: [h["command"].split("/")[-1] for g in gs for h in g["hooks"]] for ev, gs in data["hooks"].items()}
+        assert got == {"PreToolUse": ["pre_tool_use.py"], "PostToolUse": ["witness.py"], "SessionStart": ["law_inject.py"]}, got
+
+
 TESTS = [
     test_thor_case_registers_only_the_missing_witness,
     test_ensure_adds_the_feature_flag_when_absent,
@@ -311,6 +359,8 @@ TESTS = [
     test_a_member_without_a_template_is_named_as_still_a_hand_edit,
     test_a_failed_write_restores_what_this_run_read_not_the_first_backup,
     test_a_write_keeps_the_config_file_mode,
+    test_claude_code_template_registers_the_gate_and_law_inject_beside_an_existing_witness,
+    test_claude_code_template_on_an_empty_settings_registers_all_three,
 ]
 
 if __name__ == "__main__":
