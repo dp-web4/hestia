@@ -59,15 +59,24 @@ A mismatch at any edge is a named finding.
 
 ## 3. Requirements
 
-- **G1. One GT directory in the repo, per supported harness.** Its contents are:
+- **G1. One GT directory in the repo, per supported harness, and each member's version is its
+  complete closure.** A unit holds:
   - the hook entrypoints: gate, witness shim, observe/hydrate;
   - the **registration** (event → command template);
   - a `manifest.json`.
-  
-  The shared engine (`plugins/_shared` + `RUNTIME_MANIFEST.txt`) is part of the same published
-  artifact, per #481's invariant: *every byte and configuration edge that decides admission
-  belongs to one content-addressed artifact*. One mechanism, not a second one beside
-  `shared.builds`.
+
+  The shared engine (`plugins/_shared` + `RUNTIME_MANIFEST.txt`) is published as its own unit.
+  **Each member's manifest pins the exact engine version and every engine file digest, plus
+  every declared cross-unit file it executes** (`install.requires`; gemini runs claude-code's
+  gate as its governor). The member's `gt_version` is a content address over all of it (GPT
+  review of #1160). So:
+  - certifying a member identifies its whole decision behaviour;
+  - an engine change changes every member's version;
+  - a global `shared` link moving can never silently change an older certified member.
+
+  Members still move independently, and identical blobs are stored once (slice 2). This is
+  #481's invariant, *every byte and configuration edge that decides admission belongs to one
+  content-addressed artifact*, applied per member.
 - **G2. The published sha is in metadata, and in a header comment for humans.** A file cannot
   contain its own hash. The canonical digest is therefore sha256 over the file with its
   `hestia-gt-sha256:` header line normalised to a fixed placeholder. The manifest carries the
@@ -80,8 +89,14 @@ A mismatch at any edge is a named finding.
 - **G4. On every daemon start, the daemon populates the live hooks from local GT:** files, then
   registration. It does this through one witnessed act per member (`hooks_projected`: member,
   release, per-file sha, registration digest) and verifies the result with the existing
-  `gate_watch` pass. The projection replaces whatever is registered on the declared events. It is
-  not additive, which is the opposite of today's `register-members.py`.
+  `gate_watch` pass. **The projection replaces HESTIA-OWNED registration entries only** (GPT review
+  of 34d91a5). The declared events also carry other providers' hooks (snarc, memory services,
+  claude-flow), and those are preserved byte for byte. Ownership is decided by the same
+  provenance rules as agent-inventory (#1144) and qualified from agent-atlas. An entry whose
+  ownership is ambiguous is **not** rewritten; it is reported as a finding naming the entry.
+  Within hestia's own entries the projection is exact, not additive: a re-pointed or extra
+  hestia gate entry is replaced by the certified one. That is the opposite of today's additive
+  `register-members.py`.
 - **G5. The vault's shas change only when a member is certified.** Certification is PER MEMBER
   (§5.2): the operator certifies one member's GT version. That is today's ratify, re-aimed from
   "the bytes that happen to be installed" to "this member's GT version". The record is the GT
@@ -154,10 +169,14 @@ subprocess, edit its hook config mid-session, and see which command the next eve
 ## 6. Slices (proposed order)
 
 1. **GT manifest + header digest + CI check (G1, G2).** Pure repo work; nothing is deployed.
-2. **Local GT store (G3).** Extend `shared.builds` to the hook files and registration.
-3. **Startup projection + restore/repair from GT (G4, G6, G8).** Replaces the Discover restore's
-   token swap with the GT projection, keeps codex's command strings stable (§5a), and marks
+2. **Local GT store (G3), inert.** Extend `shared.builds` to immutable, deduplicated blobs keyed
+   by digest, with a per-member closure index. It is storage only: nothing reads it to deploy
+   until slice 4.
+3. **Certification per member (G5), before any projection is activated.** Re-aim ratify at a
+   member's GT version. The vault record is the member's closure (G1) plus the registration
+   digest. Nothing may project from an uncertified `current` link (GPT review of 34d91a5).
+4. **Startup projection + restore/repair from GT (G4, G6, G8)**, projecting only each member's
+   last CERTIFIED closure. It resolves that member's pinned engine (not the global link),
+   replaces only hestia-owned entries, keeps codex's command strings stable (§5a), and marks
    sessions of snapshot harnesses STALE.
-4. **Certification per member (G5).** Re-aim ratify at a member's GT version; the vault record grows
-   a registration digest.
 5. **The mismatch findings (G7)** and the atlas `hooks_reload` measurements (§5a). Includes #1156's de-registered-gate finding.
