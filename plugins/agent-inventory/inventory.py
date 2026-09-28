@@ -995,17 +995,54 @@ def owned_by_hestia(command: str, targets: list[str]) -> bool:
     """
     if "hestia" in command.lower():
         return True
+    declared = _declared_install_paths()
     for t in targets:
         if "hestia" in t.lower():
+            return True
+        # What hestia's installer INSTALLS is hestia's -- by path, so it holds even for a
+        # deleted file, where content cannot be asked.
+        if os.path.abspath(os.path.expanduser(t)) in declared:
             return True
         try:
             p = Path(t)
             if p.is_file() and p.stat().st_size <= 512_000:
-                if "hestia" in p.read_text(errors="replace")[:65_536].lower():
+                if HESTIA_IDENTIFIER.search(p.read_text(errors="replace")[:65_536]):
                     return True
         except OSError:
             continue
     return False
+
+
+# OWNERSHIP BY IDENTIFIER, NOT BY MENTION (dp, 2026-09-28). The test used to be `"hestia" in the
+# file's text`. snarc's PreToolUse handler says, in a comment, "tool telemetry (hestia owns that)"
+# -- so a stranger's prose about hestia made its observe-only hook HESTIA'S, and with the gate set
+# built from every gate-event hook, the operator was shown snarc's hook as one of this box's gates
+# ("claude"), and its post-tool-use hook counted as serving Claude Code's observe role -- which can
+# hide a missing witness. Every hook hestia deploys names hestia in CODE: an environment variable
+# (HESTIA_ENDPOINT, HESTIA_HOME, HESTIA_PLUGIN_ID ...) or its own modules (measured 2026-09-28 over
+# all four plugins' installed hooks: every one matches; snarc's handlers: none). Case-sensitive.
+HESTIA_IDENTIFIER = re.compile(
+    r"HESTIA_[A-Z]|hestia_gate_core|hestia_begin_action|hestia_record_outcome|hestia-observe")
+
+
+def _declared_install_paths() -> set[str]:
+    """Absolute paths of every hook file a plugin's expects.json declares installing
+    (install.dest + basename of each install.files entry). Empty if the registry is not built
+    (tests that stub it) -- ownership then falls to the identifier check alone."""
+    reg = REGISTRY
+    data_of = getattr(reg, "_expects_data", None) if reg is not None else None
+    if data_of is None:
+        return set()
+    out: set[str] = set()
+    for name in getattr(reg, "names", []) or []:
+        inst = (data_of(name) or {}).get("install")
+        if not isinstance(inst, dict) or not isinstance(inst.get("dest"), str):
+            continue
+        dest = os.path.expanduser(inst["dest"])
+        for f in inst.get("files") or []:
+            if isinstance(f, str):
+                out.add(os.path.abspath(os.path.join(dest, os.path.basename(f))))
+    return out
 
 
 # POSITIVE third-party evidence, for the one case where no other kind exists.

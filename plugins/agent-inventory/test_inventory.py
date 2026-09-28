@@ -115,9 +115,9 @@ def build(tmp: Path, extra_hooks: list[tuple[str, str]], *,
     so a difference in `governed` is attributable to the extra hook and nothing else.
     """
     gate = tmp / "hestia-gate.py"          # named so owned_by_hestia sees it by path...
-    gate.write_text("# hestia gate\nimport sys\n")
+    gate.write_text("# hestia gate\nimport os, sys\nENDPOINT = os.environ.get('HESTIA_ENDPOINT')\n")
     witness = tmp / "witness.py"           # ...and this one only by content, as deployed
-    witness.write_text("# hestia witness\n")
+    witness.write_text("# hestia witness\nfrom hestia_client import hestia_begin_action\n")
     hooks: dict[str, list] = {
         "PreToolUse": [{"hooks": [{"type": "command", "command": f"python3 {gate}"}]}],
         "PostToolUse": [{"hooks": [{"type": "command",
@@ -344,6 +344,33 @@ def test_member_states():
     check("worst of two rows for one member", both.get("m"), "miswired")
 
 
+def test_ownership_is_by_identifier_or_install_path_not_by_mention():
+    """dp, 2026-09-28: snarc's observe-only PreToolUse hook showed as one of this box's GATES,
+    labelled "claude". Its only tie to hestia is prose in a comment -- "(hestia owns that)" -- and
+    ownership was `"hestia" in the file's text`."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        stranger = tmp / "pre-tool-use.js"
+        stranger.write_text("/**\n * the reasoning text since the last tool call), not tool telemetry "
+                            "(hestia owns that). Deduped via a per-session hash\n */\nprocess.exit(0);\n")
+        check("a stranger that MENTIONS hestia is not hestia's",
+              inventory.owned_by_hestia(f"node {stranger}", [str(stranger)]), False)
+        ours = tmp / "gate.py"
+        ours.write_text("import os\nEP = os.environ.get('HESTIA_ENDPOINT')\n")
+        check("a hook that uses a hestia identifier is hestia's",
+              inventory.owned_by_hestia(f"python3 {ours}", [str(ours)]), True)
+        # A DELETED hook at a path hestia's installer declares is still hestia's: ownership by
+        # declared install path holds where content cannot be asked.
+        gone = tmp / "hooks" / "pre_tool_use.py"
+        orig = inventory._declared_install_paths
+        inventory._declared_install_paths = lambda: {str(gone)}
+        try:
+            check("a missing file at a declared install path is hestia's",
+                  inventory.owned_by_hestia(f"python3 {gone}", [str(gone)]), True)
+        finally:
+            inventory._declared_install_paths = orig
+
+
 def test_role_target():
     with tempfile.TemporaryDirectory() as d:
         _role_target_cases(Path(d))
@@ -353,7 +380,7 @@ def _role_target_cases(tmp: Path):
     declared = {"gate": ["PreToolUse"], "observe": ["PostToolUse"],
                 "targets": {"observe": ["witness.py"]}}
     observe = tmp / "observe.sh"
-    observe.write_text("#!/bin/sh\n# hestia observe-only: appends to a local file\ncat >> /dev/null\n")
+    observe.write_text("#!/bin/sh\n# hestia observe-only: appends to a local file\ncat >> \"$HOME/.x/hestia-observe/observe.jsonl\"\n")
 
     # A. the thor case: observe.sh on PostToolUse, witness.py nowhere. Must read MISWIRED
     # (dp: "when something isn't properly registered, it MUST read as miswired").
@@ -1448,6 +1475,7 @@ def teardown_module(module):
 
 if __name__ == "__main__":
     test_attribute()
+    test_ownership_is_by_identifier_or_install_path_not_by_mention()
     test_member_states()
     test_has_tag()
     test_role_target()
