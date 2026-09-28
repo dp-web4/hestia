@@ -1,0 +1,41 @@
+{
+  "_comment": "NON-RUNNABLE INSTALLATION TEMPLATE for Claude Code hooks (~/.claude/settings.json). deploy/register-members.py renders @HESTIA_PLUGIN_ROOT@/claude-code/hooks/<file> to the member's declared install dest (expects.json install.dest) and merges, by target basename, only the hooks the settings do not already carry. Unrendered placeholders must never be deployed. Shapes and timeouts mirror the registration measured on thor 2026-09-28.",
+  "_why": "Before this file, claude-code's registration was a hand edit on every host (#1133, #1135): the plugin shipped pre_tool_use.py, witness.py and law_inject.py and nothing wrote them into settings.json. The daemon's install_claude_code merges only the witness. This template is what the installer renders.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 @HESTIA_PLUGIN_ROOT@/claude-code/hooks/pre_tool_use.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 @HESTIA_PLUGIN_ROOT@/claude-code/hooks/witness.py",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 @HESTIA_PLUGIN_ROOT@/claude-code/hooks/law_inject.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
