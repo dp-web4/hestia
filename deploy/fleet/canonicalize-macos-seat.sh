@@ -17,9 +17,9 @@
 #   1. $HESTIA_HOME            -> mode 700                     (install.sh:113)
 #   2. the vault passphrase    -> $HESTIA_HOME/.passphrase, 600, moved from the plist's
 #                                 EnvironmentVariables.HESTIA_PASSPHRASE file-to-file; NEVER printed
-#   3. ProgramArguments        -> /bin/sh -c 'HESTIA_PASSPHRASE="$(cat …/.passphrase)" exec <bin> serve'
-#                                 -- the installer's form; <bin> is the binary the agent runs NOW
-#                                 (hestia-deploy's HESTIA_BIN points there; moving it is not this job)
+#   3. ProgramArguments        -> /bin/sh -c 'HESTIA_PASSPHRASE="$(cat …/.passphrase)" exec <the SAME argv>'
+#                                 -- the installer's form around the agent's own argv, every word quoted;
+#                                 the binary stays where it is (hestia-deploy's HESTIA_BIN points there)
 #   4. EnvironmentVariables    -> HESTIA_PASSPHRASE removed; everything else kept
 #   5. KeepAlive               -> {SuccessfulExit: false}: restart on a crash, not after a clean exit
 #   6. restart, wait for the daemon to answer, and ROLL BACK to the saved agent if it does not
@@ -27,7 +27,7 @@
 # The saved agent (it still holds the passphrase) is left at $HESTIA_HOME/launchd-before-canonical-*.plist,
 # mode 600 inside a 700 directory, for rollback. Delete it once you are satisfied.
 #
-# Test hooks (not for operators): CANON_AGENT_DIR, CANON_NO_RESTART=1.
+# Test hooks (not for operators): CANON_AGENT_DIR, CANON_NO_RESTART=1, CANON_LAUNCHCTL, CANON_HEALTH_TRIES.
 set -euo pipefail
 
 APPLY=0
@@ -37,7 +37,6 @@ LABEL="${HESTIA_LAUNCHD_LABEL:-com.web4.hestia.daemon}"
 AGENT_DIR="${CANON_AGENT_DIR:-$HOME/Library/LaunchAgents}"
 PLIST="$AGENT_DIR/$LABEL.plist"
 PP="$HESTIA_HOME/.passphrase"
-BIND="${HESTIA_BIND:-127.0.0.1:7711}"
 
 say()  { printf '%s\n' "$*"; }
 plan() { if [ $APPLY = 1 ]; then printf '  DO    %s\n' "$*"; else printf '  PLAN  %s\n' "$*"; fi; }
@@ -83,12 +82,41 @@ fi
 if [ -f "$PP" ] && [ "$(stat -f %Lp "$PP")" != 600 ]; then plan "chmod 600 $PP"; [ $APPLY = 1 ] && chmod 600 "$PP"; fi
 
 # ---- 3-5. the agent -----------------------------------------------------------------------
-bin=$(plutil -extract ProgramArguments.0 raw "$PLIST" 2>/dev/null || true)
-if [ "$bin" = /bin/sh ]; then
-  bin=$(plutil -extract ProgramArguments.2 raw "$PLIST" | grep -oE 'exec [^ ]+' | awk '{print $2}')
-fi
-[ -x "$bin" ] || die "cannot tell which hestia binary the agent runs (got '$bin')"
-want_args="HESTIA_PASSPHRASE=\"\$(cat $PP)\" exec $bin serve --bind $BIND"
+# The daemon's ARGV IS PRESERVED EXACTLY and every word is shell-quoted (GPT, review of #1154: the
+# first cut rebuilt it as `serve --bind <default>` -- dropping a seat's own bind or options -- and
+# interpolated paths unquoted into shell source, so a space broke it). Two shapes are understood:
+#   [<bin>, serve, <opts…>]                                   a direct exec (McNugget's)
+#   [/bin/sh, -c, 'HESTIA_PASSPHRASE="$(cat …)" exec <bin> <opts…>']   the installer's form
+# Anything else is REFUSED rather than guessed at.
+argv_json=$(plutil -extract ProgramArguments json -o - "$PLIST" 2>/dev/null) || die "no ProgramArguments in $PLIST"
+parsed=$(python3 - "$argv_json" "$PP" <<'PY'
+import json, shlex, sys
+argv, pp = json.loads(sys.argv[1]), sys.argv[2]
+if argv[:2] == ["/bin/sh", "-c"] and len(argv) == 3:
+    toks = shlex.split(argv[2])
+    if len(toks) < 3 or not toks[0].startswith("HESTIA_PASSPHRASE=$(cat ") or toks[1] != "exec":
+        sys.exit("unsupported /bin/sh -c form: not the installer's `HESTIA_PASSPHRASE=\"$(cat …)\" exec <bin> …`")
+    words = toks[2:]
+elif argv and argv[0] != "/bin/sh":
+    words = argv
+else:
+    sys.exit(f"unsupported ProgramArguments shape ({len(argv)} elements)")
+if len(words) < 2 or words[1] != "serve":
+    sys.exit(f"the agent does not run `<hestia> serve …` (got {words[:2]})")
+bind = "127.0.0.1:7711"   # `hestia serve`'s own default
+for i, w in enumerate(words):
+    if w == "--bind" and i + 1 < len(words):
+        bind = words[i + 1]
+    elif w.startswith("--bind="):
+        bind = w.split("=", 1)[1]
+line = f'HESTIA_PASSPHRASE="$(cat {shlex.quote(pp)})" exec ' + " ".join(shlex.quote(w) for w in words)
+print(words[0]); print(bind); print(line)
+PY
+) || die "cannot represent this agent's command line exactly; migrate it by hand"
+bin=$(printf '%s\n' "$parsed" | sed -n 1p)
+BIND=$(printf '%s\n' "$parsed" | sed -n 2p)
+want_args=$(printf '%s\n' "$parsed" | sed -n 3p)
+[ -x "$bin" ] || die "the agent's binary '$bin' is not executable"
 cur_args=$(plutil -extract ProgramArguments.2 raw "$PLIST" 2>/dev/null || true)
 ka_type=$(plutil -type KeepAlive "$PLIST" 2>/dev/null || echo absent)
 ka_ok=0; [ "$ka_type" = dictionary ] && [ "$(plutil -extract KeepAlive.SuccessfulExit raw "$PLIST" 2>/dev/null)" = false ] && ka_ok=1
@@ -119,16 +147,27 @@ ok "agent rewritten (backup: $backup)"
 if [ "${CANON_NO_RESTART:-0}" = 1 ]; then say "== done (restart skipped)"; exit 0; fi
 
 uid=$(id -u)
-launchctl bootout "gui/$uid/$LABEL" 2>/dev/null || true
+LAUNCHCTL="${CANON_LAUNCHCTL:-launchctl}"      # test hook: a mock that records and can fail
+TRIES="${CANON_HEALTH_TRIES:-30}"
+# ONE rollback for every way the restart can fail (GPT, review of #1154: the first cut ran the
+# new bootstrap unguarded under `set -e`, so a launchd refusal exited AFTER the old agent was
+# stopped and BEFORE the rollback -- the daemon down, the new plist in place). The saved agent is
+# restored and restarted; if launchd refuses that too, the operator is told the exact command.
+rollback() {
+  say "$1 -- ROLLING BACK to the saved agent" >&2
+  "$LAUNCHCTL" bootout "gui/$uid/$LABEL" 2>/dev/null || true
+  cp "$backup" "$PLIST"; chmod 600 "$PLIST"
+  if "$LAUNCHCTL" bootstrap "gui/$uid" "$PLIST"; then
+    die "restored and restarted the saved agent ($PLIST, mode 600 because it holds the passphrase). $PP is kept; nothing else changed."
+  fi
+  die "restored the saved agent, but launchd would not start it either. Run by hand: launchctl bootstrap gui/$uid $PLIST"
+}
+"$LAUNCHCTL" bootout "gui/$uid/$LABEL" 2>/dev/null || true
 sleep 1
-launchctl bootstrap "gui/$uid" "$PLIST"
-for _ in $(seq 1 30); do
+"$LAUNCHCTL" bootstrap "gui/$uid" "$PLIST" || rollback "launchctl bootstrap refused the rewritten agent"
+for _ in $(seq 1 "$TRIES"); do
   code=$(curl -s -m 2 -o /dev/null -w '%{http_code}' "http://$BIND/" || true)
   [ "$code" = 200 ] && { ok "daemon answers on $BIND"; say "== canonical. Delete $backup once satisfied."; exit 0; }
   sleep 1
 done
-say "the daemon did not answer on $BIND within 30s -- ROLLING BACK" >&2
-launchctl bootout "gui/$uid/$LABEL" 2>/dev/null || true
-cp "$backup" "$PLIST"; chmod 600 "$PLIST"
-launchctl bootstrap "gui/$uid" "$PLIST"
-die "rolled back to $backup (its plist is now mode 600). $PP is kept; nothing else was lost."
+rollback "the daemon did not answer on $BIND within ${TRIES}s"
