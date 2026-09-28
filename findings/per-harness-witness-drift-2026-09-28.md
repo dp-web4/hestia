@@ -81,6 +81,56 @@ event only, via `observe.sh`: the #1133 shape, still open for two harnesses.
 5. **Upstream `prompt-disposition-watch.sh`** into member-mesh for every seat, or close #366
    another way. A seat built it because the gap is real.
 
+## Decision and follow-through (same day)
+
+dp agreed all five recommendations: *"document the findings, and agreed on all 5. go ahead"*.
+Implementing them turned up four more facts. Each one changes what "one witness" had to contain.
+
+1. **Only claude-code's GATE cached the action it began.** The #977 seam has two halves. The gate
+   writes the action id under a per-call key, and the witness reads it. Only
+   `plugins/claude-code/hooks/pre_tool_use.py` ever wrote `/tmp/hestia-actions`. So copying
+   claude-code's witness to kimi (the 07-26 fork) could never have closed anything: the
+   half it needed was not in any file it copied. The fix puts the write in the shared
+   mechanism: `query_society_safety(..., correlation_key=)`. Every gate that asks the
+   daemon now caches the id through that one call.
+2. **Each harness names the call differently.** claude-code and codex send `tool_use_id`;
+   codex's `pre-tool-use.command.input` schema requires it. Kimi sends `tool_call_id`, from
+   `toolCallId: ctx.toolCall.id` in its hook runner. The fork keyed on `tool_use_id`, so it
+   fell back to the SESSION id and matched nothing. Gemini sends no call id at all, and its
+   gate hands the governor a translated event. The shared key rule takes the harness's own
+   call id first. Failing that, it derives a key from the fields both events carry, reading
+   the pre side from the untranslated `source_event`.
+3. **Kimi reports a failed call as its own event.** Kimi fires `PostToolUseFailure` instead of
+   `PostToolUse` when a call fails. Its registration put the witness on `PostToolUse` only, so
+   **no failed kimi act was ever witnessed**: 3,235 failure events sit in kimi's local observe
+   log, and none reached the chain. The core closes all three outcome events (`PostToolUse`,
+   `PostToolUseFailure` and gemini's `AfterTool`). Kimi now declares both events, served by
+   `witness.py`, so a host missing either one reads as MISWIRED.
+4. **The upstreamed disposition watch had to drop one line** (#1148). Kimi's hook told the
+   reader to `hestia gate poll <id>`. On claude-code, co-seats share a plugin id, and `poll`
+   arms the ASKER's claim window (#732). On 09-18, 6 of 6 dispositions delivered to claude-code
+   were a co-seat's. The shipped watch keeps everything else. It is interim: #366's real fix is
+   the session-addressed lane in #849 / PRD_DISPOSITION_DELIVERY R4.
+
+**What landed where:**
+
+| rec | where |
+|---|---|
+| 1. one outcome witness in the core | `plugins/_shared/hestia_witness_core.py`, holding both halves of the seam. Every harness registers a shim, `hooks/witness.py`, that is byte-identical except its identity lines. |
+| 2. ship and declare | `expects.json` for claude-code, kimi and gemini declares `targets.observe: [witness.py]`. Kimi gets a registration template, and `register-members.py` learns kimi's flat `[[hooks]] event =` layout. Gemini's installer puts the witness on `AfterTool`. |
+| 3. acceptance metric | `tools/witness_closure_census.py [--min-rate R --min-warns N]` |
+| 4. retire kimi's fork | By construction: the installer's registered path for kimi's `witness.py` IS the fork's path, so the first deploy after the merge replaces the fork with the shim. It keeps a `.pre-install.bak`. |
+| 5. upstream the disposition watch | #1148 (member-mesh, UserPromptSubmit on claude-code, kimi and codex) |
+
+**Still open, found along the way.** Gemini's gate runs the governor as
+`HESTIA_PLUGIN_ID=gemini-cli`, but the seat's projection and expects are `gemini`. The governor
+would therefore look for a `seats/gemini-cli.env` projection that does not exist. This was not
+measured live, because no gemini observe log exists on CBP.
+
+**The acceptance test after deploy:** `witness_closure_census.py --since <deploy time>` should
+move kimi-code and codex from 0% toward claude-code's 99.9%. If it does not, the finding's
+diagnosis is incomplete, which would be the next finding.
+
 ## Reproduce
 
 ```
