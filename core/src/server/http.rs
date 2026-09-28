@@ -5597,8 +5597,14 @@ async fn agent_register(
     }
     let is_being = rec.get("kind").and_then(|k| k.as_str()) == Some("being");
     let machine = report.get("machine").and_then(|m| m.as_str()).unwrap_or("").to_lowercase();
-    let from_record = rec.get("plugin").and_then(|p| p.as_str()).map(str::trim)
+    // `member` first (agent-inventory, 2026-09-28): the id the rest of hestia knows this harness
+    // by -- `install.member` in its expects.json, or the one `--member` a being's launcher names.
+    // `plugin` is the plugin DIRECTORY, which is the member id only where the two are spelled
+    // alike: registering Kimi from `plugin` minted `kimi`, a phantom beside the real `kimi-code`,
+    // and a being's record never had a `plugin`, so the launcher branch below never ran.
+    let pick = |k: &str| rec.get(k).and_then(|p| p.as_str()).map(str::trim)
         .filter(|p| !p.is_empty()).map(str::to_string);
+    let from_record = pick("member").or_else(|| pick("plugin"));
     // The record's own governance id first -- for a harness that is its hestia plugin id, for a
     // provisioned being the `--member` its launcher names. Only then the convention.
     let plugin_id = match from_record.clone() {
