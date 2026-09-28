@@ -3,6 +3,7 @@
     "BeforeTool"
   ],
   "install": {
+    "member": "gemini",
     "dest": "~/.gemini/hestia-plugins/gemini/hooks",
     "registration": {
       "reader": "json-hook-commands",

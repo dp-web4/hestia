@@ -115,13 +115,29 @@
 //!
 //! **Method, stated so it is checkable against its own evidence:** walk
 //! `core/src/**/*.rs`, SKIP each `#[cfg(test)] mod` block and resume after it
-//! (test modules are consumers of the *API*, not of *presence*), track the nearest
-//! preceding `fn` definition per line (the `fn` keyword in item position —
-//! start of line after visibility/modifier prefixes — so a comment saying
-//! "fn" can never re-key what follows; same-named fns in one file are
-//! suffixed `#2`, `#3`, … and no file in the pinned sets currently needs
-//! it), and collect the trimmed text of lines
-//! matching the symbol set, skipping the registry fns' own definition lines.
+//! (test modules are consumers of the *API*, not of *presence*), track the
+//! ENCLOSING `fn` per line (the `fn` keyword in item position — start of line
+//! after visibility/modifier prefixes — so a comment saying "fn" can never
+//! re-key what follows; same-named fns in one file are suffixed `#2`, `#3`, …),
+//! and collect the trimmed text of lines matching the symbol set, skipping the
+//! registry fns' own definition lines.
+//!
+//! *Enclosing*, corrected 2026-09-06 (#907 review). This paragraph used to say
+//! "the nearest preceding `fn` definition", and so did the code: ownership was
+//! never restored when a NESTED fn closed, so a fn's later lines were filed
+//! under its helper, and lines outside any fn were filed under whichever fn
+//! happened to precede them. It mattered the moment a governance handler grew a
+//! nested helper. On #907's branch `tool_connect` declares `fn witness_refusal`
+//! inside itself, and the census reported
+//! `handler.rs::witness_refusal: ["crate::member_registry::ensure_member("]`
+//! against an expected `handler.rs::tool_connect` — the instrument naming the
+//! wrong function for the one line whose reading it exists to schedule. Neither
+//! reading changes any pinned table on `main` (measured: all three census tests
+//! pass under both), which is the uncomfortable part — the defect was invisible
+//! to every test in this file until a nested helper appeared. The fixture arms
+//! `a_nested_helper_does_not_own_the_lines_after_it` and
+//! `repeat_fn_names_keep_their_ordinal_suffix` are what see it now: both go red
+//! under the old reading, and neither depends on the tree's current shape.
 //! The definition of `fn member_lct` (`core/src/server/state.rs:420`) does
 //! not match `.member_lct(`. Tables verified against `origin/main` at
 //! `fb6cc87` — reachable from `main`, stated deliberately: a census recorded
@@ -236,17 +252,34 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/handler.rs::gate_direct_tool", &[
         "let instance_lct = s.member_lct(&who.plugin_id);",
     ], SiteClass::Naming),
+    // RE-READ 2026-09-20 (claude-code@mcnugget, agent-lifecycle PRD R6). The three appeal sites
+    // below and `resolve_invitation` no longer compare two `member_lct`s themselves: they call
+    // `AppState::same_entity`, which is that comparison PLUS the operator's `identity_alias`
+    // records read without a window. This census went red on the change, as built -- four
+    // Predicate sites left its only symbol. Rather than let four name-gates drop out of view,
+    // the census now also keys on `.same_entity(`, and each site stays tagged Predicate with
+    // its call pinned. The comparison itself lives once, in `server/state.rs::same_entity`,
+    // pinned below: the header's "a future repair to the alias reach lands on both [pools] or
+    // is visibly missing from one" is this repair, landing on all four at once.
+    // DIRECTION, per site, unchanged in kind and now reachable: `true` EXCLUDES. At the three
+    // appeal sites a newly-true answer removes an arbiter who is the appellant under another
+    // name (the safe direction). At `resolve_invitation` it withholds an invitation from the
+    // asker's own alias -- the header's "opposite failure" -- which is correct here for the
+    // same reason: a member is not a peer reviewer of itself.
     ("server/handler.rs::tool_appeal", &[
-        "let appellant_lct = s.member_lct(&appellant.plugin_id);",
-        "match (&appellant_lct, s.member_lct(id)) {",
+        "!s.same_entity(&appellant.plugin_id, id)",
     ], SiteClass::Predicate),
     ("server/handler.rs::tool_arbitrate_appeal", &[
-        "let a = s.member_lct(&arbiter.plugin_id);",
-        "let b = s.member_lct(appellant);",
+        "let same_entity = s.same_entity(&arbiter.plugin_id, appellant);",
     ], SiteClass::Predicate),
     ("server/handler.rs::tool_open_appeals", &[
-        "let a = s.member_lct(&c.plugin_id);",
-        "let b = s.member_lct(appellant);",
+        "let same_entity = s.same_entity(&c.plugin_id, appellant);",
+    ], SiteClass::Predicate),
+    // The one place the name comparison now lives. Predicate: `la == lb` decides, and so do
+    // the alias relations beside it. A `None` on either side answers "not the same" -- an id
+    // that maps to no member is never asserted to be anyone, as `member_lct` always had it.
+    ("server/state.rs::same_entity", &[
+        "let (la, lb) = (self.member_lct(a), self.member_lct(b));",
     ], SiteClass::Predicate),
     // THIRD LINE ADDED 2026-08-07 (claude-code, #268 — the `policy_unevaluable` entry). The
     // census went red on it the moment it was written, which is the instrument working.
@@ -270,6 +303,31 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ], SiteClass::Naming),
     ("server/handler.rs::tool_record_reversal", &[
         "let subject_instance_lct = s.member_lct(&subject_plugin_id);",
+    ], SiteClass::Naming),
+    // A DELEGATE's answer to a scope request (#952, `hestia_scope_arbitrate`). A peer seat
+    // holding an operator delegation rules another member's request; these lines name the
+    // SUBJECT — the asking member — in the resulting chain entries.
+    //
+    // TWO IDENTICAL LINES, for exactly the reason recorded at `scope_decide` above and not a
+    // new one: a delegated grant is always STANDING, so it records INTENT -> COMMIT -> SUCCESS.
+    // The first names the subject in `scope_grant_intent`, the second in the `scope_granted`
+    // appended only after the vault commit lands. Either can be the last word: if the commit
+    // fails, the intent is the only account of who the widening was for.
+    //
+    // READING, both questions. (1) Who gets named? The ASKING member (`member`, taken from the
+    // stored request), never the arbiter — the arbiter is recorded separately and by name in
+    // `granted_by: "delegate:<seat>"` and `delegation_id`, so a reader can always tell a
+    // delegated ruling from an operator one. (2) Compared to decide control flow? No. The three
+    // decisions on this path are made before any of this: the signature check compares against
+    // the arbiter's REGISTRY public key (a registry read, censused separately below), NOT-SAME
+    // compares plugin_ids, and authority compares the delegation's action string to the path and
+    // member. None of them reads a value derived by `member_lct`. Naming, same class as
+    // `scope_decide` and `scope_grant`, and the HST-005 caveat holds unchanged: the request's
+    // `plugin_id` was caller-asserted when the request was filed, so this is a well-formed name
+    // derived from a self-reported id, not evidence of membership.
+    ("server/handler.rs::tool_scope_arbitrate", &[
+        "\"subject_instance_lct\": s.member_lct(&member),",
+        "\"subject_instance_lct\": s.member_lct(&member),",
     ], SiteClass::Naming),
     ("server/handler.rs::tool_witness_adjudication", &[
         "let adjudicator_instance_lct = s.member_lct(&adjudicator.plugin_id);",
@@ -422,9 +480,10 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     // still NOT a refusal, still fails OPEN, still the whitespace-only alias reach
     // (`state::tests::the_member_lct_alias_guard_reaches_only_whitespace`), so
     // over-inviting remains the safe direction it errs in.
+    // (2026-09-20: now via `same_entity`, so the alias reach is no longer whitespace-only.
+    // Still a pool filter, still not a refusal. See the re-read note at `tool_appeal`.)
     ("server/handler.rs::resolve_invitation", &[
-        ".filter(|id| match (&asker_lct, s.member_lct(id)) {",
-        "let asker_lct = s.member_lct(&esc.plugin_id);",
+        "!s.same_entity(&esc.plugin_id, id)",
     ], SiteClass::Predicate),
     // The shared attribution line, now emitted once for BOTH doors. Naming, unchanged in
     // class from when it sat inline in each. The HST-005 caveat is load-bearing here and
@@ -501,6 +560,65 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/http.rs::scope_standing_revoke", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
+    // ADDED 2026-09-15 (dp: "i want to be able to revoke a live grant, right now i can only
+    // revoke standing ones"). The LIVE twin of the site above.
+    //
+    // READING, both questions. (1) Who gets named? The subject of a `scope_revoked` chain
+    // entry — the member whose LIVE, memory-only grant an operator withdrew before it lapsed.
+    // The name is NOT operator-typed here and is tighter than its standing sibling: the call
+    // keys on `request_id`, and the member is read off the stored request, so the entry names
+    // whoever actually held the grant. (2) Compared to decide control flow? No — the
+    // revocation keys on the request id; the derived LCT is serialised into the witness and
+    // read by nothing. Naming, like its sibling.
+    ("server/http.rs::scope_live_revoke", &[
+        "\"subject_instance_lct\": s.member_lct(&req.plugin_id),",
+    ], SiteClass::Naming),
+    // ADDED 2026-09-08 (legion-claude, dp's "make standing" / "make recursive" buttons).
+    // The census went red on the full `cargo test` after `--lib` was green — the exact
+    // trap this file's header describes, and the reason the branch was not pushed on
+    // the `--lib` result.
+    //
+    // READING, both questions. (1) Who gets named? The subject of a `scope_grant_intent`
+    // and, after the vault commit, a `scope_granted` entry — the member whose LIVE grant is
+    // being made durable. TWO IDENTICAL LINES for the same reason as `scope_decide`: the
+    // intent record and the success record each name the subject, and the success is
+    // appended only after the commit landed. `plugin_id` is operator-typed here
+    // (HST-005 caveat unchanged), but a mismatch 404s on the live-grant lookup before either
+    // line runs. (2) Compared to decide control flow? No — the promotion keys on the live
+    // request's `(plugin_id, path)` strings; the derived LCT is serialised into the two
+    // witness entries and read by nothing. Naming.
+    ("server/http.rs::scope_standing_promote", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
+    // READING, both questions. (1) Who gets named? The subject of a
+    // `scope_reach_change_intent` and, after the vault commit, a `scope_reach_changed`
+    // entry — the member whose grant is being widened to its subtree or narrowed back to
+    // exact. Derived ONCE into a local and serialised into both records (GPT review of
+    // #1002, blocker 2: the first cut witnessed completion before the durable effect; the
+    // rewrite is intent -> commit -> terminal, so one derivation feeds two records).
+    // (2) Compared to decide control flow? No — keyed on `(member, path)` strings against
+    // both stores; the LCT is serialised and read by nothing. Naming.
+    ("server/http.rs::scope_standing_recursive", &[
+        "let subject = s.member_lct(&plugin_id);",
+    ], SiteClass::Naming),
+    // ADDED 2026-09-09 (cbp, the atomic `reassign` — GPT's hold on #1006). Caught by the
+    // full `cargo test` after `--lib` was green, exactly as the header warns.
+    //
+    // READING, both questions. (1) Who gets named? TWO members, in one record pair: the
+    // source (`subject_instance_lct`, the mistyped id the grant is leaving) and the
+    // destination (`destination_instance_lct`, the real seat receiving it), on both the
+    // `scope_reassign_intent` and the `scope_reassigned` entry. Both ids are operator-typed
+    // (HST-005 caveat unchanged); the destination is additionally checked against the
+    // member registry BEFORE either line runs (see this fn in REGISTRY_CENSUS), and the
+    // source is corroborated by the grant lookup 404ing on a mismatch. (2) Compared to
+    // decide control flow? No — the move keys on `(member, path)` strings in the store;
+    // both LCTs are derived once into locals, serialised into the two witness entries and
+    // read by nothing. Naming.
+    ("server/http.rs::scope_standing_reassign", &[
+        "let subject_from = s.member_lct(&from);",
+        "let subject_to = s.member_lct(&to);",
+    ], SiteClass::Naming),
     // ADDED 2026-08-15 (claude-code, the operator-originated grant `POST /api/scope/grant`).
     // The census went red the moment the site was written — the instrument working, and it
     // caught a change I had already convinced myself was verified: I had run only
@@ -517,6 +635,40 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     // (2) Compared to decide control flow? No. The derived LCT is serialised into the witness
     // entry and read by nothing; the grant keys on the `(plugin_id, path)` strings. Naming.
     ("server/http.rs::scope_grant", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
+    // ADDED 2026-09-21 (claude-code@mcnugget, agent-lifecycle R1 -- retire/reinstate). The
+    // census went red the moment the routes were written, which is the instrument working.
+    //
+    // READING, both questions. (1) Who gets named? The subject of a `member_retire_intent` /
+    // `member_retired` (and the reinstate pair) -- the member whose standing on this seat the
+    // operator just ended or restored. Weakly corroborated like `scope_grant`'s: `plugin_id`
+    // arrives in the URL path, typed or clicked by the operator, with no member ask to confirm
+    // the spelling. Unlike `scope_grant` it is not a widening -- retiring a MISSPELLED id is
+    // inert rather than dangerous, because it retires a member nobody has heard of; the
+    // dangerous misspelling is the one that hits a REAL neighbouring id, and that is what the
+    // recently-acted guard (`agent_acts_since`, 409 + `confirm_active`) exists to catch. The
+    // guard does not use this symbol: it counts the id's own `policy_decision`/`outcome`
+    // entries, so it is not a Predicate site.
+    // (2) Compared to decide control flow? No. The derived LCT is serialised into the witness
+    // record and read by nothing; the retirement store keys on the `plugin_id` STRING, and the
+    // refusals (retired-id grant, not-retired reinstate) compare that string. Naming.
+    ("server/http.rs::agent_retire", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
+    ("server/http.rs::agent_reinstate", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
+    // ADDED 2026-09-22 (claude-code@mcnugget, agent-lifecycle R5 -- delegations from the agent).
+    // READING: the subject of a `delegation_grant_intent`/`delegation_granted` (and the revoke
+    // pair). Same corroboration as retire's: the id arrives in the URL path. NOT the key the
+    // delegation binds to -- that is `agent_key_for_lct` over the registry LCT, derived one
+    // line earlier, and this derived label is serialised beside it for the reader and read by
+    // nothing. Naming.
+    ("server/http.rs::agent_delegation_grant", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
+    ("server/http.rs::agent_delegation_revoke", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
     ("server/state.rs::trust_entity_key", &[
@@ -555,11 +707,11 @@ const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
     // appellant's is dropped. Documents its own reach in `handler.rs`
     // (whitespace only — `the_member_lct_alias_guard_reaches_only_whitespace`).
     ("server/handler.rs::tool_appeal", &[
-        "(Some(a), Some(b)) => a != &b,",
+        "!s.same_entity(&appellant.plugin_id, id)",
     ]),
     // The `same_entity` arm feeding `hestia.arbitration_self`.
     ("server/handler.rs::tool_arbitrate_appeal", &[
-        "a.is_some() && a == b",
+        "let same_entity = s.same_entity(&arbiter.plugin_id, appellant);",
     ]),
     // The escalation INVITATION pool filter (#226's missing writer): a candidate whose
     // member LCT equals the asker's is not invited. Byte-identical to `tool_appeal`'s
@@ -569,14 +721,37 @@ const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
     // who should not rule; here a false "same" withholds an invitation and the peer then
     // reads as absent. Same line, opposite failure — which is why the pin is per site.
     ("server/handler.rs::resolve_invitation", &[
-        "(Some(a), Some(b)) => a != &b,",
+        "!s.same_entity(&esc.plugin_id, id)",
     ]),
     // The same arm, advisory here (`you_may_rule: false`). An advisory
     // predicate is still a predicate: it is the answer a member acts on when
     // deciding whether to file a ruling.
     ("server/handler.rs::tool_open_appeals", &[
-        "a.is_some() && a == b",
+        "let same_entity = s.same_entity(&c.plugin_id, appellant);",
     ]),
+    // THE comparison, since 2026-09-20. Three lines, because weakening any one of them is a
+    // different defect: drop the first and an unmappable id can be "the same" as another;
+    // drop the second and the whitespace reach goes; change the third and the alias relation
+    // (direct either way, or a shared target -- ONE level, never a chain) changes meaning.
+    //
+    // SPLIT 2026-09-20 (GPT seat, PR #1075). The comparison now lives in two halves and BOTH
+    // are pinned, because the defect was in the seam: `same_entity` documented "fails toward
+    // same" and returned `false` when the alias record could not be READ, and `false` is the
+    // permissive answer at every call site -- an unreadable chain would have admitted a party
+    // as its own arbiter. The unreadable arm is now `alias_relates`'s, and pinned as its own
+    // line; it has a test (`an_unreadable_alias_record_excludes_rather_than_admits`) because a
+    // working store cannot reach it.
+    ("server/state.rs::same_entity", &[
+        "if la.is_none() || lb.is_none() {",
+        "if la == lb {",
+    ]),
+    // The relation itself moved with the split, to `state.rs::alias_relates`, and is NOT
+    // pinned here -- deliberately. That fn consumes neither of this file's two symbols, so it
+    // is not a census site, and listing it would make this table a general-purpose pin board
+    // rather than the enumeration of `member_lct`/`same_entity` consumers it is. What carries
+    // it instead is stronger than a textual pin: `alias_relates` is pure, and
+    // `state::tests::an_unreadable_alias_record_excludes_rather_than_admits` exercises the
+    // unreadable arm directly (verified by sabotage -- restore the old `false` and it fails).
     // The `hestia.adjudication_self` refusal. The first conjunct compares
     // plugin_id strings (not this census's symbol); the second is the
     // name-gate, pinned.
@@ -597,8 +772,51 @@ const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
 /// That entry is the reason this table exists: the first census keying could
 /// not see it at all.
 const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
+    // #952 adds three registry READS, and all three are the safety direction: each one
+    // REFUSES when the registry does not hold the member, rather than proceeding on a name.
+    //
+    // READING for `cmd_delegate_agent_id`: presence, and it is the whole point of the verb.
+    // A delegation is keyed to a seat's LCT-derived id, so this prints what an operator must
+    // grant against. A seat absent from the registry has no id to key to, and the command
+    // says so and exits non-zero rather than emitting a plausible-looking UUID that would
+    // mint a delegation nothing could ever satisfy. Fail-CLOSED, and visibly.
+    ("cli.rs::cmd_delegate_agent_id", &[
+        "let registry = hestia::member_registry::load_members(&vault);",
+    ]),
+    // ADDED 2026-09-23 (claude-code@mcnugget, #1106 review, cbp finding 5). READING: presence,
+    // read to answer "which member is this agent KEY?" so the command can refuse a retired one.
+    // The map is one-way -- key = f(lct) -- so the reverse is a scan of the registry, done once.
+    // The HTTP doors all refused a retired id and this one did not, which made the PR's claim
+    // ("refused through this door as through every other") true of HTTP only.
+    //
+    // DEGRADATION DIRECTION: an unreadable or empty registry yields no match, and an unmatched
+    // key is DELEGATED TO rather than refused. That is the permissive direction, and it is the
+    // right one here: the key may legitimately belong to no member of this seat (a filler, a
+    // peer's agent), and refusing every key this registry cannot name would break the command
+    // for its normal use. The refusal it adds is exact -- this key IS this retired member --
+    // and the authority it gates is bounded by the delegation's own scope. If this ever becomes
+    // the only check on a consequential path, that reading must be redone.
+    ("cli.rs::cmd_delegate_grant", &[
+        "let registry = hestia::member_registry::load_members(&vault);",
+        // ADDED 2026-09-25 (#1110): a READ FOR A MESSAGE, feeding the refusal's "did you mean"
+        // exactly as the HTTP door's does. The presence check itself (`registry.get(m)`) sits
+        // in the next line and gates in the fail-closed direction -- an unreadable registry
+        // refuses every member-bound action, never mints one.
+        "let suggest: Vec<String> = registry.iter_sorted().into_iter().filter(|(id, _)| !registry.is_filler(id)).map(|(id, _)| id.clone()).collect();",
+        "let who = registry.iter_sorted().into_iter().find(|(_, lct)| {",
+    ]),
     ("cli.rs::cmd_lct_publish", &[
         "let members = hestia::member_registry::load_members(&vault);",
+    ]),
+    // READING for `cmd_scope_arbitrate`: presence, used to PREFLIGHT the signer against the
+    // key the daemon will verify with. The command holds a vault key and is about to sign a
+    // ruling; this read answers "would the daemon accept this signature for `--as <seat>`?"
+    // before anything is signed, and names the fixing command (`witness onboard`) when the
+    // answer is no. It grants nothing: the daemon repeats the check against its own registry
+    // and refuses independently. A local check that only ever turns a remote refusal into an
+    // earlier, clearer one is conservative by construction.
+    ("cli.rs::cmd_scope_arbitrate", &[
+        "let reg = hestia::member_registry::load_members(&vault);",
     ]),
     ("cli.rs::cmd_witness_attest", &[
         "let reg = hestia::member_registry::load_members(&vault);",
@@ -610,6 +828,11 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
         "for (plugin_id, lct) in members.iter_sorted() {",
     ]),
     ("server/dashboard.rs::dashboard_snapshot_from_projection", &[
+        // ADDED 2026-09-28 (claude-code@mcnugget). READING: presence, for DISPLAY -- every registry
+        // id the dashboard lists, so a member that never acted (a being awaiting its heartbeat, a
+        // phantom awaiting retirement) is visible at all. It gates nothing: an unreadable or empty
+        // registry lists fewer rows, never grants or refuses anything.
+        "let member_ids: Vec<String> = self.member_registry.iter_sorted().into_iter().map(|(id, _)| id.clone()).filter(|id| !self.member_registry.is_filler(id) && !self.is_synthetic(id)).collect();",
         "member_entities: self.member_registry.len(),",
     ]),
     // Added 2026-08-17 (codex, PR #490 NOT-SAME pass). READING, answering the question
@@ -651,8 +874,112 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     // that wrongly reports a member present — would restore exactly the silent-typo state this
     // was added to end, so if this ever becomes a gate rather than an advisory, that reading
     // must be redone.
+    //
+    // READING REDONE 2026-09-20 (claude-code@mcnugget, #1067) -- because it BECAME A GATE, which
+    // the paragraph above said would require exactly this. An unknown `plugin_id` is now
+    // refused (409, nothing written) unless the caller says `grant_ahead_of_connect: true`.
+    // Why the advisory was not enough: it was accurate and it was shown inside the success
+    // element; three typo'd grants went through on one seat in forty minutes while the real
+    // seat stayed denied, and the ids sat in the trust list as extra agents for twelve days.
+    //
+    // DEGRADATION DIRECTION, now that it gates: a registry that is empty or unreadable refuses
+    // EVERY operator-originated grant. Fail-closed and loud -- it cannot cause a grant, and the
+    // refusal says what to send instead. The cost is an operator blocked from a legitimate
+    // grant by a broken registry, so the deliberate path must be reachable from every surface
+    // that can grant: the API flag, AND the dashboard, which offers "grant ahead of first
+    // connect" on exactly this refusal (pinned in tools/grant_refusal_contract_test.py). The
+    // opposite failure -- a registry wrongly reporting a member present -- lets a typo through
+    // as before; no worse than the advisory it replaces.
+    //
+    // The second line is a READ FOR A MESSAGE: it lists recorded ids so the refusal can name
+    // the one the operator probably meant. It redirects nothing -- `nearest_member_ids` only
+    // ever feeds the error text -- so it is not a second gate.
     ("server/http.rs::scope_grant", &[
+        "let known: Vec<String> = s.member_registry.iter_sorted().into_iter().filter(|(id, _)| !s.member_registry.is_filler(id)).map(|(id, _)| id.clone()).collect();",
         "let member_known = s.member_registry.get(&plugin_id).is_some();",
+    ]),
+    // ADDED 2026-09-25 (claude-code@mcnugget, #1110 -- cbp's finding 4 on #1106). READING: the
+    // member segment INSIDE a delegated action (`scope.decide:<member>:/prefix`) is checked for
+    // presence before anything is signed. A segment naming no recorded member used to be stored,
+    // signed and witnessed as a delegation that enforced against no one (`action_covers`
+    // compares it to the asker by string equality) -- #1067's silent inertness, one layer in.
+    //
+    // DEGRADATION DIRECTION: an empty or unreadable registry REFUSES every member-bound action.
+    // Fail-closed and loud; it cannot cause a delegation, and the member-free forms
+    // (`scope.decide:/prefix`) are unaffected. A registry wrongly reporting a member present
+    // lets a typo through as before -- no worse than the silence it replaces.
+    //
+    // The first line is a READ FOR A MESSAGE, exactly as in `scope_grant`: it feeds
+    // `nearest_member_ids` for the refusal's "did you mean", and redirects nothing.
+    ("server/http.rs::agent_delegation_grant", &[
+        "let suggest: Vec<String> = s.member_registry.iter_sorted().into_iter().filter(|(id, _)| !s.member_registry.is_filler(id)).map(|(id, _)| id.clone()).collect();",
+        "let unvalidated = match crate::delegation::check_actions(&actions, &|m| s.member_registry.get(m).is_some(), &suggest) {",
+    ]),
+    // ADDED 2026-09-21 (claude-code@mcnugget, agent-lifecycle R4 -- register). The census went
+    // red on the route the moment it was written.
+    //
+    // READING: this is a PRODUCER, the second after `tool_connect`'s mint and the first that is
+    // an operator act rather than a consequence of a member showing up. Both reads are in the
+    // safety direction:
+    //   * `get(..).is_some()` -> already a member: return 200 having minted NOTHING and
+    //     witnessed nothing. Idempotent, so a double-click cannot make two records of one id.
+    //   * `ensure_member(..)` -> the mint itself. Fail-CLOSED where it can be: a synthetic or
+    //     empty id yields None and the route answers 409 with nothing registered.
+    // What makes a producer safe here is upstream of the registry and NOT visible in this
+    // table: the id is DERIVED from the inventory record and never taken from the caller (a
+    // body carrying `plugin_id` is refused outright), and an atlas id absent from this
+    // machine's report registers nothing. That is the property to re-read if this route ever
+    // accepts an id -- at which point it becomes #1067 with a mint attached.
+    ("server/http.rs::agent_register", &[
+        "crate::member_registry::ensure_member(",
+        "if s.member_registry.get(&plugin_id).is_some() {",
+    ]),
+    // ADDED 2026-09-22 (claude-code@mcnugget, agent-lifecycle R5 -- delegations). READING:
+    // presence, used to DERIVE the delegation key (`agent_key_for_lct` over the registry LCT)
+    // -- so a member the registry has not recorded gets 404 and no delegation, which is #952's
+    // rule: a delegation binds to an identity derived from a public key, never to a name.
+    // Fail-CLOSED: no registry entry, no key, no grant. The revoke route reads it for the same
+    // derivation, to check the delegation being struck belongs to THIS agent. And
+    // `commit_retirement` reads it to find which delegations a retiring member holds -- a
+    // member with no LCT has none, so the absent case is correctly a no-op there.
+    ("server/http.rs::delegation_key_for", &[
+        "let Some(lct) = s.member_registry.get(plugin_id) else {",
+    ]),
+    ("server/http.rs::agent_delegation_revoke", &[
+        "let Some(lct) = s.member_registry.get(&plugin_id).map(|l| l.lct_id()) else {",
+    ]),
+    ("server/state.rs::commit_retirement", &[
+        "if let Some(lct) = self.member_registry.get(member).map(|l| l.lct_id()) {",
+    ]),
+    // ADDED 2026-09-09 (cbp, the atomic `reassign`). READING: presence, used as a GATE, not
+    // an advisory — the one thing the `scope_grant` reading above said would need its own
+    // reading if it ever happened. An unknown destination is refused with 400 before any
+    // durable mutation. Why a gate is right here and an advisory was right there: `scope_grant`
+    // may legitimately grant AHEAD of a member's first connect, so it warns; `reassign` exists
+    // only to repair a grant made to a member nobody has seen, and a reassign to another
+    // unseen id would recreate that state under a new name, so it refuses.
+    //
+    // DEGRADATION DIRECTION: an empty or unreadable registry refuses every reassign — the
+    // operator is told "not a member this daemon has recorded" and falls back to revoke +
+    // grant, which still warns. Nothing is moved and nothing is silently trusted: the loud,
+    // narrow direction. The opposite failure (a registry wrongly reporting presence) would
+    // let a grant move to a phantom, which is exactly what the source grant already was —
+    // no worse than the state being repaired, and visible on the row it produces.
+    ("server/http.rs::scope_standing_reassign", &[
+        "if s.member_registry.get(&to).is_none() {",
+    ]),
+    // ADDED 2026-09-09 (cbp, #998 display alias). READING: presence, used as a GATE on a
+    // PRESENTATION write — a display alias may not be another member's real id, or the
+    // console would show one member under another's name (the #1007 typo class from the
+    // other side). No authority is involved: the alias store is read by the console only,
+    // never by anything witnessed, and the refusal protects what a human sees.
+    //
+    // DEGRADATION DIRECTION: an empty or unreadable registry accepts any alias, including a
+    // real member's id — the console could then mislabel, and nothing else changes: no grant,
+    // no row, no reach. The wrong direction would be a registry that refuses every alias,
+    // which merely leaves ids on screen. Both are cosmetic, which is the point of the design.
+    ("server/http.rs::ui_alias_set", &[
+        "if !alias.is_empty() && alias != plugin_id && s.member_registry.get(&alias).is_some() {",
     ]),
     // Added 2026-08-17 (codex, PR #490 NOT-SAME pass). READING, answering the question
     // this table schedules — **is this a safety use of presence?**
@@ -700,6 +1027,25 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("server/handler.rs::tool_appeal", &[
         ".iter_sorted()",
         ".member_registry",
+    ]),
+    // READING for `tool_scope_arbitrate` (#952): presence, and SAFETY-BEARING — this is the
+    // strongest use of the registry in the tree, so it is logged rather than waved through.
+    //
+    // Both lines read the ARBITER, never the asker. The first derives the arbiter's LCT id to
+    // key the delegation lookup; the second takes its LCT to verify the ruling's signature
+    // against the binding key, or an operational key that binding key vouched. A seat absent
+    // from the registry is REFUSED by name (`scope_arbitrate_unregistered_arbiter`) and no
+    // grant is minted — the fail-CLOSED direction, unlike `resolve_invitation` above, where
+    // absence silently shrinks a pool.
+    //
+    // Why this matters more here than anywhere else in this table: `hestia_connect`
+    // authenticates nobody (#63/#128), so a session's `plugin_id` is asserted. This is the one
+    // MCP door that mints a STANDING grant, and the registry public key is what turns an
+    // asserted name into a checked signature. If this read ever became advisory, the durable
+    // widening would rest on a name a caller typed. It must stay a refusal.
+    ("server/handler.rs::tool_scope_arbitrate", &[
+        "let Some(arbiter_lct_id) = s.member_registry.get(&arb.plugin_id).map(|l| l.lct_id()) else {",
+        "let Some(lct) = s.member_registry.get(&arb.plugin_id) else {",
     ]),
     ("server/handler.rs::tool_connect", &[
         "crate::member_registry::ensure_member(",
@@ -840,6 +1186,24 @@ fn fn_item_name(line: &str) -> Option<String> {
 /// Walk `src`, and for every line matching `symbols` (in the production
 /// prefix, skipping registry fn definition lines when `skip_defs`) record
 /// its trimmed text under `(file, enclosing fn)`.
+///
+/// ENCLOSING, not most-recently-declared (#907 review, 2026-09-06). The first version set
+/// `current_fn` to the last `fn` token it had seen and never restored it, so a fn's ownership
+/// of its own lines ended at the first NESTED fn inside it — every consumer line after that
+/// point was filed under the helper. On #907's branch that is not hypothetical: `tool_connect`
+/// declares a nested `fn witness_refusal`, and the pinned table it produces says the nested
+/// helper calls `crate::member_registry::ensure_member(` while `tool_connect` does not. Both
+/// halves are false, and this table's whole job is to schedule a human's reading of exactly
+/// that line ("is this a safety use of presence?"). A table that names the wrong function
+/// sends the reading to the wrong place, and blessing it writes the error into the pin.
+///
+/// Ownership is tracked by INDENTATION, the same item-position discipline `production_lines`
+/// uses to find the test module's closing brace, and for the same reason: it needs no Rust
+/// parser and it is exact on rustfmt-formatted code, where a fn's closing brace sits at the
+/// column of its `fn`. A stack of `(name, indent)` opens on a fn item line and closes on a
+/// `}` at or left of that indent. The assumption is stated because it is falsifiable: hand-
+/// formatted code that closes a fn at the wrong column would mis-scope, and `cargo fmt --check`
+/// is the guard that keeps that out of this tree.
 fn census(symbols: &[&str], skip_defs: bool) -> BTreeMap<String, Vec<String>> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
@@ -855,14 +1219,9 @@ fn census(symbols: &[&str], skip_defs: bool) -> BTreeMap<String, Vec<String>> {
             .to_str()
             .expect("utf-8 path")
             .replace('\\', "/");
-        let mut current_fn = "(top-level)".to_string();
-        let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-        for line in production_lines(&text) {
-            if let Some(name) = fn_item_name(line) {
-                let n = seen.entry(name.clone()).or_insert(0);
-                *n += 1;
-                current_fn = if *n == 1 { name } else { format!("{name}#{n}") };
-            }
+        let lines = production_lines(&text);
+        for (line, current_fn) in lines.iter().zip(fn_owners(&text)) {
+            let line = *line;
             if !symbols.iter().any(|s| line.contains(s)) {
                 continue;
             }
@@ -901,22 +1260,285 @@ fn fn_production_lines(rel: &str, want_fn: &str) -> Vec<String> {
     let text = fs::read_to_string(src.join(rel))
         .unwrap_or_else(|e| panic!("read {rel}: {e}"));
     let want = want_fn.split('#').next().unwrap_or(want_fn);
-    let mut current_fn = "(top-level)".to_string();
+    production_lines(&text)
+        .iter()
+        .zip(fn_owners(&text))
+        .filter(|(_, owner)| owner.split('#').next().unwrap_or(owner) == want)
+        .map(|(line, _)| line.trim().to_string())
+        .collect()
+}
+
+/// The ENCLOSING fn of every production line of `text`, in the order `production_lines`
+/// returns them — the whole of this file's lexical-ownership reading, in one place both
+/// consumers call, so a sabotage arm can drive it on a fixture rather than on the tree.
+///
+/// A fn opens on its item line and closes on a `}` at or left of that line's column. The
+/// closing brace itself is attributed to the PARENT (the pop runs before the line is read),
+/// which is what makes a fn's last line its own and the line after it the parent's.
+///
+/// Repeat names get the `#N` suffix the tables use, counted per file in item order.
+fn fn_owners(text: &str) -> Vec<String> {
+    let mut stack: Vec<(String, usize)> = Vec::new();
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     let mut out = Vec::new();
-    for line in production_lines(&text) {
+    for line in production_lines(text) {
+        let indent = indent_of(line);
+        let code = code_before_comment(line);
+        if code == "}" {
+            while stack.last().is_some_and(|(_, w)| *w >= indent) {
+                stack.pop();
+            }
+        }
         if let Some(name) = fn_item_name(line) {
-            current_fn = name;
+            // A DECLARATION OPENS NO SCOPE. `fn malloc_trim(pad: usize) -> c_int;` in an
+            // `extern "C"` block, and a trait's method signatures, have no body, so pushing
+            // them starts a scope nothing closes until an enclosing brace does — every line
+            // after such a declaration would be filed under it (#975 review). Two live today
+            // (`vault/storage.rs::flock`, `server/http.rs::malloc_trim`), neither followed by
+            // a pinned symbol, so no table moves either way; the fixture arm is what holds it.
+            // Bounded honestly: a declaration whose signature WRAPS to several lines does not
+            // end in `;` on its item line and still opens a scope, closed by the block around
+            // it. None exist here; if one appears, this is where it is handled.
+            if !code.ends_with(';') {
+                // The `#N` ordinal counts scopes that can own a line, so adding an extern
+                // declaration cannot renumber the real fns the tables key on.
+                let n = seen.entry(name.clone()).or_insert(0);
+                *n += 1;
+                let display = if *n == 1 { name } else { format!("{name}#{n}") };
+                stack.push((display, indent));
+            }
         }
-        if current_fn == want {
-            out.push(line.trim().to_string());
-        }
+        out.push(
+            stack
+                .last()
+                .map(|(n, _)| n.clone())
+                .unwrap_or_else(|| "(top-level)".to_string()),
+        );
     }
     out
 }
 
+/// Leading-space count. This tree is `cargo fmt`-formatted and uses no tabs; a tab would
+/// count as one column, which mis-scopes rather than crashes. The arms below assert the
+/// property on realistic formatting rather than trusting this note.
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// The line with any trailing `//` comment and inline `/* … */` spans removed, trimmed.
+///
+/// USED ONLY TO CLASSIFY THE LINE — does it close a scope, is it a bodyless declaration —
+/// never to decide whether a line matches the symbol set. The tables pin the trimmed text of
+/// call-site lines exactly as written, comments included, and stripping there would move every
+/// pinned line that carries one.
+///
+/// The `//` cut is naive about string literals, and that is safe HERE for a reason worth
+/// stating: a wrong cut can only shorten the line, and the two questions asked of the result
+/// are "is it exactly `}`" and "does it end in `;`". `println!("//");` cuts to `println!("`,
+/// which answers no to both, as it should. What the cut buys is the case that matters:
+/// `}  // end of the helper` is a closing brace, and the first version of this reader — which
+/// compared the whole trimmed line to `}` — left that fn open forever (#975 review, GPT).
+fn code_before_comment(line: &str) -> String {
+    let mut s = line.to_string();
+    while let Some(a) = s.find("/*") {
+        match s[a..].find("*/") {
+            Some(b) => s.replace_range(a..a + b + 2, ""),
+            None => {
+                s.truncate(a);
+                break;
+            }
+        }
+    }
+    if let Some(i) = s.find("//") {
+        s.truncate(i);
+    }
+    s.trim().to_string()
+}
+
+/// SABOTAGE ARM (#907 review, 2026-09-06). The reading this file needs is *enclosing* fn, and
+/// the cheap reading — "the last `fn` token I saw" — is indistinguishable from it on a file
+/// with no nested fns, which is most files. It is not indistinguishable on `tool_connect`,
+/// which declares `fn witness_refusal` inside itself: under the cheap reading every consumer
+/// line after that helper is filed under the helper, so the table asserts that a nested
+/// closure-shaped helper mints members and that the connect handler does not. Measured on
+/// #907's branch: the registry census went red naming
+/// `handler.rs::witness_refusal: ["crate::member_registry::ensure_member("]` against an
+/// expected `handler.rs::tool_connect`, and blessing that table would have written the false
+/// attribution into the pin.
+///
+/// Each assertion below is FALSIFIED by the cheap reading, so this test fails if the tracker
+/// regresses to it — that is the arm, not the coverage.
+#[test]
+fn a_nested_helper_does_not_own_the_lines_after_it() {
+    let src = "\
+fn outer() {
+    let reg = &state.member_registry;
+    fn helper(x: u8) -> u8 {
+        x + 1
+    }
+    crate::member_registry::ensure_member(reg);
+}
+
+pub struct State {
+    pub member_registry: MemberRegistry,
+}
+
+impl State {
+    fn open() -> Self {
+        Self { member_registry: MemberRegistry::new() }
+    }
+}
+";
+    let lines = production_lines(src);
+    let owners = fn_owners(src);
+    assert_eq!(lines.len(), owners.len(), "one owner per production line");
+    let owner_of = |needle: &str| -> String {
+        let i = lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("fixture line {needle:?} not found"));
+        owners[i].clone()
+    };
+
+    // THE MEASURED CASE. Under the cheap reading this is "helper".
+    assert_eq!(
+        owner_of("ensure_member(reg)"),
+        "outer",
+        "a line after a nested fn still belongs to the fn that lexically contains it"
+    );
+    // The nested fn still owns its own body.
+    assert_eq!(owner_of("x + 1"), "helper");
+    // The line before it was never in doubt, and must not become collateral.
+    assert_eq!(owner_of("&state.member_registry"), "outer");
+    // Items outside any fn belong to no fn. Under the cheap reading this is "helper" too:
+    // a struct field filed under a function is how a pinned table grows a member it can
+    // never explain.
+    assert_eq!(
+        owner_of("pub member_registry: MemberRegistry"),
+        "(top-level)",
+        "a struct field belongs to no fn"
+    );
+    // A method inside an impl opens and closes like any other fn.
+    assert_eq!(owner_of("Self { member_registry"), "open");
+    // Nothing is left open at the end of a balanced file.
+    assert_eq!(owners.last().map(String::as_str), Some("(top-level)"));
+}
+
+/// A nested fn closed by `} // comment` is closed (#975 review, GPT). rustfmt keeps a trailing
+/// comment on a closing brace, so this is valid formatting the first reader mis-read: it
+/// compared the whole trimmed line to `}`, found `} // done`, and left the helper open — the
+/// same false ownership the enclosing-fn repair exists to end, reintroduced by punctuation.
+///
+/// LATENT, measured: zero production `}` lines in this tree carry a trailing comment (main
+/// 40cf00de and `legion/connect-pop` 957e3fe, both 0). So no pinned table can hold this — a
+/// tree-derived pin cannot see a shape the tree does not contain, which is exactly why the
+/// acceptance rule for these readers is a synthetic fixture that makes the cheap
+/// implementation disagree with the intended one.
+#[test]
+fn a_closing_brace_with_a_trailing_comment_still_closes_its_fn() {
+    let src = "\
+fn outer() {
+    fn helper() {
+        let inner = a.member_registry;
+    } // the helper ends here, and rustfmt keeps this comment
+    crate::member_registry::ensure_member(reg);
+    let after = b.member_registry;
+} /* and a block comment closes the outer one */
+
+pub struct S {
+    pub member_registry: R,
+}
+";
+    let lines = production_lines(src);
+    let owners = fn_owners(src);
+    let owner_of = |needle: &str| {
+        owners[lines.iter().position(|l| l.contains(needle)).expect("fixture line")].clone()
+    };
+    assert_eq!(owner_of("let inner"), "helper");
+    // Both FAIL when the pop test is `line.trim() == "}"`: the helper never closes.
+    assert_eq!(
+        owner_of("ensure_member(reg)"),
+        "outer",
+        "a closing brace with a trailing comment closes the helper, so the parent owns what follows"
+    );
+    assert_eq!(owner_of("let after"), "outer");
+    assert_eq!(
+        owner_of("pub member_registry: R"),
+        "(top-level)",
+        "and a closing brace with a block comment closes the outer fn"
+    );
+}
+
+/// A bodyless `fn …;` opens no scope (#975 review, GPT). `extern "C"` blocks and trait method
+/// signatures declare functions that own no lines; pushing one starts a scope that only an
+/// enclosing brace can close, so every line after it is filed under a function that has no
+/// body to contain them.
+///
+/// LIVE but currently harmless, measured on main: two such items (`vault/storage.rs::flock`,
+/// `server/http.rs::malloc_trim`), neither followed by a pinned symbol inside its block, so
+/// the tables are identical either way. Recorded as a count rather than a reassurance.
+#[test]
+fn a_bodyless_fn_declaration_opens_no_scope() {
+    let src = "\
+extern \"C\" {
+    fn malloc_trim(pad: usize) -> c_int;
+}
+
+static REG: Registry = Registry::new();
+
+fn real() {
+    let x = s.member_registry;
+}
+";
+    let lines = production_lines(src);
+    let owners = fn_owners(src);
+    let owner_of = |needle: &str| {
+        owners[lines.iter().position(|l| l.contains(needle)).expect("fixture line")].clone()
+    };
+    // FAILS when a declaration pushes: the static, and the `}` closing the extern block,
+    // are filed under `malloc_trim`.
+    assert_eq!(
+        owner_of("static REG"),
+        "(top-level)",
+        "an item after a bodyless declaration belongs to no fn"
+    );
+    assert_eq!(owner_of("let x"), "real", "and the next real fn owns its own body");
+    assert!(
+        !owners.iter().any(|o| o == "malloc_trim"),
+        "a declaration owns no line at all: {owners:?}"
+    );
+}
+
+/// The `#N` suffix is per NAME per file and survives the stack, so two same-named nested
+/// helpers stay distinguishable — the tables key on the suffixed form. The ordinal counts
+/// scopes that can own a line, so a bodyless declaration sharing a name with a real fn does
+/// not renumber it (the wrapper-over-`extern` shape, which this tree has).
+#[test]
+fn repeat_fn_names_keep_their_ordinal_suffix() {
+    let src = "\
+fn a() {
+    fn dup() {
+        let one = x.member_registry;
+    }
+    let mid = y.member_registry;
+    fn dup() {
+        let two = z.member_registry;
+    }
+}
+";
+    let lines = production_lines(src);
+    let owners = fn_owners(src);
+    let owner_of = |needle: &str| {
+        owners[lines.iter().position(|l| l.contains(needle)).expect("line")].clone()
+    };
+    assert_eq!(owner_of("let one"), "dup");
+    assert_eq!(owner_of("let mid"), "a", "the parent resumes between the two helpers");
+    assert_eq!(owner_of("let two"), "dup#2");
+}
+
 #[test]
 fn member_lct_consumer_census_is_exact() {
-    let found = census(&[".member_lct("], false);
+    let found = census(&[".member_lct(", ".same_entity("], false);
     let projected: Vec<(&str, &[&str])> = MEMBER_LCT_CENSUS
         .iter()
         .map(|(k, v, _)| (*k, *v))

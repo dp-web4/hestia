@@ -68,6 +68,13 @@ MIN_POLL_SLEEP_MS = 50
 PROTOCOL_VERSION = 1
 DEFAULT_HESTIA_HOME = Path.home() / ".hestia"
 
+#: The capability a member names in `gate_capabilities` at `hestia_connect` when it holds
+#: `hestia_gate_escalation_corroborate` — the only door that adds a factor to an escalation.
+#: The daemon's invitation pool reads exactly this string (`handler.rs REVIEW_CAPABILITY`,
+#: #1050); the two spellings are pinned together by
+#: `hestia_gate_mechanism_test.py::the_review_capability_spelling_matches_the_daemons`.
+REVIEW_CAPABILITY = "escalation-review:v1"
+
 _RECOGNIZED_DECISIONS = ("allow", "warn", "deny")
 
 
@@ -200,6 +207,58 @@ def _discover_endpoint() -> Optional[str]:
         return None
 
 
+#: A shell act's `target` is the command itself, bounded for chain hygiene. The bound is the
+#: one the claude Post-hook witness used for the same field for five weeks (240).
+TARGET_MAX = 240
+
+#: The same give-away shapes the daemon masks in `attempted` (handler.rs `redact_secrets`).
+#: Shape-based and conservative on purpose: mask the VALUE after a credential-ish flag or
+#: assignment, keep the key so the reader still learns which knob was set, and leave the
+#: rest legible — the point of storing the command is that a human can read it.
+_MASKED_KEYS = ("password", "passwd", "secret", "token", "api_key", "apikey", "api-key",
+                "auth", "authorization", "bearer", "credential", "private_key", "passphrase",
+                "access_key", "session_key", "client_secret")
+
+
+def _mask_credential_values(command: str) -> str:
+    """Defence in depth on the SENDING side: the daemon scrubs whatever it is handed, and
+    the sender is closer to the payload. Same two passes as the daemon: `--token=VALUE` /
+    `TOKEN=VALUE` keep the key and mask the value; `--token VALUE` masks the next token.
+    Whitespace collapses to single spaces, as the daemon's pass does."""
+    first = []
+    for tok in command.split():
+        if "=" in tok:
+            key = tok.split("=", 1)[0]
+            if any(s in key.lstrip("-").lower() for s in _MASKED_KEYS):
+                first.append(key + "=***")
+                continue
+        first.append(tok)
+    out, mask_next = [], False
+    for tok in first:
+        if mask_next and not tok.startswith("-"):
+            out.append("***")
+            mask_next = False
+            continue
+        mask_next = tok.lstrip("-").rstrip(":").lower() in _MASKED_KEYS
+        out.append(tok)
+    return " ".join(out)
+
+
+def _shell_target(command: str) -> str:
+    """The command, masked and bounded — not its first word.
+
+    Until 2026-09-07 the chain feed showed every shell act's arguments, because the claude
+    Post hook opened a second action whose `target` was the full command ("for forensic
+    readability in the chain feed"). #977 made the outcome close the action the gate
+    authorized instead — the right act identity — and the outcome row inherited THIS
+    function's target, which was `cmd.split()[0]`. Every argument vanished from the feed in
+    one deploy and the operator noticed within a day. The daemon's own comment on the
+    policy row says `target` "already carries the command for Bash/Shell by overloading";
+    this makes that true at the one place every seat's shell target is made."""
+    masked = _mask_credential_values(command.strip())
+    return masked if len(masked) <= TARGET_MAX else masked[:TARGET_MAX - 3] + "..."
+
+
 def _extract_target(tool_input: Any, tool_name: str) -> Optional[str]:
     if not isinstance(tool_input, dict):
         return None
@@ -214,7 +273,7 @@ def _extract_target(tool_input: Any, tool_name: str) -> Optional[str]:
     if isinstance(tool_name, str) and tool_name.lower() in {"bash", "shell"}:
         cmd = tool_input.get("command")
         if isinstance(cmd, str) and cmd.strip():
-            return cmd.split()[0]
+            return _shell_target(cmd)
     return None
 
 
@@ -379,14 +438,8 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
         verdict.action_id = action_id  # correlation key for the caller's outcome cache
         return verdict
     except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
-        reason = getattr(e, "reason", None)
-        if isinstance(reason, TimeoutError) or isinstance(e, (TimeoutError, socket.timeout)):
-            cause = "timeout"
-        elif isinstance(reason, ConnectionRefusedError):
-            cause = "refused"
-        else:
-            cause = "unknown"
-        return _no_verdict(plugin_id, tool_name, cause, f"network: {type(e).__name__}")
+        return _no_verdict(plugin_id, tool_name, _unavailable_cause(e),
+                           f"network: {type(e).__name__}")
     except Exception as e:  # noqa: BLE001 — FAIL-CLOSED: any unexpected error is no-verdict, never allow
         return _no_verdict(plugin_id, tool_name, "unknown", f"unexpected: {type(e).__name__}")
 
@@ -545,7 +598,17 @@ def _workspace_root() -> str:
         return env if env and os.path.isdir(env) else os.getcwd()
 
 
-def _scope_entry_for_grant(path: str) -> str:
+# Reach travels IN the spelling, so an older consumer fails CLOSED on it (2026-09-08):
+# `path:/x/**` names a subtree; `path:/x` names exactly /x. An old gate that does not know
+# `/**` resolves it as a literal root that nothing descends from, so a recursive grant is
+# inert there rather than wide — and its bare `path:` entries keep the old prefix behaviour
+# until the gate is updated. Deploy order is therefore safe in both directions; the only
+# thing an update changes is that bare `path:` grants tighten to EXACT on that box, which is
+# the default dp asked for. Flip the grants that need a subtree BEFORE updating a box's gate.
+RECURSIVE_SUFFIX = "/**"
+
+
+def _scope_entry_for_grant(path: str, recursive: bool = False) -> str:
     """A granted path becomes the `in_scope` spelling the core can actually honour —
     the ONE mapping, used by live and standing grants alike (GPT #431 blocker 4;
     subsumes #430's inline live-grant fix).
@@ -560,9 +623,18 @@ def _scope_entry_for_grant(path: str) -> str:
     p = os.path.realpath(os.path.expanduser(path.strip()))
     ws = os.path.realpath(os.path.expanduser(_workspace_root()))
     par, name = os.path.split(p.rstrip("/"))
-    if par == ws and name:
+    if par == ws and name and recursive:
+        # A repo NAME is a whole-repo entry by construction — the core's segment-keyed
+        # model admits the repo and everything in it. So ONLY a RECURSIVE grant on a
+        # workspace-direct root may take that form. The first cut mapped every such root
+        # to the name regardless of `recursive`, which silently widened an EXACT grant on
+        # /ws/repo into the whole repo at the gate while the daemon's covers_path() said it
+        # reached /ws/repo alone — the daemon/gate disagreement this change exists to end,
+        # recreated for the most common directory shape (GPT review of #1002, blocker 1).
+        # An exact grant on a repo root stays the faithful `path:` form, which the core
+        # matches at exactly that boundary. Declarative `repo:` scope is untouched.
         return name
-    return "path:" + path.strip()
+    return "path:" + path.strip().rstrip("/") + (RECURSIVE_SUFFIX if recursive else "")
 
 
 #: One fetch per gate invocation — gate processes are short-lived, so a per-process cache
@@ -576,7 +648,12 @@ def fetch_policy_snapshot(plugin_id, **kw):
     session-start hook herd overlapping the first tool calls — codex, 2026-08-14),
     not a down daemon. A 250ms-backoff second attempt absorbs the blip; a genuinely
     unreachable daemon still returns None inside one extra budget and the ratified
-    degraded mode proceeds. Never raises (same contract as the single attempt)."""
+    degraded mode proceeds. Never raises (same contract as the single attempt).
+
+    `declares_review_door=True` is the CALLER asserting it holds
+    `hestia_gate_escalation_corroborate` — see `_fetch_policy_snapshot_uncached`. Default
+    False: a library cannot know its caller's effectors, and the truthful default for a
+    capability self-report is silence."""
     snap = _fetch_policy_snapshot_once(plugin_id, **kw)
     if snap is not None:
         return snap
@@ -590,7 +667,8 @@ def fetch_policy_snapshot(plugin_id, **kw):
 
 def _fetch_policy_snapshot_once(plugin_id: str, *, host_agent: Optional[str] = None,
                           host_session_id: Optional[str] = None,
-                          use_cache: bool = True) -> Optional[dict]:
+                          use_cache: bool = True,
+                          declares_review_door: bool = False) -> Optional[dict]:
     """Fetch this member's policy snapshot from the daemon, in-process. NEVER raises.
 
     None  -> the daemon is unreachable / did not authenticate the session (no sessionId):
@@ -604,27 +682,56 @@ def _fetch_policy_snapshot_once(plugin_id: str, *, host_agent: Optional[str] = N
              AgentPolicy it returns, and refuses the snapshot outright past its horizon."""
     if use_cache and plugin_id in _POLICY_SNAPSHOT_CACHE:
         return _POLICY_SNAPSHOT_CACHE[plugin_id]
-    snap = _fetch_policy_snapshot_uncached(plugin_id, host_agent, host_session_id)
+    snap = _fetch_policy_snapshot_uncached(plugin_id, host_agent, host_session_id,
+                                           declares_review_door=declares_review_door)
     if use_cache and snap is not None:
         _POLICY_SNAPSHOT_CACHE[plugin_id] = snap
     return snap
 
 
-def _snapshot_unavailable(plugin_id: str, cause: str) -> None:
+def _unavailable_cause(e: BaseException) -> str:
+    """ONE classifier for "why could the daemon not be consulted", shared by the verdict path
+    and the snapshot path: "timeout" (alive but starved: back off and retry), "refused"
+    (nothing listening: stop and escalate), "unknown" (say so rather than guess). The
+    telemetry writer normalises anything else to "unknown", so a caller that passes a
+    free-text reason where the cause goes has silently thrown the diagnosis away — which is
+    exactly what the snapshot path did for a month (every record read "unknown" while the
+    detail said TimeoutError)."""
+    reason = getattr(e, "reason", None)
+    if isinstance(reason, (TimeoutError, socket.timeout)) or isinstance(e, (TimeoutError, socket.timeout)):
+        return "timeout"
+    if isinstance(reason, ConnectionRefusedError) or isinstance(e, ConnectionRefusedError):
+        return "refused"
+    return "unknown"
+
+
+def _snapshot_unavailable(plugin_id: str, detail: str, cause: str = "unknown") -> None:
     """Field telemetry for a failed snapshot fetch (never raises): the 2026-08-14 codex
     dropouts were unreproducible from another seat precisely because every failure path
     collapsed to a causeless None — a 'daemon unreachable' that could be refused/timeout/
-    port-exhaustion/EPERM. Each is a different fix; the log now says which."""
+    port-exhaustion/EPERM. Each is a different fix; the log now says which.
+
+    `detail` is the free text (which STAGE of the handshake failed, and how); `cause` is the
+    three-valued diagnosis the writer keeps verbatim. The two were passed in each other's
+    positions until 2026-09-11, so every snapshot record carried cause "unknown" whatever
+    happened; three timeout bursts on nomad (2026-09-10/11) were attributable only by reading
+    the exception name out of the detail string, and even then not to a stage."""
     try:
         from hestia_gate_core import record_gate_unavailable  # type: ignore
-        record_gate_unavailable(plugin_id, "policy-snapshot", "snapshot-fetch", cause,
+        record_gate_unavailable(plugin_id, "policy-snapshot", cause, detail,
                                 home=str(DEFAULT_HESTIA_HOME))
     except Exception:
         pass
 
 
 def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
-                                    host_session_id: Optional[str]) -> Optional[dict]:
+                                    host_session_id: Optional[str],
+                                    declares_review_door: bool = False) -> Optional[dict]:
+    # Which step of the handshake was in flight when it failed. Named in the telemetry so a
+    # timeout on `hestia_operating_law` is distinguishable from one on `initialize`: the
+    # first is the daemon working, the second is the daemon absent, and they are different
+    # fixes. Set BEFORE each step, so an exception raised inside it reads as that step.
+    stage = "endpoint"
     try:
         endpoint = _discover_endpoint()
         if endpoint is None:
@@ -632,9 +739,11 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             return None
         deadline = time.monotonic() + (TOTAL_BUDGET_MS / 1000.0)
         client = _McpHttp(endpoint, deadline)
+        stage = "initialize"
         if "result" not in client.initialize():
             _snapshot_unavailable(plugin_id, "init-no-result")
             return None
+        stage = "initialized"
         client.initialized()
         connect_args: dict = {
             "plugin_id": plugin_id,
@@ -647,13 +756,37 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             # session, freshness, or build binding: A1 historical evidence only. It cannot
             # prove which gate is currently loaded; the governed installed-artifact problem
             # remains #481.
-            "gate_capabilities": ["society-floor:v1"],
+            # `escalation-review:v1` is the REVIEW DOOR, and it is the CALLER's assertion,
+            # never this module's. The invitation pool reads it: a member that declares its
+            # doors without this one is not woken to decide something it cannot decide, and is
+            # recorded as ineligible rather than dropped (#1050). Silence still means UNKNOWN
+            # and is still invited — the declaration is what lets a member say the other thing.
+            #
+            # A SHARED GATE LIBRARY CANNOT KNOW ITS CALLER'S EFFECTOR SET. The first cut
+            # declared the door unconditionally here, reasoning "every seat that connects
+            # through this mechanism holds the MCP tool". kimi-code refuted it cross-vendor
+            # (findings/review-13031.md): SAGE's gateway imports this same module as the
+            # being's society-safety client (being_gate_client.py:1009) and fetches with
+            # `member_id="cbp-being"`, whose effector registry has no corroborate and no
+            # arbitrate at all. That call would have declared a door the being does not hold
+            # — inviting the exact member #1050 exists to stop inviting, and recording
+            # `review_basis: "declared"` as the false reason why. It would also have
+            # OVERWRITTEN the being's one accurate declaration (`society-floor:v1` alone),
+            # which is precisely what makes the new filter exclude it correctly.
+            #
+            # So the flag defaults to False and the harnesses that actually hold the tool
+            # (the CLI hooks) pass True. Silence from a caller that holds the door costs one
+            # extra invitation; a lie from a caller that does not costs the wake this issue
+            # exists to prevent.
+            "gate_capabilities": (["society-floor:v1", REVIEW_CAPABILITY]
+                                  if declares_review_door else ["society-floor:v1"]),
         }
         role_env = os.environ.get("HESTIA_ROLE")
         if role_env:
             connect_args["role"] = role_env
         if host_session_id:
             connect_args["host_session_id"] = host_session_id
+        stage = "connect"
         connect = _unwrap_tool_result(client.call_tool("hestia_connect", connect_args))
         if "_hestia_error" in connect:
             _snapshot_unavailable(plugin_id, "connect-refused:" + str(
@@ -688,6 +821,7 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             "generation": None,
             "expires_at": None,
         }
+        stage = "operating_law"
         law = _unwrap_tool_result(
             client.call_tool("hestia_operating_law", {"session_id": session_id}))
         if isinstance(law, dict) and "_hestia_error" not in law:
@@ -699,6 +833,7 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             grant = law.get("operator_grant")
             if isinstance(grant, dict):
                 snap["operator_grant"] = grant
+        stage = "scope_status"
         scope = _unwrap_tool_result(
             client.call_tool("hestia_scope_status", {"plugin_id": plugin_id}))
         if isinstance(scope, dict) and "_hestia_error" not in scope:
@@ -706,6 +841,7 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             if isinstance(grants, list):
                 for g in grants:
                     p = g.get("path") if isinstance(g, dict) else None
+                    rec = bool(g.get("recursive")) if isinstance(g, dict) else False
                     if isinstance(p, str) and p.strip():
                         snap["scope_grants"].append(p.strip())
                         # ONE mapping for both grant channels (GPT #431 blocker 4;
@@ -714,7 +850,7 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
                         # anything deeper keeps the faithful typed "path:" form; the core
                         # admits only that resolved boundary and descendants (R2) — a file
                         # grant must not front for its whole repo.
-                        snap["in_scope"].append(_scope_entry_for_grant(p))
+                        snap["in_scope"].append(_scope_entry_for_grant(p, rec))
             # STANDING grants (Sprint F R1) — the durable, operator-promoted list the
             # daemon persists in its vault. Additive beside live_grants; absent on an
             # older daemon, in which case everything below is a no-op and the snapshot
@@ -723,15 +859,17 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             if isinstance(standing, list):
                 for g in standing:
                     p = g.get("path") if isinstance(g, dict) else None
+                    rec = bool(g.get("recursive")) if isinstance(g, dict) else False
                     if isinstance(p, str) and p.strip():
                         snap["standing_grants"].append({
                             "path": p.strip(),
                             "expires_at": g.get("expires_at"),
                             "granted_by": g.get("granted_by"),
                             "reason": g.get("reason"),
+                            "recursive": rec,
                         })
                         snap["scope_grants"].append(p.strip())
-                        snap["in_scope"].append(_scope_entry_for_grant(p))
+                        snap["in_scope"].append(_scope_entry_for_grant(p, rec))
             # CERTIFICATION, issued by the authority (Sprint F R1): the standing store's
             # monotonic generation ("WHICH policy is this copy") and the daemon's honor
             # horizon for it. Booleans are excluded deliberately — isinstance(True, int)
@@ -768,7 +906,9 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
         return snap
     except Exception as e:  # noqa: BLE001 — any failure is "unreachable"; the caller degrades
         _snapshot_unavailable(
-            plugin_id, f"{type(e).__name__}:{getattr(e, 'errno', '')}:{str(e)[:120]}")
+            plugin_id,
+            f"{stage}: {type(e).__name__}:{getattr(e, 'errno', '')}:{str(e)[:110]}",
+            _unavailable_cause(e))
         return None
 
 

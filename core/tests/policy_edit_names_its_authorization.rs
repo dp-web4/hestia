@@ -27,6 +27,7 @@ use serde_json::json;
 #[test]
 fn the_stamp_names_the_gate_row_and_absence_writes_nothing() {
     let witness = GateWitness {
+        operator: None,
         provenance: None,
         gate_entry_hash: Some("abc123".into()),
     };

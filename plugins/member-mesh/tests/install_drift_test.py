@@ -65,6 +65,7 @@ installer said nothing. So:
 Hermetic: a fake HOME, a stub CLI, no daemon, no git, no network.
 """
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -155,7 +156,7 @@ def member_home(pin_claude=True, pin_kimi=False, stale=True,
     }
     for member, (hooks, config, pinned) in layout.items():
         os.makedirs(hooks, exist_ok=True)
-        for f in ("hestia-mesh.py", "session-mesh-inbox.sh"):
+        for f in ("hestia-mesh.py", "session-mesh-inbox.sh", "prompt-disposition-watch.sh"):
             dest = os.path.join(hooks, f)
             if stale:
                 body = "#!/bin/sh\n# stale pre-#108 copy\n"
@@ -220,7 +221,7 @@ check(not os.path.exists(kimi_hook + ".pre-sync.bak"),
 print("D. sync of a pinned member is byte-exact and keeps the old copy")
 p = run(["claude-code"], home)
 check(p.returncode == 0, f"D1. sync of a pinned member succeeds (got {p.returncode})", p.stdout)
-for f in ("hestia-mesh.py", "session-mesh-inbox.sh"):
+for f in ("hestia-mesh.py", "session-mesh-inbox.sh", "prompt-disposition-watch.sh"):
     dep = os.path.join(layout["claude-code"][0], f)
     with open(dep, "rb") as a, open(os.path.join(SRC, f), "rb") as b:
         check(a.read() == b.read(), f"D2. {f} now byte-identical to the repo")
@@ -297,7 +298,69 @@ check(p.returncode == 2,
 with open(kimi_hook, "rb") as fh:
     check(fh.read() == commented_before, "H3. leaving the file untouched")
 
-for d in (fix, home, clean, drifted, unpinned, lossy, kept, noroleh, withrole, commented):
+print("I. the disposition watch (#366): shipped by sync, registration reported, never failed on")
+wired, wlay = member_home(pin_claude=True, pin_kimi=True, stale=False)
+with open(wlay["kimi-code"][1], "a") as fh:      # kimi's real flat-table shape
+    fh.write('\n[[hooks]]\nevent = "UserPromptSubmit"\n'
+             f'command = "HESTIA_MESH_PLUGIN=kimi-code {wlay["kimi-code"][0]}/prompt-disposition-watch.sh"\n'
+             'timeout = 6\n')
+with open(wlay["claude-code"][1], "a") as fh:
+    fh.write(f'# command = "{wlay["claude-code"][0]}/prompt-disposition-watch.sh"\n')
+p = run(["--check"], wired)
+check("watch=wired" in member_line(p.stdout, "kimi-code"),
+      "I1. UserPromptSubmit + this member's pin reads as wired", repr(member_line(p.stdout, "kimi-code")))
+check("watch=UNWIRED" in member_line(p.stdout, "claude-code"),
+      "I2. a commented-out line is not a registration", repr(member_line(p.stdout, "claude-code")))
+
+# GPT's nonblocking note on #1148: a filename grep called a wrong event or a missing pin "wired".
+# The parser behind the column, over each harness's real config format.
+REG = os.path.join(SRC, "watch-registration.py")
+W = "/h/prompt-disposition-watch.sh"
+
+
+def reg(name, text, member="claude-code"):
+    d = tempfile.mkdtemp(prefix="watchreg-")
+    path = os.path.join(d, name)
+    with open(path, "w") as fh:
+        fh.write(text)
+    out = subprocess.run([sys.executable, REG, path, member], capture_output=True, text=True).stdout.strip()
+    shutil.rmtree(d, ignore_errors=True)
+    return out
+
+
+def cc(event, cmd):
+    return json.dumps({"hooks": {event: [{"hooks": [{"type": "command", "command": cmd}]}]}})
+
+
+cases = [
+    ("claude json, right event + pin", "settings.json", cc("UserPromptSubmit", f"HESTIA_MESH_PLUGIN=claude-code {W}"), "wired"),
+    ("claude json, wrong event", "settings.json", cc("SessionStart", f"HESTIA_MESH_PLUGIN=claude-code {W}"), "MISWIRED"),
+    ("claude json, unpinned", "settings.json", cc("UserPromptSubmit", W), "MISWIRED"),
+    ("claude json, another member's pin", "settings.json", cc("UserPromptSubmit", f"HESTIA_MESH_PLUGIN=codex {W}"), "MISWIRED"),
+    ("claude json, pin is a prefix of another id", "settings.json", cc("UserPromptSubmit", f"HESTIA_MESH_PLUGIN=claude-code-2 {W}"), "MISWIRED"),
+    ("codex toml, header event", "config.toml",
+     f'[[hooks.UserPromptSubmit]]\n\n[[hooks.UserPromptSubmit.hooks]]\ntype = "command"\ncommand = "HESTIA_MESH_PLUGIN=claude-code {W}"\n', "wired"),
+    ("codex toml, under PostToolUse", "config.toml",
+     f'[[hooks.PostToolUse]]\nmatcher = ".*"\n\n[[hooks.PostToolUse.hooks]]\ncommand = "HESTIA_MESH_PLUGIN=claude-code {W}"\n', "MISWIRED"),
+    ("kimi toml, flat table wrong event", "config.toml",
+     f'[[hooks]]\nevent = "SessionStart"\ncommand = "HESTIA_MESH_PLUGIN=claude-code {W}"\n', "MISWIRED"),
+    ("kimi toml, event set on the NEXT table does not leak back", "config.toml",
+     f'[[hooks]]\ncommand = "HESTIA_MESH_PLUGIN=claude-code {W}"\n\n[[hooks]]\nevent = "UserPromptSubmit"\ncommand = "x"\n', "MISWIRED"),
+    ("absent", "config.toml", '[[hooks]]\nevent = "UserPromptSubmit"\ncommand = "x"\n', "UNWIRED"),
+]
+for i, (label, name, text, want) in enumerate(cases, 1):
+    got = reg(name, text)
+    check(got == want, f"I2.{i} {label} -> {want}", f"got {got!r}")
+check(p.returncode == 0,
+      f"I3. an unwired watch is informational: a clean tree still exits 0 (got {p.returncode})", p.stdout)
+os.remove(os.path.join(wlay["claude-code"][0], "prompt-disposition-watch.sh"))
+p = run(["claude-code"], wired)
+check(p.returncode == 0 and os.path.exists(os.path.join(wlay["claude-code"][0], "prompt-disposition-watch.sh")),
+      f"I4. sync ships the watch to a member that lacks it (got {p.returncode})", p.stdout)
+check("UserPromptSubmit" in p.stdout and "HESTIA_MESH_PLUGIN=claude-code" in p.stdout,
+      "I5. and prints the registration line to add, pinned", p.stdout)
+
+for d in (fix, home, clean, drifted, unpinned, lossy, kept, noroleh, withrole, commented, wired):
     shutil.rmtree(d, ignore_errors=True)
 
 print()

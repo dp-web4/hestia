@@ -87,13 +87,22 @@ def run_witness(state_dir, endpoint, tool_name="Bash"):
         "tool_response": {},
         "session_id": "host-sess-1",
     }
+    # The witness consumes the seat's projection like the gate does (#944): the fixture home
+    # carries one for `test-seat`, and the launcher's part is only the locator.
+    home = state_dir / "hestia-home"
+    seats = home / "seats"
+    seats.mkdir(parents=True, exist_ok=True)
+    (seats / ("test-seat" + "." + "env")).write_text(
+        f"# member: test-seat\nHESTIA_HOME={home}\nHESTIA_STATE_DIR={state_dir}\n"
+        f"HESTIA_ENDPOINT={endpoint}\n", encoding="utf-8")
     env = dict(
         os.environ,
-        HESTIA_STATE_DIR=str(state_dir),
-        HESTIA_ENDPOINT=endpoint,
+        HESTIA_HOME=str(home),
         HESTIA_WITNESS_TIMEOUT_S="0.3",
         HESTIA_PLUGIN_ID="test-seat",
     )
+    env.pop("HESTIA_STATE_DIR", None)
+    env.pop("HESTIA_ENDPOINT", None)
     # BACKGROUND_MARKER bypasses the detach wrapper: the test IS the child.
     subprocess.run(
         [sys.executable, str(WITNESS), "--hestia-bg"],

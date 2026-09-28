@@ -976,7 +976,11 @@ STALE_AFTER="${STALE_AFTER:-21600}"            # a notice is stale at 6h unbound
 # `role` is caller-supplied and any member that loses `HESTIA_ROLE` collides with
 # it silently. Do NOT build a detector on this field alone (see the note on the
 # `#undelivered:` marker at `report_unreachable`) — the durable fix is a reserved
-# KIND for a non-delivery report, which is vocabulary work in KINDS.md.
+# KIND for a non-delivery report, which is vocabulary work in KINDS.md. Still
+# owed as of 2026-09-05: the report moved from `reply` to `forum-note` that day
+# (see branch 4 below), which stops it being booked as the sender's debt but
+# does NOT make it reserved — `forum-note` is an ordinary member kind, so it is
+# no more a detector than `reply` was.
 #
 # `plugin_id` is still the member's: the watcher genuinely acts on that member's
 # mailbox, and a distinct gateway identity is a daemon-side enrolment question.
@@ -1090,11 +1094,48 @@ for label,key in (("I OWE A RESPONSE","i_owe"),("NOBODY ANSWERED ME","owed_to_me
 # REPORTS to the sender. Without this, a dead fire and a notice never sent are
 # indistinguishable at both ends — the sender's unanswered view reads
 # "delivered, unanswered" for mail the member never saw (41 fires / 3 dead /
-# all reported success). The report is a `reply` bound to the failed notice:
-# reply awaits a disposition, so the failure sits in the SENDER's debt row
-# until it acks — reroute, resend, or abandon, and the decision is witnessed.
-# A coordination-kind report could be ignored in silence, which is the silent
-# drop again one layer up. It is sent under the failed member's own plugin
+# all reported success).
+#
+# THE REPORT RIDES `forum-note`, AND UNTIL 2026-09-05 IT RODE `reply`. That was
+# a deliberate choice with a stated reason, reversed here on measurement rather
+# than on taste, so the reason is kept rather than deleted:
+#
+#   "The report is a `reply` bound to the failed notice: reply awaits a
+#    disposition, so the failure sits in the SENDER's debt row until it acks —
+#    reroute, resend, or abandon, and the decision is witnessed. A
+#    coordination-kind report could be ignored in silence, which is the silent
+#    drop again one layer up."
+#
+# The objection was right when written, and is now paid by a different mechanism.
+# Three measurements retire it (issue #926, three wakes, CBP seat):
+#
+#  1. The counted kind did not buy the acknowledgement it was for. On 2026-09-05
+#     this seat's `i_owe` was 161 of 161 `#undelivered:` rows — 100%, along a
+#     monotone 86% -> 91% -> 100% — and not one had been acted on. `reply` made
+#     the failure durable without making it read.
+#  2. It cost the ledger everything else. `MEMBER_KINDS_AWAIT_RESPONSE` is
+#     `["review_request", "reply"]`, so every bounce lands in the one fold a seat
+#     triages at wake. At 100% saturation `i_owe` can no longer carry a REAL
+#     obligation into anyone's attention: the anti-silence device is what made
+#     every other obligation silent. The rows are also unclearable by the route
+#     the suppression below teaches — `member_unanswered` clears a row only on a
+#     binder whose OWN pointer lacks `#undelivered:`, and echoing the bounce
+#     pointer is exactly what the visited bit rewards.
+#  3. The anti-silence guarantee MOVED. It belongs to the renderer now, not to
+#     the kind: every fire template prints `!! NOT-AN-ANSWER` at the front of the
+#     line and says what the echo means (PR #216, 2026-08-06 — eleven days after
+#     this rationale was written). That predicate reads the POINTER, never the
+#     kind, so it survives this change untouched, and it reaches the member at
+#     wake, which a debt row never did.
+#
+# What is given up, said plainly: a `forum-note` is announced once and holds no
+# standing row afterwards, so a member that does not act in that wake is not
+# asked again. That is the right trade only because the standing row was provably
+# not being acted on either. If durability is wanted back, its home is a per-peer
+# non-delivery summary (#927 — the mesh has no representation for a temporarily
+# unavailable member), not a per-notice debt booked against the sender.
+#
+# The report is sent under the failed member's own plugin
 # identity — and that is the report's remaining dishonesty (CBP review §4,
 # 2026-07-26): the daemon derives the instance LCT from plugin_id alone and
 # drops `instance_name` on connect, so on the chain an unreachable report is
@@ -1282,9 +1323,16 @@ classify_fire_failure() {
 # "#525 re-review — invariant 1" and "claude asked for a test with a member holding a
 # live scope grant". That wake then ran past `timeout -k 30 1800` at 08:46:56Z. rc=124,
 # primer retained, and this function mailed claude-code two `kind=reply` notices saying
-# the notices kimi had just spent thirty minutes answering were undelivered. `reply` is
+# the notices kimi had just spent thirty minutes answering were undelivered. `reply` was
 # in MEMBER_KINDS_AWAIT_RESPONSE, so each one also became a row in the SENDER's `i_owe`
 # and woke a session to read it.
+#
+# HALF OF THAT IS GONE AS OF 2026-09-05, AND THE HALF THAT MATTERS HERE IS NOT. The
+# report now rides `forum-note` (branch 4 above), so it no longer books an `i_owe` row.
+# It still WAKES the sender — the report is a notice, the primer carries it, and the fire
+# template renders it `!! NOT-AN-ANSWER`. The amplifier described below is a wake
+# amplifier, not a ledger one, so the rc=124 guard is untouched by that change and this
+# whole rationale still holds.
 #
 # That is an amplifier pointed the wrong way: the longer and more thorough a member's
 # wake, the likelier it is cut short by the bound, and the more of its peers are told
@@ -1337,7 +1385,12 @@ for n in d.get("notices",[]):
     # remove. The reserved region is the whole fragment, observer included.
     frag=f"#undelivered:{why};via={via}".encode()[:512]
     p=p.encode()[:512-len(frag)].decode(errors="ignore")+frag.decode(errors="ignore")
-    print(json.dumps({"to_plugin_id":sender,"kind":"reply",
+    # `forum-note`, NOT `reply` — see the branch-4 block above. The kind must
+    # stay OUT of handler.rs's MEMBER_KINDS_AWAIT_RESPONSE, which is what makes
+    # a non-delivery report an announcement rather than a debt booked against
+    # the member whose mail died. The binding is kept: `in_reply_to` is what
+    # names WHICH notice failed, and it is legal on every kind.
+    print(json.dumps({"to_plugin_id":sender,"kind":"forum-note",
                       "pointer_uri":p,"in_reply_to":nid}))
 PY
 ) || ROWS=""
@@ -1392,7 +1445,24 @@ while true; do
     # The strong asker: fold the member's outstanding debt into the primer, so
     # the question is asked where an answer is possible — inside the wake that
     # is happening anyway. Costs one read; never causes a fire on its own.
-    UN=$(unanswered 2>/dev/null || echo '{}')
+    # THE FOLD TRAVELS BY FILE, NOT BY ENVIRONMENT. `execve` caps ONE string at
+    # MAX_ARG_STRLEN = 32 pages = 131,072 B (measured, not cited: `getconf` exposes
+    # ARG_MAX, a different and much larger TOTAL-size limit). This seat's live fold
+    # measured 442,074 B on 2026-09-04 -- 3.37x -- so exporting it failed E2BIG, the
+    # interpreter never started, and the `||` fallback wrote the raw drain response
+    # with `unanswered`, `open_petitions` AND `for_plugin` all missing. The size is
+    # per-seat and NOT monotone: codex's own fold shipped at 118,995 B the same day
+    # (codex, review of #858), so there is no global floor and no single onset date.
+    # A file has no such cap.
+    #
+    # Carrier failure is NOT empty debt. `mktemp` failing, or the write failing part
+    # way, must leave the primer saying "not measured" -- never `i_owe: []`, which
+    # reads as "you owe nothing". That is the same absence-as-verdict class this
+    # repair is about, so it gets an explicit third state below.
+    UN_FILE=$(mktemp "${TMPDIR:-/tmp}/hestia-un-$PLUGIN.XXXXXX" 2>/dev/null || true)
+    if [ -n "$UN_FILE" ]; then
+      unanswered > "$UN_FILE" 2>/dev/null || : > "$UN_FILE"
+    fi
     # The mirror of the debt fold: petitions THIS member has open. Filtered
     # here, by `asked_by`, because the tool answers for the whole society and
     # another member's rows are not this member's work — the same reason the
@@ -1400,16 +1470,39 @@ while true; do
     # file (`open-petitions.py`) so one suite covers both; an unparseable or
     # failed read yields `asked:false`, which the renderer says out loud rather
     # than rendering as "you hold none".
+    # The 4th argument is the ledger of host sessions THIS watcher has fired
+    # (fire-*.sh appends one line per wake). `asked_by` is the plugin NAME, and
+    # on every box two seats share it — the interactive session and the wake —
+    # so name-equality alone renders a co-seat's live petition as the reader's
+    # own and prescribes WITHDRAW for it (#732, CBP 2026-09-06). With the ledger,
+    # a row whose `host_session_id` is not in it is folded as `co_seat`, not
+    # `mine`. A missing ledger or a daemon that omits the field degrades to the
+    # name-only fold, never to "none of these are yours".
     PET=$(open_petitions 2>/dev/null \
           | timeout 5 python3 "$WATCH_DIR/open-petitions.py" fold "$PLUGIN" \
+              "$STATE/wake-sessions-$PLUGIN" \
           2>/dev/null || echo '{"asked":false,"mine":[]}')
-    printf '%s' "$OUT" | UN="$UN" PET="$PET" FOR_PLUGIN="$PLUGIN" python3 -c '
+    printf '%s' "$OUT" | UN_FILE="$UN_FILE" PET="$PET" FOR_PLUGIN="$PLUGIN" python3 -c '
 import json,os,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
-try: u=json.loads(os.environ.get("UN") or "{}")
-except Exception: u={}
-d["unanswered"]={k:u.get(k,[]) for k in ("i_owe","owed_to_me")}
+# TRI-STATE, mirroring `open_petitions`. `asked:true` with empty lists is a MEASURED
+# zero; `asked:false` is a read that never completed. Those are different facts and
+# the renderer says which. The two-state form collapsed them: ANY failure became
+# {"i_owe":[],"owed_to_me":[]} -- a positive assertion of no debt, manufactured out
+# of a channel error. `asked` is additive; primers written before it have no such key
+# and readers that only take i_owe/owed_to_me are unaffected.
+u=None
+try:
+    with open(os.getenv("UN_FILE") or "", encoding="utf-8") as f: u=json.load(f)
+except Exception: u=None
+# A refusal, an error envelope or a truncated body is not an empty debt. The keys must
+# be PRESENT and be lists: `.get("i_owe") or []` reads every one of those as "nothing
+# owed". This is the predicate `primer_spent` already applies to its own carrier.
+if isinstance(u,dict) and all(isinstance(u.get(k),list) for k in ("i_owe","owed_to_me")):
+    d["unanswered"]={"asked":True,"i_owe":u["i_owe"],"owed_to_me":u["owed_to_me"]}
+else:
+    d["unanswered"]={"asked":False,"i_owe":[],"owed_to_me":[]}
 try: d["open_petitions"]=json.loads(os.environ.get("PET") or "")
 except Exception: d["open_petitions"]={"asked":False,"mine":[]}
 # WHO THIS IS FOR — the one fact the primer never stated. It recorded from_plugin on
@@ -1422,6 +1515,7 @@ except Exception: d["open_petitions"]={"asked":False,"mine":[]}
 d["for_plugin"]=os.environ["FOR_PLUGIN"]
 json.dump(d,sys.stdout)
 ' > "$PRIMER" 2>/dev/null || echo "$OUT" > "$PRIMER"
+    [ -n "$UN_FILE" ] && rm -f "$UN_FILE"
     echo "[hestia-watch] $N notice(s) for $PLUGIN -> $PRIMER"
     if [ -n "$FIRE" ]; then
       # Success: primer is spent, remove it. Failure: KEEP it — the drain was

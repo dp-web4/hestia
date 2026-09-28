@@ -55,6 +55,22 @@ def teardown_module(module=None) -> None:
     assert not FAILURES, FAILURES
 
 
+def project(home: Path) -> None:
+    """Render the seat's config projection under a fixture home.
+
+    The seat consumes `$HESTIA_HOME/seats/<plugin_id>` + the rendered suffix and refuses
+    without one (#944), so a fixture that stages an engine but no projection tests the CONFIG
+    refusal rather than the one this file is about. Arm [3] caught exactly that: the
+    poisoned-core arms still refused (rc 2, fail-closed) but named `config.unbacked` instead
+    of the unavailable authority, because the earlier check fired first. The fixture is
+    otherwise-valid on purpose: one missing thing at a time, or an arm proves the wrong thing.
+    """
+    seats = home / "seats"
+    seats.mkdir(parents=True, exist_ok=True)
+    (seats / ("claude-code" + '.env')).write_text(
+        f"# member: claude-code\nHESTIA_HOME={home}\n", encoding="utf-8")
+
+
 def stage(dst: Path, sentinel: str | None, poison: dict[str, str] | None = None) -> None:
     dst.mkdir(parents=True)
     for name in MODULES:
@@ -91,6 +107,7 @@ def test_preloaded_decoy_modules_are_evicted() -> None:
         installed = root / "hestia-home" / "shared"
         decoy = root / "decoy" / "_shared"
         stage(installed, None)
+        project(root / "hestia-home")
         stage(decoy, "decoy")
         code = f"""
 import importlib.util, os, sys, json
@@ -132,6 +149,7 @@ def test_decoy_first_with_installed_already_later_on_sys_path() -> None:
         installed = root / "hestia-home" / "shared"
         decoy = root / "decoy" / "_shared"
         stage(installed, None)
+        project(root / "hestia-home")
         stage(decoy, "decoy")
         code = f"""
 import importlib.util, os, sys, json
@@ -168,6 +186,7 @@ def test_installed_module_raising_at_import_fails_closed() -> None:
                 root = Path(raw)
                 installed = root / "hestia-home" / "shared"
                 stage(installed, None, poison={victim: raised})
+                project(root / "hestia-home")
                 env = dict(os.environ, HESTIA_HOME=str(root / "hestia-home"),
                            HESTIA_ENDPOINT="http://127.0.0.1:1")
                 env.pop("HESTIA_SHARED_DIR", None)

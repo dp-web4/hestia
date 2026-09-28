@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""The claude-code seat consumes the vault projection and nothing else (#944 step 5).
+
+Five arms, each a property the PRD names and one of them the whole point:
+
+  1. NO LOCATOR — HESTIA_HOME unset: the hook refuses `[config.unbacked]` with rc 2 BEFORE it
+     reads stdin, and there is no fallback to a familiar home. (#943 was held for the default
+     this arm forbids.)
+  2. NO PROJECTION — HESTIA_HOME set, `seats/claude-code.env` absent: same refusal, and the
+     message tells the operator where to populate it.
+  3. MISWIRED LOCATOR — the projection says a different HESTIA_HOME than the launcher supplied:
+     `[config.miswired]`, rc 2. The launcher's locator is verified against the authority.
+  4. THE PROJECTION WINS — the launcher exports HESTIA_WORKSPACE=/launcher/says and the
+     projection says /vault/says: after import the process sees /vault/says, plus every other
+     projected key, plus HESTIA_PROJECTION_SHA256 = sha256 of the bytes consumed. And
+     HESTIA_ROLE is NOT overridden: role is launch context, never config.
+  5. THE WITNESS HOOK shares the contract: with no projection `run()` returns 0 having recorded
+     nothing; with one, its STATE_DIR is the projected value.
+
+Fail direction: every arm asserts the refusal shape (rc, rule name, no traceback) or the
+observed environment. A hook that fell back would pass arm 4's launcher value through and
+fail it; a hook that crashed would fail the no-traceback check.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parents[2]
+sys.path.insert(0, str(HERE))
+from projection_fixture import projection_env, write_projection  # noqa: E402
+
+HOOKS = HERE.parent / "hooks"
+HOOK = HOOKS / ("pre_" + "tool_" + "use.py")
+WITNESS = HOOKS / "witness.py"
+SHARED_SRC = REPO / "plugins" / "_shared"
+
+FAILS: list[str] = []
+
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    if not ok:
+        FAILS.append(f"{name}{': ' + detail if detail else ''}")
+
+
+def stage_home(root: Path) -> Path:
+    """A fixture HESTIA_HOME with the reviewed shared runtime installed under it."""
+    home = root / "hestia-home"
+    shared = home / "shared"
+    shared.mkdir(parents=True)
+    for p in SHARED_SRC.glob("hestia_*.py"):
+        if "_test" in p.name or p.name.startswith("test_"):
+            continue
+        shutil.copy(p, shared / p.name)
+    (home / "endpoint").write_text("http://127.0.0.1:1/mcp\n")
+    return home
+
+
+EVENT = {"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {"file_path": "/tmp/x"},
+         "session_id": "proj-test", "tool_use_id": "t1"}
+
+
+def run_hook(env: dict, stdin: str | None = json.dumps(EVENT)) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, "-I", str(HOOK)], input=stdin, env=env, text=True,
+                          capture_output=True, check=False, timeout=60)
+
+
+def probe_env(env: dict, keys: list[str]) -> dict:
+    """Import the hook in a fresh interpreter and report what the environment looks like after."""
+    code = f"""
+import importlib.util, os, json, sys
+s = importlib.util.spec_from_file_location('g', {str(HOOK)!r}); g = importlib.util.module_from_spec(s); s.loader.exec_module(g)
+print(json.dumps({{'err': g._PROJECTION_ERROR, 'env': {{k: os.environ.get(k) for k in {keys!r}}}}}))
+"""
+    r = subprocess.run([sys.executable, "-I", "-c", code], env=env, text=True, capture_output=True, check=False, timeout=60)
+    check("probe_imports_cleanly", r.returncode == 0 and "Traceback" not in r.stderr, r.stderr[-400:])
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except Exception:
+        return {"err": "unparseable", "env": {}}
+
+
+def test_no_locator_refuses_before_stdin() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        env = projection_env(home)
+        env.pop("HESTIA_HOME", None)
+        # The shared runtime is still reachable explicitly, so the ONLY thing missing is the locator.
+        env["HESTIA_SHARED_DIR"] = str(home / "shared")
+        r = run_hook(env, stdin=None)   # no event at all: the refusal must come first
+        check("no_locator_rc2", r.returncode == 2, f"rc {r.returncode}: {r.stderr[-300:]!r}")
+        check("no_locator_names_rule", "[config.unbacked]" in r.stderr, r.stderr[-300:])
+        check("no_locator_no_traceback", "Traceback" not in r.stderr)
+        check("no_locator_no_fallback", ".hestia" not in r.stderr.replace(str(home), ""),
+              "a familiar home was mentioned as if it were a candidate")
+
+
+def test_no_projection_refuses_and_says_where() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        r = run_hook(projection_env(home))
+        check("no_projection_rc2", r.returncode == 2, f"rc {r.returncode}: {r.stderr[-300:]!r}")
+        check("no_projection_names_rule", "[config.unbacked]" in r.stderr, r.stderr[-300:])
+        check("no_projection_says_where", "Runtime config" in r.stderr, r.stderr[-300:])
+
+
+def test_miswired_locator_refuses() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        write_projection(home, env={"HESTIA_HOME": str(Path(raw) / "some-other-home")})
+        r = run_hook(projection_env(home))
+        check("miswired_rc2", r.returncode == 2, f"rc {r.returncode}: {r.stderr[-300:]!r}")
+        check("miswired_names_rule", "[config.miswired]" in r.stderr, r.stderr[-300:])
+
+
+def test_the_projection_wins_and_role_is_launch_context() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        path = write_projection(home, env={
+            "HESTIA_WORKSPACE": "/vault/says", "HESTIA_ENDPOINT": "http://127.0.0.1:1/mcp",
+            "HESTIA_PLUGIN_ID": "claude-code", "HESTIA_ROLE": "role:should:never:apply",
+        })
+        env = projection_env(home, HESTIA_WORKSPACE="/launcher/says", HESTIA_ROLE="role:constellation:mesh-worker")
+        got = probe_env(env, ["HESTIA_WORKSPACE", "HESTIA_ROLE", "HESTIA_ENDPOINT", "HESTIA_PROJECTION_SHA256",
+                              "HESTIA_PROJECTION_PATH", "HESTIA_SHARED_DIR"])
+        check("projection_loaded", got["err"] is None, str(got["err"]))
+        check("projection_wins_over_launcher", got["env"].get("HESTIA_WORKSPACE") == "/vault/says",
+              f"the launcher's value survived: {got['env']}")
+        check("role_is_launch_context", got["env"].get("HESTIA_ROLE") == "role:constellation:mesh-worker",
+              f"the projection overrode the launch role: {got['env']}")
+        check("projected_endpoint", got["env"].get("HESTIA_ENDPOINT") == "http://127.0.0.1:1/mcp")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        check("digest_of_consumed_bytes", got["env"].get("HESTIA_PROJECTION_SHA256") == digest,
+              f"{got['env'].get('HESTIA_PROJECTION_SHA256')} != {digest}")
+        check("path_exported", got["env"].get("HESTIA_PROJECTION_PATH") == str(path))
+        # and the hook, run for real, gets PAST the config check (its refusal, if any, is downstream)
+        r = run_hook(env)
+        check("configured_hook_passes_config_check", "[config." not in r.stderr, r.stderr[-300:])
+        check("configured_hook_no_traceback", "Traceback" not in r.stderr, r.stderr[-300:])
+
+
+def test_a_launch_role_outside_the_vaults_permitted_set_is_a_miswire() -> None:
+    """Arm 6. Role stays launch context (arm 4), but launch context is not a blank cheque.
+
+    The role decides WHICH LAW APPLIES, and until now the launcher could name any string:
+    an unpublished one is silently normalised to `member` by the daemon, splitting a
+    member's acts across two trust grains (PR #66). When the vault names the set this seat
+    may launch under, a role outside it is refused here rather than normalised downstream.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        write_projection(home, env={
+            "HESTIA_ROLE_PERMITTED": "role:constellation:interactive-dev,role:constellation:mesh-worker",
+        })
+        env = projection_env(home, HESTIA_ROLE="role:constellation:sovereign")
+        r = run_hook(env)
+        check("role_outside_set_rc2", r.returncode == 2, f"rc {r.returncode}: {r.stderr[-300:]!r}")
+        check("role_outside_set_names_rule", "[config.miswired]" in r.stderr, r.stderr[-300:])
+        check("role_outside_set_names_the_role", "sovereign" in r.stderr, r.stderr[-300:])
+        check("role_outside_set_no_traceback", "Traceback" not in r.stderr, r.stderr[-300:])
+
+
+def test_a_permitted_role_passes_and_an_unbounded_one_says_it_is_unbounded() -> None:
+    """Arm 7, the control for arm 6 — without it the change could be "refuse every role".
+
+    Two halves. A role IN the declared set runs and is marked verified. A projection that
+    declares NO set leaves today's behaviour exactly as it is and records that it did:
+    tamper-EVIDENT, which is the honest limit `seat_config.rs` sets for this mechanism.
+    A reader must be able to tell a verified role from an unbounded one; if both looked the
+    same, silence would mean nothing.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        write_projection(home, env={
+            "HESTIA_ROLE_PERMITTED": "role:constellation:interactive-dev,role:constellation:mesh-worker",
+        })
+        env = projection_env(home, HESTIA_ROLE="role:constellation:mesh-worker")
+        got = probe_env(env, ["HESTIA_ROLE", "HESTIA_ROLE_VERIFIED", "HESTIA_ROLE_PERMITTED"])
+        check("permitted_role_loads", got["err"] is None, str(got["err"]))
+        check("permitted_role_survives", got["env"].get("HESTIA_ROLE") == "role:constellation:mesh-worker",
+              f"the bound overrode the launch role: {got['env']}")
+        check("permitted_role_marked_verified", got["env"].get("HESTIA_ROLE_VERIFIED") == "1",
+              f"a bounded role must be legible as bounded: {got['env']}")
+        check("the_bound_is_not_exported_as_config",
+              got["env"].get("HESTIA_ROLE_PERMITTED") in (None, ""),
+              f"the permitted set leaked into the seat's environment: {got['env']}")
+        r = run_hook(env)
+        check("permitted_role_passes_config_check", "[config." not in r.stderr, r.stderr[-300:])
+
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        write_projection(home, env={})          # no set declared: today's behaviour, unchanged
+        env = projection_env(home, HESTIA_ROLE="role:anything:at:all")
+        got = probe_env(env, ["HESTIA_ROLE", "HESTIA_ROLE_VERIFIED"])
+        check("unbounded_role_still_runs", got["err"] is None, str(got["err"]))
+        check("unbounded_role_survives", got["env"].get("HESTIA_ROLE") == "role:anything:at:all",
+              f"an undeclared set must not start refusing roles: {got['env']}")
+        check("unbounded_role_marked_unverified", got["env"].get("HESTIA_ROLE_VERIFIED") == "0",
+              f"silence must mean something: {got['env']}")
+
+
+def test_an_old_core_without_the_verdict_fails_closed_not_open() -> None:
+    """Arm 9 -- codex's P1 on a188cde. Deploy skew: the new hook, an OLD installed core that has
+    no `launch_role_verdict`. The call raised AttributeError at import, the hook exited 1, and
+    Claude Code treats exit 1 as non-blocking: the tool ran UNGATED. A declared set that cannot
+    be evaluated must be a deny (rc 2, gate.core_unavailable), never a crash."""
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        core = home / "shared" / "hestia_gate_core.py"
+        src = core.read_text()
+        if "def launch_role_verdict" in src:     # make it the OLD core: the function is absent
+            core.write_text(src[:src.index("def launch_role_verdict")])
+        write_projection(home, env={
+            "HESTIA_ROLE_PERMITTED": "role:constellation:interactive-dev,role:constellation:mesh-worker",
+        })
+        env = projection_env(home, HESTIA_ROLE="role:constellation:mesh-worker")
+        r = run_hook(env)
+        check("old_core_is_not_exit_1", r.returncode != 1,
+              f"rc 1 is fail-OPEN in Claude Code: {r.stderr[-300:]!r}")
+        check("old_core_denies_rc2", r.returncode == 2, f"rc {r.returncode}: {r.stderr[-300:]!r}")
+        check("old_core_names_the_rule", "[gate.core_unavailable]" in r.stderr, r.stderr[-300:])
+        check("old_core_no_traceback", "Traceback" not in r.stderr, r.stderr[-300:])
+    # CONTROL: with no declared set, the same old core is not consulted at import, so this
+    # check cannot be what refuses (whatever main later does with a stale core is its own path).
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        core = home / "shared" / "hestia_gate_core.py"
+        src = core.read_text()
+        if "def launch_role_verdict" in src:
+            core.write_text(src[:src.index("def launch_role_verdict")])
+        write_projection(home, env={})
+        got = probe_env(projection_env(home, HESTIA_ROLE="role:anything"), ["HESTIA_ROLE_VERIFIED"])
+        check("no_set_does_not_consult_the_core", got["err"] is None, str(got["err"]))
+
+
+def test_a_declared_set_does_not_refuse_an_absent_role() -> None:
+    """Arm 8 — the case the migration promise is about, and the one arms 6-7 left out.
+
+    GPT's review of #1084: the prose said an absent role is deliberately not refused, but the
+    check compared "" against the permitted set and refused it (rc 2) whenever a set was
+    declared, so publishing a set would have denied every seat whose launcher sets no role.
+    An absent role runs as today, and is marked unverified, not verified: it was not checked
+    against anything.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        write_projection(home, env={
+            "HESTIA_ROLE_PERMITTED": "role:constellation:interactive-dev,role:constellation:mesh-worker",
+        })
+        env = projection_env(home)
+        env.pop("HESTIA_ROLE", None)
+        got = probe_env(env, ["HESTIA_ROLE", "HESTIA_ROLE_VERIFIED"])
+        check("absent_role_still_runs", got["err"] is None, str(got["err"]))
+        check("absent_role_marked_unverified", got["env"].get("HESTIA_ROLE_VERIFIED") == "0",
+              f"an absent role was not checked, so it must not read as verified: {got['env']}")
+        r = run_hook(env)
+        check("absent_role_not_refused", "[config.miswired]" not in r.stderr, r.stderr[-300:])
+
+
+def test_the_witness_hook_shares_the_contract() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        code = f"""
+import importlib.util, os, json
+s = importlib.util.spec_from_file_location('w', {str(WITNESS)!r}); w = importlib.util.module_from_spec(s); s.loader.exec_module(w)
+print(json.dumps({{'err': w._PROJECTION_ERROR, 'state': str(w.STATE_DIR)}}))
+"""
+        # no projection: the module imports, reports the absence, and run() would record nothing
+        r = subprocess.run([sys.executable, "-I", "-c", code], env=projection_env(home), text=True, capture_output=True, timeout=60)
+        check("witness_imports_without_projection", r.returncode == 0, r.stderr[-300:])
+        got = json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {"err": "none"}
+        check("witness_reports_absence", got["err"] is not None and got["err"][0] == "config.unbacked", str(got))
+        # with one: STATE_DIR is the projected value
+        write_projection(home, env={"HESTIA_STATE_DIR": str(Path(raw) / "projected-state")})
+        r = subprocess.run([sys.executable, "-I", "-c", code], env=projection_env(home), text=True, capture_output=True, timeout=60)
+        got = json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {"err": "none", "state": ""}
+        check("witness_projection_loaded", got["err"] is None, str(got))
+        check("witness_state_dir_projected", got["state"] == str(Path(raw) / "projected-state"), got["state"])
+
+
+def teardown_module(module):
+    assert not FAILS, FAILS
+
+
+TESTS = [test_no_locator_refuses_before_stdin, test_no_projection_refuses_and_says_where,
+         test_miswired_locator_refuses, test_the_projection_wins_and_role_is_launch_context,
+         # Arms 6-8. CI runs this file as a script, so a test missing from this list never
+         # runs there: arms 6-7 shipped in #1084 unlisted and its green CI covered neither.
+         test_a_launch_role_outside_the_vaults_permitted_set_is_a_miswire,
+         test_a_permitted_role_passes_and_an_unbounded_one_says_it_is_unbounded,
+         test_a_declared_set_does_not_refuse_an_absent_role,
+         test_an_old_core_without_the_verdict_fails_closed_not_open,
+         test_the_witness_hook_shares_the_contract]
+
+if __name__ == "__main__":
+    for t in TESTS:
+        t()
+    if FAILS:
+        print("FAILED:", *FAILS, sep="\n  ", file=sys.stderr)
+        sys.exit(1)
+    print("ok: the claude-code seat consumes the vault projection and nothing else")

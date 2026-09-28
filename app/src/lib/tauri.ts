@@ -1,5 +1,79 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DashboardSnapshot, DaemonStatus, AppConfig, RemoteEntry, DerivationReceipt, OperatorStatus } from "./types";
+import type {
+  AgentInventory,
+  DashboardSnapshot,
+  DecideOutcome,
+  GateReport,
+  DaemonStatus,
+  AppConfig,
+  RemoteEntry,
+  DerivationReceipt,
+  OperatorStatus,
+  SeatConfigList,
+  SeatConfigInspect,
+  SeatConfigPutResult,
+} from "./types";
+
+/**
+ * Decide one governance-surface escalation as the signed-in operator.
+ *
+ * Reaches `POST /api/operator/gate-escalation` — the channel behind a proved
+ * operator LCT — and never the CLI path, which is authenticated only by
+ * filesystem access to HESTIA_HOME. Returns the daemon's own answer: whether an
+ * approval actually permits the write depends on the bar, and this must not
+ * claim more than the daemon said.
+ */
+export async function decideGateEscalation(
+  id: string,
+  approve: boolean,
+  reason: string | null,
+): Promise<DecideOutcome> {
+  return invoke("decide_gate_escalation", { id, approve, reason });
+}
+
+/**
+ * Grant or refuse one scope request as the signed-in operator, via
+ * `POST /api/scope/decide`. A grant needs a reason; a refusal does not; a
+ * standing refusal is not a thing; exact unless the operator chooses recursion.
+ * A request already ruled elsewhere comes back as `already_decided`.
+ */
+export async function ruleScopeRequest(
+  requestId: string,
+  granted: boolean,
+  reason: string | null,
+  opts: { standing?: boolean; recursive?: boolean } = {},
+): Promise<DecideOutcome> {
+  return invoke("rule_scope_request", {
+    requestId,
+    granted,
+    reason,
+    standing: opts.standing ?? false,
+    recursive: opts.recursive ?? false,
+  });
+}
+
+/** Gate verdicts plus the evidence to ratify against. */
+export async function gatesVerify(): Promise<GateReport> {
+  return invoke("gates_verify");
+}
+
+/**
+ * Ratify every discovered gate's CURRENT bytes as the trusted build. Replaces the
+ * previous expectations (last edit wins) — callers show what is replaced first.
+ */
+export async function gatesRatify(
+  reason: string,
+  expected: Record<string, string | null>,
+): Promise<unknown> {
+  // `expected` binds the ratification to the bytes the operator reviewed: the daemon
+  // refuses (409) when the installed gates no longer match it.
+  return invoke("gates_ratify", { reason, expected });
+}
+
+/** Who is on this box and whether it is governed. Read-only. */
+export async function agentsInventory(): Promise<AgentInventory> {
+  return invoke("agents_inventory");
+}
 
 export async function getDashboard(): Promise<DashboardSnapshot> {
   return invoke("get_dashboard");
@@ -31,6 +105,23 @@ export async function vaultSet(
 
 export async function vaultDelete(name: string): Promise<unknown> {
   return invoke("vault_delete", { name });
+}
+
+// Vault-authored seat config (#944 phase 0). Same authed transport; no delete by design.
+export async function configSeatList(): Promise<SeatConfigList> {
+  return invoke("config_seat_list");
+}
+
+export async function configSeatGet(pluginId: string): Promise<SeatConfigInspect> {
+  return invoke("config_seat_get", { req: { plugin_id: pluginId } });
+}
+
+export async function configSeatPut(
+  pluginId: string,
+  env: Record<string, string>,
+  note: string
+): Promise<SeatConfigPutResult> {
+  return invoke("config_seat_put", { req: { plugin_id: pluginId, env, note } });
 }
 
 export async function getPolicy(): Promise<unknown> {

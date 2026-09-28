@@ -64,6 +64,52 @@ def test_registered_candidate_must_allow_the_declared_probe():
         assert rows == [{"member": "alpha", "probe": "read", "status": "ok"}]
 
 
+def _consumer_body() -> str:
+    """A candidate that acts only under a supplied locator, the way a projection consumer does."""
+    return ("import os, sys; sys.stdin.read()\n"
+            "home = os.environ.get('HESTIA_HOME')\n"
+            "if not home: sys.stderr.write('hestia: deny [config.unbacked] - HESTIA_HOME is not set\\n'); raise SystemExit(2)\n"
+            "raise SystemExit(0)\n")
+
+
+def test_a_projection_consumer_is_probed_under_the_launcher_env_not_the_deploy_units():
+    """2026-09-05, CBP: the deploy unit carries HESTIA_HOME, the interactive launcher did not,
+    and a consumer candidate answered the preflight it would have failed in the seat. The
+    probe must run under the LAUNCHER's supply: without it the consumer is refused (and the
+    seat keeps its old gate); with the locator on the registered hook line it is allowed."""
+    import os
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        repo, home = root / "repo", root / "home"
+        make_member(repo, home, "alpha", body=_consumer_body())
+        # the deploy unit's own locator must NOT reach the probe
+        saved = os.environ.get("HESTIA_HOME")
+        os.environ["HESTIA_HOME"] = str(root / "deploy-units-home")
+        try:
+            rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+            assert not good, rows
+            assert rows[0]["status"] == "refused" and "config.unbacked" in rows[0]["reason"], rows
+            # the launcher supplies it on the registered hook line -> the same candidate is allowed
+            config = home / ".alpha" / "settings.json"
+            installed = home / ".alpha" / "hooks" / "pre_tool_use.py"
+            config.write_text(json.dumps({"hooks": [{"command": f'HESTIA_HOME="{root}/launcher-home" python3 {installed}'}]}),
+                              encoding="utf-8")
+            rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+            assert good, rows
+            assert rows == [{"member": "alpha", "probe": "read", "status": "ok"}]
+            # and a `${HESTIA_HOME:-...}` default on the launcher line counts as the launcher's supply
+            config.write_text(json.dumps({"hooks": [{"command": f'HESTIA_HOME="${{HESTIA_HOME:-{root}/launcher-home}}" python3 {installed}'}]}),
+                              encoding="utf-8")
+            del os.environ["HESTIA_HOME"]
+            rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+            assert good, rows
+        finally:
+            if saved is None:
+                os.environ.pop("HESTIA_HOME", None)
+            else:
+                os.environ["HESTIA_HOME"] = saved
+
+
 def test_registered_refusal_blocks_the_set_before_installation():
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
@@ -212,4 +258,5 @@ if __name__ == "__main__":
     test_bad_registration_is_unmeasured_not_absent()
     test_workspace_is_explicit_when_a_checkout_is_nested_in_a_worktree()
     test_every_shipped_gate_declares_its_own_probe_shape()
+    test_a_projection_consumer_is_probed_under_the_launcher_env_not_the_deploy_units()
     print("ok: 11 gate-preflight checks")

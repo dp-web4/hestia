@@ -1,0 +1,825 @@
+{
+  "version": 2,
+  "adopted": "2026-09-28",
+  "about": "Canonical ground truth for what the operator can see and do, independent of any one surface. Both the daemon's web dashboard and the desktop app are checked against it by tools/operator_surfaces_spec_test.py. Change THIS first, in the same PR as the route or the screen. See README.md.",
+  "surfaces": [
+    "dashboard",
+    "app"
+  ],
+  "places": {
+    "me": "who am I and what is mine",
+    "communities": "who am I part of",
+    "activity": "what happened, and what needs me"
+  },
+  "rules": [
+    {
+      "id": "reason-to-permit",
+      "text": "Any act that PERMITS (approve, grant, ratify, register, delegate) carries a stated reason, recorded on the chain; refusing does not require one. The asymmetry is preserved, never inverted. Surfaces refuse an empty reason before the daemon sees it.",
+      "source": "PRD_APP_GOVERNING_SURFACES.md §1a; SPRINTS_APP_SURFACES.md 1.4"
+    },
+    {
+      "id": "already-decided-409",
+      "text": "A single-shot decision answered 409 renders as 'already decided elsewhere' and re-reads; it is not shown as a failure.",
+      "source": "SPRINTS_APP_SURFACES.md Sprint 1, conflict management"
+    },
+    {
+      "id": "bound-to-rendered-evidence",
+      "text": "A write whose meaning depends on state the operator reviewed sends that state, and the daemon refuses (409) if it moved. The surface shows what moved.",
+      "source": "hestia #1132 (gate ratify expected)"
+    },
+    {
+      "id": "unknown-not-fine",
+      "text": "An unmeasurable answer (UNKNOWN) is never rendered as fine, never as an empty list, and never silently replaced by the last known state.",
+      "source": "agent-inventory; gates verify; #1136"
+    },
+    {
+      "id": "member-id",
+      "text": "Members are identified by MEMBER id (e.g. kimi-code), never by atlas id (kimi_code_cli) or plugin directory (kimi).",
+      "source": "hestia #1136"
+    },
+    {
+      "id": "confirm-irreversible",
+      "text": "An act that destroys or replaces something unrecoverable asks for explicit confirmation (typed name for deletes).",
+      "source": "dashboard vault pane; #1137"
+    },
+    {
+      "id": "no-secret-values",
+      "text": "Vault values are never displayed or re-fetched; lists carry names and policy only.",
+      "source": "dashboard vault pane; hestia #1123"
+    },
+    {
+      "id": "signed-in-only",
+      "text": "Operator writes are ABSENT, not disabled-looking, without an operator session.",
+      "source": "SPRINTS_APP_SURFACES.md 1.5"
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "operator-sign-in",
+      "title": "Operator sign-in (LCT challenge/response)",
+      "place": "me",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "POST /api/operator/challenge",
+        "POST /api/operator/session"
+      ],
+      "rules": [
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "required"
+        }
+      },
+      "notes": "Custody differs by design today: the app keeps the key in a passphrase vault in Rust; the dashboard keeps the seed in browser storage. Revisit."
+    },
+    {
+      "id": "snapshot",
+      "title": "Live snapshot: members, trust, chain tail, pending decisions",
+      "place": "activity",
+      "kind": "read",
+      "risk": "low",
+      "routes": [
+        "GET /api/dashboard"
+      ],
+      "rules": [
+        "unknown-not-fine"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "required"
+        }
+      }
+    },
+    {
+      "id": "failures",
+      "title": "Recent failures",
+      "place": "activity",
+      "kind": "read",
+      "risk": "low",
+      "routes": [
+        "GET /api/failures"
+      ],
+      "rules": [],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "required"
+        }
+      }
+    },
+    {
+      "id": "trust-derivation",
+      "title": "How a trust figure was derived (receipts)",
+      "place": "activity",
+      "kind": "read",
+      "risk": "low",
+      "routes": [
+        "GET /api/trust/derivation"
+      ],
+      "rules": [],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "required"
+        }
+      }
+    },
+    {
+      "id": "chain-browse",
+      "title": "Browse the witness chain",
+      "place": "activity",
+      "kind": "read",
+      "risk": "low",
+      "routes": [
+        "GET /api/chain"
+      ],
+      "rules": [],
+      "surfaces": {
+        "dashboard": {
+          "status": "planned",
+          "why": "the ledger covers governance history; a raw chain browser is not built yet"
+        },
+        "app": {
+          "status": "required"
+        }
+      }
+    },
+    {
+      "id": "governance-ledger",
+      "title": "Governance ledger (decisions, grants, rulings)",
+      "place": "activity",
+      "kind": "read",
+      "risk": "low",
+      "routes": [
+        "GET /api/governance/ledger"
+      ],
+      "rules": [],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
+      "id": "decide-escalation",
+      "title": "Rule on a pending gate escalation",
+      "place": "activity",
+      "kind": "write",
+      "risk": "critical",
+      "routes": [
+        "POST /api/operator/gate-escalation"
+      ],
+      "rules": [
+        "reason-to-permit",
+        "already-decided-409",
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "required"
+        }
+      }
+    },
+    {
+      "id": "decide-scope-request",
+      "title": "Rule on a scope request",
+      "place": "activity",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "POST /api/scope/decide"
+      ],
+      "rules": [
+        "reason-to-permit",
+        "already-decided-409",
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "required"
+        }
+      },
+      "notes": "The app sends standing/recursive at decide time; the dashboard makes those separate witnessed acts. Reconcile."
+    },
+    {
+      "id": "scope-grant",
+      "title": "Originate a scope grant (TTL)",
+      "place": "activity",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "POST /api/scope/grant"
+      ],
+      "rules": [
+        "reason-to-permit",
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
+      "id": "scope-standing",
+      "title": "Make a grant standing / recursive / reassign it",
+      "place": "activity",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "POST /api/scope/standing/promote",
+        "POST /api/scope/standing/recursive",
+        "POST /api/scope/standing/reassign"
+      ],
+      "rules": [
+        "reason-to-permit",
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
+      "id": "scope-revoke",
+      "title": "Revoke a live or standing grant",
+      "place": "activity",
+      "kind": "write",
+      "risk": "medium",
+      "routes": [
+        "POST /api/scope/revoke",
+        "POST /api/scope/standing/revoke"
+      ],
+      "rules": [
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
+      "id": "adjudicate",
+      "title": "Adjudicate / alias / amnesty",
+      "place": "activity",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "POST /api/operator/adjudicate",
+        "POST /api/operator/alias",
+        "POST /api/operator/amnesty"
+      ],
+      "rules": [
+        "reason-to-permit",
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
+      "id": "policy-read",
+      "title": "Read the law in force",
+      "place": "activity",
+      "kind": "read",
+      "risk": "low",
+      "routes": [
+        "GET /api/policy"
+      ],
+      "rules": [],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "required"
+        }
+      }
+    },
+    {
+      "id": "policy-preset",
+      "title": "Set the global preset",
+      "place": "activity",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "PUT /api/policy/preset"
+      ],
+      "rules": [
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "required"
+        }
+      },
+      "notes": "Neither surface asks a reason or a confirm for a global preset change today. Candidate for reason-to-permit."
+    },
+    {
+      "id": "policy-instance",
+      "title": "Per-member policy grant and revoke",
+      "place": "activity",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "POST /api/policy/instance",
+        "DELETE /api/policy/instance/:plugin_id/:role"
+      ],
+      "rules": [
+        "reason-to-permit",
+        "member-id",
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
+      "id": "policy-override",
+      "title": "Rule overrides",
+      "place": "activity",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "PUT /api/policy/override",
+        "DELETE /api/policy/override/:rule_id"
+      ],
+      "rules": [
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
+      "id": "policy-rule",
+      "title": "Add or delete a rule",
+      "place": "activity",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "PUT /api/policy/rule",
+        "DELETE /api/policy/rule/:rule_id"
+      ],
+      "rules": [
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
+      "id": "agents-inventory",
+      "title": "Who is on this box and is it governed (inventory, dots, Discover)",
+      "place": "activity",
+      "kind": "read",
+      "risk": "low",
+      "routes": [
+        "GET /api/agents"
+      ],
+      "rules": [
+        "unknown-not-fine",
+        "member-id"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "required"
+        }
+      }
+    },
+    {
+      "id": "agent-register",
+      "title": "Register a discovered harness or being",
+      "place": "activity",
+      "kind": "write",
+      "risk": "medium",
+      "routes": [
+        "POST /api/agents/register"
+      ],
+      "rules": [
+        "reason-to-permit",
+        "member-id",
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
+      "id": "agent-retire",
+      "title": "Retire / reinstate a member",
+      "place": "activity",
+      "kind": "write",
+      "risk": "medium",
+      "routes": [
+        "POST /api/agents/:id/retire",
+        "POST /api/agents/:id/reinstate"
+      ],
+      "rules": [
+        "member-id",
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
+      "id": "orchestrator-connect",
+      "title": "Govern a harness (install its hooks)",
+      "place": "activity",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "POST /api/orchestrators/:id/connect"
+      ],
+      "rules": [
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
+      "id": "delegations",
+      "title": "Delegations: list, grant, revoke",
+      "place": "me",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "GET /api/agents/:id/delegations",
+        "POST /api/agents/:id/delegations",
+        "POST /api/agents/:id/delegations/:deleg/revoke"
+      ],
+      "rules": [
+        "reason-to-permit",
+        "member-id",
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      },
+      "notes": "The app shows delegations read-only from the snapshot."
+    },
+    {
+      "id": "member-aliases",
+      "title": "Display aliases for members",
+      "place": "activity",
+      "kind": "write",
+      "risk": "low",
+      "routes": [
+        "GET /api/ui/member-aliases",
+        "PUT /api/ui/member-aliases",
+        "DELETE /api/ui/member-aliases/:plugin_id"
+      ],
+      "rules": [
+        "member-id"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
+      "id": "gates-verify",
+      "title": "Gate integrity: installed vs ratified vs deployed",
+      "place": "me",
+      "kind": "read",
+      "risk": "low",
+      "routes": [
+        "GET /api/gates/verify"
+      ],
+      "rules": [
+        "unknown-not-fine"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "required"
+        }
+      }
+    },
+    {
+      "id": "gates-ratify",
+      "title": "Ratify the installed gates as the trusted build",
+      "place": "me",
+      "kind": "write",
+      "risk": "critical",
+      "routes": [
+        "POST /api/gates/ratify"
+      ],
+      "rules": [
+        "reason-to-permit",
+        "bound-to-rendered-evidence",
+        "confirm-irreversible",
+        "unknown-not-fine",
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "required"
+        }
+      }
+    },
+    {
+      "id": "deployment-update",
+      "title": "Trigger a deployment update",
+      "place": "me",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "POST /api/operator/deployment/update"
+      ],
+      "rules": [
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
+      "id": "vault",
+      "title": "Vault: list names and policy, add, delete",
+      "place": "me",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "GET /api/vault",
+        "POST /api/vault",
+        "DELETE /api/vault/:name"
+      ],
+      "rules": [
+        "no-secret-values",
+        "confirm-irreversible",
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "required"
+        }
+      }
+    },
+    {
+      "id": "runtime-config",
+      "title": "Runtime config: list, inspect, save",
+      "place": "me",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "GET /api/config/seat",
+        "GET /api/config/seat/:plugin_id",
+        "PUT /api/config/seat"
+      ],
+      "rules": [
+        "member-id",
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "required"
+        }
+      }
+    },
+    {
+      "id": "hub-read",
+      "title": "Hub status and topics",
+      "place": "communities",
+      "kind": "read",
+      "risk": "low",
+      "routes": [
+        "GET /api/hub/status",
+        "GET /api/hub/topics"
+      ],
+      "rules": [],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      },
+      "notes": "The app shows hubs read-only from the snapshot."
+    },
+    {
+      "id": "hub-act",
+      "title": "Join a hub, open a topic, post",
+      "place": "communities",
+      "kind": "write",
+      "risk": "medium",
+      "routes": [
+        "POST /api/hub/join",
+        "POST /api/hub/topic",
+        "POST /api/hub/post"
+      ],
+      "rules": [
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
+      "id": "hub-urls",
+      "title": "Hub endpoints: list, add, remove, choose active",
+      "place": "communities",
+      "kind": "write",
+      "risk": "medium",
+      "routes": [
+        "GET /api/hub/urls",
+        "POST /api/hub/urls",
+        "DELETE /api/hub/urls",
+        "PUT /api/hub/urls/active"
+      ],
+      "rules": [
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    }
+  ],
+  "unsurfaced": [
+    {
+      "route": "GET /",
+      "why": "serves the dashboard itself"
+    },
+    {
+      "route": "POST /api/agents/:id/ungovern",
+      "why": "removes a harness's hooks with no reason and discards its chain append (let _ = append_chain); must be hardened (required reason, record-or-undo) before ANY surface exposes it"
+    },
+    {
+      "route": "POST /api/scope/floor",
+      "why": "the society floor: the widest escalation there is; CLI/operator-only until a surface is designed for it. A read-only view is wanted"
+    },
+    {
+      "route": "POST /api/scope/floor/remove",
+      "why": "as scope/floor"
+    },
+    {
+      "route": "POST /api/scope/reroot",
+      "why": "rewrites the whole scope set; deliberately no UI"
+    },
+    {
+      "route": "GET /api/transport/binding",
+      "why": "transport bindings (#1030): no surface yet; a read-only view is wanted"
+    },
+    {
+      "route": "POST /api/transport/binding",
+      "why": "transport bindings (#1030): member/operator wiring, not yet a UI act"
+    },
+    {
+      "route": "POST /api/transport/binding/remove",
+      "why": "as transport/binding"
+    },
+    {
+      "route": "POST /api/config/seed",
+      "why": "bootstrap path for runtime config, run by deploy/installer"
+    },
+    {
+      "route": "GET /api/trust/graph",
+      "why": "no consumer yet"
+    },
+    {
+      "route": "GET /api/scope/requests",
+      "why": "both surfaces read requests from the snapshot (GET /api/dashboard) instead"
+    },
+    {
+      "route": "POST /credential",
+      "why": "wallet-facing credential issuance, not an operator surface"
+    },
+    {
+      "route": "POST /nonce",
+      "why": "wallet-facing"
+    },
+    {
+      "route": "GET /.well-known/openid-credential-issuer",
+      "why": "wallet-facing metadata"
+    }
+  ],
+  "known_gaps": []
+}

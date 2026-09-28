@@ -122,6 +122,11 @@ enum Command {
     #[command(subcommand)]
     Profile(ProfileCmd),
 
+    /// Scope rulings under an operator delegation (#952): a peer seat rules another
+    /// member's pending scope request, SIGNED with this seat's own registry key.
+    #[command(subcommand)]
+    Scope(ScopeCmd),
+
     /// Governance-surface escalations — the remedy every gate deny already names.
     ///
     /// Stage 2 (#114) prints `hestia gate approve <id>` on every refusal; the
@@ -172,7 +177,8 @@ enum GateCmd {
         wait: Option<u64>,
     },
 
-    /// Approve a governance write. Requires --reason; a deny does not.
+    /// Approve a governance write. Requires --reason; a PEER deny does not (but
+    /// withdrawing your OWN escalation does — see `deny`).
     Approve {
         /// Escalation id from the deny text
         escalation_id: String,
@@ -181,11 +187,19 @@ enum GateCmd {
         reason: String,
     },
 
-    /// Refuse a governance write
+    /// Refuse a governance write — or, aimed at your own escalation, WITHDRAW it.
+    ///
+    /// Those are two different acts through one verb, and they have different
+    /// requirements. Denying a PEER's ask needs no rationale: refusing is the
+    /// conservative default and should not be taxed. Withdrawing your OWN ask
+    /// REQUIRES --reason, because you are the only party who knows why the gate
+    /// fired on a command you are now dropping, and this is the only field where
+    /// that can be recorded. The daemon refuses a silent self-withdrawal; the
+    /// escalation stays pending, so just re-run with --reason.
     Deny {
         /// Escalation id from the deny text
         escalation_id: String,
-        /// Optional rationale
+        /// Why. Optional against a peer's ask; REQUIRED to withdraw your own.
         #[arg(long)]
         reason: Option<String>,
     },
@@ -637,6 +651,34 @@ enum PolicyCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum ScopeCmd {
+    /// Rule a pending scope request under an operator delegation (#952). Signs the ruling
+    /// with this seat's member key from the vault and calls `hestia_scope_arbitrate`.
+    Arbitrate {
+        /// The pending request id (from hestia_scope_status or the escalation note)
+        request_id: String,
+        /// Grant it — as a STANDING grant (a delegate cannot mint the memory-only kind)
+        #[arg(long, conflicts_with = "deny")]
+        grant: bool,
+        /// Refuse it — the member may re-file
+        #[arg(long, conflicts_with = "grant")]
+        deny: bool,
+        /// Why. Required to grant.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Which seat is ruling (its member id, e.g. claude-code). Must hold the delegation.
+        #[arg(long = "as")]
+        as_member: String,
+        /// Daemon MCP endpoint
+        #[arg(long, default_value = "http://127.0.0.1:7711")]
+        endpoint: String,
+        /// Hub connection whose member key signs (url or uuid; default: the sole connection)
+        #[arg(long, default_value = "")]
+        target: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum DelegateCmd {
     /// Grant authority to an agent
     #[command(alias = "to")]
@@ -655,6 +697,17 @@ enum DelegateCmd {
         /// Expiration in hours (e.g. --expires 24)
         #[arg(long)]
         expires: Option<u64>,
+    },
+
+    /// Print the delegation key for a seat, derived from its registry LCT (#952).
+    ///
+    /// `delegate grant` takes a UUID, member LCTs are mb32 strings, so this is the
+    /// deterministic bridge: same seat, same key, on any machine. Grant against what this
+    /// prints, never against a name.
+    #[command(name = "agent-id")]
+    AgentId {
+        /// The seat's member id, e.g. claude-code
+        plugin_id: String,
     },
 
     /// List active delegations
@@ -737,6 +790,12 @@ pub fn run() -> AnyResult<()> {
         Command::Info => cmd_info(&home),
         Command::Serve { bind, allow_remote, callback } => cmd_serve(&home, &bind, allow_remote, callback),
         Command::Dashboard { endpoint } => hestia::tui::run(&endpoint),
+        Command::Scope(ScopeCmd::Arbitrate { request_id, grant, deny, reason, as_member, endpoint, target }) => {
+            if grant == deny {
+                anyhow::bail!("say exactly one of --grant or --deny — an omitted verdict is not a verdict");
+            }
+            cmd_scope_arbitrate(&home, &endpoint, &request_id, grant, reason, &as_member, &target)
+        }
         Command::Gate { cmd, endpoint, asserted_id, role } => {
             use hestia::gate_cli;
             match cmd {
@@ -791,6 +850,7 @@ pub fn run() -> AnyResult<()> {
             PolicyCmd::RmRule { id, role } => cmd_policy_rm_rule(&home, &id, role),
         },
         Command::Delegate(d) => match d {
+            DelegateCmd::AgentId { plugin_id } => cmd_delegate_agent_id(&home, &plugin_id),
             DelegateCmd::Grant { agent, role, action, expires } => {
                 cmd_delegate_grant(&home, &agent, role, action, expires)
             }
@@ -1011,7 +1071,7 @@ fn cmd_init(home: &std::path::Path, force: bool, ai: bool) -> AnyResult<()> {
 
         // A CLEARTEXT, public-only identity artifact so a LOCKED node can self-identify —
         // `info` reads it without the vault passphrase, and it is what a hub needs to answer
-        // `/.well-known` before unlock (the dev-hub "clear tier-0 public-identity.json" wrinkle).
+        // `/.well-known` before unlock (the hub's clear tier-0 `public-identity.json`, web4 #355–357).
         // PUBLIC DATA ONLY: the LCT id is a shareable identifier derived from the public key; the
         // keypair stays sealed in the vault and never touches this file.
         let pub_identity = serde_json::json!({
@@ -1571,6 +1631,17 @@ fn cmd_witness_onboard(home: &std::path::Path, plugin_id: &str, target: &str) ->
     // The operational (witnessing) key = the connection's channel key.
     let op_kp = member_signing_keypair(&vault, &conn.member_key_source)?;
     let mut reg = hestia::member_registry::load_members(&vault);
+    // A filler is never a witness. Named here, before the vouch is attempted, so the
+    // operator reads the reason rather than the generic "is it a minted member?" below —
+    // it IS minted, and that is exactly why the answer is no.
+    if reg.is_filler(plugin_id) {
+        anyhow::bail!(
+            "'{plugin_id}' is a FILLER — a role-bound reasoner this plane invokes and signs \
+             for custodially — and a filler is never a witness: its key is this plane's key, \
+             so its attestation would be this seat witnessing itself under another name. \
+             Nothing to onboard."
+        );
+    }
     if hestia::member_registry::vouch_witnessing_key(&mut vault, &mut reg, plugin_id, op_kp.verifying_key()) {
         let id = reg.get(plugin_id).map(|l| l.lct_id()).unwrap_or_default();
         println!("Vouched operational witnessing key for '{plugin_id}'.");
@@ -3579,13 +3650,47 @@ fn cmd_delegate_grant(
         .map(|r| delegation::parse_role(r))
         .collect::<Result<_, _>>()?;
 
-    // For now, use a fresh keypair as the delegator.
-    // In production, this would come from the vault's LCT identity.
-    let delegator_kp = web4_core::crypto::KeyPair::generate();
-    let delegator_id = uuid::Uuid::new_v4();
+    // The delegator is the vault's own identity key, never a throwaway (#952): a delegation
+    // signed by a key discarded microseconds later claims a provenance it does not have, and
+    // the daemon now refuses a delegation it cannot verify against this key.
+
 
     let mut vault = open_vault(home)?;
+    // THE SAME REFUSAL AS THE HTTP DOOR. #1106 said a retired id is "refused through this door
+    // as through every other", and that was true of the three routes only: this command takes
+    // the agent KEY, so nothing here had ever mapped it back to a member to ask (cbp, #1106
+    // review, finding 5). The registry is small and the map is one way -- key = f(lct) -- so
+    // the reverse is a scan, done once, here.
+    // Loaded once, for both refusals below: the retired-member check (#1106) and the action
+    // check (#1110). Two loads would be two readings of the registry that could disagree.
+    let registry = hestia::member_registry::load_members(&vault);
+    {
+        let retired = hestia::server::retirement::load(&vault);
+        if !retired.retired.is_empty() {
+            let who = registry.iter_sorted().into_iter().find(|(_, lct)| {
+                delegation::agent_key_for_lct(&lct.lct_id()) == agent_id
+            }).map(|(id, _)| id.clone());
+            if let Some(plugin_id) = who {
+                if let Some(r) = retired.get(&plugin_id) {
+                    anyhow::bail!(
+                        "'{plugin_id}' was RETIRED on this seat ({}). Nothing was delegated: a \
+                         retired id receives no authority through this door either. Reinstate it \
+                         first — the dashboard's agent view, or POST /api/agents/{plugin_id}/reinstate.",
+                        r.reason);
+                }
+            }
+        }
+    }
+    // THE SAME ACTION CHECK AS THE HTTP DOOR (#1110), from the same function, so the two cannot
+    // drift -- this door is where #1106's retirement refusal was missing the first time. An
+    // action whose member segment names no recorded member, or a `scope.decide` shape that binds
+    // nothing, is refused before anything is signed.
+    #[rustfmt::skip]
+    let suggest: Vec<String> = registry.iter_sorted().into_iter().filter(|(id, _)| !registry.is_filler(id)).map(|(id, _)| id.clone()).collect();
+    let unvalidated = delegation::check_actions(&actions, &|m| registry.get(m).is_some(), &suggest)
+        .map_err(anyhow::Error::msg)?;
     let mut store = DelegationStore::load(&vault)?;
+    let (delegator_id, delegator_kp) = delegation::operator_delegator(&vault, home)?;
     let deleg = store.create_delegation(
         delegator_id,
         agent_id,
@@ -3605,6 +3710,163 @@ fn cmd_delegate_grant(
     println!("  id:      {id}");
     println!("  agent:   {agent_id}");
     println!("  expires: {exp}");
+    // SAID, not implied: accepted is not the same as checked.
+    for a in &unvalidated {
+        println!("  note:    '{a}' is not a verb this daemon interprets -- stored as given, NOT validated");
+    }
+    Ok(())
+}
+
+/// Print the delegation key for a seat (#952). Reads the member registry, derives the
+/// UUIDv5 the store is keyed on, and shows the grant line an operator would run — so the
+/// operator never has to hand-translate an mb32 LCT into a UUID.
+fn cmd_delegate_agent_id(home: &std::path::Path, plugin_id: &str) -> AnyResult<()> {
+    let vault = open_vault(home)?;
+    let registry = hestia::member_registry::load_members(&vault);
+    let Some(lct) = registry.get(plugin_id) else {
+        anyhow::bail!(
+            "'{plugin_id}' has no LCT in this society's member registry, so no delegation can \
+             be keyed to it — a delegation binds to an identity derived from a public key, \
+             never to a name. Connect that seat once, then retry."
+        );
+    };
+    let lct_id: String = lct.lct_id();
+    let key = delegation::agent_key_for_lct(&lct_id);
+    println!("member    {plugin_id}");
+    println!("lct       {lct_id}");
+    println!("agent-id  {key}");
+    println!();
+    println!("grant a bounded scope-ruling authority to this seat with, e.g.:");
+    println!(
+        "  hestia delegate grant {key} --action 'scope.decide:<member>:/abs/prefix' --expires 720"
+    );
+    Ok(())
+}
+
+/// `hestia scope arbitrate` (#952): the signer half of the delegated scope door.
+///
+/// The daemon side (`hestia_scope_arbitrate`) refuses an UNSIGNED ruling by name, because a
+/// session's plugin_id is asserted and this is the only MCP path that mints a durable grant.
+/// This command is what makes it callable: it reads this seat's member key from the vault
+/// (the same key `witness attest` signs with — binding key or the vouched operational
+/// channel key, per `hestia hub set-member-key`), signs the canonical arbitration message,
+/// opens a session AS the seat, and calls the tool. The daemon verifies the signature against
+/// the seat's registry LCT and checks the delegation; this CLI adds no authority of its own.
+fn cmd_scope_arbitrate(
+    home: &std::path::Path,
+    endpoint: &str,
+    request_id: &str,
+    granted: bool,
+    reason: Option<String>,
+    as_member: &str,
+    target: &str,
+) -> AnyResult<()> {
+    let reason = reason.unwrap_or_default();
+    if granted && reason.trim().is_empty() {
+        anyhow::bail!("--reason is required to grant: a delegated widening whose rationale is \
+                       unrecorded is indistinguishable afterwards from a misconfiguration");
+    }
+    let vault = open_vault(home)?;
+    let store = HubStore::load(&vault)?;
+    let conn = if target.is_empty() {
+        match store.connections.as_slice() {
+            [only] => only,
+            [] => anyhow::bail!("not connected to a hub — the member key is bound to a connection; `hestia hub connect <url>` first"),
+            _ => anyhow::bail!("multiple hub connections — pass --target <url|uuid>"),
+        }
+    } else if let Ok(id) = uuid::Uuid::parse_str(target) {
+        store.connections.iter().find(|c| c.id == id || c.hub_lct_id == id)
+            .ok_or_else(|| anyhow::anyhow!("no connection matching {target}"))?
+    } else {
+        store.connections.iter().find(|c| c.url == target)
+            .ok_or_else(|| anyhow::anyhow!("not connected to {target}"))?
+    };
+    let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
+    // Say up front whether the daemon will be able to verify this signature at all.
+    let reg = hestia::member_registry::load_members(&vault);
+    match reg.get(as_member) {
+        None => anyhow::bail!(
+            "'{as_member}' has no LCT in this society's member registry, so the daemon cannot \
+             verify a signature for it — connect that seat once, then `hestia witness onboard {as_member}`"),
+        Some(lct) => {
+            let signer = keypair.verifying_key();
+            let matches = lct.public_key == signer
+                || lct.operational_keys.iter().any(|k| {
+                    lct.operational_key_for(&k.purpose).as_ref() == Some(&k.pubkey) && k.pubkey == signer
+                });
+            if !matches {
+                anyhow::bail!(
+                    "this vault's member key is not '{as_member}'s registry binding key and is not \
+                     a key it vouched — the daemon would refuse the signature. Run `hestia witness \
+                     onboard {as_member}` (vouches the channel key) or point `hestia hub \
+                     set-member-key` at the right key."
+                );
+            }
+        }
+    }
+    let mut m = hestia::gate_cli::Mcp::connect(endpoint)?;
+    let (sid, _who) = hestia::gate_cli::open_session(&mut m, as_member, "role:constellation:member")?;
+    eprintln!("identity ASSERTED as '{as_member}' at connect; the RULING is signed by its registry key, which the daemon verifies.");
+
+    // Preflight, unsigned. The signed bytes name the MEMBER and the PATH (v2, HUB on #962),
+    // and only the daemon knows which member and path a request id stands for. The unsigned
+    // refusal hands them back in `signs`; this seat reads them out, rebuilds the canonical
+    // message ITSELF from them, checks it is byte-identical to the hint, prints what it is
+    // about to endorse, and signs bytes it constructed — never an opaque string it was told to
+    // sign. Every refusal that precedes the signature check (no such request, not pending,
+    // self-ruling) surfaces here, before anything is signed.
+    let probe = m.tool_envelope(
+        "hestia_scope_arbitrate",
+        serde_json::json!({
+            "request_id": request_id,
+            "granted": granted,
+            "reason": reason,
+            "session_id": sid,
+        }),
+    )?;
+    let code = probe["_hestia_error"]["code"].as_str().unwrap_or_default().to_string();
+    if code != "hestia.scope_arbitrate_unsigned" {
+        println!("{}", serde_json::to_string_pretty(&probe)?);
+        anyhow::bail!("the daemon refused the ruling before the signature was checked (see above)");
+    }
+    let signs = probe["_hestia_error"]["data"]["signs"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("the daemon's unsigned refusal carried no `signs` hint"))?;
+    let (member, path) = delegation::arbitration_subject(signs).ok_or_else(|| {
+        anyhow::anyhow!(
+            "the daemon's `signs` hint is not a canonical {} message; refusing to sign bytes \
+             this seat cannot reconstruct: {signs:?}",
+            delegation::ARBITRATION_HEADER
+        )
+    })?;
+    let msg = delegation::arbitration_message(request_id, &member, &path, granted, &reason);
+    if msg != signs {
+        anyhow::bail!(
+            "the daemon's `signs` hint differs from the canonical message this seat rebuilt \
+             from it; refusing to sign.\n  hint:  {signs:?}\n  built: {msg:?}"
+        );
+    }
+    eprintln!(
+        "signing: '{member}' {} {path}  (request {request_id})",
+        if granted { "MAY reach" } else { "may NOT reach" }
+    );
+    let sig = keypair.sign(msg.as_bytes());
+    let sig_hex = hex::encode(sig.bytes);
+
+    let r = m.tool(
+        "hestia_scope_arbitrate",
+        serde_json::json!({
+            "request_id": request_id,
+            "granted": granted,
+            "reason": reason,
+            "session_id": sid,
+            "arbiter_signature": sig_hex,
+        }),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&r)?);
+    if r.get("_hestia_error").is_some() {
+        anyhow::bail!("the daemon refused the ruling (see above)");
+    }
     Ok(())
 }
 
@@ -3622,13 +3884,20 @@ fn cmd_delegate_list(home: &std::path::Path) -> AnyResult<()> {
         let roles: Vec<String> = d.scope.roles.iter()
             .map(|r| format!("{:?}", r))
             .collect();
-        let role_str = if roles.is_empty() { "*".into() } else { roles.join(", ") };
+        // An action-only delegation used to print `roles=[*]`, which reads as UNRESTRICTED
+        // and hid the one thing an operator revoking it needs to see (#952). Print exactly
+        // what the record says: roles, actions, and `unrestricted` only when both are empty.
+        let scope_str = match (roles.is_empty(), d.scope.actions.is_empty()) {
+            (true, true) => "UNRESTRICTED".to_string(),
+            (false, true) => format!("roles=[{}]", roles.join(", ")),
+            (true, false) => format!("actions=[{}]", d.scope.actions.join(", ")),
+            (false, false) => format!("roles=[{}] actions=[{}]", roles.join(", "), d.scope.actions.join(", ")),
+        };
         let exp = d.expires_at
             .map(|e| e.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_else(|| "never".into());
 
-        println!("{} → agent={} roles=[{}] expires={}",
-            d.id, d.agent_lct_id, role_str, exp);
+        println!("{} → agent={} {} expires={}", d.id, d.agent_lct_id, scope_str, exp);
     }
     println!("\n{} active delegation(s), {} total", store.active().len(), store.delegations.len());
     Ok(())
@@ -3957,7 +4226,17 @@ mod serve_guard_tests {
         assert!(!bind_is_loopback("0.0.0.0:7711"));
         assert!(!bind_is_loopback("[::]:7711"));
         assert!(!bind_is_loopback("192.168.1.20:7711"));
-        assert!(!bind_is_loopback("100.75.141.17:7711")); // tailnet IP
+        assert!(!bind_is_loopback("100.64.0.1:7711")); // tailnet-range (CGNAT 100.64.0.0/10)
+    }
+}
+
+#[cfg(test)]
+mod device_key_classification_tests {
+    /// Device keys are daemon-owned: the operator vault screen must not offer to delete one.
+    #[test]
+    fn device_key_names_are_system_entries() {
+        let name = super::device_key_name(uuid::Uuid::new_v4());
+        assert!(hestia::vault::system_entry_role(&name).is_some(), "{name}");
     }
 }
 

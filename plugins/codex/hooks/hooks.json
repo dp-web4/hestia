@@ -34,6 +34,12 @@
             "type": "command",
             "command": "@HESTIA_PLUGIN_ROOT@/codex/hooks/observe.sh",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "python3 @HESTIA_PLUGIN_ROOT@/codex/hooks/witness.py",
+            "statusMessage": "hestia: witness (acts reach the chain)",
+            "timeout": 10
           }
         ]
       }
@@ -49,5 +55,6 @@
         ]
       }
     ]
-  }
+  },
+  "_witness_note": "witness.py is the hook that reaches the daemon (hestia_begin_action + hestia_record_outcome); observe.sh only appends the raw event to a local file. Before #1133 only observe.sh was registered here, so no codex act ever reached the chain while the inventory read the member as governed."
 }

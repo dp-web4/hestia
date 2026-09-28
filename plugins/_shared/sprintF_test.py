@@ -188,6 +188,17 @@ def make_workspace():
     return tmp, ws
 
 
+def project(home, plugin_id):
+    """The seat's rendered config projection under a fixture home (#944). Carries ONLY the
+    locator, so every other variable this harness sets stays the launcher's: the projection
+    wins over the environment for the keys it holds, and these arms are about scope, not
+    about which value won."""
+    seats = os.path.join(home, "seats")
+    os.makedirs(seats, exist_ok=True)
+    with open(os.path.join(seats, plugin_id + "." + "env"), "w", encoding="utf-8") as fh:
+        fh.write(f"# member: {plugin_id}\nHESTIA_HOME={home}\n")
+
+
 def run_hook(shim, ws, event, endpoint, home=None, cwd=None):
     cfg = SHIMS[shim]
     env = dict(os.environ)
@@ -199,8 +210,14 @@ def run_hook(shim, ws, event, endpoint, home=None, cwd=None):
                 # Exercise the tree under test, never an installed or per-vendor copy.
                 "HESTIA_SHARED_DIR": SHARED,
                 "HESTIA_ENDPOINT": endpoint})
-    if home:
-        env["HESTIA_HOME"] = home
+    # A seat that consumes the vault projection refuses with no locator or no projection
+    # (#944 step 5, claude first). Every arm therefore runs against a home that HAS one --
+    # the one the arm asked for, or a scratch one -- so the refusal an arm asserts is the
+    # refusal it gets. The ambient HESTIA_HOME is never inherited: a fixture that borrowed
+    # the box's real home would be testing the box.
+    home = home or os.path.join(ws, "hestia-home")
+    project(home, cfg["plugin_id"])
+    env["HESTIA_HOME"] = home
     p = subprocess.run([sys.executable, cfg["hook"]], input=json.dumps(event),
                        capture_output=True, text=True, timeout=60,
                        cwd=cwd or os.path.join(ws, "granted"), env=env)

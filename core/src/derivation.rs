@@ -153,7 +153,7 @@ fn level_of(mean: f64) -> String {
     })
     .to_string()
 }
-const RETRY_WINDOW_MINUTES: i64 = 10;
+pub(crate) const RETRY_WINDOW_MINUTES: i64 = 10;
 /// How much chain the derivation scans — SPLIT BUDGETS.
 ///
 /// One global cap starved the evidence trust is EARNED from. Until 2026-08-23 a single
@@ -325,9 +325,33 @@ pub fn scan_window_with(
         "governance",
     );
     out.extend(scan(DERIVATION_HOT_EVENT_TYPES, hot_scan, "outcome"));
+    // ALIASES ARE READ WITHOUT A WINDOW. An `identity_alias` is not evidence that ages; it is
+    // a standing operator ruling about WHO an id is, and every fold below resolves identity
+    // through it (`aliased_identities`, `alias_target`). Riding in the governance budget it
+    // shared that budget with `policy_decision` -- one per gated tool call -- so the ruling
+    // scrolled out while the traffic it was meant to join kept arriving: measured 2026-08-06,
+    // the 07-26 `codex-cli -> codex` record was already unreachable eleven days later
+    // (state.rs, `the_member_lct_alias_guard_reaches_only_whitespace`), and a merge the
+    // operator performed silently un-merged itself. Same repair, same reason, as the appeal
+    // and escalation pointers (#610, #1014): type-indexed, so the cost is the number of alias
+    // records that exist -- a handful per seat, ever -- not the length of the chain. (A read
+    // still takes a finite bound, ALIAS_SCAN; "no window" means no RECENCY window.)
+    out.extend(scan(&[IDENTITY_ALIAS_EVENT], ALIAS_SCAN, "alias"));
     out.sort_by(|a, b| b.chain_position.cmp(&a.chain_position));
+    // The governance scan returns the recent aliases too; one entry, one vote.
+    out.dedup_by_key(|e| e.chain_position);
     out
 }
+
+/// How many alias records a read takes: a FINITE BOUND, not "all of them".
+///
+/// Said plainly because the prose around this repair says "no window", and that means no
+/// RECENCY window -- the read is by event type and does not age out, which was the defect.
+/// It is not mathematical unboundedness: the millionth-and-first alias record on one chain
+/// would not be read (GPT seat, PR #1075). Nothing will approach it -- each record is a
+/// deliberate operator act carrying a stated evidence pointer, and this fleet has single
+/// digits of them -- but the number is here to be found rather than assumed away.
+pub const ALIAS_SCAN: u64 = 1_000_000;
 
 /// Build a `ChainEntry` carrying ONLY the keys in [`DERIVATION_KEYS`].
 ///
@@ -402,7 +426,7 @@ pub fn alias_target(plugin_id: &str, window: &[ChainEntry]) -> Option<String> {
 /// every identity witnessed as an alias OF it. One level only, deliberately — a chain
 /// of aliases is a rename history nobody has needed yet, and transitive resolution
 /// would let two independent aliases silently join two unrelated members.
-fn aliased_identities<'a>(plugin_id: &'a str, entries: &[&'a ChainEntry]) -> Vec<String> {
+pub(crate) fn aliased_identities<'a>(plugin_id: &'a str, entries: &[&'a ChainEntry]) -> Vec<String> {
     let mut ids = vec![plugin_id.to_string()];
     for e in entries {
         if e.event_type == IDENTITY_ALIAS_EVENT
@@ -453,6 +477,17 @@ pub fn derive_with_volume(
     window: &[ChainEntry],
     volume: Option<WitnessedVolume>,
 ) -> DerivedTrust {
+    with_volume(derive_evidence(plugin_id, role_lct, window), volume)
+}
+
+/// The WINDOW half of a derivation: every dimension, its evidence and the governed count,
+/// with the level stated as if no volume were known.
+///
+/// Split from [`with_volume`] so the expensive half can be cached per member and the cheap
+/// half applied at read time against the grain's live lifetime totals (see
+/// `derivation_cache`). The split is exact: `derive_with_volume` is literally the
+/// composition, so every test above it pins the pair.
+pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -> DerivedTrust {
     let mut entries: Vec<&ChainEntry> = window.iter().collect();
     entries.sort_by_key(|e| e.chain_position);
 
@@ -1069,17 +1104,6 @@ pub fn derive_with_volume(
     let veracity = mk_adj(1, "veracity");
     let valuation = mk_adj(2, "valuation");
 
-    // ---- Display level: from DERIVED evidence only, never the legacy scalar ----
-    let measured: Vec<f64> = [&temperament, &validity, &veracity, &valuation]
-        .iter()
-        .filter_map(|d| d.score)
-        .collect();
-    let conduct = if measured.is_empty() {
-        None
-    } else {
-        Some(measured.iter().sum::<f64>() / measured.len() as f64)
-    };
-
     // Governed coverage, counted from the window. The governance budget is deep (100,000)
     // against ~8,000 governance events on this chain, so this count is complete in
     // practice — unlike `outcome`, which is capped for recency on purpose.
@@ -1090,13 +1114,44 @@ pub fn derive_with_volume(
         }
     }
 
+    let evidence_only = DerivedTrust {
+        derivation_version: DERIVATION_VERSION.to_string(),
+        plugin_id: plugin_id.to_string(),
+        role_lct: role_lct.to_string(),
+        generated_at: Utc::now(),
+        temperament,
+        validity,
+        veracity,
+        valuation,
+        // Placeholders: `with_volume` states the level; it is the only thing that does.
+        level: String::new(),
+        level_basis: String::new(),
+        baseline_acts: 0,
+        governed_acts,
+    };
+    with_volume(evidence_only, None)
+}
+
+/// The VOLUME half of a derivation: the display level, from the dimensions already derived
+/// and the grain's lifetime witnessed totals. Pure and cheap — no window.
+///
+/// Idempotent: it reads only the dimensions and `governed_acts`, and overwrites every field
+/// it states, so applying fresh totals to a cached [`derive_evidence`] result is the same
+/// as deriving again over the same window.
+pub fn with_volume(mut d: DerivedTrust, volume: Option<WitnessedVolume>) -> DerivedTrust {
+    let dims = [&d.temperament, &d.validity, &d.veracity, &d.valuation];
+    // ---- Display level: from DERIVED evidence only, never the legacy scalar ----
+    let measured: Vec<f64> = dims.iter().filter_map(|x| x.score).collect();
+    let conduct = if measured.is_empty() {
+        None
+    } else {
+        Some(measured.iter().sum::<f64>() / measured.len() as f64)
+    };
+
     // A grain whose OWN activity is below the volume floor must not assert a level from a
     // handful of observations — least of all ones that may have leaked in from a sibling
     // role. Narrow by construction: with no volume passed, nothing here changes.
-    let observations: u64 = [&temperament, &validity, &veracity, &valuation]
-        .iter()
-        .map(|d| d.observations)
-        .sum();
+    let observations: u64 = dims.iter().map(|x| x.observations).sum();
     let thin_grain = volume.is_some_and(|v| v.total_acts < BASELINE_MIN_ACTS);
     let conduct = if thin_grain && observations < LEVEL_MIN_OBSERVATIONS {
         None
@@ -1104,6 +1159,7 @@ pub fn derive_with_volume(
         conduct
     };
 
+    let governed_acts = d.governed_acts;
     let baseline = volume.and_then(|v| baseline_score(v.total_acts, governed_acts));
     let level_basis = match (conduct.is_some(), baseline.is_some()) {
         (false, false) => "none",
@@ -1127,20 +1183,10 @@ pub fn derive_with_volume(
         }
     };
 
-    DerivedTrust {
-        derivation_version: DERIVATION_VERSION.to_string(),
-        plugin_id: plugin_id.to_string(),
-        role_lct: role_lct.to_string(),
-        generated_at: Utc::now(),
-        temperament,
-        validity,
-        veracity,
-        valuation,
-        level,
-        level_basis,
-        baseline_acts: volume.map_or(0, |v| v.total_acts),
-        governed_acts,
-    }
+    d.level = level;
+    d.level_basis = level_basis;
+    d.baseline_acts = volume.map_or(0, |v| v.total_acts);
+    d
 }
 
 #[cfg(test)]
@@ -1377,6 +1423,72 @@ mod tests {
         let mut desc = positions.clone();
         desc.sort_by(|a, b| b.cmp(a));
         assert_eq!(positions, desc, "merged window must stay chain_position DESC");
+    }
+
+    /// A merge the operator performed must STAY performed (agent-lifecycle PRD R6).
+    ///
+    /// The alias rode in the governance budget, which it shares with `policy_decision` -- one
+    /// per gated tool call -- so it aged out in days and the two ids quietly became two members
+    /// again. ARM A is the old read and must LOSE the alias, or arm B proves nothing.
+    #[test]
+    fn an_alias_survives_being_buried_by_governance_traffic() {
+        use crate::storage::chain::SqliteChainStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), [7u8; 32]).unwrap();
+        let signer = "lct:web4:hestia:sovereign:test";
+
+        store
+            .append(
+                IDENTITY_ALIAS_EVENT,
+                json!({"alias": "Claude-code", "alias_of": "claude-code", "ref": "dp typo 2026-09-08"}),
+                signer,
+            )
+            .unwrap();
+        for i in 0..40 {
+            store
+                .append(
+                    "policy_decision",
+                    json!({"plugin_id": "claude-code", "decision": "allow", "n": i}),
+                    signer,
+                )
+                .unwrap();
+        }
+
+        let old = store
+            .scan_recent(None, Some(DERIVATION_GOVERNANCE_EVENT_TYPES), 10, project_row)
+            .unwrap();
+        assert_eq!(
+            alias_target("Claude-code", &old),
+            None,
+            "CONTROL IS INERT: the fixture no longer buries the alias, so arm B proves nothing."
+        );
+
+        // Same budgets as arm A. Only the dedicated alias read differs.
+        let new = scan_window_with(&store, 10, 10);
+        assert_eq!(
+            alias_target("Claude-code", &new).as_deref(),
+            Some("claude-code"),
+            "REGRESSION: an operator's merge un-merged itself once enough traffic followed it."
+        );
+        let refs: Vec<&ChainEntry> = new.iter().collect();
+        assert_eq!(
+            aliased_identities("claude-code", &refs),
+            vec!["claude-code".to_string(), "Claude-code".to_string()],
+            "the fold must reach the alias's evidence, not only display the arrow"
+        );
+
+        // A RECENT alias is returned by both reads; it must still count once.
+        store
+            .append(IDENTITY_ALIAS_EVENT, json!({"alias": "caude-code", "alias_of": "claude-code"}), signer)
+            .unwrap();
+        let w = scan_window_with(&store, 10, 10);
+        let n = w.iter().filter(|e| e.event_type == IDENTITY_ALIAS_EVENT).count();
+        assert_eq!(n, 2, "two alias records exist; a duplicate here double-counts an entry");
+        let positions: Vec<u64> = w.iter().map(|e| e.chain_position).collect();
+        let mut desc = positions.clone();
+        desc.sort_by(|a, b| b.cmp(a));
+        desc.dedup();
+        assert_eq!(positions, desc, "merged window must stay DESC and free of duplicates");
     }
 
     fn entry(pos: u64, ts_offset_min: i64, event_type: &str, data: Value) -> ChainEntry {

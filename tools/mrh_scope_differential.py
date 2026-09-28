@@ -68,7 +68,12 @@ def build_fixture(base: Path) -> dict:
     (right / "sibling-repo" / "notes.md").write_text("x\n")
     os.symlink(".", right / "ai-agents")        # the stray self-link measured on CBP (2025-11-21)
     return {"wrong": str(wrong), "right": str(right), "hestia": str(right / "hestia"),
-            "grants": [f"path:{right / 'hestia'}", f"path:{right / 'docs'}"]}
+            # Whole-repo grants, spelled so since #1002: a bare `path:` is EXACT (the operator's
+            # default), and `/**` is the explicit subtree form. This experiment has always meant
+            # "the granted repo tree" — the pins below were measured under that meaning, and
+            # keeping the bare spelling would have quietly changed the experiment to "exact
+            # directory root" while the prose still said tree. (GPT re-review of #1002.)
+            "grants": [f"path:{right / 'hestia'}/**", f"path:{right / 'docs'}/**"]}
 
 
 def cases(fx: dict) -> list:

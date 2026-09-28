@@ -33,6 +33,8 @@ codebase keeps finding in itself: a check that reports success while measuring n
 > the baseline artifact; gate-consolidation status below was refreshed on 2026-08-23 against the
 > subsequently merged work and keeps repo state separate from live-install evidence.
 
+**Standards and public-sector reviewers:** the [standards review entry point](docs/STANDARDS_REVIEW.md) maps Hestia's identity, delegated authority, runtime governance, provenance, audit, non-repudiation, and allow/deny/revoke mechanisms into current NIST / NCCoE agent-identity vocabulary, with explicit A1/A2 assurance boundaries.
+
 > ### ⚠️ The gate stops accidents, not adversaries
 >
 > Hestia's policy gate is an **early prototype**. It reliably stops simple erroneous or

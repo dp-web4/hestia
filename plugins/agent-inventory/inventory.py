@@ -170,8 +170,74 @@ def resolve_workspace(argv: list[str]) -> tuple[Path, str]:
 WORKSPACE = resolve_workspace([])[0]
 WORKSPACE_SOURCE = "cwd-unverified"
 ATLAS = WORKSPACE / "agent-atlas" / "talk-to"
+ATLAS_SOURCE = "workspace"
 PLUGINS = WORKSPACE / "hestia" / "plugins"
 HOME = Path.home()
+
+
+def resolve_atlas(argv: list[str], workspace: Path) -> tuple[Path, str]:
+    """Where the agent-atlas `talk-to/` registry is, and how we know.
+
+    It used to be one place: `<workspace>/agent-atlas/talk-to`. That is a WORKING clone --
+    seats add descriptors to it -- and the only way to guarantee a machine had one was for
+    someone to remember to clone it. Measured on McNugget 2026-09-19: no clone, so every run
+    for two months took the narrower fallback enumeration, and nothing said the clone was the
+    fix. A deploy cannot repair that by pinning the working clone: a tool that hard-resets a
+    tree people commit to is how ten raising sessions were lost on this seat. So the deploy
+    keeps its OWN pinned checkout and points the inventory at it here. An explicit location
+    wins; the workspace clone remains the default, so a seat with no deploy is unchanged.
+    """
+    for i, a in enumerate(argv):
+        if a == "--atlas" and i + 1 < len(argv):
+            return Path(argv[i + 1]), "argv"
+        if a.startswith("--atlas="):
+            return Path(a.split("=", 1)[1]), "argv"
+    pinned = os.getenv("HESTIA_ATLAS_DIR")
+    if pinned:
+        return Path(pinned), "env"
+    return workspace / "agent-atlas" / "talk-to", "workspace"
+
+
+# What a caller needs to know about a harness BEFORE wiring a gate into it, straight from
+# its atlas descriptor. `fails_open` is the one that matters most: a gate that assumes
+# "exit 2, fail-open" silently mis-gates the five harnesses that fail CLOSED.
+ATLAS_FIELDS = ("harness", "vendor", "kind", "lineage", "hook_engine", "blocking_capable",
+                "blocking_events", "fails_open", "config_path", "fidelity")
+
+
+def atlas_frontmatter(atlas_id: str) -> dict:
+    """The descriptor's YAML frontmatter, reduced to ATLAS_FIELDS. {} if unreadable.
+
+    Hand-parsed on purpose. Every descriptor in the registry is `key: value`, `key:` or
+    `  - item` (checked across all 45 on 2026-09-19), and this check runs from a
+    SessionStart hook under a pinned interpreter that may have no PyYAML. A dependency
+    that can be missing turns "could not read one descriptor" into "the inventory did not
+    run", which is the worse failure. Anything it cannot parse is simply absent.
+    """
+    try:
+        text = (ATLAS / atlas_id / "descriptor.md").read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    out: dict = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if ":" not in line or line.startswith((" ", "\t", "-")):
+            continue
+        key, _, val = line.partition(":")
+        key, val = key.strip(), val.strip()
+        if key not in ATLAS_FIELDS or not val:
+            continue
+        if val.startswith("[") and val.endswith("]"):
+            out[key] = [x.strip() for x in val[1:-1].split(",") if x.strip()]
+        elif val.lower() in ("true", "false"):
+            out[key] = val.lower() == "true"
+        else:
+            out[key] = val.strip("\"'")
+    return out
 
 # Plugin dirs that are shared machinery, not harness adapters.
 NOT_A_HARNESS_PLUGIN = {"lib", "member-mesh", "agent-inventory"}
@@ -188,7 +254,264 @@ ALIASES = {
     "kiro_cli":      (["kiro"],              [".kiro"],                None),
     "mistral_vibe":  (["vibe"],              [".mistral"],             None),
     "factory_ai_droid": (["droid"],          [".factory"],             None),
+    # A being's executable is a daemon built from source, and its governance id is PER SEAT
+    # (`<machine>-being`), so the third column is None and the id comes from its launcher --
+    # see BEING_LAUNCHERS. No config dir: a being has no hook config to write.
+    "sage":          (["sage-daemon"],       [],                       None),
 }
+
+# ---- beings (atlas `kind: being`) --------------------------------------------------
+# Everything else here is a harness a person drives, governed by a hook that hestia's
+# plugin registers in the harness's config. A being inverts that (atlas SCHEMA.md, `kind`):
+# it holds no effectors, every intent passes a gate client BUILT INTO its launcher, and
+# there is nothing to register. So "is a hestia hook wired in its config?" -- the question
+# `inspect` asks -- has no answer for a being, and the answer it would give is wrong in the
+# dangerous direction: "ungovernable here, no hestia plugin exists for it".
+#
+# What evidences a governed being is its LAUNCHER: a service unit that starts the gateway
+# entry point with `--member <id>`. That line is also the only place the per-seat
+# governance id is written down. The daemon binary alone evidences cognition, not
+# governance (descriptor section 3; confirmed on Sprout and CBP, agent-atlas PR #1).
+#
+# THE BRANCH IS KEYED ON THE ATLAS'S `kind`, NOT ON AN ID. What is per-being is one row:
+# the regex that recognises its launcher in a unit file.
+BEING_LAUNCHERS = {
+    "sage": r"sage\.gateway\.heartbeat",
+}
+# Read off the launcher's OWN command line, never off the file: a unit's ExecStartPre, a
+# comment, or an unrelated unit can all say `--member` (Sprout, PR #1076 review, each reproduced).
+MEMBER_ARG = re.compile(r"--member[ =]+[\"']?([A-Za-z0-9][A-Za-z0-9_.-]*)")
+# Exactly the names the being's gate client reads to find the shared law (SAGE
+# `being_gate_client._resolve_hestia_shared`). Any other HESTIA_* -- HESTIA_ROLE, say -- does
+# not move law resolution, so it must not quiet LAW-SOURCE.
+LAW_ENV_NAMES = ("HESTIA_GATE_SHARED", "HESTIA_SHARED_DIR", "HESTIA_HOME")
+ETC_SYSTEMD, LIB_SYSTEMD = Path("/etc/systemd"), Path("/usr/lib/systemd")
+UNIT_GLOBS = (
+    ".config/systemd/user/*.service", ".local/share/systemd/user/*.service",
+    "Library/LaunchAgents/*.plist",
+)
+SYSTEM_UNIT_GLOBS = (
+    "/etc/systemd/system/*.service", "/etc/systemd/user/*.service",
+    "/usr/lib/systemd/system/*.service", "/usr/lib/systemd/user/*.service",
+    "/Library/LaunchDaemons/*.plist", "/Library/LaunchAgents/*.plist",
+)
+# Built from source, so not on PATH. Relative to the workspace, for the named executable only.
+WORKSPACE_BIN_GLOBS = ("*/target/release", "*/*/target/release")
+
+
+def unit_files() -> list[Path]:
+    out = [p for g in UNIT_GLOBS for p in sorted(HOME.glob(g))]
+    for g in SYSTEM_UNIT_GLOBS:
+        root, _, pat = g.rpartition("/")
+        out.extend(sorted(Path(root).glob(pat)) if Path(root).is_dir() else [])
+    return out
+
+
+def systemd_directives(text: str) -> list[tuple[str, str]]:
+    """LIVE `Key=value` directives: comments dropped, `\\` continuations joined."""
+    out, buf = [], ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line[0] in "#;":
+            continue
+        if line.endswith("\\"):
+            buf += line[:-1] + " "
+            continue
+        line, buf = buf + line, ""
+        key, sep, val = line.partition("=")
+        if sep:
+            out.append((key.strip(), val.strip()))
+    return out
+
+
+def _env_names(assignments: str) -> set[str]:
+    try:
+        words = shlex.split(assignments)
+    except ValueError:
+        words = assignments.split()
+    return {w.partition("=")[0] for w in words if "=" in w}
+
+
+def scope_config_dirs(u: Path) -> list[Path]:
+    """The dirs of `u`'s OWN manager scope that can hold its drop-ins, timers and enablement
+    links, lowest precedence first. A unit outside every known scope has only its own dir."""
+    user = [LIB_SYSTEMD / "user", HOME / ".local/share/systemd/user", ETC_SYSTEMD / "user",
+            HOME / ".config/systemd/user"]
+    system = [LIB_SYSTEMD / "system", ETC_SYSTEMD / "system"]
+    for dirs in (user, system):
+        if u.parent in dirs:
+            return dirs
+    return [u.parent]
+
+
+def _timer_fires(timer: Path, service: str) -> bool:
+    """Same-named, or says `Unit=<service>`. An unreadable timer fires nothing we can see."""
+    try:
+        named = [v for k, v in systemd_directives(timer.read_text(errors="replace")) if k == "Unit"]
+    except OSError:
+        return False
+    return service in named if named else timer.stem == service.rpartition(".")[0]
+
+
+def read_unit(u: Path) -> dict:
+    """What one unit STARTS and what environment it starts it in. Raises OSError/ValueError.
+
+    `outside` is environment this function could not read. A caller must then say "cannot
+    tell", not "sets none": an EnvironmentFile IS the correct wiring (the seat projection),
+    and asserting LAW-SOURCE over it is the wrong-direction answer.
+    """
+    commands: list[str] = []
+    env: set[str] = set()
+    outside: list[str] = []
+    if u.suffix == ".plist":
+        raw = u.read_bytes()
+        try:
+            pl = plistlib.loads(raw)
+        except Exception as e:          # plistlib raises expat/Invalid*/ValueError by format
+            raise ValueError(f"not a parseable plist ({type(e).__name__})") from e
+        args = pl.get("ProgramArguments") or ([pl["Program"]] if pl.get("Program") else [])
+        commands.append(" ".join(str(a) for a in args))
+        env |= set(pl.get("EnvironmentVariables") or {})
+        return {"commands": commands, "env": env, "outside": outside,
+                "enabled": False if pl.get("Disabled") is True else None}
+    scope = scope_config_dirs(u)
+    # One drop-in per file NAME; the later dir in `scope` wins, as /etc does over /usr/lib.
+    dropins = sorted({f.name: f for d in scope for f in sorted((d / (u.name + ".d")).glob("*.conf"))}.values(),
+                     key=lambda f: f.name)
+    installable = False
+    for f in [u, *dropins]:
+        for key, val in systemd_directives(f.read_text(errors="replace")):
+            if key == "ExecStart":
+                # systemd's own rule: an empty assignment resets the list (how a drop-in replaces it).
+                commands = commands + [val] if val else []
+            elif key == "Environment":
+                env |= _env_names(val)
+            elif key == "EnvironmentFile":
+                path = val.lstrip("-").replace("%h", str(HOME))
+                try:
+                    if "%" in path:
+                        raise OSError("unexpanded specifier")
+                    # NAMES only. The values are none of an inventory's business.
+                    env |= {k for k, _ in systemd_directives(Path(path).read_text(errors="replace"))}
+                except OSError as e:
+                    outside.append(f"EnvironmentFile={val} ({type(e).__name__})")
+            elif key in ("WantedBy", "RequiredBy"):
+                installable = True
+    # File present != launched (Sprout: a oneshot fired by a same-named .timer). A fired session
+    # has no user bus, so no `systemctl is-enabled` -- but enablement IS symlinks on disk.
+    timers = [t for d in scope for t in sorted(d.glob("*.timer")) if _timer_fires(t, u.name)]
+    names = {u.name} | {t.name for t in timers}
+    # The link may live in another dir of the SAME scope (unit in /usr/lib, link in /etc) -- and
+    # only there: a user-scope link enables nothing in the system manager (Sprout, PR #1076: the
+    # real ~/.config/systemd/user/timers.target.wants answered for a same-named unit elsewhere).
+    linked = any((w / n).is_symlink() or (w / n).exists()
+                 for d in scope for pat in ("*.wants", "*.requires") for w in d.glob(pat) for n in names)
+    # No [Install] and no timer = a static unit something else may start: cannot tell -> None.
+    enabled = True if linked else (False if installable or timers else None)
+    return {"commands": commands, "env": env, "outside": outside, "enabled": enabled}
+
+
+def find_launchers(launcher_re: str, units: list[Path]) -> tuple[list[dict], list[str]]:
+    """Units that start this being's gateway entry point. (launchers, unreadable)."""
+    found, unreadable = [], []
+    for u in units:
+        try:
+            unit = read_unit(u)
+        except (OSError, ValueError) as e:
+            unreadable.append(f"{u}: {e if isinstance(e, ValueError) else type(e).__name__}")
+            continue
+        starts = [c for c in unit["commands"] if re.search(launcher_re, c)]
+        if not starts:
+            continue
+        # The id comes from the SAME command that matched the launcher, nowhere else in the file.
+        # `ExecStart=/usr/bin/env HESTIA_HOME=/x python3 -m ...` sets it too: assignments standing
+        # BEFORE the entry point are environment; after it they are the being's own arguments.
+        cmd_env = set().union(*(_env_names(c[:re.search(launcher_re, c).start()]) for c in starts))
+        members = sorted({m.group(1) for c in starts for m in [MEMBER_ARG.search(c)] if m})
+        found.append({"unit": str(u), "member": members[0] if len(members) == 1 else None,
+                      "members_in_unit": members,
+                      # Replicated on two seats (agent-atlas PR #1): a launcher that sets none of
+                      # LAW_ENV_NAMES makes the gate client fall through to a SOURCE CHECKOUT of
+                      # the law instead of the installed copy the deploy maintains and attests.
+                      # None = environment set somewhere this could not read: cannot tell.
+                      "sets_hestia_env": (True if (unit["env"] | cmd_env) & set(LAW_ENV_NAMES)
+                                          else None if unit["outside"] else False),
+                      "env_outside_unit": unit["outside"],
+                      "enabled_on_disk": unit["enabled"]})
+    return found, unreadable
+
+
+def inspect_being(atlas_id: str, roots: list[str], atlas: dict, units: list[Path] | None = None) -> dict:
+    exes, _dirs, _ = names_for(atlas_id)
+    ws_roots = [str(p) for g in WORKSPACE_BIN_GLOBS for p in sorted(WORKSPACE.glob(g)) if p.is_dir()]
+    exe = real_executable(exes, roots + ws_roots)
+    launcher_re = BEING_LAUNCHERS.get(atlas_id)
+    rec: dict = {
+        "agent": atlas_id, "kind": "being", "plugin": None, "plugin_available": False,
+        "installed": False, "executable": exe, "config_dirs": [], "atlas": atlas,
+        "configs_read": [], "wired": False, "roles_wired": {}, "unknown": [], "findings": [],
+        "launchers": [], "members": [], "gate_wired": None, "partial": False,
+        "miswired": False, "miswired_3p": False, "governed": False, "unprovisioned": False,
+    }
+    if launcher_re is None:
+        rec["installed"] = exe is not None
+        rec["unknown"].append(
+            f"atlas says '{atlas_id}' is a being, and this inventory has no BEING_LAUNCHERS row "
+            "for it -- cannot tell a governed being from a bare daemon")
+        return rec
+    launchers, unreadable = find_launchers(launcher_re, unit_files() if units is None else units)
+    rec["launchers"] = launchers
+    rec["members"] = sorted({m for l in launchers for m in l["members_in_unit"]})
+    # One launcher, one --member: that is the being's id. Several or none: no single id to key on.
+    rec["member"] = rec["members"][0] if len(rec["members"]) == 1 else None
+    # No launcher names one: the fleet convention the daemon's register endpoint also uses
+    # (`<machine>-being`, http.rs agent_register). A being that is running but launched in a
+    # way this file cannot read then shows as not provisioned on its own chip, rather than
+    # showing nothing at all.
+    if rec["member"] is None and not rec["members"]:
+        rec["member"] = f"{platform.node().lower()}-being"
+    rec["installed"] = exe is not None or bool(launchers)
+    rec["wired"] = bool(launchers)
+    # One being per machine by fleet convention; if a seat runs two, say so rather than pick.
+    rec["plugin"] = rec["members"][0] if len(rec["members"]) == 1 else None
+    for l in launchers:
+        if not l["member"]:
+            rec["unknown"].append(
+                f"launcher {l['unit']} names " + ("more than one --member" if l["members_in_unit"] else "no --member")
+                + ": the being's governance id is unreadable")
+        if l["sets_hestia_env"] is False:
+            rec["findings"].append(
+                f"LAW-SOURCE: {l['unit']} sets none of {'/'.join(LAW_ENV_NAMES)} -- the being's gate "
+                "client will resolve the shared law from a source checkout, not the installed copy "
+                "hestia-deploy attests")
+        elif l["sets_hestia_env"] is None:
+            rec["unknown"].append(
+                f"launcher {l['unit']} takes environment from outside the unit and it could not be "
+                f"read ({'; '.join(l['env_outside_unit'])}) -- cannot tell which copy of the law it resolves")
+        if l["enabled_on_disk"] is False:
+            rec["findings"].append(
+                f"LAUNCHER-NOT-ENABLED: {l['unit']} is installed, and nothing on disk enables it or a "
+                "same-named timer -- `governed` here means the launcher is INSTALLED, not that it runs")
+    if len(rec["members"]) > 1:
+        rec["unknown"].append(f"more than one being id launched here: {', '.join(rec['members'])}")
+    for u in unreadable:
+        rec["unknown"].append(f"unit not readable, so a launcher may be hidden in it: {u}")
+    # Built-in gate, fails closed (atlas): a being launched through its gateway IS gated. The
+    # registration of `<id>` as a hestia member is NOT visible from here -- that is the
+    # operator plane -- and neither is whether the unit is RUNNING (no bus in a fired session).
+    # So `governed` means "a governed launcher is installed", and says so.
+    gated = atlas.get("blocking_capable") is True and atlas.get("fails_open") is False
+    rec["governed"] = bool(launchers) and gated and not rec["unknown"]
+    if launchers and not gated:
+        rec["unknown"].append("launcher present, but the atlas does not say this being's gate blocks and fails closed")
+    # The state worth its own word: the daemon runs, and nothing launches it as a member.
+    rec["unprovisioned"] = exe is not None and not launchers
+    if rec["unprovisioned"]:
+        rec["findings"].append(
+            "UNPROVISIONED: daemon executable present, and no service unit launches the being's "
+            "gateway -- cognition may be running, but nothing acts as a governed member")
+    return rec
+
 CONFIG_FILES = ("settings.json", "config.toml", "config.yaml", "config.json",
                 "settings.local.json", "config.yml")
 
@@ -1042,6 +1365,20 @@ class Registry:
         them name plugin dirs that are not in the registry at all — 36 subprocess spawns
         to learn what `self.names` already knew (~4s -> ~0.7s on CBP).
         """
+        data = self._expects_data(plugin_dir)
+        out = {k: list(v) for k, v in data.items() if isinstance(v, list)}
+        # `targets` (#1133): the FILE a role must be served by, per role, as basenames. A
+        # role declared by event alone cannot tell a hook that reaches the daemon from one
+        # that appends to a private file on the same event — codex's `observe` role was
+        # "wired" by observe.sh for 14 days while the witness that reaches the chain was
+        # never registered. Optional: a plugin that declares no target keeps event-only.
+        t = data.get("targets")
+        if isinstance(t, dict):
+            out["targets"] = {r: [str(x) for x in v] for r, v in t.items() if isinstance(v, list)}
+        return out
+
+    def _expects_data(self, plugin_dir: str) -> dict:
+        """The parsed expects.json, from the same source expects() has always read."""
         if not self.has(plugin_dir):
             return {}
         if self.source == "origin/main":
@@ -1057,7 +1394,19 @@ class Registry:
             data = json.loads(raw)
         except ValueError:
             return {}
-        return {k: list(v) for k, v in data.items() if isinstance(v, list)}
+        return data if isinstance(data, dict) else {}
+
+    def member(self, plugin_dir: str) -> str | None:
+        """The member id this plugin runs as -- `install.member` in its expects.json.
+
+        THREE VOCABULARIES NAME ONE HARNESS: the atlas id (`kimi_code_cli`), the plugin
+        directory (`kimi`) and the member id every chain row, grant and dashboard chip uses
+        (`kimi-code`). Reports keyed by the first two could not be joined to the third, so the
+        dashboard's governance dot rendered only where all three happen to be spelled the same
+        -- `codex`, on every machine, for as long as the dots existed (dp, 2026-09-28)."""
+        inst = self._expects_data(plugin_dir).get("install")
+        m = inst.get("member") if isinstance(inst, dict) else None
+        return m.strip() if isinstance(m, str) and m.strip() else None
 
 
 REGISTRY: Registry | None = None  # built in main(), once WORKSPACE is known
@@ -1092,20 +1441,34 @@ def expects(plugin_dir: str) -> dict:
 
 
 def inspect(atlas_id: str, roots: list[str]) -> dict:
+    atlas = atlas_frontmatter(atlas_id)
+    # `or in BEING_LAUNCHERS`: with the atlas unreadable `kind` is absent, and the harness path
+    # would file a being as "ungovernable here -- no hestia plugin exists for it". It needs none.
+    if atlas.get("kind") == "being" or atlas_id in BEING_LAUNCHERS:
+        return inspect_being(atlas_id, roots, atlas)
     exes, dirnames, plugin_dir = names_for(atlas_id)
     exe = real_executable(exes, roots)
     homes = [HOME / d for d in dirnames if (HOME / d).is_dir()]
     plugin_available = registry().has(plugin_dir)
     declared = expects(plugin_dir)
 
+    member_of = getattr(registry(), "member", None)   # stubs in tests may not define it
+    declared_member = member_of(plugin_dir) if (plugin_available and member_of) else None
     rec: dict = {
         "agent": atlas_id,
         "plugin": plugin_dir if plugin_available else None,
+        # The id the rest of hestia knows this harness by (see Registry.member). Falls back to
+        # the plugin directory only when a plugin declares none -- the old implicit assumption.
+        "member": declared_member or (plugin_dir if plugin_available else None),
         "plugin_available": plugin_available,
         # #2: installation is evidenced by an executable, not by a config dir.
         "installed": exe is not None,
         "executable": exe,
         "config_dirs": [str(h) for h in homes],
+        # From the atlas descriptor, not inferred here: whether this harness can block at
+        # all, on which events, and above all whether it FAILS OPEN. Empty when the atlas is
+        # unreadable -- absent, never guessed.
+        "atlas": atlas_frontmatter(atlas_id),
         "configs_read": [],
         "wired": False,
         "roles_wired": {},
@@ -1214,22 +1577,64 @@ def inspect(atlas_id: str, roots: list[str]) -> dict:
 
     live_events = {h["event"] for h in hestia_hooks}
     rec["wired"] = bool(hestia_hooks)
-    if declared:
-        for role, events in declared.items():
-            rec["roles_wired"][role] = sorted(e for e in events if e in live_events)
-        missing = {role: [e for e in events if e not in live_events]
-                   for role, events in declared.items()}
+    role_targets = declared.get("targets") if isinstance(declared.get("targets"), dict) else {}
+    roles = {r: ev for r, ev in declared.items() if r != "targets" and isinstance(ev, list)}
+
+    def served(role: str, event: str) -> bool:
+        """A role's event is served when a live hestia hook sits on it AND, when the plugin
+        names the file that role needs (`targets`), one of those hooks IS that file.
+
+        #1133: on thor codex read `observe: [PostToolUse]` as wired because observe.sh sat
+        there — a hook whose whole output is a local file nobody reads — while witness.py,
+        the hook that reaches the chain, was never registered. 9,284 act rows on the chain
+        under claude-code, 0 under codex, and every report green. By event alone the two
+        hooks are the same thing; by target they are not."""
+        want = role_targets.get(role) or []
+        for h in hestia_hooks:
+            if h["event"] != event:
+                continue
+            if not want or any(Path(t).name in want for t in h["targets"]):
+                return True
+        return False
+
+    if roles:
+        for role, events in roles.items():
+            rec["roles_wired"][role] = sorted(e for e in events if served(role, e))
+        missing = {role: [e for e in events if not served(role, e)]
+                   for role, events in roles.items()}
         for role, events in missing.items():
             # Only meaningful for a harness that is actually here. A dormant plugin has
             # no roles to be absent from, and saying so for every uninstalled harness
             # buries the one machine where enforcement really is missing.
+            # dp, 2026-09-27 (#1133): "when something isn't properly registered, it MUST read
+            # as miswired. currently it does not." A declared role with no live hook — or a
+            # hook that is not the file the role needs — is a registration defect, the same
+            # class as a dead gate: MISWIRED, so `governed` drops and the machine pins. It was
+            # filed as `partial` (gate) or nothing at all (observe), which is how codex sat
+            # unwitnessed for 14 days while every report read green. The remedy is named in
+            # the finding: registration is the installer's job (deploy/register-members.py),
+            # never a hand edit.
             if events and exe is not None:
-                rec["findings"].append(
-                    f"ROLE ABSENT: no live hestia hook on {role} event(s) "
-                    f"{', '.join(events)} — {'enforcement' if role == 'gate' else role} "
-                    "is not present on this machine")
+                want = role_targets.get(role) or []
+                if want and all(e in live_events for e in events):
+                    rec["findings"].append(
+                        f"MISWIRED: {role} event(s) {', '.join(events)} carry a hestia hook, "
+                        f"but not {' / '.join(want)} — the file this role is declared to "
+                        "need; what that hook records stays on this machine and the society "
+                        "never sees it. Re-run deploy/install-members.sh (it registers, then "
+                        "installs)")
+                else:
+                    rec["findings"].append(
+                        f"MISWIRED: no live hestia hook on {role} event(s) "
+                        f"{', '.join(events)} — {'enforcement' if role == 'gate' else role} "
+                        "is not registered on this machine. Re-run deploy/install-members.sh "
+                        "(it registers, then installs)")
         rec["gate_wired"] = not missing.get("gate")
-        rec["partial"] = bool(hestia_hooks) and not rec["gate_wired"]
+        # `partial` keeps its meaning (some declared role unserved) for readers that key on
+        # it, but it no longer carries the verdict: the MISWIRED finding above does, via
+        # `has_tag` below, so an unserved role demotes `governed` and lands in
+        # gaps["miswired"] — the loud bucket — not in gaps["partial"].
+        rec["partial"] = bool(hestia_hooks) and any(missing.values())
     else:
         rec["gate_wired"] = None
         rec["partial"] = False
@@ -1269,14 +1674,30 @@ def inspect(atlas_id: str, roots: list[str]) -> dict:
     return rec
 
 
+def status_of(gaps: dict, unknowns: list) -> str:
+    if gaps["miswired"]:
+        return "MISWIRED"
+    if gaps["partial"]:
+        return "PARTIAL"
+    if gaps["ungoverned"] or gaps["ungovernable"] or gaps.get("unprovisioned_being"):
+        return "UNGOVERNED_PRESENT"
+    return "UNKNOWN" if unknowns else "OK"
+
+
 def classify(recs: list[dict]) -> dict:
     """The gaps, each with its own remedy. This is the actionable part."""
     gaps: dict[str, list[str]] = {
         "miswired": [], "miswired_3p": [], "partial": [], "ungoverned": [],
-        "ungovernable": [], "dormant_plugin": [], "unknown": []}
+        "ungovernable": [], "dormant_plugin": [], "unknown": [], "unprovisioned_being": []}
     for r in recs:
         if r["unknown"]:
             gaps["unknown"].append(r["agent"])
+        if r.get("kind") == "being":
+            # A being is never "ungovernable: no plugin exists" -- it needs none. Its one gap
+            # is its own, with its own remedy (mint, join, admit, launch).
+            if r.get("unprovisioned"):
+                gaps["unprovisioned_being"].append(r["agent"])
+            continue
         # Its own bucket, and NOT in the elif chain: a stranger's dead gate is a real
         # finding with a remedy in someone else's repo, so it must not consume the slot
         # that would otherwise report an actual hestia gap on the same agent.
@@ -1294,6 +1715,46 @@ def classify(recs: list[dict]) -> dict:
         elif r["plugin_available"] and not r["installed"]:
             gaps["dormant_plugin"].append(r["agent"])
     return gaps
+
+
+# Worst first. The dashboard used to build a chip's state by walking `gaps` in dict order and
+# letting LATER buckets overwrite earlier ones, so a member that was miswired AND carried any
+# `unknown` note rendered amber ("no adapter yet"), never red.
+MEMBER_STATE_ORDER = ["miswired", "partial", "ungoverned", "ungovernable", "unprovisioned_being",
+                      "unknown", "dormant_plugin", "governed"]
+
+
+def member_states(recs: list[dict]) -> dict[str, str]:
+    """{member id: one coverage state}, keyed by the id the dashboard's chips use."""
+    out: dict[str, str] = {}
+    for r in recs:
+        m = r.get("member")
+        if not m:
+            continue
+        if r.get("kind") == "being":
+            st = ("unprovisioned_being" if r.get("unprovisioned")
+                  else "governed" if r.get("governed")
+                  else "unknown" if r.get("unknown") else None)
+        elif r.get("installed") and r.get("miswired"):
+            st = "miswired"
+        elif r.get("installed") and r.get("partial"):
+            st = "partial"
+        elif r.get("installed") and not r.get("governed"):
+            st = "ungoverned" if r.get("plugin_available") else "ungovernable"
+        elif r.get("installed") and r.get("unknown"):
+            st = "unknown"
+        elif r.get("installed"):
+            st = "governed"
+        elif r.get("plugin_available"):
+            st = "dormant_plugin"
+        else:
+            st = None
+        if st is None:
+            continue
+        prev = out.get(m)
+        if prev is None or MEMBER_STATE_ORDER.index(st) < MEMBER_STATE_ORDER.index(prev):
+            out[m] = st
+    return out
 
 
 def witness(report: dict) -> str:
@@ -1439,7 +1900,7 @@ def emit(report: dict, brief: bool) -> int:
 
 
 def main() -> int:
-    global WORKSPACE, WORKSPACE_SOURCE, ATLAS, PLUGINS, REGISTRY
+    global WORKSPACE, WORKSPACE_SOURCE, ATLAS, ATLAS_SOURCE, PLUGINS, REGISTRY
     argv = sys.argv[1:]
     # Answered before anything else is resolved: install.sh calls this to derive the
     # SessionStart timeout instead of keeping a second copy of the number, so it must
@@ -1450,7 +1911,7 @@ def main() -> int:
     brief = "--brief" in argv
 
     WORKSPACE, WORKSPACE_SOURCE = resolve_workspace(argv)
-    ATLAS = WORKSPACE / "agent-atlas" / "talk-to"
+    ATLAS, ATLAS_SOURCE = resolve_atlas(argv, WORKSPACE)
     PLUGINS = WORKSPACE / "hestia" / "plugins"
     REGISTRY = Registry()
 
@@ -1461,8 +1922,21 @@ def main() -> int:
     # none of which need atlas — and a payload of `{status, machine, reason}` with no
     # `scope` key, in the one case where scope IS the whole story. See fallback_agent_ids.
     if ATLAS.is_dir():
-        known = sorted(p.name for p in ATLAS.iterdir() if p.is_dir())
-        enumeration, enumeration_gap = "agent-atlas", None
+        # THE ATLAS IS A SOURCE, NOT THE ONLY ONE. This was `known = <atlas dirs>`, so the
+        # presence of an atlas SUPPRESSED hestia's own knowledge: `ALIASES` is this file's
+        # record of "this is a harness, and here is how to find it on disk", and an id named
+        # there but not yet described in agent-atlas was never looked for. Measured 2026-09-21:
+        # `sage` sits in ALIASES and the being on this machine could not appear in the
+        # inventory -- not because anything was undetectable, but because a descriptor was
+        # unmerged in a DIFFERENT REPOSITORY. A registry hestia does not control must not be
+        # able to veto hestia looking for a harness hestia already knows about.
+        #
+        # ALIASES only, deliberately, NOT `fallback_agent_ids`: that set is the right
+        # degradation when there is no atlas at all, and it draws on the plugin registry,
+        # which on this box also yields `_shared` and `reviewer` -- a seat-config pseudo-member
+        # and a role. Unioning those in would invent two agents to fix the omission of one.
+        known = sorted(set(p.name for p in ATLAS.iterdir() if p.is_dir()) | set(ALIASES))
+        enumeration, enumeration_gap = "agent-atlas + built-in ALIASES", None
     else:
         known = fallback_agent_ids(REGISTRY)
         enumeration = "built-in ALIASES + plugin registry"
@@ -1498,7 +1972,15 @@ def main() -> int:
         # from "McNugget never looked for one".
         "agent_enumeration": enumeration,
         "agent_enumeration_complete": enumeration_gap is None,
+        # WHICH ids, not only where the list came from. The comment above says a reader must
+        # be able to tell "McNugget has no codex" from "McNugget never looked for one" -- and
+        # the source label alone cannot answer that for any PARTICULAR id, because an id that
+        # is enumerated, found absent and has nothing to report is (correctly) quiet in
+        # `detail`. So the look itself is published: `agents_looked_for` is the whole list
+        # this run inspected, silent ones included.
+        "agents_looked_for": known,
         "atlas": str(ATLAS),
+        "atlas_source": ATLAS_SOURCE,
         "exe_search_roots": roots,
         "config_scopes_read": sorted({c["path"] for r in recs
                                       for c in r["configs_read"]}),
@@ -1591,15 +2073,11 @@ def main() -> int:
     # both are real, both are loud in `gaps`/`fragile` and in the brief line, and neither
     # is a gap in hestia's coverage of this machine. Making it a status rung would restore
     # exactly the property the split removes — a headline no hestia work can clear.
-    status = "OK"
-    if gaps["miswired"]:
-        status = "MISWIRED"
-    elif gaps["partial"]:
-        status = "PARTIAL"
-    elif gaps["ungoverned"] or gaps["ungovernable"]:
-        status = "UNGOVERNED_PRESENT"
-    elif unknowns:
-        status = "UNKNOWN"
+    #
+    # `unprovisioned_being` IS on it (Sprout, PR #1076): unlike `miswired_3p` it is exactly a gap
+    # in hestia's coverage of this machine, with a hestia remedy -- cognition present, nothing
+    # launching it as a governed member. It shares the ungoverned rung; `gaps` names which.
+    status = status_of(gaps, unknowns)
 
     report = {
         "status": status,
@@ -1610,6 +2088,9 @@ def main() -> int:
         "plugins_available": available,
         "governed": sorted(r["agent"] for r in governed),
         "gaps": gaps,
+        # The same verdicts keyed by MEMBER id -- what the dashboard's chips and every grant use.
+        # `gaps` and `governed` stay keyed by atlas id for their existing readers.
+        "members": member_states(recs),
         "fragile": fragile,
         "unknown": unknowns,
         "scope": scope,

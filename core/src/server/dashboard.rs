@@ -6,9 +6,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use super::state::ServerState;
-use crate::storage::{ChainEntry, SqliteChainStore};
+use crate::storage::SqliteChainStore;
 use web4_trust_core::EntityTrust;
 
 /// Dashboard reads are display-grade projections, never authority. Keep their
@@ -16,22 +17,47 @@ use web4_trust_core::EntityTrust;
 /// authoritative [`ServerState`] lock (see [`DashboardChainProjection`]).
 const STATS_WINDOW: u64 = 2_000;
 
-/// The slow, blocking half of a dashboard snapshot.
+/// The slow, blocking half of a dashboard snapshot: the chain reads.
 ///
 /// SQLCipher owns its own connection mutex. Carrying these reads through the
 /// outer `ServerState` mutex only made unrelated governance requests queue
 /// behind a display projection. The HTTP read-model worker builds this value on
 /// Tokio's blocking pool, then briefly re-enters state to assemble the
 /// lightweight, ephemeral presentation.
+///
+/// TRUST DERIVATION IS NOT IN HERE. It used to be: every projection re-read
+/// `derivation::scan_window` — measured 2026-09-17 on a 150,000-row chain of CBP's
+/// shape at 1.26–1.53 s, against ~160 ms for everything else here — so every
+/// dashboard poll recomputed every member's trust from scratch. Derivations now live
+/// in the chain store's event-triggered cache (`derivation_cache`), re-derived when an
+/// event that can change them is appended; [`refresh_derivations`] runs whatever is
+/// due, off the state lock, before the fold reads them.
+///
+/// Held behind `Arc`s so the worker can hand a cached read to every refresh without
+/// copying rows.
+#[derive(Clone)]
 pub(crate) struct DashboardChainProjection {
-    deriv_window: Vec<ChainEntry>,
-    stats_window: Vec<RecentEntry>,
+    stats_window: Arc<Vec<RecentEntry>>,
     stats_read_error: Option<String>,
-    recent: Vec<RecentEntry>,
+    recent: Arc<Vec<RecentEntry>>,
     recent_read_error: Option<String>,
 }
 
+/// Derive whatever the trust cache has due (never-derived grains; grains an event has
+/// invalidated). A blocking chain read when anything is due, a map check when nothing is.
+pub(crate) fn refresh_derivations(chain_store: &SqliteChainStore) -> usize {
+    chain_store.derivations().refresh(chain_store)
+}
+
 impl DashboardChainProjection {
+    /// Whether this read can be reused instead of re-reading the chain.
+    ///
+    /// A read failure is never reused: the next refresh must try again rather than serve
+    /// "unavailable" for as long as the cache happens to stay current.
+    pub(crate) fn reusable(&self) -> bool {
+        self.stats_read_error.is_none() && self.recent_read_error.is_none()
+    }
+
     pub(crate) fn read(
         chain_store: &SqliteChainStore,
         recent_cap: u64,
@@ -41,11 +67,6 @@ impl DashboardChainProjection {
         // so the UI renders unavailable rather than fabricating a quiet fleet.
         // Each scan projects only what its consumer declares: derivation gets
         // its pruned ChainEntry, while stats/feed keep RecentEntry scalars.
-        // The dashboard read its derivation window with STATS_WINDOW (2,000) while the
-        // API used 10,000 — the surface a human looks at reached back FIVE TIMES less far
-        // than the API answering for it, and the comment below claimed the opposite.
-        // Both now share `derivation::scan_window`.
-        let deriv_window = crate::derivation::scan_window(chain_store);
         let (stats_window, stats_read_error) =
             match chain_store.scan_recent(None, None, STATS_WINDOW, |r| Some(flatten_row(r))) {
                 Ok(v) => (v, None),
@@ -67,10 +88,9 @@ impl DashboardChainProjection {
             };
 
         Self {
-            deriv_window,
-            stats_window,
+            stats_window: Arc::new(stats_window),
             stats_read_error,
-            recent,
+            recent: Arc::new(recent),
             recent_read_error,
         }
     }
@@ -106,6 +126,19 @@ pub struct DashboardSnapshot {
     #[serde(default = "default_policy_view")]
     pub policy: PolicyView,
     pub trust: Vec<TrustView>,
+    /// Ids the operator retired on this seat. The rows STAY in `trust` -- hiding them here
+    /// would make "show retired" impossible and would hide a retired id that is still acting,
+    /// which is the one case worth seeing. The view filters; the snapshot reports.
+    #[serde(default)]
+    pub retired: Vec<String>,
+    /// EVERY MEMBER THE REGISTRY HOLDS, by id (fillers and synthetic test harnesses left out).
+    /// The views used to infer membership from `trust`, which has a row only for a member that
+    /// has ACTED -- so a member registered and never yet launched was shown nowhere. dp, 2026-09-28:
+    /// registering the being answered "already registered" and it did not show up, and a
+    /// phantom's visibility depended on whether it happened to have a trust grain. The registry
+    /// is the source of truth for who is a member; this is it, unfiltered by activity.
+    #[serde(default)]
+    pub members: Vec<String>,
     pub recent: Vec<RecentEntry>,
     /// Policy decisions (warn + deny) across the wider stats window — backs the
     /// warn/deny feed filters (the `recent` window may not include older denies).
@@ -861,6 +894,13 @@ impl ServerState {
     ) -> DashboardSnapshot {
         let projection =
             DashboardChainProjection::read(&self.chain_store, recent_cap, window_cutoff);
+        refresh_derivations(&self.chain_store);
+        let snapshot =
+            self.dashboard_snapshot_from_projection(projection.clone(), window_cutoff, window_label);
+        // The fold registers grains it had no derivation for; derive them and fold again.
+        if refresh_derivations(&self.chain_store) == 0 {
+            return snapshot;
+        }
         self.dashboard_snapshot_from_projection(projection, window_cutoff, window_label)
     }
 
@@ -876,7 +916,6 @@ impl ServerState {
         window_label: &str,
     ) -> DashboardSnapshot {
         let DashboardChainProjection {
-            deriv_window,
             stats_window,
             stats_read_error,
             recent,
@@ -917,7 +956,7 @@ impl ServerState {
             (chrono::DateTime<Utc>, String, String),
         > = std::collections::HashMap::new();
 
-        for e in &stats_window {
+        for e in stats_window.iter() {
             // Track per-(instance, role) last-seen across any event that carries a
             // plugin_id. Outcomes are the main signal now that session_started is
             // no longer written; historical chains may still contain older entries.
@@ -1052,7 +1091,7 @@ impl ServerState {
         // (kimi-code) falls out of it entirely though its grain is intact. Seed the active set
         // from the trust store for every registry harness so it shows its most recent standing.
         // Insert-if-absent: a harness active in the window keeps its window entry untouched.
-        // The derived LEVEL comes from `deriv_window` — `derivation::scan_window`, whose
+        // The derived LEVEL comes from the derivation cache, over `derivation::scan_window`, whose
         // governance budget is deep precisely so a member idle for days still shows the
         // standing it earned. When this comment last claimed the window "reaches back much
         // further", the dashboard was in fact passing STATS_WINDOW (~17 hours of chain) and
@@ -1098,6 +1137,10 @@ impl ServerState {
                 .filter(|(_key, (_ts, pid, _role))| !self.is_synthetic(pid))
                 .collect();
         active_sorted.sort_by(|a, b| (&a.1.1, &a.1.2).cmp(&(&b.1.1, &b.1.2)));
+        let retired_ids = self.retired_members.ids();
+        // One line on purpose: tests/member_presence_census.rs pins registry reads by line.
+        #[rustfmt::skip]
+        let member_ids: Vec<String> = self.member_registry.iter_sorted().into_iter().map(|(id, _)| id.clone()).filter(|id| !self.member_registry.is_filler(id) && !self.is_synthetic(id)).collect();
         let trust: Vec<TrustView> = active_sorted
             .into_iter()
             .map(|(key, (_ts, pid, _role_ts))| {
@@ -1130,25 +1173,39 @@ impl ServerState {
                 // Lifetime totals come from the PERSISTED grain, never the window: the
                 // whole point is that routine governed work does not evaporate when a
                 // member goes idle for three days.
-                let derived = crate::derivation::derive_with_volume(
-                    pid,
-                    _role,
-                    &deriv_window,
-                    Some(crate::derivation::WitnessedVolume {
-                        total_acts: t.action_count,
-                        success_acts: t.success_count,
-                    }),
-                );
+                // The window half comes from the event-triggered cache; the volume half is
+                // applied here, from the grain's live totals, so it is never stale.
+                let volume = Some(crate::derivation::WitnessedVolume {
+                    total_acts: t.action_count,
+                    success_acts: t.success_count,
+                });
+                let cached = self.chain_store.derivations().lookup(pid, _role);
+                // (level, basis, baseline acts, governed acts, temperament, its n, alias)
+                let (level, level_basis, baseline_acts, governed_acts, temperament, temperament_n, aliased_to) =
+                    match &cached {
+                        Some(c) => {
+                            let d = crate::derivation::with_volume((*c.evidence).clone(), volume);
+                            (d.level, d.level_basis, d.baseline_acts, d.governed_acts,
+                             d.temperament.score, d.temperament.observations, c.aliased_to.clone())
+                        }
+                        // Registered by the lookup and derived before the worker publishes;
+                        // reached only by a grain that appeared between the worker's two
+                        // folds. It says "pending" rather than folding a window it does not
+                        // have — a verdict from no evidence is the thing the derivation
+                        // exists not to render, and the UI already skips an unknown level
+                        // when it rolls grains up.
+                        None => ("pending".to_string(), "pending".to_string(), 0, 0, None, 0, None),
+                    };
                 TrustView {
                     plugin_id: pid.clone(),
                     entity_id: t.entity_id.clone(),
-                    level: derived.level.clone(),
+                    level,
                     legacy_level: t.trust_level().as_str().to_string(),
-                    derived_level_basis: derived.level_basis.clone(),
-                    derived_baseline_acts: derived.baseline_acts,
-                    derived_governed_acts: derived.governed_acts,
-                    derived_temperament: derived.temperament.score,
-                    derived_temperament_n: derived.temperament.observations,
+                    derived_level_basis: level_basis,
+                    derived_baseline_acts: baseline_acts,
+                    derived_governed_acts: governed_acts,
+                    derived_temperament: temperament,
+                    derived_temperament_n: temperament_n,
                     t3_talent: dim(t.talent(), t3c[0]),
                     t3_training: dim(t.training(), t3c[1]),
                     t3_temperament: dim(t.temperament(), t3c[2]),
@@ -1170,7 +1227,7 @@ impl ServerState {
                     // Everything in this view flows from update_from_outcome's
                     // self-reported scalar until Stage 3 of the T3-from-V3 arc.
                     derivation: "legacy-lockstep-v1".to_string(),
-                    aliased_to: crate::derivation::alias_target(pid, &deriv_window),
+                    aliased_to,
                 }
             })
             .collect();
@@ -1273,6 +1330,18 @@ impl ServerState {
                 continue; // one chip per identity, however many role grains it has
             }
             let running_now = running.contains(t.plugin_id.as_str());
+            // A RETIRED ID IS NOT A HARNESS ON THIS SEAT (dp, 2026-09-25: "i tried retiring
+            // 'caude-code' through the ui, and it shows as retired in the explore screen, but
+            // still shows up as a registered harness in the witness and other displays").
+            // This loop drew a chip for every trust grain the registry does not know -- and a
+            // retired phantom still HAS a grain -- with `connected: true`, so the one id the
+            // operator had just removed sat in the agents bar above the witness feed, reading
+            // as connected. Retirement is consulted here now, with the trust list's exception:
+            // a retired id that is RUNNING is drawn, because a retired member reconnecting is
+            // news (it is witnessed as `retired_member_connected`), not something to hide.
+            if !running_now && retired_ids.iter().any(|r| r == &t.plugin_id) {
+                continue;
+            }
             orchestrators.push(serde_json::json!({
                 "id": t.plugin_id,
                 "name": t.plugin_id,
@@ -1321,7 +1390,10 @@ impl ServerState {
             },
             stats_by_plugin,
             trust,
-            recent,
+            retired: retired_ids,
+            members: member_ids,
+            // Shared with the worker's cache, so this copies the feed rather than re-reading it.
+            recent: Arc::unwrap_or_clone(recent),
             policy_decisions,
             delegations,
             hub_connections,
@@ -1437,7 +1509,7 @@ impl ServerState {
                 let mut v: Vec<serde_json::Value> = self
                     .scope_requests
                     .values()
-                    .filter(|r| r.granted == Some(true) && now < r.expires_at)
+                    .filter(|r| r.is_live(now))
                     .map(|r| {
                         serde_json::json!({
                             "lifetime": "live",
@@ -1450,10 +1522,27 @@ impl ServerState {
                             "origin": "member_request",
                             "expires_at": r.expires_at,
                             "secs_remaining": r.expires_at.saturating_sub(now),
+                            "recursive": r.recursive,
                             "durability": "memory-only — the next daemon restart revokes this",
                         })
                     })
                     .collect();
+                // A live grant that has been PROMOTED is not a second grant: the operator pressed
+                // "make standing" expecting the row to become standing, and saw both rows
+                // instead (dp, 2026-09-12, three presses on cbp-being's home grant). The
+                // standing row for the same (member, path) with reach at least the live one's
+                // supersedes it here, so the list answers "what can this member reach" with
+                // one row per reach, and the live row's "make standing" button goes with it.
+                v.retain(|row| {
+                    let member = row["plugin_id"].as_str().unwrap_or("");
+                    let path = row["path"].as_str().unwrap_or("");
+                    let live_recursive = row["recursive"].as_bool().unwrap_or(false);
+                    !self.standing_scope.grants.iter().any(|g| {
+                        g.member == member && g.path == path
+                            && g.expires_at.is_none_or(|e| now < e)
+                            && (g.recursive || !live_recursive)
+                    })
+                });
                 v.extend(self.standing_scope.grants.iter()
                     .filter(|g| g.expires_at.is_none_or(|e| now < e))
                     .map(|g| {
@@ -1465,6 +1554,7 @@ impl ServerState {
                             "requested_because": serde_json::Value::Null,
                             "granted_by": g.granted_by,
                             "request_id": g.request_id,
+                            "recursive": g.recursive,
                             // The distinction the route table argues for: a grant that
                             // ratified a member's ask carries that ask's id; one the operator
                             // originated carries none. Derived, never stored twice.
@@ -1567,6 +1657,64 @@ mod tests {
         let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
         let state = ServerState::open(vault, dir.path(), "p").unwrap();
         (dir, state)
+    }
+
+    /// Cost of ONE dashboard projection on a chain shaped like CBP's (2026-09-17 census of the
+    /// newest 20,000 entries: outcome 77.7%, governance types 8.5%, ~3.3 KB per entry). Ignored
+    /// by default; run with `--ignored --nocapture` to reproduce the number quoted in the PR.
+    #[test]
+    #[ignore]
+    fn bench_one_dashboard_projection_on_a_realistic_chain() {
+        let (dir, state) = make_state();
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let mut conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        let pad = "x".repeat(2800);
+        let tx = conn.transaction().unwrap();
+        {
+            let mut ins = tx.prepare(
+                "INSERT INTO chain_entries (chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp)
+                 VALUES (?1, ?2, '', ?3, ?4, '', ?5)").unwrap();
+            let now = chrono::Utc::now();
+            for i in 0..150_000i64 {
+                let (ty, data) = match i % 100 {
+                    0..=77 => ("outcome", json!({"tool_name":"Bash","success":true,"magnitude":0.1,"plugin_id":"claude-code","role_lct":"role:constellation:member","note":pad})),
+                    78..=86 => ("policy_decision", json!({"tool_name":"Bash","target":"ls","decision":"allow","enforced":true,"rule_name":"r","plugin_id":"claude-code","attempted":pad})),
+                    _ => ("agent_inventory", json!({"plugin_id":"claude-code","note":pad})),
+                };
+                let ts = (now - chrono::Duration::seconds(150_000 - i)).to_rfc3339();
+                ins.execute(rusqlite::params![i, format!("{:064x}", i), ty, data.to_string(), ts]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        drop(state);
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = ServerState::open(vault, dir.path(), "p").unwrap();
+        let cutoff = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        for run in 0..2 {
+            let t = std::time::Instant::now();
+            let _d = crate::derivation::scan_window(&state.chain_store);
+            let deriv = t.elapsed();
+            let t = std::time::Instant::now();
+            let _s = state.chain_store.scan_recent(None, None, STATS_WINDOW, |r| Some(flatten_row(r))).unwrap();
+            let c = cutoff.map(|c| c.to_rfc3339());
+            let _r = state.chain_store.scan_recent(c.as_deref(), None, 2_000, |r| Some(flatten_row(r))).unwrap();
+            eprintln!("run {run}: derivation scan {:?}, stats+recent {:?}", deriv, t.elapsed());
+        }
+        let t = std::time::Instant::now();
+        let _ = state.dashboard_snapshot_window(2_000, cutoff, "hour");
+        eprintln!("first snapshot (derives every grain): {:?}", t.elapsed());
+        for run in 0..3 {
+            let t = std::time::Instant::now();
+            let p = DashboardChainProjection::read(&state.chain_store, 2_000, cutoff);
+            let read = t.elapsed();
+            let t = std::time::Instant::now();
+            let n = refresh_derivations(&state.chain_store);
+            let deriv = t.elapsed();
+            let t = std::time::Instant::now();
+            let _ = state.dashboard_snapshot_from_projection(p, cutoff, "hour");
+            eprintln!("run {run}: live read {:?}, derivations re-derived {n} in {:?}, fold {:?}", read, deriv, t.elapsed());
+        }
     }
 
     #[test]
@@ -1690,6 +1838,8 @@ mod tests {
             decided_by: granted.map(|_| "operator".to_string()),
             decided_at: granted.map(|_| now),
             decision_reason: None,
+            recursive: false,
+            revoked: None,
         };
 
         state.scope_requests.insert(

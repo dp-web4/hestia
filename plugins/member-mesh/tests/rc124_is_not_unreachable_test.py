@@ -247,10 +247,15 @@ def main():
     reports, retained, fired, out = run_case(tmp, ep, "rc1", 1)
     check("2a. rc=1 still files exactly one undelivered report", len(reports) == 1,
           f"reports={json.dumps(reports)[:600]}\n{out[-1500:]}")
+    # `forum-note` since 2026-09-05, not `reply` (#926): a delivery failure is an
+    # announcement, not a debt booked against the member whose mail died. The
+    # PROPERTY — that the kind is sendable and uncounted — is asserted against
+    # handler.rs's own constants in branch4_unreachable_report_test.py case I;
+    # this arm only pins the literal so the two files cannot disagree silently.
     check("2b. addressed to the SENDER and bound to the notice it reports on",
           bool(reports) and reports[0].get("to_plugin_id") == SENDER
           and reports[0].get("in_reply_to") == SUBJECT
-          and reports[0].get("kind") == "reply",
+          and reports[0].get("kind") == "forum-note",
           f"reports={json.dumps(reports)[:600]}")
 
     # ---- 3. rc=75 STILL FILES ONE. with-member-lock refused: the CLI never started,

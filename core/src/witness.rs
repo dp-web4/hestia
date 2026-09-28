@@ -27,8 +27,8 @@
 //!   is a citizen of the hub, its parent society) — not here.
 //!
 //! What is NOT hestia's: the *relying party's* trust decision. A relying party
-//! traverses the witness tree to whatever depth its risk appetite wants (the
-//! IP-pending dev-hub traversal); web4/hestia give the tools (attestations,
+//! traverses the witness tree to whatever depth its risk appetite wants;
+//! web4/hestia give the tools (attestations,
 //! quorum, ledger record) — the relying party uses them (LCT spec §1.2). Some
 //! entities specialize as witnesses/notaries who traverse-and-cache or
 //! witness-on-request; that is a service, not a gate.

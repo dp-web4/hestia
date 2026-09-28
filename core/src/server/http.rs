@@ -5,6 +5,7 @@
 //!   /                — embedded HTML dashboard (operator path)
 //!   /api/dashboard   — JSON snapshot consumed by the dashboard + TUI
 
+use crate::member_registry::nearest_member_ids;
 use anyhow::{Context, Result};
 use axum::{
     Extension,
@@ -26,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use web4_core::oid4vc::{CredentialIssuerMetadata, CredentialRequest, verify_holder_proof};
 use web4_core::sd_jwt_vc::SdJwtVc;
 
-use super::dashboard::{DashboardChainProjection, DashboardSnapshot};
+use super::dashboard::{refresh_derivations, DashboardChainProjection, DashboardSnapshot};
 use super::handler::HestiaServer;
 use super::state::SharedState;
 use crate::callback::{CallbackState, callback_router};
@@ -218,37 +219,105 @@ impl DashboardReadModel {
     }
 }
 
+/// How long a cached live read may be served on a chain that has not moved.
+///
+/// Time-bounded ranges (`hour`, `day`, `week`) still change on a quiet chain — entries age
+/// out of them — so reuse is capped rather than unbounded. Thirty seconds of staleness in an
+/// operator's rolling-window counts is invisible; re-reading the chain every two seconds to
+/// avoid it was not. Trust derivation is not governed by this: it is event-triggered
+/// (`derivation_cache`).
+const DASHBOARD_PROJECTION_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The live feed (stats + range) is re-read when the chain has moved, or when it is old.
+fn live_read_is_current(
+    cached_chain_len: u64,
+    cached_at: std::time::Instant,
+    chain_len: u64,
+    now: std::time::Instant,
+) -> bool {
+    cached_chain_len == chain_len
+        && now.saturating_duration_since(cached_at) < DASHBOARD_PROJECTION_MAX_AGE
+}
+
 async fn dashboard_read_model_worker(
     state: SharedState,
     model: DashboardReadModel,
     mut refresh_rx: mpsc::Receiver<DashboardRange>,
 ) {
+    // THE DASHBOARD WAS THE DAEMON'S LOAD. The page polls `/api/dashboard` every 2 s and
+    // every poll queued a refresh, and every refresh re-read the chain: the trust derivation
+    // window (10,000 outcome rows, plus the governance rows — budget 100,000), a 2,000-row
+    // stats window and the range's feed, each row decrypted from SQLCipher and parsed from
+    // JSON on the blocking pool, and then re-derived every member's trust from it. Measured
+    // 2026-09-17 on CBP: the daemon used 1h53m of CPU over 4h24m (43% of a core) while the
+    // operator was approving requests in this page; a fresh daemon with the page closed sat
+    // at 0.1%. Benched on a 150,000-row chain of CBP's shape, one refresh read the chain for
+    // 1.40–1.70 s — back-to-back, since the next poll was already queued.
+    //
+    // Now: trust derivations are re-derived only when an event that can change them lands
+    // (`derivation_cache`), and the live feed is re-read per range when the chain moves. The
+    // in-memory fold still runs on every refresh, so sessions, grants and escalations are
+    // never shown stale.
+    let mut live: HashMap<DashboardRange, (u64, std::time::Instant, DashboardChainProjection)> =
+        HashMap::new();
+    // Derive everyone at start, not at the first operator poll.
+    model.request_refresh(DashboardRange::Hour);
     while let Some(range) = refresh_rx.recv().await {
         let (cutoff, cap, label) = range.projection();
         // Clone the store handle under the authoritative lock; perform every
         // SQLCipher read after releasing it. The store serializes its own
         // connection and the blocking pool keeps SQLite off Tokio's workers.
-        let chain_store = { state.lock().await.chain_store.clone() };
-        let projection = tokio::task::spawn_blocking(move || {
-            DashboardChainProjection::read(&chain_store, cap, cutoff)
-        })
-        .await;
-        let projection = match projection {
-            Ok(projection) => projection,
-            Err(error) => {
-                tracing::warn!("dashboard projection worker failed: {error}");
-                model.failed(range);
-                continue;
+        let (chain_store, chain_len) = {
+            let s = state.lock().await;
+            (s.chain_store.clone(), s.chain_len())
+        };
+        let now = std::time::Instant::now();
+        let cached = live
+            .get(&range)
+            .filter(|(len, at, _)| live_read_is_current(*len, *at, chain_len, now))
+            .map(|(_, _, p)| p.clone());
+        let fresh = cached.is_none();
+        let derivations_due = chain_store.derivations().has_due();
+        let projection = if !fresh && !derivations_due {
+            cached.expect("checked above")
+        } else {
+            let store = chain_store.clone();
+            let read = tokio::task::spawn_blocking(move || {
+                refresh_derivations(&store);
+                cached.unwrap_or_else(|| DashboardChainProjection::read(&store, cap, cutoff))
+            })
+            .await;
+            match read {
+                Ok(p) => p,
+                Err(error) => {
+                    tracing::warn!("dashboard projection worker failed: {error}");
+                    model.failed(range);
+                    continue;
+                }
             }
         };
+        if fresh {
+            if projection.reusable() {
+                live.insert(range, (chain_len, now, projection.clone()));
+            } else {
+                live.remove(&range);
+            }
+        }
 
-        // This remaining lock covers only the in-memory presentation fold. It
-        // never covers chain I/O; the immutable result is then published into
-        // the read model used by every GET.
-        let snapshot = {
+        let mut snapshot = {
             let s = state.lock().await;
-            s.dashboard_snapshot_from_projection(projection, cutoff, label)
+            s.dashboard_snapshot_from_projection(projection.clone(), cutoff, label)
         };
+        // The fold registers any grain it had no derivation for — at start, all of them.
+        // Derive those off the lock and fold once more, so no snapshot is published with a
+        // member's trust missing.
+        if chain_store.derivations().has_due() {
+            let store = chain_store.clone();
+            if tokio::task::spawn_blocking(move || refresh_derivations(&store)).await.is_ok() {
+                let s = state.lock().await;
+                snapshot = s.dashboard_snapshot_from_projection(projection, cutoff, label);
+            }
+        }
         model.publish(range, snapshot);
     }
 }
@@ -505,7 +574,7 @@ async fn operator_gate(
     }
 
     let now = super::state::unix_now();
-    let (outcome, provenance) = {
+    let (outcome, operator, provenance) = {
         let s = state.lock().await;
         let law = s.vault.policy();
         let operator = bearer
@@ -524,6 +593,7 @@ async fn operator_gate(
             .cloned();
         (
             gate_session_request(law, operator.as_deref(), stakes),
+            operator,
             provenance,
         )
     };
@@ -564,6 +634,7 @@ async fn operator_gate(
     // a row saying so rather than a row saying nothing.
     req.extensions_mut()
         .insert(super::operator_auth::GateWitness {
+            operator,
             provenance,
             gate_entry_hash,
         });
@@ -1133,6 +1204,15 @@ pub async fn serve_with_callback(
         // member that could revoke — or, worse, could NOT be revoked — would hold the
         // control.
         .route("/api/scope/standing/revoke", post(scope_standing_revoke))
+        // The LIVE half (dp, 2026-09-15). Memory-only like the grant it withdraws, so there
+        // is no vault step: witness, then withdraw, then tell the member.
+        .route("/api/scope/revoke", post(scope_live_revoke))
+        // dp's two buttons (2026-09-08): a live grant made durable; a grant made to reach
+        // its subtree (or back to exact). Exact stays the default everywhere.
+        .route("/api/scope/standing/promote", post(scope_standing_promote))
+        .route("/api/scope/standing/recursive", post(scope_standing_recursive))
+        .route("/api/scope/standing/reassign", post(scope_standing_reassign))
+        .route("/api/scope/reroot", post(scope_reroot))
         // THE GRANT HALF NOW HAS A ROUTE, REVERSING A DELIBERATE DECISION RECORDED HERE.
         //
         // What stood here said: "The GRANT half deliberately has no route of its own: a
@@ -1153,6 +1233,26 @@ pub async fn serve_with_callback(
         // ratification carries a `request_id` and the ask it answered; an originated grant
         // carries `request_id: null` and `origin: "operator_initiated"`. A reader can always
         // tell them apart. What is gone is the DEPENDENCY, not the distinction.
+        // Writing a member's config INTO the vault. Same operator wall as every widening, and
+        // deliberately not reachable from MCP: a member that could author its own config could
+        // set its own `HESTIA_WORKSPACE`, which is to say choose the tree its gate polices.
+        // That is the whole boundary, so this door opens from one direction only.
+        // The READ half (#944 phase 0). A config system that can fail closed but cannot be
+        // viewed from the operator surface is a lockout mechanism, so the view lands before
+        // any seat consumes the projection. Two shapes, deliberately: the LIST names keys and
+        // health and never a value, so it can sit on a page that refreshes; the INSPECT is the
+        // one place a value is revealed, and it is classified above low stakes (see
+        // `Stakes::classify`) so the gate witnesses who looked. Neither is reachable from MCP:
+        // a member that could read its own authoritative config could read its peers'.
+        .route("/api/config/seed", post(config_seed_seats))
+        .route("/api/config/seat", put(config_put_seat).get(config_list_seats))
+        .route("/api/config/seat/:plugin_id", get(config_get_seat))
+        // DISPLAY ALIASES (#998): what the console CALLS a member. Operator-only like every
+        // other write here, but — by dp's ruling — NOT witnessed and NOT an artifact of
+        // record: the chain, the projections and every `plugin_id` field keep naming the id.
+        // See `member_alias.rs` for the invariant and `http.rs` tests for the leak arm.
+        .route("/api/ui/member-aliases", get(ui_alias_list).put(ui_alias_set))
+        .route("/api/ui/member-aliases/:plugin_id", delete(ui_alias_clear))
         .route("/api/scope/grant", post(scope_grant))
         // THE SOCIETY FLOOR (dp, 2026-08-16). Same operator wall as every other widening, and
         // deliberately NOT reachable from MCP: a member that could edit the floor could widen
@@ -1161,6 +1261,15 @@ pub async fn serve_with_callback(
         // one direction.
         .route("/api/scope/floor", post(scope_floor_add))
         .route("/api/scope/floor/remove", post(scope_floor_remove))
+        // TRANSPORT BINDINGS (#1030): which hub identity carries a member's routed acts, and
+        // where the answer belongs. Operator-only and deliberately absent from MCP (members
+        // READ theirs through `hestia_transport_binding`): a member that could choose its own
+        // carrier would be choosing whose name its acts travel under.
+        .route(
+            "/api/transport/binding",
+            get(transport_binding_list).post(transport_binding_set),
+        )
+        .route("/api/transport/binding/remove", post(transport_binding_remove))
         .route("/api/policy/preset", put(policy_set_preset))
         .route("/api/policy/override", put(policy_set_override))
         .route(
@@ -1174,6 +1283,17 @@ pub async fn serve_with_callback(
         .route("/api/gates/verify", get(gates_verify))
         .route("/api/gates/ratify", post(gates_ratify))
         .route("/api/agents/:id/ungovern", post(agent_ungovern))
+        // Retire / reinstate a member on THIS seat (agent-lifecycle PRD R1). Operator-gated
+        // like every other authority change: retiring revokes the id's standing grants.
+        // Register a DISCOVERED harness as a member. No `plugin_id` in the body: the id is
+        // derived from the inventory record, because an id that can be typed can be mistyped.
+        .route("/api/agents/register", post(agent_register))
+        // Delegated authority, keyed by the agent in the URL; the delegation key is derived from
+        // the registry, never typed. The three verbs of `hestia delegate`, on the operator plane.
+        .route("/api/agents/:id/delegations", get(agent_delegations_list).post(agent_delegation_grant))
+        .route("/api/agents/:id/delegations/:deleg/revoke", post(agent_delegation_revoke))
+        .route("/api/agents/:id/retire", post(agent_retire))
+        .route("/api/agents/:id/reinstate", post(agent_reinstate))
         .route("/api/chain", get(chain_query))
         // The admin ledger — governance history with status facets. Operator-gated for the same
         // reason /api/chain is: it is the society's whole record of who ruled on what.
@@ -1269,7 +1389,29 @@ pub async fn serve_with_callback(
                 let mut s = lapse_state.lock().await;
                 // One named pass, so what the worker does is testable: record lapses, then
                 // rewrite any lane projection that did not land (PRD #845 R2).
-                super::handler::disposition_worker_pass(&mut s, now).0
+                let n = super::handler::disposition_worker_pass(&mut s, now).0;
+                // Config drift on the same cadence: a file that matched at startup and was
+                // edited at noon is a miswire from noon, not from the next restart.
+                // Not `gate_capabilities.keys()` alone: that is who CONNECTED, which is a
+                // different question from who has config (#898 review, finding 4).
+                let connected: Vec<String> = s.gate_capabilities.keys().cloned().collect();
+                let home = s.home.clone();
+                let members = super::seat_config::members_to_check(&s.vault, &home, &connected);
+                let drifted = super::handler::render_and_verify_seat_configs(&mut s, &members)
+                    .iter()
+                    .filter(|v| v.is_finding())
+                    .count();
+                if drifted > 0 {
+                    tracing::warn!(drifted, "seat config: rendered artifacts do not match the vault");
+                }
+                // Gate bytes on the same cadence, and at startup (an interval's first tick is
+                // immediate). Before this the daemon checked its gates only when an operator
+                // asked (#1085); dp, 2026-09-21: the daemon verifies, the installer reads.
+                let gates = super::gate_watch::check(&mut s);
+                if gates["status"] != "VERIFIED" {
+                    tracing::warn!(status = %gates["status"], "gate integrity: not verified");
+                }
+                n
             };
             match super::handler::project_dispositions(&chain_handle, &inbox_handle) {
                 Ok(p) if p.projected > 0 || lapsed > 0 => {
@@ -1715,6 +1857,25 @@ async fn operator_amnesty(
     }
 }
 
+/// One grain's derived trust for the API: the window half from the event-triggered cache
+/// (derived now if it has never been, or an event has invalidated it), the volume half from
+/// the grain's live totals.
+fn cached_derivation(
+    s: &super::state::ServerState,
+    plugin_id: &str,
+    role: &str,
+) -> crate::derivation::DerivedTrust {
+    let cached = s.chain_store.derivations().get(&s.chain_store, plugin_id, role);
+    let vol = s.trust_for_role(plugin_id, role);
+    crate::derivation::with_volume(
+        (*cached.evidence).clone(),
+        Some(crate::derivation::WitnessedVolume {
+            total_acts: vol.action_count,
+            success_acts: vol.success_count,
+        }),
+    )
+}
+
 async fn trust_derivation_json(
     State(state): State<SharedState>,
     Query(q): Query<DerivationQuery>,
@@ -1726,17 +1887,7 @@ async fn trust_derivation_json(
     // One shared window for every derivation surface: split budgets, so sparse
     // governance evidence is not crowded out by routine outcomes. See
     // `derivation::scan_window` for why the three call sites must not diverge.
-    let window = crate::derivation::scan_window(&s.chain_store);
-    let vol = s.trust_for_role(&q.plugin_id, &role);
-    let derived = crate::derivation::derive_with_volume(
-        &q.plugin_id,
-        &role,
-        &window,
-        Some(crate::derivation::WitnessedVolume {
-            total_acts: vol.action_count,
-            success_acts: vol.success_count,
-        }),
-    );
+    let derived = cached_derivation(&s, &q.plugin_id, &role);
     drop(s);
     Json(serde_json::to_value(derived).unwrap_or_default())
 }
@@ -1760,17 +1911,7 @@ async fn trust_graph_turtle(
     // One shared window for every derivation surface: split budgets, so sparse
     // governance evidence is not crowded out by routine outcomes. See
     // `derivation::scan_window` for why the three call sites must not diverge.
-    let window = crate::derivation::scan_window(&s.chain_store);
-    let vol = s.trust_for_role(&q.plugin_id, &role);
-    let derived = crate::derivation::derive_with_volume(
-        &q.plugin_id,
-        &role,
-        &window,
-        Some(crate::derivation::WitnessedVolume {
-            total_acts: vol.action_count,
-            success_acts: vol.success_count,
-        }),
-    );
+    let derived = cached_derivation(&s, &q.plugin_id, &role);
     // The DURABLE member LCT, never the caller-supplied plugin_id — emitting the label here
     // would encode the attribution gap into the graph this projection exists to close.
     // Unmappable (synthetic / malformed) grains get an explicit urn rather than a guess.
@@ -1834,6 +1975,9 @@ async fn vault_list(State(state): State<SharedState>) -> impl IntoResponse {
                     "exposed": e.allowed_consumers.is_empty(),
                     "created_at": e.created_at,
                     "last_rotated": e.last_rotated,
+                    // Daemon-owned (identity, device keys, hub config): shown so the operator
+                    // sees everything the vault holds, but locked. Delete refuses it below.
+                    "system": crate::vault::system_entry_role(name),
                 })
             })
         })
@@ -1853,6 +1997,18 @@ async fn vault_add(
             Json(serde_json::json!({"error": "name and value required"})),
         );
     }
+    // A daemon-owned name is not a credential slot. Today `add` only fails if the entry
+    // exists, so an absent identity entry could be CREATED here and the daemon would then
+    // sign with the operator's text.
+    if let Some(role) = crate::vault::system_entry_role(name) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("'{name}' is reserved for the daemon ({role}); choose another name"),
+                "system": role,
+            })),
+        );
+    }
     let scope: Vec<String> = body
         .get("scope")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -1867,13 +2023,43 @@ async fn vault_add(
         .unwrap_or_default();
 
     let entry = crate::vault::VaultEntry::new(name, value)
-        .with_scope(scope)
-        .with_tags(tags)
-        .with_consumers(consumers);
+        .with_scope(scope.clone())
+        .with_tags(tags.clone())
+        .with_consumers(consumers.clone());
 
     let mut s = state.lock().await;
     match s.vault.add(entry) {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
+        Ok(()) => {
+            // Witness the operator's write: the name and its policy, never the value. FAIL CLOSED
+            // (GPT review of #1123): a credential must not be in the vault without its record. If
+            // the append fails, the add is undone, and the response says whether the undo worked.
+            // That is the same terminal-append-or-rollback order as transport_binding_set.
+            match s.append_chain(
+                "vault_entry_added",
+                serde_json::json!({
+                    "name": name, "scope": scope, "tags": tags,
+                    "allowed_consumers": consumers, "via": "operator",
+                }),
+            ) {
+                Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
+                Err(e) => {
+                    let undone = s.vault.remove(name);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!(
+                            "the vault_entry_added record could not be appended ({e}); rollback: {}",
+                            match undone {
+                                Ok(_) => format!("'{name}' removed again — NOT stored"),
+                                Err(rb) => format!("FAILED ({rb}) — '{name}' IS STORED without its record"),
+                            })})),
+                    )
+                }
+            }
+        }
+        Err(crate::error::CoreError::CredentialAlreadyExists(_)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("'{name}' already exists; delete it first to replace it")})),
+        ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -1881,14 +2067,58 @@ async fn vault_add(
     }
 }
 
+/// Remove one credential. Refuses daemon-owned entries: from a running surface, deleting
+/// `ai_identity_secret` would destroy this daemon's signing identity in one click. The
+/// break-glass path for those is `hestia vault remove` with the daemon stopped.
 async fn vault_delete(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(role) = crate::vault::system_entry_role(&name) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("'{name}' belongs to the daemon ({role}) and cannot be deleted from a running surface"),
+                "system": role,
+            })),
+        );
+    }
     let mut s = state.lock().await;
     match s.vault.remove(&name) {
-        Ok(_) => Json(serde_json::json!({"ok": true})),
-        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+        Ok(removed) => {
+            // FAIL CLOSED, as in vault_add: no deletion without its record. If the append fails,
+            // the removed entry goes back exactly as it was (same id, dates and policy), and the
+            // response says whether that worked.
+            match s.append_chain(
+                "vault_entry_removed",
+                serde_json::json!({
+                    "name": name, "scope": removed.scope, "tags": removed.tags,
+                    "allowed_consumers": removed.allowed_consumers, "via": "operator",
+                }),
+            ) {
+                Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
+                Err(e) => {
+                    let restored = s.vault.add(removed);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!(
+                            "the vault_entry_removed record could not be appended ({e}); rollback: {}",
+                            match restored {
+                                Ok(()) => format!("'{name}' restored — NOT deleted"),
+                                Err(rb) => format!("FAILED ({rb}) — '{name}' IS DELETED without its record"),
+                            })})),
+                    )
+                }
+            }
+        }
+        Err(crate::error::CoreError::CredentialNotFound(_)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("no vault entry named '{name}'")})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
     }
 }
 
@@ -2348,6 +2578,9 @@ async fn scope_decide(
         .trim()
         .to_string();
     let standing = body.get("standing").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Exact by default (dp, 2026-09-08). Recursion is the operator's explicit choice at
+    // decide time, never something the asking member can set: a request names ONE path.
+    let recursive = body.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
     let granted = match body.get("granted").and_then(|v| v.as_bool()) {
         Some(g) => g,
         // No default. An absent verdict is not a deny and not an approve — it is a malformed
@@ -2424,6 +2657,14 @@ async fn scope_decide(
         );
     }
     let (plugin_id, path, ask) = (req.plugin_id.clone(), req.path.clone(), req.reason.clone());
+    // A retired id is refused authority through THIS door too, live or standing. A phantom
+    // cannot file a request, so this bites only on a retired live seat -- which is the arm the
+    // guard exists for, and the one a reviewer probed (cbp, PR #1100).
+    if granted {
+        if let Some(refusal) = refuse_if_retired(&s, &plugin_id, "a decided request") {
+            return refusal;
+        }
+    }
     let expires_at = if granted {
         now + window
     } else {
@@ -2478,6 +2719,7 @@ async fn scope_decide(
             // expiry and the generation it will mint travel with the ruling that made it.
             "standing": standing,
             "standing_expires_at": standing_expires_at,
+            "recursive": recursive,
             "standing_generation": if standing {
                 serde_json::json!(s.standing_scope.generation + 1)
             } else {
@@ -2546,6 +2788,7 @@ async fn scope_decide(
             reason: reason.clone(),
             expires_at: standing_expires_at,
             request_id: Some(request_id.clone()),
+            recursive,
         };
         if let Err(e) = s.commit_standing_scope(|st| st.add(grant)) {
             return (
@@ -2636,6 +2879,7 @@ async fn scope_decide(
             Some(reason.clone())
         };
         req.expires_at = expires_at;
+        req.recursive = recursive;
     }
 
     // #459: the decision's RETURN EDGE. The requester filed through MCP and until
@@ -2668,7 +2912,11 @@ async fn scope_decide(
     )
 }
 
-/// `POST /api/scope/grant` {plugin_id, path, reason, expires_in_secs?}
+/// `POST /api/scope/grant` {plugin_id, path, reason, expires_in_secs?, grant_ahead_of_connect?}
+///
+/// An unknown `plugin_id` is refused (409, nothing written) unless `grant_ahead_of_connect` is
+/// the boolean `true` (#1067). The flag registers NOTHING: no member is minted, and the 200
+/// still says `member_known: false`. It only says the operator meant it.
 ///
 /// THE OPERATOR'S OWN GRANT — no `request_id`, because no member asked.
 ///
@@ -2699,6 +2947,614 @@ async fn scope_decide(
 /// ask; this one answers nothing, so it is durable until revoked, or until `expires_in_secs`
 /// if the operator wants it bounded — and a bounded STANDING grant still survives a restart,
 /// which is strictly better than what the fleet has been losing on every deploy.
+/// Write a member's configuration into the vault, and render it in the same act.
+///
+/// The missing half of #898: the substrate could render and verify, but nothing could put a
+/// document there, so the vault was authoritative over content only a Rust test could create. A
+/// mechanism whose authority cannot be written to is not yet the source of truth for anything.
+///
+/// VALIDATED BEFORE IT IS STORED, not only before it is rendered. Storing content that cannot
+/// render would leave the vault holding an authority that produces a permanent finding and no
+/// artifact — an unbacked projection one layer up, where nothing can quarantine it.
+/// `POST /api/config/seed` — initialise an EMPTY seat-config namespace in ONE act.
+///
+/// WHY A SEPARATE DOOR AND NOT A LOOP OVER `config_put_seat`. A client that reads the
+/// namespace, finds it empty and then writes N documents has two failure classes it cannot
+/// repair: another writer can occupy the namespace between the read and the writes, and a
+/// failure after the first document leaves a namespace that is neither empty nor complete.
+/// The second is the worse one, because the ratchet that makes seeding safe — write only into
+/// an empty namespace — then refuses to touch the half-state forever. The bootstrap's own
+/// guard would strand the box it exists to rescue (#987 review).
+///
+/// So the whole act happens here, under one lock: verify emptiness, validate and render
+/// EVERY proposed document, then commit them as a single vault write. A failure before the
+/// commit leaves the namespace byte-identical; a concurrent writer makes this refuse cleanly
+/// with what it found. One intent row and one result row, not one pair per document — the
+/// chain should say "this box was initialised", because that is the act.
+///
+/// It seeds DESCRIPTION. Nothing here grants: the documents are seat layout and society
+/// facts, and every authority surface (scope, standing scope, operator sets) is untouched and
+/// unreadable from this handler.
+async fn config_seed_seats(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use super::seat_config as sc;
+
+    let proposed = match body.get("documents").and_then(|v| v.as_object()) {
+        Some(map) if !map.is_empty() => map.clone(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "documents is required and must be a non-empty object of \
+                              member -> {env, note}"
+                })),
+            );
+        }
+    };
+
+    // PARSE AND VALIDATE EVERYTHING BEFORE ANYTHING IS WRITTEN. The commit below is one
+    // vault save; the point of validating first is that the save is then the only thing that
+    // can fail, and it fails whole.
+    let mut parsed: Vec<(String, sc::SeatConfig)> = Vec::new();
+    for (member, value) in proposed.iter() {
+        let member = member.trim().to_string();
+        if member.is_empty()
+            || member.contains('/')
+            || member.contains('\\')
+            || member.contains("..")
+            || member.starts_with('.')
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "member {member:?} becomes a filename and may not be empty or contain a \
+                         path separator, a parent reference, or a leading dot"
+                    )
+                })),
+            );
+        }
+        let cfg: sc::SeatConfig = match serde_json::from_value(value.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("document for {member:?} does not parse: {e}")
+                    })),
+                );
+            }
+        };
+        if let Err(msg) = cfg.validate() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("{member}: {msg}")})),
+            );
+        }
+        if let Err(msg) = sc::validate_attribution(&member, &cfg) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("{member}: {msg}"), "attribution": true})),
+            );
+        }
+        parsed.push((member, cfg));
+    }
+    parsed.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // A SEAT MAY NOT RESTATE A SHARED KEY — checked against the set being seeded in the same
+    // act, since there is no earlier one to check against.
+    let shared_proposed = parsed
+        .iter()
+        .find(|(m, _)| sc::is_shared(m))
+        .map(|(_, c)| c.clone());
+    for (member, cfg) in &parsed {
+        if sc::is_shared(member) {
+            continue;
+        }
+        let owned = sc::keys_owned_by_shared(shared_proposed.as_ref(), cfg);
+        if !owned.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "{member} restates keys {owned:?} that the shared set in this same seed \
+                         already owns; every seat inherits them"
+                    ),
+                    "shared_keys": owned,
+                })),
+            );
+        }
+    }
+
+    let mut encoded: Vec<(String, Vec<u8>)> = Vec::new();
+    for (member, cfg) in &parsed {
+        match serde_json::to_vec(cfg) {
+            Ok(b) => encoded.push((member.clone(), b)),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("could not serialise {member}: {e}")
+                    })),
+                );
+            }
+        }
+    }
+
+    let mut s = state.lock().await;
+
+    // THE COMPARE. Under the same lock the commit runs under, so nothing can occupy the
+    // namespace between deciding and writing.
+    if !sc::namespace_is_empty(&s.vault) {
+        let occupied = sc::declared_members(&s.vault);
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "the seat-config namespace is not empty; seeding initialises a box that \
+                          has never been configured, and the half it does not know about is a \
+                          choice it must not overwrite",
+                "declared": occupied,
+            })),
+        );
+    }
+
+    // WITNESS FIRST, and once: the act is "this box was initialised", not N writes. Keys only,
+    // never values — a config document can carry a token and the chain never forgets.
+    let record = serde_json::json!({
+        "members": parsed.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(),
+        "keys": parsed
+            .iter()
+            .map(|(m, c)| (m.clone(), c.env.keys().cloned().collect::<Vec<_>>()))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        "decided_by": "operator",
+        "via": "operator_session",
+        "precondition": "namespace_empty",
+    });
+    let intent = match s.append_chain("config_seed_intent", record.clone()) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("witness append failed, nothing was seeded: {e}")
+                })),
+            );
+        }
+    };
+
+    // THE COMMIT. One vault save for every document; on failure the vault is byte-identical
+    // and the namespace is still empty, so the next attempt is a clean retry rather than a
+    // repair.
+    if let Err(e) = s.vault.put_documents(sc::SEAT_CONFIG_NS, &encoded) {
+        let _ = s.append_chain(
+            "config_seed_failed",
+            serde_json::json!({"error": e.to_string(), "intent": intent.hash}),
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("seed NOT committed, the namespace is unchanged: {e}"),
+                "intent": intent.hash,
+            })),
+        );
+    }
+
+    // Render immediately rather than waiting for the worker's next tick: an operator who just
+    // seeded a box expects its seats to be able to act, and the verdicts are the evidence.
+    let members: Vec<String> = parsed
+        .iter()
+        .map(|(m, _)| m.clone())
+        .filter(|m| !sc::is_shared(m))
+        .collect();
+    let verdicts = super::handler::render_and_verify_seat_configs_as(
+        &mut s,
+        &members,
+        super::handler::ConfigPass::Author,
+    );
+    let _ = s.append_chain(
+        "config_seeded",
+        serde_json::json!({
+            "members": parsed.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(),
+            "intent": intent.hash,
+        }),
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "seeded": parsed.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(),
+            "verdict": verdicts,
+            "intentEntryHash": intent.hash,
+        })),
+    )
+}
+
+async fn config_put_seat(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use super::seat_config as sc;
+
+    let member = body
+        .get("plugin_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if member.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "plugin_id is required"})),
+        );
+    }
+    // A member id becomes a FILENAME (`<home>/seats/<member>.env`). A separator or a parent
+    // reference here would place the artifact outside the render directory, turning a config
+    // write into an arbitrary file write on the operator surface.
+    if member.contains('/') || member.contains('\\') || member.contains("..") || member.starts_with('.')
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "plugin_id becomes a filename and may not contain a path separator, a \
+                          parent reference, or a leading dot"
+            })),
+        );
+    }
+
+    let cfg: sc::SeatConfig = match serde_json::from_value(
+        body.get("config").cloned().unwrap_or(serde_json::Value::Null),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("config does not parse: {e}")})),
+            );
+        }
+    };
+    if let Err(msg) = cfg.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": msg})),
+        );
+    }
+    // WHO this document is for is its name, not a value in it. Refused before the vault holds
+    // it, so the authority can never carry a mis-attributed seat (dp, 2026-09-05).
+    if let Err(msg) = sc::validate_attribution(&member, &cfg) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": msg, "attribution": true})),
+        );
+    }
+
+    let bytes = match serde_json::to_vec(&cfg) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("could not serialise config: {e}")})),
+            );
+        }
+    };
+
+    let mut s = state.lock().await;
+    let home = s.home.clone();
+    let existed = s.vault.get_document(sc::SEAT_CONFIG_NS, &member).is_some();
+    let writing_shared = sc::is_shared(&member);
+
+    // A SEAT MAY NOT RESTATE A SHARED KEY. The shared set owns the society's facts; a seat
+    // document is only what is genuinely per-harness. Refused at the door so a new collision
+    // cannot be created (an existing one is reported as `shadowed`, never silently resolved).
+    if !writing_shared {
+        let shared_now = match sc::load_shared(&s.vault) {
+            Some(Ok(c)) => Some(c),
+            _ => None,
+        };
+        let owned = sc::keys_owned_by_shared(shared_now.as_ref(), &cfg);
+        if !owned.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "keys {:?} belong to the shared set and are inherited by every seat; \
+                         remove them from this seat's document (edit `_shared` to change them)",
+                        owned
+                    ),
+                    "shared_keys": owned,
+                })),
+            );
+        }
+    }
+
+    // WITNESS FIRST, the same ordering as every other authority write here: a failed vault write
+    // must not leave the chain silent about an attempted change to what a seat runs with. The
+    // record names the KEYS, never the values — a config document can carry a token, and the
+    // chain is the one store that never forgets.
+    let record = serde_json::json!({
+        "member": member,
+        "shared": writing_shared,
+        "keys": cfg.env.keys().cloned().collect::<Vec<_>>(),
+        "note": cfg.note,
+        "replaces": existed,
+        "decided_by": "operator",
+        "via": "operator_session",
+    });
+    let intent = match s.append_chain("config_seat_write_intent", record.clone()) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("witness append failed, config NOT written: {e}")
+                })),
+            );
+        }
+    };
+
+    if let Err(e) = s.vault.put_document(sc::SEAT_CONFIG_NS, &member, bytes) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("config NOT written to the vault: {e}"),
+                "intentEntryHash": intent.hash,
+            })),
+        );
+    }
+
+    // Render immediately rather than waiting for the worker's next tick: an operator who just
+    // set a workspace root should not have to guess whether the artifact has caught up. As an
+    // AUTHOR pass: render, then verify — the artifact is expected to differ from what it was,
+    // and that difference is the operator's act, not drift. A write to the shared set
+    // re-renders every seat in the same act, because every seat inherits it.
+    let members = if writing_shared {
+        let connected: Vec<String> = s.gate_capabilities.keys().cloned().collect();
+        sc::members_to_check(&s.vault, &home, &connected)
+    } else {
+        vec![member.clone()]
+    };
+    let verdicts = super::handler::render_and_verify_seat_configs_as(
+        &mut s, &members, super::handler::ConfigPass::Author,
+    );
+    let _ = s.append_chain("config_seat_written", record);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "member": member,
+            "shared": writing_shared,
+            "replaced": existed,
+            // The shared set renders no artifact of its own; its effect is every seat's.
+            "artifact": if writing_shared { serde_json::Value::Null } else {
+                serde_json::json!(sc::render_path(&home, &member).to_string_lossy())
+            },
+            "verdict": verdicts,
+            "intentEntryHash": intent.hash,
+        })),
+    )
+}
+
+/// `plugin_id` becomes a filename (`<home>/seats/<member>.env`) on the write side, and the same
+/// rule holds on the read side so a GET cannot name a document the PUT could never have made.
+fn seat_id_is_a_plain_name(member: &str) -> bool {
+    !member.is_empty()
+        && !member.contains('/')
+        && !member.contains('\\')
+        && !member.contains("..")
+        && !member.starts_with('.')
+}
+
+/// What the operator surface says about one seat WITHOUT revealing a value. Shared by the list
+/// and the inspect so the two cannot disagree about health.
+///
+/// Read-only by construction: `verify_one` compares and never writes, and no finding is opened
+/// or closed here. The worker and the PUT are the two places that render and witness; a GET
+/// that repaired the artifact would be a read with a side effect, and a page refresh would
+/// become the drift detector.
+fn seat_config_summary(
+    s: &super::state::ServerState,
+    member: &str,
+) -> serde_json::Value {
+    use super::seat_config as sc;
+    let home = s.home.clone();
+    let artifact = sc::render_path(&home, member);
+    let declared = s.vault.get_document(sc::SEAT_CONFIG_NS, member).map(|bytes| {
+        serde_json::from_slice::<sc::SeatConfig>(bytes)
+            .map_err(|e| format!("vault config does not decode as seat config: {e}"))
+            .and_then(|c| c.validate().map(|_| c))
+    });
+    let open_since = s.config_findings_open.get(member).map(|f| f.first_observed_at);
+    let live = s.seat_live.get(member).map(|l| {
+        serde_json::json!({
+            "sha256": l.sha256,
+            "expected_sha256": l.expected_sha256,
+            "matches_expected": l.matches_expected(),
+            "first_seen_at": l.first_seen_at,
+            "last_seen_at": l.last_seen_at,
+        })
+    });
+    let shared = sc::load_shared(&s.vault);
+    let declared = match (&shared, declared) {
+        (Some(Err(e)), Some(_)) => Some(Err(format!("shared set unusable: {e}"))),
+        (_, d) => d,
+    };
+    let shared_ok: Option<&sc::SeatConfig> = match &shared {
+        Some(Ok(c)) => Some(c),
+        _ => None,
+    };
+    match declared {
+        Some(Ok(cfg)) => {
+            let verdict = sc::verify_effective(&home, member, shared_ok, &cfg);
+            let (expected_bytes, shadowed) = sc::render_effective(member, shared_ok, &cfg);
+            serde_json::json!({
+                "member": member,
+                "configured": true,
+                // What THIS seat carries. The inherited keys are listed apart, so a reader can
+                // tell a seat fact from a society fact at a glance.
+                "keys": cfg.env.keys().cloned().collect::<Vec<_>>(),
+                "inherited": shared_ok.map(|sh| sh.env.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
+                "shadowed": shadowed,
+                "note": cfg.note,
+                "artifact": artifact.to_string_lossy(),
+                "expected_sha256": sc::sha256_of(expected_bytes.as_bytes()),
+                "verdict": verdict,
+                "finding_open_since": open_since,
+                // What the seat itself last said it was running (#944 liveness). Absent until
+                // the seat connects with a digest; `matches_expected` is against the render
+                // current at that connect, which is why it is stored rather than recomputed.
+                "live": live,
+            })
+        }
+        Some(Err(reason)) => serde_json::json!({
+            "member": member,
+            "configured": true,
+            "keys": [],
+            "note": "",
+            "artifact": artifact.to_string_lossy(),
+            "verdict": {"status": "unbacked", "member": member, "reason": reason},
+            "finding_open_since": open_since,
+            "live": live,
+        }),
+        None => serde_json::json!({
+            "member": member,
+            "configured": false,
+            "keys": [],
+            "note": "",
+            "artifact": artifact.to_string_lossy(),
+            // Nothing declared. If an artifact is on disk anyway the worker will quarantine
+            // it on its next pass and say so; this read only reports what it sees.
+            "verdict": {
+                "status": if artifact.exists() { "unbacked" } else { "unconfigured" },
+                "member": member,
+            },
+            "finding_open_since": open_since,
+            "live": live,
+        }),
+    }
+}
+
+/// `GET /api/config/seat` — every seat this daemon would check (vault-declared ∪ connected ∪
+/// on-disk, the same domain as the worker), with keys, note, health and digests. NO VALUES:
+/// this is the view a page polls, and a polled surface is the one an operator leaves open.
+async fn config_list_seats(State(state): State<SharedState>) -> impl IntoResponse {
+    let s = state.lock().await;
+    let connected: Vec<String> = s.gate_capabilities.keys().cloned().collect();
+    let home = s.home.clone();
+    let members = super::seat_config::members_to_check(&s.vault, &home, &connected);
+    let seats: Vec<serde_json::Value> = members.iter().map(|m| seat_config_summary(&s, m)).collect();
+    let shared = match super::seat_config::load_shared(&s.vault) {
+        None => serde_json::json!({"configured": false, "keys": [], "note": ""}),
+        Some(Ok(c)) => serde_json::json!({
+            "configured": true,
+            "keys": c.env.keys().cloned().collect::<Vec<_>>(),
+            "note": c.note,
+        }),
+        Some(Err(e)) => serde_json::json!({"configured": true, "keys": [], "note": "", "error": e}),
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "shared": shared,
+            "seats": seats,
+            "render_dir": home.join(super::seat_config::RENDER_DIR).to_string_lossy(),
+        })),
+    )
+}
+
+/// `GET /api/config/seat/:plugin_id` — the authoritative `SeatConfig` from the vault, values
+/// included, plus the current projection verdict. THE ONE DELIBERATE VALUE REVEAL on this
+/// surface. `Stakes::classify` rates it above the read flood so the operator gate writes a row
+/// naming who looked; this handler adds the member and the KEYS looked at, never the values —
+/// the chain is the one store that never forgets, and a config document can carry a token.
+///
+/// THE ROW NAMES ITS AUTHORIZATION (GPT DA review of #949). The first version wrote
+/// `decided_by: operator / via: operator_session` — a generic claim — while the proof of WHO
+/// and WHICH authorization sat in the adjacent `operator_gate` row. Adjacency is not a join
+/// (forum 2662/2664/2666; `GateWitness`): the act row must carry the pointer to the gate row
+/// that admitted it, hash-committed, and the composed provenance when the session has one.
+/// Same mechanism as every `policy_edit` site, for the same reason.
+async fn config_get_seat(
+    State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
+    axum::extract::Path(plugin_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    use super::seat_config as sc;
+    let member = plugin_id.trim().to_string();
+    if !seat_id_is_a_plain_name(&member) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "plugin_id names one document and may not contain a path separator, a \
+                          parent reference, or a leading dot"
+            })),
+        );
+    }
+    let mut s = state.lock().await;
+    let summary = if sc::is_shared(&member) {
+        // The shared set has no artifact and no verdict of its own: its health is every seat's.
+        serde_json::json!({
+            "member": member,
+            "configured": s.vault.get_document(sc::SEAT_CONFIG_NS, &member).is_some(),
+            "keys": [], "inherited": [], "shadowed": [], "note": "",
+            "artifact": serde_json::Value::Null,
+            "verdict": {"status": "shared", "member": member},
+        })
+    } else {
+        seat_config_summary(&s, &member)
+    };
+    let cfg: Option<sc::SeatConfig> = s
+        .vault
+        .get_document(sc::SEAT_CONFIG_NS, &member)
+        .and_then(|bytes| serde_json::from_slice::<sc::SeatConfig>(bytes).ok());
+    let shared_ok: Option<sc::SeatConfig> = match sc::load_shared(&s.vault) {
+        Some(Ok(c)) => Some(c),
+        _ => None,
+    };
+    let Some(cfg) = cfg else {
+        // Absent or undecodable: the summary already says which, and there is no value to
+        // reveal, so nothing is witnessed beyond the gate's own row.
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("the vault declares no decodable config for '{member}'"),
+                "summary": summary,
+            })),
+        );
+    };
+    let _ = s.append_chain(
+        "config_seat_inspected",
+        stamp_gate(
+            serde_json::json!({
+                "member": member,
+                "keys": cfg.env.keys().cloned().collect::<Vec<_>>(),
+                "act": format!("GET /api/config/seat/{member}"),
+            }),
+            &gate,
+        ),
+    );
+    let (effective, _) = if sc::is_shared(&member) {
+        (cfg.clone(), Vec::new())
+    } else {
+        sc::effective_for(&member, shared_ok.as_ref(), &cfg)
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "member": member,
+            "config": cfg,
+            // The composed set the seat actually renders — shared keys included, values and
+            // all — so the operator can see the whole projection in one place while editing
+            // only the seat's own lines.
+            "effective": effective.env,
+            "summary": summary,
+        })),
+    )
+}
+
+
 async fn scope_grant(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
@@ -2755,6 +3611,8 @@ async fn scope_grant(
         .and_then(|v| v.as_u64())
         .filter(|w| *w > 0)
         .map(|w| now + w);
+    // Exact by default; the operator opts into the subtree (dp, 2026-09-08).
+    let recursive = body.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let mut s = state.lock().await;
     // A GRANT TO A MEMBER NOBODY HAS SEEN IS ALMOST ALWAYS A TYPO, and it fails silently:
@@ -2770,7 +3628,56 @@ async fn scope_grant(
     // by running the negative case rather than the happy one; a guard nobody has watched FAIL
     // is a claim, not a check. `member_registry` is the store of members actually recorded, so
     // asking it can return false.
+    // A RETIRED id is not a party here any more (agent-lifecycle R1). Refused BEFORE the
+    // unknown-member check below, and not escapable by `register_new_member`: that flag says
+    // "this member is real and has not connected yet", which is a different claim from "this
+    // member was deliberately retired". Granting to a retired id would also be silently undone
+    // by nothing -- retirement revokes grants once, at retirement; it is not a standing filter.
+    if let Some(refusal) = refuse_if_retired(&s, &plugin_id, "an operator grant") {
+        return refusal;
+    }
     let member_known = s.member_registry.get(&plugin_id).is_some();
+    // AND NOW REFUSED BY DEFAULT (#1067). The paragraph above chose "reported, not refused",
+    // and the report was accurate, well worded, and defeated by where it was shown: inside the
+    // SUCCESS element, after the word "Granted". Measured on McNugget 2026-09-08: three grants
+    // across forty minutes to `Claude-code` and `Claude-Code`, each witnessed and durable, while
+    // `claude-code` -- the seat that needed them -- stayed denied. The ids then sat in the trust
+    // list as two extra agents until 2026-09-20. A warning that arrives with a success is read
+    // as a success.
+    //
+    // Granting ahead of a first connect is still legitimate, so it is still possible: say so,
+    // with `grant_ahead_of_connect: true`. What changes is which of the two outcomes needs a
+    // deliberate extra word -- it used to be the safe one.
+    let ahead_of_connect = body
+        .get("grant_ahead_of_connect")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !member_known && !ahead_of_connect {
+        // One line on purpose: tests/member_presence_census.rs pins registry reads by line, and
+        // a chain split across five lines pins as a bare field access -- a pin that says nothing.
+        #[rustfmt::skip]
+        // Fillers are left out: a custodial id the plane invokes is nobody to grant to, so the
+        // refusal must not suggest one (cbp's review of #1078).
+        let known: Vec<String> = s.member_registry.iter_sorted().into_iter().filter(|(id, _)| !s.member_registry.is_filler(id)).map(|(id, _)| id.clone()).collect();
+        let nearest = nearest_member_ids(&plugin_id, &known);
+        let hint = match nearest.as_slice() {
+            [] => "No recorded member resembles it.".to_string(),
+            [one] => format!("Did you mean '{one}'?"),
+            many => format!("Closest recorded members: {}.", many.join(", ")),
+        };
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "no member '{plugin_id}' has ever connected to this daemon, so this grant \
+                     would reach nothing. {hint} Nothing was written. To grant ahead of a \
+                     member's first connect, resend with \"grant_ahead_of_connect\": true."
+                ),
+                "member_known": false,
+                "nearest": nearest,
+            })),
+        );
+    }
     let replaces = s
         .standing_scope
         .grants
@@ -2790,6 +3697,7 @@ async fn scope_grant(
         // an act the operator originated.
         "request_id": serde_json::Value::Null,
         "origin": "operator_initiated",
+        "recursive": recursive,
         "plugin_id": plugin_id,
         "subject_instance_lct": s.member_lct(&plugin_id),
         "path": path,
@@ -2817,6 +3725,7 @@ async fn scope_grant(
         expires_at,
         // None, for the same reason `request_id` is null in the record above.
         request_id: None,
+        recursive,
     };
     let (intent_hash, entry_hash) = match s.witness_and_commit_standing_grant(grant, record) {
         Ok(pair) => pair,
@@ -2908,6 +3817,218 @@ async fn scope_grant(
 /// the same list — produces N copies that drift the moment one member is granted something the
 /// others are not, and then the law differs per seat while looking identical. Uniformity has
 /// to be structural or it decays. One list cannot drift.
+async fn transport_binding_list(State(state): State<SharedState>) -> impl IntoResponse {
+    let s = state.lock().await;
+    Json(serde_json::json!({
+        "bindings": s.transport_bindings.bindings,
+        "generation": s.transport_bindings.generation,
+    }))
+}
+
+/// Set (insert or replace) a member's transport binding. Witness the intent, persist the
+/// candidate, then witness the terminal fact, rolling the store back if that last append
+/// fails: the same finality construction as `scope_floor_add`, because a binding decides
+/// whose key signs a member's acts and a record that overstates it is the defect #1030 is.
+async fn transport_binding_set(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use crate::server::transport_binding::{validate, TransportBinding, TransportMode, ANY_HUB};
+    let field = |k: &str| {
+        body.get(k)
+            .and_then(|v| v.as_str())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let Some(mode) = field("mode").as_deref().and_then(TransportMode::parse) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "mode is required: direct | relay | direct_required"
+            })),
+        );
+    };
+    let binding = TransportBinding {
+        member: field("member").unwrap_or_default(),
+        hub: field("hub").unwrap_or_else(|| ANY_HUB.to_string()),
+        mode,
+        carrier_lct: field("carrier_lct"),
+        reply_to_lct: field("reply_to_lct"),
+        delegation_ref: field("delegation_ref"),
+        reason: field("reason").unwrap_or_default(),
+        set_by: "operator".to_string(),
+        set_at: crate::server::gate_escalation::now_secs(),
+        version: 0,
+    };
+    if let Err(msg) = validate(&binding) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": msg})));
+    }
+
+    let mut s = state.lock().await;
+    let replaces = s.transport_bindings.get(&binding.member, &binding.hub).filter(|b| b.hub == binding.hub).cloned();
+    let intent = match s.append_chain(
+        "transport_binding_intent",
+        serde_json::json!({
+            "binding": binding,
+            "replaces": replaces,
+            "via": "operator_session",
+            "effect": "rows this member queued under any other binding are failed toward the \
+                       member at the next drain, never relabelled",
+        }),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("witness append failed, binding NOT changed: {e}"),
+                })),
+            );
+        }
+    };
+    let prior = s.transport_bindings.clone();
+    let version = match s.commit_transport_bindings(|st| st.set(binding.clone())) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("binding NOT changed — vault write failed ({e}); the live \
+                                      store is untouched, retry"),
+                    "intentEntryHash": intent.hash,
+                })),
+            );
+        }
+    };
+    let success = match s.append_chain(
+        "transport_binding_set",
+        serde_json::json!({
+            "member": binding.member, "hub": binding.hub, "mode": binding.mode.as_str(),
+            "carrier_lct": binding.carrier_lct, "reply_to_lct": binding.reply_to_lct,
+            "delegation_ref": binding.delegation_ref, "reason": binding.reason,
+            "version": version, "intent": intent.hash,
+        }),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            let restored = s.commit_transport_bindings(|st| *st = prior);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("the terminal transport_binding_set append failed ({e}); \
+                                      rollback: {}", match restored {
+                        Ok(()) => "prior bindings restored in memory and vault — NOT in force".to_string(),
+                        Err(rb) => format!("FAILED ({rb}) — THE BINDING IS LIVE without its success record"),
+                    }),
+                    "intentEntryHash": intent.hash,
+                })),
+            );
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "member": binding.member,
+            "hub": binding.hub,
+            "mode": binding.mode.as_str(),
+            "version": version,
+            "replaced": replaces.is_some(),
+            "successEntryHash": success.hash,
+        })),
+    )
+}
+
+/// Remove a member's transport binding for one hub. The member returns to unbound (the drain
+/// chooses, every forward witnessed `transport: "unbound"`); rows queued under the removed
+/// binding are failed toward the member at the next drain.
+async fn transport_binding_remove(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use crate::server::transport_binding::ANY_HUB;
+    let member = body.get("member").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let hub = body
+        .get("hub")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .unwrap_or(ANY_HUB)
+        .to_string();
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if member.is_empty() || reason.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "member and reason are required"})),
+        );
+    }
+    let mut s = state.lock().await;
+    let Some(existing) = s
+        .transport_bindings
+        .bindings
+        .iter()
+        .find(|b| b.member == member && b.hub == hub)
+        .cloned()
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "no binding for that member and hub", "member": member, "hub": hub})),
+        );
+    };
+    let intent = match s.append_chain(
+        "transport_binding_remove_intent",
+        serde_json::json!({"binding": existing, "reason": reason, "via": "operator_session"}),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("witness append failed, binding NOT removed: {e}")})),
+            );
+        }
+    };
+    let prior = s.transport_bindings.clone();
+    if let Err(e) = s.commit_transport_bindings(|st| st.remove(&member, &hub)) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("binding NOT removed — vault write failed ({e}); retry"),
+                "intentEntryHash": intent.hash,
+            })),
+        );
+    }
+    let generation = s.transport_bindings.generation;
+    match s.append_chain(
+        "transport_binding_removed",
+        serde_json::json!({
+            "member": member, "hub": hub, "reason": reason,
+            "removed_version": existing.version, "generation": generation, "intent": intent.hash,
+        }),
+    ) {
+        Ok(e) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true, "member": member, "hub": hub, "generation": generation,
+                "successEntryHash": e.hash,
+            })),
+        ),
+        Err(e) => {
+            let restored = s.commit_transport_bindings(|st| *st = prior);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("the terminal transport_binding_removed append failed ({e}); \
+                                      rollback: {}", match restored {
+                        Ok(()) => "binding restored in memory and vault — still in force".to_string(),
+                        Err(rb) => format!("FAILED ({rb}) — THE BINDING IS GONE without its success record"),
+                    }),
+                    "intentEntryHash": intent.hash,
+                })),
+            )
+        }
+    }
+}
+
 async fn scope_floor_add(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
@@ -3186,6 +4307,122 @@ async fn scope_floor_remove(
 /// be recorded is refused, same as the grant), but on a failed PERSIST the in-memory removal
 /// is KEPT rather than rolled back — a failure here may only ever leave the TIGHTER state in
 /// force, and the error says the disk still holds the grant so the operator retries.
+/// `POST /api/scope/revoke` {request_id, reason} — withdraw a LIVE grant before it lapses.
+///
+/// Until this existed a live grant could only be waited out (8 h) or made standing and then
+/// revoked, and the second is a widening performed in order to narrow. Same wall as every
+/// other scope write. ORDER: the `scope_revoked` witness first; a failed append changes
+/// nothing. The row is marked, never deleted, so `hestia_scope_status` reads `revoked` with
+/// who and why. The member is told through the same disposition channel a decision uses,
+/// anchored to the witness hash, and the projector derives the same obligation from the chain
+/// if the direct ensure fails. A STANDING grant for the same path is a separate authority: it
+/// is named in the response, not silently revoked with it.
+async fn scope_live_revoke(
+    State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let request_id = body.get("request_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if request_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "request_id is required"})));
+    }
+    let now = crate::server::gate_escalation::now_secs();
+    let mut s = state.lock().await;
+    let Some(req) = s.scope_requests.get(&request_id).cloned() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "no scope request with that id", "request_id": request_id})),
+        );
+    };
+    if !req.is_live(now) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "not a live grant: nothing to revoke",
+                "request_id": request_id,
+                "status": req.status(now),
+            })),
+        );
+    }
+    // WHO revoked it, from the session that was actually admitted — not a literal (GPT review
+    // of #1035, point 1). `stamp_gate` attaches the composed operator provenance (actor,
+    // principal, via_device, office, authority) when the session has one, and the gate entry
+    // hash that admitted this call, so a reader can join the revocation to the authorization.
+    // The NAME comes from the authenticated operator, which a direct browser session also has
+    // and a composition does not add to (codex review of #1035, finding 1). It is the same
+    // value in the chain event and in the stored row; the office literal is left only for a
+    // call that reached the handler with no session at all (dev override, direct tests).
+    let revoked_by = gate
+        .as_ref()
+        .and_then(|axum::Extension(w)| {
+            w.operator.clone().or_else(|| w.provenance.as_ref().map(|p| p.principal.clone()))
+        })
+        .unwrap_or_else(|| "operator".to_string());
+    let record = stamp_gate(
+        serde_json::json!({
+            "request_id": request_id,
+            "plugin_id": req.plugin_id,
+            "subject_instance_lct": s.member_lct(&req.plugin_id),
+            "path": req.path,
+            "recursive": req.recursive,
+            "reason": reason,
+            "revoked_by": revoked_by,
+            "via": "operator_session",
+            "granted_by": req.decided_by,
+            "was_expiring_at": req.expires_at,
+            "lifetime": "live",
+        }),
+        &gate,
+    );
+    let entry = match s.append_chain("scope_revoked", record) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("witness append failed, grant NOT revoked: {e}")})),
+            );
+        }
+    };
+    if let Some(r) = s.scope_requests.get_mut(&request_id) {
+        r.revoked = Some(crate::server::state::ScopeRevocation {
+            at: now,
+            by: revoked_by.clone(),
+            reason: reason.clone(),
+        });
+    }
+    let disposition_notice_id = super::handler::ensure_disposition(
+        &s,
+        &req.plugin_id,
+        &format!("hestia://scope/{request_id}#revoked"),
+        &entry.hash,
+    );
+    let standing_still_covers = s
+        .standing_scope
+        .grants
+        .iter()
+        .any(|g| g.member == req.plugin_id && crate::server::standing_scope::covers_path(&g.path, g.recursive, &req.path)
+             && g.expires_at.is_none_or(|e| now < e));
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "request_id": request_id,
+            "plugin_id": req.plugin_id,
+            "path": req.path,
+            "witnessEntryHash": entry.hash,
+            "disposition_notice_id": disposition_notice_id,
+            "standing_grant_still_covers_path": standing_still_covers,
+            "note": if standing_still_covers {
+                "the live grant is revoked, but a STANDING grant still covers this path; revoke it \
+                 separately with /api/scope/standing/revoke"
+            } else {
+                "revoked; the member's next gate check for this path is refused"
+            },
+        })),
+    )
+}
+
 async fn scope_standing_revoke(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
@@ -3305,6 +4542,718 @@ async fn scope_standing_revoke(
 /// `None` is a real state and stamps nothing: a route reachable without the gate (or a
 /// dev-override) must produce an unstamped row rather than a row that claims an
 /// authorization it never had.
+/// `POST /api/scope/standing/promote` {plugin_id, path, reason?, expires_in_secs?}
+///
+/// A LIVE grant becomes a STANDING one — dp's "make standing" button (2026-09-08). The
+/// live channel is memory-only and dies with the daemon; an operator who has watched a
+/// member use a grant well should not have to re-decide it from a fresh ask after every
+/// restart. The promotion carries the live grant's provenance (its request id, the
+/// member's stated need, its reach) into the durable store, so the standing row still
+/// says why it exists and how far it goes.
+///
+/// Same discipline as a standing decide: witness the INTENT, commit the vault write,
+/// witness the SUCCESS carrying the intent's hash, roll back through the commit path if
+/// the success record fails. A standing grant nothing recorded must not exist.
+async fn scope_standing_promote(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let plugin_id = body.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if plugin_id.is_empty() || raw_path.is_empty() {
+        return (StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "plugin_id and path are required"})));
+    }
+    let path = crate::server::state::normalize_scope_path(&raw_path);
+    let now = crate::server::gate_escalation::now_secs();
+    let expires_at: Option<u64> = body
+        .get("expires_in_secs").and_then(|v| v.as_u64()).filter(|w| *w > 0).map(|w| now + w);
+
+    let mut s = state.lock().await;
+    if let Some(refusal) = refuse_if_retired(&s, &plugin_id, "promotion of a live grant") {
+        return refusal;
+    }
+    let Some(live) = s
+        .scope_requests
+        .values()
+        .find(|r| r.plugin_id == plugin_id && r.path == path && r.is_live(now))
+        .cloned()
+    else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "no LIVE grant of record for that (plugin_id, path) — only a live grant \
+                      can be promoted; an operator-originated standing grant goes through \
+                      /api/scope/grant"
+        })));
+    };
+    // Idempotent: a second press on an already-promoted grant is not a second widening.
+    // Three presses on one grant appended three scope_grant_intent/scope_granted pairs to
+    // the chain (cbp-being's home, 2026-09-12) while the store deduplicated to one row.
+    // Reach-aware (GPT review of #1021): "already standing" only when the standing grant
+    // reaches at least as far as the live one. An EXACT standing twin beside a RECURSIVE live
+    // grant is not the same grant, the dashboard keeps both rows for exactly that reason, and
+    // pressing "make standing" on the recursive row must widen the standing grant (the store's
+    // add() replaces by (member, path)) instead of answering a no-op.
+    if let Some(existing) = s.standing_scope.grants.iter()
+        .find(|g| g.member == plugin_id && g.path == path && g.expires_at.is_none_or(|e| now < e)
+                  && (g.recursive || !live.recursive))
+    {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "status": "already_standing",
+            "plugin_id": plugin_id,
+            "path": path,
+            "recursive": existing.recursive,
+            "granted_at": existing.granted_at,
+            "standing_generation": s.standing_scope.generation,
+            "note": "this grant is already standing; nothing was appended to the chain",
+        })));
+    }
+    let reason = {
+        let given = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if given.is_empty() { live.decision_reason.clone().unwrap_or_default() } else { given }
+    };
+    if reason.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "reason is required: the live grant carried none and none was given — a \
+                      durable widening whose rationale is not recorded is indistinguishable \
+                      afterwards from a misconfiguration"
+        })));
+    }
+
+    let intent = match s.append_chain("scope_grant_intent", serde_json::json!({
+        "request_id": live.id,
+        "plugin_id": plugin_id,
+        "subject_instance_lct": s.member_lct(&plugin_id),
+        "path": path,
+        "requested_because": live.reason,
+        "decision_reason": reason,
+        "granted_by": "operator",
+        "via": "operator_session",
+        "origin": "promoted_from_live",
+        "recursive": live.recursive,
+        "standing": true,
+        "standing_expires_at": expires_at,
+        "standing_generation": s.standing_scope.generation + 1,
+    })) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("witness append failed, promotion NOT applied: {e}")}))),
+    };
+    let prior = s.standing_scope.clone();
+    let grant = crate::server::standing_scope::StandingGrant {
+        member: plugin_id.clone(),
+        path: path.clone(),
+        granted_at: now,
+        granted_by: "operator".to_string(),
+        reason: reason.clone(),
+        expires_at,
+        request_id: Some(live.id.clone()),
+        recursive: live.recursive,
+    };
+    if let Err(e) = s.commit_standing_scope(|st| st.add(grant)) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("promotion NOT applied — vault write failed ({e}); the live store \
+                              is untouched, retry"),
+            "intentEntryHash": intent.hash,
+        })));
+    }
+    let success = match s.append_chain("scope_granted", serde_json::json!({
+        "request_id": live.id,
+        "plugin_id": plugin_id,
+        "subject_instance_lct": s.member_lct(&plugin_id),
+        "path": path,
+        "decision_reason": reason,
+        "granted_by": "operator",
+        "via": "operator_session",
+        "origin": "promoted_from_live",
+        "recursive": live.recursive,
+        "standing": true,
+        "standing_expires_at": expires_at,
+        "standing_generation": s.standing_scope.generation,
+        "intent": intent.hash,
+    })) {
+        Ok(e) => e,
+        Err(e) => {
+            return match s.commit_standing_scope(|st| *st = prior) {
+                Ok(()) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("promotion NOT applied — the terminal record failed ({e}); \
+                                      rolled back, the chain holds only the intent. Retry."),
+                    "intentEntryHash": intent.hash,
+                }))),
+                Err(rb) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("THE STANDING GRANT IS LIVE but its success record could not \
+                                      be appended ({e}) AND the rollback failed ({rb}). Revoke or \
+                                      repair the chain — do not assume the store is consistent."),
+                    "intentEntryHash": intent.hash,
+                }))),
+            };
+        }
+    };
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true,
+        "plugin_id": plugin_id,
+        "path": path,
+        "recursive": live.recursive,
+        "promoted_from_request": live.id,
+        "generation": s.standing_scope.generation,
+        "witnessEntryHash": success.hash,
+        "durability": "STANDING — written to the vault; survives restart; revocable via \
+                       /api/scope/standing/revoke. The live grant remains until it lapses, or \
+                       until POST /api/scope/revoke withdraws it.",
+    })))
+}
+
+/// `POST /api/scope/standing/recursive` {plugin_id, path, recursive, reason}
+///
+/// dp's "make recursive" button (2026-09-08): a grant on a directory reaches the whole
+/// subtree under it, or — `recursive: false` — goes back to exactly that path. Exact is the
+/// default everywhere; this is the one explicit, witnessed act that widens a grant to a
+/// tree, so the operator has READ the word before it means anything. Applies to the
+/// standing grant of record and, if a live grant on the same path exists, to that too, so
+/// the two channels never disagree about the same (member, path).
+///
+/// ORDER: INTENT, COMMIT, THEN THE TERMINAL RECORD (GPT review of #1002, blocker 2). The
+/// first cut appended `scope_reach_changed` and THEN wrote the vault — so a failed commit
+/// left the chain permanently asserting a reach change that never happened, and a no-op
+/// request pre-announced `generation + 1` for a store that did not move. Now: a no-op is a
+/// 409 and writes nothing; a standing change witnesses an intent, commits, and appends the
+/// terminal `scope_reach_changed` carrying the intent's hash and the generation the commit
+/// actually produced, rolling back through the commit path if that terminal append fails;
+/// a live-only change (nothing durable to fail) witnesses first and applies the in-memory
+/// flag after, which cannot fail — the same order `scope_decide` uses for a memory-only grant.
+async fn scope_standing_recursive(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let plugin_id = body.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let Some(recursive) = body.get("recursive").and_then(|v| v.as_bool()) else {
+        return (StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "recursive must be explicitly true or false"})));
+    };
+    if plugin_id.is_empty() || raw_path.is_empty() {
+        return (StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "plugin_id and path are required"})));
+    }
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if recursive && reason.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "reason is required to make a grant recursive — it widens what a member \
+                      can reach from one path to a whole tree"
+        })));
+    }
+    let path = crate::server::state::normalize_scope_path(&raw_path);
+    let now = crate::server::gate_escalation::now_secs();
+
+    let mut s = state.lock().await;
+    // What WOULD change, decided before anything is written: a grant of record whose reach
+    // already equals the request is a no-op, and a no-op mints no witness and moves no
+    // generation. `set_recursive` is idempotent, but the record must be too.
+    let standing_now: Option<bool> = s.standing_scope.grants.iter()
+        .find(|g| g.member == plugin_id && g.path == path && g.is_live(now))
+        .map(|g| g.recursive);
+    let live: Option<(String, bool)> = s.scope_requests.values()
+        .find(|r| r.plugin_id == plugin_id && r.path == path && r.is_live(now))
+        .map(|r| (r.id.clone(), r.recursive));
+    if standing_now.is_none() && live.is_none() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "no grant of record (live or standing) for that (plugin_id, path)"})));
+    }
+    let standing_changes = standing_now.is_some_and(|cur| cur != recursive);
+    let live_changes = live.as_ref().is_some_and(|(_, cur)| *cur != recursive);
+    if !standing_changes && !live_changes {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!("that grant is already {}; nothing to change, nothing witnessed",
+                             if recursive { "recursive" } else { "exact" }),
+            "recursive": recursive,
+            "generation": s.standing_scope.generation,
+        })));
+    }
+    let live_id = live.as_ref().map(|(id, _)| id.clone());
+
+    let subject = s.member_lct(&plugin_id);
+    let record = |kind: &str, extra: serde_json::Value| {
+        let mut v = serde_json::json!({
+            "plugin_id": plugin_id,
+            "subject_instance_lct": subject,
+            "path": path,
+            "recursive": recursive,
+            "reason": reason,
+            "changed_by": "operator",
+            "via": "operator_session",
+            "applies_to": {"standing": standing_changes, "live": if live_changes { live_id.clone() } else { None }},
+        });
+        v.as_object_mut().unwrap().insert("kind".into(), serde_json::Value::String(kind.into()));
+        if let Some(obj) = extra.as_object() {
+            for (k, val) in obj { v.as_object_mut().unwrap().insert(k.clone(), val.clone()); }
+        }
+        v
+    };
+
+    if standing_changes {
+        // INTENT first: the durable effect has not happened and may not.
+        let intent = match s.append_chain("scope_reach_change_intent",
+            record("intent", serde_json::json!({"standing_generation": s.standing_scope.generation + 1}))) {
+            Ok(e) => e,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("witness append failed, reach NOT changed: {e}")}))),
+        };
+        let prior = s.standing_scope.clone();
+        if let Err(e) = s.commit_standing_scope(|st| { st.set_recursive(&plugin_id, &path, recursive); }) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("reach NOT changed — vault write failed ({e}); the live store is \
+                                  untouched (the candidate was persisted first). Retry."),
+                "state": "the chain holds the INTENT and no scope_reach_changed",
+                "intentEntryHash": intent.hash,
+            })));
+        }
+        // TERMINAL, only now, with the generation the commit actually produced.
+        let success = match s.append_chain("scope_reach_changed",
+            record("terminal", serde_json::json!({
+                "standing_generation": s.standing_scope.generation, "intent": intent.hash}))) {
+            Ok(e) => e,
+            Err(e) => {
+                return match s.commit_standing_scope(|st| *st = prior) {
+                    Ok(()) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                        "error": format!("reach NOT changed — the terminal record failed ({e}); \
+                                          rolled back (live store and vault), the chain holds \
+                                          only the intent. Retry."),
+                        "intentEntryHash": intent.hash,
+                    }))),
+                    Err(rb) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                        "error": format!("THE REACH CHANGE IS LIVE but its terminal record could \
+                                          not be appended ({e}) AND the rollback failed ({rb}). \
+                                          Repair the chain — do not assume the store is consistent."),
+                        "intentEntryHash": intent.hash,
+                    }))),
+                };
+            }
+        };
+        if live_changes {
+            if let Some(id) = &live_id {
+                if let Some(r) = s.scope_requests.get_mut(id) { r.recursive = recursive; }
+            }
+        }
+        return (StatusCode::OK, Json(serde_json::json!({
+            "ok": true, "plugin_id": plugin_id, "path": path, "recursive": recursive,
+            "applied_to": {"standing": true, "live": if live_changes { live_id } else { None }},
+            "generation": s.standing_scope.generation,
+            "witnessEntryHash": success.hash,
+        })));
+    }
+
+    // LIVE ONLY: nothing durable can fail, so witness first and apply after — the order
+    // scope_decide uses for a memory-only grant.
+    let entry = match s.append_chain("scope_reach_changed",
+        record("terminal", serde_json::json!({"standing_generation": s.standing_scope.generation}))) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("witness append failed, reach NOT changed: {e}")}))),
+    };
+    if let Some(id) = &live_id {
+        if let Some(r) = s.scope_requests.get_mut(id) { r.recursive = recursive; }
+    }
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true, "plugin_id": plugin_id, "path": path, "recursive": recursive,
+        "applied_to": {"standing": false, "live": live_id},
+        "generation": s.standing_scope.generation,
+        "witnessEntryHash": entry.hash,
+    })))
+}
+
+/// `POST /api/scope/standing/reassign` {plugin_id, path, to, reason} — move ONE standing
+/// grant from a mistyped member to the real one, as one act.
+///
+/// The dashboard's first cut of "reassign" choreographed three authority writes from the
+/// page: grant the destination, promote it recursive, revoke the source. Any interruption
+/// between them leaves both grants present, or a destination with a narrower reach than the
+/// source it claims to carry unchanged — the partial-transaction class #920/#987/#1001
+/// rejected (GPT's hold on #1006). Here the whole move is one store mutation under the state
+/// lock, one vault write, and the `scope_reach_change_intent` → commit → `scope_reassigned`
+/// order `scope_standing_recursive` uses, with the same rollback when the terminal record
+/// cannot be appended.
+///
+/// Refusals, all before any write and none moving the generation: the destination is not
+/// in the member registry (that is the mistake this exists to undo, so it is not repeated
+/// under a different name — 400); no grant of record for `(plugin_id, path)` (404);
+/// self-reassign (409, a no-op is not a mutation); the destination already holds that path
+/// (409 — which reach wins is the operator's explicit call, via revoke / make recursive).
+/// A reason is required: this widens the destination's reach.
+async fn scope_standing_reassign(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let from = body.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let to = body.get("to").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if from.is_empty() || to.is_empty() || raw_path.is_empty() {
+        return (StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "plugin_id, path and to are required"})));
+    }
+    if reason.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "reason is required to reassign a grant — it widens what the destination \
+                      member can reach"
+        })));
+    }
+    let path = crate::server::state::normalize_scope_path(&raw_path);
+    let now = crate::server::gate_escalation::now_secs();
+
+    let mut s = state.lock().await;
+    // THE DESTINATION MUST BE A MEMBER THIS DAEMON HAS RECORDED. `member_lct` derives a
+    // label for any string and cannot say no (see `scope_grant`); the registry can. A grant
+    // to an id nobody has seen is exactly what this operation repairs, so it must not be
+    // able to produce one.
+    // Retired BEFORE unknown: retirement leaves the id in the registry, so the registry check
+    // below says "known" about it -- which is exactly how a reviewer handed `Claude-code` a
+    // grant through this route one keystroke from `claude-code` (cbp, PR #1100).
+    if let Some(refusal) = refuse_if_retired(&s, &to, "a reassign") {
+        return refusal;
+    }
+    if s.member_registry.get(&to).is_none() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("'{to}' is not a member this daemon has recorded; a reassign to an \
+                              unseen id would recreate the mistake it exists to undo. Nothing \
+                              was changed."),
+            "member_known": false,
+        })));
+    }
+    // What WOULD change, decided on a scratch copy before anything durable happens, so
+    // every refusal below is a pure read: no intent, no generation movement.
+    let preview = {
+        let mut probe = s.standing_scope.clone();
+        probe.reassign(&from, &path, &to, now, &reason)
+    };
+    let moved = match preview {
+        Ok(g) => g,
+        Err(crate::server::standing_scope::ReassignRefused::NoSuchGrant) => {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                "error": format!("no standing grant of record for ('{from}', '{path}')")})));
+        }
+        Err(crate::server::standing_scope::ReassignRefused::SameMember) => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "source and destination are the same member; nothing to move, nothing witnessed",
+                "generation": s.standing_scope.generation})));
+        }
+        Err(crate::server::standing_scope::ReassignRefused::DestinationHoldsPath) => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": format!("'{to}' already holds a standing grant on '{path}'; which reach \
+                                  wins is your call — revoke one, or make the survivor recursive"),
+                "generation": s.standing_scope.generation})));
+        }
+    };
+
+    let subject_from = s.member_lct(&from);
+    let subject_to = s.member_lct(&to);
+    let record = |kind: &str, extra: serde_json::Value| {
+        let mut v = serde_json::json!({
+            "plugin_id": from,
+            "to": to,
+            "subject_instance_lct": subject_from,
+            "destination_instance_lct": subject_to,
+            "path": path,
+            "recursive": moved.recursive,
+            "expires_at": moved.expires_at,
+            "reason": reason,
+            "changed_by": "operator",
+            "via": "operator_session",
+            "applies_to": {"standing": true, "live": null},
+        });
+        v.as_object_mut().unwrap().insert("kind".into(), serde_json::Value::String(kind.into()));
+        if let Some(obj) = extra.as_object() {
+            for (k, val) in obj { v.as_object_mut().unwrap().insert(k.clone(), val.clone()); }
+        }
+        v
+    };
+
+    // INTENT first: the durable effect has not happened and may not.
+    let intent = match s.append_chain("scope_reassign_intent",
+        record("intent", serde_json::json!({"standing_generation": s.standing_scope.generation + 1}))) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("witness append failed, grant NOT moved: {e}")}))),
+    };
+    let prior = s.standing_scope.clone();
+    if let Err(e) = s.commit_standing_scope(|st| { let _ = st.reassign(&from, &path, &to, now, &reason); }) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("grant NOT moved — vault write failed ({e}); the live store is \
+                              untouched (the candidate was persisted first). Retry."),
+            "state": "the chain holds the INTENT and no scope_reassigned",
+            "intentEntryHash": intent.hash,
+        })));
+    }
+    // TERMINAL, only now, with the generation the commit actually produced.
+    let success = match s.append_chain("scope_reassigned",
+        record("terminal", serde_json::json!({
+            "standing_generation": s.standing_scope.generation, "intent": intent.hash}))) {
+        Ok(e) => e,
+        Err(e) => {
+            return match s.commit_standing_scope(|st| *st = prior) {
+                Ok(()) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("grant NOT moved — the terminal record failed ({e}); rolled \
+                                      back (live store and vault), the chain holds only the \
+                                      intent. Retry."),
+                    "intentEntryHash": intent.hash,
+                }))),
+                Err(rb) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("THE MOVE IS LIVE but its terminal record could not be \
+                                      appended ({e}) AND the rollback failed ({rb}). Repair the \
+                                      chain — do not assume the store is consistent."),
+                    "intentEntryHash": intent.hash,
+                }))),
+            };
+        }
+    };
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true, "plugin_id": from, "to": to, "path": path, "recursive": moved.recursive,
+        "generation": s.standing_scope.generation,
+        "witnessEntryHash": success.hash,
+    })))
+}
+
+/// `GET /api/ui/member-aliases` — `{aliases: {plugin_id: alias}}`, the console's whole
+/// alias map. Fetched by the dashboard beside the snapshot and resolved through one render
+/// helper, so every screen draws the same name for a member.
+async fn ui_alias_list(State(state): State<SharedState>) -> impl IntoResponse {
+    let s = state.lock().await;
+    match crate::server::member_alias::MemberAliases::load(&s.vault) {
+        Ok(a) => (StatusCode::OK, Json(serde_json::json!({"aliases": a.aliases}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR,
+                   Json(serde_json::json!({"error": format!("alias store unreadable: {e}")}))),
+    }
+}
+
+/// `PUT /api/ui/member-aliases` {plugin_id, alias} — set what the console calls a member.
+///
+/// NOT WITNESSED, by ruling (dp 2026-09-07, #998): a chain row saying "the console now
+/// calls X Y" would make the alias part of the record. Refused when the alias is another
+/// member's real id — that would make the console show one member under another's name,
+/// which is the typo class #1007 exists to end, from the other side.
+async fn ui_alias_set(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let plugin_id = body.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let alias = body.get("alias").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let mut s = state.lock().await;
+    if !alias.is_empty() && alias != plugin_id && s.member_registry.get(&alias).is_some() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("'{alias}' is another member's id; an alias may not wear a real \
+                              member's name")})));
+    }
+    let mut store = match crate::server::member_alias::MemberAliases::load(&s.vault) {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                          Json(serde_json::json!({"error": format!("alias store unreadable: {e}")}))),
+    };
+    if let Err(why) = store.set(&plugin_id, &alias) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": why})));
+    }
+    if let Err(e) = store.save(&mut s.vault) {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("alias NOT saved: {e}")})));
+    }
+    (StatusCode::OK, Json(serde_json::json!({"plugin_id": plugin_id, "alias": alias})))
+}
+
+/// `DELETE /api/ui/member-aliases/:plugin_id` — the console shows the id again.
+async fn ui_alias_clear(
+    State(state): State<SharedState>,
+    axum::extract::Path(plugin_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let mut s = state.lock().await;
+    let mut store = match crate::server::member_alias::MemberAliases::load(&s.vault) {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                          Json(serde_json::json!({"error": format!("alias store unreadable: {e}")}))),
+    };
+    let cleared = store.clear(&plugin_id);
+    if cleared {
+        if let Err(e) = store.save(&mut s.vault) {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("alias NOT cleared: {e}")})));
+        }
+    }
+    (StatusCode::OK, Json(serde_json::json!({"plugin_id": plugin_id, "cleared": cleared})))
+}
+
+/// `POST /api/scope/reroot` {from, to, plugin_id?, reason, dry_run?, allow_missing_target?} —
+/// move every standing grant at or under one root to another, in ONE act.
+///
+/// THE COST THIS ENDS. Moving the workspace left 27 grants naming the old root while the
+/// configured workspace named the new one, so the member held no effective reach and the only
+/// repair available was 27 revokes plus 27 grants typed by hand. A revoke/add pair is not
+/// merely tedious: between the two calls the member holds neither reach, and the pair
+/// witnesses as two unrelated decisions — so a half-finished migration leaves an inconsistent
+/// scope set with nothing recording that it is half-finished.
+///
+/// `dry_run` returns the plan and touches nothing, because an operator should be able to read
+/// what will move before it moves.
+///
+/// REFUSES A MOVE ONTO A ROOT THAT IS NOT THERE. A re-root onto a mistyped or not-yet-created
+/// target does not fail — it succeeds, and silently leaves every rewritten grant matching
+/// nothing, which is a total revocation wearing the shape of a successful migration. That is
+/// the exact miswire this endpoint exists to end, so producing it by accident is not an
+/// acceptable failure mode; `allow_missing_target` is the deliberate override for granting
+/// ahead of a tree that does not exist yet.
+///
+/// ORDER: intent → commit → terminal, with rollback if the terminal record cannot be
+/// appended — the same order `scope_standing_recursive` and `scope_standing_reassign` use.
+/// The first cut of this endpoint appended its terminal record with `.ok()`, which would let a
+/// committed rewrite of the entire scope set outlive its own evidence.
+async fn scope_reroot(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let str_field = |k: &str| {
+        body.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string()
+    };
+    let (from_raw, to_raw, reason) = (str_field("from"), str_field("to"), str_field("reason"));
+    let member = {
+        let m = str_field("plugin_id");
+        if m.is_empty() { None } else { Some(m) }
+    };
+    let dry_run = body.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    let allow_missing = body
+        .get("allow_missing_target").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if from_raw.is_empty() || to_raw.is_empty() {
+        return (StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "from and to are required"})));
+    }
+    // Same rule as every other widening on this surface: a reach whose rationale is
+    // unrecorded is indistinguishable afterwards from a misconfiguration. A re-root touches
+    // EVERY matching grant at once, so it needs the account more than a single grant does.
+    if reason.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "reason is required — a re-root rewrites every matching grant at once, and \
+                      its rationale is the only account of why the member's whole reach moved"
+        })));
+    }
+
+    let from = crate::server::state::normalize_scope_path(&from_raw);
+    let to = crate::server::state::normalize_scope_path(&to_raw);
+    for p in [&from, &to] {
+        if let Err(msg) = crate::server::state::require_absolute_grant_path(p) {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": msg})));
+        }
+    }
+
+    let target_exists = std::path::Path::new(&to).is_dir();
+    if !target_exists && !allow_missing {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!(
+                "refusing to re-root onto '{to}', which is not a directory on this host. A \
+                 re-root onto a path that is not there does not fail — it leaves every \
+                 rewritten grant matching nothing, which is a silent total revocation. Pass \
+                 allow_missing_target:true if you are deliberately granting ahead of the tree."),
+            "target_exists": false,
+        })));
+    }
+
+    let mut s = state.lock().await;
+
+    // PLAN FIRST, on a clone, so the record can name every path that will move rather than a
+    // count, and so every refusal below is a pure read that writes nothing.
+    let plan = {
+        let mut probe = s.standing_scope.clone();
+        probe.reroot(&from, &to, member.as_deref())
+    };
+    let moved_json: Vec<serde_json::Value> = plan
+        .iter()
+        .map(|(m, old, new)| serde_json::json!({"plugin_id": m, "from": old, "to": new}))
+        .collect();
+
+    if plan.is_empty() {
+        // NOT an error, and deliberately not silent either: a mistyped `from` is the likely
+        // cause, and reporting it as a bland success is how an operator concludes a migration
+        // that never happened.
+        return (StatusCode::OK, Json(serde_json::json!({
+            "ok": true, "moved": [], "matched": 0,
+            "note": format!(
+                "no standing grant is at or under '{from}' — nothing was changed. If a move was \
+                 expected, check the from-prefix: containment is judged at a segment boundary, \
+                 so '/a/b' does not match '/a/b-old'."),
+            "generation": s.standing_scope.generation,
+        })));
+    }
+
+    if dry_run {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "ok": true, "dry_run": true, "matched": plan.len(), "moved": moved_json,
+            "target_exists": target_exists,
+            "generation": s.standing_scope.generation,
+        })));
+    }
+
+    let record = |kind: &str, extra: serde_json::Value| {
+        let mut v = serde_json::json!({
+            "from_root": from,
+            "to_root": to,
+            "plugin_id": member.clone().unwrap_or_else(|| "*".to_string()),
+            "reason": reason,
+            "changed_by": "operator",
+            "via": "operator_session",
+            "matched": plan.len(),
+            "moved": moved_json,
+            "target_exists": target_exists,
+        });
+        v.as_object_mut().unwrap().insert("kind".into(), serde_json::Value::String(kind.into()));
+        if let Some(obj) = extra.as_object() {
+            for (k, val) in obj { v.as_object_mut().unwrap().insert(k.clone(), val.clone()); }
+        }
+        v
+    };
+
+    // INTENT first: the durable effect has not happened and may not.
+    let intent = match s.append_chain("scope_reroot_intent",
+        record("intent", serde_json::json!({"standing_generation": s.standing_scope.generation + 1}))) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("witness append failed, re-root NOT applied: {e}")}))),
+    };
+    let prior = s.standing_scope.clone();
+    let (f, t, m) = (from.clone(), to.clone(), member.clone());
+    if let Err(e) = s.commit_standing_scope(move |st| { st.reroot(&f, &t, m.as_deref()); }) {
+        // `commit_standing_scope` persists a candidate before swapping it live, so the live
+        // store is byte-identical here, generation included. Nothing partial was applied.
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("re-root NOT applied, the scope store is unchanged: {e}"),
+            "state": "the chain holds the INTENT and no scope_rerooted",
+            "intentEntryHash": intent.hash,
+        })));
+    }
+
+    // TERMINAL, only now, with the generation the commit actually produced.
+    let success = match s.append_chain("scope_rerooted",
+        record("terminal", serde_json::json!({
+            "standing_generation": s.standing_scope.generation, "intent": intent.hash}))) {
+        Ok(e) => e,
+        Err(e) => {
+            return match s.commit_standing_scope(|st| *st = prior) {
+                Ok(()) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("re-root NOT applied — the terminal record failed ({e}); \
+                                      rolled back (live store and vault), the chain holds only \
+                                      the intent. Retry."),
+                    "intentEntryHash": intent.hash,
+                }))),
+                Err(rb) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("THE RE-ROOT IS LIVE but its terminal record could not be \
+                                      appended ({e}) AND the rollback failed ({rb}). Repair the \
+                                      chain — do not assume the store is consistent."),
+                    "intentEntryHash": intent.hash,
+                }))),
+            };
+        }
+    };
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true, "matched": plan.len(), "moved": moved_json,
+        "generation": s.standing_scope.generation,
+        "intentEntryHash": intent.hash,
+        "witnessEntryHash": success.hash,
+    })))
+}
+
 fn stamp_gate(
     record: serde_json::Value,
     gate: &Option<axum::Extension<super::operator_auth::GateWitness>>,
@@ -3554,6 +5503,26 @@ async fn agents_inventory() -> impl IntoResponse {
     }
 }
 
+/// REGISTER ONLY WHAT IS HERE (dp, 2026-09-27, the first time the button was on screen). The
+/// inventory reports every harness the atlas KNOWS, installed or not, and #1101 offered register
+/// on all of them -- five buttons on McNugget for Codex, Cursor, Gemini, Kimi and OpenClaw, none
+/// of which is installed there. Registering one mints a member for something absent: a phantom
+/// by the front door, which then sits in Discover's "nothing on this machine accounts for it"
+/// group waiting to be retired. dp's ask for this act was "a dropdown from actual available
+/// agents". `installed` must be TRUE; the inventory's could-not-establish rows (installed false,
+/// config present) are refused too -- unknown is not here.
+fn register_refusal_not_here(atlas_id: &str, rec: &serde_json::Value) -> Option<serde_json::Value> {
+    if rec.get("installed").and_then(|v| v.as_bool()) == Some(true) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "error": format!("'{atlas_id}' is known to the atlas but is not installed on this machine, \
+                          so there is nothing here to register. Register it when it arrives; \
+                          Discover will offer it then."),
+        "installed": rec.get("installed").cloned().unwrap_or(serde_json::Value::Null),
+    }))
+}
+
 /// `POST /api/agents/:id/ungovern` → remove hestia's hook wiring from an agent's config.
 ///
 /// surface: agent_ungovern   act: remove enforcement from a governed agent
@@ -3570,6 +5539,604 @@ async fn agents_inventory() -> impl IntoResponse {
 /// Ungoverning is deliberately louder than governing. Governing adds a gate and a bad
 /// outcome is a blocked tool call; ungoverning REMOVES one, and its bad outcome is an
 /// agent running unwatched while the dashboard still lists it as known.
+/// Register a harness the inventory DISCOVERED as a member of this society (agent-lifecycle R4).
+///
+/// dp's third ask, 2026-09-19: *"the ability to actually register a newly discovered (or
+/// previously unregistered) harness"* -- and dp's first, from 09-08, was that the agent field be
+/// **a dropdown from actual available agents, not something i type**. So the id is DERIVED here
+/// and the caller cannot supply one: the body names an `atlas_id`, this reads the SAME inventory
+/// report the Discover pane renders, and takes the governance id off that record. What gets
+/// registered is what the operator was looking at.
+///
+/// That is the other half of #1067. Refusing a grant to an unknown id closed the door; this is
+/// the door that should have been there instead -- a deliberate, witnessed act that makes an id
+/// known, rather than a typo making one by accident.
+///
+/// A BEING's id is per-seat by fleet convention (`<machine>-being`). Its launcher is where that
+/// id is written down, so a provisioned being registers under the id its own unit names. One
+/// that has no launcher yet -- this seat, today -- has no id on disk, so the convention supplies
+/// it from the report's own machine name. Derived either way, never typed.
+async fn agent_register(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let field = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let (atlas_id, reason) = (field("atlas_id"), field("reason"));
+    if atlas_id.is_empty() || reason.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "atlas_id and reason are required"})),
+        );
+    }
+    // No `plugin_id` is accepted, and saying so is load-bearing: a caller that could pass one
+    // would re-open exactly the hole #1067 closed, from a route whose whole purpose is to be the
+    // safe way in.
+    if body.get("plugin_id").is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "plugin_id is not accepted — it is derived from the discovered record, \
+                          because an id that can be typed is an id that can be mistyped (#1067). \
+                          Send atlas_id and let this route resolve it."
+            })),
+        );
+    }
+    let report = match crate::server::agents::inventory() {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "error": format!("cannot register what was not discovered: the inventory did not run ({e})")}))),
+    };
+    let detail = report.get("detail").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+    let Some(rec) = detail.into_iter()
+        .find(|r| r.get("agent").and_then(|a| a.as_str()) == Some(atlas_id.as_str())) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": format!("'{atlas_id}' is not in this machine's inventory, so there is \
+                              nothing here to register. Open Discover to see what is."),
+        })));
+    };
+    if let Some(refusal) = register_refusal_not_here(&atlas_id, &rec) {
+        return (StatusCode::CONFLICT, Json(refusal));
+    }
+    let is_being = rec.get("kind").and_then(|k| k.as_str()) == Some("being");
+    let machine = report.get("machine").and_then(|m| m.as_str()).unwrap_or("").to_lowercase();
+    // `member` first (agent-inventory, 2026-09-28): the id the rest of hestia knows this harness
+    // by -- `install.member` in its expects.json, or the one `--member` a being's launcher names.
+    // `plugin` is the plugin DIRECTORY, which is the member id only where the two are spelled
+    // alike: registering Kimi from `plugin` minted `kimi`, a phantom beside the real `kimi-code`,
+    // and a being's record never had a `plugin`, so the launcher branch below never ran.
+    let pick = |k: &str| rec.get(k).and_then(|p| p.as_str()).map(str::trim)
+        .filter(|p| !p.is_empty()).map(str::to_string);
+    let from_record = pick("member").or_else(|| pick("plugin"));
+    // The record's own governance id first -- for a harness that is its hestia plugin id, for a
+    // provisioned being the `--member` its launcher names. Only then the convention.
+    let plugin_id = match from_record.clone() {
+        Some(p) => p,
+        None if is_being && !machine.is_empty() => format!("{machine}-being"),
+        None => return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!("'{atlas_id}' was discovered but carries no governance id, and none \
+                              can be derived: it has no hestia plugin and is not a being. \
+                              Registering it would mean inventing an id, which is the mistake \
+                              this route exists to avoid."),
+        }))),
+    };
+    let mut s = state.lock().await;
+    if let Some(r) = s.retired_members.get(&plugin_id).cloned() {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!("'{plugin_id}' is RETIRED on this seat ({}). Reinstate it rather \
+                              than registering it again, so its history stays one thread.", r.reason),
+            "retired": true,
+        })));
+    }
+    if s.member_registry.get(&plugin_id).is_some() {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "ok": true, "plugin_id": plugin_id, "already_a_member": true,
+            "note": "already registered; nothing was minted and nothing was witnessed",
+        })));
+    }
+    let record = serde_json::json!({
+        "atlas_id": atlas_id,
+        "plugin_id": plugin_id,
+        "derived_from": if from_record.is_some()
+            { "the discovered record's governance id" } else { "the <machine>-being convention" },
+        "kind": if is_being { "being" } else { "harness" },
+        "installed": rec.get("installed").cloned().unwrap_or(serde_json::Value::Null),
+        "governed_at_registration": rec.get("governed").cloned().unwrap_or(serde_json::Value::Null),
+        "reason": reason,
+        "ref": field("ref"),
+        "registered_by": "operator",
+    });
+    let intent = match s.append_chain("member_register_intent", record.clone()) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("witnessing intent: {e}")}))),
+    };
+    let (sovereign_id, sovereign_anchor) = (s.sovereign.lct_id(), s.sovereign_lct.clone());
+    let is_syn = s.is_synthetic(&plugin_id);
+    let minted = {
+        let crate::server::state::ServerState { vault, member_registry, .. } = &mut *s;
+        crate::member_registry::ensure_member(
+            vault, member_registry, &plugin_id, is_syn, &sovereign_id, &sovereign_anchor)
+    };
+    let Some(lct_id) = minted else {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!("'{plugin_id}' could not be minted (synthetic or empty id); \
+                              nothing was registered"),
+            "intentEntryHash": intent.hash,
+        })));
+    };
+    let mut done = record;
+    if let Some(m) = done.as_object_mut() {
+        m.insert("member_lct".into(), serde_json::json!(lct_id.clone()));
+        m.insert("intent".into(), serde_json::json!(intent.hash.clone()));
+    }
+    let entry = s.append_chain("member_registered", done).ok();
+    // What registration does NOT do, said here because the row will look registered and a being
+    // in particular still cannot act: minting a member gives an id presence in this society. A
+    // being additionally needs its own identity minted on the SAGE side, a hub admission, and a
+    // launcher -- none of which hestia can do from here.
+    let next = if is_being {
+        "registered. A being still needs its own LCT minted on this host, admission at the hub, \
+         and a heartbeat unit naming this id before it can act — Discover will keep reporting it \
+         as unprovisioned until a launcher exists."
+    } else {
+        "registered. Installing its hestia plugin and wiring the gate is a separate act; \
+         Discover reports which of those are missing."
+    };
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true, "plugin_id": plugin_id, "atlas_id": atlas_id,
+        "member_lct": lct_id, "kind": if is_being { "being" } else { "harness" },
+        "intentEntryHash": intent.hash,
+        "witnessEntryHash": entry.map(|e| e.hash),
+        "note": next,
+    })))
+}
+
+// ── Delegated authority, from the agent (agent-lifecycle PRD R5, the half #1079 left) ──────
+//
+// `hestia delegate grant/list/revoke` existed as a CLI that writes the vault directly, and the
+// dashboard snapshot already carried `delegations` -- and no screen rendered them, and there was
+// no route. dp, 2026-09-19: "we already list them ... but i can't inspect or manage roles or
+// their environments". These three routes are that CLI's three verbs on the operator plane,
+// keyed by the AGENT the operator is looking at: the delegation key is DERIVED from the
+// member's registry LCT (`agent_key_for_lct`), never typed -- the same rule as register.
+
+/// The nine society roles a delegation may carry, spelled as `parse_role` accepts them. A
+/// closed set, offered as a picker: `parse_role` maps any other string to `Custom(..)`, which
+/// is a free-text role by another name, and this surface takes no free-text identity of any
+/// kind. tools/delegation_panel_contract_test.py pins the picker to this list.
+pub const DELEGATION_ROLES: &[&str] = &[
+    "sovereign", "law_oracle", "policy_entity", "treasurer", "administrator",
+    "archivist", "citizen", "witness", "auditor",
+];
+
+/// The delegation key for a member, from its registry LCT. A member the registry has not
+/// recorded has no key -- a delegation binds to an identity derived from a public key, never
+/// to a name (#952) -- and a retired one is refused authority through this door like every
+/// other (cbp, #1100).
+/// READING IS NOT AUTHORITY, so this does not refuse a retired id -- only the GRANT path does
+/// (`refuse_if_retired`, at its call site). The first cut put the refusal here, which every
+/// caller shares, so a plain GET of a retired agent's delegations answered 409: the one agent
+/// whose delegations retirement had just revoked was the one whose panel showed nothing, and
+/// this PR's own claim that revoked delegations stay listed was false for exactly that case
+/// (cbp, PR #1106 review, probed). `revoke` already skipped the check for the same reason --
+/// taking authority away from a retired id is the safe direction; so is looking.
+fn delegation_key_for(
+    s: &crate::server::state::ServerState, plugin_id: &str,
+) -> std::result::Result<uuid::Uuid, (StatusCode, Json<serde_json::Value>)> {
+    let Some(lct) = s.member_registry.get(plugin_id) else {
+        return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": format!("'{plugin_id}' has no LCT in this society's member registry, so no \
+                              delegation can be keyed to it. Register it, or connect it once."),
+        }))));
+    };
+    Ok(crate::delegation::agent_key_for_lct(&lct.lct_id()))
+}
+
+async fn agent_delegations_list(
+    State(state): State<SharedState>, Path(id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let plugin_id = id.trim().to_string();
+    let s = state.lock().await;
+    let key = match delegation_key_for(&s, &plugin_id) { Ok(k) => k, Err(r) => return r };
+    let store = match crate::delegation::DelegationStore::load(&s.vault) {
+        Ok(st) => st,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("the delegation store could not be read: {e}")}))),
+    };
+    let rows: Vec<serde_json::Value> = store.delegations.iter()
+        .filter(|d| d.agent_lct_id == key)
+        .map(|d| {
+            let mut v = serde_json::to_value(d).unwrap_or_default();
+            if let Some(m) = v.as_object_mut() { m.insert("active".into(), serde_json::json!(d.is_active())); }
+            v
+        })
+        .collect();
+    (StatusCode::OK, Json(serde_json::json!({
+        "plugin_id": plugin_id, "agent_key": key, "delegations": rows, "roles": DELEGATION_ROLES,
+        // Readable, and said plainly: the panel must not look like an agent that may be granted to.
+        "retired": s.retired_members.is_retired(&plugin_id),
+    })))
+}
+
+async fn agent_delegation_grant(
+    State(state): State<SharedState>, Path(id): Path<String>, Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let plugin_id = id.trim().to_string();
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let strs = |k: &str| -> Vec<String> {
+        body.get(k).and_then(|v| v.as_array()).map(|a| a.iter()
+            .filter_map(|x| x.as_str()).map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+            .unwrap_or_default()
+    };
+    let (role_names, actions) = (strs("roles"), strs("actions"));
+    if reason.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "reason is required"})));
+    }
+    if role_names.is_empty() && actions.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "a delegation with no roles and no actions is full authority; name what is delegated"})));
+    }
+    // The body may name the agent only through the URL. A typed agent id in the body is the
+    // #1067 hole again, so it is refused rather than ignored.
+    for k in ["agent", "agent_id", "agent_lct_id", "plugin_id"] {
+        if body.get(k).is_some() {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": format!("'{k}' is not accepted: the agent is the one in the URL, and its \
+                                  delegation key is derived from the registry, never typed")})));
+        }
+    }
+    if let Some(bad) = role_names.iter().find(|r| !DELEGATION_ROLES.contains(&r.to_lowercase().as_str())) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("'{bad}' is not one of the society roles; a free-text role is a typed \
+                              identity by another name"), "roles": DELEGATION_ROLES })));
+    }
+    let expires_hours = body.get("expires_hours").and_then(|v| v.as_u64()).filter(|h| *h > 0);
+    let mut s = state.lock().await;
+    // GRANTING is authority; reading is not. The refusal lives here rather than in the shared
+    // derivation, so a retired agent's history stays readable (cbp, #1106).
+    if let Some(refusal) = refuse_if_retired(&s, &plugin_id, "a delegation") {
+        return refusal;
+    }
+    // READ EVERY ACTION THE WAY THE ENFORCER WILL, before anything is signed (#1110). A member
+    // segment naming no recorded member, or a `scope.decide` shape that binds nothing, would be
+    // stored, signed and witnessed as a grant that enforces against no one. Unknown verbs pass
+    // -- the vocabulary is open -- and are named in the answer as unvalidated.
+    #[rustfmt::skip]
+    let suggest: Vec<String> = s.member_registry.iter_sorted().into_iter().filter(|(id, _)| !s.member_registry.is_filler(id)).map(|(id, _)| id.clone()).collect();
+    let unvalidated = match crate::delegation::check_actions(&actions, &|m| s.member_registry.get(m).is_some(), &suggest) {
+        Ok(u) => u,
+        Err(e) => return (StatusCode::CONFLICT, Json(serde_json::json!({"error": e, "actions": actions}))),
+    };
+    let key = match delegation_key_for(&s, &plugin_id) { Ok(k) => k, Err(r) => return r };
+    let roles: Vec<web4_core::SocietyRole> = match role_names.iter()
+        .map(|r| crate::delegation::parse_role(r)).collect::<std::result::Result<Vec<_>, _>>() {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))),
+    };
+    let record = serde_json::json!({
+        "plugin_id": plugin_id, "agent_key": key,
+        "subject_instance_lct": s.member_lct(&plugin_id),
+        "roles": role_names, "actions": actions, "expires_hours": expires_hours,
+        "reason": reason, "delegated_by": "operator",
+    });
+    let intent = match s.append_chain("delegation_grant_intent", record.clone()) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("witnessing intent: {e}")}))),
+    };
+    // Signed by the operator's own key -- the vault's identity, never a throwaway (#952).
+    let (delegator_id, kp) = match crate::delegation::operator_delegator(&s.vault, &s.home) {
+        Ok(x) => x,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("nothing was delegated: {e}"), "intentEntryHash": intent.hash }))),
+    };
+    let mut store = match crate::delegation::DelegationStore::load(&s.vault) {
+        Ok(st) => st,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("nothing was delegated: the store could not be read: {e}"),
+            "intentEntryHash": intent.hash }))),
+    };
+    let (deleg_id, expires_at) = {
+        let d = store.create_delegation(delegator_id, key, roles, actions.clone(), expires_hours, &kp);
+        (d.id, d.expires_at)
+    };
+    if let Err(e) = store.save(&mut s.vault) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("nothing was delegated: the store did not persist: {e}"),
+            "intentEntryHash": intent.hash })));
+    }
+    let mut done = record;
+    if let Some(m) = done.as_object_mut() {
+        m.insert("delegation_id".into(), serde_json::json!(deleg_id));
+        m.insert("expires_at".into(), serde_json::json!(expires_at));
+        m.insert("intent".into(), serde_json::json!(intent.hash));
+    }
+    let entry = s.append_chain("delegation_granted", done).ok();
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true, "plugin_id": plugin_id, "delegation_id": deleg_id, "expires_at": expires_at,
+        "intentEntryHash": intent.hash, "witnessEntryHash": entry.map(|e| e.hash),
+        // SAID, not implied: an accepted verb this daemon does not interpret was stored as
+        // given and checked for nothing. Empty when every action was read (#1110).
+        "unvalidated_actions": unvalidated,
+    })))
+}
+
+async fn agent_delegation_revoke(
+    State(state): State<SharedState>, Path((id, deleg)): Path<(String, String)>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let plugin_id = id.trim().to_string();
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if reason.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "reason is required"})));
+    }
+    let Ok(deleg_id) = uuid::Uuid::parse_str(deleg.trim()) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "delegation id is not a UUID"})));
+    };
+    let mut s = state.lock().await;
+    // No retired check here: revoking authority from a retired id is the safe direction.
+    let Some(lct) = s.member_registry.get(&plugin_id).map(|l| l.lct_id()) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": format!("'{plugin_id}' is not in the member registry")})));
+    };
+    let key = crate::delegation::agent_key_for_lct(&lct);
+    let mut store = match crate::delegation::DelegationStore::load(&s.vault) {
+        Ok(st) => st,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("the delegation store could not be read: {e}")}))),
+    };
+    // The delegation must be THIS agent's: a revoke reached through one agent's panel must not
+    // silently strike another's, however the id came to be pasted.
+    match store.delegations.iter().find(|d| d.id == deleg_id) {
+        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": format!("delegation {deleg_id} not found")}))),
+        Some(d) if d.agent_lct_id != key => return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!("delegation {deleg_id} does not belong to '{plugin_id}'; nothing was revoked")}))),
+        Some(d) if d.revoked => return (StatusCode::OK, Json(serde_json::json!({
+            "ok": true, "already_revoked": true, "delegation_id": deleg_id }))),
+        Some(_) => {}
+    }
+    let record = serde_json::json!({
+        "plugin_id": plugin_id, "agent_key": key, "delegation_id": deleg_id,
+        "subject_instance_lct": s.member_lct(&plugin_id),
+        "reason": reason, "revoked_by": "operator",
+    });
+    let intent = match s.append_chain("delegation_revoke_intent", record.clone()) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("witnessing intent: {e}")}))),
+    };
+    if let Err(e) = store.revoke(deleg_id).and_then(|_| store.save(&mut s.vault)) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("still in force: {e}"), "intentEntryHash": intent.hash })));
+    }
+    let mut done = record;
+    if let Some(m) = done.as_object_mut() { m.insert("intent".into(), serde_json::json!(intent.hash)); }
+    let entry = s.append_chain("delegation_revoked", done).ok();
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true, "plugin_id": plugin_id, "delegation_id": deleg_id,
+        "intentEntryHash": intent.hash, "witnessEntryHash": entry.map(|e| e.hash),
+    })))
+}
+
+/// Acts THIS ID TOOK since `cutoff` (RFC3339) -- the retire guard's evidence. A phantom, the
+/// case retirement exists for, has none ever; a live seat has thousands.
+///
+/// THE EVENT TYPES ARE THE WHOLE POINT. The first cut counted every entry carrying a
+/// `plugin_id`, which includes entries the OPERATOR wrote ABOUT an id: a scope grant names its
+/// subject. So the two ids dp wants retired -- minted by his own mistyped grants, `0 actions`
+/// on his screen -- read as LIVE members and the guard refused exactly the case it exists to
+/// permit. Caught by this function's own test before it shipped.
+///
+/// `policy_decision` and `outcome` are the agent's own record: the gate ruling on a tool call
+/// it attempted, and the result. They are also what the trust list's `action_count` is built
+/// from, so the number in a refusal is the number on the operator's screen -- a guard that
+/// argued with the column next to it would be worse than none.
+const AGENT_ACT_EVENTS: &[&str] = &["policy_decision", "outcome"];
+
+/// `Err` when the chain could not be read. NOT zero: the first cut wrote `.unwrap_or(0)`, which
+/// turned a scan failure into "never acted" and let the live seat retire with no confirm (cbp,
+/// PR #1100 review, finding 4). A guard that cannot measure must say so, not pass.
+fn agent_acts_since(s: &crate::server::state::ServerState, plugin_id: &str, cutoff: &str) -> Result<usize, String> {
+    let want = plugin_id.trim().to_string();
+    s.chain_store
+        .scan_recent(Some(cutoff), Some(AGENT_ACT_EVENTS), 50_000, |row| {
+            serde_json::from_str::<serde_json::Value>(row.event_data)
+                .ok()
+                .and_then(|v| v.get("plugin_id").and_then(|p| p.as_str()).map(str::to_string))
+        })
+        .map(|ids| ids.into_iter().filter(|id| *id == want).count())
+        .map_err(|e| e.to_string())
+}
+
+/// PURE: what the retire guard says, given what it could measure. `Err` (unmeasurable) is a
+/// refusal unless confirmed, exactly like a measured live member -- fail closed.
+fn retire_guard(acts: &Result<usize, String>, confirm_active: bool) -> Option<serde_json::Value> {
+    match acts {
+        Ok(0) => None,
+        _ if confirm_active => None,
+        Ok(n) => Some(serde_json::json!({
+            "error": format!("this id has taken {n} act(s) in the last {RETIRE_ACTIVE_WINDOW_HOURS}h, \
+                              so it is a LIVE member, not a phantom. Retiring it revokes its grants. \
+                              If that is what you mean, resend with \"confirm_active\": true."),
+            "acts_recently": n, "window_hours": RETIRE_ACTIVE_WINDOW_HOURS })),
+        Err(e) => Some(serde_json::json!({
+            "error": format!("could not measure this id's recent acts ({e}), so whether it is live \
+                              is UNKNOWN. Not retiring on a failed look; resend with \
+                              \"confirm_active\": true if you have established it yourself."),
+            "acts_recently": serde_json::Value::Null, "unmeasurable": true,
+            "window_hours": RETIRE_ACTIVE_WINDOW_HOURS })),
+    }
+}
+
+/// ONE refusal for every route that mints or moves standing authority (cbp, PR #1100 review,
+/// finding 1: the first cut checked only `scope_grant`, and `reassign`'s `to` -- one keystroke
+/// from `claude-code` -- handed a retired id a grant). A retired id receives authority through
+/// no door; the only way back is `reinstate`.
+fn refuse_if_retired(
+    s: &crate::server::state::ServerState, plugin_id: &str, via: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let r = s.retired_members.get(plugin_id)?;
+    Some((StatusCode::CONFLICT, Json(serde_json::json!({
+        "error": format!("'{plugin_id}' was RETIRED on this seat ({}). Nothing was written: a \
+                          retired id receives no authority through {via}. Reinstate it first if it \
+                          should hold authority again.", r.reason),
+        "retired": true, "retired_at": r.retired_at,
+        "reinstate_with": format!("POST /api/agents/{plugin_id}/reinstate"),
+    }))))
+}
+
+const RETIRE_ACTIVE_WINDOW_HOURS: i64 = 24;
+
+/// Retire an id on THIS seat: revoke its standing grants and take it out of the default view.
+/// Never deletion; see `server::retirement` for what it is and is deliberately not.
+async fn agent_retire(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let plugin_id = id.trim().to_string();
+    let field = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let (reason, evidence_ref) = (field("reason"), field("ref"));
+    if plugin_id.is_empty() || reason.is_empty() || evidence_ref.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "reason and ref are required — a retirement revokes authority and \
+                          removes a party from the default view, so it must not be an \
+                          unexplained row itself"
+            })),
+        );
+    }
+    let confirm_active = body.get("confirm_active").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut s = state.lock().await;
+
+    // THE GUARD. Retiring a phantom is the point; retiring the seat you are typing from is the
+    // accident, and the three ids differ by one character. A member that has ACTED recently is
+    // refused unless the operator says the word — and the refusal reports the evidence rather
+    // than just objecting, because "5,415 acts in 24h" is what identifies which of the three
+    // look-alikes is the real one.
+    let cutoff = (chrono::Utc::now() - chrono::Duration::hours(RETIRE_ACTIVE_WINDOW_HOURS))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let measured = agent_acts_since(&s, &plugin_id, &cutoff);
+    if let Some(refusal) = retire_guard(&measured, confirm_active) {
+        return (StatusCode::CONFLICT, Json(refusal));
+    }
+    let recent = measured.clone().unwrap_or(0);
+
+    let now = crate::server::gate_escalation::now_secs();
+    let held: Vec<String> = s.standing_scope.grants.iter()
+        .filter(|g| g.member == plugin_id).map(|g| g.path.clone()).collect();
+    let record = serde_json::json!({
+        "plugin_id": plugin_id,
+        "subject_instance_lct": s.member_lct(&plugin_id),
+        "reason": reason,
+        "ref": evidence_ref,
+        "revokes_standing_paths": held,
+        "acts_in_window": recent,
+        "acts_measurable": measured.is_ok(),
+        "window_hours": RETIRE_ACTIVE_WINDOW_HOURS,
+        "confirmed_active": confirm_active,
+        "retired_by": "operator",
+        "scope": "this seat only — a retirement is not published to the hub and does not reach \
+                  another seat's registry",
+    });
+    // INTENT -> COMMIT -> SUCCESS, the ordering `witness_and_commit_standing_grant` exists to
+    // keep: a failed commit must not leave the chain asserting an authority change that never
+    // took effect.
+    let intent = match s.append_chain("member_retire_intent", record.clone()) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("witnessing intent: {e}")}))),
+    };
+    let rec = crate::server::retirement::RetiredMember {
+        plugin_id: plugin_id.clone(), retired_at: now, reason: reason.clone(),
+        evidence_ref: evidence_ref.clone(), revoked_paths: held.clone(), was_active: recent > 0,
+    };
+    let revoked = match s.commit_retirement(&reason, |st| { st.retire(rec); Some(plugin_id.clone()) }) {
+        Ok(v) => v,
+        // The error names which half landed; do not summarise it into a claim it may contradict.
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("{e:#}"),
+            "intentEntryHash": intent.hash,
+        }))),
+    };
+    // The success record is the intent's, plus what actually happened -- so the pair reads as
+    // one act on the chain and a reader never has to join two shapes.
+    let mut done = record.clone();
+    if let Some(m) = done.as_object_mut() {
+        m.insert("revoked_standing_paths".into(), serde_json::json!(revoked.standing));
+        m.insert("revoked_live_paths".into(), serde_json::json!(revoked.live));
+        m.insert("revoked_delegations".into(), serde_json::json!(revoked.delegations));
+        m.insert("intent".into(), serde_json::json!(intent.hash));
+    }
+    let entry = s.append_chain("member_retired", done).ok();
+    let gen = s.retired_members.generation;
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true, "plugin_id": plugin_id, "retired": true,
+        "revoked_standing_paths": revoked.standing,
+        "revoked_live_paths": revoked.live,
+        "revoked_delegations": revoked.delegations,
+        "generation": gen,
+        "intentEntryHash": intent.hash,
+        "witnessEntryHash": entry.map(|e| e.hash),
+        "note": "not deleted: the chain keeps every act this id made, and `show retired` in the \
+                 agents view still lists it. Reversible with /reinstate, which does NOT restore \
+                 the revoked grants.",
+    })))
+}
+
+/// Undo a retirement. Deliberately does NOT restore the revoked grants: re-granting authority is
+/// an authority decision of its own, and silently handing back a path because an id came out of
+/// retirement would make reinstate a grant route wearing another name. The response names what
+/// was revoked so the operator can re-grant deliberately.
+async fn agent_reinstate(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let plugin_id = id.trim().to_string();
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if reason.is_empty() {
+        return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "reason is required"})));
+    }
+    let mut s = state.lock().await;
+    let Some(existing) = s.retired_members.get(&plugin_id).cloned() else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": format!("'{plugin_id}' is not retired on this seat; nothing to undo"),
+        })));
+    };
+    let record = serde_json::json!({
+        "plugin_id": plugin_id,
+        "subject_instance_lct": s.member_lct(&plugin_id),
+        "reason": reason,
+        "was_retired_at": existing.retired_at,
+        "was_retired_because": existing.reason,
+        "paths_revoked_then_and_NOT_restored_now": existing.revoked_paths,
+        "reinstated_by": "operator",
+    });
+    let intent = match s.append_chain("member_reinstate_intent", record.clone()) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("witnessing intent: {e}")}))),
+    };
+    if let Err(e) = s.commit_retirement(&reason, |st| { st.reinstate(&plugin_id); None }) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("still retired: {e}"), "intentEntryHash": intent.hash })));
+    }
+    let entry = s.append_chain("member_reinstated", record).ok();
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true, "plugin_id": plugin_id, "retired": false,
+        "generation": s.retired_members.generation,
+        "grants_not_restored": existing.revoked_paths,
+        "intentEntryHash": intent.hash,
+        "witnessEntryHash": entry.map(|e| e.hash),
+        "note": "the standing grants revoked at retirement were NOT restored — re-grant any that \
+                 are still wanted, deliberately.",
+    })))
+}
+
 async fn agent_ungovern(
     State(state): State<SharedState>,
     Path(id): Path<String>,
@@ -3621,7 +6188,7 @@ async fn agent_ungovern(
 /// So coverage now comes from the inventory, which already stats every hook target on the
 /// machine across the full scope chain and simply kept the list to itself. One discovery
 /// path, measured once, consumed by both surfaces.
-fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
+pub(crate) fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
     let inv = crate::server::agents::inventory().map_err(|e| e.to_string())?;
     if inv.get("status").and_then(|v| v.as_str()) == Some("UNKNOWN") {
         return Err(inv
@@ -3663,6 +6230,137 @@ fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
     Ok(out)
 }
 
+/// The deployment authority's own record of what it installed, per file, read from
+/// `HESTIA_CURRENT_BUILD_FILE` (written by `deploy/install-members.sh` on full success).
+///
+/// This is the evidence an operator ratifies AGAINST. The ratify handler's own doc says
+/// "nothing here can tell a good build from a bad one; the operator must ratify from a
+/// state they believe correct" — and this is what makes that belief checkable: whether the
+/// installed bytes are exactly what the deploy wrote from a named main commit, or have
+/// changed since. It is evidence, not a verdict: nothing is refused on it (web4 LCT spec
+/// §1.2 — produce checkable evidence and let the relying party decide).
+fn deployed_gate_digests_from(path: &std::path::Path) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let mut files = serde_json::Map::new();
+    let file_rows = v
+        .get("members")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.get("files").and_then(|f| f.as_array()))
+        .flatten()
+        .chain(v.get("shared_engine").and_then(|f| f.as_array()).into_iter().flatten());
+    for f in file_rows {
+        if let (Some(p), Some(h)) = (
+            f.get("path").and_then(|x| x.as_str()),
+            f.get("sha256").and_then(|x| x.as_str()),
+        ) {
+            files.insert(p.to_string(), serde_json::Value::String(h.to_string()));
+        }
+    }
+    Some(serde_json::json!({
+        "build_id": v.get("build_id"),
+        "head_sha": v.get("head_sha"),
+        "installed_at_iso": v.get("installed_at_iso"),
+        "files": files,
+    }))
+}
+
+fn deployed_gate_digests() -> Option<serde_json::Value> {
+    let p = std::env::var_os("HESTIA_CURRENT_BUILD_FILE")?;
+    deployed_gate_digests_from(std::path::Path::new(&p))
+}
+
+/// Ratifying is the approve direction of the most consequential decision on a box — it
+/// defines what a correct gate is — so it carries a stated why, like every other
+/// permitting act here (`operator_gate_escalation`, `scope_decide`). Same bounds.
+fn ratify_reason(body: &serde_json::Value) -> Result<String, String> {
+    let r = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if r.is_empty() {
+        return Err("reason is required to ratify: it records why these bytes are the ones \
+                    you trust, and the chain entry is what makes that judgement reviewable"
+            .into());
+    }
+    if r.len() > 512 || r.chars().any(char::is_control) {
+        return Err("reason must be at most 512 bytes with no control characters".into());
+    }
+    Ok(r.to_string())
+}
+
+/// The ratification is bound to the bytes the operator SAW. `expected` is the
+/// `evidence.current` map from `GET /api/gates/verify` — `{path: sha256 | null}` — and the
+/// daemon recomputes the same map under its lock. Any difference (a path added or gone, a
+/// digest changed, an unreadable gate) refuses the ratify before the vault is touched.
+///
+/// GPT review of #1132: the app compared a fingerprint on a second GET and then POSTed only
+/// a `reason`, and the handler hashed whatever was current. A direct API caller skipped the
+/// stale-read check entirely, and even the app raced between its GET and its POST — so the
+/// "last edit wins" baseline could bless bytes nobody looked at. Required, not optional: an
+/// unbound ratify is exactly that act.
+fn ratify_binding(
+    expected: Option<&serde_json::Value>,
+    current: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), serde_json::Value> {
+    let Some(expected) = expected.and_then(|v| v.as_object()) else {
+        return Err(serde_json::json!({
+            "error": "expected is required: send the evidence.current map from                       GET /api/gates/verify — the bytes you reviewed — so the ratification                       cannot bless bytes that changed after you looked",
+        }));
+    };
+    let mut differs = Vec::new();
+    for (path, now) in current {
+        match expected.get(path) {
+            Some(saw) if saw == now => {}
+            Some(saw) => differs.push(serde_json::json!({"path": path, "saw": saw, "now": now})),
+            None => differs.push(serde_json::json!({"path": path, "saw": "absent", "now": now})),
+        }
+    }
+    for (path, saw) in expected {
+        if !current.contains_key(path) {
+            differs.push(serde_json::json!({"path": path, "saw": saw, "now": "absent"}));
+        }
+    }
+    if differs.is_empty() {
+        Ok(())
+    } else {
+        Err(serde_json::json!({
+            "error": "refusing to ratify: the installed gates are not the bytes you reviewed. \
+                      Nothing was ratified — re-read /api/gates/verify and review again.",
+            "differs": differs,
+        }))
+    }
+}
+
+/// Install `next` and record it, or leave the vault exactly as it was.
+///
+/// Until 2026-09-27 the handler wrote the vault and then called
+/// `let _ = s.append_chain(..)` — the record's result discarded. A failed append left a
+/// new trust baseline in force with no record of who set it or why, while the handler's
+/// own RWOA block claimed `A: pass`. The sibling `operator_gate_escalation` already undoes
+/// its decision when the append fails; this is that order, for ratification. `record` is
+/// a parameter so the failure arm is testable without breaking a real chain store.
+fn apply_ratification(
+    s: &mut crate::server::state::ServerState,
+    previous: crate::vault::gate_integrity::GateExpectations,
+    next: crate::vault::gate_integrity::GateExpectations,
+    record: impl FnOnce(&crate::server::state::ServerState) -> anyhow::Result<()>,
+) -> Result<(), String> {
+    s.vault
+        .set_gate_expectations(next)
+        .map_err(|e| format!("could not store the ratification: {e}"))?;
+    if let Err(e) = record(s) {
+        return match s.vault.set_gate_expectations(previous) {
+            Ok(()) => Err(format!(
+                "ratification was not recorded ({e}); the previous expectations are restored"
+            )),
+            Err(re) => Err(format!(
+                "ratification was not recorded ({e}) AND could not be undone ({re}): the \
+                 stored expectations are unwitnessed — re-ratify"
+            )),
+        };
+    }
+    Ok(())
+}
+
 /// `GET /api/gates/verify` — hash every known gate and compare to the vault's ratified
 /// expectation. The DAEMON hashes the file; it never asks a gate about itself.
 async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
@@ -3698,6 +6396,17 @@ async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
         );
     }
     let wired: Vec<String> = discovered.iter().map(|(_, f)| f.clone()).collect();
+    // The daemon hashes every discovered gate itself — an unratified gate included, which
+    // `verify` does not hash — so an operator can see which bytes a ratify would bless.
+    let current_digests: serde_json::Map<String, serde_json::Value> = wired
+        .iter()
+        .map(|p| {
+            let h = crate::vault::gate_integrity::hash_file(std::path::Path::new(p))
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null);
+            (p.clone(), h)
+        })
+        .collect();
     let verdicts = crate::vault::gate_integrity::verify(&exp, &wired);
     let findings = verdicts.iter().filter(|v| v.is_finding()).count();
     (
@@ -3713,6 +6422,13 @@ async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
             // covers, which is the fact the previous version silently omitted.
             "discovered": discovered.len(),
             "coverage_source": "agent-inventory hook_targets (full scope chain), gate-role only",
+            // What an operator needs to ratify responsibly, stated beside the verdicts:
+            // the bytes installed NOW, per discovered gate, and what the deployment
+            // authority recorded installing. Evidence only; nothing is refused on it.
+            "evidence": {
+                "current": current_digests,
+                "deployed": deployed_gate_digests(),
+            },
             "gates": verdicts,
             "note": "Tamper-EVIDENT, not tamper-proof. The agent can rewrite its gate; it \
                      cannot rewrite this expectation, which lives in the operator-gated vault. \
@@ -3738,11 +6454,26 @@ async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
 /// attack. Nothing here can tell a good build from a bad one; the operator must ratify
 /// from a state they believe correct. The chain entry is what makes that judgement
 /// reviewable afterwards.
-async fn gates_ratify(State(state): State<SharedState>) -> impl IntoResponse {
+async fn gates_ratify(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
     use crate::vault::gate_integrity::{GateExpectation, GateExpectations};
+    // Refused before the lock and before any hashing: an unexplained ratification never
+    // starts.
+    let reason = match ratify_reason(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e })))
+                .into_response()
+        }
+    };
     let mut s = state.lock().await;
     let mut exp: GateExpectations = GateExpectations::new();
     let mut recorded = Vec::new();
+    // The same `{path: sha256|null}` map verify shows as evidence.current, recomputed here,
+    // under the lock, from the bytes this handler is about to record.
+    let mut current = serde_json::Map::new();
     // Ratify the DISCOVERED set, for the same reason verify checks it: ratifying a
     // hardcoded list would bless whichever gates that list happened to name and leave the
     // rest unratified-and-unmentioned.
@@ -3765,9 +6496,18 @@ async fn gates_ratify(State(state): State<SharedState>) -> impl IntoResponse {
             }))).into_response();
         }
     };
+    for (_, path) in &discovered {
+        let h = crate::vault::gate_integrity::hash_file(std::path::Path::new(path))
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null);
+        current.insert(path.clone(), h);
+    }
+    if let Err(refusal) = ratify_binding(body.get("expected"), &current) {
+        return (StatusCode::CONFLICT, Json(refusal)).into_response();
+    }
     for (plugin_id, path) in discovered {
         match crate::vault::gate_integrity::hash_file(std::path::Path::new(&path)) {
-            Ok(sha256) => {
+            Ok(sha256) if current.get(&path) == Some(&serde_json::Value::String(sha256.clone())) => {
                 recorded.push(
                     serde_json::json!({"path": path, "plugin_id": plugin_id, "sha256": sha256}),
                 );
@@ -3777,9 +6517,21 @@ async fn gates_ratify(State(state): State<SharedState>) -> impl IntoResponse {
                         sha256,
                         plugin_id,
                         ratified_at: chrono::Utc::now(),
-                        note: "operator ratification".into(),
+                        note: reason.clone(),
                     },
                 );
+            }
+            // Changed between the binding check and this read, inside the handler: refuse
+            // rather than record bytes other than the ones just compared.
+            Ok(_) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": format!("refusing to ratify: {path} changed while ratifying. \
+                                          Nothing was ratified — re-read and review again."),
+                    })),
+                )
+                    .into_response();
             }
             Err(e) => {
                 return (
@@ -3794,17 +6546,35 @@ async fn gates_ratify(State(state): State<SharedState>) -> impl IntoResponse {
             }
         }
     }
-    if let Err(e) = s.vault.set_gate_expectations(exp) {
+    // Last edit wins (dp, 2026-09-25) — so the record names what it replaced.
+    let previous = s.vault.gate_expectations();
+    let replaced: serde_json::Map<String, serde_json::Value> = previous
+        .iter()
+        .map(|(p, e)| (p.clone(), serde_json::Value::String(e.sha256.clone())))
+        .collect();
+    let deployed = deployed_gate_digests();
+    let entry = serde_json::json!({
+        "gates": recorded,
+        "reason": reason,
+        "replaced": replaced,
+        // Provenance the operator ratified against, when the authority file was readable.
+        "deployment": deployed.as_ref().map(|d| serde_json::json!({
+            "build_id": d.get("build_id"),
+            "head_sha": d.get("head_sha"),
+        })),
+    });
+    if let Err(e) = apply_ratification(&mut s, previous, exp, |st| {
+        st.append_chain("gate_ratified", entry).map(|_| ())
+    }) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+            Json(serde_json::json!({ "error": e })),
         )
             .into_response();
     }
-    let _ = s.append_chain("gate_ratified", serde_json::json!({"gates": recorded}));
     (
         StatusCode::OK,
-        Json(serde_json::json!({"ok": true, "ratified": recorded})),
+        Json(serde_json::json!({"ok": true, "ratified": recorded, "replaced": replaced})),
     )
         .into_response()
 }
@@ -4039,6 +6809,25 @@ async fn operator_gate_escalation(
                 serde_json::json!({
                     "escalation_id": esc.id,
                     "plugin_id": esc.plugin_id,
+                    // WHOSE petition this ruling is about, as the asker's PROVEN wake key
+                    // (`Escalation::host_session_id`, #542). Deliberately NOT spelled
+                    // `host_session_id`: on `gate_escalation_claimed` that name means the
+                    // CLAIMANT's session, and one name for two subjects is how an
+                    // attribution record starts lying.
+                    //
+                    // Recorded here because this row is the ONLY row the disposition
+                    // projector reads (`handler::disposition_obligation`), and what it
+                    // derives from it is a RECIPIENT — the asker. With no asker key on the
+                    // ruling, that recipient can only be `plugin_id`, so every seat sharing
+                    // the name is woken and the one that asked is not distinguishable
+                    // (#732, #1060; `docs/PRD_DISPOSITION_DELIVERY.md` R1 "address the
+                    // asker" needs this field to be derivable from the chain, which is what
+                    // the projector's retry path reads). Null when the asker was unproven.
+                    //
+                    // Same remedy class as `bar` on `gate_escalation_expired`: the `opened`
+                    // row has always carried it, the terminal row did not, and answering
+                    // the obvious question meant joining every ruling back to its open.
+                    "asker_host_session_id": esc.host_session_id,
                     "subject_instance_lct": s.member_lct(&esc.plugin_id),
                     "tool_name": esc.tool_name,
                     "marker": esc.marker,
@@ -4155,6 +6944,871 @@ mod disposition_tests {
         (dir, state)
     }
 
+    // ---- gate ratification (the app's gate-integrity surface, 2026-09-27) ----
+
+    fn one_expectation(path: &str, sha: &str) -> crate::vault::gate_integrity::GateExpectations {
+        let mut m = crate::vault::gate_integrity::GateExpectations::new();
+        m.insert(
+            path.to_string(),
+            crate::vault::gate_integrity::GateExpectation {
+                sha256: sha.to_string(),
+                plugin_id: "claude-code".into(),
+                ratified_at: chrono::Utc::now(),
+                note: "test".into(),
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn a_ratify_bound_to_bytes_that_changed_after_verify_is_refused() {
+        use serde_json::json;
+        // GPT's regression for #1132: verify showed A=aaa; A's bytes changed to bbb before
+        // the POST. The ratify carrying what the operator saw must be refused, naming A.
+        let saw = json!({"/g/a.py": "aaa", "/g/b.py": "ccc"});
+        let mut now = serde_json::Map::new();
+        now.insert("/g/a.py".into(), json!("bbb"));
+        now.insert("/g/b.py".into(), json!("ccc"));
+        let err = ratify_binding(Some(&saw), &now).unwrap_err();
+        assert_eq!(err["differs"][0]["path"], json!("/g/a.py"), "{err}");
+        assert_eq!(err["differs"][0]["saw"], json!("aaa"));
+        assert_eq!(err["differs"][0]["now"], json!("bbb"));
+        assert_eq!(err["differs"].as_array().unwrap().len(), 1);
+        // The same bytes bind.
+        now.insert("/g/a.py".into(), json!("aaa"));
+        assert!(ratify_binding(Some(&saw), &now).is_ok());
+    }
+
+    #[test]
+    fn a_ratify_whose_gate_set_moved_or_that_names_nothing_is_refused() {
+        use serde_json::json;
+        let mut now = serde_json::Map::new();
+        now.insert("/g/a.py".into(), json!("aaa"));
+        // no expected at all: a direct caller cannot skip the binding
+        assert!(ratify_binding(None, &now).unwrap_err()["error"].as_str().unwrap().contains("expected is required"));
+        assert!(ratify_binding(Some(&json!("aaa")), &now).is_err(), "not a map");
+        // a gate discovered after the review
+        now.insert("/g/new.py".into(), json!("nnn"));
+        let err = ratify_binding(Some(&json!({"/g/a.py": "aaa"})), &now).unwrap_err();
+        assert_eq!(err["differs"][0]["path"], json!("/g/new.py"), "{err}");
+        // a reviewed gate that is gone now
+        now.remove("/g/new.py");
+        let err = ratify_binding(Some(&json!({"/g/a.py": "aaa", "/g/gone.py": "ggg"})), &now).unwrap_err();
+        assert_eq!(err["differs"][0]["now"], json!("absent"), "{err}");
+        // unreadable (null) is only bound to null, never to a digest
+        now.insert("/g/a.py".into(), serde_json::Value::Null);
+        assert!(ratify_binding(Some(&json!({"/g/a.py": "aaa"})), &now).is_err());
+    }
+
+    #[test]
+    fn ratify_requires_a_bounded_reason() {
+        use serde_json::json;
+        assert!(ratify_reason(&json!({})).is_err());
+        assert!(ratify_reason(&json!({"reason": "   "})).is_err());
+        assert!(ratify_reason(&json!({"reason": "x".repeat(513)})).is_err());
+        assert!(ratify_reason(&json!({"reason": "bad\u{7}bell"})).is_err());
+        assert_eq!(
+            ratify_reason(&json!({"reason": "  deploy 4d59496 installed these bytes  "})).unwrap(),
+            "deploy 4d59496 installed these bytes"
+        );
+    }
+
+    /// The defect this replaces: the vault was written and the chain append's result was
+    /// discarded, so a failed record left an unwitnessed trust baseline in force.
+    #[tokio::test]
+    async fn a_ratification_that_cannot_be_recorded_is_undone() {
+        let (_dir, state) = test_state().await;
+        let mut s = state.lock().await;
+        let previous = one_expectation("/h/pre_tool_use.py", "aaaa");
+        s.vault.set_gate_expectations(previous.clone()).unwrap();
+        let next = one_expectation("/h/pre_tool_use.py", "bbbb");
+
+        let err = apply_ratification(&mut s, previous.clone(), next, |_| {
+            Err(anyhow::anyhow!("chain store refused the append"))
+        })
+        .unwrap_err();
+        assert!(err.contains("not recorded") && err.contains("restored"), "{err}");
+        assert_eq!(
+            s.vault.gate_expectations(),
+            previous,
+            "an unrecorded ratification stayed in force"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recorded_ratification_stands() {
+        let (_dir, state) = test_state().await;
+        let mut s = state.lock().await;
+        let previous = one_expectation("/h/pre_tool_use.py", "aaaa");
+        s.vault.set_gate_expectations(previous.clone()).unwrap();
+        let next = one_expectation("/h/pre_tool_use.py", "bbbb");
+
+        apply_ratification(&mut s, previous, next.clone(), |_| Ok(())).unwrap();
+        assert_eq!(s.vault.gate_expectations(), next);
+    }
+
+    #[test]
+    fn deployment_evidence_reads_every_installed_file_and_nothing_else() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("current-build.json");
+        std::fs::write(
+            &p,
+            serde_json::json!({
+                "build_id": "v0.0.4-898-g4d59496",
+                "head_sha": "4d59496fabc",
+                "installed_at_iso": "2026-09-27T19:17:39Z",
+                "members": [{"member": "claude-code", "files": [
+                    {"file": "pre_tool_use.py", "path": "/h/pre_tool_use.py", "sha256": "1111"},
+                    {"file": "witness.py", "path": "/h/witness.py", "sha256": "2222"}
+                ]}],
+                "shared_engine": [{"file": "core.py", "path": "/s/core.py", "sha256": "3333"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let d = deployed_gate_digests_from(&p).unwrap();
+        assert_eq!(d["build_id"], "v0.0.4-898-g4d59496");
+        assert_eq!(d["files"]["/h/pre_tool_use.py"], "1111");
+        assert_eq!(d["files"]["/h/witness.py"], "2222");
+        assert_eq!(d["files"]["/s/core.py"], "3333");
+        assert_eq!(d["files"].as_object().unwrap().len(), 3);
+
+        // Absent or unparseable authority is "no evidence", never an invented one.
+        assert!(deployed_gate_digests_from(&dir.path().join("absent.json")).is_none());
+        std::fs::write(&p, b"not json").unwrap();
+        assert!(deployed_gate_digests_from(&p).is_none());
+    }
+
+    /// A member id becomes a FILENAME, so it is validated as one.
+    ///
+    /// Without this the operator surface offers an arbitrary file write: `../../something`
+    /// renders outside the seats directory. Written as its own arm because the happy path
+    /// cannot show it — a handler that accepts every id passes every ordinary test.
+    #[tokio::test]
+    async fn a_seat_id_that_would_escape_the_render_directory_is_refused() {
+        let (_dir, state) = test_state().await;
+        for bad in ["../escape", "a/b", "a\\b", ".hidden", ""] {
+            let body = serde_json::json!({
+                "plugin_id": bad,
+                "config": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""},
+            });
+            let status = axum::response::IntoResponse::into_response(
+                super::config_put_seat(axum::extract::State(state.clone()), axum::Json(body)).await,
+            )
+            .status();
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "id {bad:?} must be refused: it does not name one file inside the render dir"
+            );
+        }
+    }
+
+    /// Content that cannot render is refused BEFORE it reaches the vault.
+    ///
+    /// Storing it would leave the authority holding something that produces a permanent finding
+    /// and no artifact — an unbacked projection one layer up, where nothing can quarantine it.
+    #[tokio::test]
+    async fn seat_config_that_cannot_render_never_reaches_the_vault() {
+        use crate::server::seat_config as sc;
+        let (_dir, state) = test_state().await;
+        let body = serde_json::json!({
+            "plugin_id": "claude-code",
+            "config": {"env": {"HESTIA_WORKSPACE": "/w/ai\nHESTIA_ROLE=role:sovereign"}, "note": ""},
+        });
+        let status = axum::response::IntoResponse::into_response(
+            super::config_put_seat(axum::extract::State(state.clone()), axum::Json(body)).await,
+        )
+        .status();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let s = state.lock().await;
+        assert!(
+            s.vault.get_document(sc::SEAT_CONFIG_NS, "claude-code").is_none(),
+            "the vault must not hold config that cannot be rendered"
+        );
+    }
+
+    /// The write lands, renders in the same act, and the chain names KEYS but not VALUES.
+    #[tokio::test]
+    async fn a_seat_config_write_renders_immediately_and_does_not_log_values() {
+        use crate::server::seat_config as sc;
+        let (dir, state) = test_state().await;
+        let before = {
+            let s = state.lock().await;
+            s.chain_store.len().unwrap()
+        };
+        let body = serde_json::json!({
+            "plugin_id": "claude-code",
+            "config": {
+                "env": {"HESTIA_WORKSPACE": "/w/ai", "HESTIA_TOKEN": "super-secret-value"},
+                "note": "set by the operator",
+            },
+        });
+        let status = axum::response::IntoResponse::into_response(
+            super::config_put_seat(axum::extract::State(state.clone()), axum::Json(body)).await,
+        )
+        .status();
+        assert_eq!(status, StatusCode::OK);
+
+        let rendered = std::fs::read_to_string(sc::render_path(dir.path(), "claude-code"))
+            .expect("rendered in the same act, not on the worker's next tick");
+        assert!(rendered.contains("CLAUDE_CODE__HESTIA_WORKSPACE=/w/ai"), "{rendered}");
+
+        // The chain is the one store that never forgets, and a config document can carry a
+        // token. Keys are evidence; values are not ours to keep.
+        let s = state.lock().await;
+        let rows = s.chain_store.read_recent(20).unwrap();
+        // Named explicitly rather than by prefix. `config_seat_written` does NOT start with
+        // `config_seat_write` — it diverges at `writt` — so a prefix filter here matches the
+        // intent row only and reads as "the completion was never written". Caught by this
+        // assertion failing at 1; the pair was on the chain the whole time.
+        let intents = rows.iter().filter(|e| e.event_type == "config_seat_write_intent").count();
+        let done = rows.iter().filter(|e| e.event_type == "config_seat_written").count();
+        assert_eq!((intents, done), (1, 1), "intent and completion are both witnessed");
+        for e in &rows {
+            let blob = serde_json::to_string(&e.event_data).unwrap();
+            assert!(
+                !blob.contains("super-secret-value"),
+                "a config VALUE reached the chain in {}: {blob}",
+                e.event_type
+            );
+            if e.event_type == "config_seat_write_intent" {
+                assert!(blob.contains("HESTIA_TOKEN"), "but the key is recorded: {blob}");
+            }
+        }
+        assert!(s.chain_store.len().unwrap() > before);
+    }
+
+    /// Seeding an empty namespace is ONE act: all documents or none, one witness pair.
+    ///
+    /// The arms below are written against the failure the client-side version had (#987
+    /// review): read-then-write-N leaves a half-configured namespace when anything fails
+    /// partway, and the ratchet that makes seeding safe then refuses to repair it forever.
+    /// So each arm asks what the namespace looks like AFTER a refusal, not merely whether the
+    /// call returned an error.
+    #[tokio::test]
+    async fn seeding_an_empty_namespace_is_one_atomic_act() {
+        use super::super::seat_config as sc;
+        let (dir, state) = test_state().await;
+        let seed = serde_json::json!({"documents": {
+            "_shared": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": "society facts"},
+            "claude-code": {"env": {"HESTIA_PLUGIN_ID": "claude-code"}, "note": ""},
+            "codex": {"env": {"HESTIA_PLUGIN_ID": "codex"}, "note": ""},
+        }});
+        let before = { state.lock().await.chain_store.len().unwrap() };
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_seed_seats(axum::extract::State(state.clone()), axum::Json(seed)).await,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let s = state.lock().await;
+        assert_eq!(
+            sc::declared_members(&s.vault),
+            vec!["_shared", "claude-code", "codex"],
+            "every proposed document landed"
+        );
+        assert!(
+            sc::render_path(dir.path(), "claude-code").exists()
+                && sc::render_path(dir.path(), "codex").exists(),
+            "and each seat's projection was rendered in the same act"
+        );
+        // ONE act, not one per document: intent + seeded, and nothing per-member.
+        let rows: Vec<String> = s
+            .chain_store
+            .read_recent_by_types(None, &["config_seed_intent", "config_seeded", "config_seat_written"], 50)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.event_type.to_string())
+            .collect();
+        assert_eq!(rows.iter().filter(|t| *t == "config_seed_intent").count(), 1, "{rows:?}");
+        assert_eq!(rows.iter().filter(|t| *t == "config_seeded").count(), 1, "{rows:?}");
+        assert_eq!(
+            rows.iter().filter(|t| *t == "config_seat_written").count(),
+            0,
+            "seeding is not N single writes wearing a hat: {rows:?}"
+        );
+        assert!(s.chain_store.len().unwrap() > before);
+        // The intent names the KEYS and never a value.
+        let intent = s
+            .chain_store
+            .read_recent_by_types(None, &["config_seed_intent"], 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let blob = serde_json::to_string(&intent.event_data).unwrap();
+        assert!(blob.contains("HESTIA_PLUGIN_ID"), "keys are recorded: {blob}");
+        assert!(!blob.contains("/w/ai"), "a VALUE reached the chain: {blob}");
+    }
+
+    /// A namespace that is not empty is refused, and says what occupies it.
+    #[tokio::test]
+    async fn seeding_refuses_a_namespace_that_is_not_empty() {
+        use super::super::seat_config as sc;
+        let (_dir, state) = test_state().await;
+        let first = serde_json::json!({"documents": {
+            "_shared": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""},
+            "claude-code": {"env": {"HESTIA_PLUGIN_ID": "claude-code"}, "note": ""},
+        }});
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_seed_seats(axum::extract::State(state.clone()), axum::Json(first)).await,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // A second seed — the concurrent-writer case, and the re-run case.
+        let second = serde_json::json!({"documents": {
+            "codex": {"env": {"HESTIA_PLUGIN_ID": "codex"}, "note": "would overwrite nothing"},
+        }});
+        let before = {
+            let s = state.lock().await;
+            (sc::declared_members(&s.vault), s.chain_store.len().unwrap())
+        };
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_seed_seats(axum::extract::State(state.clone()), axum::Json(second)).await,
+        );
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "the loser refuses cleanly");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("claude-code"), "it names what occupies the namespace: {text}");
+
+        let s = state.lock().await;
+        assert_eq!(sc::declared_members(&s.vault), before.0, "and changes nothing");
+        assert_eq!(s.chain_store.len().unwrap(), before.1, "not even a chain row");
+    }
+
+    /// ONE bad document refuses the WHOLE seed, and the namespace stays empty.
+    ///
+    /// This is the arm the sequential client could not pass: it wrote the shared set, then
+    /// failed on the seat, and left a namespace that its own empty-only ratchet would refuse
+    /// to touch on every later run.
+    #[tokio::test]
+    async fn one_invalid_document_refuses_the_whole_seed_and_leaves_the_namespace_empty() {
+        use super::super::seat_config as sc;
+        let (_dir, state) = test_state().await;
+        for (label, seed) in [
+            (
+                "a value carrying a newline renders extra assignments",
+                serde_json::json!({"documents": {
+                    "_shared": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""},
+                    "claude-code": {"env": {"HESTIA_X": "a\nINJECTED=1"}, "note": ""},
+                }}),
+            ),
+            (
+                "a member id that would escape the render directory",
+                serde_json::json!({"documents": {
+                    "_shared": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""},
+                    "../escape": {"env": {"HESTIA_X": "1"}, "note": ""},
+                }}),
+            ),
+            (
+                "a seat restating a key the shared set in this same seed owns",
+                serde_json::json!({"documents": {
+                    "_shared": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""},
+                    "claude-code": {"env": {"HESTIA_WORKSPACE": "/w/mine"}, "note": ""},
+                }}),
+            ),
+            (
+                "a document attributed to another seat",
+                serde_json::json!({"documents": {
+                    "_shared": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""},
+                    "claude-code": {"env": {"HESTIA_PLUGIN_ID": "codex"}, "note": ""},
+                }}),
+            ),
+        ] {
+            let resp = axum::response::IntoResponse::into_response(
+                super::config_seed_seats(axum::extract::State(state.clone()), axum::Json(seed)).await,
+            );
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{label}");
+            let s = state.lock().await;
+            assert!(
+                sc::namespace_is_empty(&s.vault),
+                "{label}: the namespace must be byte-identical after a refusal, found {:?}",
+                sc::declared_members(&s.vault)
+            );
+        }
+        // And the valid form still works afterwards, so nothing above wedged the door.
+        let good = serde_json::json!({"documents": {
+            "claude-code": {"env": {"HESTIA_PLUGIN_ID": "claude-code"}, "note": ""},
+        }});
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_seed_seats(axum::extract::State(state.clone()), axum::Json(good)).await,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// An empty or absent proposal is refused rather than treated as "seed nothing".
+    #[tokio::test]
+    async fn seeding_nothing_is_a_bad_request_not_a_silent_success() {
+        let (_dir, state) = test_state().await;
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"documents": {}}),
+            serde_json::json!({"documents": []}),
+        ] {
+            let resp = axum::response::IntoResponse::into_response(
+                super::config_seed_seats(axum::extract::State(state.clone()), axum::Json(body)).await,
+            );
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    /// The list shows LIVENESS beside drift (#944): absent until the seat connects with a
+    /// digest, then what it presented, what the vault expected, and whether they agree — and
+    /// still never a value.
+    #[tokio::test]
+    async fn the_seat_config_list_shows_what_the_seat_is_running() {
+        use super::super::seat_config as sc;
+        let (dir, state) = test_state().await;
+        let body = serde_json::json!({
+            "plugin_id": "claude-code",
+            "config": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""},
+        });
+        let put = axum::response::IntoResponse::into_response(
+            super::config_put_seat(axum::extract::State(state.clone()), axum::Json(body)).await,
+        );
+        assert_eq!(put.status(), StatusCode::OK);
+        let list = || async {
+            let resp = axum::response::IntoResponse::into_response(
+                super::config_list_seats(axum::extract::State(state.clone())).await,
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(!text.contains("/w/ai"), "a VALUE leaked into the list: {text}");
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            v["seats"].as_array().unwrap().iter().find(|s| s["member"] == "claude-code").unwrap().clone()
+        };
+        assert!(list().await["live"].is_null(), "no connect yet, no liveness claim");
+
+        let on_disk = sc::sha256_of(&std::fs::read(sc::render_path(dir.path(), "claude-code")).unwrap());
+        super::super::handler::tool_connect(
+            &state,
+            &serde_json::json!({"plugin_id": "claude-code", "host_agent": "t", "projection_sha256": on_disk}),
+        )
+        .await
+        .unwrap();
+        let seat = list().await;
+        assert_eq!(seat["live"]["sha256"], on_disk);
+        assert_eq!(seat["live"]["matches_expected"], true);
+        assert_eq!(seat["live"]["expected_sha256"], seat["expected_sha256"]);
+    }
+
+    /// The LIST never carries a value, on any seat, in any state (#944 phase 0).
+    ///
+    /// Written against the response bytes rather than the shape, because the shape is the
+    /// thing a later edit changes: a field renamed, a verdict enriched, a summary that starts
+    /// carrying `config` "for convenience". The bytes cannot carry the value by accident.
+    #[tokio::test]
+    async fn the_seat_config_list_names_keys_and_health_but_never_a_value() {
+        let (_dir, state) = test_state().await;
+        let body = serde_json::json!({
+            "plugin_id": "claude-code",
+            "config": {
+                "env": {"HESTIA_WORKSPACE": "/w/ai", "HESTIA_TOKEN": "list-must-not-show-this"},
+                "note": "phase 0",
+            },
+        });
+        let put = axum::response::IntoResponse::into_response(
+            super::config_put_seat(axum::extract::State(state.clone()), axum::Json(body)).await,
+        );
+        assert_eq!(put.status(), StatusCode::OK);
+
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_list_seats(axum::extract::State(state.clone())).await,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!text.contains("list-must-not-show-this"), "a VALUE leaked into the list: {text}");
+        assert!(!text.contains("/w/ai"), "a VALUE leaked into the list: {text}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let seat = v["seats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["member"] == "claude-code")
+            .expect("the configured seat is listed");
+        assert_eq!(seat["configured"], true);
+        let keys: Vec<&str> = seat["keys"].as_array().unwrap().iter().map(|k| k.as_str().unwrap()).collect();
+        assert_eq!(keys, vec!["HESTIA_TOKEN", "HESTIA_WORKSPACE"], "keys ARE listed, sorted");
+        assert_eq!(seat["verdict"]["status"], "verified", "rendered by the PUT, so verified: {seat}");
+        assert!(seat["expected_sha256"].as_str().unwrap().len() == 64);
+    }
+
+    /// ATTRIBUTION (dp, 2026-09-05): a document cannot claim to be another seat, the shared
+    /// set cannot carry identity, and every rendered projection states its seat's id from
+    /// its document's name.
+    #[tokio::test]
+    async fn a_document_cannot_be_attributed_to_another_seat() {
+        use crate::server::seat_config as sc;
+        let (dir, state) = test_state().await;
+        let put = |body: serde_json::Value| {
+            let st = state.clone();
+            async move {
+                let resp = axum::response::IntoResponse::into_response(
+                    super::config_put_seat(axum::extract::State(st), axum::Json(body)).await,
+                );
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap())
+            }
+        };
+        // kimi's document claiming to be codex: refused, and the vault never holds it
+        let (st, out) = put(serde_json::json!({"plugin_id": "kimi-code", "config": {"env": {"HESTIA_PLUGIN_ID": "codex"}, "note": ""}})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{out}");
+        assert_eq!(out["attribution"], true, "{out}");
+        assert!(state.lock().await.vault.get_document(sc::SEAT_CONFIG_NS, "kimi-code").is_none());
+        // the shared set carrying an identity key: refused
+        let (st, out) = put(serde_json::json!({"plugin_id": "_shared", "config": {"env": {"HESTIA_MESH_PLUGIN": "claude-code"}, "note": ""}})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{out}");
+        assert!(out["error"].as_str().unwrap().contains("never shared"), "{out}");
+        // a document with NO id renders one, derived from its name
+        let (st, _) = put(serde_json::json!({"plugin_id": "kimi-code", "config": {"env": {"HESTIA_HARNESS_HOME": "/h/kimi"}, "note": ""}})).await;
+        assert_eq!(st, StatusCode::OK);
+        let rendered = std::fs::read_to_string(sc::render_path(dir.path(), "kimi-code")).unwrap();
+        assert!(rendered.contains("KIMI_CODE__HESTIA_PLUGIN_ID=kimi-code\n"), "{rendered}");
+        assert!(rendered.contains("KIMI_CODE__HESTIA_HARNESS_HOME=/h/kimi\n"), "{rendered}");
+        // and the inspect's effective set shows it, while the own config does not carry it
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_get_seat(axum::extract::State(state.clone()), None, axum::extract::Path("kimi-code".to_string())).await,
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["effective"]["HESTIA_PLUGIN_ID"], "kimi-code", "{v}");
+        assert!(v["config"]["env"].get("HESTIA_PLUGIN_ID").is_none(), "{v}");
+    }
+
+    /// THE SHARED SET (dp, 2026-09-05). Written through the same door under the reserved id;
+    /// inherited by every seat with shared winning; a seat that restates a shared key is refused
+    /// at the door; a shared write re-renders every seat in the same act; the list names the
+    /// shared keys and never a value; the projection header names the shared keys.
+    #[tokio::test]
+    async fn the_shared_set_is_inherited_by_every_seat_and_a_seat_may_not_restate_it() {
+        use crate::server::seat_config as sc;
+        let (dir, state) = test_state().await;
+        let put = |body: serde_json::Value| {
+            let st = state.clone();
+            async move {
+                let resp = axum::response::IntoResponse::into_response(
+                    super::config_put_seat(axum::extract::State(st), axum::Json(body)).await,
+                );
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap())
+            }
+        };
+        // two seats first, each carrying only its own facts
+        for (m, role) in [("claude-code", "role:constellation:interactive-dev"), ("codex", "role:constellation:member")] {
+            let (st, _) = put(serde_json::json!({"plugin_id": m, "config": {"env": {"HESTIA_ROLE": role, "HESTIA_PLUGIN_ID": m}, "note": ""}})).await;
+            assert_eq!(st, StatusCode::OK);
+        }
+        // the shared set: society facts, and a token-shaped value that must never reach the chain
+        let (st, out) = put(serde_json::json!({"plugin_id": "_shared", "config": {
+            "env": {"HESTIA_HOME": "/h", "HESTIA_WORKSPACE": "/w/ai", "HESTIA_SHARED_TOKEN": "shared-secret-value"},
+            "note": "society"}})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert_eq!(out["shared"], true);
+        assert!(out["artifact"].is_null(), "the shared set renders no artifact of its own: {out}");
+        let statuses: Vec<&str> = out["verdict"].as_array().unwrap().iter().map(|v| v["status"].as_str().unwrap()).collect();
+        assert_eq!(statuses.len(), 2, "a shared write re-renders EVERY seat in the same act: {out}");
+        assert!(statuses.iter().all(|s| *s == "verified"), "author pass: render then verify: {out}");
+
+        // every seat's projection now carries the shared keys, names them, and its own keys survive
+        for m in ["claude-code", "codex"] {
+            let rendered = std::fs::read_to_string(sc::render_path(dir.path(), m)).unwrap();
+            assert!(rendered.contains("HESTIA_HOME=/h\n") && rendered.contains("HESTIA_WORKSPACE=/w/ai\n"), "shared lines are plain: {rendered}");
+            let token = sc::seat_token(m);
+            assert!(rendered.contains(&format!("{token}__HESTIA_PLUGIN_ID={m}\n")), "own lines carry the seat token: {rendered}");
+            assert!(rendered.contains("# shared: HESTIA_HOME HESTIA_SHARED_TOKEN HESTIA_WORKSPACE\n"), "{rendered}");
+        }
+
+        // a seat may not restate a shared key
+        let (st, out) = put(serde_json::json!({"plugin_id": "codex", "config": {"env": {"HESTIA_WORKSPACE": "/w/mine", "HESTIA_PLUGIN_ID": "codex"}, "note": ""}})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{out}");
+        assert!(out["error"].as_str().unwrap().contains("belong to the shared set"), "{out}");
+
+        // the list names the shared keys apart from each seat's own, and carries no value
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_list_seats(axum::extract::State(state.clone())).await,
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!text.contains("shared-secret-value") && !text.contains("/w/ai"), "a VALUE leaked into the list: {text}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["shared"]["configured"], true);
+        assert_eq!(v["shared"]["keys"].as_array().unwrap().len(), 3);
+        let codex = v["seats"].as_array().unwrap().iter().find(|s| s["member"] == "codex").unwrap();
+        assert_eq!(codex["keys"].as_array().unwrap().len(), 2, "own keys only: {codex}");
+        assert_eq!(codex["inherited"].as_array().unwrap().len(), 3, "{codex}");
+        assert_eq!(codex["verdict"]["status"], "verified");
+        assert!(v["seats"].as_array().unwrap().iter().all(|s| s["member"] != "_shared"), "_shared is not a seat: {text}");
+
+        // inspecting _shared reveals its values (witnessed); inspecting a seat shows own + effective
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_get_seat(axum::extract::State(state.clone()), None, axum::extract::Path("_shared".to_string())).await,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["config"]["env"]["HESTIA_SHARED_TOKEN"], "shared-secret-value");
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_get_seat(axum::extract::State(state.clone()), None, axum::extract::Path("codex".to_string())).await,
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["config"]["env"].get("HESTIA_HOME").is_none(), "own config carries no shared key: {v}");
+        assert_eq!(v["effective"]["HESTIA_HOME"], "/h", "the effective set carries it: {v}");
+        assert_eq!(v["effective"]["HESTIA_PLUGIN_ID"], "codex");
+
+        // and the chain: no value, ever; the shared write is marked as such
+        let s = state.lock().await;
+        for e in s.chain_store.read_recent(40).unwrap() {
+            let blob = serde_json::to_string(&e.event_data).unwrap();
+            assert!(!blob.contains("shared-secret-value"), "a VALUE reached the chain in {}: {blob}", e.event_type);
+            if e.event_type == "config_seat_written" && e.event_data["member"] == "_shared" {
+                assert_eq!(e.event_data["shared"], true);
+            }
+        }
+        // AUTHOR PASS: no seat write opened an integrity finding. Before this, every first
+        // write opened `config_integrity_finding{missing}` for a document rendered in the same act.
+        let findings = s.chain_store.read_recent(40).unwrap().iter()
+            .filter(|e| e.event_type == "config_integrity_finding" || e.event_type == "config_miswire").count();
+        assert_eq!(findings, 0, "an authority change was witnessed as drift");
+    }
+
+    /// The INSPECT reveals the authoritative values, reports the projection verdict, and
+    /// witnesses the LOOK by member and keys — never by value. A hand edit of the artifact
+    /// between the write and the inspect is reported as a miswire by the inspect WITHOUT
+    /// being repaired: a read is not the drift detector, the worker is.
+    #[tokio::test]
+    async fn the_seat_config_inspect_reveals_values_and_witnesses_keys_only() {
+        use crate::server::seat_config as sc;
+        let (dir, state) = test_state().await;
+        let body = serde_json::json!({
+            "plugin_id": "kimi-code",
+            "config": {"env": {"HESTIA_WORKSPACE": "/w/ai", "HESTIA_TOKEN": "inspect-shows-this"}, "note": "n"},
+        });
+        let put = axum::response::IntoResponse::into_response(
+            super::config_put_seat(axum::extract::State(state.clone()), axum::Json(body)).await,
+        );
+        assert_eq!(put.status(), StatusCode::OK);
+        let artifact = sc::render_path(dir.path(), "kimi-code");
+        std::fs::write(&artifact, "HESTIA_WORKSPACE=/somewhere/else\n").unwrap();
+        let tampered = std::fs::read_to_string(&artifact).unwrap();
+
+        // The witness the middleware would have inserted: a composed session's provenance plus
+        // the hash of the gate row that admitted this request.
+        let witness = crate::server::operator_auth::GateWitness {
+            operator: None,
+            provenance: Some(crate::server::operator_auth::OperatorProvenance {
+                actor: "lct:web4:actor:app".into(),
+                principal: "lct:web4:operator:dp".into(),
+                via_device: "lct:web4:device:cbp".into(),
+                office: "operator".into(),
+                authority: "session-ref-42".into(),
+            }),
+            gate_entry_hash: Some("gate-row-hash-for-this-request".into()),
+        };
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_get_seat(
+                axum::extract::State(state.clone()),
+                Some(axum::Extension(witness)),
+                axum::extract::Path("kimi-code".to_string()),
+            )
+            .await,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["config"]["env"]["HESTIA_TOKEN"], "inspect-shows-this");
+        assert_eq!(v["config"]["env"]["HESTIA_WORKSPACE"], "/w/ai");
+        assert_eq!(v["summary"]["verdict"]["status"], "miswired", "{v}");
+        assert_eq!(
+            std::fs::read_to_string(&artifact).unwrap(),
+            tampered,
+            "a GET must not repair the artifact; that is the worker's act, witnessed as such"
+        );
+
+        let s = state.lock().await;
+        let rows = s.chain_store.read_recent(20).unwrap();
+        let looked: Vec<_> = rows.iter().filter(|e| e.event_type == "config_seat_inspected").collect();
+        assert_eq!(looked.len(), 1, "one inspect, one row");
+        let row = &looked[0].event_data;
+        let blob = serde_json::to_string(row).unwrap();
+        assert!(blob.contains("HESTIA_TOKEN") && blob.contains("kimi-code"), "{blob}");
+        assert!(!blob.contains("inspect-shows-this") && !blob.contains("/w/ai"), "a VALUE reached the chain: {blob}");
+        // THE ROW NAMES ITS AUTHORIZATION — the pointer and the composed provenance, on the act
+        // row itself, not in a neighbour. `decided_by: operator` is gone: a generic claim
+        // beside a proof is the defect, not a summary of it.
+        assert_eq!(row["authorized_by_gate"], "gate-row-hash-for-this-request", "{blob}");
+        assert_eq!(row["principal"], "lct:web4:operator:dp", "{blob}");
+        assert_eq!(row["actor"], "lct:web4:actor:app", "{blob}");
+        assert_eq!(row["authority"], "session-ref-42", "{blob}");
+        assert_eq!(row["act"], "GET /api/config/seat/kimi-code", "{blob}");
+        assert!(row.get("decided_by").is_none(), "the generic claim must not survive beside the proof: {blob}");
+        // The handler locks the state; holding this guard across the next calls deadlocks the
+        // test (it did: the first run hung here for 42 minutes at 3% CPU).
+        drop(s);
+
+        // CONTROL: no witness (a route reached without the gate, or a dev-override) writes NO
+        // authorization field — absent, not null and not empty, so a reader can tell
+        // "unauthorized path" from "unrecorded" (PIN 1 of policy_edit_names_its_authorization).
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_get_seat(
+                axum::extract::State(state.clone()),
+                None,
+                axum::extract::Path("kimi-code".to_string()),
+            )
+            .await,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        {
+            let s = state.lock().await;
+            let rows = s.chain_store.read_recent(20).unwrap();
+            let bare = rows.iter().filter(|e| e.event_type == "config_seat_inspected").next()
+                .expect("the unwitnessed inspect still writes its row");
+            assert!(bare.event_data.get("authorized_by_gate").is_none(), "{}", bare.event_data);
+            assert!(bare.event_data.get("principal").is_none(), "{}", bare.event_data);
+        }
+
+        // An unknown seat is a 404 with the summary, and reveals nothing.
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_get_seat(
+                axum::extract::State(state.clone()),
+                None,
+                axum::extract::Path("nobody".to_string()),
+            )
+            .await,
+        );
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        for bad in ["../escape", "a/b", ".hidden"] {
+            let resp = axum::response::IntoResponse::into_response(
+                super::config_get_seat(
+                    axum::extract::State(state.clone()),
+                    None,
+                    axum::extract::Path(bad.to_string()),
+                )
+                .await,
+            );
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+    }
+
+    /// THE NEGATIVE ARM #944 REQUIRES: an unauthenticated HTTP client obtains no value from
+    /// either GET. Run against the real served router — the middleware is the thing under
+    /// test, and a handler-level test cannot see it. No dev-override token in this process.
+    #[tokio::test]
+    async fn unauthenticated_http_cannot_read_seat_config_values() {
+        std::env::remove_var("HESTIA_OPERATOR_DEV_TOKEN");
+        let (_dir, state) = test_state().await;
+        {
+            let body = serde_json::json!({
+                "plugin_id": "codex",
+                "config": {"env": {"HESTIA_TOKEN": "never-over-plain-http"}, "note": ""},
+            });
+            let put = axum::response::IntoResponse::into_response(
+                super::config_put_seat(axum::extract::State(state.clone()), axum::Json(body)).await,
+            );
+            assert_eq!(put.status(), StatusCode::OK);
+        }
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let bind = format!("127.0.0.1:{port}");
+        let served = state.clone();
+        let server = tokio::spawn(async move {
+            let _ = super::serve_with_callback(served, &bind, None).await;
+        });
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+        let mut up = false;
+        for _ in 0..50 {
+            if client.get(format!("{base}/api/config/seat")).send().await.is_ok() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(up, "the test server never came up on {base}");
+
+        for path in ["/api/config/seat", "/api/config/seat/codex"] {
+            let resp = client.get(format!("{base}{path}")).send().await.unwrap();
+            let status = resp.status();
+            let text = resp.text().await.unwrap();
+            assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "{path}: {text}");
+            assert!(!text.contains("never-over-plain-http"), "{path} leaked a value: {text}");
+            assert!(!text.contains("HESTIA_TOKEN"), "{path} leaked a key without a session: {text}");
+        }
+        // A wrong bearer is the same as none.
+        let resp = client
+            .get(format!("{base}/api/config/seat/codex"))
+            .bearer_auth("not-a-session")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // THE POSITIVE HALF OF THE SAME ARM, through the real middleware: an operator whose key
+        // is in the law signs a challenge, opens a session, and inspects. The chain row for
+        // that inspect must NAME the `operator_gate` row that admitted it — by hash, on the
+        // row itself — and that gate row must be the one for this very request. Values still
+        // never reach the chain.
+        let kp = web4_core::crypto::KeyPair::generate();
+        let lct_id = web4_core::lct::derive_lct_id(&kp.verifying_key());
+        {
+            let mut s = state.lock().await;
+            let mut policy = s.vault.policy().clone();
+            policy.operator_access.push(crate::vault::OperatorIdentity {
+                lct_id: lct_id.clone(),
+                public_key_hex: hex::encode(kp.public_key_bytes()),
+                label: "test operator".into(),
+            });
+            s.vault.set_policy(policy).unwrap();
+            s.reload_policy();
+        }
+        let ch: serde_json::Value = client
+            .post(format!("{base}/api/operator/challenge"))
+            .send().await.unwrap().json().await.unwrap();
+        let challenge = ch["challenge"].as_str().expect("a challenge").to_string();
+        let sess: serde_json::Value = client
+            .post(format!("{base}/api/operator/session"))
+            .json(&serde_json::json!({
+                "lct_id": lct_id,
+                "challenge": challenge,
+                "signature": kp.sign(challenge.as_bytes()).to_hex(),
+            }))
+            .send().await.unwrap().json().await.unwrap();
+        let token = sess["token"].as_str().expect(&format!("a session token: {sess}")).to_string();
+
+        let resp = client
+            .get(format!("{base}/api/config/seat/codex"))
+            .bearer_auth(&token)
+            .send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["config"]["env"]["HESTIA_TOKEN"], "never-over-plain-http", "the session DOES see the value");
+
+        let s = state.lock().await;
+        let rows = s.chain_store.read_recent(50).unwrap();
+        let inspected = rows.iter().filter(|e| e.event_type == "config_seat_inspected").next()
+            .expect("the inspect wrote its row");
+        let pointer = inspected.event_data["authorized_by_gate"].as_str()
+            .expect(&format!("the inspect row must name the gate row that admitted it: {}", inspected.event_data))
+            .to_string();
+        let gate_row = rows.iter().find(|e| e.hash == pointer)
+            .expect(&format!("authorized_by_gate {pointer} must resolve to a chain row"));
+        assert_eq!(gate_row.event_type, "operator_gate", "{}", gate_row.event_data);
+        let gate_blob = serde_json::to_string(&gate_row.event_data).unwrap();
+        assert!(gate_blob.contains("GET /api/config/seat/codex"), "the gate row is for THIS request: {gate_blob}");
+        assert!(gate_blob.contains(&lct_id), "the gate row names the operator who signed: {gate_blob}");
+        for e in &rows {
+            let blob = serde_json::to_string(&e.event_data).unwrap();
+            assert!(!blob.contains("never-over-plain-http"), "a VALUE reached the chain in {}: {blob}", e.event_type);
+        }
+        drop(s);
+        server.abort();
+    }
+
     /// Minting site B (#459): the operator's scope decision tells the REQUESTER.
     #[tokio::test]
     async fn a_scope_decision_reports_its_disposition_to_the_requester() {
@@ -4176,6 +7830,8 @@ mod disposition_tests {
                     decided_by: None,
                     decided_at: None,
                     decision_reason: None,
+                    recursive: false,
+                    revoked: None,
                 },
             );
         }
@@ -4323,6 +7979,1512 @@ mod disposition_tests {
     /// operator gets an error, and the request stays pending. Failure injected
     /// by a trigger that fails only the success insert (the intent names no
     /// `intent` key; the success entry does).
+    fn live_req(id: &str, path: &str, now: u64) -> crate::server::state::ScopeRequest {
+        crate::server::state::ScopeRequest {
+            id: id.into(),
+            plugin_id: "kimi-code".into(),
+            role: String::new(),
+            path: path.into(),
+            reason: "the member's stated need".into(),
+            requested_at: now,
+            expires_at: now + 3600,
+            granted: Some(true),
+            decided_by: Some("operator".into()),
+            decided_at: Some(now),
+            decision_reason: Some("watched it used well".into()),
+            recursive: false,
+            revoked: None,
+        }
+    }
+
+    /// dp, 2026-09-15: "i want to be able to revoke a live grant, right now i can only revoke
+    /// standing ones". The live grant stops granting everywhere (the gate's question, the
+    /// member's live list, the dashboard), the row reads `revoked` rather than vanishing, the
+    /// revocation is witnessed first, and the member is told through its disposition channel.
+    #[tokio::test]
+    async fn an_operator_revokes_a_live_grant_and_the_member_is_told() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-live-r".into(), live_req("scope-live-r", "/var/log/x.log", now));
+            assert!(s.has_scope_grant("kimi-code", "/var/log/x.log"), "setup: the live grant is in force");
+        }
+        let resp = scope_live_revoke(State(state.clone()), None, Json(serde_json::json!({
+            "request_id": "scope-live-r", "reason": "that file does not exist; nothing to diagnose"})))
+            .await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(out["standing_grant_still_covers_path"], false);
+
+        let s = state.lock().await;
+        assert!(!s.has_scope_grant("kimi-code", "/var/log/x.log"), "a revoked grant grants nothing");
+        assert!(s.live_scope_grants("kimi-code").is_empty(), "and is not listed as live");
+        let r = &s.scope_requests["scope-live-r"];
+        assert_eq!(r.status(now), "revoked", "the row says what happened to it");
+        assert_eq!(r.revoked.as_ref().unwrap().reason, "that file does not exist; nothing to diagnose");
+        assert!(!s.dashboard_snapshot(20).scope_grants.iter().any(|g| g["request_id"] == "scope-live-r"));
+        let w = s.recent_chain(10).into_iter().find(|e| e.event_type == "scope_revoked").expect("witnessed");
+        assert_eq!(w.event_data["request_id"], "scope-live-r");
+        assert_eq!(w.hash, out["witnessEntryHash"].as_str().unwrap());
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        let note = mail.iter().find(|n| n.kind == "disposition").expect("the member is told");
+        assert_eq!(note.pointer_uri.as_deref(), Some("hestia://scope/scope-live-r#revoked"));
+        drop(s);
+
+        let again = scope_live_revoke(State(state.clone()), None, Json(serde_json::json!({"request_id": "scope-live-r"})))
+            .await.into_response();
+        assert_eq!(again.status(), StatusCode::CONFLICT, "a revoked grant is not revoked twice");
+        let none = scope_live_revoke(State(state.clone()), None, Json(serde_json::json!({"request_id": "scope-nope"})))
+            .await.into_response();
+        assert_eq!(none.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// GPT review of #1035, point 1: the revocation must name the session that was actually
+    /// admitted, not a constant. The gate's `GateWitness` carries the composed provenance and
+    /// the hash of the gate row that admitted this call; both land on the act, and the stored
+    /// `revoked.by` is the principal rather than the office literal.
+    #[tokio::test]
+    async fn a_revocation_names_the_session_that_was_admitted() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-prov".into(), live_req("scope-prov", "/x/p.md", now));
+        }
+        let witness = crate::server::operator_auth::GateWitness {
+            operator: None,
+            provenance: Some(crate::server::operator_auth::OperatorProvenance {
+                actor: "lct:web4:harness".into(),
+                principal: "lct:web4:dp".into(),
+                via_device: "lct:web4:device".into(),
+                office: "sovereign".into(),
+                authority: "operator-session:nonce-7".into(),
+            }),
+            gate_entry_hash: Some("gate-row-hash".into()),
+        };
+        let resp = scope_live_revoke(State(state.clone()), Some(axum::Extension(witness)),
+            Json(serde_json::json!({"request_id": "scope-prov", "reason": "no longer needed"})))
+            .await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let s = state.lock().await;
+        let e = s.recent_chain(10).into_iter().find(|e| e.event_type == "scope_revoked").unwrap();
+        assert_eq!(e.event_data["principal"], "lct:web4:dp");
+        assert_eq!(e.event_data["actor"], "lct:web4:harness");
+        assert_eq!(e.event_data["office"], "sovereign");
+        assert_eq!(e.event_data["authority"], "operator-session:nonce-7");
+        assert_eq!(s.scope_requests["scope-prov"].revoked.as_ref().unwrap().by, "lct:web4:dp",
+                   "the stored revoker is the principal, not the office literal");
+    }
+
+    #[tokio::test]
+    async fn codex_review_direct_browser_revocation_names_authenticated_operator() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        let operator = "lct:web4:review-operator";
+        let token = {
+            let mut s = state.lock().await;
+            let mut law = s.vault.policy().clone();
+            law.operator_access.push(crate::vault::OperatorIdentity {
+                lct_id: operator.into(), public_key_hex: "00".repeat(32),
+                label: "review fixture".into(),
+            });
+            s.vault.set_policy(law).unwrap();
+            s.reload_policy();
+            s.scope_requests.insert("scope-review-browser".into(),
+                live_req("scope-review-browser", "/review/example.txt", now));
+            // Exact session-store path used after successful direct browser authentication.
+            let token = s.operator_sessions.open(operator.to_string(), now);
+            assert_eq!(s.operator_sessions.operator(&token, now, 3600), Some(operator));
+            assert!(s.operator_sessions.provenance(&token, now, 3600).is_none());
+            token
+        };
+        let app = axum::Router::new()
+            .route("/api/scope/revoke", axum::routing::post(scope_live_revoke))
+            .route_layer(axum::middleware::from_fn_with_state(state.clone(), operator_gate))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let resp = reqwest::Client::new().post(format!("http://{addr}/api/scope/revoke"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"request_id": "scope-review-browser", "reason": "done"}))
+            .send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        server.abort();
+        let s = state.lock().await;
+        let rows = s.recent_chain(10);
+        let act = rows.iter().find(|e| e.event_type == "scope_revoked").unwrap();
+        let gate = rows.iter().find(|e| e.event_type == "operator_gate").unwrap();
+        assert_eq!(act.event_data["authorized_by_gate"], gate.hash);
+        assert_eq!(s.scope_requests["scope-review-browser"].revoked.as_ref().unwrap().by,
+            operator, "the admitted direct operator must survive the middleware boundary");
+    }
+
+    /// GPT review of #1035, point 3: delivery cannot race the revocation into an ambiguous
+    /// state. The tightening and its witness land first; the notice is an obligation derived
+    /// from the chain, so a failed ensure leaves "revoked, witnessed, not yet told" — never
+    /// "told but not revoked" — and the projector completes it from the same entry.
+    #[tokio::test]
+    async fn a_failed_disposition_leaves_the_revocation_applied_and_recoverable() {
+        let (dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-race".into(), live_req("scope-race", "/x/race.md", now));
+        }
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("inbox.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch("CREATE TRIGGER no_disp BEFORE INSERT ON member_notices
+             WHEN NEW.kind = 'disposition' BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+        let resp = scope_live_revoke(State(state.clone()), None,
+            Json(serde_json::json!({"request_id": "scope-race", "reason": "x"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "the tightening still lands");
+        {
+            let s = state.lock().await;
+            assert!(!s.has_scope_grant("kimi-code", "/x/race.md"), "revoked despite the failed notice");
+            assert!(s.recent_chain(10).iter().any(|e| e.event_type == "scope_revoked"));
+            assert!(s.inbox_store.drain_member("kimi-code").unwrap().is_empty(), "nothing delivered yet");
+        }
+        conn.execute_batch("DROP TRIGGER no_disp").unwrap();
+        let s = state.lock().await;
+        let out = super::super::handler::project_dispositions(&s.chain_store, &s.inbox_store).unwrap();
+        assert!(out.projected >= 1, "the projector derives the obligation from the chain: {out:?}");
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        assert!(mail.iter().any(|n| n.pointer_uri.as_deref() == Some("hestia://scope/scope-race#revoked")),
+                "the member is told on the retry: {mail:?}");
+    }
+
+    /// ORDER: a revocation whose witness cannot be written is not applied.
+    #[tokio::test]
+    async fn an_unwitnessed_live_revoke_changes_nothing() {
+        let (dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-live-w".into(), live_req("scope-live-w", "/x/w.md", now));
+        }
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch("CREATE TRIGGER no_revoke BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'scope_revoked' BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+        let resp = scope_live_revoke(State(state.clone()), None, Json(serde_json::json!({"request_id": "scope-live-w"})))
+            .await.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let s = state.lock().await;
+        assert!(s.has_scope_grant("kimi-code", "/x/w.md"), "still in force: nothing was recorded");
+        assert!(s.scope_requests["scope-live-w"].revoked.is_none());
+    }
+
+    /// A standing grant over the same path is a separate authority: revoking the live grant
+    /// does not touch it, and the operator is told it still covers the path.
+    #[tokio::test]
+    async fn revoking_a_live_grant_names_a_standing_grant_that_still_covers_it() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-live-s".into(), live_req("scope-live-s", "/x/tree", now));
+        }
+        let resp = scope_standing_promote(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/x/tree"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = scope_live_revoke(State(state.clone()), None, Json(serde_json::json!({"request_id": "scope-live-s"})))
+            .await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(out["standing_grant_still_covers_path"], true, "{out}");
+        let s = state.lock().await;
+        assert!(s.standing_scope.has_live("kimi-code", "/x/tree", now), "the standing grant is untouched");
+    }
+
+    /// dp's "make standing" button (2026-09-08). A live grant — memory-only, dies with the
+    /// daemon — becomes a durable one, carrying its provenance: the request id and the
+    /// member's stated need travel into the standing row. Witnessed intent -> commit ->
+    /// witnessed success, like a standing decide.
+    #[tokio::test]
+    async fn promote_makes_a_live_grant_standing_with_its_provenance() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-live-1".into(), live_req("scope-live-1", "/x/tree", now));
+        }
+        // nothing to promote for a path with no live grant
+        let resp = scope_standing_promote(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/x/other"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = scope_standing_promote(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/x/tree"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "a live grant promotes");
+        let s = state.lock().await;
+        let g = s.standing_scope.grants.iter()
+            .find(|g| g.member == "kimi-code" && g.path == "/x/tree")
+            .expect("a standing row now exists");
+        assert_eq!(g.request_id.as_deref(), Some("scope-live-1"), "provenance travels");
+        assert_eq!(g.reason, "watched it used well", "the live decision's reason is kept when none is given");
+        assert!(!g.recursive, "reach is carried, and the live grant was exact");
+        assert!(s.standing_scope.has_live("kimi-code", "/x/tree", now));
+        let chain = s.recent_chain(20);
+        let ok = chain.iter().find(|e| e.event_type == "scope_granted").expect("terminal record");
+        assert_eq!(ok.event_data["origin"], "promoted_from_live");
+        assert!(chain.iter().any(|e| e.event_type == "scope_grant_intent"), "intent precedes success");
+        let granted_rows = chain.iter().filter(|e| e.event_type == "scope_granted").count();
+        // The dashboard shows ONE row for the reach: the standing one. The live grant it was
+        // promoted from is folded, not listed beside it with its own "make standing" button
+        // (dp, 2026-09-12: pressed it three times on cbp-being's home grant and saw both rows).
+        let rows = s.dashboard_snapshot(20).scope_grants;
+        let tree: Vec<_> = rows.iter().filter(|r| r["path"] == "/x/tree").collect();
+        assert_eq!(tree.len(), 1, "promoted live row folds into its standing row: {rows:?}");
+        assert_eq!(tree[0]["lifetime"], "standing");
+        drop(s);
+
+        // A second press is not a second widening: 200, nothing appended, store unchanged.
+        let resp = scope_standing_promote(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/x/tree"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "already standing answers OK, not an error");
+        let s = state.lock().await;
+        let chain = s.recent_chain(40);
+        assert_eq!(chain.iter().filter(|e| e.event_type == "scope_granted").count(), granted_rows,
+                   "an idempotent press appends no scope_granted row");
+        assert_eq!(s.standing_scope.grants.iter().filter(|g| g.path == "/x/tree").count(), 1);
+    }
+
+    /// The fold is by reach: a live grant that reaches MORE than its standing twin (subtree
+    /// beside an exact standing row) is still a distinct grant and stays listed.
+    #[tokio::test]
+    async fn dashboard_keeps_a_live_grant_whose_reach_exceeds_its_standing_twin() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        let mut s = state.lock().await;
+        let mut wide = live_req("scope-live-3", "/y/tree", now);
+        wide.recursive = true;
+        s.scope_requests.insert("scope-live-3".into(), wide);
+        s.scope_requests.insert("scope-live-4".into(), live_req("scope-live-4", "/y/alone", now));
+        s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+            member: "kimi-code".into(), path: "/y/tree".into(), granted_at: now,
+            granted_by: "operator".into(), reason: "r".into(), expires_at: None,
+            request_id: None, recursive: false,
+        })).unwrap();
+        let rows = s.dashboard_snapshot(20).scope_grants;
+        let tree: Vec<_> = rows.iter().filter(|r| r["path"] == "/y/tree").collect();
+        assert_eq!(tree.len(), 2, "exact standing does not cover a recursive live grant: {rows:?}");
+        let alone: Vec<_> = rows.iter().filter(|r| r["path"] == "/y/alone").collect();
+        assert_eq!(alone.len(), 1, "a live grant with no standing twin is listed as before");
+        assert_eq!(alone[0]["lifetime"], "live");
+        let granted_before = s.recent_chain(50).iter().filter(|e| e.event_type == "scope_granted").count();
+        drop(s);
+
+        // Pressing "make standing" on the surviving RECURSIVE live row widens the exact standing
+        // twin (GPT review of #1021): not a no-op, one grant remains, now recursive, the live row
+        // folds, and the widening is witnessed exactly once.
+        let resp = scope_standing_promote(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/y/tree"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_ne!(body["status"], "already_standing", "exact standing must not swallow a recursive promote: {body}");
+        let s = state.lock().await;
+        let tree_grants: Vec<_> = s.standing_scope.grants.iter().filter(|g| g.path == "/y/tree").collect();
+        assert_eq!(tree_grants.len(), 1, "the store replaces by (member, path)");
+        assert!(tree_grants[0].recursive, "the standing grant now reaches the subtree");
+        let rows = s.dashboard_snapshot(20).scope_grants;
+        let tree: Vec<_> = rows.iter().filter(|r| r["path"] == "/y/tree").collect();
+        assert_eq!(tree.len(), 1, "the recursive live row folds into the now-recursive standing row: {rows:?}");
+        assert_eq!(tree[0]["lifetime"], "standing");
+        let granted_after = s.recent_chain(50).iter().filter(|e| e.event_type == "scope_granted").count();
+        assert_eq!(granted_after, granted_before + 1, "the widening is witnessed once");
+        drop(s);
+
+        // and a second press on it is now the idempotent case
+        let resp = scope_standing_promote(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/y/tree"}))).await.into_response();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["status"], "already_standing");
+        let s = state.lock().await;
+        assert_eq!(s.recent_chain(50).iter().filter(|e| e.event_type == "scope_granted").count(), granted_after);
+    }
+
+    /// dp's "make recursive" button. Exact is the default; this is the one explicit,
+    /// witnessed act that makes a grant reach its subtree — and it moves BOTH channels for
+    /// that (member, path) so they never disagree. Widening needs a reason; narrowing does not.
+    #[tokio::test]
+    async fn recursive_flips_reach_on_both_channels_and_is_exact_by_default() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-live-2".into(), live_req("scope-live-2", "/w/tree", now));
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
+                granted_by: "operator".into(), reason: "r".into(), expires_at: None,
+                request_id: None, recursive: false,
+            })).unwrap();
+            assert!(s.has_scope_grant("kimi-code", "/w/tree"));
+            assert!(!s.has_scope_grant("kimi-code", "/w/tree/child.py"), "EXACT by default");
+        }
+        let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/w/tree", "recursive": true}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "widening without a reason is refused");
+        let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/nope", "recursive": true, "reason": "r"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let gen0 = state.lock().await.standing_scope.generation;
+        let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/w/tree", "recursive": true,
+            "reason": "it works the whole worktree"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        {
+            let s = state.lock().await;
+            assert!(s.has_scope_grant("kimi-code", "/w/tree/child.py"), "the subtree is reachable now");
+            assert!(!s.has_scope_grant("kimi-code", "/w/treeful"), "never a sibling");
+            assert_eq!(s.standing_scope.generation, gen0 + 1, "law_hash moves with reach");
+            assert!(s.scope_requests["scope-live-2"].recursive, "the live channel agrees");
+            let chain = s.recent_chain(10);
+            let term = chain.iter().find(|e| e.event_type == "scope_reach_changed").expect("terminal record");
+            let intent = chain.iter().find(|e| e.event_type == "scope_reach_change_intent").expect("intent record");
+            assert_eq!(term.event_data["intent"], serde_json::json!(intent.hash), "terminal carries the intent's hash");
+            assert_eq!(term.event_data["standing_generation"], serde_json::json!(gen0 + 1),
+                       "the generation the commit ACTUALLY produced, not a prediction");
+        }
+        // back to exact needs no reason
+        let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/w/tree", "recursive": false}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!state.lock().await.has_scope_grant("kimi-code", "/w/tree/child.py"));
+    }
+
+    /// A no-op (already that reach) is a 409: nothing witnessed, generation unmoved.
+    /// GPT review of #1002, blocker 2: the first cut pre-announced `generation + 1` in a
+    /// record for a store that then did not move.
+    #[tokio::test]
+    async fn recursive_no_op_writes_nothing_and_moves_nothing() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
+                granted_by: "operator".into(), reason: "r".into(), expires_at: None,
+                request_id: None, recursive: false,
+            })).unwrap();
+        }
+        let (gen0, chain0) = { let s = state.lock().await; (s.standing_scope.generation, s.recent_chain(50).len()) };
+        let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/w/tree", "recursive": false}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "already exact: a no-op is a conflict, not a change");
+        let s = state.lock().await;
+        assert_eq!(s.standing_scope.generation, gen0, "no generation movement on a no-op");
+        assert_eq!(s.recent_chain(50).len(), chain0, "no witness row for a change that did not happen");
+    }
+
+    /// A failed vault commit leaves the chain holding the INTENT and no terminal record,
+    /// and the store bit-identical — the record can never say reach changed when it did not.
+    #[tokio::test]
+    async fn recursive_failed_commit_leaves_intent_only_and_store_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
+                granted_by: "operator".into(), reason: "r".into(), expires_at: None,
+                request_id: None, recursive: false,
+            })).unwrap();
+        }
+        let (before_grants, before_gen) = {
+            let s = state.lock().await;
+            (s.standing_scope.grants.clone(), s.standing_scope.generation)
+        };
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/w/tree", "recursive": true, "reason": "r"}))).await.into_response();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "the vault write must have failed for this test to test anything");
+        let s = state.lock().await;
+        assert_eq!(s.standing_scope.grants, before_grants, "store bit-identical");
+        assert_eq!(s.standing_scope.generation, before_gen, "generation included");
+        assert!(!s.has_scope_grant("kimi-code", "/w/tree/child.py"));
+        let chain = s.recent_chain(20);
+        assert!(chain.iter().any(|e| e.event_type == "scope_reach_change_intent"), "the intent is the record of the attempt");
+        assert!(!chain.iter().any(|e| e.event_type == "scope_reach_changed"), "no terminal record for a change not in force");
+    }
+
+    /// A failed TERMINAL witness rolls the reach change back through the commit path, so a
+    /// reach change without its terminal record is never live.
+    #[tokio::test]
+    async fn recursive_failed_terminal_witness_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
+                granted_by: "operator".into(), reason: "r".into(), expires_at: None,
+                request_id: None, recursive: false,
+            })).unwrap();
+        }
+        let gen0 = state.lock().await.standing_scope.generation;
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_reach_terminal BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'scope_reach_changed' AND NEW.event_data LIKE '%\"intent\"%'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;").unwrap();
+        let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/w/tree", "recursive": true, "reason": "r"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        conn.execute_batch("DROP TRIGGER fail_reach_terminal").unwrap();
+        let s = state.lock().await;
+        assert!(!s.has_scope_grant("kimi-code", "/w/tree/child.py"), "rolled back: not recursive");
+        assert_eq!(s.standing_scope.generation, gen0, "generation restored by the rollback commit");
+        let chain = s.recent_chain(20);
+        assert!(chain.iter().any(|e| e.event_type == "scope_reach_change_intent"));
+        assert!(!chain.iter().any(|e| e.event_type == "scope_reach_changed"));
+    }
+
+    /// A standing grant on `member` with the given reach, committed through the vault.
+    async fn seed_grant(state: &SharedState, member: &str, path: &str, recursive: bool) {
+        let now = crate::server::gate_escalation::now_secs();
+        let mut s = state.lock().await;
+        s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+            member: member.into(), path: path.into(), granted_at: now,
+            granted_by: "operator".into(), reason: "r".into(), expires_at: None,
+            request_id: None, recursive,
+        })).unwrap();
+    }
+
+    /// A member the daemon has RECORDED — connect registers it, which is the only way
+    /// `member_registry` can say yes (it can say no; `member_lct` cannot).
+    async fn register_member(state: &SharedState, id: &str) {
+        super::super::handler::tool_connect(state, &serde_json::json!({
+            "plugin_id": id, "host_agent": "test"})).await.unwrap();
+    }
+
+    async fn grant(state: &SharedState, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let resp = scope_grant(State(state.clone()), Json(body)).await.into_response();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn retire(state: &SharedState, id: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let resp = agent_retire(State(state.clone()), Path(id.to_string()), Json(body)).await.into_response();
+        let st = resp.status();
+        let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (st, serde_json::from_slice(&b).unwrap())
+    }
+
+    async fn reinstate(state: &SharedState, id: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let resp = agent_reinstate(State(state.clone()), Path(id.to_string()), Json(body)).await.into_response();
+        let st = resp.status();
+        let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (st, serde_json::from_slice(&b).unwrap())
+    }
+
+    async fn register(state: &SharedState, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let resp = agent_register(State(state.clone()), Json(body)).await.into_response();
+        let st = resp.status();
+        let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (st, serde_json::from_slice(&b).unwrap())
+    }
+
+    /// dp's third ask: register a DISCOVERED harness. The property that matters is what the
+    /// route refuses to take from the caller -- dp, 09-08: the agent field must be "a dropdown
+    /// from actual available agents not something i type". An id that can be typed can be
+    /// mistyped, and three mistyped ids are the reason this whole sprint exists.
+    ///
+    /// The inventory is a separate installed program, so a unit test cannot make it report a
+    /// chosen fixture. What IS testable here, and is the whole security property, is that no
+    /// caller-supplied id can reach the registry: a body carrying `plugin_id` is refused
+    /// outright, and an atlas id absent from this machine's report registers nothing.
+    /// dp, 2026-09-27: Discover offered register on five harnesses not installed on McNugget.
+    #[test]
+    fn register_refuses_what_is_not_installed_here() {
+        let rec = |v: serde_json::Value| serde_json::json!({"agent": "codex", "plugin": "codex", "installed": v});
+        assert!(register_refusal_not_here("codex", &rec(serde_json::json!(true))).is_none());
+        for absent in [serde_json::json!(false), serde_json::Value::Null, serde_json::json!("yes")] {
+            let r = register_refusal_not_here("codex", &rec(absent.clone()))
+                .unwrap_or_else(|| panic!("registered a harness with installed={absent}"));
+            assert!(r["error"].as_str().unwrap().contains("not installed on this machine"), "{r}");
+        }
+        // A record with no `installed` at all is not evidence of presence either.
+        assert!(register_refusal_not_here("x", &serde_json::json!({"agent": "x"})).is_some());
+    }
+
+    #[tokio::test]
+    async fn register_never_takes_an_id_from_the_caller() {
+        let (_dir, state) = test_state().await;
+        let before = state.lock().await.member_registry.iter_sorted().len();
+
+        for body in [
+            serde_json::json!({"atlas_id": "claude", "reason": "r", "plugin_id": "Claude-code"}),
+            serde_json::json!({"atlas_id": "claude", "reason": "r", "plugin_id": ""}),
+        ] {
+            let (st, b) = register(&state, body).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "a typed id must be refused outright: {b}");
+            assert!(b["error"].as_str().unwrap().contains("plugin_id is not accepted"), "{b}");
+        }
+        // The account is required, like every other act that changes who is a party.
+        for body in [
+            serde_json::json!({"atlas_id": "claude"}),
+            serde_json::json!({"reason": "r"}),
+        ] {
+            assert_eq!(register(&state, body).await.0, StatusCode::BAD_REQUEST);
+        }
+        // An id this machine did not discover registers nothing -- "cannot register what was
+        // not discovered" is the rule that makes the derivation trustworthy.
+        let (st, b) = register(&state, serde_json::json!({
+            "atlas_id": "no-such-harness-xyz", "reason": "r"})).await;
+        assert!(
+            st == StatusCode::NOT_FOUND || st == StatusCode::SERVICE_UNAVAILABLE,
+            "either 'not in the inventory' or 'the inventory did not run' -- never a mint: {st} {b}");
+        assert_eq!(state.lock().await.member_registry.iter_sorted().len(), before,
+                   "no refusal above may have minted a member");
+    }
+
+    /// A retired id is not re-registered into existence: it is reinstated, so its history stays
+    /// one thread rather than becoming two records of the same id.
+    #[tokio::test]
+    async fn registering_a_retired_id_is_refused_in_favour_of_reinstating_it() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "claude-code").await;
+        let (st, _) = retire(&state, "claude-code", serde_json::json!({
+            "reason": "test", "ref": "x", "confirm_active": true})).await;
+        assert_eq!(st, StatusCode::OK);
+        // `claude` is the atlas id whose governance id is `claude-code` (the ALIASES mapping),
+        // so this is the retired member arriving by its discovered route. Skipped rather than
+        // asserted when the inventory is not installed on the machine running the test: the
+        // refusal being probed is downstream of a real report.
+        let (st, b) = register(&state, serde_json::json!({"atlas_id": "claude", "reason": "again"})).await;
+        if st == StatusCode::SERVICE_UNAVAILABLE || st == StatusCode::NOT_FOUND {
+            eprintln!("SKIPPED the retired-register arm: no inventory report here ({st})");
+            return;
+        }
+        assert_eq!(st, StatusCode::CONFLICT, "{b}");
+        assert_eq!(b["retired"], serde_json::json!(true));
+        assert!(b["error"].as_str().unwrap().contains("Reinstate it"), "{b}");
+    }
+
+    /// dp, 2026-09-28: registering the being "said already registered but it doesn't show up".
+    /// The views inferred membership from trust rows, which only a member that has ACTED has.
+    #[tokio::test]
+    async fn the_snapshot_lists_a_member_that_has_never_acted() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "claude-code").await;
+        register_member(&state, "mcnugget-being").await;
+        let s = state.lock().await;
+        let snap = s.dashboard_snapshot(10);
+        assert!(snap.members.contains(&"mcnugget-being".to_string()),
+                "a registered member with no acts must be listed: {:?}", snap.members);
+        assert!(!snap.trust.iter().any(|t| t.plugin_id == "mcnugget-being"),
+                "fixture: it has no trust row, which is exactly why it was invisible");
+        assert!(snap.members.contains(&"claude-code".to_string()));
+    }
+
+    /// dp, 2026-09-25: "i tried retiring 'caude-code' through the ui, and it shows as retired in
+    /// the explore screen, but still shows up as a registered harness in the witness and other
+    /// displays." The agents bar above the witness feed drew a chip for every trust grain the
+    /// built-in registry does not know, with `connected: true`, and never asked about
+    /// retirement. dp's exact id, so the pin is the complaint.
+    #[tokio::test]
+    async fn a_retired_phantom_leaves_the_agents_bar_too() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "claude-code").await;
+        register_member(&state, "caude-code").await;
+        // How dp's `caude-code` came to exist in the first place: a mistyped grant (#1067),
+        // witnessed under that id -- which is what gives it a trust grain, and so a chip.
+        let (st, b) = grant(&state, serde_json::json!({
+            "plugin_id": "caude-code", "path": "/w/repos", "reason": "dp's typo",
+            "recursive": true, "register_new_member": true})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let chips = |s: &crate::server::state::ServerState| -> Vec<String> {
+            s.dashboard_snapshot(10).orchestrators.iter()
+                .filter_map(|o| o.get("id").and_then(|v| v.as_str()).map(String::from)).collect()
+        };
+        // NOT VACUOUS: the phantom must be a chip before retirement, or this test cannot see
+        // the defect it is here for.
+        let before = chips(&*state.lock().await);
+        assert!(before.contains(&"caude-code".to_string()),
+                "fixture: the phantom must have a chip to lose: {before:?}");
+
+        let (st, b) = retire(&state, "caude-code", serde_json::json!({
+            "reason": "a typo of claude-code", "ref": "dp 2026-09-25"})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let s = state.lock().await;
+        let after = chips(&s);
+        assert!(!after.contains(&"caude-code".to_string()),
+                "a retired id is not a harness on this seat: {after:?}");
+        // The snapshot still REPORTS it retired -- the view filters, the snapshot reports.
+        assert!(s.dashboard_snapshot(10).retired.contains(&"caude-code".to_string()));
+        // ...and it removed THAT chip and nothing else: every other id drawn before is drawn
+        // after, so retirement cannot quietly thin the bar of a live seat.
+        let expected: Vec<String> = before.into_iter().filter(|c| c != "caude-code").collect();
+        assert_eq!(after, expected);
+    }
+
+    /// dp, 2026-09-08 and again on 09-19 and 09-21: three `claude-code` ids in the trust list,
+    /// "no way of managing them". This is the whole act, on the real shape of that problem: two
+    /// phantoms that have never acted beside the seat with every act.
+    #[tokio::test]
+    async fn retiring_a_phantom_revokes_its_authority_and_refuses_to_touch_the_live_seat() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "claude-code").await;
+        register_member(&state, "Claude-code").await;
+
+        // The phantom holds the grant dp typed at it by mistake.
+        let (st, _) = grant(&state, serde_json::json!({
+            "plugin_id": "Claude-code", "path": "/w/repos", "reason": "dp's typo, 2026-09-08",
+            "recursive": true, "register_new_member": true})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(state.lock().await.has_scope_grant("Claude-code", "/w/repos/x"));
+
+        // Retiring it: authority gone in the same act, and the account is required.
+        let (st, b) = retire(&state, "Claude-code", serde_json::json!({"reason": "a typo of claude-code"})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "no ref: {b}");
+        let (st, b) = retire(&state, "Claude-code", serde_json::json!({
+            "reason": "a typo of claude-code", "ref": "dp 2026-09-08"})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["revoked_standing_paths"], serde_json::json!(["/w/repos"]));
+        {
+            let s = state.lock().await;
+            assert!(s.retired_members.is_retired("Claude-code"));
+            assert!(!s.has_scope_grant("Claude-code", "/w/repos/x"),
+                    "a retired id must not still reach a path");
+            assert!(s.dashboard_snapshot(10).retired.contains(&"Claude-code".to_string()),
+                    "the view needs to know, to be able to hide it");
+        }
+
+        // ...and a NEW grant to it is refused, not escapable by the ahead-of-connect flag:
+        // "real but not yet connected" is a different claim from "deliberately retired".
+        for extra in [serde_json::json!({}), serde_json::json!({"register_new_member": true})] {
+            let mut body = serde_json::json!({
+                "plugin_id": "Claude-code", "path": "/w/other", "reason": "again"});
+            body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let (st, b) = grant(&state, body).await;
+            assert_eq!(st, StatusCode::CONFLICT, "{b}");
+            assert_eq!(b["retired"], serde_json::json!(true));
+        }
+
+        // THE GUARD. `claude-code` is the seat with the acts; the two differ by one character.
+        // The acts have to be REAL for the guard to have anything to measure -- connecting is
+        // not acting, and a fixture where the "live" seat has taken no action would let this
+        // assertion pass for the wrong reason (it did, on the first run).
+        {
+            let s = state.lock().await;
+            for i in 0..3 {
+                s.append_chain("outcome", serde_json::json!({
+                    "plugin_id": "claude-code", "success": true, "tool_name": "Read", "n": i})).unwrap();
+            }
+        }
+        let (st, b) = retire(&state, "claude-code", serde_json::json!({
+            "reason": "wrong one of the three", "ref": "x"})).await;
+        assert_eq!(st, StatusCode::CONFLICT, "a live member must not retire by one keystroke: {b}");
+        assert!(b["acts_recently"].as_u64().unwrap() > 0, "{b}");
+        assert!(state.lock().await.retired_members.get("claude-code").is_none());
+        // ...and the operator can still mean it.
+        let (st, _) = retire(&state, "claude-code", serde_json::json!({
+            "reason": "meant it", "ref": "x", "confirm_active": true})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(state.lock().await.retired_members.get("claude-code").unwrap().was_active);
+
+        // Reinstate: reversible, and it does NOT hand authority back silently.
+        let (st, b) = reinstate(&state, "Claude-code", serde_json::json!({"reason": "mistake"})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["grants_not_restored"], serde_json::json!(["/w/repos"]));
+        {
+            let s = state.lock().await;
+            assert!(!s.retired_members.is_retired("Claude-code"));
+            assert!(!s.has_scope_grant("Claude-code", "/w/repos/x"),
+                    "reinstate is not a grant route wearing another name");
+        }
+        let (st, _) = reinstate(&state, "never-retired", serde_json::json!({"reason": "x"})).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    async fn decide(state: &SharedState, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let resp = scope_decide(State(state.clone()), Json(body)).await.into_response();
+        let st = resp.status();
+        let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (st, serde_json::from_slice(&b).unwrap())
+    }
+
+    async fn promote(state: &SharedState, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let resp = scope_standing_promote(State(state.clone()), Json(body)).await.into_response();
+        let st = resp.status();
+        let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (st, serde_json::from_slice(&b).unwrap())
+    }
+
+    /// cbp, PR #1100 review, finding 1 -- probed with a throwaway test: retire `Claude-code`,
+    /// grant `/w/a` to `claude-code`, reassign `claude-code -> Claude-code`: 200, and the retired
+    /// id held the path. The first cut guarded one door of four. One test per door, as asked.
+    #[tokio::test]
+    async fn authority_reaches_a_retired_id_through_no_door() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "claude-code").await;
+        register_member(&state, "kimi-code").await;
+        let now = crate::server::gate_escalation::now_secs();
+        // A request kimi-code filed BEFORE being retired: pending, undecided.
+        {
+            let mut s = state.lock().await;
+            let mut req = live_req("scope-pending-1", "/x/pending", now);
+            req.granted = None; req.decided_by = None; req.decided_at = None; req.decision_reason = None;
+            s.scope_requests.insert("scope-pending-1".into(), req);
+        }
+        let (st, _) = retire(&state, "kimi-code", serde_json::json!({"reason": "test", "ref": "x"})).await;
+        assert_eq!(st, StatusCode::OK);
+
+        // DOOR 1: an operator grant (was already guarded; kept in the same test on purpose).
+        let (st, b) = grant(&state, serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/w/g", "reason": "r", "register_new_member": true})).await;
+        assert_eq!((st, &b["retired"]), (StatusCode::CONFLICT, &serde_json::json!(true)), "{b}");
+
+        // DOOR 2: deciding its pending request -- a grant, live or standing -- is refused; a
+        // REFUSAL of that request is not (retirement does not stop the operator saying no).
+        for standing in [false, true] {
+            let (st, b) = decide(&state, serde_json::json!({
+                "request_id": "scope-pending-1", "granted": true, "standing": standing, "reason": "r"})).await;
+            assert_eq!((st, &b["retired"]), (StatusCode::CONFLICT, &serde_json::json!(true)), "standing={standing}: {b}");
+        }
+        assert!(!state.lock().await.has_scope_grant("kimi-code", "/x/pending"));
+        let (_, b) = decide(&state, serde_json::json!({
+            "request_id": "scope-pending-1", "granted": false, "reason": "no"})).await;
+        assert_ne!(b["retired"], serde_json::json!(true), "a refusal is still allowed: {b}");
+
+        // DOOR 3: promoting a live grant to standing.
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-live-r".into(), live_req("scope-live-r", "/x/live", now));
+        }
+        let (st, b) = promote(&state, serde_json::json!({"plugin_id": "kimi-code", "path": "/x/live"})).await;
+        assert_eq!((st, &b["retired"]), (StatusCode::CONFLICT, &serde_json::json!(true)), "{b}");
+
+        // DOOR 4: reassign -- the one the reviewer walked through. `to` is one keystroke away.
+        let (st, _) = grant(&state, serde_json::json!({"plugin_id": "claude-code", "path": "/w/a", "reason": "r"})).await;
+        assert_eq!(st, StatusCode::OK);
+        let resp = reassign(&state, serde_json::json!({
+            "plugin_id": "claude-code", "to": "kimi-code", "path": "/w/a", "reason": "typo"})).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "reassign to a retired id must be refused");
+        let s = state.lock().await;
+        assert!(s.has_scope_grant("claude-code", "/w/a/x") || s.has_scope_grant("claude-code", "/w/a"),
+                "the source keeps its grant: nothing moved");
+        assert!(!s.has_scope_grant("kimi-code", "/w/a"), "and the retired id holds nothing");
+    }
+
+    /// cbp, finding 2: a live (session) grant survived retirement, because `has_scope_grant`
+    /// answers from `scope_requests` too and the commit touched only the standing store.
+    #[tokio::test]
+    async fn retiring_revokes_live_grants_with_the_standing_ones() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "kimi-code").await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-live-1".into(), live_req("scope-live-1", "/w/live", now));
+            assert!(s.has_scope_grant("kimi-code", "/w/live"), "setup: the live grant is in force");
+        }
+        let (st, b) = retire(&state, "kimi-code", serde_json::json!({"reason": "test", "ref": "x"})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["revoked_live_paths"], serde_json::json!(["/w/live"]), "{b}");
+        let s = state.lock().await;
+        assert!(!s.has_scope_grant("kimi-code", "/w/live"), "no window in which a retired id still reaches a path");
+        let r = &s.scope_requests["scope-live-1"];
+        assert!(r.revoked.as_ref().is_some_and(|v| v.reason.contains("retired")), "revoked, with the reason: {:?}", r.revoked);
+    }
+
+    /// cbp, finding 4: `.unwrap_or(0)` turned a chain scan error into "never acted", and the
+    /// live seat retired with no confirm. Unknown is a refusal, not a pass.
+    #[test]
+    fn the_retire_guard_fails_closed_when_it_cannot_measure() {
+        let err: Result<usize, String> = Err("chain read failed".into());
+        let v = retire_guard(&err, false).expect("an unmeasurable count must refuse");
+        assert_eq!(v["unmeasurable"], serde_json::json!(true));
+        assert!(v["error"].as_str().unwrap().contains("UNKNOWN"));
+        assert!(retire_guard(&err, true).is_none(), "the operator may still confirm past it");
+        assert!(retire_guard(&Ok(0), false).is_none(), "a phantom retires freely");
+        let v = retire_guard(&Ok(3), false).unwrap();
+        assert_eq!(v["acts_recently"], serde_json::json!(3));
+        assert!(retire_guard(&Ok(3), true).is_none());
+    }
+
+    /// cbp, finding 5: `retired_member_connected` was documented and did not exist.
+    #[tokio::test]
+    async fn a_retired_id_that_connects_is_witnessed_not_hidden() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "caude-code").await;
+        let (st, _) = retire(&state, "caude-code", serde_json::json!({"reason": "typo", "ref": "x"})).await;
+        assert_eq!(st, StatusCode::OK);
+        let before = state.lock().await.recent_chain(200).iter()
+            .filter(|e| e.event_type == "retired_member_connected").count();
+        register_member(&state, "caude-code").await;   // it connects anyway
+        let s = state.lock().await;
+        let after: Vec<_> = s.recent_chain(200).into_iter()
+            .filter(|e| e.event_type == "retired_member_connected").collect();
+        assert_eq!(after.len(), before + 1, "the connect is witnessed as news");
+        assert_eq!(after[0].event_data["plugin_id"], serde_json::json!("caude-code"));
+        assert!(s.retired_members.is_retired("caude-code"), "connecting does not un-retire it");
+    }
+
+    /// A delegation is signed by the operator's own key, and the test daemon has none -- the
+    /// route correctly refused with 500 until this existed. Any 32 bytes are a valid ed25519
+    /// seed; the file is the shape `operator_delegator` reads first.
+    async fn seed_operator_key(state: &SharedState) {
+        let home = state.lock().await.home.clone();
+        std::fs::write(home.join("operator.key"),
+            serde_json::json!({"secret_key_hex": hex::encode([7u8; 32])}).to_string()).unwrap();
+    }
+
+    async fn deleg(state: &SharedState, id: &str, body: Option<serde_json::Value>) -> (StatusCode, serde_json::Value) {
+        let (st, b) = match body {
+            None => agent_delegations_list(State(state.clone()), Path(id.to_string())).await,
+            Some(body) => agent_delegation_grant(State(state.clone()), Path(id.to_string()), Json(body)).await,
+        };
+        (st, b.0)
+    }
+
+    /// dp's fourth ask, the half #1079 left: manage an agent's delegated authority from the
+    /// agent. The key is DERIVED from the registry; the body may not name an agent at all.
+    #[tokio::test]
+    async fn delegations_are_keyed_to_the_agent_in_the_url_and_never_typed() {
+        let (_dir, state) = test_state().await;
+        seed_operator_key(&state).await;
+        register_member(&state, "kimi-code").await;
+        register_member(&state, "codex").await;
+
+        // Nothing yet, and the picker's vocabulary rides along.
+        let (st, b) = deleg(&state, "kimi-code", None).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["delegations"], serde_json::json!([]));
+        assert_eq!(b["roles"], serde_json::json!(DELEGATION_ROLES));
+        // An unregistered member has no key to bind to.
+        assert_eq!(deleg(&state, "nobody", None).await.0, StatusCode::NOT_FOUND);
+
+        // The body may not carry the agent: that is #1067's hole, refused not ignored.
+        for k in ["agent", "agent_id", "agent_lct_id", "plugin_id"] {
+            let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({
+                "roles": ["witness"], "reason": "r", k: "codex"}))).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{k}: {b}");
+        }
+        // A free-text role is a typed identity by another name.
+        let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({"roles": ["grand-vizier"], "reason": "r"}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["roles"], serde_json::json!(DELEGATION_ROLES), "the refusal offers the real list");
+        // Empty scope is full authority; say what is delegated.
+        assert_eq!(deleg(&state, "kimi-code", Some(serde_json::json!({"reason": "r"}))).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(deleg(&state, "kimi-code", Some(serde_json::json!({"roles": ["witness"]}))).await.0, StatusCode::BAD_REQUEST);
+
+        // The real thing: witnessed, signed by the operator key, and read back BY THE AGENT.
+        let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({
+            "roles": ["witness", "auditor"], "actions": ["scope.decide:codex:/w"], "expires_hours": 24, "reason": "test"}))).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let did = b["delegation_id"].as_str().unwrap().to_string();
+        let (_, mine) = deleg(&state, "kimi-code", None).await;
+        assert_eq!(mine["delegations"].as_array().unwrap().len(), 1);
+        assert_eq!(mine["delegations"][0]["active"], serde_json::json!(true));
+        let (_, theirs) = deleg(&state, "codex", None).await;
+        assert_eq!(theirs["delegations"], serde_json::json!([]), "another agent's panel does not show it");
+        {
+            let s = state.lock().await;
+            let chain = s.recent_chain(50);
+            let pos = |t: &str| chain.iter().find(|e| e.event_type == t).map(|e| e.chain_position);
+            assert!(pos("delegation_grant_intent") < pos("delegation_granted"), "intent precedes commit");
+        }
+
+        // Revoke: through the wrong agent's panel it is refused; through the right one it lands.
+        let rv = |id: &'static str, d: String, body: serde_json::Value| {
+            let st = state.clone();
+            async move { let (c, b) = agent_delegation_revoke(State(st), Path((id.to_string(), d)), Json(body)).await; (c, b.0) }
+        };
+        let (st, b) = rv("codex", did.clone(), serde_json::json!({"reason": "r"})).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{b}");
+        assert_eq!(rv("kimi-code", did.clone(), serde_json::json!({})).await.0, StatusCode::BAD_REQUEST, "reason required");
+        let (st, b) = rv("kimi-code", did.clone(), serde_json::json!({"reason": "done"})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let (_, mine) = deleg(&state, "kimi-code", None).await;
+        assert_eq!(mine["delegations"][0]["active"], serde_json::json!(false), "revoked, still listed");
+        let (st, b) = rv("kimi-code", did, serde_json::json!({"reason": "again"})).await;
+        assert_eq!((st, &b["already_revoked"]), (StatusCode::OK, &serde_json::json!(true)));
+
+        // A retired id gets authority through this door no more than any other.
+        let (st, _) = retire(&state, "codex", serde_json::json!({"reason": "t", "ref": "x"})).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, b) = deleg(&state, "codex", Some(serde_json::json!({"roles": ["witness"], "reason": "r"}))).await;
+        assert_eq!((st, &b["retired"]), (StatusCode::CONFLICT, &serde_json::json!(true)), "{b}");
+    }
+
+    /// cbp, PR #1106 review, both blocking findings. Probed there with a throwaway test; kept
+    /// here so neither can come back.
+    /// #1110 (cbp, finding 4 on #1106): `actions` is free text, and `scope.decide:<member>:…`
+    /// carries a member id inside it. cbp's exact case -- `codx` for `codex` -- was stored,
+    /// signed and witnessed as a delegation that enforced against no one.
+    #[tokio::test]
+    async fn a_delegated_action_must_name_a_member_this_seat_has_recorded() {
+        let (_dir, state) = test_state().await;
+        seed_operator_key(&state).await;
+        register_member(&state, "kimi-code").await;
+        register_member(&state, "codex").await;
+        let before = crate::delegation::DelegationStore::load(&state.lock().await.vault).unwrap().delegations.len();
+
+        let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({
+            "actions": ["scope.decide:codx:/w"], "reason": "r"}))).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{b}");
+        let e = b["error"].as_str().unwrap();
+        assert!(e.contains("no member 'codx'") && e.contains("Did you mean 'codex'?"), "{e}");
+        // A shape that binds nothing is refused too, with the reason.
+        let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({
+            "actions": ["scope.decide:codex"], "reason": "r"}))).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{b}");
+        assert!(b["error"].as_str().unwrap().contains("no path"), "{b}");
+        // NOTHING was signed or stored by either refusal.
+        assert_eq!(crate::delegation::DelegationStore::load(&state.lock().await.vault).unwrap().delegations.len(), before);
+
+        // The real member is accepted, and an uninterpreted verb rides through -- NAMED.
+        let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({
+            "actions": ["scope.decide:codex:/w", "ledger.read"], "reason": "r"}))).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["unvalidated_actions"], serde_json::json!(["ledger.read"]));
+    }
+
+    #[tokio::test]
+    async fn a_retired_agents_delegations_stay_readable_and_an_unreadable_store_is_not_silence() {
+        let (_dir, state) = test_state().await;
+        seed_operator_key(&state).await;
+        register_member(&state, "kimi-code").await;
+        let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({
+            "roles": ["witness"], "reason": "before retirement"}))).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let (st, _) = retire(&state, "kimi-code", serde_json::json!({"reason": "t", "ref": "x"})).await;
+        assert_eq!(st, StatusCode::OK);
+
+        // FINDING 2: reading is not authority. The one agent whose delegations retirement just
+        // revoked is the one whose history most needs reading.
+        let (st, b) = deleg(&state, "kimi-code", None).await;
+        assert_eq!(st, StatusCode::OK, "a retired agent's delegations must stay readable: {b}");
+        assert_eq!(b["delegations"].as_array().unwrap().len(), 1);
+        assert_eq!(b["delegations"][0]["active"], serde_json::json!(false), "revoked by the retirement");
+        assert_eq!(b["retired"], serde_json::json!(true), "...and the panel says so");
+        // Granting is still refused.
+        let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({
+            "roles": ["witness"], "reason": "after"}))).await;
+        assert_eq!((st, &b["retired"]), (StatusCode::CONFLICT, &serde_json::json!(true)), "{b}");
+
+        // FINDING 1: an UNREADABLE delegation store is not "this member had none". Corrupt the
+        // document (a missing one is Ok(default), which is a real answer; a non-object is not).
+        register_member(&state, "codex").await;
+        let (st, b) = deleg(&state, "codex", Some(serde_json::json!({"roles": ["auditor"], "reason": "r"}))).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        {
+            let mut s = state.lock().await;
+            s.vault.put_document("presence", "delegations", b"[\"not the store's shape\"]".to_vec()).unwrap();
+        }
+        let (st, b) = retire(&state, "codex", serde_json::json!({"reason": "t", "ref": "x"})).await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR,
+                   "an unreadable delegation store must not report a clean retirement: {b}");
+        let err = b["error"].as_str().unwrap();
+        assert!(err.contains("NOT RETIRED") && err.contains("unknown state"), "{err}");
+        // AUTHORITY FIRST, BOOKKEEPING LAST: the id is NOT marked retired, so no operator reads
+        // this as finished while a delegation may still be in force. The first cut recorded the
+        // retirement before touching delegations and this assertion is what caught it.
+        assert!(!state.lock().await.retired_members.is_retired("codex"),
+                "a failure in any authority channel must leave the id un-retired, and a retry \
+                 re-runs the whole act");
+    }
+
+    /// The third channel: retirement revokes delegations along with the grants.
+    #[tokio::test]
+    async fn retiring_revokes_delegations_too() {
+        let (_dir, state) = test_state().await;
+        seed_operator_key(&state).await;
+        register_member(&state, "kimi-code").await;
+        let (st, b) = deleg(&state, "kimi-code", Some(serde_json::json!({"roles": ["witness"], "reason": "r"}))).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let did = b["delegation_id"].as_str().unwrap().to_string();
+        let (st, b) = retire(&state, "kimi-code", serde_json::json!({"reason": "t", "ref": "x"})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        assert_eq!(b["revoked_delegations"], serde_json::json!([did]));
+        let s = state.lock().await;
+        let store = crate::delegation::DelegationStore::load(&s.vault).unwrap();
+        assert!(store.active().is_empty(), "no delegation of a retired id is in force");
+    }
+
+    /// The chain must carry the pair, in order, with the authority change named -- so the act is
+    /// auditable without trusting the response that reported it.
+    #[tokio::test]
+    async fn a_retirement_is_witnessed_as_intent_then_commit() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "caude-code").await;
+        let (st, b) = retire(&state, "caude-code", serde_json::json!({
+            "reason": "typo", "ref": "dp 2026-09-08"})).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let s = state.lock().await;
+        let chain = s.recent_chain(50);
+        let pos = |t: &str| chain.iter().find(|e| e.event_type == t).map(|e| e.chain_position);
+        let (intent, done) = (pos("member_retire_intent"), pos("member_retired"));
+        assert!(intent.is_some() && done.is_some(), "both halves are witnessed");
+        assert!(intent < done, "intent precedes the commit");
+        let rec = chain.iter().find(|e| e.event_type == "member_retired").unwrap();
+        assert_eq!(rec.event_data["plugin_id"], serde_json::json!("caude-code"));
+        assert!(rec.event_data["scope"].as_str().unwrap().contains("this seat only"),
+                "the record states it is per-seat, so a later fleet-wide ruling changes a stated \
+                 decision rather than discovering an accident");
+    }
+
+    /// #1067, measured on McNugget: a grant to `Claude-code` succeeded, was witnessed, was
+    /// durable, and reached nothing, three times, while `claude-code` stayed denied. The
+    /// refusal must leave NOTHING behind -- no row, no generation move, no chain entry -- or
+    /// the typo still mints the phantom it was refused for.
+    #[tokio::test]
+    async fn a_grant_to_a_member_nobody_has_seen_is_refused_and_names_the_one_you_meant() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "claude-code").await;
+        register_member(&state, "kimi-code").await;
+        let before = snapshot(&*state.lock().await);
+
+        let (status, body) = grant(&state, serde_json::json!({
+            "plugin_id": "Claude-code", "path": "/w/repos", "reason": "dp's typo", "recursive": true})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["nearest"], serde_json::json!(["claude-code"]));
+        assert!(body["error"].as_str().unwrap().contains("Did you mean 'claude-code'?"), "{body}");
+        assert!(body["error"].as_str().unwrap().contains("Nothing was written"), "{body}");
+        let (status, body) = grant(&state, serde_json::json!({
+            "plugin_id": "caude-code", "path": "/w/repos", "reason": "and the other one"})).await;
+        assert_eq!((status, &body["nearest"]), (StatusCode::CONFLICT, &serde_json::json!(["claude-code"])));
+        {
+            let s = state.lock().await;
+            assert_eq!(snapshot(&s), before, "a refused grant leaves no row, no generation, no chain entry");
+            assert!(!s.has_scope_grant("Claude-code", "/w/repos/x"));
+            assert!(s.member_registry.get("Claude-code").is_none(), "and mints no member");
+        }
+
+        // The real id goes through, unchanged.
+        let (status, body) = grant(&state, serde_json::json!({
+            "plugin_id": "claude-code", "path": "/w/repos", "reason": "the seat that needed it", "recursive": true})).await;
+        assert_eq!((status, &body["member_known"]), (StatusCode::OK, &serde_json::json!(true)), "{body}");
+        assert!(state.lock().await.has_scope_grant("claude-code", "/w/repos/x"));
+
+        // Granting ahead of a first connect is still possible -- deliberately.
+        let (status, body) = grant(&state, serde_json::json!({
+            "plugin_id": "nomad-being", "path": "/w/nomad", "reason": "provisioning tomorrow",
+            "grant_ahead_of_connect": true})).await;
+        assert_eq!((status, &body["member_known"]), (StatusCode::OK, &serde_json::json!(false)), "{body}");
+        // The deliberate word REGISTERS NOTHING -- which is why it is not called `register_*`.
+        // The grant is recorded; the member is still nobody until it connects.
+        {
+            let s = state.lock().await;
+            assert!(s.has_scope_grant("nomad-being", "/w/nomad"));
+            assert!(s.member_registry.get("nomad-being").is_none(), "granting ahead mints no member");
+        }
+        // ...and `false`, or a non-boolean, is not the deliberate word.
+        for v in [serde_json::json!(false), serde_json::json!("true"), serde_json::json!(1)] {
+            let (status, _) = grant(&state, serde_json::json!({
+                "plugin_id": "thor-being", "path": "/w/t", "reason": "r", "grant_ahead_of_connect": v})).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+        }
+    }
+
+    #[test]
+    fn nearest_member_ids_names_candidates_and_never_stretches() {
+        let known: Vec<String> = ["claude-code", "codex", "kimi-code", "gemini"].iter().map(|s| s.to_string()).collect();
+        let near = |a: &str| nearest_member_ids(a, &known);
+        assert_eq!(near("Claude-code"), vec!["claude-code"], "case");
+        assert_eq!(near("claude_code"), vec!["claude-code"], "punctuation");
+        assert_eq!(near("caude-code"), vec!["claude-code"], "a dropped letter");
+        assert_eq!(near("kimi-cod"), vec!["kimi-code"]);
+        assert_eq!(near("legion-being"), Vec::<String>::new(), "far from everything: say so, do not reach");
+        assert_eq!(near(""), Vec::<String>::new());
+        assert_eq!(near("---"), Vec::<String>::new(), "nothing left after folding");
+        assert_eq!(nearest_member_ids("codex", &[]), Vec::<String>::new());
+    }
+
+    async fn reassign(state: &SharedState, body: serde_json::Value) -> axum::response::Response {
+        scope_standing_reassign(State(state.clone()), Json(body)).await.into_response()
+    }
+
+    fn snapshot(s: &crate::server::state::ServerState) -> (Vec<crate::server::standing_scope::StandingGrant>, u64, usize) {
+        (s.standing_scope.grants.clone(), s.standing_scope.generation, s.recent_chain(50).len())
+    }
+
+    /// GPT's hold on #1006: reassign is ONE act. A recursive source arrives recursive, the
+    /// source row is gone in the same commit, the generation moves once, and the terminal
+    /// record carries the intent's hash and the generation the commit actually produced.
+    #[tokio::test]
+    async fn reassign_moves_the_grant_with_its_reach_in_one_act() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "codex").await;
+        seed_grant(&state, "Claude-code", "/w/tree", true).await;   // the McNugget typo, recursive
+        let (_, gen0, rows0) = { let s = state.lock().await; snapshot(&s) };
+
+        let resp = reassign(&state, serde_json::json!({
+            "plugin_id": "Claude-code", "path": "/w/tree", "to": "codex",
+            "reason": "granted to a typo; the seat is codex"})).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let s = state.lock().await;
+        assert!(s.has_scope_grant("codex", "/w/tree/child.py"), "recursive source stays recursive at the destination");
+        assert!(!s.has_scope_grant("Claude-code", "/w/tree"), "no residue on the source");
+        assert_eq!(s.standing_scope.grants.len(), 1, "one row moved, none duplicated");
+        assert_eq!(s.standing_scope.generation, gen0 + 1, "one mutation, one generation step");
+        let chain = s.recent_chain(20);
+        let intent = chain.iter().find(|e| e.event_type == "scope_reassign_intent").expect("intent record");
+        let term = chain.iter().find(|e| e.event_type == "scope_reassigned").expect("terminal record");
+        assert_eq!(term.event_data["intent"], serde_json::json!(intent.hash));
+        assert_eq!(term.event_data["standing_generation"], serde_json::json!(gen0 + 1));
+        assert_eq!(term.event_data["recursive"], serde_json::json!(true));
+        assert_eq!(term.event_data["to"], serde_json::json!("codex"));
+        assert_eq!(s.recent_chain(50).len(), rows0 + 2, "exactly the intent and the terminal");
+        drop(s);
+
+        // CONCURRENT WRITER: the state lock serialises the two; the loser finds no grant
+        // and writes nothing — there is no half-state for it to complete or to double.
+        let (_, gen1, rows1) = { let s = state.lock().await; snapshot(&s) };
+        let resp = reassign(&state, serde_json::json!({
+            "plugin_id": "Claude-code", "path": "/w/tree", "to": "codex", "reason": "again"})).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "the second writer loses cleanly");
+        let s = state.lock().await;
+        assert_eq!((s.standing_scope.generation, s.recent_chain(50).len()), (gen1, rows1));
+    }
+
+    /// Every refusal is a pure read: unknown destination, self-reassign, no such grant,
+    /// destination already holding the path, missing reason — zero writes, zero rows, the
+    /// generation where it was.
+    #[tokio::test]
+    async fn reassign_refusals_write_nothing() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "codex").await;
+        seed_grant(&state, "Claude-code", "/w/tree", false).await;
+        seed_grant(&state, "codex", "/w/other", true).await;
+        let before = { let s = state.lock().await; snapshot(&s) };
+
+        let cases = [
+            (serde_json::json!({"plugin_id": "Claude-code", "path": "/w/tree", "to": "kimi-cod", "reason": "r"}),
+             StatusCode::BAD_REQUEST, "unknown destination = the mistake this undoes"),
+            // Self-reassign on a KNOWN member: the registry check passes, the no-op is caught.
+            // (A self-reassign on the typo id itself is refused one step earlier, as unknown.)
+            (serde_json::json!({"plugin_id": "codex", "path": "/w/other", "to": "codex", "reason": "r"}),
+             StatusCode::CONFLICT, "self-reassign is a no-op"),
+            (serde_json::json!({"plugin_id": "nobody", "path": "/w/tree", "to": "codex", "reason": "r"}),
+             StatusCode::NOT_FOUND, "no such grant"),
+            (serde_json::json!({"plugin_id": "Claude-code", "path": "/w/tree", "to": "codex"}),
+             StatusCode::BAD_REQUEST, "a reason is required: this widens reach"),
+        ];
+        for (body, want, why) in cases {
+            let resp = reassign(&state, body).await;
+            assert_eq!(resp.status(), want, "{why}");
+            let s = state.lock().await;
+            assert_eq!(snapshot(&s), before, "{why}: byte-identical store, no rows");
+        }
+        // Destination already holds the path: refused, not merged.
+        seed_grant(&state, "codex", "/w/tree", true).await;
+        let before2 = { let s = state.lock().await; snapshot(&s) };
+        let resp = reassign(&state, serde_json::json!({
+            "plugin_id": "Claude-code", "path": "/w/tree", "to": "codex", "reason": "r"})).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let s = state.lock().await;
+        assert_eq!(snapshot(&s), before2, "which reach wins is the operator's explicit call");
+    }
+
+    /// Injected failure at the COMMIT stage: the chain holds the intent and no terminal
+    /// record, and the store is byte-identical — both grants where they were.
+    #[tokio::test]
+    async fn reassign_failed_commit_leaves_intent_only_and_store_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, state) = test_state().await;
+        register_member(&state, "codex").await;
+        seed_grant(&state, "Claude-code", "/w/tree", true).await;
+        let (grants0, gen0, _) = { let s = state.lock().await; snapshot(&s) };
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let resp = reassign(&state, serde_json::json!({
+            "plugin_id": "Claude-code", "path": "/w/tree", "to": "codex", "reason": "r"})).await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "the vault write must have failed for this test to test anything");
+        let s = state.lock().await;
+        assert_eq!(s.standing_scope.grants, grants0, "store byte-identical: the source still holds it, the destination never did");
+        assert_eq!(s.standing_scope.generation, gen0);
+        assert!(!s.has_scope_grant("codex", "/w/tree"));
+        let chain = s.recent_chain(20);
+        assert!(chain.iter().any(|e| e.event_type == "scope_reassign_intent"), "the intent is the record of the attempt");
+        assert!(!chain.iter().any(|e| e.event_type == "scope_reassigned"), "no terminal record for a move not in force");
+    }
+
+    /// Injected failure at the TERMINAL stage: the move is rolled back through the commit
+    /// path, so committed authority never outlives a missing terminal record.
+    #[tokio::test]
+    async fn reassign_failed_terminal_witness_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        register_member(&state, "codex").await;
+        seed_grant(&state, "Claude-code", "/w/tree", true).await;
+        let (grants0, gen0, _) = { let s = state.lock().await; snapshot(&s) };
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_reassign_terminal BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'scope_reassigned'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;").unwrap();
+        let resp = reassign(&state, serde_json::json!({
+            "plugin_id": "Claude-code", "path": "/w/tree", "to": "codex", "reason": "r"})).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        conn.execute_batch("DROP TRIGGER fail_reassign_terminal").unwrap();
+        let s = state.lock().await;
+        assert_eq!(s.standing_scope.grants, grants0, "rolled back: the source holds it again");
+        assert_eq!(s.standing_scope.generation, gen0, "generation restored by the rollback commit");
+        assert!(!s.has_scope_grant("codex", "/w/tree/child.py"));
+        let chain = s.recent_chain(20);
+        assert!(chain.iter().any(|e| e.event_type == "scope_reassign_intent"));
+        assert!(!chain.iter().any(|e| e.event_type == "scope_reassigned"));
+    }
+
+    /// #998, the invariant that IS the feature: an alias exists at the moment a name is drawn
+    /// for a human and nowhere behind it. Set one, exercise the surfaces that produce records
+    /// — connect, a governed act and its outcome, a standing-scope change, a self-read — and
+    /// assert the alias string reaches no chain row, no identity, and no `plugin_id` field.
+    /// Setting and clearing it are themselves unwitnessed: the chain length does not move.
+    #[tokio::test]
+    async fn a_display_alias_reaches_no_record() {
+        use crate::server::member_alias::MemberAliases;
+        let (_dir, state) = test_state().await;
+        super::super::handler::tool_connect(&state, &serde_json::json!({
+            "plugin_id": "claude-code", "host_agent": "test"})).await.unwrap();
+        let (lct_before, rows_before) = {
+            let s = state.lock().await;
+            (s.member_lct("claude-code"), s.recent_chain(200).len())
+        };
+
+        // SET — refused when it wears another member's id; accepted otherwise; unwitnessed.
+        super::super::handler::tool_connect(&state, &serde_json::json!({
+            "plugin_id": "codex", "host_agent": "test"})).await.unwrap();
+        let rows_after_connects = state.lock().await.recent_chain(200).len();
+        let resp = ui_alias_set(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "claude-code", "alias": "codex"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "an alias may not wear a real member's id");
+        let resp = ui_alias_set(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "claude-code", "alias": "Nugget"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        {
+            let s = state.lock().await;
+            assert_eq!(s.recent_chain(200).len(), rows_after_connects, "setting an alias writes no chain row");
+            assert_eq!(MemberAliases::load(&s.vault).unwrap().display("claude-code"), "Nugget");
+            assert_eq!(s.member_lct("claude-code"), lct_before, "the identity is a hash of the id, and did not move");
+        }
+
+        // EXERCISE the record-producing surfaces under the alias.
+        let sid = super::super::handler::tool_connect(&state, &serde_json::json!({
+            "plugin_id": "claude-code", "host_agent": "test"})).await.unwrap()["sessionId"]
+            .as_str().unwrap().to_string();
+        let begin = super::super::handler::tool_begin_action(&state, &serde_json::json!({
+            "tool_name": "Bash", "target": "ls -la", "session_id": sid})).await.unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        super::super::handler::tool_record_outcome(&state, &serde_json::json!({
+            "action_id": aid, "success": true})).await.unwrap();
+        {
+            let now = crate::server::gate_escalation::now_secs();
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "claude-code".into(), path: "/w/tree".into(), granted_at: now,
+                granted_by: "operator".into(), reason: "r".into(), expires_at: None,
+                request_id: None, recursive: false,
+            })).unwrap();
+        }
+        let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "claude-code", "path": "/w/tree", "recursive": true, "reason": "r"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // THE ARM: the alias is in no record.
+        let s = state.lock().await;
+        let chain = s.recent_chain(200);
+        // The exercise chains an outcome and the reach change's intent + terminal (an allow
+        // decision is not chained; connects are not chained): three rows, at least.
+        assert!(chain.len() >= rows_before + 3, "the exercise produced rows: {}", chain.len());
+        for e in &chain {
+            let text = serde_json::to_string(&e.event_data).unwrap();
+            assert!(!text.contains("Nugget"), "the alias leaked into a {} row: {text}", e.event_type);
+            if let Some(pid) = e.event_data.get("plugin_id").and_then(|v| v.as_str()) {
+                assert_ne!(pid, "Nugget", "a plugin_id field wore the alias");
+            }
+        }
+        // The alias document lives in its own namespace, not beside anything rendered.
+        assert!(s.vault.get_document(crate::server::member_alias::NS, crate::server::member_alias::NAME).is_some());
+        assert!(s.vault.get_document("seat-config", "claude-code").is_none()
+                || !String::from_utf8_lossy(s.vault.get_document("seat-config", "claude-code").unwrap()).contains("Nugget"),
+                "the seat document never carries the alias");
+        drop(s);
+
+        // CLEAR — the original name is back, still unwitnessed.
+        let rows = state.lock().await.recent_chain(200).len();
+        let resp = ui_alias_clear(State(state.clone()), axum::extract::Path("claude-code".to_string())).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let s = state.lock().await;
+        assert_eq!(MemberAliases::load(&s.vault).unwrap().display("claude-code"), "claude-code");
+        assert_eq!(s.recent_chain(200).len(), rows, "clearing an alias writes no chain row");
+    }
+
+    async fn reroot(state: &SharedState, body: serde_json::Value) -> axum::response::Response {
+        scope_reroot(State(state.clone()), Json(body)).await.into_response()
+    }
+
+    /// #920's second falsifier, which the original branch asserted in prose and never pinned:
+    /// a re-root onto a path that is not a directory must REFUSE. It would not error — it
+    /// would succeed and leave every rewritten grant matching nothing, a total revocation
+    /// wearing the shape of a successful migration. `allow_missing_target` is the override.
+    #[tokio::test]
+    async fn reroot_refuses_a_target_that_is_not_there_unless_told_otherwise() {
+        let (dir, state) = test_state().await;
+        seed_grant(&state, "claude-code", "/old/ws/repo", false).await;
+        let before = { let s = state.lock().await; snapshot(&s) };
+        let missing = dir.path().join("not-created").display().to_string();
+
+        let resp = reroot(&state, serde_json::json!({
+            "from": "/old/ws", "to": missing, "reason": "the workspace moved"})).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "a missing target is refused");
+        {
+            let s = state.lock().await;
+            assert_eq!(snapshot(&s), before, "the refusal wrote nothing at all");
+        }
+
+        // The override lands the same request.
+        let resp = reroot(&state, serde_json::json!({
+            "from": "/old/ws", "to": missing, "reason": "granting ahead of the tree",
+            "allow_missing_target": true})).await;
+        assert_eq!(resp.status(), StatusCode::OK, "the deliberate override proceeds");
+        let s = state.lock().await;
+        assert!(s.has_scope_grant("claude-code", &format!("{missing}/repo")),
+                "the grant re-rooted onto the not-yet-existing tree");
+
+        // An existing target needs no override at all.
+        drop(s);
+        let real = dir.path().display().to_string();
+        let resp = reroot(&state, serde_json::json!({
+            "from": &missing, "to": real, "reason": "the tree exists now"})).await;
+        assert_eq!(resp.status(), StatusCode::OK, "an existing directory needs no override");
+    }
+
+    /// The whole rewrite is one act: one generation step, one intent and one terminal record
+    /// naming every path that moved, and a dry run that touches nothing.
+    #[tokio::test]
+    async fn reroot_is_one_witnessed_act_and_dry_run_writes_nothing() {
+        let (dir, state) = test_state().await;
+        let to = dir.path().display().to_string();
+        seed_grant(&state, "claude-code", "/old/ws", false).await;
+        seed_grant(&state, "claude-code", "/old/ws/repo-a", false).await;
+        seed_grant(&state, "codex", "/old/ws-archive/keep", false).await;
+        let (_, gen0, rows0) = { let s = state.lock().await; snapshot(&s) };
+
+        // DRY RUN: the plan, and nothing else.
+        let resp = reroot(&state, serde_json::json!({
+            "from": "/old/ws", "to": &to, "reason": "r", "dry_run": true})).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        {
+            let s = state.lock().await;
+            assert_eq!(snapshot(&s), (s.standing_scope.grants.clone(), gen0, rows0),
+                       "a dry run moves no grant, no generation, no row");
+        }
+
+        let resp = reroot(&state, serde_json::json!({
+            "from": "/old/ws", "to": &to, "reason": "the workspace moved"})).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let s = state.lock().await;
+        assert!(s.has_scope_grant("claude-code", &format!("{to}/repo-a")), "depth preserved");
+        assert!(s.has_scope_grant("codex", "/old/ws-archive/keep"),
+                "the sibling tree is not swept up by a shared string prefix");
+        assert_eq!(s.standing_scope.generation, gen0 + 1, "one act, one generation step");
+        let chain = s.recent_chain(20);
+        let intent = chain.iter().find(|e| e.event_type == "scope_reroot_intent").expect("intent");
+        let term = chain.iter().find(|e| e.event_type == "scope_rerooted").expect("terminal");
+        assert_eq!(term.event_data["intent"], serde_json::json!(intent.hash));
+        assert_eq!(term.event_data["standing_generation"], serde_json::json!(gen0 + 1),
+                   "the generation the commit produced, not a prediction");
+        assert_eq!(term.event_data["moved"].as_array().unwrap().len(), 2,
+                   "the record NAMES every path that moved, not a count");
+        assert_eq!(s.recent_chain(50).len(), rows0 + 2, "exactly the intent and the terminal");
+    }
+
+    /// A prefix that matches nothing reports that it matched nothing, and does not pretend to
+    /// have migrated anything: no generation movement, no chain row.
+    #[tokio::test]
+    async fn reroot_that_matches_nothing_says_so_and_writes_nothing() {
+        let (dir, state) = test_state().await;
+        seed_grant(&state, "claude-code", "/old/ws/repo", false).await;
+        let before = { let s = state.lock().await; snapshot(&s) };
+        let resp = reroot(&state, serde_json::json!({
+            "from": "/old/ws-typo", "to": dir.path().display().to_string(), "reason": "r"})).await;
+        assert_eq!(resp.status(), StatusCode::OK, "not an error — a report");
+        let s = state.lock().await;
+        assert_eq!(snapshot(&s), before, "nothing moved, nothing witnessed");
+    }
+
+    /// A missing reason is refused: a re-root rewrites a member's whole reach, and an
+    /// unrecorded rationale is indistinguishable afterwards from a misconfiguration.
+    #[tokio::test]
+    async fn reroot_without_a_reason_is_refused() {
+        let (dir, state) = test_state().await;
+        seed_grant(&state, "claude-code", "/old/ws/repo", false).await;
+        let before = { let s = state.lock().await; snapshot(&s) };
+        let resp = reroot(&state, serde_json::json!({
+            "from": "/old/ws", "to": dir.path().display().to_string()})).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let s = state.lock().await;
+        assert_eq!(snapshot(&s), before);
+    }
+
+    /// A failed terminal record rolls the whole rewrite back, so a committed re-root of the
+    /// entire scope set never outlives its own evidence. The first cut appended the terminal
+    /// with `.ok()` and would have left exactly that.
+    #[tokio::test]
+    async fn reroot_failed_terminal_witness_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        let to = dir.path().display().to_string();
+        seed_grant(&state, "claude-code", "/old/ws/repo", false).await;
+        let (grants0, gen0, _) = { let s = state.lock().await; snapshot(&s) };
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_reroot_terminal BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'scope_rerooted'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;").unwrap();
+        let resp = reroot(&state, serde_json::json!({
+            "from": "/old/ws", "to": &to, "reason": "r"})).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        conn.execute_batch("DROP TRIGGER fail_reroot_terminal").unwrap();
+        let s = state.lock().await;
+        assert_eq!(s.standing_scope.grants, grants0, "rolled back: the old paths are back");
+        assert_eq!(s.standing_scope.generation, gen0, "generation restored by the rollback");
+        let chain = s.recent_chain(20);
+        assert!(chain.iter().any(|e| e.event_type == "scope_reroot_intent"));
+        assert!(!chain.iter().any(|e| e.event_type == "scope_rerooted"),
+                "no terminal record for a rewrite that is not in force");
+    }
+
+    /// The operator may choose recursive AT decide time; the member never can.
+    #[tokio::test]
+    async fn decide_can_grant_recursive_and_the_ask_stays_one_path() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            let mut r = live_req("scope-ask-3", "/y/tree", now);
+            r.granted = None; r.decided_by = None; r.decided_at = None; r.decision_reason = None;
+            s.scope_requests.insert("scope-ask-3".into(), r);
+        }
+        let resp = scope_decide(State(state.clone()), Json(serde_json::json!({
+            "request_id": "scope-ask-3", "granted": true, "reason": "whole tree, reviewed",
+            "recursive": true}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let s = state.lock().await;
+        assert!(s.has_scope_grant("kimi-code", "/y/tree/deep/x.rs"));
+        assert!(s.recent_chain(5).iter().any(|e| e.event_type == "scope_granted" && e.event_data["recursive"] == true));
+    }
+
     #[tokio::test]
     async fn an_unwitnessed_standing_grant_is_rolled_back() {
         let (dir, state) = test_state().await;
@@ -4343,6 +9505,8 @@ mod disposition_tests {
                     decided_by: None,
                     decided_at: None,
                     decision_reason: None,
+                    recursive: false,
+                    revoked: None,
                 },
             );
         }
@@ -4670,6 +9834,19 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// A dashboard poll re-reads the live feed only when the chain has moved or the read is
+    /// old. Measured 2026-09-17: an open dashboard re-read the chain every two seconds and was
+    /// most of the daemon's CPU. (Trust derivation's rule is tested in `derivation_cache`.)
+    #[test]
+    fn a_quiet_chain_is_not_reread_on_every_poll() {
+        let t0 = std::time::Instant::now();
+        let two = t0 + std::time::Duration::from_secs(2);
+        assert!(live_read_is_current(100, t0, 100, two), "quiet chain, fresh read: reuse");
+        assert!(!live_read_is_current(100, t0, 101, two), "the chain moved: re-read");
+        assert!(!live_read_is_current(100, t0, 100, t0 + DASHBOARD_PROJECTION_MAX_AGE),
+                "rolling windows still roll: a 30 s old live read is re-read on a quiet chain");
+    }
+
     #[test]
     fn dashboard_refresh_is_single_flight_and_failure_keeps_last_good_snapshot() {
         let (_dir, state) = make_shared_state();
@@ -4862,5 +10039,231 @@ mod tests {
         for s in spinners {
             s.await.unwrap();
         }
+    }
+}
+
+/// #1030: the operator writes transport bindings. Validation refuses the incomplete shapes,
+/// a write is durable across restart, and a set whose terminal witness fails is not in force.
+#[cfg(test)]
+mod transport_binding_route_tests {
+    use super::*;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    async fn set(state: &SharedState, body: serde_json::Value) -> axum::response::Response {
+        transport_binding_set(State(state.clone()), Json(body)).await.into_response()
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_binding_is_refused_and_writes_nothing() {
+        let (_dir, state) = test_state().await;
+        for body in [
+            serde_json::json!({"member": "cbp-being", "mode": "relay", "carrier_lct": "seat", "reason": "r"}),
+            serde_json::json!({"member": "cbp-being", "mode": "direct", "reason": "r"}),
+            serde_json::json!({"member": "cbp-being", "mode": "direct_required"}),
+            serde_json::json!({"member": "cbp-being", "mode": "sideways", "reason": "r"}),
+            // GPT review of #1031: a hub-scoped binding would be stored and never enforced.
+            serde_json::json!({"member": "cbp-being", "hub": "hub-lct-1", "mode": "direct_required", "reason": "r"}),
+        ] {
+            assert_eq!(set(&state, body.clone()).await.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+        let s = state.lock().await;
+        assert!(s.transport_bindings.bindings.is_empty());
+        assert!(!s.recent_chain(20).iter().any(|e| e.event_type.starts_with("transport_binding")));
+    }
+
+    #[tokio::test]
+    async fn a_binding_survives_restart_and_removal_moves_the_generation() {
+        let (dir, state) = test_state().await;
+        let body = serde_json::json!({
+            "member": "cbp-being", "mode": "direct", "carrier_lct": "7ba65c0d",
+            "reason": "the being holds its own hub identity",
+        });
+        assert_eq!(set(&state, body).await.status(), StatusCode::OK);
+        drop(state);
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        {
+            let s = state.lock().await;
+            let b = s.transport_bindings.get("cbp-being", "any-hub").expect("restart must reload the binding");
+            assert_eq!((b.carrier_lct.as_deref(), b.version), (Some("7ba65c0d"), 1));
+        }
+        let resp = transport_binding_remove(
+            State(state.clone()),
+            Json(serde_json::json!({"member": "cbp-being", "reason": "test"})),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let s = state.lock().await;
+        assert!(s.transport_bindings.get("cbp-being", "*").is_none());
+        assert_eq!(s.transport_bindings.generation, 2);
+        assert!(s.recent_chain(20).iter().any(|e| e.event_type == "transport_binding_removed"));
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_binding_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_binding_success BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'transport_binding_set'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;",
+        )
+        .unwrap();
+        let body = serde_json::json!({"member": "cbp-being", "mode": "direct_required", "reason": "r"});
+        assert_eq!(set(&state, body.clone()).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        {
+            let s = state.lock().await;
+            assert!(s.transport_bindings.bindings.is_empty(), "not in force without its record");
+            assert_eq!(s.transport_bindings.generation, 0);
+        }
+        conn.execute_batch("DROP TRIGGER fail_binding_success").unwrap();
+        assert_eq!(set(&state, body).await.status(), StatusCode::OK, "the identical retry lands");
+    }
+}
+
+#[cfg(test)]
+mod operator_vault_tests {
+    //! The operator vault surface (Govern -> vault, and the desktop app's Vault screen) over
+    //! GET/POST /api/vault and DELETE /api/vault/:name. Before these pins, DELETE removed any
+    //! entry, the daemon's identity keypair included, wrote nothing to the chain, and answered
+    //! a missing name with 200 + an error body.
+    use super::*;
+    use crate::vault::{Vault, VaultEntry};
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    async fn body_json(r: axum::response::Response) -> serde_json::Value {
+        let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&b).unwrap()
+    }
+
+    #[tokio::test]
+    async fn list_marks_system_entries_and_carries_no_values() {
+        let (_dir, state) = test_state().await;
+        {
+            let mut s = state.lock().await;
+            s.vault.upsert(VaultEntry::new("ai_identity_secret", "SIGNING-KEY")).unwrap();
+            s.vault.upsert(VaultEntry::new("github-pat", "TOKEN-VALUE")).unwrap();
+        }
+        let r = vault_list(State(state.clone())).await.into_response();
+        let text = serde_json::to_string(&body_json(r).await).unwrap();
+        assert!(!text.contains("SIGNING-KEY") && !text.contains("TOKEN-VALUE"), "{text}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let by = |n: &str| v["entries"].as_array().unwrap().iter().find(|e| e["name"] == n).unwrap().clone();
+        assert!(by("ai_identity_secret")["system"].is_string());
+        assert!(by("github-pat")["system"].is_null());
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_system_entries_and_keeps_them() {
+        let (_dir, state) = test_state().await;
+        state.lock().await.vault.upsert(VaultEntry::new("ai_identity_secret", "K")).unwrap();
+        let r = vault_delete(State(state.clone()), Path("ai_identity_secret".into())).await.into_response();
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+        assert!(state.lock().await.vault.get("ai_identity_secret").is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_a_credential_and_witnesses_it_without_the_value() {
+        let (_dir, state) = test_state().await;
+        state.lock().await.vault.upsert(VaultEntry::new("p0-004-cred", "sk-test-1234")).unwrap();
+        let r = vault_delete(State(state.clone()), Path("p0-004-cred".into())).await.into_response();
+        assert_eq!(r.status(), StatusCode::OK);
+        let s = state.lock().await;
+        assert!(s.vault.get("p0-004-cred").is_none());
+        let e = s.recent_chain(10).into_iter().find(|e| e.event_type == "vault_entry_removed")
+            .expect("an operator delete must be on the chain");
+        assert_eq!(e.event_data["name"], "p0-004-cred");
+        assert!(!e.event_data.to_string().contains("sk-test-1234"));
+    }
+
+    /// Make the next chain append of `event_type` fail, the way the transport-binding and
+    /// scope rollback tests do: a trigger on the encrypted witness DB.
+    fn fail_appends_of(dir: &std::path::Path, event_type: &str) -> rusqlite::Connection {
+        let key = crate::storage::storage_key(dir, "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER fail_vault_witness BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = '{event_type}'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;")).unwrap();
+        conn
+    }
+
+    /// GPT review of #1123: a delete must not stand without its record. With the append
+    /// failing, the entry is restored exactly (same id and value) and the answer is a 500.
+    #[tokio::test]
+    async fn delete_whose_witness_fails_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        state.lock().await.vault.upsert(VaultEntry::new("p0-004-cred", "sk-test-1234")).unwrap();
+        let id0 = state.lock().await.vault.get("p0-004-cred").unwrap().id;
+        let conn = fail_appends_of(dir.path(), "vault_entry_removed");
+        let r = vault_delete(State(state.clone()), Path("p0-004-cred".into())).await.into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(r).await;
+        assert!(body["error"].as_str().unwrap().contains("NOT deleted"), "{body}");
+        conn.execute_batch("DROP TRIGGER fail_vault_witness").unwrap();
+        let s = state.lock().await;
+        let e = s.vault.get("p0-004-cred").expect("rolled back: the entry is still there");
+        assert_eq!((e.id, e.secret.as_str()), (id0, "sk-test-1234"), "restored exactly");
+        assert!(!s.recent_chain(10).iter().any(|e| e.event_type == "vault_entry_removed"));
+    }
+
+    /// And an add must not stand without its record: the entry is removed again, 500.
+    #[tokio::test]
+    async fn add_whose_witness_fails_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        let conn = fail_appends_of(dir.path(), "vault_entry_added");
+        let r = vault_add(State(state.clone()), Json(serde_json::json!(
+            {"name": "openai-key", "value": "SECRET-V", "allowed_consumers": ["kimi-code"]}))).await.into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(r).await;
+        assert!(body["error"].as_str().unwrap().contains("NOT stored"), "{body}");
+        conn.execute_batch("DROP TRIGGER fail_vault_witness").unwrap();
+        let s = state.lock().await;
+        assert!(s.vault.get("openai-key").is_none(), "rolled back: nothing stored");
+        assert!(!s.recent_chain(10).iter().any(|e| e.event_type == "vault_entry_added"));
+    }
+
+    #[tokio::test]
+    async fn delete_of_a_missing_name_is_404_not_a_green_error() {
+        let (_dir, state) = test_state().await;
+        let r = vault_delete(State(state.clone()), Path("nope".into())).await.into_response();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn add_refuses_system_names_and_duplicates_and_witnesses_a_write() {
+        let (_dir, state) = test_state().await;
+        let add = |b: serde_json::Value| { let st = state.clone(); async move { vault_add(State(st), Json(b)).await.into_response() } };
+        let r = add(serde_json::json!({"name":"hub_urls","value":"x"})).await;
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+        assert!(state.lock().await.vault.get("hub_urls").is_none());
+        let r = add(serde_json::json!({"name":"openai-key","value":"SECRET-V","allowed_consumers":["kimi-code"]})).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let r = add(serde_json::json!({"name":"openai-key","value":"other"})).await;
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+        let s = state.lock().await;
+        let e = s.recent_chain(10).into_iter().find(|e| e.event_type == "vault_entry_added")
+            .expect("an operator add must be on the chain");
+        assert_eq!(e.event_data["name"], "openai-key");
+        assert!(!e.event_data.to_string().contains("SECRET-V"));
     }
 }

@@ -29,6 +29,12 @@
     <string>__HESTIA_HOME__</string>
     <key>HESTIA_CURRENT_BUILD_FILE</key>
     <string>__HESTIA_HOME__/current-build.json</string>
+    <!-- Optional workspace handed to agent-inventory for the dashboard read list, exactly as
+         in hestia.service. It was missing HERE ONLY, so on every launchd seat the daemon's
+         /api/agents could not find the inventory and answered UNKNOWN (McNugget,
+         2026-09-19). Empty means the inventory reports unknown rather than guessing. -->
+    <key>HESTIA_WORKSPACE</key>
+    <string></string>
     <key>RUST_LOG</key>
     <string>warn</string>
     <key>HOME</key>

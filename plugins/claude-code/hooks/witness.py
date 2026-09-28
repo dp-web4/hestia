@@ -57,12 +57,93 @@ PROTOCOL_VERSION = "2024-11-05"
 TIMEOUT_S = float(os.environ.get("HESTIA_WITNESS_TIMEOUT_S") or "2.0")
 HOOK_VERSION = "0.0.4"
 
+DEFAULT_ENDPOINT = "http://127.0.0.1:7711/mcp"
+
+
+# ---------------------------------------------------------------------------
+# THE PROJECTION IS THE ONLY SOURCE OF THIS SEAT'S CONFIGURATION (PRD_CONFIG_FROM_VAULT; #944)
+# ---------------------------------------------------------------------------
+# One bootstrap locator, launcher-supplied, no default: HESTIA_HOME. Everything else this hook
+# needs — the workspace it polices, where the shared runtime is, the endpoint, its own state
+# dirs — comes from `$HESTIA_HOME/seats/<plugin_id>.env`, which the daemon renders from the
+# vault and checks against it. Every key the projection carries is exported over whatever the
+# launcher happened to set: the vault is the authority, a hook line is not. Two things are
+# deliberately NOT here. A fallback ("no locator, try ~/.hestia") is a second authority with
+# extra steps and is the pattern #943 was held for. And HESTIA_ROLE: role is launch context
+# (interactive vs mesh-worker), set by whoever launched the seat, never a config value.
+#
+# Loaded at IMPORT, because the shared runtime dir is resolved at import and must already be
+# the projection's. Import never fails: the outcome is recorded in `_PROJECTION_ERROR` and
+# run() returns on it, so a test can import this module and
+# a seat with no projection witnesses nothing (there is nothing authoritative to witness AS). This function is bootstrap wiring, not law: it decides
+# nothing about any tool call. It is byte-identical across seats by intent, like the loader.
+PROJECTION_DIR = "seats"
+
+
+def _load_projection(plugin_id):
+    """Export the seat's rendered projection into the environment. Returns None, or the
+    reason the seat is not configured — never raises."""
+    home = os.environ.get("HESTIA_HOME")
+    if not home:
+        return ("config.unbacked", "HESTIA_HOME is not set; the launcher must supply the "
+                "bootstrap locator (there is no default, by design)")
+    path = os.path.join(home, PROJECTION_DIR, plugin_id + ".env")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        return ("config.unbacked", f"no rendered projection for {plugin_id} at {path} ({e}); "
+                "populate this seat's config in the vault (Govern -> Runtime config)")
+    # Imported here, not at module scope: this function is byte-identical across seats, and
+    # a seat whose module happened not to import `re` raised at import instead of reporting
+    # its own absence (caught by the witness arm of projection_consumer_test).
+    import hashlib
+    import re
+    digest = hashlib.sha256(raw).hexdigest()
+    pairs = []
+    for ln in raw.decode("utf-8", "replace").split("\n"):
+        if not ln or ln.startswith("#") or "=" not in ln:
+            continue
+        k, v = ln.split("=", 1)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
+            return ("config.unbacked", f"projection {path} carries an unusable key {k!r}")
+        pairs.append((k, v))
+    # OWNERSHIP RIDES ON EVERY LINE (design A). A per-seat line is `TOKEN__KEY`; shared lines
+    # are plain. This seat strips ITS token and exports the bare key; a line carrying any other
+    # seat's token is a miswire, not a value -- it cannot be consumed here, whatever it says.
+    token = "".join(ch.upper() if ch.isalnum() else "_" for ch in plugin_id)
+    projected = {}
+    for k, v in pairs:
+        if "__" in k:
+            prefix, bare = k.split("__", 1)
+            if prefix != token:
+                return ("config.miswired", f"projection {path} carries a line for seat token "
+                        f"{prefix!r}, but this seat is {token!r} ({plugin_id}); a line cannot be "
+                        "consumed by a seat it was not rendered for")
+            k = bare
+        projected[k] = v
+    if "HESTIA_HOME" in projected and os.path.realpath(projected["HESTIA_HOME"]) != os.path.realpath(home):
+        return ("config.miswired", f"the launcher supplied HESTIA_HOME={home!r} but the vault "
+                f"projection says {projected['HESTIA_HOME']!r}; this seat is running against a "
+                "home the authority does not name")
+    if projected.get("HESTIA_PLUGIN_ID", plugin_id) != plugin_id:
+        return ("config.miswired", f"projection {path} says HESTIA_PLUGIN_ID="
+                f"{projected['HESTIA_PLUGIN_ID']!r} but this seat is {plugin_id!r}")
+    for k, v in projected.items():
+        if k == "HESTIA_ROLE":
+            continue   # launch context, never config
+        os.environ[k] = v
+    os.environ["HESTIA_PROJECTION_SHA256"] = digest
+    os.environ["HESTIA_PROJECTION_PATH"] = path
+    return None
+
+
+_PROJECTION_ERROR = _load_projection(PLUGIN_ID)
+
 STATE_DIR = Path(
     os.environ.get("HESTIA_STATE_DIR")
     or str(Path.home() / (".hestia-claude" if PLUGIN_ID == "claude-code" else f".hestia-{PLUGIN_ID}"))
 )
-DEFAULT_HESTIA_HOME = Path.home() / ".hestia"
-DEFAULT_ENDPOINT = "http://127.0.0.1:7711/mcp"
 
 
 def debug_log(msg: str) -> None:
@@ -81,8 +162,10 @@ def discover_endpoint() -> Optional[str]:
     env = os.environ.get("HESTIA_ENDPOINT")
     if env:
         return env
-    home = Path(os.environ.get("HESTIA_HOME", str(DEFAULT_HESTIA_HOME)))
-    endpoint_file = home / "endpoint"
+    home = os.environ.get("HESTIA_HOME")
+    if not home:
+        return None
+    endpoint_file = Path(home) / "endpoint"
     try:
         return endpoint_file.read_text().strip() or None
     except OSError:
@@ -120,19 +203,28 @@ SPOOL_MAX_ENTRIES = 500
 SPOOL_DRAIN_PER_RUN = 8
 
 
-def spool_save(intent: dict) -> None:
+def spool_save(intent: dict) -> bool:
     """Best-effort append. FIFO: the name sorts by act time. When full, drop
-    the NEWEST (this one) — the backlog is the alarm, so it is preserved."""
+    the NEWEST (this one) — the backlog is the alarm, so it is preserved.
+
+    RETURNS WHETHER THE ROW IS NOW DURABLE, because the caller uses that to
+    decide whether the act's correlation file may be released (#977 review).
+    Both failure modes here — a full spool and a failed write — drop this row,
+    and releasing the cache on either would destroy the last durable carrier of
+    the action's identity while nothing had yet recorded it.
+    """
     try:
         SPOOL_DIR.mkdir(parents=True, exist_ok=True)
         if len(list(SPOOL_DIR.glob("*.json"))) >= SPOOL_MAX_ENTRIES:
             debug_log(f"spool FULL ({SPOOL_MAX_ENTRIES}) — dropping newest row; backlog preserved")
-            return
+            return False
         (SPOOL_DIR / f"{intent['client_ts']:.3f}-{uuid.uuid4().hex}.json").write_text(
             json.dumps(intent)
         )
     except (OSError, KeyError) as e:
         debug_log(f"spool save failed: {e}")
+        return False
+    return True
 
 
 def spool_drain(client: "McpHttp", session_id: Optional[str]) -> None:
@@ -330,56 +422,167 @@ def unwrap_tool_result(rpc_response: dict[str, Any]) -> dict[str, Any]:
 
 # ---- Main flow -----------------------------------------------------------
 
+# ---- Act identity continuity (#977) --------------------------------------
+#
+# The gate begins the action it DECIDES on and caches that id under
+# `ACTIONS_DIR/<tool_use_id>.json`; this hook closes that same action. The
+# literal is the only carrier of the Pre→Post contract and must stay
+# byte-identical to `pre_tool_use.py`'s. It is deliberately NOT migrated to the
+# vault in this change: it is load-bearing for a contract being repaired here,
+# and moving both at once would make a failed join impossible to attribute to
+# one of them (#944 carries the migration, after this lands and is measured).
+ACTIONS_DIR = Path("/tmp/hestia-actions")
+
+# Typed on the outcome row via the action's `intent`, so a discontinuity is
+# READ rather than inferred from a join that does not close.
+COLD_NO_CACHE = "hestia:cold-record:no-authorized-action-cached"
+COLD_STALE = "hestia:cold-record:authorized-action-not-resident"
+
+
+def cached_action_id(tool_use_id: Optional[str]) -> Optional[str]:
+    """The id of the action the gate authorized for this tool call, or None.
+
+    Absence is normal and not an error: a call the gate never saw, a cache the
+    operator cleared, a seat whose gate predates the cache. Every absence takes
+    a cold path that names itself.
+    """
+    if not tool_use_id:
+        return None
+    try:
+        blob = json.loads((ACTIONS_DIR / f"{tool_use_id}.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    action_id = blob.get("action_id")
+    return action_id if isinstance(action_id, str) and action_id else None
+
+
+def retire_cached_action(tool_use_id: Optional[str]) -> None:
+    """Drop the correlation file once its act is durably handled.
+
+    Called after the row is recorded, rejected or spooled — never while it is
+    still only in memory. A spooled row carries the action id inside the spool
+    file, so the cache has no reader left once that hand-off has happened.
+
+    Only this call's own file. The files that accumulated while nothing retired
+    them are historical evidence of the defect and are left for a deliberate
+    cleanup, not swept up by the fix that ends their production.
+    """
+    if not tool_use_id:
+        return
+    try:
+        (ACTIONS_DIR / f"{tool_use_id}.json").unlink()
+    except OSError:
+        pass
+
+
+def begin_cold_action(
+    client: "McpHttp", session_id: Optional[str], intent: dict, why: str
+) -> tuple[Optional[str], Optional[str]]:
+    """Begin an action HERE because no authorized one is usable, and SAY SO on the row.
+
+    `intent` is carried by the daemon onto the outcome (`action.intent`), so a
+    discontinuity is typed in the evidence instead of being inferred later from a
+    join that does not close. That matters because the absence of a join is
+    exactly the symptom the ambiguity produced: an outcome whose action nobody
+    decided on looks identical to an outcome whose decision row was simply never
+    written.
+
+    Returns `(action_id, None)` or `(None, verdict)`.
+    """
+    resp = client.call_tool(
+        "hestia_begin_action",
+        {
+            "tool_name": intent["tool_name"],
+            "target": intent.get("target"),
+            "intent": why,
+            **({"session_id": session_id} if session_id else {}),
+            **({"host_session_id": intent["host_session_id"]} if intent.get("host_session_id") else {}),
+        },
+    )
+    begin = unwrap_tool_result(resp)
+    if "_hestia_error" in begin:
+        debug_log(f"begin_action rejected: {begin['_hestia_error']}")
+        return None, "rejected"
+    action_id = begin.get("actionId")
+    if not action_id:
+        debug_log(f"begin_action missing actionId: {begin}")
+        return None, "rejected"
+    return action_id, None
+
+
+def record_outcome_for(
+    client: "McpHttp", session_id: Optional[str], intent: dict, action_id: str
+) -> dict:
+    """Close one action with this act's outcome. Raises on network failure."""
+    resp = client.call_tool(
+        "hestia_record_outcome",
+        {
+            "action_id": action_id,
+            "success": intent["success"],
+            "magnitude": intent["magnitude"],
+            "error": intent.get("error"),
+            # The act's own clock (#696): append-lag = chain ts - client_ts
+            # is the measurement that makes a slow referee visible. Older
+            # daemons ignore the field; newer ones carry it onto the row.
+            "client_ts": intent["client_ts"],
+            **({"session_id": session_id} if session_id else {}),
+        },
+    )
+    return unwrap_tool_result(resp)
+
+
 def witness_one(client: "McpHttp", session_id: Optional[str], intent: dict) -> str:
-    """Fire the begin+record pair for one intent.
+    """Close the AUTHORIZED action with this act's outcome.
 
     Returns one of three verdicts, because the failure kind decides the
     disposition: "recorded"; "transient" (network/timeout — the referee may
     be reachable later, so the caller spools or keeps the row); "rejected"
     (the daemon RULED on it — an error envelope or a malformed reply — and
     replaying will never succeed, so the row is dropped, loudly in debug).
-    """
-    try:
-        begin_resp = client.call_tool(
-            "hestia_begin_action",
-            {
-                "tool_name": intent["tool_name"],
-                "target": intent.get("target"),
-                **({"session_id": session_id} if session_id else {}),
-                **({"host_session_id": intent["host_session_id"]} if intent.get("host_session_id") else {}),
-            },
-        )
-    except (urllib.error.URLError, OSError) as e:
-        debug_log(f"begin network: {e}")
-        return "transient"
-    begin = unwrap_tool_result(begin_resp)
-    if "_hestia_error" in begin:
-        debug_log(f"begin_action rejected: {begin['_hestia_error']}")
-        return "rejected"
-    action_id = begin.get("actionId")
-    if not action_id:
-        debug_log(f"begin_action missing actionId: {begin}")
-        return "rejected"
 
+    ACT IDENTITY CONTINUITY (#977). This used to call `hestia_begin_action`
+    unconditionally and record the outcome against THAT action, while the gate
+    had already begun, decided on, and cached a different one. The two records
+    then described two different acts: measured on CBP over 2.5 days, 4,121
+    outcome rows and 450 gated `policy_decision` rows shared ZERO `action_id`
+    values, on every seat that produced rows. Session, tool, target and time
+    could make a pair look adjacent; adjacency is not identity. The authorized
+    action also stayed resident, because `record_outcome` is its only remover
+    and it was never called with that id.
+
+    So the normal path now begins nothing: it closes the action the gate
+    authorized, whose id `intent["action_id"]` carries (put there before any
+    network work, so a spool replay hours later still closes the same act).
+    Attribution improves with it — the daemon reads plugin and role from the
+    BEGINNING session, so the row is attributed to the session that was gated
+    rather than to this hook's own connect.
+
+    Two cold paths remain, and both name themselves rather than silently
+    looking like the defect this replaces:
+
+    * no cached id at all — no gate ran for this call, or the cache is gone;
+    * `hestia.action_not_found` — the id was cached but the daemon no longer
+      holds it (`s.actions` is RAM: a restart between the decision and the
+      outcome loses it, and a replayed spool row may already have closed it).
+    """
+    action_id = intent.get("action_id")
     try:
-        outcome_resp = client.call_tool(
-            "hestia_record_outcome",
-            {
-                "action_id": action_id,
-                "success": intent["success"],
-                "magnitude": intent["magnitude"],
-                "error": intent.get("error"),
-                # The act's own clock (#696): append-lag = chain ts - client_ts
-                # is the measurement that makes a slow referee visible. Older
-                # daemons ignore the field; newer ones carry it onto the row.
-                "client_ts": intent["client_ts"],
-                **({"session_id": session_id} if session_id else {}),
-            },
-        )
+        if action_id:
+            outcome = record_outcome_for(client, session_id, intent, action_id)
+            if (outcome.get("_hestia_error") or {}).get("code") == "hestia.action_not_found":
+                debug_log(f"authorized action {action_id} no longer resident; cold-recording")
+                action_id, verdict = begin_cold_action(client, session_id, intent, COLD_STALE)
+                if action_id is None:
+                    return verdict
+                outcome = record_outcome_for(client, session_id, intent, action_id)
+        else:
+            action_id, verdict = begin_cold_action(client, session_id, intent, COLD_NO_CACHE)
+            if action_id is None:
+                return verdict
+            outcome = record_outcome_for(client, session_id, intent, action_id)
     except (urllib.error.URLError, OSError) as e:
-        debug_log(f"record network: {e}")
+        debug_log(f"witness network: {e}")
         return "transient"
-    outcome = unwrap_tool_result(outcome_resp)
     if "_hestia_error" in outcome:
         debug_log(f"record_outcome rejected: {outcome['_hestia_error']}")
         return "rejected"
@@ -387,6 +590,11 @@ def witness_one(client: "McpHttp", session_id: Optional[str], intent: dict) -> s
 
 
 def run() -> int:
+    if _PROJECTION_ERROR is not None:
+        # No projection, no authority to witness as. Logged, not scored: a missing config is
+        # infrastructure, not conduct, and the gate already refused the act.
+        debug_log(f"projection: {_PROJECTION_ERROR[0]}: {_PROJECTION_ERROR[1]}")
+        return 0
     raw = sys.stdin.read()
     if not raw.strip():
         return 0
@@ -404,6 +612,10 @@ def run() -> int:
     tool_response = event.get("tool_response")
     # Claude Code's own stable session id — the real per-session audit grain.
     host_session_id = event.get("session_id")
+    # The gate keyed its action cache on exactly this expression (#977). The
+    # fallbacks are its, kept byte-for-byte: a divergence here does not fail
+    # loudly, it silently misses the cache and cold-records every call.
+    tool_use_id = event.get("tool_use_id") or event.get("session_id") or "no-id"
 
     success, error = derive_success(tool_response)
     intent: dict[str, Any] = {
@@ -416,13 +628,30 @@ def run() -> int:
         # Captured BEFORE any network work: this is the act's timestamp, and
         # it survives a spool-replay unchanged.
         "client_ts": time.time(),
+        # THE ACT'S IDENTITY, read from the gate's cache before any network work
+        # for the same reason as `client_ts` (#977): it rides into the spool, so
+        # a row replayed hours or a restart later still closes the action that
+        # was authorized rather than opening a fresh one nobody decided on.
+        # `None` is a normal value here and takes a cold path that names itself.
+        "action_id": cached_action_id(tool_use_id),
     }
+    # TWO-PHASE HANDOFF (#977 review). The cache is released only once this act
+    # is durable somewhere else — an outcome on the chain, or a spool row on
+    # disk. The first version released it here, as soon as the id was in memory,
+    # on the argument that a decision with no outcome is a truthful state. It is;
+    # but keeping the file does not make it less truthful, and it preserves WHICH
+    # unfinished action the decision belonged to. Dying in the gap would have
+    # destroyed the last durable carrier of that identity for nothing.
+    def hand_off_to_spool() -> None:
+        """Park the act durably, then release its correlation file — never before."""
+        if spool_save(intent):
+            retire_cached_action(tool_use_id)
 
     endpoint = discover_endpoint()
     if endpoint is None:
         warn_once_daemon_missing()
         debug_log("no endpoint discovered; spooling")
-        spool_save(intent)
+        hand_off_to_spool()
         return 0
 
     client = McpHttp(endpoint)
@@ -430,7 +659,7 @@ def run() -> int:
         init_resp = client.initialize()
         if "result" not in init_resp:
             debug_log(f"initialize failed: {init_resp}")
-            spool_save(intent)
+            hand_off_to_spool()
             return 0
         client.initialized()
 
@@ -456,6 +685,22 @@ def run() -> int:
         role_basis = os.environ.get("HESTIA_ROLE_BASIS")
         if role_basis:
             connect_args["role_basis"] = role_basis
+        # Liveness (#944): the digest of the projection this process loaded at import.
+        projection = os.environ.get("HESTIA_PROJECTION_SHA256")
+        if projection:
+            connect_args["projection_sha256"] = projection
+        # THE HOST SESSION, so connect is IDEMPOTENT across hook invocations (#981
+        # prerequisite). The gate hook has always sent this; this one sent it on
+        # `hestia_begin_action` and not on connect, which is the only call idempotency reads.
+        # So every PostToolUse minted a fresh daemon session: measured on CBP over 4,554 rows,
+        # 80 host sessions produced 48 daemon sessions behind the gate rows and 4,076 behind
+        # the outcome rows, sharing none. Two consequences, and the second is why this is a
+        # prerequisite rather than tidying. It is the dominant producer in the session leak
+        # (#320). And #981 will enforce that only the session which BEGAN an action may close
+        # it — until Pre and Post resolve to the same daemon session, every legitimate closer
+        # is a foreign closer, and enforcing ownership would refuse every outcome on the fleet.
+        if host_session_id:
+            connect_args["host_session_id"] = host_session_id
         connect_resp = client.call_tool("hestia_connect", connect_args)
         connect = unwrap_tool_result(connect_resp)
         if "_hestia_error" in connect:
@@ -470,18 +715,23 @@ def run() -> int:
 
         verdict = witness_one(client, session_id, intent)
         if verdict == "transient":
-            spool_save(intent)
-        elif verdict == "recorded":
-            debug_log(
-                f"post {tool_name} success={success} magnitude={intent['magnitude']}"
-            )
+            hand_off_to_spool()
+        else:
+            # "recorded" — the outcome is on the chain — or "rejected", where the
+            # daemon RULED and a replay can never succeed. Either way the act is
+            # durably disposed of and the correlation file has no reader left.
+            retire_cached_action(tool_use_id)
+            if verdict == "recorded":
+                debug_log(
+                    f"post {tool_name} success={success} magnitude={intent['magnitude']}"
+                )
     except urllib.error.URLError as e:
         debug_log(f"network: {e}")
         warn_once_daemon_missing()
-        spool_save(intent)
+        hand_off_to_spool()
     except Exception as e:  # noqa: BLE001 — fail-open at top level
         debug_log(f"unexpected: {type(e).__name__}: {e}")
-        spool_save(intent)
+        hand_off_to_spool()
     return 0
 
 
