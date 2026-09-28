@@ -315,6 +315,35 @@ def test_fallback_enumeration():
 # the hook that reaches the chain, was never registered. 9,284 act rows under claude-code,
 # 0 under codex, every report green. A role declared by event alone cannot see this; a
 # role that names its file can. The FIRST job of the new check is to FIRE on that case.
+def test_member_states():
+    """dp, 2026-09-28: only Codex's chip ever showed a dot, and nothing ever showed MISWIRED.
+    The report is now keyed by MEMBER id, one state per member, worst first."""
+    def r(agent, member, **kw):
+        base = {"agent": agent, "member": member, "installed": True, "plugin_available": True,
+                "governed": True, "wired": True, "partial": False, "miswired": False,
+                "unknown": []}
+        return {**base, **kw}
+    st = inventory.member_states([
+        r("kimi_code_cli", "kimi-code"),
+        r("codex", "codex", governed=False, miswired=True, unknown=["could not read a config"]),
+        r("gemini", "gemini", governed=False, partial=True),
+        r("cursor", "cursor", installed=False, governed=False),
+        r("aider", None, plugin_available=False, governed=False),
+        {"agent": "sage", "member": "cbp-being", "kind": "being", "unprovisioned": True,
+         "governed": False, "unknown": []},
+    ])
+    check("keyed by member id, not atlas id", st.get("kimi-code"), "governed")
+    check("atlas id is not a key", "kimi_code_cli" in st, False)
+    check("MISWIRED outranks an unknown note (it used to render amber)", st.get("codex"), "miswired")
+    check("partial", st.get("gemini"), "partial")
+    check("not installed here", st.get("cursor"), "dormant_plugin")
+    check("no member id -> no key invented", "aider" in st, False)
+    check("a being keyed by its member id", st.get("cbp-being"), "unprovisioned_being")
+    # Two rows for one member: the worse one wins, whichever order they arrive in.
+    both = inventory.member_states([r("a", "m"), r("b", "m", governed=False, miswired=True)])
+    check("worst of two rows for one member", both.get("m"), "miswired")
+
+
 def test_role_target():
     with tempfile.TemporaryDirectory() as d:
         _role_target_cases(Path(d))
@@ -1419,6 +1448,7 @@ def teardown_module(module):
 
 if __name__ == "__main__":
     test_attribute()
+    test_member_states()
     test_has_tag()
     test_role_target()
     test_fallback_enumeration()

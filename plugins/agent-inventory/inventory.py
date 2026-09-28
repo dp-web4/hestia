@@ -462,6 +462,14 @@ def inspect_being(atlas_id: str, roots: list[str], atlas: dict, units: list[Path
     launchers, unreadable = find_launchers(launcher_re, unit_files() if units is None else units)
     rec["launchers"] = launchers
     rec["members"] = sorted({m for l in launchers for m in l["members_in_unit"]})
+    # One launcher, one --member: that is the being's id. Several or none: no single id to key on.
+    rec["member"] = rec["members"][0] if len(rec["members"]) == 1 else None
+    # No launcher names one: the fleet convention the daemon's register endpoint also uses
+    # (`<machine>-being`, http.rs agent_register). A being that is running but launched in a
+    # way this file cannot read then shows as not provisioned on its own chip, rather than
+    # showing nothing at all.
+    if rec["member"] is None and not rec["members"]:
+        rec["member"] = f"{platform.node().lower()}-being"
     rec["installed"] = exe is not None or bool(launchers)
     rec["wired"] = bool(launchers)
     # One being per machine by fleet convention; if a seat runs two, say so rather than pick.
@@ -1357,6 +1365,20 @@ class Registry:
         them name plugin dirs that are not in the registry at all — 36 subprocess spawns
         to learn what `self.names` already knew (~4s -> ~0.7s on CBP).
         """
+        data = self._expects_data(plugin_dir)
+        out = {k: list(v) for k, v in data.items() if isinstance(v, list)}
+        # `targets` (#1133): the FILE a role must be served by, per role, as basenames. A
+        # role declared by event alone cannot tell a hook that reaches the daemon from one
+        # that appends to a private file on the same event — codex's `observe` role was
+        # "wired" by observe.sh for 14 days while the witness that reaches the chain was
+        # never registered. Optional: a plugin that declares no target keeps event-only.
+        t = data.get("targets")
+        if isinstance(t, dict):
+            out["targets"] = {r: [str(x) for x in v] for r, v in t.items() if isinstance(v, list)}
+        return out
+
+    def _expects_data(self, plugin_dir: str) -> dict:
+        """The parsed expects.json, from the same source expects() has always read."""
         if not self.has(plugin_dir):
             return {}
         if self.source == "origin/main":
@@ -1372,16 +1394,19 @@ class Registry:
             data = json.loads(raw)
         except ValueError:
             return {}
-        out = {k: list(v) for k, v in data.items() if isinstance(v, list)}
-        # `targets` (#1133): the FILE a role must be served by, per role, as basenames. A
-        # role declared by event alone cannot tell a hook that reaches the daemon from one
-        # that appends to a private file on the same event — codex's `observe` role was
-        # "wired" by observe.sh for 14 days while the witness that reaches the chain was
-        # never registered. Optional: a plugin that declares no target keeps event-only.
-        t = data.get("targets")
-        if isinstance(t, dict):
-            out["targets"] = {r: [str(x) for x in v] for r, v in t.items() if isinstance(v, list)}
-        return out
+        return data if isinstance(data, dict) else {}
+
+    def member(self, plugin_dir: str) -> str | None:
+        """The member id this plugin runs as -- `install.member` in its expects.json.
+
+        THREE VOCABULARIES NAME ONE HARNESS: the atlas id (`kimi_code_cli`), the plugin
+        directory (`kimi`) and the member id every chain row, grant and dashboard chip uses
+        (`kimi-code`). Reports keyed by the first two could not be joined to the third, so the
+        dashboard's governance dot rendered only where all three happen to be spelled the same
+        -- `codex`, on every machine, for as long as the dots existed (dp, 2026-09-28)."""
+        inst = self._expects_data(plugin_dir).get("install")
+        m = inst.get("member") if isinstance(inst, dict) else None
+        return m.strip() if isinstance(m, str) and m.strip() else None
 
 
 REGISTRY: Registry | None = None  # built in main(), once WORKSPACE is known
@@ -1427,9 +1452,14 @@ def inspect(atlas_id: str, roots: list[str]) -> dict:
     plugin_available = registry().has(plugin_dir)
     declared = expects(plugin_dir)
 
+    member_of = getattr(registry(), "member", None)   # stubs in tests may not define it
+    declared_member = member_of(plugin_dir) if (plugin_available and member_of) else None
     rec: dict = {
         "agent": atlas_id,
         "plugin": plugin_dir if plugin_available else None,
+        # The id the rest of hestia knows this harness by (see Registry.member). Falls back to
+        # the plugin directory only when a plugin declares none -- the old implicit assumption.
+        "member": declared_member or (plugin_dir if plugin_available else None),
         "plugin_available": plugin_available,
         # #2: installation is evidenced by an executable, not by a config dir.
         "installed": exe is not None,
@@ -1685,6 +1715,46 @@ def classify(recs: list[dict]) -> dict:
         elif r["plugin_available"] and not r["installed"]:
             gaps["dormant_plugin"].append(r["agent"])
     return gaps
+
+
+# Worst first. The dashboard used to build a chip's state by walking `gaps` in dict order and
+# letting LATER buckets overwrite earlier ones, so a member that was miswired AND carried any
+# `unknown` note rendered amber ("no adapter yet"), never red.
+MEMBER_STATE_ORDER = ["miswired", "partial", "ungoverned", "ungovernable", "unprovisioned_being",
+                      "unknown", "dormant_plugin", "governed"]
+
+
+def member_states(recs: list[dict]) -> dict[str, str]:
+    """{member id: one coverage state}, keyed by the id the dashboard's chips use."""
+    out: dict[str, str] = {}
+    for r in recs:
+        m = r.get("member")
+        if not m:
+            continue
+        if r.get("kind") == "being":
+            st = ("unprovisioned_being" if r.get("unprovisioned")
+                  else "governed" if r.get("governed")
+                  else "unknown" if r.get("unknown") else None)
+        elif r.get("installed") and r.get("miswired"):
+            st = "miswired"
+        elif r.get("installed") and r.get("partial"):
+            st = "partial"
+        elif r.get("installed") and not r.get("governed"):
+            st = "ungoverned" if r.get("plugin_available") else "ungovernable"
+        elif r.get("installed") and r.get("unknown"):
+            st = "unknown"
+        elif r.get("installed"):
+            st = "governed"
+        elif r.get("plugin_available"):
+            st = "dormant_plugin"
+        else:
+            st = None
+        if st is None:
+            continue
+        prev = out.get(m)
+        if prev is None or MEMBER_STATE_ORDER.index(st) < MEMBER_STATE_ORDER.index(prev):
+            out[m] = st
+    return out
 
 
 def witness(report: dict) -> str:
@@ -2018,6 +2088,9 @@ def main() -> int:
         "plugins_available": available,
         "governed": sorted(r["agent"] for r in governed),
         "gaps": gaps,
+        # The same verdicts keyed by MEMBER id -- what the dashboard's chips and every grant use.
+        # `gaps` and `governed` stay keyed by atlas id for their existing readers.
+        "members": member_states(recs),
         "fragile": fragile,
         "unknown": unknowns,
         "scope": scope,

@@ -361,6 +361,32 @@ def unaccounted() -> None:
           (True, ["claude-code", "Claude-code", "caude-code"]))
 
 
+def member_ids() -> None:
+    """THREE VOCABULARIES (dp, 2026-09-28). Kimi's atlas id is `kimi_code_cli`, its plugin
+    directory `kimi`, its member id `kimi-code`. Keyed on the directory, the pane named its
+    governance id `kimi` and filed the registered `kimi-code` under "nothing on this machine
+    accounts for it" -- with a Retire button -- while it ran governed."""
+    report = {
+        "status": "OK", "governed": ["kimi_code_cli"],
+        "gaps": {"miswired": [], "ungoverned": [], "ungovernable": [], "dormant_plugin": [],
+                 "partial": [], "miswired_3p": [], "unknown": []},
+        "scope": {"workspace": "/w", "agent_enumeration": "agent-atlas",
+                  "agent_enumeration_complete": True, "atlas": "/a", "atlas_source": "env"},
+        "detail": [agent("kimi_code_cli", "kimi", True, {"harness": "Kimi Code"}, member="kimi-code")],
+    }
+    m = run_model(report, [{"plugin_id": "kimi-code", "action_count": 48110}], [])
+    rows = {r["atlasId"]: r for g in m["groups"] for r in g["rows"]}
+    check("governance id is the MEMBER id, not the plugin directory",
+          rows["kimi_code_cli"]["governanceId"], "kimi-code")
+    check("a registered member the inventory accounts for (by member id) is not unaccounted",
+          [g["key"] for g in m["groups"]].count("unaccounted"), 0)
+    # An inventory that predates `member` still falls back to the directory.
+    old = dict(report, detail=[agent("codex", "codex", True, {"harness": "Codex"})])
+    m2 = run_model(old, [{"plugin_id": "codex", "action_count": 1}], [])
+    check("no `member` field: the plugin directory is still the fallback",
+          {r["atlasId"]: r for g in m2["groups"] for r in g["rows"]}["codex"]["governanceId"], "codex")
+
+
 def live() -> None:
     """The real report from this machine, when there is one. It is the only fixture nobody wrote."""
     inv = Path.home() / ".local/bin/hestia-agent-inventory"
@@ -391,6 +417,7 @@ def main() -> int:
     if shutil.which("node"):
         behaviour()
         unaccounted()
+        member_ids()
         live()
     else:
         print("SKIPPED: behaviour -- no node on PATH (the source contract above still ran)")
