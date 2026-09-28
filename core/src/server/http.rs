@@ -1282,6 +1282,7 @@ pub async fn serve_with_callback(
         .route("/api/agents", get(agents_inventory))
         .route("/api/gates/verify", get(gates_verify))
         .route("/api/gates/ratify", post(gates_ratify))
+        .route("/api/gates/forget", post(gates_forget))
         .route("/api/agents/:id/ungovern", post(agent_ungovern))
         // Retire / reinstate a member on THIS seat (agent-lifecycle PRD R1). Operator-gated
         // like every other authority change: retiring revokes the id's standing grants.
@@ -6378,6 +6379,294 @@ fn apply_ratification(
     Ok(())
 }
 
+/// Where one gate's CURRENT bytes stand against what the deployment authority recorded
+/// installing: `match` | `differs` | `not-deployed` (the deploy record names no such file) |
+/// `no-deploy-record` (the authority file is absent or unreadable) | `unreadable` (the
+/// daemon could not hash the gate). Evidence per gate, so an operator ratifies ONE gate
+/// knowing whether it is the bytes a deploy wrote -- dp, 2026-09-28: "currently gate ratify
+/// button ratifies all - including mismatched and non-deployed".
+fn gate_deployment_status(
+    path: &str,
+    current: Option<&serde_json::Value>,
+    deployed: Option<&serde_json::Value>,
+) -> &'static str {
+    let Some(deployed) = deployed else { return "no-deploy-record" };
+    let now = match current.and_then(|v| v.as_str()) {
+        Some(h) => h,
+        None => return "unreadable",
+    };
+    match deployed.get("files").and_then(|f| f.get(path)).and_then(|v| v.as_str()) {
+        None => "not-deployed",
+        Some(h) if h == now => "match",
+        Some(_) => "differs",
+    }
+}
+
+/// `{path: sha256 | null}` for the given paths, hashed by the daemon itself.
+fn hash_gate_paths<'a>(paths: impl Iterator<Item = &'a String>) -> serde_json::Map<String, serde_json::Value> {
+    paths
+        .map(|p| {
+            let h = crate::vault::gate_integrity::hash_file(std::path::Path::new(p))
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null);
+            (p.clone(), h)
+        })
+        .collect()
+}
+
+/// The optional `paths` of a per-gate request: None = the whole discovered set (bulk).
+fn requested_gate_paths(body: &serde_json::Value) -> Result<Option<Vec<String>>, String> {
+    match body.get("paths") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Array(a)) => {
+            let mut out = Vec::new();
+            for v in a {
+                match v.as_str() {
+                    Some(s) if !s.is_empty() => {
+                        if !out.iter().any(|x: &String| x == s) {
+                            out.push(s.to_string());
+                        }
+                    }
+                    _ => return Err("paths must be a list of gate paths (strings)".into()),
+                }
+            }
+            if out.is_empty() {
+                return Err("paths is empty: name the gates to act on, or omit it".into());
+            }
+            Ok(Some(out))
+        }
+        Some(_) => Err("paths must be a list of gate paths".into()),
+    }
+}
+
+/// What a ratification will do, decided WITHOUT touching the vault or the chain. Pure, so
+/// every refusal below is testable without a live inventory.
+struct RatifyPlan {
+    next: crate::vault::gate_integrity::GateExpectations,
+    entry: serde_json::Value,
+    response: serde_json::Value,
+    /// path -> the digest being recorded, re-checked against the file right before the write.
+    recorded: Vec<(String, String)>,
+}
+
+/// Two modes (dp, 2026-09-28):
+///
+/// * PER GATE (`paths`): ratify exactly the named discovered gates and MERGE them into the
+///   existing expectations -- every other gate's ratification is untouched. A gate whose bytes
+///   differ from the deploy record, or that no deploy installed, MAY be ratified: that is the
+///   operator's explicit judgement about one named gate, and its deployment status is carried
+///   on the chain entry per path so the judgement is reviewable.
+/// * BULK (no `paths`): allowed only when EVERY discovered gate's current bytes are what the
+///   deploy recorded. Otherwise it is refused (409) and the non-matching gates are named: a
+///   one-click ratify must never bless a mismatch nobody looked at individually. Bulk still
+///   REPLACES the whole expectation set (last edit wins, 2026-09-25), naming what it replaced.
+///
+/// Both keep the reason and the bytes-you-saw binding (#1132); `expected` binds exactly the
+/// gates being ratified.
+fn plan_ratification(
+    body: &serde_json::Value,
+    reason: &str,
+    discovered: &[(String, String)],
+    current: &serde_json::Map<String, serde_json::Value>,
+    deployed: Option<&serde_json::Value>,
+    previous: &crate::vault::gate_integrity::GateExpectations,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<RatifyPlan, (StatusCode, serde_json::Value)> {
+    use crate::vault::gate_integrity::GateExpectation;
+    let bad = |s: StatusCode, e: String| Err((s, serde_json::json!({ "error": e })));
+    if discovered.is_empty() {
+        return bad(StatusCode::BAD_REQUEST, "refusing to ratify: no gate-role hooks discovered. \
+            Ratifying an empty set would record 'this machine's gates are correct' on the basis \
+            of having found none.".into());
+    }
+    let requested = match requested_gate_paths(body) {
+        Ok(r) => r,
+        Err(e) => return bad(StatusCode::BAD_REQUEST, e),
+    };
+    let selected: Vec<(String, String)> = match &requested {
+        None => discovered.to_vec(),
+        Some(paths) => {
+            let unknown: Vec<&String> =
+                paths.iter().filter(|p| !discovered.iter().any(|(_, d)| d == *p)).collect();
+            if !unknown.is_empty() {
+                return Err((StatusCode::BAD_REQUEST, serde_json::json!({
+                    "error": "refusing to ratify: not a discovered gate. Only a gate this machine \
+                              actually wires can be ratified; a stale expectation is removed with \
+                              POST /api/gates/forget.",
+                    "unknown": unknown,
+                })));
+            }
+            discovered.iter().filter(|(_, d)| paths.contains(d)).cloned().collect()
+        }
+    };
+    let mode = if requested.is_some() { "per-gate" } else { "bulk" };
+
+    // Bind to the bytes seen -- for exactly the gates being ratified.
+    let sel_current: serde_json::Map<String, serde_json::Value> = selected
+        .iter()
+        .map(|(_, p)| (p.clone(), current.get(p).cloned().unwrap_or(serde_json::Value::Null)))
+        .collect();
+    let expected = match (&requested, body.get("expected")) {
+        (Some(_), Some(serde_json::Value::Object(m))) => Some(serde_json::Value::Object(
+            m.iter().filter(|(k, _)| sel_current.contains_key(*k)).map(|(k, v)| (k.clone(), v.clone())).collect(),
+        )),
+        (_, e) => e.cloned(),
+    };
+    if let Err(refusal) = ratify_binding(expected.as_ref(), &sel_current) {
+        return Err((StatusCode::CONFLICT, refusal));
+    }
+
+    let mut rows = Vec::new();
+    let mut not_matching = Vec::new();
+    for (plugin_id, path) in &selected {
+        let status = gate_deployment_status(path, sel_current.get(path), deployed);
+        if status == "unreadable" {
+            return bad(StatusCode::BAD_REQUEST, format!("refusing to ratify: {path} unreadable. \
+                Ratifying a gate you could not read would launder the tampering this is meant to catch."));
+        }
+        if status != "match" {
+            not_matching.push(serde_json::json!({"path": path, "plugin_id": plugin_id, "deployment": status}));
+        }
+        rows.push((plugin_id.clone(), path.clone(), status));
+    }
+    if mode == "bulk" && !not_matching.is_empty() {
+        return Err((StatusCode::CONFLICT, serde_json::json!({
+            "error": "refusing to ratify all: these gates are not the bytes the deploy installed. \
+                      Nothing was ratified. Review them and ratify each one you trust on its own \
+                      (send `paths`), so a mismatch is never blessed by a single click.",
+            "not_matching": not_matching,
+        })));
+    }
+
+    let mut next = if mode == "bulk" { Default::default() } else { previous.clone() };
+    let mut recorded_rows = Vec::new();
+    let mut recorded = Vec::new();
+    let mut replaced = serde_json::Map::new();
+    for (plugin_id, path, status) in rows {
+        let sha = sel_current.get(&path).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        if mode == "per-gate" {
+            if let Some(prev) = previous.get(&path) {
+                replaced.insert(path.clone(), serde_json::Value::String(prev.sha256.clone()));
+            }
+        }
+        recorded_rows.push(serde_json::json!({
+            "path": path, "plugin_id": plugin_id, "sha256": sha, "deployment": status,
+        }));
+        recorded.push((path.clone(), sha.clone()));
+        next.insert(path, GateExpectation { sha256: sha, plugin_id, ratified_at: now, note: reason.to_string() });
+    }
+    if mode == "bulk" {
+        for (p, e) in previous {
+            replaced.insert(p.clone(), serde_json::Value::String(e.sha256.clone()));
+        }
+    }
+    let entry = serde_json::json!({
+        "mode": mode,
+        "gates": recorded_rows,
+        "reason": reason,
+        "replaced": replaced,
+        // Provenance the operator ratified against, when the authority file was readable.
+        "deployment": deployed.map(|d| serde_json::json!({
+            "build_id": d.get("build_id"),
+            "head_sha": d.get("head_sha"),
+        })),
+    });
+    let response = serde_json::json!({"ok": true, "mode": mode, "ratified": recorded_rows, "replaced": replaced});
+    Ok(RatifyPlan { next, entry, response, recorded })
+}
+
+/// Removing expectations, per path. Now that ratification merges, an expectation for a gate
+/// this machine no longer wires (snarc's `pre-tool-use.js`, ratified while the inventory
+/// still misread it as hestia's gate) would otherwise live forever.
+///
+/// A DISCOVERED gate cannot be forgotten: forgetting a live gate turns MODIFIED (the loud
+/// verdict, a rewritten gate) into UNRATIFIED (merely unexamined) -- a way to quiet a tamper
+/// finding without re-examining anything. A live gate is re-ratified per gate instead.
+fn plan_forget(
+    body: &serde_json::Value,
+    reason: &str,
+    discovered: &[(String, String)],
+    previous: &crate::vault::gate_integrity::GateExpectations,
+) -> Result<(crate::vault::gate_integrity::GateExpectations, serde_json::Value), (StatusCode, serde_json::Value)> {
+    let paths = match requested_gate_paths(body) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Err((StatusCode::BAD_REQUEST, serde_json::json!({
+                "error": "paths is required: forget names each expectation it removes; there is no forget-all",
+            })))
+        }
+        Err(e) => return Err((StatusCode::BAD_REQUEST, serde_json::json!({ "error": e }))),
+    };
+    let not_held: Vec<&String> = paths.iter().filter(|p| !previous.contains_key(*p)).collect();
+    if !not_held.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, serde_json::json!({
+            "error": "refusing to forget: no ratified expectation at these paths",
+            "unknown": not_held,
+        })));
+    }
+    let live: Vec<&String> = paths.iter().filter(|p| discovered.iter().any(|(_, d)| d == *p)).collect();
+    if !live.is_empty() {
+        return Err((StatusCode::CONFLICT, serde_json::json!({
+            "error": "refusing to forget a gate this machine still wires: that would turn a \
+                      MODIFIED finding into a merely unratified one. Re-ratify it per gate instead.",
+            "live": live,
+        })));
+    }
+    let mut next = previous.clone();
+    let mut forgotten = Vec::new();
+    for p in &paths {
+        if let Some(e) = next.remove(p) {
+            forgotten.push(serde_json::json!({
+                "path": p, "plugin_id": e.plugin_id, "sha256": e.sha256,
+                "ratified_at": e.ratified_at, "note": e.note,
+            }));
+        }
+    }
+    Ok((next, serde_json::json!({"forgotten": forgotten, "reason": reason})))
+}
+
+/// Each verdict row, plus what a per-gate UI needs beside it: whether the inventory still
+/// discovers the gate (`discovered: false` = a stale expectation, offered for forget) and the
+/// gate's deployment status. And whether a bulk ratify would be accepted, and why not.
+fn annotate_gate_verdicts(
+    verdicts: &[crate::vault::gate_integrity::GateVerdict],
+    discovered: &[(String, String)],
+    current: &serde_json::Map<String, serde_json::Value>,
+    deployed: Option<&serde_json::Value>,
+) -> (Vec<serde_json::Value>, serde_json::Value) {
+    let mut rows = Vec::new();
+    for v in verdicts {
+        let mut row = serde_json::to_value(v).unwrap_or(serde_json::Value::Null);
+        let path = row.get("path").and_then(|p| p.as_str()).unwrap_or_default().to_string();
+        let is_discovered = discovered.iter().any(|(_, d)| d == &path);
+        let now = current.get(&path).cloned().or_else(|| {
+            crate::vault::gate_integrity::hash_file(std::path::Path::new(&path))
+                .ok()
+                .map(serde_json::Value::String)
+        });
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("discovered".into(), serde_json::Value::Bool(is_discovered));
+            obj.insert("deployment".into(),
+                serde_json::Value::String(gate_deployment_status(&path, now.as_ref(), deployed).into()));
+        }
+        rows.push(row);
+    }
+    let blocked: Vec<serde_json::Value> = discovered
+        .iter()
+        .filter_map(|(plugin_id, p)| {
+            let st = gate_deployment_status(p, current.get(p), deployed);
+            (st != "match").then(|| serde_json::json!({"path": p, "plugin_id": plugin_id, "deployment": st}))
+        })
+        .collect();
+    let bulk = serde_json::json!({
+        "allowed": blocked.is_empty() && !discovered.is_empty(),
+        "blocked_by": blocked,
+        "note": "Ratify-all is accepted only when every discovered gate is the bytes the deploy \
+                 installed; otherwise ratify each gate on its own (`paths`).",
+    });
+    (rows, bulk)
+}
+
 /// `GET /api/gates/verify` — hash every known gate and compare to the vault's ratified
 /// expectation. The DAEMON hashes the file; it never asks a gate about itself.
 async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
@@ -6415,17 +6704,11 @@ async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
     let wired: Vec<String> = discovered.iter().map(|(_, f)| f.clone()).collect();
     // The daemon hashes every discovered gate itself — an unratified gate included, which
     // `verify` does not hash — so an operator can see which bytes a ratify would bless.
-    let current_digests: serde_json::Map<String, serde_json::Value> = wired
-        .iter()
-        .map(|p| {
-            let h = crate::vault::gate_integrity::hash_file(std::path::Path::new(p))
-                .map(serde_json::Value::String)
-                .unwrap_or(serde_json::Value::Null);
-            (p.clone(), h)
-        })
-        .collect();
+    let current_digests = hash_gate_paths(wired.iter());
+    let deployed = deployed_gate_digests();
     let verdicts = crate::vault::gate_integrity::verify(&exp, &wired);
     let findings = verdicts.iter().filter(|v| v.is_finding()).count();
+    let (rows, bulk) = annotate_gate_verdicts(&verdicts, &discovered, &current_digests, deployed.as_ref());
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -6444,9 +6727,12 @@ async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
             // authority recorded installing. Evidence only; nothing is refused on it.
             "evidence": {
                 "current": current_digests,
-                "deployed": deployed_gate_digests(),
+                "deployed": deployed,
             },
-            "gates": verdicts,
+            // Per row: the verdict, `discovered` (false = a stale expectation, forgettable)
+            // and `deployment` (match | differs | not-deployed | no-deploy-record | unreadable).
+            "gates": rows,
+            "bulk_ratify": bulk,
             "note": "Tamper-EVIDENT, not tamper-proof. The agent can rewrite its gate; it \
                      cannot rewrite this expectation, which lives in the operator-gated vault. \
                      See hestia#49 for what would make a rewritten gate's verdicts stop counting.",
@@ -6454,28 +6740,29 @@ async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
     )
 }
 
-/// `POST /api/gates/ratify` — record the CURRENT bytes of every known gate as expected.
+/// `POST /api/gates/ratify` — record the CURRENT bytes of named gates (per gate), or of every
+/// discovered gate when all of them match the deploy record (bulk). See `plan_ratification`.
 ///
 /// surface: gates_ratify   act: define what a correct gate is
-/// S: high/reversible [construct: previous expectations are replaced, not merged; the
-///    chain keeps the prior ratification]
+/// S: high/reversible [construct: per-gate merges, bulk replaces; the chain keeps the prior
+///    ratification and names what was replaced]
 /// R: pass [construct: behind `operator_gate` with the rest of /api/*]
 /// W: pass [construct: operator_gate proves an Ed25519 challenge-signed session]
-/// O: pass [construct: hashes computed before the vault write]
-/// A: pass [construct: append_chain("gate_ratified") carries every path and digest]
+/// O: pass [construct: hashes computed before the vault write; bulk refused unless every gate
+///    matches the deploy record]
+/// A: pass [construct: append_chain("gate_ratified") carries every path, digest and its
+///    deployment status]
 /// V: present [construct: refuses when a gate is unreadable — ratifying what you could
 ///    not read would launder exactly the tampering this exists to catch]
 /// verdict: PASS
 ///
 /// The dangerous direction is ratifying an ALREADY-tampered gate, which would bless the
-/// attack. Nothing here can tell a good build from a bad one; the operator must ratify
-/// from a state they believe correct. The chain entry is what makes that judgement
-/// reviewable afterwards.
+/// attack. The deploy record is the evidence that makes that judgement checkable per gate;
+/// the chain entry is what makes it reviewable afterwards.
 async fn gates_ratify(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    use crate::vault::gate_integrity::{GateExpectation, GateExpectations};
     // Refused before the lock and before any hashing: an unexplained ratification never
     // starts.
     let reason = match ratify_reason(&body) {
@@ -6486,114 +6773,87 @@ async fn gates_ratify(
         }
     };
     let mut s = state.lock().await;
-    let mut exp: GateExpectations = GateExpectations::new();
-    let mut recorded = Vec::new();
-    // The same `{path: sha256|null}` map verify shows as evidence.current, recomputed here,
-    // under the lock, from the bytes this handler is about to record.
-    let mut current = serde_json::Map::new();
-    // Ratify the DISCOVERED set, for the same reason verify checks it: ratifying a
-    // hardcoded list would bless whichever gates that list happened to name and leave the
-    // rest unratified-and-unmentioned.
+    // Ratify from the DISCOVERED set, for the same reason verify checks it: a hardcoded list
+    // would bless whichever gates it happened to name and leave the rest unmentioned.
     let discovered = match discovered_gate_paths() {
-        Ok(d) if !d.is_empty() => d,
-        Ok(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "refusing to ratify: no gate-role hooks discovered. Ratifying an \
-                              empty set would record 'this machine's gates are correct' on the \
-                              basis of having found none.",
-                })),
-            )
-                .into_response();
-        }
+        Ok(d) => d,
         Err(reason) => {
             return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
                 "error": format!("refusing to ratify: gate set could not be established ({reason})"),
             }))).into_response();
         }
     };
-    for (_, path) in &discovered {
-        let h = crate::vault::gate_integrity::hash_file(std::path::Path::new(path))
-            .map(serde_json::Value::String)
-            .unwrap_or(serde_json::Value::Null);
-        current.insert(path.clone(), h);
-    }
-    if let Err(refusal) = ratify_binding(body.get("expected"), &current) {
-        return (StatusCode::CONFLICT, Json(refusal)).into_response();
-    }
-    for (plugin_id, path) in discovered {
-        match crate::vault::gate_integrity::hash_file(std::path::Path::new(&path)) {
-            Ok(sha256) if current.get(&path) == Some(&serde_json::Value::String(sha256.clone())) => {
-                recorded.push(
-                    serde_json::json!({"path": path, "plugin_id": plugin_id, "sha256": sha256}),
-                );
-                exp.insert(
-                    path,
-                    GateExpectation {
-                        sha256,
-                        plugin_id,
-                        ratified_at: chrono::Utc::now(),
-                        note: reason.clone(),
-                    },
-                );
-            }
-            // Changed between the binding check and this read, inside the handler: refuse
-            // rather than record bytes other than the ones just compared.
-            Ok(_) => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "error": format!("refusing to ratify: {path} changed while ratifying. \
-                                          Nothing was ratified — re-read and review again."),
-                    })),
-                )
-                    .into_response();
-            }
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": format!("refusing to ratify: {path} unreadable ({e}). \
-                                          Ratifying a gate you could not read would launder the \
-                                          tampering this is meant to catch."),
-                    })),
-                )
-                    .into_response();
+    // The same `{path: sha256|null}` map verify shows as evidence.current, recomputed here,
+    // under the lock, from the bytes this handler is about to record.
+    let current = hash_gate_paths(discovered.iter().map(|(_, p)| p));
+    let deployed = deployed_gate_digests();
+    let previous = s.vault.gate_expectations();
+    let plan = match plan_ratification(&body, &reason, &discovered, &current, deployed.as_ref(),
+                                       &previous, chrono::Utc::now()) {
+        Ok(p) => p,
+        Err((code, refusal)) => return (code, Json(refusal)).into_response(),
+    };
+    // Changed between the binding check and now: refuse rather than record other bytes.
+    for (path, sha) in &plan.recorded {
+        match crate::vault::gate_integrity::hash_file(std::path::Path::new(path)) {
+            Ok(h) if &h == sha => {}
+            _ => {
+                return (StatusCode::CONFLICT, Json(serde_json::json!({
+                    "error": format!("refusing to ratify: {path} changed while ratifying. \
+                                      Nothing was ratified — re-read and review again."),
+                }))).into_response();
             }
         }
     }
-    // Last edit wins (dp, 2026-09-25) — so the record names what it replaced.
-    let previous = s.vault.gate_expectations();
-    let replaced: serde_json::Map<String, serde_json::Value> = previous
-        .iter()
-        .map(|(p, e)| (p.clone(), serde_json::Value::String(e.sha256.clone())))
-        .collect();
-    let deployed = deployed_gate_digests();
-    let entry = serde_json::json!({
-        "gates": recorded,
-        "reason": reason,
-        "replaced": replaced,
-        // Provenance the operator ratified against, when the authority file was readable.
-        "deployment": deployed.as_ref().map(|d| serde_json::json!({
-            "build_id": d.get("build_id"),
-            "head_sha": d.get("head_sha"),
-        })),
-    });
-    if let Err(e) = apply_ratification(&mut s, previous, exp, |st| {
+    let entry = plan.entry;
+    if let Err(e) = apply_ratification(&mut s, previous, plan.next, |st| {
         st.append_chain("gate_ratified", entry).map(|_| ())
     }) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e })),
-        )
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e })))
             .into_response();
     }
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"ok": true, "ratified": recorded, "replaced": replaced})),
-    )
-        .into_response()
+    (StatusCode::OK, Json(plan.response)).into_response()
+}
+
+/// `POST /api/gates/forget {paths, reason}` — remove named expectations for gates this machine
+/// no longer wires. Operator-gated with the rest of /api/*; recorded as
+/// `gate_expectation_forgotten`, undone if the record cannot be written. See `plan_forget`.
+async fn gates_forget(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let reason = match ratify_reason(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": e.replace("to ratify", "to forget"),
+            }))).into_response()
+        }
+    };
+    let mut s = state.lock().await;
+    let discovered = match discovered_gate_paths() {
+        Ok(d) => d,
+        Err(reason) => {
+            // Without the discovered set this cannot tell a stale expectation from a live gate.
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": format!("refusing to forget: gate set could not be established ({reason})"),
+            }))).into_response();
+        }
+    };
+    let previous = s.vault.gate_expectations();
+    let (next, entry) = match plan_forget(&body, &reason, &discovered, &previous) {
+        Ok(p) => p,
+        Err((code, refusal)) => return (code, Json(refusal)).into_response(),
+    };
+    let response = serde_json::json!({"ok": true, "forgotten": entry["forgotten"].clone()});
+    if let Err(e) = apply_ratification(&mut s, previous, next, |st| {
+        st.append_chain("gate_expectation_forgotten", entry).map(|_| ())
+    }) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": e.replace("ratification", "forget"),
+        }))).into_response();
+    }
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 // --- Chain endpoints ---
@@ -7108,6 +7368,166 @@ mod disposition_tests {
         assert!(deployed_gate_digests_from(&dir.path().join("absent.json")).is_none());
         std::fs::write(&p, b"not json").unwrap();
         assert!(deployed_gate_digests_from(&p).is_none());
+    }
+
+    // ---- per-gate ratification (dp, 2026-09-28) ----
+
+    fn ratify_fixture() -> (Vec<(String, String)>, serde_json::Map<String, serde_json::Value>, serde_json::Value) {
+        use serde_json::json;
+        let discovered = vec![
+            ("claude-code".to_string(), "/h/cc.py".to_string()),
+            ("codex".to_string(), "/h/codex.py".to_string()),
+            ("kimi-code".to_string(), "/h/kimi.py".to_string()),
+        ];
+        let mut current = serde_json::Map::new();
+        current.insert("/h/cc.py".into(), json!("aaaa"));      // matches the deploy
+        current.insert("/h/codex.py".into(), json!("bbbb"));   // deploy wrote cccc: differs
+        current.insert("/h/kimi.py".into(), json!("dddd"));    // no deploy wrote it
+        let deployed = json!({"build_id": "b1", "head_sha": "h1",
+                              "files": {"/h/cc.py": "aaaa", "/h/codex.py": "cccc"}});
+        (discovered, current, deployed)
+    }
+
+    #[test]
+    fn deployment_status_names_every_case() {
+        use serde_json::json;
+        let (_, current, deployed) = ratify_fixture();
+        assert_eq!(gate_deployment_status("/h/cc.py", current.get("/h/cc.py"), Some(&deployed)), "match");
+        assert_eq!(gate_deployment_status("/h/codex.py", current.get("/h/codex.py"), Some(&deployed)), "differs");
+        assert_eq!(gate_deployment_status("/h/kimi.py", current.get("/h/kimi.py"), Some(&deployed)), "not-deployed");
+        assert_eq!(gate_deployment_status("/h/cc.py", current.get("/h/cc.py"), None), "no-deploy-record");
+        assert_eq!(gate_deployment_status("/h/cc.py", Some(&json!(null)), Some(&deployed)), "unreadable");
+    }
+
+    #[test]
+    fn ratify_all_is_refused_while_any_gate_is_not_the_deployed_bytes_and_names_them() {
+        use serde_json::json;
+        let (discovered, current, deployed) = ratify_fixture();
+        let previous = one_expectation("/h/cc.py", "old");
+        let body = json!({"reason": "r", "expected": current.clone()});
+        let Err((code, refusal)) = plan_ratification(&body, "r", &discovered, &current, Some(&deployed),
+                                                     &previous, chrono::Utc::now()) else {
+            panic!("a bulk ratify over a mismatch was accepted");
+        };
+        assert_eq!(code, StatusCode::CONFLICT);
+        let names: Vec<(String, String)> = refusal["not_matching"].as_array().unwrap().iter()
+            .map(|r| (r["path"].as_str().unwrap().into(), r["deployment"].as_str().unwrap().into())).collect();
+        assert_eq!(names, vec![("/h/codex.py".into(), "differs".into()), ("/h/kimi.py".into(), "not-deployed".into())]);
+        // And with no deploy record at all, bulk cannot be accepted either.
+        assert!(plan_ratification(&body, "r", &discovered, &current, None, &previous, chrono::Utc::now()).is_err());
+    }
+
+    #[test]
+    fn ratify_all_is_accepted_when_every_gate_matches_and_replaces_the_set() {
+        use serde_json::json;
+        let (discovered, mut current, _) = ratify_fixture();
+        current.insert("/h/codex.py".into(), json!("cccc"));
+        current.insert("/h/kimi.py".into(), json!("eeee"));
+        let deployed = json!({"files": {"/h/cc.py": "aaaa", "/h/codex.py": "cccc", "/h/kimi.py": "eeee"}});
+        let previous = one_expectation("/stale/snarc.js", "ssss");
+        let plan = plan_ratification(&json!({"expected": current.clone()}), "r", &discovered, &current,
+                                     Some(&deployed), &previous, chrono::Utc::now()).unwrap();
+        assert_eq!(plan.next.len(), 3);
+        assert!(!plan.next.contains_key("/stale/snarc.js"), "bulk replaces (last edit wins)");
+        assert_eq!(plan.entry["mode"], "bulk");
+        assert_eq!(plan.entry["replaced"]["/stale/snarc.js"], "ssss");
+    }
+
+    #[test]
+    fn ratifying_one_gate_merges_and_records_its_deployment_status() {
+        use serde_json::json;
+        let (discovered, current, deployed) = ratify_fixture();
+        let mut previous = one_expectation("/h/cc.py", "aaaa");
+        previous.extend(one_expectation("/stale/snarc.js", "ssss"));
+        // The operator reviewed codex's gate and ratifies it although it differs from the deploy.
+        let body = json!({"paths": ["/h/codex.py"], "expected": current.clone()});
+        let plan = plan_ratification(&body, "reviewed codex hotfix", &discovered, &current,
+                                     Some(&deployed), &previous, chrono::Utc::now()).unwrap();
+        assert_eq!(plan.next["/h/codex.py"].sha256, "bbbb");
+        assert_eq!(plan.next["/h/cc.py"], previous["/h/cc.py"], "another gate's ratification moved");
+        assert_eq!(plan.next["/stale/snarc.js"], previous["/stale/snarc.js"]);
+        assert_eq!(plan.next.len(), 3);
+        assert_eq!(plan.entry["mode"], "per-gate");
+        assert_eq!(plan.entry["gates"].as_array().unwrap().len(), 1);
+        assert_eq!(plan.entry["gates"][0]["deployment"], "differs");
+        assert_eq!(plan.entry["gates"][0]["path"], "/h/codex.py");
+        assert_eq!(plan.entry["reason"], "reviewed codex hotfix");
+        // A not-deployed gate can be ratified per gate too, and says so on the record.
+        let plan = plan_ratification(&json!({"paths": ["/h/kimi.py"], "expected": {"/h/kimi.py": "dddd"}}),
+                                     "r", &discovered, &current, Some(&deployed), &previous,
+                                     chrono::Utc::now()).unwrap();
+        assert_eq!(plan.entry["gates"][0]["deployment"], "not-deployed");
+    }
+
+    #[test]
+    fn a_per_gate_ratify_is_still_bound_to_the_bytes_seen() {
+        use serde_json::json;
+        let (discovered, current, deployed) = ratify_fixture();
+        let previous = Default::default();
+        let now = chrono::Utc::now();
+        // saw a different digest for the gate being ratified
+        let r = plan_ratification(&json!({"paths": ["/h/codex.py"], "expected": {"/h/codex.py": "cccc"}}),
+                                  "r", &discovered, &current, Some(&deployed), &previous, now);
+        assert_eq!(r.err().unwrap().0, StatusCode::CONFLICT);
+        // no expected at all
+        assert!(plan_ratification(&json!({"paths": ["/h/codex.py"]}), "r", &discovered, &current,
+                                  Some(&deployed), &previous, now).is_err());
+        // a stale digest for a gate NOT being ratified does not block this one
+        let body = json!({"paths": ["/h/codex.py"], "expected": {"/h/codex.py": "bbbb", "/h/kimi.py": "zzzz"}});
+        assert!(plan_ratification(&body, "r", &discovered, &current, Some(&deployed), &previous, now).is_ok());
+        // an undiscovered path is not ratifiable
+        let r = plan_ratification(&json!({"paths": ["/elsewhere.py"], "expected": {}}), "r", &discovered,
+                                  &current, Some(&deployed), &previous, now);
+        let (code, refusal) = r.err().unwrap();
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(refusal["unknown"][0], "/elsewhere.py");
+        // malformed paths
+        assert!(plan_ratification(&json!({"paths": [], "expected": {}}), "r", &discovered, &current,
+                                  Some(&deployed), &previous, now).is_err());
+        assert!(plan_ratification(&json!({"paths": "/h/cc.py", "expected": {}}), "r", &discovered, &current,
+                                  Some(&deployed), &previous, now).is_err());
+    }
+
+    #[test]
+    fn forget_removes_only_named_stale_expectations_and_never_a_live_gate() {
+        use serde_json::json;
+        let (discovered, _, _) = ratify_fixture();
+        let mut previous = one_expectation("/h/cc.py", "aaaa");
+        previous.extend(one_expectation("/stale/snarc.js", "ssss"));
+        previous.extend(one_expectation("/stale/other.js", "oooo"));
+        let (next, entry) = plan_forget(&json!({"paths": ["/stale/snarc.js"]}), "not a gate", &discovered, &previous).unwrap();
+        assert_eq!(next.len(), 2);
+        assert!(!next.contains_key("/stale/snarc.js"));
+        assert_eq!(next["/h/cc.py"], previous["/h/cc.py"]);
+        assert_eq!(next["/stale/other.js"], previous["/stale/other.js"]);
+        assert_eq!(entry["forgotten"][0]["path"], "/stale/snarc.js");
+        assert_eq!(entry["forgotten"][0]["sha256"], "ssss");
+        // a live gate cannot be forgotten: that would quiet a MODIFIED finding
+        let (code, refusal) = plan_forget(&json!({"paths": ["/h/cc.py"]}), "r", &discovered, &previous).unwrap_err();
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(refusal["live"][0], "/h/cc.py");
+        // nothing held there / no paths at all
+        assert!(plan_forget(&json!({"paths": ["/nope"]}), "r", &discovered, &previous).is_err());
+        assert!(plan_forget(&json!({}), "r", &discovered, &previous).is_err());
+    }
+
+    #[test]
+    fn verify_rows_say_which_expectations_are_stale_and_whether_bulk_would_pass() {
+        use crate::vault::gate_integrity::GateVerdict;
+        let (discovered, current, deployed) = ratify_fixture();
+        let verdicts = vec![
+            GateVerdict::Verified { path: "/h/cc.py".into(), plugin_id: "claude-code".into(), sha256: "aaaa".into() },
+            GateVerdict::Unratified { path: "/h/codex.py".into() },
+            GateVerdict::Missing { path: "/stale/snarc.js".into(), plugin_id: "claude-code".into(), expected: "ssss".into() },
+        ];
+        let (rows, bulk) = annotate_gate_verdicts(&verdicts, &discovered, &current, Some(&deployed));
+        assert_eq!(rows[0]["discovered"], true);
+        assert_eq!(rows[0]["deployment"], "match");
+        assert_eq!(rows[1]["deployment"], "differs");
+        assert_eq!(rows[2]["discovered"], false, "a stale expectation must be offered for forget");
+        assert_eq!(rows[0]["status"], "verified", "the verdict shape is kept");
+        assert_eq!(bulk["allowed"], false);
+        assert_eq!(bulk["blocked_by"].as_array().unwrap().len(), 2);
     }
 
     /// A member id becomes a FILENAME, so it is validated as one.

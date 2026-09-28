@@ -26,6 +26,10 @@ this file makes it checkable.
   - the `rules` it must honour;
   - for each surface, an obligation: **`required`** (must be there), **`planned`** (not yet, with
     the reason), or **`excluded`** (must NOT be there, with the reason).
+  - optionally **`obligations`** (since version 3): the concrete behaviours a surface must show
+    for that capability, beyond calling its routes. For example, per-gate ratify: a control per gate,
+    and ratify-all only when every gate is the deployed bytes. Like `rules`, they are reviewed in
+    PRs, and a PR that implements one cites file:line for each surface.
 - **`rules`**: the shared semantics every surface implements the same way (reason to permit, 409
   means already decided, bound to the rendered evidence, UNKNOWN is never fine, member ids, confirm
   irreversible acts, no secret values, signed-in only). They are cited by id and reviewed in PRs.
@@ -68,6 +72,8 @@ this file makes it checkable.
   `rules`, and cite it from the capabilities it governs.
 - **Removing something**: remove the capability, and say in the PR who relied on it.
 - Bump `version` when the meaning of a field changes, not for every capability edit.
+  Version 3 (2026-09-28) added `obligations` and the `per-item-trust` rule, for per-gate
+  ratification and `gates-forget`.
 
 The spec leads, and the surfaces follow. When they disagree, the surface is the thing to fix,
 unless the PR changing the spec says otherwise and why.
