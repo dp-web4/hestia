@@ -48,6 +48,7 @@ def profile(member="claude-code"):
         host_agent=member,
         client_name="hestia-test-gate",
         gate_path="/installed/pre_tool_use.py",
+        declares_review_door=member in ("claude-code", "codex", "kimi-code"),
     )
 
 
@@ -96,6 +97,21 @@ def install_common_fakes(records, *, snapshot=None, local=None, safety=None, clo
         mechanism__witness_gate_self=lambda *a, **k: True,
         mechanism__claim_self_write=lambda *a, **k: ("approved", "approved", None, None),
     )
+
+
+def test_review_door_capability_is_declared_by_the_harness_not_the_gate():
+    seen = {}
+    def fetch(member, **kw):
+        seen[member] = kw
+        return live_snapshot()
+    records = []
+    with install_common_fakes(records):
+        with patched(mechanism__fetch_policy_snapshot=fetch):
+            g.decide(event("Read"), profile("claude-code"))
+            g.decide(event("Read"), profile("gemini"))
+    assert seen["claude-code"]["declares_review_door"] is True
+    assert seen["gemini"]["declares_review_door"] is False
+
 
 
 def test_allow_is_witnessed():
