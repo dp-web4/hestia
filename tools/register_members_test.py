@@ -262,15 +262,32 @@ def test_a_member_without_a_template_is_named_as_still_a_hand_edit():
         assert r.returncode == 0 and "ships no hooks/hooks.json template" in r.stdout, r.stdout
 
 
+TESTS = [
+    test_thor_case_registers_only_the_missing_witness,
+    test_ensure_adds_the_feature_flag_when_absent,
+    test_json_member_merges_without_disturbing_other_keys,
+    test_a_harness_not_on_this_host_is_not_minted,
+    test_unrendered_placeholder_refuses,
+    test_dry_run_writes_nothing,
+    test_workspace_placeholder_renders_from_env_or_drops,
+    test_a_member_without_a_template_is_named_as_still_a_hand_edit,
+]
+
 if __name__ == "__main__":
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    # the explicit list is compared against what the module defines, so a test added and not listed is
+    # RED here rather than a silently smaller run (tools/ci_selfexec_test.py, the idiom from claimable_test)
+    defined = {k for k in globals() if k.startswith("test_")}
+    listed = {t.__name__ for t in TESTS}
+    if defined != listed:
+        print(f"TESTS list is stale: defined-not-listed {sorted(defined - listed)}, listed-not-defined {sorted(listed - defined)}")
+        sys.exit(1)
     failed = 0
-    for t in tests:
+    for t in TESTS:
         try:
             t()
             print(f"ok    {t.__name__}")
         except AssertionError as e:
             failed += 1
             print(f"FAIL  {t.__name__}: {e}")
-    print(f"{len(tests) - failed}/{len(tests)} passed")
+    print(f"{len(TESTS) - failed}/{len(TESTS)} passed")
     sys.exit(1 if failed else 0)
