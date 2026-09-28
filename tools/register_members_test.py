@@ -17,6 +17,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -236,6 +237,7 @@ def test_dry_run_writes_nothing():
         assert r.returncode == 0 and "would codex: would add PostToolUse/witness.py" in r.stdout, r.stdout
         assert cfg.read_text() == CODEX_TOML
         assert not (tmp / ".codex" / "config.toml.pre-register.bak").exists()
+        assert not (tmp / ".codex" / "hooks").exists(), "DRY_RUN made a directory"
 
 
 def test_workspace_placeholder_renders_from_env_or_drops():
@@ -300,6 +302,47 @@ def test_a_write_keeps_the_config_file_mode():
         assert r.returncode == 0 and "REGISTERED codex" in r.stdout, r.stdout + r.stderr
         assert (os.stat(cfg).st_mode & 0o777) == 0o600, oct(os.stat(cfg).st_mode & 0o777)
 
+def test_the_hooks_dir_it_registers_into_is_made():
+    """HUB, 2026-09-28: ~/.codex existed, ~/.codex/hooks never had. The script registered every
+    hook there and install-members.sh then died — "registered at … but … does not exist" — which
+    stopped the WHOLE members' install, so the manifest was never written on any cycle after."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        cfg = tmp / ".codex" / "config.toml"
+        cfg.parent.mkdir()
+        cfg.write_text('[projects."/w"]\ntrust_level = "trusted"\n')
+        hooks = tmp / ".codex" / "hooks"
+        assert not hooks.exists()
+        r = _run(tmp, plugins, "--member", "codex")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert hooks.is_dir(), "registered into a directory nobody made: " + r.stdout
+        # every path the installer will now read resolves to a directory that exists
+        for b in _installer_reader(cfg):
+            assert (hooks / b).parent.is_dir(), b
+
+
+def test_a_host_already_left_registered_without_the_dir_repairs():
+    """The state the bug left behind: registration present (so the merge is a no-op) and the
+    directory still absent. The `ok` arm must make it too, or the host never recovers."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        cfg = tmp / ".codex" / "config.toml"
+        cfg.parent.mkdir()
+        cfg.write_text("")
+        assert _run(tmp, plugins, "--member", "codex").returncode == 0
+        registered = cfg.read_text()
+        shutil.rmtree(tmp / ".codex" / "hooks", ignore_errors=True)
+        r = _run(tmp, plugins, "--member", "codex")
+        assert r.returncode == 0 and (tmp / ".codex" / "hooks").is_dir(), r.stdout
+        assert "made  codex" in r.stdout, r.stdout
+        assert cfg.read_text() == registered, "a repair rewrote the registration"
+        # and once it exists, the run is the plain no-op again
+        again = _run(tmp, plugins, "--member", "codex").stdout
+        assert "ok    codex" in again and "made" not in again, again
+
+
 TESTS = [
     test_thor_case_registers_only_the_missing_witness,
     test_ensure_adds_the_feature_flag_when_absent,
@@ -311,6 +354,8 @@ TESTS = [
     test_a_member_without_a_template_is_named_as_still_a_hand_edit,
     test_a_failed_write_restores_what_this_run_read_not_the_first_backup,
     test_a_write_keeps_the_config_file_mode,
+    test_the_hooks_dir_it_registers_into_is_made,
+    test_a_host_already_left_registered_without_the_dir_repairs,
 ]
 
 if __name__ == "__main__":

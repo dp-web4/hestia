@@ -246,6 +246,19 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
     if not groups:
         return "skip", ["template registers no command hooks"]
 
+    def done(verdict: str, changes: list[str]) -> tuple[str, list[str]]:
+        # What this script registers points INTO `dest`, and install-members.sh refuses a
+        # registration whose directory is absent ("registered at … but … does not exist") —
+        # correctly, for a hand edit to a path nobody made. For a registration THIS script
+        # wrote, the directory is ours to make: registering without it turned every deploy on
+        # a host whose harness had never been hand-wired (HUB, 2026-09-28: ~/.codex present,
+        # ~/.codex/hooks never created) into a FATAL that stopped the whole members' install.
+        # Made on the `ok` arm too, so a host already left in that state repairs itself.
+        if not dry and verdict in ("ok", "registered") and not os.path.isdir(dest):
+            os.makedirs(dest, exist_ok=True)
+            log(f"  made  {member}: {dest} — the directory its registration points into")
+        return verdict, changes
+
     changes: list[str] = []
     if reader == "json-hook-commands":
         if os.path.exists(cfg):
@@ -274,7 +287,7 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
                     changes.append(f"{event}/{b}")
                     have.setdefault(event, set()).add(b)
         if not changes:
-            return "ok", []
+            return done("ok", [])
         if dry:
             return "registered", [f"would add {c}" for c in changes]
         new = json.dumps(data, indent=2) + "\n"
@@ -282,7 +295,7 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
         if raw:
             _backup(cfg)
         _write_atomic(cfg, new)
-        return "registered", changes
+        return done("registered", changes)
 
     if reader == "toml-hook-commands":
         if os.path.exists(cfg):
@@ -304,7 +317,7 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
         new, ensured = toml_ensure(new, reg.get("ensure") or [])
         changes += [f"ensure {e}" for e in ensured]
         if not changes:
-            return "ok", []
+            return done("ok", [])
         err = validate_toml(new)
         if err:
             return "failed", [f"rendered {cfg} would not parse ({err}); nothing written"]
@@ -325,7 +338,7 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
             else:
                 os.remove(cfg)
             return "failed", [f"{cfg} failed to parse after write ({err}); restored as it was"]
-        return "registered", changes
+        return done("registered", changes)
 
     return "skip", [f"unknown registration reader {reader!r} — refusing to guess"]
 
