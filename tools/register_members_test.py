@@ -262,6 +262,44 @@ def test_a_member_without_a_template_is_named_as_still_a_hand_edit():
         assert r.returncode == 0 and "ships no hooks/hooks.json template" in r.stdout, r.stdout
 
 
+
+def test_a_failed_write_restores_what_this_run_read_not_the_first_backup():
+    """The restore used to copy `.pre-register.bak`, which is written only on the FIRST run ever:
+    a failure later would roll the harness config back past every edit made since."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        cfg = tmp / ".codex" / "config.toml"
+        cfg.parent.mkdir()
+        cfg.write_text(CODEX_TOML)
+        (tmp / ".codex" / "config.toml.pre-register.bak").write_text("# STALE: the config of weeks ago\n")
+        spec = json.loads((plugins / "codex" / "expects.json").read_text())["install"]
+        template = json.loads((plugins / "codex" / "hooks" / "hooks.json").read_text())
+        calls = []
+        orig = RM.validate_toml
+        RM.validate_toml = lambda text: calls.append(1) or (None if len(calls) == 1 else "forced: after-write parse failure")
+        try:
+            verdict, changes = RM.register_member("codex", spec, template, str(tmp), False)
+        finally:
+            RM.validate_toml = orig
+        assert verdict == "failed" and "restored as it was" in changes[0], (verdict, changes)
+        assert cfg.read_text() == CODEX_TOML, "restored something other than what this run read"
+        assert not list(cfg.parent.glob(".config.toml.register-tmp")), "a temp file was left behind"
+
+
+def test_a_write_keeps_the_config_file_mode():
+    """~/.codex/config.toml is 0600; an atomic replace from a fresh temp file must not loosen it."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        cfg = tmp / ".codex" / "config.toml"
+        cfg.parent.mkdir()
+        cfg.write_text(CODEX_TOML)
+        os.chmod(cfg, 0o600)
+        r = _run(tmp, plugins, "--member", "codex")
+        assert r.returncode == 0 and "REGISTERED codex" in r.stdout, r.stdout + r.stderr
+        assert (os.stat(cfg).st_mode & 0o777) == 0o600, oct(os.stat(cfg).st_mode & 0o777)
+
 TESTS = [
     test_thor_case_registers_only_the_missing_witness,
     test_ensure_adds_the_feature_flag_when_absent,
@@ -271,6 +309,8 @@ TESTS = [
     test_dry_run_writes_nothing,
     test_workspace_placeholder_renders_from_env_or_drops,
     test_a_member_without_a_template_is_named_as_still_a_hand_edit,
+    test_a_failed_write_restores_what_this_run_read_not_the_first_backup,
+    test_a_write_keeps_the_config_file_mode,
 ]
 
 if __name__ == "__main__":

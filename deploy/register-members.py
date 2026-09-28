@@ -160,6 +160,21 @@ def _backup(path: str) -> None:
         shutil.copy2(path, bak)
 
 
+def _write_atomic(path: str, text: str) -> None:
+    """Write `text` to `path` so a crash leaves the old file or the new one, never half of one.
+    The temp file takes the original's mode: ~/.codex/config.toml is 0600, and a fresh temp file
+    (0644 under the usual umask) would loosen a harness config every time this ran."""
+    d = os.path.dirname(path) or "."
+    tmp = os.path.join(d, f".{os.path.basename(path)}.register-tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    if os.path.exists(path):
+        shutil.copymode(path, tmp)
+    os.replace(tmp, path)
+
+
 def _toml_str(s: str) -> str:
     return json.dumps(s)          # a JSON string literal is a valid TOML basic string
 
@@ -266,8 +281,7 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
         json.loads(new)
         if raw:
             _backup(cfg)
-        with open(cfg, "w", encoding="utf-8") as fh:
-            fh.write(new)
+        _write_atomic(cfg, new)
         return "registered", changes
 
     if reader == "toml-hook-commands":
@@ -298,14 +312,19 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
             return "registered", [f"would add {c}" for c in changes]
         if raw:
             _backup(cfg)
-        with open(cfg, "w", encoding="utf-8") as fh:
-            fh.write(new)
+        _write_atomic(cfg, new)
         with open(cfg, encoding="utf-8", errors="replace") as fh:
             back = fh.read()
         err = validate_toml(back)
         if err:
-            shutil.copy2(cfg + ".pre-register.bak", cfg)
-            return "failed", [f"{cfg} failed to parse after write ({err}); backup restored"]
+            # Restore what THIS run read, not `.pre-register.bak`: that backup is written once,
+            # on the first run ever, so restoring it would roll the harness config back past
+            # every edit made since. A file that did not exist goes back to not existing.
+            if raw:
+                _write_atomic(cfg, raw)
+            else:
+                os.remove(cfg)
+            return "failed", [f"{cfg} failed to parse after write ({err}); restored as it was"]
         return "registered", changes
 
     return "skip", [f"unknown registration reader {reader!r} — refusing to guess"]
