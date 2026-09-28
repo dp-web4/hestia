@@ -2489,6 +2489,34 @@
     } catch (e) { alert(`retire failed: ${e.message}`); }
   }
 
+  // RETIRE EVERY NEVER-ACTED PHANTOM IN ONE ACT (dp, 2026-09-28: Discover listed 12 ids that
+  // nothing on the machine accounts for; one-at-a-time meant two prompts each). ONE reason and
+  // one evidence pointer, then the SAME route per id as the single retire above -- and never with
+  // `confirm_active`: an id that has acted recently is refused by the server's own guard and
+  // reported, not overridden. A bulk act must not be the way around the one check that tells a
+  // phantom from the live seat.
+  async function retireNeverActed(ids) {
+    if (!ids.length) return;
+    if (!confirm(`Retire these ${ids.length} ids on this seat?\n\n  ${ids.join('\n  ')}\n\nEach has never acted here. Each one's standing, live and delegated authority is revoked. Not deletion; each is reversible from "show retired".`)) return;
+    const reason = prompt(`One reason for all ${ids.length} (recorded on each):`);
+    if (!reason) return;
+    const ref = prompt('Evidence pointer (required — where the reason is recorded):');
+    if (!ref) return;
+    const done = [], refused = [];
+    for (const id of ids) {
+      try {
+        const res = await apiFetch(`/api/agents/${encodeURIComponent(id)}/retire`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reason, ref }) });
+        const out = await res.json().catch(() => ({}));
+        if (res.ok) done.push(id); else refused.push(`${id}: ${out.error || ('HTTP ' + res.status)}`);
+      } catch (e) { refused.push(`${id}: ${e.message}`); }
+    }
+    await tick();
+    discoverLoad();
+    alert(`Retired ${done.length} of ${ids.length}.` + (refused.length ? `\n\nNot retired:\n  ${refused.join('\n  ')}` : ''));
+  }
+
   async function reinstateAgent(id) {
     const reason = prompt(`Reinstate "${id}"?\n\nThe standing grants revoked at retirement are NOT restored — re-grant any that are still wanted, deliberately.\n\nWhy?`);
     if (!reason) return;
@@ -2505,13 +2533,14 @@
   }
 
   document.addEventListener('click', e => {
-    const t = e.target && e.target.closest && e.target.closest('[data-retire],[data-reinstate],#disc-show-retired,#disc-hide-retired');
+    const t = e.target && e.target.closest && e.target.closest('[data-retire],[data-reinstate],[data-retire-all],#disc-show-retired,#disc-hide-retired');
     if (!t) return;
     e.stopPropagation();
     if (t.id === 'disc-show-retired' || t.id === 'disc-hide-retired') {
       showRetired = t.id === 'disc-show-retired';
       discoverLoad();
-    } else if (t.dataset.retire) { retireAgent(t.dataset.retire); }
+    } else if (t.dataset.retireAll !== undefined) { retireNeverActed(JSON.parse(t.dataset.retireAll || '[]')); }
+    else if (t.dataset.retire) { retireAgent(t.dataset.retire); }
     else { reinstateAgent(t.dataset.reinstate); }
   }, true);
 
@@ -4466,6 +4495,14 @@
   // (#1067), and were invisible here while being the whole reason this pane was built. RETIRE
   // lives on these rows. It is the placement dp asked for -- the lifecycle pane, beside the
   // gaps and their remedies, rather than in the live trust list people glance at.
+  // HESTIA'S OWN TOOLS, which connect under a fixed name and are recorded as members by that
+  // connection. Not agents and not typos, so they are listed apart, quietly, with no retire:
+  // dp saw them among the phantoms (2026-09-28) and a phantom is something to remove.
+  const HESTIA_OWN_CLIENTS = {
+    'hestia-cli': 'the `hestia gate` CLI’s asserted identity — deliberate (#63/#128): the daemon decides, the CLI only asks',
+    'agent-inventory': 'the agent inventory, which connects to witness each scan',
+  };
+
   const UNACCOUNTED_GROUP = {
     key: 'unaccounted', tone: 'amber',
     title: 'Recorded as a member here — and nothing on this machine accounts for it',
@@ -4547,8 +4584,10 @@
       }
     }
     const retiredSet = new Set(Array.isArray(retiredIds) ? retiredIds : []);
+    const own = (Array.isArray(members) ? members : [])
+      .filter(m => m && m.plugin_id && HESTIA_OWN_CLIENTS[m.plugin_id]);
     const orphans = (Array.isArray(members) ? members : [])
-      .filter(m => m && m.plugin_id && !accounted.has(String(m.plugin_id)));
+      .filter(m => m && m.plugin_id && !accounted.has(String(m.plugin_id)) && !HESTIA_OWN_CLIENTS[m.plugin_id]);
     const shownOrphans = orphans.filter(m => showRetiredNow || !retiredSet.has(m.plugin_id));
     const hiddenRetired = orphans.length - shownOrphans.length;
     if (shownOrphans.length) groups.unshift({
@@ -4561,6 +4600,12 @@
         actionCount: typeof m.action_count === 'number' ? m.action_count : 0,
         retired: retiredSet.has(m.plugin_id),
       })),
+    });
+    if (own.length) groups.push({
+      key: 'hestia_own', tone: 'grey', title: 'Hestia’s own tools — recorded when they connect, not agents',
+      remedy: 'Listed so nothing is hidden. Nothing to do: these are how hestia’s CLI and inventory reach the daemon.',
+      rows: own.map(m => Object.assign(discoverRow(String(m.plugin_id), null), {
+        governanceId: String(m.plugin_id), ownTool: HESTIA_OWN_CLIENTS[m.plugin_id] })),
     });
     const sc = r.scope || {};
     return {
@@ -4656,6 +4701,13 @@
       <div class="disc-group disc-group-${g.tone}">
         <div class="pol-section-label">${escapeHtml(g.title)} <span class="disc-count">${g.rows.length}</span></div>
         ${g.remedy ? `<div class="grant-note">${escapeHtml(g.remedy)}</div>` : ''}
+        ${(() => {
+          if (g.key !== 'unaccounted') return '';
+          const ids = g.rows.filter(r => !r.retired && !r.actionCount).map(r => r.governanceId);
+          return ids.length > 1 ? `<div class="grant-note"><button type="button" class="pol-btn pol-remove"
+            data-retire-all="${escapeHtml(JSON.stringify(ids))}"
+            title="One reason for all of them. Each goes through the same retire as its own button, and an id that has acted recently is refused, not overridden.">retire all ${ids.length} never-acted ids…</button></div>` : '';
+        })()}
         ${g.rows.map(r => `
           <div class="disc-row">
             <span class="disc-name">${escapeHtml(r.name)}</span>
@@ -4676,6 +4728,7 @@
             ${r.findings ? badge('amber', r.findings + ' finding' + (r.findings === 1 ? '' : 's')) : ''}
             ${r.executable ? `<span class="disc-path" title="resolved executable">${escapeHtml(r.executable)}</span>` : ''}
             ${r.configs ? `<span class="disc-path">${r.configs} config${r.configs === 1 ? '' : 's'} read</span>` : ''}
+            ${r.ownTool ? `<span class="tr-dim">${escapeHtml(r.ownTool)}</span>` : ''}
             ${g.key === 'unaccounted' ? `<span class="tr-dim">${r.actionCount
                 ? r.actionCount + ' act' + (r.actionCount === 1 ? '' : 's') + ' recorded'
                 : 'never acted'}</span>` : ''}

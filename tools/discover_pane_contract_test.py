@@ -98,12 +98,22 @@ def source_contract() -> None:
     # It grew by one when register (#1101) and retire (#1113) landed in the same pane.
     WRITE_CONTROLS = {"data-retire": "retire (#1100, moved here by #1113)",
                       "data-reinstate": "reinstate (#1100, moved here by #1113)",
-                      "data-register": "register a discovered harness (#1101)"}
-    found = set(re.findall(r"\bdata-(?:retire|reinstate|register|delete|revoke|grant|merge-alias)\b", block))
-    check("the write-capable controls in this pane are exactly the reviewed three",
+                      "data-register": "register a discovered harness (#1101)",
+                      # dp, 2026-09-28: 12 phantoms, two prompts each. One reason for all of the
+                      # never-acted ones; each through the same route, never with confirm_active.
+                      "data-retire-all": "retire every never-acted orphan in one act"}
+    found = set(re.findall(r"\bdata-(?:retire-all|retire|reinstate|register|delete|revoke|grant|merge-alias)(?![\w-])", block))
+    check("the write-capable controls in this pane are exactly the reviewed four",
           sorted(found), sorted(WRITE_CONTROLS))
     check("retire and reinstate are dispatched by the retire block's own delegated handler",
-          "closest('[data-retire],[data-reinstate],#disc-show-retired,#disc-hide-retired')" in UI)
+          "closest('[data-retire],[data-reinstate],[data-retire-all],#disc-show-retired,#disc-hide-retired')" in UI)
+    # THE BULK ACT MUST NOT BE THE WAY AROUND THE LIVE-MEMBER GUARD. retireNeverActed sends each id
+    # without confirm_active, so an id that acted recently is refused by the server and reported.
+    bulk = UI[UI.index("async function retireNeverActed("):UI.index("async function reinstateAgent(")]
+    check("bulk retire never sends confirm_active", "confirm_active" in bulk, False)
+    check("bulk retire goes through the same retire route per id",
+          "/api/agents/${encodeURIComponent(id)}/retire" in bulk)
+    check("bulk retire asks for the reason and the evidence pointer", "if (!reason) return;" in bulk and "if (!ref) return;" in bulk)
     check("retire is offered ONLY on the unaccounted group, never on an installed agent's row",
           block.count("data-retire=") == 1
           and "g.key !== 'unaccounted' ? ''" in block)
@@ -445,6 +455,32 @@ def registry_members() -> None:
           rows(m)["codex"][1]["registerable"], False)
 
 
+def cleanup() -> None:
+    """dp, 2026-09-28: Discover's orphan group held 12 ids -- typos, test ids, and hestia's own
+    CLI and inventory. The tools are not phantoms; the rest should go in one act."""
+    report = {"status": "OK", "machine": "McNugget", "governed": ["claude"], "gaps": {},
+              "detail": [agent("claude", "claude-code", True, member="claude-code")]}
+    ms = [{"plugin_id": "claude-code", "action_count": 5415},
+          {"plugin_id": "hestia-cli", "action_count": 0}, {"plugin_id": "agent-inventory", "action_count": 0},
+          {"plugin_id": "Claude-code", "action_count": 0}, {"plugin_id": "test-being", "action_count": 0},
+          {"plugin_id": "claude-cod3", "action_count": 3}]
+    m = run_model(report, ms, [])
+    by = {g["key"]: [r["governanceId"] for r in g["rows"]] for g in m["groups"]}
+    check("hestia's own tools are listed apart, not as phantoms",
+          sorted(by.get("hestia_own", [])), ["agent-inventory", "hestia-cli"])
+    check("...and are NOT in the orphan group, where retire lives",
+          [x for x in by.get("unaccounted", []) if x in ("hestia-cli", "agent-inventory")], [])
+    check("the typos and test ids ARE orphans", sorted(by.get("unaccounted", [])),
+          ["Claude-code", "claude-cod3", "test-being"])
+    # The bulk list is built in the render from the group's rows: never-acted and not retired.
+    # claude-cod3 has acts here, so it must be left for a deliberate single retire.
+    rows = {r["governanceId"]: r for g in m["groups"] if g["key"] == "unaccounted" for r in g["rows"]}
+    bulk = sorted(i for i, r in rows.items() if not r.get("retired") and not r.get("actionCount"))
+    check("the bulk offer covers only never-acted ids", bulk, ["Claude-code", "test-being"])
+    check("the render builds the bulk list by exactly that rule",
+          "g.rows.filter(r => !r.retired && !r.actionCount).map(r => r.governanceId)" in UI)
+
+
 def live() -> None:
     """The real report from this machine, when there is one. It is the only fixture nobody wrote."""
     inv = Path.home() / ".local/bin/hestia-agent-inventory"
@@ -476,6 +512,7 @@ def main() -> int:
         behaviour()
         unaccounted()
         registry_members()
+        cleanup()
         member_ids()
         live()
     else:
