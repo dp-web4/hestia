@@ -8563,6 +8563,22 @@ mod disposition_tests {
         assert!(b["error"].as_str().unwrap().contains("Reinstate it"), "{b}");
     }
 
+    /// dp, 2026-09-28: registering the being "said already registered but it doesn't show up".
+    /// The views inferred membership from trust rows, which only a member that has ACTED has.
+    #[tokio::test]
+    async fn the_snapshot_lists_a_member_that_has_never_acted() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "claude-code").await;
+        register_member(&state, "mcnugget-being").await;
+        let s = state.lock().await;
+        let snap = s.dashboard_snapshot(10);
+        assert!(snap.members.contains(&"mcnugget-being".to_string()),
+                "a registered member with no acts must be listed: {:?}", snap.members);
+        assert!(!snap.trust.iter().any(|t| t.plugin_id == "mcnugget-being"),
+                "fixture: it has no trust row, which is exactly why it was invisible");
+        assert!(snap.members.contains(&"claude-code".to_string()));
+    }
+
     /// dp, 2026-09-25: "i tried retiring 'caude-code' through the ui, and it shows as retired in
     /// the explore screen, but still shows up as a registered harness in the witness and other
     /// displays." The agents bar above the witness feed drew a chip for every trust grain the

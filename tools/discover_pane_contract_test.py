@@ -114,7 +114,28 @@ def source_contract() -> None:
           "could not reach the inventory" in block and "status: 'UNKNOWN'" in block)
     # ...and it must still list the registry half, which does not come from the walk that died.
     check("a fetch failure still passes the members through, so the orphans stay reachable",
-          block.count("aggregateHarnessTrust(((lastData || {}).trust) || [])"), 2)
+          block.count("discoverMembers(lastData)"), 2)
+    # ...and the members are the REGISTRY's, not only those with a trust row: a member that never
+    # acted has none, and was invisible here (dp, 2026-09-28).
+    # BEHAVIOURAL, not a string: a first source-only pin stayed green with the merge disabled.
+    import re as _re
+    def _fn(name):
+        a = UI.index(f"function {name}(")
+        depth, i = 0, UI.index("{", a)
+        while True:
+            depth += UI[i] == "{"; depth -= UI[i] == "}"; i += 1
+            if depth == 0:
+                return UI[a:i]
+    lvl = _re.search(r"const LEVEL_ORDER = [^;]*;", UI).group(0)
+    prog = (lvl + _fn("aggregateHarnessTrust") + _fn("discoverMembers") +
+            "\nconst D = JSON.parse(process.argv[1]);"
+            "process.stdout.write(JSON.stringify(discoverMembers(D).map(m => [m.plugin_id, m.action_count])));")
+    data = {"trust": [{"plugin_id": "claude-code", "action_count": 5415, "level": "high"}],
+            "members": ["claude-code", "Claude-code", "mcnugget-being"]}
+    out = subprocess.run(["node", "-e", prog, json.dumps(data)], capture_output=True, text=True, timeout=30)
+    got = json.loads(out.stdout) if out.returncode == 0 else out.stderr.strip()[-200:]
+    check("the loader adds every registry id the trust rows lack, at zero acts, without duplicating",
+          got, [["claude-code", 5415], ["Claude-code", 0], ["mcnugget-being", 0]])
     check("UNKNOWN says it is not 'nothing found'", 'this is not "nothing found"' in block)
     check("undefined failure mode is its own state", "failure mode unknown" in block)
     check("both names are shown, and the grant-relevant one is labelled",
@@ -387,6 +408,43 @@ def member_ids() -> None:
           {r["atlasId"]: r for g in m2["groups"] for r in g["rows"]}["codex"]["governanceId"], "codex")
 
 
+def registry_members() -> None:
+    """dp, 2026-09-28: "when i tried to register the being, it said already registered but it
+    doesn't show up. and we still have two claude-code registrations." One cause: Discover built
+    its members from TRUST rows, which exist only for members that have acted."""
+    report = {"status": "GAP", "machine": "McNugget", "governed": ["claude"],
+              "gaps": {"unprovisioned_being": ["sage"]},
+              "detail": [agent("claude", "claude-code", True, member="claude-code"),
+                         agent("sage", None, True, {"harness": "SAGE", "kind": "being"}, kind="being",
+                               launchers=[])]}
+    reg = lambda *ids: [{"plugin_id": i, "action_count": 5415 if i == "claude-code" else 0} for i in ids]
+    rows = lambda m: {r["atlasId"]: (g["key"], r) for g in m["groups"] for r in g["rows"]}
+
+    m = run_model(report, reg("claude-code", "Claude-code", "mcnugget-being"), [])
+    r = rows(m)
+    check("a registered, never-launched being says who it is registered as",
+          r["sage"][1].get("registeredAs"), "mcnugget-being")
+    check("...and is NOT offered register again (that answered 'already registered')",
+          r["sage"][1]["registerable"], False)
+    check("...and is not listed as an orphan: it is right here, just not launched",
+          "mcnugget-being" in [x["governanceId"] for g in m["groups"] if g["key"] == "unaccounted" for x in g["rows"]],
+          False)
+    check("a never-acted phantom from the registry IS listed, so it can be retired",
+          [x["governanceId"] for g in m["groups"] if g["key"] == "unaccounted" for x in g["rows"]],
+          ["Claude-code"])
+
+    m = run_model(report, reg("claude-code"), [])
+    check("not yet registered: the being IS offered register",
+          rows(m)["sage"][1]["registerable"], True)
+
+    # The general rule: a row whose id is already a member is never offered register.
+    rep2 = dict(report, gaps={"ungoverned": ["codex"]},
+                detail=[agent("codex", "codex", True, member="codex")])
+    m = run_model(rep2, reg("codex"), [])
+    check("an installed harness whose id is already a member: no register button",
+          rows(m)["codex"][1]["registerable"], False)
+
+
 def live() -> None:
     """The real report from this machine, when there is one. It is the only fixture nobody wrote."""
     inv = Path.home() / ".local/bin/hestia-agent-inventory"
@@ -417,6 +475,7 @@ def main() -> int:
     if shutil.which("node"):
         behaviour()
         unaccounted()
+        registry_members()
         member_ids()
         live()
     else:

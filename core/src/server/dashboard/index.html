@@ -4494,6 +4494,27 @@
     // DIRECTORIES alone left `kimi-code` (directory `kimi`) in the "nothing on this machine
     // accounts for it" group, with a Retire button, while it was running and governed.
     const accounted = new Set(detail.flatMap(d => d ? [d.member, d.plugin] : []).filter(Boolean).map(String));
+    // A REGISTERED BEING THAT NOTHING LAUNCHES YET (dp, 2026-09-28: "when i tried to register the
+    // being, it said already registered but it doesn't show up"). The inventory learns a being's
+    // id only from a launcher's --member, so until a heartbeat exists the row said "no governance
+    // id yet" and offered register again -- which answered "already registered". The register
+    // route derives the id as <machine>-being; when the registry holds exactly that, the row says
+    // so, stops offering register, and the id counts as accounted for (it is not an orphan: the
+    // being is right here, it is just not launched).
+    //
+    // The general rule underneath: A ROW WHOSE ID IS ALREADY A MEMBER IS NOT OFFERED REGISTER.
+    // On McNugget the inventory already names the being's id (`mcnugget-being`, from its record),
+    // so the row carried a governance id AND a register button -- the loop dp hit.
+    const memberIds = new Set((Array.isArray(members) ? members : []).map(m => m && String(m.plugin_id)).filter(Boolean));
+    const machine = String(r.machine || '').toLowerCase();
+    for (const g of groups) for (const row of g.rows) {
+      const id = row.governanceId || (row.being && machine ? `${machine}-being` : '');
+      if (id && memberIds.has(id)) {
+        row.registerable = false;
+        if (row.being && g.key === 'unprovisioned_being') row.registeredAs = id;
+        accounted.add(id);
+      }
+    }
     const retiredSet = new Set(Array.isArray(retiredIds) ? retiredIds : []);
     const orphans = (Array.isArray(members) ? members : [])
       .filter(m => m && m.plugin_id && !accounted.has(String(m.plugin_id)));
@@ -4610,7 +4631,8 @@
             <span class="disc-ids">${g.key === 'unaccounted'
               ? `governance id <code>${escapeHtml(r.governanceId)}</code> → <em>no atlas id, because nothing on this machine was found to carry it</em>`
               : `atlas <code>${escapeHtml(r.atlasId)}</code>${
-                r.governanceId ? ` → governance id <code>${escapeHtml(r.governanceId)}</code>`
+                r.registeredAs ? ` → <strong>registered as <code>${escapeHtml(r.registeredAs)}</code></strong> — <em>nothing launches it yet: install its heartbeat to bring it up</em>`
+                               : r.governanceId ? ` → governance id <code>${escapeHtml(r.governanceId)}</code>`
                                : r.being ? ' → <em>no governance id yet — a being’s id is set by its launcher</em>'
                                : ' → <em>no hestia plugin, so no governance id</em>'}`}</span>
             ${r.failure === 'open' ? badge('amber', 'fails open', 'if its gate hook errors or times out, the action is ALLOWED')
@@ -4667,6 +4689,19 @@
   }, true);
 
   let discoverBusy = false;
+  // Every member Discover can see: the trust-derived rows (they carry the act counts) plus every
+  // id the REGISTRY holds that has none -- a member that never acted has no trust row, and was
+  // therefore invisible here, whether it was a being awaiting its heartbeat or a phantom
+  // awaiting retirement (dp, 2026-09-28: "we still have two claude-code registrations").
+  function discoverMembers(data) {
+    const rows = aggregateHarnessTrust(((data || {}).trust) || []);
+    const seen = new Set(rows.map(x => x.plugin_id));
+    for (const id of ((data || {}).members || [])) {
+      if (!seen.has(id)) { rows.push({ plugin_id: id, action_count: 0 }); seen.add(id); }
+    }
+    return rows;
+  }
+
   async function discoverLoad() {
     if (discoverBusy) return;
     discoverBusy = true;
@@ -4678,7 +4713,7 @@
       // exactly ONE request of its own. Registry state and disk state are different sources,
       // and reconciling the two is this pane's whole job.
       discoverRender(discoverModel(await res.json(),
-                                   aggregateHarnessTrust(((lastData || {}).trust) || []),
+                                   discoverMembers(lastData),
                                    ((lastData || {}).retired) || [], showRetired));
     } catch (e) {
       // A failed look is reported as a failed look, never as an empty machine.
@@ -4686,7 +4721,7 @@
       // from the walk that just failed. An operator who came here to retire a phantom is not
       // told the machine is empty because a filesystem scan died.
       discoverRender(discoverModel({ status: 'UNKNOWN', reason: `could not reach the inventory (${e.message})` },
-                                   aggregateHarnessTrust(((lastData || {}).trust) || []),
+                                   discoverMembers(lastData),
                                    ((lastData || {}).retired) || [], showRetired));
     } finally {
       discoverBusy = false; if (btn) btn.disabled = false;
