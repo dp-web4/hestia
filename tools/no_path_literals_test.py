@@ -128,6 +128,9 @@ ALLOWED = [
      "resolving the ACT's relative target against the event cwd; data about the act, not a root"),
     ("cwd-root-fallback", 'event.get("cwd") or',
      "the act's cwd taken from the event first; same shape as the scope resolvers, on the gemini seat"),
+    ("getenv-path-default", 'os.environ.get("HESTIA_PLUGIN_ID", DEFAULT_PLUGIN_ID)',
+     "the witness shim's member-id default, not a path: the one identity line per shim (the rest is "
+     "byte-identical across harnesses); matched only because the class flags any DEFAULT_ constant"),
 ]
 
 # Per-file, per-class CODE hit counts on origin/main, measured 2026-09-04 at cc64864 by running
@@ -146,7 +149,12 @@ PINNED_BASELINE: dict | None = {
     "plugins/_shared/hestia_gate_mechanism.py":     {"getenv-path-default": 2},
     "plugins/_shared/hestia_governance_closure.py": {},
     "plugins/_shared/hestia_shell_classifier.py":   {},
-    "plugins/claude-code/hooks/" + _HOOK:      {"abs-tmp-state": 1, "expanduser-tilde": 1},
+    "plugins/claude-code/hooks/" + _HOOK:      {"expanduser-tilde": 1},
+    # 2026-09-28: the #977 pair below (gate cache writer + witness reader, each carrying
+    # /tmp/hestia-actions) became ONE literal in the shared witness core, which owns both halves
+    # of the seam for every harness (findings/per-harness-witness-drift-2026-09-28.md). Net: 3 -> 1
+    # (the codex witness's getenv default went with its private copy). It still retires under #944.
+    "plugins/_shared/hestia_witness_core.py":       {"abs-tmp-state": 1},
     "plugins/codex/hooks/" + _HOOK:                 {"cwd-root-fallback": 2, "expanduser-tilde": 1, "getenv-path-default": 3, "tilde-hestia": 1},
     "plugins/kimi/hooks/" + _HOOK:                  {"cwd-root-fallback": 2, "expanduser-tilde": 1, "getenv-path-default": 2},
     "plugins/gemini/hooks/" + _GEM:                 {"cwd-root-fallback": 1, "expanduser-tilde": 1, "getenv-path-default": 2, "tilde-hestia": 1},
@@ -158,8 +166,10 @@ PINNED_BASELINE: dict | None = {
     # attribute to the repair or to the migration. It retires under #944, as ONE pair with the
     # pre-hook's `abs-tmp-state: 1` below — a lone survivor here means the two sides diverged,
     # which is the failure mode the whole issue is about.
-    "plugins/claude-code/hooks/witness.py":    {"abs-tmp-state": 1},
-    "plugins/codex/hooks/witness.py":               {"getenv-path-default": 1},
+    "plugins/claude-code/hooks/witness.py":    {},
+    "plugins/codex/hooks/witness.py":               {},
+    "plugins/kimi/hooks/witness.py":                {},
+    "plugins/gemini/hooks/witness.py":              {},
     "plugins/kimi/hooks/observe.sh":                {"shell-home-default": 1},
     "plugins/kimi/hooks/hydrate.sh":                {"shell-home-default": 3},
     "plugins/gemini/hooks/observe.sh":              {"shell-home-default": 1},
@@ -204,6 +214,7 @@ def runtime_set() -> list[str]:
 _SEAT_HOOKS = [
     "plugins/claude-code/hooks/witness.py",
     "plugins/codex/hooks/witness.py",
+    "plugins/kimi/hooks/witness.py", "plugins/gemini/hooks/witness.py",
     "plugins/kimi/hooks/observe.sh", "plugins/kimi/hooks/hydrate.sh",
     "plugins/gemini/hooks/observe.sh", "plugins/gemini/hooks/hydrate.sh",
 ]

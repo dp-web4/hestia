@@ -36,15 +36,20 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def load_witness(home: Path):
-    """Import the hook against a fixture projection, the way the launcher would."""
+    """Import the hook against a fixture projection, the way the launcher would, and return
+    the shared witness core it loaded — the witness logic lives there now, for every harness
+    (findings/per-harness-witness-drift-2026-09-28.md). The shared dir is named explicitly,
+    as CI's hook job does; never an ambient checkout lookup."""
     os.environ["HESTIA_HOME"] = str(home)
+    os.environ.setdefault("HESTIA_SHARED_DIR", str(HERE.parents[1] / "_shared"))
     write_projection(home, "claude-code", {"HESTIA_PLUGIN_ID": "claude-code"})
     spec = importlib.util.spec_from_file_location(
         "witness_under_test", HERE.parent / "hooks" / "witness.py"
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod
+    assert mod.core is not None, f"the shim did not load the shared core: {mod._CORE_ERROR}"
+    return mod.core
 
 
 class FakeClient:

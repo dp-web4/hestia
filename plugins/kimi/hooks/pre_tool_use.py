@@ -717,10 +717,13 @@ def main():
                 shared = os.path.join(WORKSPACE, "hestia", "plugins", "_shared")
                 if shared not in sys.path:
                     sys.path.insert(0, shared)
-                from hestia_gate_mechanism import query_society_safety
+                from hestia_gate_mechanism import query_society_safety, correlation_key
+                # The key lets the shared witness CLOSE the action this asks about (#977);
+                # without it every kimi outcome was recorded cold (0 of 37 warned acts closed).
                 verdict = query_society_safety(
                     event, plugin_id="kimi-code", host_agent="kimi-code",
-                    host_session_id=event.get("session_id"))
+                    host_session_id=event.get("session_id"),
+                    correlation_key=correlation_key(event))
             except Exception:
                 # Loading the mechanism must itself fail closed on a consequential act: a missing or
                 # unimportable module is not a reason to allow a write on a fail-open harness.

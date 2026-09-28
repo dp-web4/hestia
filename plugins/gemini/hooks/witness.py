@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Hestia outcome witness — the OpenAI Codex CLI shim. Stdlib only.
+"""Hestia outcome witness — the Gemini CLI shim. Stdlib only.
 
-Registered on the harness's post-tool event(s): PostToolUse. It says WHO is witnessing and hands
+Registered on the harness's post-tool event(s): AfterTool. It says WHO is witnessing and hands
 the event to the shared core, `hestia_witness_core` (installed at $HESTIA_HOME/shared with the
 rest of the engine). Everything else — the gate<->outcome correlation (#977), the spool (#696),
 the cold-path typing, the harness event shapes — lives in the core, once.
@@ -26,8 +26,8 @@ import subprocess
 import sys
 import time
 
-DEFAULT_PLUGIN_ID = "codex"
-HOST_AGENT_VERSION = "codex"
+DEFAULT_PLUGIN_ID = "gemini"
+HOST_AGENT_VERSION = "gemini"
 
 PLUGIN_ID = os.environ.get("HESTIA_PLUGIN_ID", DEFAULT_PLUGIN_ID)
 HOOK_VERSION = "1.0.0"
