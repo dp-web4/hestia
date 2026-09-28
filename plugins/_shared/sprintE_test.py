@@ -176,6 +176,60 @@ def test_action_id_attached_on_decided():
 
 
 # ---- (c) the ONE deny recorder ----
+def test_generic_decision_witness_records_allow_on_the_same_wire_path():
+    fake = RecordingClient()
+    ok = m.witness_decision(
+        fake, plugin_id="codex", decision="allow", rule="gate.allow",
+        tool_name="Write", target="/tmp/x", session_id="sess-allow",
+        verdict_available=True, attempted_summary="Write -> /tmp/x")
+    check("generic-allow-delivered", ok is True, "allow should use the common witness path")
+    wit = fake.args_of("hestia_witness_decision")
+    check("generic-allow-one-wire-call", len(wit) == 1, str(fake.calls))
+    check("generic-allow-kind", wit[0].get("decision") == "allow", str(wit))
+    check("generic-allow-rule", wit[0].get("reason") == "gate.allow", str(wit))
+
+
+def test_generic_decision_fallback_never_guesses_hestia_home():
+    old = os.environ.pop("HESTIA_HOME", None)
+    try:
+        m._discover_endpoint = lambda: None
+        ok = m.witness_decision(
+            None, plugin_id="codex", decision="allow", rule="gate.allow",
+            tool_name="Write", target="/tmp/x", session_id=None,
+            verdict_available=True, attempted_summary="Write -> /tmp/x")
+        check("generic-no-home-fails-delivery", ok is False, "no endpoint cannot report committed")
+        check("generic-no-home-has-no-guessed-path",
+              m._decision_fallback_path("codex") is None,
+              "generic witness must not invent ~/.hestia")
+    finally:
+        if old is not None:
+            os.environ["HESTIA_HOME"] = old
+
+
+def test_legacy_unified_wrapper_keeps_gate_denies_fallback():
+    with tempfile.TemporaryDirectory() as tmp:
+        old = os.environ.get("HESTIA_HOME")
+        os.environ["HESTIA_HOME"] = tmp
+        try:
+            failing = RecordingClient(raise_on="hestia_witness_decision")
+            ok = m.witness_decision_unified(
+                failing, plugin_id="codex", decision="deny", rule="r",
+                tool_name="Write", target="/x", session_id=None,
+                verdict_available=True, attempted_summary="Write -> /x")
+            check("legacy-wrapper-false-on-failure", ok is False)
+            check("legacy-wrapper-path",
+                  os.path.isfile(os.path.join(tmp, "telemetry", "gate-denies-codex.jsonl")),
+                  "compatibility wrapper changed the deployed fallback filename")
+            check("generic-path-not-used-by-legacy",
+                  not os.path.exists(os.path.join(tmp, "telemetry", "gate-decisions-codex.jsonl")),
+                  "legacy wrapper should not silently change its operational artifact")
+        finally:
+            if old is None:
+                os.environ.pop("HESTIA_HOME", None)
+            else:
+                os.environ["HESTIA_HOME"] = old
+
+
 def test_unified_recorder_carries_target_and_verdict_available():
     fake = RecordingClient()
     ok = m.witness_decision_unified(
