@@ -1,7 +1,7 @@
 # PRD: hook ground truth — the repo publishes, the vault certifies, the daemon projects
 
-**Status:** DRAFT. This records dp's design (2026-09-28) against the measured gaps. Nothing here is
-built yet.
+**Status:** DRAFT, with dp's decisions recorded (§5). This records dp's design (2026-09-28) against
+the measured gaps. Nothing here is built yet.
 **Closes, when built:**
 - the deploy half of dp's vault requirement (findings/ratified-hooks-are-compared-not-deployed-2026-09-28.md);
 - #1156 (a de-registered gate reads VERIFIED);
@@ -82,11 +82,12 @@ A mismatch at any edge is a named finding.
   release, per-file sha, registration digest) and verifies the result with the existing
   `gate_watch` pass. The projection replaces whatever is registered on the declared events. It is
   not additive, which is the opposite of today's `register-members.py`.
-- **G5. The vault's shas change only on a certified release.** Certifying a release is the
-  operator act: today's ratify, re-aimed from "the bytes that happen to be installed" to "this GT
-  release". Its record is the release id, the per-file shas, and the registration digest. A
-  deploy that brings a new GT release is a PROPOSAL until certified. Live hooks keep projecting
-  the last certified release, never the newest uncertified one.
+- **G5. The vault's shas change only when a member is certified.** Certification is PER MEMBER
+  (§5.2): the operator certifies one member's GT version. That is today's ratify, re-aimed from
+  "the bytes that happen to be installed" to "this member's GT version". The record is the GT
+  release id, the per-file shas, and the registration digest, keyed by member. A new GT version is
+  a PROPOSAL for that member until it is certified. The member's live hooks keep projecting its
+  last certified version. Anything else running on the member reads MISWIRED (§5.3), not refused.
 - **G6. Repair and restore copy from local GT.** Restore after a Discover bypass (#1158), repair
   of a MODIFIED gate, and repair of a de-registered one: each is "project the certified GT for
   this member", the same code path as G4.
@@ -114,27 +115,49 @@ A mismatch at any edge is a named finding.
 | operator certification | ratify per gate (#1150) | certifies installed bytes, not a release |
 | one witness per harness | `hestia_witness_core` + identical shims (#1149) | would be published as GT files like the gate |
 
-## 5. Open questions for dp
+## 5. Decisions (dp, 2026-09-28)
 
-1. **Directory:** a new top-level `hooks-gt/<harness>/`, or promote `plugins/<member>/` to be the
-   GT, with its manifest? The latter avoids a second copy of every hook in the repo.
-2. **Certification granularity:** per release (the whole GT set at once) or per member? Per
-   release matches "certified releases". Per member lets one harness move without re-certifying
-   the others.
-3. **Seats that run hooks from a checkout** (HUB, which runs the working tree in place): does G4
-   project onto them too, ending that layout? It must, for "live populated from GT" to hold
-   everywhere.
-4. **Harness hook caching:** Claude Code and others may read hook config only at session start.
-   G4 fixes the files and config on disk, but a running session may still execute the old
-   registration until it restarts. Should the projection record per-session staleness, or accept
-   that restart boundary as the model?
+1. **Directory: both, on purpose.** dp: *"two copies are the redundancy check."* `plugins/<member>/`
+   stays the working source. `hooks-gt/<harness>/` is the published, tested copy. CI compares
+   them: a difference that is not a re-publish is an unpublished change, and it is reported.
+2. **Certification is per member.** dp: *"too many harnesses and no need to lock them together."*
+   The vault record is keyed by member: GT release id, per-file shas, registration digest. A
+   member moves to a new GT version without re-certifying any other.
+3. **Everything is populated from GT, and a deviation is flagged, not blocked.** dp: *"anything
+   deviating flagged as miswired -- that allows testing to proceed unimpeded but properly flags
+   deviations."* This covers seats that run hooks from a checkout (HUB). A deviation is MISWIRED
+   and is never refused, so a tester can run a modified hook and the fleet still sees that
+   member as off-GT.
+4. **Harness hook caching: marked stale where known, a documented limitation where not.**
+
+## 5a. Harness hook caching: what is known, and what G4 must respect
+
+| harness | behaviour | basis | consequence for projection |
+|---|---|---|---|
+| claude-code | **snapshot at session start.** Edits to the settings files take effect only after `/hooks` review or a restart. | Anthropic's Claude Code docs (documented, not measured here) | Every session connected before a projection is marked **STALE** until it restarts. |
+| codex | **trust keyed by the COMMAND STRING.** A leg whose command changed is silently SKIPPED in non-interactive runs until it is re-trusted. | PRD_GATE_CONSOLIDATION §13 (nomad, measured) | **Stricter than caching: a projection that changes a registered command string disables that hook, fail-OPEN.** G4 must keep codex's registered command strings byte-stable across releases and change only file bytes. A command change for codex is an operator re-trust event, surfaced as such. |
+| kimi | unknown | not measured | known limitation; measure (below) |
+| gemini | unknown | not measured | known limitation; measure (below) |
+
+**Known limitation (to stay in this doc until every row is measured):** for a harness whose caching
+is unknown, a projection fixes the hooks on disk, but a running session may keep executing what it
+loaded. The daemon cannot tell which. For harnesses known to snapshot, "stale" is derivable: the
+daemon knows each session's first connect, `hestia_connect` with its `host_session_id`, and the
+time of the last projection.
+
+**Measure each unknown row once and record it in agent-atlas `talk-to/<harness>/descriptor.md`**
+(a new field, e.g. `hooks_reload: session-start | live | trust-keyed | unknown`), so the qualifier
+is data and not prose here. The method is already on file
+(memory: measuring harness hook behaviour from inside a session): run a headless harness
+subprocess, edit its hook config mid-session, and see which command the next event runs.
 
 ## 6. Slices (proposed order)
 
 1. **GT manifest + header digest + CI check (G1, G2).** Pure repo work; nothing is deployed.
 2. **Local GT store (G3).** Extend `shared.builds` to the hook files and registration.
 3. **Startup projection + restore/repair from GT (G4, G6, G8).** Replaces the Discover restore's
-   token swap with the GT projection.
-4. **Certification by release (G5).** Re-aim ratify at a release; the vault record grows a
-   registration digest.
-5. **The mismatch findings (G7).** Includes #1156's de-registered-gate finding.
+   token swap with the GT projection, keeps codex's command strings stable (§5a), and marks
+   sessions of snapshot harnesses STALE.
+4. **Certification per member (G5).** Re-aim ratify at a member's GT version; the vault record grows
+   a registration digest.
+5. **The mismatch findings (G7)** and the atlas `hooks_reload` measurements (§5a). Includes #1156's de-registered-gate finding.
