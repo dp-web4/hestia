@@ -821,16 +821,5 @@
       "why": "wallet-facing metadata"
     }
   ],
-  "known_gaps": [
-    {
-      "capability": "gates-verify",
-      "surface": "dashboard",
-      "why": "the app got it first (#1132); the dashboard pane is hestia #1137, pending"
-    },
-    {
-      "capability": "gates-ratify",
-      "surface": "dashboard",
-      "why": "as gates-verify: hestia #1137"
-    }
-  ]
+  "known_gaps": []
 }
