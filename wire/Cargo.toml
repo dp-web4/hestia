@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Wire formats that the Hestia daemon and the Hestia app must produce byte-identically."
+repository = "https://github.com/dp-web4/hestia"
 
 [dependencies]
 

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AgentInventory,
   DashboardSnapshot,
   DecideOutcome,
   DaemonStatus,
@@ -48,6 +49,11 @@ export async function ruleScopeRequest(
     standing: opts.standing ?? false,
     recursive: opts.recursive ?? false,
   });
+}
+
+/** Who is on this box and whether it is governed. Read-only. */
+export async function agentsInventory(): Promise<AgentInventory> {
+  return invoke("agents_inventory");
 }
 
 export async function getDashboard(): Promise<DashboardSnapshot> {

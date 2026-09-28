@@ -269,6 +269,122 @@ pub fn action_covers(action: &str, path: &str, member: &str) -> bool {
     path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
+/// What a delegated action string DOES, read exactly the way [`action_covers`] reads it.
+///
+/// WHY THIS EXISTS (#1110, cbp's finding 4 on #1106). The delegation routes refuse a typed
+/// agent id in any body FIELD, but `actions` is free text, and `scope.decide:<member>:/prefix`
+/// carries a member id inside it. A typo there (`scope.decide:codx:/w`) produced a delegation
+/// that was well-formed, signed, witnessed -- and enforced against nothing, because
+/// `action_covers` compares the member segment to the asker by string equality and no asker is
+/// named `codx`. That is #1067's silent inertness one layer in.
+///
+/// The same is true of the malformed `scope.decide` shapes: `action_covers` returns `false` for
+/// every path and every member, so a delegation carrying one binds NOTHING while reading, to
+/// whoever granted it, as a bounded grant. Those are [`ActionShape::Inert`], and the grant doors
+/// refuse them with the reason rather than store an act that does nothing.
+///
+/// Verbs this daemon does not interpret are [`ActionShape::Uninterpreted`]: the vocabulary is
+/// open by design (it is the extension point), so they are ACCEPTED -- and the grant doors say
+/// so in their answer, rather than letting "accepted" read as "checked".
+///
+/// Kept beside `action_covers` and pinned against it (`action_shape_agrees_with_action_covers`):
+/// two readings of one grammar that drift apart would make this a validator of a language the
+/// enforcer does not speak.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionShape {
+    /// `scope.decide` or `scope.decide:/abs/prefix` -- binds no member.
+    ScopeDecide,
+    /// `scope.decide:<member>:/abs/prefix` -- binds that member's requests only. The member
+    /// must be one this seat has recorded, or the delegation enforces against no one.
+    ScopeDecideFor(String),
+    /// A `scope.decide` form that authorises nothing at all. The string says why.
+    Inert(String),
+    /// Not a verb this daemon interprets. Stored as given; not validated.
+    Uninterpreted,
+}
+
+pub fn action_shape(action: &str) -> ActionShape {
+    let Some((name, rest)) = action.split_once(':') else {
+        return if action == ACTION_SCOPE_DECIDE { ActionShape::ScopeDecide } else { ActionShape::Uninterpreted };
+    };
+    if name != ACTION_SCOPE_DECIDE {
+        return ActionShape::Uninterpreted;
+    }
+    let (member, prefix) = if rest.starts_with('/') {
+        (None, rest)
+    } else {
+        match rest.split_once(':') {
+            Some((m, p)) => (Some(m.trim()), p),
+            None if rest.trim().is_empty() => return ActionShape::Inert(
+                "`scope.decide:` with nothing after the colon binds nothing. For every path, \
+                 write `scope.decide`; for a subtree, `scope.decide:/abs/prefix`".into()),
+            None => return ActionShape::Inert(format!(
+                "`{action}` names a member but no path, so it binds nothing. Write \
+                 `scope.decide:{}:/abs/prefix`", rest.trim())),
+        }
+    };
+    if member == Some("") {
+        return ActionShape::Inert(format!(
+            "`{action}` has an empty member segment, so it binds nothing. Name the member, or \
+             drop the segment for any member: `scope.decide:{}`", prefix.trim()));
+    }
+    let p = prefix.trim().trim_end_matches('/');
+    if p.is_empty() {
+        return ActionShape::Inert(format!(
+            "`{action}` has an empty path prefix, which binds nothing (it is not read as \
+             'everything' -- for every path, write `scope.decide`)"));
+    }
+    if !p.starts_with('/') {
+        return ActionShape::Inert(format!(
+            "`{action}` has a relative path prefix `{}`, which binds nothing; the prefix must be \
+             absolute", prefix.trim()));
+    }
+    match member {
+        Some(m) => ActionShape::ScopeDecideFor(m.to_string()),
+        None => ActionShape::ScopeDecide,
+    }
+}
+
+/// Read every action the way the enforcer will, BEFORE anything is signed (#1110).
+///
+/// `Err` is the refusal, worded for the operator: an Inert shape (it would bind nothing), or a
+/// member segment naming no member this seat has recorded (it would enforce against no one),
+/// with the nearest recorded ids named -- #1078's shape, one layer in. `Ok` carries the actions
+/// this daemon does not interpret, so the door can SAY they went unvalidated rather than let
+/// "accepted" read as "checked".
+///
+/// `is_member` answers for the whole registry; `suggest_from` is what may be suggested (the
+/// HTTP door leaves custodial fillers out of suggestions, as #1078 does). One function for both
+/// doors, because the CLI door is where #1106's retirement check was missing the first time.
+pub fn check_actions(
+    actions: &[String],
+    is_member: &dyn Fn(&str) -> bool,
+    suggest_from: &[String],
+) -> std::result::Result<Vec<String>, String> {
+    let mut unvalidated = Vec::new();
+    for a in actions {
+        match action_shape(a) {
+            ActionShape::ScopeDecide => {}
+            ActionShape::ScopeDecideFor(m) if is_member(&m) => {}
+            ActionShape::ScopeDecideFor(m) => {
+                let nearest = crate::member_registry::nearest_member_ids(&m, suggest_from);
+                let hint = match nearest.as_slice() {
+                    [] => "No recorded member resembles it.".to_string(),
+                    [one] => format!("Did you mean '{one}'?"),
+                    many => format!("Closest recorded members: {}.", many.join(", ")),
+                };
+                return Err(format!(
+                    "nothing was delegated: `{a}` binds the requests of '{m}', and no member \
+                     '{m}' is recorded on this seat, so the delegation would enforce against no \
+                     one. {hint}"));
+            }
+            ActionShape::Inert(why) => return Err(format!("nothing was delegated: {why}")),
+            ActionShape::Uninterpreted => unvalidated.push(a.clone()),
+        }
+    }
+    Ok(unvalidated)
+}
+
 /// Parse a role name string into a SocietyRole.
 pub fn parse_role(s: &str) -> Result<SocietyRole> {
     match s.to_lowercase().as_str() {
@@ -346,6 +462,67 @@ mod tests {
 
     /// The one sprout-claude flagged: a bare string prefix would also match the being next
     /// door. `/…/instances/b` must never cover `/…/instances/bb`.
+
+    /// THE PIN THAT KEEPS THE VALIDATOR HONEST. Every shape `action_shape` calls Inert must be
+    /// one `action_covers` refuses for every path and member; every ScopeDecideFor(m) must
+    /// cover m on its own prefix and NOT cover anyone else. If the enforcer's grammar changes
+    /// and this one does not, this fails before a delegation is refused -- or accepted -- on a
+    /// reading the enforcer does not share.
+    #[test]
+    fn check_actions_refuses_what_would_enforce_against_no_one() {
+        let known: Vec<String> = ["codex", "claude-code", "legion-being"].iter().map(|s| s.to_string()).collect();
+        let is_member = |m: &str| known.iter().any(|k| k == m);
+        let v = |a: &[&str]| check_actions(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>(), &is_member, &known);
+        // cbp's exact case: a one-letter typo in the member segment.
+        let e = v(&["scope.decide:codx:/w"]).unwrap_err();
+        assert!(e.contains("no member 'codx'") && e.contains("Did you mean 'codex'?"), "{e}");
+        // A real member is fine, and so are the member-free forms.
+        assert_eq!(v(&["scope.decide:codex:/w", "scope.decide:/w", "scope.decide"]).unwrap(), Vec::<String>::new());
+        // Inert shapes are refused with the reason, not stored as a grant that binds nothing.
+        assert!(v(&["scope.decide:legion-being"]).unwrap_err().contains("no path"));
+        assert!(v(&["scope.decide:/"]).unwrap_err().contains("empty path prefix"));
+        // Open vocabulary: accepted, and handed back so the door can SAY it was not checked.
+        assert_eq!(v(&["ledger.read", "scope.decide:/w"]).unwrap(), vec!["ledger.read".to_string()]);
+        // One bad action refuses the whole grant: a delegation is signed as a unit.
+        assert!(v(&["scope.decide:/w", "scope.decide:codx:/w"]).is_err());
+        // Nothing resembles it: say so rather than invent a suggestion.
+        assert!(v(&["scope.decide:zzzzzzzz:/w"]).unwrap_err().contains("No recorded member resembles it."));
+    }
+
+    #[test]
+    fn action_shape_agrees_with_action_covers() {
+        let probes_paths = ["/", "/a", "/a/b", "/home/dp/ws/x", "/w", "/w/sub"];
+        let probes_members = ["m", "codex", "codx", "legion-being", ""];
+        let inert = [
+            "scope.decide:", "scope.decide:legion-being", "scope.decide::/a",
+            "scope.decide:relative/path", "scope.decide:m:relative", "scope.decide:/",
+            "scope.decide:m:/", "scope.decide:m:",
+        ];
+        for a in inert {
+            assert!(matches!(action_shape(a), ActionShape::Inert(_)), "{a} should be Inert");
+            for p in probes_paths { for m in probes_members {
+                assert!(!action_covers(a, p, m), "{a} is called Inert but covers ({p}, {m})");
+            }}
+        }
+        assert_eq!(action_shape("scope.decide"), ActionShape::ScopeDecide);
+        assert_eq!(action_shape("scope.decide:/w"), ActionShape::ScopeDecide);
+        assert_eq!(action_shape("scope.decide:codex:/w"), ActionShape::ScopeDecideFor("codex".into()));
+        // ...and ScopeDecideFor means exactly what the enforcer means by it.
+        assert!(action_covers("scope.decide:codex:/w", "/w/sub", "codex"));
+        assert!(!action_covers("scope.decide:codex:/w", "/w/sub", "codx"));
+        // `@` is legal in a path and must not be read as a member (the #952 grammar lesson).
+        assert_eq!(action_shape("scope.decide:/home/dp/mail@archive"), ActionShape::ScopeDecide);
+        // Open vocabulary: anything else is stored and named as unvalidated, never refused here.
+        assert_eq!(action_shape("ledger.read"), ActionShape::Uninterpreted);
+        assert_eq!(action_shape("scope.decidex:/w"), ActionShape::Uninterpreted);
+        // Every well-formed shape the enforcer can satisfy is classified as such.
+        for (a, p, m) in [("scope.decide", "/x", "m"), ("scope.decide:/w", "/w", "m"),
+                          ("scope.decide:m:/w", "/w/sub", "m")] {
+            assert!(action_covers(a, p, m));
+            assert!(!matches!(action_shape(a), ActionShape::Inert(_) | ActionShape::Uninterpreted));
+        }
+    }
+
     #[test]
     fn prefix_is_separator_anchored_not_a_string_prefix() {
         let a = "scope.decide:/home/dp/ws/instances/b";

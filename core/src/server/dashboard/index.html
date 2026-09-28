@@ -355,6 +355,11 @@
   .disc-ids  { font-size: 0.78rem; color: var(--fg-dim); }
   .disc-path { font-family: var(--mono); font-size: 0.72rem; color: var(--fg-dim); }
   .trust-retire { grid-column: 1 / -1; margin-top: 0.15rem; }
+  .deleg-panel { padding: 0.5rem 1.25rem 0.75rem; }
+  .deleg-row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: baseline; padding: 0.3rem 0; }
+  .deleg-row.deleg-off { opacity: 0.55; }
+  .deleg-scope { flex: 1 1 12rem; min-width: 8rem; }
+  .deleg-add { flex-wrap: wrap; }
   .trust-alike { flex-basis: 100%; grid-column: 1 / -1; font-size: 0.78rem; color: var(--fg-dim); margin-top: 0.2rem; }
   .trust-alike .pol-btn-add { margin-left: 0.5rem; }
   .disc-why { flex-basis: 100%; margin: 0.15rem 0 0 1.1rem; padding: 0; font-size: 0.78rem; color: var(--fg-dim); }
@@ -839,6 +844,12 @@
   .cfg-verdict.bad { background: #f8717118; color: var(--coral); }
   .cfg-verdict.none { background: var(--bg-elev-2); color: var(--fg-faint); }
   .cfg-new { margin: 0.4rem 0 0.8rem; }
+  /* --- govern -> vault --- */
+  .vault-row { display: flex; align-items: center; gap: 0.6rem; padding: 0.35rem 0.5rem; border: 1px solid var(--border); border-radius: 4px; margin-bottom: 0.3rem; flex-wrap: wrap; }
+  .vault-row.system { background: var(--bg-elev); }
+  .vault-name { font-weight: 600; min-width: 9rem; font-size: 0.85rem; font-family: var(--mono); }
+  .vault-meta { flex: 1; color: var(--fg-dim); font-size: 0.74rem; }
+  .vault-dates { color: var(--fg-faint); font-size: 0.7rem; white-space: nowrap; }
   .cfg-editor { border: 1px solid var(--border); border-radius: 4px; padding: 0.6rem; margin-top: 0.6rem; }
   .cfg-editor-head { display: flex; align-items: center; gap: 0.6rem; }
   .cfg-digest { font-family: var(--mono); font-size: 0.7rem; color: var(--fg-faint); }
@@ -1272,6 +1283,7 @@
         <button type="button" class="govern-chip" data-gov="acts">acts</button>
         <button type="button" class="govern-chip" data-gov="policy">policy</button>
         <button type="button" class="govern-chip" data-gov="config">runtime config</button>
+        <button type="button" class="govern-chip" data-gov="vault">vault</button>
         <button type="button" class="govern-chip" data-gov="discover">discover</button>
       </nav>
 
@@ -1574,9 +1586,51 @@
           </div>
         </section>
 
-        <!-- DISCOVER (agent-lifecycle PRD R2). READ-ONLY by construction: this pane issues one
-             GET and nothing else. What is on this machine, which of it hestia governs, and what
-             the remedy is for the rest. Registration is a later, separate, operator act. -->
+        <!-- VAULT (2026-09-25, before the 0.0.4 release). The operator's view of the credentials the
+             vault holds, over the same GET/POST /api/vault and DELETE /api/vault/:name the desktop
+             app's Vault screen uses, through the same apiFetch wrapper. It exists because on a running
+             box nothing else could remove an entry: the CLI is locked out by the daemon's writer
+             lease. The LIST carries names, policy and dates and NEVER a value. There is no reveal:
+             releasing a secret is the gate's irreversible tier. Daemon-owned entries (identity, device
+             keys, hub config) are listed so the operator sees everything, but the daemon refuses to
+             delete them, so they carry no delete button. Adds and deletes are witnessed on the chain. -->
+        <section class="govern-pane" id="govern-vault" hidden>
+          <div class="govern-pane-head">
+            <h2>Vault <span class="pol-mode" id="vault-status"></span></h2>
+            <button type="button" class="pol-btn" id="vault-refresh">refresh</button>
+          </div>
+          <div class="govern-scroll">
+            <div class="grant-note">
+              Credentials held in this daemon's vault. Values are never shown here. An entry with
+              no allowed consumers is readable by <strong>any</strong> member (marked
+              <em>exposed</em>). Entries marked <em>daemon</em> belong to hestia itself and cannot be
+              deleted while it runs. Every add and delete is recorded on the witness chain, by name only.
+            </div>
+            <div id="vault-list"><div class="empty">Loading…</div></div>
+            <div class="pol-section-label">Add a credential</div>
+            <div class="pol-add vault-add">
+              <input class="pol-input" id="vault-new-name" placeholder="name" size="18" autocomplete="off">
+              <input class="pol-input" id="vault-new-value" type="password" placeholder="value" size="22" autocomplete="new-password">
+              <input class="pol-input" id="vault-new-consumers" placeholder="allowed consumers (comma-separated member ids)" size="34">
+              <input class="pol-input" id="vault-new-scope" placeholder="scope (e.g. publish, infer)" size="18">
+              <input class="pol-input" id="vault-new-tags" placeholder="tags" size="12">
+              <button type="button" class="pol-btn cfg-save" id="vault-add-btn">add to vault</button>
+            </div>
+            <div class="cfg-err" id="vault-err" hidden></div>
+            <div class="cfg-saved" id="vault-ok" hidden></div>
+          </div>
+        </section>
+
+        <!-- DISCOVER (agent-lifecycle PRD R2). What is on this machine, which of it hestia
+             governs, and what the remedy is for the rest.
+             ONE GET AND ONE WRITE. The write arrived 2026-09-21 and is exactly the "later,
+             separate, operator act" the read-only version of this comment promised: per-row
+             Register (R4). The pin was there because the easiest way for an operator act to
+             reach a screen unreviewed is as a convenient button on the one that already lists
+             the agents -- so the allowance is SINGULAR and pinned as such in
+             tools/discover_pane_contract_test.py: exactly one POST, only to
+             /api/agents/register, carrying NO plugin_id (the id is derived from the record being
+             looked at, #1067). A second write here turns that test red. -->
         <section class="govern-pane" id="govern-discover" hidden>
           <div class="govern-pane-head">
             <h2>Discover <span class="pol-mode" id="disc-status"></span></h2>
@@ -2084,6 +2138,17 @@
     return `<span class="gov-dot gov-${GOV_SEVERITY[g] || 'grey'}" title="governance: ${escapeHtml(GOV_LABEL[g] || g)} — ${escapeHtml(GOV_NOTE[g] || '')}"></span>`;
   }
 
+  // Is `id` still something a bar offers for selection? The agents bar lists every
+  // orchestrator in the snapshot (connected or not). The govern bar also offers members that
+  // hold grants. A selection is dropped only when neither offers it: the member is GONE.
+  // Whether it is connected or quiet has nothing to do with it.
+  function selectionStillOffered(data, id) {
+    if ((data?.orchestrators || []).some(o => o.id === id)) return true;
+    if ((data?.scope_grants || []).some(g => g.plugin_id === id)) return true;
+    if ((data?.instance_grants || []).some(g => g.plugin_id === id)) return true;
+    return false;
+  }
+
   function renderOrchBar(data) {
     const root = $('orch-bar');
     const orchs = data.orchestrators || [];
@@ -2101,7 +2166,14 @@
     // moment a member idled past an hour, collapsing its history view; the chip stayed
     // clickable (below), so the data was there and the selection had been thrown away.
     // Same ruling dp already gave for trust rows: staleness is shown, not hidden.
-    if (selectedOrch && !orchs.some(o => o.connected && o.id === selectedOrch)) selectedOrch = null;
+    // IT READ `o.connected` UNTIL 2026-09-25, contradicting the rule above. `connected` is
+    // active-in-the-window OR a detected running process, and a seat that runs as mesh wakes
+    // is usually neither. So a selection made on either bar was revoked on the next tick,
+    // BEFORE renderFeed ran. dp: "chain display does not seem to be filtered by agent when a
+    // specific agent is selected — it shows all regardless of selection." The selection now
+    // survives while ANY bar still offers the id (selectionStillOffered), and never on
+    // connectivity.
+    if (selectedOrch && !selectionStillOffered(data, selectedOrch)) selectedOrch = null;
 
     // The aggregate ("All") view is the default and a first-class destination, not just the
     // absence of a selection. Clicking a harness filters to it; there was no signposted way
@@ -2227,6 +2299,119 @@
     // A pure alias target with no grain of its own (roles === 0) is not a harness row.
     return Object.values(byId).filter(v => v.roles > 0);
   }
+
+  // ── Delegated authority, from the agent (agent-lifecycle PRD R5, the half #1079 left) ──
+  //
+  // `hestia delegate grant/list/revoke` existed as a CLI writing the vault directly and the
+  // snapshot already carried `delegations`; no screen rendered them and there was no route.
+  // dp, 2026-09-19: "i can't inspect or manage roles or their environments". This panel is
+  // that CLI's three verbs, keyed by the agent the operator is looking at. NOTHING HERE TYPES
+  // AN AGENT: the agent is the selected one, the delegation key is derived server-side from
+  // its registry LCT, and the roles are a picker over the daemon's closed list.
+  let delegLoadedFor = null;
+  function delegationsMount(pluginId) {
+    let el = $('deleg-panel');
+    if (!el) {
+      el = document.createElement('div'); el.id = 'deleg-panel'; el.className = 'deleg-panel';
+      const list = $('trust-list'); if (list && list.parentNode) list.parentNode.insertBefore(el, list.nextSibling);
+    }
+    el.hidden = !pluginId;
+    if (!pluginId) { delegLoadedFor = null; return; }
+    if (delegLoadedFor !== pluginId) { delegLoadedFor = pluginId; delegationsLoad(pluginId); }
+  }
+  async function delegationsLoad(pluginId) {
+    const el = $('deleg-panel'); if (!el) return;
+    el.innerHTML = '<div class="pol-section-label">Delegated authority</div><div class="empty">Loading…</div>';
+    try {
+      const res = await apiFetch(`/api/agents/${encodeURIComponent(pluginId)}/delegations`);
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      el.innerHTML = delegationsHtml(pluginId, out);
+    } catch (e) {
+      el.innerHTML = `<div class="pol-section-label">Delegated authority</div><div class="esc-err">${escapeHtml(e.message)}</div>`;
+    }
+  }
+  // PURE (run under node by tools/delegation_panel_contract_test.py): the daemon's answer in,
+  // markup out. Revoked delegations stay listed and marked -- a delegation that vanished when
+  // revoked would leave the history unreadable from the screen that made it.
+  function delegationsHtml(pluginId, out) {
+    const rows = Array.isArray(out.delegations) ? out.delegations : [];
+    const roles = Array.isArray(out.roles) ? out.roles : [];
+    const row = d => {
+      const sc = d.scope || {};
+      const rl = Array.isArray(sc.roles) ? sc.roles.map(r => typeof r === 'string' ? r : (r.Custom || JSON.stringify(r))) : [];
+      const ac = Array.isArray(sc.actions) ? sc.actions : [];
+      const scope = (rl.length || ac.length) ? [...rl, ...ac].map(escapeHtml).join(', ') : '<em>unrestricted</em>';
+      const when = d.expires_at ? 'until ' + escapeHtml(String(d.expires_at).slice(0, 16)) : 'no expiry';
+      return `<div class="deleg-row${d.active ? '' : ' deleg-off'}">
+        <code title="${escapeHtml(String(d.id))}">${escapeHtml(String(d.id).slice(0, 8))}</code>
+        <span class="deleg-scope">${scope}</span>
+        <span class="tr-dim">${d.active ? when : (d.revoked ? 'revoked' : 'expired')}</span>
+        ${d.active ? `<button type="button" class="pol-btn pol-remove" data-deleg-revoke="${escapeHtml(String(d.id))}" data-deleg-agent="${escapeHtml(pluginId)}" title="Revoke this delegation. Witnessed; the record stays.">revoke…</button>` : ''}
+      </div>`;
+    };
+    // A RETIRED agent's panel is readable -- that is the point, its history is what retirement
+    // just revoked -- but it must not look like one that may be granted to, so the form goes
+    // and the reason is on screen (cbp, PR #1106).
+    const retired = out.retired === true;
+    return `<div class="pol-section-label">Delegated authority <span class="disc-count">${rows.length}</span></div>
+      <div class="grant-note">What <strong>${escapeHtml(pluginId)}</strong> may do on this society's behalf, signed by the operator's key.
+        Its delegation key is derived from its registry identity — <code>${escapeHtml(String(out.agent_key || '')).slice(0, 8)}…</code> — not typed.</div>
+      ${retired ? `<div class="grant-note"><strong>This id is retired on this seat.</strong> Its delegations were revoked when it was retired and are listed below as history. Reinstate it before delegating to it again.</div>` : ''}
+      ${rows.length ? rows.map(row).join('') : '<div class="empty">No delegations.</div>'}
+      ${retired ? '' : `<div class="pol-add grant-add deleg-add">
+        <select class="pol-input" id="deleg-roles" multiple size="4" title="society roles (pick one or more)">
+          ${roles.map(r => `<option value="${escapeHtml(r)}">${escapeHtml(r)}</option>`).join('')}
+        </select>
+        <input class="pol-input" id="deleg-actions" placeholder="actions, comma-separated (e.g. scope.decide:codex:/abs/prefix)" size="34">
+        <input class="pol-input" id="deleg-hours" type="number" min="1" placeholder="hours (blank = no expiry)" size="10">
+        <input class="pol-input" id="deleg-reason" placeholder="reason (required)" size="22">
+        <button type="button" class="pol-btn-add" id="deleg-grant" data-deleg-agent="${escapeHtml(pluginId)}">delegate</button>
+      </div>`}
+      <div class="esc-err" id="deleg-err" hidden></div>`;
+  }
+  async function delegationGrant(pluginId) {
+    const err = $('deleg-err'); if (err) err.hidden = true;
+    const roles = [...(($('deleg-roles') || {}).selectedOptions || [])].map(o => o.value);
+    const actions = (($('deleg-actions') || {}).value || '').split(',').map(x => x.trim()).filter(Boolean);
+    const hours = Number((($('deleg-hours') || {}).value || '').trim());
+    const reason = (($('deleg-reason') || {}).value || '').trim();
+    const body = { roles, actions, reason };
+    if (hours > 0) body.expires_hours = hours;
+    try {
+      const res = await apiFetch(`/api/agents/${encodeURIComponent(pluginId)}/delegations`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      await delegationsLoad(pluginId);
+      // SAID, not implied (#1110): a verb this daemon does not interpret was stored as given and
+      // checked for nothing. The panel re-rendered above, so look the note line up again.
+      const unv = Array.isArray(out.unvalidated_actions) ? out.unvalidated_actions : [];
+      const note = $('deleg-err');
+      if (unv.length && note) {
+        note.textContent = `delegated — but not validated: ${unv.join(', ')} ${unv.length === 1 ? 'is not a verb' : 'are not verbs'} this daemon interprets, so ${unv.length === 1 ? 'it was' : 'they were'} stored as given and checked for nothing.`;
+        note.hidden = false;
+      }
+    } catch (e) { if (err) { err.textContent = `delegate failed: ${e.message}`; err.hidden = false; } }
+  }
+  async function delegationRevoke(pluginId, delegId) {
+    const reason = prompt(`Revoke delegation ${delegId.slice(0, 8)}… from "${pluginId}"?\n\nWhy?`);
+    if (!reason) return;
+    try {
+      const res = await apiFetch(`/api/agents/${encodeURIComponent(pluginId)}/delegations/${encodeURIComponent(delegId)}/revoke`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason }) });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      delegationsLoad(pluginId);
+    } catch (e) { alert(`revoke failed: ${e.message}`); }
+  }
+  document.addEventListener('click', e => {
+    const t = e.target && e.target.closest && e.target.closest('#deleg-grant,[data-deleg-revoke]');
+    if (!t) return;
+    e.stopPropagation();
+    if (t.id === 'deleg-grant') delegationGrant(t.dataset.delegAgent);
+    else delegationRevoke(t.dataset.delegAgent, t.dataset.delegRevoke);
+  }, true);
 
   let showRetired = false;
 
@@ -2360,6 +2545,7 @@
 
   function renderHarnessTrust(trust, orchs) {
     const root = $('trust-list'), title = $('trust-title'), hint = $('trust-hint');
+    delegationsMount(null);
     title.textContent = 'Plugin trust';
     if (hint) hint.textContent = 'click a harness to see its role trust';
     trustShown = [];   // no per-grain detail buttons in the aggregate view
@@ -2415,7 +2601,12 @@
             data-merge-of="${escapeHtml(alike[r.plugin_id].of)}" data-merge-ref="${escapeHtml(alike[r.plugin_id].ref)}"
             title="Fills the alias form under govern → acts. Nothing is recorded until you press its button.">prepare merge</button></div>` : ''}
       </div>`;
-    }).join('');
+    // #1113 moved this trailer to renderRoleTrust, where `hidden` is not declared. Selecting any
+    // agent then threw "hidden is not defined" out of the tick, the header read "offline (hidden
+    // is not defined)", and the witness chain was never re-rendered for the selection (dp,
+    // 2026-09-25). It belongs here, in the aggregate view that computes `hidden`.
+    }).join('') + (hidden ? `<div class="grant-note">${hidden} retired id${hidden === 1 ? '' : 's'} hidden —
+      listed, with the controls, under <strong>govern → discover</strong>.</div>` : '');
   }
 
   function renderRoleTrust(trust, orchs) {
@@ -2435,6 +2626,10 @@
       ? `<span class="gov-badge gov-${GOV_SEVERITY[gcov] || 'grey'}" title="${escapeHtml(GOV_NOTE[gcov] || '')}">${escapeHtml(GOV_LABEL[gcov] || gcov)}</span>`
       : 'click a role’s detail for the full tensor and its receipts') + ' ' + seatLink;
     let filtered = trust.filter(t => t.plugin_id === selectedOrch);
+    // The delegations panel rides below the role list, loaded on demand -- one GET per open,
+    // like a seat config. Rendered into its own element so a rerender of the list does not
+    // wipe a form the operator is filling in.
+    delegationsMount(selectedOrch);
     if (!filtered.length) {
       root.innerHTML = `<div class="empty">No trust data for ${escapeHtml(selectedOrch)}.</div>`;
       trustShown = [];
@@ -2477,8 +2672,7 @@
         <button type="button" class="tr-detail" onclick="showTrustDetail(${i})"
                 title="Full tensor, every dimension, and the chain receipts behind it">detail</button>
       </div>`;
-    }).join('') + (hidden ? `<div class="grant-note">${hidden} retired id${hidden === 1 ? '' : 's'} hidden —
-      listed, with the controls, under <strong>govern → discover</strong>.</div>` : '');
+    }).join('');
   }
 
   // Drill from the harness aggregate into that harness's role trust — the same selection
@@ -4335,6 +4529,16 @@
       blocking: Array.isArray(a.blocking_events) ? a.blocking_events : [],
       fidelity: a.fidelity || '',
       findings: Array.isArray(x.findings) ? x.findings.length : 0,
+      // Offered only where there IS something to register: a governance id the daemon can
+      // derive -- the record's own, or a being's `<machine>-being` convention -- and no
+      // membership yet. `governed` implies it is already a member, so a button there is a no-op.
+      // Reads `x.kind` off the record rather than a field of this view: the being rows come
+      // from the INSTALLED inventory, which the deploy updates independently of this page.
+      // INSTALLED HERE, and nothing less (dp, 2026-09-27): the atlas knows harnesses this machine
+      // does not have, and registering one mints a member for something absent. The route refuses
+      // it too (register_refusal_not_here); the button just does not offer it.
+      registerable: x.installed === true && !x.governed && (!!(x.plugin && String(x.plugin).trim())
+                                    || x.kind === 'being' || a.kind === 'being'),
       // The inventory's own words for what it could not determine about THIS agent.
       // Provenance only (atlas SCHEMA.md): shown, and nothing here decides on it.
       being: x.kind === 'being' || a.kind === 'being',
@@ -4412,6 +4616,8 @@
                   title="Undo the retirement. The authority revoked at retirement is NOT restored.">reinstate</button>`
               : `<button type="button" class="pol-btn pol-remove" data-retire="${escapeHtml(r.governanceId)}"
                   title="Stop this id being a party on this seat: revokes its standing, live and delegated authority. Not deletion — the chain keeps every act it made, and it is reversible.">retire…</button>`}
+            ${r.registerable ? `<button type="button" class="pol-btn-add disc-register" data-register="${escapeHtml(r.atlasId)}"
+              title="Make this a member of this society, under an id derived from THIS record — not typed. Witnessed.">register…</button>` : ''}
             ${r.alsoFiledUnder.map(k => badge('grey', 'report also says: ' + k, 'a claim the inventory could not stand behind for this agent — see the reasons on this row')).join('')}
             ${g.key === 'unknown' ? `<ul class="disc-why">${(r.unknownReasons.length ? r.unknownReasons
                 : ['the report lists this agent as unknown and gives no reason — that is itself a finding about the inventory'])
@@ -4419,6 +4625,30 @@
           </div>`).join('')}
       </div>`).join('') + toggle;
   }
+
+  // REGISTER a discovered harness. The id is NOT typed and NOT passed: the route derives it
+  // from the same record this row was drawn from, which is the whole point (#1067 -- dp, 09-08:
+  // "a dropdown from actual available agents not something i type").
+  async function registerDiscovered(atlasId) {
+    const reason = prompt(`Register "${atlasId}" as a member of this society?\n\nIts governance id is derived from what was discovered here — you are not typing one.\n\nWhy?`);
+    if (!reason) return;
+    try {
+      const res = await apiFetch('/api/agents/register', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ atlas_id: atlasId, reason }),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      alert(`${out.already_a_member ? 'Already a member' : 'Registered'}: ${out.plugin_id}\n\n${out.note || ''}`);
+      discoverLoad();
+    } catch (e) { alert(`register failed: ${e.message}`); }
+  }
+  document.addEventListener('click', e => {
+    const b = e.target && e.target.closest && e.target.closest('[data-register]');
+    if (!b) return;
+    e.stopPropagation();
+    registerDiscovered(b.dataset.register);
+  }, true);
 
   let discoverBusy = false;
   async function discoverLoad() {
@@ -4458,6 +4688,8 @@
     policy: { el: 'govern-policy', mount: () => fetchPolicy() },
     // The list is the mount: keys and health only. Values are fetched by an explicit open.
     config: { el: 'govern-config', mount: () => cfgLoadList() },
+    // Names and policy only; the list never carries a value.
+    vault:  { el: 'govern-vault',  mount: () => vaultLoad() },
     // One GET of the inventory report. The report is a live filesystem walk, so it is fetched
     // when the pane is SHOWN and on an explicit rescan, never on a timer of its own.
     discover: { el: 'govern-discover', mount: () => discoverLoad() },
@@ -4484,6 +4716,97 @@
     if (nav) nav.addEventListener('click', (e) => {
       const chip = e.target.closest('.govern-chip');
       if (chip) governShow(chip.dataset.gov);
+    });
+  })();
+
+  // ---- VAULT pane ----------------------------------------------------------------------------
+  // Three calls, shared with the desktop app: GET /api/vault (names + policy, no values),
+  // POST /api/vault (add), DELETE /api/vault/<name>. The daemon refuses daemon-owned entries
+  // (409) and witnesses both writes; this pane only renders that authority.
+  const vaultEsc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const vaultList = (s) => String(s || '').split(',').map(x => x.trim()).filter(Boolean);
+  function vaultMsg(err, ok) {
+    const e = $('vault-err'), o = $('vault-ok');
+    if (e) { e.hidden = !err; e.textContent = err || ''; }
+    if (o) { o.hidden = !ok; o.textContent = ok || ''; }
+  }
+  async function vaultLoad() {
+    const status = $('vault-status');
+    try {
+      const res = await apiFetch('/api/vault');
+      if (!res.ok) throw new Error((await res.text()) || ('HTTP ' + res.status));
+      const entries = ((await res.json()).entries || []);
+      const list = $('vault-list');
+      if (!entries.length) { list.innerHTML = '<div class="empty">The vault holds no entries.</div>'; }
+      else {
+        // Credentials first, then the daemon's own entries.
+        entries.sort((a, b) => (!!a.system - !!b.system) || String(a.name).localeCompare(String(b.name)));
+        list.innerHTML = entries.map(e => {
+          const consumers = (e.allowed_consumers || []);
+          const meta = [
+            consumers.length ? 'readable by ' + consumers.join(', ') : '',
+            (e.scope || []).length ? 'scope ' + e.scope.join(', ') : '',
+            (e.tags || []).length ? 'tags ' + e.tags.join(', ') : '',
+          ].filter(Boolean).join(' · ');
+          const day = (t) => t ? String(t).slice(0, 10) : '';
+          return `
+          <div class="vault-row${e.system ? ' system' : ''}" data-name="${vaultEsc(e.name)}">
+            <span class="vault-name">${vaultEsc(e.name)}</span>
+            ${e.system ? `<span class="cfg-verdict none" title="${vaultEsc(e.system)}">daemon</span>`
+                       : (e.exposed ? '<span class="cfg-verdict bad" title="no allowed consumers: any member can read it">exposed</span>' : '')}
+            <span class="vault-meta">${e.system ? vaultEsc(e.system) : vaultEsc(meta)}</span>
+            <span class="vault-dates">${vaultEsc(day(e.created_at))}${e.last_rotated ? ' · rotated ' + vaultEsc(day(e.last_rotated)) : ''}</span>
+            ${e.system ? '' : '<button type="button" class="grant-revoke vault-del">delete</button>'}
+          </div>`;
+        }).join('');
+      }
+      if (status) status.textContent = `${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}`;
+    } catch (e) { if (status) status.textContent = '⚠ ' + e.message; }
+  }
+  async function vaultDelete(name) {
+    // Typing the name back is the confirmation: a deleted value cannot be recovered from here.
+    const typed = window.prompt(`Delete '${name}' from the vault? Its value cannot be recovered.\nType the name to confirm:`);
+    if (typed === null) return;
+    if (typed.trim() !== name) { vaultMsg('Name did not match — nothing was deleted.', null); return; }
+    try {
+      const res = await apiFetch('/api/vault/' + encodeURIComponent(name), { method: 'DELETE' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok || body.error) throw new Error(body.error || ('HTTP ' + res.status));
+      vaultMsg(null, `Deleted '${name}' (witnessed on the chain).`);
+    } catch (e) { vaultMsg(e.message, null); }
+    vaultLoad();
+  }
+  async function vaultAdd() {
+    const name = ($('vault-new-name').value || '').trim();
+    const value = $('vault-new-value').value || '';
+    if (!name || !value) { vaultMsg('Name and value are both required.', null); return; }
+    const consumers = vaultList($('vault-new-consumers').value);
+    if (!consumers.length && !window.confirm(`'${name}' has no allowed consumers, so ANY member could read it. Add it anyway?`)) return;
+    try {
+      const res = await apiFetch('/api/vault', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, value, allowed_consumers: consumers,
+          scope: vaultList($('vault-new-scope').value), tags: vaultList($('vault-new-tags').value) }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok || body.error) throw new Error(body.error || ('HTTP ' + res.status));
+      // Clear the value field at once: it should not sit in the DOM after the write.
+      ['vault-new-name', 'vault-new-value', 'vault-new-consumers', 'vault-new-scope', 'vault-new-tags']
+        .forEach(id => { $(id).value = ''; });
+      vaultMsg(null, `Added '${name}' (witnessed on the chain, name only).`);
+    } catch (e) { vaultMsg(e.message, null); }
+    vaultLoad();
+  }
+  (function wireVaultPane() {
+    document.addEventListener('click', (e) => {
+      const t = e.target;
+      if (!t) return;
+      if (t.id === 'vault-refresh') { vaultMsg(null, null); vaultLoad(); }
+      else if (t.id === 'vault-add-btn') vaultAdd();
+      else if (t.classList && t.classList.contains('vault-del')) {
+        const row = t.closest('.vault-row');
+        if (row) vaultDelete(row.dataset.name);
+      }
     });
   })();
 
@@ -5199,7 +5522,9 @@
     tmodal.addEventListener('click', (e) => { if (e.target.dataset.close) tmodal.hidden = true; });
     document.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape') return;
-      if (!modal.hidden) modal.hidden = true;
+      // A `modal.hidden` line sat above this from 512d7c2 (2026-07-26). No element or variable
+      // named `modal` exists, so Escape threw a ReferenceError before reaching this line and
+      // never closed the trust-detail modal. Found by ESLint no-undef, 2026-09-25.
       if (!tmodal.hidden) tmodal.hidden = true;
     });
   })();

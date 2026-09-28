@@ -25,6 +25,25 @@ use std::path::PathBuf;
 
 use crate::error::{CoreError, Result};
 
+/// Which vault entries the daemon itself owns, and what each one is.
+///
+/// Credentials and the daemon's own material share `entries`: the identity keypair written by
+/// `init --ai`, per-constellation device keys, and the hub URL config. A surface that manages
+/// credentials cannot tell them apart by shape, so it asks here. `Some(role)` means the daemon
+/// depends on the entry. A running surface must neither remove it nor let a caller write it:
+/// deleting `ai_identity_secret` destroys this daemon's signing identity, and overwriting it
+/// replaces the identity. The one place to add a new system entry is this function.
+pub fn system_entry_role(name: &str) -> Option<&'static str> {
+    match name {
+        "ai_identity_lct_id" => Some("this daemon's identity (LCT id)"),
+        "ai_identity_pubkey" => Some("this daemon's identity (public key)"),
+        "ai_identity_secret" => Some("this daemon's identity (signing key)"),
+        "hub_urls" => Some("hub connection config"),
+        _ if name.starts_with("constellation_device_key:") => Some("constellation device key"),
+        _ => None,
+    }
+}
+
 /// High-level Vault interface. Loads on construction; saves back on mutating ops.
 pub struct Vault {
     path: PathBuf,
@@ -138,6 +157,11 @@ impl Vault {
     }
 
     /// Remove an entry by name. Returns the removed entry.
+    ///
+    /// Deliberately NOT restricted to credentials: with the daemon stopped, `hestia vault
+    /// remove` is the break-glass path, and it must be able to reach a system entry. The
+    /// running surfaces (operator HTTP, agent MCP) refuse system entries before they get
+    /// here; see [`system_entry_role`].
     pub fn remove(&mut self, name: &str) -> Result<VaultEntry> {
         let idx = self
             .data
@@ -505,6 +529,18 @@ pub fn save_doc<T: serde::Serialize>(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn system_entries_are_classified_and_credentials_are_not() {
+        for n in ["ai_identity_lct_id", "ai_identity_pubkey", "ai_identity_secret", "hub_urls",
+                  "constellation_device_key:00000000-0000-0000-0000-000000000000"] {
+            assert!(system_entry_role(n).is_some(), "{n} is daemon-owned");
+        }
+        for n in ["github-pat", "p0-004-cred", "openai-key", "ai_identity", "hub_urls_backup",
+                  "constellation_device_key"] {
+            assert!(system_entry_role(n).is_none(), "{n} is an ordinary credential");
+        }
+    }
 
     fn temp_path() -> (TempDir, PathBuf) {
         let dir = TempDir::new().unwrap();

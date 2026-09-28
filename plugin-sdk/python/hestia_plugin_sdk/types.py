@@ -166,11 +166,18 @@ class WitnessEntry:
 
 @dataclass(frozen=True)
 class HistoryFilter:
+    """Filter for ``hestia_query_history``.
+
+    These are exactly the keys the daemon honours (``QUERY_FILTER_KEYS``: limit, hash,
+    tool_name). It refuses any other key rather than silently serving an unfiltered
+    window. ``target_pattern``, ``since`` and ``outcome`` were removed in 0.0.3: the
+    daemon refused them outright, so every call that set them failed. Passing one now
+    raises ``TypeError`` at construction.
+    """
+
     tool_name: str | None = None
-    target_pattern: str | None = None
-    since: str | None = None  # ISO-8601 or relative ("1h", "30m", "2d")
     limit: int = 50
-    outcome: Literal["success", "failure", "abandoned"] | None = None
+    hash: str | None = None  # reach one entry by chain hash; short-circuits the window
 
 
 @dataclass(frozen=True)
