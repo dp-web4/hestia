@@ -294,6 +294,24 @@ first_entry=1
 any_installed=0
 any_skipped=0
 
+# --- REGISTER FIRST, THEN INSTALL (dp, 2026-09-27, #1133) ------------------------------------
+# "the auto install process is supposed to take care of all this. isn't there a script? editing
+# files by hand is unacceptable friction for product we're trying to release generally."
+# This script derives every target from the harness's OWN registration and never writes one —
+# correct (#315), and the reason an unregistered hook could sit skipped forever: codex's
+# witness.py was declared, shipped, and "not registered on this host" for 14 days while no
+# codex act reached the chain. deploy/register-members.py renders each installed member's
+# hooks/hooks.json into that member's config, idempotently, so the loop below then finds the
+# hook registered and installs it. A registration failure is LOUD and does not stop the
+# install of what is already registered. DRY_RUN passes through (it writes nothing).
+if [ "${HESTIA_SKIP_REGISTER:-0}" != "1" ]; then
+  log "REGISTER (deploy/register-members.py)"
+  if ! DRY_RUN="$DRY_RUN" python3 "$REPO_ROOT/deploy/register-members.py" 2>&1 | sed 's/^/  /'; then
+    log "  WARN register-members.py failed (rc=${PIPESTATUS[0]}) — installing what is already registered"
+    any_skipped=1
+  fi
+fi
+
 for expects in "$REPO_ROOT"/plugins/*/expects.json; do
   [ -e "$expects" ] || continue
   member="$(basename "$(dirname "$expects")")"

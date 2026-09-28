@@ -107,7 +107,8 @@ class _FakeRegistry:
         return dict(self._declared) if self.has(plugin_dir) else {}
 
 
-def build(tmp: Path, extra_hooks: list[tuple[str, str]]) -> dict:
+def build(tmp: Path, extra_hooks: list[tuple[str, str]], *,
+          post_command: str | None = None, declared: dict | None = None) -> dict:
     """One agent record, from a config holding a LIVE hestia gate plus `extra_hooks`.
 
     The live gate is the control: every case below is governed-but-for the extra hook,
@@ -119,7 +120,8 @@ def build(tmp: Path, extra_hooks: list[tuple[str, str]]) -> dict:
     witness.write_text("# hestia witness\n")
     hooks: dict[str, list] = {
         "PreToolUse": [{"hooks": [{"type": "command", "command": f"python3 {gate}"}]}],
-        "PostToolUse": [{"hooks": [{"type": "command", "command": f"python3 {witness}"}]}],
+        "PostToolUse": [{"hooks": [{"type": "command",
+                                    "command": post_command or f"python3 {witness}"}]}],
     }
     for event, command in extra_hooks:
         hooks.setdefault(event, []).append(
@@ -141,7 +143,9 @@ def build(tmp: Path, extra_hooks: list[tuple[str, str]]) -> dict:
     # has nothing to do with. That is how these tests failed when the registry landed:
     # every case went False, including the two controls, so the suite reported the split
     # broken when what had moved was the fixture. Stub the object, not the functions.
-    inventory.REGISTRY = _FakeRegistry({"gate": ["PreToolUse"], "witness": ["PostToolUse"]})
+    inventory.REGISTRY = _FakeRegistry(
+        declared if declared is not None
+        else {"gate": ["PreToolUse"], "witness": ["PostToolUse"]})
     try:
         return inventory.inspect("claude", [])
     finally:
@@ -305,6 +309,65 @@ def test_fallback_enumeration():
 # install.sh installs the binary at step 1 and wires the schedule at step 2, so an abort
 # in between (exit 127 on Darwin, where there is no systemctl) leaves a machine that
 # answers on demand and never runs on its own. Nothing after the fact said so.
+# --- role targets (#1133) ------------------------------------------------------------
+# codex read `observe: [PostToolUse]` as wired for 14 days because observe.sh sat on that
+# event — a hook that appends the raw event to a local file nobody reads — while witness.py,
+# the hook that reaches the chain, was never registered. 9,284 act rows under claude-code,
+# 0 under codex, every report green. A role declared by event alone cannot see this; a
+# role that names its file can. The FIRST job of the new check is to FIRE on that case.
+def test_role_target():
+    with tempfile.TemporaryDirectory() as d:
+        _role_target_cases(Path(d))
+
+
+def _role_target_cases(tmp: Path):
+    declared = {"gate": ["PreToolUse"], "observe": ["PostToolUse"],
+                "targets": {"observe": ["witness.py"]}}
+    observe = tmp / "observe.sh"
+    observe.write_text("#!/bin/sh\n# hestia observe-only: appends to a local file\ncat >> /dev/null\n")
+
+    # A. the thor case: observe.sh on PostToolUse, witness.py nowhere. Must read MISWIRED
+    # (dp: "when something isn't properly registered, it MUST read as miswired").
+    a = build(tmp, [], post_command=str(observe), declared=declared)
+    check("A observe role not served", a["roles_wired"].get("observe"), [])
+    check("A gate still served", a["roles_wired"].get("gate"), ["PreToolUse"])
+    # dp 2026-09-27: not properly registered MUST read as miswired — not partial, not green.
+    check("A MISWIRED", a["miswired"], True)
+    check("A not governed", a["governed"], False)
+    check("A finding names the missing file",
+          any(f.startswith("MISWIRED") and "witness.py" in f for f in a["findings"]), True)
+    check("A classify: miswired bucket", inventory.classify([a])["miswired"], ["claude"])
+    check("A classify: not filed as partial", inventory.classify([a])["partial"], [])
+
+    # B. the fix: witness.py registered on PostToolUse. Served, governed.
+    b = build(tmp, [], declared=declared)
+    check("B observe served by its target", b["roles_wired"].get("observe"), ["PostToolUse"])
+    check("B not partial", b["partial"], False)
+    check("B governed", b["governed"], True)
+    check("B classify: no gap", inventory.classify([b])["partial"], [])
+
+    # C. both registered on the same event (the template after #1133): served.
+    c = build(tmp, [("PostToolUse", str(observe))], declared=declared)
+    check("C observe served with observe.sh beside it", c["roles_wired"].get("observe"), ["PostToolUse"])
+    check("C not partial", c["partial"], False)
+
+    # D. no target declared (every other plugin today): event-only, unchanged behaviour —
+    # observe.sh alone still satisfies the role. The declaration is owed by each plugin.
+    d = build(tmp, [], post_command=str(observe),
+              declared={"gate": ["PreToolUse"], "observe": ["PostToolUse"]})
+    check("D event-only role served by observe.sh", d["roles_wired"].get("observe"), ["PostToolUse"])
+    check("D not partial", d["partial"], False)
+
+    # E. a declared non-gate role missing by EVENT (nothing on PostToolUse at all) is
+    # MISWIRED too — #902's ask: a mandatory role's absence must be loud, not only the gate's.
+    e = build(tmp, [], post_command="true", declared=declared)
+    # `true` is not a hestia hook: no marker in command or (nonexistent) target.
+    check("E observe absent by event", e["roles_wired"].get("observe"), [])
+    check("E MISWIRED", e["miswired"], True)
+    check("E not governed", e["governed"], False)
+    check("E gate_wired", e["gate_wired"], True)
+
+
 def test_periodic_trigger(tmp: Path):
     home = tmp / "home"
     (home / ".config" / "systemd" / "user").mkdir(parents=True)
@@ -1357,6 +1420,7 @@ def teardown_module(module):
 if __name__ == "__main__":
     test_attribute()
     test_has_tag()
+    test_role_target()
     test_fallback_enumeration()
     test_interpreter_finding()
     test_wrapper_heredoc_is_inert()
