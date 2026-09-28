@@ -92,7 +92,9 @@ def with_header(src: bytes, rel: str) -> bytes:
 
 
 def units(root: Path = ROOT) -> dict[str, dict]:
-    """{unit: {member, files: {gt_rel: source_rel}}} from the declarations, never a glob."""
+    """{unit: {member, files: {gt_rel: source_rel}, registration, requires}} from the declarations,
+    never a glob. `requires` is the member's declared cross-unit dependency (install.requires:
+    ["<unit>/<path>", ...]) -- gemini's gate runs claude-code's gate as its governor."""
     out: dict[str, dict] = {}
     for exp in sorted((root / "plugins").glob("*/expects.json")):
         d = exp.parent.name
@@ -103,62 +105,133 @@ def units(root: Path = ROOT) -> dict[str, dict]:
         if tmpl.is_file():
             files["hooks/hooks.json"] = f"plugins/{d}/hooks/hooks.json"
         out[d] = {"member": inst.get("member") or d, "files": files,
-                  "registration": "hooks/hooks.json" if tmpl.is_file() else None}
+                  "registration": "hooks/hooks.json" if tmpl.is_file() else None,
+                  "requires": sorted(inst.get("requires") or [])}
     man = root / "plugins" / "_shared" / "RUNTIME_MANIFEST.txt"
     names = [ln.strip() for ln in man.read_text(encoding="utf-8").splitlines()
              if ln.strip() and not ln.lstrip().startswith("#")]
     out["_shared"] = {"member": None, "files": {n: f"plugins/_shared/{n}" for n in names},
-                      "registration": None}
+                      "registration": None, "requires": []}
+    return out
+
+
+def _version(body: dict) -> str:
+    """Content address of a manifest: sha256 over its canonical JSON WITHOUT `gt_version`. Every
+    field is covered -- identity, registration, rows, the engine pin, requires -- so a manifest
+    whose metadata was edited no longer matches its own version."""
+    b = {k: v for k, v in body.items() if k != "gt_version"}
+    return hashlib.sha256(json.dumps(b, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def manifest_for(unit: str, u: dict, digests: dict[str, str], engine: dict | None,
+                 requires: list[dict]) -> dict:
+    """The ONE composition of a unit's manifest, used by publish and by check alike.
+
+    A MEMBER'S CERTIFIED CLOSURE (#1160 review): a member's version must identify its whole
+    decision behaviour, so it binds the exact shared engine it runs (`engine`: the _shared
+    version and every engine file digest) and every cross-unit file it executes (`requires`).
+    Change the engine and every member's version changes; certify a member and you have certified
+    the engine bytes it will resolve. Members still move independently: two members may pin
+    different engine versions, and the store deduplicates identical blobs."""
+    rows = [{"path": rel, "sha256": digests[rel], "source": src}
+            for rel, src in sorted(u["files"].items())]
+    body = {
+        "unit": unit,
+        "member": u["member"],
+        "digest_rule": DIGEST_RULE,
+        "registration": u["registration"],
+        "registration_note": (None if u["registration"] or unit == "_shared" else
+                              "this member ships no registration template yet; its registration "
+                              "edge is NOT ground truth until it does"),
+        "files": rows,
+        "engine": engine,
+        "requires": requires,
+    }
+    body["gt_version"] = _version(body)
+    return body
+
+
+def _engine_pin(shared_manifest: dict) -> dict:
+    return {"unit": "_shared", "gt_version": shared_manifest["gt_version"],
+            "files": [{"path": r["path"], "sha256": r["sha256"]} for r in shared_manifest["files"]]}
+
+
+def _compose(root: Path, digest_of) -> dict[str, dict]:
+    """Every unit's manifest, engine first, from a digest source (`digest_of(unit, rel)`)."""
+    decl = units(root)
+    out: dict[str, dict] = {}
+    shared = decl["_shared"]
+    out["_shared"] = manifest_for("_shared", shared,
+                                  {rel: digest_of("_shared", rel) for rel in shared["files"]}, None, [])
+    pin = _engine_pin(out["_shared"])
+    for unit, u in decl.items():
+        if unit == "_shared":
+            continue
+        reqs = []
+        for ref in u["requires"]:
+            runit, _, rrel = ref.partition("/")
+            reqs.append({"unit": runit, "path": rrel, "sha256": digest_of(runit, rrel)})
+        out[unit] = manifest_for(unit, u, {rel: digest_of(unit, rel) for rel in u["files"]}, pin, reqs)
     return out
 
 
 def build(root: Path = ROOT) -> dict[str, bytes]:
     """{repo-relative path: bytes} for the whole GT tree as it should be published now."""
+    decl = units(root)
     tree: dict[str, bytes] = {}
-    for unit, u in units(root).items():
-        rows = []
-        for gt_rel, src_rel in sorted(u["files"].items()):
-            src = (root / src_rel).read_bytes()
-            data = with_header(src, gt_rel)
-            tree[f"{GT_DIR}/{unit}/{gt_rel}"] = data
-            rows.append({"path": gt_rel, "sha256": canonical_digest(data), "source": src_rel})
-        version = hashlib.sha256(
-            "\n".join(f"{r['path']} {r['sha256']}" for r in rows).encode()).hexdigest()
-        manifest = {
-            "unit": unit,
-            "member": u["member"],
-            "gt_version": version,
-            "digest_rule": DIGEST_RULE,
-            "registration": u["registration"],
-            "registration_note": (None if u["registration"] or unit == "_shared" else
-                                  "this member ships no registration template yet; its registration "
-                                  "edge is NOT ground truth until it does"),
-            "files": rows,
-        }
-        tree[f"{GT_DIR}/{unit}/manifest.json"] = (json.dumps(manifest, indent=2) + "\n").encode()
+    for unit, u in decl.items():
+        for gt_rel, src_rel in u["files"].items():
+            tree[f"{GT_DIR}/{unit}/{gt_rel}"] = with_header((root / src_rel).read_bytes(), gt_rel)
+
+    def digest_of(unit, rel):
+        return canonical_digest(tree[f"{GT_DIR}/{unit}/{rel}"])
+
+    for unit, m in _compose(root, digest_of).items():
+        tree[f"{GT_DIR}/{unit}/manifest.json"] = (json.dumps(m, indent=2) + "\n").encode()
     return tree
 
 
 def check(root: Path = ROOT) -> list[str]:
-    """Every finding, as a sentence. Empty means the GT holds."""
+    """Every finding, as a sentence. Empty means the GT holds.
+
+    The manifest is VERIFIED, not trusted (#1160 review): the expected manifest is recomputed from
+    the declarations and the GT files' own digests, and the one on disk must equal it exactly --
+    identity, registration, sources, rows (no duplicates), engine pin, requires, and version.
+    Files on disk that no manifest names are findings too."""
     findings: list[str] = []
     gt = root / GT_DIR
     if not gt.is_dir():
         return [f"{GT_DIR}/ does not exist: nothing is published"]
     declared = units(root)
-    for unit in sorted(set(declared) | {p.name for p in gt.iterdir() if p.is_dir()}):
+    on_disk = {p.name for p in gt.iterdir() if p.is_dir()}
+    for unit in sorted(on_disk - set(declared)):
+        findings.append(f"{unit}: published in {GT_DIR}/ but no longer declared by any plugin")
+
+    def digest_of(unit, rel):
+        f = gt / unit / rel
+        return canonical_digest(f.read_bytes()) if f.is_file() else "missing"
+
+    expected = _compose(root, digest_of)
+    for unit in sorted(declared):
         mpath = gt / unit / "manifest.json"
-        if unit not in declared:
-            findings.append(f"{unit}: published in {GT_DIR}/ but no longer declared by any plugin")
-            continue
         if not mpath.is_file():
             findings.append(f"{unit}: declared but never published (no {GT_DIR}/{unit}/manifest.json)")
             continue
-        m = json.loads(mpath.read_text(encoding="utf-8"))
-        rows = {r["path"]: r for r in m.get("files") or []}
+        try:
+            m = json.loads(mpath.read_text(encoding="utf-8"))
+        except ValueError as e:
+            findings.append(f"{unit}: manifest.json is not JSON ({e})")
+            continue
+        rows = m.get("files") or []
+        paths = [r.get("path") for r in rows]
+        for dup in sorted({p for p in paths if paths.count(p) > 1}):
+            findings.append(f"{unit}/{dup}: listed more than once in the manifest")
+        exp = expected[unit]
+        # Per-file checks first: they name the file, which is what a reader needs.
         want = declared[unit]["files"]
-        for gt_rel in sorted(set(rows) | set(want)):
-            if gt_rel not in rows:
+        pub = {r.get("path"): r for r in rows}
+        for gt_rel in sorted(set(pub) | set(want)):
+            if gt_rel not in pub:
                 findings.append(f"{unit}/{gt_rel}: declared by the plugin but not in the published manifest")
                 continue
             if gt_rel not in want:
@@ -170,19 +243,34 @@ def check(root: Path = ROOT) -> list[str]:
                 continue
             data = f.read_bytes()
             digest = canonical_digest(data)
-            if digest != rows[gt_rel]["sha256"]:
+            if digest != pub[gt_rel].get("sha256"):
                 findings.append(f"{unit}/{gt_rel}: GT file does not match its published sha "
-                                f"(manifest {rows[gt_rel]['sha256'][:12]}, file {digest[:12]}) -- MISWIRED")
+                                f"(manifest {str(pub[gt_rel].get('sha256'))[:12]}, file {digest[:12]}) -- MISWIRED")
             hv = header_value(data)
-            if not gt_rel.endswith(".json") and hv != rows[gt_rel]["sha256"]:
+            if not gt_rel.endswith(".json") and hv != pub[gt_rel].get("sha256"):
                 findings.append(f"{unit}/{gt_rel}: header sha {str(hv)[:12]} disagrees with the "
-                                f"manifest {rows[gt_rel]['sha256'][:12]}")
+                                f"manifest {str(pub[gt_rel].get('sha256'))[:12]}")
             src = root / want[gt_rel]
             if not src.is_file():
                 findings.append(f"{unit}/{gt_rel}: its source {want[gt_rel]} is gone")
             elif strip_header(data) != src.read_bytes():
                 findings.append(f"{unit}/{gt_rel}: UNPUBLISHED change -- {want[gt_rel]} differs from "
                                 f"its published ground truth; re-publish (tools/hooks_gt.py publish)")
+        # Then the whole-manifest contract: every field, exactly.
+        for key in sorted(set(exp) | set(m)):
+            if key in ("files",):
+                if [{k: r.get(k) for k in ("path", "sha256", "source")} for r in rows] != exp["files"]:
+                    if not any(x.startswith(f"{unit}/") for x in findings):
+                        findings.append(f"{unit}: manifest file rows differ from the declared, digested set")
+                continue
+            if m.get(key) != exp.get(key):
+                findings.append(f"{unit}: manifest `{key}` is {json.dumps(m.get(key))[:80]}, "
+                                f"expected {json.dumps(exp.get(key))[:80]}")
+        # Files on disk that no manifest names.
+        listed = {str(Path(p)) for p in paths} | {"manifest.json"}
+        for f in sorted((gt / unit).rglob("*")):
+            if f.is_file() and str(f.relative_to(gt / unit)) not in listed:
+                findings.append(f"{unit}/{f.relative_to(gt / unit)}: on disk but in no manifest")
     return findings
 
 

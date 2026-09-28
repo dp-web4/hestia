@@ -113,6 +113,62 @@ def main() -> int:
         check("a newly declared file that was never published is named",
               any("not in the published manifest" in x for x in f), f)
 
+        print("C2. the manifest is verified, not trusted (GPT #1160 review, each mutation reproduced)")
+        publish_into(r)
+        mp = r / "hooks-gt" / "demo" / "manifest.json"
+        good = mp.read_text()
+
+        def mutated(fn):
+            m = json.loads(good)
+            fn(m)
+            mp.write_text(json.dumps(m, indent=2) + "\n")
+            out = gt.check(r)
+            mp.write_text(good)
+            return out
+
+        f = mutated(lambda m: m.__setitem__("gt_version", "0" * 64))
+        check("a zeroed gt_version is named", any("gt_version" in x for x in f), f)
+        f = mutated(lambda m: m.__setitem__("member", "other-member"))
+        check("a changed member identity is named", any("`member`" in x for x in f), f)
+        f = mutated(lambda m: m.__setitem__("registration", None))
+        check("a nulled registration is named", any("`registration`" in x for x in f), f)
+        f = mutated(lambda m: m["files"].append(dict(m["files"][0])))
+        check("a duplicate row is named", any("more than once" in x for x in f), f)
+        f = mutated(lambda m: m["files"][0].__setitem__("source", "plugins/elsewhere/x.py"))
+        check("a rewritten source path is named", any("file rows differ" in x for x in f), f)
+        extra = r / "hooks-gt" / "demo" / "undeclared.py"
+        extra.write_text("print('smuggled')\n")
+        f = gt.check(r)
+        check("a file on disk that no manifest names is named",
+              any("undeclared.py" in x and "in no manifest" in x for x in f), f)
+        extra.unlink()
+        check("control: the untouched tree is clean again", gt.check(r) == [], gt.check(r))
+
+        print("C3. a member's version binds its engine and its declared requirements")
+        v0 = json.loads(mp.read_text())["gt_version"]
+        (r / "plugins" / "_shared" / "engine.py").write_text("X = 2\n")
+        publish_into(r)
+        m1 = json.loads(mp.read_text())
+        check("an engine change changes the MEMBER's version", m1["gt_version"] != v0)
+        check("the member pins the engine version it was published with",
+              m1["engine"]["gt_version"] == json.loads(
+                  (r / "hooks-gt" / "_shared" / "manifest.json").read_text())["gt_version"])
+        (r / "plugins" / "gov" / "hooks").mkdir(parents=True)
+        (r / "plugins" / "gov" / "expects.json").write_text(json.dumps(
+            {"install": {"member": "gov", "files": ["hooks/governor.py"]}}))
+        (r / "plugins" / "gov" / "hooks" / "governor.py").write_text("print('v1')\n")
+        e = json.loads((r / "plugins" / "demo" / "expects.json").read_text())
+        e["install"]["requires"] = ["gov/hooks/governor.py"]
+        (r / "plugins" / "demo" / "expects.json").write_text(json.dumps(e))
+        publish_into(r)
+        v1 = json.loads(mp.read_text())["gt_version"]
+        (r / "plugins" / "gov" / "hooks" / "governor.py").write_text("print('v2')\n")
+        publish_into(r)
+        m2 = json.loads(mp.read_text())
+        check("a change in a REQUIRED file changes the dependent member's version", m2["gt_version"] != v1)
+        check("...and the requirement is pinned by digest", m2["requires"][0]["path"] == "hooks/governor.py")
+        check("the whole tree is clean after re-publishing", gt.check(r) == [], gt.check(r))
+
         print("D. publish emits one patch for a tree that has none yet")
         r2 = repo(Path(d) / "fresh")
         out = Path(d) / "gt.patch"

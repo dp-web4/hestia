@@ -1,7 +1,6 @@
 {
   "unit": "claude-code",
   "member": "claude-code",
-  "gt_version": "85b78f1a58f07534993b543a002fab2a14a18f57eae2b0d2e9ba5f75c54f3773",
   "digest_rule": "sha256 over the file bytes with the 64-hex value on its `hestia-gt-sha256:` header line replaced by 64 zeros; files without a header (JSON) are plain sha256",
   "registration": null,
   "registration_note": "this member ships no registration template yet; its registration edge is NOT ground truth until it does",
@@ -21,5 +20,29 @@
       "sha256": "69102379cd193cf59103ae96694fb57f6de01ababac9b24e1853f609343cd393",
       "source": "plugins/claude-code/hooks/witness.py"
     }
-  ]
+  ],
+  "engine": {
+    "unit": "_shared",
+    "gt_version": "d5838606c5c9aec17177a69e7313c1dd256bd9dded7aadbd1c6dc633b67db51e",
+    "files": [
+      {
+        "path": "hestia_gate_core.py",
+        "sha256": "4d0807d35482e36b4e107e572f44a92a4864fc9357348baf6313ac734d105301"
+      },
+      {
+        "path": "hestia_gate_mechanism.py",
+        "sha256": "f75f67f347f56ccc56004386335fc12757f36943508ce61d3a3825bb5847af1f"
+      },
+      {
+        "path": "hestia_governance_closure.py",
+        "sha256": "9c9a00843a8956a3220917eef39dc3dd85f25412ba5d2fdabe04fe4fdce32d5a"
+      },
+      {
+        "path": "hestia_shell_classifier.py",
+        "sha256": "b3f508899069c0b894c792838d9d43925121ec4605cc7e30df22c7d7b425bce2"
+      }
+    ]
+  },
+  "requires": [],
+  "gt_version": "4965d13587d3563323919bd4df23a523f8a6a07e25d7207841f085b972af8913"
 }

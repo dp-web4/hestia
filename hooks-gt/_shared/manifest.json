@@ -1,7 +1,6 @@
 {
   "unit": "_shared",
   "member": null,
-  "gt_version": "672065a0166af5b2703e6b7280890bbeac977ee191bbea84c8f3d92e211fcac3",
   "digest_rule": "sha256 over the file bytes with the 64-hex value on its `hestia-gt-sha256:` header line replaced by 64 zeros; files without a header (JSON) are plain sha256",
   "registration": null,
   "registration_note": null,
@@ -26,5 +25,8 @@
       "sha256": "b3f508899069c0b894c792838d9d43925121ec4605cc7e30df22c7d7b425bce2",
       "source": "plugins/_shared/hestia_shell_classifier.py"
     }
-  ]
+  ],
+  "engine": null,
+  "requires": [],
+  "gt_version": "d5838606c5c9aec17177a69e7313c1dd256bd9dded7aadbd1c6dc633b67db51e"
 }
