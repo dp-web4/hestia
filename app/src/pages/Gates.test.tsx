@@ -190,7 +190,7 @@ describe("Gates", () => {
       report("aaaa1111", "aaaa1111", {
         gates: [
           { status: "unratified", path: HOOK, discovered: true, deployment: "match" },
-          { status: "verified", path: STALE, plugin_id: "claude-code", sha256: "ssss", discovered: false },
+          { status: "verified", path: STALE, plugin_id: "retired-seat", sha256: "ssss", discovered: false, forgettable: true },
         ],
       }),
     );
@@ -203,6 +203,29 @@ describe("Gates", () => {
     expect(screen.queryByRole("button", { name: `ratify ${STALE}` })).toBeNull();
     screen.getByRole("button", { name: `forget ${STALE}` }).click();
     await waitFor(() => expect(gatesForget).toHaveBeenCalledWith("snarc is not a gate", [STALE]));
+  });
+
+  it("a de-registered gate is badged as a possible bypass and cannot be forgotten (#1156)", async () => {
+    // Its member still declares a gate; the registration was re-pointed and the ratified file
+    // left on disk. Forget would delete the only record that a gate belongs there.
+    const BYPASSED = "/home/dp/.claude/hooks/hestia/pre_tool_use.py";
+    operatorStatus.mockResolvedValue(signedIn);
+    gatesVerify.mockResolvedValue(
+      report("aaaa1111", "aaaa1111", {
+        gates: [
+          { status: "unratified", path: "/other/gate.py", discovered: true, deployment: "match" },
+          {
+            status: "verified", path: BYPASSED, plugin_id: "claude-code", sha256: "aaaa", discovered: false,
+            forgettable: false, not_registered: true,
+            forget_blocked_reason: "claude-code still declares a gate; a ratified gate that is no longer registered is a bypass or a miswire",
+          },
+        ],
+      }),
+    );
+    render(<Gates />);
+    expect(await screen.findByText(/NOT REGISTERED — possible bypass/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: `forget ${BYPASSED}` })).toBeNull();
+    expect(screen.getByText(/still declares a gate/)).toBeTruthy();
   });
 
   it("an old daemon without per-gate support gets no ratify controls", async () => {
