@@ -4708,6 +4708,39 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             }
             None => {}
         }
+        // #1115: the addressee side of the binding. `binding_verified` proves the
+        // answerer owns the notice; it says nothing about where the answer GOES. A
+        // disposition addressed to anyone but the asker discharged the asker's debt
+        // while never reaching them — 14574 cleared codex's row from the dead name
+        // 'codex-cli' (2026-09-25, claude-code's repro). Disposition kinds only:
+        // reply/ack/review_done are the debt-clearing kinds; a bound forum-note FYI to
+        // a third party answers nothing and clears nothing, so it stays allowed.
+        // Aged-out notices keep the accepted-unverifiable posture (None arm).
+        if binding_verified
+            && crate::storage::inbox::is_disposition_kind(&kind)
+        {
+            if let Some(asker) = s
+                .inbox_store
+                .member_notice_sender(rid)
+                .map_err(|e| anyhow::anyhow!("resolving in_reply_to asker: {e}"))?
+            {
+                // EXACT, on the address as sent (routed `peer/member` included): the
+                // store and `member_unanswered` compare the routed form, so a bare-member
+                // test here let a reply to local `claude-code` go to `legion/claude-code`
+                // unrefused, reach another machine, and leave the debt standing.
+                if asker != to_plugin.as_str() {
+                    return Ok(hestia_error_envelope(
+                        "hestia.member_notify_reply_binding_misaddressed",
+                        &format!(
+                            "notice {rid} came from '{asker}' — a {kind} answers it only if \
+                             addressed back to '{asker}', not to '{to_plugin}'. A misaddressed \
+                             disposition would clear their debt without reaching them"
+                        ),
+                        Some(json!({"in_reply_to": rid, "correct_addressee": asker})),
+                    ));
+                }
+            }
+        }
     }
     // TRANSPORT BINDING (#1030), resolved for routed sends only, and BEFORE the limiter
     // records or anything is witnessed as sent. A member bound `direct_required` must sign
@@ -10382,6 +10415,108 @@ mod member_mesh_tests {
         .await
         .unwrap();
         assert_eq!(post["owed_to_me"].as_array().unwrap().len(), 0, "{post}");
+    }
+
+    /// #1115: binding checks the answerer AND the addressee. A disposition bound
+    /// to your own mail but addressed to the wrong member is refused with the
+    /// right addressee named — otherwise the asker's debt clears while the answer
+    /// never reaches them (the live repro: 14574 cleared codex's row from the
+    /// dead name `codex-cli`).
+    #[tokio::test]
+    async fn a_disposition_misaddressed_is_refused_naming_the_asker() {
+        let (_dir, state) = test_state().await;
+        let claude = connect(&state, "claude-code").await;
+        let kimi = connect(&state, "kimi-code").await;
+
+        let sent = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": "pr/1", "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        let nid = sent["queued_id"].as_u64().unwrap();
+
+        // kimi-code answers — but addresses it to codex-cli, not claude-code.
+        let misaddressed = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "codex-cli", "kind": "reply",
+                    "pointer_uri": "forum/v.md", "session_id": kimi, "in_reply_to": nid}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            misaddressed["_hestia_error"]["code"],
+            json!("hestia.member_notify_reply_binding_misaddressed"),
+            "{misaddressed}"
+        );
+        assert_eq!(
+            misaddressed["_hestia_error"]["data"]["correct_addressee"],
+            json!("claude-code"),
+            "the refusal names who the answer belongs to: {misaddressed}"
+        );
+        // The debt stands: nothing reached the asker.
+        let mid = tool_member_unanswered(
+            &state,
+            &json!({"session_id": claude, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mid["owed_to_me"].as_array().unwrap().len(), 1, "{mid}");
+
+        // Addressed back to the asker, the same answer lands and clears.
+        let fixed = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "claude-code", "kind": "reply",
+                    "pointer_uri": "forum/v.md", "session_id": kimi, "in_reply_to": nid}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fixed["binding_verified"], json!(true), "{fixed}");
+        let post = tool_member_unanswered(
+            &state,
+            &json!({"session_id": claude, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(post["owed_to_me"].as_array().unwrap().len(), 0, "{post}");
+    }
+
+    /// #1126 review: the addressee comparison is EXACT on the routed form. A reply to a
+    /// LOCAL asker addressed to the same member name on another machine
+    /// (`legion/claude-code`) is refused naming the local asker — under a bare-member
+    /// comparison it was accepted, forwarded to the wrong machine, and (because
+    /// `member_unanswered` compares the routed form) left the debt standing unexplained.
+    #[tokio::test]
+    async fn a_disposition_to_the_same_name_on_another_machine_is_refused() {
+        let (_dir, state) = test_state().await;
+        let claude = connect(&state, "claude-code").await;
+        let kimi = connect(&state, "kimi-code").await;
+        let sent = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": "pr/2", "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        let nid = sent["queued_id"].as_u64().unwrap();
+        let routed = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "legion/claude-code", "kind": "reply",
+                    "pointer_uri": "forum/v.md", "session_id": kimi, "in_reply_to": nid}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            routed["_hestia_error"]["code"],
+            json!("hestia.member_notify_reply_binding_misaddressed"),
+            "{routed}"
+        );
+        assert_eq!(routed["_hestia_error"]["data"]["correct_addressee"], json!("claude-code"), "{routed}");
+        let mid = tool_member_unanswered(&state, &json!({"session_id": claude, "older_than_secs": 0}))
+            .await
+            .unwrap();
+        assert_eq!(mid["owed_to_me"].as_array().unwrap().len(), 1, "the debt stands: {mid}");
     }
 
     /// A disposition sent with no binding is nudged, never blocked — silencing
