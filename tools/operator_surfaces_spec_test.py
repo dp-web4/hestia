@@ -50,6 +50,7 @@ METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH")
 KNOWN_GAPS_BASELINE = {
     1: frozenset({("gates-verify", "dashboard"), ("gates-ratify", "dashboard")}),
     2: frozenset(),   # #1137 closed both dashboard gates gaps
+    3: frozenset(),   # per-gate ratify + forget: required on both surfaces, no gap opened
 }
 GAP_GROWTH_MIGRATIONS: dict[int, str] = {}   # {version: why this version may ADD gaps}
 FAILS: list[str] = []
