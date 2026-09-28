@@ -444,37 +444,52 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
         return _no_verdict(plugin_id, tool_name, "unknown", f"unexpected: {type(e).__name__}")
 
 
-# ── ONE deny recorder (Sprint E — PRD §3.3 bullets 4-6, §6.E) ─────────────────────────────────
-# Before this, the deny recorder varied by vendor: codex reported to the chain (with its own
-# private client), kimi recorded only inside a bare `except: pass`, claude wrote no refusal
-# record at all on this path — and NO plugin's deny record carried the command/target (only
-# claude's begin_action did), so the trust chain's denominator differed by harness and the
-# record could not say WHAT was refused. Every shim now calls witness_decision_unified for
-# refusal records. Contract:
-#   - ALWAYS carries `target` (the audit hole) and `verdict_available` (kimi previously could
-#     not distinguish a real deny from an infra fail-close — §3.3 bullet 5);
-#   - NEVER raises and never changes the caller's decision (the deny stands regardless);
-#   - NON-SILENT failure: if the daemon witness cannot be delivered, the full record — with the
-#     delivery error — is appended to the per-shim diagnostic log
-#     ~/.hestia/telemetry/gate-denies-<plugin_id>.jsonl (criterion 9(c) fallback witness), so a
-#     dead daemon degrades the record's REACH, never its existence.
-
+# ── ONE decision witness path ────────────────────────────────────────────────────────────────
+# The historical entrypoint below was deny/warn-only because it was built during Sprint E.
+# The common orchestrator needs the same path for ALLOW as well: a second MCP client inside
+# hestia_single_gate.py would recreate the exact duplicate-authority defect the collapse removes.
+#
+# New code calls witness_decision(). Existing shims keep witness_decision_unified() as a
+# compatibility wrapper so this slice changes no live hook behaviour.
 def _deny_fallback_path(plugin_id: str) -> Path:
+    # LEGACY compatibility only. Existing refusal shims historically used this default.
+    # The new generic decision path below never guesses an authority root.
     home = Path(os.environ.get("HESTIA_HOME", str(DEFAULT_HESTIA_HOME)))
     safe = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in (plugin_id or "unknown"))
     return home / "telemetry" / f"gate-denies-{safe}.jsonl"
 
 
 def _append_deny_fallback(plugin_id: str, record: dict) -> None:
-    """Criterion 9(c) fallback witness: append-only, per-shim, never raises."""
+    """Legacy refusal fallback: append-only, per-shim, never raises."""
     try:
         path = _deny_fallback_path(plugin_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, default=str) + "\n")
     except Exception:
-        pass  # the fallback of the fallback is silence; the deny itself already stood
+        pass
 
+
+def _decision_fallback_path(plugin_id: str) -> Optional[Path]:
+    """Generic decision fallback. No HESTIA_HOME means no authority root, never a guess."""
+    home = os.environ.get("HESTIA_HOME")
+    if not home:
+        return None
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in (plugin_id or "unknown"))
+    return Path(home) / "telemetry" / f"gate-decisions-{safe}.jsonl"
+
+
+def _append_decision_fallback(plugin_id: str, record: dict) -> None:
+    """Generic all-verdict fallback; absence of an authority root remains unmeasurable."""
+    try:
+        path = _decision_fallback_path(plugin_id)
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+    except Exception:
+        pass
 
 
 def _loaded_core_digest():
@@ -485,26 +500,27 @@ def _loaded_core_digest():
     except Exception:
         return None
 
-def witness_decision_unified(client_or_none, *, plugin_id: str, decision: str, rule: str,
-                             tool_name: str, target: Optional[str], session_id: Optional[str],
-                             verdict_available: bool, attempted_summary: str) -> bool:
-    """Record a refusal (deny/warn) to the daemon's witness chain — the ONE deny recorder.
 
-    `client_or_none`: an already-initialized MCP client to reuse, or None to open a short
-    single-shot session (deadline ~1.5s; only ever runs on the deny/warn path, so no
-    hook-clamp pressure on allows). Returns True when the daemon acknowledged the record;
-    False when it went to the fallback log instead. NEVER raises."""
+def witness_decision(client_or_none, *, plugin_id: str, decision: str, rule: str,
+                     tool_name: str, target: Optional[str], session_id: Optional[str],
+                     verdict_available: bool, attempted_summary: str,
+                     _legacy_deny_fallback: bool = False) -> bool:
+    """Witness one final gate decision through the single shared path.
+
+    Supports allow/warn/deny. Returns True only when the daemon acknowledged the witness.
+    It NEVER raises. Delivery failure is recorded locally when an authoritative HESTIA_HOME
+    exists. The generic path never invents a home; the private compatibility flag exists only
+    so witness_decision_unified() can preserve the already-deployed refusal fallback contract.
+    """
     ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     record = {
         "plugin_id": plugin_id,
-        "decision": decision,                       # deny | warn
+        "decision": decision,
         "rule": (rule or "")[:300],
         "tool_name": tool_name or "",
-        "target": target,                           # ALWAYS present — the audit hole, closed
+        "target": target,
         "session_id": session_id,
         "verdict_available": bool(verdict_available),
-        # Deployed-generation attestation (§7.2(7)): the digest of the core THIS process
-        # imported, or absent when no core is loaded — never a bystander file hash.
         "core_digest": _loaded_core_digest(),
         "attempted": attempted_summary,
         "ts": ts,
@@ -524,31 +540,45 @@ def witness_decision_unified(client_or_none, *, plugin_id: str, decision: str, r
             "decision": decision,
             "adjudicator": f"plugin-gate:{plugin_id}",
             "reason": (rule or "")[:300],
-            # False => the gate could not REACH a verdict (infra fail-close). Structurally not
-            # conduct: "I could not judge" is not "I judged you badly" — derivation excludes
-            # these from temperament with no exoneration needed (codex's discrimination, now
-            # every harness's — §6.E).
             "verdict_available": bool(verdict_available),
             "tool_name": tool_name or "",
             "target": target,
             "session_id": session_id,
             "attempted": attempted_summary,
-            # REPAIR 5 (GPT fleet-review blocker 5): the deployed-generation attestation
-            # rides the HEALTHY witness call too, not only the fallback log — before this,
-            # the digest that #7.2(7) exists for reached no chain record at all. The daemon
-            # accepts extra arguments (hestia tools accept any argument), which ALSO means
-            # a schema that does not persist this field would discard it SILENTLY - so the
-            # local fallback record above keeps carrying it regardless, and daemon-side
-            # persistence needs its own verification (R345_NOTES.md).
             "core_digest": record["core_digest"],
         })
         if not (isinstance(out, dict) and "result" in out):
             raise RuntimeError("witness call returned no result")
         return True
-    except Exception as e:  # noqa: BLE001 — non-silent: the record survives in the fallback log
-        record["witness_delivery_failed"] = f"{type(e).__name__}: {e}"
-        _append_deny_fallback(plugin_id, record)
+    except BaseException as exc:
+        record["witness_delivery_failed"] = f"{type(exc).__name__}: {exc}"
+        if _legacy_deny_fallback:
+            _append_deny_fallback(plugin_id, record)
+        else:
+            _append_decision_fallback(plugin_id, record)
         return False
+
+
+def witness_decision_unified(client_or_none, *, plugin_id: str, decision: str, rule: str,
+                             tool_name: str, target: Optional[str], session_id: Optional[str],
+                             verdict_available: bool, attempted_summary: str) -> bool:
+    """Compatibility wrapper for the deployed deny/warn recorder.
+
+    New common-gate code must call witness_decision(). Keeping this name and its historical
+    fallback filename means the live shims do not change behaviour in this refactor.
+    """
+    return witness_decision(
+        client_or_none,
+        plugin_id=plugin_id,
+        decision=decision,
+        rule=rule,
+        tool_name=tool_name,
+        target=target,
+        session_id=session_id,
+        verdict_available=verdict_available,
+        attempted_summary=attempted_summary,
+        _legacy_deny_fallback=True,
+    )
 
 
 # ── Authenticated policy path (Sprint F — PRD §6.F; §7.1 criteria 2/5) ─────────────────
