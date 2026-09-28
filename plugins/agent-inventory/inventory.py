@@ -1169,6 +1169,30 @@ def match_provider(command: str, targets: list[str], is_hestia: bool) -> dict | 
     return None
 
 
+UNKNOWN = "unknown"
+
+
+def hook_capability(prov: dict | None, event: str | None):
+    """Can this hook block on THIS event? True | False | "unknown", or None when unqualified.
+
+    Knowing WHO provides a hook is not knowing whether it can block (GPT, agent-atlas #2 / #1144).
+    The atlas says `unknown` for an unassessed provider, and a missing `can_block` means the same;
+    neither may become False here. The first draft computed `bool(prov.get("can_block"))`, so
+    claude-flow -- identified, capability never read -- came out False and dropped out of
+    `foreign_gates` without a word."""
+    if not prov:
+        return None
+    cb = prov.get("can_block", UNKNOWN)
+    if cb is False:
+        return False
+    if cb is True:
+        events = prov.get("gate_events")
+        if not isinstance(events, list):
+            return UNKNOWN          # blocks somewhere, on events nobody listed
+        return event in events
+    return UNKNOWN
+
+
 def attribute(command: str, targets: list[str], is_hestia: bool) -> tuple[str, str]:
     """Who owns this hook, and on what evidence — decided once, where the evidence is.
 
@@ -1648,9 +1672,11 @@ def inspect(atlas_id: str, roots: list[str]) -> dict:
                     # Qualified from agent-atlas/hooks: who provides it, and whether it can
                     # block on THIS event. None = unqualified -- reported, never defaulted.
                     "provider": (prov or {}).get("provider"),
-                    "can_block": (bool((prov or {}).get("can_block"))
-                                  and hook.get("event") in ((prov or {}).get("gate_events") or [])
-                                  if prov else None),
+                    # True / False / "unknown" (provider known, capability unassessed). hestia's
+                    # own hooks are assessed by hestia's own declaration (expects.json `gate`),
+                    # not by an atlas entry that may lag it.
+                    "can_block": (hook["event"] in declared.get("gate", []) if is_hestia
+                                  else hook_capability(prov, hook.get("event"))),
                     "config": str(cfg),
                     "scope": scope,
                 })
@@ -2042,6 +2068,26 @@ def emit(report: dict, brief: bool) -> int:
     return 0
 
 
+def hook_qualification(recs: list[dict]) -> dict:
+    """The report's hook-qualification lists, from the inspected records.
+
+    - unqualified_hooks: no agent-atlas provider describes them; reported, never assigned.
+      (A directory is not a hook: a `--workspace <dir>` argument parsed as a target is left out.)
+    - foreign_gates: a hook that CAN block (assessed) and is not hestia's -- a second gate here.
+    - unassessed_hooks: the provider is identified, but nobody has assessed whether it can block.
+      Neither a gate nor not one; listed so an unassessed provider cannot pass as a harmless one.
+    """
+    targets = [t for r in recs for t in (r.get("hook_targets") or [])]
+    return {
+        "unqualified_hooks": sorted({t["path"] for t in targets
+                                     if t.get("provider") is None and not Path(t["path"]).is_dir()}),
+        "foreign_gates": sorted({(t.get("provider"), t["path"], t.get("event")) for t in targets
+                                 if t.get("can_block") is True and t.get("provider") != "hestia"}),
+        "unassessed_hooks": sorted({(t.get("provider"), t["path"], t.get("event")) for t in targets
+                                    if t.get("can_block") == UNKNOWN}),
+    }
+
+
 def main() -> int:
     global WORKSPACE, WORKSPACE_SOURCE, ATLAS, ATLAS_SOURCE, PLUGINS, REGISTRY
     argv = sys.argv[1:]
@@ -2231,15 +2277,7 @@ def main() -> int:
         "plugins_available": available,
         "governed": sorted(r["agent"] for r in governed),
         "gaps": gaps,
-        # Hooks no agent-atlas provider describes: reported, never assigned to anyone.
-        # (A directory is not a hook: a `--workspace <dir>` argument parsed as a target is left out.)
-        "unqualified_hooks": sorted({t["path"] for r in recs for t in (r.get("hook_targets") or [])
-                                     if t.get("provider") is None and not Path(t["path"]).is_dir()}),
-        # A hook that can BLOCK and is not hestia's: a second gate on this machine. Not a gap in
-        # hestia's coverage, but an operator governing the box should see it.
-        "foreign_gates": sorted({(t.get("provider"), t["path"], t.get("event"))
-                                 for r in recs for t in (r.get("hook_targets") or [])
-                                 if t.get("can_block") and t.get("provider") != "hestia"}),
+        **hook_qualification(recs),
         # The same verdicts keyed by MEMBER id -- what the dashboard's chips and every grant use.
         # `gaps` and `governed` stay keyed by atlas id for their existing readers.
         "members": member_states(recs),

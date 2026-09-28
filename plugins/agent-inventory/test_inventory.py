@@ -46,7 +46,7 @@ FIXTURE_PROVIDERS = [
      "gate_events": ["PreToolUse", "BeforeTool"]},
     {"provider": "claude-flow", "kind": "hook-provider", "match": "paths",
      "match_paths": ["*claude-flow*", "*/hook-handler.cjs", "*/auto-memory-hook.mjs", "*ruv-swarm*"],
-     "can_block": False, "gate_events": []},
+     "can_block": "unknown", "gate_events": "unknown"},   # unassessed, as the atlas says
 ]
 inventory._HOOK_PROVIDERS = FIXTURE_PROVIDERS
 
@@ -435,6 +435,61 @@ def test_hook_providers_load_from_the_atlas():
                   inventory.match_provider("node /w/other/x.js", ["/w/other/x.js"], False), None)
         finally:
             inventory.ATLAS, inventory._HOOK_PROVIDERS = orig_atlas, orig_prov
+
+
+def test_known_provider_with_unknown_capability_stays_unknown():
+    """GPT, agent-atlas #2 / #1144: knowing WHO provides a hook is not knowing whether it can block.
+    claude-flow's capability was never assessed; its descriptor first said `can_block: false`,
+    and `bool(prov.get("can_block"))` turned that -- or an omitted field -- into a clean "cannot
+    block" and dropped it from foreign_gates. Through the REAL loader and inspect(), three
+    providers on PreToolUse must come out three different ways."""
+    descriptors = {
+        "claude-flow": "match_paths: [*/hook-handler.cjs]\ngate_events: unknown\ncan_block: unknown\n",
+        "snarc": "match_paths: [*/snarc/dist/hooks/handlers/*]\ngate_events: []\ncan_block: false\n",
+        "web4-governance": "match_paths: [*/plugins/web4-governance/hooks/*]\n"
+                           "gate_events: [PreToolUse]\ncan_block: true\n",
+        "omits-it": "match_paths: [*/omits/*]\n",   # no can_block at all: unknown, never false
+    }
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        (root / "talk-to").mkdir()
+        for name, body in descriptors.items():
+            (root / "hooks" / name).mkdir(parents=True)
+            (root / "hooks" / name / "descriptor.md").write_text(
+                f"---\nprovider: {name}\nkind: hook-provider\nmatch: paths\n{body}---\n# {name}\n")
+        live = {}
+        for name, rel in (("claude-flow", "cf/.claude/helpers/hook-handler.cjs"),
+                          ("snarc", "snarc/dist/hooks/handlers/pre-tool-use.js"),
+                          ("web4-governance", "plugins/web4-governance/hooks/pre_tool_use.py"),
+                          ("omits-it", "omits/hook.sh")):
+            f = root / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("// a stranger's hook\n")
+            live[name] = f
+        orig_atlas, orig_prov = inventory.ATLAS, inventory._HOOK_PROVIDERS
+        inventory.ATLAS, inventory._HOOK_PROVIDERS = root / "talk-to", None
+        try:
+            tmp = root / "machine"
+            tmp.mkdir()
+            rec = build(tmp, [("PreToolUse", f"node {p}") for p in live.values()])
+        finally:
+            inventory.ATLAS, inventory._HOOK_PROVIDERS = orig_atlas, orig_prov
+        by_path = {t["path"]: t for t in rec.get("hook_targets") or []}
+        got = {n: (by_path.get(str(p), {}).get("provider"), by_path.get(str(p), {}).get("can_block"))
+               for n, p in live.items()}
+        check("claude-flow stays IDENTIFIED with capability unknown", got["claude-flow"],
+              ("claude-flow", "unknown"))
+        check("snarc is assessed: cannot block", got["snarc"], ("snarc", False))
+        check("web4-governance is assessed: blocks on PreToolUse", got["web4-governance"],
+              ("web4-governance", True))
+        check("an omitted can_block is unknown, never false", got["omits-it"], ("omits-it", "unknown"))
+        q = inventory.hook_qualification([rec])
+        check("the assessed blocker is a foreign gate",
+              [g[0] for g in q["foreign_gates"]], ["web4-governance"])
+        check("the unassessed ones are reported as unassessed, not dropped",
+              sorted(g[0] for g in q["unassessed_hooks"]), ["claude-flow", "omits-it"])
+        check("none of the four is unqualified",
+              [u for u in q["unqualified_hooks"] if u in {str(p) for p in live.values()}], [])
 
 
 def test_role_target():
@@ -1543,6 +1598,7 @@ if __name__ == "__main__":
     test_attribute()
     test_ownership_is_provenance_never_text()
     test_hook_providers_load_from_the_atlas()
+    test_known_provider_with_unknown_capability_stays_unknown()
     test_member_states()
     test_has_tag()
     test_role_target()
