@@ -57,7 +57,14 @@
 set -eu
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
-FILES="hestia-mesh.py session-mesh-inbox.sh"
+FILES="hestia-mesh.py session-mesh-inbox.sh prompt-disposition-watch.sh"
+# prompt-disposition-watch.sh (UserPromptSubmit, #366) was built by kimi-code for itself and
+# upstreamed 2026-09-28. Shipping the FILE is this script's job; REGISTERING it is the
+# operator's, like the SessionStart line (this script greps configs, it never writes them).
+# So --check reports watch=wired|MISWIRED|UNWIRED per member and a sync prints the line to add. That
+# column is informational and does not fail --check: a member without the watch is where
+# every member was before this landed, and a red check on every seat the day this merges
+# would train operators to read the check as noise.
 
 # member | live hooks dir | config file that wires the SessionStart hook
 # The hooks dir differs per member because each engine picked its own layout; the
@@ -152,6 +159,12 @@ while IFS=: read -r member hooks config; do
   # it would mask a genuine loss of exactly the variable this script exists to protect.
   # The config line is the only place that counts, because it is the only place that
   # survives the copy.
+  # Is the watch REGISTERED? Shipping the file without it is a hook nothing invokes (the codex
+  # witness.py shape, #1133). A filename in the config is not enough (GPT, #1148): the line
+  # must sit under UserPromptSubmit and pin THIS member. watch-registration.py parses each
+  # config format and answers wired / MISWIRED (named, wrong event or pin) / UNWIRED.
+  watch="watch=$(python3 "$SRC/watch-registration.py" "$config" "$member" 2>/dev/null || echo UNWIRED)"
+
   lost=""
   case "$state" in
     *DRIFT*|*ABSENT*)
@@ -177,7 +190,7 @@ while IFS=: read -r member hooks config; do
 
   losstxt=""
   if [ -n "$lost" ]; then losstxt="  LOSS-ON-SYNC:$(echo $lost | tr ' ' ',')"; fi
-  printf '  %-12s %-9s %-9s%s%s\n' "$member" "$pin" "$rolestate" "$state" "$losstxt"
+  printf '  %-12s %-9s %-9s %-13s%s%s\n' "$member" "$pin" "$rolestate" "$watch" "$state" "$losstxt"
 
   # `[ x ] && flag=1` would be the last command of the list, so a FALSE test returns 1
   # and `set -e` kills the script mid-audit. Every conditional here is a full if/fi.
@@ -228,6 +241,11 @@ while IFS=: read -r member hooks config; do
     chmod +x "$hooks/$f"
   done
   echo "      synced (previous copies kept as *.pre-sync.bak)"
+  if [ "$watch" != "watch=wired" ]; then
+    echo "      NOTE: prompt-disposition-watch.sh is installed but ${watch#watch=}. To surface"
+    echo "      rulings mid-session (#366), add a UserPromptSubmit hook to $config running:"
+    echo "        HESTIA_MESH_PLUGIN=$member $hooks/prompt-disposition-watch.sh"
+  fi
 done <<MEMBER_TABLE
 $MEMBERS
 MEMBER_TABLE
