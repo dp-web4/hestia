@@ -477,6 +477,64 @@ The shim's content hash MUST match the certified hash stored in the vault (§3),
 deployed copy MUST match the repository copy. Certification is of a *specific artifact*,
 not of a design.
 
+### C13 — The outcome half is one witness, and the seam closes on every seat
+
+**ADDED 2026-09-28** (findings/per-harness-witness-drift-2026-09-28.md; dp: *"generally
+approved, let's work through them keeping in mind one-gate goal"*).
+
+C1–C12 certify the gate: the thing that DECIDES. The act's outcome is recorded by a second
+hook on the post-tool event. Until this date it had been left out of the consolidation, and it
+forked the way the gate had. Measured over warned acts since #977:
+
+| member | warned acts closed by a same-id outcome |
+|---|---|
+| claude-code | 1985 / 1986 |
+| kimi-code | 0 / 37 |
+| codex | 0 / 1 |
+
+Gemini's outcomes never reached the daemon at all. Every inventory report read all four as
+witnessed.
+
+A certified shim MUST satisfy four requirements:
+
+1. **The witness is a shim too.** It carries its identity (plugin id, host-agent version) and
+   nothing else. Correlation, spooling (#696), cold-path typing and the harness event shapes
+   all live in `hestia_witness_core`, loaded under C1's rules. The test: the harness's
+   `hooks/witness.py` is byte-identical to every other harness's, except its identity lines.
+2. **Correlation is the core's rule, used on both sides.** The gate caches the action it began
+   under `correlation_key(event)`, which `query_society_safety(..., correlation_key=)` writes.
+   The witness closes the action it finds under the same key. The two sides must never key a
+   call in two different ways. Keying on `tool_use_id` alone fails twice over: kimi names its
+   call `tool_call_id`, and gemini has no call id. The same test applies to any orchestrator
+   that replaces the per-harness gates (see the one-gate note below).
+3. **Every outcome event is witnessed.** The declared observe events are the harness's
+   complete set of post-tool events, and each is served by the witness (`targets.observe:
+   [witness.py]`). Kimi fires `PostToolUseFailure` INSTEAD of `PostToolUse` for a failed call,
+   so a witness on `PostToolUse` alone never records a failure. That gap held 3,235 of them.
+   An event served only by `observe.sh` reads as MISWIRED (#1133).
+4. **The seam is measured, not asserted.** `tools/witness_closure_census.py --since <deploy>
+   --min-rate R --min-warns N` reports, per member, the share of warned acts closed by an
+   outcome under the same `action_id`. A harness below R with at least N warns fails this
+   criterion, whatever its wiring reads as. Warns are the observable sample because `allow`
+   emits no reputation delta. A thin sample is reported as thin, never as a pass.
+
+**How it can fail.**
+- A shim with any witness logic of its own.
+- A gate path that reaches the daemon without passing the key.
+- A declared post-tool event with no witness on it.
+- A seat whose census is below the bar after a deploy.
+
+**One-gate note, binding on #934 / #1139 / #1140.** A common orchestrator inherits the
+seam. #934's `hestia_single_gate.py` carries its own `_cache_action`, keyed on
+`event.tool_use_id`. That is the claude-code rule reproduced one level up, and it would
+leave kimi and gemini cold. #1140 calls `query_society_safety` without the key. When either
+lands, the orchestrator MUST:
+- pass `correlation_key=` computed by the core rule from the RAW harness event, not from its
+  normalized `GateEvent`, because gemini's pre side keys on its untranslated `source_event`;
+- carry no cache writer of its own.
+The decision record (#1139) and the outcome record are two halves of one join, and one-gate
+is not done while only one half is common.
+
 ## 3. Certification record and the vault
 
 > **SUPERSEDED, 2026-09-04.** This section proposed a new `shim-cert/*` store. It should

@@ -259,3 +259,50 @@ this PRD read "Not started"; the line now records dp's 2026-08-13 execution dire
 inline §6.F cutover-precondition paragraph, and its §7.5 proposing criteria 11 and 12. Re-adding proposals to a
 plan that has already executed would misdate them; the two criteria are recorded above as one open, one
 half-landed, each with the instrument that would close it.
+
+## 14. Revision note — criterion 11 (witness-path parity) measured to its root, 2026-09-28
+
+§13.2 recorded nomad's criterion 11 as **open**: witness ingestion was "a property of one seat's
+hand-edited config", not of adopting the shared core. Six weeks later that was still the whole
+truth, and it had been measured. The measurement is in findings/per-harness-witness-drift-2026-09-28.md
+(#1147), and dp approved its recommendations for work "keeping in mind one-gate goal".
+
+**What the measurement showed.** The consolidation train unified LAW, and Sprint E unified the
+DENY recorder. It never touched the outcome path. The outcome path forked one level down from the
+gate:
+
+- claude-code's witness has #977 (close the action the gate authorized) and #696 (spool).
+- codex's shipped witness is an older copy with neither.
+- kimi shipped no witness. Its seat ran a private 07-26 copy of claude-code's, frozen when its
+  hooks moved off 9p.
+- gemini's outcomes never reached the daemon.
+
+Warned acts closed by a same-id outcome since #977: claude-code 1985/1986, kimi-code 0/37,
+codex 0/1. The root is one level deeper than "the witness forked". The #977 seam has a gate
+half (cache the begun action) and a witness half (close it), and **only claude-code's gate ever
+wrote the gate half**. No copy of the witness could have closed kimi's or codex's acts, however
+current it was.
+
+**Where each recommendation goes, in one-gate terms.** Status is kept to what has actually
+happened: built, reviewed, merged, deployed and live-verified are different states.
+
+| # | recommendation | one-gate placement | status 2026-09-28 |
+|---|---|---|---|
+| 1 | one outcome witness in the shared core | `hestia_witness_core` in the engine set, beside the mechanism. The gate half lives in `query_society_safety(..., correlation_key=)`. | built; core file on branch `cbp/one-outcome-witness`; the remaining 19-file patch awaits its governance approval |
+| 2 | every harness ships and declares it | Byte-identical `hooks/witness.py` shims. `targets.observe: [witness.py]` covers every post-tool event. Registration comes from templates, including kimi's flat layout. | built, same branch |
+| 3 | per-harness acceptance metric | `tools/witness_closure_census.py`. PRD_SHIM_CERTIFICATION C13 makes it a certification criterion. | built and tested; reproduces the table above |
+| 4 | retire kimi's fork after the replacement lands | By construction: the installer's registered target for kimi's `witness.py` is the fork's own path | lands with the first deploy after rec 1 merges |
+| 5 | upstream kimi's disposition watch | member-mesh `UserPromptSubmit` hook, for every seat | #1148; held by GPT (a per-member watermark hides a sibling's ruling); being reworked per session |
+
+**The contract one-gate must keep**, binding on #934, #1139 and #1140 (stated fully in
+PRD_SHIM_CERTIFICATION C13):
+- A common orchestrator passes the core's `correlation_key(raw_event)` to the mechanism.
+- It carries no action cache of its own. #934's `_cache_action`, keyed on `tool_use_id`,
+  reproduces the claude-code-only rule.
+- Every harness's full set of post-tool events is witnessed through the shared core.
+
+#1139 makes the DECISION record common. This makes the OUTCOME record common. The join between
+them is what the chain is for, and it is common only when both halves are.
+
+**Criterion 11 closes when the census says it does, not when this merges.** The bar is kimi-code
+and codex at claude-code's rate on warns after the deploy.

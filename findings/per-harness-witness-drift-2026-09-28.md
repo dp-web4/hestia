@@ -112,15 +112,21 @@ Implementing them turned up four more facts. Each one changes what "one witness"
    were a co-seat's. The shipped watch keeps everything else. It is interim: #366's real fix is
    the session-addressed lane in #849 / PRD_DISPOSITION_DELIVERY R4.
 
-**What landed where:**
+**Implementation prepared, and where it lands.** Status as of 2026-09-28 (GPT review of 08e6caa):
+nothing below is on main, deployed or live-verified yet. Each row says how far it has actually got.
 
-| rec | where |
-|---|---|
-| 1. one outcome witness in the core | `plugins/_shared/hestia_witness_core.py`, holding both halves of the seam. Every harness registers a shim, `hooks/witness.py`, that is byte-identical except its identity lines. |
-| 2. ship and declare | `expects.json` for claude-code, kimi and gemini declares `targets.observe: [witness.py]`. Kimi gets a registration template, and `register-members.py` learns kimi's flat `[[hooks]] event =` layout. Gemini's installer puts the witness on `AfterTool`. |
-| 3. acceptance metric | `tools/witness_closure_census.py [--min-rate R --min-warns N]` |
-| 4. retire kimi's fork | By construction: the installer's registered path for kimi's `witness.py` IS the fork's path, so the first deploy after the merge replaces the fork with the shim. It keeps a `.pre-install.bak`. |
-| 5. upstream the disposition watch | #1148 (member-mesh, UserPromptSubmit on claude-code, kimi and codex) |
+| rec | landing target | status |
+|---|---|---|
+| 1. one outcome witness in the core | `plugins/_shared/hestia_witness_core.py` holds both halves of the seam; the gate half is in `query_society_safety(..., correlation_key=)` | core file committed on branch `cbp/one-outcome-witness`; the other 19 files are one patch awaiting governance approval |
+| 2. ship and declare | byte-identical `hooks/witness.py` shims; `targets.observe: [witness.py]` for every harness; kimi registration template plus the flat-layout reader; gemini installer | built, same patch |
+| 3. acceptance metric | `tools/witness_closure_census.py [--min-rate R --min-warns N]`; certification criterion C13 | built and tested; reproduces this finding's table live |
+| 4. retire kimi's fork | the installer's registered path for kimi's `witness.py` is the fork's own path, so the first deploy replaces it (`.pre-install.bak` kept) | follows rec 1's merge and deploy |
+| 5. upstream the disposition watch | member-mesh, `UserPromptSubmit`, on claude-code, kimi and codex | #1148; held by GPT (a per-member watermark lets a sibling session consume the asker's ruling), being reworked to track presentation per session |
+
+The recommendations are also recorded where the one-gate plan is kept. `docs/PRD_GATE_CONSOLIDATION.md`
+§14 closes the open criterion 11 by naming its root. `docs/PRD_SHIM_CERTIFICATION.md` C13 makes
+the outcome half a certification criterion, and states the contract that #934, #1139 and #1140
+must keep.
 
 **Still open, found along the way.** Gemini's gate runs the governor as
 `HESTIA_PLUGIN_ID=gemini-cli`, but the seat's projection and expects are `gemini`. The governor
