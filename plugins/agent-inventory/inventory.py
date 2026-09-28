@@ -1016,8 +1016,10 @@ def owned_by_hestia(command: str, targets: list[str]) -> bool:
                 return True
             # A GENERATED file (agent-inventory's wrapper pins paths into itself, so its bytes
             # match nothing shipped) carries its installer's own receipt: install.sh copies
-            # itself to `<bin>.installed-by` as its last act. That copy being a shipped file IS
-            # the provenance -- the file was written by a hestia installer that ran to the end.
+            # itself to `<bin>.installed-by` as its last act. A receipt whose bytes are a shipped
+            # file identifies WHICH installer claims this path -- an ownership classification,
+            # not an integrity check: the receipt is not bound to the wrapper's current bytes, so
+            # a wrapper edited after install still classifies as hestia's (GPT, #1144 review).
             receipt = Path(rp + ".installed-by")
             if receipt.is_file() and _git_blob_id(receipt) in prov["shipped"]:
                 return True
