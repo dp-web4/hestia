@@ -141,6 +141,12 @@ export interface DashboardSnapshot {
    * make "show retired" impossible and would hide a retired id that is still acting.
    */
   retired?: string[];
+  /** Every member id this seat has recorded (the registry), acted or not (#1141). */
+  members?: string[];
+  /** MRH grants in force — BOTH lifetimes, each row saying which. */
+  scope_grants?: ScopeGrantRow[];
+  /** The standing store's generation; moves on every durable change. */
+  standing_generation?: number;
   generated_at: string;
 }
 
@@ -391,3 +397,29 @@ export interface AgentInventory {
   gaps?: Record<string, string[]>;
   detail?: AgentRow[];
 }
+
+/**
+ * One grant in force, from the snapshot. `live` dies at the next daemon restart; `standing`
+ * survives it. The distinction is on every row because an operator who cannot see it keeps
+ * spending grants that evaporate on the next deploy.
+ */
+export interface ScopeGrantRow {
+  lifetime: "live" | "standing";
+  plugin_id: string;
+  path: string;
+  reason?: string | null;
+  requested_because?: string | null;
+  granted_by?: string | null;
+  request_id?: string | null;
+  origin?: string;
+  recursive?: boolean;
+  expires_at?: number | null;
+  secs_remaining?: number;
+  durability?: string;
+}
+
+export type ReachOutcome =
+  | { outcome: "granted"; result: Record<string, unknown>; replaced: ScopeGrantRow | null }
+  | { outcome: "moved"; current: ScopeGrantRow | null }
+  | { outcome: "revoked"; result: Record<string, unknown> }
+  | { outcome: "already_revoked"; detail: string };

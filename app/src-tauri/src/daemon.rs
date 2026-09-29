@@ -99,7 +99,7 @@ async fn request(
 
 /// The shared transport: auth, one re-auth on 401, and the raw status handed
 /// back. `request` flattens it; `send_checked` reads it.
-async fn request_status(
+pub(crate) async fn request_status(
     state: &AppState,
     method: reqwest::Method,
     path: &str,

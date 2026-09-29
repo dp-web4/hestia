@@ -1,5 +1,6 @@
 import { BrowserRouter, Routes, Route, NavLink } from "react-router";
 import { Dashboard } from "./pages/Dashboard";
+import { Reach } from "./pages/Reach";
 import { Decide } from "./pages/Decide";
 import { Gates } from "./pages/Gates";
 import { Agents } from "./pages/Agents";
@@ -25,6 +26,7 @@ export default function App() {
           <div className="nav-links">
             <NavLink to="/" end>Dashboard</NavLink>
             <NavLink to="/decide">Decide</NavLink>
+            <NavLink to="/reach">Reach</NavLink>
             <NavLink to="/gates">Gates</NavLink>
             <NavLink to="/agents">Agents</NavLink>
             <NavLink to="/vault">Vault</NavLink>
@@ -44,6 +46,7 @@ export default function App() {
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/decide" element={<Decide />} />
+            <Route path="/reach" element={<Reach />} />
             <Route path="/gates" element={<Gates />} />
             <Route path="/agents" element={<Agents />} />
             <Route path="/vault" element={<Vault />} />
