@@ -1253,6 +1253,16 @@ pub struct EscalationStore {
     /// `request_key`, and `rehydrate` rebuilds the map from them. Bounded by
     /// `REQUEST_KEY_CAP`, oldest evicted first.
     request_keys: HashMap<String, RequestKeyRecord>,
+    /// Execution evidence for #1166/#774 (GPT review of #1169): the daemon's own record that a
+    /// tool INVOCATION reached `hestia_begin_action` -- which every gate reaches, for a permitted
+    /// write, BEFORE the tool runs. Keyed by the invocation's correlation key
+    /// (hestia_witness_core.correlation_key: tool_use_id / kimi tool_call_id / gemini content
+    /// key), valued by the time it was last seen. MEMORY-ONLY, and `booted_at` makes that safe:
+    /// a claim older than this daemon's start is never reclaimable, because its begin may have
+    /// been seen by a process that no longer exists.
+    begins_seen: HashMap<String, u64>,
+    /// When this store was created (daemon start). See `begins_seen`.
+    booted_at: u64,
 }
 
 /// How long after a spend the SAME request key may be answered with the same permit
@@ -1262,6 +1272,13 @@ pub struct EscalationStore {
 pub const RECLAIM_WINDOW_SECS: u64 = 120;
 /// Upper bound on remembered request keys; the oldest are evicted first.
 pub const REQUEST_KEY_CAP: usize = 4096;
+/// Upper bound on remembered begin keys; the oldest are evicted first.
+pub const BEGINS_SEEN_CAP: usize = 8192;
+
+/// A correlation key as the witness core emits it: `[A-Za-z0-9_.-]`, at most 200 bytes.
+pub fn valid_correlation_key(k: &str) -> bool {
+    !k.is_empty() && k.len() <= 200 && k.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+}
 
 /// The daemon's record of one request key's last outcome.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1278,6 +1295,9 @@ pub struct RequestKeyRecord {
     pub payload_sha256: Option<String>,
     /// The PROVEN host session at the time, if the caller had one.
     pub host_session_id: Option<String>,
+    /// The tool INVOCATION the claim answered (its correlation key), when the hook sent one.
+    /// A reclaim is only for a DIFFERENT invocation whose predecessor never reached execution.
+    pub invocation_key: Option<String>,
 }
 
 /// A request key is sha256 hex: 64 lowercase hex characters. Anything else is refused by
@@ -1329,6 +1349,9 @@ impl EscalationStore {
     /// store cannot describe honestly, and inventing a shell for it would put a governance record
     /// in front of an operator that no witnessed act supports.
     pub fn rehydrate(&mut self, entries: &[crate::storage::chain::ChainEntry], now: u64) -> usize {
+        // Everything replayed below happened before this process existed, and so did any
+        // begin_action that answered it: a replayed claim can never be reclaimed (#1169).
+        self.booted_at = self.booted_at.max(now);
         let s = |v: &serde_json::Value, k: &str| {
             v.get(k).and_then(|x| x.as_str()).map(|x| x.to_string())
         };
@@ -1373,6 +1396,7 @@ impl EscalationStore {
                                 act_digest: s(d, "act_digest"),
                                 payload_sha256: s(d, "payload_sha256"),
                                 host_session_id: s(d, "host_session_id"),
+                                invocation_key: s(d, "invocation_key"),
                             },
                         );
                     }
@@ -2430,19 +2454,48 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         self.request_keys.get(key)
     }
 
-    /// The spend this SAME request already made, if a lost response is being retried (#774).
+    #[cfg(test)]
+    pub(crate) fn clone_for_test(&self) -> EscalationStore {
+        EscalationStore {
+            request_keys: self.request_keys.clone(),
+            begins_seen: self.begins_seen.clone(),
+            booted_at: self.booted_at,
+            ..Default::default()
+        }
+    }
+
+    /// Record that a tool invocation reached `hestia_begin_action` (execution evidence).
+    pub fn record_begin(&mut self, correlation_key: &str, now: u64) {
+        if !valid_correlation_key(correlation_key) {
+            return;
+        }
+        self.begins_seen.insert(correlation_key.to_string(), now);
+        if self.begins_seen.len() > BEGINS_SEEN_CAP {
+            if let Some(oldest) = self.begins_seen.iter().min_by_key(|(_, t)| **t).map(|(k, _)| k.clone()) {
+                self.begins_seen.remove(&oldest);
+            }
+        }
+    }
+
+    /// Has this invocation reached begin_action at or after `since`?
+    pub fn begin_seen_since(&self, correlation_key: &str, since: u64) -> bool {
+        self.begins_seen.get(correlation_key).is_some_and(|t| *t >= since)
+    }
+
+    /// May THIS retry be answered with the permit its request already spent? (#774, #1169)
     ///
-    /// Every conjunct must hold, or the answer is None and the caller falls through to the
-    /// ordinary refuse-and-open path:
-    ///   - the key's last outcome was a spend (`claimed` or `reclaimed`);
-    ///   - within `RECLAIM_WINDOW_SECS` of that spend;
-    ///   - the same member and marker;
-    ///   - the same act digest (the retry names the same act);
-    ///   - a BOUND payload is presented again byte-for-byte;
-    ///   - the same PROVEN host session when the spend had one. A retry that cannot prove it
-    ///     is the same session does not inherit a session's permit.
-    /// Nothing here widens any other key's window, and nothing here re-arms the escalation:
-    /// it stays consumed.
+    /// A reclaim is recovery of ONE lost answer, never repeat authority. Command equality
+    /// cannot prove a transport failure (GPT review of #1169): an identical command after a
+    /// delivered, executed permit must NOT inherit it. So the evidence is the daemon's own --
+    /// whether the claimed invocation ever reached `hestia_begin_action`, which every gate
+    /// reaches for a permitted write before the tool runs -- and never anything the agent
+    /// asserts. Every conjunct must hold; the error names the first that fails:
+    ///   - the key's record is a spend (`claimed`), not an open, and not already reclaimed;
+    ///   - the claim happened in THIS daemon's lifetime (its begin evidence is held here);
+    ///   - within `RECLAIM_WINDOW_SECS` of that claim;
+    ///   - same member, marker, act digest, bound payload, and proven host session;
+    ///   - the claim recorded its invocation, and the retry names a DIFFERENT invocation;
+    ///   - the claimed invocation has NO begin_action since the claim (it never executed).
     #[allow(clippy::too_many_arguments)]
     pub fn reclaimable(
         &self,
@@ -2452,36 +2505,51 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         attempted_act: Option<&str>,
         attempted_payload: Option<&str>,
         proven_host_session_id: Option<&str>,
+        invocation_key: Option<&str>,
         now: u64,
-    ) -> Option<RequestKeyRecord> {
-        let rec = self.request_keys.get(key)?;
-        if rec.outcome != "claimed" && rec.outcome != "reclaimed" {
-            return None;
+    ) -> Result<RequestKeyRecord, &'static str> {
+        let rec = self.request_keys.get(key).ok_or("no record for this request key")?;
+        match rec.outcome.as_str() {
+            "claimed" => {}
+            "reclaimed" => return Err("this claim was already reclaimed once"),
+            _ => return Err("this request key's last outcome was not a spend"),
+        }
+        if rec.at < self.booted_at {
+            return Err("the daemon restarted since that claim, so its execution evidence is not held here");
         }
         if now.saturating_sub(rec.at) > RECLAIM_WINDOW_SECS {
-            return None;
+            return Err("past the reclaim window of the first claim");
         }
         if rec.plugin_id != plugin_id.trim() || rec.marker != marker.trim() {
-            return None;
+            return Err("different member or marker");
         }
         let asked = attempted_act
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .map(Self::act_digest_of)?;
+            .map(Self::act_digest_of)
+            .ok_or("the retry names no act")?;
         if rec.act_digest.as_deref() != Some(asked.as_str()) {
-            return None;
+            return Err("different act");
         }
         if let Some(bound) = &rec.payload_sha256 {
             if Self::normalize_payload(attempted_payload).as_deref() != Some(bound.as_str()) {
-                return None;
+                return Err("different or absent payload");
             }
         }
         if let Some(sess) = &rec.host_session_id {
             if proven_host_session_id != Some(sess.as_str()) {
-                return None;
+                return Err("different or unproven host session");
             }
         }
-        Some(rec.clone())
+        let original = rec.invocation_key.as_deref().ok_or("the claim recorded no invocation")?;
+        let retry = invocation_key.ok_or("the retry names no invocation")?;
+        if retry == original {
+            return Err("the same invocation retried: its permit was already delivered to it");
+        }
+        if self.begin_seen_since(original, rec.at) {
+            return Err("the claimed invocation reached execution (begin_action seen): its permit was delivered");
+        }
+        Ok(rec.clone())
     }
 
     pub fn get(&self, id: &str) -> Option<&Escalation> {
@@ -2760,13 +2828,14 @@ mod tests {
 
     const T0: u64 = 1_800_000_000;
 
-    /// #774: a lost spend is reclaimable only by the SAME request, within the window. Every
-    /// conjunct is exercised on its own; the positive arm is the control.
+    /// #774/#1169: a reclaim is recovery of one lost answer. Every conjunct is exercised on its
+    /// own, and the positive arm is the control.
     #[test]
     fn a_reclaim_requires_every_conjunct_and_never_outlives_its_window() {
         let key = "c".repeat(64);
         let mut st = EscalationStore::default();
         let act = "Bash: git apply /tmp/p/fix.patch";
+        let pay = "ab".repeat(32);
         let rec = RequestKeyRecord {
             outcome: "claimed".into(),
             escalation_id: "E1".into(),
@@ -2774,34 +2843,61 @@ mod tests {
             plugin_id: "codex".into(),
             marker: "pre_tool_use.py".into(),
             act_digest: Some(EscalationStore::act_digest_of(act)),
-            payload_sha256: Some("ab".repeat(32)),
+            payload_sha256: Some(pay.clone()),
             host_session_id: Some("hs-1".into()),
+            invocation_key: Some("toolu_A".into()),
         };
         st.record_request_key(&key, rec.clone());
-        let pay = "ab".repeat(32);
-        let ok = |st: &EscalationStore, k: &str, pl: &str, mk: &str, a: &str, p: Option<&str>, hs: Option<&str>, now: u64| {
-            st.reclaimable(k, pl, mk, Some(a), p, hs, now).is_some()
-        };
-        assert!(ok(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), T0 + 5), "control");
-        assert!(ok(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"),
-                   T0 + RECLAIM_WINDOW_SECS), "the window's last second still holds");
-        assert!(!ok(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"),
-                    T0 + RECLAIM_WINDOW_SECS + 1), "past the window: refused");
-        assert!(!ok(&st, &"d".repeat(64), "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), T0 + 5), "other key");
-        assert!(!ok(&st, &key, "kimi-code", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), T0 + 5), "other member");
-        assert!(!ok(&st, &key, "codex", "other.py", act, Some(&pay), Some("hs-1"), T0 + 5), "other marker");
-        assert!(!ok(&st, &key, "codex", "pre_tool_use.py", "Bash: rm x", Some(&pay), Some("hs-1"), T0 + 5), "other act");
-        assert!(!ok(&st, &key, "codex", "pre_tool_use.py", act, Some(&"ff".repeat(32)), Some("hs-1"), T0 + 5), "other payload");
-        assert!(!ok(&st, &key, "codex", "pre_tool_use.py", act, None, Some("hs-1"), T0 + 5), "a bound payload must be presented");
-        assert!(!ok(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-2"), T0 + 5), "other session");
-        assert!(!ok(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), None, T0 + 5), "an unproven retry does not inherit a session's permit");
-        // An open (not a spend) is never reclaimable.
-        st.record_request_key(&key, RequestKeyRecord { outcome: "opened".into(), ..rec.clone() });
-        assert!(!ok(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), T0 + 5), "an open is not a spend");
+        #[allow(clippy::too_many_arguments)]
+        fn why(st: &EscalationStore, k: &str, pl: &str, mk: &str, a: &str, p: Option<&str>,
+               hs: Option<&str>, inv: Option<&str>, now: u64) -> Result<(), &'static str> {
+            st.reclaimable(k, pl, mk, Some(a), p, hs, inv, now).map(|_| ())
+        }
+        let base = |st: &EscalationStore, now| why(st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), Some("toolu_B"), now);
+        assert_eq!(base(&st, T0 + 5), Ok(()), "control");
+        assert_eq!(base(&st, T0 + RECLAIM_WINDOW_SECS), Ok(()), "the window's last second still holds");
+        assert!(base(&st, T0 + RECLAIM_WINDOW_SECS + 1).unwrap_err().contains("window"));
+        assert!(why(&st, &"d".repeat(64), "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), Some("toolu_B"), T0 + 5).is_err(), "other key");
+        assert!(why(&st, &key, "kimi-code", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), Some("toolu_B"), T0 + 5).unwrap_err().contains("member"));
+        assert!(why(&st, &key, "codex", "other.py", act, Some(&pay), Some("hs-1"), Some("toolu_B"), T0 + 5).unwrap_err().contains("marker"));
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", "Bash: rm x", Some(&pay), Some("hs-1"), Some("toolu_B"), T0 + 5).unwrap_err().contains("act"));
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", act, Some(&"ff".repeat(32)), Some("hs-1"), Some("toolu_B"), T0 + 5).unwrap_err().contains("payload"));
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", act, None, Some("hs-1"), Some("toolu_B"), T0 + 5).unwrap_err().contains("payload"));
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-2"), Some("toolu_B"), T0 + 5).unwrap_err().contains("session"));
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), None, Some("toolu_B"), T0 + 5).unwrap_err().contains("session"));
+        // THE INVOCATION CONJUNCTS (#1169).
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), Some("toolu_A"), T0 + 5)
+                    .unwrap_err().contains("same invocation"), "the same invocation retried");
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), None, T0 + 5)
+                    .unwrap_err().contains("no invocation"), "a retry that names no invocation");
+        let mut no_inv = st.clone_for_test();
+        no_inv.record_request_key(&key, RequestKeyRecord { invocation_key: None, ..rec.clone() });
+        assert!(base(&no_inv, T0 + 5).unwrap_err().contains("recorded no invocation"));
+        // Execution evidence: a begin for the CLAIMED invocation at/after the claim refuses.
+        let mut ran = st.clone_for_test();
+        ran.record_begin("toolu_A", T0 + 1);
+        assert!(base(&ran, T0 + 5).unwrap_err().contains("reached execution"));
+        // ...but a begin from BEFORE the claim is not evidence about this permit.
+        let mut before = st.clone_for_test();
+        before.record_begin("toolu_A", T0 - 1);
+        assert_eq!(base(&before, T0 + 5), Ok(()));
+        // Once reclaimed, never again.
+        let mut once = st.clone_for_test();
+        once.record_request_key(&key, RequestKeyRecord { outcome: "reclaimed".into(), ..rec.clone() });
+        assert!(base(&once, T0 + 5).unwrap_err().contains("already reclaimed"));
+        // An open is not a spend.
+        let mut opened = st.clone_for_test();
+        opened.record_request_key(&key, RequestKeyRecord { outcome: "opened".into(), ..rec.clone() });
+        assert!(base(&opened, T0 + 5).unwrap_err().contains("not a spend"));
+        // A claim older than this daemon (replayed) holds no execution evidence here.
+        let mut restarted = st.clone_for_test();
+        restarted.booted_at = T0 + 1;
+        assert!(base(&restarted, T0 + 5).unwrap_err().contains("restarted"));
         // Malformed keys are never stored.
         st.record_request_key("nope", rec.clone());
         assert!(st.request_key("nope").is_none());
         assert!(!valid_request_key(&"A".repeat(64)) && valid_request_key(&"0".repeat(64)));
+        assert!(valid_correlation_key("toolu_01ABC") && !valid_correlation_key("a/b") && !valid_correlation_key(""));
     }
 
     /// The key map is bounded: the oldest record goes first.
@@ -2811,7 +2907,7 @@ mod tests {
         let rec = |at| RequestKeyRecord {
             outcome: "opened".into(), escalation_id: "E".into(), at,
             plugin_id: "p".into(), marker: "m".into(), act_digest: None,
-            payload_sha256: None, host_session_id: None,
+            payload_sha256: None, host_session_id: None, invocation_key: None,
         };
         for i in 0..=REQUEST_KEY_CAP {
             st.record_request_key(&format!("{:064x}", i), rec(T0 + i as u64));
