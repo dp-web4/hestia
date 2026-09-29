@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: c162fa9845ebea07c50aeed3e113bb9612258f9ef8ea5922dd623b8870e48f74  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: cf539a43589dc53398eea0641c055cbc39e1a28341b559bda1d7ad864bd968f0  (published ground truth; manifest: hooks-gt)
 """Hestia PreToolUse hook for Claude Code — synchronous policy gate.
 
 Wired from .claude-plugin/plugin.json as the PreToolUse hook. Reads the
@@ -1279,6 +1279,16 @@ def _connect_session(client: "McpHttp", host_session_id: Optional[str]) -> Optio
         return None
 
 
+def escalation_request_key(plugin_id: str, marker: str, act: str,
+                           host_session_id: Optional[str]) -> str:
+    """The claim's request key (#1166): sha256 over member, marker, the exact act string sent,
+    and the host session. Stable across identical re-issues in one session, so a retry after a
+    lost answer names the same request; any change to the act is a different request."""
+    import hashlib
+    basis = "\x1f".join([plugin_id, marker, act, host_session_id or ""])
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
 def request_self_write(marker: str, tool_name: str, attempted: str = "",
                        resource: Optional[str] = None, key: Optional[str] = None,
                        dest: Optional[str] = None,
@@ -1303,6 +1313,10 @@ def request_self_write(marker: str, tool_name: str, attempted: str = "",
     is a refusal. A daemon that cannot answer must not be a way to get a governance write
     through.
     """
+    request_key = escalation_request_key(
+        _escalation_plugin_id(), marker, attempted or f"{tool_name} -> {resource or marker}",
+        host_session_id)
+    claim_sent = False
     try:
         endpoint = discover_endpoint() or DEFAULT_ENDPOINT
         client = McpHttp(endpoint, deadline=time.monotonic() + ESCALATION_RPC_TIMEOUT_S)
@@ -1330,20 +1344,44 @@ def request_self_write(marker: str, tool_name: str, attempted: str = "",
                 "because it did not choose to escalate. Approving authorises this one write."
             ),
         }
+        # THE REQUEST KEY (#1166, #774): stable across identical re-issues in one session, so
+        # when this round trip dies the daemon can answer the retry with what it already did.
+        claim_args["request_key"] = request_key
         # WHO is asking, provable — see `_connect_session`. Absent on any failure:
         # the claim accepts its absence and records `asker_basis: "asserted"`.
         sid = _connect_session(client, host_session_id)
         if sid:
             claim_args["session_id"] = sid
+        claim_sent = True
         r = client.call_tool("hestia_gate_escalation_claim", claim_args)
     except Exception as e:  # noqa: BLE001
-        return "unreachable", f"no answer from the daemon ({type(e).__name__}) -- refused"
+        if not claim_sent:
+            # The claim never left this process: nothing can have happened on the daemon.
+            return "unreachable", f"no answer from the daemon ({type(e).__name__}) -- refused"
+        # A TIMEOUT AFTER THE CLAIM WAS SENT IS AN UNKNOWN OUTCOME, NOT "NOTHING HAPPENED"
+        # (#1166, GPT). The daemon may have opened an escalation, matched a pending one, or
+        # spent an approval after this deadline passed. Refuse -- the budget cannot grow,
+        # because the harness kills a hook at 5 s and a killed hook fails OPEN -- but say what
+        # is known and how to recover.
+        sys.stderr.write(
+            f"hestia: OUTCOME UNKNOWN — the daemon did not answer within "
+            f"{ESCALATION_RPC_TIMEOUT_S}s ({type(e).__name__}); it may have opened or matched "
+            f"an escalation for this act. request key {request_key[:16]}… — "
+            f"`hestia gate lookup {request_key}`; re-issuing this identical act is safe: it "
+            f"returns the same escalation or the grant already claimed for you.\n"
+        )
+        sys.stderr.flush()
+        return "unknown", f"outcome unknown ({type(e).__name__}); request key {request_key}"
 
     # BOTH flags, and the daemon owns both. Two places deciding what "approved" means is how
     # they come to disagree, so the hook re-derives nothing.
     if _dig(r, "claimed") is True and _dig(r, "permits_write") is True:
         who = _dig(r, "decided_by") or "a human"
         via = _dig(r, "decided_via") or "unknown-channel"
+        if _dig(r, "reclaimed") is True:
+            # The SAME request already spent this grant and its answer was lost (#774).
+            return "approved", (f"re-claimed the approval from {who} via {via} that this "
+                                f"request already spent (its first answer was lost)")
         return "approved", f"claimed an approval from {who} via {via} (single use, now spent)"
 
     esc_id = _dig(r, "escalation_id")

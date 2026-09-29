@@ -1189,16 +1189,33 @@ def claim_self_write(marker, tool_name, attempted, *,
     # would be a lie in the exact record used to argue about who authorised what.
     if host_session_id:
         claim_args["host_session_id"] = host_session_id
+    # THE REQUEST KEY (#1166, #774): the same rule as the claude-code gate's
+    # `escalation_request_key` -- member, marker, the exact act string, host session.
+    import hashlib
+    request_key = hashlib.sha256("\x1f".join(
+        [plugin_id, marker, claim_args["reason"], host_session_id or ""]).encode("utf-8")).hexdigest()
+    claim_args["request_key"] = request_key
     r = gate_self_call("hestia_gate_escalation_claim", claim_args,
                        plugin_id=plugin_id, role=role, client_name=client_name,
                        host_session_id=host_session_id)
     if not isinstance(r, dict):
-        return "unreachable", "no answer from the daemon — refused", None, None
+        # A TIMEOUT IS AN UNKNOWN OUTCOME, NOT "NOTHING HAPPENED" (#1166): the daemon may have
+        # opened, matched or spent after the call's budget passed. Refuse, and say how to recover.
+        return ("unknown",
+                "OUTCOME UNKNOWN — the daemon did not answer in time; it may have opened or "
+                f"matched an escalation for this act. request key {request_key[:16]}… — "
+                f"`hestia gate lookup {request_key}`; re-issuing this identical act is safe: it "
+                "returns the same escalation or the grant already claimed for you",
+                None, None)
     # BOTH flags, and the daemon owns both — two places deciding what "approved" means is how
     # they come to disagree, so the hook re-derives nothing.
     if r.get("claimed") is True and r.get("permits_write") is True:
         who = r.get("decided_by") or "a human"
         via = r.get("decided_via") or "unknown-channel"
+        if r.get("reclaimed") is True:
+            return ("approved",
+                    f"re-claimed the approval from {who} via {via} that this request already "
+                    "spent (its first answer was lost)", None, None)
         return ("approved",
                 f"claimed an approval from {who} via {via} (single use, now spent)", None, None)
     esc_id = r.get("escalation_id")
