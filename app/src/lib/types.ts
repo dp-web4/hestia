@@ -198,6 +198,44 @@ export interface PendingEscalation {
   /** What else the bar still requires when this operator alone does not suffice. */
   still_needs: string[] | null;
   request_id: string | null;
+  /**
+   * What the retained act would DO, measured by the daemon (`evidence::write_effect`), never
+   * the member's description. Absent when the act is not measurable (then nothing is shown,
+   * rather than a guess). Two shapes: a copy (`cp <source> <governed>`) and, with `kind:
+   * "patch"`, a patch application (`git apply|am`, `patch -i|<`).
+   */
+  write_effect?: WriteEffect | null;
+}
+
+export interface PatchFileStat {
+  path: string;
+  added: number;
+  removed: number;
+  created: boolean;
+  deleted: boolean;
+}
+
+export interface WriteEffect {
+  kind?: "patch";
+  // copy-shaped
+  source?: string;
+  source_readable?: boolean;
+  source_lines?: number;
+  compared_against?: { path: string; what: string } | null;
+  identical_to_enforcing?: boolean;
+  // patch-shaped
+  patch_path?: string;
+  patch_readable?: boolean;
+  files?: PatchFileStat[];
+  file_count?: number;
+  payload_unbound_reason?: string | null;
+  // both
+  payload_sha256?: string | null;
+  added_lines?: number;
+  removed_lines?: number;
+  diff?: string[];
+  diff_truncated?: boolean;
+  note?: string;
 }
 
 export interface DaemonStatus {
