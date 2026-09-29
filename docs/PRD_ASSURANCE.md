@@ -117,8 +117,21 @@ single sentence is the difference between A1 and A2.
 An append-only log is not automatically evidence. What makes it evidence is that omissions
 are detectable and that no party can author another party's statement.
 
+**External evidence (Qin et al., 2026).** *LLM Agents Can Easily Tamper With Their Own
+Traces* ([arXiv:2609.30266](https://arxiv.org/abs/2609.30266)) demonstrates that popular
+local agent harnesses can let agents delete or alter their native traces, spoof tool-call
+records, and discover trace manipulation under reward pressure. The paper's mitigation is
+the same boundary this requirement needs: recording must happen outside the acting agent's
+control. It also makes an important distinction explicit: tamper-evident storage protects
+records after collection; it does not prove that every consequential event was captured
+faithfully.
+
 - Entries are signed; heads are anchored beyond the local machine so that rewriting a
   complete local chain is detectable.
+- Agent-native or harness-native traces are **supporting evidence, not authoritative
+  execution evidence** at A2+. Evidence used for oversight must be collected or witnessed
+  outside the actor's write authority; otherwise deletion, omission, fabrication or
+  tool-call spoofing can occur before cryptographic protection is applied.
 - For high-consequence actions, the accepted decision persists **before** execution and the
   result persists before final success is reported. Evidence is part of the action contract,
   not telemetry emitted afterwards.

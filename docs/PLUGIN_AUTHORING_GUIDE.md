@@ -221,4 +221,4 @@ If you've written a Hestia plugin for an agent that doesn't yet have one (or for
 2. Submit a PR with the plugin under `plugins/<agent-name>/`.
 3. We'll iterate on the integration and merge once it satisfies the contract.
 
-Third-party plugins live in this repo at first (to ensure consistency); as the ecosystem matures, we'll factor plugins into their own repos under the `@hestia/` npm scope.
+Third-party plugins live in this repo at first (to ensure consistency); as the ecosystem matures, we'll factor plugins into their own repos under the `@hestia-tools/` npm scope (`@hestia/` belongs to an unrelated publisher).

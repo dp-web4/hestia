@@ -126,7 +126,7 @@ indication the config is stale rather than the state.
 ### 4. Verify — *in force*, not merged
 
 ```bash
-DRY_RUN=1 deploy/install-members.sh        # every member should report "already current"
+DRY_RUN=1 deploy/install-members.sh        # every line should read "ok … (already current)"
 $HOME/.local/bin/hestia --version          # matches origin/main
 cat "$HESTIA_HOME/current-build.json"      # build id AND per-file hashes
 systemctl --user is-active hestia hestia-watch-claude hestia-watch-codex hestia-watch-kimi
@@ -139,6 +139,13 @@ seconds of a tool call.
 > **The authority file must carry per-file hashes, not only a build id.** A build id alone reports
 > "current" while individual member gates are stale — exactly the 2026-08-08 state. If the file
 > disagrees with a `DRY_RUN` pass, the file is wrong.
+
+> **What the shared engine's line means.** The four `plugins/_shared` files are installed as one
+> immutable build directory with `shared` symlinked at it, so their currency is the symlink target,
+> not four file comparisons — one `ok    shared -> shared.builds/<digest> (already current)` line
+> covers all four. Until 2026-09-21 the dry run printed `would` for them unconditionally, including
+> on a box that had just installed successfully; if you are reading an older checkout, verify the
+> engine with `readlink "$HESTIA_HOME/shared"` instead.
 
 ---
 

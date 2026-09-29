@@ -67,22 +67,26 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 
 # Web4 primitives
-web4-core = { path = "../../web4/web4-core" }
+web4-core = { path = "../../web4/web4-core", version = "0.4" }
 # Wire formats shared byte-for-byte with the app (session transcript). One source
 # consumed twice — see wire/src/lib.rs for why this is not in web4-core.
-hestia-wire = { path = "../wire" }
+hestia-wire = { path = "../wire", version = "0.1" }
 # The generic plugin seam — shared with the hub (public open-core crate) instead
 # of maintaining a near-identical copy here. `crate::plugin` re-exports it.
-hub-plugin = { path = "../../web4/hub/hub-plugin" }
+# `package =` because web4 renamed the PACKAGE for crates.io publishability
+# (web4 69fa2a0, 2026-09-26) while keeping `[lib] name = "hub_plugin"`: the path
+# and the Rust identifier are unchanged, only the registry-facing name moved.
+# `version =` because crates.io refuses a path-only dependency when this crate publishes.
+hub-plugin = { package = "web4-hub-plugin", path = "../../web4/hub/hub-plugin", version = "=0.1.0-alpha.0" }
 # P3b: consume the sibling web4 checkout by path (matching web4-core / hub-plugin
 # above) so hestia builds in lockstep against the migrated EntityTrust, whose T3/V3
 # are now the canonical `web4_core::t3::T3` / `web4_core::v3::V3`. This unifies the
 # single web4-core source across the dependency graph (no duplicate tensor types).
-web4-trust-core = { path = "../../web4/web4-trust-core", features = ["file-store"] }
+web4-trust-core = { path = "../../web4/web4-trust-core", version = "0.3", features = ["file-store"] }
 # Consolidation (2026-07-10, hestia-role-orchestration): chapter-law norms
 # evaluate in the ONE canonical crate the hub uses — closing the two-engines
 # drift seam CBP flagged. Same P3b by-path pattern as the deps above.
-web4-policy = { path = "../../web4/web4-policy" }
+web4-policy = { path = "../../web4/web4-policy", version = "0.1" }
 # serde_yaml: the web4-policy law payload type (R6Request.payload)
 serde_yaml = "0.9"
 rusqlite = { version = "0.31", features = ["backup", "bundled-sqlcipher-vendored-openssl"] }

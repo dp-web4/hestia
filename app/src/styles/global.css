@@ -1167,3 +1167,36 @@ input::placeholder {
 .cfg-actions .cfg-note { flex: 1; }
 .cfg-saved { margin-top: 12px; padding: 10px; border-left: 3px solid var(--accent, #6aa9ff); font-size: 0.9rem; }
 .cfg-saved-verdicts { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+
+/* --- Decide: governance escalations awaiting the operator --- */
+.muted { color: var(--text-muted); }
+/* The escalation's own words, shown whole. Truncating the asker's detail is how
+   a governance write gets approved on its summary rather than its substance. */
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 10px 0; }
+.kv dt { color: var(--text-muted); font-size: 0.85rem; }
+.kv dd { margin: 0; }
+.kv dd.pre { white-space: pre-wrap; font-family: monospace; font-size: 0.85rem; }
+.decide-actions { display: flex; align-items: flex-end; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+.decide-actions label { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 240px; font-size: 0.85rem; }
+.decide-actions input { padding: 6px 8px; }
+
+/* Two queues, two questions: a stopped act vs an asked-for reach. */
+.queue-heading { margin: 22px 0 8px; font-size: 1rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.scope-request { border-left: 3px solid var(--accent, #6aa9ff); }
+.decide-actions label.check { flex: 0 0 auto; min-width: 0; flex-direction: row; align-items: center; gap: 6px; }
+
+/* --- Gates: integrity of the installed gates --- */
+/* Tables shared by the integrity and inventory views. */
+.gate-table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 0.9rem; }
+.gate-table th { text-align: left; color: var(--text-muted); font-weight: normal; padding: 4px 8px; }
+.gate-table td { padding: 6px 8px; border-top: 1px solid var(--border, #222); vertical-align: top; }
+.gate-table td.pre { font-family: monospace; font-size: 0.8rem; word-break: break-all; }
+.gate-status { font-family: monospace; padding: 2px 8px; border-radius: 4px; }
+.gate-verified { background: rgba(80, 180, 120, 0.18); }
+.gate-findings, .gate-unknown { background: rgba(220, 170, 60, 0.2); }
+.gate-modified, .gate-differs { color: #e06c6c; }
+.gate-modified { background: rgba(220, 90, 90, 0.2); }
+.gate-differs { color: #e06c6c; }
+
+.findings { margin: 0; padding-left: 16px; font-size: 0.85rem; }
+.findings li { margin: 2px 0; }

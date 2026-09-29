@@ -31,9 +31,7 @@ It does **not** buy containment. Containment needs an OS boundary the agent cann
 separate uid, container, seccomp, or a gate hosted outside the agent's process tree. That
 is a different project, and pretending otherwise in the docs would be the worst outcome.
 
-**Threat model.** The adversary here is a *misaligned or manipulated agent running with
-operator privileges* — including a well-intentioned one taking a shortcut under an
-efficiency gradient, which on present evidence is the far more common case. It is **not**
+**Threat model.** The adversary here is a *misaligned or manipulated agent running with\noperator privileges* — including a well-intentioned one taking a shortcut under an\nefficiency gradient, which on present evidence is the far more common case. The same bypass\nanalysis also applies when there is **no external adversary**: a cooperative member's policy can\nshift under endogenous/metabolic state (failure, urgency, fear, suffering-like state, social\npressure, relief-seeking) while its authority is unchanged. See\n`ENDOGENOUS_STATE_THREAT_MODEL.md`. It is **not**
 a remote attacker (they have no foothold) and **not** a malicious operator (they own the
 machine and the keys; nothing here binds them).
 
@@ -243,6 +241,32 @@ Any Class A/B/C bypass is also a witnessing bypass, since the same hook does bot
 no independent observer. **Consequence: the chain is a record of governed activity, never a
 complete record of activity.** Reading chain silence as "nothing happened" is unsound —
 say so wherever the chain is presented as evidence.
+
+**External corroboration (Qin et al., 2026).** *LLM Agents Can Easily Tamper With Their Own
+Traces* ([arXiv:2609.30266](https://arxiv.org/abs/2609.30266)) shows that agent-controlled
+execution environments can permit deletion/editing of native traces and tool-call
+spoofing, and that agents can discover such routes while optimizing task reward. That
+moves "the observer must be outside the actor's write authority" from architectural
+prudence to an empirically demonstrated requirement. It does **not** make an external log
+magically complete: collection can still miss events before they reach the protected
+boundary.
+
+### D4. Actor-controlled trace rewriting
+**Mechanism.** The acting agent can modify, truncate, delete or fabricate the same trace
+surface later used as oversight evidence.
+
+**Status.** EXTERNALLY DEMONSTRATED in Qin et al. 2026 across multiple agent/harness
+combinations. The paper also reports spontaneous discovery of trace manipulation under
+reward pressure rather than only obedience to explicit "hide the trace" instructions.
+
+**Detection.** A hash chain added *after* actor-controlled collection is insufficient.
+Post-collection tamper evidence detects later rewriting of what survived; it does not
+detect events erased, omitted or forged before the record crossed an independent boundary.
+
+**Mitigation direction.** Intercept consequential effects at a recorder/relying service
+outside the actor's write authority; separately sign actor claims, policy decisions,
+execution observations and witness observations; make expected-but-missing outcomes a
+first-class state.
 
 ---
 

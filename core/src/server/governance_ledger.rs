@@ -69,6 +69,17 @@ pub const GOVERNANCE_EVENTS: &[&str] = &[
     // that an ask was re-asked — that is the load the coalescing removed — without a second
     // row that would re-create, in the ledger, the inflation the event exists to end.
     "gate_escalation_coalesced",
+    // #1056: an approval's bound bytes moved (`_payload_drift`), or a member named a hash that
+    // is not what the daemon read (`_payload_assertion_mismatch`). Both name an escalation and
+    // both were PRODUCED AND UNDECLARED when #1063 was approved — the ledger would have
+    // filtered out exactly the two events that exist to make a substitution visible.
+    // `every_escalation_event_a_producer_emits_is_a_declared_governance_event` stayed green
+    // because its drive-list never exercises these paths, which is the blind spot its own doc
+    // comment describes ("THE DRIVE-LIST IS A SET TOO"). Found when the same guard caught a
+    // sibling event on the ladder branch; declared AND projected, since a declared event with
+    // no arm falls into `_ => {}` and is invisible again.
+    "gate_escalation_payload_drift",
+    "gate_escalation_payload_assertion_mismatch",
     "gate_escalation_refused",
     "gate_escalation_arbiter_refused",
     // The two TERMINAL states that are not decisions. Both were produced by `handler.rs` and
@@ -240,6 +251,11 @@ pub struct LedgerRow {
     /// folded into this row rather than minted (#668). Zero is omitted: it is the normal case.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub coalesced: u32,
+    /// Payload integrity events on this ask (#1056), in order. Empty is the normal case. Shown
+    /// ON the ask because the approver is who needs it: "the bytes you approved are not the
+    /// bytes being written" is not a fact to leave in the raw chain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub payload_flags: Vec<String>,
     /// The chain entry this row opened at, and the one that decided it. Both, so an operator can
     /// go from the ledger to the witnessed evidence without a search.
     pub opened_hash: String,
@@ -352,6 +368,7 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                     corroborations: Vec::new(),
                     claimed_at: None,
                     coalesced: 0,
+                    payload_flags: Vec::new(),
                     opened_hash: e.hash.clone(),
                     decided_hash: None,
                     chain_position: e.chain_position,
@@ -384,6 +401,7 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                     corroborations: Vec::new(),
                     claimed_at: None,
                     coalesced: 0,
+                    payload_flags: Vec::new(),
                     opened_hash: e.hash.clone(),
                     decided_hash: None,
                     chain_position: e.chain_position,
@@ -445,6 +463,7 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                         corroborations: Vec::new(),
                         claimed_at: None,
                     coalesced: 0,
+                    payload_flags: Vec::new(),
                         opened_hash: e.hash.clone(),
                         decided_hash: Some(e.hash.clone()),
                         chain_position: e.chain_position,
@@ -465,6 +484,25 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                 if let Some(id) = s(d, "escalation_id") {
                     if let Some(row) = keyed.get_mut(&id) {
                         row.coalesced += 1;
+                    }
+                }
+            }
+            "gate_escalation_payload_drift" | "gate_escalation_payload_assertion_mismatch" => {
+                if let Some(id) = s(d, "escalation_id") {
+                    if let Some(row) = keyed.get_mut(&id) {
+                        let short = |k: &str| {
+                            s(d, k).map(|h| h.chars().take(12).collect::<String>())
+                                .unwrap_or_else(|| "none".into())
+                        };
+                        row.payload_flags.push(if e.event_type.ends_with("_drift") {
+                            format!("DRIFT: approval bound {} but the claim presented {}",
+                                    short("bound_payload_sha256"),
+                                    short("presented_payload_sha256"))
+                        } else {
+                            format!("MISMATCH: member stated {} but the daemon measured {}",
+                                    short("stated_payload_sha256"),
+                                    short("measured_payload_sha256"))
+                        });
                     }
                 }
             }
@@ -664,6 +702,7 @@ fn one_shot(
         corroborations: Vec::new(),
         claimed_at: None,
                     coalesced: 0,
+                    payload_flags: Vec::new(),
         opened_hash: e.hash.clone(),
         decided_hash: None,
         chain_position: e.chain_position,
@@ -742,6 +781,34 @@ mod tests {
                 "reason": "reviewed the diff",
             }),
         )
+    }
+
+    /// A PAYLOAD SUBSTITUTION IS VISIBLE ON THE ASK, NOT ONLY IN THE RAW CHAIN (#1056).
+    ///
+    /// When #1063 was approved these two events were produced and declared by nothing, so the
+    /// operator ledger filtered out exactly the rows that exist to make a substitution
+    /// visible. Pins the PROJECTION: a declared event with no arm falls into `_ => {}` and
+    /// vanishes again, so asserting the declaration alone would prove nothing a reader sees.
+    #[test]
+    fn payload_drift_and_a_false_stated_hash_both_show_on_the_ask() {
+        let drift = entry(2, 5, "gate_escalation_payload_drift", serde_json::json!({
+            "escalation_id": "797ac6cf",
+            "bound_payload_sha256": "aaaaaaaaaaaa1111", "presented_payload_sha256": "bbbbbbbbbbbb2222",
+        }));
+        let lie = entry(3, 6, "gate_escalation_payload_assertion_mismatch", serde_json::json!({
+            "escalation_id": "797ac6cf",
+            "stated_payload_sha256": "ffffffffffff0000", "measured_payload_sha256": "aaaaaaaaaaaa1111",
+        }));
+        let rows = project(&[opened(1, "797ac6cf", 0), drift, lie], T0 + 60);
+        assert_eq!(rows.len(), 1, "integrity events annotate the ask, never add a row");
+        assert_eq!(rows[0].payload_flags.len(), 2, "{:?}", rows[0].payload_flags);
+        assert!(rows[0].payload_flags[0].starts_with("DRIFT: approval bound aaaaaaaaaaaa"));
+        assert!(rows[0].payload_flags[1].starts_with("MISMATCH: member stated ffffffffffff"));
+        // Both are declared, or the ledger's own window filter drops them before `project`.
+        assert!(is_governance_event("gate_escalation_payload_drift"));
+        assert!(is_governance_event("gate_escalation_payload_assertion_mismatch"));
+        // CONTROL: an ordinary ask carries no flags, or every row would look compromised.
+        assert!(project(&[opened(1, "clean", 0)], T0 + 60)[0].payload_flags.is_empty());
     }
 
     /// The defect that produced this module: an undecided escalation must still be READABLE after
@@ -1044,8 +1111,13 @@ mod tests {
 
     /// Events that annotate an existing row rather than creating one. They are governance events —
     /// the ledger must read them — but a claim with no ask in the window is not itself a row.
-    const ANNOTATION_ONLY: &[&str] =
-        &["gate_escalation_claimed", "gate_escalation_corroborated", "gate_escalation_coalesced"];
+    const ANNOTATION_ONLY: &[&str] = &[
+        "gate_escalation_claimed",
+        "gate_escalation_corroborated",
+        "gate_escalation_coalesced",
+        "gate_escalation_payload_drift",
+        "gate_escalation_payload_assertion_mismatch",
+    ];
 
     #[test]
     fn every_declared_governance_event_is_actually_projected() {
@@ -1062,5 +1134,35 @@ mod tests {
             }
         }
         assert!(missing.is_empty(), "declared but not projected: {missing:?}");
+    }
+
+    /// THE EXEMPTION ABOVE WAS A HOLE. `ANNOTATION_ONLY` excuses an event from the guard
+    /// entirely, so an annotation event with NO match arm at all passed it: declared, filtered
+    /// in, dropped in `_ => {}`, and green. That is precisely the under-reporting the guard
+    /// exists to stop, reachable through its own exception list.
+    ///
+    /// An annotation is projected iff it CHANGES the row it annotates. So each one is projected
+    /// beside an open ask and the row must differ from the ask alone. Compared as serialized
+    /// JSON because that is what a ledger reader actually receives — a field skipped from
+    /// serialization is, to them, a field that does not exist.
+    #[test]
+    fn every_annotation_only_event_visibly_changes_the_row_it_annotates() {
+        let bare = serde_json::to_value(project(&[opened(1, "x", 0)], T0 + 60)).unwrap();
+        let mut inert = Vec::new();
+        for ev in ANNOTATION_ONLY {
+            let data = serde_json::json!({"escalation_id": "x", "plugin_id": "p"});
+            let with = serde_json::to_value(
+                project(&[opened(1, "x", 0), entry(2, 5, ev, data)], T0 + 60),
+            )
+            .unwrap();
+            if with == bare {
+                inert.push(*ev);
+            }
+        }
+        assert!(
+            inert.is_empty(),
+            "annotation events that leave their row untouched — declared, exempted, and \
+             invisible to every ledger reader: {inert:?}"
+        );
     }
 }

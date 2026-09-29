@@ -10,6 +10,9 @@ interface VaultEntry {
   allowed_consumers: string[];
   created_at: string;
   last_rotated?: string;
+  /** Set when the daemon owns the entry (identity, device key, hub config). The daemon refuses
+   *  to delete it, so this page offers no delete. Same field the dashboard's Govern -> vault reads. */
+  system?: string | null;
 }
 
 export function Vault() {
@@ -56,6 +59,16 @@ export function Vault() {
   };
 
   const handleDelete = async (name: string) => {
+    // A deleted value cannot be recovered from here, so typing the name back is the
+    // confirmation (same as the dashboard's Govern -> vault).
+    const typed = window.prompt(
+      `Delete '${name}' from the vault? Its value cannot be recovered.\nType the name to confirm:`,
+    );
+    if (typed === null) return;
+    if (typed.trim() !== name) {
+      setError("Name did not match — nothing was deleted.");
+      return;
+    }
     try {
       await vaultDelete(name);
       refresh();
@@ -117,12 +130,18 @@ export function Vault() {
             <div key={entry.id} className="vault-entry">
               <div className="vault-entry-header">
                 <span className="vault-name">{entry.name}</span>
-                <button
-                  className="btn btn-danger btn-sm"
-                  onClick={() => handleDelete(entry.name)}
-                >
-                  Delete
-                </button>
+                {entry.system ? (
+                  <span className="vault-scope" title={entry.system}>
+                    daemon · {entry.system}
+                  </span>
+                ) : (
+                  <button
+                    className="btn btn-danger btn-sm"
+                    onClick={() => handleDelete(entry.name)}
+                  >
+                    Delete
+                  </button>
+                )}
               </div>
               <div className="vault-meta">
                 {entry.scope.length > 0 && (

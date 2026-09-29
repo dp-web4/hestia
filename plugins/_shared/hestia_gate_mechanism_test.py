@@ -447,6 +447,227 @@ def test_bad_budget_env_defaults_not_raises():
 # Explicit list — NOT a globals() comprehension — so every test name is a static reference
 # (tools/ci_selfexec_test.py rejects test functions whose execution cannot be established
 # statically; a dynamic sweep leaves each name un-referenced and reads as inert).
+
+# ── snapshot-fetch telemetry names the cause AND the stage (2026-09-11) ─────────────────────
+# Until this slice every failed snapshot fetch was recorded with cause "unknown", because the
+# helper passed a free-text reason where the three-valued cause goes and the writer
+# normalised it away. Three timeout bursts on nomad were attributable only by reading the
+# exception name out of the detail string, and to no handshake stage at all.
+
+class _CapturedTelemetry:
+    def __init__(self):
+        self.records = []
+
+    def __call__(self, member, tool, cause, detail="", home=None):
+        self.records.append({"member": member, "tool": tool, "cause": cause, "detail": detail})
+        return True
+
+
+def _with_captured_telemetry(fn):
+    import hestia_gate_core as core
+    real = core.record_gate_unavailable
+    cap = _CapturedTelemetry()
+    core.record_gate_unavailable = cap
+    try:
+        fn()
+    finally:
+        core.record_gate_unavailable = real
+    return cap.records
+
+
+def test_snapshot_timeout_is_recorded_as_timeout_at_its_stage():
+    class Starved(FakeClient):
+        def call_tool(self, name, args):
+            if name == "hestia_operating_law":
+                raise TimeoutError("timed out")
+            return super().call_tool(name, args)
+
+    fake = Starved()
+    fake.extra = {"hestia_operating_law": {}, "hestia_scope_status": {}}
+    m._discover_endpoint = lambda: "http://fake/mcp"
+    m._McpHttp = lambda ep, dl: fake
+
+    def run():
+        check("snapshot_is_none_on_timeout",
+              m.fetch_policy_snapshot("kimi-code", use_cache=False) is None)
+
+    recs = _with_captured_telemetry(run)
+    check("timeout_recorded", len(recs) >= 1, repr(recs))
+    last = recs[-1]
+    check("timeout_tool_is_policy_snapshot", last["tool"] == "policy-snapshot", repr(last))
+    check("timeout_cause_is_timeout_not_unknown", last["cause"] == "timeout", repr(last))
+    check("timeout_detail_names_the_stage", last["detail"].startswith("operating_law:"), repr(last))
+    check("timeout_detail_keeps_the_exception", "TimeoutError" in last["detail"], repr(last))
+
+
+def test_snapshot_refused_is_recorded_as_refused_at_initialize():
+    class Absent(FakeClient):
+        def initialize(self):
+            raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+    fake = Absent()
+    m._discover_endpoint = lambda: "http://fake/mcp"
+    m._McpHttp = lambda ep, dl: fake
+
+    def run():
+        check("snapshot_is_none_on_refused",
+              m.fetch_policy_snapshot("kimi-code", use_cache=False) is None)
+
+    recs = _with_captured_telemetry(run)
+    check("refused_recorded", len(recs) >= 1, repr(recs))
+    last = recs[-1]
+    check("refused_cause_is_refused", last["cause"] == "refused", repr(last))
+    check("refused_detail_names_initialize", last["detail"].startswith("initialize:"), repr(last))
+
+
+def test_verdict_and_snapshot_share_one_cause_classifier():
+    """One law for 'why could the daemon not be consulted': the verdict path and the snapshot
+    path must not drift into two answers for the same exception."""
+    check("bare_timeout", m._unavailable_cause(TimeoutError()) == "timeout")
+    check("wrapped_timeout", m._unavailable_cause(urllib.error.URLError(TimeoutError())) == "timeout")
+    check("wrapped_refused",
+          m._unavailable_cause(urllib.error.URLError(ConnectionRefusedError())) == "refused")
+    check("bare_refused", m._unavailable_cause(ConnectionRefusedError()) == "refused")
+    check("other_is_unknown", m._unavailable_cause(ValueError("x")) == "unknown")
+    check("plain_urlerror_is_unknown", m._unavailable_cause(urllib.error.URLError("boom")) == "unknown")
+
+
+def test_the_review_door_is_the_callers_assertion_not_the_librarys():
+    """#1050, and the refutation that shaped it (kimi-code, findings/review-13031.md).
+
+    `gate_capabilities` is a self-report the daemon's invitation pool now ACTS on: a member
+    that declares its doors without `escalation-review:v1` is not woken to decide an
+    escalation it cannot decide. The first cut declared that capability unconditionally,
+    right here, on the reasoning that every seat reaching this module holds the corroborate
+    tool. That reasoning is false for the fleet's gateway member: SAGE's
+    `being_gate_client.py` imports THIS module as the being's society-safety client and
+    fetches with `member_id="cbp-being"`, whose effector registry has no corroborate and no
+    arbitrate. The unconditional declaration would have made cbp-being — the exact member
+    #1050 exists to stop inviting — read as `review_basis: "declared"`, and would have
+    overwritten its one accurate declaration.
+
+    A SHARED LIBRARY CANNOT KNOW ITS CALLER'S EFFECTOR SET, so the default is silence. The
+    cost of each direction is asymmetric and that is why the default sits where it does: a
+    door-holder that stays silent reads `undeclared` and is invited anyway (one wasted
+    notice), while a non-holder that declares is invited with a FALSE recorded basis, which
+    is the defect itself."""
+    calls = []
+
+    class Recorder(FakeClient):
+        def call_tool(self, name, args):
+            calls.append((name, args))
+            return super().call_tool(name, args)
+
+    def connect_args_for(**kw):
+        calls.clear()
+        fake = Recorder()
+        # No grants, so the workspace root never enters the assertion: this test reads the
+        # CONNECT arguments, which is one seam earlier than every mapping test below.
+        fake.extra = _std_stub("/nonexistent-workspace").extra
+        m._discover_endpoint = lambda: "http://fake/mcp"
+        m._McpHttp = lambda ep, dl: fake
+        snap = m.fetch_policy_snapshot("cbp-being", use_cache=False, **kw)
+        check("recorder_snapshot_present", isinstance(snap, dict), repr(snap))
+        args = [a for (n, a) in calls if n == "hestia_connect"]
+        check("connect_called_once", len(args) == 1, repr(calls))
+        return args[0]
+
+    # THE DEFAULT — what the being's gateway gets, because it passes no flag.
+    default = connect_args_for()
+    check("default_declares_the_floor",
+          default["gate_capabilities"] == ["society-floor:v1"], str(default))
+    check("default_withholds_the_review_door",
+          m.REVIEW_CAPABILITY not in default["gate_capabilities"], str(default))
+
+    # THE OPT-IN — what the three CLI hooks pass, each of which has actually used the door.
+    # FULL-chain census 2026-09-17 (all 259,522 entries, not a window): kimi-code 149,
+    # codex 141, claude-code 121, and `claudecode` 1 — a fourth spelling, older than the
+    # first 40,000 entries, which a windowed walk reported as a member that had NEVER
+    # corroborated. The window was the error, not the chain; `has_corroborated` matches the
+    # id exactly, so the alias keeps its own history and neither name inherits the other's.
+    declared = connect_args_for(declares_review_door=True)
+    check("optin_declares_both",
+          declared["gate_capabilities"] == ["society-floor:v1", m.REVIEW_CAPABILITY],
+          str(declared))
+
+
+def test_the_review_capability_spelling_matches_the_daemons():
+    """One string, two languages, and the filter is an EXACT `contains` on it.
+
+    A rename on either side is a silent regression, not a build error: the daemon would stop
+    recognising the seats' declaration and read every seat as `undeclared`, which invites
+    everyone — the pre-#1050 behaviour, restored without a single failing test. So pin the
+    two spellings against each other. Skips (rather than fails) when the Rust source is not
+    beside this checkout, so a plugins-only install still runs the suite."""
+    rs = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "..", "..", "core", "src", "server", "handler.rs")
+    if not os.path.exists(rs):
+        print("SKIP the_review_capability_spelling_matches_the_daemons (no core/ beside plugins/)")
+        return
+    import re
+    with open(rs, encoding="utf-8", errors="replace") as fh:
+        found = re.findall(r'REVIEW_CAPABILITY:\s*&str\s*=\s*"([^"]+)"', fh.read())
+    check("daemon_declares_one_review_capability", len(found) == 1, repr(found))
+    check("spellings_match", found[0] == m.REVIEW_CAPABILITY,
+          f"daemon={found[0]!r} mechanism={m.REVIEW_CAPABILITY!r}")
+
+
+def test_the_review_door_comment_names_the_seats_own_identity():
+    """The sentence that declares the door must name the id the seat actually acts under.
+
+    kimi-code's second-seat review of the comment-truth fix (notice 13150, 2026-09-18) found
+    the codex shim's declaration sentence naming `codex-cli` while that same file's
+    HESTIA_PLUGIN_ID asserts `codex`. `codex-cli` is a real witnessed alias (the operator's
+    2026-07-26 `identity_alias`), but it carries ZERO `gate_escalation_corroborated` rows on
+    the full chain against codex's 142 — so a reader who checks this comment against the
+    chain the way the census does counts the named id, finds nothing, and holds a false
+    refutation of the very claim the comment exists to support.
+
+    Two things make it worth a test rather than a re-read. The drift re-entered inside the
+    one file that already names the hazard — its HESTIA_PLUGIN_ID exists because "codex
+    spent days reporting as both `codex` and `codex-cli`" — and it re-entered through a
+    commit whose whole subject was comment truth: that correction rewrote five lines of this
+    comment and left the identifier on the first one. Prose cannot fail a build; this can.
+
+    Measured over all three shims when this was written: 2 correct, 1 wrong. A singleton,
+    not a class, which is why this is a six-line predicate and not a repo-wide lint.
+    """
+    import re
+    here = os.path.dirname(os.path.abspath(__file__))
+    declaring = 0
+    for seat in ("claude-code", "codex", "kimi"):
+        path = os.path.join(here, "..", seat, "hooks", "pre_tool_use.py")
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            shim = fh.read()
+        if "declares_review_door=True" not in shim:
+            continue          # this seat does not claim the door; it has nothing to name
+        declaring += 1
+        # The seat's asserted identity: the LAST string literal on its identity assignment.
+        # That is the bare literal in one spelling and the environment default in the other,
+        # and it is what every witness call on the seat passes.
+        own = []
+        for line in shim.splitlines():
+            head = re.match(r'^(?:HESTIA_)?PLUGIN_ID\s*=\s*(.+)$', line)
+            if head:
+                lits = re.findall(r'"([^"]+)"', head.group(1))
+                if lits:
+                    own.append(lits[-1])
+        check(f"{seat}_asserts_exactly_one_identity", len(set(own)) == 1, repr(own))
+        named = re.findall(r"This seat HOLDS the review door:\s*([A-Za-z0-9_-]+)\s+reaches",
+                           shim)
+        check(f"{seat}_declaration_sentence_is_findable", len(named) == 1,
+              f"expected one 'This seat HOLDS the review door: <id> reaches', got {named!r}")
+        check(f"{seat}_comment_names_its_own_id", named[0] == own[0],
+              f"comment says {named[0]!r}; this shim acts as {own[0]!r}")
+    # Never render "every declaration is honest" out of "found no shim to read" — the
+    # agent-inventory rule, and the same fail direction the certification suite uses.
+    check("at_least_one_shim_declares_the_door", declaring > 0,
+          "no shim beside this test declares the review door — a check that cannot look "
+          "certifies nothing")
+
+
 ALL = [
     test_allow_proceeds,
     test_deny_enforced_blocks,
@@ -472,6 +693,12 @@ ALL = [
     test_cached_snapshot_refused_after_bounded_horizon,
     test_exhausted_deadline_refuses_request,
     test_bad_budget_env_defaults_not_raises,
+    test_snapshot_timeout_is_recorded_as_timeout_at_its_stage,
+    test_snapshot_refused_is_recorded_as_refused_at_initialize,
+    test_verdict_and_snapshot_share_one_cause_classifier,
+    test_the_review_door_is_the_callers_assertion_not_the_librarys,
+    test_the_review_capability_spelling_matches_the_daemons,
+    test_the_review_door_comment_names_the_seats_own_identity,
 ]
 
 if __name__ == "__main__":

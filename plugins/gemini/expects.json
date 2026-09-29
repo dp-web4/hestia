@@ -4,6 +4,9 @@
   ],
   "install": {
     "member": "gemini",
+    "requires": [
+      "claude-code/hooks/pre_tool_use.py"
+    ],
     "dest": "~/.gemini/hestia-plugins/gemini/hooks",
     "registration": {
       "reader": "json-hook-commands",
@@ -14,6 +17,7 @@
     },
     "files": [
       "hooks/before_tool.py",
+      "hooks/witness.py",
       "hooks/observe.sh",
       "hooks/hydrate.sh"
     ],
@@ -49,5 +53,10 @@
   },
   "observe": [
     "AfterTool"
-  ]
+  ],
+  "targets": {
+    "observe": [
+      "witness.py"
+    ]
+  }
 }

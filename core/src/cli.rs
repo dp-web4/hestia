@@ -1071,7 +1071,7 @@ fn cmd_init(home: &std::path::Path, force: bool, ai: bool) -> AnyResult<()> {
 
         // A CLEARTEXT, public-only identity artifact so a LOCKED node can self-identify —
         // `info` reads it without the vault passphrase, and it is what a hub needs to answer
-        // `/.well-known` before unlock (the dev-hub "clear tier-0 public-identity.json" wrinkle).
+        // `/.well-known` before unlock (the hub's clear tier-0 `public-identity.json`, web4 #355–357).
         // PUBLIC DATA ONLY: the LCT id is a shareable identifier derived from the public key; the
         // keypair stays sealed in the vault and never touches this file.
         let pub_identity = serde_json::json!({
@@ -3656,6 +3656,39 @@ fn cmd_delegate_grant(
 
 
     let mut vault = open_vault(home)?;
+    // THE SAME REFUSAL AS THE HTTP DOOR. #1106 said a retired id is "refused through this door
+    // as through every other", and that was true of the three routes only: this command takes
+    // the agent KEY, so nothing here had ever mapped it back to a member to ask (cbp, #1106
+    // review, finding 5). The registry is small and the map is one way -- key = f(lct) -- so
+    // the reverse is a scan, done once, here.
+    // Loaded once, for both refusals below: the retired-member check (#1106) and the action
+    // check (#1110). Two loads would be two readings of the registry that could disagree.
+    let registry = hestia::member_registry::load_members(&vault);
+    {
+        let retired = hestia::server::retirement::load(&vault);
+        if !retired.retired.is_empty() {
+            let who = registry.iter_sorted().into_iter().find(|(_, lct)| {
+                delegation::agent_key_for_lct(&lct.lct_id()) == agent_id
+            }).map(|(id, _)| id.clone());
+            if let Some(plugin_id) = who {
+                if let Some(r) = retired.get(&plugin_id) {
+                    anyhow::bail!(
+                        "'{plugin_id}' was RETIRED on this seat ({}). Nothing was delegated: a \
+                         retired id receives no authority through this door either. Reinstate it \
+                         first — the dashboard's agent view, or POST /api/agents/{plugin_id}/reinstate.",
+                        r.reason);
+                }
+            }
+        }
+    }
+    // THE SAME ACTION CHECK AS THE HTTP DOOR (#1110), from the same function, so the two cannot
+    // drift -- this door is where #1106's retirement refusal was missing the first time. An
+    // action whose member segment names no recorded member, or a `scope.decide` shape that binds
+    // nothing, is refused before anything is signed.
+    #[rustfmt::skip]
+    let suggest: Vec<String> = registry.iter_sorted().into_iter().filter(|(id, _)| !registry.is_filler(id)).map(|(id, _)| id.clone()).collect();
+    let unvalidated = delegation::check_actions(&actions, &|m| registry.get(m).is_some(), &suggest)
+        .map_err(anyhow::Error::msg)?;
     let mut store = DelegationStore::load(&vault)?;
     let (delegator_id, delegator_kp) = delegation::operator_delegator(&vault, home)?;
     let deleg = store.create_delegation(
@@ -3677,6 +3710,10 @@ fn cmd_delegate_grant(
     println!("  id:      {id}");
     println!("  agent:   {agent_id}");
     println!("  expires: {exp}");
+    // SAID, not implied: accepted is not the same as checked.
+    for a in &unvalidated {
+        println!("  note:    '{a}' is not a verb this daemon interprets -- stored as given, NOT validated");
+    }
     Ok(())
 }
 
@@ -4189,7 +4226,17 @@ mod serve_guard_tests {
         assert!(!bind_is_loopback("0.0.0.0:7711"));
         assert!(!bind_is_loopback("[::]:7711"));
         assert!(!bind_is_loopback("192.168.1.20:7711"));
-        assert!(!bind_is_loopback("100.75.141.17:7711")); // tailnet IP
+        assert!(!bind_is_loopback("100.64.0.1:7711")); // tailnet-range (CGNAT 100.64.0.0/10)
+    }
+}
+
+#[cfg(test)]
+mod device_key_classification_tests {
+    /// Device keys are daemon-owned: the operator vault screen must not offer to delete one.
+    #[test]
+    fn device_key_names_are_system_entries() {
+        let name = super::device_key_name(uuid::Uuid::new_v4());
+        assert!(hestia::vault::system_entry_role(&name).is_some(), "{name}");
     }
 }
 

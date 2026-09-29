@@ -62,21 +62,17 @@ pub async fn operator_sign_in(
         _ => default_path.to_string_lossy().to_string(),
     };
     let path = PathBuf::from(path);
-    let legacy = operator::default_legacy_key_path();
-    let vault = if path == default_path && legacy.is_some() {
-        identity_vault::migrate_plaintext_operator_key(
-            legacy.as_ref().expect("checked above"),
-            &path,
-            passphrase.as_str(),
-        )?
-    } else if path.exists() {
-        identity_vault::IdentityVault::open(&path, passphrase.as_str())?
+    // Vault copy only (dp, 2026-09-25). An existing vault is opened and the
+    // legacy file is not consulted; with no vault, the legacy credential at the
+    // DEFAULT location is imported and left in place. The previous order tried
+    // migration first whenever `operator.key` existed, so every sign-in re-read
+    // the plaintext and a changed file could refuse it.
+    let legacy = if path == default_path {
+        operator::default_legacy_key_path()
     } else {
-        return Err(format!(
-            "no identity vault at {} and no legacy operator credential is available to import",
-            path.display()
-        ));
+        None
     };
+    let vault = identity_vault::open_or_import(&path, legacy.as_deref(), passphrase.as_str())?;
     let session = operator::authenticate(&state.daemon_url(), Arc::new(vault)).await?;
     state.set_operator(session);
     Ok(state.operator_status())

@@ -1,4 +1,4 @@
-# @hestia/plugin-openclaw
+# @hestia-tools/plugin-openclaw
 
 Hestia plugin for [OpenClaw](https://github.com/getclawdbot/) (formerly Moltbot). A thin observer that emits R6/R7 records to the user's Hestia daemon via [`@hestia-tools/plugin-sdk`](../../plugin-sdk/typescript).
 
@@ -14,7 +14,7 @@ This refactor strips all of that out. The plugin now delegates everything to the
 
 ## The numbers (refactor scorecard)
 
-| | Original (`moltbot/extensions/web4-governance/`) | Refactored (`@hestia/plugin-openclaw`) |
+| | Original (`moltbot/extensions/web4-governance/`) | Refactored (`@hestia-tools/plugin-openclaw`) |
 |---|---:|---:|
 | Production source lines (excl. tests) | **4,504** | **272** |
 | Modules | 11 | 2 |
@@ -140,7 +140,7 @@ Outputs `dist/index.js` + `dist/index.d.ts` for consumption by OpenClaw.
 (Once OpenClaw publishes its plugin loader)
 
 ```bash
-npm install @hestia/plugin-openclaw
+npm install @hestia-tools/plugin-openclaw
 ```
 
 Then in OpenClaw config:

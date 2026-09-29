@@ -19,9 +19,9 @@ DESIGN
   `status: "evaluating"` with `nextPollMs: N`, we sleep N ms and
   re-query — up to `MAX_POLLS` times. Useful when (future) LLM-backed
   policy entities need a moment.
-- **Action cache.** On a decision we store the action_id under
-  /tmp/hestia-actions/<tool_use_id>.json so the PostToolUse hook can
-  pair the outcome to the begin_action.
+- **Action cache.** On a decision the shared mechanism caches the action_id under the
+  call's correlation key (hestia_witness_core, one rule for every harness) so the
+  PostToolUse witness closes the action this gate decided on.
 - **Exit semantics for Claude Code:**
     - `exit 0` (silent)               — allow, no message
     - `exit 0` with stderr message    — warn, surfaced to the agent
@@ -63,7 +63,6 @@ PROTOCOL_VERSION = 1
 HOOK_VERSION = "0.0.2"
 
 STATE_DIR = Path.home() / ".hestia-claude"
-ACTIONS_DIR = Path("/tmp/hestia-actions")
 DEFAULT_ENDPOINT = "http://127.0.0.1:7711/mcp"
 
 
@@ -136,15 +135,32 @@ def _load_projection(plugin_id):
     if projected.get("HESTIA_PLUGIN_ID", plugin_id) != plugin_id:
         return ("config.miswired", f"projection {path} says HESTIA_PLUGIN_ID="
                 f"{projected['HESTIA_PLUGIN_ID']!r} but this seat is {plugin_id!r}")
+    # THE ROLE IS LAUNCH CONTEXT, AND LAUNCH CONTEXT IS NOT A BLANK CHEQUE.
+    #
+    # Role stays out of the export loop below, for the reason given at the top of this file:
+    # which role a seat runs under (interactive vs mesh-worker) is decided by whoever launched
+    # it, and the vault cannot know that. That reasoning is sound and this does not change it.
+    # A 2026-09-20 audit read the carve-out as config escaping vault authority; re-reading it,
+    # the carve-out is right and the hole is next to it.
+    #
+    # THE BOUND IS KEPT ASIDE, NOT JUDGED HERE. Which launch roles pass, the unset-role exemption
+    # and the refusal's words are law, and live in the shared engine
+    # (hestia_gate_core.launch_role_verdict, hestia #1084; dp 2026-09-22: "all law goes into
+    # shared engine"). This loader runs before shared authority is findable, so it only keeps
+    # the declared set for `_apply_launch_role`, which hands it over once it is.
+    global _ROLE_PERMITTED
+    _ROLE_PERMITTED = projected.get("HESTIA_ROLE_PERMITTED", "")
+
     for k, v in projected.items():
-        if k == "HESTIA_ROLE":
-            continue   # launch context, never config
+        if k in ("HESTIA_ROLE", "HESTIA_ROLE_PERMITTED"):
+            continue   # launch context and its bound — never exported as config
         os.environ[k] = v
     os.environ["HESTIA_PROJECTION_SHA256"] = digest
     os.environ["HESTIA_PROJECTION_PATH"] = path
     return None
 
 
+_ROLE_PERMITTED = ""   # set by _load_projection; judged by the shared engine
 _PROJECTION_ERROR = _load_projection(PLUGIN_ID)
 
 # Total time budget across all daemon round-trips + re-polls.
@@ -1449,6 +1465,7 @@ def ask_daemon(
     tool_input: Any,
     tool_use_id: str,
     host_session_id: Optional[str] = None,
+    event: Optional[dict] = None,
 ):
     """Obtain the daemon's verdict IN-PROCESS via the shared mechanism (Sprint E).
 
@@ -1482,6 +1499,7 @@ def ask_daemon(
         plugin_version=HOOK_VERSION,
         host_agent_version="claude-code",
         host_session_id=host_session_id,
+        correlation_key=(mech.correlation_key(event) if event is not None else tool_use_id),
     )
     if not verdict.decided:
         # The mechanism already recorded the plane-E row (record_gate_unavailable) —
@@ -1490,16 +1508,6 @@ def ask_daemon(
         debug_log(f"no verdict from daemon path: {verdict.message}")
         return None
     return verdict
-
-
-def cache_action(tool_use_id: str, action_id: str, tool_name: str) -> None:
-    try:
-        ACTIONS_DIR.mkdir(parents=True, exist_ok=True)
-        (ACTIONS_DIR / f"{tool_use_id}.json").write_text(
-            json.dumps({"action_id": action_id, "tool_name": tool_name, "ts": time.time()})
-        )
-    except OSError as e:
-        debug_log(f"action cache failed: {e}")
 
 
 def _record_plane_e(cause: str, detail: str, tool_name: str = "unknown") -> None:
@@ -1643,6 +1651,42 @@ def emit_decision(verdict) -> int:
         sys.stderr.write(verdict.message + "\n")
         return 0
     return 0
+
+
+def _apply_launch_role():
+    """Hand the projection's permitted launch roles to the shared engine, record its answer.
+
+    The role verdict -- the predicate, the unset-role exemption, the refusal's words -- is
+    `hestia_gate_core.launch_role_verdict`'s (hestia #1084). This function owns exactly two
+    things, both narrow:
+
+    - NO DECLARED SET: the core is not consulted. Nothing is decided by skipping it: the core's
+      own answer for an empty set is (None, False), which is what this records.
+    - A DECLARED SET THAT CANNOT BE EVALUATED fails closed. Anything that goes wrong reaching or
+      calling the verdict -- the core missing, or an OLD core without the function (deploy skew:
+      new hook, old shared; codex's P1 on a188cde) -- becomes gate.core_unavailable. That has to
+      be here, not in the core, and it has to catch everything: this runs at import, and a hook
+      that raises exits 1, which Claude Code treats as NON-BLOCKING -- the tool would run ungated.
+    """
+    if not _ROLE_PERMITTED.strip():
+        os.environ["HESTIA_ROLE_VERIFIED"] = "0"
+        return None
+    try:
+        core = _load_shared_module("hestia_gate_core")
+        miswire, verified = core.launch_role_verdict(
+            _ROLE_PERMITTED, os.environ.get("HESTIA_ROLE", ""),
+            f"projection {os.environ.get('HESTIA_PROJECTION_PATH', '')}")
+    except Exception as e:  # noqa: BLE001 -- any failure here must deny, never exit 1
+        os.environ["HESTIA_ROLE_VERIFIED"] = "0"
+        return ("gate.core_unavailable",
+                f"the projection declares permitted launch roles, and the shared law core could "
+                f"not evaluate them ({type(e).__name__}: {str(e)[:120]}); a bound that cannot be "
+                f"evaluated is not a pass")
+    os.environ["HESTIA_ROLE_VERIFIED"] = "1" if verified else "0"
+    return miswire
+
+if _PROJECTION_ERROR is None:
+    _PROJECTION_ERROR = _apply_launch_role()
 
 
 def main() -> int:
@@ -1798,11 +1842,40 @@ def main() -> int:
     _ev = _core.NormalizedEvent(tool=tool_name, paths=_paths, command=_cmd,
                                 cwd=event.get("cwd"), raw=event)
 
+    # GATE 1's REFUSALS WERE NEVER RECORDED (#1028). Both `return 2` sites below wrote stderr
+    # and returned — no witness call — so every scope and innate refusal this seat issued
+    # (egress.secret, mrh.path) existed only in the session that received it. The shared
+    # mechanism's header says "every shim now calls witness_decision_unified for refusal
+    # records"; kimi and codex do, at exactly these seams. This shim adopted the common law in
+    # the Sprint F cutover (2026-08-16) and never adopted its recorder, so the one seat whose
+    # false refusals were reported most (#983, #639) was the one whose refusals the chain
+    # could not count. Measured on Legion 2026-09-14: 20 refusals in a day, 0 decision rows;
+    # on CBP 2026-09-17, dp: "the latest denials do NOT show up in the witness chain".
+    #
+    # Best-effort and after the decision: it never raises and never changes the verdict, and
+    # with the daemon unreachable the record lands in the per-shim fallback log instead.
+    def _record_core_refusal(v, *, available: bool) -> None:
+        try:
+            _m = _load_mechanism()
+            _m.witness_decision_unified(
+                None, plugin_id=PLUGIN_ID, decision="deny", rule=v.rule,
+                tool_name=tool_name, target=_m._extract_target(tool_input, tool_name),
+                session_id=host_session_id, verdict_available=available,
+                attempted_summary=_attempted_summary(tool_name, tool_input))
+        except Exception:  # noqa: BLE001 — recording must never turn a deny into a crash
+            pass
+
     _snapshot = None
     try:
         from hestia_gate_mechanism import fetch_policy_snapshot
+        # This seat HOLDS the review door: claude-code reaches
+        # `hestia_gate_escalation_corroborate` and the chain records its use. No count is
+        # quoted — the counts these three comments first carried were of a 40,000-entry
+        # window, published as chain totals (findings/review-13031-verdict.md §A).
+        # The caller asserts it; the shared mechanism must not (#1050).
         _snapshot = fetch_policy_snapshot(PLUGIN_ID, host_agent=HOST_AGENT,
-                                          host_session_id=host_session_id)
+                                          host_session_id=host_session_id,
+                                          declares_review_door=True)
     except Exception:  # noqa: BLE001 — an unimportable mechanism IS an unreachable daemon
         _snapshot = None
 
@@ -1817,6 +1890,8 @@ def main() -> int:
         if _v.blocks:
             sys.stderr.write(f"hestia: deny [{_v.rule}] — {_v.reason}\n")
             debug_log(f"scope deny: {_v.rule} {tool_name}")
+            # A real verdict from the common law: conduct, recorded like every other seat's.
+            _record_core_refusal(_v, available=True)
             return 2
     else:
         # The ratified degraded mode, computed by the core rather than invented here:
@@ -1825,13 +1900,14 @@ def main() -> int:
         if _v.blocks:
             sys.stderr.write(f"hestia: deny [{_v.rule}] — {_v.reason}\n")
             debug_log(f"degraded scope deny: {_v.rule} {tool_name}")
+            # An innate refusal is a real verdict the core reached without the daemon; a
+            # degraded deny-writes is infrastructure, never conduct (kimi's split).
+            _record_core_refusal(_v, available=bool(_v.innate))
             return 2
 
     # Try the daemon first — IN-PROCESS via the shared mechanism (Sprint E, one transport).
-    verdict = ask_daemon(tool_name, tool_input, tool_use_id, host_session_id)
+    verdict = ask_daemon(tool_name, tool_input, tool_use_id, host_session_id, event=event)
     if verdict is not None:
-        if verdict.action_id:
-            cache_action(tool_use_id, verdict.action_id, tool_name)
         debug_log(f"daemon decided: {tool_name} → {verdict.kind}")
         return emit_decision(verdict)
 

@@ -78,6 +78,15 @@ Measured 2026-08-19 against three closures, same probe, neutral cwd, LITERAL_FLO
           operator to decide. Paired control run 5 minutes apart at the time: identical
           body, literal destination, allowed. A variable in an assignment VALUE or in a
           READ position is also allowed — it is the write position specifically.
+          Three spellings measured, one class: a quoted heredoc body under a $VAR
+          destination, the same in plain argv, and a `git show <rev>:<marker>` READ
+          redirected into a $VAR-built /tmp path (2026-09-18, corroborated by
+          kimi-code on escalation e75ad10d84fc996d). That third spelling was first
+          filed here as a fourth class caused by the LOOP it happened to sit in — a
+          minimal pair that moved two tokens at once. The 2x2 is in its arm. What it
+          did add is the `resource` the escalation shows: out of grammar the matched
+          token can be a git REVSPEC, so the human is asked to approve a write to a
+          thing that is not a file while the real destination goes unnamed.
 
     BRACE a `{ ...; }` GROUP with a read-only body — the residual #978 left out of grammar
           on purpose (the `function f { }` hole). Both read-only escalations opened since
@@ -418,6 +427,97 @@ def test_pin_a_brace_group_with_a_read_only_body_is_refused():
           f"the group; got {grouped_write}")
 
 
+def test_pin_a_write_position_substitution_names_a_revspec_to_the_human():
+    """OPEN DEFECT, pinned at the WRONG verdict — and the SAME class as the $VAR arm two
+    above, not a new one. This arm exists for the one thing that arm does not check, and
+    for the wrong cause this seat published before checking.
+
+    WHAT IT IS. `git show <rev>:<core marker>` — a READ — with its output redirected into
+    an absolute /tmp path built from a loop variable. Refused as a write, rule
+    out-of-grammar; measured live on CBP 2026-09-18 while reading three seats' gate files.
+
+    WHAT IT IS NOT — and this half is the record that matters. It is not a fourth
+    out-of-grammar class, and the loop is not the trigger. The first cut of this pin
+    asserted both. Its "minimal pair" moved TWO tokens in one step: it compared
+    `for s in a b; do READ > /tmp/out/$s.py; done` against `READ > /tmp/out/x.py`, dropping
+    the loop AND the write-position substitution together, saw the verdict move, and
+    credited the loop. kimi-code measured the substitution instead, cross-vendor, while
+    corroborating escalation e75ad10d84fc996d (2026-09-18). The 2x2 that separates them was
+    run afterwards and is decisive:
+
+        loop    + $-destination   write   |   loop    + literal destination   read
+        no loop + $-destination   write   |   no loop + literal destination   read
+
+    The loop column is constant across both rows; the destination column carries the whole
+    effect. That is exactly
+    test_pin_a_variable_in_a_write_position_sweeps_in_a_quoted_body, whose own arms already
+    pin `echo <marker> > $V/a.md` as a write with no heredoc and no loop anywhere. The
+    prior art for this class was in this file, above this line, when the first cut was
+    written — and its docstring already said the payload is never the trigger.
+
+    WHAT IS NEW, and why the arm stays rather than being deleted as a duplicate: the
+    `resource` field. Out of grammar, classify() matches the command's full token
+    vocabulary, so the token handed to the human is whichever one matched — here the git
+    REVSPEC, with the shell variable holding the branch name still unexpanded on the live
+    instance. A human is asked to approve a write to a thing that is not a file, while the
+    command's only real destination is ungoverned and goes unnamed. The class above checks
+    classification and rule; nobody was checking what the escalation SHOWS.
+
+    And the cost profile, unchanged from the first cut because it survives the correction:
+    this class charges a refusal only when the marker sits where a write cannot happen —
+    i.e. exactly when the command is read-only. Anti-correlated with danger, the same shape
+    as the delete-verb pattern on #533.
+
+    A RED on the first check means someone repaired the class. Invert this arm and the $VAR
+    arm above together — they are one defect — and keep the 2x2 rows exactly as they are.
+    They are here so the loop hypothesis is not re-derived a third time.
+    """
+    read = "git show HEAD:" + MARK
+    subst_dest = "/tmp/out/$s.py"
+
+    got = verdict("for s in a b; do " + read + " > " + subst_dest + "; done")
+    check("OOGR_write_position_substitution_is_refused", got[0] == "write",
+          "THE WRITE-POSITION-SUBSTITUTION OVER-REFUSAL APPEARS FIXED — a command that only "
+          f"reads the closure and writes elsewhere now classifies {got[0]!r}. Invert this "
+          "pin and the $VAR arm above it together.")
+    check("OOGR_reason_is_out_of_grammar", got[1] == g.RULE_OUT_OF_GRAMMAR,
+          f"the over-refusal should still be the grammar rule; got {got[1]}")
+    check("OOGR_resource_named_is_not_a_writable_path", got[2] == "HEAD:" + MARK,
+          "THE POINT OF THIS ARM: the record's whole value is that a human can read what "
+          f"would be written, and here it names a revspec. Got {got[2]!r}. If this row goes "
+          "red because the resource changed, check whether it became the REAL destination "
+          "(a fix) or merely a different token that cannot be written to (not one).")
+
+    loop_literal = cls("for s in a b; do " + read + " > /tmp/out/x.py; done")
+    check("OOGR_2x2_loop_with_a_literal_destination_is_a_read", loop_literal == "read",
+          "THE CONTROL THE FIRST CUT OMITTED: same loop, same revspec read, literal "
+          f"destination — and it is a read, so the loop is not the trigger; got {loop_literal}")
+
+    bare_subst = cls(read + " > " + subst_dest)
+    check("OOGR_2x2_no_loop_with_a_substitution_is_a_write", bare_subst == "write",
+          "the other cell: strip the loop, keep the $-destination, and the refusal survives "
+          f"— so the substitution is the trigger on its own; got {bare_subst}")
+
+    bare_literal = cls(read + " > /tmp/out/x.py")
+    check("OOGR_2x2_no_loop_with_a_literal_destination_is_a_read", bare_literal == "read",
+          f"the fourth cell, and the in-grammar baseline; got {bare_literal}")
+
+    piped = cls("for s in a b; do " + read + " | head -1; done")
+    check("OOGR_a_pipe_is_not_a_write_position", piped == "read",
+          "same loop, same revspec read, pipe instead of a redirect: a pipe opens no write "
+          f"position, so there is nothing for a substitution to sit in; got {piped}")
+
+    benign = cls("for s in a b; do git show HEAD:README.md > " + subst_dest + "; done")
+    check("OOGR_benign_twin", benign == "none",
+          "out of grammar alone must not refuse; it needs closure vocabulary somewhere in "
+          f"the command; got {benign}")
+
+    real_write = cls("for s in a b; do echo x > " + MARK + "; done")
+    check("OOGR_a_write_at_the_marker_stays_a_write", real_write == "write",
+          "the hole direction: any repair that resolves write-position substitutions must "
+          f"still see a redirect whose DESTINATION is the marker; got {real_write}")
+
+
 def test_every_case_in_this_file_is_in_ALL():
     """An explicit ALL satisfies tools/ci_selfexec_test.py, which refuses a `def test_*`
     that no Name node references — reflection over globals() is invisible to a static
@@ -448,6 +548,7 @@ ALL = [
     test_a_control_flow_keyword_no_longer_refuses_a_plain_read,
     test_pin_a_variable_in_a_write_position_sweeps_in_a_quoted_body,
     test_pin_a_brace_group_with_a_read_only_body_is_refused,
+    test_pin_a_write_position_substitution_names_a_revspec_to_the_human,
     test_every_case_in_this_file_is_in_ALL,
 ]
 

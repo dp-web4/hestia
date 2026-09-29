@@ -645,8 +645,15 @@ def main():
         snapshot = None
         try:
             from hestia_gate_mechanism import fetch_policy_snapshot
+            # This seat HOLDS the review door: kimi-code reaches
+            # `hestia_gate_escalation_corroborate` and the chain records its use. No count
+            # is quoted — the counts these three comments first carried were of a
+            # 40,000-entry window, published as chain totals, and kimi-code's own review
+            # is what caught it (findings/review-13031-verdict.md §A).
+            # The caller asserts it; the shared mechanism must not (#1050).
             snapshot = fetch_policy_snapshot(HESTIA_PLUGIN_ID, host_agent=HESTIA_PLUGIN_ID,
-                                             host_session_id=event.get("session_id"))
+                                             host_session_id=event.get("session_id"),
+                                             declares_review_door=True)
         except Exception:
             snapshot = None   # an unimportable mechanism == an unreachable daemon: degrade below
         if snapshot is not None:
@@ -710,10 +717,13 @@ def main():
                 shared = os.path.join(WORKSPACE, "hestia", "plugins", "_shared")
                 if shared not in sys.path:
                     sys.path.insert(0, shared)
-                from hestia_gate_mechanism import query_society_safety
+                from hestia_gate_mechanism import query_society_safety, correlation_key
+                # The key lets the shared witness CLOSE the action this asks about (#977);
+                # without it every kimi outcome was recorded cold (0 of 37 warned acts closed).
                 verdict = query_society_safety(
                     event, plugin_id="kimi-code", host_agent="kimi-code",
-                    host_session_id=event.get("session_id"))
+                    host_session_id=event.get("session_id"),
+                    correlation_key=correlation_key(event))
             except Exception:
                 # Loading the mechanism must itself fail closed on a consequential act: a missing or
                 # unimportable module is not a reason to allow a write on a fail-open harness.
