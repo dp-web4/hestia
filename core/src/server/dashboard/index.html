@@ -1624,8 +1624,9 @@
 
         <!-- GATES (2026-09-28). The web half of #1132, which put its Gates screen only in the desktop
              app -- and on the boxes where the operator reads this dashboard no app build exists, so the
-             ratify endpoint was reachable only by a hand-signed POST. Same two calls as the app:
-             GET /api/gates/verify (verdicts + evidence) and POST /api/gates/ratify, which the daemon
+             ratify endpoint was reachable only by a hand-signed POST. Same calls as the app:
+             GET /api/gates/verify (verdicts + evidence), POST /api/gates/ratify (per gate, or all when
+             every gate matches the deploy), POST /api/gates/forget (stale rows), which the daemon
              binds to the bytes shown here: `expected` is the evidence.current this pane rendered, and
              the daemon refuses (409, nothing ratified) if the installed gates differ from it. -->
         <section class="govern-pane" id="govern-gates" hidden>
@@ -1636,16 +1637,21 @@
           <div class="govern-scroll">
             <div class="grant-note">
               The installed hook files that enforce this box's law, hashed by the daemon and compared to
-              the expectations you last ratified. <strong>Ratifying records the bytes installed now as the
-              trusted build</strong> and replaces the previous expectations. Nothing here can tell a good
-              build from a tampered one: compare the installed hash with what the deploy recorded
-              installing before you ratify. The ratification is witnessed on the chain with your reason.
+              the expectations you last ratified. <strong>Ratifying a gate records its bytes installed now as
+              trusted</strong>, and changes only that gate's expectation. Nothing here can tell a good build
+              from a tampered one: compare the installed hash with what the deploy recorded installing before
+              you ratify. <em>Ratify all</em> is offered only when every gate is exactly the bytes the deploy
+              installed (dp, 2026-09-28). A row that is no longer a gate on this machine can be forgotten.
+              Every act is witnessed on the chain with your reason.
+            </div>
+            <div class="pol-add">
+              <input class="pol-input" id="gates-reason" placeholder="why (e.g. matches deploy 6d78d87) — required to ratify or forget" size="56" maxlength="512" autocomplete="off">
             </div>
             <div id="gates-list"><div class="empty">Loading…</div></div>
-            <div class="pol-section-label">Ratify the installed build</div>
+            <div class="pol-section-label">Ratify all</div>
+            <div class="grant-note" id="gates-bulk-note"></div>
             <div class="pol-add">
-              <input class="pol-input" id="gates-reason" placeholder="why these bytes are trusted (e.g. matches deploy 6d78d87)" size="56" maxlength="512" autocomplete="off">
-              <button type="button" class="pol-btn cfg-save" id="gates-ratify-btn">ratify</button>
+              <button type="button" class="pol-btn cfg-save" id="gates-ratify-btn" disabled>ratify all</button>
             </div>
             <div class="cfg-err" id="gates-err" hidden></div>
             <div class="cfg-saved" id="gates-ok" hidden></div>
@@ -2489,6 +2495,34 @@
     } catch (e) { alert(`retire failed: ${e.message}`); }
   }
 
+  // RETIRE EVERY NEVER-ACTED PHANTOM IN ONE ACT (dp, 2026-09-28: Discover listed 12 ids that
+  // nothing on the machine accounts for; one-at-a-time meant two prompts each). ONE reason and
+  // one evidence pointer, then the SAME route per id as the single retire above -- and never with
+  // `confirm_active`: an id that has acted recently is refused by the server's own guard and
+  // reported, not overridden. A bulk act must not be the way around the one check that tells a
+  // phantom from the live seat.
+  async function retireNeverActed(ids) {
+    if (!ids.length) return;
+    if (!confirm(`Retire these ${ids.length} ids on this seat?\n\n  ${ids.join('\n  ')}\n\nEach has never acted here. Each one's standing, live and delegated authority is revoked. Not deletion; each is reversible from "show retired".`)) return;
+    const reason = prompt(`One reason for all ${ids.length} (recorded on each):`);
+    if (!reason) return;
+    const ref = prompt('Evidence pointer (required — where the reason is recorded):');
+    if (!ref) return;
+    const done = [], refused = [];
+    for (const id of ids) {
+      try {
+        const res = await apiFetch(`/api/agents/${encodeURIComponent(id)}/retire`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reason, ref }) });
+        const out = await res.json().catch(() => ({}));
+        if (res.ok) done.push(id); else refused.push(`${id}: ${out.error || ('HTTP ' + res.status)}`);
+      } catch (e) { refused.push(`${id}: ${e.message}`); }
+    }
+    await tick();
+    discoverLoad();
+    alert(`Retired ${done.length} of ${ids.length}.` + (refused.length ? `\n\nNot retired:\n  ${refused.join('\n  ')}` : ''));
+  }
+
   async function reinstateAgent(id) {
     const reason = prompt(`Reinstate "${id}"?\n\nThe standing grants revoked at retirement are NOT restored — re-grant any that are still wanted, deliberately.\n\nWhy?`);
     if (!reason) return;
@@ -2505,13 +2539,14 @@
   }
 
   document.addEventListener('click', e => {
-    const t = e.target && e.target.closest && e.target.closest('[data-retire],[data-reinstate],#disc-show-retired,#disc-hide-retired');
+    const t = e.target && e.target.closest && e.target.closest('[data-retire],[data-reinstate],[data-retire-all],#disc-show-retired,#disc-hide-retired');
     if (!t) return;
     e.stopPropagation();
     if (t.id === 'disc-show-retired' || t.id === 'disc-hide-retired') {
       showRetired = t.id === 'disc-show-retired';
       discoverLoad();
-    } else if (t.dataset.retire) { retireAgent(t.dataset.retire); }
+    } else if (t.dataset.retireAll !== undefined) { retireNeverActed(JSON.parse(t.dataset.retireAll || '[]')); }
+    else if (t.dataset.retire) { retireAgent(t.dataset.retire); }
     else { reinstateAgent(t.dataset.reinstate); }
   }, true);
 
@@ -4466,6 +4501,14 @@
   // (#1067), and were invisible here while being the whole reason this pane was built. RETIRE
   // lives on these rows. It is the placement dp asked for -- the lifecycle pane, beside the
   // gaps and their remedies, rather than in the live trust list people glance at.
+  // HESTIA'S OWN TOOLS, which connect under a fixed name and are recorded as members by that
+  // connection. Not agents and not typos, so they are listed apart, quietly, with no retire:
+  // dp saw them among the phantoms (2026-09-28) and a phantom is something to remove.
+  const HESTIA_OWN_CLIENTS = {
+    'hestia-cli': 'the `hestia gate` CLI’s asserted identity — deliberate (#63/#128): the daemon decides, the CLI only asks',
+    'agent-inventory': 'the agent inventory, which connects to witness each scan',
+  };
+
   const UNACCOUNTED_GROUP = {
     key: 'unaccounted', tone: 'amber',
     title: 'Recorded as a member here — and nothing on this machine accounts for it',
@@ -4547,8 +4590,10 @@
       }
     }
     const retiredSet = new Set(Array.isArray(retiredIds) ? retiredIds : []);
+    const own = (Array.isArray(members) ? members : [])
+      .filter(m => m && m.plugin_id && HESTIA_OWN_CLIENTS[m.plugin_id]);
     const orphans = (Array.isArray(members) ? members : [])
-      .filter(m => m && m.plugin_id && !accounted.has(String(m.plugin_id)));
+      .filter(m => m && m.plugin_id && !accounted.has(String(m.plugin_id)) && !HESTIA_OWN_CLIENTS[m.plugin_id]);
     const shownOrphans = orphans.filter(m => showRetiredNow || !retiredSet.has(m.plugin_id));
     const hiddenRetired = orphans.length - shownOrphans.length;
     if (shownOrphans.length) groups.unshift({
@@ -4561,6 +4606,12 @@
         actionCount: typeof m.action_count === 'number' ? m.action_count : 0,
         retired: retiredSet.has(m.plugin_id),
       })),
+    });
+    if (own.length) groups.push({
+      key: 'hestia_own', tone: 'grey', title: 'Hestia’s own tools — recorded when they connect, not agents',
+      remedy: 'Listed so nothing is hidden. Nothing to do: these are how hestia’s CLI and inventory reach the daemon.',
+      rows: own.map(m => Object.assign(discoverRow(String(m.plugin_id), null), {
+        governanceId: String(m.plugin_id), ownTool: HESTIA_OWN_CLIENTS[m.plugin_id] })),
     });
     const sc = r.scope || {};
     return {
@@ -4656,6 +4707,13 @@
       <div class="disc-group disc-group-${g.tone}">
         <div class="pol-section-label">${escapeHtml(g.title)} <span class="disc-count">${g.rows.length}</span></div>
         ${g.remedy ? `<div class="grant-note">${escapeHtml(g.remedy)}</div>` : ''}
+        ${(() => {
+          if (g.key !== 'unaccounted') return '';
+          const ids = g.rows.filter(r => !r.retired && !r.actionCount).map(r => r.governanceId);
+          return ids.length > 1 ? `<div class="grant-note"><button type="button" class="pol-btn pol-remove"
+            data-retire-all="${escapeHtml(JSON.stringify(ids))}"
+            title="One reason for all of them. Each goes through the same retire as its own button, and an id that has acted recently is refused, not overridden.">retire all ${ids.length} never-acted ids…</button></div>` : '';
+        })()}
         ${g.rows.map(r => `
           <div class="disc-row">
             <span class="disc-name">${escapeHtml(r.name)}</span>
@@ -4676,6 +4734,7 @@
             ${r.findings ? badge('amber', r.findings + ' finding' + (r.findings === 1 ? '' : 's')) : ''}
             ${r.executable ? `<span class="disc-path" title="resolved executable">${escapeHtml(r.executable)}</span>` : ''}
             ${r.configs ? `<span class="disc-path">${r.configs} config${r.configs === 1 ? '' : 's'} read</span>` : ''}
+            ${r.ownTool ? `<span class="tr-dim">${escapeHtml(r.ownTool)}</span>` : ''}
             ${g.key === 'unaccounted' ? `<span class="tr-dim">${r.actionCount
                 ? r.actionCount + ' act' + (r.actionCount === 1 ? '' : 's') + ' recorded'
                 : 'never acted'}</span>` : ''}
@@ -4907,8 +4966,15 @@
     if (e) { e.hidden = !err; e.textContent = err || ''; }
     if (o) { o.hidden = !ok; o.textContent = ok || ''; }
   }
+  // Per gate (dp, 2026-09-28: "currently gate ratify button ratifies all - including mismatched and
+  // non-deployed ... provide a by-gate ratification"; spec v3 gates-ratify / gates-forget, rule
+  // per-item-trust). Each row ratifies ONLY itself, sending paths:[it] and expected for it alone.
+  // Ratify-all sends no paths and is enabled only when the daemon says bulk_ratify.allowed.
+  // A daemon whose verify has no bulk_ratify predates per-gate and would ratify EVERY gate from a
+  // per-gate request, so no ratify control is offered to it at all.
   async function gatesLoad() {
-    const status = $('gates-status'), list = $('gates-list');
+    const status = $('gates-status'), list = $('gates-list'), bulkBtn = $('gates-ratify-btn'), bulkNote = $('gates-bulk-note');
+    bulkBtn.disabled = true;
     try {
       const res = await apiFetch('/api/gates/verify', { cache: 'no-store' });
       if (!res.ok) throw new Error((await res.text()) || ('HTTP ' + res.status));
@@ -4918,59 +4984,109 @@
       if (r.status === 'UNKNOWN') {
         // An unmeasurable set is never rendered as "all fine", and cannot be ratified.
         list.innerHTML = `<div class="empty">${gatesEsc(r.reason || 'the gate set could not be established')}</div>`;
-        $('gates-ratify-btn').disabled = true;
+        bulkNote.textContent = '';
         return;
       }
-      $('gates-ratify-btn').disabled = false;
+      const perGate = !!r.bulk_ratify;
       const cur = (r.evidence && r.evidence.current) || {};
       const dep = (r.evidence && r.evidence.deployed) || null;
-      const depFiles = (dep && dep.files) || {};
+      const DEPLOY = {
+        'match': '<span class="cfg-verdict ok" title="installed bytes are exactly what the deploy wrote">matches deploy</span>',
+        'differs': '<span class="cfg-verdict bad" title="installed bytes differ from what the deploy wrote — review before ratifying">differs from deploy</span>',
+        'not-deployed': '<span class="cfg-verdict none" title="the deploy record names no such file: this gate was not installed by a deploy">not deployed</span>',
+        'no-deploy-record': '<span class="cfg-verdict none" title="no deploy record is readable on this box">no deploy record</span>',
+        'unreadable': '<span class="cfg-verdict bad" title="the daemon could not hash this file">unreadable</span>',
+      };
       const rows = (r.gates || []).map(g => {
         const path = g.path || '';
         const now = cur[path];
-        const deployed = depFiles[path];
-        // Evidence, not a verdict: say whether the installed bytes are what the deploy wrote.
-        const vsDeploy = !deployed ? '<span class="cfg-verdict none" title="the deploy recorded no digest for this file">no deploy record</span>'
-          : (now === deployed ? '<span class="cfg-verdict ok" title="installed bytes are exactly what the deploy wrote">matches deploy</span>'
-             : '<span class="cfg-verdict bad" title="installed bytes differ from what the deploy wrote — review before ratifying">differs from deploy</span>');
+        const stale = g.discovered === false;
+        const ratified = g.status === 'verified' ? g.sha256 : g.expected;
         const cls = g.status === 'verified' ? 'ok' : (g.status === 'modified' ? 'bad' : 'none');
+        // #1156: a ratified gate whose member still declares one but has none registered is a
+        // bypass or a miswire, not a stale row. Forget is shown ONLY where the daemon says
+        // forgettable -- the pane renders the daemon's judgement, never its own.
+        const notReg = g.not_registered === true;
+        const vsDeploy = notReg ? `<span class="cfg-verdict bad gates-not-registered" title="${gatesEsc(g.forget_blocked_reason || '')}"><strong>NOT REGISTERED — possible bypass</strong></span>`
+          : stale ? '<span class="cfg-verdict none" title="an expectation for a path no gate is wired at any more">no longer a gate here</span>'
+          : (DEPLOY[g.deployment] || '');
+        const act = !perGate ? ''
+          : stale ? (g.forgettable === true
+              ? `<button type="button" class="pol-btn gates-forget-one" data-gate-path="${gatesEsc(path)}" title="remove this stale expectation">forget</button>`
+              : `<span class="vault-meta">${gatesEsc(g.forget_blocked_reason || 'not forgettable')}</span>`)
+          : `<button type="button" class="pol-btn cfg-save gates-ratify-one" data-gate-path="${gatesEsc(path)}"${g.deployment === 'unreadable' ? ' disabled' : ''} title="ratify only this gate's installed bytes">ratify</button>`;
         return `
-          <div class="vault-row">
+          <div class="vault-row" data-gate-status="${gatesEsc(g.status)}" data-gate-deployment="${gatesEsc(stale ? 'stale' : (g.deployment || ''))}">
             <span class="cfg-verdict ${cls}">${gatesEsc(g.status)}</span>
             <span class="vault-name" title="${gatesEsc(path)}">${gatesEsc(g.plugin_id || path.split('/').pop())}</span>
             <span class="vault-meta">${gatesEsc(path)}</span>
-            <span class="vault-dates" title="installed now${g.expected ? ' · ratified ' + gatesEsc(g.expected) : ''}">now ${gatesEsc(gatesShort(now))}${g.expected ? ' · ratified ' + gatesEsc(gatesShort(g.expected)) : ''}</span>
+            <span class="vault-dates" title="installed now${ratified ? ' · ratified ' + gatesEsc(ratified) : ''}">now ${gatesEsc(gatesShort(now))}${ratified ? ' · ratified ' + gatesEsc(gatesShort(ratified)) : ''}</span>
             ${vsDeploy}
+            ${act}
           </div>`;
       });
       const depLine = dep ? `<div class="grant-note">Deploy record: build ${gatesEsc(dep.build_id || '?')} · ${gatesEsc((dep.head_sha || '').slice(0, 9))} · installed ${gatesEsc(dep.installed_at_iso || '?')}</div>` : '';
       list.innerHTML = depLine + (rows.join('') || '<div class="empty">No gates discovered.</div>');
+      if (!perGate) {
+        bulkNote.textContent = 'This daemon predates per-gate ratification and would ratify every gate from any ratify request. Update the daemon; nothing can be ratified here until then.';
+      } else if (r.bulk_ratify.allowed) {
+        bulkBtn.disabled = false;
+        bulkNote.textContent = 'Every gate is exactly the bytes the deploy installed, so all can be ratified at once. This replaces every expectation, including stale ones.';
+      } else {
+        bulkNote.textContent = 'Not every gate is the bytes the deploy installed, so there is no ratify-all: review and ratify each gate above on its own. Blocking: '
+          + (r.bulk_ratify.blocked_by || []).map(b => `${b.path} (${b.deployment})`).join('; ');
+      }
     } catch (e) {
       gatesReport = null;
       if (status) status.textContent = '⚠ ' + e.message;
       if (list) list.innerHTML = '<div class="empty">Could not read the gates.</div>';
     }
   }
-  async function gatesRatify() {
+  function gatesReason() {
     const reason = ($('gates-reason').value || '').trim();
-    if (!reason) { gatesMsg('A reason is required: it is what makes this judgement reviewable on the chain.', null); return; }
-    const expected = gatesReport && gatesReport.evidence && gatesReport.evidence.current;
-    if (!expected || !Object.keys(expected).length) { gatesMsg('Nothing to ratify: refresh and review the gates first.', null); return; }
-    const n = Object.keys(expected).length;
-    if (!window.confirm(`Ratify the ${n} installed gate file${n === 1 ? '' : 's'} shown as the trusted build?\nThis replaces the previous expectations (last edit wins).`)) return;
+    if (!reason) gatesMsg('A reason is required: it is what makes this judgement reviewable on the chain.', null);
+    return reason;
+  }
+  // paths === null: ratify all (the daemon accepts it only when every gate matches the deploy).
+  async function gatesRatify(paths) {
+    const reason = gatesReason();
+    if (!reason) return;
+    const all = gatesReport && gatesReport.evidence && gatesReport.evidence.current;
+    if (!all || !Object.keys(all).length) { gatesMsg('Nothing to ratify: refresh and review the gates first.', null); return; }
+    const expected = paths ? Object.fromEntries(paths.map(p => [p, all[p] ?? null])) : all;
+    const what = paths ? `this gate's installed bytes:\n${paths.join('\n')}\n\nOther gates' ratifications are not changed.`
+                       : `all ${Object.keys(all).length} installed gate files (every one matches the deploy).\nThis replaces every previous expectation.`;
+    if (!window.confirm(`Ratify ${what}`)) return;
     try {
       const res = await apiFetch('/api/gates/ratify', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reason, expected }),
+        body: JSON.stringify(paths ? { reason, expected, paths } : { reason, expected }),
       });
       const body = await res.json().catch(() => ({}));
       if (res.status === 409) {
-        const d = (body.differs || []).map(x => `${x.path}: saw ${gatesShort(x.saw)}, now ${gatesShort(x.now)}`).join('; ');
+        const d = (body.differs || []).map(x => `${x.path}: saw ${gatesShort(x.saw)}, now ${gatesShort(x.now)}`)
+          .concat((body.not_matching || []).map(x => `${x.path}: ${x.deployment}`)).join('; ');
         throw new Error((body.error || 'The installed gates changed since you looked; nothing was ratified.') + (d ? ' — ' + d : ''));
       }
       if (!res.ok || body.error) throw new Error(body.error || ('HTTP ' + res.status));
       $('gates-reason').value = '';
-      gatesMsg(null, `Ratified ${(body.ratified || []).length} gate file(s) (witnessed on the chain with your reason).`);
+      gatesMsg(null, `Ratified ${(body.ratified || []).length} gate file(s) (${body.mode || ''}, witnessed on the chain with your reason).`);
+    } catch (e) { gatesMsg(e.message, null); }
+    gatesLoad();
+  }
+  async function gatesForget(path) {
+    const reason = gatesReason();
+    if (!reason) return;
+    if (!window.confirm(`Forget the ratified expectation for\n${path}\n\nIt is no longer a gate on this machine.`)) return;
+    try {
+      const res = await apiFetch('/api/gates/forget', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason, paths: [path] }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok || body.error) throw new Error(body.error || ('HTTP ' + res.status));
+      $('gates-reason').value = '';
+      gatesMsg(null, `Forgot ${path} (witnessed on the chain with your reason).`);
     } catch (e) { gatesMsg(e.message, null); }
     gatesLoad();
   }
@@ -4979,7 +5095,9 @@
       const t = e.target;
       if (!t) return;
       if (t.id === 'gates-refresh') { gatesMsg(null, null); gatesLoad(); }
-      else if (t.id === 'gates-ratify-btn') gatesRatify();
+      else if (t.id === 'gates-ratify-btn') gatesRatify(null);
+      else if (t.classList && t.classList.contains('gates-ratify-one')) gatesRatify([t.dataset.gatePath]);
+      else if (t.classList && t.classList.contains('gates-forget-one')) gatesForget(t.dataset.gatePath);
     });
   })();
 

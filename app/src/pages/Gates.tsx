@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { gatesRatify, gatesVerify, operatorStatus } from "../lib/tauri";
+import { gatesForget, gatesRatify, gatesVerify, operatorStatus } from "../lib/tauri";
 import type { GateReport, GateVerdict, OperatorStatus } from "../lib/types";
 
 /**
@@ -12,17 +12,21 @@ import type { GateReport, GateVerdict, OperatorStatus } from "../lib/types";
  * build. If they match, the gate is exactly what the deploy wrote from main. If they
  * differ, something changed it after install — the case ratifying would bless.
  *
- * Evidence, not a verdict. Nothing is refused because bytes differ; the operator decides.
+ * PER GATE (dp, 2026-09-28: "currently gate ratify button ratifies all - including mismatched
+ * and non-deployed ... provide a by-gate ratification"). Each discovered gate is ratified on
+ * its own, and only its own expectation changes. "Ratify all" remains for the clean case and
+ * is offered only when the daemon says every gate is the bytes the deploy installed — the
+ * daemon refuses it otherwise. A stale expectation (a path no gate is wired at any more) can
+ * be forgotten, per path.
+ *
  * Three rules hold regardless:
- *  - a reason is required to ratify, as for every permitting act;
- *  - signed out, there is no ratify control at all;
- *  - ratifying REPLACES the previous expectations (last edit wins), so the page shows what
- *    it replaces and re-reads the gates immediately before the write. If the bytes moved
- *    since the operator looked, it stops and says so rather than ratifying unseen bytes.
+ *  - a reason is required to ratify or forget, as for every permitting act;
+ *  - signed out, there are no controls at all;
+ *  - the page re-reads the gates immediately before a write, and if the bytes being ratified
+ *    moved since the operator looked, it stops and says so rather than ratifying unseen bytes.
  */
 
 const short = (h?: string | null) => (h ? h.slice(0, 12) : "—");
-
 
 function ratifiedDigest(v: GateVerdict): string | null {
   if (v.status === "verified") return v.sha256;
@@ -30,20 +34,12 @@ function ratifiedDigest(v: GateVerdict): string | null {
   return null;
 }
 
-type Provenance = "matches" | "differs" | "no-record" | "unreadable";
 
-function provenance(path: string, report: GateReport): Provenance {
-  const cur = report.evidence?.current?.[path];
-  const dep = report.evidence?.deployed?.files?.[path];
-  if (cur === null || cur === undefined) return "unreadable";
-  if (!dep) return "no-record";
-  return cur === dep ? "matches" : "differs";
-}
-
-/** The set of current digests an operator actually looked at — the stale-read key. */
-function fingerprint(report: GateReport | null): string {
+/** The digests an operator looked at, for the given paths — the stale-read key. */
+function fingerprint(report: GateReport | null, paths?: string[]): string {
   const cur = report?.evidence?.current ?? {};
-  return JSON.stringify(Object.keys(cur).sort().map((k) => [k, cur[k]]));
+  const keys = (paths ?? Object.keys(cur)).slice().sort();
+  return JSON.stringify(keys.map((k) => [k, cur[k] ?? null]));
 }
 
 export function Gates() {
@@ -80,29 +76,52 @@ export function Gates() {
     return () => window.removeEventListener("focus", onFocus);
   }, [refresh]);
 
-  const ratify = async () => {
+  const needReason = (verb: string) => {
+    if (reason.trim()) return false;
+    setNotice(
+      `${verb} requires a reason: it records why, and the chain entry is what makes that judgement reviewable.`,
+    );
+    return true;
+  };
+
+  /** paths === undefined: ratify all (the daemon accepts it only when every gate matches). */
+  const ratify = async (paths?: string[]) => {
     setNotice(null);
-    if (!reason.trim()) {
-      setNotice(
-        "Ratifying requires a reason: it records why these bytes are the ones you trust, and the chain entry is what makes that judgement reviewable.",
-      );
-      return;
-    }
+    if (needReason("Ratifying")) return;
     setBusy(true);
     try {
-      // Last edit wins, so never ratify bytes the operator has not seen: re-read, and stop
-      // if the installed gates moved since the page was rendered.
+      // Never ratify bytes the operator has not seen: re-read, and stop if the gates being
+      // ratified moved since the page was rendered.
       const fresh = await gatesVerify();
-      if (fingerprint(fresh) !== fingerprint(report)) {
+      if (fingerprint(fresh, paths) !== fingerprint(report, paths)) {
         setReport(fresh);
         setNotice(
           "The installed gates changed since you looked. Nothing was ratified — review the new bytes below first.",
         );
         return;
       }
-      await gatesRatify(reason.trim(), report?.evidence?.current ?? {});
+      const cur = report?.evidence?.current ?? {};
+      const expected = paths ? Object.fromEntries(paths.map((p) => [p, cur[p] ?? null])) : cur;
+      await gatesRatify(reason.trim(), expected, paths);
       setReason("");
-      setNotice("Ratified. The expectations above were replaced; re-reading.");
+      setNotice(paths ? `Ratified ${paths.join(", ")}. Other gates are unchanged; re-reading.`
+                      : "Ratified every gate (all matched the deploy). Re-reading.");
+      await refresh();
+    } catch (e) {
+      setNotice(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const forget = async (path: string) => {
+    setNotice(null);
+    if (needReason("Forgetting an expectation")) return;
+    setBusy(true);
+    try {
+      await gatesForget(reason.trim(), [path]);
+      setReason("");
+      setNotice(`Forgot the expectation for ${path}. Re-reading.`);
       await refresh();
     } catch (e) {
       setNotice(String(e));
@@ -114,8 +133,10 @@ export function Gates() {
   const signedIn = !!status?.signed_in;
   const current = report?.evidence?.current ?? {};
   const deployed = report?.evidence?.deployed ?? null;
-  const anyDiffers =
-    report?.gates?.some((g) => provenance(g.path, report) === "differs") ?? false;
+  // A daemon that predates per-gate ratification ignores `paths` and would ratify EVERY gate
+  // from a per-gate click. It is recognised by the absent `bulk_ratify` block.
+  const perGate = !!report?.bulk_ratify;
+  const canAct = signedIn && !!report && report.status !== "UNKNOWN" && perGate;
 
   return (
     <div className="page">
@@ -126,7 +147,8 @@ export function Gates() {
 
       <p className="muted">
         Tamper-evident, not tamper-proof: the daemon hashes the gates itself and compares them to
-        what you last ratified. Ratifying records the bytes installed now as the build you trust.
+        what you last ratified. Ratifying a gate records its bytes installed now as the build you
+        trust.
       </p>
 
       {!signedIn && status && (
@@ -146,12 +168,35 @@ export function Gates() {
         </div>
       )}
 
+      {signedIn && report && report.status !== "UNKNOWN" && !perGate && (
+        <div className="error-banner">
+          This daemon predates per-gate ratification, and would ratify every gate from any ratify
+          request. Update the daemon; nothing can be ratified from here until then.
+        </div>
+      )}
+
       {deployed && (
         <p className="muted">
           Deploy authority: <code>{deployed.build_id ?? "?"}</code> from main{" "}
           <code>{short(deployed.head_sha)}</code>, installed {deployed.installed_at_iso ?? "?"}.
         </p>
       )}
+
+      {canAct && (
+        <div className="decide-actions">
+          <label>
+            reason <span className="muted">(required)</span>
+            <input
+              type="text"
+              value={reason}
+              maxLength={512}
+              onChange={(e) => setReason(e.target.value)}
+              placeholder="why these bytes are the build you trust"
+            />
+          </label>
+        </div>
+      )}
+      {notice && <div className="error-banner">{notice}</div>}
 
       {report?.gates && report.gates.length > 0 && (
         <table className="gate-table">
@@ -162,30 +207,68 @@ export function Gates() {
               <th>installed now</th>
               <th>last ratified</th>
               <th>vs the deploy</th>
+              {canAct && <th></th>}
             </tr>
           </thead>
           <tbody>
             {report.gates.map((g, i) => {
               const path = g.path;
-              const prov = provenance(path, report);
+              const stale = g.discovered === false;
+              // #1156: the daemon's judgement, rendered as-is. A ratified gate whose member still
+              // declares one but has none registered is a bypass or a miswire, not a stale row.
+              const notRegistered = g.not_registered === true;
+              // The daemon's per-row status (spec v3): the same five values the dashboard shows.
+              const dep = g.deployment;
               return (
                 <tr key={i} data-gate-status={g.status}>
                   <td className="pre">{path}</td>
-                  <td>{g.status}</td>
+                  <td>{stale ? `${g.status} · no longer wired` : g.status}</td>
                   <td className="pre">{short(current[path])}</td>
                   <td className="pre">{short(ratifiedDigest(g))}</td>
                   <td>
-                    {prov === "matches" && (
+                    {notRegistered && (
+                      <strong className="gate-differs" title={g.forget_blocked_reason ?? undefined}>
+                        NOT REGISTERED — possible bypass
+                      </strong>
+                    )}
+                    {stale && !notRegistered && <span className="muted">not a gate on this machine any more</span>}
+                    {!stale && dep === "match" && (
                       <span className="muted">matches what {deployed?.build_id} installed</span>
                     )}
-                    {prov === "differs" && (
+                    {!stale && dep === "differs" && (
                       <strong className="gate-differs">
                         DIFFERS from what the deploy installed — changed after install
                       </strong>
                     )}
-                    {prov === "no-record" && <span className="muted">no deploy record for this file</span>}
-                    {prov === "unreadable" && <strong>unreadable</strong>}
+                    {!stale && dep === "not-deployed" && (
+                      <span className="muted">not deployed: the deploy record names no such file</span>
+                    )}
+                    {!stale && dep === "no-deploy-record" && (
+                      <span className="muted">no deploy record is readable on this box</span>
+                    )}
+                    {!stale && dep === "unreadable" && <strong>unreadable</strong>}
                   </td>
+                  {canAct && (
+                    <td>
+                      {stale ? (
+                        g.forgettable === true ? (
+                          <button disabled={busy} aria-label={`forget ${path}`} onClick={() => forget(path)}>
+                            Forget
+                          </button>
+                        ) : (
+                          <span className="muted">{g.forget_blocked_reason ?? "not forgettable"}</span>
+                        )
+                      ) : (
+                        <button
+                          disabled={busy || dep === "unreadable"}
+                          aria-label={`ratify ${path}`}
+                          onClick={() => ratify([path])}
+                        >
+                          Ratify
+                        </button>
+                      )}
+                    </td>
+                  )}
                 </tr>
               );
             })}
@@ -193,36 +276,32 @@ export function Gates() {
         </table>
       )}
 
-      {signedIn && report && report.status !== "UNKNOWN" && (report.gates?.length ?? 0) > 0 && (
+      {canAct && (report?.gates?.length ?? 0) > 0 && (
         <section className="section">
-          <h2>Ratify the installed gates</h2>
-          <p className="muted">
-            This replaces the expectation for every gate above with its <em>installed now</em>{" "}
-            digest. The <em>last ratified</em> column is what gets replaced.
-          </p>
-          {anyDiffers && (
+          <h2>Ratify all</h2>
+          {report?.bulk_ratify?.allowed ? (
+            <p className="muted">
+              Every gate is exactly the bytes the deploy installed, so all of them can be ratified at
+              once. This replaces every expectation, including stale ones.
+            </p>
+          ) : (
             <div className="error-banner">
-              At least one gate differs from what the deploy installed. Ratifying would record those
-              changed bytes as trusted. You can — this is your decision, not the daemon's — but it is
-              the one case this check exists to make you look at.
+              Not every gate is the bytes the deploy installed, so there is no ratify-all: review
+              and ratify each gate on its own above. Ratifying a gate that differs records those
+              changed bytes as trusted — you can, and the record says so, but it is the one case
+              this check exists to make you look at.
+              <ul>
+                {(report?.bulk_ratify?.blocked_by ?? []).map((b) => (
+                  <li key={b.path} className="pre">
+                    {b.path} — {b.deployment}
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
-          {notice && <div className="error-banner">{notice}</div>}
-          <div className="decide-actions">
-            <label>
-              reason <span className="muted">(required)</span>
-              <input
-                type="text"
-                value={reason}
-                maxLength={512}
-                onChange={(e) => setReason(e.target.value)}
-                placeholder="why these bytes are the build you trust"
-              />
-            </label>
-            <button disabled={busy} onClick={ratify}>
-              Ratify
-            </button>
-          </div>
+          <button disabled={busy || !report?.bulk_ratify?.allowed} onClick={() => ratify(undefined)}>
+            Ratify all
+          </button>
         </section>
       )}
     </div>

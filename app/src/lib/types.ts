@@ -294,12 +294,25 @@ export type DecideOutcome =
  * One gate's verdict, as `GET /api/gates/verify` serializes it (tagged on `status`).
  * Mirrors `vault::gate_integrity::GateVerdict`.
  */
-export type GateVerdict =
+export type GateVerdict = (
   | { status: "verified"; path: string; plugin_id: string; sha256: string }
   | { status: "modified"; path: string; plugin_id: string; expected: string; actual: string; ratified_at: string }
   | { status: "missing"; path: string; plugin_id: string; expected: string }
   | { status: "unratified"; path: string }
-  | { status: "unreadable"; path: string; error: string };
+  | { status: "unreadable"; path: string; error: string }
+) & {
+  /** false = an expectation for a path no gate is wired at any more (offered for forget). */
+  discovered?: boolean;
+  /** Current bytes vs the deploy record. */
+  deployment?: GateDeployment;
+  /** The daemon's judgement (#1156): may this expectation be forgotten, and if not, why. */
+  forgettable?: boolean;
+  forget_blocked_reason?: string | null;
+  /** A ratified gate whose member still declares a gate but has none registered: possible bypass. */
+  not_registered?: boolean;
+};
+
+export type GateDeployment = "match" | "differs" | "not-deployed" | "no-deploy-record" | "unreadable";
 
 /** What the deployment authority (`current-build.json`) recorded installing. */
 export interface DeployedDigests {
@@ -327,6 +340,14 @@ export interface GateReport {
   evidence?: {
     current: Record<string, string | null>;
     deployed: DeployedDigests | null;
+  };
+  /**
+   * Whether ratify-all would be accepted: only when every discovered gate is the bytes the
+   * deploy installed. Absent on a daemon that predates per-gate ratification.
+   */
+  bulk_ratify?: {
+    allowed: boolean;
+    blocked_by: { path: string; plugin_id: string; deployment: GateDeployment }[];
   };
 }
 

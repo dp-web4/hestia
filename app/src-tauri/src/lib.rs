@@ -176,6 +176,7 @@ pub fn run() {
             commands::decide::decide_gate_escalation,
             commands::gates::gates_verify,
             commands::gates::gates_ratify,
+            commands::gates::gates_forget,
             commands::agents::agents_inventory,
             commands::scope::rule_scope_request,
             commands::dashboard::get_failures,

@@ -140,7 +140,12 @@ def test_candidate_gate_is_probed_against_the_candidate_engine():
     install that shipped the missing module. The candidate hook must see HESTIA_SHARED_DIR
     naming the checkout's own plugins/_shared, the tree about to be installed."""
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        # RESOLVED, as production resolves it: the CLI entry passes `args.repo.resolve()` to
+        # run_probes. Unresolved, this compared `/var/folders/...` (what run_probes was handed)
+        # with `/private/var/folders/...` (the expectation), which on macOS -- where /var is a
+        # symlink to /private/var -- never matched: the probe exited 2 and the test failed on
+        # every Mac while passing on Linux, where /tmp has one spelling (McNugget, 2026-09-28).
+        root = Path(raw).resolve()
         repo, home = root / "repo", root / "home"
         expected = str((repo / "plugins" / "_shared").resolve())
         body = ("import os, sys; sys.stdin.read()\n"
@@ -210,7 +215,10 @@ def test_bad_registration_is_unmeasured_not_absent():
 
 def test_workspace_is_explicit_when_a_checkout_is_nested_in_a_worktree():
     with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
+        # RESOLVED for the same reason as the candidate-engine test above: run_probes resolves
+        # the workspace it exports (`(workspace or repo.parent).resolve()`), so the candidate
+        # must compare against the resolved spelling. Unresolved, every Mac failed this test.
+        root = Path(raw).resolve()
         repo, home, workspace = root / "nested" / "repo", root / "home", root / "workspace"
         workspace.mkdir()
         make_member(repo, home, "alpha")

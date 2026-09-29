@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "adopted": "2026-09-28",
   "about": "Canonical ground truth for what the operator can see and do, independent of any one surface. Both the daemon's web dashboard and the desktop app are checked against it by tools/operator_surfaces_spec_test.py. Change THIS first, in the same PR as the route or the screen. See README.md.",
   "surfaces": [
@@ -51,6 +51,11 @@
       "id": "signed-in-only",
       "text": "Operator writes are ABSENT, not disabled-looking, without an operator session.",
       "source": "SPRINTS_APP_SURFACES.md 1.5"
+    },
+    {
+      "id": "per-item-trust",
+      "text": "A write that defines what is trusted names the items it applies to, and changes only those. A bulk form is accepted only when every item matches the independent record (for gates: the deploy record); otherwise it is refused and the non-matching items are named. The surface shows each item's status against that record beside its control.",
+      "source": "dp, 2026-09-28: \"currently gate ratify button ratifies all - including mismatched and non-deployed. it should either only ratify gates that match deployment, or provide a by-gate ratification\""
     }
   ],
   "capabilities": [
@@ -584,7 +589,8 @@
         "GET /api/gates/verify"
       ],
       "rules": [
-        "unknown-not-fine"
+        "unknown-not-fine",
+        "per-item-trust"
       ],
       "surfaces": {
         "dashboard": {
@@ -593,11 +599,17 @@
         "app": {
           "status": "required"
         }
-      }
+      },
+      "obligations": [
+        "each gate row shows its deployment status: match | differs | not-deployed | no-deploy-record | unreadable",
+        "a ratified expectation whose path is no longer a discovered gate is shown as stale (discovered: false)",
+        "whether ratify-all would be accepted (bulk_ratify.allowed) is shown, with the gates that block it",
+        "each row carries forgettable and, when not, forget_blocked_reason; not_registered: true marks a ratified gate whose member still declares a gate but no gate is registered"
+      ]
     },
     {
       "id": "gates-ratify",
-      "title": "Ratify the installed gates as the trusted build",
+      "title": "Ratify gates as the trusted build: per gate, or all at once only when every gate is the deployed bytes",
       "place": "me",
       "kind": "write",
       "risk": "critical",
@@ -609,7 +621,43 @@
         "bound-to-rendered-evidence",
         "confirm-irreversible",
         "unknown-not-fine",
+        "signed-in-only",
+        "per-item-trust"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "required"
+        }
+      },
+      "obligations": [
+        "every discovered gate row carries its own ratify control, which sends paths: [that gate] and expected for exactly that gate",
+        "a per-gate ratify changes only that gate's expectation; every other gate's ratification is untouched",
+        "ratify-all sends no paths and is offered only when bulk_ratify.allowed; the daemon refuses it (409, naming the gates) otherwise",
+        "a surface must not offer per-gate controls to a daemon whose verify has no bulk_ratify (it predates per-gate and would ratify every gate)"
+      ]
+    },
+    {
+      "id": "gates-forget",
+      "title": "Forget a stale gate expectation (a path no gate is wired at any more)",
+      "place": "me",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "POST /api/gates/forget"
+      ],
+      "rules": [
+        "reason-to-permit",
+        "per-item-trust",
         "signed-in-only"
+      ],
+      "obligations": [
+        "offered only on rows the daemon marks forgettable: true in GET /api/gates/verify, one path per control; the surface renders the daemon's judgement, never its own",
+        "the daemon refuses to forget a gate it still discovers: that would turn a MODIFIED finding into a merely unratified one",
+        "the daemon refuses to forget an expectation whose member is installed, not retired, and still declares a gate role: a ratified gate that is no longer registered is a bypass or a miswire, not a stale row (hestia #1156). Forget becomes available once the member is retired or uninstalled",
+        "a row that is not discovered while its member still declares a gate is shown with a prominent NOT REGISTERED — possible bypass badge and the daemon's forget_blocked_reason, instead of a forget control"
       ],
       "surfaces": {
         "dashboard": {
