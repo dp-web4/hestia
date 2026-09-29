@@ -477,8 +477,11 @@ def test_the_fallback_line_scan_cannot_widen_a_matcher():
                 got = RM.registered_toml(str(p))
                 assert got == {"PreToolUse": {"pre_tool_use.py": [want]}}, (line, got)
             p.write_text(body.format(m="matcher = shell"))               # not a TOML string: undecodable
-            got = RM.registered_toml(str(p))["PreToolUse"]["pre_tool_use.py"]
-            assert got == [RM.UNPARSED], got
+            try:
+                RM.registered_toml(str(p))
+                raise AssertionError("an undecodable matcher was read instead of refused")
+            except RM.TomlUnsupported:
+                pass
             assert not RM.covers(RM.UNPARSED, "*") and not RM.covers(RM.UNPARSED, "Read")
         finally:
             RM.FORCE_LINE_SCAN = old
@@ -486,6 +489,79 @@ def test_the_fallback_line_scan_cannot_widen_a_matcher():
         for line, want in cases.items():
             p.write_text(body.format(m=line))
             assert RM.registered_toml(str(p)) == {"PreToolUse": {"pre_tool_use.py": [want]}}, (line, "structural")
+
+
+def test_quoted_keys_are_read_through_the_fallback_path():
+    """#1142 third review: `"matcher" = "shell"` is valid TOML; the fallback recorded [None] (all tools)
+    and certified the narrow gate. Through the COMPOSED registration path with the fallback forced
+    (--toml-line-scan), both quoted-key spellings and a quoted header segment are NARROW on every run,
+    and the structural reader agrees."""
+    variants = {
+        "double-quoted key": ('[[hooks.PreToolUse]]\nmatcher = ".*"', '[[hooks.PreToolUse]]\n"matcher" = "shell"'),
+        "literal-quoted key": ('[[hooks.PreToolUse]]\nmatcher = ".*"', "[[hooks.PreToolUse]]\n'matcher' = 'shell'"),
+        "quoted header": ('[[hooks.PreToolUse]]\nmatcher = ".*"', '[[hooks."PreToolUse"]]\nmatcher = "shell"'),
+    }
+    for name, (a, b) in variants.items():
+        for scan in (["--toml-line-scan"], []):
+            with tempfile.TemporaryDirectory() as d:
+                tmp = Path(d)
+                plugins = _plugins(tmp)
+                cfg = tmp / ".codex" / "config.toml"
+                cfg.parent.mkdir()
+                text = CODEX_TOML.replace(a, b)
+                if name == "quoted header":
+                    text = text.replace("[[hooks.PreToolUse.hooks]]", '[[hooks."PreToolUse".hooks]]', 1)
+                assert text != CODEX_TOML, name
+                cfg.write_text(text)
+                _install(tmp, "codex", "witness.py")
+                for run in (1, 2):
+                    r = _run(tmp, plugins, "--member", "codex", *scan)
+                    assert r.returncode == 8, (name, scan, run, r.returncode, r.stdout)
+                    assert "is registered only for matcher 'shell'" in r.stdout, (name, scan, r.stdout)
+                    assert "every templated hook is registered" not in r.stdout, (name, scan, r.stdout)
+
+
+def test_the_fallback_refuses_toml_it_cannot_verify():
+    """Anything outside the fallback's grammar that could bear on hooks is REFUSED (rc 7), never read as
+    absence -- absence is all-tools. The config is left untouched and nothing is certified."""
+    entry = '[[hooks.PreToolUse.hooks]]\ntype          = "command"'
+    forms = {
+        "inline array of hook entries": CODEX_TOML.replace(
+            '[[hooks.PreToolUse]]\nmatcher = ".*"\n',
+            '[[hooks.PreToolUse]]\nmatcher = "shell"\nhooks = [ { type = "command", command = "python3 /x/pre_tool_use.py" } ]\n'),
+        "dotted key in a hooks table": CODEX_TOML.replace('matcher = ".*"', 'matcher.x = "shell"', 1),
+        "multi-line string anywhere": CODEX_TOML + '\n[notes]\ntext = """\n[[hooks.PreToolUse]]\nmatcher = "*"\n"""\n',
+        "a [hooks] table": CODEX_TOML + '\n[hooks]\nPreToolUse = []\n',
+    }
+    for name, text in forms.items():
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            plugins = _plugins(tmp)
+            cfg = tmp / ".codex" / "config.toml"
+            cfg.parent.mkdir()
+            cfg.write_text(text)
+            _install(tmp, "codex", "witness.py")
+            r = _run(tmp, plugins, "--member", "codex", "--toml-line-scan")
+            assert r.returncode == 7 and "REFUSED codex" in r.stdout, (name, r.returncode, r.stdout)
+            assert "every templated hook is registered" not in r.stdout and "REGISTERED" not in r.stdout, (name, r.stdout)
+            assert cfg.read_text() == text, name
+
+
+def test_the_left_behind_repair_also_works_through_the_fallback():
+    """registered_targets() reads targets with the scan when there is no tomllib, so a host left
+    registered without its files is PENDING (not ok) through the fallback too."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        cfg = tmp / ".codex" / "config.toml"
+        cfg.parent.mkdir()
+        cfg.write_text("")
+        rows = _plan_rows(tmp, plugins, "codex")
+        _install(tmp, "codex", *[b for b, _ in rows])
+        assert _run(tmp, plugins, "--member", "codex", "--toml-line-scan").returncode == 0
+        shutil.rmtree(tmp / ".codex" / "hooks")
+        r = _run(tmp, plugins, "--member", "codex", "--toml-line-scan")
+        assert r.returncode == 9 and r.stdout.count("is registered but") == len(rows), r.stdout
 
 
 def test_mixed_installed_and_missing_targets_exit_pending():
@@ -654,6 +730,9 @@ TESTS = [
     test_a_narrow_toml_matcher_is_read_from_its_group,
     test_an_inline_comment_on_a_narrow_toml_matcher_is_still_narrow,
     test_the_fallback_line_scan_cannot_widen_a_matcher,
+    test_quoted_keys_are_read_through_the_fallback_path,
+    test_the_fallback_refuses_toml_it_cannot_verify,
+    test_the_left_behind_repair_also_works_through_the_fallback,
     test_mixed_installed_and_missing_targets_exit_pending,
     test_the_hooks_dir_it_registers_into_is_made,
     test_a_host_already_left_registered_without_the_dir_repairs,

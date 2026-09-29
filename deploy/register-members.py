@@ -187,11 +187,18 @@ def _toml_structural(path: str):
     return out
 
 
-# one TOML string value, basic ("...", with escapes) or literal ('...'), then optional whitespace and an
-# optional comment -- the forms the fallback accepts; anything else on a matcher line is UNPARSED
-_TOML_VALUE = r"""\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)')\s*(?:#.*)?$"""
-_MATCHER_LINE = re.compile(r"\s*matcher" + _TOML_VALUE)
-_CMD_LINE = re.compile(r"\s*command" + _TOML_VALUE)
+class TomlUnsupported(Exception):
+    """The fallback reader met TOML it cannot verify. The registrar refuses to certify anything."""
+
+
+# The fallback's whole grammar. Keys: bare or quoted. Headers: [a.b] / [[a.b]] with bare or quoted
+# segments. Values: one basic or literal string, an integer, or a boolean. Each line may end in a comment.
+_KEY = r"""(?:[A-Za-z0-9_-]+|"(?:[^"\\]|\\.)*"|'[^']*')"""
+_KEYPATH = rf"{_KEY}(?:\s*\.\s*{_KEY})*"
+_HEADER = re.compile(rf"""^\s*(\[\[|\[)\s*({_KEYPATH})\s*(\]\]|\])\s*(?:#.*)?$""")
+_ASSIGN = re.compile(rf"""^\s*({_KEYPATH})\s*=\s*(.*?)\s*$""")
+_VALUE = re.compile(r"""^(?:"((?:[^"\\]|\\.)*)"|'([^']*)'|([+-]?[0-9_]+)|(true|false))\s*(?:#.*)?$""")
+_KEYSEG = re.compile(_KEY)
 
 
 def _toml_basic(s: str) -> str:
@@ -202,48 +209,96 @@ def _toml_basic(s: str) -> str:
         return s
 
 
+def _segments(keypath: str) -> list[str]:
+    out = []
+    for m in _KEYSEG.finditer(keypath):
+        k = m.group(0)
+        if k.startswith('"'):
+            k = _toml_basic(k[1:-1])
+        elif k.startswith("'"):
+            k = k[1:-1]
+        out.append(k)
+    return out
+
+
+def _toml_scan(path: str) -> tuple[dict, set]:
+    """The fallback reader: ({event: {basename: [matcher]}}, {absolute target}). Raises TomlUnsupported
+    on anything outside its grammar that could bear on hooks -- it never guesses.
+
+    #1142 third review: `"matcher" = "shell"` (a quoted key, valid TOML) was not recognised, the matcher
+    stayed None, and None is all-tools. Quoted keys and quoted header segments are now read the TOML way,
+    and every other form the scan cannot parse is a refusal, not an absence."""
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    if '"' * 3 in text or "'" * 3 in text:
+        raise TomlUnsupported("a multi-line string (it can hide table headers from a line scan)")
+    have: dict[str, dict[str, list]] = {}
+    targets: set[str] = set()
+    ctx = None                     # None | ("group", event) | ("entry", event) | ("other",)
+    matcher = None
+    for n, line in enumerate(text.splitlines(), 1):
+        st = line.strip()
+        if not st or st.startswith("#"):
+            continue
+        h = _HEADER.match(line)
+        if h:
+            segs = _segments(h.group(2))
+            arr = h.group(1) == "[["
+            if segs and segs[0] == "hooks" and not arr and len(segs) >= 2 and segs[1] == "state":
+                ctx = ("other",)          # codex's per-hook approval state: defines no hooks
+            elif segs and segs[0] == "hooks":
+                if arr and len(segs) == 2:
+                    ctx, matcher = ("group", segs[1]), None
+                elif arr and len(segs) == 3 and segs[2] == "hooks" and ctx and ctx[0] in ("group", "entry") and ctx[1] == segs[1]:
+                    ctx = ("entry", segs[1])
+                else:
+                    raise TomlUnsupported(f"line {n}: hooks table form {st!r}")
+            else:
+                ctx = ("other",)
+            continue
+        if st.startswith("["):
+            raise TomlUnsupported(f"line {n}: unparseable table header {st!r}")
+        a = _ASSIGN.match(line)
+        segs = _segments(a.group(1)) if a else []
+        in_hooks = ctx is not None and ctx[0] in ("group", "entry")
+        if not a:
+            if in_hooks:
+                raise TomlUnsupported(f"line {n}: {st!r}")
+            continue                              # an unrelated value spanning lines (a multi-line array)
+        if ctx is None and segs and segs[0] == "hooks":
+            raise TomlUnsupported(f"line {n}: hooks set by a top-level key {st!r}")
+        if not in_hooks:
+            continue
+        if len(segs) != 1:
+            raise TomlUnsupported(f"line {n}: dotted key inside a hooks table {st!r}")
+        v = _VALUE.match(a.group(2))
+        if v is None:
+            raise TomlUnsupported(f"line {n}: value the scan cannot read {st!r}")
+        sval = _toml_basic(v.group(1)) if v.group(1) is not None else v.group(2)
+        key = segs[0]
+        if ctx[0] == "group" and key == "matcher":
+            if sval is None:
+                raise TomlUnsupported(f"line {n}: non-string matcher {st!r}")
+            matcher = sval
+        elif ctx[0] == "entry" and key == "command" and sval is not None:
+            t = target_path(sval)
+            if t:
+                targets.add(t)
+            b = target_basename(sval)
+            if b:
+                have.setdefault(ctx[1], {}).setdefault(b, []).append(matcher)
+    return have, targets
+
+
 def registered_toml(path: str) -> dict[str, dict[str, list]]:
     """{event: {target basename: [matcher of each group that registers it]}} -- toml-hook-commands
-    semantics. A structural parse (tomllib) when the host has one; otherwise a line scan, in which the
-    event is the nearest `[[hooks.<Event>...]]` header and the matcher the `matcher = ...` line under
-    the nearest GROUP header, None when the group has none.
-
-    #1142 re-review P1: the old scan required the closing quote to END the line, so
-    `matcher = "shell" # deliberately narrow` was not recognised, the matcher stayed None, and None is
-    all-tools -- a narrow gate certified as complete. Now a matcher line the scan cannot decode is
-    UNPARSED, which covers nothing: an unreadable matcher can never become a wider one."""
+    semantics. A structural parse (tomllib) when the host has one; otherwise `_toml_scan`, which
+    refuses (TomlUnsupported) rather than reading an unrecognised matcher as absent -- absent is
+    all-tools, so a misread would certify a narrow gate (#1142 reviews 2 and 3)."""
     got = _toml_structural(path)
     if got is not None:
         return got
-    out: dict[str, dict[str, list]] = {}
-    event, matcher = None, None
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            m = re.match(r"\s*\[\[\s*hooks\.([A-Za-z_]+)(\.hooks)?\s*\]\]", line)
-            if m:
-                event = m.group(1)
-                if not m.group(2):
-                    matcher = None
-                continue
-            if re.match(r"\s*\[", line):            # any other table ends the hooks context
-                event = None
-                continue
-            if not event:
-                continue
-            if re.match(r"\s*matcher\s*=", line):
-                mm = _MATCHER_LINE.match(line)
-                if mm is None:
-                    matcher = UNPARSED
-                else:
-                    matcher = _toml_basic(mm.group(1)) if mm.group(1) is not None else mm.group(2)
-                continue
-            mc = _CMD_LINE.match(line)
-            if mc:
-                cmd = _toml_basic(mc.group(1)) if mc.group(1) is not None else mc.group(2)
-                b = target_basename(cmd)
-                if b:
-                    out.setdefault(event, {}).setdefault(b, []).append(matcher)
-    return out
+    return _toml_scan(path)[0]
 
 
 def target_path(cmd: str) -> str | None:
@@ -338,7 +393,12 @@ def registered_targets(cfg: str, reader: str) -> set[str]:
                 data = json.load(fh)
             groups = (data.get("hooks") or {}).values()
         else:
-            import tomllib  # type: ignore
+            try:
+                if FORCE_LINE_SCAN:
+                    raise ImportError
+                import tomllib  # type: ignore
+            except ImportError:
+                return _toml_scan(cfg)[1]
             with open(cfg, "rb") as fh:
                 groups = (tomllib.load(fh).get("hooks") or {}).values()
         for gs in groups:
@@ -434,7 +494,12 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
                 return "failed", [f"{cfg} is not a JSON object"]
             have = registered_json(cfg) if raw.strip() else {}
         else:
-            have = registered_toml(cfg)
+            try:
+                have = registered_toml(cfg)
+            except TomlUnsupported as e:
+                return "refused", [f"{cfg}: the TOML reader on this host (no tomllib) cannot verify this "
+                                   f"config ({e}); nothing registered, nothing certified -- run with "
+                                   f"Python >= 3.11 or register by hand"]
     else:
         have = {}
 
@@ -513,8 +578,12 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
 def main(argv: list[str]) -> int:
     plugins = os.path.join(REPO_ROOT, "plugins")
     home = os.path.expanduser("~")
+    global FORCE_LINE_SCAN
     only = None
     plan = False
+    if "--toml-line-scan" in argv:
+        FORCE_LINE_SCAN = True
+        argv = [a for a in argv if a != "--toml-line-scan"]
     it = iter(argv)
     for a in it:
         if a == "--plugins":
