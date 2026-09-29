@@ -44,6 +44,11 @@ pub struct Swap {
     #[serde(default)]
     pub event: String,
     pub original: String,
+    /// The COMPLETE shell word that was replaced, with its own quoting as it appeared in the config
+    /// (`/g/x.py`, `'/g/x.py'`, or `\"/g/x.py\"` inside a JSON/TOML basic string). Restore puts
+    /// back exactly this; empty in a record written before 2026-09-28's quoting fix.
+    #[serde(default)]
+    pub original_word: String,
     pub replacement: String,
     #[serde(default)]
     pub stub_file: String,
@@ -135,7 +140,9 @@ pub fn stub_source(member: &str, at: &str) -> String {
 fn is_boundary(c: Option<char>) -> bool {
     match c {
         None => true,
-        Some(c) => c.is_whitespace() || matches!(c, '"' | '\'' | '=' | '`'),
+        // A backslash is a boundary for the `\"` of a double-quoted word inside a JSON/TOML basic
+        // string; `word_span` then checks the whole word, so a glued word is still refused.
+        Some(c) => c.is_whitespace() || matches!(c, '"' | '\'' | '=' | '`' | '\\'),
     }
 }
 
@@ -360,6 +367,28 @@ fn token_positions(text: &str, start: usize, end: usize, tok: &str) -> Vec<usize
     out
 }
 
+/// Widen an occurrence of a path at `p` to its COMPLETE shell word inside the command span `c`:
+/// if the path is wrapped in shell quotes -- `'…'`, or `"…"` which appears as `\"…\"` inside a JSON
+/// or TOML basic string and raw inside a TOML literal string -- the quotes belong to the word. The
+/// replacement must take them too, or an already-quoted original with a quoted stub becomes
+/// `''/stub path''`, which the shell splits (GPT, #1158 re-review). Returns None when the word is
+/// glued to something else (`'/g/x.py'--flag`): a word this cannot read is refused, not guessed.
+fn word_span(text: &str, c: &CommandSpan, p: usize, len: usize) -> Option<(usize, usize)> {
+    let dq: &str = if c.delim == '"' { "\\\"" } else { "\"" };
+    let (mut s, mut e) = (p, p + len);
+    for q in ["'", dq] {
+        if text[c.start..s].ends_with(q) && text[e..c.end].starts_with(q) {
+            s -= q.len();
+            e += q.len();
+            break;
+        }
+    }
+    let before = text[c.start..s].chars().next_back();
+    let after = text[e..c.end].chars().next();
+    let ok = |ch: Option<char>| ch.map_or(true, char::is_whitespace);
+    (ok(before) && ok(after)).then_some((s, e))
+}
+
 pub fn active(home: &Path, member: &str) -> Option<BypassRecord> {
     let raw = std::fs::read(record_path(home, member)).ok()?;
     serde_json::from_slice(&raw).ok()
@@ -417,21 +446,29 @@ fn swap_back(swaps: &[Swap], to_original: bool) -> Result<()> {
         let before = std::fs::read_to_string(&cfg).with_context(|| format!("read {cfg}"))?;
         let mut text = before.clone();
         for s in swaps.iter().filter(|s| s.config == cfg) {
-            let (from, to) = if to_original { (&s.replacement, &s.original) } else { (&s.original, &s.replacement) };
+            let orig_word = if s.original_word.is_empty() { &s.original } else { &s.original_word };
+            let (from, to) = if to_original { (&s.replacement, orig_word) } else { (&s.original, &s.replacement) };
             let (t, n) = if to_original {
                 swap_token(&text, from, to)
             } else {
-                // Re-applying binds to the gate's event again, as the bypass did.
+                // Re-applying binds to the gate's event again, and replaces the whole word, as the
+                // bypass did.
                 let spans: Vec<CommandSpan> = command_spans(Path::new(&cfg), &text)
                     .into_iter().filter(|c| c.event == s.event).collect();
-                let mut pos: Vec<usize> = spans.iter()
-                    .flat_map(|c| token_positions(&text, c.start, c.end, from)).collect();
-                pos.sort_unstable();
-                let mut t = text.clone();
-                for p in pos.iter().rev() {
-                    t.replace_range(*p..*p + from.len(), to);
+                let mut words: Vec<(usize, usize)> = Vec::new();
+                for c in &spans {
+                    for p in token_positions(&text, c.start, c.end, from) {
+                        if let Some(w) = word_span(&text, c, p, from.len()) {
+                            words.push(w);
+                        }
+                    }
                 }
-                (t, pos.len())
+                words.sort_unstable();
+                let mut t = text.clone();
+                for (ws, we) in words.iter().rev() {
+                    t.replace_range(*ws..*we, to);
+                }
+                (t, words.len())
             };
             if n == 0 {
                 bail!(
@@ -480,10 +517,21 @@ pub fn bypass(
             let stub = stub_path(home, member, &t.path);
             let stub_s = stub.display().to_string();
             let mut n = 0;
+            let mut original_word: Option<String> = None;
             for c in spans.iter().filter(|c| c.event == t.event) {
                 let word = command_word(&stub_s, c.delim)?;
                 for p in token_positions(&before, c.start, c.end, &t.path) {
-                    edits.push((p, p + t.path.len(), word.clone()));
+                    let Some((ws, we)) = word_span(&before, c, p, t.path.len()) else {
+                        bail!("{cfg}: the gate path {} on {} is part of a larger shell word this cannot \
+                               read safely; nothing was changed", t.path, t.event);
+                    };
+                    let w = before[ws..we].to_string();
+                    if original_word.as_ref().is_some_and(|o| o != &w) {
+                        bail!("{cfg}: {} is registered on {} under two different quotings; restore could \
+                               not tell them apart, so nothing was changed", t.path, t.event);
+                    }
+                    original_word = Some(w);
+                    edits.push((ws, we, word.clone()));
                     n += 1;
                 }
             }
@@ -497,6 +545,7 @@ pub fn bypass(
                 config: cfg.clone(),
                 event: t.event.clone(),
                 original: t.path.clone(),
+                original_word: original_word.unwrap_or_else(|| t.path.clone()),
                 replacement: command_word(&stub_s, '"').unwrap_or_else(|_| stub_s.clone()),
                 stub_file: stub_s,
                 occurrences: n,
@@ -709,6 +758,67 @@ mod tests {
         assert!(e.to_string().contains("literal string"), "{e}");
         assert_eq!(std::fs::read_to_string(&cfg).unwrap(), lit);
         assert!(command_word("/a'b", '"').is_err());
+    }
+
+    /// The command the harness would run for the PreToolUse gate, decoded from its config string.
+    fn pre_command(cfg: &Path) -> String {
+        let text = std::fs::read_to_string(cfg).unwrap();
+        let c = command_spans(cfg, &text).into_iter().find(|c| c.event == "PreToolUse").unwrap();
+        let raw = &text[c.start..c.end];
+        if cfg.extension().and_then(|e| e.to_str()) == Some("json") || c.delim == '"' {
+            serde_json::from_str::<String>(&format!("\"{raw}\"")).unwrap()
+        } else {
+            raw.to_string()
+        }
+    }
+
+    /// argv as the real shell splits it, and whether the command actually runs to exit 0.
+    fn shell_argv(cmd: &str) -> Vec<String> {
+        let out = std::process::Command::new("sh")
+            .arg("-c").arg(format!("set -- {cmd}; printf '%s\\n' \"$@\""))
+            .output().unwrap();
+        String::from_utf8(out.stdout).unwrap().lines().map(str::to_string).collect()
+    }
+
+    /// GPT, #1158 re-review: an ALREADY-QUOTED original plus a spaced destination became
+    /// `''/stub path''` -- split by the shell, so the stub never ran. Read-back of bytes cannot see
+    /// that; the shell can. Each case is executed.
+    #[test]
+    fn a_quoted_original_with_a_spaced_stub_is_one_argv_word_and_runs() {
+        let cases = [
+            ("settings.json", "{\n  \"hooks\": {\n    \"PreToolUse\": [\n      { \"hooks\": [ { \"type\": \"command\", \"command\": \"python3 '/g/hooks/pre_tool_use.py'\" } ] }\n    ]\n  }\n}\n"),
+            ("settings.json", "{\n  \"hooks\": {\n    \"PreToolUse\": [\n      { \"hooks\": [ { \"type\": \"command\", \"command\": \"python3 \\\"/g/hooks/pre_tool_use.py\\\"\" } ] }\n    ]\n  }\n}\n"),
+            ("config.toml", "[[hooks.PreToolUse.hooks]]\ncommand = \"python3 \\\"/g/hooks/pre_tool_use.py\\\"\"\n"),
+            ("config.toml", "[[hooks.PreToolUse.hooks]]\ncommand = \"HESTIA_ROLE=r python3 '/g/hooks/pre_tool_use.py'\"\n"),
+            ("kimi.toml", "[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"python3 '/g/hooks/pre_tool_use.py'\"\n"),
+            ("config.toml", "[[hooks.PreToolUse.hooks]]\ncommand = \"python3 /g/hooks/pre_tool_use.py\"\n"),
+        ];
+        for (name, body) in cases {
+            let d = tempfile::tempdir().unwrap();
+            let home = d.path().join("hestia home");
+            let cfg = d.path().join(name);
+            std::fs::write(&cfg, body).unwrap();
+            // before: the shell sees the ORIGINAL gate as one word
+            assert!(shell_argv(&pre_command(&cfg)).contains(&G.to_string()), "{name}: fixture");
+            let rec = bypass(&home, "m", "r", &[gt(&cfg, "PreToolUse", G)], "T").unwrap();
+            let cmd = pre_command(&cfg);
+            let argv = shell_argv(&cmd);
+            let at = argv.iter().position(|a| a == "python3").unwrap();
+            assert_eq!(argv[at + 1], rec.swaps[0].stub_file, "{name}: argv after python3 is the stub, as ONE word: {argv:?} from {cmd}");
+            assert_eq!(argv.len(), at + 2, "{name}: no stray words: {argv:?}");
+            let run = std::process::Command::new("sh").arg("-c").arg(&cmd)
+                .stdin(std::process::Stdio::null()).status().unwrap();
+            assert!(run.success(), "{name}: the generated command runs the stub and allows: {cmd}");
+            restore(&home, "m").unwrap();
+            assert_eq!(std::fs::read_to_string(&cfg).unwrap(), body, "{name}: restore is exact, quotes included");
+        }
+        // A word this cannot read safely is refused, not guessed.
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("config.toml");
+        let glued = "[[hooks.PreToolUse.hooks]]\ncommand = \"python3 '/g/hooks/pre_tool_use.py'--x\"\n";
+        std::fs::write(&cfg, glued).unwrap();
+        assert!(bypass(&d.path().join("h"), "m", "r", &[gt(&cfg, "PreToolUse", G)], "T").is_err());
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), glued);
     }
 
     #[test]
