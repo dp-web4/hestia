@@ -446,3 +446,9 @@ export type ReachOutcome =
   | { outcome: "moved"; current: ScopeGrantRow | null }
   | { outcome: "revoked"; result: Record<string, unknown> }
   | { outcome: "already_revoked"; detail: string };
+
+/** Answers from make-standing / reach / reassign. Conflicts are outcomes (PRD §1a). */
+export type StandingActOutcome =
+  | { outcome: "done"; result: Record<string, unknown> }
+  | { outcome: "already" | "already_gone"; detail: string }
+  | { outcome: "moved"; current: ScopeGrantRow | null };

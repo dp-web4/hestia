@@ -133,6 +133,21 @@ client held would be the race GPT caught on #1132, so the check lives where the 
 `expected_existing` is unbound, so the dashboard keeps working — **follow-up: the dashboard's grant
 form should send it too** (spec rule `bound-to-rendered-evidence` now lists `scope-grant`).
 
+**4b as built (2026-09-29).** On each Reach row:
+- **Make standing:** live rows only;
+- **Include below / Make exact:** any row; widening needs a reason, narrowing none;
+- **Reassign:** standing rows only; the destination is chosen from recorded, unretired members
+  other than the source, and a reason is required.
+
+Promote REPLACES a standing twin on the same path, and reassign MOVES the source row as it is now.
+So both send the row the operator was shown as `expected_existing`, and `/api/scope/standing/promote`
+and `/reassign` now refuse (409 `moved`, nothing written) under the lock when it changed. This is the
+same `refuse_if_binding_moved` check `/api/scope/grant` uses. Reach needs no binding: it only flips
+exact/subtree, and the route already refuses a no-op (409), which the app shows as `already`.
+Already standing, already gone (404) and moved are outcomes, not errors.
+
+Spec: `scope-standing` app -> required, with `bound-to-rendered-evidence`.
+
 ---
 
 ## What is deliberately not scheduled

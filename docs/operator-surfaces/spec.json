@@ -264,15 +264,15 @@
       ],
       "rules": [
         "reason-to-permit",
-        "signed-in-only"
+        "signed-in-only",
+        "bound-to-rendered-evidence"
       ],
       "surfaces": {
         "dashboard": {
           "status": "required"
         },
         "app": {
-          "status": "planned",
-          "why": "Sprint 4b (promote / recursive / reassign), after 4a's grant and revoke"
+          "status": "required"
         }
       }
     },

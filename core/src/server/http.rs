@@ -3558,6 +3558,33 @@ async fn config_get_seat(
 }
 
 
+/// The binding check every standing-grant write that REPLACES or MOVES a row shares
+/// (`scope_grant`, `scope_standing_promote`, `scope_standing_reassign`): when the surface sent
+/// `expected_existing` — the row it showed the operator, `null` for "none" — refuse (409,
+/// nothing written) if the store no longer holds that row. Absent = unbound (older callers).
+fn refuse_if_binding_moved(
+    body: &serde_json::Value,
+    grants: &[crate::server::standing_scope::StandingGrant],
+    member: &str,
+    path: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let expected = body.get("expected_existing")?;
+    let current = standing_grant_binding(grants, member, path, crate::server::gate_escalation::now_secs());
+    if grant_binding_of(expected) == current {
+        return None;
+    }
+    Some((
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "the standing grant on this (member, path) is not the one you were shown - \
+                      another view changed it since. Nothing was written; review the current row \
+                      and resend.",
+            "moved": true,
+            "current": current,
+        })),
+    ))
+}
+
 /// The fields a standing grant REPLACES — the binding a surface was shown — for the unexpired
 /// standing grant on (member, path), or `null`. Unexpired only, because the snapshot a surface
 /// renders drops expired rows: an expired row was shown as "none" and must compare as none.
@@ -3722,19 +3749,8 @@ async fn scope_grant(
     // none"), and it is compared HERE, under the lock, so nothing another view writes between
     // the surface's read and this write can be replaced unseen. Absent = unbound: the older
     // callers keep working, and say nothing about what they saw.
-    if let Some(expected) = body.get("expected_existing") {
-        let now_b = crate::server::gate_escalation::now_secs();
-        let current = standing_grant_binding(&s.standing_scope.grants, &plugin_id, &path, now_b);
-        if grant_binding_of(expected) != current {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "the standing grant on this (member, path) is not the one you were                               shown — another view changed it since. Nothing was written; review                               the current row and resend.",
-                    "moved": true,
-                    "current": current,
-                })),
-            );
-        }
+    if let Some(refusal) = refuse_if_binding_moved(&body, &s.standing_scope.grants, &plugin_id, &path) {
+        return refusal;
     }
     let replaces = s
         .standing_scope
@@ -4631,6 +4647,11 @@ async fn scope_standing_promote(
     if let Some(refusal) = refuse_if_retired(&s, &plugin_id, "promotion of a live grant") {
         return refusal;
     }
+    // Promotion REPLACES a standing twin on the same path (the store's add() is by (member,
+    // path)), so it binds to the standing row the operator was shown, like scope_grant.
+    if let Some(refusal) = refuse_if_binding_moved(&body, &s.standing_scope.grants, &plugin_id, &path) {
+        return refusal;
+    }
     let Some(live) = s
         .scope_requests
         .values()
@@ -4975,6 +4996,11 @@ async fn scope_standing_reassign(
                               was changed."),
             "member_known": false,
         })));
+    }
+    // A reassign MOVES the row the operator picked — its reason, reach and expiry — so it binds
+    // to the source row as shown: another view's edit since is refused, not carried unseen.
+    if let Some(refusal) = refuse_if_binding_moved(&body, &s.standing_scope.grants, &from, &path) {
+        return refusal;
     }
     // What WOULD change, decided on a scratch copy before anything durable happens, so
     // every refusal below is a pure read: no intent, no generation movement.
@@ -10021,6 +10047,64 @@ mod disposition_tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "the second writer loses cleanly");
         let s = state.lock().await;
         assert_eq!((s.standing_scope.generation, s.recent_chain(50).len()), (gen1, rows1));
+    }
+
+    /// Last edit wins, bound to what was shown (Sprint 4b): a reassign MOVES the source row as
+    /// it is now, so a surface that picked it sends it back, and another view's edit since is
+    /// refused with nothing written.
+    #[tokio::test]
+    async fn a_reassign_bound_to_a_source_row_that_moved_writes_nothing() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "codex").await;
+        seed_grant(&state, "Claude-code", "/w/tree", false).await;
+        let shown = { let s = state.lock().await;
+            standing_grant_binding(&s.standing_scope.grants, "Claude-code", "/w/tree", 0) };
+        // another view widens it after the surface rendered
+        { let mut s = state.lock().await;
+          s.commit_standing_scope(|st| { st.set_recursive("Claude-code", "/w/tree", true); }).unwrap(); }
+        let before = { let s = state.lock().await; snapshot(&s) };
+        let resp = reassign(&state, serde_json::json!({"plugin_id": "Claude-code", "path": "/w/tree",
+            "to": "codex", "reason": "typo", "expected_existing": shown})).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!((body["moved"].clone(), body["current"]["recursive"].clone()),
+                   (serde_json::json!(true), serde_json::json!(true)), "{body}");
+        assert_eq!({ let s = state.lock().await; snapshot(&s) }, before, "a refused bound reassign wrote something");
+        let resp = reassign(&state, serde_json::json!({"plugin_id": "Claude-code", "path": "/w/tree",
+            "to": "codex", "reason": "typo", "expected_existing": body["current"]})).await;
+        assert_eq!(resp.status(), StatusCode::OK, "bound to the row that IS there, it moves");
+    }
+
+    /// Promotion replaces a standing twin on the same path; bound to the twin as shown.
+    #[tokio::test]
+    async fn a_promotion_bound_to_a_standing_twin_that_moved_writes_nothing() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        let twin = |reason: &str| crate::server::standing_scope::StandingGrant {
+            member: "kimi-code".into(), path: "/y/tree".into(), granted_at: now,
+            granted_by: "operator".into(), reason: reason.into(), expires_at: None,
+            request_id: None, recursive: false,
+        };
+        let shown = {
+            let mut s = state.lock().await;
+            let mut wide = live_req("scope-bind", "/y/tree", now);
+            wide.recursive = true;
+            s.scope_requests.insert("scope-bind".into(), wide);
+            s.commit_standing_scope(|st| st.add(twin("shown reason"))).unwrap();
+            standing_grant_binding(&s.standing_scope.grants, "kimi-code", "/y/tree", now)
+        };
+        { let mut s = state.lock().await; s.commit_standing_scope(|st| st.add(twin("edited elsewhere"))).unwrap(); }
+        let gen = state.lock().await.standing_scope.generation;
+        let (st, body) = promote(&state, serde_json::json!({"plugin_id": "kimi-code", "path": "/y/tree",
+            "reason": "widen", "expected_existing": shown})).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["current"]["reason"], "edited elsewhere");
+        assert_eq!(state.lock().await.standing_scope.generation, gen, "nothing committed");
+        let (st, _) = promote(&state, serde_json::json!({"plugin_id": "kimi-code", "path": "/y/tree",
+            "reason": "widen", "expected_existing": body["current"]})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(state.lock().await.standing_scope.grants.iter().any(|g| g.path == "/y/tree" && g.recursive));
     }
 
     /// Every refusal is a pure read: unknown destination, self-reassign, no such grant,
