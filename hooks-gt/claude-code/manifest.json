@@ -6,6 +6,11 @@
   "registration_note": "this member ships no registration template yet; its registration edge is NOT ground truth until it does",
   "files": [
     {
+      "path": "hooks/disposition_deliver.py",
+      "sha256": "c54e5ebceea5c92a0bff63276dd79e462f6bc7156fe2d98e5189b736ee7aadd5",
+      "source": "plugins/claude-code/hooks/disposition_deliver.py"
+    },
+    {
       "path": "hooks/law_inject.py",
       "sha256": "5242a2e5a18475e6c05c2d16b7c1d2da53df1947168df4ec39b093d2495d45a9",
       "source": "plugins/claude-code/hooks/law_inject.py"
@@ -48,5 +53,5 @@
     ]
   },
   "requires": [],
-  "gt_version": "134ac604e09fc9d0a961f28b35354f06bc3c70c350735ba59062692a1e8025cf"
+  "gt_version": "8080f2536c67539c190e11691529eeb9377c4afe43c622c11b57bc103cb62419"
 }
