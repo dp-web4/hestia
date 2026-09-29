@@ -580,8 +580,7 @@
           "status": "required"
         },
         "app": {
-          "status": "planned",
-          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+          "status": "required"
         }
       },
       "notes": "The app shows delegations read-only from the snapshot."

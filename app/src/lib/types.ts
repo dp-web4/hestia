@@ -446,3 +446,27 @@ export type ReachOutcome =
   | { outcome: "moved"; current: ScopeGrantRow | null }
   | { outcome: "revoked"; result: Record<string, unknown> }
   | { outcome: "already_revoked"; detail: string };
+
+/** One delegation, as `GET /api/agents/:id/delegations` lists it (revoked ones stay listed). */
+export interface DelegationRow {
+  id: string;
+  delegator_lct_id: string;
+  agent_lct_id: string;
+  /** Roles serialize as snake_case strings; a custom role is an object, shown as-is. */
+  scope: { roles: unknown[]; actions: string[]; society_lct_id?: string | null };
+  created_at: string;
+  expires_at?: string | null;
+  revoked: boolean;
+  revoked_at?: string | null;
+  active: boolean;
+}
+
+export interface DelegationList {
+  plugin_id: string;
+  agent_key: string;
+  delegations: DelegationRow[];
+  /** The closed role vocabulary a grant may name. */
+  roles: string[];
+  /** Readable, and nothing may be granted to it. */
+  retired: boolean;
+}

@@ -3,6 +3,7 @@ import type {
   AgentInventory,
   DashboardSnapshot,
   DecideOutcome,
+  DelegationList,
   ReachOutcome,
   ScopeGrantRow,
   GateReport,
@@ -127,6 +128,35 @@ export async function agentGateBypass(member: string, reason: string): Promise<u
 /** Put a bypassed member's gate back exactly as it was registered. */
 export async function agentGateRestore(member: string): Promise<unknown> {
   return invoke("agent_gate_restore", { member });
+}
+
+/** One member's delegations, the role vocabulary, and whether it is retired. */
+export async function delegationsList(member: string): Promise<DelegationList> {
+  return invoke("delegations_list", { member });
+}
+
+/**
+ * Delegate authority to a member, named only by the member id (its key is derived by the
+ * daemon). Roles from the daemon's closed list; actions are an open vocabulary the daemon reads
+ * and reports on (`unvalidated_actions`). A reason is required.
+ */
+export async function delegationGrant(
+  member: string,
+  roles: string[],
+  actions: string[],
+  expiresHours: number | null,
+  reason: string,
+): Promise<{ delegation_id: string; unvalidated_actions?: string[] }> {
+  return invoke("delegation_grant", { member, roles, actions, expiresHours, reason });
+}
+
+/** Revoke one delegation. The daemon requires a reason here too. */
+export async function delegationRevoke(
+  member: string,
+  delegationId: string,
+  reason: string,
+): Promise<{ outcome: "revoked" | "already_revoked" }> {
+  return invoke("delegation_revoke", { member, delegationId, reason });
 }
 
 export async function getDashboard(): Promise<DashboardSnapshot> {
