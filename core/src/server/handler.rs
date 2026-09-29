@@ -5687,6 +5687,14 @@ pub(crate) fn ensure_disposition_lane(
     now: u64,
 ) -> bool {
     use std::io::Write;
+    // A lane line is a projection OF A COMMITTED RULING, keyed to that ruling's chain hash
+    // (PRD #845 R2). A caller that cannot name the hash has no ruling to project: writing
+    // `"ruling_hash": ""` would publish a line nobody can check against the chain, which is the
+    // exact inversion the lane exists to prevent (GPT review of f5baa33). Refuse, loudly.
+    if ruling_hash.trim().is_empty() {
+        tracing::warn!("disposition lane for {} NOT written: no committed ruling hash to project", esc.id);
+        return false;
+    }
     let dir = s.home.join(DISPOSITION_LANE_DIR);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("disposition lane dir {dir:?} unavailable ({e}) - the asker will not be told");
@@ -5784,9 +5792,23 @@ store-only and resets on replay (#850). NOT the canonical delivery-started deadl
     // hash; the repair pass has only the row, and #867 says the row may be gone before the
     // chain page is walked. Keying on the escalation id lets both callers converge on one
     // line, and a ruling delivered twice is a ruling the asker cannot trust.
-    let marker = format!("\"escalation_id\":\"{}\"", esc.id);
+    //
+    // Duplicates are detected on PARSED, COMPLETE rows (GPT review of f5baa33). The first cut
+    // matched `"escalation_id":"<id>"` as a SUBSTRING of raw lines, so a truncated tail -- a
+    // write that died halfway, which is precisely what repair exists for -- still contained the
+    // id and blocked its own repair forever. A row counts only if it parses as an object and
+    // carries this escalation's id, a non-empty ruling hash, a decision and a render.
+    let mut partial_tail = false;
     if let Ok(existing) = std::fs::read_to_string(&path) {
-        if existing.lines().any(|l| l.replace(' ', "").contains(&marker)) {
+        partial_tail = !existing.is_empty() && !existing.ends_with('\n');
+        let complete = |l: &str| -> bool {
+            let Ok(v) = serde_json::from_str::<Value>(l) else { return false };
+            v.get("escalation_id").and_then(Value::as_str) == Some(esc.id.as_str())
+                && v.get("ruling_hash").and_then(Value::as_str).is_some_and(|h| !h.is_empty())
+                && v.get("decision").and_then(Value::as_str).is_some()
+                && v.get("render").and_then(Value::as_str).is_some()
+        };
+        if existing.lines().any(complete) {
             return false;
         }
     }
@@ -5797,8 +5819,10 @@ store-only and resets on replay (#850). NOT the canonical delivery-started deadl
             return false;
         }
     };
+    // A torn tail (no final newline) must not swallow the repaired row: start it on its own line.
+    let lead = if partial_tail { "\n" } else { "" };
     match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        Ok(mut f) => match writeln!(f, "{line}") {
+        Ok(mut f) => match write!(f, "{lead}{line}\n") {
             Ok(()) => return true,
             Err(e) => tracing::warn!("disposition lane {path:?} not written ({e})"),
         },
@@ -5837,17 +5861,51 @@ pub(crate) fn disposition_worker_pass(
     (lapsed, repaired)
 }
 
+/// How far back the repair pass looks for the ruling entries it re-projects. The live store is
+/// bounded by reaping, so this only has to reach as far as the oldest row still held.
+pub(crate) const LANE_REPAIR_SCAN: u64 = 5_000;
+
 pub(crate) fn repair_disposition_lanes(s: &super::state::ServerState, now: u64) -> usize {
-    let repairs: Vec<(String, String)> = s
+    // THE COMMITTED RULING, not an empty placeholder (GPT review of f5baa33). The first cut
+    // repaired with `ruling_hash: ""`, so the repaired line pointed at no chain entry and a
+    // reader could not tell a projection from an invention. Each ruling's own chain entry --
+    // `gate_escalation_decided` or `gate_escalation_withdrawn`, newest first -- supplies its
+    // hash and its pointer kind; a decided row with NO ruling entry in reach is reported and
+    // left alone, because the lane may only project what the chain holds.
+    let rulings = match s.chain_store.read_recent_by_types(
+        None,
+        &["gate_escalation_decided", "gate_escalation_withdrawn"],
+        LANE_REPAIR_SCAN,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("disposition lane repair: ruling entries unreadable ({e}); nothing repaired this pass");
+            return 0;
+        }
+    };
+    let mut ruling_of: std::collections::HashMap<String, (String, String)> = Default::default();
+    for entry in &rulings {
+        if let Some(id) = entry.event_data.get("escalation_id").and_then(Value::as_str) {
+            let kind = if entry.event_type == "gate_escalation_withdrawn" { "withdrawn" } else { "decided" };
+            ruling_of
+                .entry(id.to_string())
+                .or_insert_with(|| (entry.hash.clone(), format!("hestia://escalation/{id}#{kind}")));
+        }
+    }
+    let ids: Vec<String> = s
         .gate_escalations
         .rows()
         .filter(|e| e.decided_at.is_some())
-        .map(|e| (e.id.clone(), format!("hestia://escalation/{}#decided", e.id)))
+        .map(|e| e.id.clone())
         .collect();
     let mut wrote = 0usize;
-    for (id, pointer) in repairs {
+    for id in ids {
+        let Some((hash, pointer)) = ruling_of.get(&id) else {
+            tracing::warn!("disposition lane repair: {id} is decided but no ruling entry is in reach; not projected");
+            continue;
+        };
         if let Some(esc) = s.gate_escalations.get(&id) {
-            if ensure_disposition_lane(s, esc, &pointer, "", now) {
+            if ensure_disposition_lane(s, esc, pointer, hash, now) {
                 wrote += 1;
             }
         }
@@ -16232,6 +16290,10 @@ mod tests {
             .join(super::DISPOSITION_LANE_DIR)
             .join("claude-code.jsonl");
         assert!(lane.is_file(), "the ruling site wrote it");
+        let original: Value =
+            serde_json::from_str(std::fs::read_to_string(&lane).unwrap().lines().next().unwrap()).unwrap();
+        let ruled_hash = original["ruling_hash"].as_str().unwrap().to_string();
+        assert!(!ruled_hash.is_empty(), "the ruling site projects its own chain hash");
         std::fs::remove_file(&lane).unwrap();
 
         // THE WORKER'S PASS, not the repair function alone. Calling the function directly
@@ -16247,6 +16309,26 @@ mod tests {
         let row: Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
         assert_eq!(row["escalation_id"], esc_id, "and it is the same ruling: {row}");
         assert_eq!(row["for_session"], "sess-repair-1", "still addressed to the asker: {row}");
+        assert_eq!(
+            row["ruling_hash"], ruled_hash,
+            "the repaired line names the COMMITTED ruling, not an empty placeholder (GPT, f5baa33): {row}"
+        );
+
+        // A TORN TAIL must not block its own repair (GPT, f5baa33): half of the line, containing
+        // the escalation id, with no newline -- the shape a write that died midway leaves.
+        let full = std::fs::read_to_string(&lane).unwrap();
+        let torn = &full[..full.len() / 2];
+        assert!(torn.contains(&esc_id), "precondition: the torn half still names the escalation");
+        std::fs::write(&lane, torn).unwrap();
+        let rewrote = {
+            let mut s = shared.lock().await;
+            super::disposition_worker_pass(&mut s, now).1
+        };
+        assert_eq!(rewrote, 1, "a torn row is not a delivered ruling; the repair writes a whole one");
+        let body = std::fs::read_to_string(&lane).unwrap();
+        let rows: Vec<Value> = body.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        assert_eq!(rows.len(), 1, "exactly one COMPLETE row now, on its own line: {body}");
+        assert_eq!(rows[0]["ruling_hash"], ruled_hash);
 
         // Idempotent: a second pass must not deliver the same ruling twice.
         let again = {
@@ -16255,9 +16337,13 @@ mod tests {
         };
         assert_eq!(again, 0, "a repaired lane is not repaired again");
         assert_eq!(
-            std::fs::read_to_string(&lane).unwrap().lines().count(),
+            std::fs::read_to_string(&lane)
+                .unwrap()
+                .lines()
+                .filter(|l| serde_json::from_str::<Value>(l).is_ok())
+                .count(),
             1,
-            "one ruling, one line"
+            "one ruling, one complete line"
         );
     }
 
