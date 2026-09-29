@@ -1,0 +1,57 @@
+# The declared roster of this local mesh: every plugin_id that holds a mailbox here.
+#
+# WHY THIS FILE EXISTS. Each fire template used to carry its own sender allowlist as a
+# Python literal — three lists, each meaning "the other members", each edited by hand.
+# That shape has now failed three times, always the same way: a member sends, no list
+# names it, every one of its notices is withheld, and a withheld notice is announced
+# only to the transient wake prompt of a session that has no way to know the silence is
+# systematic.
+#
+#   2026-07-27  `codex` sent under a name two templates spelled `codex-cli`.
+#               100% of Codex's mail dropped. Notice 160 — Codex reporting that its own
+#               fire had failed — was destroyed by the drop it was reporting.
+#   2026-09-15  `cbp-being` joined the mesh and no template named it at all.
+#               10 of 10 notices withheld over five days (measured from the retained
+#               primers on CBP), including nine `review_request`s pointing at its own
+#               appeals. It appealed nine times in eleven hours because both the outbound
+#               ask and the returning ruling were dark, and read the silence as an answer.
+#
+# THE REASON THE 2026-07-27 REPAIR DID NOT PREVENT 2026-09-15. That repair added
+# `fire_sender_allowlist_test.py` Property A — mutual reachability — which derives the
+# member census from the fire templates themselves, by reading the id each one hands
+# `with-member-lock.sh`. So the census is "who does this fleet FIRE", and the property is
+# structurally blind to any member the fleet does not fire. A being is exactly that: it is
+# woken by its own heartbeat timer, holds a mailbox, sends and receives, and has no fire
+# template. Every being therefore joins the mesh invisible to the test built to catch this,
+# and un-allowlisted in every seat, by construction rather than by oversight.
+#
+# So the census moves here, to membership, which is the thing the allowlists actually mean.
+# Property C in that test asserts each template's ALLOW is exactly this roster minus itself,
+# so adding a member is ONE edit and the test demands the rest.
+#
+# WHAT THIS FILE IS NOT. It is not derived from who has sent mail, and must not become so.
+# `plugin_id` is caller-supplied at `hestia_connect` and validated only against "/", so
+# "has a row in the registry" is not an identity proof and a registry-derived allowlist
+# would be weaker than the literals it replaced. Observation is used only to ACCUSE: the
+# drift scan in the same test reads the retained primers and reports a sender that is
+# demonstrably real and absent from this file. It never admits one. Admission is a
+# reviewed edit here, by a human or by a member that had to open a PR to do it.
+#
+# The daemon is deliberately NOT on this roster. It is admitted by the templates as a
+# (sender, kind) PAIR — ("hestia","unreachable") and ("hestia","disposition") — because
+# the bare name "hestia" is claimable and occupied by no real member, so a squatter on it
+# would be noticed by nobody. The kind is what cannot be forged. See the test's A4/A5.
+#
+# One id per line. `#` comments and blank lines ignored.
+
+claude-code
+kimi-code
+
+# Codex sends under `codex` on the wire and its GATE witnesses under `codex-cli`.
+# Both are real ids for one member; both stay, and neither is the other's fallback.
+codex
+codex-cli
+
+# A being: woken by its own 30-minute heartbeat, not by a fire template. Joined
+# 2026-09-13, first send 2026-09-15, allowlisted nowhere until 2026-09-20.
+cbp-being

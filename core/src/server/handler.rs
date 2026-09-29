@@ -816,6 +816,19 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
         );
     }
 
+    // A RETIRED id that connects is not refused (retiring the seat you are typing from must not
+    // lock you out) and is not hidden either: it is news. Witnessed here so the fact is on the
+    // record, and the agents view keeps the row visible while it is connected (cbp, PR #1100
+    // review, finding 5 -- this event was documented before it existed).
+    if let Some(r) = s.retired_members.get(&plugin_id).cloned() {
+        let _ = s.append_chain("retired_member_connected", serde_json::json!({
+            "plugin_id": plugin_id,
+            "retired_at": r.retired_at,
+            "retired_because": r.reason,
+            "note": "a retired id connected; it holds no standing authority, and the operator \
+                     should decide whether to reinstate it or find out what is running under it",
+        }));
+    }
     s.sessions.insert(session_id, session);
     // Fresh-connect success boundary: synthetic persistence/member setup has completed and
     // the session now exists. Recording before this point would let a refused connect claim
@@ -1983,6 +1996,22 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
 async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
     let name = require_string(args, "name")?;
     let value = require_string(args, "value")?;
+    // A member stores CREDENTIALS here; it never writes the daemon's own entries. This write
+    // is an upsert, so before this check any connected agent could replace the identity
+    // pubkey, the identity LCT id, a device key or the hub URL config. Measured 2026-09-25 on
+    // a sandbox daemon: all four accepted. `ai_identity_secret` was refused only because the
+    // law's credential-file rule matched the word "secret" in its name. The refusal lives here,
+    // with the one classifier, and does not rely on that coincidence.
+    if let Some(role) = crate::vault::system_entry_role(&name) {
+        return Ok(hestia_error_envelope(
+            "hestia.vault_name_reserved",
+            &format!(
+                "'{name}' is reserved for the daemon ({role}); a member cannot write it. \
+                 Store the credential under another name."
+            ),
+            Some(json!({ "name": name, "system": role })),
+        ));
+    }
     let scope: Vec<String> = args
         .get("scope")
         .and_then(Value::as_array)
@@ -2070,14 +2099,18 @@ async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
         .with_tags(tags)
         .with_consumers(allowed_consumers);
     let entry_id = entry.id;
+    // The write is an upsert, so the rollback below needs what was there before.
+    let prior = s.vault.get(&name).cloned();
 
     s.vault
         .upsert(entry)
         .map_err(|e| anyhow::anyhow!("vault write: {}", e))?;
 
     // Audit the mutation in the chain (the secret is never written; only the
-    // name), attributed to the writing WHO.
-    let _ = s.append_chain(
+    // name), attributed to the writing WHO. FAIL CLOSED, as the operator vault routes do
+    // (GPT review of #1123): a credential write must not stand without its record. On a failed
+    // append the prior entry is restored (or the new one removed), and the caller is told.
+    if let Err(e) = s.append_chain(
         "vault_set",
         json!({
             "name": name,
@@ -2087,7 +2120,23 @@ async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
             "session_id": who.session_uuid,
             "defaulted_consumers_to_creator": defaulted_consumers,
         }),
-    );
+    ) {
+        let rollback = match prior {
+            Some(p) => s.vault.upsert(p).map(|_| "the previous entry is restored"),
+            None => s.vault.remove(&name).map(|_| "the new entry is removed"),
+        };
+        return Ok(hestia_error_envelope(
+            "hestia.vault_set_unwitnessed",
+            &format!(
+                "the vault_set record could not be appended ({e}); rollback: {}",
+                match rollback {
+                    Ok(done) => format!("{done} — NOT stored"),
+                    Err(rb) => format!("FAILED ({rb}) — '{name}' IS STORED without its record"),
+                }
+            ),
+            Some(json!({ "name": name })),
+        ));
+    }
 
     Ok(json!({"stored": true, "entryId": entry_id, "boundToCreator": defaulted_consumers}))
 }
@@ -3185,7 +3234,12 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
     // one-liner it looks like — that resolver scans a window, and `APPEAL_CHAIN_WINDOW`
     // (20_000) had already scrolled past 07-26 by 08-01. See the test above for the
     // measurement and the shape of a real repair (a durable index rebuilt at load).
-    let appellant_lct = s.member_lct(&appellant.plugin_id);
+    //
+    // REPAIRED 2026-09-20 (agent-lifecycle PRD R6). `SharedState::same_entity` is LCT equality
+    // OR the alias records, read type-indexed with NO window -- the repair the paragraph above
+    // asked for, without a second copy of the chain to keep in step. The history is left
+    // standing because the lesson is the comment, not the fix: this filter was cited as entity
+    // resolution for six weeks by three call sites, and resolved nothing.
     let pool: Vec<String> = s
         .member_registry
         .iter_sorted()
@@ -3196,10 +3250,10 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
             // None for synthetic ids, and select_arbiter refuses unrecognised reasoners
             // separately — an unmappable candidate must not be silently dropped here as if
             // identity had been established.
-            match (&appellant_lct, s.member_lct(id)) {
-                (Some(a), Some(b)) => a != &b,
-                _ => true,
-            }
+            // `same_entity` since 2026-09-20: LCT equality OR the operator's alias records,
+            // read without a window -- so this now reaches the `codex`/`codex-cli` case the
+            // comment above spent six weeks explaining it could not.
+            !s.same_entity(&appellant.plugin_id, id)
         })
         .collect();
     // Reachability is resolved per candidate and fed to routing — an arbiter that cannot
@@ -3384,11 +3438,8 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
     // (it costs nothing and catches the whitespace variant clause 1 misses), but it supplies
     // no independence evidence beyond the string compare, and the `why` it renders below
     // should not be read as "two names resolved to one entity".
-    let same_entity = {
-        let a = s.member_lct(&arbiter.plugin_id);
-        let b = s.member_lct(appellant);
-        a.is_some() && a == b
-    };
+    // (Since 2026-09-20 it may be: `same_entity` reads the operator's alias records too.)
+    let same_entity = s.same_entity(&arbiter.plugin_id, appellant);
     let independence = match crate::arbiter::eligibility(&parties) {
         _ if same_entity => {
             return Ok(hestia_error_envelope(
@@ -3693,12 +3744,9 @@ async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
         // `why` it renders — "different plugin_ids, same entity" — can only ever fire on ids
         // that differ by whitespace. Measured 2026-08-06,
         // `state::tests::the_member_lct_alias_guard_reaches_only_whitespace`.
+        // Since 2026-09-20 `same_entity` also follows the alias records, windowless.
         let eligibility = caller.as_ref().map(|c| {
-            let same_entity = {
-                let a = s.member_lct(&c.plugin_id);
-                let b = s.member_lct(appellant);
-                a.is_some() && a == b
-            };
+            let same_entity = s.same_entity(&c.plugin_id, appellant);
             if same_entity {
                 return json!({
                     "you_may_rule": false,
@@ -4679,6 +4727,39 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             }
             None => {}
         }
+        // #1115: the addressee side of the binding. `binding_verified` proves the
+        // answerer owns the notice; it says nothing about where the answer GOES. A
+        // disposition addressed to anyone but the asker discharged the asker's debt
+        // while never reaching them — 14574 cleared codex's row from the dead name
+        // 'codex-cli' (2026-09-25, claude-code's repro). Disposition kinds only:
+        // reply/ack/review_done are the debt-clearing kinds; a bound forum-note FYI to
+        // a third party answers nothing and clears nothing, so it stays allowed.
+        // Aged-out notices keep the accepted-unverifiable posture (None arm).
+        if binding_verified
+            && crate::storage::inbox::is_disposition_kind(&kind)
+        {
+            if let Some(asker) = s
+                .inbox_store
+                .member_notice_sender(rid)
+                .map_err(|e| anyhow::anyhow!("resolving in_reply_to asker: {e}"))?
+            {
+                // EXACT, on the address as sent (routed `peer/member` included): the
+                // store and `member_unanswered` compare the routed form, so a bare-member
+                // test here let a reply to local `claude-code` go to `legion/claude-code`
+                // unrefused, reach another machine, and leave the debt standing.
+                if asker != to_plugin.as_str() {
+                    return Ok(hestia_error_envelope(
+                        "hestia.member_notify_reply_binding_misaddressed",
+                        &format!(
+                            "notice {rid} came from '{asker}' — a {kind} answers it only if \
+                             addressed back to '{asker}', not to '{to_plugin}'. A misaddressed \
+                             disposition would clear their debt without reaching them"
+                        ),
+                        Some(json!({"in_reply_to": rid, "correct_addressee": asker})),
+                    ));
+                }
+            }
+        }
     }
     // TRANSPORT BINDING (#1030), resolved for routed sends only, and BEFORE the limiter
     // records or anything is witnessed as sent. A member bound `direct_required` must sign
@@ -5559,6 +5640,299 @@ pub(crate) fn ensure_disposition(
             None
         }
     }
+}
+
+/// The asker's lane: `<home>/dispositions/<plugin>.jsonl`.
+///
+/// A disposition row in `member_notices` is durable and addressed, and it is PULLED -- by the
+/// seat watcher, every 60s, consume-once, into a fresh session that is not the asker, cannot
+/// claim, and whose poll would light the asker's fuse (#732). The asker's own live session
+/// reads no mailbox at all after its start. So the ruling existed, was recorded, was even
+/// queued, and the only channel that ever delivered it was a human typing "approved" into the
+/// session (`observed_at` doc; `gate_cli::poll` doc; measured again 2026-09-02, three grants,
+/// two dead at zero seconds).
+///
+/// A file is the delivery the mailbox cannot be: reading it costs no round trip on a daemon
+/// that serializes every member, consumes nothing, and cannot start a claim window. A
+/// bystander session of the same seat may read the whole lane and harm no one, which is why
+/// the address rides IN the line (`for_session`) rather than being enforced by who opens the
+/// file (PRD_DISPOSITION_DELIVERY R1/R6).
+///
+/// `for_session` is the asker's `host_session_id`, and what that is worth is worth stating
+/// exactly: it is a caller-supplied label, copied onto the escalation from a PROVEN session at
+/// open (`record_seat_keys`), never read from the arguments at claim time. So the session it
+/// names was proven; the string itself is a reuse key and never an authorisation discriminator
+/// (`state::Session`, guard B). It is being used here only to ROUTE a rendering, which is the
+/// weakest thing it could be used for, and nothing downstream may treat a match as authority.
+pub(crate) const DISPOSITION_LANE_DIR: &str = "dispositions";
+
+/// Text cap for member-supplied strings that ride to the asker's context window.
+const LANE_TEXT_CAP: usize = 400;
+
+fn lane_clip(v: Option<&String>) -> Option<String> {
+    v.map(|t| {
+        let t = t.trim();
+        if t.chars().count() <= LANE_TEXT_CAP {
+            t.to_string()
+        } else {
+            t.chars().take(LANE_TEXT_CAP).collect::<String>() + " [clipped]"
+        }
+    })
+    .filter(|t| !t.is_empty())
+}
+
+/// Put this ruling on the asker's lane, idempotently, keyed by the ruling hash.
+///
+/// Warn-and-continue at the ruling site, exactly like `ensure_disposition`: the decision has
+/// already committed to the chain, and a failed projection must never unmake a ruling. But it
+/// must not be warn-and-FORGET either (PRD #845 R2): the chain is the evidence and the lane is
+/// a projection of it, so a line that failed to land is re-derived by the projector on its next
+/// pass. That is why this checks for the ruling hash before appending -- the repair path and
+/// the ruling path call the same function, and calling it twice writes one line.
+///
+/// The repair window is the row's lifetime. Once an escalation is reaped there is no row to
+/// render from (#867: a later `open()` reaps, not only a restart), and nothing claimable is
+/// lost by that, because the claim horizon is far shorter than the reap window.
+///
+/// The `render` field is composed HERE, by the gate, and the seat prints it. What was decided,
+/// whether a grant still authorises anything, when it dies and what the asker may do next are
+/// all law; a shim that composed them would be a second legal system with a nicer font
+/// (GATE_ARCHITECTURE section 2, and the SHIM_LEDGER class for the reader is refusal-channel).
+pub(crate) fn ensure_disposition_lane(
+    s: &super::state::ServerState,
+    esc: &super::gate_escalation::Escalation,
+    pointer: &str,
+    ruling_hash: &str,
+    now: u64,
+) -> bool {
+    use std::io::Write;
+    // A lane line is a projection OF A COMMITTED RULING, keyed to that ruling's chain hash
+    // (PRD #845 R2). A caller that cannot name the hash has no ruling to project: writing
+    // `"ruling_hash": ""` would publish a line nobody can check against the chain, which is the
+    // exact inversion the lane exists to prevent (GPT review of f5baa33). Refuse, loudly.
+    if ruling_hash.trim().is_empty() {
+        tracing::warn!("disposition lane for {} NOT written: no committed ruling hash to project", esc.id);
+        return false;
+    }
+    let dir = s.home.join(DISPOSITION_LANE_DIR);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("disposition lane dir {dir:?} unavailable ({e}) - the asker will not be told");
+        return false;
+    }
+    let status = match serde_json::to_value(esc.stored_status()) {
+        Ok(Value::String(v)) => v,
+        _ => "unknown".to_string(),
+    };
+    let claimable = esc.is_claimable(now);
+    // NOT `claim_deadline`. The canonical, delivery-started deadline does not exist yet: it
+    // begins at a witnessed receipt, and receipt has no event (PRD R5/R8, the next slice).
+    // What this horizon IS today is `observed_at.or(decided_at) + window`, and #850 measured
+    // what `observed_at` is: store-only, absent from the chain, unreconstructible by an
+    // offline reader, reset to None on replay, and silently not set by the default CLI
+    // identity. Exporting that as `claim_deadline` would freeze a current implementation
+    // accident into a new outward artifact, which is the debt #845 exists to retire. So it
+    // ships named and versioned, and a reader looking for the canonical deadline finds no
+    // field to mistake for it (GPT review of #849).
+    let horizon = esc.pre_migration_horizon();
+    let utc = |t: u64| chrono::DateTime::from_timestamp(t as i64, 0).map(|d| d.to_rfc3339());
+    let horizon_utc = horizon.and_then(utc);
+    let act = lane_clip(esc.stated_detail.as_ref())
+        .or_else(|| lane_clip(esc.stated_reason.as_ref()))
+        .unwrap_or_else(|| format!("{} {}", esc.tool_name, esc.marker));
+    let by = esc.decided_by.as_deref().unwrap_or("an arbiter").to_string();
+    let why = lane_clip(esc.reason.as_ref())
+        .map(|r| format!(" ({r})"))
+        .unwrap_or_default();
+    let render = if claimable {
+        format!(
+            "{status} - escalation {id} ({act}). Decided by {by}{why}. This grant is UNSPENT and \
+authorises exactly the write it was opened for. Under TODAY'S policy it stops authorising at \
+{until}, a horizon anchored on the ruling rather than on your receipt of it (#845, #850). \
+RE-ISSUE THE SAME WRITE to claim it, single use. Match what you stated: the binding is a \
+digest over a BOUNDED SUMMARY of the act, not over its bytes (#539 measures the classes: a \
+220-character command prefix, a 140-character path tail, and a redaction keyed on length), so a \
+difference inside that summary claims nothing and a difference beyond it may still claim. \
+Anything else lets this lapse. Ruling {hash}.",
+            status = status.to_uppercase(),
+            id = esc.id,
+            until = horizon_utc
+                .clone()
+                .unwrap_or_else(|| "the horizon on record".to_string()),
+            hash = ruling_hash,
+        )
+    } else {
+        format!(
+            "{status} - escalation {id} ({act}). Decided by {by}{why}. Nothing is claimable: \
+{blocked}. Do not re-issue the write; if the rule itself is wrong, appeal it. Ruling {hash}.",
+            status = status.to_uppercase(),
+            id = esc.id,
+            blocked = if esc.consumed_at.is_some() {
+                "this grant was already spent".to_string()
+            } else if status == "approved" {
+                "the approval is past its horizon or short of its bar".to_string()
+            } else {
+                format!("the ruling is {status}")
+            },
+            hash = ruling_hash,
+        )
+    };
+    let row = json!({
+        "v": 1,
+        "written_at": now,
+        "escalation_id": esc.id,
+        "plugin_id": esc.plugin_id,
+        "for_session": esc.host_session_id,
+        "decision": status,
+        "decided_at": esc.decided_at,
+        "decided_by": esc.decided_by,
+        "decided_role": esc.decided_role,
+        "reason": lane_clip(esc.reason.as_ref()),
+        "ruling_hash": ruling_hash,
+        "pointer": pointer,
+        "claimable": claimable,
+        "consumed_at": esc.consumed_at,
+        // The canonical deadline is ABSENT, not null-by-accident: it is not derivable before a
+        // witnessed receipt exists. What is here is today's horizon, named as the projection
+        // it is, so no reader can mistake one for the other.
+        "pre_migration_horizon": horizon,
+        "pre_migration_horizon_utc": horizon_utc,
+        "pre_migration_horizon_basis": if esc.observed_at.is_some() { "observed_at" } else { "decided_at" },
+        "pre_migration_horizon_model":
+            "min(observed_at or decided_at, expires_at) + APPROVAL_CLAIM_WINDOW_SECS; observation is \
+store-only and resets on replay (#850). NOT the canonical delivery-started deadline (#845 R5).",
+        "expires_at": esc.expires_at,
+        "expires_at_utc": utc(esc.expires_at),
+        "act_digest": esc.act_digest,
+        "attempted": lane_clip(esc.stated_detail.as_ref()),
+        "render": render,
+    });
+    let path = dir.join(format!("{}.jsonl", esc.plugin_id));
+    // Idempotent by ESCALATION, not by ruling hash. The ruling site knows the chain entry's
+    // hash; the repair pass has only the row, and #867 says the row may be gone before the
+    // chain page is walked. Keying on the escalation id lets both callers converge on one
+    // line, and a ruling delivered twice is a ruling the asker cannot trust.
+    //
+    // Duplicates are detected on PARSED, COMPLETE rows (GPT review of f5baa33). The first cut
+    // matched `"escalation_id":"<id>"` as a SUBSTRING of raw lines, so a truncated tail -- a
+    // write that died halfway, which is precisely what repair exists for -- still contained the
+    // id and blocked its own repair forever. A row counts only if it parses as an object and
+    // carries this escalation's id, a non-empty ruling hash, a decision and a render.
+    let mut partial_tail = false;
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        partial_tail = !existing.is_empty() && !existing.ends_with('\n');
+        let complete = |l: &str| -> bool {
+            let Ok(v) = serde_json::from_str::<Value>(l) else { return false };
+            v.get("escalation_id").and_then(Value::as_str) == Some(esc.id.as_str())
+                && v.get("ruling_hash").and_then(Value::as_str).is_some_and(|h| !h.is_empty())
+                && v.get("decision").and_then(Value::as_str).is_some()
+                && v.get("render").and_then(Value::as_str).is_some()
+        };
+        if existing.lines().any(complete) {
+            return false;
+        }
+    }
+    let line = match serde_json::to_string(&row) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("disposition lane line for {} not serialisable ({e})", esc.id);
+            return false;
+        }
+    };
+    // A torn tail (no final newline) must not swallow the repaired row: start it on its own line.
+    let lead = if partial_tail { "\n" } else { "" };
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut f) => match write!(f, "{lead}{line}\n") {
+            Ok(()) => return true,
+            Err(e) => tracing::warn!("disposition lane {path:?} not written ({e})"),
+        },
+        Err(e) => tracing::warn!("disposition lane {path:?} not open ({e})"),
+    }
+    false
+}
+
+/// Re-derive any lane line a ruling site failed to write. THE REPAIR, not prose about one.
+///
+/// PRD #845 R2 stopped promising that the chain entry and the lane line commit together,
+/// because they are different stores and that promise would be a lie the first time a
+/// filesystem write failed after a committed ruling. What replaces atomicity is this: the
+/// ruling is on the chain, the lane is a projection of it, and a projection that did not land
+/// is rewritten on the next pass. `ensure_disposition_lane` is idempotent by escalation, so
+/// the ruling site and this pass converge on one line and calling both writes once.
+///
+/// Bounded by reaping, deliberately and visibly: a row the store no longer holds cannot be
+/// repaired from here. That costs nothing claimable, because the claim horizon is far shorter
+/// than the reap window, and a caller that needs the ruling after reap has the chain.
+/// The disposition worker's state-side pass, named so a test can hold it.
+///
+/// The worker body is a `tokio::spawn` loop that no test drives, so anything written only
+/// inside it is verified by reading rather than by running. That is how the first cut of this
+/// PR shipped a repair the diff did not contain: the arm exercised the repair FUNCTION and
+/// stayed green with the call site deleted. Both effects of a pass now live behind one name,
+/// and the untested remainder is a single call in the loop rather than the logic itself.
+///
+/// Returns (lapses recorded, lane projections repaired).
+pub(crate) fn disposition_worker_pass(
+    s: &mut super::state::ServerState,
+    now: u64,
+) -> (usize, usize) {
+    let lapsed = record_newly_lapsed(s, now);
+    let repaired = repair_disposition_lanes(s, now);
+    (lapsed, repaired)
+}
+
+/// How far back the repair pass looks for the ruling entries it re-projects. The live store is
+/// bounded by reaping, so this only has to reach as far as the oldest row still held.
+pub(crate) const LANE_REPAIR_SCAN: u64 = 5_000;
+
+pub(crate) fn repair_disposition_lanes(s: &super::state::ServerState, now: u64) -> usize {
+    // THE COMMITTED RULING, not an empty placeholder (GPT review of f5baa33). The first cut
+    // repaired with `ruling_hash: ""`, so the repaired line pointed at no chain entry and a
+    // reader could not tell a projection from an invention. Each ruling's own chain entry --
+    // `gate_escalation_decided` or `gate_escalation_withdrawn`, newest first -- supplies its
+    // hash and its pointer kind; a decided row with NO ruling entry in reach is reported and
+    // left alone, because the lane may only project what the chain holds.
+    let rulings = match s.chain_store.read_recent_by_types(
+        None,
+        &["gate_escalation_decided", "gate_escalation_withdrawn"],
+        LANE_REPAIR_SCAN,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("disposition lane repair: ruling entries unreadable ({e}); nothing repaired this pass");
+            return 0;
+        }
+    };
+    let mut ruling_of: std::collections::HashMap<String, (String, String)> = Default::default();
+    for entry in &rulings {
+        if let Some(id) = entry.event_data.get("escalation_id").and_then(Value::as_str) {
+            let kind = if entry.event_type == "gate_escalation_withdrawn" { "withdrawn" } else { "decided" };
+            ruling_of
+                .entry(id.to_string())
+                .or_insert_with(|| (entry.hash.clone(), format!("hestia://escalation/{id}#{kind}")));
+        }
+    }
+    let ids: Vec<String> = s
+        .gate_escalations
+        .rows()
+        .filter(|e| e.decided_at.is_some())
+        .map(|e| e.id.clone())
+        .collect();
+    let mut wrote = 0usize;
+    for id in ids {
+        let Some((hash, pointer)) = ruling_of.get(&id) else {
+            tracing::warn!("disposition lane repair: {id} is decided but no ruling entry is in reach; not projected");
+            continue;
+        };
+        if let Some(esc) = s.gate_escalations.get(&id) {
+            if ensure_disposition_lane(s, esc, pointer, hash, now) {
+                wrote += 1;
+            }
+        }
+    }
+    if wrote > 0 {
+        tracing::info!(repaired = wrote, "disposition lanes: rulings whose projection had not landed");
+    }
+    wrote
 }
 
 /// One projector pass's page bound (#480 revised review, item 4a): at most this
@@ -8133,6 +8507,86 @@ mod accountability_tests {
         assert!(!err.contains("s3cret"));
     }
 
+    /// A member's vault_set must not stand without its chain record. With the append failing,
+    /// an overwrite is rolled back to the previous value, and a new name is not stored.
+    #[tokio::test]
+    async fn vault_set_whose_witness_fails_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        state.lock().await.vault.upsert(crate::vault::VaultEntry::new("github-pat", "OLD")).unwrap();
+        let m = tool_connect(
+            &state,
+            &json!({"plugin_id":"claude-code","host_agent":"t","role":"role:constellation:member"}),
+        )
+        .await
+        .unwrap();
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_vault_set BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'vault_set'
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;").unwrap();
+        for (name, value) in [("github-pat", "NEW"), ("brand-new", "V")] {
+            let r = tool_vault_set(
+                &state,
+                &json!({"name": name, "value": value, "session_id": m["sessionId"]}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(r["_hestia_error"]["code"], "hestia.vault_set_unwitnessed", "{name}: {r}");
+        }
+        conn.execute_batch("DROP TRIGGER fail_vault_set").unwrap();
+        let s = state.lock().await;
+        assert_eq!(s.vault.get("github-pat").unwrap().secret, "OLD", "overwrite rolled back");
+        assert!(s.vault.get("brand-new").is_none(), "new name not stored");
+    }
+
+    /// A member cannot write the daemon's own entries through hestia_vault_set. The write is an
+    /// upsert, and measured on a sandbox daemon 2026-09-25 it accepted ai_identity_pubkey,
+    /// ai_identity_lct_id, hub_urls and a device key from a plain member session. Each is now
+    /// refused before the law runs, the stored value is untouched, and an ordinary credential
+    /// still writes.
+    #[tokio::test]
+    async fn vault_set_refuses_daemon_owned_names() {
+        let (_dir, state) = test_state().await;
+        {
+            let mut s = state.lock().await;
+            s.vault
+                .upsert(crate::vault::VaultEntry::new("ai_identity_pubkey", "ORIGINAL"))
+                .unwrap();
+        }
+        let m = tool_connect(
+            &state,
+            &json!({"plugin_id":"claude-code","host_agent":"t","role":"role:constellation:member"}),
+        )
+        .await
+        .unwrap();
+        for name in [
+            "ai_identity_secret", "ai_identity_pubkey", "ai_identity_lct_id", "hub_urls",
+            "constellation_device_key:00000000-0000-0000-0000-000000000001",
+        ] {
+            let r = tool_vault_set(
+                &state,
+                &json!({"name": name, "value": "EVIL", "session_id": m["sessionId"]}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(r["_hestia_error"]["code"], "hestia.vault_name_reserved", "{name}: {r}");
+        }
+        {
+            let s = state.lock().await;
+            assert_eq!(s.vault.get("ai_identity_pubkey").unwrap().secret, "ORIGINAL");
+            assert!(s.vault.get("hub_urls").is_none(), "a refused name must not be created");
+        }
+        let ok = tool_vault_set(
+            &state,
+            &json!({"name":"ordinary-cred","value":"v","session_id": m["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok["stored"], true, "{ok}");
+    }
+
     /// Regression pin for GPT 3rd-pass HST-002: credential WRITES hit the same
     /// daemon-side law as reads. An overlaid unattended role is refused before
     /// the vault is touched, the deny is witnessed with WHO, and nothing lands
@@ -10273,6 +10727,108 @@ mod member_mesh_tests {
         .await
         .unwrap();
         assert_eq!(post["owed_to_me"].as_array().unwrap().len(), 0, "{post}");
+    }
+
+    /// #1115: binding checks the answerer AND the addressee. A disposition bound
+    /// to your own mail but addressed to the wrong member is refused with the
+    /// right addressee named — otherwise the asker's debt clears while the answer
+    /// never reaches them (the live repro: 14574 cleared codex's row from the
+    /// dead name `codex-cli`).
+    #[tokio::test]
+    async fn a_disposition_misaddressed_is_refused_naming_the_asker() {
+        let (_dir, state) = test_state().await;
+        let claude = connect(&state, "claude-code").await;
+        let kimi = connect(&state, "kimi-code").await;
+
+        let sent = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": "pr/1", "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        let nid = sent["queued_id"].as_u64().unwrap();
+
+        // kimi-code answers — but addresses it to codex-cli, not claude-code.
+        let misaddressed = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "codex-cli", "kind": "reply",
+                    "pointer_uri": "forum/v.md", "session_id": kimi, "in_reply_to": nid}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            misaddressed["_hestia_error"]["code"],
+            json!("hestia.member_notify_reply_binding_misaddressed"),
+            "{misaddressed}"
+        );
+        assert_eq!(
+            misaddressed["_hestia_error"]["data"]["correct_addressee"],
+            json!("claude-code"),
+            "the refusal names who the answer belongs to: {misaddressed}"
+        );
+        // The debt stands: nothing reached the asker.
+        let mid = tool_member_unanswered(
+            &state,
+            &json!({"session_id": claude, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mid["owed_to_me"].as_array().unwrap().len(), 1, "{mid}");
+
+        // Addressed back to the asker, the same answer lands and clears.
+        let fixed = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "claude-code", "kind": "reply",
+                    "pointer_uri": "forum/v.md", "session_id": kimi, "in_reply_to": nid}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fixed["binding_verified"], json!(true), "{fixed}");
+        let post = tool_member_unanswered(
+            &state,
+            &json!({"session_id": claude, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(post["owed_to_me"].as_array().unwrap().len(), 0, "{post}");
+    }
+
+    /// #1126 review: the addressee comparison is EXACT on the routed form. A reply to a
+    /// LOCAL asker addressed to the same member name on another machine
+    /// (`legion/claude-code`) is refused naming the local asker — under a bare-member
+    /// comparison it was accepted, forwarded to the wrong machine, and (because
+    /// `member_unanswered` compares the routed form) left the debt standing unexplained.
+    #[tokio::test]
+    async fn a_disposition_to_the_same_name_on_another_machine_is_refused() {
+        let (_dir, state) = test_state().await;
+        let claude = connect(&state, "claude-code").await;
+        let kimi = connect(&state, "kimi-code").await;
+        let sent = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": "pr/2", "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        let nid = sent["queued_id"].as_u64().unwrap();
+        let routed = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "legion/claude-code", "kind": "reply",
+                    "pointer_uri": "forum/v.md", "session_id": kimi, "in_reply_to": nid}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            routed["_hestia_error"]["code"],
+            json!("hestia.member_notify_reply_binding_misaddressed"),
+            "{routed}"
+        );
+        assert_eq!(routed["_hestia_error"]["data"]["correct_addressee"], json!("claude-code"), "{routed}");
+        let mid = tool_member_unanswered(&state, &json!({"session_id": claude, "older_than_secs": 0}))
+            .await
+            .unwrap();
+        assert_eq!(mid["owed_to_me"].as_array().unwrap().len(), 1, "the debt stands: {mid}");
     }
 
     /// A disposition sent with no binding is nudged, never blocked — silencing
@@ -15565,6 +16121,324 @@ mod tests {
         );
     }
 
+    /// PRD_DISPOSITION_DELIVERY R1/R2/R3: the ruling reaches the ASKER, at decide time, on a
+    /// lane addressed to the asker's own live session, carrying an ABSOLUTE deadline and the
+    /// one sentence saying what may be done.
+    ///
+    /// The mechanism this replaces was a human. Measured 2026-09-02 on this seat: three
+    /// approvals, every delivery that worked was dp typing "approved" into the session, two
+    /// grants dead at zero seconds remaining. The daemon knew all three the moment it ruled.
+    ///
+    /// Drives the REAL path (`tool_gate_arbitrate_escalation`), not the lane writer directly:
+    /// a test that called the writer would pass with both call sites deleted.
+    #[tokio::test]
+    async fn the_ruling_reaches_the_askers_live_session_at_decide_time() {
+        let (dir, shared) = make_shared_state();
+        let asker = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "host_agent": "h",
+                "host_session_id": "sess-asker-42",
+            }),
+        )
+        .await
+        .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let peer = tool_connect(&shared, &json!({ "plugin_id": "codex", "host_agent": "h" }))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": asker,
+                "tool_name": "Edit",
+                "marker": "hestia_gate_core.py",
+                "act": "Edit -> hestia_gate_core.py",
+                "detail": "add HESTIA_WORKSPACE to the gate hook line",
+            }),
+        )
+        .await
+        .unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap().to_string();
+
+        let lane = dir
+            .path()
+            .join(super::DISPOSITION_LANE_DIR)
+            .join("claude-code.jsonl");
+        assert!(!lane.exists(), "no ruling yet, so nothing to deliver");
+
+        let decided = tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "approve": true,
+                "reason": "the asker must learn this without a human relaying it",
+                "session_id": peer,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(decided["status"], "approved", "{decided}");
+
+        let body = std::fs::read_to_string(&lane)
+            .expect("the ruling must reach the asker's lane, not only the mailbox");
+        let row: Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            row["for_session"], "sess-asker-42",
+            "addressed to the ASKER's own session, so a co-seat session knows it is not theirs: {row}"
+        );
+        assert_eq!(row["decision"], "approved", "{row}");
+        assert_eq!(row["escalation_id"], esc_id, "{row}");
+        // The canonical delivery-started deadline is NOT exported, because it does not exist
+        // until a witnessed receipt does (#845 R5, GPT review of #849). A reader must find no
+        // field it could mistake for one; today's horizon ships named as the projection it is.
+        assert!(
+            row.get("claim_deadline").is_none() && row.get("claim_deadline_utc").is_none(),
+            "no field may impersonate the canonical deadline: {row}"
+        );
+        let horizon = row["pre_migration_horizon"]
+            .as_u64()
+            .expect("today's horizon, absolute, because a countdown decays in flight");
+        let decided_at = row["decided_at"].as_u64().unwrap();
+        assert_eq!(
+            horizon,
+            decided_at + crate::server::gate_escalation::APPROVAL_CLAIM_WINDOW_SECS,
+            "the horizon is the one the gate itself enforces today: {row}"
+        );
+        assert_eq!(
+            row["pre_migration_horizon_basis"], "decided_at",
+            "and it names what it is anchored on, since observation is store-only (#850): {row}"
+        );
+        assert!(
+            row["pre_migration_horizon_utc"].as_str().unwrap().starts_with("20")
+                && row["expires_at_utc"].as_str().unwrap().starts_with("20"),
+            "both instants are legible to whoever reads them: {row}"
+        );
+
+        let render = row["render"].as_str().unwrap();
+        assert!(
+            render.contains(&esc_id) && render.to_lowercase().contains("re-issue"),
+            "the render tells the asker what it may do, composed by the GATE: {render}"
+        );
+        // What the binding IS, stated as narrowly as it is true. `act_digest_of` hashes a
+        // summary the seat already normalised, and that normalisation is lossy in three
+        // measured ways (#539: a 220-char command prefix, a 140-char path tail, a redaction
+        // keyed on length). A render promising "byte-identical, because the digest covers the
+        // whole command" would be false in the direction that costs an asker its grant.
+        assert!(
+            render.contains("BOUNDED SUMMARY") && render.contains("#539"),
+            "the render says what the binding covers, and cites what measured it: {render}"
+        );
+        assert!(
+            !render.to_lowercase().contains("whole command"),
+            "and never promises binding over the whole command: {render}"
+        );
+        assert!(
+            render.contains("add HESTIA_WORKSPACE to the gate hook line"),
+            "and which act it authorises: {render}"
+        );
+        assert_eq!(
+            row["claimable"], true,
+            "a single-approver bar is MET by one peer, so this grant is live: {row}"
+        );
+        assert!(
+            !render.to_lowercase().contains("do not re-issue"),
+            "and a live grant must never be rendered as a spent one: {render}"
+        );
+    }
+
+    /// A ruling whose lane projection did not land is rewritten by the repair pass.
+    ///
+    /// This arm exists because the review of #849 caught the PR describing a repair that the
+    /// diff did not contain: the ruling sites wrote the lane, nothing re-derived it, and the
+    /// prose said the projector would. Deleting the lane after a real ruling is the closest
+    /// honest model of a filesystem write that failed after the chain entry committed.
+    #[tokio::test]
+    async fn a_ruling_whose_lane_write_failed_is_repaired() {
+        let (dir, shared) = make_shared_state();
+        let asker = tool_connect(
+            &shared,
+            &json!({"plugin_id": "claude-code", "host_agent": "h", "host_session_id": "sess-repair-1"}),
+        )
+        .await
+        .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let peer = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h"}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": asker,
+                "tool_name": "Edit",
+                "marker": "hestia_gate_core.py",
+                "act": "Edit -> hestia_gate_core.py",
+            }),
+        )
+        .await
+        .unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap().to_string();
+        tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "approve": true,
+                "reason": "ruled, and then the projection is lost",
+                "session_id": peer,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let lane = dir
+            .path()
+            .join(super::DISPOSITION_LANE_DIR)
+            .join("claude-code.jsonl");
+        assert!(lane.is_file(), "the ruling site wrote it");
+        let original: Value =
+            serde_json::from_str(std::fs::read_to_string(&lane).unwrap().lines().next().unwrap()).unwrap();
+        let ruled_hash = original["ruling_hash"].as_str().unwrap().to_string();
+        assert!(!ruled_hash.is_empty(), "the ruling site projects its own chain hash");
+        std::fs::remove_file(&lane).unwrap();
+
+        // THE WORKER'S PASS, not the repair function alone. Calling the function directly
+        // would leave this arm green with the worker's call site deleted, which is exactly how
+        // the previous cut shipped a repair that existed only in prose.
+        let now = crate::server::gate_escalation::now_secs();
+        let repaired = {
+            let mut s = shared.lock().await;
+            super::disposition_worker_pass(&mut s, now).1
+        };
+        assert!(repaired >= 1, "the lost projection is rewritten, not forgotten");
+        let body = std::fs::read_to_string(&lane).expect("the lane is back");
+        let row: Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(row["escalation_id"], esc_id, "and it is the same ruling: {row}");
+        assert_eq!(row["for_session"], "sess-repair-1", "still addressed to the asker: {row}");
+        assert_eq!(
+            row["ruling_hash"], ruled_hash,
+            "the repaired line names the COMMITTED ruling, not an empty placeholder (GPT, f5baa33): {row}"
+        );
+
+        // A TORN TAIL must not block its own repair (GPT, f5baa33): half of the line, containing
+        // the escalation id, with no newline -- the shape a write that died midway leaves.
+        let full = std::fs::read_to_string(&lane).unwrap();
+        let torn = &full[..full.len() / 2];
+        assert!(torn.contains(&esc_id), "precondition: the torn half still names the escalation");
+        std::fs::write(&lane, torn).unwrap();
+        let rewrote = {
+            let mut s = shared.lock().await;
+            super::disposition_worker_pass(&mut s, now).1
+        };
+        assert_eq!(rewrote, 1, "a torn row is not a delivered ruling; the repair writes a whole one");
+        let body = std::fs::read_to_string(&lane).unwrap();
+        let rows: Vec<Value> = body.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        assert_eq!(rows.len(), 1, "exactly one COMPLETE row now, on its own line: {body}");
+        assert_eq!(rows[0]["ruling_hash"], ruled_hash);
+
+        // Idempotent: a second pass must not deliver the same ruling twice.
+        let again = {
+            let mut s = shared.lock().await;
+            super::disposition_worker_pass(&mut s, now).1
+        };
+        assert_eq!(again, 0, "a repaired lane is not repaired again");
+        assert_eq!(
+            std::fs::read_to_string(&lane)
+                .unwrap()
+                .lines()
+                .filter(|l| serde_json::from_str::<Value>(l).is_ok())
+                .count(),
+            1,
+            "one ruling, one complete line"
+        );
+    }
+
+    /// The other half of the same mechanism: a ruling that does NOT authorise anything must not
+    /// read like one that does.
+    ///
+    /// `pre_tool_use.py` draws `Bar::SovereignPlusPeer` (`bar_for`), which one peer does not meet
+    /// — approved, recorded, and claimable by nobody. The first cut of the arm above asserted the
+    /// claimable wording inside `if row["claimable"]`, opened exactly this marker, and therefore
+    /// never ran the branch it existed to check. The bar is the variable, so it is the axis.
+    #[tokio::test]
+    async fn a_ruling_short_of_its_bar_is_not_rendered_as_a_grant() {
+        let (dir, shared) = make_shared_state();
+        let asker = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "host_agent": "h",
+                "host_session_id": "sess-asker-77",
+            }),
+        )
+        .await
+        .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let peer = tool_connect(&shared, &json!({ "plugin_id": "codex", "host_agent": "h" }))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "session_id": asker,
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "act": "Edit -> pre_tool_use.py",
+            }),
+        )
+        .await
+        .unwrap();
+        tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({
+                "escalation_id": opened["escalation_id"].as_str().unwrap(),
+                "approve": true,
+                "reason": "one peer, on a two-factor marker",
+                "session_id": peer,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let body = std::fs::read_to_string(
+            dir.path()
+                .join(super::DISPOSITION_LANE_DIR)
+                .join("claude-code.jsonl"),
+        )
+        .expect("a ruling short of its bar is still a ruling, and still reaches the asker");
+        let row: Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(row["decision"], "approved", "{row}");
+        assert_eq!(
+            row["claimable"], false,
+            "approved is not the same fact as claimable: {row}"
+        );
+        let render = row["render"].as_str().unwrap();
+        assert!(
+            render.to_lowercase().contains("do not re-issue")
+                && !render.contains("RE-ISSUE THE SAME WRITE"),
+            "the asker must not be told to spend a grant that authorises nothing: {render}"
+        );
+    }
+
     /// Two members with live sessions and one escalation opened by the first — the fixture
     /// every corroborate-stance test below starts from. Returns (state, escalation_id,
     /// corroborator's session_id).
@@ -15634,6 +16508,49 @@ mod tests {
             peer["argument"], "entire act redacted; evidence insufficient to review",
             "the argument must land on the factor record, not be silently discarded: {peer}"
         );
+    }
+
+    /// #1058: the corroborate row names the corroborator's WAKE, not only its seat. The
+    /// door refuses without a proven live session, so the key is in hand at write time; before
+    /// this the row dropped it, and tying a factor to the transcript that produced it meant a
+    /// seat-and-clock join (kimi-code re-located 30 filing sessions by hand for one order
+    /// audit, 2026-09-24). Control: a session connected with no wake key records null, never
+    /// a borrowed one.
+    #[tokio::test]
+    async fn the_corroborate_row_names_the_corroborators_wake() {
+        async fn corroborated_row(host_session_id: Option<&str>) -> Value {
+            let (dir, shared) = make_shared_state();
+            let asker = tool_connect(&shared, &json!({"plugin_id": "claude-code", "host_agent": "h",
+                                                      "host_session_id": "asker-wake"}))
+                .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+            let mut peer_args = json!({"plugin_id": "codex", "host_agent": "h"});
+            if let Some(h) = host_session_id {
+                peer_args["host_session_id"] = json!(h);
+            }
+            let peer = tool_connect(&shared, &peer_args)
+                .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+            let opened = tool_gate_escalation_open(&shared, &json!({
+                "plugin_id": "claude-code", "session_id": asker, "tool_name": "Bash",
+                "marker": "witness.py", "act": "Bash -> witness.py",
+            })).await.unwrap();
+            tool_gate_escalation_corroborate(&shared, &json!({
+                "escalation_id": opened["escalation_id"], "session_id": peer,
+                "stance": "concur", "argument": "checked",
+            })).await.unwrap();
+            let s = shared.lock().await;
+            let row = s.chain_store.read_recent(60).unwrap().into_iter()
+                .find(|e| e.event_type == "gate_escalation_corroborated")
+                .expect("the factor is witnessed").event_data;
+            drop(dir);
+            row
+        }
+
+        let row = corroborated_row(Some("peer-wake-7")).await;
+        assert_eq!(row["corroborator_host_session_id"], "peer-wake-7",
+                   "the corroborator's proven wake must be on its own row: {row}");
+        let row = corroborated_row(None).await;
+        assert!(row["corroborator_host_session_id"].is_null(),
+                "no wake key means null — never the asker's or a guess: {row}");
     }
 
     /// Refuse-don't-default, the missing-input arm. The silent path — a call that names no
@@ -19293,7 +20210,6 @@ fn resolve_invitation(
         // Kept because it fails CLOSED — an unmappable candidate is invited rather than
         // dropped — but this receipt must not be read as evidence that entity resolution
         // happened. An invitation is cheap to over-issue and expensive to under-issue.
-        let asker_lct = s.member_lct(&esc.plugin_id);
         // Liveness is read from the member's own ACTS, never from its mailbox: a watcher
         // queues notices under a member's id whether or not the member ever woke, so a
         // mailbox signal would let the doorbell certify the member. Same window as the appeal
@@ -19319,9 +20235,8 @@ fn resolve_invitation(
             .into_iter()
             .map(|(id, _)| id.clone())
             .filter(|id| id != &esc.plugin_id)
-            .filter(|id| match (&asker_lct, s.member_lct(id)) {
-                (Some(a), Some(b)) => a != &b,
-                _ => true,
+            .filter(|id| {
+                !s.same_entity(&esc.plugin_id, id)
             })
             .filter(|id| match review_capability(s, id) {
                 Ok(basis) => {
@@ -21104,9 +22019,41 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
         })
         .collect();
 
+    // THE OTHER QUEUE A RESTART DROPS. Scope requests (hestia_request_scope) are a separate,
+    // memory-only table from gate escalations, and a daemon restart loses every pending one
+    // (measured on Sprout 2026-09-22). Until now the only all-members view of them was the
+    // operator dashboard, so a seat about to restart the daemon for maintenance (SAGE #180,
+    // delegation renewal needs the vault writer lease) could not CHECK "nothing pending" — it
+    // could only guess an hour. Served here, beside the escalations, on the surface every seat
+    // already reaches, so the precondition is machine-checked, not scheduled around.
+    let pending_scope: Vec<Value> = {
+        let mut v: Vec<&crate::server::state::ScopeRequest> = s
+            .scope_requests
+            .values()
+            .filter(|r| r.status(now) == "pending")
+            .collect();
+        v.sort_by_key(|r| r.requested_at);
+        v.into_iter()
+            .map(|r| {
+                json!({
+                    "request_id": r.id,
+                    // Caller-asserted (HST-005), as the dashboard labels it.
+                    "claimed_by": r.plugin_id,
+                    "path": r.path,
+                    "reason": r.reason,
+                    "requested_at": r.requested_at,
+                    "expires_at": r.expires_at,
+                    "secs_remaining": r.expires_at.saturating_sub(now),
+                })
+            })
+            .collect()
+    };
+
     Ok(json!({
         "pending": items,
         "count": items.len(),
+        "pending_scope_requests": pending_scope,
+        "pending_scope_count": pending_scope.len(),
         "you": caller.as_ref().map(|c| json!({"plugin_id": c.plugin_id, "role": c.role_lct})),
         "caveat": if caller.is_none() {
             "UNATTRIBUTED caller — pass your session_id from hestia_connect and each entry will \
@@ -21361,6 +22308,9 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
                 &pointer,
                 &entry.hash,
             );
+            // ...and the same ruling on the lane the asker's LIVE session reads, because a
+            // queued notice reaches the next wake and the asker is here now (PRD R2).
+            let _ = ensure_disposition_lane(&s, &decided, &pointer, &entry.hash, now);
             // The bar and whether this decision met it go to the DECIDER, not only to the
             // chain. They were recorded above and withheld here, and the asymmetry had a
             // measured cost: across the whole chain, 66 `sovereign_plus_peer` escalations
@@ -21522,6 +22472,22 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
     // dp's invitation-semantics ruling a dissent is evidence surfaced for review, never a
     // veto: it lands here as a factor, shows on the pending view and dashboard, and the
     // sovereign decides over the whole set.
+    // The corroborator's wake, from the session this door just PROVED (#1058). Without it a
+    // factor can only be tied to the transcript that produced it by seat and clock, and an
+    // audit of "was the peer's factor displayed before this one's work?" has to re-locate
+    // every filing session by hand — a wrong location silently inverts the verdict. The
+    // opened and ruling rows already carry the asker's (#542, #1061); this is the same
+    // lookup for the other party, with ONE deliberate difference: a blank or whitespace-only
+    // key records null here, where the #542 and claim sites record it verbatim. `connect`
+    // stores the key untrimmed, and a blank string names no transcript — writing it would
+    // make an audit field look populated while pointing nowhere. The older sites are left
+    // as they are so their existing rows keep one meaning on replay.
+    let corroborator_host_session_id = arb
+        .session_uuid
+        .and_then(|u| s.sessions.get(&u))
+        .and_then(|sess| sess.host_session_id.clone())
+        .filter(|v| !v.trim().is_empty());
+
     match s.gate_escalations.corroborate(
         &escalation_id,
         &arb.plugin_id,
@@ -21540,6 +22506,7 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                     "plugin_id": updated.plugin_id,
                     "corroborated_by": arb.plugin_id,
                     "corroborated_role": arb.role_lct,
+                    "corroborator_host_session_id": corroborator_host_session_id,
                     "independence": independence,
                     // The peer's stance and argument, first-class on the event — a chain
                     // reader must never have to dig the only dissent out of a factor list
@@ -22181,6 +23148,47 @@ mod standing_scope_surface_tests {
             s.standing_scope.generation, 2,
             "grant + revoke: the persisted generation carries both mutations"
         );
+    }
+
+    /// (SAGE #180, GPT review) A seat about to restart the daemon must be able to CHECK that
+    /// no member's scope request is pending — the restart drops them all. Both directions:
+    /// a pending request from ANY member (not the seat's own being) is listed with its id
+    /// and claimant; decided and lapsed ones are not; and the count is zero when the table is
+    /// empty, so a script can refuse on `pending_scope_count != 0` and proceed on `== 0`.
+    #[tokio::test]
+    async fn pending_escalations_also_serve_every_members_pending_scope_requests() {
+        let (_d, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        let out = tool_gate_pending_escalations(&state, &json!({})).await.unwrap();
+        assert_eq!(out["pending_scope_count"], 0, "empty table reads as zero, not absent: {out}");
+        assert!(out["pending_scope_requests"].as_array().unwrap().is_empty());
+        {
+            let mut s = state.lock().await;
+            let mut pending = live_request("cbp-being", "/w/cbp/notes/x.md", now);
+            pending.id = "scope-pending-1".into();
+            pending.granted = None;
+            pending.decided_by = None;
+            pending.decided_at = None;
+            s.scope_requests.insert(pending.id.clone(), pending);
+            let mut decided = live_request("sprout-being", "/w/sprout/journal.md", now);
+            decided.id = "scope-decided-1".into();
+            s.scope_requests.insert(decided.id.clone(), decided);
+            let mut lapsed = live_request("legion-being", "/w/legion/todo.md", now - 7200);
+            lapsed.id = "scope-lapsed-1".into();
+            lapsed.granted = None;
+            lapsed.decided_by = None;
+            lapsed.decided_at = None;
+            lapsed.expires_at = now - 3600;
+            s.scope_requests.insert(lapsed.id.clone(), lapsed);
+        }
+        let out = tool_gate_pending_escalations(&state, &json!({})).await.unwrap();
+        assert_eq!(out["pending_scope_count"], 1, "{out}");
+        let row = &out["pending_scope_requests"][0];
+        assert_eq!(row["request_id"], "scope-pending-1");
+        assert_eq!(row["claimed_by"], "cbp-being", "another member's ask is visible to the seat");
+        assert_eq!(row["path"], "/w/cbp/notes/x.md");
+        assert!(row["secs_remaining"].as_u64().unwrap() > 0);
+        assert_eq!(out["count"], 0, "the escalation queue itself is untouched by this");
     }
 
     /// (GPT #431 blocker 3) `snapshot_expires_at` never outlives a grant the snapshot

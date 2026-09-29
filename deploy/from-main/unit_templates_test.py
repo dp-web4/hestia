@@ -101,7 +101,7 @@ def main() -> int:
     units = {
         "daemon": {
             "systemd template": service_keys(DEPLOY / "templates" / "hestia.service"),
-            "launchd template": plist_keys(DEPLOY / "templates" / "io.hestia.tools.plist"),
+            "launchd template": plist_keys(DEPLOY / "templates" / "com.web4.hestia.daemon.plist"),
             "fleet/install.sh heredoc": heredoc_plist_keys(DEPLOY / "fleet" / "install.sh", "PLIST"),
         },
         "deploy": {

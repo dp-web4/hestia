@@ -21,7 +21,9 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "mcp>=1.27",
+    # <2: mcp 2.0 is a major break (McpError became MCPError, first seen by the sdk-conformance
+    # CI job on 2026-09-25). This SDK is tested against 1.x; supporting 2.x is its own change.
+    "mcp>=1.27,<2",
     "httpx>=0.27",
     "anyio>=4.0",
 ]

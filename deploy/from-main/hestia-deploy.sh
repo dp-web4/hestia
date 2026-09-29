@@ -174,6 +174,37 @@ if stat -c %Y / >/dev/null 2>&1; then mtime_of() { stat -c %Y "$1"; }
 else                                   mtime_of() { stat -f %m "$1"; }; fi
 
 # Absolute path with symlinks resolved where the tools allow; else absolutised (pwd -P).
+# SECRET HYGIENE, every cycle, warn-only (hestia #1152). A seat installed before the installer's
+# `.passphrase` form keeps the vault passphrase INLINE in its unit, and nothing said so: on
+# McNugget it sat in a 644 launchd plist, readable by every account on the machine, for two
+# months, while this script redeployed the daemon by label every four hours without looking.
+# This never fails a cycle -- a deploy that refuses to run because of an old plist would stop
+# delivering the fix -- but it says it where the operator already reads gate warnings.
+secret_hygiene() {
+  local home="$HESTIA_HOME" f m=""   # resolved once, at the top of this script
+  case "$OS" in
+    Darwin)
+      f="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
+      # -type, not -extract: presence without reading the value.
+      if [ -f "$f" ] && plutil -type EnvironmentVariables.HESTIA_PASSPHRASE "$f" >/dev/null 2>&1; then
+        log "WARN secret: the vault passphrase is INLINE in $f (mode $(stat -f %Lp "$f")). Move it: bash $DEPLOY_ROOT/hestia/deploy/fleet/canonicalize-macos-seat.sh (dry run first; hestia #1152)"
+      fi
+      m=$(stat -f %Lp "$home" 2>/dev/null || true) ;;
+    *)
+      f="$HOME/.config/systemd/user/$UNIT"
+      # An Environment= line carrying it. The installer's form reads the file inside ExecStart
+      # (`HESTIA_PASSPHRASE="$(cat …)"`), which this does not match.
+      if [ -f "$f" ] && grep -qE '^[[:space:]]*Environment="?HESTIA_PASSPHRASE=' "$f"; then
+        log "WARN secret: the vault passphrase is INLINE in $f. The installer's form reads $home/.passphrase (mode 600) in ExecStart (hestia #1152)"
+      fi
+      m=$(stat -c %a "$home" 2>/dev/null || true) ;;
+  esac
+  if [ -n "$m" ] && [ "$m" != 700 ]; then
+    log "WARN secret: $home is mode $m, not 700 -- it holds vault.enc, operator.key and the chain. chmod 700 $home"
+  fi
+  return 0
+}
+
 canon() { readlink -f "$1" 2>/dev/null || (cd "$(dirname "$1")" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$(basename "$1")"); }
 
 # The file the daemon is actually executing, when the seat can tell us: /proc on a systemd
@@ -626,9 +657,16 @@ install_inventory() {
   # PR #1071 review). install.sh copies itself to $bin.installed-by as its LAST act, after
   # every trigger surface, and removes that copy as its first -- so a matching copy means
   # "this installer ran here, to the end". cmp, not a digest: no sha tool to go missing.
+  # And the INPUTS it ran with, which install.sh records in $bin.installed-with: the same
+  # installer run for another workspace writes a different surface. This was a grep for the
+  # atlas pin in the wrapper and nothing for the workspace, so a HESTIA_WORKSPACE corrected
+  # in the deploy unit answered ok(current) forever while every trigger kept the old pin --
+  # they do not inherit this unit's environment (cbp, PR #1071 post-merge review, measured on
+  # this file's own harness). The printf must stay byte-identical to install.sh's;
+  # inventory_step_test.py holds the pair together.
   if [ -f "$bin.py" ] && cmp -s "$src/inventory.py" "$bin.py" \
      && cmp -s "$src/install.sh" "$bin.installed-by" \
-     && grep -qxF "AT_PIN='$at'" "$bin" 2>/dev/null; then
+     && printf 'workspace=%s\natlas=%s\n' "$HESTIA_WORKSPACE" "$at" | cmp -s - "$bin.installed-with"; then
     inventory="ok(current)"; return 0
   fi
   if HESTIA_WORKSPACE="$HESTIA_WORKSPACE" HESTIA_ATLAS_DIR="$at" bash "$src/install.sh" >>"$LOG" 2>&1; then
@@ -636,6 +674,10 @@ install_inventory() {
       inventory="FAILED(installer rc=0, but the installed copy is not the checkout's)"
     elif ! cmp -s "$src/install.sh" "$bin.installed-by"; then
       inventory="FAILED(installer rc=0, but it did not record finishing: no current .installed-by)"
+    elif ! printf 'workspace=%s\natlas=%s\n' "$HESTIA_WORKSPACE" "$at" | cmp -s - "$bin.installed-with"; then
+      # Without this an installer that records other inputs than it was given reinstalls
+      # every cycle and says ok every time.
+      inventory="FAILED(installer rc=0, but .installed-with does not record the inputs it was given)"
     else
       # `|| true`: a report with no such key makes grep exit 1, pipefail makes that the
       # substitution's status, and `set -e` would end the deploy over a missing label.
@@ -851,6 +893,7 @@ if [ "$running" = "$target" ] && [ "$ondisk" = "$target" ]; then
   # The ordinary cycle is where a stale inventory copy gets noticed: most cycles are this
   # one, and the inventory's source moves without the daemon's binary moving with it.
   if [ "$MODE" = "full" ]; then install_inventory; fi
+  secret_hygiene
   log "CURRENT $target${inventory:+ inventory=$inventory}"
   exit 0
 fi
@@ -912,6 +955,7 @@ ls -1t "$HESTIA_HOME"/hestia.prev-* 2>/dev/null | tail -n +"$(( KEEP_BACKUPS + 1
   rm -f -- "$f"
 done
 
+secret_hygiene
 log "DEPLOYED ${running:-none} -> $newv (hestia $target_sha, web4 $web4_sha, atlas $atlas) hooks=$hooks inventory=$inventory in $(( $(date +%s) - T0 ))s"
 
 # A DEPLOYED line with hooks != ok is HALF a deploy: the binary is current, the manifest is not,

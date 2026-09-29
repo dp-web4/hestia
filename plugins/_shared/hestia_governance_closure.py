@@ -918,7 +918,10 @@ def _flush_simple_command(words: list, eff: str, targets: list, stdin_src=None) 
 
 
 
-_HEREDOC_OP = re.compile(r"<<-?(?!<)\s*([\'\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+# `(?<!<)` as well as `(?!<)`: without it the match starts at the SECOND `<` of a `<<<`
+# here-string, reads its word as a heredoc delimiter, and strips every following line as
+# body — `cat <<< EOF` + newline + `echo x > <governed>` classified read (codex, 13545).
+_HEREDOC_OP = re.compile(r"(?<!<)<<-?(?!<)\s*([\'\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 
 def _strip_heredoc_bodies(command: str) -> str:

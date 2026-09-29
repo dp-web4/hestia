@@ -58,14 +58,17 @@ pub struct GateExpectation {
 /// Path → expectation. Ordered so the serialized vault is diffable.
 pub type GateExpectations = BTreeMap<String, GateExpectation>;
 
-/// What a verification found for one gate.
+/// What a verification found for one gate. Every variant names the gate's `path`: until
+/// 2026-09-27 three of them named only the plugin, and each consumer recovered the file a
+/// different way (`gate_watch` by index into the expectation map, the app by digest).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "status")]
 pub enum GateVerdict {
     /// Hash matches the ratified expectation.
-    Verified { plugin_id: String, sha256: String },
+    Verified { path: String, plugin_id: String, sha256: String },
     /// File exists and its hash differs. The loud case.
     Modified {
+        path: String,
         plugin_id: String,
         expected: String,
         actual: String,
@@ -73,7 +76,7 @@ pub enum GateVerdict {
     },
     /// Ratified but the file is gone. A missing gate FAILS OPEN on Claude-lineage
     /// engines, so an absent gate is a governance hole, never a clean result.
-    Missing { plugin_id: String, expected: String },
+    Missing { path: String, plugin_id: String, expected: String },
     /// A gate is wired but nothing was ever ratified for it. Not "fine" — unexamined.
     Unratified { path: String },
     /// The file could not be read (permissions, I/O). Reported, never assumed clean.
@@ -108,6 +111,7 @@ pub fn verify(expectations: &GateExpectations, wired: &[String]) -> Vec<GateVerd
         let p = Path::new(path);
         if !p.is_file() {
             out.push(GateVerdict::Missing {
+                path: path.clone(),
                 plugin_id: exp.plugin_id.clone(),
                 expected: exp.sha256.clone(),
             });
@@ -115,10 +119,12 @@ pub fn verify(expectations: &GateExpectations, wired: &[String]) -> Vec<GateVerd
         }
         match hash_file(p) {
             Ok(actual) if actual == exp.sha256 => out.push(GateVerdict::Verified {
+                path: path.clone(),
                 plugin_id: exp.plugin_id.clone(),
                 sha256: actual,
             }),
             Ok(actual) => out.push(GateVerdict::Modified {
+                path: path.clone(),
                 plugin_id: exp.plugin_id.clone(),
                 expected: exp.sha256.clone(),
                 actual,

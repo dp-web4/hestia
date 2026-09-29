@@ -101,6 +101,104 @@ jobs:
         working-directory: hestia/core
         run: cargo test --locked
 
+  # The three plugin SDKs (TS / Python / Rust) against a REAL daemon. Nothing ran them
+  # before this job. During the 2026-09 release prep (#1122), the first run against a clean
+  # daemon found two ship-stopping SDK bugs: null-valued history filter keys, and Rust never
+  # sending session_id. It also found a Rust unit test that had been red since May. The daemon
+  # is built from this commit, gets a throwaway home, and listens on :7799. The suites are
+  # opt-in (HESTIA_ENDPOINT / RUN_CONFORMANCE=1), so they never touch a live :7711.
+  # P1-003 is an explicit, logged KNOWN SKIP in each harness: none can run a second
+  # hestia_connect. Vectors come from the sibling web4 checkout (main, as above).
+  sdk-conformance:
+    name: plugin SDK conformance (ts/py/rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hestia
+      - uses: actions/checkout@v4
+        with:
+          repository: dp-web4/web4
+          path: web4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            hestia/core
+            hestia/plugin-sdk/rust
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build the daemon
+        working-directory: hestia/core
+        run: cargo build --locked --bin hestia
+
+      - name: Start an isolated daemon on :7799
+        run: |
+          set -euo pipefail
+          home="$(mktemp -d)"
+          echo "SBX_HOME=$home" >> "$GITHUB_ENV"
+          export HESTIA_HOME="$home" HESTIA_PASSPHRASE="ci-$GITHUB_RUN_ID"
+          bin="$GITHUB_WORKSPACE/hestia/core/target/debug/hestia"
+          "$bin" --home "$home" init --ai
+          nohup "$bin" --home "$home" serve --bind 127.0.0.1:7799 >"$home/serve.log" 2>&1 &
+          for _ in $(seq 1 60); do
+            (exec 3<>/dev/tcp/127.0.0.1/7799) 2>/dev/null && exit 0
+            sleep 1
+          done
+          echo "daemon did not come up"; cat "$home/serve.log"; exit 1
+
+      - name: TypeScript SDK
+        working-directory: hestia/plugin-sdk/typescript
+        env:
+          HESTIA_ENDPOINT: http://127.0.0.1:7799/mcp
+          RUN_CONFORMANCE: "1"
+        run: |
+          npm install --no-audit --no-fund
+          npm test
+
+      - name: Python SDK
+        working-directory: hestia/plugin-sdk/python
+        env:
+          HESTIA_ENDPOINT: http://127.0.0.1:7799/mcp
+          RUN_CONFORMANCE: "1"
+        run: |
+          python -m pip install -q -e '.[dev]'
+          python -m pytest -q -s
+
+      - name: Rust SDK
+        working-directory: hestia/plugin-sdk/rust
+        env:
+          HESTIA_ENDPOINT: http://127.0.0.1:7799/mcp
+          RUN_CONFORMANCE: "1"
+        run: cargo test -- --nocapture
+
+      - name: Daemon log (on failure)
+        if: failure()
+        run: tail -100 "$SBX_HOME/serve.log" || true
+
+  # The dashboard's inline JS, checked for identifiers nothing declares (ESLint no-undef). An
+  # undeclared name parses fine and throws only when its line runs. Two shipped: `hidden`
+  # (selecting any agent threw "hidden is not defined" out of the tick, and the witness chain
+  # never filtered) and `modal` (Escape never closed the trust modal, for two months).
+  # See tools/dashboard_no_undef.mjs.
+  dashboard-js:
+    name: dashboard js (no-undef)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+      - name: Undeclared identifiers in the dashboard's inline scripts
+        run: |
+          npm install --silent --no-audit --no-fund --prefix "$RUNNER_TEMP/lint" eslint@10 globals
+          NODE_PATH="$RUNNER_TEMP/lint/node_modules" node tools/dashboard_no_undef.mjs
+
   # The app is a separate Rust crate plus a TypeScript frontend. Core green says
   # nothing about either: Sprint A demonstrated the gap when an app-only helper
   # passed its tests while the production sign-in path never called it.
@@ -401,9 +499,27 @@ jobs:
           # attribution; the wiring itself has no legislative content. Adjudicated,
           # not absorbed: the alternative was a second connect-args builder outside
           # the debt function, which is more shim, not less.
+          #
+          # claude-code 29.0 -> 29.9 (#1084, the vault-bounded launch role). The LAW is in the
+          # shared engine: `hestia_gate_core.launch_role_verdict` owns the predicate, the
+          # unset-role exemption and the refusal's words (dp 2026-09-22: "all law goes into
+          # shared engine"; the first cut had it in the shim at 30.0). What stays in the seat is
+          # `_apply_launch_role`, ledgered as wiring: it loads the core, hands it the projection's
+          # set, and records the answer, plus the essential fail-closed when a declared set cannot
+          # be evaluated because the core is unreachable (which cannot live in the core). The meter
+          # counts it as law lexically ("gate" in the module name it loads); it decides nothing.
+          # Adjudicated, not absorbed, the same reading as the 28.9 -> 29.0 entry above: the
+          # alternative was renaming things to dodge the vocabulary, which is optimising the gauge.
+          # 29.9, not 29.7: codex's P1 review found the first cut called the core's verdict OUTSIDE
+          # its try, so a new hook against an old installed core raised at import and exited 1 --
+          # which Claude Code treats as non-blocking, i.e. fail-OPEN. The catch-all that fixes it
+          # is a few more lines in the same wiring function, and the meter counts them the same
+          # lexical way. Worth saying plainly: this number barely moved (30.0 in-shim -> 29.9),
+          # because the meter measures vocabulary in the seat, not where decisions live. What
+          # moved is in SHIM_LEDGER: the predicate, exemption and refusal words are the core's.
           python3 tools/gate_collapse_meter.py \
             --max-divergent-forked 0 --max-verbatim-forked 0 \
-            --max-seat-pct claude-code=29.0 --max-seat-pct codex=20.6 \
+            --max-seat-pct claude-code=29.9 --max-seat-pct codex=20.6 \
             --max-seat-pct gemini=10.3 --max-seat-pct kimi=16.8
 
       - name: Do the forked predicates actually disagree with the engine?
