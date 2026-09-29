@@ -377,6 +377,18 @@ fn wait_is_over(r: &Value) -> bool {
 /// The session is opened ONCE and reused for the whole wait; a tool error mid-wait
 /// propagates rather than being retried, so a caller never mistakes a broken connection for
 /// a still-pending petition.
+/// `hestia gate lookup <request_key>` (#1166): what the daemon did for a request whose answer
+/// the gate hook never received. Read-only on the daemon side -- no observation, no fuse.
+pub fn lookup(endpoint: &str, request_key: &str, asserted_id: Option<String>, role: &str) -> Result<()> {
+    let asserted = asserted_id.unwrap_or_else(|| DEFAULT_ASSERTED_ID.to_string());
+    let mut m = Mcp::connect(endpoint)?;
+    let (_sid, who) = open_session(&mut m, &asserted, role)?;
+    banner(&who);
+    let r = m.tool("hestia_gate_escalation_lookup", json!({"request_key": request_key}))?;
+    println!("{}", serde_json::to_string_pretty(&r)?);
+    Ok(())
+}
+
 pub fn poll(
     endpoint: &str,
     id: &str,

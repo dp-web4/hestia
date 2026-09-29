@@ -1220,6 +1220,51 @@ pub struct EscalationStore {
     /// not at all). The chain entry is the durable record; this set only dedups
     /// the append within one daemon lifetime.
     lapse_recorded: std::collections::HashSet<String>,
+    /// What the daemon last did for each `request_key` (#1166, #774).
+    ///
+    /// A gate hook gives initialize + connect + claim one 1.5 s deadline, because the harness
+    /// kills a hook at 5 s and a killed hook fails OPEN. When that deadline passes, the outcome
+    /// is UNKNOWN: the daemon may still open an escalation (whose id the asker never learns,
+    /// #1166) or spend an approval (#774: the grant is consumed, the write never happens, and
+    /// the re-issue mints a new petition). The hook sends a key that is stable across identical
+    /// re-issues in one session; this map is how the daemon answers the retry with what it
+    /// already did instead of with a second, different answer.
+    ///
+    /// A projection of the chain like the rest of the store: every outcome row carries its
+    /// `request_key`, and `rehydrate` rebuilds the map from them. Bounded by
+    /// `REQUEST_KEY_CAP`, oldest evicted first.
+    request_keys: HashMap<String, RequestKeyRecord>,
+}
+
+/// How long after a spend the SAME request key may be answered with the same permit
+/// (#774). Long enough to cover a lost response and the member's immediate re-issue; short
+/// enough that a key cannot become a standing permit. It never widens anyone else's window:
+/// a different key, act, payload, member, marker or proven session is refused as before.
+pub const RECLAIM_WINDOW_SECS: u64 = 120;
+/// Upper bound on remembered request keys; the oldest are evicted first.
+pub const REQUEST_KEY_CAP: usize = 4096;
+
+/// The daemon's record of one request key's last outcome.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RequestKeyRecord {
+    /// `opened` | `coalesced` | `claimed` | `reclaimed`.
+    pub outcome: String,
+    pub escalation_id: String,
+    pub at: u64,
+    pub plugin_id: String,
+    pub marker: String,
+    /// sha256 of the act the request named, as `act_digest_of` computes it.
+    pub act_digest: Option<String>,
+    /// The payload binding the spent escalation carried, if any.
+    pub payload_sha256: Option<String>,
+    /// The PROVEN host session at the time, if the caller had one.
+    pub host_session_id: Option<String>,
+}
+
+/// A request key is sha256 hex: 64 lowercase hex characters. Anything else is refused by
+/// name rather than stored, so a key can never smuggle an arbitrary string into the chain.
+pub fn valid_request_key(k: &str) -> bool {
+    k.len() == 64 && k.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub fn now_secs() -> u64 {
@@ -1278,6 +1323,42 @@ impl EscalationStore {
             let entry_ts = e.timestamp.timestamp().max(0) as u64;
             let d = &e.event_data;
             let Some(id) = s(d, "escalation_id") else { continue };
+            // THE REQUEST-KEY MAP (#1166) is rebuilt from the same rows: every outcome the
+            // claim door witnesses carries the key it answered, so a restart keeps "what did
+            // I do for this key" exactly as it keeps "what did the operator rule".
+            if let Some(outcome) = match e.event_type.as_str() {
+                "gate_escalation_opened" => Some("opened"),
+                "gate_escalation_coalesced" => Some("coalesced"),
+                "gate_escalation_claimed" => Some("claimed"),
+                "gate_escalation_reclaimed" => Some("reclaimed"),
+                _ => None,
+            } {
+                if let (Some(key), Some(plugin_id), Some(marker)) =
+                    (s(d, "request_key"), s(d, "plugin_id"), s(d, "marker"))
+                {
+                    if valid_request_key(&key) {
+                        self.record_request_key(
+                            &key,
+                            RequestKeyRecord {
+                                outcome: outcome.to_string(),
+                                escalation_id: id.clone(),
+                                // A reclaim never slides the window: it stays anchored at the
+                                // first spend, which its row carries.
+                                at: if outcome == "reclaimed" {
+                                    u(d, "first_claimed_at").unwrap_or(entry_ts)
+                                } else {
+                                    entry_ts
+                                },
+                                plugin_id,
+                                marker,
+                                act_digest: s(d, "act_digest"),
+                                payload_sha256: s(d, "payload_sha256"),
+                                host_session_id: s(d, "host_session_id"),
+                            },
+                        );
+                    }
+                }
+            }
             match e.event_type.as_str() {
                 "gate_escalation_opened" => {
                     let (Some(plugin_id), Some(marker), Some(expires_at)) =
@@ -2306,6 +2387,84 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
             .unwrap_or(Status::Expired)
     }
 
+    /// Remember what was done for a request key (#1166). Last write wins; the oldest key is
+    /// evicted once the map passes `REQUEST_KEY_CAP`.
+    pub fn record_request_key(&mut self, key: &str, rec: RequestKeyRecord) {
+        if !valid_request_key(key) {
+            return;
+        }
+        self.request_keys.insert(key.to_string(), rec);
+        if self.request_keys.len() > REQUEST_KEY_CAP {
+            if let Some(oldest) = self
+                .request_keys
+                .iter()
+                .min_by_key(|(_, r)| r.at)
+                .map(|(k, _)| k.clone())
+            {
+                self.request_keys.remove(&oldest);
+            }
+        }
+    }
+
+    /// The last outcome recorded for a key. READ-ONLY: never observes, never arms a fuse.
+    pub fn request_key(&self, key: &str) -> Option<&RequestKeyRecord> {
+        self.request_keys.get(key)
+    }
+
+    /// The spend this SAME request already made, if a lost response is being retried (#774).
+    ///
+    /// Every conjunct must hold, or the answer is None and the caller falls through to the
+    /// ordinary refuse-and-open path:
+    ///   - the key's last outcome was a spend (`claimed` or `reclaimed`);
+    ///   - within `RECLAIM_WINDOW_SECS` of that spend;
+    ///   - the same member and marker;
+    ///   - the same act digest (the retry names the same act);
+    ///   - a BOUND payload is presented again byte-for-byte;
+    ///   - the same PROVEN host session when the spend had one. A retry that cannot prove it
+    ///     is the same session does not inherit a session's permit.
+    /// Nothing here widens any other key's window, and nothing here re-arms the escalation:
+    /// it stays consumed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reclaimable(
+        &self,
+        key: &str,
+        plugin_id: &str,
+        marker: &str,
+        attempted_act: Option<&str>,
+        attempted_payload: Option<&str>,
+        proven_host_session_id: Option<&str>,
+        now: u64,
+    ) -> Option<RequestKeyRecord> {
+        let rec = self.request_keys.get(key)?;
+        if rec.outcome != "claimed" && rec.outcome != "reclaimed" {
+            return None;
+        }
+        if now.saturating_sub(rec.at) > RECLAIM_WINDOW_SECS {
+            return None;
+        }
+        if rec.plugin_id != plugin_id.trim() || rec.marker != marker.trim() {
+            return None;
+        }
+        let asked = attempted_act
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(Self::act_digest_of)?;
+        if rec.act_digest.as_deref() != Some(asked.as_str()) {
+            return None;
+        }
+        if let Some(bound) = &rec.payload_sha256 {
+            if Self::normalize_payload(attempted_payload).as_deref() != Some(bound.as_str()) {
+                return None;
+            }
+        }
+        if let Some(sess) = &rec.host_session_id {
+            if proven_host_session_id != Some(sess.as_str()) {
+                return None;
+            }
+        }
+        Some(rec.clone())
+    }
+
     pub fn get(&self, id: &str) -> Option<&Escalation> {
         self.by_id.get(id)
     }
@@ -2573,6 +2732,66 @@ mod tests {
     use super::*;
 
     const T0: u64 = 1_800_000_000;
+
+    /// #774: a lost spend is reclaimable only by the SAME request, within the window. Every
+    /// conjunct is exercised on its own; the positive arm is the control.
+    #[test]
+    fn a_reclaim_requires_every_conjunct_and_never_outlives_its_window() {
+        let key = "c".repeat(64);
+        let mut st = EscalationStore::default();
+        let act = "Bash: git apply /tmp/p/fix.patch";
+        let rec = RequestKeyRecord {
+            outcome: "claimed".into(),
+            escalation_id: "E1".into(),
+            at: T0,
+            plugin_id: "codex".into(),
+            marker: "pre_tool_use.py".into(),
+            act_digest: Some(EscalationStore::act_digest_of(act)),
+            payload_sha256: Some("ab".repeat(32)),
+            host_session_id: Some("hs-1".into()),
+        };
+        st.record_request_key(&key, rec.clone());
+        let pay = "ab".repeat(32);
+        let ok = |st: &EscalationStore, k: &str, pl: &str, mk: &str, a: &str, p: Option<&str>, hs: Option<&str>, now: u64| {
+            st.reclaimable(k, pl, mk, Some(a), p, hs, now).is_some()
+        };
+        assert!(ok(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), T0 + 5), "control");
+        assert!(ok(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"),
+                   T0 + RECLAIM_WINDOW_SECS), "the window's last second still holds");
+        assert!(!ok(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"),
+                    T0 + RECLAIM_WINDOW_SECS + 1), "past the window: refused");
+        assert!(!ok(&st, &"d".repeat(64), "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), T0 + 5), "other key");
+        assert!(!ok(&st, &key, "kimi-code", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), T0 + 5), "other member");
+        assert!(!ok(&st, &key, "codex", "other.py", act, Some(&pay), Some("hs-1"), T0 + 5), "other marker");
+        assert!(!ok(&st, &key, "codex", "pre_tool_use.py", "Bash: rm x", Some(&pay), Some("hs-1"), T0 + 5), "other act");
+        assert!(!ok(&st, &key, "codex", "pre_tool_use.py", act, Some(&"ff".repeat(32)), Some("hs-1"), T0 + 5), "other payload");
+        assert!(!ok(&st, &key, "codex", "pre_tool_use.py", act, None, Some("hs-1"), T0 + 5), "a bound payload must be presented");
+        assert!(!ok(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-2"), T0 + 5), "other session");
+        assert!(!ok(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), None, T0 + 5), "an unproven retry does not inherit a session's permit");
+        // An open (not a spend) is never reclaimable.
+        st.record_request_key(&key, RequestKeyRecord { outcome: "opened".into(), ..rec.clone() });
+        assert!(!ok(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), T0 + 5), "an open is not a spend");
+        // Malformed keys are never stored.
+        st.record_request_key("nope", rec.clone());
+        assert!(st.request_key("nope").is_none());
+        assert!(!valid_request_key(&"A".repeat(64)) && valid_request_key(&"0".repeat(64)));
+    }
+
+    /// The key map is bounded: the oldest record goes first.
+    #[test]
+    fn the_request_key_map_is_bounded_oldest_first() {
+        let mut st = EscalationStore::default();
+        let rec = |at| RequestKeyRecord {
+            outcome: "opened".into(), escalation_id: "E".into(), at,
+            plugin_id: "p".into(), marker: "m".into(), act_digest: None,
+            payload_sha256: None, host_session_id: None,
+        };
+        for i in 0..=REQUEST_KEY_CAP {
+            st.record_request_key(&format!("{:064x}", i), rec(T0 + i as u64));
+        }
+        assert!(st.request_key(&format!("{:064x}", 0)).is_none(), "the oldest was evicted");
+        assert!(st.request_key(&format!("{:064x}", REQUEST_KEY_CAP)).is_some());
+    }
 
     fn chain_entry(event_type: &str, data: serde_json::Value) -> crate::storage::chain::ChainEntry {
         crate::storage::chain::ChainEntry {
