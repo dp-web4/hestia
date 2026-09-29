@@ -3,9 +3,13 @@
 <!--
   launchd user agent for the Hestia daemon on macOS.
 
-  Install: copy to ~/Library/LaunchAgents/io.hestia.tools.plist and
-  run `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.hestia.tools.plist`
-  (or just `launchctl load …` on older macOS).
+  Install: copy to ~/Library/LaunchAgents/com.web4.hestia.daemon.plist and
+  run `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.web4.hestia.daemon.plist`.
+
+  The label is com.web4.hestia.daemon because that is what hestia-deploy restarts
+  (LAUNCHD_LABEL's default) and what the fleet's Mac has run since 2026-05-21. This template
+  was `io.hestia.tools` until 2026-09-28: a seat installed from it was one hestia-deploy could
+  not restart without HESTIA_LAUNCHD_LABEL set by hand.
 
   The passphrase file lives at $HOME/.hestia/.passphrase (mode 600).
   This is the consumer-tier security boundary; Hardbound replaces it
@@ -14,7 +18,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>io.hestia.tools</string>
+  <string>com.web4.hestia.daemon</string>
 
   <key>ProgramArguments</key>
   <array>

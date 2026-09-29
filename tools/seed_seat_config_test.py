@@ -122,6 +122,18 @@ def main() -> int:
         missing = seeder.verify_rendered(hestia_home, docs)
         check("C3 the seat with a full projection passes; the seat with none is named",
               len(missing) == 1 and missing[0].startswith("codex:"), str(missing))
+        (seats_dir / "claude-code.env").write_text(
+            "\n".join([f"{k}={v}" for k, v in shared_env.items()]
+                      + [f"CLAUDE_CODE__{k}={v}" for k, v in seat_env.items()]) + "\n")
+        missing = seeder.verify_rendered(hestia_home, docs)
+        check("C3 the daemon's own shape (seat keys token-prefixed, shared bare) passes",
+              len(missing) == 1 and missing[0].startswith("codex:"), str(missing))
+        (seats_dir / "claude-code.env").write_text(
+            "\n".join(f"{k}={v}" for k, v in shared_env.items())
+            + "\nGEMINI__HESTIA_PLUGIN_ID=claude-code\n")
+        missing = seeder.verify_rendered(hestia_home, docs)
+        check("C3 a seat key under ANOTHER seat's token is not this seat's key",
+              any(m.startswith("claude-code:") and "HESTIA_PLUGIN_ID" in m for m in missing), str(missing))
         (seats_dir / "claude-code.env").write_text("HESTIA_PLUGIN_ID=claude-code\n")
         missing = seeder.verify_rendered(hestia_home, docs)
         check("C3 a projection missing a SHARED key is reported, not passed on the 200",

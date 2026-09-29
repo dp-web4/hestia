@@ -208,6 +208,23 @@ fn file_identity(p: &Path) -> Option<(u64, u64)> {
 /// measured at most of a core with the page open — and re-introducing it one PR after fixing
 /// it would be its own kind of finding. A render surface must not be an unbounded recompute.
 pub fn write_effect_cached(act: &str) -> Option<Value> {
+    if let Some(patch) = crate::server::gate_escalation::EscalationStore::patch_file_of_act(act) {
+        let key: MemoKey = (act.to_string(), file_identity(&patch), None);
+        if let Ok(g) = EFFECT_MEMO.lock() {
+            if let Some(hit) = g.as_ref().and_then(|m| m.get(&key)) {
+                return Some(hit.clone());
+            }
+        }
+        let computed = patch_effect(&patch, act);
+        if let Ok(mut g) = EFFECT_MEMO.lock() {
+            let m = g.get_or_insert_with(HashMap::new);
+            if m.len() >= MEMO_MAX_ENTRIES {
+                m.clear();
+            }
+            m.insert(key, computed.clone());
+        }
+        return Some(computed);
+    }
     let operands = copy_operands(act);
     let key: MemoKey = (
         act.to_string(),
@@ -240,6 +257,11 @@ pub fn write_effect_cached(act: &str) -> Option<Value> {
 /// a decision surface that mixes measurement with inference teaches its reader to trust the
 /// inference, and the reader is about to authorise a write to the thing that governs them.
 pub fn write_effect(act: &str) -> Option<Value> {
+    // A patch-application act is recognised FIRST: `git -C <dir> apply <patch>` would otherwise
+    // read as a copy from `<dir>` and report a directory as an unreadable source.
+    if let Some(patch) = crate::server::gate_escalation::EscalationStore::patch_file_of_act(act) {
+        return Some(patch_effect(&patch, act));
+    }
     let (src, dest_token) = copy_operands(act)?;
     let meta = std::fs::metadata(&src).ok();
     let readable = meta.as_ref().map(|m| m.is_file()).unwrap_or(false);
@@ -298,6 +320,117 @@ pub fn write_effect(act: &str) -> Option<Value> {
         }
     }
     Some(out)
+}
+
+/// Per-file stat of a unified diff, read from its own structure: `--- ` / `+++ ` headers are
+/// read only OUTSIDE a hunk, and a hunk is consumed by the exact line counts its `@@ -a,b +c,d @@`
+/// header declares -- so a removed line that happens to start `--- ` is never mistaken for a new
+/// file. A target is the `+++` path (`b/` stripped), or the `---` path when the file is deleted
+/// (`+++ /dev/null`); `--- /dev/null` marks a creation.
+pub fn patch_stat(text: &str) -> (Vec<Value>, u64, u64) {
+    fn strip(t: &str) -> String {
+        let t = t.split('\t').next().unwrap_or(t).trim();
+        t.strip_prefix("a/").or_else(|| t.strip_prefix("b/")).unwrap_or(t).to_string()
+    }
+    fn count(spec: &str) -> u64 {
+        // "a,b" -> b ; "a" -> 1
+        spec.split(',').nth(1).and_then(|n| n.parse().ok()).unwrap_or(1)
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut files: Vec<Value> = Vec::new();
+    let (mut total_add, mut total_del) = (0u64, 0u64);
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i];
+        if let (Some(minus), Some(plus)) = (
+            l.strip_prefix("--- "),
+            lines.get(i + 1).and_then(|n| n.strip_prefix("+++ ")),
+        ) {
+            let created = minus.trim().starts_with("/dev/null");
+            let deleted = plus.trim().starts_with("/dev/null");
+            let path = if deleted { strip(minus) } else { strip(plus) };
+            let (mut add, mut del) = (0u64, 0u64);
+            i += 2;
+            while i < lines.len() && lines[i].starts_with("@@") {
+                let h = lines[i];
+                let mut parts = h.split_whitespace().skip(1);
+                let old_n = parts.next().map(|t| count(t.trim_start_matches('-'))).unwrap_or(0);
+                let new_n = parts.next().map(|t| count(t.trim_start_matches('+'))).unwrap_or(0);
+                let (mut o, mut n) = (old_n, new_n);
+                i += 1;
+                while i < lines.len() && (o > 0 || n > 0) {
+                    let b = lines[i].as_bytes().first().copied();
+                    match b {
+                        Some(b'-') => { del += 1; o = o.saturating_sub(1); }
+                        Some(b'+') => { add += 1; n = n.saturating_sub(1); }
+                        Some(b'\\') => {} // "\ No newline at end of file"
+                        _ => { o = o.saturating_sub(1); n = n.saturating_sub(1); }
+                    }
+                    i += 1;
+                }
+                // a trailing "\ No newline" marker after the counts ran out
+                while i < lines.len() && lines[i].starts_with('\\') {
+                    i += 1;
+                }
+            }
+            total_add += add;
+            total_del += del;
+            files.push(json!({"path": path, "added": add, "removed": del,
+                              "created": created, "deleted": deleted}));
+            continue;
+        }
+        i += 1;
+    }
+    (files, total_add, total_del)
+}
+
+/// What a PATCH-APPLICATION act would do: the patch the daemon read, the hash the approval binds
+/// (the same `measured_payload_for_act`), and per file what it touches.
+///
+/// WHY (#648, 2026-09-28). codex dissented on an escalation whose record showed a `git apply`
+/// command truncated at `…/witness-` with four sibling patches sharing that prefix: *"I cannot
+/// bind an endorsement to one of them. Please provide the exact patch filename, digest, and
+/// intended behavior."* A patch is the most self-describing act there is once it is READ; the
+/// decider was shown its path and nothing else. Every field is measured from the file: targets
+/// and counts come from the patch's own headers and hunk lines, never from the member's words.
+pub fn patch_effect(patch: &Path, act: &str) -> Value {
+    let readable = std::fs::metadata(patch).map(|m| m.is_file()).unwrap_or(false);
+    if !readable {
+        return json!({
+            "kind": "patch",
+            "patch_path": patch.display().to_string(),
+            "patch_readable": false,
+            "note": "the act names a patch file the daemon cannot read; nothing about what it \
+                     would change is asserted here",
+        });
+    }
+    let bytes = std::fs::read(patch).unwrap_or_default();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let too_big = bytes.len() as u64
+        > crate::server::gate_escalation::MAX_MEASURED_PAYLOAD_BYTES;
+    let (files, total_add, total_del) = patch_stat(&text);
+    let mut rendered: Vec<String> = Vec::new();
+    let mut truncated = false;
+    for line in text.lines() {
+        push_line(&mut rendered, &mut truncated, line.to_string());
+    }
+    json!({
+        "kind": "patch",
+        "patch_path": patch.display().to_string(),
+        "patch_readable": true,
+        "patch_bytes": bytes.len(),
+        // The same value the approval BINDS (`measured_payload_for_act`), so the decider can see
+        // that the patch they are reading and the bytes the permit holds are one object. None
+        // above the measurement cap: then the approval binds nothing, and the card must say so.
+        "payload_sha256": crate::server::gate_escalation::EscalationStore::measured_payload_for_act(act),
+        "payload_unbound_reason": if too_big { Value::from("patch larger than the measurement cap; the approval does not bind its bytes") } else { Value::Null },
+        "files": files,
+        "file_count": files.len(),
+        "added_lines": total_add,
+        "removed_lines": total_del,
+        "diff": rendered,
+        "diff_truncated": truncated,
+    })
 }
 
 /// How much of a marker's escalation history the bundle carries.
@@ -654,6 +787,113 @@ mod tests {
             v["payload_sha256"].as_str().map(str::to_string),
             crate::server::gate_escalation::EscalationStore::measured_payload_for_act(&act),
         );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // ---- patch-application acts (#648: the decider must be able to identify the bytes) ----
+
+    use crate::server::gate_escalation::EscalationStore as ES;
+
+    const TWO_FILE_PATCH: &str = "diff --git a/docs/notes.md b/docs/notes.md
+--- a/docs/notes.md
++++ b/docs/notes.md
+@@ -1,3 +1,3 @@
+ title
+---- a removed line that merely LOOKS like a header
++++++ an added line that merely LOOKS like a header
+ end
+diff --git a/src/new.rs b/src/new.rs
+new file mode 100644
+--- /dev/null
++++ b/src/new.rs
+@@ -0,0 +1,2 @@
++fn a() {}
++fn b() {}
+\\ No newline at end of file
+diff --git a/old.txt b/old.txt
+deleted file mode 100644
+--- a/old.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-gone
+";
+
+    #[test]
+    fn a_patch_act_is_recognised_only_in_its_unambiguous_forms() {
+        let p = |a: &str| ES::patch_file_of_act(a).map(|x| x.display().to_string());
+        assert_eq!(p("Bash: git -C /wt apply /p/x.patch"), Some("/p/x.patch".into()));
+        assert_eq!(p("git apply --3way /p/x.patch"), Some("/p/x.patch".into()));
+        assert_eq!(p("git -c core.x=y am /p/m.mbox"), Some("/p/m.mbox".into()));
+        assert_eq!(p("patch -p1 -i /p/x.patch"), Some("/p/x.patch".into()));
+        assert_eq!(p("patch -p1 --input=/p/x.patch"), Some("/p/x.patch".into()));
+        assert_eq!(p("patch -p1 < /p/x.patch"), Some("/p/x.patch".into()));
+        // read-only, ambiguous, relative, escaping, compound, or not a patch at all: nothing
+        assert_eq!(p("git apply --check /p/x.patch"), None);
+        assert_eq!(p("git apply --stat /p/x.patch"), None);
+        assert_eq!(p("git apply /p/a.patch /p/b.patch"), None);
+        assert_eq!(p("git apply x.patch"), None);
+        assert_eq!(p("git apply /p/../etc/x.patch"), None);
+        assert_eq!(p("cd /wt && git apply /p/x.patch"), None);
+        assert_eq!(p("git apply /p/x.patch; rm /p/x.patch"), None);
+        assert_eq!(p("cp /a /b"), None);
+        assert_eq!(p("git status"), None);
+    }
+
+    #[test]
+    fn the_approval_binds_the_patch_bytes_not_the_directory() {
+        let d = tmpdir("patchbind");
+        let patch = d.join("x.patch");
+        std::fs::write(&patch, TWO_FILE_PATCH).unwrap();
+        let act = format!("Bash: git -C {} apply {}", d.display(), patch.display());
+        let h1 = ES::measured_payload_for_act(&act).expect("a readable patch is measured");
+        // Before this change the first absolute token (the -C directory) was read as the copy
+        // source, found not to be a file, and the approval bound NOTHING.
+        std::fs::write(&patch, format!("{TWO_FILE_PATCH}\n")).unwrap();
+        let h2 = ES::measured_payload_for_act(&act).unwrap();
+        assert_ne!(h1, h2, "changed patch bytes must change the bound hash");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn patch_stat_reads_structure_not_lookalike_lines() {
+        let (files, add, del) = patch_stat(TWO_FILE_PATCH);
+        assert_eq!(files.len(), 3, "{files:?}");
+        assert_eq!(files[0], json!({"path": "docs/notes.md", "added": 1, "removed": 1,
+                                    "created": false, "deleted": false}),
+                   "a '--- '/'+++ ' line INSIDE a hunk is content, not a new file");
+        assert_eq!(files[1], json!({"path": "src/new.rs", "added": 2, "removed": 0,
+                                    "created": true, "deleted": false}));
+        assert_eq!(files[2], json!({"path": "old.txt", "added": 0, "removed": 1,
+                                    "created": false, "deleted": true}));
+        assert_eq!((add, del), (3, 2));
+    }
+
+    #[test]
+    fn a_patch_act_shows_what_it_would_do_and_the_hash_it_binds() {
+        let d = tmpdir("patcheffect");
+        let patch = d.join("y.patch");
+        std::fs::write(&patch, TWO_FILE_PATCH).unwrap();
+        let act = format!("git -C /repo apply {}", patch.display());
+        let v = write_effect(&act).expect("a patch act has an effect");
+        assert_eq!(v["kind"], json!("patch"));
+        assert_eq!(v["patch_readable"], json!(true));
+        assert_eq!(v["file_count"], json!(3));
+        assert_eq!(v["added_lines"], json!(3));
+        assert_eq!(v["removed_lines"], json!(2));
+        assert_eq!(v["payload_sha256"].as_str().map(str::to_string),
+                   ES::measured_payload_for_act(&act),
+                   "the bytes a reviewer reads and the bytes the permit binds are one object");
+        assert!(v["diff"].as_array().map(|a| !a.is_empty()).unwrap_or(false));
+        // the cached form returns the same object, and recomputes when the patch changes
+        assert_eq!(write_effect_cached(&act), Some(v.clone()));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&patch, "--- a/z\n+++ b/z\n@@ -1 +1 @@\n-a\n+b\n").unwrap();
+        let v2 = write_effect_cached(&act).unwrap();
+        assert_eq!(v2["file_count"], json!(1), "a rewritten patch is re-read, not served stale");
+        // an unreadable patch is REPORTED, not treated as a copy from the -C directory
+        let gone = write_effect(&format!("git -C /repo apply {}/missing.patch", d.display())).unwrap();
+        assert_eq!(gone["kind"], json!("patch"));
+        assert_eq!(gone["patch_readable"], json!(false));
         std::fs::remove_dir_all(&d).ok();
     }
 }

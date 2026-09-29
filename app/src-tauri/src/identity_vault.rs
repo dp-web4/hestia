@@ -1,9 +1,28 @@
 //! App identity-vault custody for the human/root credential.
 //!
 //! This store is intentionally separate from the daemon's governance vault: it
-//! belongs to a person rather than a machine. The legacy `operator.key` is read
-//! only by the explicit migration function, and is removed only after the new
-//! encrypted file has been written, synced, reopened, and authenticated.
+//! belongs to a person rather than a machine.
+//!
+//! # The plaintext `operator.key` — kept, never read again, never re-projected
+//!
+//! dp's ruling, 2026-09-25: *"for now we can keep the key but should be resilient
+//! to manual delete (do not re-project, use vault copy only)."* So:
+//!
+//!  * **Once an identity vault exists it is the only source.** [`open_or_import`]
+//!    opens it and does not read `operator.key` at all. A plaintext file that
+//!    has since changed, been corrupted, or been deleted cannot veto a sign-in,
+//!    because nothing consults it.
+//!  * **Import keeps the plaintext.** The first sign-in with no vault imports the
+//!    legacy credential and leaves `~/.hestia/operator.key` exactly as it was.
+//!    Other views of the same engine still read that file — the daemon's
+//!    delegation signer prefers it — so removing it here would change what those
+//!    views do without their operator deciding to.
+//!  * **Nothing here ever writes `operator.key`.** No path re-creates it from the
+//!    vault. Deleting it by hand is the operator's act, and it stays deleted.
+//!
+//! Until 2026-09-25 migration deleted the plaintext once the vault verified, and
+//! every sign-in while the plaintext existed re-read it and refused on a
+//! mismatch. Both are reversed by the ruling above.
 
 use std::fs;
 use std::io::Write;
@@ -201,6 +220,14 @@ pub fn migrate_plaintext_operator_key(
         return Err("identity vault passphrase must not be empty".into());
     }
 
+    // Vault copy only: an existing vault is the credential, and the plaintext is
+    // not consulted — so a changed, corrupt, or deleted `operator.key` cannot
+    // block a sign-in. Checked BEFORE the source is read, so a source that no
+    // longer parses does not matter either.
+    if destination.exists() {
+        return IdentityVault::open(destination, passphrase);
+    }
+
     let source_meta = fs::symlink_metadata(source).map_err(|e| {
         format!(
             "inspect legacy operator credential {}: {e}",
@@ -213,29 +240,7 @@ pub fn migrate_plaintext_operator_key(
             source.display()
         ));
     }
-
     let stored = load_legacy(source)?;
-
-    // A crash or permissions failure can leave a valid encrypted destination
-    // beside the still-live plaintext source. Resume only after proving both
-    // files contain the same principal and key; never overwrite either on a
-    // mismatch.
-    if destination.exists() {
-        let opened = IdentityVault::open(destination, passphrase)?;
-        let expected = SigningKey::from_bytes(&stored.secret_key)
-            .verifying_key()
-            .to_bytes();
-        if opened.principal_lct() != stored.principal_lct
-            || opened.verifying_key_bytes() != expected
-        {
-            return Err(
-                "existing identity vault does not match the legacy credential; refusing to retire either file"
-                    .into(),
-            );
-        }
-        retire_plaintext_source(source)?;
-        return Ok(opened);
-    }
 
     save_new(destination, passphrase, &stored)?;
     let reopened = IdentityVault::open(destination, passphrase).map_err(|e| {
@@ -252,8 +257,30 @@ pub fn migrate_plaintext_operator_key(
         return Err("new identity vault changed the principal credential".into());
     }
 
-    retire_plaintext_source(source)?;
+    // The plaintext stays (dp, 2026-09-25): other views of this engine read it.
     Ok(reopened)
+}
+
+/// Open the identity vault if it exists — the only source once it does — and
+/// otherwise import `legacy` into a new vault at `vault_path`, leaving the
+/// legacy file in place. `legacy` is `None` when the caller is not at the
+/// default location or no legacy credential exists.
+pub fn open_or_import(
+    vault_path: impl AsRef<Path>,
+    legacy: Option<&Path>,
+    passphrase: &str,
+) -> Result<IdentityVault, String> {
+    let vault_path = vault_path.as_ref();
+    if vault_path.exists() {
+        return IdentityVault::open(vault_path, passphrase);
+    }
+    match legacy {
+        Some(src) => migrate_plaintext_operator_key(src, vault_path, passphrase),
+        None => Err(format!(
+            "no identity vault at {} and no legacy operator credential is available to import",
+            vault_path.display()
+        )),
+    }
 }
 
 fn load_legacy(source: &Path) -> Result<StoredCredential, String> {
@@ -292,16 +319,6 @@ fn lct_for_key(key: &SigningKey) -> Result<String, String> {
     Ok(derive_lct_id(&public))
 }
 
-fn retire_plaintext_source(source: &Path) -> Result<(), String> {
-    fs::remove_file(source).map_err(|e| {
-        format!(
-            "encrypted identity vault is valid, but removing plaintext source {} failed: {e}",
-            source.display()
-        )
-    })?;
-    sync_parent(source)?;
-    Ok(())
-}
 
 fn validate_lct(lct: &str) -> Result<(), String> {
     if lct.trim() != lct || !lct.starts_with("lct:") || lct.len() <= 4 {

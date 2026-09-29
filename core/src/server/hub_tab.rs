@@ -689,6 +689,12 @@ mod tests {
     use super::*;
     use crate::vault::Vault;
 
+    /// The hub URL entry is daemon-owned: the operator vault screen must not offer to delete it.
+    #[test]
+    fn hub_urls_key_is_a_system_entry() {
+        assert!(crate::vault::system_entry_role(HUB_URLS_VAULT_KEY).is_some());
+    }
+
     fn temp_vault() -> (tempfile::TempDir, Vault) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vault.enc");

@@ -146,6 +146,124 @@ def test_the_projection_wins_and_role_is_launch_context() -> None:
         check("configured_hook_no_traceback", "Traceback" not in r.stderr, r.stderr[-300:])
 
 
+def test_a_launch_role_outside_the_vaults_permitted_set_is_a_miswire() -> None:
+    """Arm 6. Role stays launch context (arm 4), but launch context is not a blank cheque.
+
+    The role decides WHICH LAW APPLIES, and until now the launcher could name any string:
+    an unpublished one is silently normalised to `member` by the daemon, splitting a
+    member's acts across two trust grains (PR #66). When the vault names the set this seat
+    may launch under, a role outside it is refused here rather than normalised downstream.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        write_projection(home, env={
+            "HESTIA_ROLE_PERMITTED": "role:constellation:interactive-dev,role:constellation:mesh-worker",
+        })
+        env = projection_env(home, HESTIA_ROLE="role:constellation:sovereign")
+        r = run_hook(env)
+        check("role_outside_set_rc2", r.returncode == 2, f"rc {r.returncode}: {r.stderr[-300:]!r}")
+        check("role_outside_set_names_rule", "[config.miswired]" in r.stderr, r.stderr[-300:])
+        check("role_outside_set_names_the_role", "sovereign" in r.stderr, r.stderr[-300:])
+        check("role_outside_set_no_traceback", "Traceback" not in r.stderr, r.stderr[-300:])
+
+
+def test_a_permitted_role_passes_and_an_unbounded_one_says_it_is_unbounded() -> None:
+    """Arm 7, the control for arm 6 — without it the change could be "refuse every role".
+
+    Two halves. A role IN the declared set runs and is marked verified. A projection that
+    declares NO set leaves today's behaviour exactly as it is and records that it did:
+    tamper-EVIDENT, which is the honest limit `seat_config.rs` sets for this mechanism.
+    A reader must be able to tell a verified role from an unbounded one; if both looked the
+    same, silence would mean nothing.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        write_projection(home, env={
+            "HESTIA_ROLE_PERMITTED": "role:constellation:interactive-dev,role:constellation:mesh-worker",
+        })
+        env = projection_env(home, HESTIA_ROLE="role:constellation:mesh-worker")
+        got = probe_env(env, ["HESTIA_ROLE", "HESTIA_ROLE_VERIFIED", "HESTIA_ROLE_PERMITTED"])
+        check("permitted_role_loads", got["err"] is None, str(got["err"]))
+        check("permitted_role_survives", got["env"].get("HESTIA_ROLE") == "role:constellation:mesh-worker",
+              f"the bound overrode the launch role: {got['env']}")
+        check("permitted_role_marked_verified", got["env"].get("HESTIA_ROLE_VERIFIED") == "1",
+              f"a bounded role must be legible as bounded: {got['env']}")
+        check("the_bound_is_not_exported_as_config",
+              got["env"].get("HESTIA_ROLE_PERMITTED") in (None, ""),
+              f"the permitted set leaked into the seat's environment: {got['env']}")
+        r = run_hook(env)
+        check("permitted_role_passes_config_check", "[config." not in r.stderr, r.stderr[-300:])
+
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        write_projection(home, env={})          # no set declared: today's behaviour, unchanged
+        env = projection_env(home, HESTIA_ROLE="role:anything:at:all")
+        got = probe_env(env, ["HESTIA_ROLE", "HESTIA_ROLE_VERIFIED"])
+        check("unbounded_role_still_runs", got["err"] is None, str(got["err"]))
+        check("unbounded_role_survives", got["env"].get("HESTIA_ROLE") == "role:anything:at:all",
+              f"an undeclared set must not start refusing roles: {got['env']}")
+        check("unbounded_role_marked_unverified", got["env"].get("HESTIA_ROLE_VERIFIED") == "0",
+              f"silence must mean something: {got['env']}")
+
+
+def test_an_old_core_without_the_verdict_fails_closed_not_open() -> None:
+    """Arm 9 -- codex's P1 on a188cde. Deploy skew: the new hook, an OLD installed core that has
+    no `launch_role_verdict`. The call raised AttributeError at import, the hook exited 1, and
+    Claude Code treats exit 1 as non-blocking: the tool ran UNGATED. A declared set that cannot
+    be evaluated must be a deny (rc 2, gate.core_unavailable), never a crash."""
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        core = home / "shared" / "hestia_gate_core.py"
+        src = core.read_text()
+        if "def launch_role_verdict" in src:     # make it the OLD core: the function is absent
+            core.write_text(src[:src.index("def launch_role_verdict")])
+        write_projection(home, env={
+            "HESTIA_ROLE_PERMITTED": "role:constellation:interactive-dev,role:constellation:mesh-worker",
+        })
+        env = projection_env(home, HESTIA_ROLE="role:constellation:mesh-worker")
+        r = run_hook(env)
+        check("old_core_is_not_exit_1", r.returncode != 1,
+              f"rc 1 is fail-OPEN in Claude Code: {r.stderr[-300:]!r}")
+        check("old_core_denies_rc2", r.returncode == 2, f"rc {r.returncode}: {r.stderr[-300:]!r}")
+        check("old_core_names_the_rule", "[gate.core_unavailable]" in r.stderr, r.stderr[-300:])
+        check("old_core_no_traceback", "Traceback" not in r.stderr, r.stderr[-300:])
+    # CONTROL: with no declared set, the same old core is not consulted at import, so this
+    # check cannot be what refuses (whatever main later does with a stale core is its own path).
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        core = home / "shared" / "hestia_gate_core.py"
+        src = core.read_text()
+        if "def launch_role_verdict" in src:
+            core.write_text(src[:src.index("def launch_role_verdict")])
+        write_projection(home, env={})
+        got = probe_env(projection_env(home, HESTIA_ROLE="role:anything"), ["HESTIA_ROLE_VERIFIED"])
+        check("no_set_does_not_consult_the_core", got["err"] is None, str(got["err"]))
+
+
+def test_a_declared_set_does_not_refuse_an_absent_role() -> None:
+    """Arm 8 — the case the migration promise is about, and the one arms 6-7 left out.
+
+    GPT's review of #1084: the prose said an absent role is deliberately not refused, but the
+    check compared "" against the permitted set and refused it (rc 2) whenever a set was
+    declared, so publishing a set would have denied every seat whose launcher sets no role.
+    An absent role runs as today, and is marked unverified, not verified: it was not checked
+    against anything.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        home = stage_home(Path(raw))
+        write_projection(home, env={
+            "HESTIA_ROLE_PERMITTED": "role:constellation:interactive-dev,role:constellation:mesh-worker",
+        })
+        env = projection_env(home)
+        env.pop("HESTIA_ROLE", None)
+        got = probe_env(env, ["HESTIA_ROLE", "HESTIA_ROLE_VERIFIED"])
+        check("absent_role_still_runs", got["err"] is None, str(got["err"]))
+        check("absent_role_marked_unverified", got["env"].get("HESTIA_ROLE_VERIFIED") == "0",
+              f"an absent role was not checked, so it must not read as verified: {got['env']}")
+        r = run_hook(env)
+        check("absent_role_not_refused", "[config.miswired]" not in r.stderr, r.stderr[-300:])
+
+
 def test_the_witness_hook_shares_the_contract() -> None:
     with tempfile.TemporaryDirectory() as raw:
         home = stage_home(Path(raw))
@@ -173,6 +291,12 @@ def teardown_module(module):
 
 TESTS = [test_no_locator_refuses_before_stdin, test_no_projection_refuses_and_says_where,
          test_miswired_locator_refuses, test_the_projection_wins_and_role_is_launch_context,
+         # Arms 6-8. CI runs this file as a script, so a test missing from this list never
+         # runs there: arms 6-7 shipped in #1084 unlisted and its green CI covered neither.
+         test_a_launch_role_outside_the_vaults_permitted_set_is_a_miswire,
+         test_a_permitted_role_passes_and_an_unbounded_one_says_it_is_unbounded,
+         test_a_declared_set_does_not_refuse_an_absent_role,
+         test_an_old_core_without_the_verdict_fails_closed_not_open,
          test_the_witness_hook_shares_the_contract]
 
 if __name__ == "__main__":

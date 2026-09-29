@@ -360,6 +360,42 @@ fn mint_once(
     Some(lct_id)
 }
 
+// Moved from server/http.rs (#1110) so the CLI's `delegate grant` door can name the nearest
+// recorded id exactly as the HTTP doors do -- one helper, so the two refusals cannot drift.
+/// Recorded member ids a mistyped `asked` most plausibly meant: equal ignoring case and
+/// punctuation first, else within two edits. At most three, best first. Pure, so its refusals
+/// can be tested without a daemon. It only ever NAMES candidates in an error message -- it
+/// never redirects a grant, because guessing the target of an authority change is the
+/// operator's job, not a string distance's.
+pub fn nearest_member_ids(asked: &str, known: &[String]) -> Vec<String> {
+    let fold = |s: &str| -> Vec<char> {
+        s.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_lowercase()).collect()
+    };
+    let a = fold(asked);
+    if a.is_empty() {
+        return Vec::new();
+    }
+    let dist = |x: &[char], y: &[char]| -> usize {
+        let mut prev: Vec<usize> = (0..=y.len()).collect();
+        for (i, cx) in x.iter().enumerate() {
+            let mut cur = vec![i + 1];
+            for (j, cy) in y.iter().enumerate() {
+                let sub = prev[j] + usize::from(cx != cy);
+                cur.push(sub.min(prev[j + 1] + 1).min(cur[j] + 1));
+            }
+            prev = cur;
+        }
+        prev[y.len()]
+    };
+    let mut scored: Vec<(usize, &String)> = known
+        .iter()
+        .map(|k| (dist(&a, &fold(k)), k))
+        .filter(|(d, _)| *d <= 2)
+        .collect();
+    scored.sort_by(|x, y| x.0.cmp(&y.0).then_with(|| x.1.cmp(y.1)));
+    scored.into_iter().take(3).map(|(_, k)| k.clone()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

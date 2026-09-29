@@ -252,17 +252,34 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/handler.rs::gate_direct_tool", &[
         "let instance_lct = s.member_lct(&who.plugin_id);",
     ], SiteClass::Naming),
+    // RE-READ 2026-09-20 (claude-code@mcnugget, agent-lifecycle PRD R6). The three appeal sites
+    // below and `resolve_invitation` no longer compare two `member_lct`s themselves: they call
+    // `AppState::same_entity`, which is that comparison PLUS the operator's `identity_alias`
+    // records read without a window. This census went red on the change, as built -- four
+    // Predicate sites left its only symbol. Rather than let four name-gates drop out of view,
+    // the census now also keys on `.same_entity(`, and each site stays tagged Predicate with
+    // its call pinned. The comparison itself lives once, in `server/state.rs::same_entity`,
+    // pinned below: the header's "a future repair to the alias reach lands on both [pools] or
+    // is visibly missing from one" is this repair, landing on all four at once.
+    // DIRECTION, per site, unchanged in kind and now reachable: `true` EXCLUDES. At the three
+    // appeal sites a newly-true answer removes an arbiter who is the appellant under another
+    // name (the safe direction). At `resolve_invitation` it withholds an invitation from the
+    // asker's own alias -- the header's "opposite failure" -- which is correct here for the
+    // same reason: a member is not a peer reviewer of itself.
     ("server/handler.rs::tool_appeal", &[
-        "let appellant_lct = s.member_lct(&appellant.plugin_id);",
-        "match (&appellant_lct, s.member_lct(id)) {",
+        "!s.same_entity(&appellant.plugin_id, id)",
     ], SiteClass::Predicate),
     ("server/handler.rs::tool_arbitrate_appeal", &[
-        "let a = s.member_lct(&arbiter.plugin_id);",
-        "let b = s.member_lct(appellant);",
+        "let same_entity = s.same_entity(&arbiter.plugin_id, appellant);",
     ], SiteClass::Predicate),
     ("server/handler.rs::tool_open_appeals", &[
-        "let a = s.member_lct(&c.plugin_id);",
-        "let b = s.member_lct(appellant);",
+        "let same_entity = s.same_entity(&c.plugin_id, appellant);",
+    ], SiteClass::Predicate),
+    // The one place the name comparison now lives. Predicate: `la == lb` decides, and so do
+    // the alias relations beside it. A `None` on either side answers "not the same" -- an id
+    // that maps to no member is never asserted to be anyone, as `member_lct` always had it.
+    ("server/state.rs::same_entity", &[
+        "let (la, lb) = (self.member_lct(a), self.member_lct(b));",
     ], SiteClass::Predicate),
     // THIRD LINE ADDED 2026-08-07 (claude-code, #268 — the `policy_unevaluable` entry). The
     // census went red on it the moment it was written, which is the instrument working.
@@ -463,9 +480,10 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     // still NOT a refusal, still fails OPEN, still the whitespace-only alias reach
     // (`state::tests::the_member_lct_alias_guard_reaches_only_whitespace`), so
     // over-inviting remains the safe direction it errs in.
+    // (2026-09-20: now via `same_entity`, so the alias reach is no longer whitespace-only.
+    // Still a pool filter, still not a refusal. See the re-read note at `tool_appeal`.)
     ("server/handler.rs::resolve_invitation", &[
-        ".filter(|id| match (&asker_lct, s.member_lct(id)) {",
-        "let asker_lct = s.member_lct(&esc.plugin_id);",
+        "!s.same_entity(&esc.plugin_id, id)",
     ], SiteClass::Predicate),
     // The shared attribution line, now emitted once for BOTH doors. Naming, unchanged in
     // class from when it sat inline in each. The HST-005 caveat is load-bearing here and
@@ -619,6 +637,40 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/http.rs::scope_grant", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
+    // ADDED 2026-09-21 (claude-code@mcnugget, agent-lifecycle R1 -- retire/reinstate). The
+    // census went red the moment the routes were written, which is the instrument working.
+    //
+    // READING, both questions. (1) Who gets named? The subject of a `member_retire_intent` /
+    // `member_retired` (and the reinstate pair) -- the member whose standing on this seat the
+    // operator just ended or restored. Weakly corroborated like `scope_grant`'s: `plugin_id`
+    // arrives in the URL path, typed or clicked by the operator, with no member ask to confirm
+    // the spelling. Unlike `scope_grant` it is not a widening -- retiring a MISSPELLED id is
+    // inert rather than dangerous, because it retires a member nobody has heard of; the
+    // dangerous misspelling is the one that hits a REAL neighbouring id, and that is what the
+    // recently-acted guard (`agent_acts_since`, 409 + `confirm_active`) exists to catch. The
+    // guard does not use this symbol: it counts the id's own `policy_decision`/`outcome`
+    // entries, so it is not a Predicate site.
+    // (2) Compared to decide control flow? No. The derived LCT is serialised into the witness
+    // record and read by nothing; the retirement store keys on the `plugin_id` STRING, and the
+    // refusals (retired-id grant, not-retired reinstate) compare that string. Naming.
+    ("server/http.rs::agent_retire", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
+    ("server/http.rs::agent_reinstate", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
+    // ADDED 2026-09-22 (claude-code@mcnugget, agent-lifecycle R5 -- delegations from the agent).
+    // READING: the subject of a `delegation_grant_intent`/`delegation_granted` (and the revoke
+    // pair). Same corroboration as retire's: the id arrives in the URL path. NOT the key the
+    // delegation binds to -- that is `agent_key_for_lct` over the registry LCT, derived one
+    // line earlier, and this derived label is serialised beside it for the reader and read by
+    // nothing. Naming.
+    ("server/http.rs::agent_delegation_grant", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
+    ("server/http.rs::agent_delegation_revoke", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
     ("server/state.rs::trust_entity_key", &[
         "match self.member_lct(plugin_id) {",
     ], SiteClass::Naming),
@@ -655,11 +707,11 @@ const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
     // appellant's is dropped. Documents its own reach in `handler.rs`
     // (whitespace only — `the_member_lct_alias_guard_reaches_only_whitespace`).
     ("server/handler.rs::tool_appeal", &[
-        "(Some(a), Some(b)) => a != &b,",
+        "!s.same_entity(&appellant.plugin_id, id)",
     ]),
     // The `same_entity` arm feeding `hestia.arbitration_self`.
     ("server/handler.rs::tool_arbitrate_appeal", &[
-        "a.is_some() && a == b",
+        "let same_entity = s.same_entity(&arbiter.plugin_id, appellant);",
     ]),
     // The escalation INVITATION pool filter (#226's missing writer): a candidate whose
     // member LCT equals the asker's is not invited. Byte-identical to `tool_appeal`'s
@@ -669,14 +721,37 @@ const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
     // who should not rule; here a false "same" withholds an invitation and the peer then
     // reads as absent. Same line, opposite failure — which is why the pin is per site.
     ("server/handler.rs::resolve_invitation", &[
-        "(Some(a), Some(b)) => a != &b,",
+        "!s.same_entity(&esc.plugin_id, id)",
     ]),
     // The same arm, advisory here (`you_may_rule: false`). An advisory
     // predicate is still a predicate: it is the answer a member acts on when
     // deciding whether to file a ruling.
     ("server/handler.rs::tool_open_appeals", &[
-        "a.is_some() && a == b",
+        "let same_entity = s.same_entity(&c.plugin_id, appellant);",
     ]),
+    // THE comparison, since 2026-09-20. Three lines, because weakening any one of them is a
+    // different defect: drop the first and an unmappable id can be "the same" as another;
+    // drop the second and the whitespace reach goes; change the third and the alias relation
+    // (direct either way, or a shared target -- ONE level, never a chain) changes meaning.
+    //
+    // SPLIT 2026-09-20 (GPT seat, PR #1075). The comparison now lives in two halves and BOTH
+    // are pinned, because the defect was in the seam: `same_entity` documented "fails toward
+    // same" and returned `false` when the alias record could not be READ, and `false` is the
+    // permissive answer at every call site -- an unreadable chain would have admitted a party
+    // as its own arbiter. The unreadable arm is now `alias_relates`'s, and pinned as its own
+    // line; it has a test (`an_unreadable_alias_record_excludes_rather_than_admits`) because a
+    // working store cannot reach it.
+    ("server/state.rs::same_entity", &[
+        "if la.is_none() || lb.is_none() {",
+        "if la == lb {",
+    ]),
+    // The relation itself moved with the split, to `state.rs::alias_relates`, and is NOT
+    // pinned here -- deliberately. That fn consumes neither of this file's two symbols, so it
+    // is not a census site, and listing it would make this table a general-purpose pin board
+    // rather than the enumeration of `member_lct`/`same_entity` consumers it is. What carries
+    // it instead is stronger than a textual pin: `alias_relates` is pure, and
+    // `state::tests::an_unreadable_alias_record_excludes_rather_than_admits` exercises the
+    // unreadable arm directly (verified by sabotage -- restore the old `false` and it fails).
     // The `hestia.adjudication_self` refusal. The first conjunct compares
     // plugin_id strings (not this census's symbol); the second is the
     // name-gate, pinned.
@@ -708,6 +783,28 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("cli.rs::cmd_delegate_agent_id", &[
         "let registry = hestia::member_registry::load_members(&vault);",
     ]),
+    // ADDED 2026-09-23 (claude-code@mcnugget, #1106 review, cbp finding 5). READING: presence,
+    // read to answer "which member is this agent KEY?" so the command can refuse a retired one.
+    // The map is one-way -- key = f(lct) -- so the reverse is a scan of the registry, done once.
+    // The HTTP doors all refused a retired id and this one did not, which made the PR's claim
+    // ("refused through this door as through every other") true of HTTP only.
+    //
+    // DEGRADATION DIRECTION: an unreadable or empty registry yields no match, and an unmatched
+    // key is DELEGATED TO rather than refused. That is the permissive direction, and it is the
+    // right one here: the key may legitimately belong to no member of this seat (a filler, a
+    // peer's agent), and refusing every key this registry cannot name would break the command
+    // for its normal use. The refusal it adds is exact -- this key IS this retired member --
+    // and the authority it gates is bounded by the delegation's own scope. If this ever becomes
+    // the only check on a consequential path, that reading must be redone.
+    ("cli.rs::cmd_delegate_grant", &[
+        "let registry = hestia::member_registry::load_members(&vault);",
+        // ADDED 2026-09-25 (#1110): a READ FOR A MESSAGE, feeding the refusal's "did you mean"
+        // exactly as the HTTP door's does. The presence check itself (`registry.get(m)`) sits
+        // in the next line and gates in the fail-closed direction -- an unreadable registry
+        // refuses every member-bound action, never mints one.
+        "let suggest: Vec<String> = registry.iter_sorted().into_iter().filter(|(id, _)| !registry.is_filler(id)).map(|(id, _)| id.clone()).collect();",
+        "let who = registry.iter_sorted().into_iter().find(|(_, lct)| {",
+    ]),
     ("cli.rs::cmd_lct_publish", &[
         "let members = hestia::member_registry::load_members(&vault);",
     ]),
@@ -731,6 +828,11 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
         "for (plugin_id, lct) in members.iter_sorted() {",
     ]),
     ("server/dashboard.rs::dashboard_snapshot_from_projection", &[
+        // ADDED 2026-09-28 (claude-code@mcnugget). READING: presence, for DISPLAY -- every registry
+        // id the dashboard lists, so a member that never acted (a being awaiting its heartbeat, a
+        // phantom awaiting retirement) is visible at all. It gates nothing: an unreadable or empty
+        // registry lists fewer rows, never grants or refuses anything.
+        "let member_ids: Vec<String> = self.member_registry.iter_sorted().into_iter().map(|(id, _)| id.clone()).filter(|id| !self.member_registry.is_filler(id) && !self.is_synthetic(id)).collect();",
         "member_entities: self.member_registry.len(),",
     ]),
     // Added 2026-08-17 (codex, PR #490 NOT-SAME pass). READING, answering the question
@@ -772,8 +874,82 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     // that wrongly reports a member present — would restore exactly the silent-typo state this
     // was added to end, so if this ever becomes a gate rather than an advisory, that reading
     // must be redone.
+    //
+    // READING REDONE 2026-09-20 (claude-code@mcnugget, #1067) -- because it BECAME A GATE, which
+    // the paragraph above said would require exactly this. An unknown `plugin_id` is now
+    // refused (409, nothing written) unless the caller says `grant_ahead_of_connect: true`.
+    // Why the advisory was not enough: it was accurate and it was shown inside the success
+    // element; three typo'd grants went through on one seat in forty minutes while the real
+    // seat stayed denied, and the ids sat in the trust list as extra agents for twelve days.
+    //
+    // DEGRADATION DIRECTION, now that it gates: a registry that is empty or unreadable refuses
+    // EVERY operator-originated grant. Fail-closed and loud -- it cannot cause a grant, and the
+    // refusal says what to send instead. The cost is an operator blocked from a legitimate
+    // grant by a broken registry, so the deliberate path must be reachable from every surface
+    // that can grant: the API flag, AND the dashboard, which offers "grant ahead of first
+    // connect" on exactly this refusal (pinned in tools/grant_refusal_contract_test.py). The
+    // opposite failure -- a registry wrongly reporting a member present -- lets a typo through
+    // as before; no worse than the advisory it replaces.
+    //
+    // The second line is a READ FOR A MESSAGE: it lists recorded ids so the refusal can name
+    // the one the operator probably meant. It redirects nothing -- `nearest_member_ids` only
+    // ever feeds the error text -- so it is not a second gate.
     ("server/http.rs::scope_grant", &[
+        "let known: Vec<String> = s.member_registry.iter_sorted().into_iter().filter(|(id, _)| !s.member_registry.is_filler(id)).map(|(id, _)| id.clone()).collect();",
         "let member_known = s.member_registry.get(&plugin_id).is_some();",
+    ]),
+    // ADDED 2026-09-25 (claude-code@mcnugget, #1110 -- cbp's finding 4 on #1106). READING: the
+    // member segment INSIDE a delegated action (`scope.decide:<member>:/prefix`) is checked for
+    // presence before anything is signed. A segment naming no recorded member used to be stored,
+    // signed and witnessed as a delegation that enforced against no one (`action_covers`
+    // compares it to the asker by string equality) -- #1067's silent inertness, one layer in.
+    //
+    // DEGRADATION DIRECTION: an empty or unreadable registry REFUSES every member-bound action.
+    // Fail-closed and loud; it cannot cause a delegation, and the member-free forms
+    // (`scope.decide:/prefix`) are unaffected. A registry wrongly reporting a member present
+    // lets a typo through as before -- no worse than the silence it replaces.
+    //
+    // The first line is a READ FOR A MESSAGE, exactly as in `scope_grant`: it feeds
+    // `nearest_member_ids` for the refusal's "did you mean", and redirects nothing.
+    ("server/http.rs::agent_delegation_grant", &[
+        "let suggest: Vec<String> = s.member_registry.iter_sorted().into_iter().filter(|(id, _)| !s.member_registry.is_filler(id)).map(|(id, _)| id.clone()).collect();",
+        "let unvalidated = match crate::delegation::check_actions(&actions, &|m| s.member_registry.get(m).is_some(), &suggest) {",
+    ]),
+    // ADDED 2026-09-21 (claude-code@mcnugget, agent-lifecycle R4 -- register). The census went
+    // red on the route the moment it was written.
+    //
+    // READING: this is a PRODUCER, the second after `tool_connect`'s mint and the first that is
+    // an operator act rather than a consequence of a member showing up. Both reads are in the
+    // safety direction:
+    //   * `get(..).is_some()` -> already a member: return 200 having minted NOTHING and
+    //     witnessed nothing. Idempotent, so a double-click cannot make two records of one id.
+    //   * `ensure_member(..)` -> the mint itself. Fail-CLOSED where it can be: a synthetic or
+    //     empty id yields None and the route answers 409 with nothing registered.
+    // What makes a producer safe here is upstream of the registry and NOT visible in this
+    // table: the id is DERIVED from the inventory record and never taken from the caller (a
+    // body carrying `plugin_id` is refused outright), and an atlas id absent from this
+    // machine's report registers nothing. That is the property to re-read if this route ever
+    // accepts an id -- at which point it becomes #1067 with a mint attached.
+    ("server/http.rs::agent_register", &[
+        "crate::member_registry::ensure_member(",
+        "if s.member_registry.get(&plugin_id).is_some() {",
+    ]),
+    // ADDED 2026-09-22 (claude-code@mcnugget, agent-lifecycle R5 -- delegations). READING:
+    // presence, used to DERIVE the delegation key (`agent_key_for_lct` over the registry LCT)
+    // -- so a member the registry has not recorded gets 404 and no delegation, which is #952's
+    // rule: a delegation binds to an identity derived from a public key, never to a name.
+    // Fail-CLOSED: no registry entry, no key, no grant. The revoke route reads it for the same
+    // derivation, to check the delegation being struck belongs to THIS agent. And
+    // `commit_retirement` reads it to find which delegations a retiring member holds -- a
+    // member with no LCT has none, so the absent case is correctly a no-op there.
+    ("server/http.rs::delegation_key_for", &[
+        "let Some(lct) = s.member_registry.get(plugin_id) else {",
+    ]),
+    ("server/http.rs::agent_delegation_revoke", &[
+        "let Some(lct) = s.member_registry.get(&plugin_id).map(|l| l.lct_id()) else {",
+    ]),
+    ("server/state.rs::commit_retirement", &[
+        "if let Some(lct) = self.member_registry.get(member).map(|l| l.lct_id()) {",
     ]),
     // ADDED 2026-09-09 (cbp, the atomic `reassign`). READING: presence, used as a GATE, not
     // an advisory — the one thing the `scope_grant` reading above said would need its own
@@ -1362,7 +1538,7 @@ fn a() {
 
 #[test]
 fn member_lct_consumer_census_is_exact() {
-    let found = census(&[".member_lct("], false);
+    let found = census(&[".member_lct(", ".same_entity("], false);
     let projected: Vec<(&str, &[&str])> = MEMBER_LCT_CENSUS
         .iter()
         .map(|(k, v, _)| (*k, *v))

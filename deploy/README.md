@@ -9,7 +9,7 @@ machines. Not a rollout — a sequence of probes.
 - `templates/hestia.service` — copy this into `~/.config/systemd/user/`
   on Linux machines; per-machine env via `%h` substitution
 - `templates/` — drop-ins for other machine types as we add them
-  (`io.hestia.tools.plist` for McNugget, etc.)
+  (`com.web4.hestia.daemon.plist` for macOS: the label hestia-deploy restarts)
 
 The pattern at every stage:
 

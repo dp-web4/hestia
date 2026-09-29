@@ -991,4 +991,18 @@ fi
 # fix to the wrapper, the unit, the plist or the hook registration changes no byte of
 # inventory.py and would otherwise never reach a seat that already has one (GPT, hestia
 # PR #1071). Last, under `set -e`: its presence means every step above survived.
+#
+# `.installed-with` IS THE OTHER HALF OF "CURRENT" (cbp, PR #1071 post-merge review). The
+# installed surface is a function of this file AND the inputs it was run with, and the
+# deploy's fast path compared this file, inventory.py and the atlas pin -- not the workspace.
+# Measured by cbp on the deploy's own harness: HESTIA_WORKSPACE wsA -> wsB answered
+# ok(current) with the installer never rerun, so an operator who corrected a wrong workspace
+# in the deploy unit kept the old pin in all three triggers, which do not inherit that unit's
+# environment. The inputs are recorded AS THE CALLER SUPPLIED THEM, not as resolved: a caller
+# can only compare what it passed, and a run that supplied none (a human, workspace derived
+# from git) must not look current to a deploy that supplies one. Recorded here rather than
+# grepped back out of the wrapper, so the next pinned input costs a field in this printf and
+# not a hand-rebuilt copy of `sh_pin`'s quoting in another script. It needs no drop of its
+# own: it is only ever read beside `.installed-by`, which part 1 has already removed.
+printf 'workspace=%s\natlas=%s\n' "${HESTIA_WORKSPACE:-}" "${HESTIA_ATLAS_DIR:-}" > "$BIN.installed-with"
 install -m 0644 "$SRC_DIR/install.sh" "$BIN.installed-by"

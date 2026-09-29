@@ -1,28 +1,21 @@
 #!/usr/bin/env python3
-"""Hestia witness hook for OpenAI Codex CLI — self-contained, stdlib only.
+"""Hestia outcome witness — the OpenAI Codex CLI shim. Stdlib only.
 
-Wired from ~/.codex/config.toml as a PostToolUse command hook. Reads
-the hook event JSON from stdin, fires a `hestia_begin_action` +
-`hestia_record_outcome` pair against the local Hestia daemon's MCP
-endpoint, and exits.
+Registered on the harness's post-tool event(s): PostToolUse. It says WHO is witnessing and hands
+the event to the shared core, `hestia_witness_core` (installed at $HESTIA_HOME/shared with the
+rest of the engine). Everything else — the gate<->outcome correlation (#977), the spool (#696),
+the cold-path typing, the harness event shapes — lives in the core, once.
 
-DESIGN
-- Pure stdlib. No `httpx`, no `mcp`, no `hestia_plugin_sdk`. The plugin
-  drops in as a single file and works wherever Python 3.10+ is present.
-- Fail-open at every layer. Any error connecting to Hestia is logged
-  (when `HESTIA_HOOK_DEBUG=1`) and swallowed. The hook MUST NOT block
-  Claude Code's tool execution.
-- First-run UX: if the daemon is missing, write a single one-time
-  "daemon not detected" hint to ~/.hestia-claude/last-warning so a
-  user who never ran `hestia init` knows what's happening.
-- Stateless across invocations. Each hook process opens its own MCP
-  session and disconnects. ~50-200 ms overhead amortized through the
-  fire-and-forget wrapper; the actual round-trip happens off Claude
-  Code's critical path.
+WHY A SHIM (findings/per-harness-witness-drift-2026-09-28.md). Each harness used to carry its own
+witness, and a fix landed in one copy of four: claude-code 1985 of 1986 warned acts closed by a
+same-id outcome, kimi 0 of 37, codex 0 of 1, gemini's outcomes never reached the daemon. This
+file is byte-identical across harnesses except the two identity lines below; a shim that needs
+more than that has started to fork — extend the core instead.
 
 DEBUG
-  HESTIA_HOOK_DEBUG=1     log to ~/.hestia-claude/hook.log
-  HESTIA_ENDPOINT=URL     override endpoint discovery
+  HESTIA_HOOK_DEBUG=1         log to the seat's state dir (hook.log)
+  HESTIA_ENDPOINT=URL         override endpoint discovery
+  HESTIA_WITNESS_TIMEOUT_S    per-call budget (default 2.0; tests)
 """
 
 from __future__ import annotations
@@ -32,344 +25,200 @@ import os
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
-from pathlib import Path
-from typing import Any, Optional
 
-# ---- Configuration --------------------------------------------------------
+DEFAULT_PLUGIN_ID = "codex"
+HOST_AGENT_VERSION = "codex"
 
-PLUGIN_ID = "codex"
-HOST_AGENT = "codex"
-PROTOCOL_VERSION = "2024-11-05"
-TIMEOUT_S = 2.0
-HOOK_VERSION = "0.0.1"
-
-STATE_DIR = Path.home() / ".hestia-claude"
-DEFAULT_HESTIA_HOME = Path.home() / ".hestia"
-DEFAULT_ENDPOINT = "http://127.0.0.1:7711/mcp"
+PLUGIN_ID = os.environ.get("HESTIA_PLUGIN_ID", DEFAULT_PLUGIN_ID)
+HOOK_VERSION = "1.0.0"
 
 
-def debug_log(msg: str) -> None:
-    if os.environ.get("HESTIA_HOOK_DEBUG") != "1":
-        return
+# ---------------------------------------------------------------------------
+# THE PROJECTION IS THE ONLY SOURCE OF THIS SEAT'S CONFIGURATION (PRD_CONFIG_FROM_VAULT; #944)
+# ---------------------------------------------------------------------------
+# One bootstrap locator, launcher-supplied, no default: HESTIA_HOME. Everything else — the shared
+# runtime dir, the endpoint, the state dir — comes from `$HESTIA_HOME/seats/<plugin_id>.env`.
+# Loaded at IMPORT (the shared dir is resolved from it). Import never fails: the outcome is
+# recorded in `_PROJECTION_ERROR` and run() returns on it. Bootstrap wiring, not law.
+PROJECTION_DIR = "seats"
+
+
+def _load_projection(plugin_id):
+    """Export the seat's rendered projection into the environment. Returns None, or the
+    reason the seat is not configured — never raises."""
+    home = os.environ.get("HESTIA_HOME")
+    if not home:
+        return ("config.unbacked", "HESTIA_HOME is not set; the launcher must supply the "
+                "bootstrap locator (there is no default, by design)")
+    path = os.path.join(home, PROJECTION_DIR, plugin_id + ".env")
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        with (STATE_DIR / "hook.log").open("a") as f:
-            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
-    except OSError:
-        pass
-
-
-def discover_endpoint() -> Optional[str]:
-    """Mirror the SDK's discovery order: env → file → default."""
-    env = os.environ.get("HESTIA_ENDPOINT")
-    if env:
-        return env
-    home = Path(os.environ.get("HESTIA_HOME", str(DEFAULT_HESTIA_HOME)))
-    endpoint_file = home / "endpoint"
-    try:
-        return endpoint_file.read_text().strip() or None
-    except OSError:
-        return None  # daemon hasn't run; let warn_once handle the UX
-
-
-def warn_once_daemon_missing() -> None:
-    """Surface a single one-time hint if the daemon was never set up."""
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        marker = STATE_DIR / "daemon-warned"
-        if marker.exists():
-            return
-        marker.touch()
-        sys.stderr.write(
-            "hestia: daemon not detected — install at https://hestia.tools "
-            "to start recording tool calls. (This message shown once.)\n"
-        )
-    except OSError:
-        pass
-
-
-# ---- Magnitude / target heuristics ---------------------------------------
-
-def magnitude_for(tool_name: str) -> float:
-    """R6 magnitude in [0..1] by tool class."""
-    if tool_name in {"Bash", "Shell"}:
-        return 0.8
-    if tool_name in {"Write", "Edit", "MultiEdit", "NotebookEdit"}:
-        return 0.6
-    if tool_name in {"WebFetch", "WebSearch"}:
-        return 0.4
-    if tool_name in {"Read", "Glob", "Grep", "TodoWrite"}:
-        return 0.2
-    return 0.4
-
-
-def extract_target(tool_input: Any) -> Optional[str]:
-    if not isinstance(tool_input, dict):
-        return None
-    for key in ("file_path", "path", "url", "notebook_path"):
-        v = tool_input.get(key)
-        if isinstance(v, str):
-            return v
-    cmd = tool_input.get("command")
-    if isinstance(cmd, str) and cmd.strip():
-        # Send the full command (truncated for chain-entry hygiene).
-        # The policy gate already sees the untruncated command via the
-        # PreToolUse hook's `parameters.command`; this `target` is for
-        # forensic readability in the chain feed.
-        s = cmd.strip()
-        return s if len(s) <= 240 else s[:237] + "..."
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        return ("config.unbacked", f"no rendered projection for {plugin_id} at {path} ({e}); "
+                "populate this seat's config in the vault (Govern -> Runtime config)")
+    import hashlib
+    import re
+    digest = hashlib.sha256(raw).hexdigest()
+    pairs = []
+    for ln in raw.decode("utf-8", "replace").split("\n"):
+        if not ln or ln.startswith("#") or "=" not in ln:
+            continue
+        k, v = ln.split("=", 1)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
+            return ("config.unbacked", f"projection {path} carries an unusable key {k!r}")
+        pairs.append((k, v))
+    # OWNERSHIP RIDES ON EVERY LINE (design A): `TOKEN__KEY` lines belong to one seat.
+    token = "".join(ch.upper() if ch.isalnum() else "_" for ch in plugin_id)
+    projected = {}
+    for k, v in pairs:
+        if "__" in k:
+            prefix, bare = k.split("__", 1)
+            if prefix != token:
+                return ("config.miswired", f"projection {path} carries a line for seat token "
+                        f"{prefix!r}, but this seat is {token!r} ({plugin_id}); a line cannot be "
+                        "consumed by a seat it was not rendered for")
+            k = bare
+        projected[k] = v
+    if "HESTIA_HOME" in projected and os.path.realpath(projected["HESTIA_HOME"]) != os.path.realpath(home):
+        return ("config.miswired", f"the launcher supplied HESTIA_HOME={home!r} but the vault "
+                f"projection says {projected['HESTIA_HOME']!r}; this seat is running against a "
+                "home the authority does not name")
+    if projected.get("HESTIA_PLUGIN_ID", plugin_id) != plugin_id:
+        return ("config.miswired", f"projection {path} says HESTIA_PLUGIN_ID="
+                f"{projected['HESTIA_PLUGIN_ID']!r} but this seat is {plugin_id!r}")
+    for k, v in projected.items():
+        if k == "HESTIA_ROLE":
+            continue   # launch context, never config
+        os.environ[k] = v
+    os.environ["HESTIA_PROJECTION_SHA256"] = digest
+    os.environ["HESTIA_PROJECTION_PATH"] = path
     return None
 
 
-def derive_success(tool_response: Any) -> tuple[bool, Optional[str]]:
-    """Best-effort success flag from Claude Code's tool_response shape."""
-    if not isinstance(tool_response, dict):
-        return True, None
-    if tool_response.get("is_error") or tool_response.get("isError"):
-        err = tool_response.get("error") or tool_response.get("message") or "tool error"
-        return False, str(err)[:500]
-    return True, None
+_PROJECTION_ERROR = _load_projection(PLUGIN_ID)
+
+# Resolved AFTER the projection: the vault may name it (projection_consumer_test pins this). No
+# default is spelled here -- once the core loads, its STATE_DIR (one rule, in the engine) is used.
+STATE_DIR = os.environ.get("HESTIA_STATE_DIR")
 
 
-# ---- Minimal MCP-over-HTTP client ----------------------------------------
-
-class McpHttp:
-    """Tiny synchronous MCP client. Just enough to fire init + 2 tool calls."""
-
-    def __init__(self, endpoint: str) -> None:
-        self.endpoint = endpoint
-        self.session_id: Optional[str] = None
-        self.next_id = 0
-
-    def _id(self) -> int:
-        self.next_id += 1
-        return self.next_id
-
-    def _request(
-        self, body: dict[str, Any], *, is_notification: bool = False
-    ) -> Optional[dict[str, Any]]:
-        data = json.dumps(body).encode("utf-8")
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-        }
-        if self.session_id:
-            headers["mcp-session-id"] = self.session_id
-        req = urllib.request.Request(self.endpoint, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
-            # Capture session id on first call.
-            if not self.session_id:
-                sid = resp.headers.get("mcp-session-id")
-                if sid:
-                    self.session_id = sid
-            if is_notification:
-                return None
-            payload = resp.read().decode("utf-8", errors="replace")
-        return parse_json_or_sse(payload)
-
-    # --- public ops ---
-
-    def initialize(self) -> dict[str, Any]:
-        result = self._request({
-            "jsonrpc": "2.0",
-            "id": self._id(),
-            "method": "initialize",
-            "params": {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": PLUGIN_ID, "version": HOOK_VERSION},
-            },
-        })
-        return result or {}
-
-    def initialized(self) -> None:
-        self._request(
-            {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
-            is_notification=True,
-        )
-
-    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        result = self._request({
-            "jsonrpc": "2.0",
-            "id": self._id(),
-            "method": "tools/call",
-            "params": {"name": name, "arguments": arguments},
-        })
-        return result or {}
+# ---------------------------------------------------------------------------
+# The core is loaded ONLY from the installed authority directory — the gates' loader, verbatim in
+# behaviour: never a checkout fallback (#742/#747).
+# ---------------------------------------------------------------------------
+def _shared_runtime_dir():
+    explicit = os.environ.get("HESTIA_SHARED_DIR")
+    if explicit:
+        return explicit
+    home = os.environ.get("HESTIA_HOME")
+    return os.path.join(home, "shared") if home else ""
 
 
-def parse_json_or_sse(text: str) -> dict[str, Any]:
-    """Hestia returns either a plain JSON-RPC body or an SSE stream
-    containing the body. Handle both."""
-    text = text.strip()
-    if not text:
-        return {}
-    if text.startswith("{"):
-        return json.loads(text)
-    # SSE: pick the last `data:` line that parses as JSON.
-    for line in reversed(text.splitlines()):
-        line = line.strip()
-        if line.startswith("data:"):
-            body = line[5:].strip()
-            if body and body.startswith("{"):
-                try:
-                    return json.loads(body)
-                except json.JSONDecodeError:
-                    continue
-    return {}
+def _load_shared_module(name):
+    """Load the named module only from the selected installed authority directory."""
+    import importlib.util
+
+    shared = _shared_runtime_dir()
+    required = os.path.realpath(os.path.join(shared, name + ".py"))
+    if not os.path.isfile(required):
+        raise ImportError(f"installed Hestia shared module {name!r} is unavailable at {required!r}; "
+                          "run deploy/install-members.sh")
+    selected_dir = os.path.dirname(required)
+    selected_key = os.path.normcase(selected_dir)
+    retained = []
+    for entry in sys.path:
+        try:
+            entry_key = os.path.normcase(os.path.realpath(os.fspath(entry) or os.getcwd()))
+        except (TypeError, ValueError, OSError):
+            retained.append(entry)
+            continue
+        if entry_key != selected_key:
+            retained.append(entry)
+    sys.path[:] = [selected_dir, *retained]
+    cached = sys.modules.get(name)
+    if cached is not None:
+        cached_file = getattr(cached, "__file__", None)
+        if cached_file and os.path.realpath(cached_file) == required:
+            return cached
+        sys.modules.pop(name, None)
+    spec = importlib.util.spec_from_file_location(name, required)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot construct a loader for installed module {required!r}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        sys.modules.pop(name, None)
+        raise ImportError(f"installed Hestia shared module {name!r} failed to initialize") from exc
+    return module
 
 
-def unwrap_tool_result(rpc_response: dict[str, Any]) -> dict[str, Any]:
-    """Extract the structured payload from an MCP tools/call response."""
-    result = rpc_response.get("result") or {}
-    structured = result.get("structuredContent")
-    if isinstance(structured, dict):
-        return structured
-    # Fallback to first text content.
-    for block in result.get("content") or []:
-        if isinstance(block, dict) and block.get("type") == "text":
-            text = block.get("text", "")
-            try:
-                return json.loads(text)
-            except json.JSONDecodeError:
-                pass
-    return {}
+core = None
+_CORE_ERROR = None
+if _PROJECTION_ERROR is None:
+    try:
+        core = _load_shared_module("hestia_witness_core")
+        core.configure(plugin_id=PLUGIN_ID, host_agent_version=HOST_AGENT_VERSION,
+                       hook_version=HOOK_VERSION)
+        STATE_DIR = str(core.STATE_DIR)
+    except Exception as e:  # noqa: BLE001 — recorded below, never raised into the harness
+        core, _CORE_ERROR = None, f"{type(e).__name__}: {e}"
 
 
-# ---- Main flow -----------------------------------------------------------
+def _note_unwitnessed(why: str) -> None:
+    """The core could not run, so this act reaches no chain. Say so where an operator looks —
+    a silent skip is how four witness copies drifted for two months without anyone seeing."""
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {PLUGIN_ID} unwitnessed: {why}\n"
+    where = STATE_DIR or os.environ.get("HESTIA_HOME")
+    try:
+        if not where:
+            raise OSError("no state dir and no HESTIA_HOME")
+        os.makedirs(where, exist_ok=True)
+        with open(os.path.join(where, "witness-unwitnessed.log"), "a") as f:
+            f.write(line)
+    except OSError:
+        sys.stderr.write("hestia: " + line)
+
 
 def run() -> int:
     raw = sys.stdin.read()
     if not raw.strip():
         return 0
+    if _PROJECTION_ERROR is not None:
+        # No projection, no authority to witness as. Infrastructure, not conduct.
+        _note_unwitnessed(f"projection {_PROJECTION_ERROR[0]}: {_PROJECTION_ERROR[1]}")
+        return 0
+    if core is None:
+        _note_unwitnessed(f"witness core unavailable: {_CORE_ERROR}")
+        return 0
     try:
         event = json.loads(raw)
     except json.JSONDecodeError as e:
-        debug_log(f"bad json: {e}")
+        core._debug_log(f"bad json: {e}")
         return 0
-
-    if event.get("hook_event_name") != "PostToolUse":
-        return 0
-
-    tool_name = event.get("tool_name") or "?"
-    tool_input = event.get("tool_input") or {}
-    tool_response = event.get("tool_response")
-
-    endpoint = discover_endpoint()
-    if endpoint is None:
-        warn_once_daemon_missing()
-        debug_log("no endpoint discovered; skipping")
-        return 0
-
-    target = extract_target(tool_input)
-    magnitude = magnitude_for(tool_name)
-    success, error = derive_success(tool_response)
-
-    client = McpHttp(endpoint)
-    try:
-        init_resp = client.initialize()
-        if "result" not in init_resp:
-            debug_log(f"initialize failed: {init_resp}")
-            return 0
-        client.initialized()
-
-        connect_resp = client.call_tool(
-            "hestia_connect",
-            {
-                "plugin_id": PLUGIN_ID,
-                "plugin_version": HOOK_VERSION,
-                "host_agent": HOST_AGENT,
-                "host_agent_version": "codex",
-                "requested_role": "citizen",
-            },
-        )
-        connect = unwrap_tool_result(connect_resp)
-        if "_hestia_error" in connect:
-            debug_log(f"connect rejected: {connect['_hestia_error']}")
-            return 0
-        session_id = connect.get("sessionId")
-
-        begin_resp = client.call_tool(
-            "hestia_begin_action",
-            {
-                "tool_name": tool_name,
-                "target": target,
-                **({"session_id": session_id} if session_id else {}),
-            },
-        )
-        begin = unwrap_tool_result(begin_resp)
-        if "_hestia_error" in begin:
-            debug_log(f"begin_action rejected: {begin['_hestia_error']}")
-            return 0
-        action_id = begin.get("actionId")
-        if not action_id:
-            debug_log(f"begin_action missing actionId: {begin}")
-            return 0
-
-        outcome_resp = client.call_tool(
-            "hestia_record_outcome",
-            {
-                "action_id": action_id,
-                "success": success,
-                "magnitude": magnitude,
-                "error": error,
-                **({"session_id": session_id} if session_id else {}),
-            },
-        )
-        outcome = unwrap_tool_result(outcome_resp)
-        if "_hestia_error" in outcome:
-            debug_log(f"record_outcome rejected: {outcome['_hestia_error']}")
-            return 0
-
-        debug_log(
-            f"post {tool_name} action={action_id[:8]} "
-            f"success={success} magnitude={magnitude}"
-        )
-    except urllib.error.URLError as e:
-        debug_log(f"network: {e}")
-        warn_once_daemon_missing()
-    except Exception as e:  # noqa: BLE001 — fail-open at top level
-        debug_log(f"unexpected: {type(e).__name__}: {e}")
-    return 0
+    return core.run(event)
 
 
 BACKGROUND_MARKER = "--hestia-bg"
 
 
 def fire_and_forget() -> None:
-    """Relaunch self detached so the parent (Claude Code) doesn't block.
-
-    Reads stdin in the foreground, hands it to the background process,
-    exits immediately. The background process does the actual MCP work.
-
-    Cross-platform: `start_new_session=True` on POSIX, `DETACHED_PROCESS`
-    + `CREATE_NEW_PROCESS_GROUP` on Windows.
-    """
+    """Relaunch self detached so the harness doesn't block on the round-trip."""
     raw = sys.stdin.buffer.read()
-    kwargs: dict[str, Any] = {
-        "stdin": subprocess.PIPE,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-    }
+    kwargs = {"stdin": subprocess.PIPE, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     if os.name == "nt":
-        DETACHED_PROCESS = 0x00000008
-        CREATE_NEW_PROCESS_GROUP = 0x00000200
-        kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
-
     try:
-        proc = subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), BACKGROUND_MARKER],
-            **kwargs,
-        )
+        proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), BACKGROUND_MARKER], **kwargs)
         if proc.stdin is not None:
             proc.stdin.write(raw)
             proc.stdin.close()
-    except OSError as e:
-        debug_log(f"could not background: {e}")
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":
@@ -378,6 +227,5 @@ if __name__ == "__main__":
             sys.exit(run())
         fire_and_forget()
         sys.exit(0)
-    except Exception as e:  # noqa: BLE001
-        debug_log(f"top-level: {e}")
+    except Exception:  # noqa: BLE001 — the witness never fails the tool call
         sys.exit(0)

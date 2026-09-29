@@ -19,9 +19,9 @@ DESIGN
   `status: "evaluating"` with `nextPollMs: N`, we sleep N ms and
   re-query — up to `MAX_POLLS` times. Useful when (future) LLM-backed
   policy entities need a moment.
-- **Action cache.** On a decision we store the action_id under
-  /tmp/hestia-actions/<tool_use_id>.json so the PostToolUse hook can
-  pair the outcome to the begin_action.
+- **Action cache.** On a decision the shared mechanism caches the action_id under the
+  call's correlation key (hestia_witness_core, one rule for every harness) so the
+  PostToolUse witness closes the action this gate decided on.
 - **Exit semantics for Claude Code:**
     - `exit 0` (silent)               — allow, no message
     - `exit 0` with stderr message    — warn, surfaced to the agent
@@ -63,7 +63,6 @@ PROTOCOL_VERSION = 1
 HOOK_VERSION = "0.0.2"
 
 STATE_DIR = Path.home() / ".hestia-claude"
-ACTIONS_DIR = Path("/tmp/hestia-actions")
 DEFAULT_ENDPOINT = "http://127.0.0.1:7711/mcp"
 
 
@@ -136,15 +135,32 @@ def _load_projection(plugin_id):
     if projected.get("HESTIA_PLUGIN_ID", plugin_id) != plugin_id:
         return ("config.miswired", f"projection {path} says HESTIA_PLUGIN_ID="
                 f"{projected['HESTIA_PLUGIN_ID']!r} but this seat is {plugin_id!r}")
+    # THE ROLE IS LAUNCH CONTEXT, AND LAUNCH CONTEXT IS NOT A BLANK CHEQUE.
+    #
+    # Role stays out of the export loop below, for the reason given at the top of this file:
+    # which role a seat runs under (interactive vs mesh-worker) is decided by whoever launched
+    # it, and the vault cannot know that. That reasoning is sound and this does not change it.
+    # A 2026-09-20 audit read the carve-out as config escaping vault authority; re-reading it,
+    # the carve-out is right and the hole is next to it.
+    #
+    # THE BOUND IS KEPT ASIDE, NOT JUDGED HERE. Which launch roles pass, the unset-role exemption
+    # and the refusal's words are law, and live in the shared engine
+    # (hestia_gate_core.launch_role_verdict, hestia #1084; dp 2026-09-22: "all law goes into
+    # shared engine"). This loader runs before shared authority is findable, so it only keeps
+    # the declared set for `_apply_launch_role`, which hands it over once it is.
+    global _ROLE_PERMITTED
+    _ROLE_PERMITTED = projected.get("HESTIA_ROLE_PERMITTED", "")
+
     for k, v in projected.items():
-        if k == "HESTIA_ROLE":
-            continue   # launch context, never config
+        if k in ("HESTIA_ROLE", "HESTIA_ROLE_PERMITTED"):
+            continue   # launch context and its bound — never exported as config
         os.environ[k] = v
     os.environ["HESTIA_PROJECTION_SHA256"] = digest
     os.environ["HESTIA_PROJECTION_PATH"] = path
     return None
 
 
+_ROLE_PERMITTED = ""   # set by _load_projection; judged by the shared engine
 _PROJECTION_ERROR = _load_projection(PLUGIN_ID)
 
 # Total time budget across all daemon round-trips + re-polls.
@@ -1449,6 +1465,7 @@ def ask_daemon(
     tool_input: Any,
     tool_use_id: str,
     host_session_id: Optional[str] = None,
+    event: Optional[dict] = None,
 ):
     """Obtain the daemon's verdict IN-PROCESS via the shared mechanism (Sprint E).
 
@@ -1482,6 +1499,7 @@ def ask_daemon(
         plugin_version=HOOK_VERSION,
         host_agent_version="claude-code",
         host_session_id=host_session_id,
+        correlation_key=(mech.correlation_key(event) if event is not None else tool_use_id),
     )
     if not verdict.decided:
         # The mechanism already recorded the plane-E row (record_gate_unavailable) —
@@ -1490,16 +1508,6 @@ def ask_daemon(
         debug_log(f"no verdict from daemon path: {verdict.message}")
         return None
     return verdict
-
-
-def cache_action(tool_use_id: str, action_id: str, tool_name: str) -> None:
-    try:
-        ACTIONS_DIR.mkdir(parents=True, exist_ok=True)
-        (ACTIONS_DIR / f"{tool_use_id}.json").write_text(
-            json.dumps({"action_id": action_id, "tool_name": tool_name, "ts": time.time()})
-        )
-    except OSError as e:
-        debug_log(f"action cache failed: {e}")
 
 
 def _record_plane_e(cause: str, detail: str, tool_name: str = "unknown") -> None:
@@ -1643,6 +1651,42 @@ def emit_decision(verdict) -> int:
         sys.stderr.write(verdict.message + "\n")
         return 0
     return 0
+
+
+def _apply_launch_role():
+    """Hand the projection's permitted launch roles to the shared engine, record its answer.
+
+    The role verdict -- the predicate, the unset-role exemption, the refusal's words -- is
+    `hestia_gate_core.launch_role_verdict`'s (hestia #1084). This function owns exactly two
+    things, both narrow:
+
+    - NO DECLARED SET: the core is not consulted. Nothing is decided by skipping it: the core's
+      own answer for an empty set is (None, False), which is what this records.
+    - A DECLARED SET THAT CANNOT BE EVALUATED fails closed. Anything that goes wrong reaching or
+      calling the verdict -- the core missing, or an OLD core without the function (deploy skew:
+      new hook, old shared; codex's P1 on a188cde) -- becomes gate.core_unavailable. That has to
+      be here, not in the core, and it has to catch everything: this runs at import, and a hook
+      that raises exits 1, which Claude Code treats as NON-BLOCKING -- the tool would run ungated.
+    """
+    if not _ROLE_PERMITTED.strip():
+        os.environ["HESTIA_ROLE_VERIFIED"] = "0"
+        return None
+    try:
+        core = _load_shared_module("hestia_gate_core")
+        miswire, verified = core.launch_role_verdict(
+            _ROLE_PERMITTED, os.environ.get("HESTIA_ROLE", ""),
+            f"projection {os.environ.get('HESTIA_PROJECTION_PATH', '')}")
+    except Exception as e:  # noqa: BLE001 -- any failure here must deny, never exit 1
+        os.environ["HESTIA_ROLE_VERIFIED"] = "0"
+        return ("gate.core_unavailable",
+                f"the projection declares permitted launch roles, and the shared law core could "
+                f"not evaluate them ({type(e).__name__}: {str(e)[:120]}); a bound that cannot be "
+                f"evaluated is not a pass")
+    os.environ["HESTIA_ROLE_VERIFIED"] = "1" if verified else "0"
+    return miswire
+
+if _PROJECTION_ERROR is None:
+    _PROJECTION_ERROR = _apply_launch_role()
 
 
 def main() -> int:
@@ -1862,10 +1906,8 @@ def main() -> int:
             return 2
 
     # Try the daemon first — IN-PROCESS via the shared mechanism (Sprint E, one transport).
-    verdict = ask_daemon(tool_name, tool_input, tool_use_id, host_session_id)
+    verdict = ask_daemon(tool_name, tool_input, tool_use_id, host_session_id, event=event)
     if verdict is not None:
-        if verdict.action_id:
-            cache_action(tool_use_id, verdict.action_id, tool_name)
         debug_log(f"daemon decided: {tool_name} → {verdict.kind}")
         return emit_decision(verdict)
 
