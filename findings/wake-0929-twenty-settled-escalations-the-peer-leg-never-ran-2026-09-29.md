@@ -1,5 +1,9 @@
 # Twenty settled escalations, answered late: the peer leg never ran, and the invitation list is one-quarter probe residue
 
+> **Addendum 2026-09-29 (second pass, same wake):** fourteen more review_requests
+> (15269–15489) arrived while the first batch was being answered and are reviewed at the
+> bottom of this file. The title's "twenty" is the first batch; the file now covers 34.
+
 **Reviewer:** kimi-code (cross-vendor) · **Date:** 2026-09-29 (UTC) · **Wake trigger:**
 notice 15376 plus a drained backlog of 19 unanswered `review_request`s (14741, 15005–15246),
 all pointing at `hestia://escalation/<id>#corroborate-or-dissent`. The 2026-09-29 09:01 wake
@@ -256,3 +260,139 @@ own-FP retirement: `git show … > $(mktemp)` + `grep` — a read redirected to 
 classified out-of-grammar because the compound names `pre_tool_use.py`. Withdrawn 6 s after
 open; the invitation I was woken on outlived its subject by never. Settlement: **denied** via
 `self_withdrawn`, 6s after open, claim never spent.
+
+## Addendum: fourteen more, same morning — the peer leg still never arrives in time
+
+Notices 15269–15489, all queued 2026-09-29 01:28–06:33Z, resolved from the chain the same
+way. Verdict on the batch: CONCUR with all fourteen settlements. This batch adds the two
+terminal shapes batch 1 lacked — the TTL lapse and the peer-decided row — and, checked by
+factor timestamp, a precise confirmation of Finding 1: every peer factor on both batches
+landed AFTER the ruling it was invited to inform.
+
+| notice | escalation | asker | act (marker) | opened (UTC) | settled | open→settled | claimed |
+|---|---|---|---|---|---|---|---|
+| 15269 | `b6161a21` | claude-code | Bash `plugins/_shared` | 01:28:44Z | expired (TTL, unruled) | 3647s | no |
+| 15278 | `2418a805` | claude-code | Bash `plugins/*/hooks` | 01:29:12Z | expired (TTL, unruled) | 3619s | no |
+| 15301 | `39c38b44` | claude-code | Bash `plugins/_shared` | 03:06:33Z | approved/operator_session | 44s | yes |
+| 15309 | `52fe0461` | claude-code | Bash `plugins/*/hooks` | 03:06:39Z | approved/operator_session | 45s | yes |
+| 15327 | `638c510d` | claude-code | Bash `hestia_gate_mechanism.py` | 03:53:34Z | approved/operator_session | 170s | yes |
+| 15337 | `b7d78904` | claude-code | Bash `governance-closure-opaque-writer` | 03:54:47Z | denied/self_withdrawn | 6s | no |
+| 15347 | `05641051` | claude-code | Bash `plugins/*/hooks` | 03:55:02Z | approved/operator_session | 96s | yes |
+| 15391 | `ed66b051` | claude-code | Bash `hestia_gate_mechanism.py` | 05:01:08Z | approved/operator_session | 164s | yes |
+| 15399 | `ca75d758` | claude-code | Bash `governance-closure-opaque-writer` | 05:01:22Z | denied/self_withdrawn | 6s | no |
+| 15413 | `1ce044b7` | claude-code | Bash `governance-closure-opaque-writer` | 05:03:04Z | denied/self_withdrawn | 6s | no |
+| 15438 | `88889689` | claude-code | Bash `hestia_gate_mechanism.py` | 05:51:48Z | approved/peer_member — **bar UNMET** | ~225s | no |
+| 15451 | `0ef796bf` | claude-code | Bash `hestia_gate_mechanism.py` | 05:56:07Z | approved/operator_session | 196s | yes |
+| 15465 | `ad0cf72c` | codex | Bash `hestia_gate_mechanism.py` | 05:59:03Z | approved/operator_session | 28s | no (window lapsed) |
+| 15489 | `6ebfb7d8` | claude-code | Bash `hestia_gate_mechanism.py` | 06:33:52Z | approved/operator_session | 13s | yes |
+
+Three things this batch teaches that batch 1 did not:
+
+1. **Even a live, mid-session peer arrives after the ruling.** codex was actively working
+   this exact patch series this morning (it had SHA-verified the applies for PR #1169), and
+   it still corroborated `0ef796bf` 38 s after the operator's decision and `6ebfb7d8` 259 s
+   after; claude-code's peer evidence on `ad0cf72c` landed 519 s post-decision. So the 09-03
+   finding's 25.4% in-time rate does not reproduce here: across both batches, in-time peer
+   factors are **0 of 34**. The record absorbs late evidence honestly (factors are stamped
+   with their arrival; nothing backdates), but "corroborate-or-dissent" as an *input to the
+   decision* is a dead letter at this fleet's ruling cadence — what actually exists is
+   post-hoc review, which is what this document practices.
+2. **A peer DECISION on `sovereign_plus_peer` is recorded and permits nothing.** `88889689`
+   was approved by codex (cross_vendor, with a thorough SHA-bound verification argument),
+   polled back `bar_met: false` — "this decision does NOT permit the write… re-issue" — and
+   the asker did exactly that (`0ef796bf`, operator-approved, claimed). The bar held under a
+   well-argued peer approval from a seat that had done the work. This is the two-bar design
+   behaving precisely as ruled, on live traffic.
+3. **The morning's FP hotspot is one grammar cell:** `git apply --stat|--check` with the
+   patch path behind a shell variable or substitution → `governance-closure-opaque-writer`.
+   Three of claude-code's four withdrawals (`b7d78904`, `ca75d758`, `1ce044b7`) and both of
+   codex's batch-1 withdrawals are this exact cell. `--stat` and `--check` write nothing
+   regardless of whether the path resolves; that is one targeted grammar rule, and it would
+   have prevented 5 of the 13 withdrawals across both batches.
+
+### `b6161a21cb588d5c` — notice 15269: CONCUR
+
+TTL lapse, unruled (3647s): a wt-witness `git apply` the operator never saw inside the hour.
+Lapse-as-denial is the designed semantics ("no decision within the window is a refusal, not
+a retry"); the same apply was re-asked as `39c38b44` and approved and claimed there. Nothing
+was lost; the record is honest. Settlement: **expired**, claim never spent.
+
+### `2418a80571225c5a` — notice 15278: CONCUR
+
+TTL lapse, unruled (3619s): same shape, wt-lane apply; re-asked and approved as `52fe0461`
+and `05641051`. Settlement: **expired**, claim never spent.
+
+### `39c38b447ff65c08` — notice 15301: CONCUR
+
+operator-approved wt-witness `git apply`, claimed 44s after open. Continuation of the #1149
+witness work verified in batch 1. Settlement: **approved** via `operator_session`, claim spent.
+
+### `52fe0461ae6f88c0` — notice 15309: CONCUR
+
+operator-approved wt-lane `git apply`, claimed 45s after open. Settlement: **approved** via
+`operator_session`, claim spent.
+
+### `638c510d9b6a4c39` — notice 15327: CONCUR
+
+operator-approved wt-witness apply against the `hestia_gate_mechanism.py` marker, claimed
+170s after open. Settlement: **approved** via `operator_session`, claim spent.
+
+### `b7d78904cb634e7c` — notice 15337: CONCUR
+
+own-FP retirement: `git apply --stat $P` — a read-only stat with the patch path in a shell
+variable the closure cannot resolve → opaque-writer. Withdrawal reason names the cell
+exactly. Settlement: **denied** via `self_withdrawn`, 6s after open.
+
+### `05641051ae7c777c` — notice 15347: CONCUR
+
+operator-approved wt-lane apply, claimed 96s after open. Settlement: **approved** via
+`operator_session`, claim spent.
+
+### `ed66b051c35d332d` — notice 15391: CONCUR
+
+operator-approved wt-reqkey apply (request-key work on the gate mechanism), claimed 164s
+after open. Settlement: **approved** via `operator_session`, claim spent.
+
+### `ca75d7586fe8cf90` — notice 15399: CONCUR
+
+own-FP retirement: same `git apply --stat` cell, path through `$S`. Settlement: **denied**
+via `self_withdrawn`, 6s after open.
+
+### `1ce044b7465bb012` — notice 15413: CONCUR
+
+own-FP retirement: same cell again, path through `$PWD/$(ls …)` substitution. Settlement:
+**denied** via `self_withdrawn`, 6s after open.
+
+### `888896892bffe126` — notice 15438: CONCUR
+
+The instructive one. codex — an invited cross-vendor peer — verified the exact patch
+(SHA256 `4bae1156…`, 10 hunks, syntax, manifests, checked against `2b80b5c` in memory) and
+then **decided** to approve. The bar is `sovereign_plus_peer`; a peer decision alone does
+not meet it; the record says so (`bar_met: false`, "does NOT permit the write"). The asker
+re-issued and got the sovereign leg (`0ef796bf`). Every layer told the truth about itself.
+Settlement: **approved** via `peer_member`, bar unmet, never claimable, never claimed.
+
+### `0ef796bf69ad870c` — notice 15451: CONCUR
+
+The re-issue: operator approved 196 s after open, permit claimed; codex's SHA-bound
+cross-vendor concur is on the record 38 s after the ruling — post-decision evidence, not a
+pre-decision leg. The permit's validity never depended on it, and the record doesn't pretend
+otherwise. Settlement: **approved** via `operator_session`, claim spent.
+
+### `ad0cf72cd193a97d` — notice 15465: CONCUR (with a note)
+
+codex's own ask: a read-only compound (`rg`/`sed`/`sha256sum` over handler.rs and a patch
+file) that escalated on the `hestia_gate_mechanism.py` marker — the same FP family, but here
+the operator approved ("k") 28 s after open rather than the asker withdrawing. The permit was
+never claimed (the window lapsed; nothing needed it — the reads succeeded in-grammar). An
+approval for a read is a permit for nothing, spent on nothing; the record carries
+claude-code's post-decision evidence (519 s later) saying exactly that. No harm; one line
+here because "approved an FP read" and "withdrew an FP read" should cost the same, and today
+they don't quite — the approved one mints a ruling row and a claim window the withdrawn one
+doesn't.
+
+### `6ebfb7d85202d7af` — notice 15489: CONCUR
+
+operator-approved wt-reqkey2 apply, decided 13 s after open and claimed; codex's second
+SHA-bound cross-vendor verification (SHA-256 `7ce…` independently checked) is on the record
+259 s post-decision. Settlement: **approved** via `operator_session`, claim spent.
