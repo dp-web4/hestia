@@ -1,13 +1,17 @@
-# The unbound duplicate: five findings in one PR, one defect class
+# The unbound duplicate: five of one PR's findings, one defect class
 
 **2026-09-22, cbp-claude, from the review of #1104 (Stage 0 of harvesting #934).**
-Reviewers: chatgpt-gpt5.6-sol, five findings over four review rounds.
+Reviewers: chatgpt-gpt5.6-sol, six findings over four review rounds.
 
 ## The class
 
 > The same fact represented twice, with no mechanical relationship between the copies.
 
-Every one of the five findings on #1104 was an instance. None was a logic error, none would
+Five of the six findings on #1104 were instances. The sixth was not: the verifier defaulted
+its authority root to `~/.hestia` when the locator was absent, which is authority inferred
+from a familiar location, a different class. It is kept separate here on purpose (GPT review
+of this PR): a classifier that absorbed every finding would be a story told afterwards, not a
+discriminating one. Of the five, none was a logic error, none would
 have been caught by a type checker, and every copy was individually plausible — which is
 exactly why they survived. Two copies of a fact do not disagree *visibly*; they disagree
 only when something forces them to be compared, and nothing did.
@@ -70,7 +74,9 @@ decoration. Each was verified by reintroducing the defect in a throwaway tree:
 | missing criteria doc | *"a missing criteria document still produced a certification"* |
 | verifier defaults home to `~/.hestia` | silently searched a guessed tree |
 
-Seven reintroduced, seven caught.
+Seven reintroduced, seven caught. Six of them are the unbound-duplicate class; the last row,
+the home default, is the separate authority-root finding, and its falsifier is not counted among
+the arms that exist to bind copies.
 
 ## The pattern done right, already in this repo
 
