@@ -88,13 +88,64 @@ def has_shebang(repo, path):
     right after the bang, so that is what we match -- a structural rule rather
     than a file-extension denylist that would rot as languages are added.
     """
-    blob = subprocess.run(
-        ["git", "show", f":{path}"], cwd=repo, capture_output=True
-    )
-    if blob.returncode != 0:
-        return False
-    first = blob.stdout.split(b"\n", 1)[0]
-    return re.match(rb"#!\s*/", first) is not None
+    return path in _shebang_paths(repo)
+
+
+_SHEBANG_CACHE = {}
+
+
+def _shebang_paths(repo):
+    """Every tracked path whose INDEX blob opens with an absolute-interpreter shebang.
+
+    ONE `git cat-file --batch` instead of one `git show` per file. The old shape spawned a
+    subprocess for every tracked file and took 37s on this fleet's WSL checkout -- which is
+    the whole reason it ran only in CI. A guard that is correct but too slow to run before a
+    push is a guard that reports mistakes instead of preventing them: five separate PRs went
+    red on this exact check in one week, each author reading the repair off a job log.
+
+    Semantics are unchanged and that is the point: same source (the INDEX blob, `:path`),
+    same structural match (`#!` then an absolute path), same set. Only the process count
+    moves. `shebang_exec_bit_divergence_test.py` and this file's own arms still pin the
+    behaviour; if this rewrite changed the answer, they would say so.
+    """
+    hit = _SHEBANG_CACHE.get(repo)
+    if hit is not None:
+        return hit
+
+    candidates = [p for mode, p in tracked_modes(repo) if mode in ("100644", "100755")]
+    found = set()
+    if candidates:
+        proc = subprocess.Popen(
+            ["git", "cat-file", "--batch"], cwd=repo,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        req = "".join(f":{p}\n" for p in candidates).encode()
+        out, _ = proc.communicate(req)
+
+        # `--batch` answers `<oid> <type> <size>\n<contents>\n`, or `<req> missing\n`.
+        # Requests are answered IN ORDER, so the reply stream indexes back onto
+        # `candidates` positionally -- the path is not echoed on the success line.
+        pos, idx = 0, 0
+        while pos < len(out) and idx < len(candidates):
+            nl = out.find(b"\n", pos)
+            if nl == -1:
+                break
+            header = out[pos:nl]
+            pos = nl + 1
+            if header.endswith(b"missing"):
+                idx += 1
+                continue
+            try:
+                size = int(header.rsplit(b" ", 1)[1])
+            except (IndexError, ValueError):
+                break
+            body = out[pos:pos + size]
+            pos += size + 1                      # trailing newline after the blob
+            if re.match(rb"#!\s*/", body.split(b"\n", 1)[0]):
+                found.add(candidates[idx])
+            idx += 1
+
+    _SHEBANG_CACHE[repo] = found
+    return found
 
 
 def main():

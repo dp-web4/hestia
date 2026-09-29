@@ -243,6 +243,20 @@ def render(law):
                       "path currently consumes. They state the operator's intent and will "
                       "not stop the act. Treat them as intent, not as a gate — and do not "
                       "read the absence of a block as permission."]
+    # THE PREAMBLE IS THE RULING'S ONLY DELIVERY SURFACE, so it must be rendered (#461).
+    # The daemon sends it; this function used to walk identity/law/note and drop it. The
+    # paragraph it drops was added *because* a ruling that is merely queryable reaches
+    # nobody -- the same argument this hook'''s own docstring makes for existing at all.
+    # Five seats re-derived dp'''s two-bar ruling as a defect; the fifth landed 13 days
+    # after the remedy merged, because the remedy stopped at the daemon.
+    #
+    # UNCAPPED, deliberately, unlike the rule rows. The caps above exist because an
+    # OVERLAY is not trusted to be brief; the preamble is first-party law text under the
+    # same review as this file, and it is the half that carries the remedies -- cutting it
+    # mid-sentence is the #135 failure the deny cap was widened to 1200 to avoid.
+    pre = law.get("preamble")
+    if pre:
+        lines += ["", str(pre)]
     lines += ["", "Full text and any later amendment: `hestia_operating_law`. "
                   "Dispute a deny with `hestia_appeal` (its chain hash + your reason) — "
                   "never by rephrasing to reach the same resource."]

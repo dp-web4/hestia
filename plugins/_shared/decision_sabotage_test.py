@@ -181,6 +181,7 @@ def run_hook(shim, ws, event, endpoint, mode="enforce", sabotage=False):
                 cfg["identity_env"]: os.path.join(ws, "identity.json"),
                 "HESTIA_OBSERVE_DIR": os.path.join(ws, "observe-" + shim),
                 cfg["mode_env"]: mode,
+                "HESTIA_SHARED_DIR": os.path.join(ws, "hestia", "plugins", "_shared"),
                 "HESTIA_ENDPOINT": endpoint})
     if sabotage:
         env["HESTIA_TEST_SABOTAGE"] = "1"

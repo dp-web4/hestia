@@ -14,8 +14,9 @@ use hestia_plugin_sdk::{
 use serde_json::{json, Value};
 
 #[test]
-fn protocol_version_is_zero() {
-    assert_eq!(HESTIA_PROTOCOL_VERSION, 0);
+fn protocol_version_is_one() {
+    // Presence protocol v1 since 35b51bf; matches the TypeScript and Python SDKs.
+    assert_eq!(HESTIA_PROTOCOL_VERSION, 1);
 }
 
 #[test]
@@ -196,4 +197,24 @@ async fn methods_reject_when_not_connected() {
         .begin_action(ToolCallSpec::new("Read"))
         .await;
     assert!(matches!(action_result, Err(HestiaError::NotConnected)));
+}
+
+#[test]
+fn history_filter_sends_only_the_keys_the_daemon_honours() {
+    // The daemon honours exactly limit, hash and tool_name, and refuses any other key,
+    // including one sent as null. An unset field must not appear on the wire.
+    let f = hestia_plugin_sdk::HistoryFilter {
+        limit: Some(10),
+        ..Default::default()
+    };
+    assert_eq!(serde_json::to_value(&f).unwrap(), json!({"limit": 10}));
+    let f = hestia_plugin_sdk::HistoryFilter {
+        tool_name: Some("Bash".into()),
+        hash: Some("abc".into()),
+        limit: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&f).unwrap(),
+        json!({"tool_name": "Bash", "hash": "abc"})
+    );
 }

@@ -101,6 +101,27 @@ check("a live deadline never yields a non-positive urlopen timeout",
       law_inject._remaining() >= law_inject._MIN_SLICE)
 law_inject._DEADLINE = None
 
+print("case 6: the preamble is DELIVERED, not merely sent (#461, renderer leg)")
+# The two-bar ruling lives in `LAW_PREAMBLE` and is pinned there by
+# `the_two_bar_ruling_is_published_and_not_merely_enforced`, whose message asserts the
+# preamble "reaches every member". That test's domain is a Rust string constant; it cannot
+# see this function. The daemon duly SENDS `preamble`, and render() walked identity/law/note
+# and dropped it -- so the paragraph written to stop peers re-deriving the ruling reached no
+# launch context at all. Five seats have re-derived it; the fifth, kimi-code on 2026-09-02,
+# landed 13 days after the remedy merged. The pin belongs at BOTH ends or the claim that the
+# ruling is published is only true of a string nobody reads.
+RULING = "an invitation to participate, not a blocker"
+with_preamble = dict(empty)
+with_preamble["preamble"] = f"...text...{RULING}...more text..."
+out = law_inject.render(with_preamble)
+check("a preamble on the response reaches the rendered block", RULING in out)
+check("and it is not truncated into the rule-row caps", "truncated at" not in out)
+# The counterfactual, in this file's own idiom (case 4): a law with NO preamble must render
+# cleanly rather than printing an empty section or the word None.
+no_pre = law_inject.render(empty)
+check("a law with no preamble renders no phantom section", "None" not in no_pre)
+check("...and still says what it does say", UNGOVERNED in no_pre)
+
 print()
 if FAILURES:
     print(f"FAILED ({len(FAILURES)}): " + ", ".join(FAILURES))

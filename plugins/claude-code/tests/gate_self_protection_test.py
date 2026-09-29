@@ -55,6 +55,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 HOOK = os.path.join(REPO, "plugins", "claude-code", "hooks", "pre_tool_use.py")
 SHARED = os.path.join(REPO, "plugins", "_shared")
+# The seat resolves shared law ONLY from an explicit HESTIA_SHARED_DIR or the installed
+# engine (#747); the tree is no longer an implicit fallback. This names the reviewed tree
+# under test explicitly: a fixture, chosen and visible, not an authority fallback.
+os.environ.setdefault("HESTIA_SHARED_DIR", SHARED)
 
 # Files under plugins/_shared/ that do NOT decide policy, each with the reason it is safe.
 #

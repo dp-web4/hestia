@@ -36,16 +36,27 @@ launchers -- no test seam:
   1. DISCHARGED IS NOT RE-FIRED. A retained primer whose every notice is absent from
      `i_owe` is retired to `.discharged` without spending a wake. Red before the fix.
   2. STILL-OWED IS STILL FIRED. The guard must not eat the case the retry exists for.
-  3. UNMEASURED IS FIRED, BOTH EDGES. Absence from the fold means nothing outside the
-     window where the fold is complete: past the daemon's 7d prune, absence means
-     "pruned"; below the 6h default floor, absence means "hidden by the floor". Both
-     fire. The young edge is the dangerous one -- the stub honours `older_than_secs`
-     exactly as the daemon does, so this case is red if the guard ever trusts the
-     floor, whether because the argument was misspelled (#155 discards it into a
-     success) or because someone deleted the min-age check as redundant.
+  3. UNMEASURED IS FIRED -- ON THE YOUNG EDGE. Below the 6h default floor, absence
+     from the fold means "hidden by the floor", and that edge fires. The stub honours
+     `older_than_secs` exactly as the daemon does, so this case is red if the guard
+     ever trusts the floor, whether because the argument was misspelled (#155
+     discards it into a success) or because someone deleted the min-age check as
+     redundant. The OLD edge changed on 2026-09-02: past the daemon's 7d prune the
+     row is gone, a binding to it is witnessed unverifiable and the sender's ledger
+     cannot credit it, so a list whose every notice is past the TTL is set aside as
+     `.expired` rather than fired (3a); one live notice keeps the list live (3a2).
+  7. THE FOLD IS DATA, NOT AN ARGUMENT. A fold past the kernel's 128 KiB
+     per-argument cap must still reach the judge (it did not: 2026-09-02).
+  8. JUDGED ON A CADENCE. A retained primer whose debt is paid after startup is
+     retired by the hourly sweep, without a restart and without a fire.
   4. A REFUSAL IS NOT AN EMPTY DEBT. When the `unanswered` RPC fails, the primer fires.
      `{}` and a 500 must not read as "nothing owed" -- that is the shape this corpus
      keeps finding, and here it would delete the only copy of a work list.
+  9. THE WALK YIELDS TO THE LOOP (kimi-code, reply 9164, 2026-09-02). The startup pass
+     fires nothing; surviving lists are fired from the main loop, one per tick, only on
+     a tick whose drain found no fresh mail. The kimi-code watcher on CBP restarted with
+     149 retained lists and, at a full wake per list, had not reached its first drain
+     in the 30 hours before this was written. Red before the fix.
 
 Usage: ./stale_primer_discharged_test.py     (runtime ~20s)
 """
@@ -100,6 +111,7 @@ DEBTS = []                 # rows the member genuinely still owes
 REFUSE_UNANSWERED = False
 IGNORE_FLOOR_ARG = False   # model #155: the daemon DISCARDS `older_than_secs` and defaults
 FLOORS_SEEN = []
+PAD_OWED_TO_ME = 0         # case 7: rows in `owed_to_me`, which the guard never reads
 
 
 class Stub(http.server.BaseHTTPRequestHandler):
@@ -145,7 +157,15 @@ class Stub(http.server.BaseHTTPRequestHandler):
             #   | older_than_secs=60 -> 60.  The misspelled cell reports the fallback,
             # which is what makes the echo usable as an oracle rather than a mirror.
             # `floor` here is post-fallback for exactly that reason.
-            payload = {"i_owe": shown, "owed_to_me": [], "older_than_secs": floor}
+            # `owed_to_me` is the sender's side of the ledger. The guard reads only `i_owe`,
+            # but the fold travels as ONE string, and on CBP 2026-09-02 that string was
+            # 388,367 bytes for claude-code at floor 0 (738 `owed_to_me` rows). Case 7
+            # pads it past the kernel's per-argument limit for exactly that reason.
+            pad = [{"id": 500000 + i, "kind": "review_request", "from_plugin": PLUGIN,
+                    "to_plugin": "kimi-code", "queued_at": ago(3 * 86400), "drained_at": None,
+                    "pointer_uri": "https://github.com/dp-web4/hestia/pull/" + str(i) + "#" + ("x" * 300)}
+                   for i in range(PAD_OWED_TO_ME)]
+            payload = {"i_owe": shown, "owed_to_me": pad, "older_than_secs": floor}
         else:
             payload = {}
         self._sse({"jsonrpc": "2.0", "id": body.get("id"),
@@ -222,13 +242,32 @@ def notice(nid, age_secs, kind="reply"):
             "queued_at": ago(age_secs), "in_reply_to": None}
 
 
+def decided(primers, planted, log):
+    """Every planted list has been judged: set aside (renamed away), or fired at least
+    once (its `.attempts` file exists and the fire log carries its path)."""
+    logged = {f["primer"] for f in fired(log)}
+    for name in planted:
+        path = os.path.join(primers, f"notice-{name}.json")
+        if not os.path.exists(path):
+            continue
+        if os.path.exists(path + ".attempts") and path in logged:
+            continue
+        return False
+    return True
+
+
 def run_case(tmp, ep, label, planted, debts, want_ids, refuse=False, sentinel_id=99999,
-             ignore_floor_arg=False):
-    """Run the real watcher once. The observable that says the startup stale pass has
-    finished is the member's OWN fresh mail being fired -- the drain happens after that
-    pass, so a sentinel in the log means every stale decision is already made. Never a
-    fixed sleep: a duration is a coin flip on a loaded host."""
-    global DEBTS, REFUSE_UNANSWERED, IGNORE_FLOOR_ARG
+             ignore_floor_arg=False, pad_owed=0, sweep_every=None, then=None,
+             on_first_stale=None, also_wait_for=()):
+    """Run the real watcher once. Two observables, never a fixed sleep (a duration is a
+    coin flip on a loaded host): the member's OWN fresh mail (the sentinel) being fired
+    says the loop is running; every planted list being judged -- set aside, or fired
+    once from the loop -- says every stale decision is made. Until 2026-09-02 the walk
+    fired BEFORE the first drain, so the sentinel alone was the second observable too.
+    `on_first_stale(primers)` runs once, as soon as any planted list has been fired;
+    `also_wait_for` are extra ids that must be in the log before the run is over."""
+    global DEBTS, REFUSE_UNANSWERED, IGNORE_FLOOR_ARG, PAD_OWED_TO_ME
+    PAD_OWED_TO_ME = pad_owed
     state = os.path.join(tmp, label)
     primers = os.path.join(state, "primers", PLUGIN)
     os.makedirs(primers)
@@ -245,18 +284,40 @@ def run_case(tmp, ep, label, planted, debts, want_ids, refuse=False, sentinel_id
 
     env = dict(os.environ)
     env.update(HESTIA_MESH_STATE=state, HESTIA_ENDPOINT=ep, HOME=state,
-               WATCH_INTERVAL="1", UNANSWERED_EVERY="99999")
+               WATCH_INTERVAL="1", UNANSWERED_EVERY="99999",
+               DISCHARGE_SWEEP_EVERY=str(sweep_every if sweep_every is not None else 99999))
     p = subprocess.Popen([WATCHER, PLUGIN, f"{PLUGIN}-watch", fire],
                          env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     deadline = time.time() + 60
-    while time.time() < deadline and sentinel_id not in fired_ids(log):
+    hooked = False
+    while time.time() < deadline:
         if p.poll() is not None:
             break
+        ids = fired_ids(log)
+        if on_first_stale is not None and not hooked and any(
+                f["primer"] != "" and os.path.basename(f["primer"])[7:13] in planted
+                for f in fired(log)):
+            on_first_stale(primers)
+            hooked = True
+        if (sentinel_id in ids and decided(primers, planted, log)
+                and set(also_wait_for) <= ids and (on_first_stale is None or hooked)):
+            break
         time.sleep(0.2)
+    if then is not None and p.poll() is None:
+        # Case 8: every stale decision is made (the owed list fired once, from the loop).
+        # Change the world, then wait for the watcher's own cadence to notice.
+        then(primers)
+        deadline = time.time() + 30
+        while time.time() < deadline and not os.path.exists(
+                os.path.join(primers, "notice-SWEEPD.json.discharged")):
+            if p.poll() is not None:
+                break
+            time.sleep(0.2)
     p.kill()
     out, _ = p.communicate()
     REFUSE_UNANSWERED = False
     IGNORE_FLOOR_ARG = False
+    PAD_OWED_TO_ME = 0
     got = fired_ids(log) - {sentinel_id}
     return got, primers, out
 
@@ -306,8 +367,22 @@ def main():
         debts=[{"id": 901, "kind": "reply", "from_plugin": "kimi-code",
                 "to_plugin": PLUGIN, "queued_at": young["queued_at"], "drained_at": None}],
         want_ids={330, 901})
-    check("3a. a notice past the inbox TTL is unmeasured, so it fires", 330 in got,
-          f"fired ids={sorted(got)}\n{out[-1500:]}")
+    # 3a REVERSED 2026-09-02. It used to read "past the inbox TTL is unmeasured, so it
+    # fires". Past the TTL the daemon has pruned the row: a disposition bound to it is
+    # witnessed `binding_verified: false`, the sender's `owed_to_me` cannot hold it, and
+    # the fire buys a wake whose answer discharges nothing. Measured on CBP the day of
+    # the change: 11 of 21 consecutive kimi-code stale re-fires were on notices 8-15
+    # days old, all answered on the chain in August, all re-answered unverifiably. So a
+    # list whose EVERY notice is past the TTL is set aside as `.expired` -- kept, named
+    # in the journal, never fired. A list with one live notice still fires (3a2).
+    check("3a. a notice past the inbox TTL is owed to nobody, so it is set aside, not fired",
+          330 not in got
+          and os.path.exists(os.path.join(primers, "notice-OLDOLD.json.expired"))
+          and not os.path.exists(os.path.join(primers, "notice-OLDOLD.json")),
+          f"fired ids={sorted(got)} dir={sorted(os.listdir(primers))}\n{out[-1500:]}")
+    check("3a1. and it is set ASIDE, not retired as discharged (nobody proved that)",
+          not os.path.exists(os.path.join(primers, "notice-OLDOLD.json.discharged")),
+          f"dir={sorted(os.listdir(primers))}")
     check("3b. a notice younger than the default floor is unmeasured, so it fires "
           "(it is genuinely owed and the floor hides it)", 901 in got,
           f"fired ids={sorted(got)}\n{out[-1500:]}")
@@ -377,6 +452,124 @@ def main():
     check("4. when the unanswered RPC fails, the primer fires rather than being retired",
           709 in got and not os.path.exists(os.path.join(primers, "notice-REFUSE.json.discharged")),
           f"fired ids={sorted(got)} dir={sorted(os.listdir(primers))}\n{out[-1500:]}")
+
+    # ---- 7. THE FOLD IS DATA, NOT AN ARGUMENT.
+    # Identical to case 1 -- two days old, nothing owed, retirable -- with one change
+    # the guard is not supposed to see: the fold is large. `primer_spent` handed the
+    # whole fold to python as ONE argv string, and Linux caps a single argument at
+    # MAX_ARG_STRLEN = 131072 bytes (32 pages; measured on CBP: 131,000 passes,
+    # 131,072 fails). Past that, `python3` never starts: bash prints "Argument list
+    # too long", the function returns nonzero, and nonzero is the guard's "unmeasured
+    # -> fire" arm. So a fold that has grown past 128 KiB fires EVERY retained primer,
+    # discharged or not, at every restart, to the attempt budget -- which is what the
+    # kimi-code watcher on CBP did on 2026-09-02: 21 consecutive stale re-fires from
+    # 04:22Z to 10:26Z, "Argument list too long" printed before 8 of the 8 whose
+    # journal survived, four of them on notices already answered with
+    # `binding_verified: true` in August. The fold crosses the limit on its own: the
+    # claude-code fold at floor 0 was 388,367 bytes the same day, and every stale
+    # re-fire adds rows to the peer's fold. Red before the fix; the padding rows sit
+    # in `owed_to_me`, which the guard does not read, so the ONLY thing that can fail
+    # here is delivery of the fold to the judge.
+    got, primers, out = run_case(
+        tmp, ep, "big-fold",
+        planted={"BIGFLD": [notice(709, 2 * 86400)]},
+        debts=[], want_ids=set(), pad_owed=600)
+    check("7a. a discharged primer is retired even when the fold exceeds the kernel's "
+          "per-argument limit (128 KiB)", got == set(),
+          f"fired ids={sorted(got)}\n{out[-1500:]}")
+    check("7b. and the watcher did not print 'Argument list too long' on the way",
+          "Argument list too long" not in out, out[-1500:])
+
+    # ---- 3a2. A LIST WITH ONE LIVE NOTICE IS A LIVE LIST.
+    # The set-aside is for lists the daemon has forgotten ENTIRELY. One notice inside
+    # the window beside two past it: the live one is still owed (it is in `i_owe`), so
+    # the whole list fires, exactly as before.
+    live = notice(931, 2 * 86400)
+    got, primers, out = run_case(
+        tmp, ep, "mixed-age",
+        planted={"MIXAGE": [notice(930, 30 * 86400), live, notice(932, 31 * 86400)]},
+        debts=[{"id": 931, "kind": "reply", "from_plugin": "kimi-code",
+                "to_plugin": PLUGIN, "queued_at": live["queued_at"], "drained_at": None}],
+        want_ids={930, 931, 932})
+    check("3a2. a list with one live, owed notice beside expired ones still fires whole",
+          {930, 931, 932} <= got
+          and not os.path.exists(os.path.join(primers, "notice-MIXAGE.json.expired")),
+          f"fired ids={sorted(got)} dir={sorted(os.listdir(primers))}\n{out[-1500:]}")
+
+    # ---- 8. JUDGED INSIDE THE WINDOW, NOT ONLY AT RESTART.
+    # The startup pass is the only place a retained primer was ever judged, and a
+    # watcher restarts rarely (kimi-code on CBP: 2026-08-20 -> 09-01 without one). A
+    # primer retained during that run was first judged twelve days later, past the 6d
+    # judging window, and could only be "unmeasured -> fire": 45 of 57 claude-code
+    # retained primers were in that state on 2026-09-02. Here the primer is OWED at
+    # startup (fires, is preserved), the debt is then paid, and the watcher's own sweep
+    # must retire it -- without a restart and without a second fire.
+    owed8 = notice(940, 2 * 86400)
+    debt8 = {"id": 940, "kind": "reply", "from_plugin": "kimi-code",
+             "to_plugin": PLUGIN, "queued_at": owed8["queued_at"], "drained_at": None}
+
+    def pay(primers):
+        global DEBTS
+        DEBTS = []
+
+    got, primers, out = run_case(
+        tmp, ep, "swept",
+        planted={"SWEEPD": [owed8]},
+        debts=[debt8], want_ids={940}, sweep_every=1, then=pay)
+    check("8a. an owed primer fires once, from the loop, and is preserved", 940 in got, f"{out[-1500:]}")
+    check("8b. once the debt is paid, the cadence sweep retires it without a restart",
+          os.path.exists(os.path.join(primers, "notice-SWEEPD.json.discharged"))
+          and not os.path.exists(os.path.join(primers, "notice-SWEEPD.json")),
+          f"dir={sorted(os.listdir(primers))}\n{out[-1500:]}")
+    check("8c. and the sweep never fires: exactly one fire of 940 (the loop's; a second "
+          "attempt waits STALE_RETRY_BACKOFF_SECS)",
+          sum(1 for f in fired(os.path.join(tmp, "swept.log")) if 940 in f["ids"]) == 1,
+          f"{fired(os.path.join(tmp, 'swept.log'))}")
+
+    # ---- 9. THE WALK YIELDS TO THE LOOP.
+    # Four owed lists retained at startup, one fresh notice waiting in the inbox, and a
+    # second fresh notice that arrives while the walk is in progress. Before the fix the
+    # watcher fired all four lists before its first drain; the first fresh notice waited
+    # behind them and the second was never seen until the walk was over. Now: the fresh
+    # notice fires FIRST, then one list per tick with a drain between each -- so the
+    # late notice overtakes the rest of the walk.
+    owed9 = {name: [notice(nid, 2 * 86400)] for name, nid in
+             (("WALK01", 950), ("WALK02", 951), ("WALK03", 952), ("WALK04", 953))}
+    debts9 = [{"id": n["id"], "kind": "reply", "from_plugin": "kimi-code",
+               "to_plugin": PLUGIN, "queued_at": n["queued_at"], "drained_at": None}
+              for lst in owed9.values() for n in lst]
+    LATE = 99998
+
+    def late_mail(primers):
+        INBOX[PLUGIN] = [notice(LATE, 30, kind="coordination")]
+
+    got, primers, out = run_case(
+        tmp, ep, "yields",
+        planted=owed9, debts=debts9, want_ids={950, 951, 952, 953},
+        on_first_stale=late_mail, also_wait_for=(LATE,))
+    got -= {LATE}
+    log9 = fired(os.path.join(tmp, "yields.log"))
+    order = [f["ids"][0] for f in log9 if f["ids"]]
+    check("9a. the member's own fresh mail fires BEFORE any retained list (the walk no "
+          "longer runs ahead of the first drain)",
+          order and order[0] == 99999,
+          f"fire order={order}\n{out[-2000:]}")
+    check("9b. the startup pass judged every list and fired none of them",
+          "4 retained primer(s) survive the judge" in out
+          and out.find("RETRYING stale primer") > out.find("notice(s) for"),
+          out[-2000:])
+    check("9c. every surviving list is still fired -- the loop works through the walk",
+          {950, 951, 952, 953} <= got, f"fired ids={sorted(got)}\n{out[-2000:]}")
+    last_stale = max((i for i, x in enumerate(order) if x in {950, 951, 952, 953}), default=-1)
+    check("9d. fresh mail that arrives mid-walk overtakes the rest of the walk "
+          "(a drain between every stale fire)",
+          LATE in order and order.index(LATE) < last_stale,
+          f"fire order={order}\n{out[-2000:]}")
+    check("9e. one retained list per tick: no two stale fires without a drain between "
+          "them (every stale fire is preceded by the loop's own inbox poll)",
+          out.count("RETRYING stale primer") == 4
+          and all(i == 0 or order[i - 1] != order[i] for i in range(len(order))),
+          f"fire order={order}\n{out[-2000:]}")
 
     srv.shutdown()
     print()

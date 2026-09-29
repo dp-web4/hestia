@@ -25,14 +25,49 @@ use std::path::PathBuf;
 
 use crate::error::{CoreError, Result};
 
+/// Which vault entries the daemon itself owns, and what each one is.
+///
+/// Credentials and the daemon's own material share `entries`: the identity keypair written by
+/// `init --ai`, per-constellation device keys, and the hub URL config. A surface that manages
+/// credentials cannot tell them apart by shape, so it asks here. `Some(role)` means the daemon
+/// depends on the entry. A running surface must neither remove it nor let a caller write it:
+/// deleting `ai_identity_secret` destroys this daemon's signing identity, and overwriting it
+/// replaces the identity. The one place to add a new system entry is this function.
+pub fn system_entry_role(name: &str) -> Option<&'static str> {
+    match name {
+        "ai_identity_lct_id" => Some("this daemon's identity (LCT id)"),
+        "ai_identity_pubkey" => Some("this daemon's identity (public key)"),
+        "ai_identity_secret" => Some("this daemon's identity (signing key)"),
+        "hub_urls" => Some("hub connection config"),
+        _ if name.starts_with("constellation_device_key:") => Some("constellation device key"),
+        _ => None,
+    }
+}
+
 /// High-level Vault interface. Loads on construction; saves back on mutating ops.
 pub struct Vault {
     path: PathBuf,
     passphrase: String,
     data: VaultData,
+    /// Long-lived exclusive writer lease when this Vault is the daemon or an explicit
+    /// break-glass writer. Read-only Vault opens do not acquire it. Ordinary short-lived
+    /// writers acquire the same lease around each save in `storage::save_if_current`.
+    writer_lease: Option<storage::WriterLease>,
 }
 
 impl Vault {
+    /// Re-read THIS vault from disk with the same path and passphrase.
+    ///
+    /// The daemon holds one `Vault` in memory from startup; documents the CLI writes after
+    /// that (a delegation minted with `hestia delegate grant`) are invisible to it until a
+    /// restart — and a restart destroys every pending scope request, so "restart to see the
+    /// delegation" would also destroy the ask it was minted to answer (measured on Legion,
+    /// 2026-09-05, #952). A surface that must see the operator's latest durable state reads
+    /// it fresh through this instead of the startup snapshot.
+    pub fn reopen(&self) -> Result<Self> {
+        Self::open(self.path.clone(), self.passphrase.clone())
+    }
+
     /// Open an existing vault file at `path` using `passphrase`.
     pub fn open(path: PathBuf, passphrase: String) -> Result<Self> {
         let data = storage::load(&path, &passphrase)?;
@@ -40,6 +75,7 @@ impl Vault {
             path,
             passphrase,
             data,
+            writer_lease: None,
         })
     }
 
@@ -59,7 +95,25 @@ impl Vault {
             path,
             passphrase,
             data,
+            writer_lease: None,
         })
+    }
+
+    /// Hold the stable exclusive writer lease until this Vault is dropped.
+    ///
+    /// The daemon calls this before building mutable server state; the offline break-glass
+    /// writer calls it before touching authority. Calling it twice is idempotent. A competing
+    /// process receives `VaultWriterBusy` rather than relying on a ceremonial "offline" flag.
+    pub fn hold_writer_lease(&mut self) -> Result<()> {
+        if self.writer_lease.is_none() {
+            self.writer_lease = Some(storage::acquire_writer_lease(&self.path)?);
+        }
+        Ok(())
+    }
+
+    /// Current persisted-authority generation as loaded/last saved by this snapshot.
+    pub fn generation(&self) -> u64 {
+        self.data.generation
     }
 
     /// Number of entries
@@ -103,6 +157,11 @@ impl Vault {
     }
 
     /// Remove an entry by name. Returns the removed entry.
+    ///
+    /// Deliberately NOT restricted to credentials: with the daemon stopped, `hestia vault
+    /// remove` is the break-glass path, and it must be able to reach a system entry. The
+    /// running surfaces (operator HTTP, agent MCP) refuse system entries before they get
+    /// here; see [`system_entry_role`].
     pub fn remove(&mut self, name: &str) -> Result<VaultEntry> {
         let idx = self
             .data
@@ -115,8 +174,14 @@ impl Vault {
         Ok(removed)
     }
 
-    fn save(&self) -> Result<()> {
-        storage::save(&self.path, &self.passphrase, &self.data)
+    fn save(&mut self) -> Result<()> {
+        let next_generation = if self.writer_lease.is_some() {
+            storage::save_if_current_locked(&self.path, &self.passphrase, &self.data)?
+        } else {
+            storage::save_if_current(&self.path, &self.passphrase, &self.data)?
+        };
+        self.data.generation = next_generation;
+        Ok(())
     }
 
     pub fn path(&self) -> &std::path::Path {
@@ -290,6 +355,34 @@ impl Vault {
         self.save()
     }
 
+    /// Store SEVERAL master-tier documents as ONE commit: all of them land, or none does.
+    ///
+    /// `put_document` saves per call, so a caller writing a set writes a sequence of commits,
+    /// and a failure partway leaves the vault holding a prefix of what was intended. For an
+    /// initialisation that claims to be all-or-none (`#987`: seeding an empty seat-config
+    /// namespace) a prefix is the worst outcome available — it is neither the old state nor
+    /// the new one, and a ratchet that refuses non-empty namespaces can then never repair it.
+    ///
+    /// The vault file is written whole, so staging every document and saving once IS the
+    /// atomic commit. On a failed save the in-memory index is rolled back to its snapshot, so
+    /// memory and disk still agree: without that, a caller that ignored the error would go on
+    /// serving documents the vault does not contain.
+    pub fn put_documents(&mut self, namespace: &str, entries: &[(String, Vec<u8>)]) -> Result<()> {
+        let snapshot = self.data.documents.clone();
+        for (name, bytes) in entries {
+            let doc = Document::master(namespace, name, bytes.clone());
+            match self.doc_pos(namespace, name) {
+                Some(i) => self.data.documents[i] = doc,
+                None => self.data.documents.push(doc),
+            }
+        }
+        if let Err(e) = self.save() {
+            self.data.documents = snapshot;
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Read a master-tier document's bytes. `None` if absent or sealed (use
     /// [`open_document`](Self::open_document) for sealed items).
     pub fn get_document(&self, namespace: &str, name: &str) -> Option<&[u8]> {
@@ -340,8 +433,8 @@ impl Vault {
     // ---- Recursion: a sub-vault is a sealed document whose plaintext is itself
     // a whole `VaultData`, opened with its own credential. ----
 
-    /// Store a nested vault, sealed under its own `credential`. The sub-vault's
-    /// contents are invisible (and unreadable) under the outer unlock alone.
+    /// Store a nested vault, sealed under its own `credential`.
+    /// The sub-vault's contents are invisible (and unreadable) under the outer unlock alone.
     pub fn put_subvault(
         &mut self,
         namespace: &str,
@@ -437,6 +530,18 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn system_entries_are_classified_and_credentials_are_not() {
+        for n in ["ai_identity_lct_id", "ai_identity_pubkey", "ai_identity_secret", "hub_urls",
+                  "constellation_device_key:00000000-0000-0000-0000-000000000000"] {
+            assert!(system_entry_role(n).is_some(), "{n} is daemon-owned");
+        }
+        for n in ["github-pat", "p0-004-cred", "openai-key", "ai_identity", "hub_urls_backup",
+                  "constellation_device_key"] {
+            assert!(system_entry_role(n).is_none(), "{n} is an ordinary credential");
+        }
+    }
+
     fn temp_path() -> (TempDir, PathBuf) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("vault.enc");
@@ -449,6 +554,7 @@ mod tests {
         let _v = Vault::init(path.clone(), "passphrase".into()).unwrap();
         let v2 = Vault::open(path, "passphrase".into()).unwrap();
         assert_eq!(v2.len(), 0);
+        assert_eq!(v2.generation(), 0);
     }
 
     #[test]
@@ -457,6 +563,59 @@ mod tests {
         Vault::init(path.clone(), "p".into()).unwrap();
         let result = Vault::init(path, "p".into());
         assert!(matches!(result, Err(CoreError::VaultAlreadyExists(_))));
+    }
+
+    #[test]
+    fn writer_lease_excludes_a_competing_writer_and_releases_on_drop() {
+        let (_dir, path) = temp_path();
+        let mut daemon = Vault::init(path.clone(), "p".into()).unwrap();
+        daemon.hold_writer_lease().unwrap();
+
+        let mut rescue = Vault::open(path.clone(), "p".into()).unwrap();
+        assert!(matches!(
+            rescue.hold_writer_lease(),
+            Err(CoreError::VaultWriterBusy(_))
+        ));
+
+        drop(daemon);
+        rescue.hold_writer_lease().unwrap();
+        rescue
+            .put_document("seat-config", "claude-code", b"repaired".to_vec())
+            .unwrap();
+        assert_eq!(rescue.generation(), 1);
+    }
+
+    #[test]
+    fn stale_snapshot_cannot_overwrite_newer_authority_after_lease_release() {
+        let (_dir, path) = temp_path();
+        let mut stale = Vault::init(path.clone(), "p".into()).unwrap();
+        let mut writer = Vault::open(path.clone(), "p".into()).unwrap();
+        writer.hold_writer_lease().unwrap();
+        writer
+            .put_document("seat-config", "claude-code", b"new".to_vec())
+            .unwrap();
+        assert_eq!(writer.generation(), 1);
+        drop(writer);
+
+        let err = stale
+            .put_document("seat-config", "codex", b"stale".to_vec())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::VaultGenerationConflict {
+                expected: 0,
+                actual: 1,
+                ..
+            }
+        ));
+
+        let reopened = Vault::open(path, "p".into()).unwrap();
+        assert_eq!(reopened.generation(), 1);
+        assert_eq!(
+            reopened.get_document("seat-config", "claude-code").unwrap(),
+            b"new"
+        );
+        assert!(reopened.get_document("seat-config", "codex").is_none());
     }
 
     #[test]

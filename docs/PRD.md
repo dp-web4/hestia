@@ -137,6 +137,59 @@ Each capability lists the user-facing job and the requirement. "Built" reflects 
 - **R:** identity is surfaced as human trust ("this device is yours, verified"), the machinery inspectable on demand. Session-plane identity **never auto-promotes** to fleet-plane identity.
 - **R (persistence, 2026-08-11):** derived trust is **persisted in the vault as a situational cache** and read from there for display — the deliberate law-following recompute writes the cache; between recomputes the cache is the source of truth; the display path re-derives nothing per poll. Specified in **[`PRD_TRUST_CACHE.md`](PRD_TRUST_CACHE.md)**. (The chain stays the sacred, expensive source; the cache is the cheap situational read the dashboard already declares itself to be.)
 
+### 5.9 Channels — *"how the world reaches me, and how much it learns"* (dp, 2026-09-01)
+
+A **`channels`** surface beside **agents / hubs / devices / govern**: the gateway to every
+**addressable surface of this entity**. Two families, one model — and the second is the one that makes
+this more than a link list:
+
+| family | examples |
+|---|---|
+| **contact / social** | Discord, Slack, Matrix, Telegram, Meetup, GitHub, site, email |
+| **record** | **the witness log**, the governance record, the ledger head |
+
+> *"in fact witness log access can be a channel."* — dp
+
+An entity is *reached* through its Discord and *read* through its record. Both are addressable
+surfaces, so both belong behind one gateway with one disclosure model, rather than a social-links
+feature beside an unrelated audit feature.
+
+#### Disclosure is tiered, and the tiers are depths of question
+
+| tier | the question it answers | a social channel | the witness log |
+|---|---|---|---|
+| **public** | *that it exists / that an act occurred* | "this entity has a Discord" | "acts occurred, and when" |
+| **member** | *the address / who participated* | the handle itself | who took part |
+| **governance** | *substance and outcome* | who operates it, verification chain, posting authority | the reason, the evidence relied on |
+
+- **R:** a caller does not deepen by asking. **Deepening is role-mediated** — standing decides which
+  role is reached, and the role decides what it may disclose (`PRD_ROLE_SCOPE_BRIDGE.md` §9). There is
+  no `?tier=` parameter, because that would be a second authorization vocabulary beside the roles.
+- **R:** a tier-3 inquiry **is itself a governed, witnessed act by the asker**. This is what makes deep
+  transparency safe for a person: others can learn who did what, and the asking leaves a trace. An
+  unrecorded right to inspect anyone is surveillance with better manners.
+- **R:** a refusal to deepen is recorded, or *"nobody asked"* and *"asked and refused"* become
+  indistinguishable.
+- **R:** the owner sets tiers per channel; **unset is the shallowest tier**, never the deepest.
+
+#### This is a THIRD axis, not a rename of `Visibility`
+
+`ProfileLink.visibility` (`{Public, Member, Trusted, Private}`, §5.8 / `profile.rs`) answers **who may
+see a link**. The ladder above answers **what depth of fact is returned**. They are orthogonal and
+both are required: a link may be `Member`-visible while its verification chain remains tier 3.
+Collapsing them silently drops one of the two questions.
+
+#### Relationship to existing work
+
+- The reference substrate exists (`ProfileLink`, `Visibility`, `Verification`, `links_for_tier`), and
+  the gaps to close are tracked in **#563** (H1–H6: community-channel kinds, group-owned channels, a
+  served external plane, lossy `hub_fields`, no `SelfVerified` mechanism, no expiry).
+- **Reference, not mirror**: a channel is a verified pointer; hestia does not become a Slack archive.
+  Reading or posting *into* a channel is the later internal plane and is opt-in per channel.
+- Twin: `web4/hub/docs/PRD_CHAPTER_DELIVERY.md` §4.5 carries the same model at society scale, where
+  the witness channel's tier 1 already ships as the public decision record.
+
+
 ## 6. Non-functional requirements
 
 - **Seamless:** a non-technical user completes install → join a hub → add a device → run an agent without touching a config file or a key.

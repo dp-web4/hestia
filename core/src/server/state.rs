@@ -163,13 +163,54 @@ pub struct ScopeRequest {
     pub decided_by: Option<String>,
     pub decided_at: Option<u64>,
     pub decision_reason: Option<String>,
+    /// Set by the OPERATOR at decide time, never by the asking member: a request names one
+    /// path (the doc comment above still holds), and whether the answer reaches the subtree
+    /// under it is the operator's explicit choice. Exact by default (dp, 2026-09-08).
+    #[serde(default)]
+    pub recursive: bool,
+    /// Set when the operator revokes a LIVE grant before it lapses (dp, 2026-09-15: "i want to
+    /// be able to revoke a live grant, right now i can only revoke standing ones"). The row is
+    /// kept, not deleted: a grant that vanished and a grant that was withdrawn are different
+    /// facts, and the member's `hestia_scope_status` must be able to say which.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked: Option<ScopeRevocation>,
+}
+
+/// What a retirement actually removed, by channel.
+#[derive(Debug, Default, Clone, serde::Serialize, PartialEq)]
+pub struct RetirementCommit {
+    /// Durable, vault-held rows revoked.
+    pub standing: Vec<String>,
+    /// Session-scoped grants marked revoked.
+    pub live: Vec<String>,
+    /// Delegated-authority ids marked revoked -- the third channel a retired id must not keep.
+    #[serde(default)]
+    pub delegations: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScopeRevocation {
+    pub at: u64,
+    pub by: String,
+    pub reason: String,
 }
 
 impl ScopeRequest {
+    /// The ONE predicate for "this request is a grant in force": granted, inside its window,
+    /// and not revoked. Every caller that asked `granted == Some(true) && now < expires_at`
+    /// inline now asks this, so a revocation cannot be honoured in one place and missed in
+    /// another.
+    pub fn is_live(&self, now: u64) -> bool {
+        self.granted == Some(true) && now < self.expires_at && self.revoked.is_none()
+    }
+
     /// Live = granted, and not past its window. A refused or expired request grants nothing,
     /// and an unanswered one grants nothing — the default is always the standing MRH.
+    /// Reach is by the grant's own rule (`covers_path`): exact unless the operator made it
+    /// recursive — the same rule the standing store uses, so the two channels agree.
     pub fn grants(&self, path: &str, now: u64) -> bool {
-        self.granted == Some(true) && now < self.expires_at && self.path == path
+        self.is_live(now)
+            && crate::server::standing_scope::covers_path(&self.path, self.recursive, path)
     }
 
     /// One word for the whole record. `expires_at` means the same thing in both phases — the
@@ -178,6 +219,9 @@ impl ScopeRequest {
     /// channel already rules. Silence has to decide the same way everywhere or members will
     /// learn that waiting is a strategy.
     pub fn status(&self, now: u64) -> &'static str {
+        if self.revoked.is_some() {
+            return "revoked";
+        }
         match self.granted {
             Some(true) if now < self.expires_at => "granted",
             Some(true) => "expired",
@@ -214,6 +258,15 @@ pub const SCOPE_REQUEST_TTL_SECS: u64 = 8 * 3600;
 /// permission has to be ephemeral, with the daemon restarting as the backstop that guarantees
 /// a grant nobody remembers to revoke dies on its own.
 ///
+/// AMENDED 2026-09-15 (dp: "i want to be able to revoke a live grant, right now i can only
+/// revoke standing ones"). The restart backstop is a FLOOR on how long a live grant can
+/// outlive its need, not a ceiling: until now the only ways to end one early were to wait out
+/// its 8 h window or to make it standing and revoke that — a widening performed in order to
+/// narrow. `POST /api/scope/revoke` withdraws a live grant directly, witnessed as
+/// `scope_revoked` and reported to the member. The row is marked, not deleted, so the member
+/// reads `revoked` rather than inferring an expiry. What is unchanged is the direction of the
+/// asymmetry: the live channel still cannot be made durable by anything but the standing one.
+///
 /// The third row was added on dp's explicit ruling (2026-08-14, Sprint F R1 "the real fix"):
 /// standing member scope needs a daemon surface, or the only durable widening is a
 /// member-writable `identity.json` the certified-replica logic rightly refuses. A STANDING
@@ -248,6 +301,36 @@ pub struct ServerState {
     /// it understood a newly served field. #481 remains the integrity boundary for proving
     /// which installed bytes made that report.
     pub gate_capabilities: HashMap<String, HashSet<String>>,
+    /// Member → wall-clock time its current seat-config finding was FIRST observed.
+    ///
+    /// The edge, not the level. A stateless check can only ever report "miswired again" on every
+    /// pass, which makes the chain a function of the poll interval, and it can never report the
+    /// close — so drift has no duration and a fixed one is indistinguishable from an unexamined
+    /// one (GPT review of #898, finding 3).
+    ///
+    /// DERIVED FROM THE CHAIN, REBUILT AT OPEN. It stays observation bookkeeping rather than
+    /// vault authority — the chain already records both edges, so it is the source, and a second
+    /// durable copy could drift from it. But it must be RECONSTRUCTED, not started empty.
+    ///
+    /// An earlier version of this comment said losing the map on restart "re-opens the finding,
+    /// which is the safe direction". That was wrong, and wrong in the unsafe direction: the pass
+    /// that opens a finding also repairs the artifact, so after a restart the next pass sees a
+    /// clean file, has no memory of anything open, and writes no resolution. Nothing re-opens.
+    /// The chain is simply left asserting a finding that is permanently open, for drift that was
+    /// fixed before the restart (GPT blocker on #898).
+    ///
+    /// Keyed by member, but the VALUE carries the finding's fingerprint (#971): two distinct
+    /// findings on one member are two events, and a map that only knew the member folded the
+    /// second into the first.
+    pub config_findings_open: HashMap<String, crate::server::seat_config::OpenConfigFinding>,
+    /// Gate path → the integrity finding open against it (`gate_watch`). Rebuilt from the chain
+    /// at startup for the same reason as `config_findings_open`: a restart that forgot an open
+    /// finding would re-witness it, and lose the duration of its eventual resolution.
+    pub gate_findings_open: HashMap<String, crate::server::gate_watch::OpenGateFinding>,
+    /// Member → the projection digest it PRESENTED on its last connect, against what the vault
+    /// expected at that moment (#944 liveness). RAM-only and rebuilt by the next connect: a
+    /// seat that has not connected since the restart has no liveness claim, which is the truth.
+    pub seat_live: HashMap<String, crate::server::seat_config::LiveProjection>,
     /// In-scope work awaiting attestation, keyed by (plugin_id, role_lct) → (allows, denies).
     ///
     /// WHY THIS EXISTS. Trust could only be earned two ways — be denied and comply, or be
@@ -367,6 +450,18 @@ pub struct ServerState {
     /// decision. Mutated ONLY from the operator-gated HTTP surface; no MCP tool reaches it
     /// (`no_mcp_tool_can_mutate_standing_scope`). See `server::standing_scope`.
     pub standing_scope: crate::server::standing_scope::StandingScopeStore,
+    /// Ids the operator has retired on THIS seat: no longer parties, their standing grants
+    /// revoked in the same commit, hidden from the default agent view. Rebuilt from the vault
+    /// at load like `member_registry`. Never deletion -- see `server::retirement`.
+    pub retired_members: crate::server::retirement::RetirementStore,
+    /// What was found where the standing authority should be, at launch. Set once during
+    /// construction and served beside the envelope so an unmigrated society is legible
+    /// rather than silently empty.
+    pub authority_status: crate::server::standing_scope::AuthorityStatus,
+    /// The most recent proof that the runtime projection still equals the vault. `None`
+    /// until the first verification runs, which is itself information: it means no
+    /// verification has happened yet, not that everything is fine.
+    pub standing_projection_audit: Option<crate::server::standing_scope::ProjectionAudit>,
     /// TRUE while the in-memory standing store is TIGHTER than the persisted vault copy —
     /// set when a revoke's vault write fails after the row was already removed from memory
     /// (memory keeps the tighter state on purpose). While set, the revoke surface accepts a
@@ -375,6 +470,10 @@ pub struct ServerState {
     /// Never persisted: a restart reloads the vault copy, at which point memory and vault
     /// agree again (the grant resurrects, visibly, and a fresh revoke takes the normal path).
     pub standing_scope_dirty: bool,
+    /// Transport bindings (#1030): which hub identity carries each member's routed acts,
+    /// and where the answer belongs. Operator-written through `commit_transport_bindings`,
+    /// vault-persisted, read by `member_notify` at enqueue and by the egress plane.
+    pub transport_bindings: crate::server::transport_binding::TransportBindingStore,
     /// Hub-law gate (consolidation, 2026-07-10): the third fold input.
     /// `None` = no law file at `$HESTIA_HOME/law/hub-law.yaml` (no-op);
     /// `Some(Invalid)` fails closed. See `policy::law_gate`.
@@ -440,6 +539,29 @@ pub fn normalize_scope_path(path: &str) -> String {
         format!("/{joined}")
     } else {
         joined
+    }
+}
+
+/// A `path:` scope grant MUST be stored absolute (#722). A relative grant renders in the seat's
+/// grant set — e.g. `path:home/dp/ai-workspace` with no leading slash — but can never match a
+/// resolved absolute candidate under #597 prefix containment (`_within_path_grant`/`_scope_parts`),
+/// so it is dead weight: the seat reads a workspace-wide grant it does not actually hold.
+///
+/// `normalize_scope_path` is deliberately LEXICAL and cannot safely absolutise — the daemon RECORDS
+/// the grant while the plugin gate ENFORCES it, and the two may not even share a mount (see its
+/// doc). So admission REJECTS a relative path, naming it, rather than guessing an absolute one
+/// against the daemon's own workspace (which could mint a grant for a path the seat cannot reach).
+/// This is #722 ask #1, the "refuse with a message that names the grant" arm.
+pub fn require_absolute_grant_path(path: &str) -> Result<(), String> {
+    if path.starts_with('/') {
+        Ok(())
+    } else {
+        Err(format!(
+            "scope grant path must be absolute; got '{path}'. A relative path grant renders in the \
+             grant set but can never match a resolved path under #597 prefix containment, so the \
+             seat would read a workspace-wide grant it does not hold (#722). Re-issue with a \
+             leading slash."
+        ))
     }
 }
 
@@ -516,6 +638,7 @@ impl ServerState {
         );
         // Custodial member LCTs, loaded from the vault (minted lazily on connect).
         let member_registry = crate::member_registry::load_members(&vault);
+        let retired_members = crate::server::retirement::load(&vault);
         // Resolve the active policy from the vault. Falls back to the
         // safety preset if the vault's named preset isn't built-in.
         let policy_config = vault
@@ -566,6 +689,21 @@ impl ServerState {
         // corrupt store to empty would silently drop operator-made durable grants, and a
         // ruling that vanishes without a trace is the exact failure the escalation-replay
         // block above refuses. An ABSENT document is a fresh install and empty is correct.
+        // ABSENT IS TWO STATES, AND ONLY ONE OF THEM IS "EMPTY IS CORRECT" (dp's ruling on
+        // #715/#596, 2026-08-29: "society exists but generation is 0 because the feature
+        // arrived later must not silently become deny-all"). A fresh install has no standing
+        // document and no history, and empty is right. A society that has been acting since
+        // before the standing-scope feature landed also has no document, and empty is a
+        // 24-hour outage wearing the same face. The chain tells them apart: it is this
+        // society's history, and a society that has acted has entries.
+        let transport_bindings: crate::server::transport_binding::TransportBindingStore = {
+            use anyhow::Context;
+            crate::vault::load_doc(&vault, "transport", "bindings", "transport-bindings.json").context(
+                "transport-binding store unreadable: failing closed rather than forwarding members' \
+                 acts under carriers nobody bound",
+            )?
+        };
+        let standing_doc_present = vault.get_document("scope", "standing").is_some();
         let standing_scope: crate::server::standing_scope::StandingScopeStore = {
             use anyhow::Context;
             crate::vault::load_doc(&vault, "scope", "standing", "standing-scope.json").context(
@@ -573,9 +711,29 @@ impl ServerState {
                  operator-made durable grants",
             )?
         };
+        let authority_status = if standing_doc_present {
+            crate::server::standing_scope::AuthorityStatus::Loaded
+        } else if chain_store.len().unwrap_or(0) > 0 {
+            tracing::warn!(
+                "standing-scope authority ABSENT on a society with history: the vault holds no \
+                 scope/standing document, so every member's envelope is empty. This is a \
+                 migration, not a fresh install. Grant scope or seed a floor through the \
+                 operator surface; the daemon serves the state rather than hiding it."
+            );
+            crate::server::standing_scope::AuthorityStatus::MigrationRequired
+        } else {
+            crate::server::standing_scope::AuthorityStatus::Fresh
+        };
 
         let mut st = Self {
             gate_capabilities: HashMap::new(),
+            // REBUILT FROM THE CHAIN, not started empty. Starting empty loses the ability to
+            // close any finding opened before this restart, because the pass that opened it
+            // also repaired the artifact — so the next pass sees clean, has nothing to close,
+            // and the chain keeps asserting an open finding forever.
+            config_findings_open: crate::server::seat_config::rehydrate_open_findings(&chain_store),
+            gate_findings_open: crate::server::gate_watch::rehydrate(&chain_store),
+            seat_live: HashMap::new(),
             scope_tally: std::collections::HashMap::new(),
             vault,
             sessions: HashMap::new(),
@@ -587,6 +745,7 @@ impl ServerState {
             sovereign,
             role_registry,
             member_registry,
+            retired_members,
             shared_context: serde_json::Map::new(),
             policy_engine,
             role_policy_engines,
@@ -600,8 +759,14 @@ impl ServerState {
             // The deliberate exception (row 3): standing grants are durable and were just
             // loaded from the vault, so an operator's standing ruling survives the deploy.
             standing_scope,
+            authority_status,
+            // No verification has run yet. Deliberately not a synthetic "matches: true":
+            // construction agreeing with itself is not a proof, and claiming one here would
+            // make the freshness timestamp lie from the first second.
+            standing_projection_audit: None,
             // Memory was just loaded FROM the vault, so the two agree by construction.
             standing_scope_dirty: false,
+            transport_bindings,
             law_gate,
             synthetic_plugins,
             home: home.to_path_buf(),
@@ -897,7 +1062,7 @@ impl ServerState {
         let mut live: Vec<&ScopeRequest> = self
             .scope_requests
             .values()
-            .filter(|r| r.plugin_id == plugin_id && r.granted == Some(true) && now < r.expires_at)
+            .filter(|r| r.plugin_id == plugin_id && r.is_live(now))
             .collect();
         live.sort_by_key(|r| r.requested_at);
         live
@@ -970,6 +1135,46 @@ impl ServerState {
         // committed mutation.
         self.standing_scope_dirty = false;
         Ok(())
+    }
+
+    /// Mutate the transport-binding store through a candidate persisted BEFORE it becomes
+    /// live, the same construction as `commit_standing_scope`: on a persist failure the live
+    /// store, generation included, was never touched.
+    pub fn commit_transport_bindings<F, R>(&mut self, mutate: F) -> Result<R>
+    where
+        F: FnOnce(&mut crate::server::transport_binding::TransportBindingStore) -> R,
+    {
+        let mut candidate = self.transport_bindings.clone();
+        let out = mutate(&mut candidate);
+        crate::vault::save_doc(&mut self.vault, "transport", "bindings", "transport-bindings.json", &candidate)?;
+        self.transport_bindings = candidate;
+        Ok(out)
+    }
+
+    /// Re-read the authority from the vault and prove the runtime projection still equals it.
+    ///
+    /// This is the "continuously proves the published projection matches it" half of dp's
+    /// 2026-08-29 ruling. It reads the vault fresh rather than trusting any cached copy,
+    /// because a verifier that compares memory to memory proves nothing.
+    ///
+    /// It reports and does not repair. Repair direction is a governed decision: a PHANTOM
+    /// grant should lose to the vault, but a LOST grant may mean the vault write failed and
+    /// the operator's intent is the one in memory. Choosing silently would make the verifier
+    /// an authority, which is exactly what the ruling says it must not be.
+    pub fn verify_standing_projection(&self, now: u64) -> Result<crate::server::standing_scope::ProjectionAudit> {
+        use crate::server::standing_scope::{ProjectionAudit, StandingScopeStore};
+        let vault_copy: StandingScopeStore =
+            crate::vault::load_doc(&self.vault, "scope", "standing", "standing-scope.json")?;
+        let divergence = self.standing_scope.divergence_from(&vault_copy);
+        Ok(ProjectionAudit {
+            verified_at: now,
+            matches: divergence.is_empty(),
+            runtime_generation: self.standing_scope.generation,
+            vault_generation: vault_copy.generation,
+            runtime_digest: self.standing_scope.authority_digest(),
+            vault_digest: vault_copy.authority_digest(),
+            divergence,
+        })
     }
 
     /// INTENT → COMMIT → SUCCESS. The one place the ordering of a durable scope widening is
@@ -1074,6 +1279,179 @@ impl ServerState {
         let digest = hasher.finalize();
         let hex: String = digest[..12].iter().map(|b| format!("{:02x}", b)).collect();
         Some(format!("lct:web4:member:{hex}"))
+    }
+
+    /// Are these two plugin ids ONE member, on the record? True when they hash to the same
+    /// member LCT (equal after trimming), or when the operator's witnessed `identity_alias`
+    /// records join them: one is an alias of the other, or both are aliases of one target.
+    ///
+    /// Reads the alias records with no recency window -- the measured reason the four guards
+    /// that call this were inert (`the_member_lct_alias_guard_reaches_only_whitespace`): the
+    /// resolver existed, but over a window the record had already left. Type-indexed, so the
+    /// cost is the number of alias records, not the length of the chain.
+    ///
+    /// An unmappable (synthetic/empty) id is `false`, as `member_lct` has always had it:
+    /// identity that was never established is not asserted. Which way an UNREADABLE record
+    /// falls, and why, is on `alias_relates` -- the half that decides it.
+    pub fn same_entity(&self, a: &str, b: &str) -> bool {
+        let (la, lb) = (self.member_lct(a), self.member_lct(b));
+        if la.is_none() || lb.is_none() {
+            return false;
+        }
+        if la == lb {
+            return true;
+        }
+        // The alias relation needs the record, and a read that FAILS is not an answer. It is
+        // passed through as `None` rather than resolved here, because resolving it here is
+        // what went wrong the first time: this function documented "fails toward same" and
+        // returned `false` on a read error, which at all four call sites is the PERMISSIVE
+        // answer -- an unreadable chain would have admitted a party as its own arbiter (GPT
+        // seat review, PR #1075).
+        let aliases = match self.chain_store.scan_recent(
+            None,
+            Some(&[crate::derivation::IDENTITY_ALIAS_EVENT]),
+            crate::derivation::ALIAS_SCAN,
+            crate::derivation::project_row,
+        ) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::error!(
+                    "same_entity: alias read failed ({e}); until the chain is readable every \
+                     pair of distinct ids reads as ONE member, so no party can rule on or \
+                     review another's act"
+                );
+                None
+            }
+        };
+        Self::alias_relates(a, b, aliases.as_deref())
+    }
+
+    /// The relation itself: pure, so the arm that cannot be reached with a live store has a
+    /// test. `aliases` is `None` when the record could not be READ -- distinct from an empty
+    /// slice, which means the record was read and holds no aliases.
+    ///
+    /// UNREADABLE FAILS TOWARD "SAME". Every caller uses a `true` to EXCLUDE a party from
+    /// ruling on, or reviewing, an act of its own, so `true` is the conservative answer and
+    /// `false` is the permissive one. The cost is real and worth naming: while the chain is
+    /// unreadable every distinct pair reads as one member, the arbiter and reviewer pools
+    /// empty, and appeals cannot be routed at all. That is the right direction anyway. The
+    /// chain is the store the ruling itself must be written to, so a read failing there is
+    /// trouble in the one place accountability lives; routing an appeal on the strength of a
+    /// failed look would risk an unwitnessed ruling, which is the outcome this whole surface
+    /// exists to prevent. Refusing to route reaches the same conclusion one step earlier, and
+    /// LOUDLY -- the appellant is told no arbiter is eligible -- rather than silently.
+    /// (The read and the append use different sqlite connections, so a failed read does not
+    /// PROVE the append would fail. It is evidence, not a proof, and the direction follows
+    /// from which error is recoverable.)
+    ///
+    /// ONE LEVEL, like `derivation::aliased_identities` and for its reason: following chains
+    /// would let two independent aliases silently join two unrelated members.
+    fn alias_relates(a: &str, b: &str, aliases: Option<&[ChainEntry]>) -> bool {
+        let Some(aliases) = aliases else {
+            return true;
+        };
+        // Stated as the relations themselves, not as "compare canonical forms": canonicalising
+        // both sides silently breaks the DIRECT relation whenever the target is itself an
+        // alias (cc -> bb, bb -> aa: canon(cc)=bb, canon(bb)=aa, and the pair the operator
+        // explicitly joined reads as two members). Caught by this function's own test.
+        let (a, b) = (a.trim(), b.trim());
+        let (ta, tb) = (
+            crate::derivation::alias_target(a, aliases),
+            crate::derivation::alias_target(b, aliases),
+        );
+        ta.as_deref() == Some(b) || tb.as_deref() == Some(a) || (ta.is_some() && ta == tb)
+    }
+
+    /// Retire or reinstate an id and revoke EVERY grant it holds -- standing and live -- as one
+    /// step, with memory never looser than the vault.
+    ///
+    /// ORDER, and why (cbp, PR #1100 review, finding 3). The first cut saved the scope document,
+    /// then the retirement, and only then swapped BOTH into memory. A retirement save that
+    /// failed left the vault with the grants revoked and memory still enforcing them; the next
+    /// `commit_standing_scope` would have cloned memory and written the grants straight back.
+    /// And the 500 said "no grant was revoked", which was false on disk. So each store is swapped
+    /// into memory the moment ITS save succeeds -- the `apply_standing_revoke` rule: memory may
+    /// only ever be the tighter side -- and a failure names which half landed.
+    ///
+    /// Live grants (cbp, finding 2) are the session-scoped `ScopeRequest`s. They are memory-only
+    /// and lapse on their own, but "no window in which a retired id still reaches a path" is the
+    /// claim, so they are marked revoked in the same act, last, after everything that can fail.
+    pub fn commit_retirement<F>(&mut self, reason: &str, mutate: F) -> Result<RetirementCommit>
+    where
+        F: FnOnce(&mut crate::server::retirement::RetirementStore) -> Option<String>,
+    {
+        use anyhow::Context;
+        let mut retired = self.retired_members.clone();
+        let revoke_for = mutate(&mut retired);
+        let mut standing: Vec<String> = Vec::new();
+        if let Some(member) = revoke_for.as_deref() {
+            let mut scope = self.standing_scope.clone();
+            for path in scope.grants.iter().filter(|g| g.member == member)
+                .map(|g| g.path.clone()).collect::<Vec<_>>()
+            {
+                if scope.revoke(member, &path) { standing.push(path); }
+            }
+            if !standing.is_empty() {
+                crate::vault::save_doc(&mut self.vault, "scope", "standing", "standing-scope.json", &scope)
+                    .context("NOTHING changed: the standing-scope document did not persist")?;
+                self.standing_scope = scope;
+                self.standing_scope_dirty = false;
+            }
+        }
+        // DELEGATIONS BEFORE THE RETIREMENT IS RECORDED. Authority first, bookkeeping last:
+        // every channel this id holds is revoked before it is marked retired, so no failure can
+        // leave the state "retired, and possibly still empowered" -- the one shape an operator
+        // would read as finished. The earlier order recorded the retirement first, and this
+        // function's own test caught it. Keyed by the member's registry LCT; none, none.
+        let mut delegations: Vec<String> = Vec::new();
+        if let Some(member) = revoke_for.as_deref() {
+            if let Some(lct) = self.member_registry.get(member).map(|l| l.lct_id()) {
+                let key = crate::delegation::agent_key_for_lct(&lct);
+                // `?`, NOT `if let Ok(..)`. `load_doc` answers Ok(default) for a MISSING
+                // document, so an Err here means the store exists and cannot be read -- and
+                // swallowing it produced `200 OK, revoked_delegations: []`, which is exactly
+                // what "this member had none" looks like, over a delegation still in force
+                // (cbp, PR #1106 review, probed). The same fail-open class as #1100's
+                // `unwrap_or(0)`: a channel that cannot be read has not been revoked.
+                let mut store = crate::delegation::DelegationStore::load(&self.vault)
+                    .context("NOT RETIRED: the standing grants are revoked, but the delegation \
+                              store could not be READ, so this id's delegations are in an unknown \
+                              state -- nothing was marked retired; retry")?;
+                for d in store.delegations.iter_mut().filter(|d| d.agent_lct_id == key && d.is_active()) {
+                    d.revoke();
+                    delegations.push(d.id.to_string());
+                }
+                if !delegations.is_empty() {
+                    store.save(&mut self.vault).context(
+                        "NOT RETIRED: the standing grants are revoked, but the delegation store \
+                         did not persist, so this id's delegations are still in force -- nothing \
+                         was marked retired; retry")?;
+                }
+            }
+        }
+        crate::server::retirement::save(&mut self.vault, &retired).with_context(|| {
+            if standing.is_empty() && delegations.is_empty() {
+                "NOTHING changed: the retirement did not persist".to_string()
+            } else {
+                // Names ONLY what landed. The live grants are revoked further down and have not
+                // been reached from here (cbp, #1106, finding 3).
+                format!("HALF landed: {} standing grant(s) and {} delegation(s) are revoked, and \
+                         nothing else -- the retirement did not persist, and this id's live grants \
+                         are untouched; retry", standing.len(), delegations.len())
+            }
+        })?;
+        self.retired_members = retired;
+        let mut live: Vec<String> = Vec::new();
+        if let Some(member) = revoke_for.as_deref() {
+            let now = crate::server::gate_escalation::now_secs();
+            for r in self.scope_requests.values_mut().filter(|r| r.plugin_id == member && r.is_live(now)) {
+                r.revoked = Some(ScopeRevocation {
+                    at: now, by: "operator".into(), reason: format!("retired: {reason}") });
+                live.push(r.path.clone());
+            }
+        }
+        standing.sort(); live.sort(); delegations.sort();
+        Ok(RetirementCommit { standing, live, delegations })
     }
 
     /// Append a chain entry under the sovereign LCT.
@@ -1602,6 +1980,95 @@ mod tests {
         assert!(same_entity("codex", " codex "), "trim is the guard's whole reach");
     }
 
+    /// The repair `the_member_lct_alias_guard_reaches_only_whitespace` asked for. That test
+    /// still stands, unchanged: `member_lct` equality alone is exactly as inert as it says.
+    /// `same_entity` adds the operator's alias records, read without a window.
+    #[test]
+    fn same_entity_follows_the_operators_alias_and_does_not_forget_it() {
+        let (_dir, state) = make_state();
+        let alias = crate::derivation::IDENTITY_ALIAS_EVENT;
+        assert!(!state.same_entity("codex", "codex-cli"), "no record yet: two members");
+        assert!(state.same_entity("codex", " codex "), "what the old guard did reach");
+
+        state
+            .append_chain(alias, serde_json::json!({"alias": "codex-cli", "alias_of": "codex", "ref": "t"}))
+            .unwrap();
+        assert!(state.same_entity("codex", "codex-cli"));
+        assert!(state.same_entity("codex-cli", "codex"), "symmetric");
+        assert!(!state.same_entity("codex", "claude-code"), "an alias joins two ids, not everyone");
+
+        // Two typos of one id are each other, through their shared target.
+        for typo in ["Claude-code", "caude-code"] {
+            state
+                .append_chain(alias, serde_json::json!({"alias": typo, "alias_of": "claude-code", "ref": "t"}))
+                .unwrap();
+        }
+        assert!(state.same_entity("Claude-code", "caude-code"));
+
+        // ONE level. b -> a and c -> b does not make c the same entity as a.
+        state.append_chain(alias, serde_json::json!({"alias": "bb", "alias_of": "aa", "ref": "t"})).unwrap();
+        state.append_chain(alias, serde_json::json!({"alias": "cc", "alias_of": "bb", "ref": "t"})).unwrap();
+        assert!(state.same_entity("cc", "bb") && state.same_entity("bb", "aa"));
+        assert!(!state.same_entity("cc", "aa"), "alias chains are not followed, by design");
+
+        // An id that maps to no member is never asserted to be anyone.
+        assert!(!state.same_entity("", "codex") && !state.same_entity("", ""));
+
+        // THE POINT: bury the record under more traffic than any window this path ever used,
+        // proportionally -- the read is by type, so distance does not matter.
+        for i in 0..500 {
+            state
+                .append_chain("policy_decision", serde_json::json!({"plugin_id": "codex", "decision": "allow", "n": i}))
+                .unwrap();
+        }
+        assert!(state.same_entity("codex", "codex-cli"), "a ruling does not age out");
+    }
+
+    /// THE ARM A LIVE STORE CANNOT REACH: the alias record could not be READ.
+    ///
+    /// The first cut of `same_entity` documented "fails toward same" and returned `false`
+    /// there. At all four call sites `false` is the PERMISSIVE answer -- it says "independent,
+    /// eligible" -- so an unreadable chain would have admitted a party as the arbiter of its
+    /// own appeal, or as the reviewer of its own escalation. A docstring claiming one
+    /// direction over code taking the other, which is the defect class this module's census
+    /// exists to make visible. Caught by the GPT seat on PR #1075; the happy-path tests above
+    /// cannot see it, because a working store never takes the branch.
+    #[test]
+    fn an_unreadable_alias_record_excludes_rather_than_admits() {
+        use crate::derivation::IDENTITY_ALIAS_EVENT;
+        let entry = |alias: &str, of: &str| ChainEntry {
+            chain_position: 1,
+            hash: "h".into(),
+            prev_hash: "p".into(),
+            event_type: IDENTITY_ALIAS_EVENT.into(),
+            event_data: serde_json::json!({"alias": alias, "alias_of": of}),
+            signer_lct: "lct:test".into(),
+            timestamp: chrono::Utc::now(),
+        };
+        let relates = ServerState::alias_relates;
+
+        // READ, and holds nothing: these two ids are two members. `false` is an ANSWER here.
+        assert!(!relates("codex", "codex-cli", Some(&[])));
+        // READ, and joins them.
+        assert!(relates("codex", "codex-cli", Some(&[entry("codex-cli", "codex")])));
+
+        // NOT READ. Every pair reads as one member -- including pairs no operator ever joined,
+        // which is the whole point: the answer is unknown, and unknown must not read as
+        // independent.
+        for (a, b) in [("codex", "codex-cli"), ("claude-code", "kimi-code"), ("x", "y")] {
+            assert!(
+                relates(a, b, None),
+                "an unreadable alias record must EXCLUDE ({a}, {b}) from judging each other, \
+                 not admit them: every caller's `true` is the conservative branch"
+            );
+        }
+
+        // ...and the id that maps to no member is still nobody, decided before the read is
+        // even attempted -- an unreadable chain must not conjure an identity for a synthetic.
+        let (_dir, state) = make_state();
+        assert!(!state.same_entity("", "codex"));
+    }
+
     #[test]
     fn confer_citizenship_records_a_birth_cert_in_the_ledger_only_on_quorum() {
         let (_dir, state) = make_state();
@@ -1884,6 +2351,7 @@ mod tests {
             reason: "forced-failure fixture".into(),
             expires_at: None,
             request_id: None,
+        recursive: false,
         }
     }
 

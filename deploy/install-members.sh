@@ -123,10 +123,194 @@ log "  home      : $HESTIA_HOME"
 [ "$DRY_RUN" = "1" ] && log "  MODE      : DRY RUN (nothing will be written)"
 log ""
 
+# ORDER IS LOAD-BEARING: the engine is installed and $HESTIA_HOME/shared is repointed
+# BEFORE any hook entrypoint is written. Hooks import their decision engine from that
+# symlink, so installing a hook first opens a window in which the installed hook is newer
+# than the engine it imports -- and since 2026-08-31 the seats import the shared shell
+# classifier with no local copy to fall back to, that window is a hook that cannot start.
+# The engine swap is already atomic (build dir, verify digests, rename the symlink); this
+# ordering is what makes the whole install atomic from a hook's point of view.
+# --- THE SHARED ENGINE IS AN INSTALL ARTIFACT TOO. ----------------------------------------
+# Every hook entrypoint installed by the loop below imports its decision engine from plugins/_shared/ —
+# and until now the ledger bound the entrypoints and ZERO bytes of the engine they call
+# (#481: current-build.json binds hook entrypoints but 0 bytes of _shared; the hooks digested
+# to installed paths while the engine executed from the mutable workspace checkout). An audit
+# that digests the hook but not the engine the hook imports proves the shape of the gate, not
+# its decisions.
+#
+# WHAT IS INSTALLED IS WHAT THE MANIFEST DECLARES (#525 review, the "option B" ruling). The
+# runtime set is plugins/_shared/RUNTIME_MANIFEST.txt, one filename per line — NOT a glob of
+# the directory, because _shared holds the tests beside the engine, and "which files are
+# engine" as an implicit rule is exactly the rule that drifts. The manifest declares; this
+# script deploys precisely that set; the test suite pins the declaration against what the
+# hooks actually import, in both directions.
+#
+# THE ACTIVE SET IS EXACTLY THE RECORDED SET. A per-file overwrite loop leaves a deleted or
+# renamed module live on disk while the ledger stops naming it — bytes executable that no
+# deployment truth represents, the failure the #525 review blocked on. So the engine installs
+# as ONE content-addressed build: stage every declared file into a fresh directory, verify
+# each digest THERE, and only then point $HESTIA_HOME/shared — a symlink — at the verified
+# build with a single atomic rename. Three consequences, each load-bearing:
+#   * a source file deleted in build N+1 is absent from build N+1's directory, so it leaves
+#     the ACTIVE set the moment the symlink flips — ledger and executable set cannot disagree;
+#   * an interrupted install never flips, so the running engine is never a half-written mix
+#     of two builds;
+#   * old builds stay, content-addressed and inert — they ARE the backup invariant 2 asks
+#     for, and a build whose bytes no longer match its address is quarantined, never reused.
+# The ledger still records the stable active paths ($HESTIA_HOME/shared/<file>) and is still
+# written last, only on full success — a failed stage or verify dies BEFORE any flip.
+#
+# What is deliberately NOT here: plugins/lib/path_scope.py (gemini's installed lib) is copied
+# by plugins/gemini/install.sh, a different installer with its own discipline. Folding it in
+# would mean this script deriving gemini's ext4 layout — the one-off shape this script exists
+# to end. Recording gemini's lib belongs to gemini's installer gaining ledger discipline, not
+# to this section reaching sideways.
+log "SHARED ENGINE (plugins/_shared)"
+engine_manifest="$REPO_ROOT/plugins/_shared/RUNTIME_MANIFEST.txt"
+[ -f "$engine_manifest" ] || die "plugins/_shared/RUNTIME_MANIFEST.txt is missing — the engine set is a declaration, not a glob"
+mapfile -t engine_names < <(grep -vE '^[[:space:]]*(#|$)' "$engine_manifest")
+[ "${#engine_names[@]}" -gt 0 ] || die "RUNTIME_MANIFEST.txt declares no files — refusing to record an empty engine"
+
+engine_hashes=()
+set_fingerprint=""
+for base in "${engine_names[@]}"; do
+  src="$REPO_ROOT/plugins/_shared/$base"
+  [ -f "$src" ] || die "RUNTIME_MANIFEST.txt declares '$base' but $src does not exist"
+  src_hash="$(sha256sum "$src" | cut -d' ' -f1)"
+  engine_hashes+=("$src_hash")
+  set_fingerprint="$set_fingerprint$src_hash  $base
+"
+done
+# One address for the whole set: the build directory's name IS the digests of its contents.
+build_digest="$(printf '%s' "$set_fingerprint" | sha256sum | cut -c1-16)"
+builds_dir="$HESTIA_HOME/shared.builds"
+build_dir="$builds_dir/$build_digest"
+shared_link="$HESTIA_HOME/shared"
+
+# Every declared file present in $1, each hashing to its declared digest. Applied to the
+# STAGED set before it may become active, and to an existing build before it may be reused.
+engine_build_ok() {
+  local i
+  for i in "${!engine_names[@]}"; do
+    [ -f "$1/${engine_names[$i]}" ] || return 1
+    [ "$(sha256sum "$1/${engine_names[$i]}" | cut -d' ' -f1)" = "${engine_hashes[$i]}" ] || return 1
+  done
+}
+
+shared_engine_json="["
+for i in "${!engine_names[@]}"; do
+  [ "$i" -eq 0 ] || shared_engine_json="$shared_engine_json,"
+  # Same record shape as the member files below, so one audit reads both sections. The path
+  # is the stable ACTIVE path, not the build directory: the symlink is the contract.
+  shared_engine_json="$shared_engine_json{\"file\":\"${engine_names[$i]}\",\"path\":\"$shared_link/${engine_names[$i]}\",\"sha256\":\"${engine_hashes[$i]}\"}"
+done
+shared_engine_json="$shared_engine_json]"
+
+# ACTIVATION IS LAZY, ON THE FIRST REAL MEMBER (codex pin, codex/final-747 831d760). The
+# engine must be active before the first hook byte lands (a hook imports it at start), and
+# a box with NO registered member must not have its state mutated by a run that then says
+# "no member installed" and withholds the authority record. Engine-before-loop satisfied
+# the first by breaking the second. So: computed above, activated here, called from inside
+# the member loop immediately before the first install, once.
+engine_active=0
+activate_shared_engine() {
+  [ "$engine_active" = 1 ] && return 0
+  # Bash variables are global unless declared. The caller is mid-loop over member files
+  # with $base bound to the hook it is about to install and RECORD; this body's own loop
+  # over engine names reused the name and the first probe run ledgered hook.py as
+  # engine.py. Every name this body binds is local.
+  local base i stale staging current_target flip
+  if [ "$DRY_RUN" = "1" ]; then
+    # Answer the same question the real pass answers — is the ENGINE current? — instead of
+    # always printing the plan. The flip below decides currency by comparing the symlink
+    # target to this build, and that comparison costs nothing and writes nothing, so a dry
+    # run can make it too. It could not before, so these four files printed `would` on a
+    # box that was exactly current, and DEPLOY.md's verify step ("every member should
+    # report already current") was unachievable for them: a reader following it concludes
+    # the deploy failed and runs it again. Measured on HUB 2026-09-21, minutes after a
+    # successful install.
+    current_target="$(readlink "$shared_link" 2>/dev/null || true)"
+    if [ "$current_target" = "shared.builds/$build_digest" ]; then
+      log "  ok    shared -> $current_target (already current)"
+    else
+      for base in "${engine_names[@]}"; do
+        log "  would $base -> $shared_link (build $build_digest)"
+      done
+    fi
+  else
+    mkdir -p "$builds_dir"
+    # Staging dirs from an interrupted run are inert — nothing points at them. Sweep them.
+    for stale in "$builds_dir"/.staging.*; do
+      [ -e "$stale" ] && rm -rf "$stale"
+    done
+
+    if [ -d "$build_dir" ]; then
+      if engine_build_ok "$build_dir"; then
+        log "  ok    build $build_digest (already staged, re-verified)"
+      else
+        # A content-addressed directory whose bytes no longer match their address: an installed
+        # engine file was rewritten after deploy. Quarantine loudly; never silently reuse. The
+        # symlink dangles until the rebuild below lands — the honest direction for a tampered
+        # engine is to fail, not to coast on bytes the ledger no longer recognizes.
+        warn "build $build_digest FAILED re-verification — quarantining as $build_dir.corrupt.$$ and rebuilding"
+        mv "$build_dir" "$build_dir.corrupt.$$"
+      fi
+    fi
+    if [ ! -d "$build_dir" ]; then
+      staging="$builds_dir/.staging.$$"
+      mkdir -p "$staging"
+      for i in "${!engine_names[@]}"; do
+        # Imported, not executed: 0644, not the entrypoints' 0755.
+        install -m 0644 "$REPO_ROOT/plugins/_shared/${engine_names[$i]}" "$staging/${engine_names[$i]}"
+      done
+      # INVARIANT 3: prove the bytes landed — the WHOLE staged set, before it can become active.
+      engine_build_ok "$staging" || die "engine build $build_digest verify FAILED in staging; nothing was activated"
+      mv "$staging" "$build_dir"
+      log "  wrote build $build_digest (${#engine_names[@]} files, staged and verified)"
+    fi
+
+    # THE FLIP: one atomic rename of a symlink. Before it, the active engine is untouched;
+    # after it, it is exactly the verified build. There is no between.
+    if [ -e "$shared_link" ] && [ ! -L "$shared_link" ]; then
+      # A pre-symlink install left shared/ as a real directory. INVARIANT 2: preserve, then move.
+      warn "migrating legacy shared/ directory aside to $shared_link.pre-flip.bak"
+      mv "$shared_link" "$shared_link.pre-flip.bak"
+    fi
+    current_target="$(readlink "$shared_link" 2>/dev/null || true)"
+    if [ "$current_target" = "shared.builds/$build_digest" ]; then
+      log "  ok    shared -> $current_target (already current)"
+    else
+      flip="$HESTIA_HOME/.shared.flip.$$"
+      ln -s "shared.builds/$build_digest" "$flip"
+      python3 -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$flip" "$shared_link"
+      log "  wrote shared -> shared.builds/$build_digest"
+    fi
+  fi
+  engine_active=1
+}
+
 installed_json="["
 first_entry=1
 any_installed=0
 any_skipped=0
+
+# --- REGISTER FIRST, THEN INSTALL (dp, 2026-09-27, #1133) ------------------------------------
+# "the auto install process is supposed to take care of all this. isn't there a script? editing
+# files by hand is unacceptable friction for product we're trying to release generally."
+# This script derives every target from the harness's OWN registration and never writes one —
+# correct (#315), and the reason an unregistered hook could sit skipped forever: codex's
+# witness.py was declared, shipped, and "not registered on this host" for 14 days while no
+# codex act reached the chain. deploy/register-members.py renders each installed member's
+# hooks/hooks.json into that member's config, idempotently, so the loop below then finds the
+# hook registered and installs it. A registration failure is LOUD and does not stop the
+# install of what is already registered. DRY_RUN passes through (it writes nothing).
+if [ "${HESTIA_SKIP_REGISTER:-0}" != "1" ]; then
+  log "REGISTER (deploy/register-members.py)"
+  if ! DRY_RUN="$DRY_RUN" python3 "$REPO_ROOT/deploy/register-members.py" 2>&1 | sed 's/^/  /'; then
+    log "  WARN register-members.py failed (rc=${PIPESTATUS[0]}) — installing what is already registered"
+    any_skipped=1
+  fi
+fi
 
 for expects in "$REPO_ROOT"/plugins/*/expects.json; do
   [ -e "$expects" ] || continue
@@ -251,6 +435,9 @@ print(os.path.expanduser(p) if p else "")' "$expects")"
       warn "$member/$base: expects.json declares '$declared' but the harness invokes it from '$target_dir' — installing to the REGISTERED path. The declared value is a per-seat CLAIM this run just checked, not a fleet-wide target: layouts differ by seat, so this divergence may be structural rather than a stale string to correct"
     fi
 
+    # A registered consumer exists on this host: the engine it imports must be active (and
+    # re-verified) before its bytes are touched or confirmed current. Once per run, lazily.
+    activate_shared_engine
     src_hash="$(sha256sum "$src" | cut -d' ' -f1)"
     if [ -f "$target" ] && [ "$(sha256sum "$target" | cut -d' ' -f1)" = "$src_hash" ]; then
       log "  ok    $base (already current) -> $target_dir"
@@ -296,135 +483,6 @@ if [ "$any_installed" = "0" ]; then
   exit 0
 fi
 
-# --- THE SHARED ENGINE IS AN INSTALL ARTIFACT TOO. ----------------------------------------
-# Every hook entrypoint installed above imports its decision engine from plugins/_shared/ —
-# and until now the ledger bound the entrypoints and ZERO bytes of the engine they call
-# (#481: current-build.json binds hook entrypoints but 0 bytes of _shared; the hooks digested
-# to installed paths while the engine executed from the mutable workspace checkout). An audit
-# that digests the hook but not the engine the hook imports proves the shape of the gate, not
-# its decisions.
-#
-# WHAT IS INSTALLED IS WHAT THE MANIFEST DECLARES (#525 review, the "option B" ruling). The
-# runtime set is plugins/_shared/RUNTIME_MANIFEST.txt, one filename per line — NOT a glob of
-# the directory, because _shared holds the tests beside the engine, and "which files are
-# engine" as an implicit rule is exactly the rule that drifts. The manifest declares; this
-# script deploys precisely that set; the test suite pins the declaration against what the
-# hooks actually import, in both directions.
-#
-# THE ACTIVE SET IS EXACTLY THE RECORDED SET. A per-file overwrite loop leaves a deleted or
-# renamed module live on disk while the ledger stops naming it — bytes executable that no
-# deployment truth represents, the failure the #525 review blocked on. So the engine installs
-# as ONE content-addressed build: stage every declared file into a fresh directory, verify
-# each digest THERE, and only then point $HESTIA_HOME/shared — a symlink — at the verified
-# build with a single atomic rename. Three consequences, each load-bearing:
-#   * a source file deleted in build N+1 is absent from build N+1's directory, so it leaves
-#     the ACTIVE set the moment the symlink flips — ledger and executable set cannot disagree;
-#   * an interrupted install never flips, so the running engine is never a half-written mix
-#     of two builds;
-#   * old builds stay, content-addressed and inert — they ARE the backup invariant 2 asks
-#     for, and a build whose bytes no longer match its address is quarantined, never reused.
-# The ledger still records the stable active paths ($HESTIA_HOME/shared/<file>) and is still
-# written last, only on full success — a failed stage or verify dies BEFORE any flip.
-#
-# What is deliberately NOT here: plugins/lib/path_scope.py (gemini's installed lib) is copied
-# by plugins/gemini/install.sh, a different installer with its own discipline. Folding it in
-# would mean this script deriving gemini's ext4 layout — the one-off shape this script exists
-# to end. Recording gemini's lib belongs to gemini's installer gaining ledger discipline, not
-# to this section reaching sideways.
-log "SHARED ENGINE (plugins/_shared)"
-engine_manifest="$REPO_ROOT/plugins/_shared/RUNTIME_MANIFEST.txt"
-[ -f "$engine_manifest" ] || die "plugins/_shared/RUNTIME_MANIFEST.txt is missing — the engine set is a declaration, not a glob"
-mapfile -t engine_names < <(grep -vE '^[[:space:]]*(#|$)' "$engine_manifest")
-[ "${#engine_names[@]}" -gt 0 ] || die "RUNTIME_MANIFEST.txt declares no files — refusing to record an empty engine"
-
-engine_hashes=()
-set_fingerprint=""
-for base in "${engine_names[@]}"; do
-  src="$REPO_ROOT/plugins/_shared/$base"
-  [ -f "$src" ] || die "RUNTIME_MANIFEST.txt declares '$base' but $src does not exist"
-  src_hash="$(sha256sum "$src" | cut -d' ' -f1)"
-  engine_hashes+=("$src_hash")
-  set_fingerprint="$set_fingerprint$src_hash  $base
-"
-done
-# One address for the whole set: the build directory's name IS the digests of its contents.
-build_digest="$(printf '%s' "$set_fingerprint" | sha256sum | cut -c1-16)"
-builds_dir="$HESTIA_HOME/shared.builds"
-build_dir="$builds_dir/$build_digest"
-shared_link="$HESTIA_HOME/shared"
-
-# Every declared file present in $1, each hashing to its declared digest. Applied to the
-# STAGED set before it may become active, and to an existing build before it may be reused.
-engine_build_ok() {
-  local i
-  for i in "${!engine_names[@]}"; do
-    [ -f "$1/${engine_names[$i]}" ] || return 1
-    [ "$(sha256sum "$1/${engine_names[$i]}" | cut -d' ' -f1)" = "${engine_hashes[$i]}" ] || return 1
-  done
-}
-
-shared_engine_json="["
-for i in "${!engine_names[@]}"; do
-  [ "$i" -eq 0 ] || shared_engine_json="$shared_engine_json,"
-  # Same record shape as the member files above, so one audit reads both sections. The path
-  # is the stable ACTIVE path, not the build directory: the symlink is the contract.
-  shared_engine_json="$shared_engine_json{\"file\":\"${engine_names[$i]}\",\"path\":\"$shared_link/${engine_names[$i]}\",\"sha256\":\"${engine_hashes[$i]}\"}"
-done
-shared_engine_json="$shared_engine_json]"
-
-if [ "$DRY_RUN" = "1" ]; then
-  for base in "${engine_names[@]}"; do
-    log "  would $base -> $shared_link (build $build_digest)"
-  done
-else
-  mkdir -p "$builds_dir"
-  # Staging dirs from an interrupted run are inert — nothing points at them. Sweep them.
-  for stale in "$builds_dir"/.staging.*; do
-    [ -e "$stale" ] && rm -rf "$stale"
-  done
-
-  if [ -d "$build_dir" ]; then
-    if engine_build_ok "$build_dir"; then
-      log "  ok    build $build_digest (already staged, re-verified)"
-    else
-      # A content-addressed directory whose bytes no longer match their address: an installed
-      # engine file was rewritten after deploy. Quarantine loudly; never silently reuse. The
-      # symlink dangles until the rebuild below lands — the honest direction for a tampered
-      # engine is to fail, not to coast on bytes the ledger no longer recognizes.
-      warn "build $build_digest FAILED re-verification — quarantining as $build_dir.corrupt.$$ and rebuilding"
-      mv "$build_dir" "$build_dir.corrupt.$$"
-    fi
-  fi
-  if [ ! -d "$build_dir" ]; then
-    staging="$builds_dir/.staging.$$"
-    mkdir -p "$staging"
-    for i in "${!engine_names[@]}"; do
-      # Imported, not executed: 0644, not the entrypoints' 0755.
-      install -m 0644 "$REPO_ROOT/plugins/_shared/${engine_names[$i]}" "$staging/${engine_names[$i]}"
-    done
-    # INVARIANT 3: prove the bytes landed — the WHOLE staged set, before it can become active.
-    engine_build_ok "$staging" || die "engine build $build_digest verify FAILED in staging; nothing was activated"
-    mv "$staging" "$build_dir"
-    log "  wrote build $build_digest (${#engine_names[@]} files, staged and verified)"
-  fi
-
-  # THE FLIP: one atomic rename of a symlink. Before it, the active engine is untouched;
-  # after it, it is exactly the verified build. There is no between.
-  if [ -e "$shared_link" ] && [ ! -L "$shared_link" ]; then
-    # A pre-symlink install left shared/ as a real directory. INVARIANT 2: preserve, then move.
-    warn "migrating legacy shared/ directory aside to $shared_link.pre-flip.bak"
-    mv "$shared_link" "$shared_link.pre-flip.bak"
-  fi
-  current_target="$(readlink "$shared_link" 2>/dev/null || true)"
-  if [ "$current_target" = "shared.builds/$build_digest" ]; then
-    log "  ok    shared -> $current_target (already current)"
-  else
-    flip="$HESTIA_HOME/.shared.flip.$$"
-    ln -s "shared.builds/$build_digest" "$flip"
-    python3 -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$flip" "$shared_link"
-    log "  wrote shared -> shared.builds/$build_digest"
-  fi
-fi
 log ""
 
 if [ "$DRY_RUN" = "1" ]; then
@@ -456,3 +514,81 @@ log ""
 log "The daemon reads this via HESTIA_CURRENT_BUILD_FILE. If the dashboard still says"
 log "'deployment authority is not configured', the INSTALLED unit is missing that"
 log "Environment= line — deploy/templates/hestia.service carries it, so the unit is stale."
+
+# --------------------------------------------------------------------------------
+# CERTIFY THE INSTALLED GATES AGAINST THE VAULT — or say plainly that we did not.
+#
+# dp, 2026-09-20: "we must have an audit mechanism vs vault reference to check for
+# drift ... the whole shim hashed on release with hash stored in vault on deploy."
+#
+# The mechanism already exists and had ZERO callers: `vault::gate_integrity` plus
+# `/api/gates/verify` and `/api/gates/ratify`, built 2026-07-27 and never wired to
+# anything. This is the deploy-side caller. It VERIFIES; it deliberately does not
+# ratify.
+#
+# WHY NOT RATIFY HERE, though a one-line `curl` to /api/gates/ratify was the obvious
+# move: ratification is the operator asserting "this build is the one I trust", and
+# the handler's own doc says so — "nothing here can tell a good build from a bad one;
+# the operator must ratify from a state they believe correct." An installer that
+# ratified whatever it had just written would bless a tampered build automatically
+# and convert a human judgement into a no-op. The whole point of hashing on release
+# is lost if the release hashes itself.
+#
+# The daemon hashes the files itself rather than trusting anything reported here, and
+# refuses both an empty gate set and an unreadable gate, so this caller cannot launder
+# a bad state by lying about it.
+#
+# THREE OUTCOMES, AND NONE OF THEM IS SILENT:
+#   VERIFIED - installed gates match what the operator ratified.
+#   DRIFT    - they do not. Loud, and a non-zero exit: this is the event the whole
+#              mechanism exists to surface.
+#   UNKNOWN  - the daemon could not establish the set, nothing is ratified yet, or we
+#              could not reach/authenticate to it. Reported as UNKNOWN and never as
+#              success. `gates_verify` already refuses to answer VERIFIED over an
+#              empty denominator (http.rs) after thor measured a host reporting
+#              "VERIFIED, findings: 0, gates: []" while its gate pointed at a missing
+#              file and was failing open. This block must not re-introduce that
+#              inversion one level up by reading a failed check as a passed one.
+#
+# HOW IT READS THE VERDICT (reworked after GPT's HOLD on #1085). The first version
+# called /api/gates/verify, which sits behind the operator gate; the installer carries
+# no operator session, so against a real daemon every run landed on UNKNOWN and the
+# VERIFIED/DRIFT arms were unreachable. dp ruled 2026-09-21 (option 1): the DAEMON
+# verifies its own gates — at startup and on its maintenance tick, witnessing each
+# finding and resolution to the chain (core/src/server/gate_watch.rs) — and writes a
+# readable projection, $HESTIA_HOME/status/gate-integrity.json. This reads that file
+# through tools/gate_verdict.py. No operator session, no chain walk, and the operator
+# wall is untouched.
+#
+# THE VERDICT IS BOUND TO BYTES. The file lists the hash the daemon judged for each
+# gate; a verdict counts only if the bytes on disk still match. A gate this install just
+# rewrote has not been judged yet, so it reads PENDING until the daemon's next pass —
+# never the stale verdict about the bytes it replaced.
+#
+# NO OUTCOME FAILS THE INSTALL. Installing new hook bytes makes them differ from the
+# ratified ones by construction, so MODIFIED after a deploy is the normal state before
+# the operator ratifies; exiting non-zero on it would make every hook deploy read as
+# failed. Every outcome is reported loudly, and none is reported as success unless it is.
+verify_installed_gates() {
+    local out rc=0
+    # Branch on the status explicitly: `set -e` must not turn a finding into an abort.
+    out=$(python3 "$REPO_ROOT/tools/gate_verdict.py" --home "$HESTIA_HOME" 2>&1) || rc=$?
+    printf '%s\n' "$out" | while IFS= read -r line; do log "$line"; done
+    case "$rc" in
+        0) log "gate certification: VERIFIED — the daemon judged exactly these bytes against the vault." ;;
+        2) log "gate certification: PENDING — this install changed gate bytes the daemon has not"
+           log "  judged yet. Re-check after its next pass:"
+           log "    python3 $REPO_ROOT/tools/gate_verdict.py --home $HESTIA_HOME --wait 330" ;;
+        3) log "gate certification: the installed gates DO NOT match what the operator ratified."
+           log "  After a deploy of new hooks this is expected until the operator ratifies the"
+           log "  build (POST /api/gates/ratify, operator-gated, witnessed). If this install did"
+           log "  not change hooks, a gate changed underneath it: read the chain rows named above." ;;
+        4) log "gate certification: UNKNOWN — the daemon could not establish the gate set." ;;
+        *) log "gate certification: NOT CERTIFIED — no usable gate status (reader exit $rc): an"
+           log "  older daemon, one not restarted since the upgrade, or the reader itself failed."
+           log "  Absence of evidence, not a pass." ;;
+    esac
+    return 0
+}
+
+verify_installed_gates || exit 1

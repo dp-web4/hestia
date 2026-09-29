@@ -23,12 +23,18 @@ output; do not substitute a short commit prefix or normalize a `-dirty` suffix:
 
 The daemon's own build identity is baked in at compile time. The dashboard shows **current** in
 green when the identities match, **stale** in amber when they differ, and **unknown** when the
-authority is missing, unreadable, or malformed. Unknown is intentionally not treated as healthy:
-the daemon cannot prove freshness from its own version string. A stale result tells the operator to
-relaunch through the supervisor; Hestia does not self-upgrade or mutate deployment state. A
-supervisor should generate this manifest at install time from the artifact it is about to start,
-so the comparison is true by construction at deployment and turns stale only when a newer
-artifact is selected.
+authority is missing, unreadable, or malformed. `stale` means the running build and the last
+successfully installed authority record disagree; it does not claim which side is newer. Unknown
+is intentionally not treated as healthy:
+the daemon cannot prove freshness from its own version string. A stale result offers an **Update** action to an authenticated operator. The dashboard does
+not implement deployment itself: the action triggers the registered systemd/launchd deployment
+supervisor, which owns sync/build/install, restart verification, hook postconditions, and rollback.
+The supervisor publishes requested/held/running/succeeded/failed status next to the build manifest so
+the dashboard never has to infer success from a dropped HTTP connection. The request carries no
+branch or target; the supervisor determines the actual target only after syncing its dedicated checkout. A supervisor should
+generate this manifest only after the deployment transaction has established the artifact and
+its member-hook postconditions, so `current` means the last successful authority record agrees
+with the running daemon.
 
 **Evidence boundary:** a green daemon build comparison proves the selected daemon artifact is
 running. It does not prove that separately installed harness hooks match their source, that every

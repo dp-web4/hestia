@@ -193,6 +193,7 @@ def run_hook(hook_path, ws, event, endpoint, member="codex", home=None, cwd=None
                 identity_env: os.path.join(ws, "identity.json"),
                 "HESTIA_OBSERVE_DIR": os.path.join(ws, "observe"),
                 mode_env: "enforce",
+                "HESTIA_SHARED_DIR": os.path.join(ws, "hestia", "plugins", "_shared"),
                 "HESTIA_ENDPOINT": endpoint})
     if home:
         env["HESTIA_HOME"] = home

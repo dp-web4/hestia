@@ -19,7 +19,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from escalation_payload_census import classify  # noqa: E402
+from escalation_payload_census import _cap_suspects, classify  # noqa: E402
 
 
 # ---- destination-only: the `_attempted_summary` path fallback, both spellings ----
@@ -71,6 +71,43 @@ def test_command_that_merely_starts_with_a_path_is_attestable():
     assert classify("/usr/bin/env python3 -c 'print(1)'") == "attestable"
 
 
+# ---- truncated: a cut act, in BOTH renderings the fleet emits ----
+#
+# These two fixtures exist as a PAIR and must stay one. Either alone passes on a detector
+# that is blind to the other seat, which is exactly the defect they were written for: the
+# driver circulated on 13674a4dde3475ce tested `r.endswith(" …")`, matched claude-code's
+# 76 cut rows, and returned zero for kimi's 13 and codex's 10 -- a clean, well-formed zero
+# that got published as "claude-code is the only seat still truncating."
+
+def test_claude_bare_ellipsis_is_truncated():
+    """`s[:220] + " …"`. Observed at exactly 228 chars, 76 times, 2026-08-18..08-27."""
+    assert classify("Bash: " + "x" * 220 + " …") == "truncated"
+
+
+def test_kimi_and_codex_bracket_marker_is_truncated():
+    """`s[:400] + "…[truncated]"`. Observed at exactly 412 chars on BOTH seats -- verbatim
+    from 13674a4dde3475ce, whose act stops after a bare `|`."""
+    assert classify(
+        "cd /mnt/c/exe/projects/ai-agents/hestia && for f in plugins/claude-code/hooks/"
+        "pre_tool_use.py; do git show origin/main:$f | grep -n foo; done; "
+        "git show origin/main:plugins/codex/hooks/pre_tool_use.py |…[truncated]") \
+        == "truncated"
+
+
+def test_a_cut_path_is_truncated_not_destination_only():
+    """SYNTHETIC, and the reason `_TRUNCATED` is tested first. A cut path is still one
+    whitespace-free token, so `_DEST_ONLY` matches it and the cut vanishes -- the row would
+    be counted as a destination the member was reaching, at a path that does not exist."""
+    assert classify("Write -> /home/dp/" + "d/" * 200 + "fi…[truncated]") == "truncated"
+
+
+def test_an_uncut_command_is_still_attestable():
+    """The falsifier for the two above: if `_TRUNCATED` ever grows loose enough to match a
+    complete act, this census stops reporting any attestable rows at all and says nothing."""
+    assert classify("Bash: git log --format='%h %ad %s' --date=short -1 7abd786") \
+        == "attestable"
+
+
 # ---- the two edges that must not be folded into either bucket ----
 
 def test_redacted_is_its_own_class():
@@ -114,6 +151,45 @@ def test_no_edit_or_write_shape_survives_as_attestable():
         assert classify(shape) == "destination-only", shape
 
 
+# ---- the detector's own blind spot, as an executable claim ----
+
+def test_cap_suspects_finds_a_marker_this_census_cannot_spell():
+    """A FOURTH seat truncating with a marker `_TRUNCATED` does not know.
+
+    Every row it emits scores `attestable` and the census reports `truncated: 0` for it --
+    confidently, with no error, which is the failure mode a spelling test always has. The
+    cap still leaves a signature the spelling cannot hide: many rows at ONE length, and
+    that length the longest the seat produces. This is what has to fail if the scream is
+    ever removed."""
+    rows = [{"plugin_id": "newseat", "class": "attestable",
+             "stated_reason": f"cmd{i} " + "y" * (514 - len(f"cmd{i} ")) + "<<cut>>"}
+            for i in range(4)]
+    rows.append({"plugin_id": "newseat", "class": "attestable", "stated_reason": "short"})
+    suspects = _cap_suspects(rows)
+    assert suspects == [("newseat", 521, 4, 5)], suspects
+
+
+def test_cap_suspects_does_not_fire_on_one_act_retried():
+    """The live false positive that taught the guard its shape, kept as a pin.
+
+    On the 2026-08-27 walk the row-counting draft screamed at kimi-code for 5 rows at
+    exactly 399 chars. They were TWO commands retried, both ending in a complete
+    `| tail -3` -- no cap anywhere. A cap piles many DIFFERENT acts at one length; a
+    retry piles one act there. Counting rows cannot tell those apart."""
+    retried = "git status --short; echo BOUNDARY-PASS; git diff --cached --stat | tail -3"
+    rows = [{"plugin_id": "kimi-code", "class": "attestable", "stated_reason": retried}
+            for _ in range(5)]
+    rows.append({"plugin_id": "kimi-code", "class": "attestable", "stated_reason": "ls"})
+    assert _cap_suspects(rows) == []
+
+
+def test_cap_suspects_is_quiet_on_naturally_varied_lengths():
+    """The falsifier. A scream that fires on ordinary traffic is a scream nobody reads."""
+    rows = [{"plugin_id": "s", "class": "attestable", "stated_reason": "z" * n}
+            for n in (10, 40, 41, 90, 200)]
+    assert _cap_suspects(rows) == []
+
+
 # Listed by name rather than handed to a runner. `tools/ci_selfexec_test.py` answers
 # "is this test wired up?" by walking `ast.Name`, so dispatch through a runner -- like a
 # `globals()` sweep -- is invisible to it and the whole file reads as inert. Third PR to
@@ -127,10 +203,17 @@ TESTS = [
     test_kimi_bare_command_is_attestable,
     test_codex_apply_patch_is_attestable,
     test_command_that_merely_starts_with_a_path_is_attestable,
+    test_claude_bare_ellipsis_is_truncated,
+    test_kimi_and_codex_bracket_marker_is_truncated,
+    test_a_cut_path_is_truncated_not_destination_only,
+    test_an_uncut_command_is_still_attestable,
     test_redacted_is_its_own_class,
     test_missing_reason_is_absent,
     test_path_with_trailing_space_is_still_destination_only,
     test_no_edit_or_write_shape_survives_as_attestable,
+    test_cap_suspects_finds_a_marker_this_census_cannot_spell,
+    test_cap_suspects_does_not_fire_on_one_act_retried,
+    test_cap_suspects_is_quiet_on_naturally_varied_lengths,
 ]
 
 

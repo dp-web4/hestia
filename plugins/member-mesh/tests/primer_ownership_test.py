@@ -251,8 +251,23 @@ def main():
     # ---- Arrange: codex has one notice, and a debt report that names it. Its
     # fire refuses (rc=70), so the primer is RETAINED -- the exact state the
     # real shared directory was in.
+    # Fixture notices are dated RELATIVE TO NOW. The comment below already named this
+    # hazard -- a hardcoded date judged against an AGE rule -- and defended against the
+    # one age rule that existed then (discharge) by keeping these ids in `i_owe`. That
+    # defence was specific to that rule, and 2026-09-02 added a second one it does not
+    # cover: a retained primer whose notices are ALL past the daemon's 7d inbox TTL is
+    # set aside `.expired` by the startup judge, before any retry runs. These fixtures
+    # were written 2026-07-31, so they aged out on 2026-08-07 and case 2 has been
+    # measuring an empty directory ever since -- it reports `live=[] exhausted=[]`,
+    # which its own message renders as "parked", naming a cause that did not happen.
+    # Relative dates retire the class rather than this instance: no age rule, present
+    # or future, can silently delete this file's subject.
+    _now = time.time()
+    RECENT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now - 3600))    # 1h old
+    OLDER = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now - 7200))     # 2h old
+
     INBOX["codex"] = [{"id": 215, "kind": "coordination", "from_plugin": "claude-code",
-                       "pointer_uri": "hestia://appeals-waiting-for-you", "queued_at": "2026-07-31T00:00:00Z"}]
+                       "pointer_uri": "hestia://appeals-waiting-for-you", "queued_at": RECENT}]
     # The notice each member is about (215, 500) is listed as STILL OWED, alongside the
     # older debt that names the owner. This is not decoration: since 2026-08-05 the
     # stale-retry pass asks the daemon whether a retained primer is still owed and
@@ -264,22 +279,22 @@ def main():
     # is about; keeping its work list live is how they stay measurable.
     UNANSWERED["codex"] = {
         "i_owe": [{"id": 126, "kind": "reply", "from_plugin": "claude-code", "to_plugin": "codex",
-                   "pointer_uri": "p", "queued_at": "2026-07-26T00:00:00Z", "drained_at": None},
+                   "pointer_uri": "p", "queued_at": OLDER, "drained_at": None},
                   {"id": 215, "kind": "coordination", "from_plugin": "claude-code", "to_plugin": "codex",
                    "pointer_uri": "hestia://appeals-waiting-for-you",
-                   "queued_at": "2026-07-31T00:00:00Z", "drained_at": None}],
+                   "queued_at": RECENT, "drained_at": None}],
         "owed_to_me": [],
     }
     UNANSWERED["kimi-code"] = {
         "i_owe": [{"id": 496, "kind": "reply", "from_plugin": "claude-code", "to_plugin": "kimi-code",
-                   "pointer_uri": "q", "queued_at": "2026-07-31T00:00:00Z", "drained_at": None},
+                   "pointer_uri": "q", "queued_at": RECENT, "drained_at": None},
                   {"id": 500, "kind": "coordination", "from_plugin": "claude-code", "to_plugin": "kimi-code",
                    "pointer_uri": "kimis-own-mail",
-                   "queued_at": "2026-07-31T00:00:00Z", "drained_at": None}],
+                   "queued_at": RECENT, "drained_at": None}],
         "owed_to_me": [],
     }
     KIMI_NOTICE = {"id": 500, "kind": "coordination", "from_plugin": "claude-code",
-                   "pointer_uri": "kimis-own-mail", "queued_at": "2026-07-31T00:00:00Z"}
+                   "pointer_uri": "kimis-own-mail", "queued_at": RECENT}
 
     # Both stubs REFUSE. A succeeding retry deletes the primer and its sidecar,
     # which would leave cases 2 and 3a inspecting an empty directory and passing
@@ -414,7 +429,7 @@ def main():
     fb_fire = os.path.join(tmp, "fire-fallback.sh")
     write_fire(fb_fire, fb_log, EX_REFUSED)
     INBOX["codex"] = [{"id": 216, "kind": "reply", "from_plugin": "claude-code",
-                       "pointer_uri": "p2", "queued_at": "2026-07-31T00:00:00Z"}]
+                       "pointer_uri": "p2", "queued_at": RECENT}]
     UNANSWERED["codex"] = FAIL_UNANSWERED
     run_watcher("codex", fb_fire, env2, fb_log, 1)
     fb = fired(fb_log)
@@ -439,7 +454,7 @@ def main():
     with open(foreign, "w") as f:
         json.dump({"for_plugin": "codex", "total": 1, "evicted": 0, "peeked": False,
                    "notices": [{"id": 9001, "kind": "reply", "from_plugin": "claude-code",
-                                "pointer_uri": "somebody-elses-mail", "queued_at": "2026-07-31T00:00:00Z"}]}, f)
+                                "pointer_uri": "somebody-elses-mail", "queued_at": RECENT}]}, f)
     fenv = dict(os.environ)
     fenv.update(HOME=os.path.join(tmp, "home4"), PATH=bindir + os.pathsep + os.environ["PATH"])
     os.makedirs(fenv["HOME"], exist_ok=True)

@@ -43,13 +43,17 @@ flock -n 9 || { echo "[hestia-watch] another watcher holds $STATE/watch-$PLUGIN.
 # repository commit: an installed copy or dirty worktree can honestly differ from either
 # HEAD or main. Bash does not expose its parsed buffer, so this is explicitly a source
 # snapshot rather than a claim that every byte had already been parsed.
-WATCH_SOURCE="${BASH_SOURCE[0]}"
+# HANDED DOWN BY A DEPLOYING PREDECESSOR (see maybe_self_deploy). After a self-deploy
+# this process is executing a private snapshot under $STATE, but the file the fleet
+# DEPLOYS is still the canonical repo path -- so the predecessor passes it, and drift is
+# measured against the file operators actually update rather than against our own copy.
+WATCH_SOURCE="${HESTIA_WATCH_SOURCE:-${BASH_SOURCE[0]}}"
 # Resolved once, from the same source path the drift snapshot above hashes, so a
 # helper is loaded from the copy that is actually running rather than from a cwd
 # that is nobody's guarantee.
 WATCH_DIR="$(cd "$(dirname "$WATCH_SOURCE")" && pwd)"
-watch_source_hash() {
-  python3 - "$WATCH_SOURCE" <<'PY'
+sha256_file() {
+  python3 - "$1" <<'PY'
 import hashlib, sys
 h = hashlib.sha256()
 with open(sys.argv[1], "rb") as fh:
@@ -58,8 +62,94 @@ with open(sys.argv[1], "rb") as fh:
 print(h.hexdigest())
 PY
 }
-WATCH_STARTUP_SHA256="$(watch_source_hash 2>/dev/null || true)"
-[[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]] || WATCH_STARTUP_SHA256="unavailable"
+watch_source_hash() { sha256_file "$WATCH_SOURCE"; }
+
+# THE BYTES THIS INTERPRETER IS READING, not the bytes at a pathname.
+#
+# Bash holds the script open on a descriptor for the life of the process and reads the
+# not-yet-parsed tail from it, so /proc/<pid>/fd/<n> is the SAME open file description
+# bash itself reads -- opening it does not re-resolve the path. Measured on this host:
+# replace the script by rename underneath a running process and this fd still hashes the
+# ORIGINAL bytes (readlink additionally reports "(deleted)"), while hashing "$0" returns
+# the impostor that never executed. That is the difference between naming what is running
+# and naming what happens to be at a name.
+#
+# The descriptor number is DISCOVERED, never assumed. Bash takes the highest FREE fd:
+# 255 normally, 254 when the parent handed us 255, 249 with 250-255 taken (all measured).
+# Hardcoding 255 does not fail loudly -- it hashes an unrelated inherited fd.
+#
+# KNOWN BLIND SPOT, pinned by a test rather than left to be discovered: a same-length
+# IN-PLACE rewrite of our own inode is followed by this fd, because it is the same inode.
+# It is invisible here and to every other spelling; a length-CHANGING in-place rewrite
+# corrupts the running parse instead. Rename-replace -- the shape maybe_self_deploy and
+# every sane deploy actually use -- is the case this closes.
+watch_own_fd_path() {
+  local want="$1" fd n target best=""
+  for fd in /proc/$$/fd/*; do
+    n="${fd##*/}"
+    case "$n" in ''|*[!0-9]*) continue ;; esac
+    target="$(readlink "$fd" 2>/dev/null || true)"
+    target="${target% (deleted)}"
+    if [ -n "$target" ] && [ "$target" = "$want" ]; then
+      if [ -z "$best" ] || [ "$n" -gt "$best" ]; then best="$n"; fi
+    fi
+  done
+  if [ -z "$best" ]; then return 1; fi
+  printf '/proc/%s/fd/%s\n' "$$" "$best"
+}
+
+# HOW the baseline was obtained, printed beside it. A bare hash on a log line has already
+# been misread as a commit sha in a published table: it is a CONTENT hash, and recovering
+# a commit from it needs a reverse lookup that only succeeds while some commit still holds
+# those exact bytes. The origin token says which question the number answers.
+#   own-fd                     -- hashed from the descriptor bash is reading (authoritative)
+#   own-fd-handover-mismatch   -- self-derived, and the predecessor's claim DISAGREED
+#   handover                   -- /proc unavailable; believed the predecessor
+#   path-reread                -- believed the pathname; a baseline for bytes we may not run
+#   unavailable                -- no baseline was ever captured
+WATCH_STARTUP_ORIGIN="unavailable"
+WATCH_STARTUP_SHA256=""
+WATCH_SELF_FD_PATH="$(watch_own_fd_path "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+if [ -n "$WATCH_SELF_FD_PATH" ]; then
+  WATCH_STARTUP_SHA256="$(sha256_file "$WATCH_SELF_FD_PATH" 2>/dev/null || true)"
+  if [[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    WATCH_STARTUP_ORIGIN="own-fd"
+  fi
+fi
+# The predecessor's claim is now a CROSS-CHECK, not the source. As the source it meant an
+# operator who exported the pair could tell a fresh watcher what it was running; `unset`
+# bounded that lie to one process but did not remove it. Self-derivation removes the need
+# to believe it at all, and keeping the comparison converts a lie -- or a snapshot that
+# moved between hash and exec -- from a silent adoption into a reportable disagreement.
+WATCH_HANDOVER_SHA256="${HESTIA_WATCH_STARTUP_SHA256:-}"
+if [ "$WATCH_STARTUP_ORIGIN" = "own-fd" ]; then
+  if [[ "$WATCH_HANDOVER_SHA256" =~ ^[0-9a-f]{64}$ ]] && \
+     [ "$WATCH_HANDOVER_SHA256" != "$WATCH_STARTUP_SHA256" ]; then
+    WATCH_STARTUP_ORIGIN="own-fd-handover-mismatch"
+  fi
+fi
+# Fall back exactly as before when /proc gives us nothing: the handover, then the path.
+if [ "$WATCH_STARTUP_ORIGIN" = "unavailable" ]; then
+  WATCH_STARTUP_SHA256="$WATCH_HANDOVER_SHA256"
+  if [[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    WATCH_STARTUP_ORIGIN="handover"
+  fi
+fi
+if [ "$WATCH_STARTUP_ORIGIN" = "unavailable" ]; then
+  WATCH_STARTUP_SHA256="$(watch_source_hash 2>/dev/null || true)"
+  if [[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    WATCH_STARTUP_ORIGIN="path-reread"
+  fi
+fi
+if ! [[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  WATCH_STARTUP_SHA256="unavailable"
+  WATCH_STARTUP_ORIGIN="unavailable"
+fi
+unset WATCH_HANDOVER_SHA256
+# Consumed. Not inherited by the fired CLI, and not inherited by a successor that did
+# not get it from us -- these two say "your predecessor verified this", and only a
+# predecessor is entitled to say it.
+unset HESTIA_WATCH_SOURCE HESTIA_WATCH_STARTUP_SHA256
 WATCH_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 WATCH_CURRENT_SHA256="$WATCH_STARTUP_SHA256"
 if [[ "$WATCH_STARTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
@@ -74,6 +164,15 @@ else
   WATCH_ARTIFACT_REASON="startup-baseline-unavailable"
 fi
 WATCH_LAST_ALARM_KEY=""
+# The argv this process was started with, captured at TOP LEVEL. Inside a function
+# `"$@"` is that function's own arguments, which is precisely how a re-exec loses the
+# plugin id and the fire command and comes back up watching nothing.
+WATCH_ARGV=("$@")
+# Last drifted disk hash seen, so a deploy needs the SAME new bytes on two consecutive
+# passes. The tree this mesh executes from has concurrent writers -- three watchers and
+# whatever session is awake in it -- and a file caught mid-write hashes to bytes nobody
+# ever committed. One sample is not a version; it is a race.
+WATCH_DRIFT_SEEN_SHA256=""
 
 # DAEMON DRIFT (2026-08-03, mesh-vocabulary thread: "landed is three steps short").
 # The watcher refuses to run stale bytes of ITSELF (check_artifact_drift above), but
@@ -257,7 +356,7 @@ announce_artifact() {
   # is the level-triggered gauge that survives log rotation; it must never depend on
   # a prior one-shot alarm still being visible.
   check_artifact_drift
-  echo "[hestia-watch] ARTIFACT plugin=$PLUGIN state=$WATCH_ARTIFACT_STATE reason=$WATCH_ARTIFACT_REASON startup_sha256=$WATCH_STARTUP_SHA256 disk_sha256=$WATCH_CURRENT_SHA256 started=$WATCH_STARTED_AT"
+  echo "[hestia-watch] ARTIFACT plugin=$PLUGIN state=$WATCH_ARTIFACT_STATE reason=$WATCH_ARTIFACT_REASON startup_sha256=$WATCH_STARTUP_SHA256 startup_origin=$WATCH_STARTUP_ORIGIN disk_sha256=$WATCH_CURRENT_SHA256 started=$WATCH_STARTED_AT"
 }
 
 check_artifact_drift() {
@@ -298,12 +397,187 @@ check_artifact_drift() {
     WATCH_LAST_ALARM_KEY=""
   elif [ "$STATE:$REASON" != "$WATCH_LAST_ALARM_KEY" ]; then
     if [ "$STATE" = "drift" ]; then
-      echo "[hestia-watch] ARTIFACT DRIFT — restart required; startup_sha256=$WATCH_STARTUP_SHA256 disk_sha256=$CURRENT"
+      echo "[hestia-watch] ARTIFACT DRIFT — restart required; startup_sha256=$WATCH_STARTUP_SHA256 startup_origin=$WATCH_STARTUP_ORIGIN disk_sha256=$CURRENT"
     else
-      echo "[hestia-watch] ARTIFACT UNVERIFIABLE — reason=$REASON startup_sha256=$WATCH_STARTUP_SHA256 disk_sha256=$CURRENT"
+      echo "[hestia-watch] ARTIFACT UNVERIFIABLE — reason=$REASON startup_sha256=$WATCH_STARTUP_SHA256 startup_origin=$WATCH_STARTUP_ORIGIN disk_sha256=$CURRENT"
     fi
     WATCH_LAST_ALARM_KEY="$STATE:$REASON"
   fi
+}
+
+# THE ALARM THAT HAD NO RECOVERY.
+#
+# `check_artifact_drift` above has been correct, level-triggered and hourly for twenty
+# days, and it changed nothing -- because the only sentence it can say is "restart
+# required" and it says it to a log no member reads, on behalf of a process no member
+# can restart. This file already names that defect, one function down, about a
+# different alarm: "The alarm existed and the recovery did not, which is this corpus's
+# recurring defect wearing recovery's clothes." The drift alarm is the next instance.
+#
+# MEASURED, CBP 2026-08-26. The claude-code and kimi-code watchers were executing
+# a8dccda (2026-08-06) while origin/main was three mesh commits ahead. One of the three
+# is ebc3719, which stops this script reporting a DELIVERED primer as undelivered.
+# In one member's primer that morning: 41 non-delivery labels on rc=124 -- the one rc
+# that proves delivery -- of which 40 were filed by the two stale-vintage watchers.
+# The 41st was codex's, queued 2026-08-25T18:37:02Z, 4h35m BEFORE codex restarted into
+# the current bytes at 23:12:38Z. THE DENOMINATOR IS ONE MEMBER'S PRIMER, not the
+# fleet: codex, reviewing this PR from its own retained snapshots, counted seven unique
+# rc=124 rows attributed via watch-codex, and the 18:37:02Z batch filed four notices --
+# only one of which reached the primer counted here. Post-restart, on either
+# denominator, that seat has filed zero. The fix works. It was merged. It was not in
+# force.
+#
+# WHY NOBODY APPLIED IT BY HAND. There is no moment to apply it in. The session that
+# reads the alarm is a descendant of its own watcher's cgroup, so `systemctl restart`
+# is suicide; the other stale seat was mid-wake behind a foreground `timeout -k 30
+# 1800`. Three members waking each other makes "idle at the instant a human looks"
+# close to a null set. A remedy only a human can apply, to a machine that is never
+# idle when the human is there, is not a remedy.
+#
+# FOUR CONJUNCTS. Each one removes a way this could be worse than the staleness it
+# fixes; none of them is decoration.
+#
+#   drift          -- nothing to deploy otherwise.
+#
+#   stable twice   -- the same NEW hash on two consecutive passes, not one sighting.
+#                     Concurrent writers; a half-written file is not a version.
+#
+#   MERGED, BYTE   -- the disk bytes must be byte-identical to `origin/main:<path>`.
+#     FOR BYTE        This is the conjunct that carries the design. Deploying
+#                     "whatever changed" would make the fleet's in-force vintage a
+#                     function of whoever last hit save in a shared worktree, which is
+#                     strictly WORSE than being stale: stale is at least stable and
+#                     nameable, and this file's whole vintage story depends on that.
+#                     Deploying "what was merged" closes the last link of
+#                     committed -> routed -> merged -> IN FORCE, and refuses to close
+#                     it for bytes that skipped the earlier ones.
+#
+#                     NOT `git hash-object` against `rev-parse origin/main:<path>`,
+#                     which is the obvious spelling and is WRONG HERE. This tree lives
+#                     on a Windows mount with `core.autocrlf=input`, so the clean
+#                     filter normalises CRLF on the way in: a CRLF-mangled working copy
+#                     has the SAME blob id as the clean merged file. Measured on this
+#                     box -- identical blob, and `bash -n` accepts the mangled file too,
+#                     so the parse conjunct does not catch it either. Both guards would
+#                     have waved it through. Comparing the RAW BYTES of `git show`
+#                     against the same sha256 the startup snapshot already computes puts
+#                     no filter anywhere in the path, and costs one hash.
+#
+#   SAME OBJECT    -- the hash, the parse and the `exec` all name ONE private file
+#                     under $STATE holding the `git show` output, placed by rename.
+#                     Checking a PATHNAME and then exec'ing that pathname binds
+#                     nothing in a tree with concurrent writers: the replacement that
+#                     lands in between is what runs. Rehashing just before exec
+#                     narrows that window and does not close it.
+#
+#   parses         -- `bash -n`. Unreachable unless origin/main itself carries a syntax
+#                     error, and kept for exactly that case: the unit is Restart=always,
+#                     so exec'ing into a file that does not parse is a fleet-wide crash
+#                     loop rather than a deploy. Cheap insurance against the one input
+#                     the merged-bytes conjunct cannot vet.
+#
+# FAIL CLOSED. Any conjunct that cannot be answered -- source not tracked, no
+# origin/main, git absent, hash unavailable -- declines to deploy and says which one,
+# leaving today's behaviour exactly as it is. The polarity is deliberate: an
+# auto-deployer that fires when it cannot verify is the bug it is here to fix.
+#
+# WHERE IT RUNS is the safety argument, and it is structural rather than a heuristic.
+# The fire is FOREGROUND (`if "$FIRE" "$PRIMER"; then`), so the top of the loop is the
+# one point in this script where this watcher provably has no wake in flight. A deploy
+# that can only happen where there is no wake can never cut one short.
+#
+# `exec` and not `systemctl restart`: same pid, the unit never goes inactive, MainPID
+# does not move, nothing else in the cgroup is signalled -- and the successor reads the
+# file from byte zero, which is the entire point, since a long-running bash executes
+# the buffer it began with and can otherwise resume at a stale byte offset.
+#
+# BOOTSTRAP, SAID OUT LOUD: this function cannot deploy itself. The seats that predate
+# it need exactly one manual restart, ever, and then never another one.
+maybe_self_deploy() {
+  if [ "$WATCH_ARTIFACT_STATE" != "drift" ]; then
+    WATCH_DRIFT_SEEN_SHA256=""
+    return 0
+  fi
+  [[ "$WATCH_CURRENT_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 0
+
+  if [ "$WATCH_CURRENT_SHA256" != "$WATCH_DRIFT_SEEN_SHA256" ]; then
+    WATCH_DRIFT_SEEN_SHA256="$WATCH_CURRENT_SHA256"
+    return 0
+  fi
+
+  local REL SNAP SNAP_NEW SNAP_SHA
+
+  # A FAILING COMMAND MUST PRODUCE A HELD VERDICT, NOT AN EXIT. Codex review of #636,
+  # blocking 2, and it was not hypothetical: under `set -euo pipefail` the previous
+  # spelling `REL="$(git ... | head -1)"` made a non-repo working directory kill the
+  # WHOLE WATCHER with rc=128 before the "not tracked" branch below could ever print.
+  # CI reproduced it -- watch_artifact_identity_test.py runs this script from a bare
+  # temp dir, and the watcher died mid-test. `if !` puts the status in a condition
+  # (where errexit is suspended), and the first line is taken with an expansion rather
+  # than a pipe, so nothing but git's own status decides the verdict.
+  if ! REL="$(git -C "$WATCH_DIR" ls-files --full-name -- "$WATCH_SOURCE" 2>/dev/null)"; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — cannot ask git whether the source is tracked; deploy declined"
+    return 0
+  fi
+  REL="${REL%%$'\n'*}"
+  if [ -z "$REL" ]; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — source is not tracked in a git repo; deploy declined"
+    return 0
+  fi
+
+  # THE BYTES CHECKED MUST BE THE BYTES `exec` OPENS. Codex review of #636, blocking 1.
+  # Hashing and parsing a PATHNAME and then exec'ing that same pathname binds nothing:
+  # this tree has concurrent writers, and a replacement landing between the last check
+  # and the open is precisely what gets executed. Re-hashing just before exec narrows
+  # the window; it does not close it.
+  #
+  # So `git show` is materialised into a private file under $STATE (0700, one per
+  # plugin, and the flock above guarantees a single watcher per plugin writes it), and
+  # the hash, the `bash -n` and the `exec` all name THAT file. The final `mv` is a
+  # rename, so the inode verified is the inode executed, and a predecessor still
+  # running from the old snapshot keeps its own open inode rather than being truncated
+  # underneath itself.
+  #
+  # What the successor loses by running from $STATE -- the canonical path it should
+  # keep watching, and the hash of what it is really executing -- is handed to it
+  # explicitly on the exec line.
+  SNAP="$STATE/self-deploy/watch-$PLUGIN.sh"
+  SNAP_NEW="$SNAP.new"
+  mkdir -p "$STATE/self-deploy" && chmod 700 "$STATE/self-deploy"
+  # Branching on git's status, NOT on the digest. The previous spelling ended in
+  # `|| true`, which threw away rc=128 for an unreadable origin/main and kept the
+  # hasher's stdout: sha256 of EMPTY INPUT, e3b0c442... If the drifted disk file were
+  # also empty the two would match, `bash -n` would accept it, and the watcher would
+  # deploy an empty script under Restart=always -- fail-OPEN on the exact conjunct this
+  # function advertises as fail-closed.
+  if ! git -C "$WATCH_DIR" show "origin/main:$REL" > "$SNAP_NEW" 2>/dev/null; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — cannot read origin/main:$REL; deploy declined"
+    return 0
+  fi
+  SNAP_SHA="$(sha256_file "$SNAP_NEW" 2>/dev/null || true)"
+  if [[ ! "$SNAP_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — cannot hash origin/main:$REL; deploy declined"
+    return 0
+  fi
+  if [ "$SNAP_SHA" != "$WATCH_CURRENT_SHA256" ]; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — disk bytes are not origin/main:$REL (disk=$WATCH_CURRENT_SHA256 main=$SNAP_SHA); merged bytes deploy, edited bytes do not"
+    return 0
+  fi
+  if ! "${BASH:-bash}" -n "$SNAP_NEW" 2>/dev/null; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — origin/main:$REL does not parse; deploy declined"
+    return 0
+  fi
+  if ! mv -f "$SNAP_NEW" "$SNAP"; then
+    echo "[hestia-watch] ARTIFACT DRIFT held — cannot place the verified snapshot at $SNAP; deploy declined"
+    return 0
+  fi
+
+  echo "[hestia-watch] ARTIFACT DEPLOY plugin=$PLUGIN — exec into merged bytes; was=$WATCH_STARTUP_SHA256 now=$WATCH_CURRENT_SHA256 ref=origin/main:$REL snapshot=$SNAP_SHA"
+  # `exec bash "$path"` and not `exec "$path"`: the executable bit does not survive on
+  # the Windows mount this tree lives on, which is why the unit invokes the script
+  # through bash to begin with.
+  HESTIA_WATCH_SOURCE="$WATCH_SOURCE" HESTIA_WATCH_STARTUP_SHA256="$SNAP_SHA" \
+    exec "${BASH:-bash}" "$SNAP" "${WATCH_ARGV[@]}"
 }
 
 announce_artifact
@@ -437,14 +711,31 @@ migrate_flat_primers
 SPENT_MAX_AGE_SECS="${SPENT_MAX_AGE_SECS:-518400}"   # 6d — deliberately INSIDE the daemon's 7d inbox TTL
 SPENT_MIN_AGE_SECS="${SPENT_MIN_AGE_SECS:-21600}"    # 6h — MEMBER_UNANSWERED_DEFAULT_SECS, the fallback when the fold will not say
 
-# $1 = primer path, $2 = the `unanswered` fold, fetched once per pass. Exit 0 ONLY when
-# every notice in the primer is inside the measurable window and absent from `i_owe`.
+# THE FOLD TRAVELS AS A FILE, NOT AN ARGUMENT (2026-09-02). This function took the fold
+# as `$2` and handed it to python as one argv string. Linux caps a single argument at
+# MAX_ARG_STRLEN = 131072 bytes (32 pages; measured on CBP: 131,000 passes, 131,072
+# fails). A fold past that never reaches the judge: bash prints "Argument list too
+# long", the function returns nonzero, and nonzero is the "unmeasured -> fire" arm
+# below. Every failure direction fires, by design — so a fold that outgrew an argument
+# turned the guard into a no-op that fires EVERY retained primer, discharged or not,
+# to the attempt budget, at every restart. The fold crosses the line on its own: at
+# floor 0 the claude-code fold was 388,367 bytes on 2026-09-02 (738 `owed_to_me` rows;
+# the guard reads only `i_owe`, but the whole fold is one string), and the kimi-code
+# watcher's journal that day shows "Argument list too long" before 8 of 8 surviving
+# stale passes, 21 consecutive stale re-fires from 04:22Z to 10:26Z, four of them on
+# notices already answered with `binding_verified: true` in August. Each re-fire adds
+# rows to the peer's fold, so the storm feeds the condition that causes it.
+#
+# $1 = primer path, $2 = PATH TO the `unanswered` fold, fetched once per pass. Exit 0
+# ONLY when every notice in the primer is inside the measurable window and absent from
+# `i_owe`. `stale_primer_discharged_test.py` case 7 pads the fold past 128 KiB.
 primer_spent() {
   python3 - "$1" "$SPENT_MAX_AGE_SECS" "$2" "$SPENT_MIN_AGE_SECS" <<'PY'
 import datetime, json, sys
-primer, max_age, fold_raw, min_age = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+primer, max_age, fold_path, min_age = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
 try:
-    fold = json.loads(fold_raw)
+    with open(fold_path, encoding="utf-8") as f:
+        fold = json.load(f)
     notices = json.load(open(primer)).get("notices") or []
 except Exception:
     raise SystemExit(1)                     # unreadable either side -> unmeasured
@@ -475,30 +766,146 @@ raise SystemExit(0)
 PY
 }
 
+# PAST THE DAEMON'S TTL THERE IS NOBODY TO PAY (2026-09-02). A notice older than the
+# inbox TTL (7d, `INBOX_TTL_SECS`) has been pruned from `member_notices`: the daemon
+# answers `member_notice_recipient` with no row, so a disposition bound to it is
+# witnessed `binding_verified: false`; the sender's `owed_to_me` cannot hold it either,
+# so nothing the member does can discharge anything. The old rule fired it anyway
+# ("absence means pruned, not answered"), and the member woke, answered mail the ledger
+# had forgotten, and read its own unverifiable binding as "a TTL-aged notice can never
+# close". On CBP 2026-09-02, 11 of kimi-code's 21 consecutive stale re-fires were on
+# notices 8–15 days old, every one already answered on the chain in August.
+#
+# Set aside, never deleted: `.expired` keeps the only copy, and the journal line names
+# every id so the member can read the pointers by hand if the work still matters. Only
+# when EVERY notice in the list is past the TTL — a list with one live notice is still
+# a live list, and the live notice is what the attempt budget is for.
+EXPIRED_AGE_SECS="${EXPIRED_AGE_SECS:-604800}"   # 7d — the daemon's INBOX_TTL_SECS, exactly
+
+# $1 = primer path. Exit 0 ONLY when every notice in it is older than the daemon's TTL.
+primer_expired() {
+  python3 - "$1" "$EXPIRED_AGE_SECS" <<'PY'
+import datetime, json, sys
+primer, ttl = sys.argv[1], int(sys.argv[2])
+try:
+    notices = json.load(open(primer)).get("notices") or []
+except Exception:
+    raise SystemExit(1)
+if not notices:
+    raise SystemExit(1)
+now = datetime.datetime.now(datetime.timezone.utc)
+for n in notices:
+    try:
+        q = datetime.datetime.fromisoformat(str(n.get("queued_at", "")).replace("Z", "+00:00"))
+    except ValueError:
+        raise SystemExit(1)
+    if (now - q).total_seconds() <= ttl:
+        raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
+# One fold, on disk, for a whole pass. Prints the path; empty on failure. The caller
+# removes it. `unanswered_now` failing yields an empty file, which `primer_spent` reads
+# as unmeasured — the refusal arm, unchanged.
+fold_to_file() {
+  local f
+  f="$(mktemp "${TMPDIR:-/tmp}/hestia-fold-$PLUGIN.XXXXXX")" || return 1
+  unanswered_now > "$f" 2>/dev/null || true
+  echo "$f"
+}
+
 # Wrapped in a function only so it can run AFTER `mesh_rpc` is defined; it is still
 # called from the startup path, in the same place, before the first poll.
+# THE WALK YIELDS TO THE LOOP (kimi-code, reply 9164, 2026-09-02). This pass used to
+# FIRE every surviving list, synchronously, before the main loop below ever ran. Each
+# fire is a full wake (kimi-code on CBP: 4.5-27.5 min, mean 16.6), and the kimi-code
+# watcher restarted on 2026-09-01 21:22 PDT with 149 retained lists: at that rate the
+# first `drain` was ~41 hours away. Measured in its journal the next day: zero
+# "notice(s) for kimi-code" lines, zero ARTIFACT, zero DAEMON, eight consecutive
+# "RETRYING stale primer" -- fresh mail queued daemon-side while the watcher re-delivered
+# August. The fold it judged against was also a single snapshot from hour 0.
+#
+# So the startup pass now only JUDGES: set aside what is discharged, expired or out of
+# attempts (no fire, cheap, every list named in the journal). What survives is fired
+# from the main loop, ONE per tick, and only on a tick whose drain found no fresh mail
+# -- the member's own inbox always goes first. Between attempts on the same list the
+# loop waits `STALE_RETRY_BACKOFF_SECS` (6h): the old cadence was "once per restart",
+# which was days, and a member out of credits for a night would otherwise burn all
+# three attempts in six minutes. The FIRST attempt is not held back -- a retained list
+# whose launcher merely timed out is retried on the next quiet tick, and if the session
+# inside did the work, the judge (re-run against a FRESH fold at fire time) retires it
+# instead.
+STALE_RETRY_BACKOFF_SECS="${STALE_RETRY_BACKOFF_SECS:-21600}"
+
+# judge_stale_primer <primer> <fold_file>: 0 = set aside (never to be fired), 1 = live.
+judge_stale_primer() {
+  local stale="$1" fold_file="$2" attempts_file="$1.attempts" attempts
+  # Before the attempt budget, not after: a discharged list should retire on the
+  # first pass that can prove it, whatever the counter says.
+  if [ -n "$fold_file" ] && primer_spent "$stale" "$fold_file"; then
+    echo "[hestia-watch] STALE PRIMER ALREADY DISCHARGED (the daemon owes nothing for any notice in it) — retired without a fire: $stale.discharged"
+    mv -f "$stale" "$stale.discharged" 2>/dev/null && rm -f "$attempts_file"
+    return 0
+  fi
+  if primer_expired "$stale"; then
+    echo "[hestia-watch] STALE PRIMER EXPIRED (every notice is past the daemon's ${EXPIRED_AGE_SECS}s inbox TTL: pruned, unbindable, owed to nobody) — set aside without a fire; the ids above are the only record, read them by hand if the work still matters: $stale.expired"
+    mv -f "$stale" "$stale.expired" 2>/dev/null && rm -f "$attempts_file"
+    return 0
+  fi
+  attempts="$(cat "$attempts_file" 2>/dev/null || echo 0)"
+  [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
+  if [ "$attempts" -ge "$STALE_MAX_ATTEMPTS" ]; then
+    echo "[hestia-watch] STALE PRIMER exhausted ($attempts/$STALE_MAX_ATTEMPTS) — set aside: $stale.exhausted"
+    mv -f "$stale" "$stale.exhausted" 2>/dev/null && rm -f "$attempts_file"
+    return 0
+  fi
+  return 1
+}
+
+# The startup pass: name every retained list in the journal and judge it. Fires nothing.
 retry_stale_primers() {
-  local fold; fold="$(unanswered_now 2>/dev/null || true)"
+  local fold_file live=0
+  ls "$PRIMERS"/notice-*.json >/dev/null 2>&1 || return 0
+  fold_file="$(fold_to_file || true)"
   for stale in "$PRIMERS"/notice-*.json; do
     [ -e "$stale" ] || break
     echo "[hestia-watch] STALE PRIMER (undelivered notices from a failed fire): $stale"
     python3 -c "import json,sys;d=json.load(open(sys.argv[1]));[print(f\"    id={n.get('id')} {n.get('kind')} from {n.get('from_plugin')} queued={n.get('queued_at','')}: {n.get('pointer_uri','')}\") for n in d.get('notices',[])]" "$stale" 2>/dev/null || true
     [ -n "$FIRE" ] || continue
-    attempts_file="$stale.attempts"
-    # Before the attempt budget, not after: a discharged list should retire on the
-    # first pass that can prove it, whatever the counter says.
-    if primer_spent "$stale" "$fold"; then
-      echo "[hestia-watch] STALE PRIMER ALREADY DISCHARGED (the daemon owes nothing for any notice in it) — retired without a fire: $stale.discharged"
-      mv -f "$stale" "$stale.discharged" 2>/dev/null && rm -f "$attempts_file"
-      continue
+    judge_stale_primer "$stale" "$fold_file" || live=$((live + 1))
+  done
+  [ -n "$fold_file" ] && rm -f "$fold_file"
+  [ "$live" -gt 0 ] && echo "[hestia-watch] $live retained primer(s) survive the judge; the loop will fire them one per quiet tick, the inbox first"
+  return 0
+}
+
+# stale_primer_due <primer>: the first attempt is immediate; later ones wait the backoff
+# measured from the previous attempt (the `.attempts` file's mtime).
+stale_primer_due() {
+  local attempts_file="$1.attempts" last now
+  [ -e "$attempts_file" ] || return 0
+  last="$(stat -c %Y "$attempts_file" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  [ $((now - last)) -ge "$STALE_RETRY_BACKOFF_SECS" ]
+}
+
+# One quiet tick, one retained list: re-judged against a fresh fold, then fired.
+fire_one_stale_primer() {
+  local fold_file attempts_file attempts rc
+  ls "$PRIMERS"/notice-*.json >/dev/null 2>&1 || return 0
+  for stale in "$PRIMERS"/notice-*.json; do
+    [ -e "$stale" ] || break
+    stale_primer_due "$stale" || continue
+    fold_file="$(fold_to_file || true)"
+    if judge_stale_primer "$stale" "$fold_file"; then
+      [ -n "$fold_file" ] && rm -f "$fold_file"
+      continue                              # set aside; look for the next one
     fi
+    [ -n "$fold_file" ] && rm -f "$fold_file"
+    attempts_file="$stale.attempts"
     attempts="$(cat "$attempts_file" 2>/dev/null || echo 0)"
     [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
-    if [ "$attempts" -ge "$STALE_MAX_ATTEMPTS" ]; then
-      echo "[hestia-watch] STALE PRIMER exhausted ($attempts/$STALE_MAX_ATTEMPTS) — set aside: $stale.exhausted"
-      mv -f "$stale" "$stale.exhausted" 2>/dev/null && rm -f "$attempts_file"
-      continue
-    fi
     echo $((attempts + 1)) > "$attempts_file"
     echo "[hestia-watch] RETRYING stale primer (attempt $((attempts + 1))/$STALE_MAX_ATTEMPTS): $stale"
     if "$FIRE" "$stale"; then
@@ -506,9 +913,38 @@ retry_stale_primers() {
       echo "[hestia-watch] stale primer DELIVERED on retry: $stale"
     else
       rc=$?
-      echo "[hestia-watch] stale retry failed rc=$rc (preserved, will retry): $stale"
+      echo "[hestia-watch] stale retry failed rc=$rc (preserved, will retry after ${STALE_RETRY_BACKOFF_SECS}s): $stale"
     fi
+    return 0                                # one fire per tick
   done
+  return 0
+}
+
+# JUDGE INSIDE THE WINDOW (2026-09-02). The startup pass judges once, and a
+# watcher restarts rarely: the kimi-code watcher on CBP ran 2026-08-20 -> 09-01 without
+# one. Every primer retained in between was first judged after the 6d judging window
+# had closed, so `primer_spent` could only say "unmeasured" and the pass fired all of
+# them — 45 of the 57 claude-code retained primers were in that state the day this was
+# written, 3 were provably discharged, 9 owed. This sweep asks the same question on a
+# cadence and does the ONE thing that is safe on a cadence: set aside what the daemon says
+# is discharged (and, since the walk moved into the loop, what is expired or out of
+# attempts — the same judge). It never fires: firing is the loop's job, one list per
+# quiet tick, held to `STALE_RETRY_BACKOFF_SECS` between attempts on the same list.
+# `DISCHARGE_SWEEP_EVERY` is its own knob only so the test can turn it.
+DISCHARGE_SWEEP_EVERY="${DISCHARGE_SWEEP_EVERY:-3600}"
+
+retire_discharged_primers() {
+  local fold_file n=0
+  ls "$PRIMERS"/notice-*.json >/dev/null 2>&1 || return 0
+  fold_file="$(fold_to_file || true)"
+  [ -n "$fold_file" ] || return 0
+  for stale in "$PRIMERS"/notice-*.json; do
+    [ -e "$stale" ] || break
+    judge_stale_primer "$stale" "$fold_file" && n=$((n + 1))
+  done
+  rm -f "$fold_file"
+  [ "$n" -gt 0 ] && echo "[hestia-watch] discharge sweep set aside $n retained primer(s)"
+  return 0
 }
 
 # The unanswered row exists (daemon-side) only if something ASKS on a cadence —
@@ -540,7 +976,11 @@ STALE_AFTER="${STALE_AFTER:-21600}"            # a notice is stale at 6h unbound
 # `role` is caller-supplied and any member that loses `HESTIA_ROLE` collides with
 # it silently. Do NOT build a detector on this field alone (see the note on the
 # `#undelivered:` marker at `report_unreachable`) — the durable fix is a reserved
-# KIND for a non-delivery report, which is vocabulary work in KINDS.md.
+# KIND for a non-delivery report, which is vocabulary work in KINDS.md. Still
+# owed as of 2026-09-05: the report moved from `reply` to `forum-note` that day
+# (see branch 4 below), which stops it being booked as the sender's debt but
+# does NOT make it reserved — `forum-note` is an ordinary member kind, so it is
+# no more a detector than `reply` was.
 #
 # `plugin_id` is still the member's: the watcher genuinely acts on that member's
 # mailbox, and a distinct gateway identity is a daemon-side enrolment question.
@@ -654,11 +1094,48 @@ for label,key in (("I OWE A RESPONSE","i_owe"),("NOBODY ANSWERED ME","owed_to_me
 # REPORTS to the sender. Without this, a dead fire and a notice never sent are
 # indistinguishable at both ends — the sender's unanswered view reads
 # "delivered, unanswered" for mail the member never saw (41 fires / 3 dead /
-# all reported success). The report is a `reply` bound to the failed notice:
-# reply awaits a disposition, so the failure sits in the SENDER's debt row
-# until it acks — reroute, resend, or abandon, and the decision is witnessed.
-# A coordination-kind report could be ignored in silence, which is the silent
-# drop again one layer up. It is sent under the failed member's own plugin
+# all reported success).
+#
+# THE REPORT RIDES `forum-note`, AND UNTIL 2026-09-05 IT RODE `reply`. That was
+# a deliberate choice with a stated reason, reversed here on measurement rather
+# than on taste, so the reason is kept rather than deleted:
+#
+#   "The report is a `reply` bound to the failed notice: reply awaits a
+#    disposition, so the failure sits in the SENDER's debt row until it acks —
+#    reroute, resend, or abandon, and the decision is witnessed. A
+#    coordination-kind report could be ignored in silence, which is the silent
+#    drop again one layer up."
+#
+# The objection was right when written, and is now paid by a different mechanism.
+# Three measurements retire it (issue #926, three wakes, CBP seat):
+#
+#  1. The counted kind did not buy the acknowledgement it was for. On 2026-09-05
+#     this seat's `i_owe` was 161 of 161 `#undelivered:` rows — 100%, along a
+#     monotone 86% -> 91% -> 100% — and not one had been acted on. `reply` made
+#     the failure durable without making it read.
+#  2. It cost the ledger everything else. `MEMBER_KINDS_AWAIT_RESPONSE` is
+#     `["review_request", "reply"]`, so every bounce lands in the one fold a seat
+#     triages at wake. At 100% saturation `i_owe` can no longer carry a REAL
+#     obligation into anyone's attention: the anti-silence device is what made
+#     every other obligation silent. The rows are also unclearable by the route
+#     the suppression below teaches — `member_unanswered` clears a row only on a
+#     binder whose OWN pointer lacks `#undelivered:`, and echoing the bounce
+#     pointer is exactly what the visited bit rewards.
+#  3. The anti-silence guarantee MOVED. It belongs to the renderer now, not to
+#     the kind: every fire template prints `!! NOT-AN-ANSWER` at the front of the
+#     line and says what the echo means (PR #216, 2026-08-06 — eleven days after
+#     this rationale was written). That predicate reads the POINTER, never the
+#     kind, so it survives this change untouched, and it reaches the member at
+#     wake, which a debt row never did.
+#
+# What is given up, said plainly: a `forum-note` is announced once and holds no
+# standing row afterwards, so a member that does not act in that wake is not
+# asked again. That is the right trade only because the standing row was provably
+# not being acted on either. If durability is wanted back, its home is a per-peer
+# non-delivery summary (#927 — the mesh has no representation for a temporarily
+# unavailable member), not a per-notice debt booked against the sender.
+#
+# The report is sent under the failed member's own plugin
 # identity — and that is the report's remaining dishonesty (CBP review §4,
 # 2026-07-26): the daemon derives the instance LCT from plugin_id alone and
 # drops `instance_name` on connect, so on the chain an unreachable report is
@@ -846,9 +1323,16 @@ classify_fire_failure() {
 # "#525 re-review — invariant 1" and "claude asked for a test with a member holding a
 # live scope grant". That wake then ran past `timeout -k 30 1800` at 08:46:56Z. rc=124,
 # primer retained, and this function mailed claude-code two `kind=reply` notices saying
-# the notices kimi had just spent thirty minutes answering were undelivered. `reply` is
+# the notices kimi had just spent thirty minutes answering were undelivered. `reply` was
 # in MEMBER_KINDS_AWAIT_RESPONSE, so each one also became a row in the SENDER's `i_owe`
 # and woke a session to read it.
+#
+# HALF OF THAT IS GONE AS OF 2026-09-05, AND THE HALF THAT MATTERS HERE IS NOT. The
+# report now rides `forum-note` (branch 4 above), so it no longer books an `i_owe` row.
+# It still WAKES the sender — the report is a notice, the primer carries it, and the fire
+# template renders it `!! NOT-AN-ANSWER`. The amplifier described below is a wake
+# amplifier, not a ledger one, so the rc=124 guard is untouched by that change and this
+# whole rationale still holds.
 #
 # That is an amplifier pointed the wrong way: the longer and more thorough a member's
 # wake, the likelier it is cut short by the bound, and the more of its peers are told
@@ -901,7 +1385,12 @@ for n in d.get("notices",[]):
     # remove. The reserved region is the whole fragment, observer included.
     frag=f"#undelivered:{why};via={via}".encode()[:512]
     p=p.encode()[:512-len(frag)].decode(errors="ignore")+frag.decode(errors="ignore")
-    print(json.dumps({"to_plugin_id":sender,"kind":"reply",
+    # `forum-note`, NOT `reply` — see the branch-4 block above. The kind must
+    # stay OUT of handler.rs's MEMBER_KINDS_AWAIT_RESPONSE, which is what makes
+    # a non-delivery report an announcement rather than a debt booked against
+    # the member whose mail died. The binding is kept: `in_reply_to` is what
+    # names WHICH notice failed, and it is legal on every kind.
+    print(json.dumps({"to_plugin_id":sender,"kind":"forum-note",
                       "pointer_uri":p,"in_reply_to":nid}))
 PY
 ) || ROWS=""
@@ -932,9 +1421,11 @@ print(live+(" — "+note if note else ""))' 2>/dev/null)
 
 announce_unanswered
 LAST_ANNOUNCE=$(date +%s)
+LAST_SWEEP=$LAST_ANNOUNCE
 
 while true; do
   check_artifact_drift
+  maybe_self_deploy
   check_daemon_drift
   NOW=$(date +%s)
   if [ $((NOW - LAST_ANNOUNCE)) -ge "$UNANSWERED_EVERY" ]; then
@@ -943,6 +1434,10 @@ while true; do
     announce_unanswered
     LAST_ANNOUNCE=$NOW
   fi
+  if [ $((NOW - LAST_SWEEP)) -ge "$DISCHARGE_SWEEP_EVERY" ]; then
+    retire_discharged_primers
+    LAST_SWEEP=$NOW
+  fi
   OUT=$(drain || echo '{"total":0}')
   N=$(echo "$OUT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
   if [ "$N" -gt 0 ]; then
@@ -950,7 +1445,24 @@ while true; do
     # The strong asker: fold the member's outstanding debt into the primer, so
     # the question is asked where an answer is possible — inside the wake that
     # is happening anyway. Costs one read; never causes a fire on its own.
-    UN=$(unanswered 2>/dev/null || echo '{}')
+    # THE FOLD TRAVELS BY FILE, NOT BY ENVIRONMENT. `execve` caps ONE string at
+    # MAX_ARG_STRLEN = 32 pages = 131,072 B (measured, not cited: `getconf` exposes
+    # ARG_MAX, a different and much larger TOTAL-size limit). This seat's live fold
+    # measured 442,074 B on 2026-09-04 -- 3.37x -- so exporting it failed E2BIG, the
+    # interpreter never started, and the `||` fallback wrote the raw drain response
+    # with `unanswered`, `open_petitions` AND `for_plugin` all missing. The size is
+    # per-seat and NOT monotone: codex's own fold shipped at 118,995 B the same day
+    # (codex, review of #858), so there is no global floor and no single onset date.
+    # A file has no such cap.
+    #
+    # Carrier failure is NOT empty debt. `mktemp` failing, or the write failing part
+    # way, must leave the primer saying "not measured" -- never `i_owe: []`, which
+    # reads as "you owe nothing". That is the same absence-as-verdict class this
+    # repair is about, so it gets an explicit third state below.
+    UN_FILE=$(mktemp "${TMPDIR:-/tmp}/hestia-un-$PLUGIN.XXXXXX" 2>/dev/null || true)
+    if [ -n "$UN_FILE" ]; then
+      unanswered > "$UN_FILE" 2>/dev/null || : > "$UN_FILE"
+    fi
     # The mirror of the debt fold: petitions THIS member has open. Filtered
     # here, by `asked_by`, because the tool answers for the whole society and
     # another member's rows are not this member's work — the same reason the
@@ -958,16 +1470,39 @@ while true; do
     # file (`open-petitions.py`) so one suite covers both; an unparseable or
     # failed read yields `asked:false`, which the renderer says out loud rather
     # than rendering as "you hold none".
+    # The 4th argument is the ledger of host sessions THIS watcher has fired
+    # (fire-*.sh appends one line per wake). `asked_by` is the plugin NAME, and
+    # on every box two seats share it — the interactive session and the wake —
+    # so name-equality alone renders a co-seat's live petition as the reader's
+    # own and prescribes WITHDRAW for it (#732, CBP 2026-09-06). With the ledger,
+    # a row whose `host_session_id` is not in it is folded as `co_seat`, not
+    # `mine`. A missing ledger or a daemon that omits the field degrades to the
+    # name-only fold, never to "none of these are yours".
     PET=$(open_petitions 2>/dev/null \
           | timeout 5 python3 "$WATCH_DIR/open-petitions.py" fold "$PLUGIN" \
+              "$STATE/wake-sessions-$PLUGIN" \
           2>/dev/null || echo '{"asked":false,"mine":[]}')
-    printf '%s' "$OUT" | UN="$UN" PET="$PET" FOR_PLUGIN="$PLUGIN" python3 -c '
+    printf '%s' "$OUT" | UN_FILE="$UN_FILE" PET="$PET" FOR_PLUGIN="$PLUGIN" python3 -c '
 import json,os,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
-try: u=json.loads(os.environ.get("UN") or "{}")
-except Exception: u={}
-d["unanswered"]={k:u.get(k,[]) for k in ("i_owe","owed_to_me")}
+# TRI-STATE, mirroring `open_petitions`. `asked:true` with empty lists is a MEASURED
+# zero; `asked:false` is a read that never completed. Those are different facts and
+# the renderer says which. The two-state form collapsed them: ANY failure became
+# {"i_owe":[],"owed_to_me":[]} -- a positive assertion of no debt, manufactured out
+# of a channel error. `asked` is additive; primers written before it have no such key
+# and readers that only take i_owe/owed_to_me are unaffected.
+u=None
+try:
+    with open(os.getenv("UN_FILE") or "", encoding="utf-8") as f: u=json.load(f)
+except Exception: u=None
+# A refusal, an error envelope or a truncated body is not an empty debt. The keys must
+# be PRESENT and be lists: `.get("i_owe") or []` reads every one of those as "nothing
+# owed". This is the predicate `primer_spent` already applies to its own carrier.
+if isinstance(u,dict) and all(isinstance(u.get(k),list) for k in ("i_owe","owed_to_me")):
+    d["unanswered"]={"asked":True,"i_owe":u["i_owe"],"owed_to_me":u["owed_to_me"]}
+else:
+    d["unanswered"]={"asked":False,"i_owe":[],"owed_to_me":[]}
 try: d["open_petitions"]=json.loads(os.environ.get("PET") or "")
 except Exception: d["open_petitions"]={"asked":False,"mine":[]}
 # WHO THIS IS FOR — the one fact the primer never stated. It recorded from_plugin on
@@ -980,6 +1515,7 @@ except Exception: d["open_petitions"]={"asked":False,"mine":[]}
 d["for_plugin"]=os.environ["FOR_PLUGIN"]
 json.dump(d,sys.stdout)
 ' > "$PRIMER" 2>/dev/null || echo "$OUT" > "$PRIMER"
+    [ -n "$UN_FILE" ] && rm -f "$UN_FILE"
     echo "[hestia-watch] $N notice(s) for $PLUGIN -> $PRIMER"
     if [ -n "$FIRE" ]; then
       # Success: primer is spent, remove it. Failure: KEEP it — the drain was
@@ -995,6 +1531,10 @@ json.dump(d,sys.stdout)
     else
       python3 -c "import json;d=json.load(open('$PRIMER'));[print(f\"  {n['kind']} from {n['from_plugin']}: {n.get('pointer_uri','')}\") for n in d['notices']]"
     fi
+  elif [ -n "$FIRE" ]; then
+    # No fresh mail this tick: spend it on ONE retained list, if any is due. The inbox
+    # was drained first, so a member with new work never waits behind old work.
+    fire_one_stale_primer
   fi
   sleep "$IVL"
 done

@@ -27,7 +27,7 @@ echo "[install] source=$SRC  workspace=$WORKSPACE  ext4=$EXT4_DEST"
 
 # 1. Copy gate + instance + shared lib to ext4, preserving the gate's ../../lib import structure.
 mkdir -p "$EXT4_DEST/gemini/hooks" "$EXT4_DEST/gemini/instance" "$EXT4_DEST/lib"
-cp "$SRC/gemini/hooks/before_tool.py" "$SRC/gemini/hooks/observe.sh" "$SRC/gemini/hooks/hydrate.sh" "$EXT4_DEST/gemini/hooks/"
+cp "$SRC/gemini/hooks/before_tool.py" "$SRC/gemini/hooks/witness.py" "$SRC/gemini/hooks/observe.sh" "$SRC/gemini/hooks/hydrate.sh" "$EXT4_DEST/gemini/hooks/"
 cp "$SRC/gemini/instance/identity.seed.json" "$EXT4_DEST/gemini/instance/"
 cp "$SRC/lib/path_scope.py" "$EXT4_DEST/lib/"
 chmod +x "$EXT4_DEST/gemini/hooks/"*.sh "$EXT4_DEST/gemini/hooks/before_tool.py"
@@ -49,8 +49,11 @@ echo "[install] GEMINI.md deployed to $GEMINI_HOME"
 # 4. Merge the hooks block into settings.json (USER level), pinning hooksConfig.enabled.
 GATE="HESTIA_WORKSPACE=$WORKSPACE HESTIA_SOCIETY_GATE=$GOVERNOR python3 $EXT4_DEST/gemini/hooks/before_tool.py"
 OBS="$EXT4_DEST/gemini/hooks/observe.sh"
+# The witness is the hook that reaches the daemon; observe.sh only appends to a local file.
+# Before 2026-09-28 only observe.sh sat on AfterTool, so no gemini outcome reached the chain.
+WIT="python3 $EXT4_DEST/gemini/hooks/witness.py"
 HYD="HESTIA_WORKSPACE=$WORKSPACE $EXT4_DEST/gemini/hooks/hydrate.sh"
-SETTINGS="$GEMINI_HOME/settings.json" GATE="$GATE" OBS="$OBS" HYD="$HYD" python3 - <<'PY'
+SETTINGS="$GEMINI_HOME/settings.json" GATE="$GATE" OBS="$OBS" WIT="$WIT" HYD="$HYD" python3 - <<'PY'
 import json, os
 p = os.environ["SETTINGS"]
 try:
@@ -61,7 +64,8 @@ cfg.setdefault("hooksConfig", {})["enabled"] = True   # a one-line kill-switch; 
 cfg["hooks"] = {
     "BeforeTool":  [{"matcher": ".*", "hooks": [{"type": "command", "command": os.environ["GATE"], "timeout": 15000}]}],
     "SessionStart":[{"hooks": [{"type": "command", "command": os.environ["OBS"], "timeout": 15000}]}],
-    "AfterTool":   [{"matcher": ".*", "hooks": [{"type": "command", "command": os.environ["OBS"], "timeout": 10000}]}],
+    "AfterTool":   [{"matcher": ".*", "hooks": [{"type": "command", "command": os.environ["OBS"], "timeout": 10000},
+                                                {"type": "command", "command": os.environ["WIT"], "timeout": 10000}]}],
     "SessionEnd":  [{"hooks": [{"type": "command", "command": os.environ["HYD"], "timeout": 20000}]}],
 }
 json.dump(cfg, open(p, "w"), indent=2)

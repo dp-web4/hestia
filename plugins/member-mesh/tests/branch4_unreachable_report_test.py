@@ -13,7 +13,7 @@ fire_concurrency_test.py: the test cannot pass by exercising a path only the
 test uses.
 
 Four cases:
-  A  ordinary notice          -> one `reply` report, bound (in_reply_to=id),
+  A  ordinary notice          -> one `forum-note` report, bound (in_reply_to=id),
                                  pointer keeps naming the content and gains
                                  `#undelivered:fire-rc=N;via=watch-<member>` —
                                  the fragment names the routing verdict AND the
@@ -41,6 +41,7 @@ Usage: ./branch4_unreachable_report_test.py   (runtime ~25s, deliberate waits)
 """
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -213,13 +214,13 @@ def main():
     reports = [c for c in daemon.notify_calls]
     ok = (len(reports) == 1
           and reports[0].get("to_plugin_id") == "claude-code"
-          and reports[0].get("kind") == "reply"
+          and reports[0].get("kind") == "forum-note"
           and reports[0].get("in_reply_to") == 42
           and reports[0].get("pointer_uri")
           == NOTICE_A["pointer_uri"]
           + "#undelivered:fire-rc=3;why=unknown;via=watch-dest-member")
-    check("A: exactly one bound reply report to the original sender, pointer names "
-          "the undelivered content + the routing verdict + the observer", ok,
+    check("A: exactly one bound forum-note report to the original sender, pointer "
+          "names the undelivered content + the routing verdict + the observer", ok,
           f"notify_calls={json.dumps(reports)}\n{out}")
     check("A: report journaled", "UNREACHABLE reported" in out, out)
 
@@ -334,6 +335,54 @@ def main():
     check("H: a fire log that does not exist yields unknown, never a guess",
           len(rnl) == 1 and ";why=unknown;" in rnl[0].get("pointer_uri", ""),
           f"calls={json.dumps(dnl.notify_calls)}\n{onl}")
+
+    # Case I (2026-09-05) — THE KIND IS PINNED TO THE RUST, NOT TO A STRING HERE.
+    # The report moved `reply` -> `forum-note` because `reply` is counted by
+    # `hestia_member_unanswered`, which booked every delivery failure as a debt
+    # against the member whose mail died (#926: 161/161 = 100% of this seat's
+    # `i_owe`). Asserting the literal only would let the two ends drift apart in
+    # either direction, and BOTH directions are silent failures:
+    #
+    #   * back into MEMBER_KINDS_AWAIT_RESPONSE -> the saturation returns, and
+    #     nothing fails; the fold just fills up again over days.
+    #   * out of MEMBER_NOTICE_KINDS            -> `tool_member_notify` refuses
+    #     every report with `member_notify_unknown_kind`, and branch 4 goes
+    #     silent — the exact silent drop it exists to remove.
+    #
+    # So the check reads handler.rs and asserts the PROPERTY. If the constants
+    # move, this test names which one and why, rather than reporting a diff.
+    handler = os.path.join(HERE, os.pardir, os.pardir, os.pardir,
+                           "core", "src", "server", "handler.rs")
+    if not os.path.exists(handler):
+        check("I: handler.rs is readable from the test (kind property is checkable)",
+              False, f"not found: {os.path.abspath(handler)}")
+    else:
+        src = open(handler, encoding="utf-8", errors="replace").read()
+
+        def rust_str_list(name):
+            i = src.find(f"const {name}: &[&str] = &[")
+            if i < 0:
+                return None
+            body = src[i:src.find("];", i)]
+            return re.findall(r'"([^"]+)"', body)
+
+        sendable = rust_str_list("MEMBER_NOTICE_KINDS")
+        counted = rust_str_list("MEMBER_KINDS_AWAIT_RESPONSE")
+        check("I: both handler.rs kind constants were found (the check is not "
+              "vacuously green on a parse miss)",
+              bool(sendable) and bool(counted),
+              f"MEMBER_NOTICE_KINDS={sendable} MEMBER_KINDS_AWAIT_RESPONSE={counted}")
+        if sendable and counted:
+            d2, o2, _, _ = run_watcher([dict(NOTICE_A)])
+            minted = (d2.notify_calls[0].get("kind") if d2.notify_calls else None)
+            check("I: the minted non-delivery kind is one tool_member_notify accepts",
+                  minted in sendable,
+                  f"minted={minted!r} MEMBER_NOTICE_KINDS={sendable}\n{o2}")
+            check("I: the minted non-delivery kind is NOT counted as a debt by "
+                  "hestia_member_unanswered (#926 — a failed fire is an "
+                  "announcement, not an obligation on the sender)",
+                  minted is not None and minted not in counted,
+                  f"minted={minted!r} MEMBER_KINDS_AWAIT_RESPONSE={counted}\n{o2}")
 
     print()
     if failures:

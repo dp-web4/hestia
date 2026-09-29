@@ -10,6 +10,15 @@
 //! 401, the still-unlocked identity vault re-runs the handshake once and
 //! retries. The webview never sees the token or credential either way — it
 //! just sees data or an error saying "sign in".
+//!
+//! ONE ENGINE, SEVERAL VIEWS. The daemon on this machine also serves its own
+//! web dashboard, and the CLI drives the same state; the app is not a second
+//! engine but a second view onto the first. Every act therefore races the other
+//! views, and the daemon — not any view — is the arbiter. `send` flattens a
+//! refusal to a sentence, which is right for a caller that can only report it;
+//! `send_checked` keeps the status, because "someone else already did this"
+//! (409) is an outcome of the world and must not be rendered as a failure of
+//! the operator's action.
 
 use serde_json::Value;
 
@@ -34,12 +43,68 @@ pub async fn send(
     request(state, method, path, body).await
 }
 
+/// A refusal the caller needs to tell apart from other refusals.
+#[derive(Debug)]
+pub enum Refused {
+    /// The daemon says this act is already done — another view won the race.
+    /// Single-shot acts answer 409 (`DecideError::AlreadyDecided`), and a view
+    /// that renders this as an error teaches the operator that their click
+    /// failed when in fact the intent was already settled.
+    Conflict(String),
+    Other(String),
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::Conflict(m) | Refused::Other(m) => f.write_str(m),
+        }
+    }
+}
+
+/// `send`, but a 409 comes back as [`Refused::Conflict`] rather than a bare
+/// string. For acts that race the daemon's other views.
+pub async fn send_checked(
+    state: &AppState,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value, Refused> {
+    match request_status(state, method, path, body).await {
+        Ok((status, value)) if status.is_success() => Ok(value),
+        Ok((status, value)) => {
+            let why = value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("daemon returned {status}"));
+            if status == reqwest::StatusCode::CONFLICT {
+                Err(Refused::Conflict(why))
+            } else {
+                Err(Refused::Other(why))
+            }
+        }
+        Err(e) => Err(Refused::Other(e)),
+    }
+}
+
 async fn request(
     state: &AppState,
     method: reqwest::Method,
     path: &str,
     body: Option<Value>,
 ) -> Result<Value, String> {
+    finish(request_status(state, method, path, body).await?)
+}
+
+/// The shared transport: auth, one re-auth on 401, and the raw status handed
+/// back. `request` flattens it; `send_checked` reads it.
+async fn request_status(
+    state: &AppState,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Value>,
+) -> Result<(reqwest::StatusCode, Value), String> {
     let Some(token) = state.operator_token() else {
         return Err(needs_signin());
     };
@@ -47,7 +112,7 @@ async fn request(
 
     let first = one_shot(&url, method.clone(), &token, body.clone()).await?;
     if first.0 != reqwest::StatusCode::UNAUTHORIZED {
-        return finish(first);
+        return Ok(first);
     }
 
     // Session expired (or was revoked). Re-authenticate once from the unlocked
@@ -60,7 +125,7 @@ async fn request(
         Ok(session) => {
             let token = session.token.clone();
             state.set_operator(session);
-            finish(one_shot(&url, method, &token, body).await?)
+            one_shot(&url, method, &token, body).await
         }
         Err(e) => {
             state.clear_operator();

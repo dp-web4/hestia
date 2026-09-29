@@ -3,12 +3,20 @@
     "PreToolUse"
   ],
   "install": {
+    "member": "codex",
     "dest": "~/.codex/hooks",
     "registration": {
       "reader": "toml-hook-commands",
       "path": [
         ".codex",
         "config.toml"
+      ],
+      "ensure": [
+        {
+          "table": "features",
+          "key": "codex_hooks",
+          "line": "codex_hooks = true"
+        }
       ]
     },
     "files": [
@@ -16,9 +24,45 @@
       "hooks/witness.py",
       "hooks/observe.sh",
       "hooks/hydrate.sh"
-    ]
+    ],
+    "gate_probe": {
+      "entry": "hooks/pre_tool_use.py",
+      "environment": {
+        "HESTIA_CODEX_GATE_MODE": "enforce"
+      },
+      "events": [
+        {
+          "label": "read recovery scratch",
+          "event": {
+            "hook_event_name": "PreToolUse",
+            "session_id": "hestia-deploy-preflight",
+            "tool_name": "Read",
+            "tool_input": {
+              "file_path": "{scratch}"
+            }
+          }
+        },
+        {
+          "label": "evaluate deploy hold",
+          "event": {
+            "hook_event_name": "PreToolUse",
+            "session_id": "hestia-deploy-preflight",
+            "tool_name": "Bash",
+            "tool_input": {
+              "command": "touch {hold}"
+            }
+          },
+          "advisory": true
+        }
+      ]
+    }
   },
   "observe": [
     "PostToolUse"
-  ]
+  ],
+  "targets": {
+    "observe": [
+      "witness.py"
+    ]
+  }
 }

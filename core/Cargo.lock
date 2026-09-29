@@ -908,7 +908,6 @@ dependencies = [
  "globset",
  "hestia-wire",
  "hex",
- "hub-plugin",
  "rand 0.8.6",
  "ratatui",
  "regex",
@@ -928,6 +927,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "web4-core",
+ "web4-hub-plugin",
  "web4-policy",
  "web4-trust-core",
  "x25519-dalek",
@@ -1006,16 +1006,6 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
-
-[[package]]
-name = "hub-plugin"
-version = "0.1.0-alpha.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "serde_json",
- "uuid",
-]
 
 [[package]]
 name = "hyper"
@@ -2205,6 +2195,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2756,6 +2752,7 @@ dependencies = [
  "getrandom 0.4.2",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 
@@ -2941,6 +2938,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "web4-hub-plugin"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "web4-policy"
 version = "0.1.0"
 dependencies = [
@@ -2953,7 +2960,7 @@ dependencies = [
 
 [[package]]
 name = "web4-trust-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "serde",

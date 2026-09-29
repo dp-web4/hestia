@@ -235,11 +235,14 @@ fn every_fold_call_site_applies_the_declared_prefilter() {
                 continue;
             }
             let prod = body.split("#[cfg(test)]").next().unwrap_or(&body);
-            // Both fold entry points: `derive` and `derive_with_volume` (which carries the
-            // grain's persisted lifetime totals). Renaming a call site must not be able to
-            // empty this scan silently — the assertion below fails loudly if it does.
+            // Every fold entry point: `derive`, `derive_with_volume` (which carries the
+            // grain's persisted lifetime totals), and `derive_evidence` — the window half the
+            // event-triggered cache (`derivation_cache.rs`) folds and keeps. Renaming a call
+            // site must not be able to empty this scan silently — the assertion below fails
+            // loudly if it does. (`with_volume` is NOT an entry point: it reads no window.)
             let folds = prod.contains("derivation::derive(")
-                || prod.contains("derivation::derive_with_volume(");
+                || prod.contains("derivation::derive_with_volume(")
+                || prod.contains("derivation::derive_evidence(");
             if folds {
                 checked.push(path.display().to_string());
                 // The window must come from the ONE prefiltered path. A file that builds

@@ -101,6 +101,104 @@ jobs:
         working-directory: hestia/core
         run: cargo test --locked
 
+  # The three plugin SDKs (TS / Python / Rust) against a REAL daemon. Nothing ran them
+  # before this job. During the 2026-09 release prep (#1122), the first run against a clean
+  # daemon found two ship-stopping SDK bugs: null-valued history filter keys, and Rust never
+  # sending session_id. It also found a Rust unit test that had been red since May. The daemon
+  # is built from this commit, gets a throwaway home, and listens on :7799. The suites are
+  # opt-in (HESTIA_ENDPOINT / RUN_CONFORMANCE=1), so they never touch a live :7711.
+  # P1-003 is an explicit, logged KNOWN SKIP in each harness: none can run a second
+  # hestia_connect. Vectors come from the sibling web4 checkout (main, as above).
+  sdk-conformance:
+    name: plugin SDK conformance (ts/py/rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hestia
+      - uses: actions/checkout@v4
+        with:
+          repository: dp-web4/web4
+          path: web4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            hestia/core
+            hestia/plugin-sdk/rust
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build the daemon
+        working-directory: hestia/core
+        run: cargo build --locked --bin hestia
+
+      - name: Start an isolated daemon on :7799
+        run: |
+          set -euo pipefail
+          home="$(mktemp -d)"
+          echo "SBX_HOME=$home" >> "$GITHUB_ENV"
+          export HESTIA_HOME="$home" HESTIA_PASSPHRASE="ci-$GITHUB_RUN_ID"
+          bin="$GITHUB_WORKSPACE/hestia/core/target/debug/hestia"
+          "$bin" --home "$home" init --ai
+          nohup "$bin" --home "$home" serve --bind 127.0.0.1:7799 >"$home/serve.log" 2>&1 &
+          for _ in $(seq 1 60); do
+            (exec 3<>/dev/tcp/127.0.0.1/7799) 2>/dev/null && exit 0
+            sleep 1
+          done
+          echo "daemon did not come up"; cat "$home/serve.log"; exit 1
+
+      - name: TypeScript SDK
+        working-directory: hestia/plugin-sdk/typescript
+        env:
+          HESTIA_ENDPOINT: http://127.0.0.1:7799/mcp
+          RUN_CONFORMANCE: "1"
+        run: |
+          npm install --no-audit --no-fund
+          npm test
+
+      - name: Python SDK
+        working-directory: hestia/plugin-sdk/python
+        env:
+          HESTIA_ENDPOINT: http://127.0.0.1:7799/mcp
+          RUN_CONFORMANCE: "1"
+        run: |
+          python -m pip install -q -e '.[dev]'
+          python -m pytest -q -s
+
+      - name: Rust SDK
+        working-directory: hestia/plugin-sdk/rust
+        env:
+          HESTIA_ENDPOINT: http://127.0.0.1:7799/mcp
+          RUN_CONFORMANCE: "1"
+        run: cargo test -- --nocapture
+
+      - name: Daemon log (on failure)
+        if: failure()
+        run: tail -100 "$SBX_HOME/serve.log" || true
+
+  # The dashboard's inline JS, checked for identifiers nothing declares (ESLint no-undef). An
+  # undeclared name parses fine and throws only when its line runs. Two shipped: `hidden`
+  # (selecting any agent threw "hidden is not defined" out of the tick, and the witness chain
+  # never filtered) and `modal` (Escape never closed the trust modal, for two months).
+  # See tools/dashboard_no_undef.mjs.
+  dashboard-js:
+    name: dashboard js (no-undef)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+      - name: Undeclared identifiers in the dashboard's inline scripts
+        run: |
+          npm install --silent --no-audit --no-fund --prefix "$RUNNER_TEMP/lint" eslint@10 globals
+          NODE_PATH="$RUNNER_TEMP/lint/node_modules" node tools/dashboard_no_undef.mjs
+
   # The app is a separate Rust crate plus a TypeScript frontend. Core green says
   # nothing about either: Sprint A demonstrated the gap when an app-only helper
   # passed its tests while the production sign-in path never called it.
@@ -251,6 +349,14 @@ jobs:
           python-version: "3.12"
 
       - name: Test hooks
+        # The seats resolve runtime law ONLY from an explicit HESTIA_SHARED_DIR or an
+        # installed $HESTIA_HOME/shared (#742 for codex, #747 for claude-code). A CI runner
+        # has no installed engine, and the repository checkout is deliberately NOT an
+        # implicit fallback any more -- that fallback is what let a hook execute whatever
+        # law the branch happened to carry. So the runner names the reviewed shared tree
+        # explicitly: a test fixture, chosen and visible, not an ambient path lookup.
+        env:
+          HESTIA_SHARED_DIR: ${{ github.workspace }}/plugins/_shared
         run: |
           set -euo pipefail
           # Discovery comes from tools/ci_discovery.py (mode: hooks), the same
@@ -281,3 +387,201 @@ jobs:
             exit 1
           fi
           echo "all ${#tests[@]} passed"
+
+  # ADDITION: the ratchet under the engine collapse.
+  #
+  # The `hooks` job above runs each seat's tests FROM ITS OWN DIRECTORY, which is
+  # correct for what it tests and is also exactly why the seats drift: it proves
+  # every seat is self-consistent and compares no seat to any other. A fix that
+  # lands in one seat's file is green. Three seats, three greens, one law that
+  # differs by seat.
+  #
+  # "The seats all import the shared closure" was true and reported as done for
+  # weeks. It was never the question. The question is what fraction of
+  # LAW-BEARING code still executes per-seat, and on the day this job was added
+  # the answer was 67.7% -- with claude-code alone carrying more law-bearing
+  # SLOC (1,654) than the shared engine's law-bearing portion (1,470).
+  #
+  # This job does not require the number to fall. It requires that it not RISE.
+  # Lower the pins in the same PR that lowers the number; that edit is the
+  # progress record, and it is the thing a verdict could never be.
+  collapse-ratchet:
+    name: gate collapse ratchet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Measure how much of the gate still executes per-seat
+        run: |
+          set -euo pipefail
+          # THREE pins now, because the fork count was one number over two
+          # opposite risks and that cost us a landing.
+          #
+          # --max-divergent-forked is the tight one and keeps the old meaning:
+          # a name the shared engine owns, implemented a SECOND TIME with a
+          # different body. All 4 are gemini's scope predicates, and the step
+          # below independently finds 6 inputs they answer differently from the
+          # engine. This number may not rise.
+          #
+          # --max-verbatim-forked counts copies that are character-for-character
+          # the engine's. It is 0 and stays 0. It briefly stood at 16 to admit
+          # claude-code's shell classifier while a two-step move published it
+          # before deleting it; that transition was wrong. A move publishes and
+          # deletes in ONE act, and the deploy-order problem it was working
+          # around got fixed instead (install-members.sh now repoints
+          # $HESTIA_HOME/shared BEFORE writing any hook, so a hook can never be
+          # newer than the engine it imports). Duplicate law is not preserved to
+          # accommodate the deploy mechanism.
+          #
+          # --max-pct is still the number that actually matters and still
+          # depends on a published vocabulary, so it is arguable -- which is a
+          # reason to print it every run, not a reason to leave it unpinned.
+          # 52.3, not 52.2. The cutover measured 52.2; the mandated fail-closed
+          # import guard (missing shared authority -> exit 2, proven by
+          # plugins/claude-code/tests/missing_shared_authority_blocks_test.py)
+          # added 11 law-bearing sloc to the seat and moved it to 52.3. Pinned at
+          # the MEASURED value. The alternative was writing terser refusal code to
+          # hit a round number, which is optimising the gauge instead of the thing.
+          # 52.8, not 52.3. Review of #747 found the negative test did not model
+          # an ABSENT install (an existing empty dir suppressed the repo fallback),
+          # so the fallback and two unconditional working-tree resolutions were
+          # deleted and replaced by ONE installed-only loader, BYTE-IDENTICAL to
+          # codex's (#742 head 03a0ba8), asserted by the staging script, not
+          # eyeballed. The loader is per-seat law the meter counts. It cannot
+          # live in shared authority because it IS the reach to shared authority.
+          # (An earlier version of this comment predicted the verbatim ratchet
+          # would trip when both seats carried one loader text. Wrong: that grade
+          # covers only names the SHARED ENGINE owns, and the loader is not one; a
+          # duplicated loader lands in the informational unshared-fork surface,
+          # as _load_mechanism already does. Recorded so the next reader does not
+          # inherit the prediction.)
+          #
+          # PER SEAT, NOT FLEET (#771). The fleet aggregate let one shim's added
+          # authority read as a fleet regression and let three lean adapters dilute
+          # one forked shim. Bounds are now one per discovered seat, at the MEASURED
+          # value on this head; a regression names its seat and moves no other
+          # seat's number. A pinned seat that is not discovered fails: unmeasurable
+          # is not compliant. The aggregate is still printed, labeled TREND, and
+          # decides nothing. Deployment readiness over RESIDENT bytes is the other
+          # instrument (tools/installed_seat_readiness.py); CI has no installed
+          # seats, so its self-test runs in the plugin-tests job instead.
+          #
+          # codex 25.0, not 23.9 (#742): the installed-only loader and its refusal
+          # path are per-seat mechanics the meter counts as law. Moved to the
+          # measured value on that head and no other seat's pin touched, which is
+          # the point of pinning per seat: the same change under the fleet gauge
+          # read as "the fleet regressed 0.1".
+          #
+          # Slice 3 (#796) moved the five codex/kimi gate-self bodies into the
+          # shared mechanism. Codex and kimi lose the duplicated bodies; the
+          # shared-law denominator grows for every seat, so all four measured
+          # percentages fall. Pin the exact post-move values in the same PR: a
+          # lower number left only in the PR prose is not a ratchet.
+          #
+          # claude-code 28.8 -> 28.9 (#944, the projection consumer). The seat now
+          # refuses before stdin when its vault-rendered config is missing or names a
+          # different home than the launcher supplied. That refusal is LAW, and it is
+          # per-seat only because each shim owns its own `main` -- SHIM_LEDGER's `main`
+          # row carries it as debt with #934's decide() as the retirement path. The
+          # explanatory comment was kept OUT of the function (the #950/#951 lesson),
+          # which is why this is +0.1 and not +0.2. Adjudicated, not absorbed: the
+          # alternative was to route the refusal through deny_no_verdict, whose
+          # remedies are about daemon reachability, and tell the operator to retry a
+          # daemon that is fine.
+          #
+          # claude-code 28.9 -> 29.0 (#944, liveness). One line in `_connect_session`
+          # presents the loaded projection's digest to the daemon on connect, beside
+          # the role it already presents from the same environment. The function is
+          # already SHIM_LEDGER debt (#844, the never-raise degrade rule), so its one
+          # new line of identity wiring counts as law under the meter's per-function
+          # attribution; the wiring itself has no legislative content. Adjudicated,
+          # not absorbed: the alternative was a second connect-args builder outside
+          # the debt function, which is more shim, not less.
+          #
+          # claude-code 29.0 -> 29.9 (#1084, the vault-bounded launch role). The LAW is in the
+          # shared engine: `hestia_gate_core.launch_role_verdict` owns the predicate, the
+          # unset-role exemption and the refusal's words (dp 2026-09-22: "all law goes into
+          # shared engine"; the first cut had it in the shim at 30.0). What stays in the seat is
+          # `_apply_launch_role`, ledgered as wiring: it loads the core, hands it the projection's
+          # set, and records the answer, plus the essential fail-closed when a declared set cannot
+          # be evaluated because the core is unreachable (which cannot live in the core). The meter
+          # counts it as law lexically ("gate" in the module name it loads); it decides nothing.
+          # Adjudicated, not absorbed, the same reading as the 28.9 -> 29.0 entry above: the
+          # alternative was renaming things to dodge the vocabulary, which is optimising the gauge.
+          # 29.9, not 29.7: codex's P1 review found the first cut called the core's verdict OUTSIDE
+          # its try, so a new hook against an old installed core raised at import and exited 1 --
+          # which Claude Code treats as non-blocking, i.e. fail-OPEN. The catch-all that fixes it
+          # is a few more lines in the same wiring function, and the meter counts them the same
+          # lexical way. Worth saying plainly: this number barely moved (30.0 in-shim -> 29.9),
+          # because the meter measures vocabulary in the seat, not where decisions live. What
+          # moved is in SHIM_LEDGER: the predicate, exemption and refusal words are the core's.
+          python3 tools/gate_collapse_meter.py \
+            --max-divergent-forked 0 --max-verbatim-forked 0 \
+            --max-seat-pct claude-code=29.9 --max-seat-pct codex=20.6 \
+            --max-seat-pct gemini=10.3 --max-seat-pct kimi=16.8
+
+      - name: Do the forked predicates actually disagree with the engine?
+        run: |
+          set -euo pipefail
+          # A fork count is debt; a divergence count is exposure. This pins how
+          # many inputs the forked scope predicates answer differently from the
+          # shared engine -- currently 6, every one of them a defect class the
+          # engine's own docstring says it was hardened against. Collapsing a
+          # fork is what drives it down.
+          # 0 divergent forks and 0 differential divergences (slice 4): gemini's four
+          # scope predicates -- the fleet's last forks of engine-owned names, all measured
+          # fail-open -- are deleted and delegate to the core. gemini 10.7, not 8.8: the
+          # installed-only loader is per-seat mechanics the meter counts as law, the same
+          # move codex made at 25.0. The differential is now a WIRING pin: any re-fork
+          # reads as a divergence and trips at zero.
+          python3 tools/scope_fork_differential_test.py --max-divergences 0
+
+      - name: Does every shim function say why it is in the shim?
+        run: |
+          # dp's ruling: every function in every shim carries an explicit justification for
+          # being in the shim and not in the common gate. plugins/_shared/SHIM_LEDGER.md is
+          # the proof; this checks only that it EXISTS for every function, is CURRENT (a
+          # source hash per row) and that admitted debt names its owning issue. It judges
+          # no justification: a reviewer does. Not a metric, on purpose.
+          python3 tools/shim_ledger_check.py
+
+      - name: Does the scope verdict depend on where the session was parked?
+        run: |
+          # The MRH-layer differential #760 asks for. One command through the shared
+          # command_in_scope at four cells (resolved root wrong/right x event cwd at the
+          # root / in a granted repo). Pinned mode: today's cells, false positives
+          # included (7 of 14 cases; every live refusal of 2026-09-02 reproduced token
+          # for token). A regression AND a fix both move a cell off its pin, so either
+          # must update the pin in the same change. `--strict` is the acceptance for
+          # the TOOLS + FILES replacement model and is red today by design.
+          python3 tools/mrh_scope_differential.py
+
+      - name: Is every seat reaching for the same domain?
+        run: |
+          set -euo pipefail
+          # The collapse percentage measures the PREDICATE. This pins the DOMAIN
+          # the predicate is applied to, which every seat builds itself before
+          # the engine is ever called (#734). A gate can reach 0.0% per-seat law
+          # and still disagree with its peers about which argument is a path.
+          # Floor is the measured number, 3 of 10, so it ratchets up from
+          # reality rather than aspiring downward from a target nobody hit.
+          # Deliberately a SEPARATE step from the collapse meter above: one
+          # number failing should not hide the other behind set -e.
+          # 10, not 3 (slice 5): the reach domain is ONE engine table and every seat
+          # consumes it, so agreed == union by construction. This flat key census is a
+          # TREND, not the contract: it cannot see the (tool, key) typing (delete "glob"
+          # from PATTERN_REACH_TOOLS and it stays 10/10), and a substring delegation
+          # check blessed a re-forked live site (GPT review of #830, both falsified).
+          # The contract is pinned by tools/reach_domain_contract_test.py in the
+          # plugin-tests job: typed behaviour with a sabotage self-check, the live
+          # extraction site proven by AST, and behaviour through every seat under a
+          # stub daemon. claude-code's pin moved 28.7 -> 28.8 (the delegation's own
+          # comment carries law vocabulary the meter counts); gemini/kimi dropped to
+          # their measured floors in the same act. codex 20.6, not 20.5: the review
+          # repair composed apply_patch's shape translator with the engine call at the
+          # call site and said so in two comment lines inside main(), which the meter
+          # counts as law sloc. Pinned at the measured value rather than trimming a
+          # comment to move a gauge.
+          python3 tools/gate_collapse_meter.py --quiet --min-agreed-keys 10

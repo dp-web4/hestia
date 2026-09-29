@@ -498,14 +498,19 @@ verify_service_linux() {
 step_service_macos() {
   c_hdr "launchd user agent"
   local agent_dir="$HOME/Library/LaunchAgents"
-  local plist="$agent_dir/io.hestia.tools.plist"
+  # The label hestia-deploy restarts (its LAUNCHD_LABEL default) and the fleet's Mac runs. This
+  # was `io.hestia.tools` until 2026-09-28, so a seat installed here was one deploy could not
+  # restart without HESTIA_LAUNCHD_LABEL set by hand.
+  local label="com.web4.hestia.daemon"
+  local plist="$agent_dir/$label.plist"
+  local legacy="$agent_dir/io.hestia.tools.plist"
   mkdir -p "$agent_dir"
   cat > "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>io.hestia.tools</string>
+  <key>Label</key><string>${label}</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/sh</string>
@@ -515,6 +520,8 @@ step_service_macos() {
   <key>EnvironmentVariables</key>
   <dict>
     <key>HESTIA_HOME</key><string>${HESTIA_HOME}</string>
+    <key>HESTIA_CURRENT_BUILD_FILE</key><string>${HESTIA_HOME}/current-build.json</string>
+    <key>HESTIA_WORKSPACE</key><string>${HESTIA_WORKSPACE:-}</string>
     <key>HOME</key><string>${HOME}</string>
     <key>RUST_LOG</key><string>warn</string>
   </dict>
@@ -525,11 +532,19 @@ step_service_macos() {
 </dict>
 </plist>
 PLIST
-  launchctl unload "$plist" 2>/dev/null || true
-  launchctl load "$plist"
-  c_ok "loaded $plist"
+  # A seat installed under the OLD label would otherwise keep a second hestia contending for
+  # the same port -- the collision probe 2 below warns about. Retire it: it is ours by name.
+  if [ -f "$legacy" ]; then
+    launchctl bootout "gui/$(id -u)/io.hestia.tools" 2>/dev/null || true
+    mv "$legacy" "$legacy.retired-$(date +%Y%m%d)"
+    c_warn "retired the old io.hestia.tools agent (kept as $legacy.retired-*)"
+  fi
+  # bootout/bootstrap, not unload/load: the latter are deprecated and report nothing useful.
+  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$plist"
+  c_ok "bootstrapped $plist"
 
-  verify_service_macos "$plist" "io.hestia.tools"
+  verify_service_macos "$plist" "$label"
 }
 
 # launchd's PID for a label, or empty. `launchctl list <label>` prints a plist-ish
@@ -562,6 +577,19 @@ macos_agent_pid() {
 # written on Linux and could not be executed against it. Shipping an unrun command is
 # the defect this file is about. Left for the Mac; see the PR thread.
 plist_uncond_keepalive() {
+  # plutil answers the actual question -- is KeepAlive's VALUE the boolean true -- through the
+  # plist PARSER, so comments, line breaks and `<true />` spacing cannot fool it. Measured on
+  # macOS (McNugget, 2026-09-28): `plutil -type KeepAlive` says bool / dictionary / (absent,
+  # non-zero); a dict value is conditional and never flagged; an XML-commented decoy is ignored.
+  # The awk text reading below stays as the fallback for a machine without plutil, which is
+  # only ever reached off macOS.
+  if command -v plutil >/dev/null 2>&1; then
+    if [ "$(plutil -type KeepAlive "$1" 2>/dev/null)" = bool ] \
+       && [ "$(plutil -extract KeepAlive raw "$1" 2>/dev/null)" = true ]; then
+      printf '%s\n' "$1"
+    fi
+    return 0
+  fi
   awk -v f="$1" '
     { doc = doc $0 " " }
     END {
@@ -604,7 +632,7 @@ verify_service_macos() {
   esac
 
   # 2. Label drift: is some OTHER agent already serving hestia under a different
-  #    label? The repo template is `io.hestia.tools`; McNugget has been running
+  #    label? The repo template was `io.hestia.tools` until 2026-09-28; McNugget has been running
   #    `com.web4.hestia.daemon` since 2026-05-21 and ROSTER.md certifies THAT one.
   #    Installing here does not replace it -- it adds a second agent contending for
   #    the same port, and whichever loses is invisible in both.
@@ -628,7 +656,7 @@ verify_service_macos() {
     # read-loop, not `printf %s\\n $var`: macOS paths have spaces in them.
     printf '%s\n' "$others" | while IFS= read -r f; do c_warn "    $f"; done
     c_warn "  Two agents, one bind address. Unload the stale one before trusting this install:"
-    c_warn "    launchctl unload <plist>   # then confirm only one pid answers on ${HESTIA_BIND}"
+    c_warn "    launchctl bootout gui/\$(id -u)/<label>   # then confirm only one pid answers on ${HESTIA_BIND}"
   else
     c_ok "no competing hestia agent in ~/Library/LaunchAgents"
   fi

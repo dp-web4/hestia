@@ -40,6 +40,31 @@ const MAX_INBOX_NOTICES: u64 = 1000;
 /// arbitrary.
 pub(crate) const MAX_EGRESS_QUEUE: u64 = 200;
 
+/// Per-peer share of the egress plane. The global bound above is necessary and not
+/// sufficient: it counts undrained forwards TOTAL, so one wedged link can occupy every
+/// slot and the refusal then lands on traffic to peers that are perfectly healthy.
+///
+/// MEASURED (S1, 2026-07-28, reproduced against main 2026-08-27 — the fix was written a
+/// month ago, superseded by an additive recompose that could not see it, and never landed):
+///
+/// ```text
+/// 200 forwards enqueued to peer "wedged"   -> all 200 ADMITTED
+/// 1 forward to unrelated peer "healthy"    -> REFUSED
+///   "egress queue full (200/200 undrained forwards)"
+/// ```
+///
+/// (Fenced as `text` on purpose: a four-space-indented block in a doc comment is a Rust
+/// DOCTEST, and this one failed CI with "expected item, found `200`". `cargo test --lib`
+/// never runs doctests, which is why it was green locally while `cargo test` was red.)
+///
+/// One dead link, a fleet-wide coordination outage, and a refusal that reports a full plane
+/// while saying nothing about WHICH peer filled it — a disposition without its basis.
+///
+/// 50 against a global 200: four peers must each wedge before the global bound can be the
+/// binding one, so in the ordinary case the per-peer clause is what refuses and its message
+/// names the responsible link. The value is a judgment call and the only one in this change.
+pub(crate) const MAX_EGRESS_QUEUE_PER_PEER: u64 = 50;
+
 /// How many failed hand-offs an egress row survives before it is retired and its
 /// sender is told (r6-routing branch 4, at the egress seam).
 ///
@@ -75,6 +100,16 @@ pub struct InboxNotice {
 pub struct SqliteInboxStore {
     conn: Mutex<Connection>,
     path: PathBuf,
+}
+
+/// The debt-clearing kinds (`reply`, `ack`, `review_done`), matched fractally —
+/// `reply.thread` is a reply — the way the send gate matches its kinds (#977).
+/// A bound send of one of these kinds DISCHARGES the notice it names, so it is
+/// the set whose addressee must be the notice's asker (#1115).
+pub(crate) fn is_disposition_kind(kind: &str) -> bool {
+    ["reply", "ack", "review_done"]
+        .iter()
+        .any(|d| kind == *d || kind.starts_with(&format!("{d}.")))
 }
 
 impl SqliteInboxStore {
@@ -300,6 +335,12 @@ impl SqliteInboxStore {
             // several notices legitimately share one entry (a multi-peer
             // invitation writes one row per invited seat, all on the open's hash).
             ("disposition_key", "TEXT"),
+            // The transport binding in force for the SENDER when a routed notice was queued
+            // (#1030): JSON {mode, carrier_lct, reply_to_lct, delegation_ref, hub, version},
+            // NULL when the sender had no binding. Stamped at enqueue so the drain forwards
+            // under the contract the act was made under, and so a binding that changes while
+            // the row waits is detected rather than silently applied.
+            ("transport_stamp", "TEXT"),
         ] {
             if !existing.iter().any(|c| c == col) {
                 conn.execute_batch(&format!(
@@ -621,6 +662,29 @@ impl SqliteInboxStore {
                  refusing admission rather than evicting a queued forward"
             );
         }
+        // PER-PEER, and the reason it is a SECOND clause rather than a replacement: the
+        // global bound protects the STORE (unbounded growth), this one protects the other
+        // PEERS (one wedged link starving every healthy one). Both are real and neither
+        // implies the other, so both are tested.
+        //
+        // Ordered after the global check so that when the plane is genuinely full the
+        // caller still gets the plane-full message; this clause speaks only when the plane
+        // has room and THIS destination does not, which is the case the old code answered
+        // with a message about the total.
+        let queued_peer: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM member_notices
+              WHERE dest_peer = ?1 AND drained_at IS NULL",
+            params![dest_peer],
+            |row| row.get(0),
+        )?;
+        if queued_peer as u64 >= MAX_EGRESS_QUEUE_PER_PEER {
+            anyhow::bail!(
+                "egress queue full for peer '{dest_peer}' \
+                 ({queued_peer}/{MAX_EGRESS_QUEUE_PER_PEER} undrained forwards to that peer; \
+                 plane holds {queued}/{MAX_EGRESS_QUEUE}) — refusing admission to this peer \
+                 while others still have room"
+            );
+        }
         conn.execute(
             "INSERT INTO member_notices
                 (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at, dest_peer)
@@ -630,6 +694,21 @@ impl SqliteInboxStore {
         )
         .context("enqueueing egress notice")?;
         Ok(conn.last_insert_rowid() as u64)
+    }
+
+    /// Record the sender's transport binding on a just-queued egress row (#1030). A separate
+    /// write rather than a parameter to [`Self::enqueue_egress`] only to keep that function's
+    /// many callers unchanged; the handler makes both calls under the one server lock, so no
+    /// drainer can read the row between them.
+    pub fn set_egress_transport_stamp(&self, id: u64, stamp: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        conn.execute(
+            "UPDATE member_notices SET transport_stamp = ?1 WHERE id = ?2 AND dest_peer IS NOT NULL",
+            params![stamp, id as i64],
+        )
+        .context("stamping egress transport")?;
+        Ok(())
     }
 
     /// Undrained forwards currently parked on the egress plane — the number the
@@ -666,7 +745,7 @@ impl SqliteInboxStore {
         Self::ensure_member_schema(&conn)?;
         let mut stmt = conn.prepare(
             "SELECT id, dest_peer, dest_peer_lct, to_plugin, from_plugin, kind, pointer_uri,
-                    attempts, last_error
+                    attempts, last_error, transport_stamp
                FROM member_notices
               WHERE dest_peer IS NOT NULL AND drained_at IS NULL
               ORDER BY id ASC LIMIT ?1",
@@ -682,6 +761,7 @@ impl SqliteInboxStore {
                 pointer_uri: r.get(6)?,
                 attempts: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
                 last_error: r.get(8)?,
+                transport_stamp: r.get(9)?,
             })
         })?;
         let mut out = Vec::new();
@@ -714,10 +794,73 @@ impl SqliteInboxStore {
         chain_hash: &str,
         in_reply_to: Option<u64>,
     ) -> Result<u64> {
-        let now = Utc::now();
-        let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
+        Self::enqueue_member_on(&conn, to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, in_reply_to)
+    }
+
+    /// Retire an egress row AND queue its author's report in one transaction (#1030 review):
+    /// either both land or neither does. `None` means the row was not pending (already
+    /// forwarded, retired, or never queued), and nothing was written. Before this, a
+    /// transport-fault retirement was three separate writes, so a failure after the first
+    /// could leave a row gone from the queue with its author never told.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retire_egress_with_report(
+        &self,
+        id: u64,
+        report_to: &str,
+        report_from: &str,
+        report_role: &str,
+        report_kind: &str,
+        report_pointer: Option<&str>,
+        chain_hash: &str,
+    ) -> Result<Option<u64>> {
+        let mut conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let tx = conn.transaction().context("starting egress retirement")?;
+        let n = tx
+            .execute(
+                "UPDATE member_notices SET drained_at = ?1
+                  WHERE id = ?2 AND dest_peer IS NOT NULL AND drained_at IS NULL",
+                params![Utc::now().to_rfc3339(), id as i64],
+            )
+            .context("retiring egress row")?;
+        if n != 1 {
+            return Ok(None); // dropping the transaction rolls it back; nothing was written
+        }
+        let report = Self::enqueue_member_on(
+            &tx, report_to, report_from, report_role, report_kind, report_pointer, chain_hash, None,
+        )?;
+        tx.commit().context("committing egress retirement and its report")?;
+        Ok(Some(report))
+    }
+
+    /// Whether an egress row is still waiting to be forwarded.
+    pub fn egress_is_pending(&self, id: u64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM member_notices
+              WHERE id = ?1 AND dest_peer IS NOT NULL AND drained_at IS NULL",
+            params![id as i64],
+            |r| r.get(0),
+        )?;
+        Ok(n == 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_member_on(
+        conn: &Connection,
+        to_plugin: &str,
+        from_plugin: &str,
+        from_role: &str,
+        kind: &str,
+        pointer_uri: Option<&str>,
+        chain_hash: &str,
+        in_reply_to: Option<u64>,
+    ) -> Result<u64> {
+        let now = Utc::now();
+        let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
         // "You may only answer mail addressed to YOU" — enforced HERE, in the
         // store, not only at the call site (Kimi/CBP git-manager thread,
         // 2026-07-28, notice 309). Until this check the guard lived inside
@@ -763,6 +906,40 @@ impl SqliteInboxStore {
                     "notice {rid} was addressed to '{addressee}', not to '{from_plugin}' — \
                      a member can only answer its own mail"
                 );
+                // #1115: the addressee side of the same binding. A disposition
+                // (`reply`/`ack`/`review_done`, fractally) DISCHARGES the notice it
+                // names in `member_unanswered` — so a disposition addressed to anyone
+                // but the notice's asker pays a debt the asker never sees paid. Measured
+                // live 2026-09-25: notice 14574, a reply bound to codex's 14567 but
+                // addressed to the dead name `codex-cli`, cleared codex's row; nothing
+                // told codex. Check the asker, not only the answerer, and name the right
+                // addressee in the refusal — the sender holding the typo is awake.
+                // Non-disposition kinds skip this: a bound `forum-note` FYI to a third
+                // party answers nothing and clears nothing (the query side agrees —
+                // `member_unanswered` only clears when the response addresses the asker).
+                // Comparison is EXACT, on the address as sent: `member_unanswered` clears
+                // only when the reply's routed form (`dest_peer/to_plugin`, or the bare
+                // local id) equals the asker's `from_plugin`, so a bare-member test here
+                // accepted a reply to local `claude-code` sent to `legion/claude-code` —
+                // delivered to another machine, and the debt left standing with no refusal
+                // (review of #1126). Gate and query now agree by construction.
+                if is_disposition_kind(kind) {
+                    let asked_by: Option<String> = conn
+                        .query_row(
+                            "SELECT from_plugin FROM member_notices WHERE id = ?1",
+                            params![rid as i64],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .context("resolving in_reply_to asker")?;
+                    if let Some(asker) = asked_by {
+                        anyhow::ensure!(
+                            asker == to_plugin,
+                            "notice {rid} came from '{asker}' — a {kind} answers it only if \
+                             addressed back to '{asker}', not to '{to_plugin}'"
+                        );
+                    }
+                }
             }
         }
         // `dest_peer IS NULL` = the LOCAL plane. Every statement in this function
@@ -939,6 +1116,21 @@ impl SqliteInboxStore {
                     None => to_plugin,
                 })
             }
+            None => None,
+        })
+    }
+
+    /// The ASKER of a stored notice (`from_plugin`, bare as written) — the second
+    /// half of reply binding (#1115): a disposition answers a notice only when it is
+    /// addressed back to this party. `None` when the id is not on record (aged out:
+    /// unverifiable, not forged — same posture as `member_notice_recipient`).
+    pub fn member_notice_sender(&self, id: u64) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let mut stmt = conn.prepare("SELECT from_plugin FROM member_notices WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id as i64])?;
+        Ok(match rows.next()? {
+            Some(row) => Some(row.get(0)?),
             None => None,
         })
     }
@@ -1163,10 +1355,29 @@ impl SqliteInboxStore {
         let before = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
+        // Fractal kinds, matched the way the send gate matches them (#977). `kind IN
+        // (?)` was exact, which was right while `tool_member_notify` was exact too.
+        // Once the gate admits `review_request.pr`, an exact `IN` makes this ledger —
+        // the accountability half, the thing `hestia_member_unanswered` reports and
+        // `i_owe` is computed from — silently blind to precisely the specializations
+        // the gate now exists to admit. Not a refusal: a sent, witnessed, queued
+        // notice that never appears in anyone's debt row. A gate and a ledger that
+        // disagree about what a kind is, is worse than either rule alone.
+        //
+        // `substr(...) = ? || '.'`, NOT `LIKE ? || '.%'`, and the difference is not
+        // style. `_` is a single-character WILDCARD in SQL LIKE, and four of the
+        // seven roots contain one — `LIKE 'review_request.%'` also matches
+        // `reviewXrequest.pr`, a kind the send gate refuses. The obvious spelling
+        // would have made the ledger LOOSER than the gate in exactly the direction
+        // that lets a refused kind be counted. `substr`/`length` has no wildcard
+        // semantics at all, so there is nothing to escape and nothing to get wrong.
         let placeholders = (0..kinds.len())
-            .map(|i| format!("?{}", i + 3))
+            .map(|i| {
+                let p = i + 3;
+                format!("(n.kind = ?{p} OR substr(n.kind, 1, length(?{p}) + 1) = ?{p} || '.')")
+            })
             .collect::<Vec<_>>()
-            .join(",");
+            .join(" OR ");
         let sql = format!(
             "SELECT id, to_plugin, from_plugin, kind, pointer_uri, queued_at, drained_at,
                     in_reply_to
@@ -1174,11 +1385,21 @@ impl SqliteInboxStore {
              WHERE (n.to_plugin = ?1 OR n.from_plugin = ?1)
                AND n.dest_peer IS NULL
                AND n.queued_at < ?2
-               AND n.kind IN ({placeholders})
+               AND ({placeholders})
                AND NOT EXISTS (SELECT 1 FROM member_notices r
                                WHERE r.in_reply_to = n.id
                                  AND (r.pointer_uri IS NULL
-                                      OR r.pointer_uri NOT LIKE '%#undelivered:%'))
+                                      OR r.pointer_uri NOT LIKE '%#undelivered:%')
+                                 -- #1115: a response discharges the debt only when it is
+                                 -- addressed back to the ASKER, compared EXACTLY on the
+                                 -- routed form (`peer/member` for a forward, the bare id
+                                 -- locally): the same rule the send gate enforces. A misaddressed
+                                 -- reply stays a misroute, visible as unanswered — the
+                                 -- one kind of misroute that used to erase its own
+                                 -- evidence (14574 cleared codex's row from 'codex-cli').
+                                 AND (CASE WHEN r.dest_peer IS NULL THEN r.to_plugin
+                                           ELSE r.dest_peer || '/' || r.to_plugin
+                                      END) = n.from_plugin)
              ORDER BY n.id ASC"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -1245,7 +1466,7 @@ impl SqliteInboxStore {
         Self::ensure_member_schema(&conn)?;
         let mut stmt = conn.prepare(
             "SELECT id, dest_peer, dest_peer_lct, to_plugin, from_plugin, kind, pointer_uri,
-                    attempts, last_error
+                    attempts, last_error, transport_stamp
                FROM member_notices WHERE id = ?1 AND dest_peer IS NOT NULL",
         )?;
         let mut rows = stmt.query_map(params![id as i64], |r| {
@@ -1259,6 +1480,7 @@ impl SqliteInboxStore {
                 pointer_uri: r.get(6)?,
                 attempts: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
                 last_error: r.get(8)?,
+                transport_stamp: r.get(9)?,
             })
         })?;
         match rows.next() {
@@ -1523,12 +1745,98 @@ pub struct EgressRow {
     pub pointer_uri: Option<String>,
     pub attempts: i64,
     pub last_error: Option<String>,
+    /// The sender's transport binding when the row was queued (#1030); None = unbound.
+    pub transport_stamp: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Enqueue `n` forwards to `peer`, asserting each is admitted. Returns nothing: a
+    /// helper that swallowed a refusal would make the starvation test pass for the wrong
+    /// reason (nothing queued -> nothing starved).
+    fn fill(store: &SqliteInboxStore, peer: &str, n: u64) {
+        for i in 0..n {
+            store
+                .enqueue_egress(peer, "to", "from", "role:constellation:member",
+                                "reply", None, &format!("hash-{peer}-{i}"))
+                .unwrap_or_else(|e| panic!("forward {i} to {peer} was refused: {e}"));
+        }
+    }
+
+    /// THE DEFECT, and the reason S1 exists. One wedged link must not refuse traffic to
+    /// a healthy one.
+    ///
+    /// Measured on main before this change: 200 forwards to "wedged" were all admitted,
+    /// and the very next forward to an unrelated peer was refused with a message about
+    /// the TOTAL. One dead link, a fleet-wide coordination outage, and a refusal whose
+    /// text named no peer.
+    #[test]
+    fn one_wedged_peer_does_not_starve_a_healthy_one() {
+        let (_tmp, store) = fresh();
+        fill(&store, "wedged", MAX_EGRESS_QUEUE_PER_PEER);
+
+        let err = store
+            .enqueue_egress("wedged", "to", "from", "role:constellation:member",
+                            "reply", None, "one-too-many")
+            .expect_err("the wedged peer is at its own bound and must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("wedged"),
+            "the refusal must NAME the peer that filled its share — a disposition \
+             without its basis is what the global-only message was: {msg}");
+
+        // The plane still has room, so a healthy destination must still be admitted.
+        store
+            .enqueue_egress("healthy", "to", "from", "role:constellation:member",
+                            "reply", None, "healthy-1")
+            .expect("a healthy peer must not inherit another peer's backlog");
+        assert_eq!(store.egress_queued_for("healthy").unwrap(), 1);
+        assert_eq!(store.egress_queued_for("wedged").unwrap(), MAX_EGRESS_QUEUE_PER_PEER);
+    }
+
+    /// The GLOBAL bound still binds. Without this, "make the per-peer bound generous"
+    /// would silently remove the store's own protection and this suite would not notice.
+    #[test]
+    fn the_global_bound_still_refuses_when_the_plane_is_actually_full() {
+        let (_tmp, store) = fresh();
+        // Spread across enough peers that no single one reaches its share first.
+        let peers = (MAX_EGRESS_QUEUE / MAX_EGRESS_QUEUE_PER_PEER) as usize;
+        assert!(peers >= 2, "fixture assumes the plane holds several peers' shares");
+        for p in 0..peers {
+            fill(&store, &format!("peer{p}"), MAX_EGRESS_QUEUE_PER_PEER);
+        }
+        assert_eq!(store.egress_queued().unwrap(), MAX_EGRESS_QUEUE);
+
+        let err = store
+            .enqueue_egress("fresh-peer", "to", "from", "role:constellation:member",
+                            "reply", None, "over-the-plane")
+            .expect_err("the plane is full; admission must be refused");
+        assert!(err.to_string().contains("egress queue full ("),
+            "when the PLANE is full the caller must get the plane-full message, not a \
+             per-peer one: {err}");
+    }
+
+    /// A drained row frees its peer's share. Otherwise the bound is a lifetime quota
+    /// rather than a depth bound, and a busy-but-healthy link would wedge itself.
+    #[test]
+    fn draining_releases_the_peers_share() {
+        let (_tmp, store) = fresh();
+        fill(&store, "busy", MAX_EGRESS_QUEUE_PER_PEER);
+        assert!(store
+            .enqueue_egress("busy", "to", "from", "role:constellation:member",
+                            "reply", None, "blocked")
+            .is_err());
+
+        let row = store.pending_egress(1).unwrap().into_iter().next().unwrap();
+        store.mark_egress_forwarded(row.id).unwrap();
+
+        store
+            .enqueue_egress("busy", "to", "from", "role:constellation:member",
+                            "reply", None, "after-drain")
+            .expect("draining one forward must free exactly one slot for that peer");
+    }
 
     fn fresh() -> (tempfile::TempDir, SqliteInboxStore) {
         let tmp = tempdir().unwrap();
@@ -1797,6 +2105,102 @@ mod tests {
             store.member_unanswered("kimi-code", &["review_request"], -1).unwrap().len(),
             1,
             "kimi still owes the answer: a third party must not be able to clear the debt"
+        );
+    }
+
+    /// #1115: a disposition addressed to anyone but the asker is refused at the
+    /// store, naming the right addressee — the answerer-side guard alone let 14574
+    /// clear codex's row from the dead name `codex-cli`.
+    #[test]
+    fn a_disposition_addressed_to_someone_other_than_the_asker_is_refused() {
+        let (_tmp, store) = fresh();
+        let asked = store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "review_request",
+                            Some("pr/1"), "h1", None)
+            .unwrap();
+        // kimi-code answers — but addresses the reply to codex-cli, not claude-code.
+        let misaddressed = store.enqueue_member(
+            "codex-cli", "kimi-code", "role:r", "review_done",
+            Some("forum/v.md"), "h2", Some(asked),
+        );
+        let err = misaddressed.expect_err("a misaddressed disposition must not land");
+        assert!(err.to_string().contains("came from 'claude-code'"), "{err}");
+        assert_eq!(
+            store.member_unanswered("claude-code", &["review_request"], -1).unwrap().len(),
+            1,
+            "the asker's row must not clear when the answer never reaches them"
+        );
+        // Fractally: a specialized reply is still a disposition.
+        let dotted = store.enqueue_member(
+            "codex-cli", "kimi-code", "role:r", "reply.thread",
+            Some("forum/v.md"), "h3", Some(asked),
+        );
+        assert!(dotted.is_err(), "reply.thread is a reply for the addressee check");
+        // Addressed back to the asker, it lands and clears.
+        store
+            .enqueue_member("claude-code", "kimi-code", "role:r", "review_done",
+                            Some("forum/v.md"), "h4", Some(asked))
+            .unwrap();
+        assert!(store
+            .member_unanswered("claude-code", &["review_request"], -1)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// #1115, query side: a misaddressed bound reply already ON the books (written
+    /// before the store guard, or by a future writer that bypasses it) still does
+    /// not clear the asker's row — the unanswered query itself is addressee-aware.
+    #[test]
+    fn a_misaddressed_disposition_already_stored_does_not_discharge() {
+        let (_tmp, store) = fresh();
+        let asked = store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "review_request",
+                            Some("pr/1"), "h1", None)
+            .unwrap();
+        // Simulate the pre-guard row: bound, disposition kind, wrong addressee.
+        let ok = store
+            .enqueue_member("claude-code", "kimi-code", "role:r", "reply",
+                            Some("forum/v.md"), "h2", Some(asked))
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("UPDATE member_notices SET to_plugin = 'codex-cli' WHERE id = ?1",
+                         params![ok as i64])
+                .unwrap();
+        }
+        assert_eq!(
+            store.member_unanswered("claude-code", &["review_request"], -1).unwrap().len(),
+            1,
+            "a bound reply addressed to someone else is not the asker's answer"
+        );
+        // The corrected re-send (the live repro's 14575) clears it.
+        store
+            .enqueue_member("claude-code", "kimi-code", "role:r", "reply",
+                            Some("forum/v.md"), "h3", Some(asked))
+            .unwrap();
+        assert!(store
+            .member_unanswered("claude-code", &["review_request"], -1)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// #1115, the FYI carve-out: a bound `forum-note` to a third party is not a
+    /// disposition — it must land (closure rides forum-note) and must not clear.
+    #[test]
+    fn a_third_party_forum_note_binds_without_refusing_or_clearing() {
+        let (_tmp, store) = fresh();
+        let asked = store
+            .enqueue_member("kimi-code", "claude-code", "role:r", "review_request",
+                            Some("pr/1"), "h1", None)
+            .unwrap();
+        store
+            .enqueue_member("codex", "kimi-code", "role:r", "forum-note",
+                            Some("forum/fyi.md"), "h2", Some(asked))
+            .unwrap();
+        assert_eq!(
+            store.member_unanswered("claude-code", &["review_request"], -1).unwrap().len(),
+            1,
+            "an FYI to a third party is not the asker's answer"
         );
     }
 
@@ -2267,19 +2671,29 @@ mod tests {
     #[test]
     fn the_egress_plane_carries_its_own_bound_and_it_refuses_rather_than_evicts() {
         let (_tmp, store) = fresh();
+        // SPREAD ACROSS PEERS. This fill used one destination ("thor"), which stopped being
+        // able to reach the plane's bound when MAX_EGRESS_QUEUE_PER_PEER landed: a single
+        // peer is now refused at its own share long before the plane is full. That is the
+        // per-peer clause doing its job, not a regression here — this test is about the
+        // PLANE's bound and about refusing rather than evicting, and the single destination
+        // was incidental to both. Distributing keeps every assertion below unchanged.
+        let peer_of = |i: u64| format!("peer{}", i / MAX_EGRESS_QUEUE_PER_PEER);
         let first = store
-            .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+            .enqueue_egress(&peer_of(0), "claude-code", "codex-cli", "role:r", "reply",
                             Some("forum/first.md#t"), "hash-first")
             .unwrap();
         for i in 1..MAX_EGRESS_QUEUE {
             store
-                .enqueue_egress("thor", "claude-code", "codex-cli", "role:r", "reply",
+                .enqueue_egress(&peer_of(i), "claude-code", "codex-cli", "role:r", "reply",
                                 Some(&format!("forum/f{i}.md#t")), "hash-e")
                 .unwrap();
         }
         assert_eq!(store.egress_queued().unwrap(), MAX_EGRESS_QUEUE);
-        let refused = store.enqueue_egress("thor", "claude-code", "codex-cli", "role:r",
-                                           "reply", Some("forum/over.md#t"), "hash-o");
+        // A destination with NO backlog of its own: the only thing that can refuse it is
+        // the plane's bound, which is what this test is for.
+        let refused = store.enqueue_egress("unused-peer", "claude-code", "codex-cli",
+                                           "role:r", "reply", Some("forum/over.md#t"),
+                                           "hash-o");
         assert!(refused.is_err(), "the egress plane admitted past its cap");
         // The oldest forward is still queued: at the bound we tell the newest sender
         // no, we do not silently destroy the oldest sender's packet.
