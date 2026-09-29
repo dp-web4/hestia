@@ -97,6 +97,11 @@ GATE_BASENAMES = ("pre_tool_use.py", "before_tool.py")
 NON_GATE_BASENAMES = (
     "witness.py",      # records what happened; holds no verdict
     "law_inject.py",   # puts the law in context; does not apply it
+    # Renders a ruling the daemon already made, on this harness's context port. It reads one
+    # file and prints one string: no predicate, no verdict, and it cannot block a call. Same
+    # class as witness.py, one direction over -- that one records what happened, this one
+    # reports what was decided (PRD_DISPOSITION_DELIVERY R4).
+    "disposition_deliver.py",
     "__init__.py",
 )
 

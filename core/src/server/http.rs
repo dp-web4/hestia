@@ -1390,7 +1390,9 @@ pub async fn serve_with_callback(
             let now = super::gate_escalation::now_secs();
             let lapsed = {
                 let mut s = lapse_state.lock().await;
-                let n = super::handler::record_newly_lapsed(&mut s, now);
+                // One named pass, so what the worker does is testable: record lapses, then
+                // rewrite any lane projection that did not land (PRD #845 R2).
+                let n = super::handler::disposition_worker_pass(&mut s, now).0;
                 // Config drift on the same cadence: a file that matched at startup and was
                 // edited at noon is a miswire from noon, not from the next restart.
                 // Not `gate_capabilities.keys()` alone: that is who CONNECTED, which is a
@@ -7391,6 +7393,16 @@ async fn operator_gate_escalation(
                 &esc.plugin_id,
                 &format!("hestia://escalation/{}#decided", esc.id),
                 &entry.hash,
+            );
+            // The operator just ruled from the dashboard. The asker is a live session that
+            // reads no mailbox until it restarts, so put the ruling where it can see it now
+            // (PRD_DISPOSITION_DELIVERY R2).
+            let _ = super::handler::ensure_disposition_lane(
+                &s,
+                &esc,
+                &format!("hestia://escalation/{}#decided", esc.id),
+                &entry.hash,
+                now,
             );
             // THE DECIDER SEES THE BAR — on this surface too.
             //
