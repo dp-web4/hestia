@@ -19,9 +19,9 @@ DESIGN
   `status: "evaluating"` with `nextPollMs: N`, we sleep N ms and
   re-query — up to `MAX_POLLS` times. Useful when (future) LLM-backed
   policy entities need a moment.
-- **Action cache.** On a decision we store the action_id under
-  /tmp/hestia-actions/<tool_use_id>.json so the PostToolUse hook can
-  pair the outcome to the begin_action.
+- **Action cache.** On a decision the shared mechanism caches the action_id under the
+  call's correlation key (hestia_witness_core, one rule for every harness) so the
+  PostToolUse witness closes the action this gate decided on.
 - **Exit semantics for Claude Code:**
     - `exit 0` (silent)               — allow, no message
     - `exit 0` with stderr message    — warn, surfaced to the agent
@@ -63,7 +63,6 @@ PROTOCOL_VERSION = 1
 HOOK_VERSION = "0.0.2"
 
 STATE_DIR = Path.home() / ".hestia-claude"
-ACTIONS_DIR = Path("/tmp/hestia-actions")
 DEFAULT_ENDPOINT = "http://127.0.0.1:7711/mcp"
 
 
@@ -1466,6 +1465,7 @@ def ask_daemon(
     tool_input: Any,
     tool_use_id: str,
     host_session_id: Optional[str] = None,
+    event: Optional[dict] = None,
 ):
     """Obtain the daemon's verdict IN-PROCESS via the shared mechanism (Sprint E).
 
@@ -1499,6 +1499,7 @@ def ask_daemon(
         plugin_version=HOOK_VERSION,
         host_agent_version="claude-code",
         host_session_id=host_session_id,
+        correlation_key=(mech.correlation_key(event) if event is not None else tool_use_id),
     )
     if not verdict.decided:
         # The mechanism already recorded the plane-E row (record_gate_unavailable) —
@@ -1507,16 +1508,6 @@ def ask_daemon(
         debug_log(f"no verdict from daemon path: {verdict.message}")
         return None
     return verdict
-
-
-def cache_action(tool_use_id: str, action_id: str, tool_name: str) -> None:
-    try:
-        ACTIONS_DIR.mkdir(parents=True, exist_ok=True)
-        (ACTIONS_DIR / f"{tool_use_id}.json").write_text(
-            json.dumps({"action_id": action_id, "tool_name": tool_name, "ts": time.time()})
-        )
-    except OSError as e:
-        debug_log(f"action cache failed: {e}")
 
 
 def _record_plane_e(cause: str, detail: str, tool_name: str = "unknown") -> None:
@@ -1915,10 +1906,8 @@ def main() -> int:
             return 2
 
     # Try the daemon first — IN-PROCESS via the shared mechanism (Sprint E, one transport).
-    verdict = ask_daemon(tool_name, tool_input, tool_use_id, host_session_id)
+    verdict = ask_daemon(tool_name, tool_input, tool_use_id, host_session_id, event=event)
     if verdict is not None:
-        if verdict.action_id:
-            cache_action(tool_use_id, verdict.action_id, tool_name)
         debug_log(f"daemon decided: {tool_name} → {verdict.kind}")
         return emit_decision(verdict)
 

@@ -63,7 +63,7 @@ class Stub(BaseHTTPRequestHandler):
             payload = {
                 "hestia_connect": {"sessionId": "S1"},
                 "hestia_begin_action": {"actionId": str(uuid.uuid4())},
-                "hestia_record_outcome": {"recorded": True},
+                "hestia_record_outcome": {"witnessEntryHash": "stub-entry", "updatedTrustState": {}},
             }.get(name, {})
             if name == "hestia_record_outcome":
                 RECORDED.append(args)
@@ -100,6 +100,9 @@ def run_witness(state_dir, endpoint, tool_name="Bash"):
         HESTIA_HOME=str(home),
         HESTIA_WITNESS_TIMEOUT_S="0.3",
         HESTIA_PLUGIN_ID="test-seat",
+        # The witness logic is the shared core, loaded only from a named engine dir: name the
+        # reviewed tree, as CI's hook job does (an ambient value, if set, is kept).
+        HESTIA_SHARED_DIR=os.environ.get("HESTIA_SHARED_DIR") or str(HERE.parent.parent / "_shared"),
     )
     env.pop("HESTIA_STATE_DIR", None)
     env.pop("HESTIA_ENDPOINT", None)

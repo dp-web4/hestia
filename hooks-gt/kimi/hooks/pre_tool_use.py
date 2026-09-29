@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 4a29b23902e43ed53a7fc3b53fad45ac69cf085d0bcfd4d5f2cd720a2a0dbb4d  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: aa8b16d72b73f7120df1dcfe273edc4d4ea8465cf144e2e3f522e13e098e9e75  (published ground truth; manifest: hooks-gt)
 """Hestia Phase-1 PreToolUse GATE for a foreign member (Kimi Code) — reference adapter.
 
 
@@ -718,10 +718,13 @@ def main():
                 shared = os.path.join(WORKSPACE, "hestia", "plugins", "_shared")
                 if shared not in sys.path:
                     sys.path.insert(0, shared)
-                from hestia_gate_mechanism import query_society_safety
+                from hestia_gate_mechanism import query_society_safety, correlation_key
+                # The key lets the shared witness CLOSE the action this asks about (#977);
+                # without it every kimi outcome was recorded cold (0 of 37 warned acts closed).
                 verdict = query_society_safety(
                     event, plugin_id="kimi-code", host_agent="kimi-code",
-                    host_session_id=event.get("session_id"))
+                    host_session_id=event.get("session_id"),
+                    correlation_key=correlation_key(event))
             except Exception:
                 # Loading the mechanism must itself fail closed on a consequential act: a missing or
                 # unimportable module is not a reason to allow a write on a fail-open harness.

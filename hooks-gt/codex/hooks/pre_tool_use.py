@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 6977c193525f3c6d41f7f2e49ed571cb6fe1759a87ae98d4f60c3caf5809b984  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: f7d6befc8cdec2cc9d7968d80ded37a50b22b5a801ab5a95a5ecfbe6fd852cb1  (published ground truth; manifest: hooks-gt)
 """Hestia Phase-1 PreToolUse GATE for a foreign member (OpenAI Codex CLI) — reference adapter.
 
 Adapted from the Kimi reference gate. Codex's hook engine is genuine Claude-Code lineage:
@@ -868,7 +868,8 @@ def main():
                 m = _load_mechanism()
                 verdict = m.query_society_safety(
                     event, plugin_id="codex", host_agent="codex",
-                    host_session_id=event.get("session_id"))
+                    host_session_id=event.get("session_id"),
+                    correlation_key=m.correlation_key(event))
             except Exception:
                 # Loading the mechanism must itself fail closed on a consequential act: a missing
                 # or unimportable module is not a reason to allow a write on a fail-open harness.

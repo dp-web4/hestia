@@ -88,7 +88,7 @@ def _plugins(tmp: Path) -> Path:
     return p
 
 
-DEST = {"codex": (".codex", "hooks"), "claude-code": (".claude", "hooks", "hestia")}
+DEST = {"codex": (".codex", "hooks"), "claude-code": (".claude", "hooks", "hestia"), "kimi": (".kimi-code", "hooks")}
 
 
 def _install(tmp: Path, member: str, *bases: str) -> Path:
@@ -160,6 +160,86 @@ def test_thor_case_registers_only_the_missing_witness():
         r2 = _run(tmp, plugins, "--member", "codex")
         assert r2.returncode == 0 and "ok    codex" in r2.stdout, r2.stdout
         assert cfg.read_text() == after
+
+
+KIMI_TOML = """default_model = "kimi"
+
+[[hooks]]
+event = "SessionStart"
+command = "/HOME/.kimi-code/hooks/observe.sh"
+timeout = 15
+
+[[hooks]]
+event = "PostToolUse"
+command = "/HOME/.kimi-code/hooks/observe.sh"
+timeout = 10
+
+[[hooks]]
+event = "PostToolUseFailure"
+command = "/HOME/.kimi-code/hooks/observe.sh"
+timeout = 10
+
+[[hooks]]
+event = "SessionEnd"
+command = "/HOME/.kimi-code/hooks/observe.sh"
+timeout = 10
+
+[[hooks]]
+event = "SessionEnd"
+command = "/HOME/.kimi-code/hooks/hydrate.sh"
+timeout = 20
+
+[[hooks]]
+event = "PostToolUse"
+command = "HESTIA_PLUGIN_ID=kimi-code python3 /HOME/.kimi-code/hooks/witness.py"
+timeout = 10
+
+[[hooks]]
+command = "python3 /HOME/.kimi-code/hooks/pre_tool_use.py"
+event = "PreToolUse"
+timeout = 15
+"""
+
+
+def test_kimi_flat_layout_registers_the_failure_witness_only():
+    """kimi's config is flat `[[hooks]] event = ...` tables. The seat already ran a witness on
+    PostToolUse (its private fork, at the installed path) but none on PostToolUseFailure — the
+    event kimi fires INSTEAD of PostToolUse for a failed call — so no failed kimi act was ever
+    witnessed. Registration must see what is there (keys in either order) and add only that."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        (plugins / "kimi" / "hooks").mkdir(parents=True)
+        (plugins / "kimi" / "expects.json").write_text((REPO / "plugins" / "kimi" / "expects.json").read_text())
+        (plugins / "kimi" / "hooks" / "hooks.json").write_text(
+            (REPO / "plugins" / "kimi" / "hooks" / "hooks.json").read_text())
+        cfg = tmp / ".kimi-code" / "config.toml"
+        cfg.parent.mkdir()
+        before = KIMI_TOML.replace("/HOME", str(tmp))
+        cfg.write_text(before)
+        # the seat's hooks are installed (the registrar registers nothing that is not on disk, #1142)
+        _install(tmp, "kimi", "observe.sh", "hydrate.sh", "witness.py", "pre_tool_use.py")
+        r = _run(tmp, plugins, "--member", "kimi")
+        assert r.returncode == 0, r.stdout + r.stderr
+        added = sorted(ln.split(": ", 1)[1] for ln in r.stdout.splitlines()
+                       if ln.strip().startswith("REGISTERED kimi"))
+        assert "PostToolUseFailure/witness.py" in r.stdout, r.stdout
+        assert "PostToolUse/witness.py" not in r.stdout.replace("PostToolUseFailure/witness.py", ""), r.stdout
+        assert "PreToolUse/pre_tool_use.py" not in r.stdout, "a key-order-swapped table was not read"
+        after = cfg.read_text()
+        assert after.startswith(before), "existing content was rewritten or reordered"
+        assert "[[hooks.PostToolUseFailure" not in after, "wrote codex's nested layout into kimi's flat file"
+        try:
+            import tomllib
+            data = tomllib.loads(after)
+            evs = [(h["event"], h["command"].split()[-1].rsplit("/", 1)[-1]) for h in data["hooks"]]
+            assert ("PostToolUseFailure", "witness.py") in evs, evs
+        except ImportError:
+            pass
+        r2 = _run(tmp, plugins, "--member", "kimi")
+        assert r2.returncode == 0 and "REGISTERED" not in r2.stdout, r2.stdout
+        assert cfg.read_text() == after, "a second run was not a no-op"
+        assert added == ["PostToolUseFailure/witness.py"], added
 
 
 def test_ensure_adds_the_feature_flag_when_absent():
@@ -564,6 +644,30 @@ def test_the_left_behind_repair_also_works_through_the_fallback():
         assert r.returncode == 9 and r.stdout.count("is registered but") == len(rows), r.stdout
 
 
+def test_a_narrow_kimi_flat_matcher_is_narrow_in_both_readers():
+    """#1149's flat reader kept no matchers, so a kimi `[[hooks]]` gate with `matcher = "Shell"` read as
+    all-tools -- the same false completeness as #1142's reviews. Flat tables carry their matcher now,
+    in the structural reader and in the fallback, quoted key or not."""
+    for spelling in ('matcher = "Shell"', '"matcher" = "Shell" # narrow'):
+        for scan in (["--toml-line-scan"], []):
+            with tempfile.TemporaryDirectory() as d:
+                tmp = Path(d)
+                plugins = _plugins(tmp)
+                (plugins / "kimi" / "hooks").mkdir(parents=True)
+                (plugins / "kimi" / "expects.json").write_text((REPO / "plugins" / "kimi" / "expects.json").read_text())
+                (plugins / "kimi" / "hooks" / "hooks.json").write_text(
+                    (REPO / "plugins" / "kimi" / "hooks" / "hooks.json").read_text())
+                cfg = tmp / ".kimi-code" / "config.toml"
+                cfg.parent.mkdir()
+                text = KIMI_TOML.replace("/HOME", str(tmp)).replace(
+                    'event = "PreToolUse"', 'event = "PreToolUse"\n' + spelling)
+                cfg.write_text(text)
+                _install(tmp, "kimi", "observe.sh", "hydrate.sh", "witness.py", "pre_tool_use.py")
+                r = _run(tmp, plugins, "--member", "kimi", *scan)
+                assert r.returncode == 8, (spelling, scan, r.returncode, r.stdout)
+                assert "PreToolUse/pre_tool_use.py is registered only for matcher 'Shell'" in r.stdout, (spelling, scan, r.stdout)
+
+
 def test_mixed_installed_and_missing_targets_exit_pending():
     """#1142 re-review P2: with only witness.py installed, the registrar registered it, printed PENDING
     for the other two, and exited 0. The additions are reported AND the run exits 9."""
@@ -713,6 +817,7 @@ def test_install_members_reports_a_narrow_gate_and_leaves_it():
 
 TESTS = [
     test_thor_case_registers_only_the_missing_witness,
+    test_kimi_flat_layout_registers_the_failure_witness_only,
     test_ensure_adds_the_feature_flag_when_absent,
     test_json_member_merges_without_disturbing_other_keys,
     test_a_harness_not_on_this_host_is_not_minted,
@@ -733,6 +838,7 @@ TESTS = [
     test_quoted_keys_are_read_through_the_fallback_path,
     test_the_fallback_refuses_toml_it_cannot_verify,
     test_the_left_behind_repair_also_works_through_the_fallback,
+    test_a_narrow_kimi_flat_matcher_is_narrow_in_both_readers,
     test_mixed_installed_and_missing_targets_exit_pending,
     test_the_hooks_dir_it_registers_into_is_made,
     test_a_host_already_left_registered_without_the_dir_repairs,

@@ -159,7 +159,7 @@ def registered_json(path: str) -> dict[str, dict[str, list]]:
 UNPARSED = object()   # a matcher line the fallback reader could not decode: covers NOTHING
 
 
-def _toml_structural(path: str):
+def _toml_structural(path: str, flat: bool = False):
     """{event: {basename: [matcher]}} from a real TOML parse, or None when no parser is available
     (or FORCE_LINE_SCAN is set, for the tests of the fallback)."""
     if FORCE_LINE_SCAN:
@@ -171,6 +171,17 @@ def _toml_structural(path: str):
     with open(path, "rb") as fh:
         data = tomllib.load(fh)
     out: dict[str, dict[str, list]] = {}
+    if flat:
+        for tbl in data.get("hooks") or []:
+            if not isinstance(tbl, dict) or not isinstance(tbl.get("event"), str):
+                continue
+            m = tbl.get("matcher")
+            m = m if (m is None or isinstance(m, str)) else UNPARSED
+            cmd = tbl.get("command")
+            b = target_basename(cmd) if isinstance(cmd, str) else None
+            if b:
+                out.setdefault(tbl["event"], {}).setdefault(b, []).append(m)
+        return out
     for event, groups in (data.get("hooks") or {}).items():
         if not isinstance(groups, list):
             continue
@@ -221,7 +232,7 @@ def _segments(keypath: str) -> list[str]:
     return out
 
 
-def _toml_scan(path: str) -> tuple[dict, set]:
+def _toml_scan(path: str, flat: bool = False) -> tuple[dict, set]:
     """The fallback reader: ({event: {basename: [matcher]}}, {absolute target}). Raises TomlUnsupported
     on anything outside its grammar that could bear on hooks -- it never guesses.
 
@@ -234,8 +245,19 @@ def _toml_scan(path: str) -> tuple[dict, set]:
         raise TomlUnsupported("a multi-line string (it can hide table headers from a line scan)")
     have: dict[str, dict[str, list]] = {}
     targets: set[str] = set()
-    ctx = None                     # None | ("group", event) | ("entry", event) | ("other",)
+    ctx = None                     # None | ("group", event) | ("entry", event) | ("flat",) | ("other",)
     matcher = None
+    table: dict = {}               # the current flat [[hooks]] table's keys
+
+    def flush_flat() -> None:
+        ev, cmd = table.get("event"), table.get("command")
+        if isinstance(ev, str) and isinstance(cmd, str):
+            t = target_path(cmd)
+            if t:
+                targets.add(t)
+            b = target_basename(cmd)
+            if b:
+                have.setdefault(ev, {}).setdefault(b, []).append(table.get("matcher"))
     for n, line in enumerate(text.splitlines(), 1):
         st = line.strip()
         if not st or st.startswith("#"):
@@ -244,6 +266,17 @@ def _toml_scan(path: str) -> tuple[dict, set]:
         if h:
             segs = _segments(h.group(2))
             arr = h.group(1) == "[["
+            if ctx == ("flat",):
+                flush_flat()
+                table = {}
+            if flat:
+                if segs and segs[0] == "hooks":
+                    if arr and segs == ["hooks"]:
+                        ctx = ("flat",)
+                        continue
+                    raise TomlUnsupported(f"line {n}: hooks table form {st!r} in a flat layout")
+                ctx = ("other",)
+                continue
             if segs and segs[0] == "hooks" and not arr and len(segs) >= 2 and segs[1] == "state":
                 ctx = ("other",)          # codex's per-hook approval state: defines no hooks
             elif segs and segs[0] == "hooks":
@@ -260,7 +293,7 @@ def _toml_scan(path: str) -> tuple[dict, set]:
             raise TomlUnsupported(f"line {n}: unparseable table header {st!r}")
         a = _ASSIGN.match(line)
         segs = _segments(a.group(1)) if a else []
-        in_hooks = ctx is not None and ctx[0] in ("group", "entry")
+        in_hooks = ctx is not None and ctx[0] in ("group", "entry", "flat")
         if not a:
             if in_hooks:
                 raise TomlUnsupported(f"line {n}: {st!r}")
@@ -276,6 +309,14 @@ def _toml_scan(path: str) -> tuple[dict, set]:
             raise TomlUnsupported(f"line {n}: value the scan cannot read {st!r}")
         sval = _toml_basic(v.group(1)) if v.group(1) is not None else v.group(2)
         key = segs[0]
+        if ctx[0] == "flat":
+            if key in ("event", "command", "matcher"):
+                if sval is None:
+                    raise TomlUnsupported(f"line {n}: non-string {key} {st!r}")
+                if key in table:
+                    raise TomlUnsupported(f"line {n}: {key} set twice in one [[hooks]] table")
+                table[key] = sval
+            continue
         if ctx[0] == "group" and key == "matcher":
             if sval is None:
                 raise TomlUnsupported(f"line {n}: non-string matcher {st!r}")
@@ -287,18 +328,20 @@ def _toml_scan(path: str) -> tuple[dict, set]:
             b = target_basename(sval)
             if b:
                 have.setdefault(ctx[1], {}).setdefault(b, []).append(matcher)
+    if ctx == ("flat",):
+        flush_flat()
     return have, targets
 
 
-def registered_toml(path: str) -> dict[str, dict[str, list]]:
+def registered_toml(path: str, flat: bool = False) -> dict[str, dict[str, list]]:
     """{event: {target basename: [matcher of each group that registers it]}} -- toml-hook-commands
     semantics. A structural parse (tomllib) when the host has one; otherwise `_toml_scan`, which
     refuses (TomlUnsupported) rather than reading an unrecognised matcher as absent -- absent is
     all-tools, so a misread would certify a narrow gate (#1142 reviews 2 and 3)."""
-    got = _toml_structural(path)
+    got = _toml_structural(path, flat)
     if got is not None:
         return got
-    return _toml_scan(path)[0]
+    return _toml_scan(path, flat)[0]
 
 
 def target_path(cmd: str) -> str | None:
@@ -351,6 +394,22 @@ def toml_block(member: str, event: str, group: dict, hook: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def toml_block_flat(member: str, event: str, hook: dict, group: dict | None = None) -> str:
+    """One flat `[[hooks]]` table (kimi's layout, #1149): the event is a key, not the header. A group
+    matcher that is not all-tools is carried as a `matcher` key -- dropping it would widen the gate."""
+    lines = [f"\n{MARK} ({member}) — do not hand-edit; re-run deploy/install-members.sh",
+             "[[hooks]]",
+             f"event = {_toml_str(event)}"]
+    m = (group or {}).get("matcher")
+    if isinstance(m, str) and m not in ALL_MATCHERS:
+        lines.append(f"matcher = {_toml_str(m)}")
+    lines.append(f"command = {_toml_str(hook['command'])}")
+    t = hook.get("timeout")
+    if isinstance(t, (int, float)) and not isinstance(t, bool):
+        lines.append(f"timeout = {int(t)}")
+    return "\n".join(lines) + "\n"
+
+
 def toml_ensure(text: str, ensure: list[dict]) -> tuple[str, list[str]]:
     """Add `line` under `[table]` when no `key =` exists anywhere. Insert after an existing
     header; append the table when there is none."""
@@ -383,7 +442,7 @@ def validate_toml(text: str) -> str | None:
         return f"{type(e).__name__}: {e}"
 
 
-def registered_targets(cfg: str, reader: str) -> set[str]:
+def registered_targets(cfg: str, reader: str, flat: bool = False) -> set[str]:
     """Every absolute target a config registers (the installer's rule: the first absolute path in the
     command), read structurally. Empty when the file is absent or unreadable."""
     out: set[str] = set()
@@ -398,9 +457,17 @@ def registered_targets(cfg: str, reader: str) -> set[str]:
                     raise ImportError
                 import tomllib  # type: ignore
             except ImportError:
-                return _toml_scan(cfg)[1]
+                return _toml_scan(cfg, flat)[1]
             with open(cfg, "rb") as fh:
-                groups = (tomllib.load(fh).get("hooks") or {}).values()
+                hooks = tomllib.load(fh).get("hooks") or ({} if not flat else [])
+            if flat:
+                for tbl in hooks if isinstance(hooks, list) else []:
+                    c = tbl.get("command") if isinstance(tbl, dict) else None
+                    t = target_path(c) if isinstance(c, str) else None
+                    if t:
+                        out.add(t)
+                return out
+            groups = hooks.values()
         for gs in groups:
             for g in gs if isinstance(gs, list) else []:
                 for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
@@ -481,6 +548,7 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
     if reader not in ("json-hook-commands", "toml-hook-commands"):
         return "skip", [f"unknown registration reader {reader!r} — refusing to guess"]
 
+    flat = reg.get("layout") == "flat"
     raw, data = "", {}
     if os.path.exists(cfg):
         with open(cfg, encoding="utf-8", errors="replace") as fh:
@@ -495,7 +563,7 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
             have = registered_json(cfg) if raw.strip() else {}
         else:
             try:
-                have = registered_toml(cfg)
+                have = registered_toml(cfg, flat=flat)
             except TomlUnsupported as e:
                 return "refused", [f"{cfg}: the TOML reader on this host (no tomllib) cannot verify this "
                                    f"config ({e}); nothing registered, nothing certified -- run with "
@@ -503,7 +571,7 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
     else:
         have = {}
 
-    own = registered_targets(cfg, reader) if os.path.exists(cfg) else set()
+    own = registered_targets(cfg, reader, flat) if os.path.exists(cfg) else set()
     want, narrow, pending, planned = _decide(groups, have, dry, plan, own)
     notes = [f"NARROW {n}" for n in narrow] + [f"PENDING {p}" for p in pending]
     if plan:
@@ -537,7 +605,7 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
     else:
         new = raw
         for event, g, h in want:
-            new += toml_block(member, event, g, h)
+            new += toml_block_flat(member, event, h, g) if flat else toml_block(member, event, g, h)
             changes.append(f"{event}/{target_basename(h['command'])}")
         new, ensured = toml_ensure(new, reg.get("ensure") or [])
         changes += [f"ensure {e}" for e in ensured]

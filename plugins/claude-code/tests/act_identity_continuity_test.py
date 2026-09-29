@@ -36,15 +36,20 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def load_witness(home: Path):
-    """Import the hook against a fixture projection, the way the launcher would."""
+    """Import the hook against a fixture projection, the way the launcher would, and return
+    the shared witness core it loaded — the witness logic lives there now, for every harness
+    (findings/per-harness-witness-drift-2026-09-28.md). The shared dir is named explicitly,
+    as CI's hook job does; never an ambient checkout lookup."""
     os.environ["HESTIA_HOME"] = str(home)
+    os.environ.setdefault("HESTIA_SHARED_DIR", str(HERE.parents[1] / "_shared"))
     write_projection(home, "claude-code", {"HESTIA_PLUGIN_ID": "claude-code"})
     spec = importlib.util.spec_from_file_location(
         "witness_under_test", HERE.parent / "hooks" / "witness.py"
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod
+    assert mod.core is not None, f"the shim did not load the shared core: {mod._CORE_ERROR}"
+    return mod.core
 
 
 class FakeClient:
@@ -80,7 +85,7 @@ def main() -> int:
         print("A. the warm path closes the AUTHORIZED action")
 
         # A1: an id from the gate's cache is closed directly; NO second begin.
-        client = FakeClient({"hestia_record_outcome": [{"ok": True}]})
+        client = FakeClient({"hestia_record_outcome": [{"witnessEntryHash": "h1"}]})
         verdict = w.witness_one(client, "sess-1", intent_for(w, "GATED-1"))
         check("A1 recorded", verdict == "recorded", verdict)
         check("A1 no second begin_action is issued",
@@ -99,7 +104,7 @@ def main() -> int:
         # B1: no cached id at all -> begin here, typed, then record against it.
         client = FakeClient({
             "hestia_begin_action": [{"actionId": "COLD-1"}],
-            "hestia_record_outcome": [{"ok": True}],
+            "hestia_record_outcome": [{"witnessEntryHash": "h2"}],
         })
         verdict = w.witness_one(client, "sess-1", intent_for(w, None))
         check("B1 recorded", verdict == "recorded", verdict)
@@ -116,7 +121,7 @@ def main() -> int:
         client = FakeClient({
             "hestia_record_outcome": [
                 {"_hestia_error": {"code": "hestia.action_not_found", "message": "gone"}},
-                {"ok": True},
+                {"witnessEntryHash": "h3"},
             ],
             "hestia_begin_action": [{"actionId": "COLD-2"}],
         })

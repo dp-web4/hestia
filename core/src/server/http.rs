@@ -1295,6 +1295,8 @@ pub async fn serve_with_callback(
         .route("/api/agents/:id/delegations/:deleg/revoke", post(agent_delegation_revoke))
         .route("/api/agents/:id/retire", post(agent_retire))
         .route("/api/agents/:id/reinstate", post(agent_reinstate))
+        .route("/api/agents/:id/bypass", post(agent_gate_bypass))
+        .route("/api/agents/:id/restore", post(agent_gate_restore))
         .route("/api/chain", get(chain_query))
         // The admin ledger — governance history with status facets. Operator-gated for the same
         // reason /api/chain is: it is the society's whole record of who ruled on what.
@@ -1388,7 +1390,9 @@ pub async fn serve_with_callback(
             let now = super::gate_escalation::now_secs();
             let lapsed = {
                 let mut s = lapse_state.lock().await;
-                let n = super::handler::record_newly_lapsed(&mut s, now);
+                // One named pass, so what the worker does is testable: record lapses, then
+                // rewrite any lane projection that did not land (PRD #845 R2).
+                let n = super::handler::disposition_worker_pass(&mut s, now).0;
                 // Config drift on the same cadence: a file that matched at startup and was
                 // edited at noon is a miswire from noon, not from the next restart.
                 // Not `gate_capabilities.keys()` alone: that is who CONNECTED, which is a
@@ -5486,9 +5490,18 @@ async fn orchestrator_connect(
 /// `GET /api/agents` → the three inventories: what is installed, what hestia has an
 /// adapter for, and what is actually governed. Read-only; the write half is
 /// `/api/orchestrators/:id/connect` (govern) and `/api/agents/:id/ungovern`.
-async fn agents_inventory() -> impl IntoResponse {
+async fn agents_inventory(State(state): State<SharedState>) -> impl IntoResponse {
     match crate::server::agents::inventory() {
-        Ok(v) => (StatusCode::OK, Json(v)),
+        // `bypassed`: the operator's active gate bypasses, beside -- never merged into -- the
+        // inventory's own verdicts. The inventory is not told; whether it reads a bypassed member
+        // as miswired is its finding (dp, 2026-09-28: the bypass is the test of that detection).
+        Ok(mut v) => {
+            let home = state.lock().await.home.clone();
+            if let Some(o) = v.as_object_mut() {
+                o.insert("bypassed".into(), bypassed_json(&home));
+            }
+            (StatusCode::OK, Json(v))
+        }
         // A failed look is reported as a failed look. Returning an empty inventory here
         // would render as "nothing ungoverned on this machine", which is the precise
         // inversion this surface exists to prevent.
@@ -5500,6 +5513,135 @@ async fn agents_inventory() -> impl IntoResponse {
             })),
         ),
     }
+}
+
+fn bypassed_json(home: &std::path::Path) -> serde_json::Value {
+    serde_json::Value::Object(
+        crate::server::gate_bypass::all_active(home)
+            .into_iter()
+            .map(|r| {
+                let m = r.member.clone();
+                (m, serde_json::json!({
+                    "bypassed_at": r.bypassed_at, "reason": r.reason, "stub": r.stub,
+                    "configs": r.swaps.iter().map(|w| w.config.clone()).collect::<Vec<_>>(),
+                }))
+            })
+            .collect(),
+    )
+}
+
+/// `POST /api/agents/:id/bypass` -- let a member its own gate has locked out ACT again.
+///
+/// surface: agent_gate_bypass   act: remove enforcement from one member, reversibly
+/// S: high/reversible [construct: one path token swapped per registration file, the original
+///    recorded in $HESTIA_HOME/bypass/<member>.json before the edit; restore swaps it back]
+/// R: pass [construct: behind `operator_gate` with the rest of /api/*]
+/// W: pass [construct: operator_gate proves an Ed25519 challenge-signed session]
+/// O: pass [construct: targets come from the inventory's discovered gate rows, not the caller]
+/// A: pass [construct: `gate_bypassed` on the chain, or the edit is undone]
+/// V: present [construct: refuses an UNKNOWN inventory, a member with no hestia gate, a second
+///    bypass, and a config that does not spell its gate as a token]
+/// verdict: PASS
+///
+/// dp, 2026-09-28: "useful for instances when an update locks out a member that we need to be
+/// active to fix the issues". The member acts UNGOVERNED until restored. Unlike `ungovern` (which
+/// stays unsurfaced), it requires a reason and records-or-undoes.
+async fn agent_gate_bypass(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let reason = match ratify_reason(&body) {
+        Ok(r) => r,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": "reason is required to bypass a gate: it records why this member may act \
+                          ungoverned, and the chain entry is what makes that reviewable",
+            })));
+        }
+    };
+    // An ACTIVE bypass answers first. Measured live on the isolated daemon: asked again while
+    // bypassed, the inventory (correctly) lists no hestia gate for the member any more, so the
+    // target lookup refused with "no registered hestia gate to bypass" -- true, and the wrong
+    // answer. The truth is "already bypassed", and 409 like every other already-decided act.
+    let home = state.lock().await.home.clone();
+    if let Some(r) = crate::server::gate_bypass::active(&home, &id) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!("member '{id}' is already bypassed (since {}, reason: {}); restore it first",
+                             r.bypassed_at, r.reason),
+        })));
+    }
+    let inv = match crate::server::agents::inventory() {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("the inventory could not run ({e}); refusing to edit a registration it cannot see"),
+        }))),
+    };
+    let targets = match crate::server::gate_bypass::gate_targets(&inv, &id) {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))),
+    };
+    let s = state.lock().await;
+    let at = chrono::Utc::now().to_rfc3339();
+    let rec = match crate::server::gate_bypass::bypass(&s.home, &id, &reason, &targets, &at) {
+        Ok(r) => r,
+        Err(e) => {
+            let code = if e.to_string().contains("already bypassed") { StatusCode::CONFLICT } else { StatusCode::BAD_REQUEST };
+            return (code, Json(serde_json::json!({"error": e.to_string()})));
+        }
+    };
+    if let Err(e) = s.append_chain("gate_bypassed", serde_json::json!({
+        "member": rec.member, "reason": rec.reason, "stub": rec.stub, "swaps": rec.swaps,
+    })) {
+        let undone = crate::server::gate_bypass::undo_bypass(&s.home, &rec);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": match undone {
+                Ok(()) => format!("the bypass was not recorded ({e}); the gate is restored"),
+                Err(u) => format!("the bypass was not recorded ({e}) AND could not be undone ({u}): \
+                                   the member is bypassed without a record -- restore it"),
+            },
+        })));
+    }
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true, "member": rec.member, "bypassed_at": rec.bypassed_at, "swaps": rec.swaps,
+        "warning": format!("{} now acts UNGOVERNED: no gate, no scope, no safety preset, no \
+                            escalations, until restored. A running harness may keep its old hook \
+                            until it restarts.", rec.member),
+    })))
+}
+
+/// `POST /api/agents/:id/restore` -- put a bypassed member's gate back exactly.
+///
+/// The refusing direction, so a reason is optional (`reason-to-permit`). Refuses, naming the file,
+/// when the registration no longer carries the stub; `gate_restored` on the chain, or undone.
+async fn agent_gate_restore(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> impl IntoResponse {
+    let reason = body
+        .and_then(|Json(b)| b.get("reason").and_then(|v| v.as_str()).map(|r| r.trim().to_string()))
+        .filter(|r| !r.is_empty());
+    let s = state.lock().await;
+    let rec = match crate::server::gate_bypass::restore(&s.home, &id) {
+        Ok(r) => r,
+        Err(e) => {
+            let code = if e.to_string().contains("is not bypassed") { StatusCode::NOT_FOUND } else { StatusCode::CONFLICT };
+            return (code, Json(serde_json::json!({"error": e.to_string()})));
+        }
+    };
+    if let Err(e) = s.append_chain("gate_restored", serde_json::json!({
+        "member": rec.member, "bypassed_at": rec.bypassed_at, "swaps": rec.swaps, "reason": reason,
+    })) {
+        let undone = crate::server::gate_bypass::undo_restore(&s.home, &rec);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": match undone {
+                Ok(()) => format!("the restore was not recorded ({e}); the member is still bypassed"),
+                Err(u) => format!("the restore was not recorded ({e}) AND could not be undone ({u})"),
+            },
+        })));
+    }
+    (StatusCode::OK, Json(serde_json::json!({"ok": true, "member": rec.member, "swaps": rec.swaps})))
 }
 
 /// REGISTER ONLY WHAT IS HERE (dp, 2026-09-27, the first time the button was on screen). The
@@ -7251,6 +7393,16 @@ async fn operator_gate_escalation(
                 &esc.plugin_id,
                 &format!("hestia://escalation/{}#decided", esc.id),
                 &entry.hash,
+            );
+            // The operator just ruled from the dashboard. The asker is a live session that
+            // reads no mailbox until it restarts, so put the ruling where it can see it now
+            // (PRD_DISPOSITION_DELIVERY R2).
+            let _ = super::handler::ensure_disposition_lane(
+                &s,
+                &esc,
+                &format!("hestia://escalation/{}#decided", esc.id),
+                &entry.hash,
+                now,
             );
             // THE DECIDER SEES THE BAR — on this surface too.
             //
