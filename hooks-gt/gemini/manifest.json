@@ -28,7 +28,7 @@
   ],
   "engine": {
     "unit": "_shared",
-    "gt_version": "d5838606c5c9aec17177a69e7313c1dd256bd9dded7aadbd1c6dc633b67db51e",
+    "gt_version": "dba8ccfbcb3574a0c726a5f54c38eeda6b8cbe070a0ff63e840f42caf0a72261",
     "files": [
       {
         "path": "hestia_gate_core.py",
@@ -36,7 +36,7 @@
       },
       {
         "path": "hestia_gate_mechanism.py",
-        "sha256": "f75f67f347f56ccc56004386335fc12757f36943508ce61d3a3825bb5847af1f"
+        "sha256": "d10860267d03feb997f5ba48b84c9f97fab6f9436495fdb91f64bcbd09a7c80f"
       },
       {
         "path": "hestia_governance_closure.py",
@@ -52,8 +52,8 @@
     {
       "unit": "claude-code",
       "path": "hooks/pre_tool_use.py",
-      "sha256": "3f34b62a8a7e3346daf4c221fd0fc6ee6924bdfc51413e6ea911c15088ace836"
+      "sha256": "f9f8bf6c0208167a44b4d6e5a1ecc46cc6f346ee798abc8112c7807605fab713"
     }
   ],
-  "gt_version": "df93eb18bd8ea5014eb47d43e31512a67903205010cc3c7fab79da15d4e8bf26"
+  "gt_version": "cae0e372a8762a3139bbb4104d4e44d8f82fbc44f472140807e0b655983ad8ad"
 }
