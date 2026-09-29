@@ -436,6 +436,73 @@ def test_a_narrow_toml_matcher_is_read_from_its_group():
         assert "REGISTERED codex: PostToolUse/witness.py" in r.stdout, r.stdout
 
 
+def test_an_inline_comment_on_a_narrow_toml_matcher_is_still_narrow():
+    """#1142 re-review P1: `matcher = "shell" # deliberately narrow` was not recognised by the line scan,
+    the matcher stayed None (all tools), and the second run certified 'every templated hook is registered'."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        cfg = tmp / ".codex" / "config.toml"
+        cfg.parent.mkdir()
+        cfg.write_text(CODEX_TOML.replace('[[hooks.PreToolUse]]\nmatcher = ".*"',
+                                          '[[hooks.PreToolUse]]\nmatcher = "shell" # deliberately narrow'))
+        _install(tmp, "codex", "witness.py")
+        for run in (1, 2):
+            r = _run(tmp, plugins, "--member", "codex")
+            assert r.returncode == 8, (run, r.returncode, r.stdout)
+            assert "NARROW codex: PreToolUse/pre_tool_use.py is registered only for matcher 'shell'" in r.stdout, r.stdout
+            assert "every templated hook is registered" not in r.stdout, (run, r.stdout)
+        assert 'matcher = "shell" # deliberately narrow' in cfg.read_text(), "the narrow gate was rewritten"
+
+
+def test_the_fallback_line_scan_cannot_widen_a_matcher():
+    """The line scan (hosts without tomllib) reads inline comments and escapes, and a matcher line it
+    cannot decode is UNPARSED -- which covers nothing, never all tools."""
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "config.toml"
+        body = ('[[hooks.PreToolUse]]\n{m}\n\n[[hooks.PreToolUse.hooks]]\ntype = "command"\n'
+                'command = "python3 /x/pre_tool_use.py" # the gate\n')
+        old = RM.FORCE_LINE_SCAN
+        RM.FORCE_LINE_SCAN = True
+        try:
+            cases = {
+                'matcher = "shell" # narrow': "shell",
+                "matcher = 'Read'   # literal string": "Read",
+                'matcher = "sh\\"ell"': 'sh"ell',
+                'matcher = ".*"': ".*",
+            }
+            for line, want in cases.items():
+                p.write_text(body.format(m=line))
+                got = RM.registered_toml(str(p))
+                assert got == {"PreToolUse": {"pre_tool_use.py": [want]}}, (line, got)
+            p.write_text(body.format(m="matcher = shell"))               # not a TOML string: undecodable
+            got = RM.registered_toml(str(p))["PreToolUse"]["pre_tool_use.py"]
+            assert got == [RM.UNPARSED], got
+            assert not RM.covers(RM.UNPARSED, "*") and not RM.covers(RM.UNPARSED, "Read")
+        finally:
+            RM.FORCE_LINE_SCAN = old
+        # the structural reader agrees on every decodable case
+        for line, want in cases.items():
+            p.write_text(body.format(m=line))
+            assert RM.registered_toml(str(p)) == {"PreToolUse": {"pre_tool_use.py": [want]}}, (line, "structural")
+
+
+def test_mixed_installed_and_missing_targets_exit_pending():
+    """#1142 re-review P2: with only witness.py installed, the registrar registered it, printed PENDING
+    for the other two, and exited 0. The additions are reported AND the run exits 9."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        _install(tmp, "claude-code", "witness.py")
+        r = _run(tmp, plugins, "--member", "claude-code")
+        assert r.returncode == 9, (r.returncode, r.stdout)
+        assert "REGISTERED claude-code: PostToolUse/witness.py" in r.stdout, r.stdout
+        assert r.stdout.count("PENDING claude-code") == 2, r.stdout
+        assert "every templated hook is registered" not in r.stdout
+        data = json.loads((tmp / ".claude" / "settings.json").read_text())
+        assert list(data["hooks"]) == ["PostToolUse"], data
+
+
 def test_covers():
     assert RM.covers("*", "*") and RM.covers(None, ".*") and RM.covers(".*", "*") and RM.covers("", None)
     assert not RM.covers("Read", "*") and not RM.covers("shell", ".*")
@@ -523,6 +590,9 @@ TESTS = [
     test_plan_names_every_hook_to_add_with_its_target,
     test_a_read_only_gate_is_reported_narrow_not_registered,
     test_a_narrow_toml_matcher_is_read_from_its_group,
+    test_an_inline_comment_on_a_narrow_toml_matcher_is_still_narrow,
+    test_the_fallback_line_scan_cannot_widen_a_matcher,
+    test_mixed_installed_and_missing_targets_exit_pending,
     test_covers,
     test_install_members_end_to_end_in_an_isolated_home,
     test_install_members_reports_a_narrow_gate_and_leaves_it,
