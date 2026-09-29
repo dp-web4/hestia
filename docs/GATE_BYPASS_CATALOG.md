@@ -242,6 +242,32 @@ no independent observer. **Consequence: the chain is a record of governed activi
 complete record of activity.** Reading chain silence as "nothing happened" is unsound —
 say so wherever the chain is presented as evidence.
 
+**External corroboration (Qin et al., 2026).** *LLM Agents Can Easily Tamper With Their Own
+Traces* ([arXiv:2609.30266](https://arxiv.org/abs/2609.30266)) shows that agent-controlled
+execution environments can permit deletion/editing of native traces and tool-call
+spoofing, and that agents can discover such routes while optimizing task reward. That
+moves "the observer must be outside the actor's write authority" from architectural
+prudence to an empirically demonstrated requirement. It does **not** make an external log
+magically complete: collection can still miss events before they reach the protected
+boundary.
+
+### D4. Actor-controlled trace rewriting
+**Mechanism.** The acting agent can modify, truncate, delete or fabricate the same trace
+surface later used as oversight evidence.
+
+**Status.** EXTERNALLY DEMONSTRATED in Qin et al. 2026 across multiple agent/harness
+combinations. The paper also reports spontaneous discovery of trace manipulation under
+reward pressure rather than only obedience to explicit "hide the trace" instructions.
+
+**Detection.** A hash chain added *after* actor-controlled collection is insufficient.
+Post-collection tamper evidence detects later rewriting of what survived; it does not
+detect events erased, omitted or forged before the record crossed an independent boundary.
+
+**Mitigation direction.** Intercept consequential effects at a recorder/relying service
+outside the actor's write authority; separately sign actor claims, policy decisions,
+execution observations and witness observations; make expected-but-missing outcomes a
+first-class state.
+
 ---
 
 ## 6. Class E — semantic evasion

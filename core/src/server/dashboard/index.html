@@ -5068,10 +5068,17 @@
         const stale = g.discovered === false;
         const ratified = g.status === 'verified' ? g.sha256 : g.expected;
         const cls = g.status === 'verified' ? 'ok' : (g.status === 'modified' ? 'bad' : 'none');
-        const vsDeploy = stale ? '<span class="cfg-verdict none" title="an expectation for a path no gate is wired at any more">no longer a gate here</span>'
+        // #1156: a ratified gate whose member still declares one but has none registered is a
+        // bypass or a miswire, not a stale row. Forget is shown ONLY where the daemon says
+        // forgettable -- the pane renders the daemon's judgement, never its own.
+        const notReg = g.not_registered === true;
+        const vsDeploy = notReg ? `<span class="cfg-verdict bad gates-not-registered" title="${gatesEsc(g.forget_blocked_reason || '')}"><strong>NOT REGISTERED — possible bypass</strong></span>`
+          : stale ? '<span class="cfg-verdict none" title="an expectation for a path no gate is wired at any more">no longer a gate here</span>'
           : (DEPLOY[g.deployment] || '');
         const act = !perGate ? ''
-          : stale ? `<button type="button" class="pol-btn gates-forget-one" data-gate-path="${gatesEsc(path)}" title="remove this stale expectation">forget</button>`
+          : stale ? (g.forgettable === true
+              ? `<button type="button" class="pol-btn gates-forget-one" data-gate-path="${gatesEsc(path)}" title="remove this stale expectation">forget</button>`
+              : `<span class="vault-meta">${gatesEsc(g.forget_blocked_reason || 'not forgettable')}</span>`)
           : `<button type="button" class="pol-btn cfg-save gates-ratify-one" data-gate-path="${gatesEsc(path)}"${g.deployment === 'unreadable' ? ' disabled' : ''} title="ratify only this gate's installed bytes">ratify</button>`;
         return `
           <div class="vault-row" data-gate-status="${gatesEsc(g.status)}" data-gate-deployment="${gatesEsc(stale ? 'stale' : (g.deployment || ''))}">

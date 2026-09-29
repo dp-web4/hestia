@@ -305,6 +305,11 @@ export type GateVerdict = (
   discovered?: boolean;
   /** Current bytes vs the deploy record. */
   deployment?: GateDeployment;
+  /** The daemon's judgement (#1156): may this expectation be forgotten, and if not, why. */
+  forgettable?: boolean;
+  forget_blocked_reason?: string | null;
+  /** A ratified gate whose member still declares a gate but has none registered: possible bypass. */
+  not_registered?: boolean;
 };
 
 export type GateDeployment = "match" | "differs" | "not-deployed" | "no-deploy-record" | "unreadable";

@@ -1,0 +1,58 @@
+{
+  "unit": "codex",
+  "member": "codex",
+  "digest_rule": "sha256 over the file bytes with the 64-hex value on its `hestia-gt-sha256:` header line replaced by 64 zeros; files without a header (JSON) are plain sha256",
+  "registration": "hooks/hooks.json",
+  "registration_note": null,
+  "files": [
+    {
+      "path": "hooks/hooks.json",
+      "sha256": "a3ea58218d823ebdb203879a26edfa4134bc08ceab25aa587ae1140faf95a240",
+      "source": "plugins/codex/hooks/hooks.json"
+    },
+    {
+      "path": "hooks/hydrate.sh",
+      "sha256": "9a38550200d5e42bbcbb5d3b5100944186c06a601166d88147ae420a495c6819",
+      "source": "plugins/codex/hooks/hydrate.sh"
+    },
+    {
+      "path": "hooks/observe.sh",
+      "sha256": "ced8c660198bd6d4579e11f98f668eca4228a7b1eb2574ad00481b93c97d4fb5",
+      "source": "plugins/codex/hooks/observe.sh"
+    },
+    {
+      "path": "hooks/pre_tool_use.py",
+      "sha256": "6977c193525f3c6d41f7f2e49ed571cb6fe1759a87ae98d4f60c3caf5809b984",
+      "source": "plugins/codex/hooks/pre_tool_use.py"
+    },
+    {
+      "path": "hooks/witness.py",
+      "sha256": "084c8035b245e4d75025c77e7c3c45d2379aea6ba1dae3d37a7e50857cce061f",
+      "source": "plugins/codex/hooks/witness.py"
+    }
+  ],
+  "engine": {
+    "unit": "_shared",
+    "gt_version": "d5838606c5c9aec17177a69e7313c1dd256bd9dded7aadbd1c6dc633b67db51e",
+    "files": [
+      {
+        "path": "hestia_gate_core.py",
+        "sha256": "4d0807d35482e36b4e107e572f44a92a4864fc9357348baf6313ac734d105301"
+      },
+      {
+        "path": "hestia_gate_mechanism.py",
+        "sha256": "f75f67f347f56ccc56004386335fc12757f36943508ce61d3a3825bb5847af1f"
+      },
+      {
+        "path": "hestia_governance_closure.py",
+        "sha256": "9c9a00843a8956a3220917eef39dc3dd85f25412ba5d2fdabe04fe4fdce32d5a"
+      },
+      {
+        "path": "hestia_shell_classifier.py",
+        "sha256": "b3f508899069c0b894c792838d9d43925121ec4605cc7e30df22c7d7b425bce2"
+      }
+    ]
+  },
+  "requires": [],
+  "gt_version": "81e909d7518c5027068b1ea7c73d956d4995f76e01320eb4f26c40fadc36164e"
+}

@@ -1,0 +1,48 @@
+{
+  "unit": "kimi",
+  "member": "kimi-code",
+  "digest_rule": "sha256 over the file bytes with the 64-hex value on its `hestia-gt-sha256:` header line replaced by 64 zeros; files without a header (JSON) are plain sha256",
+  "registration": null,
+  "registration_note": "this member ships no registration template yet; its registration edge is NOT ground truth until it does",
+  "files": [
+    {
+      "path": "hooks/hydrate.sh",
+      "sha256": "4a475aa2baa0e00f4fd4091dbeff269ae93d38f587c45a13d29d44cc1296b0d0",
+      "source": "plugins/kimi/hooks/hydrate.sh"
+    },
+    {
+      "path": "hooks/observe.sh",
+      "sha256": "5820c3ce4f02ed0aba51bf89254d942e6933189e12b790ee638b6344adb578c5",
+      "source": "plugins/kimi/hooks/observe.sh"
+    },
+    {
+      "path": "hooks/pre_tool_use.py",
+      "sha256": "4a29b23902e43ed53a7fc3b53fad45ac69cf085d0bcfd4d5f2cd720a2a0dbb4d",
+      "source": "plugins/kimi/hooks/pre_tool_use.py"
+    }
+  ],
+  "engine": {
+    "unit": "_shared",
+    "gt_version": "d5838606c5c9aec17177a69e7313c1dd256bd9dded7aadbd1c6dc633b67db51e",
+    "files": [
+      {
+        "path": "hestia_gate_core.py",
+        "sha256": "4d0807d35482e36b4e107e572f44a92a4864fc9357348baf6313ac734d105301"
+      },
+      {
+        "path": "hestia_gate_mechanism.py",
+        "sha256": "f75f67f347f56ccc56004386335fc12757f36943508ce61d3a3825bb5847af1f"
+      },
+      {
+        "path": "hestia_governance_closure.py",
+        "sha256": "9c9a00843a8956a3220917eef39dc3dd85f25412ba5d2fdabe04fe4fdce32d5a"
+      },
+      {
+        "path": "hestia_shell_classifier.py",
+        "sha256": "b3f508899069c0b894c792838d9d43925121ec4605cc7e30df22c7d7b425bce2"
+      }
+    ]
+  },
+  "requires": [],
+  "gt_version": "1036bb2e2285abf0c91c320dca195488b0128dd074da2430e2dab55ce092c80c"
+}
