@@ -1,18 +1,22 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { AgentInventory, AgentRow } from "../lib/types";
 
 const agentsInventory = vi.fn();
 const getDashboard = vi.fn();
 const operatorStatus = vi.fn();
+const retireAgent = vi.fn();
+const reinstateAgent = vi.fn();
 
 vi.mock("../lib/tauri", () => ({
   agentsInventory: () => agentsInventory(),
   getDashboard: () => getDashboard(),
   operatorStatus: () => operatorStatus(),
+  retireAgent: (...a: unknown[]) => retireAgent(...a),
+  reinstateAgent: (...a: unknown[]) => reinstateAgent(...a),
 }));
 
-const { Agents } = await import("./Agents");
+const { Agents, unaccountedMembers } = await import("./Agents");
 
 const claude: AgentRow = {
   agent: "claude", plugin: "claude-code", plugin_available: true, installed: true,
@@ -103,5 +107,101 @@ describe("Agents", () => {
     getDashboard.mockResolvedValue({ retired: [] });
     render(<Agents />);
     expect(await screen.findByText(/Adapters available for agents not installed here: gemini/)).toBeTruthy();
+  });
+
+  describe("Sprint 3b — retire / reinstate a member nothing here accounts for", () => {
+    const trust = (plugin_id: string, action_count: number, aliased_to?: string) =>
+      ({ plugin_id, action_count, aliased_to }) as never;
+
+    it("finds the registry's ids that no installed agent carries, and only those", () => {
+      const inv = inventory([claude, being]);
+      const out = unaccountedMembers(inv, {
+        members: ["claude-code", "hub-being", "caude-code", "hestia-cli", "agent-inventory", "early-grant"],
+        trust: [trust("claude-code", 9000), trust("caude-code", 2), trust("Claude-code", 3, "claude-code")],
+        retired: ["early-grant"],
+      });
+      expect(out).toEqual([
+        { id: "caude-code", actions: 2, retired: false },
+        { id: "early-grant", actions: 0, retired: true },
+      ]);
+    });
+
+    it("offers retire on a phantom id, and on no installed agent's row", async () => {
+      operatorStatus.mockResolvedValue(signedIn);
+      agentsInventory.mockResolvedValue(inventory([claude, codex]));
+      getDashboard.mockResolvedValue({ retired: [], members: ["claude-code", "codex", "caude-code"], trust: [] });
+      render(<Agents />);
+      const row = await screen.findByText("caude-code");
+      expect(row).toBeTruthy();
+      expect(screen.getAllByRole("button", { name: "Retire" })).toHaveLength(1);
+      expect(document.querySelector('[data-member="claude-code"]')).toBeNull();
+      expect(screen.queryByRole("button", { name: /connect/i })).toBeNull();
+    });
+
+    it("the live-member refusal is a question with its evidence, confirmed only by the operator", async () => {
+      operatorStatus.mockResolvedValue(signedIn);
+      agentsInventory.mockResolvedValue(inventory([claude]));
+      getDashboard.mockResolvedValue({ retired: [], members: ["caude-code"], trust: [] });
+      retireAgent.mockResolvedValueOnce({
+        outcome: "needs_confirmation",
+        detail: "this id has taken 12 act(s) in the last 24h, so it is a LIVE member",
+        acts_recently: 12, unmeasurable: false, window_hours: 24,
+      });
+      retireAgent.mockResolvedValueOnce({ outcome: "retired", result: { ok: true } });
+      render(<Agents />);
+      await screen.findByText("caude-code");
+      const [reason, ref] = screen.getAllByRole("textbox");
+      fireEvent.change(reason, { target: { value: "typo of claude-code" } });
+      fireEvent.change(ref, { target: { value: "dp 2026-09-28" } });
+      fireEvent.click(screen.getByRole("button", { name: "Retire" }));
+      expect(await screen.findByText(/12 act\(s\) in the last 24h/)).toBeTruthy();
+      expect(retireAgent).toHaveBeenLastCalledWith("caude-code", "typo of claude-code", "dp 2026-09-28", false);
+      const btn = screen.getByRole("button", { name: "Retire" }) as HTMLButtonElement;
+      expect(btn.disabled).toBe(true);
+      const box = screen.getByRole("checkbox") as HTMLInputElement;
+      expect(box.checked).toBe(false);
+      fireEvent.click(box);
+      fireEvent.click(btn);
+      await waitFor(() =>
+        expect(retireAgent).toHaveBeenLastCalledWith("caude-code", "typo of claude-code", "dp 2026-09-28", true),
+      );
+      expect(await screen.findByText(/Retired on this seat/)).toBeTruthy();
+    });
+
+    it("an id another view already retired is reported, not overwritten", async () => {
+      operatorStatus.mockResolvedValue(signedIn);
+      agentsInventory.mockResolvedValue(inventory([claude]));
+      getDashboard.mockResolvedValue({ retired: [], members: ["caude-code"], trust: [] });
+      retireAgent.mockResolvedValue({
+        outcome: "already_retired",
+        detail: "'caude-code' was already retired on this seat — another view got there first.",
+      });
+      render(<Agents />);
+      await screen.findByText("caude-code");
+      fireEvent.click(screen.getByRole("button", { name: "Retire" }));
+      expect(await screen.findByText(/another view got there first/)).toBeTruthy();
+    });
+
+    it("reinstate says which authority it did NOT give back", async () => {
+      operatorStatus.mockResolvedValue(signedIn);
+      agentsInventory.mockResolvedValue(inventory([claude]));
+      getDashboard.mockResolvedValue({ retired: ["caude-code"], members: ["caude-code"], trust: [] });
+      reinstateAgent.mockResolvedValue({
+        outcome: "reinstated", result: { ok: true, grants_not_restored: ["/w/repos"] },
+      });
+      render(<Agents />);
+      await screen.findByText("caude-code");
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "it was real after all" } });
+      fireEvent.click(screen.getByRole("button", { name: "Reinstate" }));
+      expect(await screen.findByText(/NOT restored .*\/w\/repos/)).toBeTruthy();
+      expect(reinstateAgent).toHaveBeenCalledWith("caude-code", "it was real after all");
+    });
+
+    it("signed out: no lifecycle control exists", async () => {
+      operatorStatus.mockResolvedValue({ signed_in: false, lct_id: null });
+      render(<Agents />);
+      await screen.findByText(/not the same as nothing being ungoverned/);
+      expect(screen.queryByRole("button", { name: /Retire|Reinstate/ })).toBeNull();
+    });
   });
 });

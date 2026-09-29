@@ -178,6 +178,8 @@ pub fn run() {
             commands::gates::gates_ratify,
             commands::gates::gates_forget,
             commands::agents::agents_inventory,
+            commands::agents::retire_agent,
+            commands::agents::reinstate_agent,
             commands::scope::rule_scope_request,
             commands::dashboard::get_failures,
             commands::dashboard::get_daemon_status,

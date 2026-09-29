@@ -17,6 +17,8 @@ export interface ActivityStats {
 
 export interface TrustView {
   plugin_id: string;
+  /** Set when this id was merged into another: its acts count toward that one. */
+  aliased_to?: string | null;
   entity_id: string;
   level: string;
   // Canonical unmeasured-handling: a dimension with zero observations is null
@@ -141,6 +143,8 @@ export interface DashboardSnapshot {
    * make "show retired" impossible and would hide a retired id that is still acting.
    */
   retired?: string[];
+  /** Every member id this seat has recorded (the registry), acted or not (#1141). */
+  members?: string[];
   generated_at: string;
 }
 
@@ -391,3 +395,15 @@ export interface AgentInventory {
   gaps?: Record<string, string[]>;
   detail?: AgentRow[];
 }
+
+/** What a retire/reinstate came back as. Conflicts are outcomes, not errors (PRD §1a). */
+export type MemberActOutcome =
+  | { outcome: "retired" | "reinstated"; result: Record<string, unknown> }
+  | { outcome: "already_retired" | "already_reinstated"; detail: string }
+  | {
+      outcome: "needs_confirmation";
+      detail: string;
+      acts_recently: number | null;
+      unmeasurable: boolean;
+      window_hours: number | null;
+    };
