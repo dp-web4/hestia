@@ -6,24 +6,29 @@
   "registration_note": "this member ships no registration template yet; its registration edge is NOT ground truth until it does",
   "files": [
     {
+      "path": "hooks/disposition_deliver.py",
+      "sha256": "c54e5ebceea5c92a0bff63276dd79e462f6bc7156fe2d98e5189b736ee7aadd5",
+      "source": "plugins/claude-code/hooks/disposition_deliver.py"
+    },
+    {
       "path": "hooks/law_inject.py",
       "sha256": "5242a2e5a18475e6c05c2d16b7c1d2da53df1947168df4ec39b093d2495d45a9",
       "source": "plugins/claude-code/hooks/law_inject.py"
     },
     {
       "path": "hooks/pre_tool_use.py",
-      "sha256": "3f34b62a8a7e3346daf4c221fd0fc6ee6924bdfc51413e6ea911c15088ace836",
+      "sha256": "c162fa9845ebea07c50aeed3e113bb9612258f9ef8ea5922dd623b8870e48f74",
       "source": "plugins/claude-code/hooks/pre_tool_use.py"
     },
     {
       "path": "hooks/witness.py",
-      "sha256": "69102379cd193cf59103ae96694fb57f6de01ababac9b24e1853f609343cd393",
+      "sha256": "036d3c9c87fcf79932ed9e8f52b9d7945ddf1bbc5750220eebeb7b55a1cba49b",
       "source": "plugins/claude-code/hooks/witness.py"
     }
   ],
   "engine": {
     "unit": "_shared",
-    "gt_version": "d5838606c5c9aec17177a69e7313c1dd256bd9dded7aadbd1c6dc633b67db51e",
+    "gt_version": "3b3e685ba1f21092e4ddfbd48a6aeb11c92ada32409d9c66fdd8de664e7c649f",
     "files": [
       {
         "path": "hestia_gate_core.py",
@@ -31,7 +36,7 @@
       },
       {
         "path": "hestia_gate_mechanism.py",
-        "sha256": "f75f67f347f56ccc56004386335fc12757f36943508ce61d3a3825bb5847af1f"
+        "sha256": "5bb44382c00720fb06439695ad5a0b47fe635601f9cd19e576d203b94b2bed65"
       },
       {
         "path": "hestia_governance_closure.py",
@@ -40,9 +45,13 @@
       {
         "path": "hestia_shell_classifier.py",
         "sha256": "b3f508899069c0b894c792838d9d43925121ec4605cc7e30df22c7d7b425bce2"
+      },
+      {
+        "path": "hestia_witness_core.py",
+        "sha256": "750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777"
       }
     ]
   },
   "requires": [],
-  "gt_version": "4965d13587d3563323919bd4df23a523f8a6a07e25d7207841f085b972af8913"
+  "gt_version": "8080f2536c67539c190e11691529eeb9377c4afe43c622c11b57bc103cb62419"
 }

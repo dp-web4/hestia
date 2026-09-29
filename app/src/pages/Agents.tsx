@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
-import { agentsInventory, getDashboard, operatorStatus, reinstateAgent, retireAgent } from "../lib/tauri";
+import {
+  agentGateBypass,
+  agentGateRestore,
+  agentsInventory,
+  getDashboard,
+  operatorStatus,
+  reinstateAgent,
+  retireAgent,
+} from "../lib/tauri";
 import type {
   AgentInventory,
   AgentRow,
@@ -34,7 +42,16 @@ import type {
  *  - A retired id that is still governed or wired is called out: retiring revokes standing
  *    grants and hides an id by default, and an id that keeps acting after that is the case
  *    an operator most needs to see.
+ *
+ * One write (dp, 2026-09-28): BYPASS a member's gate, and RESTORE it -- a fail-open recovery
+ * switch for a member its own gate has locked out. The row keeps the inventory's verdict: this
+ * page never labels a bypassed member itself, because whether the inventory flags it miswired is
+ * exactly what dp asked the bypass to test.
  */
+
+const memberOf = (r: AgentRow) => r.member || r.plugin;
+const hasHestiaGate = (r: AgentRow) =>
+  (r.hook_targets ?? []).some((t) => t.is_gate === true && t.owned_by_hestia === true);
 
 function governanceLabel(row: AgentRow): string {
   if (row.unprovisioned) return "unprovisioned";
@@ -167,6 +184,9 @@ export function Agents() {
   const [snap, setSnap] = useState<DashboardSnapshot | null>(null);
   const [status, setStatus] = useState<OperatorStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const [reason, setReason] = useState("");
+  const [actError, setActError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -200,6 +220,33 @@ export function Agents() {
   }, [refresh]);
 
   const rows = (inv?.detail ?? []).filter((r) => r.installed);
+  const bypassed = inv?.bypassed ?? {};
+
+  const doBypass = async (member: string) => {
+    if (!reason.trim()) {
+      setActError("bypassing a gate requires a reason: it records why this member may act ungoverned");
+      return;
+    }
+    try {
+      await agentGateBypass(member, reason.trim());
+      setConfirming(null);
+      setReason("");
+      setActError(null);
+      await refresh();
+    } catch (e) {
+      setActError(`bypass refused: ${String(e)}`);
+    }
+  };
+  const doRestore = async (member: string) => {
+    try {
+      await agentGateRestore(member);
+      setActError(null);
+      await refresh();
+    } catch (e) {
+      // The daemon's reason, shown and not retried: the registration changed since the bypass.
+      setActError(`restore refused: ${String(e)}`);
+    }
+  };
   const dormant = inv?.gaps?.dormant_plugin ?? [];
   const ungoverned = inv?.gaps?.ungoverned ?? [];
   const orphans = status?.signed_in ? unaccountedMembers(inv, snap) : [];
@@ -241,6 +288,8 @@ export function Agents() {
         </p>
       )}
 
+      {actError && <div className="error-banner">{actError}</div>}
+
       {rows.length > 0 && (
         <table className="gate-table">
           <thead>
@@ -249,6 +298,7 @@ export function Agents() {
               <th>governance</th>
               <th>governed as</th>
               <th>what the inventory found</th>
+              <th>gate</th>
             </tr>
           </thead>
           <tbody>
@@ -294,6 +344,47 @@ export function Agents() {
                           <li key={i}>{f}</li>
                         ))}
                       </ul>
+                    )}
+                  </td>
+                  <td>
+                    {bypassed[memberOf(r)] ? (
+                      <div>
+                        <strong className="gate-differs" title={`since ${bypassed[memberOf(r)].bypassed_at}`}>
+                          BYPASSED
+                        </strong>
+                        <div className="muted">{bypassed[memberOf(r)].reason}</div>
+                        <button type="button" onClick={() => doRestore(memberOf(r))}>
+                          restore gate
+                        </button>
+                      </div>
+                    ) : hasHestiaGate(r) ? (
+                      confirming === memberOf(r) ? (
+                        <div className="bypass-confirm">
+                          <p className="gate-differs">
+                            Bypass replaces {memberOf(r)}'s PreToolUse gate with a stub that ALLOWS every
+                            call. Until you restore it, {memberOf(r)} acts UNGOVERNED: no gate, no scope, no
+                            safety preset, no escalations. A running harness may keep its old hook until it
+                            restarts. The bypass is recorded on the chain; the rest of hestia should read
+                            this member as miswired.
+                          </p>
+                          <label>
+                            reason <span className="muted">(required)</span>
+                            <input value={reason} onChange={(e) => setReason(e.target.value)} />
+                          </label>
+                          <button type="button" onClick={() => doBypass(memberOf(r))}>
+                            bypass {memberOf(r)}'s gate
+                          </button>
+                          <button type="button" onClick={() => { setConfirming(null); setReason(""); }}>
+                            cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <button type="button" onClick={() => { setConfirming(memberOf(r)); setActError(null); }}>
+                          bypass gate…
+                        </button>
+                      )
+                    ) : (
+                      <span className="muted">—</span>
                     )}
                   </td>
                 </tr>

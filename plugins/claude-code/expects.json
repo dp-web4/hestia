@@ -15,7 +15,8 @@
     "files": [
       "hooks/pre_tool_use.py",
       "hooks/witness.py",
-      "hooks/law_inject.py"
+      "hooks/law_inject.py",
+      "hooks/disposition_deliver.py"
     ],
     "gate_probe": {
       "entry": "hooks/pre_tool_use.py",
@@ -50,5 +51,10 @@
   },
   "observe": [
     "PostToolUse"
-  ]
+  ],
+  "targets": {
+    "observe": [
+      "witness.py"
+    ]
+  }
 }

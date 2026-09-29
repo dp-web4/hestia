@@ -12,7 +12,7 @@
     },
     {
       "path": "hestia_gate_mechanism.py",
-      "sha256": "f75f67f347f56ccc56004386335fc12757f36943508ce61d3a3825bb5847af1f",
+      "sha256": "5bb44382c00720fb06439695ad5a0b47fe635601f9cd19e576d203b94b2bed65",
       "source": "plugins/_shared/hestia_gate_mechanism.py"
     },
     {
@@ -24,9 +24,14 @@
       "path": "hestia_shell_classifier.py",
       "sha256": "b3f508899069c0b894c792838d9d43925121ec4605cc7e30df22c7d7b425bce2",
       "source": "plugins/_shared/hestia_shell_classifier.py"
+    },
+    {
+      "path": "hestia_witness_core.py",
+      "sha256": "750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777",
+      "source": "plugins/_shared/hestia_witness_core.py"
     }
   ],
   "engine": null,
   "requires": [],
-  "gt_version": "d5838606c5c9aec17177a69e7313c1dd256bd9dded7aadbd1c6dc633b67db51e"
+  "gt_version": "3b3e685ba1f21092e4ddfbd48a6aeb11c92ada32409d9c66fdd8de664e7c649f"
 }

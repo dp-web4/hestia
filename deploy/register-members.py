@@ -133,10 +133,13 @@ def registered_json(path: str) -> dict[str, set[str]]:
     return out
 
 
-def registered_toml(path: str) -> dict[str, set[str]]:
+def registered_toml(path: str, flat: bool = False) -> dict[str, set[str]]:
     """{event: {target basenames}} — toml-hook-commands semantics (a line scan: the installer
     deliberately does not require tomllib). The event is the nearest preceding
-    `[[hooks.<Event>...]]` header."""
+    `[[hooks.<Event>...]]` header — or, for a FLAT layout (kimi: `[[hooks]]` tables carrying
+    `event = "X"`), the `event` key of the same table, in whichever order the keys appear."""
+    if flat:
+        return _registered_toml_flat(path)
     out: dict[str, set[str]] = {}
     event = None
     with open(path, encoding="utf-8", errors="replace") as fh:
@@ -150,6 +153,37 @@ def registered_toml(path: str) -> dict[str, set[str]]:
                 b = target_basename(m.group(2))
                 if b:
                     out.setdefault(event, set()).add(b)
+    return out
+
+
+_TOML_EVENT = re.compile(r"""\s*event\s*=\s*(['"])(.*)\1\s*$""")
+
+
+def _registered_toml_flat(path: str) -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {}
+    table: dict[str, list[str]] = {}
+
+    def flush() -> None:
+        for ev in table.get("event", []):
+            for cmd in table.get("command", []):
+                b = target_basename(cmd)
+                if b:
+                    out.setdefault(ev, set()).add(b)
+
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if re.match(r"\s*\[", line):
+                flush()
+                table = {}
+                continue
+            m = _TOML_EVENT.match(line)
+            if m:
+                table.setdefault("event", []).append(m.group(2))
+                continue
+            m = _TOML_CMD.match(line)
+            if m:
+                table.setdefault("command", []).append(m.group(2))
+    flush()
     return out
 
 
@@ -189,6 +223,18 @@ def toml_block(member: str, event: str, group: dict, hook: dict) -> str:
               f"command = {_toml_str(hook['command'])}"]
     if isinstance(hook.get("statusMessage"), str):
         lines.append(f"statusMessage = {_toml_str(hook['statusMessage'])}")
+    t = hook.get("timeout")
+    if isinstance(t, (int, float)) and not isinstance(t, bool):
+        lines.append(f"timeout = {int(t)}")
+    return "\n".join(lines) + "\n"
+
+
+def toml_block_flat(member: str, event: str, hook: dict) -> str:
+    """One flat `[[hooks]]` table (kimi's layout): the event is a key, not the header."""
+    lines = [f"\n{MARK} ({member}) — do not hand-edit; re-run deploy/install-members.sh",
+             "[[hooks]]",
+             f"event = {_toml_str(event)}",
+             f"command = {_toml_str(hook['command'])}"]
     t = hook.get("timeout")
     if isinstance(t, (int, float)) and not isinstance(t, bool):
         lines.append(f"timeout = {int(t)}")
@@ -298,10 +344,11 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
         return done("registered", changes)
 
     if reader == "toml-hook-commands":
+        flat = reg.get("layout") == "flat"
         if os.path.exists(cfg):
             with open(cfg, encoding="utf-8", errors="replace") as fh:
                 raw = fh.read()
-            have = registered_toml(cfg)
+            have = registered_toml(cfg, flat=flat)
         else:
             raw, have = "", {}
         new = raw
@@ -311,7 +358,8 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
                     b = target_basename(h["command"])
                     if b in have.get(event, set()):
                         continue
-                    new += toml_block(member, event, g, h)
+                    new += (toml_block_flat(member, event, h) if flat
+                            else toml_block(member, event, g, h))
                     changes.append(f"{event}/{b}")
                     have.setdefault(event, set()).add(b or "")
         new, ensured = toml_ensure(new, reg.get("ensure") or [])

@@ -102,6 +102,19 @@ export async function reinstateAgent(id: string, reason: string): Promise<Member
   return invoke("reinstate_agent", { id, reason });
 }
 
+/**
+ * Bypass a member's gate: its PreToolUse gate is swapped for a stub that ALLOWS every call, so a
+ * member its own gate has locked out can act to fix it. It is UNGOVERNED until restored.
+ */
+export async function agentGateBypass(member: string, reason: string): Promise<unknown> {
+  return invoke("agent_gate_bypass", { member, reason });
+}
+
+/** Put a bypassed member's gate back exactly as it was registered. */
+export async function agentGateRestore(member: string): Promise<unknown> {
+  return invoke("agent_gate_restore", { member });
+}
+
 export async function getDashboard(): Promise<DashboardSnapshot> {
   return invoke("get_dashboard");
 }

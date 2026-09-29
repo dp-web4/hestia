@@ -7,6 +7,8 @@ const getDashboard = vi.fn();
 const operatorStatus = vi.fn();
 const retireAgent = vi.fn();
 const reinstateAgent = vi.fn();
+const agentGateBypass = vi.fn();
+const agentGateRestore = vi.fn();
 
 vi.mock("../lib/tauri", () => ({
   agentsInventory: () => agentsInventory(),
@@ -14,6 +16,8 @@ vi.mock("../lib/tauri", () => ({
   operatorStatus: () => operatorStatus(),
   retireAgent: (...a: unknown[]) => retireAgent(...a),
   reinstateAgent: (...a: unknown[]) => reinstateAgent(...a),
+  agentGateBypass: (m: string, r: string) => agentGateBypass(m, r),
+  agentGateRestore: (m: string) => agentGateRestore(m),
 }));
 
 const { Agents, unaccountedMembers } = await import("./Agents");
@@ -107,6 +111,47 @@ describe("Agents", () => {
     getDashboard.mockResolvedValue({ retired: [] });
     render(<Agents />);
     expect(await screen.findByText(/Adapters available for agents not installed here: gemini/)).toBeTruthy();
+  });
+
+  // dp, 2026-09-28: a fail-open recovery switch for a member its own gate has locked out.
+  const gated: AgentRow = {
+    ...claude, member: "claude-code",
+    hook_targets: [{ path: "/h/pre_tool_use.py", event: "PreToolUse", is_gate: true, owned_by_hestia: true }],
+  };
+
+  it("offers bypass only where a hestia gate is registered, and requires a reason", async () => {
+    operatorStatus.mockResolvedValue(signedIn);
+    agentsInventory.mockResolvedValue(inventory([gated, codex]));
+    getDashboard.mockResolvedValue({ retired: [] });
+    agentGateBypass.mockResolvedValue({ ok: true });
+    render(<Agents />);
+    const offers = await screen.findAllByText("bypass gate…");
+    expect(offers.length).toBe(1); // codex has no hestia gate row: nothing to bypass
+    fireEvent.click(offers[0]);
+    expect(screen.getByText(/acts UNGOVERNED: no gate, no scope, no\s+safety preset, no escalations/)).toBeTruthy();
+    fireEvent.click(screen.getByText("bypass claude-code's gate"));
+    expect(await screen.findByText(/requires a reason/)).toBeTruthy();
+    expect(agentGateBypass).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "gate update locked it out" } });
+    fireEvent.click(screen.getByText("bypass claude-code's gate"));
+    await screen.findAllByText("bypass gate…");
+    expect(agentGateBypass).toHaveBeenCalledWith("claude-code", "gate update locked it out");
+  });
+
+  it("a bypassed member shows BYPASSED and restore, and keeps the inventory's own verdict", async () => {
+    operatorStatus.mockResolvedValue(signedIn);
+    const bypassedRow: AgentRow = { ...codex, member: "codex" };
+    agentsInventory.mockResolvedValue(
+      inventory([claude, bypassedRow], { bypassed: { codex: { bypassed_at: "T", reason: "locked out" } } }),
+    );
+    getDashboard.mockResolvedValue({ retired: [] });
+    agentGateRestore.mockRejectedValue("the registration changed since the bypass");
+    render(<Agents />);
+    expect(await screen.findByText("BYPASSED")).toBeTruthy();
+    expect(screen.getByText("UNGOVERNED")).toBeTruthy(); // the inventory's word, not the page's
+    fireEvent.click(screen.getByText("restore gate"));
+    expect(await screen.findByText(/restore refused: the registration changed/)).toBeTruthy();
+    expect(agentGateRestore).toHaveBeenCalledWith("codex");
   });
 
   describe("Sprint 3b — retire / reinstate a member nothing here accounts for", () => {

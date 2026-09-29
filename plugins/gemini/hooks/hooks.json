@@ -26,7 +26,8 @@
       {
         "matcher": ".*",
         "hooks": [
-          { "type": "command", "command": "@HESTIA_PLUGIN_ROOT@/gemini/hooks/observe.sh", "timeout": 10000 }
+          { "type": "command", "command": "@HESTIA_PLUGIN_ROOT@/gemini/hooks/observe.sh", "timeout": 10000 },
+          { "type": "command", "command": "python3 @HESTIA_PLUGIN_ROOT@/gemini/hooks/witness.py", "timeout": 10000 }
         ]
       }
     ],

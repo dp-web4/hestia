@@ -45,17 +45,8 @@ const TEXT_MAX: usize = 512;
 /// Member ids travel in a URL path segment. Accept the spellings this fleet uses and refuse the
 /// rest here, rather than percent-encode something the daemon would then fail to find.
 fn check_member_id(id: &str) -> Result<String, String> {
-    let id = id.trim();
-    if id.is_empty() {
-        return Err("no member id".to_string());
-    }
-    if !id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
-    {
-        return Err(format!("'{id}' is not a member id this app can address"));
-    }
-    Ok(id.to_string())
+    // One rule for member ids on this surface: `checked_member`, which bypass/restore use too.
+    checked_member(id).map(str::to_string)
 }
 
 fn check_text(what: &str, v: Option<&str>) -> Result<String, String> {
@@ -169,6 +160,47 @@ pub async fn reinstate_agent(
     reinstate_outcome(status, value)
 }
 
+/// A member id as the daemon's route takes it. Refused rather than encoded: member ids are
+/// `[A-Za-z0-9_.-]`, and anything else is not one.
+fn checked_member(member: &str) -> Result<&str, String> {
+    let m = member.trim();
+    if m.is_empty() || m.starts_with('.') || !m.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')) {
+        return Err(format!("'{member}' is not a member id"));
+    }
+    Ok(m)
+}
+
+/// Bypass a member's gate — `POST /api/agents/:id/bypass` (dp, 2026-09-28: "useful for instances
+/// when an update locks out a member that we need to be active to fix the issues"). Fail OPEN: the
+/// member acts ungoverned until restored. The permitting direction, so a reason is required here
+/// before the daemon (which requires it too) is asked.
+#[tauri::command]
+pub async fn agent_gate_bypass(
+    state: State<'_, AppState>,
+    member: String,
+    reason: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let m = checked_member(&member)?;
+    let reason = reason.as_deref().map(str::trim).unwrap_or("");
+    if reason.is_empty() {
+        return Err("bypassing a gate requires a reason: it records why this member may act ungoverned".to_string());
+    }
+    let path = format!("/api/agents/{m}/bypass");
+    daemon::send(&state, reqwest::Method::POST, &path, Some(serde_json::json!({ "reason": reason }))).await
+}
+
+/// Put a bypassed member's gate back exactly — `POST /api/agents/:id/restore`. The refusing
+/// direction: no reason required. A refusal (the registration changed since) is passed through.
+#[tauri::command]
+pub async fn agent_gate_restore(
+    state: State<'_, AppState>,
+    member: String,
+) -> Result<serde_json::Value, String> {
+    let m = checked_member(&member)?;
+    let path = format!("/api/agents/{m}/restore");
+    daemon::send(&state, reqwest::Method::POST, &path, Some(serde_json::json!({}))).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +269,13 @@ mod tests {
         assert_eq!(already_retired(&snap, "caude-code").unwrap()["outcome"], "already_retired");
         assert!(already_retired(&snap, "claude-code").is_none());
         assert!(already_retired(&json!({}), "claude-code").is_none());
+    }
+
+    #[test]
+    fn only_member_ids_reach_the_route() {
+        assert_eq!(checked_member("kimi-code").unwrap(), "kimi-code");
+        assert!(checked_member("../x").is_err());
+        assert!(checked_member("a/b").is_err());
+        assert!(checked_member("").is_err());
     }
 }

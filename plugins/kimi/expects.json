@@ -10,10 +10,12 @@
       "path": [
         ".kimi-code",
         "config.toml"
-      ]
+      ],
+      "layout": "flat"
     },
     "files": [
       "hooks/pre_tool_use.py",
+      "hooks/witness.py",
       "hooks/observe.sh",
       "hooks/hydrate.sh"
     ],
@@ -50,6 +52,12 @@
     }
   },
   "observe": [
-    "PostToolUse"
-  ]
+    "PostToolUse",
+    "PostToolUseFailure"
+  ],
+  "targets": {
+    "observe": [
+      "witness.py"
+    ]
+  }
 }

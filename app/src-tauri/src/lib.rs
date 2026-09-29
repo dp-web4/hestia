@@ -180,6 +180,8 @@ pub fn run() {
             commands::agents::agents_inventory,
             commands::agents::retire_agent,
             commands::agents::reinstate_agent,
+            commands::agents::agent_gate_bypass,
+            commands::agents::agent_gate_restore,
             commands::scope::rule_scope_request,
             commands::dashboard::get_failures,
             commands::dashboard::get_daemon_status,

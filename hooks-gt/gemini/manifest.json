@@ -12,7 +12,7 @@
     },
     {
       "path": "hooks/hooks.json",
-      "sha256": "2176f1b8411973d3fe50d196b043c04c7d43d1e9ae924ea2706edaf8cfac16eb",
+      "sha256": "9d8260aeb44f6cc59f1d981bc9c1f15c970ebb252a7fd8d0f65ccbc8152ec3a2",
       "source": "plugins/gemini/hooks/hooks.json"
     },
     {
@@ -24,11 +24,16 @@
       "path": "hooks/observe.sh",
       "sha256": "5f0f33bbc73ae65037b38ff1383df93719765ff1383562101ee94ef7d7b4717b",
       "source": "plugins/gemini/hooks/observe.sh"
+    },
+    {
+      "path": "hooks/witness.py",
+      "sha256": "45d0a881ce7dcad40dfd747abdec6dcfe0d8e047f4284191380888a69af5b570",
+      "source": "plugins/gemini/hooks/witness.py"
     }
   ],
   "engine": {
     "unit": "_shared",
-    "gt_version": "d5838606c5c9aec17177a69e7313c1dd256bd9dded7aadbd1c6dc633b67db51e",
+    "gt_version": "3b3e685ba1f21092e4ddfbd48a6aeb11c92ada32409d9c66fdd8de664e7c649f",
     "files": [
       {
         "path": "hestia_gate_core.py",
@@ -36,7 +41,7 @@
       },
       {
         "path": "hestia_gate_mechanism.py",
-        "sha256": "f75f67f347f56ccc56004386335fc12757f36943508ce61d3a3825bb5847af1f"
+        "sha256": "5bb44382c00720fb06439695ad5a0b47fe635601f9cd19e576d203b94b2bed65"
       },
       {
         "path": "hestia_governance_closure.py",
@@ -45,6 +50,10 @@
       {
         "path": "hestia_shell_classifier.py",
         "sha256": "b3f508899069c0b894c792838d9d43925121ec4605cc7e30df22c7d7b425bce2"
+      },
+      {
+        "path": "hestia_witness_core.py",
+        "sha256": "750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777"
       }
     ]
   },
@@ -52,8 +61,8 @@
     {
       "unit": "claude-code",
       "path": "hooks/pre_tool_use.py",
-      "sha256": "3f34b62a8a7e3346daf4c221fd0fc6ee6924bdfc51413e6ea911c15088ace836"
+      "sha256": "c162fa9845ebea07c50aeed3e113bb9612258f9ef8ea5922dd623b8870e48f74"
     }
   ],
-  "gt_version": "df93eb18bd8ea5014eb47d43e31512a67903205010cc3c7fab79da15d4e8bf26"
+  "gt_version": "c5015c27e14231aac8f43f66bd3503765d1453b7e3e2b2715247f1e697c84d01"
 }
