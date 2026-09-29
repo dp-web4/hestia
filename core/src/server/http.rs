@@ -3558,6 +3558,40 @@ async fn config_get_seat(
 }
 
 
+/// The fields a standing grant REPLACES — the binding a surface was shown — for the unexpired
+/// standing grant on (member, path), or `null`. Unexpired only, because the snapshot a surface
+/// renders drops expired rows: an expired row was shown as "none" and must compare as none.
+fn standing_grant_binding(
+    grants: &[crate::server::standing_scope::StandingGrant],
+    member: &str,
+    path: &str,
+    now: u64,
+) -> serde_json::Value {
+    grants
+        .iter()
+        .find(|g| g.member == member && g.path == path && g.expires_at.is_none_or(|e| now < e))
+        .map(|g| {
+            serde_json::json!({
+                "reason": g.reason, "recursive": g.recursive, "granted_by": g.granted_by,
+                "expires_at": g.expires_at, "request_id": g.request_id,
+            })
+        })
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// The same five fields out of whatever row a surface sends back (a whole snapshot row is fine;
+/// its clock fields are ignored). `null` stays `null`.
+fn grant_binding_of(v: &serde_json::Value) -> serde_json::Value {
+    if v.is_null() {
+        return serde_json::Value::Null;
+    }
+    let f = |k: &str| v.get(k).cloned().unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "reason": f("reason"), "recursive": f("recursive"), "granted_by": f("granted_by"),
+        "expires_at": f("expires_at"), "request_id": f("request_id"),
+    })
+}
+
 async fn scope_grant(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
@@ -3680,6 +3714,27 @@ async fn scope_grant(
                 "nearest": nearest,
             })),
         );
+    }
+    // BOUND TO WHAT THE OPERATOR SAW (spec rule `bound-to-rendered-evidence`; the #1132 lesson).
+    // Last edit wins (ruled 2026-09-25), so a grant on a (member, path) that already holds a
+    // standing grant REPLACES its reason, reach and expiry. A surface that showed the operator
+    // the row it is about to replace sends it back as `expected_existing` (`null` = "I was shown
+    // none"), and it is compared HERE, under the lock, so nothing another view writes between
+    // the surface's read and this write can be replaced unseen. Absent = unbound: the older
+    // callers keep working, and say nothing about what they saw.
+    if let Some(expected) = body.get("expected_existing") {
+        let now_b = crate::server::gate_escalation::now_secs();
+        let current = standing_grant_binding(&s.standing_scope.grants, &plugin_id, &path, now_b);
+        if grant_binding_of(expected) != current {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "the standing grant on this (member, path) is not the one you were                               shown — another view changed it since. Nothing was written; review                               the current row and resend.",
+                    "moved": true,
+                    "current": current,
+                })),
+            );
+        }
     }
     let replaces = s
         .standing_scope
@@ -7663,6 +7718,61 @@ mod disposition_tests {
         }, |_| Ok("wired".into())).unwrap();
         assert_eq!(v["recorded"], serde_json::json!(false), "{v}");
         assert_eq!(v["recordError"], serde_json::json!("disk full"));
+    }
+
+    /// Last edit wins, bound to what was shown: a grant that names the row it replaces is refused
+    /// — with nothing written — when that row is not the one in the store any more.
+    #[tokio::test]
+    async fn a_grant_bound_to_a_row_that_moved_is_refused_and_writes_nothing() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "hub-being").await;
+        let first = serde_json::json!({"plugin_id": "hub-being", "path": "/w/home",
+                                       "reason": "its home", "recursive": true});
+        assert_eq!(grant(&state, first).await.0, StatusCode::OK);
+        let shown = standing_grant_binding(&state.lock().await.standing_scope.grants,
+                                           "hub-being", "/w/home", 0);
+        assert_eq!(shown["reason"], "its home");
+
+        // Another view replaced it after this surface rendered.
+        let other = serde_json::json!({"plugin_id": "hub-being", "path": "/w/home",
+                                       "reason": "changed on the dashboard", "recursive": false});
+        assert_eq!(grant(&state, other).await.0, StatusCode::OK);
+        let before = snapshot(&*state.lock().await);
+
+        let (st, body) = grant(&state, serde_json::json!({"plugin_id": "hub-being", "path": "/w/home",
+            "reason": "mine", "expected_existing": shown})).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["current"]["reason"], "changed on the dashboard");
+        assert_eq!(snapshot(&*state.lock().await), before, "a refused bound grant wrote something");
+
+        // "I was shown none" is a binding too.
+        let (st, _) = grant(&state, serde_json::json!({"plugin_id": "hub-being", "path": "/w/home",
+            "reason": "mine", "expected_existing": null})).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+
+        // Bound to the row that IS there: it goes through, and says it replaced one.
+        let current = body["current"].clone();
+        let (st, ok) = grant(&state, serde_json::json!({"plugin_id": "hub-being", "path": "/w/home",
+            "reason": "mine", "expected_existing": current})).await;
+        assert_eq!((st, ok["replaced_existing"].clone()), (StatusCode::OK, serde_json::json!(true)), "{ok}");
+        // And a new path bound to "none" goes through.
+        let (st, _) = grant(&state, serde_json::json!({"plugin_id": "hub-being", "path": "/w/new",
+            "reason": "fresh", "expected_existing": null})).await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    #[test]
+    fn the_binding_ignores_clock_fields_and_treats_expired_as_none() {
+        let row = serde_json::json!({"lifetime": "standing", "plugin_id": "m", "path": "/p",
+            "reason": "r", "recursive": false, "granted_by": "operator", "expires_at": null,
+            "request_id": null, "secs_remaining": 12, "granted_at": 99});
+        let g = crate::server::standing_scope::StandingGrant {
+            member: "m".into(), path: "/p".into(), granted_at: 1, granted_by: "operator".into(),
+            reason: "r".into(), expires_at: None, request_id: None, recursive: false,
+        };
+        assert_eq!(grant_binding_of(&row), standing_grant_binding(&[g.clone()], "m", "/p", 10));
+        let expired = crate::server::standing_scope::StandingGrant { expires_at: Some(5), ..g };
+        assert!(standing_grant_binding(&[expired], "m", "/p", 10).is_null());
     }
 
     #[test]

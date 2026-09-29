@@ -4,6 +4,8 @@ import type {
   DashboardSnapshot,
   DecideOutcome,
   MemberActOutcome,
+  ReachOutcome,
+  ScopeGrantRow,
   GateReport,
   DaemonStatus,
   AppConfig,
@@ -100,6 +102,38 @@ export async function retireAgent(
 /** Undo a retirement. The authority revoked then is NOT restored; the result names it. */
 export async function reinstateAgent(id: string, reason: string): Promise<MemberActOutcome> {
   return invoke("reinstate_agent", { id, reason });
+}
+
+/**
+ * Grant a member STANDING reach on a path. A reason is required. `seen` is the standing row the
+ * form showed for this (member, path), or null: last edit wins in the engine, so the command
+ * re-reads and returns `moved` — sending nothing — if the row is no longer what was shown.
+ */
+export async function grantReach(
+  member: string,
+  path: string,
+  reason: string,
+  opts: { recursive?: boolean; expiresInSecs?: number | null; seen: ScopeGrantRow | null },
+): Promise<ReachOutcome> {
+  return invoke("grant_reach", {
+    member,
+    path,
+    reason,
+    recursive: opts.recursive ?? false,
+    expiresInSecs: opts.expiresInSecs ?? null,
+    seen: opts.seen,
+  });
+}
+
+/** Revoke one grant: a live one by request id, a standing one by (member, path). No reason required. */
+export async function revokeReach(row: ScopeGrantRow, reason: string | null): Promise<ReachOutcome> {
+  return invoke("revoke_reach", {
+    lifetime: row.lifetime,
+    requestId: row.request_id ?? null,
+    member: row.plugin_id,
+    path: row.path,
+    reason,
+  });
 }
 
 /**

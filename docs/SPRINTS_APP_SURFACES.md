@@ -130,6 +130,24 @@ an overwrite, the view must make it visible: 4.4 below.
 the chain entry names the operator; a write over a value another view changed since the last read
 shows that value before it is replaced (tested against a stale read).
 
+**Split on 2026-09-28**, by the spec's own capabilities: **4a** grant (operator-originated,
+standing) + revoke (live and standing) + the read — built; **4b** promote / recursive / reassign
+(`scope-standing`); **4c** delegations. **Floor adjust is out**: the spec keeps `/api/scope/floor`
+off every UI until a surface is designed for the widest escalation there is.
+
+**4a as built.** A *Reach* page (activity place, beside Decide): every grant grouped by member with
+its lifetime on the row (a live grant says it dies at the next restart), reach (exact / subtree),
+why, and who. Members are **chosen** from the recorded, unretired registry — never typed. Grant needs
+a reason; revoke does not, and a revoke of something already gone is `already_revoked`.
+
+**4.4, bound in the daemon, not just the view.** The form shows the standing row a grant would
+replace ("This REPLACES…", old reason and reach) and sends it back as `expected_existing` (`null` =
+shown none). `/api/scope/grant` compares it **under the lock** and answers 409 `moved` with the
+current row, writing nothing; the app renders that as "changed since you looked". A binding only the
+client held would be the race GPT caught on #1132, so the check lives where the write does. Absent
+`expected_existing` is unbound, so the dashboard keeps working — **follow-up: the dashboard's grant
+form should send it too** (spec rule `bound-to-rendered-evidence` now lists `scope-grant`).
+
 ---
 
 ## What is deliberately not scheduled
