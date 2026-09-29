@@ -253,6 +253,7 @@ def test_dry_run_writes_nothing():
         assert r.returncode == 0 and "would codex: would add PostToolUse/witness.py" in r.stdout, r.stdout
         assert cfg.read_text() == CODEX_TOML
         assert not (tmp / ".codex" / "config.toml.pre-register.bak").exists()
+        assert not (tmp / ".codex" / "hooks").exists(), "DRY_RUN made a directory"
 
 
 def test_workspace_placeholder_renders_from_env_or_drops():
@@ -503,6 +504,67 @@ def test_mixed_installed_and_missing_targets_exit_pending():
         assert list(data["hooks"]) == ["PostToolUse"], data
 
 
+def _plan_rows(tmp: Path, plugins: Path, member: str) -> list[tuple[str, str]]:
+    r = _run(tmp, plugins, "--member", member, "--plan")
+    assert r.returncode == 0, r.stdout + r.stderr
+    return [tuple(ln.split("\t")[1:]) for ln in r.stdout.splitlines() if ln.startswith(member + "\t")]
+
+
+def test_the_hooks_dir_it_registers_into_is_made():
+    """HUB, 2026-09-28 (#1153, hub-claude): ~/.codex existed, ~/.codex/hooks never had. The registrar
+    registered every hook there and install-members.sh died -- "registered at ... but ... does not exist" --
+    which stopped the WHOLE members' install. Under plan -> install -> register the registrar alone
+    registers NOTHING that is not on disk; the plan names every target; once the installer has put them
+    there, all register and every path the installer reads resolves to a file."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        cfg = tmp / ".codex" / "config.toml"
+        cfg.parent.mkdir()
+        before = '[projects."/w"]\ntrust_level = "trusted"\n'
+        cfg.write_text(before)
+        hooks = tmp / ".codex" / "hooks"
+        r = _run(tmp, plugins, "--member", "codex")
+        assert r.returncode == 9 and "REGISTERED codex: " not in r.stdout.replace("REGISTERED codex: ensure", ""), r.stdout
+        assert not _installer_reader(cfg), "registered hooks that are not installed: " + cfg.read_text()
+        rows = _plan_rows(tmp, plugins, "codex")
+        assert rows and all(tg == str(hooks / b) for b, tg in rows), rows
+        _install(tmp, "codex", *[b for b, _ in rows])            # what install-members.sh does next
+        r = _run(tmp, plugins, "--member", "codex")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert hooks.is_dir()
+        for b in _installer_reader(cfg):
+            assert (hooks / b).is_file(), b
+
+
+def test_a_host_already_left_registered_without_the_dir_repairs():
+    """The state #1153's bug left behind: registrations present, hooks dir gone. That is not `ok` -- a
+    registration is only as good as the file it names -- so it is PENDING (rc 9) with the config left
+    byte-identical, the plan lists every missing target (the installer's repair rows), and once they are
+    installed the run is the plain `ok` again."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        cfg = tmp / ".codex" / "config.toml"
+        cfg.parent.mkdir()
+        cfg.write_text("")
+        rows = _plan_rows(tmp, plugins, "codex")
+        _install(tmp, "codex", *[b for b, _ in rows])
+        assert _run(tmp, plugins, "--member", "codex").returncode == 0
+        registered = cfg.read_text()
+        shutil.rmtree(tmp / ".codex" / "hooks")
+        r = _run(tmp, plugins, "--member", "codex")
+        assert r.returncode == 9, (r.returncode, r.stdout)
+        assert r.stdout.count("is registered but") == len(rows), r.stdout
+        assert "every templated hook is registered" not in r.stdout, r.stdout
+        assert cfg.read_text() == registered, "a repair rewrote the registration"
+        assert sorted(_plan_rows(tmp, plugins, "codex")) == sorted(rows), "the plan did not list the repair"
+        _install(tmp, "codex", *[b for b, _ in rows])
+        again = _run(tmp, plugins, "--member", "codex")
+        assert again.returncode == 0 and "ok    codex" in again.stdout, again.stdout
+        assert cfg.read_text() == registered
+
+
 def test_covers():
     assert RM.covers("*", "*") and RM.covers(None, ".*") and RM.covers(".*", "*") and RM.covers("", None)
     assert not RM.covers("Read", "*") and not RM.covers("shell", ".*")
@@ -593,6 +655,8 @@ TESTS = [
     test_an_inline_comment_on_a_narrow_toml_matcher_is_still_narrow,
     test_the_fallback_line_scan_cannot_widen_a_matcher,
     test_mixed_installed_and_missing_targets_exit_pending,
+    test_the_hooks_dir_it_registers_into_is_made,
+    test_a_host_already_left_registered_without_the_dir_repairs,
     test_covers,
     test_install_members_end_to_end_in_an_isolated_home,
     test_install_members_reports_a_narrow_gate_and_leaves_it,

@@ -328,13 +328,39 @@ def validate_toml(text: str) -> str | None:
         return f"{type(e).__name__}: {e}"
 
 
-def _decide(groups: dict, have: dict, dry: bool, plan: bool):
+def registered_targets(cfg: str, reader: str) -> set[str]:
+    """Every absolute target a config registers (the installer's rule: the first absolute path in the
+    command), read structurally. Empty when the file is absent or unreadable."""
+    out: set[str] = set()
+    try:
+        if reader == "json-hook-commands":
+            with open(cfg, encoding="utf-8") as fh:
+                data = json.load(fh)
+            groups = (data.get("hooks") or {}).values()
+        else:
+            import tomllib  # type: ignore
+            with open(cfg, "rb") as fh:
+                groups = (tomllib.load(fh).get("hooks") or {}).values()
+        for gs in groups:
+            for g in gs if isinstance(gs, list) else []:
+                for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
+                    c = h.get("command") if isinstance(h, dict) else None
+                    t = target_path(c) if isinstance(c, str) else None
+                    if t:
+                        out.add(t)
+    except Exception:                     # noqa: BLE001 -- absent, unparseable, or no tomllib: no repair rows
+        return set()
+    return out
+
+
+def _decide(groups: dict, have: dict, dry: bool, plan: bool, own: set | None = None):
     """For each templated hook: present (a covering registration exists), NARROW (registered only
     under a matcher that does not cover the template's -- reported, never silently widened, never
     counted as present), PENDING (its target file is not installed yet -- never registered, so no
     live registration points at a missing file), or WANT (register it).
     -> (want [(event, group, hook)], narrow [str], pending [str], planned [(base, target)])"""
     want, narrow, pending, planned = [], [], [], []
+    own = own or set()
     for event, gs in groups.items():
         for g in gs:
             tm = g.get("matcher")
@@ -344,6 +370,17 @@ def _decide(groups: dict, have: dict, dry: bool, plan: bool):
                 existing = have.get(event, {}).get(b)
                 if existing:
                     if any(covers(m, tm) for m in existing):
+                        # registered -- but a registration is only as good as the file it names. When the
+                        # registration names THIS template's target (one this script wrote) and that file is
+                        # missing -- a host left registered with nothing installed (HUB 2026-09-28, #1153) --
+                        # it is PENDING, not ok, and --plan lists it so the installer puts the file there.
+                        # A registration naming some other path is the installer's to check, as before.
+                        if t is not None and t in own and not os.path.isfile(t):
+                            if plan:
+                                planned.append((b, t))
+                            elif not dry:
+                                pending.append(f"{event}/{b} is registered but {t} is not installed "
+                                               f"(install-members.sh installs it)")
                         continue
                     narrow.append(f"{event}/{b} is registered only for matcher "
                                   f"{', '.join('<unreadable>' if m is UNPARSED else repr(m) for m in existing)}; "
@@ -401,10 +438,24 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
     else:
         have = {}
 
-    want, narrow, pending, planned = _decide(groups, have, dry, plan)
+    own = registered_targets(cfg, reader) if os.path.exists(cfg) else set()
+    want, narrow, pending, planned = _decide(groups, have, dry, plan, own)
     notes = [f"NARROW {n}" for n in narrow] + [f"PENDING {p}" for p in pending]
     if plan:
         return "plan", [f"{b}\t{t}" for b, t in planned] + notes
+
+    def done(verdict: str, changes: list[str]) -> tuple[str, list[str]]:
+        # What this script registers points INTO `dest`, and install-members.sh refuses a
+        # registration whose directory is absent ("registered at … but … does not exist") —
+        # correctly, for a hand edit to a path nobody made. For a registration THIS script
+        # wrote, the directory is ours to make: registering without it turned every deploy on
+        # a host whose harness had never been hand-wired (HUB, 2026-09-28: ~/.codex present,
+        # ~/.codex/hooks never created) into a FATAL that stopped the whole members' install.
+        # Made on the `ok` arm too, so a host already left in that state repairs itself.
+        if not dry and verdict in ("ok", "registered") and not os.path.isdir(dest):
+            os.makedirs(dest, exist_ok=True)
+            log(f"  made  {member}: {dest} — the directory its registration points into")
+        return verdict, changes
 
     changes: list[str] = []
     if reader == "json-hook-commands":
@@ -455,8 +506,8 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
     if pending:
         return "pending", lines
     if changes:
-        return "registered", lines
-    return "ok", lines
+        return done("registered", lines)
+    return done("ok", lines)
 
 
 def main(argv: list[str]) -> int:

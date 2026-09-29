@@ -1,0 +1,59 @@
+{
+  "unit": "gemini",
+  "member": "gemini",
+  "digest_rule": "sha256 over the file bytes with the 64-hex value on its `hestia-gt-sha256:` header line replaced by 64 zeros; files without a header (JSON) are plain sha256",
+  "registration": "hooks/hooks.json",
+  "registration_note": null,
+  "files": [
+    {
+      "path": "hooks/before_tool.py",
+      "sha256": "245cc79187ec995903278c04f7fd27b97162aa8067eaa1aac586d1c94d150a07",
+      "source": "plugins/gemini/hooks/before_tool.py"
+    },
+    {
+      "path": "hooks/hooks.json",
+      "sha256": "2176f1b8411973d3fe50d196b043c04c7d43d1e9ae924ea2706edaf8cfac16eb",
+      "source": "plugins/gemini/hooks/hooks.json"
+    },
+    {
+      "path": "hooks/hydrate.sh",
+      "sha256": "506854a8ecce88271054b7df9a7c1f0fa7d560b939ee753fa17c1d313073f5e6",
+      "source": "plugins/gemini/hooks/hydrate.sh"
+    },
+    {
+      "path": "hooks/observe.sh",
+      "sha256": "5f0f33bbc73ae65037b38ff1383df93719765ff1383562101ee94ef7d7b4717b",
+      "source": "plugins/gemini/hooks/observe.sh"
+    }
+  ],
+  "engine": {
+    "unit": "_shared",
+    "gt_version": "d5838606c5c9aec17177a69e7313c1dd256bd9dded7aadbd1c6dc633b67db51e",
+    "files": [
+      {
+        "path": "hestia_gate_core.py",
+        "sha256": "4d0807d35482e36b4e107e572f44a92a4864fc9357348baf6313ac734d105301"
+      },
+      {
+        "path": "hestia_gate_mechanism.py",
+        "sha256": "f75f67f347f56ccc56004386335fc12757f36943508ce61d3a3825bb5847af1f"
+      },
+      {
+        "path": "hestia_governance_closure.py",
+        "sha256": "9c9a00843a8956a3220917eef39dc3dd85f25412ba5d2fdabe04fe4fdce32d5a"
+      },
+      {
+        "path": "hestia_shell_classifier.py",
+        "sha256": "b3f508899069c0b894c792838d9d43925121ec4605cc7e30df22c7d7b425bce2"
+      }
+    ]
+  },
+  "requires": [
+    {
+      "unit": "claude-code",
+      "path": "hooks/pre_tool_use.py",
+      "sha256": "3f34b62a8a7e3346daf4c221fd0fc6ee6924bdfc51413e6ea911c15088ace836"
+    }
+  ],
+  "gt_version": "df93eb18bd8ea5014eb47d43e31512a67903205010cc3c7fab79da15d4e8bf26"
+}
