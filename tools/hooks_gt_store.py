@@ -109,17 +109,27 @@ def get_blob(root: Path, digest: str) -> bytes:
 
 
 def closure_record(manifest: dict) -> dict:
+    """What is stored: the published manifest, and nothing that could disagree with it.
+
+    ONE SOURCE (GPT review of #1161). The first cut also stored `files`, `engine` and `requires`
+    beside the manifest, and `resolve` read those copies while `load_closure` verified only the
+    manifest: pointing alpha's `files["hooks/gate.py"]` at beta's blob, with the manifest and
+    version untouched, made `resolve(alpha)` return beta's hook and `verify()` report nothing.
+    Every operational field is now DERIVED from the verified manifest (`closure_view`), so there
+    is no second copy to diverge."""
+    return {"manifest": manifest, "note": INERT_NOTE}
+
+
+def closure_view(manifest: dict) -> dict:
+    """The operational fields, derived from a manifest that has already been verified."""
     return {
         "unit": manifest["unit"],
         "member": manifest["member"],
         "gt_version": manifest["gt_version"],
         "registration": manifest["registration"],
         "files": {r["path"]: r["sha256"] for r in manifest["files"]},
-        "sources": {r["path"]: r["source"] for r in manifest["files"]},
         "engine": manifest.get("engine"),
         "requires": manifest.get("requires") or [],
-        "manifest": manifest,
-        "note": INERT_NOTE,
     }
 
 
@@ -173,10 +183,16 @@ def load_closure(root: Path, unit: str, version: str) -> dict:
         rec = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
         raise StoreError(f"closure {unit}@{version[:12]} is not in the store ({e})")
-    # A closure is itself content-addressed through its manifest's gt_version.
-    if hooks_gt._version(rec["manifest"]) != version or rec["gt_version"] != version:
+    if not isinstance(rec, dict) or set(rec) != {"manifest", "note"}:
+        raise StoreError(f"closure {unit}@{version[:12]} carries fields beyond its manifest "
+                         f"({sorted(rec) if isinstance(rec, dict) else type(rec).__name__}) -- "
+                         f"an operational field stored outside the verified manifest is refused")
+    m = rec["manifest"]
+    # A closure is content-addressed through its manifest's gt_version, and filed under its own
+    # unit: a manifest moved to another unit's directory is refused too.
+    if hooks_gt._version(m) != version or m.get("gt_version") != version or m.get("unit") != unit:
         raise StoreError(f"closure {unit}@{version[:12]} does not match its own version -- tampered")
-    return rec
+    return closure_view(m)
 
 
 def resolve(home, unit: str, version: str) -> dict[str, bytes]:
@@ -204,10 +220,14 @@ def listing(home) -> list[dict]:
     root = store_root(home)
     rows = []
     for p in sorted((root / "closures").glob("*/*.json")):
-        rec = json.loads(p.read_text(encoding="utf-8"))
-        rows.append({"unit": rec["unit"], "member": rec["member"], "gt_version": rec["gt_version"],
-                     "engine": (rec.get("engine") or {}).get("gt_version"),
-                     "files": len(rec["files"])})
+        # Listed by LOCATION, then verified by resolve in verify(): a listing never trusts content.
+        rows.append({"unit": p.parent.name, "gt_version": p.stem})
+        try:
+            v = load_closure(root, p.parent.name, p.stem)
+            rows[-1].update(member=v["member"], engine=(v.get("engine") or {}).get("gt_version"),
+                            files=len(v["files"]))
+        except StoreError:
+            rows[-1].update(member=None, engine=None, files=None)
     return rows
 
 
@@ -241,7 +261,7 @@ def main(argv=None) -> int:
         elif a.cmd == "list":
             for r in listing(home):
                 print(f"{r['unit']:12} {r['gt_version'][:12]}  engine {str(r['engine'])[:12]}  "
-                      f"{r['files']} file(s)")
+                      f"{r['files'] if r['files'] is not None else 'UNVERIFIED'} file(s)")
         else:
             f = verify(home)
             for x in f:

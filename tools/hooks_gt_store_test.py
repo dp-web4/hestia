@@ -87,6 +87,7 @@ def main() -> int:
               not any(p.name in ("current", "active") for p in root.rglob("*")))
         rec = json.loads(next((root / "closures" / "alpha").glob("*.json")).read_text())
         check("each closure says presence is not certification", "not certification" in rec["note"])
+        check("a stored closure holds only its manifest and the note", set(rec) == {"manifest", "note"}, sorted(rec))
 
         print("D. a member version resolves to ITS pinned engine, even when a newer engine exists")
         a1 = json.loads((r / "hooks-gt" / "alpha" / "manifest.json").read_text())["gt_version"]
@@ -105,8 +106,7 @@ def main() -> int:
         check("the whole store verifies", st.verify(home) == [], st.verify(home))
 
         print("E. tampering is refused on read, and on reuse at the next ingest")
-        target = st.blob_path(root, json.loads(
-            (root / "closures" / "alpha" / f"{a1}.json").read_text())["files"]["hooks/gate.py"])
+        target = st.blob_path(root, st.load_closure(root, "alpha", a1)["files"]["hooks/gate.py"])
         os.chmod(target, 0o644)
         target.write_bytes(target.read_bytes().replace(b"print('alpha')", b"print('bypassed')"))
         check("resolve refuses a tampered blob",
@@ -118,11 +118,54 @@ def main() -> int:
         cp = root / "closures" / "beta" / f"{json.loads((r / 'hooks-gt' / 'beta' / 'manifest.json').read_text())['gt_version']}.json"
         os.chmod(cp, 0o644)
         cr = json.loads(cp.read_text())
+        bver = cr["manifest"]["gt_version"]
         cr["manifest"]["member"] = "someone-else"
         cp.write_text(json.dumps(cr))
         check("a closure edited to lie about itself is refused",
               "does not match its own version" in (raises(
-                  lambda: st.resolve(home, "beta", cr["gt_version"])) or ""))
+                  lambda: st.resolve(home, "beta", bver)) or ""))
+
+        print("E2. a closure's operational fields cannot diverge from its verified manifest (GPT #1161)")
+        # Fresh store, so E's deliberate tampering does not mask these arms.
+        home3 = tmp / "home3"
+        home3.mkdir()
+        st.ingest(r, home3)
+        root3 = st.store_root(home3)
+        av = json.loads((r / "hooks-gt" / "alpha" / "manifest.json").read_text())["gt_version"]
+        bv = json.loads((r / "hooks-gt" / "beta" / "manifest.json").read_text())["gt_version"]
+        ap = root3 / "closures" / "alpha" / f"{av}.json"
+        os.chmod(ap, 0o644)
+        pristine = ap.read_text()
+        beta_gate = st.load_closure(root3, "beta", bv)["files"]["hooks/gate.py"]
+        alpha_gate = st.load_closure(root3, "alpha", av)["files"]["hooks/gate.py"]
+        check("precondition: alpha and beta gates are different blobs", beta_gate != alpha_gate)
+        # GPT's reproduction, and one arm per duplicated operational field: each adds the field
+        # BESIDE an untouched manifest (the pre-fix record shape), pointing somewhere else.
+        arms = {
+            "files": {"hooks/gate.py": beta_gate, "hooks/common.sh":
+                      st.load_closure(root3, "alpha", av)["files"]["hooks/common.sh"]},
+            "engine": {"unit": "_shared", "gt_version": "0" * 64, "files": []},
+            "requires": [{"unit": "beta", "path": "hooks/gate.py", "sha256": beta_gate}],
+        }
+        for field, value in arms.items():
+            rec = json.loads(pristine)
+            rec[field] = value
+            ap.write_text(json.dumps(rec))
+            msg = raises(lambda: st.resolve(home3, "alpha", av))
+            check(f"a stored `{field}` beside the manifest is refused by resolve",
+                  msg is not None and "beyond its manifest" in msg, msg)
+            check(f"...and named by verify", any("beyond its manifest" in x for x in st.verify(home3)),
+                  st.verify(home3))
+        ap.write_text(pristine)
+        got = st.resolve(home3, "alpha", av)["alpha/hooks/gate.py"]
+        check("control: the untouched closure resolves ALPHA's hook", b"print('alpha')" in got, got[:80])
+        check("control: the untouched store verifies clean", st.verify(home3) == [], st.verify(home3))
+        # A manifest moved under another unit's directory is refused (unit identity).
+        moved = root3 / "closures" / "beta" / f"{av}.json"
+        moved.write_text(pristine)
+        check("alpha's closure filed under beta is refused",
+              "does not match its own version" in (raises(lambda: st.resolve(home3, "beta", av)) or ""))
+        moved.unlink()
 
         print("F. a repo whose GT does not hold is refused, and nothing is written")
         home2 = tmp / "home2"
