@@ -12,7 +12,7 @@ Normalize before concluding. The absolute count falls whenever total traffic fal
 what made the post-#963 drop look like a fix; per-primer SHARE is the honest statistic, and on
 this box it did not fall. See findings/963-closed-the-debt-axis-not-the-fire-axis-2026-09-12.md.
 
-Usage: bounce_only_wake_census.py [primer_glob] [--cut YYYY-MM-DD]
+Usage: bounce_only_wake_census.py <primer_glob> [--cut YYYY-MM-DD]   (required; no default)
 """
 import collections
 import glob
@@ -58,7 +58,12 @@ def main():
             sys.exit("--cut needs a YYYY-MM-DD value")
         del argv[i:i + 2]
     positional = [a for a in argv if not a.startswith("--")]
-    pattern = positional[0] if positional else "/home/dp/.claude/hestia-mesh-primers/*.json"
+    # No default: the primer directory is per seat and per host (each harness keeps its own), and a
+    # guessed path is the hardcoded config the directive forbids (#944). The caller names it.
+    if not positional:
+        sys.exit("usage: bounce_only_wake_census.py <primer_glob> [--cut YYYY-MM-DD]\n"
+                 "  e.g. the seat's hestia-mesh-primers/*.json (each harness keeps its own)")
+    pattern = positional[0]
     tot, bo, ab, why, via = census(pattern)
     if not tot:
         sys.exit(f"no primers with notices matched {pattern}")
