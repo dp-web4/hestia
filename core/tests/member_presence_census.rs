@@ -510,6 +510,21 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/handler.rs::tool_gate_arbitrate_escalation", &[
         "\"subject_instance_lct\": s.member_lct(&decided.plugin_id),",
     ], SiteClass::Naming),
+    // ADDED 2026-09-29 (kimi-code, #1169 request-key reclaim — the `gate_escalation_reclaimed`
+    // witness entry). The census went red on the branch's full CI run; `cargo test --lib` never
+    // exercises this integration test — the instrument working again.
+    //
+    // READING, both questions. (1) Who gets named? The ASKER reclaiming a spent permit whose
+    // first claim never reached execution — `prev.plugin_id` is the id recorded at the first
+    // claim, itself caller-asserted at open, so the HST-005 caveat holds unchanged: a
+    // well-formed name derived from a self-reported id, not evidence of membership. (2)
+    // Compared to decide control flow? No — the reclaim decision keys on the request key's
+    // stored record (outcome, act digest, window), never on this name; the derived LCT is
+    // serialised into the witness payload and read by nothing. Naming, same class as the
+    // claim/arbitrate siblings directly above.
+    ("server/handler.rs::commit_reclaim", &[
+        "\"subject_instance_lct\": s.member_lct(&prev.plugin_id),",
+    ], SiteClass::Naming),
     // ADDED 2026-08-16 (kimi-code, revised #480 review defect 4b — the lapse recorder's
     // `gate_escalation_expired` entry). The census went red the moment the site was written —
     // the instrument working, again on an integration test `cargo test --lib` never runs.
