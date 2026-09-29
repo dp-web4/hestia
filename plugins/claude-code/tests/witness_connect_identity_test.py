@@ -68,7 +68,7 @@ class Stub(BaseHTTPRequestHandler):
             elif name == "hestia_begin_action":
                 result = {"structuredContent": {"actionId": "action-1"}}
             else:
-                result = {"structuredContent": {"ok": True}}
+                result = {"structuredContent": {"witnessEntryHash": "stub-entry"}}
         body = json.dumps({"jsonrpc": "2.0", "id": msg.get("id"), "result": result}).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
@@ -87,7 +87,10 @@ def run_hook(home: Path, endpoint: str, host_session: str) -> subprocess.Complet
         "tool_response": {"stdout": "hi"},
     }
     env = {k: v for k, v in os.environ.items() if not k.startswith("HESTIA_")}
+    # The witness logic is the shared core now, loaded only from an explicitly named engine
+    # dir (never a checkout fallback) -- name the reviewed tree, as CI's hook job does.
     env.update({"HESTIA_HOME": str(home), "HESTIA_ENDPOINT": endpoint,
+                "HESTIA_SHARED_DIR": str(HERE.parents[1] / "_shared"),
                 "PATH": os.environ.get("PATH", "")})
     # SYNCHRONOUSLY, via the hook's own background marker. Invoked plainly it forks a detached
     # child and the parent exits 0 at once — so a test that reads the wire without this races a

@@ -2,9 +2,14 @@
   "unit": "kimi",
   "member": "kimi-code",
   "digest_rule": "sha256 over the file bytes with the 64-hex value on its `hestia-gt-sha256:` header line replaced by 64 zeros; files without a header (JSON) are plain sha256",
-  "registration": null,
-  "registration_note": "this member ships no registration template yet; its registration edge is NOT ground truth until it does",
+  "registration": "hooks/hooks.json",
+  "registration_note": null,
   "files": [
+    {
+      "path": "hooks/hooks.json",
+      "sha256": "a40fc68686096fc0088094b0270d634f43d9714d269575c2de7e9fe09b5c8029",
+      "source": "plugins/kimi/hooks/hooks.json"
+    },
     {
       "path": "hooks/hydrate.sh",
       "sha256": "4a475aa2baa0e00f4fd4091dbeff269ae93d38f587c45a13d29d44cc1296b0d0",
@@ -17,13 +22,18 @@
     },
     {
       "path": "hooks/pre_tool_use.py",
-      "sha256": "4a29b23902e43ed53a7fc3b53fad45ac69cf085d0bcfd4d5f2cd720a2a0dbb4d",
+      "sha256": "aa8b16d72b73f7120df1dcfe273edc4d4ea8465cf144e2e3f522e13e098e9e75",
       "source": "plugins/kimi/hooks/pre_tool_use.py"
+    },
+    {
+      "path": "hooks/witness.py",
+      "sha256": "4fdc379b4b08a679c291820535857e1ef2ddf2c318e0e07aa84a8bd737732aee",
+      "source": "plugins/kimi/hooks/witness.py"
     }
   ],
   "engine": {
     "unit": "_shared",
-    "gt_version": "d5838606c5c9aec17177a69e7313c1dd256bd9dded7aadbd1c6dc633b67db51e",
+    "gt_version": "3b3e685ba1f21092e4ddfbd48a6aeb11c92ada32409d9c66fdd8de664e7c649f",
     "files": [
       {
         "path": "hestia_gate_core.py",
@@ -31,7 +41,7 @@
       },
       {
         "path": "hestia_gate_mechanism.py",
-        "sha256": "f75f67f347f56ccc56004386335fc12757f36943508ce61d3a3825bb5847af1f"
+        "sha256": "5bb44382c00720fb06439695ad5a0b47fe635601f9cd19e576d203b94b2bed65"
       },
       {
         "path": "hestia_governance_closure.py",
@@ -40,9 +50,13 @@
       {
         "path": "hestia_shell_classifier.py",
         "sha256": "b3f508899069c0b894c792838d9d43925121ec4605cc7e30df22c7d7b425bce2"
+      },
+      {
+        "path": "hestia_witness_core.py",
+        "sha256": "750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777"
       }
     ]
   },
   "requires": [],
-  "gt_version": "1036bb2e2285abf0c91c320dca195488b0128dd074da2430e2dab55ce092c80c"
+  "gt_version": "c83a06d7f81efac73a426e2f59f80612d9f46fb545104c11cd625b15e17011c6"
 }

@@ -78,7 +78,19 @@ def source_contract() -> None:
     # TWO requests of the pane's own: the inventory read, and register (#1101), which is the one
     # write built inline here -- retire and reinstate go through the retire block's reviewed
     # functions instead. Pinned by route and method, not by count alone.
-    check("exactly two requests in the Discover block: the read and the one write", len(fetches), 2)
+    # And two more since 2026-09-28, the gate BYPASS and RESTORE (dp: "in discover, for every
+    # registered harness add a 'bypass' button (that turns into 'restore')"), each a POST to the
+    # member's own route. They are template literals -- the spelling the operator-surfaces checker
+    # reads -- so the single-quote scan above does not see them; they are pinned by exact spelling
+    # here, and the total of template-literal requests in the block is pinned too, so a fifth
+    # request of either kind still turns this red.
+    GATE_ACTS = ["apiFetch(`/api/agents/${encodeURIComponent(member)}/bypass`, {\n        method: 'POST'",
+                 "apiFetch(`/api/agents/${encodeURIComponent(member)}/restore`, {\n        method: 'POST'"]
+    for act in GATE_ACTS:
+        check(f"the gate act is a POST on the member's own route: {act.split(',')[0]}", block.count(act), 1)
+    check("the only template-literal requests in the block are the two gate acts",
+          len(re.findall(r"apiFetch\(\s*`", block)), 2)
+    check("exactly two single-quoted requests in the Discover block: the read and register", len(fetches), 2)
     reads = [f for f in fetches if "method" not in f[1]]
     writes = [f for f in fetches if "method" in f[1]]
     check("the read is the inventory read, with no method override",
@@ -101,9 +113,13 @@ def source_contract() -> None:
                       "data-register": "register a discovered harness (#1101)",
                       # dp, 2026-09-28: 12 phantoms, two prompts each. One reason for all of the
                       # never-acted ones; each through the same route, never with confirm_active.
-                      "data-retire-all": "retire every never-acted orphan in one act"}
-    found = set(re.findall(r"\bdata-(?:retire-all|retire|reinstate|register|delete|revoke|grant|merge-alias)(?![\w-])", block))
-    check("the write-capable controls in this pane are exactly the reviewed four",
+                      "data-retire-all": "retire every never-acted orphan in one act",
+                      # dp, 2026-09-28: a fail-open recovery switch for a member its own gate has
+                      # locked out, and its undo. Reason on bypass; the confirm names what is off.
+                      "data-gate-bypass": "bypass a member's gate (fail-open recovery)",
+                      "data-gate-restore": "restore a bypassed gate exactly"}
+    found = set(re.findall(r"\bdata-(?:retire-all|retire|reinstate|register|gate-bypass|gate-restore|delete|revoke|grant|merge-alias)(?![\w-])", block))
+    check("the write-capable controls in this pane are exactly the reviewed six",
           sorted(found), sorted(WRITE_CONTROLS))
     check("retire and reinstate are dispatched by the retire block's own delegated handler",
           "closest('[data-retire],[data-reinstate],[data-retire-all],#disc-show-retired,#disc-hide-retired')" in UI)
@@ -506,10 +522,31 @@ def live() -> None:
     print(f"live report: status={report.get('status')} groups={[ (g['key'], len(g['rows'])) for g in m['groups'] ]}")
 
 
+def gate_bypass() -> None:
+    """A bypassed member keeps the INVENTORY's group -- the pane adds a badge and a restore, and
+    never relabels it (dp, 2026-09-28: the existing miswired detection is what the bypass tests)."""
+    gate = {"path": "/k/pre_tool_use.py", "event": "PreToolUse", "is_gate": True, "owned_by_hestia": True}
+    report = {
+        "status": "OK", "governed": ["kimi"], "gaps": {"ungoverned": ["codex"]},
+        "detail": [agent("kimi", "kimi", True, member="kimi-code", hook_targets=[gate]),
+                   agent("codex", "codex", True, member="codex",
+                         hook_targets=[{**gate, "owned_by_hestia": False}])],
+        "bypassed": {"codex": {"bypassed_at": "T", "reason": "locked out"}},
+    }
+    m = run_model(report)
+    rows = {r["atlasId"]: (g["key"], r) for g in m.get("groups", []) for r in g["rows"]}
+    check("the inventory's group is kept for a bypassed member", rows["codex"][0], "ungoverned")
+    check("the bypass is drawn on its row", rows["codex"][1].get("bypass"), {"at": "T", "reason": "locked out"})
+    check("a member with a hestia gate is offered bypass", rows["kimi"][1].get("bypassable"), True)
+    check("an unbypassed row carries no bypass", rows["kimi"][1].get("bypass"), None)
+    check("a member whose gate is not hestia's is not offered bypass", rows["codex"][1].get("bypassable"), False)
+
+
 def main() -> int:
     source_contract()
     if shutil.which("node"):
         behaviour()
+        gate_bypass()
         unaccounted()
         registry_members()
         cleanup()
