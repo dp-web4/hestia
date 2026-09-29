@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: cf539a43589dc53398eea0641c055cbc39e1a28341b559bda1d7ad864bd968f0  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: eaf7533fc41c32b24b4676c35cdc84c84a02975cde66c8193f997a64006b1930  (published ground truth; manifest: hooks-gt)
 """Hestia PreToolUse hook for Claude Code — synchronous policy gate.
 
 Wired from .claude-plugin/plugin.json as the PreToolUse hook. Reads the
@@ -1289,10 +1289,17 @@ def escalation_request_key(plugin_id: str, marker: str, act: str,
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
+# THIS CALL'S INVOCATION (#1169): the tool call's correlation key, set by main() from the event
+# through the shared rule (hestia_witness_core.correlation_key). The claim sends it so the daemon
+# can tell a retry of a lost answer from a repeat of a delivered permit. None when unset.
+_INVOCATION_KEY: Optional[str] = None
+
+
 def request_self_write(marker: str, tool_name: str, attempted: str = "",
                        resource: Optional[str] = None, key: Optional[str] = None,
                        dest: Optional[str] = None,
-                       host_session_id: Optional[str] = None) -> Tuple[str, str]:
+                       host_session_id: Optional[str] = None,
+                       invocation_key: Optional[str] = None) -> Tuple[str, str]:
     """One round trip. Returns (verdict, detail); only 'approved' permits the write.
 
     `marker` is what the daemon keys the approval on and is NOT the human-facing
@@ -1347,6 +1354,11 @@ def request_self_write(marker: str, tool_name: str, attempted: str = "",
         # THE REQUEST KEY (#1166, #774): stable across identical re-issues in one session, so
         # when this round trip dies the daemon can answer the retry with what it already did.
         claim_args["request_key"] = request_key
+        # THE INVOCATION (#1169): a reclaim is only for a DIFFERENT invocation whose predecessor
+        # never reached execution, which the daemon learns from the society-safety begin_action.
+        _inv = invocation_key or _INVOCATION_KEY
+        if _inv:
+            claim_args["invocation_key"] = _inv
         # WHO is asking, provable — see `_connect_session`. Absent on any failure:
         # the claim accepts its absence and records `asker_basis: "asserted"`.
         sid = _connect_session(client, host_session_id)
@@ -1762,6 +1774,13 @@ def main() -> int:
     host_session_id = event.get("session_id")
     tool_use_id = event.get("tool_use_id") or event.get("session_id") or "no-id"
     tool_input = event.get("tool_input") or {}
+    # This call's invocation key (#1169), by the one shared rule; best effort -- a claim that
+    # carries none can never be reclaimed, which is the safe direction.
+    global _INVOCATION_KEY
+    try:
+        _INVOCATION_KEY = _load_mechanism().correlation_key(event)
+    except Exception:  # noqa: BLE001
+        _INVOCATION_KEY = None
 
     # SELF-PROTECTION FIRST — before the daemon, and never conditional on it.
     # If this required a verdict, "stop the daemon, then edit the gate" would be

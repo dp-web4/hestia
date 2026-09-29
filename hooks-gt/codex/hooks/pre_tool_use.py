@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: f7d6befc8cdec2cc9d7968d80ded37a50b22b5a801ab5a95a5ecfbe6fd852cb1  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 39cc0835e791f229bd8c678f31abcf8e9f200bbd45993394fe21087bd40df620  (published ground truth; manifest: hooks-gt)
 """Hestia Phase-1 PreToolUse GATE for a foreign member (OpenAI Codex CLI) — reference adapter.
 
 Adapted from the Kimi reference gate. Codex's hook engine is genuine Claude-Code lineage:
@@ -452,10 +452,12 @@ def _witness_gate_self(event_type, marker, tool_name, rule=None):
 def _claim_self_write(marker, tool_name, attempted):
     """Seat wrapper; every failure is a refusal, spelled the way the local copy spelled it."""
     try:
-        return _load_mechanism().claim_self_write(
+        _m = _load_mechanism()
+        return _m.claim_self_write(
             marker, tool_name, attempted,
             plugin_id=HESTIA_PLUGIN_ID, role=_role_bridge(),
-            client_name='hestia-codex-gate-self', host_session_id=_EVENT.get("session_id"))
+            client_name='hestia-codex-gate-self', host_session_id=_EVENT.get("session_id"),
+            invocation_key=_m.correlation_key(_EVENT))  # #1169
     except Exception:
         return "unreachable", "no answer from the daemon — refused", None, None
 

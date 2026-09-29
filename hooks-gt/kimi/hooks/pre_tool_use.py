@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: aa8b16d72b73f7120df1dcfe273edc4d4ea8465cf144e2e3f522e13e098e9e75  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: c181df8c80e46b86223d3e9be42e88af618f1c649f886dc67b931b966418f151  (published ground truth; manifest: hooks-gt)
 """Hestia Phase-1 PreToolUse GATE for a foreign member (Kimi Code) — reference adapter.
 
 
@@ -484,10 +484,12 @@ def _witness_gate_self(event_type, marker, tool_name, rule=None):
 def _claim_self_write(marker, tool_name, attempted):
     """Seat wrapper; every failure is a refusal, spelled the way the local copy spelled it."""
     try:
-        return __import__('hestia_gate_mechanism').claim_self_write(
+        _m = __import__('hestia_gate_mechanism')
+        return _m.claim_self_write(
             marker, tool_name, attempted,
             plugin_id=HESTIA_PLUGIN_ID, role=_role_bridge(),
-            client_name='hestia-kimi-gate-self', host_session_id=_EVENT.get("session_id"))
+            client_name='hestia-kimi-gate-self', host_session_id=_EVENT.get("session_id"),
+            invocation_key=_m.correlation_key(_EVENT))  # #1169
     except Exception:
         return "unreachable", "no answer from the daemon — refused", None, None
 

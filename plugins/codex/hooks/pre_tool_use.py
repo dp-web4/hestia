@@ -451,10 +451,12 @@ def _witness_gate_self(event_type, marker, tool_name, rule=None):
 def _claim_self_write(marker, tool_name, attempted):
     """Seat wrapper; every failure is a refusal, spelled the way the local copy spelled it."""
     try:
-        return _load_mechanism().claim_self_write(
+        _m = _load_mechanism()
+        return _m.claim_self_write(
             marker, tool_name, attempted,
             plugin_id=HESTIA_PLUGIN_ID, role=_role_bridge(),
-            client_name='hestia-codex-gate-self', host_session_id=_EVENT.get("session_id"))
+            client_name='hestia-codex-gate-self', host_session_id=_EVENT.get("session_id"),
+            invocation_key=_m.correlation_key(_EVENT))  # #1169
     except Exception:
         return "unreachable", "no answer from the daemon — refused", None, None
 

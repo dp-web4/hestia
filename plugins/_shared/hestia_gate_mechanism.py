@@ -450,6 +450,11 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
         }
         if host_session_id:
             begin_args["host_session_id"] = host_session_id
+        # EXECUTION EVIDENCE (#1169): this begin runs BEFORE the tool, so the daemon recording
+        # "invocation K reached begin_action" is how it knows a delivered permit was used -- and
+        # so never reclaims it for a repeat of the same command.
+        if correlation_key:
+            begin_args["correlation_key"] = correlation_key
         begin = _unwrap_tool_result(client.call_tool("hestia_begin_action", begin_args))
         if "_hestia_error" in begin:
             return _no_verdict(plugin_id, tool_name, "unknown", "begin_action rejected")
@@ -1160,7 +1165,7 @@ def witness_gate_self(event_type, marker, tool_name, rule=None, *,
 
 
 def claim_self_write(marker, tool_name, attempted, *,
-                     plugin_id, role, client_name, host_session_id=None):
+                     plugin_id, role, client_name, host_session_id=None, invocation_key=None):
     """Ask ONCE whether a human has already approved this exact (member, marker) write.
     Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
 
@@ -1195,6 +1200,8 @@ def claim_self_write(marker, tool_name, attempted, *,
     request_key = hashlib.sha256("\x1f".join(
         [plugin_id, marker, claim_args["reason"], host_session_id or ""]).encode("utf-8")).hexdigest()
     claim_args["request_key"] = request_key
+    if invocation_key:
+        claim_args["invocation_key"] = invocation_key  # #1169: retry vs repeat
     r = gate_self_call("hestia_gate_escalation_claim", claim_args,
                        plugin_id=plugin_id, role=role, client_name=client_name,
                        host_session_id=host_session_id)

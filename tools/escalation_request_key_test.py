@@ -108,7 +108,7 @@ def call_hook(endpoint):
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
         v, d = ptu.request_self_write("pre_tool_use.py", "Bash", "Bash: git apply /tmp/p/x.patch",
-                                      host_session_id="hs-1")
+                                      host_session_id="hs-1", invocation_key="toolu_INV1")
     return v, d, err.getvalue()
 
 
@@ -126,6 +126,8 @@ def main() -> int:
     check("A the claim reached the daemon", len(Stub.claims) == 1, Stub.claims)
     check("A the claim carried the request key", Stub.claims and Stub.claims[0].get("request_key") == want_key,
           Stub.claims)
+    check("A the claim carried the invocation key (#1169)",
+          Stub.claims and Stub.claims[0].get("invocation_key") == "toolu_INV1", Stub.claims)
     check("A verdict is `unknown`, not `unreachable`", v == "unknown", f"{v}: {d}")
     check("A the refusal says OUTCOME UNKNOWN", "OUTCOME UNKNOWN" in err, err)
     check("A ...names the key and the lookup", want_key in err and "hestia gate lookup" in err, err)
@@ -162,11 +164,50 @@ def main() -> int:
     try:
         mech.claim_self_write("pre_tool_use.py", "Bash", "Bash: git apply /tmp/p/x.patch",
                               plugin_id=ptu._escalation_plugin_id(), role="r", client_name="c",
-                              host_session_id="hs-1")
+                              host_session_id="hs-1", invocation_key="call_XYZ")
     finally:
         mech.gate_self_call = real
     check("D the shared mechanism computes the SAME key as the claude-code gate",
           captured.get("request_key") == want_key, captured.get("request_key"))
+    check("D the mechanism's claim carries the invocation key (#1169)",
+          captured.get("invocation_key") == "call_XYZ", captured)
+
+    print("D2. the society-safety begin carries the correlation key (#1169 execution evidence)")
+    begins = []
+    orig_do = Stub.do_POST
+
+    def spy(self):  # noqa: N802
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        body = json.loads(self.rfile.read(n) or b"{}")
+        params = body.get("params") or {}
+        name = params.get("name")
+        payload = {}
+        if name == "hestia_connect":
+            payload = {"sessionId": "S-1"}
+        elif name == "hestia_begin_action":
+            begins.append(params.get("arguments") or {})
+            payload = {"actionId": "A-1"}
+        elif name == "hestia_query_policy":
+            payload = {"status": "decided", "decision": "allow"}
+        out = json.dumps({"jsonrpc": "2.0", "id": body.get("id", 1),
+                          "result": {"content": [{"type": "text", "text": json.dumps(payload)}]}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("mcp-session-id", "stub")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+    Stub.do_POST = spy
+    os.environ["HESTIA_ENDPOINT"] = endpoint
+    try:
+        mech.query_society_safety({"tool_name": "Bash", "tool_input": {"command": "true"}},
+                                  plugin_id="codex", host_agent="codex", host_session_id="hs-1",
+                                  correlation_key="call_XYZ")
+    finally:
+        Stub.do_POST = orig_do
+    check("D2 begin_action carries correlation_key",
+          bool(begins) and begins[0].get("correlation_key") == "call_XYZ", begins)
 
     print("E. the mechanism's dead round trip")
     mech.gate_self_call = lambda *a, **kw: None
