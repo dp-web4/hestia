@@ -1,0 +1,32 @@
+{
+  "unit": "_shared",
+  "member": null,
+  "digest_rule": "sha256 over the file bytes with the 64-hex value on its `hestia-gt-sha256:` header line replaced by 64 zeros; files without a header (JSON) are plain sha256",
+  "registration": null,
+  "registration_note": null,
+  "files": [
+    {
+      "path": "hestia_gate_core.py",
+      "sha256": "4d0807d35482e36b4e107e572f44a92a4864fc9357348baf6313ac734d105301",
+      "source": "plugins/_shared/hestia_gate_core.py"
+    },
+    {
+      "path": "hestia_gate_mechanism.py",
+      "sha256": "f75f67f347f56ccc56004386335fc12757f36943508ce61d3a3825bb5847af1f",
+      "source": "plugins/_shared/hestia_gate_mechanism.py"
+    },
+    {
+      "path": "hestia_governance_closure.py",
+      "sha256": "9c9a00843a8956a3220917eef39dc3dd85f25412ba5d2fdabe04fe4fdce32d5a",
+      "source": "plugins/_shared/hestia_governance_closure.py"
+    },
+    {
+      "path": "hestia_shell_classifier.py",
+      "sha256": "b3f508899069c0b894c792838d9d43925121ec4605cc7e30df22c7d7b425bce2",
+      "source": "plugins/_shared/hestia_shell_classifier.py"
+    }
+  ],
+  "engine": null,
+  "requires": [],
+  "gt_version": "d5838606c5c9aec17177a69e7313c1dd256bd9dded7aadbd1c6dc633b67db51e"
+}

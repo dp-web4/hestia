@@ -4,6 +4,9 @@
   ],
   "install": {
     "member": "gemini",
+    "requires": [
+      "claude-code/hooks/pre_tool_use.py"
+    ],
     "dest": "~/.gemini/hestia-plugins/gemini/hooks",
     "registration": {
       "reader": "json-hook-commands",

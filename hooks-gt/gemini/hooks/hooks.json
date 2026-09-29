@@ -1,0 +1,41 @@
+{
+  "_comment": "NON-RUNNABLE INSTALLATION TEMPLATE for Gemini CLI user-level hooks. Prefer plugins/gemini/install.sh, which renders verified absolute runtime paths. Project-source hooks may be gated by the harness trust setting and are not a substitute for user-level installation.",
+  "_paths_note": "Replace @HESTIA_WORKSPACE@ and @HESTIA_PLUGIN_ROOT@ before installation, then verify every command target exists. Unrendered placeholders must never be installed: a missing hook process may fail open in the harness.",
+  "_hooksConfig_note": "Pin \"hooksConfig\": {\"enabled\": true} in settings.json alongside this block. It defaults true, but \"enabled\": false disarms every hook and hooksConfig.disabled can disable this gate by command string. Operator's prerogative, but it must be visible to anything auditing the member.",
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HESTIA_WORKSPACE=@HESTIA_WORKSPACE@ python3 @HESTIA_PLUGIN_ROOT@/gemini/hooks/before_tool.py",
+            "timeout": 15000
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "@HESTIA_PLUGIN_ROOT@/gemini/hooks/observe.sh", "timeout": 15000 }
+        ]
+      }
+    ],
+    "AfterTool": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "@HESTIA_PLUGIN_ROOT@/gemini/hooks/observe.sh", "timeout": 10000 }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "HESTIA_WORKSPACE=@HESTIA_WORKSPACE@ @HESTIA_PLUGIN_ROOT@/gemini/hooks/hydrate.sh", "timeout": 20000 }
+        ]
+      }
+    ]
+  }
+}

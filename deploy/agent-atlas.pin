@@ -3,4 +3,7 @@
 # so the universe changes when main says so, not when a registry commit happens to land.
 # Bumped 2026-09-21: agent-atlas #1 merged -- talk-to/sage, the registry's first
 # `kind: being`. Until this line moved, no seat enumerated `sage` FROM THE ATLAS.
-67184decafe5809b9e36a170fb5a23c6ab429602
+# Bumped 2026-09-28: agent-atlas #2 merged -- hooks/<provider>/descriptor.md, which agent-inventory
+# qualifies every hook against (#1144). At the old pin the deployed inventory has no hooks/ dir,
+# so every non-hestia hook reads unqualified.
+e13dc6e972bbad6b0040acf9249faace452b7d36
