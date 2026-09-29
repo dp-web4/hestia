@@ -213,6 +213,12 @@ BILLING_SPECIMENS = {
     # claude-20260816-050152.log — weekly bound, dated reset variant
     "claude-weekly-dated": "You've hit your weekly limit · resets Aug 17, 11pm "
                            "(America/Los_Angeles)",
+    # claude-20260928-225930.log — the credits-exhausted spelling, on disk since 08-12
+    # (claude-20260812-233707.log) and never in the list: 71 of 71 classified `unknown`.
+    "claude-usage-credits": "You're out of usage credits. Switch to another model, or "
+                            "manage usage credits at "
+                            "claude.ai/settings/usage?from=cc_cli_limit_message, "
+                            "to continue.",
 }
 for name, specimen in BILLING_SPECIMENS.items():
     # claude and kimi echo no prompt, so their real logs have no anchor and the whole

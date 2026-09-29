@@ -1292,7 +1292,13 @@ classify_fire_failure() {
   else
     TAIL=$(tail -n 200 "$LOG" 2>/dev/null) || TAIL=""
   fi
-  if printf '%s' "$TAIL" | grep -qi 'out of credits\|insufficient credit\|quota exceeded\|usage limit\|billing cycle\|purchase extra usage\|upgrade your plan\|hit your session limit\|hit your weekly limit\|hit your usage limit'; then
+  # `out of usage credits` — claude's THIRD billing spelling ("You're out of usage credits.
+  # Switch to another model, or manage usage credits at claude.ai/..."), on disk since
+  # claude-20260812-233707.log, i.e. BEFORE the 08-26 widening (#646) that declared all
+  # three vendors covered. 71 claude logs carried it by 2026-09-29 and every one
+  # classified `unknown` (55 `why=unknown;via=watch-claude-code` in peers' primers on
+  # 09-28 alone). Fourth instance of the vendor-spelling bet; the A8 row is verbatim.
+  if printf '%s' "$TAIL" | grep -qi 'out of credits\|out of usage credits\|insufficient credit\|quota exceeded\|usage limit\|billing cycle\|purchase extra usage\|upgrade your plan\|hit your session limit\|hit your weekly limit\|hit your usage limit'; then
     echo out-of-credits
   elif printf '%s' "$TAIL" | grep -qi 'EPERM\|operation not permitted\|network is unreachable\|connection refused\|urllib\.error'; then
     echo egress-blocked
