@@ -50,5 +50,10 @@
   },
   "observe": [
     "PostToolUse"
-  ]
+  ],
+  "targets": {
+    "observe": [
+      "witness.py"
+    ]
+  }
 }

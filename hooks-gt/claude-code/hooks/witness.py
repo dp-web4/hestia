@@ -1,35 +1,22 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 69102379cd193cf59103ae96694fb57f6de01ababac9b24e1853f609343cd393  (published ground truth; manifest: hooks-gt)
-"""Hestia witness hook for Claude Code — self-contained, stdlib only.
+# hestia-gt-sha256: 036d3c9c87fcf79932ed9e8f52b9d7945ddf1bbc5750220eebeb7b55a1cba49b  (published ground truth; manifest: hooks-gt)
+"""Hestia outcome witness — the Claude Code shim. Stdlib only.
 
-Wired from .claude-plugin/plugin.json as the PostToolUse hook. Reads
-the hook event JSON from stdin, fires a `hestia_begin_action` +
-`hestia_record_outcome` pair against the local Hestia daemon's MCP
-endpoint, and exits.
+Registered on the harness's post-tool event(s): PostToolUse. It says WHO is witnessing and hands
+the event to the shared core, `hestia_witness_core` (installed at $HESTIA_HOME/shared with the
+rest of the engine). Everything else — the gate<->outcome correlation (#977), the spool (#696),
+the cold-path typing, the harness event shapes — lives in the core, once.
 
-DESIGN
-- Pure stdlib. No `httpx`, no `mcp`, no `hestia_plugin_sdk`. The plugin
-  drops in as a single file and works wherever Python 3.10+ is present.
-- Fail-open at every layer. Any error connecting to Hestia is logged
-  (when `HESTIA_HOOK_DEBUG=1`) and swallowed. The hook MUST NOT block
-  Claude Code's tool execution.
-- Fail-open means DEFER, not DESTROY (#696): on any transient failure the
-  full intent is spooled locally and replayed by a later run, with the
-  original `client_ts` preserved. A dropped row used to leave no trace
-  anywhere, so the ledger's loss rate was invisible by construction; the
-  spool's depth is now the daemon-health metric.
-- First-run UX: if the daemon is missing, write a single one-time
-  "daemon not detected" hint to ~/.hestia-claude/last-warning so a
-  user who never ran `hestia init` knows what's happening.
-- Stateless across invocations. Each hook process opens its own MCP
-  session and disconnects. ~50-200 ms overhead amortized through the
-  fire-and-forget wrapper; the actual round-trip happens off Claude
-  Code's critical path.
+WHY A SHIM (findings/per-harness-witness-drift-2026-09-28.md). Each harness used to carry its own
+witness, and a fix landed in one copy of four: claude-code 1985 of 1986 warned acts closed by a
+same-id outcome, kimi 0 of 37, codex 0 of 1, gemini's outcomes never reached the daemon. This
+file is byte-identical across harnesses except the two identity lines below; a shim that needs
+more than that has started to fork — extend the core instead.
 
 DEBUG
-  HESTIA_HOOK_DEBUG=1     log to ~/.hestia-claude/hook.log
-  HESTIA_ENDPOINT=URL     override endpoint discovery
-  HESTIA_WITNESS_TIMEOUT_S  override the per-call budget (default 2.0; tests)
+  HESTIA_HOOK_DEBUG=1         log to the seat's state dir (hook.log)
+  HESTIA_ENDPOINT=URL         override endpoint discovery
+  HESTIA_WITNESS_TIMEOUT_S    per-call budget (default 2.0; tests)
 """
 
 from __future__ import annotations
@@ -39,45 +26,21 @@ import os
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
-import uuid
-from pathlib import Path
-from typing import Any, Optional
 
-# ---- Configuration --------------------------------------------------------
+DEFAULT_PLUGIN_ID = "claude-code"
+HOST_AGENT_VERSION = "claude-code"
 
-# One witness for every orchestrator: the hook event schema (hook_event_name /
-# tool_name / tool_input) is shared across the Claude-Code lineage (Claude Code,
-# Kimi Code, Codex), so the SAME script witnesses any of them — set
-# HESTIA_PLUGIN_ID in the hook's environment to identify the member. All plugins
-# are treated identically; each accrues to its own (instance, role) trust grain.
-PLUGIN_ID = os.environ.get("HESTIA_PLUGIN_ID", "claude-code")
-HOST_AGENT = os.environ.get("HESTIA_HOST_AGENT", PLUGIN_ID)
-PROTOCOL_VERSION = "2024-11-05"
-TIMEOUT_S = float(os.environ.get("HESTIA_WITNESS_TIMEOUT_S") or "2.0")
-HOOK_VERSION = "0.0.4"
-
-DEFAULT_ENDPOINT = "http://127.0.0.1:7711/mcp"
+PLUGIN_ID = os.environ.get("HESTIA_PLUGIN_ID", DEFAULT_PLUGIN_ID)
+HOOK_VERSION = "1.0.0"
 
 
 # ---------------------------------------------------------------------------
 # THE PROJECTION IS THE ONLY SOURCE OF THIS SEAT'S CONFIGURATION (PRD_CONFIG_FROM_VAULT; #944)
 # ---------------------------------------------------------------------------
-# One bootstrap locator, launcher-supplied, no default: HESTIA_HOME. Everything else this hook
-# needs — the workspace it polices, where the shared runtime is, the endpoint, its own state
-# dirs — comes from `$HESTIA_HOME/seats/<plugin_id>.env`, which the daemon renders from the
-# vault and checks against it. Every key the projection carries is exported over whatever the
-# launcher happened to set: the vault is the authority, a hook line is not. Two things are
-# deliberately NOT here. A fallback ("no locator, try ~/.hestia") is a second authority with
-# extra steps and is the pattern #943 was held for. And HESTIA_ROLE: role is launch context
-# (interactive vs mesh-worker), set by whoever launched the seat, never a config value.
-#
-# Loaded at IMPORT, because the shared runtime dir is resolved at import and must already be
-# the projection's. Import never fails: the outcome is recorded in `_PROJECTION_ERROR` and
-# run() returns on it, so a test can import this module and
-# a seat with no projection witnesses nothing (there is nothing authoritative to witness AS). This function is bootstrap wiring, not law: it decides
-# nothing about any tool call. It is byte-identical across seats by intent, like the loader.
+# One bootstrap locator, launcher-supplied, no default: HESTIA_HOME. Everything else — the shared
+# runtime dir, the endpoint, the state dir — comes from `$HESTIA_HOME/seats/<plugin_id>.env`.
+# Loaded at IMPORT (the shared dir is resolved from it). Import never fails: the outcome is
+# recorded in `_PROJECTION_ERROR` and run() returns on it. Bootstrap wiring, not law.
 PROJECTION_DIR = "seats"
 
 
@@ -95,9 +58,6 @@ def _load_projection(plugin_id):
     except OSError as e:
         return ("config.unbacked", f"no rendered projection for {plugin_id} at {path} ({e}); "
                 "populate this seat's config in the vault (Govern -> Runtime config)")
-    # Imported here, not at module scope: this function is byte-identical across seats, and
-    # a seat whose module happened not to import `re` raised at import instead of reporting
-    # its own absence (caught by the witness arm of projection_consumer_test).
     import hashlib
     import re
     digest = hashlib.sha256(raw).hexdigest()
@@ -109,9 +69,7 @@ def _load_projection(plugin_id):
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
             return ("config.unbacked", f"projection {path} carries an unusable key {k!r}")
         pairs.append((k, v))
-    # OWNERSHIP RIDES ON EVERY LINE (design A). A per-seat line is `TOKEN__KEY`; shared lines
-    # are plain. This seat strips ITS token and exports the bare key; a line carrying any other
-    # seat's token is a miswire, not a value -- it cannot be consumed here, whatever it says.
+    # OWNERSHIP RIDES ON EVERY LINE (design A): `TOKEN__KEY` lines belong to one seat.
     token = "".join(ch.upper() if ch.isalnum() else "_" for ch in plugin_id)
     projected = {}
     for k, v in pairs:
@@ -141,636 +99,127 @@ def _load_projection(plugin_id):
 
 _PROJECTION_ERROR = _load_projection(PLUGIN_ID)
 
-STATE_DIR = Path(
-    os.environ.get("HESTIA_STATE_DIR")
-    or str(Path.home() / (".hestia-claude" if PLUGIN_ID == "claude-code" else f".hestia-{PLUGIN_ID}"))
-)
+# Resolved AFTER the projection: the vault may name it (projection_consumer_test pins this). No
+# default is spelled here -- once the core loads, its STATE_DIR (one rule, in the engine) is used.
+STATE_DIR = os.environ.get("HESTIA_STATE_DIR")
 
 
-def debug_log(msg: str) -> None:
-    if os.environ.get("HESTIA_HOOK_DEBUG") != "1":
-        return
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        with (STATE_DIR / "hook.log").open("a") as f:
-            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
-    except OSError:
-        pass
-
-
-def discover_endpoint() -> Optional[str]:
-    """Mirror the SDK's discovery order: env → file → default."""
-    env = os.environ.get("HESTIA_ENDPOINT")
-    if env:
-        return env
+# ---------------------------------------------------------------------------
+# The core is loaded ONLY from the installed authority directory — the gates' loader, verbatim in
+# behaviour: never a checkout fallback (#742/#747).
+# ---------------------------------------------------------------------------
+def _shared_runtime_dir():
+    explicit = os.environ.get("HESTIA_SHARED_DIR")
+    if explicit:
+        return explicit
     home = os.environ.get("HESTIA_HOME")
-    if not home:
-        return None
-    endpoint_file = Path(home) / "endpoint"
-    try:
-        return endpoint_file.read_text().strip() or None
-    except OSError:
-        return None  # daemon hasn't run; let warn_once handle the UX
+    return os.path.join(home, "shared") if home else ""
 
 
-def warn_once_daemon_missing() -> None:
-    """Surface a single one-time hint if the daemon was never set up."""
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        marker = STATE_DIR / "daemon-warned"
-        if marker.exists():
-            return
-        marker.touch()
-        sys.stderr.write(
-            "hestia: daemon not detected — install at https://hestia.tools "
-            "to start recording tool calls. (This message shown once.)\n"
-        )
-    except OSError:
-        pass
+def _load_shared_module(name):
+    """Load the named module only from the selected installed authority directory."""
+    import importlib.util
 
-
-# ---- Spool: a slow referee must not DESTROY the record (#696) --------------
-#
-# Fail-open stays absolute — nothing here may block or fail the tool call.
-# But "fail open" used to mean "drop the row", and a dropped row leaves no
-# trace anywhere: measured 2026-08-28, a seat's dashboard showed 5 outcome
-# rows for an hour with ~36 tool calls, rows landing minutes late or never,
-# and no component recording the loss. The spool converts silent destruction
-# into a visible backlog: on transient failure the full intent becomes one
-# file; a later run replays up to SPOOL_DRAIN_PER_RUN entries with the
-# ORIGINAL client_ts, so append-lag stays measurable across the replay.
-SPOOL_DIR = STATE_DIR / "spool"
-SPOOL_MAX_ENTRIES = 500
-SPOOL_DRAIN_PER_RUN = 8
-
-
-def spool_save(intent: dict) -> bool:
-    """Best-effort append. FIFO: the name sorts by act time. When full, drop
-    the NEWEST (this one) — the backlog is the alarm, so it is preserved.
-
-    RETURNS WHETHER THE ROW IS NOW DURABLE, because the caller uses that to
-    decide whether the act's correlation file may be released (#977 review).
-    Both failure modes here — a full spool and a failed write — drop this row,
-    and releasing the cache on either would destroy the last durable carrier of
-    the action's identity while nothing had yet recorded it.
-    """
-    try:
-        SPOOL_DIR.mkdir(parents=True, exist_ok=True)
-        if len(list(SPOOL_DIR.glob("*.json"))) >= SPOOL_MAX_ENTRIES:
-            debug_log(f"spool FULL ({SPOOL_MAX_ENTRIES}) — dropping newest row; backlog preserved")
-            return False
-        (SPOOL_DIR / f"{intent['client_ts']:.3f}-{uuid.uuid4().hex}.json").write_text(
-            json.dumps(intent)
-        )
-    except (OSError, KeyError) as e:
-        debug_log(f"spool save failed: {e}")
-        return False
-    return True
-
-
-def spool_drain(client: "McpHttp", session_id: Optional[str]) -> None:
-    """Replay spooled intents, oldest first, bounded per run. Record-then-
-    unlink: a crash between the two replays the row, and a duplicate is
-    detectable (same client_ts) where a loss is invisible. flock serializes
-    concurrent children; on platforms without fcntl the race is accepted
-    (same direction: a duplicate, never a loss)."""
-    try:
-        files = sorted(SPOOL_DIR.glob("*.json"))[:SPOOL_DRAIN_PER_RUN]
-    except OSError:
-        return
-    if not files:
-        return
-    lock_file = None
-    fcntl = None
-    if os.name != "nt":
+    shared = _shared_runtime_dir()
+    required = os.path.realpath(os.path.join(shared, name + ".py"))
+    if not os.path.isfile(required):
+        raise ImportError(f"installed Hestia shared module {name!r} is unavailable at {required!r}; "
+                          "run deploy/install-members.sh")
+    selected_dir = os.path.dirname(required)
+    selected_key = os.path.normcase(selected_dir)
+    retained = []
+    for entry in sys.path:
         try:
-            import fcntl as _fcntl
-            fcntl = _fcntl
-            lock_file = open(SPOOL_DIR / ".lock", "w")
-            fcntl.flock(lock_file, fcntl.LOCK_EX)
-        except (OSError, ImportError):
-            lock_file = None
+            entry_key = os.path.normcase(os.path.realpath(os.fspath(entry) or os.getcwd()))
+        except (TypeError, ValueError, OSError):
+            retained.append(entry)
+            continue
+        if entry_key != selected_key:
+            retained.append(entry)
+    sys.path[:] = [selected_dir, *retained]
+    cached = sys.modules.get(name)
+    if cached is not None:
+        cached_file = getattr(cached, "__file__", None)
+        if cached_file and os.path.realpath(cached_file) == required:
+            return cached
+        sys.modules.pop(name, None)
+    spec = importlib.util.spec_from_file_location(name, required)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot construct a loader for installed module {required!r}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
     try:
-        for f in files:
-            try:
-                intent = json.loads(f.read_text())
-            except (OSError, json.JSONDecodeError):
-                continue
-            verdict = witness_one(client, session_id, intent)
-            if verdict == "transient":
-                continue  # referee still unreachable; the row stays
-            try:
-                f.unlink()
-            except OSError:
-                pass
-            debug_log(f"spool: {verdict} {f.name} (client_ts {intent.get('client_ts')})")
-    finally:
-        if lock_file is not None:
-            try:
-                fcntl.flock(lock_file, fcntl.LOCK_UN)
-                lock_file.close()
-            except OSError:
-                pass
+        spec.loader.exec_module(module)
+    except BaseException as exc:
+        sys.modules.pop(name, None)
+        raise ImportError(f"installed Hestia shared module {name!r} failed to initialize") from exc
+    return module
 
 
-# ---- Magnitude / target heuristics ---------------------------------------
-
-def magnitude_for(tool_name: str) -> float:
-    """R6 magnitude in [0..1] by tool class."""
-    if tool_name in {"Bash", "Shell"}:
-        return 0.8
-    if tool_name in {"Write", "Edit", "MultiEdit", "NotebookEdit"}:
-        return 0.6
-    if tool_name in {"WebFetch", "WebSearch"}:
-        return 0.4
-    if tool_name in {"Read", "Glob", "Grep", "TodoWrite"}:
-        return 0.2
-    return 0.4
-
-
-def extract_target(tool_input: Any) -> Optional[str]:
-    if not isinstance(tool_input, dict):
-        return None
-    for key in ("file_path", "path", "url", "notebook_path"):
-        v = tool_input.get(key)
-        if isinstance(v, str):
-            return v
-    cmd = tool_input.get("command")
-    if isinstance(cmd, str) and cmd.strip():
-        # Send the full command (truncated for chain-entry hygiene).
-        # The policy gate already sees the untracked command via the
-        # PreToolUse hook's `parameters.command`; this `target` is for
-        # forensic readability in the chain feed.
-        s = cmd.strip()
-        return s if len(s) <= 240 else s[:237] + "..."
-    return None
-
-
-def derive_success(tool_response: Any) -> tuple[bool, Optional[str]]:
-    """Best-effort success flag from Claude Code's tool_response shape."""
-    if not isinstance(tool_response, dict):
-        return True, None
-    if tool_response.get("is_error") or tool_response.get("isError"):
-        err = tool_response.get("error") or tool_response.get("message") or "tool error"
-        return False, str(err)[:500]
-    return True, None
-
-
-# ---- Minimal MCP-over-HTTP client ----------------------------------------
-
-class McpHttp:
-    """Tiny synchronous MCP client. Just enough to fire init + 2 tool calls."""
-
-    def __init__(self, endpoint: str) -> None:
-        self.endpoint = endpoint
-        self.session_id: Optional[str] = None
-        self.next_id = 0
-
-    def _id(self) -> int:
-        self.next_id += 1
-        return self.next_id
-
-    def _request(
-        self, body: dict[str, Any], *, is_notification: bool = False
-    ) -> Optional[dict[str, Any]]:
-        data = json.dumps(body).encode("utf-8")
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-        }
-        if self.session_id:
-            headers["mcp-session-id"] = self.session_id
-        req = urllib.request.Request(self.endpoint, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
-            # Capture session id on first call.
-            if not self.session_id:
-                sid = resp.headers.get("mcp-session-id")
-                if sid:
-                    self.session_id = sid
-            if is_notification:
-                return None
-            payload = resp.read().decode("utf-8", errors="replace")
-        return parse_json_or_sse(payload)
-
-    # --- public ops ---
-
-    def initialize(self) -> dict[str, Any]:
-        result = self._request({
-            "jsonrpc": "2.0",
-            "id": self._id(),
-            "method": "initialize",
-            "params": {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": PLUGIN_ID, "version": HOOK_VERSION},
-            },
-        })
-        return result or {}
-
-    def initialized(self) -> None:
-        self._request(
-            {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
-            is_notification=True,
-        )
-
-    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        result = self._request({
-            "jsonrpc": "2.0",
-            "id": self._id(),
-            "method": "tools/call",
-            "params": {"name": name, "arguments": arguments},
-        })
-        return result or {}
-
-
-def parse_json_or_sse(text: str) -> dict[str, Any]:
-    """Hestia returns either a plain JSON-RPC body or an SSE stream
-    containing the body. Handle both."""
-    text = text.strip()
-    if not text:
-        return {}
-    if text.startswith("{"):
-        return json.loads(text)
-    # SSE: pick the last `data:` line that parses as JSON.
-    for line in reversed(text.splitlines()):
-        line = line.strip()
-        if line.startswith("data:"):
-            body = line[5:].strip()
-            if body and body.startswith("{"):
-                try:
-                    return json.loads(body)
-                except json.JSONDecodeError:
-                    continue
-    return {}
-
-
-def unwrap_tool_result(rpc_response: dict[str, Any]) -> dict[str, Any]:
-    """Extract the structured payload from an MCP tools/call response."""
-    result = rpc_response.get("result") or {}
-    structured = result.get("structuredContent")
-    if isinstance(structured, dict):
-        return structured
-    # Fallback to first text content.
-    for block in result.get("content") or []:
-        if isinstance(block, dict) and block.get("type") == "text":
-            text = block.get("text", "")
-            try:
-                return json.loads(text)
-            except json.JSONDecodeError:
-                pass
-    return {}
-
-
-# ---- Main flow -----------------------------------------------------------
-
-# ---- Act identity continuity (#977) --------------------------------------
-#
-# The gate begins the action it DECIDES on and caches that id under
-# `ACTIONS_DIR/<tool_use_id>.json`; this hook closes that same action. The
-# literal is the only carrier of the Pre→Post contract and must stay
-# byte-identical to `pre_tool_use.py`'s. It is deliberately NOT migrated to the
-# vault in this change: it is load-bearing for a contract being repaired here,
-# and moving both at once would make a failed join impossible to attribute to
-# one of them (#944 carries the migration, after this lands and is measured).
-ACTIONS_DIR = Path("/tmp/hestia-actions")
-
-# Typed on the outcome row via the action's `intent`, so a discontinuity is
-# READ rather than inferred from a join that does not close.
-COLD_NO_CACHE = "hestia:cold-record:no-authorized-action-cached"
-COLD_STALE = "hestia:cold-record:authorized-action-not-resident"
-
-
-def cached_action_id(tool_use_id: Optional[str]) -> Optional[str]:
-    """The id of the action the gate authorized for this tool call, or None.
-
-    Absence is normal and not an error: a call the gate never saw, a cache the
-    operator cleared, a seat whose gate predates the cache. Every absence takes
-    a cold path that names itself.
-    """
-    if not tool_use_id:
-        return None
+core = None
+_CORE_ERROR = None
+if _PROJECTION_ERROR is None:
     try:
-        blob = json.loads((ACTIONS_DIR / f"{tool_use_id}.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    action_id = blob.get("action_id")
-    return action_id if isinstance(action_id, str) and action_id else None
+        core = _load_shared_module("hestia_witness_core")
+        core.configure(plugin_id=PLUGIN_ID, host_agent_version=HOST_AGENT_VERSION,
+                       hook_version=HOOK_VERSION)
+        STATE_DIR = str(core.STATE_DIR)
+    except Exception as e:  # noqa: BLE001 — recorded below, never raised into the harness
+        core, _CORE_ERROR = None, f"{type(e).__name__}: {e}"
 
 
-def retire_cached_action(tool_use_id: Optional[str]) -> None:
-    """Drop the correlation file once its act is durably handled.
-
-    Called after the row is recorded, rejected or spooled — never while it is
-    still only in memory. A spooled row carries the action id inside the spool
-    file, so the cache has no reader left once that hand-off has happened.
-
-    Only this call's own file. The files that accumulated while nothing retired
-    them are historical evidence of the defect and are left for a deliberate
-    cleanup, not swept up by the fix that ends their production.
-    """
-    if not tool_use_id:
-        return
+def _note_unwitnessed(why: str) -> None:
+    """The core could not run, so this act reaches no chain. Say so where an operator looks —
+    a silent skip is how four witness copies drifted for two months without anyone seeing."""
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {PLUGIN_ID} unwitnessed: {why}\n"
+    where = STATE_DIR or os.environ.get("HESTIA_HOME")
     try:
-        (ACTIONS_DIR / f"{tool_use_id}.json").unlink()
+        if not where:
+            raise OSError("no state dir and no HESTIA_HOME")
+        os.makedirs(where, exist_ok=True)
+        with open(os.path.join(where, "witness-unwitnessed.log"), "a") as f:
+            f.write(line)
     except OSError:
-        pass
-
-
-def begin_cold_action(
-    client: "McpHttp", session_id: Optional[str], intent: dict, why: str
-) -> tuple[Optional[str], Optional[str]]:
-    """Begin an action HERE because no authorized one is usable, and SAY SO on the row.
-
-    `intent` is carried by the daemon onto the outcome (`action.intent`), so a
-    discontinuity is typed in the evidence instead of being inferred later from a
-    join that does not close. That matters because the absence of a join is
-    exactly the symptom the ambiguity produced: an outcome whose action nobody
-    decided on looks identical to an outcome whose decision row was simply never
-    written.
-
-    Returns `(action_id, None)` or `(None, verdict)`.
-    """
-    resp = client.call_tool(
-        "hestia_begin_action",
-        {
-            "tool_name": intent["tool_name"],
-            "target": intent.get("target"),
-            "intent": why,
-            **({"session_id": session_id} if session_id else {}),
-            **({"host_session_id": intent["host_session_id"]} if intent.get("host_session_id") else {}),
-        },
-    )
-    begin = unwrap_tool_result(resp)
-    if "_hestia_error" in begin:
-        debug_log(f"begin_action rejected: {begin['_hestia_error']}")
-        return None, "rejected"
-    action_id = begin.get("actionId")
-    if not action_id:
-        debug_log(f"begin_action missing actionId: {begin}")
-        return None, "rejected"
-    return action_id, None
-
-
-def record_outcome_for(
-    client: "McpHttp", session_id: Optional[str], intent: dict, action_id: str
-) -> dict:
-    """Close one action with this act's outcome. Raises on network failure."""
-    resp = client.call_tool(
-        "hestia_record_outcome",
-        {
-            "action_id": action_id,
-            "success": intent["success"],
-            "magnitude": intent["magnitude"],
-            "error": intent.get("error"),
-            # The act's own clock (#696): append-lag = chain ts - client_ts
-            # is the measurement that makes a slow referee visible. Older
-            # daemons ignore the field; newer ones carry it onto the row.
-            "client_ts": intent["client_ts"],
-            **({"session_id": session_id} if session_id else {}),
-        },
-    )
-    return unwrap_tool_result(resp)
-
-
-def witness_one(client: "McpHttp", session_id: Optional[str], intent: dict) -> str:
-    """Close the AUTHORIZED action with this act's outcome.
-
-    Returns one of three verdicts, because the failure kind decides the
-    disposition: "recorded"; "transient" (network/timeout — the referee may
-    be reachable later, so the caller spools or keeps the row); "rejected"
-    (the daemon RULED on it — an error envelope or a malformed reply — and
-    replaying will never succeed, so the row is dropped, loudly in debug).
-
-    ACT IDENTITY CONTINUITY (#977). This used to call `hestia_begin_action`
-    unconditionally and record the outcome against THAT action, while the gate
-    had already begun, decided on, and cached a different one. The two records
-    then described two different acts: measured on CBP over 2.5 days, 4,121
-    outcome rows and 450 gated `policy_decision` rows shared ZERO `action_id`
-    values, on every seat that produced rows. Session, tool, target and time
-    could make a pair look adjacent; adjacency is not identity. The authorized
-    action also stayed resident, because `record_outcome` is its only remover
-    and it was never called with that id.
-
-    So the normal path now begins nothing: it closes the action the gate
-    authorized, whose id `intent["action_id"]` carries (put there before any
-    network work, so a spool replay hours later still closes the same act).
-    Attribution improves with it — the daemon reads plugin and role from the
-    BEGINNING session, so the row is attributed to the session that was gated
-    rather than to this hook's own connect.
-
-    Two cold paths remain, and both name themselves rather than silently
-    looking like the defect this replaces:
-
-    * no cached id at all — no gate ran for this call, or the cache is gone;
-    * `hestia.action_not_found` — the id was cached but the daemon no longer
-      holds it (`s.actions` is RAM: a restart between the decision and the
-      outcome loses it, and a replayed spool row may already have closed it).
-    """
-    action_id = intent.get("action_id")
-    try:
-        if action_id:
-            outcome = record_outcome_for(client, session_id, intent, action_id)
-            if (outcome.get("_hestia_error") or {}).get("code") == "hestia.action_not_found":
-                debug_log(f"authorized action {action_id} no longer resident; cold-recording")
-                action_id, verdict = begin_cold_action(client, session_id, intent, COLD_STALE)
-                if action_id is None:
-                    return verdict
-                outcome = record_outcome_for(client, session_id, intent, action_id)
-        else:
-            action_id, verdict = begin_cold_action(client, session_id, intent, COLD_NO_CACHE)
-            if action_id is None:
-                return verdict
-            outcome = record_outcome_for(client, session_id, intent, action_id)
-    except (urllib.error.URLError, OSError) as e:
-        debug_log(f"witness network: {e}")
-        return "transient"
-    if "_hestia_error" in outcome:
-        debug_log(f"record_outcome rejected: {outcome['_hestia_error']}")
-        return "rejected"
-    return "recorded"
+        sys.stderr.write("hestia: " + line)
 
 
 def run() -> int:
-    if _PROJECTION_ERROR is not None:
-        # No projection, no authority to witness as. Logged, not scored: a missing config is
-        # infrastructure, not conduct, and the gate already refused the act.
-        debug_log(f"projection: {_PROJECTION_ERROR[0]}: {_PROJECTION_ERROR[1]}")
-        return 0
     raw = sys.stdin.read()
     if not raw.strip():
+        return 0
+    if _PROJECTION_ERROR is not None:
+        # No projection, no authority to witness as. Infrastructure, not conduct.
+        _note_unwitnessed(f"projection {_PROJECTION_ERROR[0]}: {_PROJECTION_ERROR[1]}")
+        return 0
+    if core is None:
+        _note_unwitnessed(f"witness core unavailable: {_CORE_ERROR}")
         return 0
     try:
         event = json.loads(raw)
     except json.JSONDecodeError as e:
-        debug_log(f"bad json: {e}")
+        core._debug_log(f"bad json: {e}")
         return 0
-
-    if event.get("hook_event_name") != "PostToolUse":
-        return 0
-
-    tool_name = event.get("tool_name") or "?"
-    tool_input = event.get("tool_input") or {}
-    tool_response = event.get("tool_response")
-    # Claude Code's own stable session id — the real per-session audit grain.
-    host_session_id = event.get("session_id")
-    # The gate keyed its action cache on exactly this expression (#977). The
-    # fallbacks are its, kept byte-for-byte: a divergence here does not fail
-    # loudly, it silently misses the cache and cold-records every call.
-    tool_use_id = event.get("tool_use_id") or event.get("session_id") or "no-id"
-
-    success, error = derive_success(tool_response)
-    intent: dict[str, Any] = {
-        "tool_name": tool_name,
-        "target": extract_target(tool_input),
-        "success": success,
-        "magnitude": magnitude_for(tool_name),
-        "error": error,
-        "host_session_id": host_session_id,
-        # Captured BEFORE any network work: this is the act's timestamp, and
-        # it survives a spool-replay unchanged.
-        "client_ts": time.time(),
-        # THE ACT'S IDENTITY, read from the gate's cache before any network work
-        # for the same reason as `client_ts` (#977): it rides into the spool, so
-        # a row replayed hours or a restart later still closes the action that
-        # was authorized rather than opening a fresh one nobody decided on.
-        # `None` is a normal value here and takes a cold path that names itself.
-        "action_id": cached_action_id(tool_use_id),
-    }
-    # TWO-PHASE HANDOFF (#977 review). The cache is released only once this act
-    # is durable somewhere else — an outcome on the chain, or a spool row on
-    # disk. The first version released it here, as soon as the id was in memory,
-    # on the argument that a decision with no outcome is a truthful state. It is;
-    # but keeping the file does not make it less truthful, and it preserves WHICH
-    # unfinished action the decision belonged to. Dying in the gap would have
-    # destroyed the last durable carrier of that identity for nothing.
-    def hand_off_to_spool() -> None:
-        """Park the act durably, then release its correlation file — never before."""
-        if spool_save(intent):
-            retire_cached_action(tool_use_id)
-
-    endpoint = discover_endpoint()
-    if endpoint is None:
-        warn_once_daemon_missing()
-        debug_log("no endpoint discovered; spooling")
-        hand_off_to_spool()
-        return 0
-
-    client = McpHttp(endpoint)
-    try:
-        init_resp = client.initialize()
-        if "result" not in init_resp:
-            debug_log(f"initialize failed: {init_resp}")
-            hand_off_to_spool()
-            return 0
-        client.initialized()
-
-        connect_args: dict[str, Any] = {
-            "plugin_id": PLUGIN_ID,
-            "plugin_version": HOOK_VERSION,
-            "host_agent": HOST_AGENT,
-            "host_agent_version": "claude-code",
-            "requested_role": "citizen",
-        }
-        # Optional constellation role. Absent env → omit → daemon defaults to
-        # role:constellation:member. (Distinct from the legacy requested_role.)
-        role = os.environ.get("HESTIA_ROLE")
-        if role:
-            connect_args["role"] = role
-        # Optional basis for that role — HOW it was established (e.g.
-        # "provisional:declared-by-fire; identity file absent or unreadable
-        # at …"). Exported by the member-mesh fire scripts alongside
-        # HESTIA_ROLE when the identity file could not be hydrated. The daemon
-        # carries it onto outcome chain entries so a provisional role is
-        # distinguishable from a hydrated one — the role string alone cannot
-        # separate them. Absent env → omit.
-        role_basis = os.environ.get("HESTIA_ROLE_BASIS")
-        if role_basis:
-            connect_args["role_basis"] = role_basis
-        # Liveness (#944): the digest of the projection this process loaded at import.
-        projection = os.environ.get("HESTIA_PROJECTION_SHA256")
-        if projection:
-            connect_args["projection_sha256"] = projection
-        # THE HOST SESSION, so connect is IDEMPOTENT across hook invocations (#981
-        # prerequisite). The gate hook has always sent this; this one sent it on
-        # `hestia_begin_action` and not on connect, which is the only call idempotency reads.
-        # So every PostToolUse minted a fresh daemon session: measured on CBP over 4,554 rows,
-        # 80 host sessions produced 48 daemon sessions behind the gate rows and 4,076 behind
-        # the outcome rows, sharing none. Two consequences, and the second is why this is a
-        # prerequisite rather than tidying. It is the dominant producer in the session leak
-        # (#320). And #981 will enforce that only the session which BEGAN an action may close
-        # it — until Pre and Post resolve to the same daemon session, every legitimate closer
-        # is a foreign closer, and enforcing ownership would refuse every outcome on the fleet.
-        if host_session_id:
-            connect_args["host_session_id"] = host_session_id
-        connect_resp = client.call_tool("hestia_connect", connect_args)
-        connect = unwrap_tool_result(connect_resp)
-        if "_hestia_error" in connect:
-            # A RULED-ON refusal, not an unreachable referee: replaying the
-            # intent will not heal it, so there is nothing to spool.
-            debug_log(f"connect rejected: {connect['_hestia_error']}")
-            return 0
-        session_id = connect.get("sessionId")
-
-        # Replay the backlog first: older acts outrank this one.
-        spool_drain(client, session_id)
-
-        verdict = witness_one(client, session_id, intent)
-        if verdict == "transient":
-            hand_off_to_spool()
-        else:
-            # "recorded" — the outcome is on the chain — or "rejected", where the
-            # daemon RULED and a replay can never succeed. Either way the act is
-            # durably disposed of and the correlation file has no reader left.
-            retire_cached_action(tool_use_id)
-            if verdict == "recorded":
-                debug_log(
-                    f"post {tool_name} success={success} magnitude={intent['magnitude']}"
-                )
-    except urllib.error.URLError as e:
-        debug_log(f"network: {e}")
-        warn_once_daemon_missing()
-        hand_off_to_spool()
-    except Exception as e:  # noqa: BLE001 — fail-open at top level
-        debug_log(f"unexpected: {type(e).__name__}: {e}")
-        hand_off_to_spool()
-    return 0
+    return core.run(event)
 
 
 BACKGROUND_MARKER = "--hestia-bg"
 
 
 def fire_and_forget() -> None:
-    """Relaunch self detached so the parent (Claude Code) doesn't block.
-
-    Reads stdin in the foreground, hands it to the background process,
-    exits immediately. The background process does the actual MCP work.
-
-    Cross-platform: `start_new_session=True` on POSIX, `DETACHED_PROCESS`
-    + `CREATE_NEW_PROCESS_GROUP` on Windows.
-    """
+    """Relaunch self detached so the harness doesn't block on the round-trip."""
     raw = sys.stdin.buffer.read()
-    kwargs: dict[str, Any] = {
-        "stdin": subprocess.PIPE,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-    }
+    kwargs = {"stdin": subprocess.PIPE, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     if os.name == "nt":
-        DETACHED_PROCESS = 0x00000008
-        CREATE_NEW_PROCESS_GROUP = 0x00000200
-        kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
-
     try:
-        proc = subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), BACKGROUND_MARKER],
-            **kwargs,
-        )
+        proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), BACKGROUND_MARKER], **kwargs)
         if proc.stdin is not None:
             proc.stdin.write(raw)
             proc.stdin.close()
-    except OSError as e:
-        debug_log(f"could not background: {e}")
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":
@@ -779,6 +228,5 @@ if __name__ == "__main__":
             sys.exit(run())
         fire_and_forget()
         sys.exit(0)
-    except Exception as e:  # noqa: BLE001
-        debug_log(f"top-level: {e}")
+    except Exception:  # noqa: BLE001 — the witness never fails the tool call
         sys.exit(0)
