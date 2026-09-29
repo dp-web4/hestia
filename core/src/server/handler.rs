@@ -21558,7 +21558,7 @@ async fn tool_gate_escalation_claimable(state: &SharedState, args: &Value) -> To
 
     let session_id_arg = optional_session_id(args);
     let now = now_secs();
-    let s = state.lock().await;
+    let mut s = state.lock().await;
 
     // Identity, proven where possible. `plugin_id` is caller-supplied across this API at A1,
     // so accepting it is consistent — but a resolved session OUTRANKS the assertion rather
@@ -21595,6 +21595,25 @@ async fn tool_gate_escalation_claimable(state: &SharedState, args: &Value) -> To
     };
     let basis = "session";
 
+    // ASKING IS OBSERVING (2026-09-28). #667 anchors the claim fuse at the asker's observation,
+    // but the only thing that recorded one was an attributed poll. An asker that came here to
+    // ask "what may I spend?" has observed its grants by any reading, and without this a grant
+    // that lapsed unobserved -- the operator approved in seconds, the interactive asker heard
+    // 11 minutes later (#1166's measurements) -- was simply absent from this list, while a
+    // poll would have revived it. Scoped to the escalations THIS proven session asked
+    // (`host_session_id` is the asker's proven session, recorded at open), so a sibling
+    // session on the same seat never starts another session's window (#732).
+    // `mark_observed` keeps its own conjuncts: approved, bar met, unspent, first observation.
+    let asker_host = caller
+        .as_ref()
+        .and_then(|c| c.session_uuid)
+        .and_then(|u| s.sessions.get(&u))
+        .and_then(|sess| sess.host_session_id.clone());
+    let observed_now: Vec<String> = match asker_host.as_deref() {
+        Some(h) => s.gate_escalations.observe_session_grants(&plugin_id, h, now),
+        None => Vec::new(),
+    };
+
     let items: Vec<Value> = s
         .gate_escalations
         .claimable_for(&plugin_id, now)
@@ -21624,6 +21643,8 @@ async fn tool_gate_escalation_claimable(state: &SharedState, args: &Value) -> To
         "plugin_id": plugin_id,
         "asker_basis": basis,
         "claimable": items,
+        // Which of this session's grants this very call observed (their windows start now).
+        "observed_now": observed_now,
         // State the anchor, not a countdown from now. The window opens at the DECISION and
         // is not determinable when the escalation is opened, which is why the open path's
         // single `retry_within_secs` number is a supremum presented as a point

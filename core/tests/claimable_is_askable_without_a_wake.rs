@@ -231,3 +231,43 @@ fn the_claimable_surface_has_no_asserted_plugin_id_fallback() {
          so the negative assertions above prove nothing"
     );
 }
+
+/// PIN D -- ASKING IS OBSERVING, for the asking session's own grants only (2026-09-28).
+///
+/// The failure it pins, measured that day: the operator approved within 8-19 s; the interactive
+/// asker heard 11-25 minutes later and asked; the grant had lapsed UNOBSERVED (the fuse burns
+/// from the ruling until the asker observes), so it was absent from this listing while one
+/// attributed poll would have revived it. Sabotage: drop the `observe_session_grants` call in the
+/// tool and the source arm fails; drop the session filter and the sibling arm fails.
+#[test]
+fn asking_observes_this_sessions_own_lapsed_grant_and_no_one_elses() {
+    use hestia::server::gate_escalation::APPROVAL_CLAIM_WINDOW_SECS as W;
+    let decided = T0 + 8;
+    let (mut s, id) = opened_and_approved(decided);
+    s.record_seat_keys(&id, None, Some("asker-session"), None);
+    let late = decided + W + 61;
+    assert!(s.claimable_for(SEAT, late).is_empty(), "precondition: lapsed unobserved, not listed");
+
+    // A SIBLING session on the same seat asks: it must neither observe nor revive this grant.
+    let sib = s.observe_session_grants(SEAT, "sibling-session", late);
+    assert!(sib.is_empty(), "a sibling session's ask observed another session's grant: {sib:?}");
+    assert!(s.claimable_for(SEAT, late).is_empty(), "and the grant stays lapsed for the sibling");
+
+    // The asking session itself: observed now, and listed with a fresh window.
+    let mine = s.observe_session_grants(SEAT, "asker-session", late);
+    assert_eq!(mine, vec![id.clone()], "the asker's own ask observes its grant");
+    let listed: Vec<&str> = s.claimable_for(SEAT, late).iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(listed, vec![id.as_str()], "and the grant is now listed as spendable");
+
+    // Idempotent and one-way: a second ask observes nothing new.
+    assert!(s.observe_session_grants(SEAT, "asker-session", late + 1).is_empty());
+
+    // Source: the tool observes BEFORE it lists, keyed on the proven session's host id.
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server/handler.rs"))
+        .expect("handler.rs");
+    let f = src.find("async fn tool_gate_escalation_claimable(").expect("tool exists");
+    let body = &src[f..f + src[f..].find("\n}\n").expect("fn end")];
+    let obs = body.find("observe_session_grants(").expect("the tool must observe the asker's grants");
+    let list = body.find("claimable_for(").expect("the tool lists");
+    assert!(obs < list, "observation must precede the listing, or a lapsed grant is never listed");
+}

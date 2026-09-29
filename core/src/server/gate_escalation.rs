@@ -1940,6 +1940,25 @@ impl EscalationStore {
         }
     }
 
+    /// ASKING IS OBSERVING: the proven asker session's OWN approved grants are observed when it
+    /// asks what it may spend (`hestia_gate_escalation_claimable`). Only escalations whose
+    /// recorded asker session (`host_session_id`, set from the proven session at open) is this
+    /// one, so a sibling session on the same seat never starts another's window (#732); each
+    /// passes through `mark_observed`'s own conjuncts (approved, bar met, unspent, first
+    /// observation). Returns the ids this call observed.
+    pub fn observe_session_grants(&mut self, plugin_id: &str, host_session_id: &str, now: u64) -> Vec<String> {
+        if host_session_id.trim().is_empty() {
+            return Vec::new();
+        }
+        let mine: Vec<String> = self
+            .by_id
+            .values()
+            .filter(|e| e.plugin_id == plugin_id && e.host_session_id.as_deref() == Some(host_session_id))
+            .map(|e| e.id.clone())
+            .collect();
+        mine.into_iter().filter(|id| self.mark_observed(id, plugin_id, now)).collect()
+    }
+
     pub fn claimable_for(&self, plugin_id: &str, now: u64) -> Vec<&Escalation> {
         let mut out: Vec<&Escalation> = self
             .by_id
