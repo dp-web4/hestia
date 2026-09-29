@@ -867,7 +867,8 @@ def main():
                 m = _load_mechanism()
                 verdict = m.query_society_safety(
                     event, plugin_id="codex", host_agent="codex",
-                    host_session_id=event.get("session_id"))
+                    host_session_id=event.get("session_id"),
+                    correlation_key=m.correlation_key(event))
             except Exception:
                 # Loading the mechanism must itself fail closed on a consequential act: a missing
                 # or unimportable module is not a reason to allow a write on a fail-open harness.

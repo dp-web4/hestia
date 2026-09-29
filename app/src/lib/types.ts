@@ -377,6 +377,27 @@ export interface AgentRow {
   /** The inventory's own sentences. Shown in full: they say what is missing and where. */
   findings: string[];
   launchers?: BeingLauncher[];
+  /** The MEMBER id (agent-inventory `member`); `plugin` is the older fallback. */
+  member?: string;
+  /** Each registered hook target, qualified: a hestia gate is `is_gate && owned_by_hestia`. */
+  hook_targets?: HookTarget[];
+}
+
+export interface HookTarget {
+  path: string;
+  event?: string;
+  exists?: boolean;
+  is_gate?: boolean;
+  owned_by_hestia?: boolean;
+  config?: string;
+}
+
+/** An operator's active gate bypass, keyed by member id in `AgentInventory.bypassed`. */
+export interface GateBypass {
+  bypassed_at: string;
+  reason: string;
+  stub?: string;
+  configs?: string[];
 }
 
 /** `GET /api/agents`. UNKNOWN carries a reason and must never render as an empty, clean list. */
@@ -390,4 +411,6 @@ export interface AgentInventory {
   registry_known?: number;
   gaps?: Record<string, string[]>;
   detail?: AgentRow[];
+  /** Active gate bypasses, BESIDE the inventory's verdicts (the daemon does not tell the inventory). */
+  bypassed?: Record<string, GateBypass>;
 }

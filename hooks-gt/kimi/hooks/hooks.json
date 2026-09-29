@@ -1,0 +1,76 @@
+{
+  "_comment": "NON-RUNNABLE INSTALLATION TEMPLATE for Kimi Code hooks. deploy/register-members.py renders it into ~/.kimi-code/config.toml as flat `[[hooks]] event = ...` tables (install.registration.layout = flat), adding only what is missing by target basename. Unrendered placeholders must never be deployed.",
+  "_witness_note": "witness.py is the hook that reaches the daemon; kimi fires PostToolUseFailure INSTEAD of PostToolUse for a failed call, so the witness is registered on both. Before 2026-09-28 kimi shipped no witness: its seat ran a private 07-26 copy of claude-code's that never saw a failure and never closed a gated action (findings/per-harness-witness-drift-2026-09-28.md).",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HESTIA_WORKSPACE=@HESTIA_WORKSPACE@ python3 @HESTIA_PLUGIN_ROOT@/kimi/hooks/pre_tool_use.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "@HESTIA_PLUGIN_ROOT@/kimi/hooks/observe.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "@HESTIA_PLUGIN_ROOT@/kimi/hooks/observe.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "python3 @HESTIA_PLUGIN_ROOT@/kimi/hooks/witness.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "@HESTIA_PLUGIN_ROOT@/kimi/hooks/observe.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "python3 @HESTIA_PLUGIN_ROOT@/kimi/hooks/witness.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "@HESTIA_PLUGIN_ROOT@/kimi/hooks/observe.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "HESTIA_WORKSPACE=@HESTIA_WORKSPACE@ @HESTIA_PLUGIN_ROOT@/kimi/hooks/hydrate.sh",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}

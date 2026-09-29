@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: f75f67f347f56ccc56004386335fc12757f36943508ce61d3a3825bb5847af1f  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 5bb44382c00720fb06439695ad5a0b47fe635601f9cd19e576d203b94b2bed65  (published ground truth; manifest: hooks-gt)
 """Shared in-process daemon-query mechanism — the society-safety verdict path.
 
 PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
@@ -366,10 +366,33 @@ def _no_verdict(plugin_id: str, tool_name: str, cause: str, detail: str) -> Safe
     return SafetyVerdict(allow=False, decided=False, message=msg, cause=cause)
 
 
+def _witness_core():
+    """The outcome witness's shared core, beside this module in the installed engine set."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import hestia_witness_core  # type: ignore
+    return hestia_witness_core
+
+
+def correlation_key(event) -> Optional[str]:
+    """The key under which this call's authorized action is cached for the outcome witness.
+
+    The rule is hestia_witness_core's — ONE rule for the Pre and the Post side of every harness
+    (findings/per-harness-witness-drift-2026-09-28.md). NEVER raises: a gate computing it inside
+    its decision path must not turn a missing core into a fail-closed deny; None just means the
+    witness will record this act cold, and say so on the row."""
+    try:
+        return _witness_core().correlation_key(event)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
                          plugin_version: Optional[str] = None,
                          host_agent_version: Optional[str] = None,
-                         host_session_id: Optional[str] = None) -> SafetyVerdict:
+                         host_session_id: Optional[str] = None,
+                         correlation_key: Optional[str] = None) -> SafetyVerdict:
     """Obtain the daemon's society-safety verdict for a write/exec act, IN-PROCESS.
 
     Replaces "spawn the claude gate as a subprocess" for a thin shim. Returns a SafetyVerdict;
@@ -377,6 +400,12 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
 
     `plugin_version` / `host_agent_version` are the shim's REAL version facts and are omitted
     from the connect payload when unknown — the mechanism does not manufacture provenance (GPT #3).
+
+    `correlation_key` (the caller's `correlation_key(event)`): when given, the action this call
+    begins is cached under it for the outcome witness to CLOSE (#977). This used to live in
+    claude-code's gate alone, so on every other harness the witness could only record cold —
+    kimi 0 of 37 warned acts closed, codex 0 of 1. The cache is evidence plumbing: it is written
+    after the verdict exists and can never change it.
     """
     tool_name = event.get("tool_name") or "?"
     tool_input = event.get("tool_input") or {}
@@ -437,6 +466,11 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
             return _no_verdict(plugin_id, tool_name, "unknown",
                                "daemon returned a malformed or unrecognized decision")
         verdict.action_id = action_id  # correlation key for the caller's outcome cache
+        if correlation_key:
+            try:
+                _witness_core().cache_authorized_action(correlation_key, action_id, tool_name)
+            except Exception:  # noqa: BLE001 — never let the cache touch the verdict
+                pass
         return verdict
     except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
         return _no_verdict(plugin_id, tool_name, _unavailable_cause(e),
