@@ -23,6 +23,8 @@ it can fail:
                                  on later events -- each ruling exactly once, none skipped
  11. asker + 20 sibling rows  -> the asker's ruling is rendered although 20 rows for another
                                  session follow it (bound AFTER addressing; GPT, f5baa33)
+ 13. bounded first drain      -> >20 addressed rows + an OLD unaddressed row before first firing:
+                                 the old row is never rendered on any pass; a later one is
  12. cursor identity          -> `a/b` and `a_b` (and two ids sharing 120 characters) keep
                                  separate cursors
   9. BYSTANDER FIRST           -> a co-seat session fires before the asker: it renders nothing
@@ -310,6 +312,33 @@ def test_first_sight_takes_what_names_it_and_no_backlog() -> None:
               "[10] an unaddressed line written LATER is delivered, because now it may be ours")
 
 
+def test_bounded_drain_never_inherits_the_preexisting_backlog() -> None:
+    """GPT re-review of e053cc4, composed exactly: a fresh session, 21 rows addressed to it, then an
+    OLD unaddressed row, all written before its first firing. The first pass renders 20 and writes
+    a cursor; the second must render the 21st and NOT the old unaddressed row -- which the cursor's
+    mere existence used to admit. Control: an unaddressed row appended AFTER first sight shows."""
+    with tempfile.TemporaryDirectory() as raw:
+        seat = Seat(raw)
+        seat.write(*[line(f"OWN ruling {i:02d}.") for i in range(21)],
+                   line("OLD unaddressed backlog", for_session=None))
+        bodies = []
+        for _ in range(3):
+            _, ctx = seat.context()
+            bodies.append((ctx or {}).get("additionalContext") or "")
+        allb = "\n".join(bodies)
+        check(bodies[0].count("OWN ruling") == 20 and "OWN ruling 20." in bodies[1],
+              f"[13] the 21 addressed rulings drain 20 then 1: {[b.count('OWN ruling') for b in bodies]}")
+        check("OLD unaddressed backlog" not in allb,
+              "[13] and the pre-existing unaddressed row is NEVER rendered, on any bounded pass")
+        seat.write(line("LATER unaddressed, after first sight", for_session=None))
+        _, later = seat.context()
+        check(bool(later) and "LATER unaddressed" in (later.get("additionalContext") or ""),
+              "[13] control: an unaddressed row appended after first sight IS delivered")
+        cur = json.loads(cursor_file(seat).read_text())
+        check(isinstance(cur.get("boundary"), int) and cur["boundary"] > 0,
+              f"[13] the first-sight boundary is persisted with the cursor: {cur}")
+
+
 if __name__ == "__main__":
     test_no_lane_is_silence()
     test_the_askers_line_is_delivered()
@@ -323,6 +352,7 @@ if __name__ == "__main__":
     test_first_sight_takes_what_names_it_and_no_backlog()
     test_asker_ruling_survives_twenty_sibling_rows()
     test_cursor_identity_does_not_collide()
+    test_bounded_drain_never_inherits_the_preexisting_backlog()
     if FAILURES:
         print(f"FAILED: {len(FAILURES)}", file=sys.stderr)
         sys.exit(1)

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# hestia-gt-sha256: c54e5ebceea5c92a0bff63276dd79e462f6bc7156fe2d98e5189b736ee7aadd5  (published ground truth; manifest: hooks-gt)
 """Deliver a governance disposition to the asker's LIVE session, on the seat's own hook stream.
 
 dp, 2026-09-02: "regardless of window, the mechanism is supposed to notify the asker of the
