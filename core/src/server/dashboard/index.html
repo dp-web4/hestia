@@ -954,6 +954,7 @@
   .esc-effect .add { color: var(--ok, #6c6); }
   .esc-effect .del { color: var(--danger, #d66); }
   .esc-effect .esc-effect-note { color: var(--warning); font-style: italic; }
+  .esc-effect .esc-effect-files { font-family: var(--mono, monospace); font-size: 0.7rem; margin-top: 0.2rem; }
   .esc-effect pre { font-family: var(--mono, monospace); font-size: 0.7rem; margin: 0.3rem 0 0;
     background: var(--bg-elev); border-radius: 3px; padding: 0.35rem 0.5rem;
     max-height: 18rem; overflow: auto; white-space: pre; }
@@ -4097,7 +4098,47 @@
         eff.hidden = !fx;
         eff.innerHTML = '';
         if (fx) {
-          if (fx.source_readable === false) {
+          if (fx.kind === 'patch') {
+            // A PATCH-APPLICATION act (#648): the patch the daemon read, the sha the approval
+            // BINDS, and what it touches per file -- so a decider can identify the bytes rather
+            // than a truncated path shared by sibling patches.
+            if (fx.patch_readable === false) {
+              eff.innerHTML = `<div class="esc-effect-note">${escapeHtml(fx.note || '')}` +
+                ` (${escapeHtml(fx.patch_path || '')})</div>`;
+            } else {
+              const sha = (fx.payload_sha256 || '').slice(0, 12);
+              const head = document.createElement('div');
+              head.className = 'esc-effect-sum';
+              head.innerHTML = `patch <span class="add">+${fx.added_lines | 0}</span>` +
+                ` <span class="del">-${fx.removed_lines | 0}</span> across ${fx.file_count | 0} file(s)` +
+                (sha ? ` \u2014 approval binds sha ${escapeHtml(sha)}`
+                     : ` \u2014 <span class="esc-effect-note">${escapeHtml(fx.payload_unbound_reason || 'the approval does not bind these bytes')}</span>`);
+              eff.appendChild(head);
+              const files = Array.isArray(fx.files) ? fx.files : [];
+              if (files.length) {
+                const ul = document.createElement('div');
+                ul.className = 'esc-effect-files';
+                ul.innerHTML = files.map(f =>
+                  `<div>${escapeHtml(f.path || '?')} <span class="add">+${f.added | 0}</span> ` +
+                  `<span class="del">-${f.removed | 0}</span>` +
+                  `${f.created ? ' (new)' : ''}${f.deleted ? ' (deleted)' : ''}</div>`).join('');
+                eff.appendChild(ul);
+              }
+              const lines = Array.isArray(fx.diff) ? fx.diff : [];
+              if (lines.length) {
+                const det = document.createElement('details');
+                const sum = document.createElement('summary');
+                sum.textContent = fx.diff_truncated
+                  ? `patch text (first ${lines.length} lines \u2014 TRUNCATED, open ${fx.patch_path || 'the file'} for the rest)`
+                  : `patch text (${lines.length} lines)`;
+                det.appendChild(sum);
+                const pre = document.createElement('pre');
+                pre.textContent = lines.join('\n');
+                det.appendChild(pre);
+                eff.appendChild(det);
+              }
+            }
+          } else if (fx.source_readable === false) {
             eff.innerHTML = `<div class="esc-effect-note">${escapeHtml(fx.note || '')}` +
               ` (${escapeHtml(fx.source || '')})</div>`;
           } else {
