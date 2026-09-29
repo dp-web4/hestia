@@ -45,9 +45,9 @@ worse than the manual relay it replaces, and this hook holds no verdict to fail 
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import re
 import sys
 import time
 
@@ -59,14 +59,19 @@ CURSOR_DIR = os.path.join(STATE_DIR, "disposition-cursors")
 MAX_RENDER = 4000            # one delivery is a paragraph, never a transcript
 MAX_LINES = 20               # a backlog is delivered; a runaway lane is not a context bomb
 CURSOR_TTL_SECS = 7 * 86400  # a cursor outlives its session by a week, then it is litter
-SAFE_SESSION = re.compile(r"[^A-Za-z0-9_.-]")
 
 
 def cursor_path(session_id: str) -> str:
-    """One cursor per (seat, session). The session id is a path segment, so it is sanitised:
-    a session id is caller-supplied text and must never select a file outside this dir."""
-    name = SAFE_SESSION.sub("_", session_id)[:120] or "no-session"
-    return os.path.join(CURSOR_DIR, name + ".json")
+    """One cursor per (seat, session), named by a HASH of the full session identity.
+
+    The first cut sanitised the id into a filename (`[^A-Za-z0-9_.-]` -> `_`, cut at 120), which
+    is lossy: `a/b` and `a_b` shared one cursor, and so did any two ids agreeing on their first
+    120 characters -- one session's read then advanced another's position, the #851 failure by a
+    different road (GPT review of f5baa33). A digest cannot select a path outside this dir and
+    cannot collide two sessions; #1148's prompt watch keys its state the same way."""
+    if not session_id:
+        return os.path.join(CURSOR_DIR, "no-session.json")
+    return os.path.join(CURSOR_DIR, "s-" + hashlib.sha256(session_id.encode("utf-8")).hexdigest() + ".json")
 
 
 def reap_cursors(now: float) -> None:
@@ -104,8 +109,9 @@ def write_cursor(path: str, offset: int, inode: int) -> None:
         pass
 
 
-def unread_lines(lane: str, cursor: dict):
-    """(lines, (offset, inode) to record, first_sight) for THIS session.
+def unread_records(lane: str, cursor: dict):
+    """([(line, end_offset)], inode, first_sight) for THIS session: each COMPLETE unread line with
+    the byte offset just past it, so the caller can advance exactly as far as it processed.
 
     A session with no cursor for this lane reads it whole and is told so: `first_sight` is what
     lets the caller render only what NAMES this session, rather than either the whole backlog or
@@ -120,41 +126,65 @@ def unread_lines(lane: str, cursor: dict):
     if offset > st.st_size:                     # truncated under us: start over
         offset, first_sight = 0, True
     if offset == st.st_size:
-        return [], None, first_sight
+        return [], st.st_ino, first_sight
     try:
-        with open(lane, "r", encoding="utf-8", errors="replace") as fh:
+        with open(lane, "rb") as fh:
             fh.seek(offset)
             payload = fh.read()
-            end = fh.tell()
     except OSError:
-        return [], None, first_sight
-    return ([ln for ln in payload.splitlines() if ln.strip()], (end, st.st_ino), first_sight)
+        return [], st.st_ino, first_sight
+    out, pos = [], offset
+    for chunk in payload.split(b"\n")[:-1]:    # the last piece has no newline: not yet complete
+        pos += len(chunk) + 1
+        text = chunk.decode("utf-8", "replace")
+        if text.strip():
+            out.append((text, pos))
+    return out, st.st_ino, first_sight
+
+
+def select(records, session_id: str, first_sight: bool = False):
+    """(texts to render, offset to advance to) -- addressing FIRST, then the bound.
+
+    The first cut sliced `lines[-MAX_LINES:]` BEFORE filtering on `for_session`, while the cursor
+    advanced to the end of the whole lane: an approval for the asker followed by 20 rows for a
+    sibling was sliced away and the cursor moved past it, so it was never rendered, on that call
+    or any later one (GPT review of f5baa33). Now every record is judged in order; a record not
+    ours is processed (the cursor may pass it); a record that IS ours is rendered until the bound
+    is reached, and the first one past the bound stops the pass WITHOUT advancing over it, so the
+    next hook event renders it. Oldest first: a backlog drains in order across events, and no
+    addressed ruling is ever passed without being shown."""
+    out, advance = [], None
+    for raw, end in records:
+        try:
+            row = json.loads(raw)
+        except Exception:
+            advance = end
+            continue
+        if not isinstance(row, dict):
+            advance = end
+            continue
+        want = row.get("for_session")
+        text = row.get("render")
+        ours = not (want and session_id and want != session_id)
+        if first_sight and not (want and session_id and want == session_id):
+            ours = False      # predates this session and does not name it: not ours to render
+        if ours and isinstance(text, str) and text.strip():
+            if len(out) >= MAX_LINES:
+                break         # the bound: this record waits for the next event, unpassed
+            out.append(text.strip()[:MAX_RENDER])
+        advance = end
+    return out, advance
 
 
 def deliverable(lines, session_id: str, first_sight: bool = False):
-    """The lines addressed to THIS asker, rendered by the daemon.
+    """The lines addressed to THIS asker, rendered by the daemon -- the same judgement as `select`,
+    over a plain list (kept for callers and the review's composed case).
 
     `for_session` absent means the daemon could not prove the asker's session (`asker_basis`
     asserted): those are delivered to any session of the seat, because the alternative is not
     delivering a ruling at all. `for_session` present and different is another asker's mail,
     and skipping it costs that asker nothing now that the cursor is its own."""
-    out = []
-    for raw in lines[-MAX_LINES:]:
-        try:
-            row = json.loads(raw)
-        except Exception:
-            continue
-        if not isinstance(row, dict):
-            continue
-        want = row.get("for_session")
-        if want and session_id and want != session_id:
-            continue
-        if first_sight and not (want and session_id and want == session_id):
-            continue      # predates this session and does not name it: not ours to render
-        text = row.get("render")
-        if isinstance(text, str) and text.strip():
-            out.append(text.strip()[:MAX_RENDER])
-    return out
+    return select([(ln, i) for i, ln in enumerate(lines)], session_id, first_sight)[0]
 
 
 def main() -> int:
@@ -166,14 +196,15 @@ def main() -> int:
     session_id = event.get("session_id") or ""
     path = cursor_path(session_id)
     reap_cursors(time.time())
-    lines, advance, first_sight = unread_lines(LANE, read_cursor(path))
-    if advance is not None:
-        # This session's own position only. No other session's delivery is affected by it,
-        # which is the property #851 falsified in the first cut.
-        write_cursor(path, advance[0], advance[1])
-    if not lines:
+    records, inode, first_sight = unread_records(LANE, read_cursor(path))
+    if not records:
         return 0
-    texts = deliverable(lines, session_id, first_sight)
+    texts, advance = select(records, session_id, first_sight)
+    if advance is not None:
+        # This session's own position only, and only as far as it PROCESSED: an addressed
+        # ruling held back by the bound is not passed (GPT, f5baa33). No other session's
+        # delivery is affected, which is the property #851 falsified in the first cut.
+        write_cursor(path, advance, inode)
     if not texts:
         return 0
     body = ("hestia: governance disposition (the daemon ruled; this is the ruling, not a gate)\n\n"

@@ -19,7 +19,12 @@ it can fail:
                                  path DERIVED from the hook: the hand-spelled path in the first
                                  cut kept passing after the cursor moved per session, because
                                  it corrupted a file nothing reads
-  8. runaway lane (60 lines)  -> at most MAX_LINES rendered, and still valid JSON out
+  8. runaway lane (60 lines)  -> at most MAX_LINES per event, oldest first, and the rest DRAIN
+                                 on later events -- each ruling exactly once, none skipped
+ 11. asker + 20 sibling rows  -> the asker's ruling is rendered although 20 rows for another
+                                 session follow it (bound AFTER addressing; GPT, f5baa33)
+ 12. cursor identity          -> `a/b` and `a_b` (and two ids sharing 120 characters) keep
+                                 separate cursors
   9. BYSTANDER FIRST           -> a co-seat session fires before the asker: it renders nothing
                                  AND the asker is still delivered. This is #851, which the
                                  first cut of this file failed while every arm above stayed
@@ -207,14 +212,65 @@ def test_corrupt_cursor_still_delivers() -> None:
 
 
 def test_runaway_lane_is_bounded() -> None:
+    import re
     with tempfile.TemporaryDirectory() as raw:
         seat = Seat(raw)
-        seat.write(*[line(f"APPROVED number {i}") for i in range(60)])
+        seat.write(*[line(f"APPROVED number {i:02d}.") for i in range(60)])
         rc, ctx = seat.context()
         body = (ctx or {}).get("additionalContext") or ""
         check(rc == 0 and bool(ctx) and body.count("APPROVED number") <= 20,
-              f"[8] a runaway lane is bounded ({body.count('APPROVED number')} rendered)")
-        check("number 59" in body, "[8] and the bound keeps the NEWEST rulings")
+              f"[8] one event is bounded ({body.count('APPROVED number')} rendered)")
+        # The first cut kept the NEWEST 20 and moved the cursor past the other 40, which is how an
+        # addressed ruling was lost. Now the backlog drains: every ruling, once, in order.
+        seen = re.findall(r"APPROVED number (\d\d)\.", body)
+        for _ in range(5):
+            _, more = seat.context()
+            seen += re.findall(r"APPROVED number (\d\d)\.", (more or {}).get("additionalContext") or "")
+        check(seen == [f"{i:02d}" for i in range(60)],
+              f"[8] across events the whole backlog drains, each ruling exactly once, in order "
+              f"({len(seen)} delivered; first {seen[:3]}, last {seen[-3:]})")
+
+
+def test_asker_ruling_survives_twenty_sibling_rows() -> None:
+    """GPT's composed case (f5baa33): the bound was applied BEFORE addressing."""
+    with tempfile.TemporaryDirectory() as raw:
+        seat = Seat(raw)
+        seat.write(line("ASKER-OPENS: a ruling to make this session's cursor real"))
+        seat.context()
+        seat.write(line("APPROVED for the asker, then buried"),
+                   *[line(f"SIBLING row {i}", for_session=OTHER) for i in range(20)])
+        rc, ctx = seat.context()
+        body = (ctx or {}).get("additionalContext") or ""
+        check(rc == 0 and "then buried" in body,
+              f"[11] the asker's ruling is rendered although 20 sibling rows follow it: {body[:120]}")
+        check("SIBLING" not in body, "[11] and no sibling row is rendered to the asker")
+        # The pure function, exactly as the review composed it: first sight, asker first.
+        spec = importlib.util.spec_from_file_location("deliverer_pure", TOOL)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        rows = [line("ASKER approval", for_session="asker")] + \
+               [line(f"sib {i}", for_session="sibling") for i in range(20)]
+        check(mod.deliverable(rows, "asker", True) == ["ASKER approval"],
+              f"[11] deliverable(asker + 20 siblings, first sight) returns the asker's row: "
+              f"{mod.deliverable(rows, 'asker', True)}")
+
+
+def test_cursor_identity_does_not_collide() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        seat = Seat(raw)
+        a, b = cursor_file(seat, "a/b"), cursor_file(seat, "a_b")
+        check(a != b, f"[12] `a/b` and `a_b` keep separate cursors: {a.name} vs {b.name}")
+        long1, long2 = "x" * 120 + "one", "x" * 120 + "two"
+        check(cursor_file(seat, long1) != cursor_file(seat, long2),
+              "[12] two ids sharing their first 120 characters keep separate cursors")
+        check(cursor_file(seat, "../../etc/passwd").parent == cursor_file(seat, "a").parent,
+              "[12] and no session id selects a path outside the cursor dir")
+        # Behaviour, not only names: the sibling `a_b` reading does not advance `a/b`.
+        seat.write(line("APPROVED for a/b", for_session="a/b"))
+        _, sib = seat.context(session="a_b")
+        _, own = seat.context(session="a/b")
+        check(sib is None and bool(own) and "for a/b" in (own.get("additionalContext") or ""),
+              f"[12] `a_b` firing first does not consume `a/b`'s ruling: {str(own)[:120]}")
 
 
 def test_bystander_first_does_not_eat_the_askers_ruling() -> None:
@@ -265,6 +321,8 @@ if __name__ == "__main__":
     test_runaway_lane_is_bounded()
     test_bystander_first_does_not_eat_the_askers_ruling()
     test_first_sight_takes_what_names_it_and_no_backlog()
+    test_asker_ruling_survives_twenty_sibling_rows()
+    test_cursor_identity_does_not_collide()
     if FAILURES:
         print(f"FAILED: {len(FAILURES)}", file=sys.stderr)
         sys.exit(1)
