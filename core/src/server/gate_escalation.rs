@@ -2217,6 +2217,14 @@ impl EscalationStore {
     /// closes that, and this is not that change. What it removes is the four-and-a-half
     /// minutes an operator's approval spent pointing at mutable bytes.
     pub fn measured_payload_for_act(act: &str) -> Option<String> {
+        // A PATCH-APPLICATION act installs the bytes of its patch file, so those are what it
+        // binds (#648, 2026-09-28: codex could not bind an endorsement to `git apply <scratch>/
+        // witness-…` because four sibling patches shared the truncated prefix, and the approval
+        // bound nothing at all). Checked first: `git -C <dir> apply <patch>` would otherwise
+        // read `<dir>` as the copy source, find a directory, and measure nothing.
+        if let Some(patch) = Self::patch_file_of_act(act) {
+            return Self::sha256_of_regular_file(&patch);
+        }
         let toks: Vec<&str> = act.split_whitespace().collect();
         // The destination is what the act WRITES; hashing it would bind the thing being
         // overwritten rather than the thing being installed, which is the opposite record.
@@ -2234,6 +2242,88 @@ impl EscalationStore {
         h.update(&bytes);
         Some(format!("{:x}", h.finalize()))
     }
+
+/// sha256 of a regular file no larger than `MAX_MEASURED_PAYLOAD_BYTES`, else `None`.
+fn sha256_of_regular_file(p: &std::path::Path) -> Option<String> {
+    let meta = std::fs::metadata(p).ok()?;
+    if !meta.is_file() || meta.len() > MAX_MEASURED_PAYLOAD_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(p).ok()?;
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    Some(format!("{:x}", h.finalize()))
+}
+
+/// The patch file a patch-APPLICATION act installs, when the act names exactly one.
+///
+/// Recognised, conservatively (a guess here would bind an approval to the wrong bytes):
+/// - `git [-C <dir>|-c k=v|--opt]… apply|am [--opt]… <patch>`: exactly one non-option operand;
+/// - `patch [--opt]… (-i <patch> | --input=<patch> | < <patch> | <<patch>)`.
+/// The act text may carry the gate's `<Tool>: ` prefix, which is skipped. The patch path must
+/// be ABSOLUTE with no `..` (the daemon does not share the member's working directory), and an
+/// act containing a shell separator (`&&`, `||`, `;`, `|`) is not read at all: which command
+/// the patch belongs to would be a guess. Read-only forms (`--check`, `--stat`, `--numstat`,
+/// `--summary`) are not applications and yield `None`.
+pub fn patch_file_of_act(act: &str) -> Option<std::path::PathBuf> {
+    let mut toks: Vec<&str> = act.split_whitespace().collect();
+    if toks.first().map(|t| t.ends_with(':')).unwrap_or(false) {
+        toks.remove(0);
+    }
+    if toks.iter().any(|t| matches!(*t, "&&" | "||" | ";" | "|") || t.ends_with(';')) {
+        return None;
+    }
+    let abs = |t: &str| -> Option<std::path::PathBuf> {
+        (t.starts_with('/') && !t.contains("..")).then(|| std::path::PathBuf::from(t))
+    };
+    let first = *toks.first()?;
+    if first == "git" {
+        let mut i = 1;
+        // global options before the subcommand; -C and -c take a value
+        while i < toks.len() && toks[i].starts_with('-') {
+            i += if matches!(toks[i], "-C" | "-c") { 2 } else { 1 };
+        }
+        let sub = *toks.get(i)?;
+        if sub != "apply" && sub != "am" {
+            return None;
+        }
+        let rest = &toks[i + 1..];
+        if rest.iter().any(|t| matches!(*t, "--check" | "--stat" | "--numstat" | "--summary")) {
+            return None;
+        }
+        let operands: Vec<&str> = rest.iter().copied().filter(|t| !t.starts_with('-')).collect();
+        return match operands.as_slice() {
+            [one] => abs(one),
+            _ => None,
+        };
+    }
+    if first == "patch" {
+        let mut found: Option<&str> = None;
+        let mut j = 1;
+        while j < toks.len() {
+            let t = toks[j];
+            let v = if t == "-i" || t == "<" {
+                j += 1;
+                toks.get(j).copied()
+            } else if let Some(v) = t.strip_prefix("--input=") {
+                Some(v)
+            } else if let Some(v) = t.strip_prefix('<') {
+                Some(v)
+            } else {
+                None
+            };
+            if let Some(v) = v {
+                if found.is_some() {
+                    return None; // two inputs named: not one patch
+                }
+                found = Some(v);
+            }
+            j += 1;
+        }
+        return abs(found?);
+    }
+    None
+}
 
 /// THE RULE, IN ONE PLACE: measurement is authoritative wherever it is possible.
 ///
