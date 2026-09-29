@@ -408,6 +408,38 @@ def _unwrap_tool_result(rpc_response: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+
+def _classify_reply(rpc) -> tuple[str, dict]:
+    """What the daemon SAID, in three kinds -- never inferred from an absence (#1149 review).
+
+    ("ok", payload)        a readable tool result with a non-empty payload;
+    ("ruled", error)       the daemon RULED: a structured `_hestia_error` carrying a `code`;
+    ("ambiguous", {why})   anything else -- an outer JSON-RPC error, an MCP `isError`, an empty
+                           or unreadable result. Nobody ruled, so nothing may be discarded on it.
+
+    GPT reproduced the defect this replaces: `_unwrap_tool_result` reduced an outer -32603, an
+    `isError` text and an empty `{}` alike to `{}`, and "no `_hestia_error`" read as success. The
+    witness then retired the act's correlation file and unlinked its spool row -- the only
+    evidence, destroyed under a claim that it had landed.
+    """
+    if not isinstance(rpc, dict) or not rpc:
+        return "ambiguous", {"why": "no reply"}
+    if "error" in rpc:
+        return "ambiguous", {"why": f"json-rpc error {rpc.get('error')}"}
+    result = rpc.get("result")
+    if not isinstance(result, dict):
+        return "ambiguous", {"why": "no result"}
+    payload = _unwrap_tool_result(rpc)
+    err = payload.get("_hestia_error") if isinstance(payload, dict) else None
+    if isinstance(err, dict) and isinstance(err.get("code"), str) and err["code"]:
+        return "ruled", err
+    if result.get("isError"):
+        return "ambiguous", {"why": "the tool reported isError without a ruling"}
+    if not isinstance(payload, dict) or not payload:
+        return "ambiguous", {"why": "empty result"}
+    return "ok", payload
+
+
 # ---- Closing the authorized action (#977) ------------------------------------------------
 
 def begin_cold_action(client: "_McpHttp", session_id: Optional[str], intent: dict,
@@ -420,20 +452,22 @@ def begin_cold_action(client: "_McpHttp", session_id: Optional[str], intent: dic
         **({"session_id": session_id} if session_id else {}),
         **({"host_session_id": intent["host_session_id"]} if intent.get("host_session_id") else {}),
     })
-    begin = _unwrap_tool_result(resp)
-    if "_hestia_error" in begin:
-        _debug_log(f"begin_action rejected: {begin['_hestia_error']}")
+    kind, begin = _classify_reply(resp)
+    if kind == "ruled":
+        _debug_log(f"begin_action rejected: {begin}")
         return None, "rejected"
-    action_id = begin.get("actionId")
-    if not action_id:
-        _debug_log(f"begin_action missing actionId: {begin}")
-        return None, "rejected"
+    action_id = begin.get("actionId") if kind == "ok" else None
+    if not isinstance(action_id, str) or not action_id:
+        # No ruling and no action: the daemon answered nothing usable, so the act is kept.
+        _debug_log(f"begin_action gave no actionId ({kind}: {begin}); keeping the act")
+        return None, "transient"
     return action_id, None
 
 
 def record_outcome_for(client: "_McpHttp", session_id: Optional[str], intent: dict,
-                       action_id: str) -> dict:
-    """Close one action with this act's outcome. Raises on network failure."""
+                       action_id: str) -> tuple[str, dict]:
+    """Close one action with this act's outcome -> `_classify_reply`'s (kind, payload). Raises on
+    network failure."""
     resp = client.call_tool("hestia_record_outcome", {
         "action_id": action_id,
         "success": intent["success"],
@@ -442,7 +476,7 @@ def record_outcome_for(client: "_McpHttp", session_id: Optional[str], intent: di
         "client_ts": intent["client_ts"],  # the act's own clock (#696)
         **({"session_id": session_id} if session_id else {}),
     })
-    return _unwrap_tool_result(resp)
+    return _classify_reply(resp)
 
 
 def witness_one(client: "_McpHttp", session_id: Optional[str], intent: dict) -> str:
@@ -456,25 +490,32 @@ def witness_one(client: "_McpHttp", session_id: Optional[str], intent: dict) -> 
     action_id = intent.get("action_id")
     try:
         if action_id:
-            outcome = record_outcome_for(client, session_id, intent, action_id)
-            if (outcome.get("_hestia_error") or {}).get("code") == "hestia.action_not_found":
+            kind, outcome = record_outcome_for(client, session_id, intent, action_id)
+            if kind == "ruled" and outcome.get("code") == "hestia.action_not_found":
                 _debug_log(f"authorized action {action_id} no longer resident; cold-recording")
                 action_id, verdict = begin_cold_action(client, session_id, intent, COLD_STALE)
                 if action_id is None:
                     return verdict
-                outcome = record_outcome_for(client, session_id, intent, action_id)
+                kind, outcome = record_outcome_for(client, session_id, intent, action_id)
         else:
             action_id, verdict = begin_cold_action(client, session_id, intent, COLD_NO_CACHE)
             if action_id is None:
                 return verdict
-            outcome = record_outcome_for(client, session_id, intent, action_id)
-    except (urllib.error.URLError, OSError) as e:
+            kind, outcome = record_outcome_for(client, session_id, intent, action_id)
+    except (urllib.error.URLError, OSError, ValueError) as e:
         _debug_log(f"witness network: {e}")
         return "transient"
-    if "_hestia_error" in outcome:
-        _debug_log(f"record_outcome rejected: {outcome['_hestia_error']}")
+    if kind == "ruled":
+        _debug_log(f"record_outcome rejected: {outcome}")
         return "rejected"
-    return "recorded"
+    # RECORDED IS A RECEIPT, never an absence (#1149 review): the daemon's success reply is
+    # `{"witnessEntryHash", "updatedTrustState"}` (handler.rs `tool_record_outcome`), so the
+    # chain hash of the outcome row is what proves it landed.
+    receipt = outcome.get("witnessEntryHash") if kind == "ok" else None
+    if isinstance(receipt, str) and receipt:
+        return "recorded"
+    _debug_log(f"record_outcome gave no receipt ({kind}: {outcome}); keeping the act")
+    return "transient"
 
 
 def intent_from(event: dict) -> Optional[dict]:
@@ -547,11 +588,16 @@ def run(event: dict) -> int:
         # without it every PostToolUse minted a fresh daemon session (#320).
         if intent.get("host_session_id"):
             connect_args["host_session_id"] = intent["host_session_id"]
-        connect = _unwrap_tool_result(client.call_tool("hestia_connect", connect_args))
-        if "_hestia_error" in connect:
-            _debug_log(f"connect rejected: {connect['_hestia_error']}")  # ruled on: nothing to spool
+        kind, connect = _classify_reply(client.call_tool("hestia_connect", connect_args))
+        if kind == "ruled":
+            _debug_log(f"connect rejected: {connect}")  # ruled on: nothing to spool
             return 0
-        session_id = connect.get("sessionId")
+        session_id = connect.get("sessionId") if kind == "ok" else None
+        if not isinstance(session_id, str) or not session_id:
+            # No session, no attributable outcome (#1149 review): keep the act for a later run.
+            _debug_log(f"connect gave no session ({kind}: {connect}); spooling")
+            hand_off_to_spool()
+            return 0
 
         spool_drain(client, session_id)  # older acts outrank this one
 

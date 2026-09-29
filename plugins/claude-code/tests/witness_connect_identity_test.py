@@ -68,7 +68,7 @@ class Stub(BaseHTTPRequestHandler):
             elif name == "hestia_begin_action":
                 result = {"structuredContent": {"actionId": "action-1"}}
             else:
-                result = {"structuredContent": {"ok": True}}
+                result = {"structuredContent": {"witnessEntryHash": "stub-entry"}}
         body = json.dumps({"jsonrpc": "2.0", "id": msg.get("id"), "result": result}).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")

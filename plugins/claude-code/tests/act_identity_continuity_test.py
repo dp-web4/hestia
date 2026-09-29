@@ -85,7 +85,7 @@ def main() -> int:
         print("A. the warm path closes the AUTHORIZED action")
 
         # A1: an id from the gate's cache is closed directly; NO second begin.
-        client = FakeClient({"hestia_record_outcome": [{"ok": True}]})
+        client = FakeClient({"hestia_record_outcome": [{"witnessEntryHash": "h1"}]})
         verdict = w.witness_one(client, "sess-1", intent_for(w, "GATED-1"))
         check("A1 recorded", verdict == "recorded", verdict)
         check("A1 no second begin_action is issued",
@@ -104,7 +104,7 @@ def main() -> int:
         # B1: no cached id at all -> begin here, typed, then record against it.
         client = FakeClient({
             "hestia_begin_action": [{"actionId": "COLD-1"}],
-            "hestia_record_outcome": [{"ok": True}],
+            "hestia_record_outcome": [{"witnessEntryHash": "h2"}],
         })
         verdict = w.witness_one(client, "sess-1", intent_for(w, None))
         check("B1 recorded", verdict == "recorded", verdict)
@@ -121,7 +121,7 @@ def main() -> int:
         client = FakeClient({
             "hestia_record_outcome": [
                 {"_hestia_error": {"code": "hestia.action_not_found", "message": "gone"}},
-                {"ok": True},
+                {"witnessEntryHash": "h3"},
             ],
             "hestia_begin_action": [{"actionId": "COLD-2"}],
         })

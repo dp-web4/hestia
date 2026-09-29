@@ -114,7 +114,7 @@ class Daemon:
                     elif name == "hestia_query_policy":
                         payload = {"status": "decided", "decision": "warn", "reason": "stub"}
                     else:
-                        payload = {"ok": True}
+                        payload = {"witnessEntryHash": "w-" + name, "updatedTrustState": {}}
                     result = {"structuredContent": payload}
                 out = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": result}).encode()
                 self.send_response(200)

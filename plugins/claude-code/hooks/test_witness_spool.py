@@ -63,7 +63,7 @@ class Stub(BaseHTTPRequestHandler):
             payload = {
                 "hestia_connect": {"sessionId": "S1"},
                 "hestia_begin_action": {"actionId": str(uuid.uuid4())},
-                "hestia_record_outcome": {"recorded": True},
+                "hestia_record_outcome": {"witnessEntryHash": "stub-entry", "updatedTrustState": {}},
             }.get(name, {})
             if name == "hestia_record_outcome":
                 RECORDED.append(args)
