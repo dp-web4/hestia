@@ -383,7 +383,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_gate_escalation_claimable",
-            "What approvals YOU can spend RIGHT NOW, newest decision first. REQUIRES a proven session_id from hestia_connect: this reports your OWN permissions, so a caller-supplied plugin_id is refused rather than trusted (it would let one member enumerate another's grants). Ask this after any deny, and again whenever you suspect a decision landed: an approval dies APPROVAL_CLAIM_WINDOW_SECS (600) after the DECISION, not after the open, and a live seat is never woken, so the notice announcing your grant waits for a wake that never comes while the window closes against a member that was online the whole time. Each entry carries act_digest — the exact act the approval is bound to (#539), which you must re-issue verbatim — and claim_window_secs_remaining, the CLAIM clock rather than the record clock. Read-only, and the same predicate hestia_gate_escalation_claim spends against, so it can never advertise a claim that would fail. An empty list is a real answer: you hold nothing spendable",
+            "What approvals YOU can spend RIGHT NOW, newest decision first. REQUIRES a proven session_id from hestia_connect: this reports your OWN permissions, so a caller-supplied plugin_id is refused rather than trusted (it would let one member enumerate another's grants). Ask this after any deny, and again whenever you suspect a decision landed: an approval dies APPROVAL_CLAIM_WINDOW_SECS (600) after you first OBSERVE the ruling (an attributed hestia_gate_escalation_poll, or this call), or after the RULING if you never observed it, and never later than the record's expires_at + 600; a live seat is never woken, so the notice announcing your grant waits for a wake that never comes. ASKING IS OBSERVING: this call first observes the approved, unspent, never-observed grants that THIS session opened (a sibling session on the same seat observes nothing), so a grant whose ruling-anchored window already shut can reappear here with a fresh window, and observed_now names it. Each entry carries act_digest — the exact act the approval is bound to (#539), which you must re-issue verbatim — plus claim_window_secs_remaining (the CLAIM clock rather than the record clock), the absolute pre_migration_horizon and the pre_migration_horizon_basis it was anchored on. Not read-only (it may start your windows, never another session's), and it lists with the same predicate hestia_gate_escalation_claim spends against, so it can never advertise a claim that would fail. An empty list is a real answer: you hold nothing spendable",
         ),
         t(
             "hestia_gate_arbitrate_escalation",
@@ -5783,9 +5783,7 @@ Anything else lets this lapse. Ruling {hash}.",
         "pre_migration_horizon": horizon,
         "pre_migration_horizon_utc": horizon_utc,
         "pre_migration_horizon_basis": if esc.observed_at.is_some() { "observed_at" } else { "decided_at" },
-        "pre_migration_horizon_model":
-            "min(observed_at or decided_at, expires_at) + APPROVAL_CLAIM_WINDOW_SECS; observation is \
-store-only and resets on replay (#850). NOT the canonical delivery-started deadline (#845 R5).",
+        "pre_migration_horizon_model": PRE_MIGRATION_HORIZON_MODEL,
         "expires_at": esc.expires_at,
         "expires_at_utc": utc(esc.expires_at),
         "act_digest": esc.act_digest,
@@ -15578,6 +15576,117 @@ mod tests {
         );
     }
 
+    /// THE CLAIMABLE REPLY STATES THE ANCHOR ITS OWN CALL USES (GPT review of #613 @ dd3f1b1).
+    ///
+    /// `hestia_gate_escalation_claimable` observes the asking session's own grants before it
+    /// lists, which re-anchors a lapsed grant on the observation -- while the reply advertised
+    /// `claim_window_anchor: "decided_at"` and "a grant past its horizon will not reappear". A
+    /// member applying that anchor to a row this very call had revived computes a window that
+    /// shut 300 s ago and discards a spendable approval. The store tests and the source-order
+    /// pin could not see it: they never read the RETURNED fields. This test reads only those.
+    ///
+    /// Three calls against one grant ruled 900 s ago and never observed: a SIBLING session on
+    /// the same seat (observes nothing, lists nothing, and must not say `"decided_at"` as the
+    /// global anchor either), the ASKER's first call (late first observation: listed, basis
+    /// `observed_at`, a full window, absolute horizon = observed_at + window), and the asker's
+    /// second call (repeated observation: nothing newly observed, horizon unchanged).
+    #[tokio::test]
+    async fn the_claimable_reply_states_the_anchor_its_own_observation_set() {
+        use crate::server::gate_escalation::{now_secs, APPROVAL_CLAIM_WINDOW_SECS as W};
+        let (_dir, shared) = make_shared_state();
+        let connect = |hs: &'static str| {
+            let shared = shared.clone();
+            async move {
+                tool_connect(
+                    &shared,
+                    &json!({ "plugin_id": "claude-code", "host_agent": "h", "host_session_id": hs }),
+                )
+                .await
+                .unwrap()["sessionId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        let asker = connect("hs-asker").await;
+        let sibling = connect("hs-sibling").await;
+        assert_ne!(asker, sibling, "fixture: two distinct sessions on one seat");
+
+        const ACT: &str = "Bash -> /repo/tools/late_grant.sh";
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code", "session_id": asker, "tool_name": "Bash",
+                "marker": "policy.json", "act": ACT, "reason": ACT,
+            }),
+        )
+        .await
+        .unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        let ruled_at = now_secs() - 900;
+        {
+            let mut s = shared.lock().await;
+            s.gate_escalations
+                .decide(
+                    &id, true, "operator", "role:constellation:sovereign",
+                    crate::server::gate_escalation::Channel::OperatorSession,
+                    None, Some("k"), ruled_at,
+                )
+                .expect("the sovereign channel approves");
+            let e = s.gate_escalations.get(&id).unwrap();
+            assert_eq!(e.host_session_id.as_deref(), Some("hs-asker"), "fixture: asker recorded");
+            assert!(e.observed_at.is_none() && !e.is_claimable(now_secs()), "precondition: lapsed unobserved");
+        }
+        let ask = |sid: String| {
+            let shared = shared.clone();
+            async move { tool_gate_escalation_claimable(&shared, &json!({ "session_id": sid })).await.unwrap() }
+        };
+        // No response may advertise the ruling as THE anchor: it is one arm of two.
+        let anchor_is_honest = |r: &Value| {
+            assert_ne!(r["claim_window_anchor"], "decided_at", "the global anchor is the stale one: {r}");
+            assert_eq!(r["claim_window_anchor"], "observed_at_else_decided_at", "{r}");
+            assert_eq!(r["claim_window_model"], PRE_MIGRATION_HORIZON_MODEL, "{r}");
+            let note = r["note"].as_str().unwrap();
+            assert!(note.contains("reappear here with a fresh window"), "the note must say a lapsed grant can come back: {r}");
+        };
+
+        // SIBLING: same seat, different session. Observes nothing, revives nothing.
+        let sib = ask(sibling).await;
+        anchor_is_honest(&sib);
+        assert_eq!(sib["observed_now"], json!([]), "a sibling's ask observed another session's grant: {sib}");
+        assert_eq!(sib["claimable"], json!([]), "and the grant stays lapsed for it: {sib}");
+        assert!(shared.lock().await.gate_escalations.get(&id).unwrap().observed_at.is_none());
+
+        // ASKER, first call: the late first observation. Listed, on the observation arm.
+        let first = ask(asker.clone()).await;
+        anchor_is_honest(&first);
+        assert_eq!(first["observed_now"], json!([id]), "{first}");
+        let rows = first["claimable"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "the revived grant must be listed: {first}");
+        let row = &rows[0];
+        assert_eq!(row["escalation_id"], id);
+        assert_eq!(row["pre_migration_horizon_basis"], "observed_at", "{row}");
+        let observed = row["observed_at"].as_u64().expect("observed_at rendered");
+        assert!(observed >= ruled_at + 900, "observed at the ask, not the ruling: {row}");
+        assert_eq!(row["decided_at"], json!(ruled_at));
+        assert_eq!(
+            row["pre_migration_horizon"], json!(observed + W),
+            "the absolute horizon runs from the observation, not the ruling (ruling + W is {}): {row}",
+            ruled_at + W
+        );
+        assert!(row["claim_window_secs_remaining"].as_u64().unwrap() > W - 5, "a full window: {row}");
+
+        // ASKER, second call: repeated observation observes nothing and moves nothing.
+        let second = ask(asker).await;
+        anchor_is_honest(&second);
+        assert_eq!(second["observed_now"], json!([]), "first observation wins: {second}");
+        let row2 = &second["claimable"][0];
+        assert_eq!(row2["escalation_id"], id, "still listed: {second}");
+        assert_eq!(row2["observed_at"], json!(observed), "the observation is one-way: {second}");
+        assert_eq!(row2["pre_migration_horizon"], json!(observed + W), "horizon unchanged: {second}");
+        assert_eq!(row2["pre_migration_horizon_basis"], "observed_at");
+    }
+
     /// THE DERIVATION, with nothing on the wire to derive from.
     ///
     /// The first draft of this change wrote the caller's `host_session_id` argument straight
@@ -21553,6 +21662,14 @@ permit for something the approver did not see.",
 /// reading your own permissions is not an act. It lists ONLY what the PROVEN caller may spend
 /// -- see the identity block below for why an earlier draft's `asserted` fallback made that
 /// sentence false, and why "the label was honest" was not a defence.
+/// The ONE statement of today's claim-horizon rule for anything that leaves this process
+/// (the disposition lane and the claimable listing both render it). `decided_horizon()` is the
+/// one definition; this is its prose, kept in one place so the two surfaces cannot drift apart
+/// the way the claimable reply's `"decided_at"` anchor drifted from the code (GPT, #613).
+const PRE_MIGRATION_HORIZON_MODEL: &str =
+    "min(observed_at or decided_at, expires_at) + APPROVAL_CLAIM_WINDOW_SECS; observation is \
+store-only and resets on replay (#850). NOT the canonical delivery-started deadline (#845 R5).";
+
 async fn tool_gate_escalation_claimable(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::now_secs;
 
@@ -21635,6 +21752,16 @@ async fn tool_gate_escalation_claimable(state: &SharedState, args: &Value) -> To
                 // permits reported ~1500s of record life while ~24 minutes past their grant
                 // horizon. That is how a dead permit publishes as live.
                 "claim_window_secs_remaining": c.claim_window_secs_remaining(now),
+                // THE ANCHOR THIS ROW'S WINDOW ACTUALLY RUNS FROM, per row (GPT review of
+                // dd3f1b1). The response used to state one global `claim_window_anchor:
+                // "decided_at"` while this very call can re-anchor a grant on its observation,
+                // so a member following the advertised anchor would compute "expired" for a
+                // grant the call had just made spendable, and discard it. The absolute horizon
+                // travels (a deadline survives the trip; a countdown decays, #795), named as
+                // the pre-migration projection it is, same vocabulary as the disposition lane.
+                "observed_at": c.observed_at,
+                "pre_migration_horizon": c.pre_migration_horizon(),
+                "pre_migration_horizon_basis": if c.observed_at.is_some() { "observed_at" } else { "decided_at" },
             })
         })
         .collect();
@@ -21645,17 +21772,29 @@ async fn tool_gate_escalation_claimable(state: &SharedState, args: &Value) -> To
         "claimable": items,
         // Which of this session's grants this very call observed (their windows start now).
         "observed_now": observed_now,
-        // State the anchor, not a countdown from now. The window opens at the DECISION and
-        // is not determinable when the escalation is opened, which is why the open path's
-        // single `retry_within_secs` number is a supremum presented as a point
-        // (`core/tests/claim_horizon_is_never_rendered.rs`, PINs 1 and 2). A rule the member
-        // can apply beats a number that is wrong in every history.
+        // State the RULE, not a countdown from now, and state the rule the code runs. The
+        // first cut said `claim_window_anchor: "decided_at"` -- true only for a grant nobody
+        // observed. `decided_horizon()` is `min(observed_at or decided_at, expires_at) +
+        // window`, and since dd3f1b1 THIS CALL sets `observed_at` for the asking session's own
+        // grants, so the one response that re-anchors a grant was advertising the anchor it
+        // had just moved (GPT review, 2026-09-29). The per-row `pre_migration_horizon_basis`
+        // says which arm each row is on; this is the rule that produces it. Still not a single
+        // number at open time, which is why the open path's `retry_within_secs` is a supremum
+        // presented as a point (`core/tests/claim_horizon_is_never_rendered.rs`, PINs 1/2).
         "claim_window_secs": crate::server::gate_escalation::APPROVAL_CLAIM_WINDOW_SECS,
-        "claim_window_anchor": "decided_at",
+        "claim_window_anchor": "observed_at_else_decided_at",
+        "claim_window_model": PRE_MIGRATION_HORIZON_MODEL,
         "note": "Re-issue the act named by act_digest VERBATIM to spend an approval; the \
-                 claim is single-use. An empty list means you hold nothing spendable right \
-                 now, which is not the same as never having been approved: a grant that \
-                 passed its horizon is gone and will not reappear here.",
+                 claim is single-use. Each row's window runs claim_window_secs from its \
+                 pre_migration_horizon_basis: your first observation of the ruling if there \
+                 was one, else the ruling itself, and never past the record's expires_at + \
+                 claim_window_secs. This call OBSERVES the approved, unspent, never-observed \
+                 grants this session opened before it lists (observed_now), so a grant whose \
+                 ruling-anchored window had shut can reappear here with a fresh window. An \
+                 empty list means you hold nothing spendable right now, which is not the same \
+                 as never having been approved: a grant past an OBSERVED horizon, or past the \
+                 expires_at cap, is gone and will not reappear, and a sibling session's ask \
+                 never revives yours.",
     }))
 }
 
