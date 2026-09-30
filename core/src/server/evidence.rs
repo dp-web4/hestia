@@ -379,22 +379,205 @@ pub struct PatchStat {
     pub incomplete: Vec<String>,
 }
 
+/// One file section, holding every name as the patch SPELLS it (C-quoting decoded, nothing
+/// stripped). Which path that is on disk depends on the act's strip level and `--directory`,
+/// which only the act knows -- so stripping happens once, in `finish`, under a `NameRule`.
 #[derive(Debug, Default)]
 struct PatchRow {
-    path: Option<String>,
-    diff_git: Option<String>,
     diff_git_raw: Option<String>,
+    /// `---` / `+++` names; `None` for `/dev/null` or when absent.
+    minus_name: Option<String>,
+    plus_name: Option<String>,
+    /// `rename|copy from|to` names (repo-relative: they carry no diff prefix).
+    hdr_from: Option<String>,
+    hdr_to: Option<String>,
+    is_copy: bool,
     added: u64,
     removed: u64,
     created: bool,
     deleted: bool,
     old_mode: Option<String>,
     new_mode: Option<String>,
-    renamed_from: Option<String>,
-    copied_from: Option<String>,
     binary: bool,
     /// Path spellings that could not be decoded (a malformed or non-UTF-8 C-quoted name).
     undecodable: Vec<String>,
+}
+
+/// How an act turns the names in a patch into paths: the strip level (`-pN`), a `--directory`
+/// prefix, and anything in the act this does not model.
+///
+/// WHY (coordinator, after GPT's re-review of 8caa210): every earlier cut assumed `-p1` in
+/// silence. `git apply -p0` on a `git diff --no-prefix` patch writes `a/keep.txt` where the
+/// summary said `keep.txt`; `git apply -p2` writes `core/x.rs` where it said
+/// `hestia/core/x.rs`. The level is read from the act; when it cannot be, or the act carries
+/// an option this does not model, the summary is marked incomplete and says why.
+#[derive(Debug, Clone)]
+pub struct NameRule {
+    /// `None` = could not be determined from the act.
+    pub p: Option<usize>,
+    pub directory: Option<String>,
+    /// `"git"` or `"patch"`: GNU patch's handling of git rename/copy headers is not modelled.
+    pub tool: &'static str,
+    /// Where `p` came from, in words (shown to the decider).
+    pub source: String,
+    /// Options in the act that could change which files or lines are affected.
+    pub unmodelled: Vec<String>,
+}
+
+impl NameRule {
+    /// `git apply`'s documented default: `-p1`, no `--directory`.
+    pub fn git_default() -> Self {
+        NameRule { p: Some(1), directory: None, tool: "git",
+                   source: "git apply's default -p1".into(), unmodelled: vec![] }
+    }
+}
+
+/// Options that do not change WHICH files or lines a `git apply` / `git am` touches.
+const GIT_APPLY_OPTS_OK: [&str; 13] = [
+    "-3", "--3way", "--index", "--cached", "--intent-to-add", "-N", "-v", "--verbose", "-q",
+    "--quiet", "--ignore-whitespace", "--ignore-space-change", "--allow-empty",
+];
+const GIT_AM_OPTS_OK: [&str; 21] = [
+    "-s", "--signoff", "-k", "--keep", "--keep-non-patch", "--keep-cr", "--no-keep-cr", "-c",
+    "--scissors", "--no-scissors", "-m", "--message-id", "--no-message-id", "-u", "--utf8",
+    "--no-utf8", "--committer-date-is-author-date", "--ignore-date", "--no-gpg-sign",
+    "--no-verify", "--no-3way",
+];
+const PATCH_OPTS_OK: [&str; 12] = [
+    "-N", "--forward", "-s", "--silent", "--quiet", "--verbose", "-b", "--backup",
+    "--no-backup-if-mismatch", "--backup-if-mismatch", "-t", "--batch",
+];
+
+/// Read the name rule from the act's own command. Recognises the same forms as
+/// `EscalationStore::patch_file_of_act`: `git [global opts] apply|am …` and `patch …`.
+///
+/// - git: `-pN` / `-p N` (default `-p1`, stated as the default), `--directory=<d>` /
+///   `--directory <d>`; `--include`/`--exclude`, `-R`/`--reverse`, `--recount`, `--no-add`,
+///   `--reject` and any other option not known to be neutral are UNMODELLED.
+/// - patch: `-pN` / `-p N` / `--strip=N` / `--strip N`, `-d <d>` / `--directory=<d>`; with no
+///   `-p`, GNU patch's choice depends on the patch and its version, so the level is
+///   UNDETERMINED. A positional file operand (patch applies to that file, whatever the names
+///   say) and any unknown option are UNMODELLED.
+pub fn patch_name_rule(act: &str) -> NameRule {
+    let mut toks: Vec<&str> = act.split_whitespace().collect();
+    if toks.first().map(|t| t.ends_with(':')).unwrap_or(false) {
+        toks.remove(0);
+    }
+    let mut rule = NameRule { p: None, directory: None, tool: "git", source: String::new(),
+                              unmodelled: vec![] };
+    let parse_p = |v: Option<&str>, rule: &mut NameRule, spelled: String| {
+        match v.and_then(|v| v.parse::<usize>().ok()) {
+            Some(n) => {
+                rule.p = Some(n);
+                rule.source = format!("`{spelled}` in the act");
+            }
+            None => {
+                rule.p = None;
+                rule.source = format!("`{spelled}` in the act is not a strip level");
+            }
+        }
+    };
+    match toks.first().copied() {
+        Some("git") => {
+            let mut i = 1;
+            while i < toks.len() && toks[i].starts_with('-') {
+                i += if matches!(toks[i], "-C" | "-c") { 2 } else { 1 };
+            }
+            let am = toks.get(i).copied() == Some("am");
+            rule.p = Some(1);
+            rule.source = format!("git {}'s default -p1 (no -p in the act)",
+                                  if am { "am" } else { "apply" });
+            let rest: Vec<&str> = toks.get(i + 1..).unwrap_or(&[]).to_vec();
+            let mut j = 0;
+            while j < rest.len() {
+                let t = rest[j];
+                if t == "-p" {
+                    j += 1;
+                    parse_p(rest.get(j).copied(), &mut rule, format!("-p {}", rest.get(j).unwrap_or(&"")));
+                } else if let Some(v) = t.strip_prefix("-p") {
+                    parse_p(Some(v), &mut rule, t.to_string());
+                } else if t == "--directory" {
+                    j += 1;
+                    rule.directory = rest.get(j).map(|d| d.to_string());
+                } else if let Some(d) = t.strip_prefix("--directory=") {
+                    rule.directory = Some(d.to_string());
+                } else if t.starts_with("--whitespace=")
+                    || (t.starts_with("-C") && t.len() > 2 && t[2..].chars().all(|c| c.is_ascii_digit()))
+                    || t == "--unidiff-zero"
+                    || GIT_APPLY_OPTS_OK.contains(&t)
+                    || (am && (GIT_AM_OPTS_OK.contains(&t) || t.starts_with("-S")
+                        || t.starts_with("--gpg-sign") || t.starts_with("--quoted-cr=")
+                        || t.starts_with("--empty=") || t.starts_with("--patch-format=")))
+                {
+                } else if t.starts_with('-') {
+                    rule.unmodelled.push(format!("`{t}`"));
+                    if matches!(t, "--include" | "--exclude") {
+                        j += 1;
+                    }
+                }
+                j += 1;
+            }
+        }
+        Some("patch") => {
+            rule.tool = "patch";
+            rule.source = "patch(1) was given no -p; its strip level then depends on the                            patch and the patch version".into();
+            let mut j = 1;
+            while j < toks.len() {
+                let t = toks[j];
+                if t == "-p" || t == "--strip" {
+                    j += 1;
+                    parse_p(toks.get(j).copied(), &mut rule, format!("{t} {}", toks.get(j).unwrap_or(&"")));
+                } else if let Some(v) = t.strip_prefix("--strip=") {
+                    parse_p(Some(v), &mut rule, t.to_string());
+                } else if let Some(v) = t.strip_prefix("-p") {
+                    parse_p(Some(v), &mut rule, t.to_string());
+                } else if t == "-d" || t == "--directory" {
+                    j += 1;
+                    rule.directory = toks.get(j).map(|d| d.to_string());
+                } else if let Some(d) = t.strip_prefix("--directory=") {
+                    rule.directory = Some(d.to_string());
+                } else if let Some(d) = t.strip_prefix("-d") {
+                    rule.directory = Some(d.to_string());
+                } else if t == "-i" || t == "<" {
+                    j += 1; // the patch file itself
+                } else if t.starts_with("--input=") || (t.starts_with('<') && t.len() > 1) {
+                } else if PATCH_OPTS_OK.contains(&t) || t.starts_with("--fuzz=")
+                    || (t.starts_with("-F") && t.len() > 2)
+                {
+                } else if t.starts_with('-') {
+                    rule.unmodelled.push(format!("`{t}`"));
+                } else {
+                    rule.unmodelled.push(format!(
+                        "file operand `{t}` (patch applies to that file whatever the patch names)"
+                    ));
+                }
+                j += 1;
+            }
+        }
+        _ => {
+            rule.source = "the act's patch tool was not recognised".into();
+        }
+    }
+    rule
+}
+
+/// Remove `n` leading path components the way `git apply -p<n>` does (a run of slashes
+/// counts as one separator). `None` when the name has fewer than `n` components to remove --
+/// `git apply` refuses such a patch rather than guessing, and so does this.
+fn strip_components(name: &str, n: usize) -> Option<String> {
+    let mut rest = name;
+    for _ in 0..n {
+        let pos = rest.find('/')?;
+        rest = rest[pos..].trim_start_matches('/');
+    }
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
+fn with_directory(dir: &Option<String>, path: String) -> String {
+    match dir.as_deref().map(|d| d.trim_end_matches('/')) {
+        Some(d) if !d.is_empty() => format!("{d}/{path}"),
+        _ => path,
+    }
 }
 
 /// Git C-quotes a path that contains a `"`, a backslash, a control character or (under the
@@ -446,11 +629,11 @@ fn unquote_c(s: &str) -> Option<(String, &str)> {
     None
 }
 
-/// A path from an EXTENDED header (`rename from/to`, `copy from/to`). These are repo-relative
-/// and carry NO `a/`/`b/` diff prefix, so nothing is stripped: a real top-level directory named
-/// `a/` or `b/` is part of the path. (e0df1c9 ran them through the prefix stripper and reported
+/// A name from an EXTENDED header (`rename from/to`, `copy from/to`), decoded if C-quoted.
+/// These are repo-relative and carry NO diff prefix: `git apply -pN` strips N-1 components
+/// from them, not N. (e0df1c9 stripped `a/`/`b/` from them and reported
 /// `rename a/old.txt => b/new.txt` as `old.txt => new.txt`: GPT re-review, 2026-09-30.)
-fn header_path(v: &str) -> Option<String> {
+fn header_name(v: &str) -> Option<String> {
     if v.starts_with('"') {
         let (p, rest) = unquote_c(v)?;
         return rest.is_empty().then_some(p);
@@ -458,76 +641,41 @@ fn header_path(v: &str) -> Option<String> {
     Some(v.to_string())
 }
 
-/// Drop exactly ONE diff prefix (`a/` or `b/`) -- what `git apply`'s default `-p1` removes
-/// from a `diff --git` / `---` / `+++` name. Never applied to an extended-header path.
-fn strip_one_prefix(p: &str) -> String {
-    p.strip_prefix("a/").or_else(|| p.strip_prefix("b/")).unwrap_or(p).to_string()
-}
-
-/// The path named by a `--- ` / `+++ ` line: decoded if C-quoted, a trailing tab-separated
-/// timestamp (plain `diff -u`) dropped, then one diff prefix stripped. `None` if undecodable.
-fn diff_side_path(t: &str) -> Option<String> {
+/// The name on a `--- ` / `+++ ` line, decoded if C-quoted, with a trailing tab-separated
+/// timestamp (plain `diff -u`) dropped. Nothing is stripped here. `None` if undecodable.
+fn diff_side_name(t: &str) -> Option<String> {
     if t.starts_with('"') {
         let (p, rest) = unquote_c(t)?;
-        return (rest.is_empty() || rest.starts_with('\t')).then(|| strip_one_prefix(&p));
+        return (rest.is_empty() || rest.starts_with('\t')).then_some(p);
     }
-    let t = t.split('\t').next().unwrap_or(t).trim();
-    Some(strip_one_prefix(t))
+    Some(t.split('\t').next().unwrap_or(t).trim().to_string())
 }
 
-/// Consume the name `want` (prefix included) from the start of `s`, in either spelling git may
-/// have used for it: C-quoted, or verbatim.
-fn take_name<'s>(s: &'s str, want: &str) -> Option<&'s str> {
-    if s.starts_with('"') {
-        let (p, rest) = unquote_c(s)?;
-        return (p == want).then_some(rest);
-    }
-    s.strip_prefix(want)
-}
-
-/// Does `diff --git <rest>` name exactly `a/<from>` and `b/<to>`? Used to check a rename or
-/// copy's extended headers against the line that opened its section, so a patch whose two
-/// descriptions of the same file disagree is reported rather than summarised from one of them.
-fn diff_git_names(rest: &str, from: &str, to: &str) -> bool {
-    take_name(rest, &format!("a/{from}"))
-        .and_then(|r| r.strip_prefix(' '))
-        .and_then(|r| take_name(r, &format!("b/{to}")))
-        .map(str::is_empty)
-        .unwrap_or(false)
-}
-
-/// The two names of a `diff --git` line, prefixes intact, when they can be read unambiguously:
-/// either side may be C-quoted; two unquoted sides are split only where they name the same
-/// file (a path may contain spaces, so a differing unquoted pair is not guessed at).
-fn diff_git_sides(rest: &str) -> Option<(String, String)> {
+/// Every way `diff --git <rest>` can be read as two names. A quoted side is unambiguous; two
+/// unquoted names may contain spaces, so every split at a space is a candidate and the caller
+/// keeps only the one its other evidence (equal paths, or the rename headers) confirms.
+fn diff_git_candidates(rest: &str) -> Vec<(String, String)> {
     if rest.starts_with('"') {
-        let (a, r) = unquote_c(rest)?;
-        let r = r.strip_prefix(' ')?;
+        let Some((a, r)) = unquote_c(rest) else { return vec![] };
+        let Some(r) = r.strip_prefix(' ') else { return vec![] };
         if r.starts_with('"') {
-            let (b, tail) = unquote_c(r)?;
-            return tail.is_empty().then_some((a, b));
+            return match unquote_c(r) {
+                Some((b, tail)) if tail.is_empty() => vec![(a, b)],
+                _ => vec![],
+            };
         }
-        return Some((a, r.to_string()));
+        return vec![(a, r.to_string())];
     }
     if rest.ends_with('"') {
-        let pos = rest.find(" \"")?;
-        let (b, tail) = unquote_c(&rest[pos + 1..])?;
-        return tail.is_empty().then(|| (rest[..pos].to_string(), b));
+        let Some(pos) = rest.find(" \"") else { return vec![] };
+        return match unquote_c(&rest[pos + 1..]) {
+            Some((b, tail)) if tail.is_empty() => vec![(rest[..pos].to_string(), b)],
+            _ => vec![],
+        };
     }
-    if rest.len() % 2 == 0 {
-        return None;
-    }
-    let mid = rest.len() / 2;
-    let (l, r) = (rest.get(..mid)?, rest.get(mid + 1..)?);
-    (rest.as_bytes()[mid] == b' ' && strip_one_prefix(l) == strip_one_prefix(r))
-        .then(|| (l.to_string(), r.to_string()))
-}
-
-/// The file a `diff --git` line names when both sides are the same file (a mode-only change,
-/// a binary change): the only case where the line alone determines the path.
-fn diff_git_path(rest: &str) -> Option<String> {
-    let (a, b) = diff_git_sides(rest)?;
-    (strip_one_prefix(&a) == strip_one_prefix(&b)).then(|| strip_one_prefix(&b))
+    rest.match_indices(' ')
+        .map(|(i, _)| (rest[..i].to_string(), rest[i + 1..].to_string()))
+        .collect()
 }
 
 /// `12a13`, `5,7c5,8`, `3d2` -- a normal-format diff command line (GNU `patch` reads these).
@@ -585,41 +733,114 @@ fn consume_hunk<'a, I: Iterator<Item = &'a str>>(
 }
 
 impl PatchRow {
-    fn finish(self, st: &mut PatchStat) {
+    fn finish(self, st: &mut PatchStat, rule: &NameRule) {
         let raw = self.diff_git_raw.clone().unwrap_or_default();
+        let short = |s: &str| s.chars().take(80).collect::<String>();
         for u in &self.undecodable {
             st.incomplete.push(format!(
                 "a path spelled `{}` could not be decoded (malformed or non-UTF-8 quoting); it \
                  is not shown as a path",
-                u.chars().take(80).collect::<String>()
+                short(u)
             ));
         }
-        // A rename or copy is described twice: by `diff --git a/<from> b/<to>` and by its
-        // extended headers. If the two disagree, which file changes is not established.
-        if let (Some(from), Some(to), Some(_)) = (
-            self.renamed_from.as_deref().or(self.copied_from.as_deref()),
-            self.path.as_deref(),
-            self.diff_git_raw.as_deref(),
-        ) {
-            if !diff_git_names(&raw, from, to) {
+        // An undetermined level has already been reported by the caller; names are then
+        // computed at -p1 and that report says so.
+        let p = rule.p.unwrap_or(1);
+        let hp = p.saturating_sub(1);
+        let mut too_short: Vec<String> = Vec::new();
+        let mut strip = |name: &str, n: usize| -> Option<String> {
+            let r = strip_components(name, n);
+            if r.is_none() {
+                too_short.push(name.to_string());
+            }
+            r
+        };
+        let is_git = self.diff_git_raw.is_some();
+        let (mut path, mut from): (Option<String>, Option<String>) = (None, None);
+        // The diff --git pair this row's other evidence confirms, prefixes intact.
+        let mut pair: Option<(String, String)> = None;
+        if let (Some(f), Some(t)) = (self.hdr_from.as_deref(), self.hdr_to.as_deref()) {
+            // RENAME/COPY: headers are stripped by p-1 (git's apply.c does the same).
+            let (sf, stt) = (strip(f, hp), strip(t, hp));
+            if is_git {
+                pair = diff_git_candidates(&raw).into_iter().find(|(a, b)| {
+                    strip_components(a, p).as_deref() == sf.as_deref()
+                        && strip_components(b, p).as_deref() == stt.as_deref()
+                        && sf.is_some()
+                });
+                if pair.is_none() && sf.is_some() && stt.is_some() {
+                    st.incomplete.push(format!(
+                        "`diff --git {}` does not name the same files as its rename/copy \
+                         headers ({f} -> {t}) under -p{p}",
+                        short(&raw)
+                    ));
+                }
+            }
+            if rule.tool == "patch" {
                 st.incomplete.push(format!(
-                    "`diff --git {}` does not name the same files as its rename/copy headers \
-                     ({from} -> {to})",
-                    raw.chars().take(80).collect::<String>()
+                    "{t}: patch(1)'s handling of git rename/copy headers is not modelled; use \
+                     git apply to have this summarised"
+                ));
+            }
+            path = stt;
+            from = sf;
+        } else {
+            let side = if self.deleted { self.minus_name.as_deref() } else { self.plus_name.as_deref() };
+            if let Some(n) = side {
+                path = strip(n, p);
+            }
+            if is_git {
+                pair = diff_git_candidates(&raw).into_iter().find(|(a, b)| {
+                    let (sa, sb) = (strip_components(a, p), strip_components(b, p));
+                    sa.is_some() && sa == sb && (path.is_none() || sb == path)
+                });
+                if path.is_none() {
+                    path = pair.as_ref().and_then(|(_, b)| strip_components(b, p));
+                }
+            }
+        }
+        for n in &too_short {
+            st.incomplete.push(format!(
+                "`{}` has fewer than {} leading component(s) to strip (-p{p}); git apply refuses \
+                 such a name, so which file it means is not established",
+                short(n), if self.hdr_to.is_some() { hp } else { p }
+            ));
+        }
+        // A patch whose names do not carry the prefixes the strip level removes (a
+        // `git diff --no-prefix` patch under -p1), or that carry git's a/ b/ prefixes under
+        // -p0, is summarised at the wrong paths. Both sides of `diff --git` show which it is.
+        if let Some((a, b)) = pair.as_ref() {
+            let first = |s: &str| s.split('/').next().unwrap_or("").to_string();
+            let (ca, cb) = (first(a), first(b));
+            if p >= 1 && a.contains('/') && b.contains('/') && ca == cb {
+                st.incomplete.push(format!(
+                    "`diff --git {}`: both names start `{ca}/`, as a `git diff --no-prefix` patch \
+                     does -- but -p{p} ({}) strips that component, so the paths shown may not be \
+                     the files written",
+                    short(&raw), rule.source
+                ));
+            } else if p == 0 && ca == "a" && cb == "b" {
+                st.incomplete.push(format!(
+                    "`diff --git {}`: the names carry git's a/ b/ prefixes, but -p0 keeps them, so \
+                     the files written are under a/ and b/",
+                    short(&raw)
                 ));
             }
         }
-        let path = match self.path.or(self.diff_git) {
-            Some(p) => p,
+        let path = match path {
+            Some(pth) => with_directory(&rule.directory, pth),
             None => {
-                st.incomplete.push(format!(
-                    "could not determine which file `diff --git {}` changes",
-                    raw.chars().take(80).collect::<String>()
-                ));
+                if too_short.is_empty() {
+                    st.incomplete.push(format!(
+                        "could not determine which file `diff --git {}` changes",
+                        short(&raw)
+                    ));
+                }
                 // Never the raw (possibly escaped) spelling presented as a path.
                 "<undetermined path>".to_string()
             }
         };
+        let from = from.map(|f| with_directory(&rule.directory, f));
         if self.binary {
             st.incomplete.push(format!(
                 "{path}: binary content is changed; it is neither counted nor shown here"
@@ -629,8 +850,9 @@ impl PatchRow {
         st.removed += self.removed;
         let mut row = json!({"path": path, "added": self.added, "removed": self.removed,
                              "created": self.created, "deleted": self.deleted});
+        let (renamed_from, copied_from) = if self.is_copy { (None, from) } else { (from, None) };
         for (k, v) in [("old_mode", self.old_mode), ("new_mode", self.new_mode),
-                       ("renamed_from", self.renamed_from), ("copied_from", self.copied_from)] {
+                       ("renamed_from", renamed_from), ("copied_from", copied_from)] {
             if let Some(v) = v {
                 row[k] = json!(v);
             }
@@ -663,7 +885,26 @@ impl PatchRow {
 /// One pass over `text.lines()` with one line of lookahead: no per-line allocation, so the
 /// work is linear in a buffer the caller has already bounded.
 pub fn patch_stat(text: &str) -> PatchStat {
+    patch_stat_with(text, &NameRule::git_default())
+}
+
+/// `patch_stat` under the name rule the ACT specifies (`patch_name_rule`). The rule's own
+/// gaps -- an undetermined strip level, an unmodelled option -- are reported first.
+pub fn patch_stat_with(text: &str, rule: &NameRule) -> PatchStat {
     let mut st = PatchStat::default();
+    if rule.p.is_none() {
+        st.incomplete.push(format!(
+            "the strip level could not be determined: {}; the paths shown assume -p1 and may \
+             not be the files written",
+            rule.source
+        ));
+    }
+    for o in &rule.unmodelled {
+        st.incomplete.push(format!(
+            "the act passes {o}, which this summary does not model; it may change which files \
+             or lines are affected"
+        ));
+    }
     let mut it = text.lines().peekable();
     let mut cur: Option<PatchRow> = None;
     // true between a `diff --git` line and its first hunk / binary body: the header zone.
@@ -672,10 +913,9 @@ pub fn patch_stat(text: &str) -> PatchStat {
     while let Some(l) = it.next() {
         if let Some(rest) = l.strip_prefix("diff --git ") {
             if let Some(r) = cur.take() {
-                r.finish(&mut st);
+                r.finish(&mut st, rule);
             }
             cur = Some(PatchRow {
-                diff_git: diff_git_path(rest),
                 diff_git_raw: Some(rest.to_string()),
                 ..Default::default()
             });
@@ -690,7 +930,7 @@ pub fn patch_stat(text: &str) -> PatchStat {
                     cur.take().unwrap_or_default()
                 } else {
                     if let Some(r) = cur.take() {
-                        r.finish(&mut st);
+                        r.finish(&mut st, rule);
                     }
                     PatchRow::default()
                 };
@@ -701,15 +941,19 @@ pub fn patch_stat(text: &str) -> PatchStat {
                 if plus.trim().starts_with("/dev/null") {
                     r.deleted = true;
                 }
-                let side = if r.deleted { minus } else { plus.as_str() };
-                match diff_side_path(side) {
-                    Some(p) => r.path = Some(p),
-                    None => r.undecodable.push(side.to_string()),
+                for (spelled, slot) in [(minus, &mut r.minus_name), (plus.as_str(), &mut r.plus_name)] {
+                    if spelled.trim().starts_with("/dev/null") {
+                        continue;
+                    }
+                    match diff_side_name(spelled) {
+                        Some(n) => *slot = Some(n),
+                        None => r.undecodable.push(spelled.to_string()),
+                    }
                 }
                 while it.peek().map(|n| n.starts_with("@@")).unwrap_or(false) {
                     let h = it.next().unwrap_or_default();
                     if !consume_hunk(h, &mut it, &mut r.added, &mut r.removed) {
-                        let p = r.path.clone().unwrap_or_default();
+                        let p = r.plus_name.clone().or_else(|| r.minus_name.clone()).unwrap_or_default();
                         st.incomplete.push(format!(
                             "{p}: a hunk is cut off or malformed (`{}`); its counts are partial",
                             h.chars().take(60).collect::<String>()
@@ -732,25 +976,17 @@ pub fn patch_stat(text: &str) -> PatchStat {
             } else if let Some(m) = l.strip_prefix("deleted file mode ") {
                 r.deleted = true;
                 r.old_mode = Some(m.trim().to_string());
-            } else if let Some(p) = l.strip_prefix("rename from ") {
-                match header_path(p) {
-                    Some(p) => r.renamed_from = Some(p),
-                    None => r.undecodable.push(p.to_string()),
-                }
-            } else if let Some(p) = l.strip_prefix("rename to ") {
-                match header_path(p) {
-                    Some(p) => r.path = Some(p),
-                    None => r.undecodable.push(p.to_string()),
-                }
-            } else if let Some(p) = l.strip_prefix("copy from ") {
-                match header_path(p) {
-                    Some(p) => r.copied_from = Some(p),
-                    None => r.undecodable.push(p.to_string()),
-                }
-            } else if let Some(p) = l.strip_prefix("copy to ") {
-                match header_path(p) {
-                    Some(p) => r.path = Some(p),
-                    None => r.undecodable.push(p.to_string()),
+            } else if let Some((v, is_from, is_copy)) = l
+                .strip_prefix("rename from ").map(|v| (v, true, false))
+                .or_else(|| l.strip_prefix("rename to ").map(|v| (v, false, false)))
+                .or_else(|| l.strip_prefix("copy from ").map(|v| (v, true, true)))
+                .or_else(|| l.strip_prefix("copy to ").map(|v| (v, false, true)))
+            {
+                r.is_copy |= is_copy;
+                match header_name(v) {
+                    Some(n) if is_from => r.hdr_from = Some(n),
+                    Some(n) => r.hdr_to = Some(n),
+                    None => r.undecodable.push(v.to_string()),
                 }
             } else if l.starts_with("similarity index ")
                 || l.starts_with("dissimilarity index ")
@@ -767,9 +1003,9 @@ pub fn patch_stat(text: &str) -> PatchStat {
                     it.next();
                 }
             } else {
-                let p = r.path.clone().or_else(|| r.diff_git.clone()).unwrap_or_default();
+                let p = r.diff_git_raw.clone().unwrap_or_default();
                 st.incomplete.push(format!(
-                    "{p}: unrecognised line in a git file header: `{}`",
+                    "`diff --git {p}`: unrecognised line in a git file header: `{}`",
                     l.chars().take(60).collect::<String>()
                 ));
                 in_git_headers = false;
@@ -787,7 +1023,7 @@ pub fn patch_stat(text: &str) -> PatchStat {
         }
     }
     if let Some(r) = cur.take() {
-        r.finish(&mut st);
+        r.finish(&mut st, rule);
     }
     if saw_context {
         st.incomplete.push("a context-format diff (`*** `/`--- `) is present; it is not \
@@ -824,7 +1060,8 @@ pub fn patch_stat(text: &str) -> PatchStat {
 /// `summary_complete` is false whenever `incomplete` names something the summary does not
 /// represent, and the sha is computed from the same buffer the summary was parsed from.
 pub fn patch_effect(patch: &Path, act: &str) -> Value {
-    let _ = act; // the act only locates the file; everything below is read from the bytes
+    // The act locates the file AND says how its names become paths (`-pN`, `--directory`).
+    let rule = patch_name_rule(act);
     use crate::server::gate_escalation::{read_regular_file_bounded, sha256_hex, BoundedRead};
     let cap = crate::server::gate_escalation::MAX_MEASURED_PAYLOAD_BYTES;
     let bytes = match read_regular_file_bounded(patch, cap) {
@@ -865,7 +1102,7 @@ pub fn patch_effect(patch: &Path, act: &str) -> Value {
         }
     };
     let text = String::from_utf8_lossy(&bytes);
-    let mut stat = patch_stat(&text);
+    let mut stat = patch_stat_with(&text, &rule);
     if matches!(text, std::borrow::Cow::Owned(_)) {
         stat.incomplete.push("the patch is not valid UTF-8; the text shown replaces the invalid \
                               bytes, and the sha is of the original bytes".into());
@@ -887,6 +1124,9 @@ pub fn patch_effect(patch: &Path, act: &str) -> Value {
         // of different bytes than the summary it sits beside.
         "payload_sha256": sha256_hex(&bytes),
         "payload_unbound_reason": Value::Null,
+        "strip_level": rule.p,
+        "strip_level_source": rule.source,
+        "directory": rule.directory,
         "files": stat.files,
         "file_count": stat.files.len(),
         "added_lines": stat.added,
@@ -1649,6 +1889,110 @@ index b68fde2..ad2705a 100644
             let shown = v["files"].to_string();
             assert!(!shown.contains("\\\\377") && !shown.contains("\\\"y"),
                     "{tag}: an escaped spelling was shown as a path: {shown}");
+        }
+    }
+
+    // ---- The strip level comes from the ACT (coordinator, after 8caa210 assumed -p1 in
+    // silence). Fixtures are byte-for-byte `git diff` output from a throwaway repo
+    // (2026-09-30): `git diff --no-prefix` of edits to a/keep.txt (a REAL directory named a/)
+    // and src/lib.rs; and `git diff --cached -M` of a rename hestia/core/old.rs -> new.rs plus
+    // an edit to hestia/core/x.rs (ground truth `git diff --summary --numstat`:
+    // "rename hestia/core/{old.rs => new.rs} (100%)", "1 0 hestia/core/x.rs").
+
+    const GIT_NO_PREFIX: &str = "diff --git a/keep.txt a/keep.txt
+index b68fde2..ad2705a 100644
+--- a/keep.txt
++++ a/keep.txt
+@@ -1 +1,2 @@
+ k
++k2
+diff --git src/lib.rs src/lib.rs
+index ca05282..83021ca 100644
+--- src/lib.rs
++++ src/lib.rs
+@@ -1 +1,2 @@
+ fn a() {}
++fn b() {}
+";
+
+    const GIT_DEEP: &str = "diff --git a/hestia/core/old.rs b/hestia/core/new.rs
+similarity index 100%
+rename from hestia/core/old.rs
+rename to hestia/core/new.rs
+diff --git a/hestia/core/x.rs b/hestia/core/x.rs
+index 5626abf..814f4a4 100644
+--- a/hestia/core/x.rs
++++ b/hestia/core/x.rs
+@@ -1 +1,2 @@
+ one
++two
+";
+
+    fn effect_of_patch_act(tag: &str, body: &str, act_of: impl Fn(&str) -> String) -> Value {
+        let d = tmpdir(tag);
+        let patch = d.join("p.patch");
+        std::fs::write(&patch, body).unwrap();
+        let act = act_of(&patch.display().to_string());
+        let v = write_effect(&act).unwrap_or_else(|| panic!("{tag}: `{act}` is not a patch act"));
+        std::fs::remove_dir_all(&d).ok();
+        v
+    }
+
+    fn paths(v: &Value) -> Vec<String> {
+        v["files"].as_array().map(|a| a.iter().map(|f| f["path"].as_str().unwrap_or("?").to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_no_prefix_patch_under_p0_names_its_real_paths() {
+        let v = effect_of_patch_act("noprefixp0", GIT_NO_PREFIX, |p| format!("git -C /repo apply -p0 {p}"));
+        assert_eq!(paths(&v), vec!["a/keep.txt", "src/lib.rs"], "8caa210 said keep.txt: {v}");
+        assert_eq!(v["strip_level"], json!(0));
+        assert_eq!(v["summary_complete"], json!(true), "{v}");
+    }
+
+    #[test]
+    fn a_no_prefix_patch_under_the_default_p1_is_incomplete() {
+        let v = effect_of_patch_act("noprefixp1", GIT_NO_PREFIX, |p| format!("git -C /repo apply {p}"));
+        assert_eq!(v["summary_complete"], json!(false), "8caa210 called it complete: {v}");
+        assert_eq!(v["strip_level"], json!(1));
+        let why = v["incomplete"].to_string();
+        assert!(why.contains("--no-prefix") && why.contains("-p1"), "{why}");
+    }
+
+    #[test]
+    fn a_p2_act_strips_two_components_and_one_from_rename_headers() {
+        for act in ["git -C /repo/hestia apply -p2 {p}", "git -C /repo/hestia apply -p 2 {p}"] {
+            let v = effect_of_patch_act("deepp2", GIT_DEEP, |p| act.replace("{p}", p));
+            assert_eq!(paths(&v), vec!["core/new.rs", "core/x.rs"], "{act}: {v}");
+            assert_eq!(v["files"][0]["renamed_from"], json!("core/old.rs"), "{act}");
+            assert_eq!(v["strip_level"], json!(2), "{act}");
+            assert_eq!(v["summary_complete"], json!(true), "{act}: {v}");
+        }
+        // --directory prefixes every name after stripping
+        let v = effect_of_patch_act("deepdir", GIT_DEEP, |p| format!("git apply --directory=sub {p}"));
+        assert_eq!(paths(&v), vec!["sub/hestia/core/new.rs", "sub/hestia/core/x.rs"], "{v}");
+        assert_eq!(v["files"][0]["renamed_from"], json!("sub/hestia/core/old.rs"));
+        assert_eq!(v["summary_complete"], json!(true), "{v}");
+    }
+
+    #[test]
+    fn an_undeterminable_strip_level_or_unmodelled_option_is_incomplete() {
+        for (act, needle) in [
+            ("patch -i {p}", "strip level could not be determined"),
+            ("git apply -pX {p}", "strip level could not be determined"),
+            ("git apply --include=src/* {p}", "--include"),
+            ("git apply -R {p}", "`-R`"),
+            ("patch -p1 --dry-run -i {p}", "--dry-run"),
+        ] {
+            let v = effect_of_patch_act("undet", TWO_FILE_PATCH, |p| act.replace("{p}", p));
+            assert_eq!(v["summary_complete"], json!(false), "{act}: 8caa210 called it complete: {v}");
+            assert!(v["incomplete"].to_string().contains(needle), "{act}: {}", v["incomplete"]);
+        }
+        // controls: a determined level and neutral options stay complete
+        for act in ["patch -p1 -i {p}", "git apply -p1 --3way {p}", "git am -3 --signoff {p}"] {
+            let v = effect_of_patch_act("det", TWO_FILE_PATCH, |p| act.replace("{p}", p));
+            assert_eq!(v["summary_complete"], json!(true), "{act}: {v}");
         }
     }
 }

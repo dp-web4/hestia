@@ -2329,7 +2329,22 @@ pub fn patch_file_of_act(act: &str) -> Option<std::path::PathBuf> {
         if rest.iter().any(|t| matches!(*t, "--check" | "--stat" | "--numstat" | "--summary")) {
             return None;
         }
-        let operands: Vec<&str> = rest.iter().copied().filter(|t| !t.starts_with('-')).collect();
+        // Options that take their value as the NEXT token (`-p 2`, `--directory d`): that
+        // value is not a patch operand. Without this, `git apply -p 2 /p/x.patch` read as two
+        // operands and measured nothing.
+        let mut operands: Vec<&str> = Vec::new();
+        let mut k = 0;
+        while k < rest.len() {
+            let t = rest[k];
+            if matches!(t, "-p" | "--directory" | "--include" | "--exclude") {
+                k += 2;
+                continue;
+            }
+            if !t.starts_with('-') {
+                operands.push(t);
+            }
+            k += 1;
+        }
         return match operands.as_slice() {
             [one] => abs(one),
             _ => None,
