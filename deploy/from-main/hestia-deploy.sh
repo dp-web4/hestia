@@ -867,6 +867,17 @@ if [ "$MODE" = full ] && [ -r "$UPDATE_REQUEST" ]; then
   fi
 fi
 
+# The script keeps itself current from the checkout it deploys (units run the installed copy).
+# BEFORE the BIN guard below, not after it: a guard that refuses wrongly must be fixable from
+# main. When this ran after the guard, the daemon_exe bug (McNugget, 2026-09-29) could never
+# heal itself: the installed copy died at the guard every cycle and never installed the fix.
+# Updating the script deploys nothing; the guard still stands between it and the binary.
+if [ -f "$DEPLOY_ROOT/hestia/deploy/from-main/hestia-deploy.sh" ] && \
+   ! cmp -s "$DEPLOY_ROOT/hestia/deploy/from-main/hestia-deploy.sh" "$SELF_INSTALL"; then
+  install -m 0755 "$DEPLOY_ROOT/hestia/deploy/from-main/hestia-deploy.sh" "$SELF_INSTALL.new" && \
+    mv -f "$SELF_INSTALL.new" "$SELF_INSTALL" && log "self-updated $SELF_INSTALL from $target"
+fi
+
 # BIN must be the file the daemon execs. Otherwise one cycle installs to a path nothing
 # launches, restarts the OLD binary, sees the old version, and "rolls back" a file nobody runs
 # (mcnugget: default ~/.local/bin/hestia vs a launchd plist exec'ing /opt/homebrew/bin/hestia).
@@ -876,13 +887,6 @@ fi
 exe="$(daemon_exe)"
 if [ -n "$exe" ] && [ "$(canon "$exe")" != "$(canon "$BIN")" ]; then
   die "BIN=$BIN but the daemon ($UNIT / $LAUNCHD_LABEL) is executing $exe; set HESTIA_BIN to that path"
-fi
-
-# The script keeps itself current from the checkout it deploys (units run the installed copy).
-if [ -f "$DEPLOY_ROOT/hestia/deploy/from-main/hestia-deploy.sh" ] && \
-   ! cmp -s "$DEPLOY_ROOT/hestia/deploy/from-main/hestia-deploy.sh" "$SELF_INSTALL"; then
-  install -m 0755 "$DEPLOY_ROOT/hestia/deploy/from-main/hestia-deploy.sh" "$SELF_INSTALL.new" && \
-    mv -f "$SELF_INSTALL.new" "$SELF_INSTALL" && log "self-updated $SELF_INSTALL from $target"
 fi
 
 # Recovery path for a cycle that deployed the binary and then failed the manifest: run the
