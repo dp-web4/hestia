@@ -95,12 +95,14 @@ impl ServerHandler for HestiaServer {
             "hestia_scope_status" => tool_scope_status(&self.state, &args).await,
             "hestia_gate_escalation_open" => tool_gate_escalation_open(&self.state, &args).await,
             "hestia_gate_escalation_poll" => tool_gate_escalation_poll(&self.state, &args).await,
+            "hestia_escalation_evidence" => tool_escalation_evidence(&self.state, &args).await,
             "hestia_gate_escalation_claim" => tool_gate_escalation_claim(&self.state, &args).await,
             "hestia_gate_escalation_lookup" => tool_gate_escalation_lookup(&self.state, &args).await,
             "hestia_gate_escalation_corroborate" => {
                 tool_gate_escalation_corroborate(&self.state, &args).await
             }
             "hestia_gate_pending_escalations" => tool_gate_pending_escalations(&self.state, &args).await,
+            "hestia_gate_escalation_claimable" => tool_gate_escalation_claimable(&self.state, &args).await,
             "hestia_gate_arbitrate_escalation" => tool_gate_arbitrate_escalation(&self.state, &args).await,
             "hestia_scope_arbitrate" => tool_scope_arbitrate(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
@@ -382,6 +384,10 @@ fn hestia_tools() -> Vec<Tool> {
             }),
         ),
         t(
+            "hestia_gate_escalation_claimable",
+            "What approvals YOU can spend RIGHT NOW, newest decision first. REQUIRES a proven session_id from hestia_connect: this reports your OWN permissions, so a caller-supplied plugin_id is refused rather than trusted (it would let one member enumerate another's grants). Ask this after any deny, and again whenever you suspect a decision landed: an approval dies APPROVAL_CLAIM_WINDOW_SECS (600) after you first OBSERVE the ruling (an attributed hestia_gate_escalation_poll, or this call), or after the RULING if you never observed it, and never later than the record's expires_at + 600; a live seat is never woken, so the notice announcing your grant waits for a wake that never comes. ASKING IS OBSERVING: this call first observes the approved, unspent, never-observed grants that THIS session opened (a sibling session on the same seat observes nothing), so a grant whose ruling-anchored window already shut can reappear here with a fresh window, and observed_now names it. Each entry carries act_digest — the exact act the approval is bound to (#539), which you must re-issue verbatim — plus claim_window_secs_remaining (the CLAIM clock rather than the record clock), the absolute pre_migration_horizon and the pre_migration_horizon_basis it was anchored on. Not read-only (it may start your windows, never another session's), and it lists with the same predicate hestia_gate_escalation_claim spends against, so it can never advertise a claim that would fail. An empty list is a real answer: you hold nothing spendable",
+        ),
+        t(
             "hestia_gate_arbitrate_escalation",
             "Rule on ANOTHER member's governance-write escalation. NOT-SAME enforced server-side using the same independence rules as the appeal arbiter — you can never grant your own gate write, and an escalation whose asker was never proven against a session (asker_basis: asserted) cannot be peer-cleared at all; the operator decides those. Approving requires a stated reason; refusing does not. Records role@agent and the independence tier. At A1 a peer shares the operator's UID, so this is recorded SECOND-PARTY REVIEW, not an enforced boundary",
         ),
@@ -441,6 +447,24 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_gate_escalation_poll",
             "Read the verdict on an escalation you opened. Read-only and deliberately NOT witnessed — a wait is not an act, and witnessing every poll would bury the opened/decided entries under one member's loop. Only status `approved` permits the write; `pending`, `denied`, `expired` and an UNKNOWN id all refuse, the last two identically on purpose",
+        ),
+        t_args(
+            "hestia_escalation_evidence",
+            "Everything known about ONE pending governance escalation, in one read: what the write would DO (the incoming bytes, their hash, and a diff against the copy now enforcing), the asker's own stated reason and whether its identity was PROVEN or merely asserted, the bar in force when it was opened and the factors filed so far, every prior escalation on the same marker with how each was decided, and the rules this member has been refused under. Read-only and NOT witnessed — reading the case is not acting on it. The point is that a human and an automated reviewer read the SAME object: a reviewer shown less than the operator is a filter wearing a reviewer's clothes (PRD_ADJUDICATOR_LADDER §3.3). It does NOT carry a law_hash: call `hestia_operating_law` yourself and pin the hash IT returns, because that composition is per-caller and a hash minted for someone else proves nothing about what YOU read. An unknown id answers `found: false` rather than an empty bundle — 'no such escalation' and 'an escalation about which nothing is known' are different facts",
+            json!({
+                "type": "object",
+                // `true`, truthfully: this handler ignores unknown keys rather than refusing
+                // them by name, so a strict schema here would advertise a refusal the runtime
+                // does not perform — the inverse of the #962 defect, and just as false.
+                "additionalProperties": true,
+                "required": ["escalation_id"],
+                "properties": {
+                    "escalation_id": {
+                        "type": "string",
+                        "description": "The escalation to read, as `hestia_gate_escalation_open` or an invitation notice gave it to you",
+                    },
+                },
+            }),
         ),
         t(
             "hestia_witness_decision",
@@ -1994,7 +2018,10 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
     // DISCLOSURE — the actual theft step — left no trace on the evidence plane while the
     // WRITE was witnessed. The secret value is never recorded, only the name, the reader,
     // and whether the read went through the exposed bypass.
-    let _ = s.append_chain(
+    //
+    // RECORDED OR NOT RELEASED (#1131 class A): the append's result used to be discarded, so a
+    // chain failure released the secret with no trace — exactly the case the record exists for.
+    if let Err(e) = s.append_chain(
         "vault_get",
         json!({
             "name": name,
@@ -2003,7 +2030,13 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
             "session_id": who.session_uuid,
             "exposed": exposed,
         }),
-    );
+    ) {
+        return Ok(hestia_error_envelope(
+            "hestia.vault_release_unrecorded",
+            &format!("the release of '{name}' could not be recorded ({e}); the value was not released"),
+            Some(json!({"name": name})),
+        ));
+    }
     Ok(json!({"value": entry.secret}))
 }
 
@@ -5811,9 +5844,7 @@ Anything else lets this lapse. Ruling {hash}.",
         "pre_migration_horizon": horizon,
         "pre_migration_horizon_utc": horizon_utc,
         "pre_migration_horizon_basis": if esc.observed_at.is_some() { "observed_at" } else { "decided_at" },
-        "pre_migration_horizon_model":
-            "min(observed_at or decided_at, expires_at) + APPROVAL_CLAIM_WINDOW_SECS; observation is \
-store-only and resets on replay (#850). NOT the canonical delivery-started deadline (#845 R5).",
+        "pre_migration_horizon_model": PRE_MIGRATION_HORIZON_MODEL,
         "expires_at": esc.expires_at,
         "expires_at_utc": utc(esc.expires_at),
         "act_digest": esc.act_digest,
@@ -15891,6 +15922,117 @@ mod tests {
         );
     }
 
+    /// THE CLAIMABLE REPLY STATES THE ANCHOR ITS OWN CALL USES (GPT review of #613 @ dd3f1b1).
+    ///
+    /// `hestia_gate_escalation_claimable` observes the asking session's own grants before it
+    /// lists, which re-anchors a lapsed grant on the observation -- while the reply advertised
+    /// `claim_window_anchor: "decided_at"` and "a grant past its horizon will not reappear". A
+    /// member applying that anchor to a row this very call had revived computes a window that
+    /// shut 300 s ago and discards a spendable approval. The store tests and the source-order
+    /// pin could not see it: they never read the RETURNED fields. This test reads only those.
+    ///
+    /// Three calls against one grant ruled 900 s ago and never observed: a SIBLING session on
+    /// the same seat (observes nothing, lists nothing, and must not say `"decided_at"` as the
+    /// global anchor either), the ASKER's first call (late first observation: listed, basis
+    /// `observed_at`, a full window, absolute horizon = observed_at + window), and the asker's
+    /// second call (repeated observation: nothing newly observed, horizon unchanged).
+    #[tokio::test]
+    async fn the_claimable_reply_states_the_anchor_its_own_observation_set() {
+        use crate::server::gate_escalation::{now_secs, APPROVAL_CLAIM_WINDOW_SECS as W};
+        let (_dir, shared) = make_shared_state();
+        let connect = |hs: &'static str| {
+            let shared = shared.clone();
+            async move {
+                tool_connect(
+                    &shared,
+                    &json!({ "plugin_id": "claude-code", "host_agent": "h", "host_session_id": hs }),
+                )
+                .await
+                .unwrap()["sessionId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        let asker = connect("hs-asker").await;
+        let sibling = connect("hs-sibling").await;
+        assert_ne!(asker, sibling, "fixture: two distinct sessions on one seat");
+
+        const ACT: &str = "Bash -> /repo/tools/late_grant.sh";
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code", "session_id": asker, "tool_name": "Bash",
+                "marker": "policy.json", "act": ACT, "reason": ACT,
+            }),
+        )
+        .await
+        .unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        let ruled_at = now_secs() - 900;
+        {
+            let mut s = shared.lock().await;
+            s.gate_escalations
+                .decide(
+                    &id, true, "operator", "role:constellation:sovereign",
+                    crate::server::gate_escalation::Channel::OperatorSession,
+                    None, Some("k"), ruled_at,
+                )
+                .expect("the sovereign channel approves");
+            let e = s.gate_escalations.get(&id).unwrap();
+            assert_eq!(e.host_session_id.as_deref(), Some("hs-asker"), "fixture: asker recorded");
+            assert!(e.observed_at.is_none() && !e.is_claimable(now_secs()), "precondition: lapsed unobserved");
+        }
+        let ask = |sid: String| {
+            let shared = shared.clone();
+            async move { tool_gate_escalation_claimable(&shared, &json!({ "session_id": sid })).await.unwrap() }
+        };
+        // No response may advertise the ruling as THE anchor: it is one arm of two.
+        let anchor_is_honest = |r: &Value| {
+            assert_ne!(r["claim_window_anchor"], "decided_at", "the global anchor is the stale one: {r}");
+            assert_eq!(r["claim_window_anchor"], "observed_at_else_decided_at", "{r}");
+            assert_eq!(r["claim_window_model"], PRE_MIGRATION_HORIZON_MODEL, "{r}");
+            let note = r["note"].as_str().unwrap();
+            assert!(note.contains("reappear here with a fresh window"), "the note must say a lapsed grant can come back: {r}");
+        };
+
+        // SIBLING: same seat, different session. Observes nothing, revives nothing.
+        let sib = ask(sibling).await;
+        anchor_is_honest(&sib);
+        assert_eq!(sib["observed_now"], json!([]), "a sibling's ask observed another session's grant: {sib}");
+        assert_eq!(sib["claimable"], json!([]), "and the grant stays lapsed for it: {sib}");
+        assert!(shared.lock().await.gate_escalations.get(&id).unwrap().observed_at.is_none());
+
+        // ASKER, first call: the late first observation. Listed, on the observation arm.
+        let first = ask(asker.clone()).await;
+        anchor_is_honest(&first);
+        assert_eq!(first["observed_now"], json!([id]), "{first}");
+        let rows = first["claimable"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "the revived grant must be listed: {first}");
+        let row = &rows[0];
+        assert_eq!(row["escalation_id"], id);
+        assert_eq!(row["pre_migration_horizon_basis"], "observed_at", "{row}");
+        let observed = row["observed_at"].as_u64().expect("observed_at rendered");
+        assert!(observed >= ruled_at + 900, "observed at the ask, not the ruling: {row}");
+        assert_eq!(row["decided_at"], json!(ruled_at));
+        assert_eq!(
+            row["pre_migration_horizon"], json!(observed + W),
+            "the absolute horizon runs from the observation, not the ruling (ruling + W is {}): {row}",
+            ruled_at + W
+        );
+        assert!(row["claim_window_secs_remaining"].as_u64().unwrap() > W - 5, "a full window: {row}");
+
+        // ASKER, second call: repeated observation observes nothing and moves nothing.
+        let second = ask(asker).await;
+        anchor_is_honest(&second);
+        assert_eq!(second["observed_now"], json!([]), "first observation wins: {second}");
+        let row2 = &second["claimable"][0];
+        assert_eq!(row2["escalation_id"], id, "still listed: {second}");
+        assert_eq!(row2["observed_at"], json!(observed), "the observation is one-way: {second}");
+        assert_eq!(row2["pre_migration_horizon"], json!(observed + W), "horizon unchanged: {second}");
+        assert_eq!(row2["pre_migration_horizon_basis"], "observed_at");
+    }
+
     /// THE DERIVATION, with nothing on the wire to derive from.
     ///
     /// The first draft of this change wrote the caller's `host_session_id` argument straight
@@ -17932,6 +18074,379 @@ mod preamble_tests {
 }
 
 #[cfg(test)]
+mod ladder_evidence_tests {
+    use super::*;
+    use super::inbox_tests::{open_state, seeded_home};
+
+    /// Open through the REAL door, not by poking the store.
+    ///
+    /// The first cut of these tests called `EscalationStore::open` directly and every
+    /// chain-derived field came back empty — because the store does not append the chain row;
+    /// the handler does. A bundle assembled from the chain can only be tested against a chain
+    /// that something actually wrote to, which is the standing lesson about running the real
+    /// path at least once.
+    ///
+    /// `reason` is set equal to the act here only because these tests are about other fields.
+    /// Since #1066 the act text is retained from `act` itself, and a reason that DIFFERS from
+    /// the act is pinned by `a_member_rationale_containing_another_copy_is_never_shown_as_the_act`.
+    async fn open_one(state: &SharedState, marker: &str, act: &str) -> String {
+        open_as(state, marker, act, None).await
+    }
+
+    /// With a live session the asker is PROVEN (#128), which is what a peer needs before it
+    /// can rule: NOT-SAME will not clear an asserted name, because it would be grading a
+    /// forgeable operand.
+    async fn open_as(
+        state: &SharedState,
+        marker: &str,
+        act: &str,
+        session: Option<&str>,
+    ) -> String {
+        let mut args = json!({
+            "plugin_id": "claude-code",
+            "role": "role:constellation:member",
+            "tool_name": "Bash",
+            "marker": marker,
+            "act": act,
+            "reason": act,
+        });
+        if let Some(sid) = session {
+            args["session_id"] = json!(sid);
+        }
+        let r = tool_gate_escalation_open(state, &args).await.unwrap();
+        r["escalation_id"].as_str().unwrap_or_default().to_string()
+    }
+
+    /// AN UNKNOWN ID IS ANSWERED, NOT ERRORED, AND NEVER AS AN EMPTY BUNDLE.
+    ///
+    /// "No such escalation" and "an escalation about which nothing is known" are different
+    /// facts, and a reviewer that cannot tell them apart will reason from the wrong one — it
+    /// would read an empty bundle as "nothing of concern here" and concur. That is the same
+    /// shape as a windowed absence read as a never (#610), arriving through a bundle instead
+    /// of through a census.
+    #[tokio::test]
+    async fn an_unknown_escalation_says_so_rather_than_returning_an_empty_case() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let r = tool_escalation_evidence(&state, &json!({"escalation_id": "deadbeefdeadbeef"}))
+            .await
+            .unwrap();
+        assert_eq!(r["found"], json!(false), "{r}");
+        assert!(r["evidence"].is_null(), "an absent case must not render as a case: {r}");
+        assert!(
+            r["note"].as_str().unwrap_or("").contains("reaped"),
+            "and must say that reaped and never-existed are indistinguishable here: {r}"
+        );
+    }
+
+    /// The bundle carries what §3.3 says a decider gets — including the two fields that are
+    /// about the ASK rather than the act.
+    #[tokio::test]
+    async fn the_bundle_carries_the_ask_its_bar_and_the_askers_basis() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let id = open_one(&state, "plugins/_shared", "Bash: cp /tmp/x plugins/_shared/SHIM_LEDGER.md").await;
+
+        let r = tool_escalation_evidence(&state, &json!({"escalation_id": id})).await.unwrap();
+        assert_eq!(r["found"], json!(true), "{r}");
+        let e = &r["evidence"]["escalation"];
+        assert_eq!(e["marker"], json!("plugins/_shared"));
+        // Caller-asserted, and LABELLED as a claim rather than as an identity.
+        assert_eq!(e["claimed_by"], json!("claude-code"));
+        assert!(e.get("claimed_by").is_some() && e.get("member").is_none(),
+                "the unauthenticated name must not be presented as `member`: {e}");
+        // #128: a reviewer must be able to see whether the asker was proven or asserted,
+        // because that is the clause NOT-SAME reads before it will clear anyone.
+        assert_eq!(e["asker_basis"], json!("Asserted"),
+                   "an open() with no session is asserted, and must say so: {e}");
+        assert!(e["bar"].is_string() || e["bar"].is_object(), "the bar in force: {e}");
+        assert!(e.get("bar_met").is_some(), "and whether it is met: {e}");
+        assert!(r["evidence"]["law"]["society_policy_hash"].is_string(), "{r}");
+        // §3.3 + AC-8: no law_hash is minted here, because that composition is per-caller.
+        assert!(r["evidence"]["law"].get("law_hash").is_none(),
+                "a law_hash minted for someone else proves nothing about what the rung read");
+    }
+
+    /// PRIOR DECISIONS ON THE SAME MARKER — §3.3's "the thing a human cannot hold in their
+    /// head" — and the case's OWN rows are not counted as its own precedent.
+    #[tokio::test]
+    async fn prior_escalations_on_the_marker_are_carried_and_the_subject_is_not_its_own_precedent() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        const MARKER: &str = "plugins/*/hooks";
+
+        // Decided through the REAL door. The first cut called `EscalationStore::decide`
+        // directly and `approved` stayed 0 — the store does not append the chain row, the
+        // ruling path does, and this bundle reads the chain. Same shortcut, same lesson, twice
+        // in one test: a surface assembled from the chain can only be tested against a chain
+        // that something actually wrote to.
+        let asker = super::appeal_tests::seat(&state, "claude-code").await;
+        let peer = super::appeal_tests::seat(&state, "codex").await;
+        let first = open_as(&state, MARKER, "Bash: cp /tmp/a plugins/codex/hooks/pre_tool_use.py",
+                            Some(&asker.to_string())).await;
+        tool_gate_arbitrate_escalation(&state, &json!({
+            "escalation_id": first, "approve": true, "session_id": peer.to_string(),
+            "reason": "read the diff; it is a comment correction inside one file",
+        })).await.unwrap();
+        let subject = open_as(&state, MARKER, "Bash: cp /tmp/b plugins/kimi/hooks/pre_tool_use.py",
+                              Some(&asker.to_string())).await;
+
+        let r = tool_escalation_evidence(&state, &json!({"escalation_id": subject})).await.unwrap();
+        let prior = &r["evidence"]["prior_on_this_marker"];
+        assert!(prior["opened"].as_u64().unwrap() >= 1, "the earlier ask is precedent: {prior}");
+        assert_eq!(prior["approved"], json!(1), "and how it was decided: {prior}");
+        // The control that makes the count mean something: the subject's own rows must not
+        // inflate its own history, or every first-time ask would look like a repeat offender.
+        let rows = prior["rows"].as_array().unwrap();
+        assert!(
+            rows.iter().all(|row| row["escalation_id"] != json!(subject)),
+            "the case must not appear in its own precedent: {prior}"
+        );
+        assert_eq!(prior["truncated"], json!(false), "a short history is not truncated: {prior}");
+    }
+
+    /// THE RUNG MUST READ THE REAL BUNDLE, NOT A FIXTURE THAT RESEMBLES IT.
+    ///
+    /// `adjudicator`'s own tests hand `BaselineRung` a bundle built by hand, which proves the
+    /// rung's logic and NOTHING about whether it can read what `evidence::bundle` actually
+    /// emits. If a field were renamed on one side, every verdict would quietly become
+    /// `EvidenceInsufficient` — a rung that declines everything looks exactly like a rung
+    /// being careful, and the agreement measurement would report an honest-looking zero
+    /// forever. So the two are joined here, against a real escalation opened through the real
+    /// door.
+    #[tokio::test]
+    async fn the_baseline_rung_can_actually_read_a_bundle_this_daemon_produces() {
+        use crate::server::adjudicator::{Adjudicator, BaselineRung, Decision, Decline};
+        use std::io::Write as _;
+
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let src = dir.path().join("incoming.py");
+        let mut f = std::fs::File::create(&src).unwrap();
+        f.write_all(b"alpha\nbeta\n").unwrap();
+        drop(f);
+        let act = format!("Bash: cp {} plugins/codex/hooks/pre_tool_use.py", src.display());
+        let id = open_one(&state, "plugins/*/hooks", &act).await;
+
+        let bundle = {
+            let s = state.lock().await;
+            crate::server::evidence::bundle(&s, &id).expect("a real bundle")
+        };
+        let v = BaselineRung.adjudicate(&bundle);
+
+        // The load-bearing assertion: it did NOT fall through to "I cannot see the act".
+        assert_ne!(
+            v.declined_because,
+            Some(Decline::EvidenceInsufficient),
+            "the rung could not read the daemon's own bundle — the field names have drifted              apart, and every verdict would silently become an evidence failure: {v:?}"
+        );
+        assert_eq!(v.decision, Decision::Decline, "the baseline still never decides");
+        // And it read real fields, not just the ones that happened to exist in a fixture.
+        for field in ["act_text_source", "write_effect", "escalation.asker_basis"] {
+            assert!(
+                v.consulted.iter().any(|c| c == field),
+                "consulted must name {field}, or the record overstates what was read: {:?}",
+                v.consulted
+            );
+        }
+        // NOT asserted: the diff's numbers.
+        //
+        // `enforcing_copy` resolves the PROCESS home, which in production is the daemon's home
+        // and is correct, but in a test means the bundle diffs against whatever this MACHINE
+        // has installed under ~/.hestia/deploy. The first cut asserted "+2" and passed here for
+        // that accidental reason — it would have gone red on CI, where no such tree exists, and
+        // it DID go red in the full suite the moment `hub.rs` set HOME for its own test.
+        // A rung-reads-the-bundle test must not depend on the host's filesystem.
+        assert!(
+            v.rationale.as_deref().unwrap_or("").starts_with("diff vs the enforcing copy"),
+            "it must report what it read, in the shape the rung composes: {:?}", v.rationale
+        );
+    }
+
+    /// THE HUMAN AND THE RUNG MUST READ ONE OBJECT, NOT TWO RENDERINGS OF ONE IDEA.
+    ///
+    /// This is the load-bearing claim of §3.3 — *"if a rung sees less than the human would, it
+    /// is not a rung, it is a filter"* — and it is a claim about a SURFACE, so it is asserted
+    /// here rather than trusted to the fact that both call the same function today. If the
+    /// card and the tool ever diverge, the ladder's promotion measurement is comparing two
+    /// different questions and the agreement rate it produces is meaningless.
+    #[tokio::test]
+    async fn the_operator_card_and_the_reviewers_bundle_show_the_same_write_effect() {
+        use std::io::Write as _;
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let src = dir.path().join("incoming.py");
+        let mut f = std::fs::File::create(&src).unwrap();
+        f.write_all(b"one\ntwo\nthree\n").unwrap();
+        drop(f);
+        let act = format!("Bash: cp {} plugins/codex/hooks/pre_tool_use.py", src.display());
+        let id = open_one(&state, "plugins/*/hooks", &act).await;
+
+        let via_tool = tool_escalation_evidence(&state, &json!({"escalation_id": id}))
+            .await
+            .unwrap();
+        let bundle_effect = via_tool["evidence"]["write_effect"].clone();
+
+        // The card's value, built the way the dashboard builds it.
+        let card_effect = serde_json::to_value(
+            crate::server::evidence::write_effect_cached(&act),
+        )
+        .unwrap();
+
+        assert!(!bundle_effect.is_null(), "the bundle must carry the effect: {via_tool}");
+        assert_eq!(
+            bundle_effect, card_effect,
+            "the operator's card and the reviewer's bundle must be the SAME object"
+        );
+        assert_eq!(bundle_effect["source_lines"], json!(3), "{bundle_effect}");
+        assert!(bundle_effect["payload_sha256"].is_string(),
+                "and must carry the hash the approval binds: {bundle_effect}");
+    }
+
+    fn write_src(dir: &std::path::Path, name: &str, body: &[u8]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    /// GPT's required falsifier on #1064 (#1066). The member door documents `reason` as a
+    /// RATIONALE, distinct from the act. Here the rationale itself contains a DIFFERENT,
+    /// syntactically valid `cp` whose source exists — so a bundle that reads the act out of
+    /// `stated_reason` shows the decider a real, measurable write that is NOT the one the
+    /// approval binds. The act text shown, and the effect derived, must be the bound act's.
+    #[tokio::test]
+    async fn a_member_rationale_containing_another_copy_is_never_shown_as_the_act() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let bound = write_src(dir.path(), "bound.py", b"bound\n");
+        let decoy = write_src(dir.path(), "decoy.py", b"decoy\nwith\nfour\nlines\n");
+        let act = format!("Bash: cp {} plugins/codex/hooks/pre_tool_use.py", bound.display());
+        let reason = format!("because the old gate is wrong; compare: cp {} plugins/kimi/hooks/pre_tool_use.py",
+                             decoy.display());
+        assert!(crate::server::evidence::write_effect_cached(&reason).is_some(),
+                "precondition: the rationale must itself be a measurable copy, or this proves nothing");
+
+        let r = tool_gate_escalation_open(&state, &json!({
+            "plugin_id": "claude-code", "role": "role:constellation:member", "tool_name": "Bash",
+            "marker": "plugins/*/hooks", "act": act, "reason": reason,
+        })).await.unwrap();
+        let id = r["escalation_id"].as_str().unwrap().to_string();
+        let b = tool_escalation_evidence(&state, &json!({"escalation_id": id})).await.unwrap();
+        let ev = &b["evidence"];
+
+        assert_ne!(ev["act_text"], json!(reason), "the rationale was presented as the act: {ev}");
+        assert_eq!(ev["act_text"], json!(act), "the bound act must be what is shown: {ev}");
+        assert_eq!(ev["act_text_source"].as_str().map(|s| s.starts_with("retained")), Some(true),
+                   "and labelled as retained from the act, not inferred: {ev}");
+        let from_reason = serde_json::to_value(crate::server::evidence::write_effect_cached(&reason)).unwrap();
+        let from_act = serde_json::to_value(crate::server::evidence::write_effect_cached(&act)).unwrap();
+        assert_ne!(ev["write_effect"], from_reason, "the effect was derived from the rationale: {ev}");
+        assert_eq!(ev["write_effect"], from_act, "the effect must be the bound act's: {ev}");
+        // The object the approval binds and the object the evidence describes are ONE object.
+        assert_eq!(
+            json!(crate::server::gate_escalation::EscalationStore::act_digest_of(ev["act_text"].as_str().unwrap())),
+            ev["escalation"]["act_digest"],
+            "digest(act_text) must equal the bound act_digest: {ev}"
+        );
+        assert_eq!(ev["escalation"]["opened_via"], json!("open"), "{ev}");
+    }
+
+    /// A row that predates retention carries only a digest. Its `stated_reason` may still hold a
+    /// valid copy (the claim door always put the act there, and a member may put anything
+    /// there) — and nothing proves which. So nothing is inferred: null act, UNAVAILABLE, null
+    /// effect. The legacy half of the same falsifier.
+    #[tokio::test]
+    async fn a_legacy_row_without_retained_act_text_infers_nothing_from_its_reason() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let decoy = write_src(dir.path(), "decoy.py", b"decoy\n");
+        let reason = format!("Bash: cp {} plugins/kimi/hooks/pre_tool_use.py", decoy.display());
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            let entry = crate::storage::chain::ChainEntry {
+                chain_position: 0, hash: String::new(), prev_hash: String::new(),
+                event_type: "gate_escalation_opened".into(),
+                event_data: json!({
+                    "escalation_id": "legacy0000000001", "plugin_id": "claude-code",
+                    "role": "role:constellation:member", "tool_name": "Bash",
+                    "marker": "plugins/*/hooks", "act_digest": "d", "stated_reason": reason,
+                    "opened_via": "claim", "opened_at": now, "expires_at": now + 3600,
+                    "ttl_secs": 3600,
+                }),
+                signer_lct: "test".into(),
+                timestamp: chrono::Utc::now(),
+            };
+            assert_eq!(s.gate_escalations.rehydrate(&[entry], now), 1);
+        }
+        let b = tool_escalation_evidence(&state, &json!({"escalation_id": "legacy0000000001"}))
+            .await.unwrap();
+        let ev = &b["evidence"];
+        assert!(ev["act_text"].is_null(), "a legacy reason was promoted to the act: {ev}");
+        assert!(ev["act_text_source"].as_str().unwrap_or("").starts_with("UNAVAILABLE"), "{ev}");
+        assert!(ev["write_effect"].is_null(), "an effect was derived from a legacy reason: {ev}");
+    }
+
+    /// CONTROL — without it the fix could be "never show an act". The gate hook's door takes
+    /// `reason` AS the act when no `act` is sent; that string is what the digest binds, so it
+    /// IS the act, and the bundle must show it and measure it.
+    #[tokio::test]
+    async fn the_claim_door_act_is_retained_shown_and_measured() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let src = write_src(dir.path(), "incoming.py", b"one\ntwo\n");
+        let act = format!("Bash: cp {} plugins/codex/hooks/pre_tool_use.py", src.display());
+        let _ = tool_gate_escalation_claim(&state, &json!({
+            "plugin_id": "claude-code", "role": "role:constellation:member", "tool_name": "Bash",
+            "marker": "plugins/*/hooks", "reason": act,
+        })).await;
+        let id = {
+            let s = state.lock().await;
+            s.chain_store.read_recent(60).unwrap().into_iter()
+                .find(|e| e.event_type == "gate_escalation_opened")
+                .and_then(|e| e.event_data["escalation_id"].as_str().map(str::to_string))
+                .expect("the claim door opened and witnessed an escalation")
+        };
+        let b = tool_escalation_evidence(&state, &json!({"escalation_id": id})).await.unwrap();
+        let ev = &b["evidence"];
+        assert_eq!(ev["act_text"], json!(act), "{ev}");
+        assert!(!ev["write_effect"].is_null(), "the bound act is a measurable copy: {ev}");
+        assert_eq!(ev["escalation"]["opened_via"], json!("claim"), "{ev}");
+        assert_eq!(
+            json!(crate::server::gate_escalation::EscalationStore::act_digest_of(&act)),
+            ev["escalation"]["act_digest"], "{ev}"
+        );
+        assert_eq!(ev["act_text_covers"], json!("the command as stated"), "{ev}");
+    }
+
+    /// #1091: for Edit/Write the gate hook's act is the TARGET PATH, so the retained text is
+    /// true and incomplete. The bundle must say it names the destination only — a decider
+    /// reading a path as the content it approved is the failure this field prevents.
+    #[tokio::test]
+    async fn an_edit_act_is_labelled_as_naming_the_destination_not_the_content() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let path = "/repo/deploy/install-members.sh";
+        let _ = tool_gate_escalation_claim(&state, &json!({
+            "plugin_id": "claude-code", "role": "role:constellation:member", "tool_name": "Edit",
+            "marker": "deploy/install-members.sh", "reason": path,
+        })).await;
+        let id = {
+            let s = state.lock().await;
+            s.chain_store.read_recent(60).unwrap().into_iter()
+                .find(|e| e.event_type == "gate_escalation_opened")
+                .and_then(|e| e.event_data["escalation_id"].as_str().map(str::to_string))
+                .expect("opened")
+        };
+        let b = tool_escalation_evidence(&state, &json!({"escalation_id": id})).await.unwrap();
+        let ev = &b["evidence"];
+        assert_eq!(ev["act_text"], json!(path), "{ev}");
+        assert!(ev["act_text_covers"].as_str().unwrap_or("").starts_with("destination only"),
+                "an Edit's act is its target; the bundle must not let it read as content: {ev}");
+    }
+}
+
+#[cfg(test)]
 mod appeal_tests {
     use super::*;
     use super::inbox_tests::{open_state, seeded_home};
@@ -19629,6 +20144,24 @@ mod vault_hst001_tests {
                 "the secret value must NEVER be written to the chain");
     }
 
+    /// #1131 class A: a secret whose release cannot be recorded is not released.
+    #[tokio::test]
+    async fn a_read_that_cannot_be_recorded_releases_nothing() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        { state.lock().await.vault.upsert(VaultEntry::new("legacy-cred", "DUMMY-SECRET")).unwrap(); }
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_vget BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'vault_get' BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+        let anon = seat_session(&state, "some-random-caller").await;
+        let r = get(&state, Some(anon), "legacy-cred").await;
+        assert!(r.get("value").is_none(), "the secret was released unrecorded: {r}");
+        assert!(!r.to_string().contains("DUMMY-SECRET"));
+        assert!(r.to_string().contains("vault_release_unrecorded"), "{r}");
+    }
+
     /// kimi's residual on #76: an ANONYMOUS write must not bind the credential to whoever
     /// connected last. `resolve_caller` falls back to `max_by_key(connected_at)`, so before
     /// this fix an unattributed writer made a bystander the owner of a secret it never
@@ -20399,7 +20932,6 @@ fn opened_payload(
     inv: &OpenedInvitation,
     asker_is_proven: bool,
     answers_deny: Option<&str>,
-    opened_via: &'static str,
     ttl_secs: u64,
 ) -> Value {
     json!({
@@ -20412,6 +20944,11 @@ fn opened_payload(
         // Explicit null when the opener stated no act, so a census can count that class
         // rather than confuse it with a row that predates the field.
         "act_digest": esc.act_digest,
+        // THE ACT ITSELF (#1066) — the exact text the digest above was computed from. On the
+        // chain because the struct is restored from here: without it a restart would turn
+        // every pending ask back into a digest nobody can read. `rehydrate` restores it only
+        // if it still hashes to `act_digest`.
+        "act_text": esc.act_text,
         // WHICH BYTES this approval is being asked for (#1056), when the act named a source
         // the daemon could read. On the chain for the same reason the act digest is: the
         // binding must survive a restart. Explicit null when nothing was measurable, so a
@@ -20429,8 +20966,9 @@ fn opened_payload(
         // contradicted it.
         "payload_stated_but_not_measured": esc.payload_stated_but_not_measured,
         // WHICH DOOR. See the doc comment: the key-set accident that used to answer this is
-        // gone as of this change, deliberately.
-        "opened_via": opened_via,
+        // gone as of this change, deliberately. Read from the struct (#1066), which each door
+        // records before it witnesses, so the row and the record cannot name different doors.
+        "opened_via": esc.opened_via.as_str(),
         // Clause A: the record commits the evidence it relied on, not just the claim.
         // `session` means the asker was resolved through `resolve_attributed_caller` and
         // equals the session's own member; `asserted` means it is a bare string this
@@ -20838,6 +21376,9 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
         proven_host_session_id.as_deref(),
         proven_session_id.as_deref(),
     );
+    // THE DOOR (#1066): the member door, where `reason` is a rationale and never the act.
+    s.gate_escalations
+        .record_opened_via(&esc.id, crate::server::gate_escalation::OpenedVia::Open);
     // Re-read AFTER the recording: `open` returned a clone taken before it, and
     // the payload below is built from the struct — the store is the record.
     let esc = s
@@ -20871,7 +21412,6 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
             &inv,
             asker_is_proven,
             answers_deny.as_deref(),
-            "open",
             DEFAULT_TTL_SECS,
         ),
     )?;
@@ -21285,6 +21825,30 @@ async fn tool_gate_escalation_lookup(state: &SharedState, args: &Value) -> ToolR
         "consumed_at": esc.and_then(|e| e.consumed_at),
         "note": "read-only: this lookup observed nothing and started no claim window",
     }))
+}
+
+/// The evidence bundle for one escalation — `PRD_ADJUDICATOR_LADDER` §3.3.
+///
+/// READ-ONLY AND NOT WITNESSED, for the same reason `tool_gate_escalation_poll` is not:
+/// reading a case is not acting on it, and witnessing every read would bury the opened and
+/// decided rows under one reviewer's inspection. A rung that must consult the evidence twice
+/// before forming a view should not thereby look twice as busy as one that guessed.
+async fn tool_escalation_evidence(state: &SharedState, args: &Value) -> ToolResult {
+    let escalation_id = require_string(args, "escalation_id")?;
+    let s = state.lock().await;
+    match crate::server::evidence::bundle(&s, &escalation_id) {
+        Some(b) => Ok(json!({"found": true, "evidence": b})),
+        // An unknown id is answered, not errored: the caller's only safe reading of an error
+        // is "try again", while the safe reading of `found: false` is "there is nothing here
+        // to decide". Same discipline as `status_of` answering Expired for an unknown id.
+        None => Ok(json!({
+            "found": false,
+            "escalation_id": escalation_id,
+            "note": "no escalation with that id is live on this daemon. An id that has been \
+                     reaped is indistinguishable here from one that never existed — read the \
+                     chain by id if you need to tell those apart",
+        })),
+    }
 }
 
 async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolResult {
@@ -21932,6 +22496,9 @@ permit for something the approver did not see.",
                     .map(|uuid| uuid.to_string())
                     .as_deref(),
             );
+            // THE DOOR (#1066): claim-or-open, where `reason` may BE the act.
+            s.gate_escalations
+                .record_opened_via(&esc.id, crate::server::gate_escalation::OpenedVia::Claim);
             // Re-read AFTER the recording, same reason as the member door: `open`
             // returned a pre-recording clone and the payload is built from it.
             let esc = s
@@ -21960,7 +22527,6 @@ permit for something the approver did not see.",
                 &inv,
                 asker_is_proven,
                 answers_deny.as_deref(),
-                "claim",
                 DEFAULT_TTL_SECS,
             );
             // WHAT THIS MEMBER CAN ALREADY SPEND, told to the member. `opened_payload` has
@@ -22102,6 +22668,168 @@ permit for something the approver did not see.",
 // What it buys is that something which is not the asker looked, and that the record says how
 // different that something was (cross-vendor beats cross-member). Anyone reading this as a
 // security boundary is reading it wrong, and the `assurance` field says so on every entry.
+
+/// THE ASKER'S HALF of the deny → decide-out-of-band → re-issue loop.
+///
+/// WHY THIS EXISTS. `claimable_for` — the only function that answers "what may I spend right
+/// now" — had exactly ONE production caller before this one: the refusal reply's
+/// `decided_awaiting_claim` field. So the answer reached a member only as a SIDE EFFECT of
+/// being refused again. A member whose grant landed while it sat idle could not ask; it had
+/// to provoke a second refusal to be told about the first approval, and the 600s window ran
+/// the whole time.
+///
+/// The push half already exists and does not arrive: the disposition projector mints a mesh
+/// notice on decision, but delivery is a WAKE, and a LIVE seat is never woken because it is
+/// already running (`claimable_for`'s own doc, #366). Measured 2026-08-23/24 on CBP: four
+/// escalations opened, four approved by the operator, ZERO notifications received, exactly
+/// one claimed — and that one only because dp mentioned it in conversation while the window
+/// happened to still be open. Reproduced 2026-08-25 on `74195558206f22ca`: approved by the
+/// operator, `bar_met: true`, and `claim_window_secs_remaining: 0` by the time its asker
+/// thought to look. The information was never missing. Nothing delivered it, and nothing
+/// could be asked for it.
+///
+/// A PULL surface needs no wake, and the member is by definition talking to this daemon at
+/// the moment it wants to know.
+///
+/// Read-only and deliberately unwitnessed, for the same reason `hestia_scope_status` is:
+/// reading your own permissions is not an act. It lists ONLY what the PROVEN caller may spend
+/// -- see the identity block below for why an earlier draft's `asserted` fallback made that
+/// sentence false, and why "the label was honest" was not a defence.
+/// The ONE statement of today's claim-horizon rule for anything that leaves this process
+/// (the disposition lane and the claimable listing both render it). `decided_horizon()` is the
+/// one definition; this is its prose, kept in one place so the two surfaces cannot drift apart
+/// the way the claimable reply's `"decided_at"` anchor drifted from the code (GPT, #613).
+const PRE_MIGRATION_HORIZON_MODEL: &str =
+    "min(observed_at or decided_at, expires_at) + APPROVAL_CLAIM_WINDOW_SECS; observation is \
+store-only and resets on replay (#850). NOT the canonical delivery-started deadline (#845 R5).";
+
+async fn tool_gate_escalation_claimable(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::server::gate_escalation::now_secs;
+
+    let session_id_arg = optional_session_id(args);
+    let now = now_secs();
+    let mut s = state.lock().await;
+
+    // Identity, proven where possible. `plugin_id` is caller-supplied across this API at A1,
+    // so accepting it is consistent — but a resolved session OUTRANKS the assertion rather
+    // than merely joining it, and the basis is reported. A member reading its own grants
+    // under `asserted` should know that is what it did.
+    let caller = resolve_attributed_caller(&s, session_id_arg.as_deref());
+    // A PROVEN SESSION IS REQUIRED, and the first cut of this got it wrong (GPT/Nova review).
+    //
+    // That version fell back to a caller-supplied `plugin_id` when the session did not resolve
+    // and labelled the result `asker_basis: "asserted"`. The reasoning was that an honest label
+    // makes the evidence honest — and it does. What it does not do is make the SURFACE honest:
+    // the tool advertises "what approvals YOU can spend" and the doc claimed it "lists ONLY what
+    // the caller may spend", while the asserted arm let an unauthenticated caller ENUMERATE
+    // ANOTHER MEMBER'S claimable approvals by naming that member. Labelling a disclosure does
+    // not stop it being one, and the doc's excuse — "discloses nothing a member could not learn
+    // by being refused" — was simply false: your own refusal never tells you what a PEER holds.
+    //
+    // This surface exists precisely BECAUSE the member is already talking to this daemon, so
+    // requiring the live session costs it nothing and removes an identity-laundering seam.
+    // Same null-state discipline as before: unresolved identity is an ERROR, never an empty
+    // list, because "I do not know who you are" and "you hold nothing" are different answers.
+    let plugin_id = match caller.as_ref() {
+        Some(c) => c.plugin_id.clone(),
+        None => {
+            return Err(anyhow::anyhow!(
+                "cannot determine who is asking: this surface reports YOUR OWN claimable \
+                 approvals and therefore requires a PROVEN session_id (from hestia_connect). \
+                 A caller-supplied plugin_id is not accepted here: it would let one member \
+                 enumerate another's grants. Note that an empty list is a real answer and this \
+                 is not it — 'I do not know who you are' is a different fact from 'you hold \
+                 nothing spendable'"
+            ))
+        }
+    };
+    let basis = "session";
+
+    // ASKING IS OBSERVING (2026-09-28). #667 anchors the claim fuse at the asker's observation,
+    // but the only thing that recorded one was an attributed poll. An asker that came here to
+    // ask "what may I spend?" has observed its grants by any reading, and without this a grant
+    // that lapsed unobserved -- the operator approved in seconds, the interactive asker heard
+    // 11 minutes later (#1166's measurements) -- was simply absent from this list, while a
+    // poll would have revived it. Scoped to the escalations THIS proven session asked
+    // (`host_session_id` is the asker's proven session, recorded at open), so a sibling
+    // session on the same seat never starts another session's window (#732).
+    // `mark_observed` keeps its own conjuncts: approved, bar met, unspent, first observation.
+    let asker_host = caller
+        .as_ref()
+        .and_then(|c| c.session_uuid)
+        .and_then(|u| s.sessions.get(&u))
+        .and_then(|sess| sess.host_session_id.clone());
+    let observed_now: Vec<String> = match asker_host.as_deref() {
+        Some(h) => s.gate_escalations.observe_session_grants(&plugin_id, h, now),
+        None => Vec::new(),
+    };
+
+    let items: Vec<Value> = s
+        .gate_escalations
+        .claimable_for(&plugin_id, now)
+        .iter()
+        .map(|c| {
+            json!({
+                "escalation_id": c.id,
+                "marker": c.marker,
+                // WITHOUT THIS THE LIST IS A TRAP. Since #539 `claim()` matches on the act
+                // digest and treats a missing one as no match, so "you hold an approval" is
+                // actionable only alongside "for exactly this act". A member told the former
+                // re-issues a DIFFERENT write, is refused, and reads that refusal as the
+                // approval having lapsed — concluding the window is broken when the binding
+                // is what refused.
+                "act_digest": c.act_digest,
+                "decided_by": c.decided_by,
+                "decided_at": c.decided_at,
+                // The CLAIM clock, never the record clock. Measured 2026-08-08: three
+                // permits reported ~1500s of record life while ~24 minutes past their grant
+                // horizon. That is how a dead permit publishes as live.
+                "claim_window_secs_remaining": c.claim_window_secs_remaining(now),
+                // THE ANCHOR THIS ROW'S WINDOW ACTUALLY RUNS FROM, per row (GPT review of
+                // dd3f1b1). The response used to state one global `claim_window_anchor:
+                // "decided_at"` while this very call can re-anchor a grant on its observation,
+                // so a member following the advertised anchor would compute "expired" for a
+                // grant the call had just made spendable, and discard it. The absolute horizon
+                // travels (a deadline survives the trip; a countdown decays, #795), named as
+                // the pre-migration projection it is, same vocabulary as the disposition lane.
+                "observed_at": c.observed_at,
+                "pre_migration_horizon": c.pre_migration_horizon(),
+                "pre_migration_horizon_basis": if c.observed_at.is_some() { "observed_at" } else { "decided_at" },
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "plugin_id": plugin_id,
+        "asker_basis": basis,
+        "claimable": items,
+        // Which of this session's grants this very call observed (their windows start now).
+        "observed_now": observed_now,
+        // State the RULE, not a countdown from now, and state the rule the code runs. The
+        // first cut said `claim_window_anchor: "decided_at"` -- true only for a grant nobody
+        // observed. `decided_horizon()` is `min(observed_at or decided_at, expires_at) +
+        // window`, and since dd3f1b1 THIS CALL sets `observed_at` for the asking session's own
+        // grants, so the one response that re-anchors a grant was advertising the anchor it
+        // had just moved (GPT review, 2026-09-29). The per-row `pre_migration_horizon_basis`
+        // says which arm each row is on; this is the rule that produces it. Still not a single
+        // number at open time, which is why the open path's `retry_within_secs` is a supremum
+        // presented as a point (`core/tests/claim_horizon_is_never_rendered.rs`, PINs 1/2).
+        "claim_window_secs": crate::server::gate_escalation::APPROVAL_CLAIM_WINDOW_SECS,
+        "claim_window_anchor": "observed_at_else_decided_at",
+        "claim_window_model": PRE_MIGRATION_HORIZON_MODEL,
+        "note": "Re-issue the act named by act_digest VERBATIM to spend an approval; the \
+                 claim is single-use. Each row's window runs claim_window_secs from its \
+                 pre_migration_horizon_basis: your first observation of the ruling if there \
+                 was one, else the ruling itself, and never past the record's expires_at + \
+                 claim_window_secs. This call OBSERVES the approved, unspent, never-observed \
+                 grants this session opened before it lists (observed_now), so a grant whose \
+                 ruling-anchored window had shut can reappear here with a fresh window. An \
+                 empty list means you hold nothing spendable right now, which is not the same \
+                 as never having been approved: a grant past an OBSERVED horizon, or past the \
+                 expires_at cap, is gone and will not reappear, and a sibling session's ask \
+                 never revives yours.",
+    }))
+}
 
 async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> ToolResult {
     use crate::arbiter::{eligibility, AppealParties, Eligibility};

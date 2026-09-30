@@ -948,6 +948,16 @@
   .esc-what { font-family: var(--mono, monospace); font-size: 0.74rem; color: var(--fg-dim);
     background: var(--bg-elev); border-radius: 3px; padding: 0.3rem 0.5rem; margin-bottom: 0.4rem;
     white-space: pre-wrap; word-break: break-word; max-height: 8rem; overflow-y: auto; }
+  .esc-effect { font-size: 0.74rem; margin-bottom: 0.45rem; }
+  .esc-effect summary { cursor: pointer; color: var(--fg); }
+  .esc-effect .esc-effect-sum { font-family: var(--mono, monospace); }
+  .esc-effect .add { color: var(--ok, #6c6); }
+  .esc-effect .del { color: var(--danger, #d66); }
+  .esc-effect .esc-effect-note { color: var(--warning); font-style: italic; }
+  .esc-effect .esc-effect-files { font-family: var(--mono, monospace); font-size: 0.7rem; margin-top: 0.2rem; }
+  .esc-effect pre { font-family: var(--mono, monospace); font-size: 0.7rem; margin: 0.3rem 0 0;
+    background: var(--bg-elev); border-radius: 3px; padding: 0.35rem 0.5rem;
+    max-height: 18rem; overflow: auto; white-space: pre; }
   .esc-meta { font-size: 0.72rem; color: var(--fg-dim); margin-bottom: 0.5rem; }
   .esc-actions { display: flex; gap: 0.4rem; align-items: center; }
   .esc-reason { flex: 1; min-width: 0; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px;
@@ -4042,6 +4052,7 @@
         <div class="esc-marker"></div>
         <div class="esc-why"></div>
         <div class="esc-what"></div>
+        <div class="esc-effect"></div>
         <div class="esc-meta"></div>
         <div class="esc-actions">
           <input class="esc-reason" placeholder="reason (required to approve)">
@@ -4076,6 +4087,118 @@
         const d = (e.stated_detail || '').trim();
         what.textContent = d ? `what: ${d}` : '';
         what.hidden = !d;
+      }
+      // WHAT THE BYTES WOULD DO. The `why:` line above tells an operator to "decide on the
+      // payload alone" when the member stated nothing — which, until this block existed, was
+      // advice the card made impossible to follow: nothing on it described the payload.
+      // Measured by the daemon from the act (see `evidence::write_effect`), never asserted by
+      // the member, and absent rather than guessed when the act is not copy-shaped.
+      const eff = row.querySelector('.esc-effect'), fx = e.write_effect;
+      if (eff) {
+        eff.hidden = !fx;
+        eff.innerHTML = '';
+        if (fx) {
+          if (fx.kind === 'patch') {
+            // A PATCH-APPLICATION act (#648): the patch the daemon read, the sha the approval
+            // BINDS, and what it touches per file -- so a decider can identify the bytes rather
+            // than a truncated path shared by sibling patches.
+            const gaps = Array.isArray(fx.incomplete) ? fx.incomplete : [];
+            if (fx.patch_readable === false) {
+              eff.innerHTML = `<div class="esc-effect-note">${escapeHtml(fx.note || '')}` +
+                ` (${escapeHtml(fx.patch_path || '')})</div>`;
+            } else if (fx.patch_read === false) {
+              // Over the measurement cap: NOT read, so no counts at all -- "+0 -0 across 0
+              // file(s)" would be a claim about bytes nobody looked at.
+              eff.innerHTML = `<div class="esc-effect-note">NOT READ \u2014 ${escapeHtml(gaps.join('; ') || fx.payload_unbound_reason || '')}` +
+                ` (${escapeHtml(fx.patch_path || '')})</div>`;
+            } else {
+              const sha = (fx.payload_sha256 || '').slice(0, 12);
+              const head = document.createElement('div');
+              head.className = 'esc-effect-sum';
+              head.innerHTML = `patch <span class="add">+${fx.added_lines | 0}</span>` +
+                ` <span class="del">-${fx.removed_lines | 0}</span> across ${fx.file_count | 0} file(s)` +
+                (sha ? ` \u2014 approval binds sha ${escapeHtml(sha)}`
+                     : ` \u2014 <span class="esc-effect-note">${escapeHtml(fx.payload_unbound_reason || 'the approval does not bind these bytes')}</span>`);
+              eff.appendChild(head);
+              if (fx.summary_complete === false) {
+                // GPT hold on #1064: a summary that drops part of the patch lets a decider
+                // endorse bytes they were not shown. Say what is missing, above the file list.
+                const inc = document.createElement('div');
+                inc.className = 'esc-effect-note';
+                inc.textContent = `INCOMPLETE summary \u2014 not the whole patch: ${gaps.join('; ') || 'unrepresented content'}`;
+                eff.appendChild(inc);
+              }
+              const files = Array.isArray(fx.files) ? fx.files : [];
+              if (files.length) {
+                const ul = document.createElement('div');
+                ul.className = 'esc-effect-files';
+                ul.innerHTML = files.map(f =>
+                  `<div>${escapeHtml(f.path || '?')} <span class="add">+${f.added | 0}</span> ` +
+                  `<span class="del">-${f.removed | 0}</span>` +
+                  `${f.created ? ' (new)' : ''}${f.deleted ? ' (deleted)' : ''}` +
+                  `${f.renamed_from ? ` (renamed from ${escapeHtml(f.renamed_from)})` : ''}` +
+                  `${f.copied_from ? ` (copied from ${escapeHtml(f.copied_from)})` : ''}` +
+                  `${f.old_mode && f.new_mode ? ` (mode ${escapeHtml(f.old_mode)} \u2192 ${escapeHtml(f.new_mode)})`
+                     : f.new_mode ? ` (mode ${escapeHtml(f.new_mode)})` : ''}` +
+                  `${f.binary ? ' (BINARY \u2014 not counted)' : ''}</div>`).join('');
+                eff.appendChild(ul);
+              }
+              const lines = Array.isArray(fx.diff) ? fx.diff : [];
+              if (lines.length) {
+                const det = document.createElement('details');
+                const sum = document.createElement('summary');
+                sum.textContent = fx.diff_truncated
+                  ? `patch text (first ${lines.length} lines \u2014 TRUNCATED, open ${fx.patch_path || 'the file'} for the rest)`
+                  : `patch text (${lines.length} lines)`;
+                det.appendChild(sum);
+                const pre = document.createElement('pre');
+                pre.textContent = lines.join('\n');
+                det.appendChild(pre);
+                eff.appendChild(det);
+              }
+            }
+          } else if (fx.source_readable === false || fx.source_read === false) {
+            eff.innerHTML = `<div class="esc-effect-note">${escapeHtml(fx.note || '')}` +
+              ` (${escapeHtml(fx.source || '')})</div>`;
+          } else {
+            const sha = (fx.payload_sha256 || '').slice(0, 12);
+            const cmp = fx.compared_against;
+            const head = document.createElement('div');
+            head.className = 'esc-effect-sum';
+            if (cmp && fx.enforcing_read === false) {
+              head.innerHTML = `${escapeHtml((fx.source_lines | 0) + '')} lines, sha ${escapeHtml(sha)}` +
+                ` \u2014 <span class="esc-effect-note">${escapeHtml(fx.note || 'the enforcing copy could not be read; no diff')}</span>`;
+            } else if (cmp) {
+              const a = fx.added_lines | 0, d = fx.removed_lines | 0;
+              head.innerHTML = fx.identical_to_enforcing
+                // A no-op write is worth SAYING, not leaving to be inferred from two zeros:
+                // it is the cheapest approval an operator will ever give and the one most
+                // likely to be a mistake somewhere upstream.
+                ? `no change vs the enforcing copy \u2014 ${escapeHtml(fx.source_lines + '')} lines, sha ${escapeHtml(sha)}`
+                : `<span class="add">+${a}</span> <span class="del">-${d}</span>` +
+                  ` vs the copy now ENFORCING \u2014 sha ${escapeHtml(sha)}`;
+            } else {
+              head.innerHTML = `${escapeHtml((fx.source_lines | 0) + '')} lines, sha ${escapeHtml(sha)}` +
+                ` \u2014 <span class="esc-effect-note">${escapeHtml(fx.note || 'no enforcing copy to compare')}</span>`;
+            }
+            eff.appendChild(head);
+            const lines = Array.isArray(fx.diff) ? fx.diff : [];
+            if (lines.length) {
+              const det = document.createElement('details');
+              const sum = document.createElement('summary');
+              sum.textContent = fx.diff_truncated
+                // A diff that stops without saying so manufactures false confidence: the
+                // reader reaches the end and concludes they have seen the change.
+                ? `diff (first ${lines.length} lines \u2014 TRUNCATED, open the file for the rest)`
+                : `diff (${lines.length} lines)`;
+              det.appendChild(sum);
+              const pre = document.createElement('pre');
+              pre.textContent = lines.join('\n');
+              det.appendChild(pre);
+              eff.appendChild(det);
+            }
+          }
+        }
       }
       const bar = typeof e.bar === 'string' ? e.bar : JSON.stringify(e.bar ?? '');
       const nf = Array.isArray(e.factors) ? e.factors.length : 0;
