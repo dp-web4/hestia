@@ -4102,8 +4102,14 @@
             // A PATCH-APPLICATION act (#648): the patch the daemon read, the sha the approval
             // BINDS, and what it touches per file -- so a decider can identify the bytes rather
             // than a truncated path shared by sibling patches.
+            const gaps = Array.isArray(fx.incomplete) ? fx.incomplete : [];
             if (fx.patch_readable === false) {
               eff.innerHTML = `<div class="esc-effect-note">${escapeHtml(fx.note || '')}` +
+                ` (${escapeHtml(fx.patch_path || '')})</div>`;
+            } else if (fx.patch_read === false) {
+              // Over the measurement cap: NOT read, so no counts at all -- "+0 -0 across 0
+              // file(s)" would be a claim about bytes nobody looked at.
+              eff.innerHTML = `<div class="esc-effect-note">NOT READ \u2014 ${escapeHtml(gaps.join('; ') || fx.payload_unbound_reason || '')}` +
                 ` (${escapeHtml(fx.patch_path || '')})</div>`;
             } else {
               const sha = (fx.payload_sha256 || '').slice(0, 12);
@@ -4114,6 +4120,14 @@
                 (sha ? ` \u2014 approval binds sha ${escapeHtml(sha)}`
                      : ` \u2014 <span class="esc-effect-note">${escapeHtml(fx.payload_unbound_reason || 'the approval does not bind these bytes')}</span>`);
               eff.appendChild(head);
+              if (fx.summary_complete === false) {
+                // GPT hold on #1064: a summary that drops part of the patch lets a decider
+                // endorse bytes they were not shown. Say what is missing, above the file list.
+                const inc = document.createElement('div');
+                inc.className = 'esc-effect-note';
+                inc.textContent = `INCOMPLETE summary \u2014 not the whole patch: ${gaps.join('; ') || 'unrepresented content'}`;
+                eff.appendChild(inc);
+              }
               const files = Array.isArray(fx.files) ? fx.files : [];
               if (files.length) {
                 const ul = document.createElement('div');
@@ -4121,7 +4135,12 @@
                 ul.innerHTML = files.map(f =>
                   `<div>${escapeHtml(f.path || '?')} <span class="add">+${f.added | 0}</span> ` +
                   `<span class="del">-${f.removed | 0}</span>` +
-                  `${f.created ? ' (new)' : ''}${f.deleted ? ' (deleted)' : ''}</div>`).join('');
+                  `${f.created ? ' (new)' : ''}${f.deleted ? ' (deleted)' : ''}` +
+                  `${f.renamed_from ? ` (renamed from ${escapeHtml(f.renamed_from)})` : ''}` +
+                  `${f.copied_from ? ` (copied from ${escapeHtml(f.copied_from)})` : ''}` +
+                  `${f.old_mode && f.new_mode ? ` (mode ${escapeHtml(f.old_mode)} \u2192 ${escapeHtml(f.new_mode)})`
+                     : f.new_mode ? ` (mode ${escapeHtml(f.new_mode)})` : ''}` +
+                  `${f.binary ? ' (BINARY \u2014 not counted)' : ''}</div>`).join('');
                 eff.appendChild(ul);
               }
               const lines = Array.isArray(fx.diff) ? fx.diff : [];
@@ -4138,7 +4157,7 @@
                 eff.appendChild(det);
               }
             }
-          } else if (fx.source_readable === false) {
+          } else if (fx.source_readable === false || fx.source_read === false) {
             eff.innerHTML = `<div class="esc-effect-note">${escapeHtml(fx.note || '')}` +
               ` (${escapeHtml(fx.source || '')})</div>`;
           } else {
@@ -4146,7 +4165,10 @@
             const cmp = fx.compared_against;
             const head = document.createElement('div');
             head.className = 'esc-effect-sum';
-            if (cmp) {
+            if (cmp && fx.enforcing_read === false) {
+              head.innerHTML = `${escapeHtml((fx.source_lines | 0) + '')} lines, sha ${escapeHtml(sha)}` +
+                ` \u2014 <span class="esc-effect-note">${escapeHtml(fx.note || 'the enforcing copy could not be read; no diff')}</span>`;
+            } else if (cmp) {
               const a = fx.added_lines | 0, d = fx.removed_lines | 0;
               head.innerHTML = fx.identical_to_enforcing
                 // A no-op write is worth SAYING, not leaving to be inferred from two zeros:

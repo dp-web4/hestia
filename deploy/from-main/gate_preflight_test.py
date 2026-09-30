@@ -254,6 +254,45 @@ def test_every_shipped_gate_declares_its_own_probe_shape():
             assert isinstance(declared.get("event"), dict), f"{expects_path}: event has no payload"
 
 
+def test_a_projection_consuming_candidate_is_probed_against_the_candidate_engine():
+    """#1171: the gate loads $HESTIA_HOME/seats/<member>.env at import and exports every key
+    OVER the probe environment, so the HESTIA_SHARED_DIR env pin alone pairs the candidate gate
+    with the INSTALLED engine (measured 2026-09-29 on CBP and Legion: #1149's correlation_key
+    deploy refused on every cycle). The probe must run under a throwaway seat home whose
+    projection names the candidate tree. The stub below reproduces the loader's override."""
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        repo, home = root / "repo", root / "home"
+        launcher_home = root / "launcher-home"
+        # the seat's real rendered projection names the INSTALLED engine
+        seats = launcher_home / "seats"
+        seats.mkdir(parents=True)
+        (seats / "alpha.env").write_text(
+            f"# member: alpha\nHESTIA_HOME={launcher_home}\n"
+            f"HESTIA_SHARED_DIR={root / 'installed-shared'}\n",
+            encoding="utf-8",
+        )
+        # the candidate loads its projection at import and exports it over the probe env,
+        # exactly as _load_projection does, then answers by the engine it was paired with
+        expected = str((repo / "plugins" / "_shared").resolve())
+        body = (
+            "import os, sys; sys.stdin.read()\n"
+            "for line in open(os.path.join(os.environ['HESTIA_HOME'], 'seats', 'alpha.env')):\n"
+            "    line = line.strip()\n"
+            "    if line and not line.startswith('#') and '=' in line:\n"
+            "        k, v = line.split('=', 1); os.environ[k] = v\n"
+            f"raise SystemExit(0 if os.environ.get('HESTIA_SHARED_DIR') == {expected!r} else 2)\n"
+        )
+        make_member(repo, home, "alpha", body=body)
+        config = home / ".alpha" / "settings.json"
+        installed = home / ".alpha" / "hooks" / "pre_tool_use.py"
+        config.write_text(json.dumps({"hooks": [{"command": f'HESTIA_HOME="{launcher_home}" python3 {installed}'}]}),
+                          encoding="utf-8")
+        rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+        assert good, rows
+        assert rows == [{"member": "alpha", "probe": "read", "status": "ok"}]
+
+
 if __name__ == "__main__":
     test_registered_candidate_must_allow_the_declared_probe()
     test_registered_refusal_blocks_the_set_before_installation()
@@ -267,4 +306,5 @@ if __name__ == "__main__":
     test_workspace_is_explicit_when_a_checkout_is_nested_in_a_worktree()
     test_every_shipped_gate_declares_its_own_probe_shape()
     test_a_projection_consumer_is_probed_under_the_launcher_env_not_the_deploy_units()
-    print("ok: 11 gate-preflight checks")
+    test_a_projection_consuming_candidate_is_probed_against_the_candidate_engine()
+    print("ok: 12 gate-preflight checks")

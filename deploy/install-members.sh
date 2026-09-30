@@ -294,23 +294,41 @@ first_entry=1
 any_installed=0
 any_skipped=0
 
-# --- REGISTER FIRST, THEN INSTALL (dp, 2026-09-27, #1133) ------------------------------------
+# --- PLAN, INSTALL, THEN REGISTER (dp 2026-09-27 #1133; #1142 review 2026-09-28) -----------
 # "the auto install process is supposed to take care of all this. isn't there a script? editing
 # files by hand is unacceptable friction for product we're trying to release generally."
 # This script derives every target from the harness's OWN registration and never writes one —
-# correct (#315), and the reason an unregistered hook could sit skipped forever: codex's
-# witness.py was declared, shipped, and "not registered on this host" for 14 days while no
-# codex act reached the chain. deploy/register-members.py renders each installed member's
-# hooks/hooks.json into that member's config, idempotently, so the loop below then finds the
-# hook registered and installs it. A registration failure is LOUD and does not stop the
-# install of what is already registered. DRY_RUN passes through (it writes nothing).
+# correct (#315). deploy/register-members.py renders each member's hooks/hooks.json into that
+# member's config. The ORDER is the invariant (#1142 review): registering first left live
+# registrations pointing into a directory nothing had created, and the loop below then died on
+# it. So: (1) ask the registrar which hooks it WOULD add and where (`--plan`); (2) the member loop
+# creates each planned destination and installs its file exactly as it installs a registered
+# one; (3) only then does the registrar write registrations, and it refuses any whose target file
+# is not on disk (PENDING). No registration ever points at a missing file. A matcher narrower
+# than the template's (a gate on `Read` only) is reported NARROW and left untouched.
+declare -A planned=()
 if [ "${HESTIA_SKIP_REGISTER:-0}" != "1" ]; then
-  log "REGISTER (deploy/register-members.py)"
-  if ! DRY_RUN="$DRY_RUN" python3 "$REPO_ROOT/deploy/register-members.py" 2>&1 | sed 's/^/  /'; then
-    log "  WARN register-members.py failed (rc=${PIPESTATUS[0]}) — installing what is already registered"
+  log "PLAN (deploy/register-members.py --plan)"
+  plan_rc=0
+  plan_out="$(python3 "$REPO_ROOT/deploy/register-members.py" --plan 2>&1)" || plan_rc=$?
+  if [ "$plan_rc" != "0" ]; then
+    log "  WARN register-members.py --plan failed (rc=$plan_rc): ${plan_out:0:200}"
     any_skipped=1
+    plan_out=""
   fi
+  while IFS=$'\t' read -r p_member p_base p_target; do
+    [ -n "${p_target:-}" ] || continue
+    planned["$p_member/$p_base"]="$p_target"
+    log "  plan  $p_member: $p_base -> $(dirname "$p_target") (installed first, then registered)"
+  done <<< "$plan_out"
+  [ "${#planned[@]}" -gt 0 ] || log "  nothing to add: every templated hook is registered or its member is absent"
 fi
+
+has_plan() {   # has_plan <member> — any planned hook for this member?
+  local k
+  for k in "${!planned[@]}"; do [ "${k%%/*}" = "$1" ] && return 0; done
+  return 1
+}
 
 for expects in "$REPO_ROOT"/plugins/*/expects.json; do
   [ -e "$expects" ] || continue
@@ -375,7 +393,14 @@ PY
 )" || reg_rc=$?
   case "$reg_rc" in
     2) log "SKIP  $member — declares no install.registration (nothing to derive a target from)"; any_skipped=1; continue ;;
-    3) log "SKIP  $member — its harness registration file is absent (member not on this host)"; any_skipped=1; continue ;;
+    3) if has_plan "$member"; then
+         # The harness is here (its config DIR exists; the registrar checked) but has no
+         # registration file yet: install the planned hooks, then the registrar writes it.
+         log "  $member: no registration file yet — installing its planned hooks, then registering"
+         reg_out=""
+       else
+         log "SKIP  $member — its harness registration file is absent (member not on this host)"; any_skipped=1; continue
+       fi ;;
     4) log "SKIP  $member — registration file present but unparseable; refusing to guess a target"; any_skipped=1; continue ;;
     5) die  "$member declares an unknown install.registration.reader" ;;
   esac
@@ -421,6 +446,19 @@ print(os.path.expanduser(p) if p else "")' "$expects")"
     base="$(basename "$rel")"
 
     target="${registered[$base]:-}"
+    is_planned=""
+    if [ -z "$target" ] && [ -n "${planned[$member/$base]:-}" ]; then
+      target="${planned[$member/$base]}"
+      is_planned=1
+      if [ ! -d "$(dirname "$target")" ]; then
+        if [ "$DRY_RUN" = "1" ]; then
+          log "  would create $(dirname "$target")"
+        else
+          mkdir -p -m 0755 "$(dirname "$target")"
+          log "  made  $(dirname "$target")"
+        fi
+      fi
+    fi
     if [ -z "$target" ]; then
       # NOT an error and NOT a silent success: a host that does not register this hook has
       # nothing to deploy, which is a different outcome from "deployed". Same reason the
@@ -430,7 +468,13 @@ print(os.path.expanduser(p) if p else "")' "$expects")"
       continue
     fi
     target_dir="$(dirname "$target")"
-    [ -d "$target_dir" ] || die "$member/$base is registered at $target but $target_dir does not exist"
+    if [ ! -d "$target_dir" ]; then
+      if [ -n "$is_planned" ] && [ "$DRY_RUN" = "1" ]; then
+        :   # a dry run creates nothing; the planned directory is named above
+      else
+        die "$member/$base is registered at $target but $target_dir does not exist"
+      fi
+    fi
     if [ -n "$declared" ] && [ "$target_dir" != "$declared" ]; then
       warn "$member/$base: expects.json declares '$declared' but the harness invokes it from '$target_dir' — installing to the REGISTERED path. The declared value is a per-seat CLAIM this run just checked, not a fleet-wide target: layouts differ by seat, so this divergence may be structural rather than a stale string to correct"
     fi
@@ -474,6 +518,24 @@ print(os.path.expanduser(p) if p else "")' "$expects")"
 done
 
 installed_json="$installed_json]"
+log ""
+
+# (3) REGISTER, now that every planned file is on disk. The registrar refuses a target that is
+# not (PENDING, rc 9), reports a narrower matcher (NARROW, rc 8) without touching it, and fails
+# closed on a config it cannot parse or re-read (rc 6). Any of those is a gap in this deploy,
+# said loudly; none of them rolls back what installed correctly.
+if [ "${HESTIA_SKIP_REGISTER:-0}" != "1" ]; then
+  log "REGISTER (deploy/register-members.py)"
+  reg_rc=0
+  reg_log="$(DRY_RUN="$DRY_RUN" python3 "$REPO_ROOT/deploy/register-members.py" 2>&1)" || reg_rc=$?
+  printf '%s\n' "$reg_log" | sed 's/^/  /'
+  case "$reg_rc" in
+    0) ;;
+    8) warn "a hestia hook is registered under a matcher narrower than its template's (NARROW above) — not widened, not counted as registered"; any_skipped=1 ;;
+    9) warn "a planned hook's file is not on disk after install (PENDING above) — it was NOT registered"; any_skipped=1 ;;
+    *) warn "register-members.py failed (rc=$reg_rc) — installed files stand; their registration did not happen"; any_skipped=1 ;;
+  esac
+fi
 log ""
 
 if [ "$any_installed" = "0" ]; then

@@ -21,7 +21,15 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 from typing import Any, Iterable
+
+# The projection rewrite is shared with hestia-deploy.sh's claude-code arm, which shells out
+# to the same module: one literal-safe implementation, tested once (sed's replacement side
+# expands `&` to the whole match — a deploy root like `build&review` corrupted the line it was
+# meant to re-point, GPT review of #1176).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from seat_projection_repoint import repoint as _repoint_projection  # noqa: E402
 
 
 def _commands_from_registration(path: Path, reader: str) -> list[str]:
@@ -136,6 +144,32 @@ def _payload_denies(stdout: str) -> bool:
     )
 
 
+def _throwaway_seat_home(member: str, environment: dict[str, str], parent: Path) -> Path | None:
+    """A seat home whose projection names the CANDIDATE engine, or None if unconfigured.
+
+    The candidate gate loads its seat projection at import and exports every projected key
+    OVER the probe environment (#944: the vault is the authority, a hook line is not). That
+    silently replaces the HESTIA_SHARED_DIR pin below with the INSTALLED engine path, so the
+    probe pairs the new gate with the old engine and every deploy that adds an engine function
+    the gate uses fails preflight forever (#1171: #1149's correlation_key refused on CBP and
+    Legion identically; nothing repaired it).
+
+    The pairing that exists after install is gate + the tree being installed, so probe under a
+    throwaway home whose projection is the seat's own, re-pointed by the shared
+    seat_projection_repoint module. A seat with no rendered projection keeps the probe env
+    unchanged: its candidate refuses config.unbacked either way, which is the truth of that
+    seat.
+    """
+    launcher_home = environment.get(BOOTSTRAP_LOCATOR)
+    if not launcher_home:
+        return None
+    real_projection = Path(launcher_home) / "seats" / f"{member}.env"
+    if not real_projection.is_file():
+        return None
+    return _repoint_projection(member, real_projection, parent / member,
+                               environment["HESTIA_SHARED_DIR"])
+
+
 def run_probes(
     repo: Path,
     home: Path,
@@ -150,6 +184,26 @@ def run_probes(
     rows: list[dict[str, Any]] = []
     good = True
     workspace_text = str((workspace or repo.parent).resolve())
+    # One temp root for every throwaway seat home this run builds; the probes are
+    # synchronous, so the homes can leave with the run.
+    with tempfile.TemporaryDirectory(prefix="gate-preflight-homes-") as homes_raw:
+        homes = Path(homes_raw)
+        rows, good = _run_probes(repo, home, endpoint, scratch, hold, excluded, workspace_text, homes)
+    return rows, good
+
+
+def _run_probes(
+    repo: Path,
+    home: Path,
+    endpoint: str,
+    scratch: str,
+    hold: str,
+    excluded: set[str],
+    workspace_text: str,
+    homes: Path,
+) -> tuple[list[dict[str, Any]], bool]:
+    rows: list[dict[str, Any]] = []
+    good = True
 
     for expects_path in sorted((repo / "plugins").glob("*/expects.json")):
         member = expects_path.parent.name
@@ -227,6 +281,12 @@ def run_probes(
         # gate + the reviewed tree about to be installed is the one that will. This is the
         # explicit dev/test selection the loader allows, naming the exact tree under test.
         environment["HESTIA_SHARED_DIR"] = str(repo / "plugins" / "_shared")
+        # ...and for a candidate that CONSUMES the vault projection the pin above is not
+        # enough: the projection overrides it at import. Probe under a throwaway seat home
+        # whose projection names the candidate engine (#1171).
+        throwaway = _throwaway_seat_home(member, environment, homes)
+        if throwaway is not None:
+            environment[BOOTSTRAP_LOCATOR] = str(throwaway)
 
         for declared in events:
             if not isinstance(declared, dict):

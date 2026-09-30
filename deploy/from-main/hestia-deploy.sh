@@ -422,6 +422,24 @@ preflight_gate() {
   # this preflight read it as "gate refuses a benign read" and blocked the install that ships
   # the module the gate needed. The pairing that exists after install is gate + the reviewed
   # tree about to be installed, so that is the pairing probed. gate-preflight.py does the same.
+  # UNDER A THROWAWAY SEAT HOME (#1171): the gate loads $HESTIA_HOME/seats/claude-code.env at
+  # import and exports every projected key OVER the probe's environment, so pinning
+  # HESTIA_SHARED_DIR in the env alone pairs the candidate gate with the INSTALLED engine and
+  # every deploy whose gate uses a new engine function fails preflight on every cycle (#1149's
+  # correlation_key, CBP and Legion 2026-09-29). Copy the seat's rendered projection into a
+  # throwaway home with exactly two keys re-pointed — HESTIA_SHARED_DIR at the candidate engine,
+  # HESTIA_HOME at the throwaway (the loader realpath-compares it against the launcher's and
+  # calls a mismatch a miswire). The rewrite is done by seat_projection_repoint.py, the module
+  # gate-preflight.py imports: TEXT, not sed — the replacement side of s/// expands `&` to the
+  # whole match, and a deploy root like `build&review` corrupted the line it was meant to
+  # re-point (GPT review of this fix). A seat with no rendered projection keeps the old
+  # behaviour: the probe refuses config.unbacked, which is that seat's truth either way.
+  probe_home="$HESTIA_HOME"
+  if [ -f "$HESTIA_HOME/seats/claude-code.env" ]; then
+    probe_home="$(python3 "$DEPLOY_ROOT/hestia/deploy/from-main/seat_projection_repoint.py" \
+      claude-code "$HESTIA_HOME/seats/claude-code.env" "$tmp/home-claude-code" \
+      "$DEPLOY_ROOT/hestia/plugins/_shared")" || probe_home="$HESTIA_HOME"
+  fi
   _probe() {  # $1 = label, $2 = event json
     # HESTIA_HOME is the bootstrap locator and has no default by design (#944): since the
     # config-from-vault consumer landed, a gate that cannot find the vault refuses every tool
@@ -431,7 +449,7 @@ preflight_gate() {
     # message about the seat's config rather than about the probe's own environment (Sprout,
     # 2026-09-08: four rendered projections, all four probes still denied).
     printf '%s' "$2" | (cd "$DEPLOY_ROOT/hestia" && env HESTIA_PRE_FAIL_CLOSED=1 CLAUDECODE=1 \
-      HESTIA_HOME="$HESTIA_HOME" \
+      HESTIA_HOME="$probe_home" \
       HESTIA_SHARED_DIR="$DEPLOY_ROOT/hestia/plugins/_shared" \
       HESTIA_ENDPOINT="$EP" python3 "$gate") >"$tmp/out" 2>"$tmp/err"
     rc=$?

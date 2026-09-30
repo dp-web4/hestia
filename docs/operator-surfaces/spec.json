@@ -207,7 +207,8 @@
         "each pending escalation shows the daemon-MEASURED write effect of its retained act (evidence::write_effect), never the member's description of it; an act the daemon cannot measure shows no effect rather than a guessed one",
         "a copy-shaped act (cp <source> <governed>) shows the source's line count and the sha256 the approval binds, and a +/- line diff against the copy currently ENFORCING, labelled as that (not as the act's destination); a no-op is said, not left to two zeros",
         "a patch-application act (git apply|am <patch>, patch -i|<) shows the patch's sha256 the approval binds, the number of files, each target path with +/- counts and created/deleted, and the patch text; a patch the daemon cannot read is shown as unreadable, and a patch above the measurement cap says the approval does not bind its bytes",
-        "any rendered diff or patch text that was cut says so (\"TRUNCATED\"), so the reader never concludes they have seen the whole change"
+        "any rendered diff or patch text that was cut says so (\"TRUNCATED\"), so the reader never concludes they have seen the whole change",
+        "a patch's per-file summary represents mode changes, renames, copies and binary files (a file section with no ---/+++ pair is still a file), and when the summary does not represent the whole patch (summary_complete=false) the surface says INCOMPLETE and names what is missing; a patch or copy source above the measurement cap is NOT read, and the surface says so instead of showing counts"
       ]
     },
     {
@@ -245,15 +246,15 @@
       ],
       "rules": [
         "reason-to-permit",
-        "signed-in-only"
+        "signed-in-only",
+        "bound-to-rendered-evidence"
       ],
       "surfaces": {
         "dashboard": {
           "status": "required"
         },
         "app": {
-          "status": "planned",
-          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+          "status": "required"
         }
       }
     },
@@ -278,7 +279,7 @@
         },
         "app": {
           "status": "planned",
-          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+          "why": "Sprint 4b (promote / recursive / reassign), after 4a's grant and revoke"
         }
       }
     },
@@ -300,8 +301,7 @@
           "status": "required"
         },
         "app": {
-          "status": "planned",
-          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+          "status": "required"
         }
       }
     },
@@ -856,7 +856,7 @@
     },
     {
       "route": "POST /api/agents/:id/ungovern",
-      "why": "removes a harness's hooks with no reason and discards its chain append (let _ = append_chain); must be hardened (required reason, record-or-undo) before ANY surface exposes it"
+      "why": "hardened for #1131 (a reason is required; the intent is recorded before any hook is touched; a failed terminal record is reported, not hidden). Still unsurfaced by choice: removing a gate is the one act no view offers until the owner decides it should"
     },
     {
       "route": "POST /api/scope/floor",

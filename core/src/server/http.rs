@@ -2245,7 +2245,10 @@ async fn vci_credential(
     // Witness the issuance (RWOA A): minting a claim signed with the owner's key is a consequential act
     // and must be on the chain, not just the write of a name. The operator gate (route_layer) did the
     // R+W preflight; this records the act it authorized.
-    let _ = s.append_chain(
+    // Nothing is stored by issuing: the act IS handing the signed credential out. So an issuance
+    // that cannot be recorded is not released (#1131 class A) — the credential is dropped here
+    // unseen, and a retry mints a fresh one once the chain is writable.
+    if let Err(e) = s.append_chain(
         "credential_issued",
         serde_json::json!({
             "vct": "Web4Presence",
@@ -2254,7 +2257,14 @@ async fn vci_credential(
             "assurance_level": assurance,
             "evidence": "operator-gated + holder-proof",
         }),
-    );
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("the issuance could not be recorded ({e}); no credential was released"),
+            })),
+        );
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({ "credential": credential, "format": "vc+sd-jwt" })),
@@ -2433,6 +2443,11 @@ async fn policy_set_instance_grant(
     // restart; sending a loosening through the vault would have made permissions permanent and
     // written to disk. Same control, opposite correct answers.
     let loosening = s.is_loosening(&preset);
+    // What this grant replaces, for the undo below if it cannot be recorded (#1131 class A, the
+    // sibling the `let _` sweep missed: this route kept a failed append as an empty hash).
+    let key = (plugin_id.clone(), role.clone());
+    let previous_grant = s.instance_grants.get(&key).cloned();
+    let previous_policy = s.vault.policy().clone();
     let durability = if loosening {
         s.instance_grants.insert(
             (plugin_id.clone(), role.clone()),
@@ -2463,7 +2478,7 @@ async fn policy_set_instance_grant(
         s.reload_policy();
         "vault — survives a daemon restart"
     };
-    let entry = s.append_chain(
+    let entry = match s.append_chain(
         "policy_instance_grant",
         serde_json::json!({
             "plugin_id": plugin_id,
@@ -2477,7 +2492,30 @@ async fn policy_set_instance_grant(
             "direction": if loosening { "loosening" } else { "tightening" },
             "durability": durability,
         }),
-    );
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            // Recorded or undone: put back exactly what was there.
+            let undone = if loosening {
+                match previous_grant {
+                    Some(g) => { s.instance_grants.insert(key, g); }
+                    None => { s.instance_grants.remove(&key); }
+                }
+                Ok(())
+            } else {
+                let r = s.vault.set_policy(previous_policy);
+                s.reload_policy();
+                r
+            };
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": match undone {
+                    Ok(()) => format!("the grant was not recorded ({e}); it is undone and nothing changed"),
+                    Err(re) => format!("the grant was not recorded ({e}) AND the tightening could not be \
+                                        undone ({re}): the restriction in force is unwitnessed"),
+                },
+            })));
+        }
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2486,7 +2524,7 @@ async fn policy_set_instance_grant(
             "role": role,
             "preset": preset,
             "expires_at": expires_at,
-            "witnessEntryHash": entry.map(|e| e.hash).unwrap_or_default(),
+            "witnessEntryHash": entry.hash,
             "direction": if loosening { "loosening" } else { "tightening" },
             "durability": durability,
         })),
@@ -2500,12 +2538,13 @@ async fn policy_revoke_instance_grant(
     Path((plugin_id, role)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let mut s = state.lock().await;
-    let had = s
-        .instance_grants
-        .remove(&(plugin_id.clone(), role.clone()))
-        .is_some();
+    let key = (plugin_id.clone(), role.clone());
+    let had = s.instance_grants.contains_key(&key);
     if had {
-        let _ = s.append_chain(
+        // Witness FIRST, then remove — removing from memory cannot fail, so the order is exact,
+        // and a revoke that cannot be recorded is refused (the scope revoke's rule), never left
+        // unwitnessed (#1131 class A).
+        if let Err(e) = s.append_chain(
             "policy_instance_grant_revoked",
             serde_json::json!({
                 "plugin_id": plugin_id,
@@ -2513,7 +2552,12 @@ async fn policy_revoke_instance_grant(
                 "role": role,
                 "via": "operator_session",
             }),
-        );
+        ) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("the revoke could not be recorded ({e}); the grant is still in force — retry"),
+            })));
+        }
+        s.instance_grants.remove(&key);
     }
     (
         StatusCode::OK,
@@ -3144,6 +3188,32 @@ async fn config_seed_seats(
         );
     }
 
+    // TERMINAL RECORD, before anything is rendered to disk (#1131 class A: it used to be
+    // appended after rendering and discarded). If it cannot be written, the seed is undone — the
+    // namespace goes back to empty — so no config is in force that the chain holds only an
+    // intent for, and nothing was rendered from it.
+    let seeded_names: Vec<String> = encoded.iter().map(|(n, _)| n.clone()).collect();
+    if let Err(e) = s.append_chain(
+        "config_seeded",
+        serde_json::json!({
+            "members": parsed.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(),
+            "intent": intent.hash,
+        }),
+    ) {
+        let undone = s.vault.remove_documents(sc::SEAT_CONFIG_NS, &seeded_names);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": match undone {
+                    Ok(()) => format!("the seed was not recorded ({e}); it is undone and the namespace is empty again"),
+                    Err(re) => format!("the seed was not recorded ({e}) AND could not be undone ({re}): the \
+                                        seat configs in the vault are unwitnessed"),
+                },
+                "intentEntryHash": intent.hash,
+            })),
+        );
+    }
+
     // Render immediately rather than waiting for the worker's next tick: an operator who just
     // seeded a box expects its seats to be able to act, and the verdicts are the evidence.
     let members: Vec<String> = parsed
@@ -3155,13 +3225,6 @@ async fn config_seed_seats(
         &mut s,
         &members,
         super::handler::ConfigPass::Author,
-    );
-    let _ = s.append_chain(
-        "config_seeded",
-        serde_json::json!({
-            "members": parsed.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(),
-            "intent": intent.hash,
-        }),
     );
 
     (
@@ -3245,7 +3308,8 @@ async fn config_put_seat(
 
     let mut s = state.lock().await;
     let home = s.home.clone();
-    let existed = s.vault.get_document(sc::SEAT_CONFIG_NS, &member).is_some();
+    let previous: Option<Vec<u8>> = s.vault.get_document(sc::SEAT_CONFIG_NS, &member).map(<[u8]>::to_vec);
+    let existed = previous.is_some();
     let writing_shared = sc::is_shared(&member);
 
     // A SEAT MAY NOT RESTATE A SHARED KEY. The shared set owns the society's facts; a seat
@@ -3307,6 +3371,31 @@ async fn config_put_seat(
         );
     }
 
+    // TERMINAL RECORD before rendering (#1131 class A: it used to follow the render and be
+    // discarded). If it cannot be written, the previous document is put back — or removed if there
+    // was none — so the config in force is always one the chain accounts for.
+    let mut done = record;
+    if let Some(m) = done.as_object_mut() {
+        m.insert("intent".into(), serde_json::json!(intent.hash));
+    }
+    if let Err(e) = s.append_chain("config_seat_written", done) {
+        let undone = match previous {
+            Some(bytes) => s.vault.put_document(sc::SEAT_CONFIG_NS, &member, bytes),
+            None => s.vault.remove_document(sc::SEAT_CONFIG_NS, &member),
+        };
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": match undone {
+                    Ok(()) => format!("the config write was not recorded ({e}); the previous document is restored"),
+                    Err(re) => format!("the config write was not recorded ({e}) AND could not be undone ({re}): \
+                                        the seat config in the vault is unwitnessed"),
+                },
+                "intentEntryHash": intent.hash,
+            })),
+        );
+    }
+
     // Render immediately rather than waiting for the worker's next tick: an operator who just
     // set a workspace root should not have to guess whether the artifact has caught up. As an
     // AUTHOR pass: render, then verify — the artifact is expected to differ from what it was,
@@ -3321,7 +3410,6 @@ async fn config_put_seat(
     let verdicts = super::handler::render_and_verify_seat_configs_as(
         &mut s, &members, super::handler::ConfigPass::Author,
     );
-    let _ = s.append_chain("config_seat_written", record);
 
     (
         StatusCode::OK,
@@ -3558,6 +3646,40 @@ async fn config_get_seat(
 }
 
 
+/// The fields a standing grant REPLACES — the binding a surface was shown — for the unexpired
+/// standing grant on (member, path), or `null`. Unexpired only, because the snapshot a surface
+/// renders drops expired rows: an expired row was shown as "none" and must compare as none.
+fn standing_grant_binding(
+    grants: &[crate::server::standing_scope::StandingGrant],
+    member: &str,
+    path: &str,
+    now: u64,
+) -> serde_json::Value {
+    grants
+        .iter()
+        .find(|g| g.member == member && g.path == path && g.expires_at.is_none_or(|e| now < e))
+        .map(|g| {
+            serde_json::json!({
+                "reason": g.reason, "recursive": g.recursive, "granted_by": g.granted_by,
+                "expires_at": g.expires_at, "request_id": g.request_id,
+            })
+        })
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// The same five fields out of whatever row a surface sends back (a whole snapshot row is fine;
+/// its clock fields are ignored). `null` stays `null`.
+fn grant_binding_of(v: &serde_json::Value) -> serde_json::Value {
+    if v.is_null() {
+        return serde_json::Value::Null;
+    }
+    let f = |k: &str| v.get(k).cloned().unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "reason": f("reason"), "recursive": f("recursive"), "granted_by": f("granted_by"),
+        "expires_at": f("expires_at"), "request_id": f("request_id"),
+    })
+}
+
 async fn scope_grant(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
@@ -3680,6 +3802,27 @@ async fn scope_grant(
                 "nearest": nearest,
             })),
         );
+    }
+    // BOUND TO WHAT THE OPERATOR SAW (spec rule `bound-to-rendered-evidence`; the #1132 lesson).
+    // Last edit wins (ruled 2026-09-25), so a grant on a (member, path) that already holds a
+    // standing grant REPLACES its reason, reach and expiry. A surface that showed the operator
+    // the row it is about to replace sends it back as `expected_existing` (`null` = "I was shown
+    // none"), and it is compared HERE, under the lock, so nothing another view writes between
+    // the surface's read and this write can be replaced unseen. Absent = unbound: the older
+    // callers keep working, and say nothing about what they saw.
+    if let Some(expected) = body.get("expected_existing") {
+        let now_b = crate::server::gate_escalation::now_secs();
+        let current = standing_grant_binding(&s.standing_scope.grants, &plugin_id, &path, now_b);
+        if grant_binding_of(expected) != current {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "the standing grant on this (member, path) is not the one you were                               shown — another view changed it since. Nothing was written; review                               the current row and resend.",
+                    "moved": true,
+                    "current": current,
+                })),
+            );
+        }
     }
     let replaces = s
         .standing_scope
@@ -5267,6 +5410,33 @@ fn stamp_gate(
     }
 }
 
+/// A law edit that is recorded or undone (#1131 class A). The five policy routes used to write
+/// the vault, reload the policy, then `let _ =` the `policy_edit` append — so a failed append left
+/// the law changed with no record of who changed it or how. Now: snapshot the whole policy state,
+/// apply the edit, reload, record; if the record fails, restore the snapshot and reload, so the
+/// law in force is always one the chain accounts for. The `apply_ratification` shape.
+fn policy_edit_recorded<R>(
+    s: &mut crate::server::state::ServerState,
+    edit: impl FnOnce(&mut crate::vault::Vault) -> crate::error::Result<R>,
+    record: impl FnOnce(&crate::server::state::ServerState, &R) -> anyhow::Result<()>,
+) -> Result<R, String> {
+    let previous = s.vault.policy().clone();
+    let out = edit(&mut s.vault).map_err(|e| e.to_string())?;
+    s.reload_policy();
+    if let Err(e) = record(s, &out) {
+        let restored = s.vault.set_policy(previous);
+        s.reload_policy();
+        return Err(match restored {
+            Ok(()) => format!("the law edit was not recorded ({e}); the previous policy is restored"),
+            Err(re) => format!(
+                "the law edit was not recorded ({e}) AND could not be undone ({re}): the policy in \
+                 force is unwitnessed — re-apply or revert it"
+            ),
+        });
+    }
+    Ok(out)
+}
+
 async fn policy_set_preset(
     State(state): State<SharedState>,
     gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
@@ -5284,25 +5454,19 @@ async fn policy_set_preset(
         );
     }
     let mut s = state.lock().await;
-    match s.vault.set_active_preset(&preset) {
-        Ok(()) => {
-            s.reload_policy();
-            let _ = s.append_chain(
-                "policy_edit",
-                stamp_gate(
-                    serde_json::json!({"change": "preset", "preset": preset}),
-                    &gate,
-                ),
-            );
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"ok": true, "preset": preset})),
-            )
+    match policy_edit_recorded(
+        &mut s,
+        |v| v.set_active_preset(&preset),
+        |st, out| {
+            let _ = out;
+            st.append_chain("policy_edit", stamp_gate(serde_json::json!({"change": "preset", "preset": preset}), &gate)).map(|_| ())
+        },
+    ) {
+        Ok(out) => {
+            let _ = &out;
+            (StatusCode::OK, Json(serde_json::json!({"ok": true, "preset": preset})))
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        ),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
     }
 }
 
@@ -5339,28 +5503,19 @@ async fn policy_set_override(
         enabled: body.enabled,
     };
     let mut s = state.lock().await;
-    match s.vault.set_policy_override(&body.rule_id, ov) {
-        Ok(()) => {
-            s.reload_policy();
-            let _ = s.append_chain(
-                "policy_edit",
-                stamp_gate(
-                serde_json::json!({
-                    "change": "override", "rule_id": body.rule_id,
-                    "decision": body.decision, "enabled": body.enabled,
-                }),
-                &gate,
-                ),
-            );
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"ok": true, "rule_id": body.rule_id})),
-            )
+    match policy_edit_recorded(
+        &mut s,
+        |v| v.set_policy_override(&body.rule_id, ov),
+        |st, out| {
+            let _ = out;
+            st.append_chain("policy_edit", stamp_gate(serde_json::json!({"change": "override", "rule_id": body.rule_id, "decision": body.decision, "enabled": body.enabled}), &gate)).map(|_| ())
+        },
+    ) {
+        Ok(out) => {
+            let _ = &out;
+            (StatusCode::OK, Json(serde_json::json!({"ok": true, "rule_id": body.rule_id})))
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        ),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
     }
 }
 
@@ -5371,25 +5526,19 @@ async fn policy_clear_override(
     Path(rule_id): Path<String>,
 ) -> impl IntoResponse {
     let mut s = state.lock().await;
-    match s.vault.clear_policy_override(&rule_id) {
-        Ok(()) => {
-            s.reload_policy();
-            let _ = s.append_chain(
-                "policy_edit",
-                stamp_gate(
-                    serde_json::json!({"change": "clear_override", "rule_id": rule_id}),
-                    &gate,
-                ),
-            );
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"ok": true, "rule_id": rule_id})),
-            )
+    match policy_edit_recorded(
+        &mut s,
+        |v| v.clear_policy_override(&rule_id),
+        |st, out| {
+            let _ = out;
+            st.append_chain("policy_edit", stamp_gate(serde_json::json!({"change": "clear_override", "rule_id": rule_id}), &gate)).map(|_| ())
+        },
+    ) {
+        Ok(out) => {
+            let _ = &out;
+            (StatusCode::OK, Json(serde_json::json!({"ok": true, "rule_id": rule_id})))
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        ),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
     }
 }
 
@@ -5409,25 +5558,19 @@ async fn policy_upsert_rule(
     }
     let rule_id = rule.id.clone();
     let mut s = state.lock().await;
-    match s.vault.upsert_custom_rule(rule) {
-        Ok(()) => {
-            s.reload_policy();
-            let _ = s.append_chain(
-                "policy_edit",
-                stamp_gate(
-                    serde_json::json!({"change": "upsert_rule", "rule_id": rule_id}),
-                    &gate,
-                ),
-            );
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"ok": true, "rule_id": rule_id})),
-            )
+    match policy_edit_recorded(
+        &mut s,
+        |v| v.upsert_custom_rule(rule),
+        |st, out| {
+            let _ = out;
+            st.append_chain("policy_edit", stamp_gate(serde_json::json!({"change": "upsert_rule", "rule_id": rule_id}), &gate)).map(|_| ())
+        },
+    ) {
+        Ok(out) => {
+            let _ = &out;
+            (StatusCode::OK, Json(serde_json::json!({"ok": true, "rule_id": rule_id})))
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        ),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
     }
 }
 
@@ -5438,25 +5581,19 @@ async fn policy_delete_rule(
     Path(rule_id): Path<String>,
 ) -> impl IntoResponse {
     let mut s = state.lock().await;
-    match s.vault.remove_custom_rule(&rule_id) {
-        Ok(removed) => {
-            s.reload_policy();
-            let _ = s.append_chain(
-                "policy_edit",
-                stamp_gate(
-                    serde_json::json!({"change": "delete_rule", "rule_id": rule_id, "removed": removed}),
-                    &gate,
-                ),
-            );
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"ok": true, "removed": removed})),
-            )
+    match policy_edit_recorded(
+        &mut s,
+        |v| v.remove_custom_rule(&rule_id),
+        |st, out| {
+            let _ = out;
+            st.append_chain("policy_edit", stamp_gate(serde_json::json!({"change": "delete_rule", "rule_id": rule_id, "removed": *out}), &gate)).map(|_| ())
+        },
+    ) {
+        Ok(out) => {
+            let _ = &out;
+            (StatusCode::OK, Json(serde_json::json!({"ok": true, "removed": out})))
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        ),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
     }
 }
 
@@ -5670,9 +5807,10 @@ fn register_refusal_not_here(atlas_id: &str, rec: &serde_json::Value) -> Option<
 /// S: high/reversible [construct: `ungovern` writes a verified backup before any edit]
 /// R: pass [construct: mounted behind `operator_gate` with the rest of /api/*]
 /// W: pass [construct: operator_gate proves an Ed25519 challenge-signed session]
-/// O: pass [construct: backup written + byte-compared before the config is rewritten]
-/// A: pass [construct: append_chain("agent_ungovern") carries agent, backup path and
-///    hooks_removed — the evidence the act relied on, not merely that it happened]
+/// O: pass [construct: ungovern_ordered — reason, then the agent_ungovern_intent record, then
+///    the backup written + byte-compared, then the config rewritten]
+/// A: pass [construct: agent_ungovern_intent before the edit; agent_ungovern carries agent,
+///    reason, backup path, hooks_removed and the intent hash; a failed terminal is reported]
 /// V: present [construct: TOML configs are refused outright rather than edited
 ///    approximately; the operator is told to do it by hand]
 /// verdict: PASS
@@ -6281,31 +6419,67 @@ async fn agent_reinstate(
 async fn agent_ungovern(
     State(state): State<SharedState>,
     Path(id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
 ) -> impl IntoResponse {
-    match crate::server::agents::ungovern(&id) {
-        Ok((backup, removed)) => {
-            let s = state.lock().await;
-            let _ = s.append_chain(
-                "agent_ungovern",
-                serde_json::json!({
-                    "agent": id, "hooks_removed": removed, "backup": backup,
-                }),
-            );
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": true, "hooks_removed": removed, "backup": backup,
-                    "message": format!(
-                        "{removed} hestia hook(s) removed from {id}; backup at {backup}. \
-                         Restart {id} for this to take effect."),
-                })),
-            )
-        }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": e.to_string()})),
-        ),
+    // The one route that REMOVES enforcement. It used to take no reason at all — less than
+    // approving an escalation asks — and to discard its record (#1131 class A).
+    let reason = body
+        .as_ref()
+        .and_then(|Json(b)| b.get("reason").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mut s = state.lock().await;
+    let out = ungovern_ordered(
+        &id,
+        &reason,
+        |t, d| s.append_chain(t, d).map(|e| e.hash).map_err(|e| e.to_string()),
+        crate::server::agents::ungovern,
+    );
+    match out {
+        Ok(v) => (StatusCode::OK, Json(v)),
+        Err((code, v)) => (code, Json(v)),
     }
+}
+
+/// REASON -> INTENT -> ACT -> RECORD. A config edit on disk cannot always be cleanly undone, so
+/// the record must PRECEDE it (the agent_retire order): no reason, no intent record, no edit. A
+/// failed edit leaves the intent unpaired and returns its hash; a terminal record that fails is
+/// REPORTED (`recorded: false`), not hidden — the hooks are gone and the intent already witnesses
+/// that it was attempted, with the backup path to restore from.
+fn ungovern_ordered(
+    id: &str,
+    reason: &str,
+    mut append: impl FnMut(&str, serde_json::Value) -> Result<String, String>,
+    ungovern: impl FnOnce(&str) -> anyhow::Result<(String, usize)>,
+) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, serde_json::json!({
+            "error": "a reason is required: ungoverning removes an agent's gate, and the record has \
+                      to say why enforcement was taken away",
+        })));
+    }
+    let intent = append("agent_ungovern_intent", serde_json::json!({"agent": id, "reason": reason}))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({
+            "error": format!("witnessing intent: {e}. Nothing was changed."),
+        })))?;
+    let (backup, removed) = ungovern(id).map_err(|e| (StatusCode::BAD_REQUEST, serde_json::json!({
+        "error": e.to_string(), "intentEntryHash": intent,
+    })))?;
+    let entry = append("agent_ungovern", serde_json::json!({
+        "agent": id, "hooks_removed": removed, "backup": backup, "reason": reason, "intent": intent,
+    }));
+    Ok(serde_json::json!({
+        "ok": true, "hooks_removed": removed, "backup": backup,
+        "message": format!(
+            "{removed} hestia hook(s) removed from {id}; backup at {backup}. \
+             Restart {id} for this to take effect."),
+        "intentEntryHash": intent,
+        "recorded": entry.is_ok(),
+        "witnessEntryHash": entry.as_ref().ok(),
+        "recordError": entry.err(),
+    }))
 }
 
 // --- Gate integrity ---
@@ -7585,6 +7759,61 @@ mod disposition_tests {
 
         apply_ratification(&mut s, previous, next.clone(), |_| Ok(())).unwrap();
         assert_eq!(s.vault.gate_expectations(), next);
+    }
+
+    /// Last edit wins, bound to what was shown: a grant that names the row it replaces is refused
+    /// — with nothing written — when that row is not the one in the store any more.
+    #[tokio::test]
+    async fn a_grant_bound_to_a_row_that_moved_is_refused_and_writes_nothing() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "hub-being").await;
+        let first = serde_json::json!({"plugin_id": "hub-being", "path": "/w/home",
+                                       "reason": "its home", "recursive": true});
+        assert_eq!(grant(&state, first).await.0, StatusCode::OK);
+        let shown = standing_grant_binding(&state.lock().await.standing_scope.grants,
+                                           "hub-being", "/w/home", 0);
+        assert_eq!(shown["reason"], "its home");
+
+        // Another view replaced it after this surface rendered.
+        let other = serde_json::json!({"plugin_id": "hub-being", "path": "/w/home",
+                                       "reason": "changed on the dashboard", "recursive": false});
+        assert_eq!(grant(&state, other).await.0, StatusCode::OK);
+        let before = snapshot(&*state.lock().await);
+
+        let (st, body) = grant(&state, serde_json::json!({"plugin_id": "hub-being", "path": "/w/home",
+            "reason": "mine", "expected_existing": shown})).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["current"]["reason"], "changed on the dashboard");
+        assert_eq!(snapshot(&*state.lock().await), before, "a refused bound grant wrote something");
+
+        // "I was shown none" is a binding too.
+        let (st, _) = grant(&state, serde_json::json!({"plugin_id": "hub-being", "path": "/w/home",
+            "reason": "mine", "expected_existing": null})).await;
+        assert_eq!(st, StatusCode::CONFLICT);
+
+        // Bound to the row that IS there: it goes through, and says it replaced one.
+        let current = body["current"].clone();
+        let (st, ok) = grant(&state, serde_json::json!({"plugin_id": "hub-being", "path": "/w/home",
+            "reason": "mine", "expected_existing": current})).await;
+        assert_eq!((st, ok["replaced_existing"].clone()), (StatusCode::OK, serde_json::json!(true)), "{ok}");
+        // And a new path bound to "none" goes through.
+        let (st, _) = grant(&state, serde_json::json!({"plugin_id": "hub-being", "path": "/w/new",
+            "reason": "fresh", "expected_existing": null})).await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    #[test]
+    fn the_binding_ignores_clock_fields_and_treats_expired_as_none() {
+        let row = serde_json::json!({"lifetime": "standing", "plugin_id": "m", "path": "/p",
+            "reason": "r", "recursive": false, "granted_by": "operator", "expires_at": null,
+            "request_id": null, "secs_remaining": 12, "granted_at": 99});
+        let g = crate::server::standing_scope::StandingGrant {
+            member: "m".into(), path: "/p".into(), granted_at: 1, granted_by: "operator".into(),
+            reason: "r".into(), expires_at: None, request_id: None, recursive: false,
+        };
+        assert_eq!(grant_binding_of(&row), standing_grant_binding(&[g.clone()], "m", "/p", 10));
+        let expired = crate::server::standing_scope::StandingGrant { expires_at: Some(5), ..g };
+        assert!(standing_grant_binding(&[expired], "m", "/p", 10).is_null());
     }
 
     #[test]
@@ -11024,5 +11253,166 @@ mod operator_vault_tests {
             .expect("an operator add must be on the chain");
         assert_eq!(e.event_data["name"], "openai-key");
         assert!(!e.event_data.to_string().contains("SECRET-V"));
+    }
+
+    // ── #1131 class A: every consequential act is recorded or undone ─────────────────────────
+    //
+    // Each arm injects a failure on exactly ONE event type (fail_appends_of) and asks what the
+    // governed state looks like AFTER — not merely whether the call returned an error.
+
+    #[tokio::test]
+    async fn a_law_edit_whose_record_fails_leaves_the_law_as_it_was() {
+        let (dir, state) = test_state().await;
+        let before = state.lock().await.vault.policy().active_preset.clone();
+        let other = crate::policy::PRESET_NAMES.iter().find(|p| **p != before).unwrap().to_string();
+        let conn = fail_appends_of(dir.path(), "policy_edit");
+        let r = policy_set_preset(State(state.clone()), None, Json(serde_json::json!({"preset": other})))
+            .await.into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body_json(r).await["error"].as_str().unwrap().contains("previous policy is restored"));
+        assert_eq!(state.lock().await.vault.policy().active_preset, before, "the law changed unrecorded");
+        // and the same edit, recordable, stands
+        conn.execute_batch("DROP TRIGGER fail_vault_witness").unwrap();
+        let r = policy_set_preset(State(state.clone()), None, Json(serde_json::json!({"preset": other})))
+            .await.into_response();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(state.lock().await.vault.policy().active_preset, other);
+    }
+
+    #[tokio::test]
+    async fn a_policy_edit_helper_restores_on_every_route_shape() {
+        // The five routes share policy_edit_recorded; this pins the helper on an edit shape the
+        // preset test does not cover (an override insert), with the record failing in-process.
+        let (_dir, state) = test_state().await;
+        let mut s = state.lock().await;
+        let before = s.vault.policy().overrides.clone();
+        let err = policy_edit_recorded(
+            &mut s,
+            |v| v.set_policy_override("some-rule", crate::vault::PolicyOverride { decision: None, enabled: Some(false) }),
+            |_, _| Err(anyhow::anyhow!("chain store refused the append")),
+        )
+        .unwrap_err();
+        assert!(err.contains("previous policy is restored"), "{err}");
+        assert_eq!(s.vault.policy().overrides, before);
+    }
+
+    #[tokio::test]
+    async fn an_instance_grant_whose_record_fails_is_undone_and_a_revoke_is_refused() {
+        let (dir, state) = test_state().await;
+        let conn = fail_appends_of(dir.path(), "policy_instance_grant");
+        let r = policy_set_instance_grant(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "role": "worker", "preset": "permissive", "reason": "r"})))
+            .await.into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.lock().await.instance_grants.is_empty(), "a widening stood unrecorded");
+        conn.execute_batch("DROP TRIGGER fail_vault_witness").unwrap();
+        // now grant for real, then fail the REVOKE's record: the grant must still be in force
+        let r = policy_set_instance_grant(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "role": "worker", "preset": "permissive", "reason": "r"})))
+            .await.into_response();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(!state.lock().await.instance_grants.is_empty(),
+                "permissive over the default must be a LOOSENING (memory grant), or this test proves nothing");
+        let _c2 = fail_appends_of(dir.path(), "policy_instance_grant_revoked");
+        let r = policy_revoke_instance_grant(State(state.clone()), Path(("kimi-code".into(), "worker".into())))
+            .await.into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!state.lock().await.instance_grants.is_empty(), "a revoke stood unrecorded");
+    }
+
+    #[tokio::test]
+    async fn a_seat_config_write_whose_record_fails_restores_the_previous_document() {
+        use super::super::seat_config as sc;
+        let (dir, state) = test_state().await;
+        let put = |env: &str| serde_json::json!({"plugin_id": "claude-code",
+            "config": {"env": {"HESTIA_WORKSPACE": env}, "note": ""}});
+        let r = config_put_seat(State(state.clone()), Json(put("/w/one"))).await.into_response();
+        assert_eq!(r.status(), StatusCode::OK);
+        let before = state.lock().await.vault.get_document(sc::SEAT_CONFIG_NS, "claude-code").map(<[u8]>::to_vec);
+        let rendered = std::fs::read_to_string(sc::render_path(dir.path(), "claude-code")).unwrap();
+        let _c = fail_appends_of(dir.path(), "config_seat_written");
+        let r = config_put_seat(State(state.clone()), Json(put("/w/two"))).await.into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let s = state.lock().await;
+        assert_eq!(s.vault.get_document(sc::SEAT_CONFIG_NS, "claude-code").map(<[u8]>::to_vec), before,
+                   "the previous document is restored");
+        assert_eq!(std::fs::read_to_string(sc::render_path(dir.path(), "claude-code")).unwrap(), rendered,
+                   "and nothing unrecorded was rendered to disk");
+    }
+
+    #[tokio::test]
+    async fn a_seed_whose_record_fails_leaves_the_namespace_empty() {
+        use super::super::seat_config as sc;
+        let (dir, state) = test_state().await;
+        let _c = fail_appends_of(dir.path(), "config_seeded");
+        let seed = serde_json::json!({"documents": {
+            "claude-code": {"env": {"HESTIA_PLUGIN_ID": "claude-code"}, "note": ""}}});
+        let r = config_seed_seats(State(state.clone()), Json(seed)).await.into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let s = state.lock().await;
+        assert!(sc::namespace_is_empty(&s.vault), "a seed stood unrecorded");
+        assert!(!sc::render_path(dir.path(), "claude-code").exists(), "and nothing was rendered");
+    }
+
+    #[test]
+    fn ungovern_needs_a_reason_and_records_before_it_edits() {
+        let touched = std::cell::Cell::new(false);
+        let e = ungovern_ordered("claude-code", "  ", |_, _| Ok("h".into()),
+            |_| { touched.set(true); Ok(("b".into(), 1)) }).unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+        let e = ungovern_ordered("claude-code", "locked out", |_, _| Err("chain down".into()),
+            |_| { touched.set(true); Ok(("b".into(), 1)) }).unwrap_err();
+        assert_eq!(e.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!touched.get(), "a gate was removed with no reason or no record");
+        let mut log = Vec::new();
+        let v = ungovern_ordered("claude-code", "locked out",
+            |t, d| { log.push((t.to_string(), d)); Ok(format!("h{}", log.len())) },
+            |_| Ok(("/b.json".into(), 2))).unwrap();
+        assert_eq!(log.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(), ["agent_ungovern_intent", "agent_ungovern"]);
+        assert_eq!((log[1].1["intent"].clone(), log[1].1["reason"].clone()),
+                   (serde_json::json!("h1"), serde_json::json!("locked out")));
+        assert_eq!(v["recorded"], true);
+    }
+
+    #[test]
+    fn a_bootstrap_that_cannot_be_recorded_mints_nothing() {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let _c = fail_appends_of(dir.path(), "operator_bootstrap");
+        let mut s = state.blocking_lock();
+        assert!(s.bootstrap_operator_if_genesis().is_err());
+        assert!(!dir.path().join("operator.key").exists(), "a key was written for an unrecorded genesis");
+        assert!(!s.vault.policy().operator_access_bootstrapped(), "the window closed without a record");
+    }
+
+    #[tokio::test]
+    async fn a_credential_whose_issuance_cannot_be_recorded_is_not_released() {
+        let (dir, state) = test_state().await;
+        let issuer = web4_core::crypto::KeyPair::generate();
+        state.lock().await.vault.upsert(VaultEntry::new(
+            "ai_identity_secret", hex::encode(issuer.secret_key_bytes()))).unwrap();
+        let holder = web4_core::crypto::KeyPair::generate();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "127.0.0.1:7711".parse().unwrap());
+        let base = issuer_base(&headers);
+        let request = |nonce: &str| {
+            web4_core::oid4vc::CredentialRequest {
+                credential_configuration_id: "Web4Presence".into(),
+                proof_jwt: web4_core::oid4vc::build_holder_proof(&holder, &base, nonce, chrono::Utc::now().timestamp()),
+            }
+        };
+        // recordable: issued
+        state.lock().await.vci_nonces.insert("n1".into());
+        let r = vci_credential(State(state.clone()), headers.clone(), Json(request("n1"))).await.into_response();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(body_json(r).await["credential"].is_string());
+        // unrecordable: nothing released
+        let _c = fail_appends_of(dir.path(), "credential_issued");
+        state.lock().await.vci_nonces.insert("n2".into());
+        let r = vci_credential(State(state.clone()), headers, Json(request("n2"))).await.into_response();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let b = body_json(r).await;
+        assert!(b.get("credential").is_none(), "a credential was released unrecorded: {b}");
     }
 }
