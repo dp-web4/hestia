@@ -276,14 +276,44 @@ pub fn write_effect(act: &str) -> Option<Value> {
                      nothing about its contents is asserted here",
         }));
     }
-    let new_bytes = std::fs::read(&src).ok()?;
+    // BOUNDED (GPT hold on #1064): the size is checked before anything is allocated, and a
+    // source over the cap is REPORTED as unread -- never diffed from a prefix, never counted.
+    let cap = crate::server::gate_escalation::MAX_MEASURED_PAYLOAD_BYTES;
+    let new_bytes = match crate::server::gate_escalation::read_regular_file_bounded(&src, cap) {
+        Ok(b) => b,
+        Err(e) => {
+            let size = std::fs::metadata(&src).map(|m| m.len()).ok();
+            let too_large = matches!(e, crate::server::gate_escalation::BoundedRead::TooLarge(_));
+            return Some(json!({
+                "source": src.display().to_string(),
+                "source_readable": too_large,
+                "source_read": false,
+                "source_bytes": size,
+                "payload_sha256": Value::Null,
+                "destination_stated": dest_token,
+                "diff": Value::Null,
+                "note": match e {
+                    crate::server::gate_escalation::BoundedRead::TooLarge(_) => format!(
+                        "the source is larger than the {cap}-byte measurement cap; it was NOT \
+                         read, so nothing about its contents is asserted and the approval does \
+                         not bind its bytes"),
+                    _ => "the source could not be read; nothing about its contents is asserted"
+                        .to_string(),
+                },
+            }));
+        }
+    };
     let new_text = String::from_utf8_lossy(&new_bytes).to_string();
-    let payload_sha256 =
-        crate::server::gate_escalation::EscalationStore::measured_payload_for_act(act);
+    // The sha of THESE bytes -- the ones summarised below -- which is what the approval binds
+    // for them (`measured_payload_for_act` hashes the same file through the same bounded
+    // reader). Computed from this buffer, not by a second read, so the card cannot show a
+    // digest of different bytes than the diff it renders.
+    let payload_sha256 = Some(crate::server::gate_escalation::sha256_hex(&new_bytes));
 
     let mut out = json!({
         "source": src.display().to_string(),
         "source_readable": true,
+        "source_read": true,
         "source_bytes": new_bytes.len(),
         "source_lines": new_text.lines().count(),
         // The same value the approval BINDS (#1056), carried here so a reader can see that
@@ -294,10 +324,6 @@ pub fn write_effect(act: &str) -> Option<Value> {
 
     match enforcing_copy(&dest_token) {
         Some(cur) => {
-            let old_text = std::fs::read(&cur)
-                .map(|b| String::from_utf8_lossy(&b).to_string())
-                .unwrap_or_default();
-            let d = line_diff(&old_text, &new_text);
             out["compared_against"] = json!({
                 "path": cur.display().to_string(),
                 // NAMED PRECISELY. This is not the destination the act will write; it is the
@@ -305,6 +331,22 @@ pub fn write_effect(act: &str) -> Option<Value> {
                 // that a reviewer would reasonably rely on.
                 "what": "the copy currently ENFORCING on this daemon, not the act's destination",
             });
+            // Bounded like the source. An enforcing copy that cannot be read is SAID, never
+            // diffed as if it were empty: `unwrap_or_default()` here used to render every line
+            // of the source as an addition against a file nobody had read.
+            let old_text = match crate::server::gate_escalation::read_regular_file_bounded(&cur, cap) {
+                Ok(b) => String::from_utf8_lossy(&b).to_string(),
+                Err(_) => {
+                    out["enforcing_read"] = json!(false);
+                    out["diff"] = Value::Null;
+                    out["note"] = json!(
+                        "the enforcing copy could not be read within the measurement cap, so no \
+                         diff is shown"
+                    );
+                    return Some(out);
+                }
+            };
+            let d = line_diff(&old_text, &new_text);
             out["added_lines"] = json!(d.added);
             out["removed_lines"] = json!(d.removed);
             out["diff"] = json!(d.rendered);
@@ -322,70 +364,294 @@ pub fn write_effect(act: &str) -> Option<Value> {
     Some(out)
 }
 
-/// Per-file stat of a unified diff, read from its own structure: `--- ` / `+++ ` headers are
-/// read only OUTSIDE a hunk, and a hunk is consumed by the exact line counts its `@@ -a,b +c,d @@`
-/// header declares -- so a removed line that happens to start `--- ` is never mistaken for a new
-/// file. A target is the `+++` path (`b/` stripped), or the `---` path when the file is deleted
-/// (`+++ /dev/null`); `--- /dev/null` marks a creation.
-pub fn patch_stat(text: &str) -> (Vec<Value>, u64, u64) {
-    fn strip(t: &str) -> String {
-        let t = t.split('\t').next().unwrap_or(t).trim();
-        t.strip_prefix("a/").or_else(|| t.strip_prefix("b/")).unwrap_or(t).to_string()
-    }
-    fn count(spec: &str) -> u64 {
-        // "a,b" -> b ; "a" -> 1
-        spec.split(',').nth(1).and_then(|n| n.parse().ok()).unwrap_or(1)
-    }
-    let lines: Vec<&str> = text.lines().collect();
-    let mut files: Vec<Value> = Vec::new();
-    let (mut total_add, mut total_del) = (0u64, 0u64);
-    let mut i = 0;
-    while i < lines.len() {
-        let l = lines[i];
-        if let (Some(minus), Some(plus)) = (
-            l.strip_prefix("--- "),
-            lines.get(i + 1).and_then(|n| n.strip_prefix("+++ ")),
-        ) {
-            let created = minus.trim().starts_with("/dev/null");
-            let deleted = plus.trim().starts_with("/dev/null");
-            let path = if deleted { strip(minus) } else { strip(plus) };
-            let (mut add, mut del) = (0u64, 0u64);
-            i += 2;
-            while i < lines.len() && lines[i].starts_with("@@") {
-                let h = lines[i];
-                let mut parts = h.split_whitespace().skip(1);
-                let old_n = parts.next().map(|t| count(t.trim_start_matches('-'))).unwrap_or(0);
-                let new_n = parts.next().map(|t| count(t.trim_start_matches('+'))).unwrap_or(0);
-                let (mut o, mut n) = (old_n, new_n);
-                i += 1;
-                while i < lines.len() && (o > 0 || n > 0) {
-                    let b = lines[i].as_bytes().first().copied();
-                    match b {
-                        Some(b'-') => { del += 1; o = o.saturating_sub(1); }
-                        Some(b'+') => { add += 1; n = n.saturating_sub(1); }
-                        Some(b'\\') => {} // "\ No newline at end of file"
-                        _ => { o = o.saturating_sub(1); n = n.saturating_sub(1); }
-                    }
-                    i += 1;
-                }
-                // a trailing "\ No newline" marker after the counts ran out
-                while i < lines.len() && lines[i].starts_with('\\') {
-                    i += 1;
-                }
-            }
-            total_add += add;
-            total_del += del;
-            files.push(json!({"path": path, "added": add, "removed": del,
-                              "created": created, "deleted": deleted}));
-            continue;
-        }
-        i += 1;
-    }
-    (files, total_add, total_del)
+/// Per-file summary of a patch, read from its own structure, and an explicit list of what it
+/// could NOT represent.
+///
+/// `incomplete` is the load-bearing field. A summary is shown to a decider as the effect of
+/// the act; a summary that silently drops part of the patch lets them endorse bytes they were
+/// not shown. So every form this parser does not fully read lands in `incomplete` by name, and
+/// a surface must render a non-empty `incomplete` as "this summary is NOT the whole patch".
+#[derive(Debug, Default)]
+pub struct PatchStat {
+    pub files: Vec<Value>,
+    pub added: u64,
+    pub removed: u64,
+    pub incomplete: Vec<String>,
 }
 
-/// What a PATCH-APPLICATION act would do: the patch the daemon read, the hash the approval binds
-/// (the same `measured_payload_for_act`), and per file what it touches.
+#[derive(Debug, Default)]
+struct PatchRow {
+    path: Option<String>,
+    diff_git: Option<String>,
+    diff_git_raw: Option<String>,
+    added: u64,
+    removed: u64,
+    created: bool,
+    deleted: bool,
+    old_mode: Option<String>,
+    new_mode: Option<String>,
+    renamed_from: Option<String>,
+    copied_from: Option<String>,
+    binary: bool,
+}
+
+fn strip_ab(t: &str) -> String {
+    let t = t.split('\t').next().unwrap_or(t).trim();
+    let t = t.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(t);
+    t.strip_prefix("a/").or_else(|| t.strip_prefix("b/")).unwrap_or(t).to_string()
+}
+
+/// The path of a `diff --git <a> <b>` line when both sides name the same file -- the only case
+/// where the line alone is unambiguous (a path may contain spaces, so a rename is read from its
+/// `rename to` header instead). Quoted paths yield `None` and are reported, not guessed.
+fn diff_git_path(rest: &str) -> Option<String> {
+    if rest.starts_with('"') || rest.len() % 2 == 0 {
+        return None;
+    }
+    let mid = rest.len() / 2;
+    let (l, r) = (rest.get(..mid)?, rest.get(mid + 1..)?);
+    (rest.as_bytes()[mid] == b' ' && strip_ab(l) == strip_ab(r)).then(|| strip_ab(r))
+}
+
+/// `12a13`, `5,7c5,8`, `3d2` -- a normal-format diff command line (GNU `patch` reads these).
+fn is_normal_diff_command(l: &str) -> bool {
+    let Some(pos) = l.find(|c: char| matches!(c, 'a' | 'c' | 'd')) else { return false };
+    let (a, b) = (&l[..pos], &l[pos + 1..]);
+    let num = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == ',')
+        && s.starts_with(|c: char| c.is_ascii_digit());
+    num(a) && num(b)
+}
+
+/// Consume one hunk whose `@@ -a,b +c,d @@` header is `h`, by its DECLARED counts. Returns
+/// false when the header does not parse or the patch ends (or a new file starts) before the
+/// declared lines do: a cut-off hunk is reported, not counted as if it were whole.
+fn consume_hunk<'a, I: Iterator<Item = &'a str>>(
+    h: &str,
+    it: &mut std::iter::Peekable<I>,
+    add: &mut u64,
+    del: &mut u64,
+) -> bool {
+    fn count(spec: &str) -> Option<u64> {
+        // "a,b" -> b ; "a" -> 1
+        match spec.split_once(',') {
+            Some((_, n)) => n.parse().ok(),
+            None => spec.parse::<u64>().ok().map(|_| 1),
+        }
+    }
+    let mut parts = h.split_whitespace().skip(1);
+    let (Some(o), Some(n)) = (
+        parts.next().and_then(|t| t.strip_prefix('-')).and_then(count),
+        parts.next().and_then(|t| t.strip_prefix('+')).and_then(count),
+    ) else {
+        return false;
+    };
+    let (mut o, mut n) = (o, n);
+    while o > 0 || n > 0 {
+        match it.peek() {
+            None => return false,
+            Some(l) if l.starts_with("diff --git ") => return false,
+            Some(_) => {}
+        }
+        let l = it.next().unwrap_or_default();
+        match l.as_bytes().first().copied() {
+            Some(b'-') => { *del += 1; o = o.saturating_sub(1); }
+            Some(b'+') => { *add += 1; n = n.saturating_sub(1); }
+            Some(b'\\') => {} // "\ No newline at end of file"
+            _ => { o = o.saturating_sub(1); n = n.saturating_sub(1); }
+        }
+    }
+    // a trailing "\ No newline" marker after the counts ran out
+    while it.peek().map(|l| l.starts_with('\\')).unwrap_or(false) {
+        it.next();
+    }
+    true
+}
+
+impl PatchRow {
+    fn finish(self, st: &mut PatchStat) {
+        let path = match self.path.or(self.diff_git) {
+            Some(p) => p,
+            None => {
+                let raw = self.diff_git_raw.unwrap_or_default();
+                st.incomplete.push(format!(
+                    "could not determine which file `diff --git {raw}` changes"
+                ));
+                raw
+            }
+        };
+        if self.binary {
+            st.incomplete.push(format!(
+                "{path}: binary content is changed; it is neither counted nor shown here"
+            ));
+        }
+        st.added += self.added;
+        st.removed += self.removed;
+        let mut row = json!({"path": path, "added": self.added, "removed": self.removed,
+                             "created": self.created, "deleted": self.deleted});
+        for (k, v) in [("old_mode", self.old_mode), ("new_mode", self.new_mode),
+                       ("renamed_from", self.renamed_from), ("copied_from", self.copied_from)] {
+            if let Some(v) = v {
+                row[k] = json!(v);
+            }
+        }
+        if self.binary {
+            row["binary"] = json!(true);
+        }
+        st.files.push(row);
+    }
+}
+
+/// Per-file summary of a patch (`git diff` / `git format-patch` output, or a plain unified
+/// diff), read from its own structure.
+///
+/// - A `diff --git` line opens a file row ON ITS OWN. Its extended headers (`old/new mode`,
+///   `new/deleted file mode`, `rename from/to`, `copy from/to`, `similarity index`, `index`)
+///   are read into that row, so a mode-only change, a pure rename and a binary patch -- none
+///   of which has a `---`/`+++` pair -- are each a file, not nothing. (a32919c keyed rows on
+///   that pair and reported all three as ZERO files: GPT hold, 2026-09-29.)
+/// - `--- `/`+++ ` are read only OUTSIDE a hunk, and a hunk is consumed by the exact line
+///   counts its `@@ -a,b +c,d @@` header declares -- so a removed line that starts `--- ` is
+///   never mistaken for a new file. `--- /dev/null` marks a creation, `+++ /dev/null` a
+///   deletion (whose target is the `---` path).
+/// - Anything this does not fully read is NAMED in `incomplete`: binary content, an unknown
+///   git header line, a cut-off or unparseable hunk, a context- or normal-format diff, a hunk
+///   with no file header, a path it cannot determine, or a non-empty patch with no file at
+///   all. Text between file sections that is not a header (a commit message, a signature) is
+///   skipped, exactly as `git apply` skips it.
+///
+/// One pass over `text.lines()` with one line of lookahead: no per-line allocation, so the
+/// work is linear in a buffer the caller has already bounded.
+pub fn patch_stat(text: &str) -> PatchStat {
+    let mut st = PatchStat::default();
+    let mut it = text.lines().peekable();
+    let mut cur: Option<PatchRow> = None;
+    // true between a `diff --git` line and its first hunk / binary body: the header zone.
+    let mut in_git_headers = false;
+    let (mut saw_context, mut saw_normal, mut saw_orphan_hunk) = (false, false, false);
+    while let Some(l) = it.next() {
+        if let Some(rest) = l.strip_prefix("diff --git ") {
+            if let Some(r) = cur.take() {
+                r.finish(&mut st);
+            }
+            cur = Some(PatchRow {
+                diff_git: diff_git_path(rest),
+                diff_git_raw: Some(rest.to_string()),
+                ..Default::default()
+            });
+            in_git_headers = true;
+            continue;
+        }
+        if let Some(minus) = l.strip_prefix("--- ") {
+            if let Some(plus) = it.peek().and_then(|n| n.strip_prefix("+++ ")) {
+                let plus = plus.to_string();
+                it.next();
+                let mut r = if in_git_headers {
+                    cur.take().unwrap_or_default()
+                } else {
+                    if let Some(r) = cur.take() {
+                        r.finish(&mut st);
+                    }
+                    PatchRow::default()
+                };
+                in_git_headers = false;
+                if minus.trim().starts_with("/dev/null") {
+                    r.created = true;
+                }
+                if plus.trim().starts_with("/dev/null") {
+                    r.deleted = true;
+                }
+                r.path = Some(if r.deleted { strip_ab(minus) } else { strip_ab(&plus) });
+                while it.peek().map(|n| n.starts_with("@@")).unwrap_or(false) {
+                    let h = it.next().unwrap_or_default();
+                    if !consume_hunk(h, &mut it, &mut r.added, &mut r.removed) {
+                        let p = r.path.clone().unwrap_or_default();
+                        st.incomplete.push(format!(
+                            "{p}: a hunk is cut off or malformed (`{}`); its counts are partial",
+                            h.chars().take(60).collect::<String>()
+                        ));
+                    }
+                }
+                cur = Some(r);
+                continue;
+            }
+        }
+        if in_git_headers {
+            let r = cur.get_or_insert_with(PatchRow::default);
+            if let Some(m) = l.strip_prefix("old mode ") {
+                r.old_mode = Some(m.trim().to_string());
+            } else if let Some(m) = l.strip_prefix("new mode ") {
+                r.new_mode = Some(m.trim().to_string());
+            } else if let Some(m) = l.strip_prefix("new file mode ") {
+                r.created = true;
+                r.new_mode = Some(m.trim().to_string());
+            } else if let Some(m) = l.strip_prefix("deleted file mode ") {
+                r.deleted = true;
+                r.old_mode = Some(m.trim().to_string());
+            } else if let Some(p) = l.strip_prefix("rename from ") {
+                r.renamed_from = Some(strip_ab(p));
+            } else if let Some(p) = l.strip_prefix("rename to ") {
+                r.path = Some(strip_ab(p));
+            } else if let Some(p) = l.strip_prefix("copy from ") {
+                r.copied_from = Some(strip_ab(p));
+            } else if let Some(p) = l.strip_prefix("copy to ") {
+                r.path = Some(strip_ab(p));
+            } else if l.starts_with("similarity index ")
+                || l.starts_with("dissimilarity index ")
+                || l.starts_with("index ")
+            {
+            } else if l.starts_with("Binary files ") && l.ends_with(" differ") {
+                r.binary = true;
+                in_git_headers = false;
+            } else if l == "GIT binary patch" {
+                r.binary = true;
+                in_git_headers = false;
+                // the base85 body runs to the next file section; none of it is a header
+                while it.peek().map(|n| !n.starts_with("diff --git ")).unwrap_or(false) {
+                    it.next();
+                }
+            } else {
+                let p = r.path.clone().or_else(|| r.diff_git.clone()).unwrap_or_default();
+                st.incomplete.push(format!(
+                    "{p}: unrecognised line in a git file header: `{}`",
+                    l.chars().take(60).collect::<String>()
+                ));
+                in_git_headers = false;
+            }
+            continue;
+        }
+        if (l.starts_with("*** ") && it.peek().map(|n| n.starts_with("--- ")).unwrap_or(false))
+            || l == "***************"
+        {
+            saw_context = true;
+        } else if is_normal_diff_command(l) {
+            saw_normal = true;
+        } else if l.starts_with("@@ ") {
+            saw_orphan_hunk = true;
+        }
+    }
+    if let Some(r) = cur.take() {
+        r.finish(&mut st);
+    }
+    if saw_context {
+        st.incomplete.push("a context-format diff (`*** `/`--- `) is present; it is not \
+                            summarised here".into());
+    }
+    if saw_normal {
+        st.incomplete.push("a normal-format diff (`12c12`-style commands) is present; it is \
+                            not summarised here".into());
+    }
+    if saw_orphan_hunk {
+        st.incomplete.push("a hunk with no file header is present; its target and counts are \
+                            not summarised here".into());
+    }
+    if st.files.is_empty() && !text.trim().is_empty() {
+        st.incomplete.push("no file section was recognised in a non-empty patch".into());
+    }
+    st
+}
+
+/// What a PATCH-APPLICATION act would do: the patch the daemon read, the hash of exactly those
+/// bytes (the value the approval binds for them), and per file what it touches.
 ///
 /// WHY (#648, 2026-09-28). codex dissented on an escalation whose record showed a `git apply`
 /// command truncated at `…/witness-` with four sibling patches sharing that prefix: *"I cannot
@@ -393,43 +659,85 @@ pub fn patch_stat(text: &str) -> (Vec<Value>, u64, u64) {
 /// intended behavior."* A patch is the most self-describing act there is once it is READ; the
 /// decider was shown its path and nothing else. Every field is measured from the file: targets
 /// and counts come from the patch's own headers and hunk lines, never from the member's words.
+///
+/// BOUNDED, AND HONEST ABOUT IT (GPT hold on a32919c, 2026-09-29). The file is read ONCE,
+/// through `read_regular_file_bounded` with the same cap the approval binding uses: a patch
+/// over the cap is never allocated, parsed or rendered -- the result says it was not read,
+/// carries `file_count: null` rather than a zero, and binds nothing. Within the cap,
+/// `summary_complete` is false whenever `incomplete` names something the summary does not
+/// represent, and the sha is computed from the same buffer the summary was parsed from.
 pub fn patch_effect(patch: &Path, act: &str) -> Value {
-    let readable = std::fs::metadata(patch).map(|m| m.is_file()).unwrap_or(false);
-    if !readable {
-        return json!({
-            "kind": "patch",
-            "patch_path": patch.display().to_string(),
-            "patch_readable": false,
-            "note": "the act names a patch file the daemon cannot read; nothing about what it \
-                     would change is asserted here",
-        });
+    let _ = act; // the act only locates the file; everything below is read from the bytes
+    use crate::server::gate_escalation::{read_regular_file_bounded, sha256_hex, BoundedRead};
+    let cap = crate::server::gate_escalation::MAX_MEASURED_PAYLOAD_BYTES;
+    let bytes = match read_regular_file_bounded(patch, cap) {
+        Ok(b) => b,
+        Err(BoundedRead::TooLarge(n)) => {
+            let why = format!(
+                "the patch is {n} bytes, above the {cap}-byte measurement cap; it was NOT read, \
+                 so nothing about what it changes is asserted"
+            );
+            return json!({
+                "kind": "patch",
+                "patch_path": patch.display().to_string(),
+                "patch_readable": true,
+                "patch_read": false,
+                "patch_bytes": n,
+                "payload_sha256": Value::Null,
+                "payload_unbound_reason": "patch larger than the measurement cap; the approval does not bind its bytes",
+                "files": Value::Null,
+                "file_count": Value::Null,
+                "added_lines": Value::Null,
+                "removed_lines": Value::Null,
+                "diff": [],
+                "diff_truncated": false,
+                "summary_complete": false,
+                "incomplete": [why],
+            });
+        }
+        Err(_) => {
+            return json!({
+                "kind": "patch",
+                "patch_path": patch.display().to_string(),
+                "patch_readable": false,
+                "patch_read": false,
+                "summary_complete": false,
+                "note": "the act names a patch file the daemon cannot read; nothing about what it \
+                         would change is asserted here",
+            });
+        }
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let mut stat = patch_stat(&text);
+    if matches!(text, std::borrow::Cow::Owned(_)) {
+        stat.incomplete.push("the patch is not valid UTF-8; the text shown replaces the invalid \
+                              bytes, and the sha is of the original bytes".into());
     }
-    let bytes = std::fs::read(patch).unwrap_or_default();
-    let text = String::from_utf8_lossy(&bytes).to_string();
-    let too_big = bytes.len() as u64
-        > crate::server::gate_escalation::MAX_MEASURED_PAYLOAD_BYTES;
-    let (files, total_add, total_del) = patch_stat(&text);
     let mut rendered: Vec<String> = Vec::new();
     let mut truncated = false;
-    for line in text.lines() {
+    for line in text.lines().take(MAX_RENDERED_DIFF_LINES + 1) {
         push_line(&mut rendered, &mut truncated, line.to_string());
     }
     json!({
         "kind": "patch",
         "patch_path": patch.display().to_string(),
         "patch_readable": true,
+        "patch_read": true,
         "patch_bytes": bytes.len(),
-        // The same value the approval BINDS (`measured_payload_for_act`), so the decider can see
-        // that the patch they are reading and the bytes the permit holds are one object. None
-        // above the measurement cap: then the approval binds nothing, and the card must say so.
-        "payload_sha256": crate::server::gate_escalation::EscalationStore::measured_payload_for_act(act),
-        "payload_unbound_reason": if too_big { Value::from("patch larger than the measurement cap; the approval does not bind its bytes") } else { Value::Null },
-        "files": files,
-        "file_count": files.len(),
-        "added_lines": total_add,
-        "removed_lines": total_del,
+        // The sha of THESE bytes -- the ones summarised and rendered here -- which is what
+        // `measured_payload_for_act` binds for them (same file, same bounded reader). Computed
+        // from this buffer rather than by a second read, so the card can never show the digest
+        // of different bytes than the summary it sits beside.
+        "payload_sha256": sha256_hex(&bytes),
+        "payload_unbound_reason": Value::Null,
+        "files": stat.files,
+        "file_count": stat.files.len(),
+        "added_lines": stat.added,
+        "removed_lines": stat.removed,
         "diff": rendered,
         "diff_truncated": truncated,
+        "summary_complete": stat.incomplete.is_empty(),
+        "incomplete": stat.incomplete,
     })
 }
 
@@ -856,16 +1164,18 @@ deleted file mode 100644
 
     #[test]
     fn patch_stat_reads_structure_not_lookalike_lines() {
-        let (files, add, del) = patch_stat(TWO_FILE_PATCH);
+        let st = patch_stat(TWO_FILE_PATCH);
+        let (files, add, del) = (&st.files, st.added, st.removed);
         assert_eq!(files.len(), 3, "{files:?}");
         assert_eq!(files[0], json!({"path": "docs/notes.md", "added": 1, "removed": 1,
                                     "created": false, "deleted": false}),
                    "a '--- '/'+++ ' line INSIDE a hunk is content, not a new file");
         assert_eq!(files[1], json!({"path": "src/new.rs", "added": 2, "removed": 0,
-                                    "created": true, "deleted": false}));
+                                    "created": true, "deleted": false, "new_mode": "100644"}));
         assert_eq!(files[2], json!({"path": "old.txt", "added": 0, "removed": 1,
-                                    "created": false, "deleted": true}));
+                                    "created": false, "deleted": true, "old_mode": "100644"}));
         assert_eq!((add, del), (3, 2));
+        assert!(st.incomplete.is_empty(), "{:?}", st.incomplete);
     }
 
     #[test]
@@ -896,4 +1206,191 @@ deleted file mode 100644
         assert_eq!(gone["patch_readable"], json!(false));
         std::fs::remove_dir_all(&d).ok();
     }
+
+    // ---- GPT hold on a32919c: incomplete patch summaries and unbounded reads ----
+    //
+    // Every fixture below is byte-for-byte what `git diff` (git 2.x) wrote in a throwaway repo
+    // on 2026-09-29, not a hand-written approximation: `chmod +x gate.py` for the mode change,
+    // `git mv` + `git diff -M --cached` for the rename, `git diff --binary` / plain `git diff`
+    // for the two binary shapes. Ground truth came from `git diff --summary --numstat` on the
+    // same trees: "mode change 100644 => 100755 gate.py", "rename old_name.txt => new_name.txt
+    // (100%)", "-\t-\tblob.bin". None of them has a `---`/`+++` pair, and the parser on
+    // a32919c keyed a file row on exactly that pair, so each read as ZERO files changed.
+
+    const GIT_MODE_ONLY: &str = "diff --git a/gate.py b/gate.py
+old mode 100644
+new mode 100755
+";
+
+    const GIT_RENAME_ONLY: &str = "diff --git a/old_name.txt b/new_name.txt
+similarity index 100%
+rename from old_name.txt
+rename to new_name.txt
+";
+
+    const GIT_BINARY: &str = "diff --git a/blob.bin b/blob.bin
+index 677273046bce3115f56c248238f3b83f77cfc239..54424e41e1456e098229110a9867f38b15657dc3 100644
+GIT binary patch
+literal 7
+OcmZSJ<VecQGXekvHUWJA
+
+literal 6
+NcmZQzWJ=1+0{{Yf0X+Z!
+
+";
+
+    const GIT_BINARY_NO_DATA: &str = "diff --git a/blob.bin b/blob.bin
+index 6772730..54424e4 100644
+Binary files a/blob.bin and b/blob.bin differ
+";
+
+    /// A mode-only change BESIDE a text change: the case where an unsupported effect could
+    /// vanish silently next to a supported one and the summary would still look plausible.
+    const GIT_MIXED_MODE_AND_TEXT: &str = "diff --git a/gate.py b/gate.py
+old mode 100644
+new mode 100755
+diff --git a/notes.md b/notes.md
+index de98044..7be73ce 100644
+--- a/notes.md
++++ b/notes.md
+@@ -1,3 +1,3 @@
+ a
+-b
++B
+ c
+";
+
+    fn effect_of_patch(tag: &str, body: &[u8]) -> Value {
+        let d = tmpdir(tag);
+        let patch = d.join("p.patch");
+        std::fs::write(&patch, body).unwrap();
+        let v = write_effect(&format!("git -C /repo apply {}", patch.display())).unwrap();
+        std::fs::remove_dir_all(&d).ok();
+        v
+    }
+
+    #[test]
+    fn a_mode_only_git_patch_is_one_file_with_its_mode_change() {
+        let v = effect_of_patch("modeonly", GIT_MODE_ONLY.as_bytes());
+        assert_eq!(v["file_count"], json!(1), "a32919c said 0 files: {v}");
+        assert_eq!(v["files"][0]["path"], json!("gate.py"));
+        assert_eq!(v["files"][0]["old_mode"], json!("100644"));
+        assert_eq!(v["files"][0]["new_mode"], json!("100755"));
+        assert_eq!(v["summary_complete"], json!(true), "a mode change is represented: {v}");
+    }
+
+    #[test]
+    fn a_pure_rename_git_patch_is_one_file_naming_both_paths() {
+        let v = effect_of_patch("renameonly", GIT_RENAME_ONLY.as_bytes());
+        assert_eq!(v["file_count"], json!(1), "{v}");
+        assert_eq!(v["files"][0]["path"], json!("new_name.txt"));
+        assert_eq!(v["files"][0]["renamed_from"], json!("old_name.txt"));
+        assert_eq!(v["summary_complete"], json!(true), "{v}");
+    }
+
+    #[test]
+    fn a_binary_git_patch_is_listed_and_the_summary_says_it_is_incomplete() {
+        for (tag, body) in [("binlit", GIT_BINARY), ("binnodata", GIT_BINARY_NO_DATA)] {
+            let v = effect_of_patch(tag, body.as_bytes());
+            assert_eq!(v["file_count"], json!(1), "{tag}: {v}");
+            assert_eq!(v["files"][0]["path"], json!("blob.bin"), "{tag}");
+            assert_eq!(v["files"][0]["binary"], json!(true), "{tag}");
+            // +0/-0 would understate a binary change; the summary must SAY it cannot count it.
+            assert_eq!(v["summary_complete"], json!(false), "{tag}: {v}");
+            let why = v["incomplete"].to_string();
+            assert!(why.contains("blob.bin") && why.contains("binary"), "{tag}: {why}");
+        }
+    }
+
+    #[test]
+    fn a_mode_change_beside_a_text_change_does_not_disappear() {
+        let v = effect_of_patch("mixed", GIT_MIXED_MODE_AND_TEXT.as_bytes());
+        assert_eq!(v["file_count"], json!(2), "a32919c showed only notes.md: {v}");
+        let gate = v["files"].as_array().unwrap().iter()
+            .find(|f| f["path"] == json!("gate.py")).cloned().expect("gate.py row");
+        assert_eq!(gate["new_mode"], json!("100755"));
+        let notes = v["files"].as_array().unwrap().iter()
+            .find(|f| f["path"] == json!("notes.md")).cloned().expect("notes.md row");
+        assert_eq!((notes["added"].clone(), notes["removed"].clone()), (json!(1), json!(1)));
+        assert_eq!(v["summary_complete"], json!(true), "{v}");
+    }
+
+    #[test]
+    fn an_unsupported_patch_form_is_marked_incomplete_not_summarised_as_zero() {
+        // A context-format diff (GNU `patch` applies it; this parser does not read it).
+        let context = "*** a/gate.py\n--- b/gate.py\n***************\n*** 1 ****\n! x\n--- 1 ----\n! y\n";
+        let v = effect_of_patch("context", context.as_bytes());
+        assert_eq!(v["summary_complete"], json!(false), "{v}");
+        // A git segment carrying a header this parser does not know.
+        let odd = "diff --git a/x b/x\nsomething new 1\n";
+        let v = effect_of_patch("oddheader", odd.as_bytes());
+        assert_eq!(v["summary_complete"], json!(false), "{v}");
+        assert!(v["incomplete"].to_string().contains("something new"), "{v}");
+        // A hunk that declares more lines than the patch contains (a cut-off patch).
+        let cut = "--- a/x\n+++ b/x\n@@ -1,5 +1,5 @@\n a\n-b\n";
+        let v = effect_of_patch("cuthunk", cut.as_bytes());
+        assert_eq!(v["summary_complete"], json!(false), "{v}");
+        // And the complete control still reads complete.
+        let v = effect_of_patch("complete", TWO_FILE_PATCH.as_bytes());
+        assert_eq!(v["summary_complete"], json!(true), "{v}");
+        assert_eq!(v["incomplete"], json!([]));
+    }
+
+    #[test]
+    fn a_patch_above_the_cap_is_not_read_and_says_so() {
+        let cap = crate::server::gate_escalation::MAX_MEASURED_PAYLOAD_BYTES as usize;
+        // A syntactically valid patch one byte over the cap: if it were read and parsed, it
+        // would produce a file row and a rendered diff.
+        let head = "--- a/big\n+++ b/big\n@@ -0,0 +1,1 @@\n+";
+        let mut body = head.as_bytes().to_vec();
+        body.resize(cap + 1, b'x');
+        let v = effect_of_patch("bigpatch", &body);
+        assert_eq!(v["kind"], json!("patch"));
+        assert_eq!(v["patch_read"], json!(false), "{}", v["incomplete"]);
+        assert_eq!(v["patch_bytes"], json!(cap + 1), "size comes from metadata, not a read");
+        assert_eq!(v["payload_sha256"], Value::Null, "an unread patch binds nothing");
+        assert_eq!(v["summary_complete"], json!(false));
+        assert_eq!(v["file_count"], Value::Null, "not 0: nothing is asserted about its files");
+        assert_eq!(v["diff"], json!([]), "a32919c read and rendered the whole file");
+    }
+
+    #[test]
+    fn a_copy_source_above_the_cap_is_not_read_and_says_so() {
+        let cap = crate::server::gate_escalation::MAX_MEASURED_PAYLOAD_BYTES as usize;
+        let d = tmpdir("bigcopy");
+        let src = d.join("big.txt");
+        std::fs::write(&src, vec![b'y'; cap + 1]).unwrap();
+        let v = write_effect(&format!("cp {} plugins/codex/hooks/pre_tool_use.py", src.display()))
+            .unwrap();
+        assert_eq!(v["source_read"], json!(false), "{v}");
+        assert_eq!(v["source_bytes"], json!(cap + 1));
+        assert_eq!(v["payload_sha256"], Value::Null);
+        assert_eq!(v["diff"], Value::Null, "no diff is claimed for bytes nobody read");
+        assert!(v.get("source_lines").map(Value::is_null).unwrap_or(true),
+                "a line count is a claim about content that was not read");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn the_sha_shown_is_the_sha_of_the_bytes_shown() {
+        // The card's sha must be computed from the SAME buffer the summary was parsed from --
+        // one read, one object -- and it must equal what the approval binds for those bytes.
+        let v = effect_of_patch("shaone", GIT_MIXED_MODE_AND_TEXT.as_bytes());
+        use sha2::{Digest, Sha256};
+        let want = format!("{:x}", Sha256::digest(GIT_MIXED_MODE_AND_TEXT.as_bytes()));
+        assert_eq!(v["payload_sha256"], json!(want));
+    }
+    #[test]
+    fn the_bounded_reader_refuses_past_its_cap_without_reading_the_rest() {
+        let d = tmpdir("bounded");
+        let f = d.join("f");
+        std::fs::write(&f, b"0123456789").unwrap();
+        use crate::server::gate_escalation::{read_regular_file_bounded as rb, BoundedRead};
+        assert_eq!(rb(&f, 10).unwrap(), b"0123456789".to_vec());
+        assert!(matches!(rb(&f, 9), Err(BoundedRead::TooLarge(10))));
+        assert!(matches!(rb(&d, 100), Err(BoundedRead::NotAFile)));
+        assert!(matches!(rb(&d.join("nope"), 100), Err(BoundedRead::NotAFile)));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
 }

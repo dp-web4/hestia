@@ -112,6 +112,56 @@ pub const DEFAULT_TTL_SECS: u64 = 3600;
 /// an act name /dev/zero and turn a gate check into an unbounded read.
 pub const MAX_MEASURED_PAYLOAD_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Why a bounded read returned no bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundedRead {
+    /// Missing, a directory, a FIFO, a device -- anything that is not a regular file. A FIFO or
+    /// `/dev/zero` is exactly the path an unbounded reader never returns from.
+    NotAFile,
+    /// Larger than the cap: the size metadata reported, or -- if the file grew between the
+    /// `stat` and the read -- the number of bytes read before the reader stopped at cap + 1.
+    TooLarge(u64),
+    /// A regular file the daemon could not open or read.
+    Unreadable,
+}
+
+/// Read a regular file of at most `cap` bytes, and NEVER more than `cap + 1` bytes of it.
+///
+/// WHY (GPT hold on #1064, 2026-09-29): the patch path checked `MAX_MEASURED_PAYLOAD_BYTES`
+/// only after `fs::read` had allocated the whole file, so the cap changed a label and bounded
+/// nothing. The size is checked from metadata BEFORE any allocation, and the read itself is
+/// `take(cap + 1)`, so a file swapped or grown between the check and the read still cannot
+/// make this allocate more than the cap plus one byte. Every measurement a decision surface or
+/// an approval binding makes goes through here, so the bytes shown and the bytes bound share
+/// one bound.
+pub fn read_regular_file_bounded(p: &std::path::Path, cap: u64) -> Result<Vec<u8>, BoundedRead> {
+    use std::io::Read;
+    let meta = std::fs::metadata(p).map_err(|_| BoundedRead::NotAFile)?;
+    if !meta.is_file() {
+        return Err(BoundedRead::NotAFile);
+    }
+    if meta.len() > cap {
+        return Err(BoundedRead::TooLarge(meta.len()));
+    }
+    let f = std::fs::File::open(p).map_err(|_| BoundedRead::Unreadable)?;
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    f.take(cap.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|_| BoundedRead::Unreadable)?;
+    if buf.len() as u64 > cap {
+        return Err(BoundedRead::TooLarge(buf.len() as u64));
+    }
+    Ok(buf)
+}
+
+/// Lower-case hex sha256 -- the one spelling of a payload digest used everywhere it is bound
+/// or shown.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
 /// How long an APPROVAL stays claimable after it is granted.
 ///
 /// This exists because the hook cannot wait. `plugin.json` and the live `settings.json` both
@@ -2233,26 +2283,14 @@ impl EscalationStore {
             .iter()
             .find(|t| t.starts_with('/') && !t.contains(".."))
             .map(std::path::Path::new)?;
-        let meta = std::fs::metadata(src).ok()?;
-        if !meta.is_file() || meta.len() > MAX_MEASURED_PAYLOAD_BYTES {
-            return None;
-        }
-        let bytes = std::fs::read(src).ok()?;
-        let mut h = Sha256::new();
-        h.update(&bytes);
-        Some(format!("{:x}", h.finalize()))
+        Self::sha256_of_regular_file(src)
     }
 
 /// sha256 of a regular file no larger than `MAX_MEASURED_PAYLOAD_BYTES`, else `None`.
 fn sha256_of_regular_file(p: &std::path::Path) -> Option<String> {
-    let meta = std::fs::metadata(p).ok()?;
-    if !meta.is_file() || meta.len() > MAX_MEASURED_PAYLOAD_BYTES {
-        return None;
-    }
-    let bytes = std::fs::read(p).ok()?;
-    let mut h = Sha256::new();
-    h.update(&bytes);
-    Some(format!("{:x}", h.finalize()))
+    read_regular_file_bounded(p, MAX_MEASURED_PAYLOAD_BYTES)
+        .ok()
+        .map(|b| sha256_hex(&b))
 }
 
 /// The patch file a patch-APPLICATION act installs, when the act names exactly one.
