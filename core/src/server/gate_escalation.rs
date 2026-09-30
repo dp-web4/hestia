@@ -1263,6 +1263,16 @@ pub struct EscalationStore {
     begins_seen: HashMap<String, u64>,
     /// When this store was created (daemon start). See `begins_seen`.
     booted_at: u64,
+    /// The latest begin time ever evicted from `begins_seen` (GPT review of 8056dce). An
+    /// evicted begin is execution evidence this store no longer holds, so any claim at or
+    /// before this mark is refused a reclaim rather than read as "never executed".
+    begins_evicted_hwm: u64,
+    /// FENCES (GPT review of 8056dce, the claim/begin race): an invocation whose permit was
+    /// re-delivered to another invocation by a reclaim. Written in the SAME state change that
+    /// grants the reclaim, and checked by `hestia_begin_action`, which refuses a fenced key --
+    /// so of {the original's begin, the reclaim} whichever the lock orders first wins, and the
+    /// other is refused. Value: (fenced_at, escalation_id).
+    fenced: HashMap<String, (u64, String)>,
 }
 
 /// How long after a spend the SAME request key may be answered with the same permit
@@ -1272,8 +1282,17 @@ pub struct EscalationStore {
 pub const RECLAIM_WINDOW_SECS: u64 = 120;
 /// Upper bound on remembered request keys; the oldest are evicted first.
 pub const REQUEST_KEY_CAP: usize = 4096;
-/// Upper bound on remembered begin keys; the oldest are evicted first.
+/// Upper bound on remembered begin keys; the oldest are evicted first, and the eviction
+/// high-water mark (`begins_evicted_hwm`) refuses any reclaim that eviction could affect.
 pub const BEGINS_SEEN_CAP: usize = 8192;
+/// Upper bound on live fences. A fence is only EVICTABLE once it is older than `FENCE_TTL_SECS`;
+/// when the table is full of younger fences, a new reclaim is REFUSED rather than a fence
+/// dropped -- the fail-closed direction: losing a fence would let a superseded invocation run.
+pub const FENCE_CAP: usize = 4096;
+/// How long a fence must live. It only has to outlive the fenced invocation's own hook (the
+/// harness kills a hook at 5 s, and a killed hook never reaches begin_action); twice the reclaim
+/// window is far past that.
+pub const FENCE_TTL_SECS: u64 = 2 * RECLAIM_WINDOW_SECS;
 
 /// A correlation key as the witness core emits it: `[A-Za-z0-9_.-]`, at most 200 bytes.
 pub fn valid_correlation_key(k: &str) -> bool {
@@ -1365,6 +1384,14 @@ impl EscalationStore {
             let entry_ts = e.timestamp.timestamp().max(0) as u64;
             let d = &e.event_data;
             let Some(id) = s(d, "escalation_id") else { continue };
+            // FENCES (#1169) are rebuilt from the reclaimed rows that created them, so a restart
+            // cannot let a superseded invocation begin. (A replayed claim is never reclaimable
+            // anyway -- booted_at -- but a fence written just before a restart must survive it.)
+            if e.event_type == "gate_escalation_reclaimed" {
+                if let Some(orig) = s(d, "fenced_invocation_key").filter(|k| valid_correlation_key(k)) {
+                    self.fenced.insert(orig, (entry_ts, id.clone()));
+                }
+            }
             // THE REQUEST-KEY MAP (#1166) is rebuilt from the same rows: every outcome the
             // claim door witnesses carries the key it answered, so a restart keeps "what did
             // I do for this key" exactly as it keeps "what did the operator rule".
@@ -2460,6 +2487,8 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
             request_keys: self.request_keys.clone(),
             begins_seen: self.begins_seen.clone(),
             booted_at: self.booted_at,
+            begins_evicted_hwm: self.begins_evicted_hwm,
+            fenced: self.fenced.clone(),
             ..Default::default()
         }
     }
@@ -2471,8 +2500,11 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         }
         self.begins_seen.insert(correlation_key.to_string(), now);
         if self.begins_seen.len() > BEGINS_SEEN_CAP {
-            if let Some(oldest) = self.begins_seen.iter().min_by_key(|(_, t)| **t).map(|(k, _)| k.clone()) {
+            if let Some((oldest, t)) = self.begins_seen.iter().min_by_key(|(_, t)| **t)
+                .map(|(k, t)| (k.clone(), *t))
+            {
                 self.begins_seen.remove(&oldest);
+                self.begins_evicted_hwm = self.begins_evicted_hwm.max(t);
             }
         }
     }
@@ -2480,6 +2512,39 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
     /// Has this invocation reached begin_action at or after `since`?
     pub fn begin_seen_since(&self, correlation_key: &str, since: u64) -> bool {
         self.begins_seen.get(correlation_key).is_some_and(|t| *t >= since)
+    }
+
+    /// The reclaim that superseded this invocation, if any: (fenced_at, escalation_id).
+    pub fn fenced_by(&self, correlation_key: &str) -> Option<&(u64, String)> {
+        self.fenced.get(correlation_key)
+    }
+
+    /// Lift a fence this reclaim wrote, only if it is still that reclaim's (append failed).
+    pub fn unfence(&mut self, correlation_key: &str, escalation_id: &str) {
+        if self.fenced.get(correlation_key).is_some_and(|(_, e)| e == escalation_id) {
+            self.fenced.remove(correlation_key);
+        }
+    }
+
+    /// Fence a superseded invocation. Returns false -- and fences nothing -- when the table is
+    /// full of fences still inside their TTL: the caller must then REFUSE the reclaim, because
+    /// granting it without a fence is exactly the race the fence exists to close.
+    pub fn fence(&mut self, correlation_key: &str, escalation_id: &str, now: u64) -> bool {
+        if !valid_correlation_key(correlation_key) {
+            return false;
+        }
+        if self.fenced.len() >= FENCE_CAP && !self.fenced.contains_key(correlation_key) {
+            let expired: Option<String> = self.fenced.iter()
+                .filter(|(_, (t, _))| now.saturating_sub(*t) > FENCE_TTL_SECS)
+                .min_by_key(|(_, (t, _))| *t)
+                .map(|(k, _)| k.clone());
+            match expired {
+                Some(k) => { self.fenced.remove(&k); }
+                None => return false,
+            }
+        }
+        self.fenced.insert(correlation_key.to_string(), (now, escalation_id.to_string()));
+        true
     }
 
     /// May THIS retry be answered with the permit its request already spent? (#774, #1169)
@@ -2517,6 +2582,9 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         if rec.at < self.booted_at {
             return Err("the daemon restarted since that claim, so its execution evidence is not held here");
         }
+        if self.begins_evicted_hwm >= rec.at {
+            return Err("begin evidence at or after that claim was evicted under pressure, so execution cannot be ruled out");
+        }
         if now.saturating_sub(rec.at) > RECLAIM_WINDOW_SECS {
             return Err("past the reclaim window of the first claim");
         }
@@ -2545,6 +2613,9 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         let retry = invocation_key.ok_or("the retry names no invocation")?;
         if retry == original {
             return Err("the same invocation retried: its permit was already delivered to it");
+        }
+        if self.fenced.contains_key(retry) {
+            return Err("the retrying invocation is itself fenced by an earlier reclaim");
         }
         if self.begin_seen_since(original, rec.at) {
             return Err("the claimed invocation reached execution (begin_action seen): its permit was delivered");
