@@ -1961,7 +1961,10 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
     // DISCLOSURE — the actual theft step — left no trace on the evidence plane while the
     // WRITE was witnessed. The secret value is never recorded, only the name, the reader,
     // and whether the read went through the exposed bypass.
-    let _ = s.append_chain(
+    //
+    // RECORDED OR NOT RELEASED (#1131 class A): the append's result used to be discarded, so a
+    // chain failure released the secret with no trace — exactly the case the record exists for.
+    if let Err(e) = s.append_chain(
         "vault_get",
         json!({
             "name": name,
@@ -1970,7 +1973,13 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
             "session_id": who.session_uuid,
             "exposed": exposed,
         }),
-    );
+    ) {
+        return Ok(hestia_error_envelope(
+            "hestia.vault_release_unrecorded",
+            &format!("the release of '{name}' could not be recorded ({e}); the value was not released"),
+            Some(json!({"name": name})),
+        ));
+    }
     Ok(json!({"value": entry.secret}))
 }
 
@@ -19309,6 +19318,24 @@ mod vault_hst001_tests {
                    "the witness must flag it as an exposed read");
         assert!(!format!("{:?}", vget.event_data).contains("DUMMY-SECRET"),
                 "the secret value must NEVER be written to the chain");
+    }
+
+    /// #1131 class A: a secret whose release cannot be recorded is not released.
+    #[tokio::test]
+    async fn a_read_that_cannot_be_recorded_releases_nothing() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        { state.lock().await.vault.upsert(VaultEntry::new("legacy-cred", "DUMMY-SECRET")).unwrap(); }
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_vget BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'vault_get' BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+        let anon = seat_session(&state, "some-random-caller").await;
+        let r = get(&state, Some(anon), "legacy-cred").await;
+        assert!(r.get("value").is_none(), "the secret was released unrecorded: {r}");
+        assert!(!r.to_string().contains("DUMMY-SECRET"));
+        assert!(r.to_string().contains("vault_release_unrecorded"), "{r}");
     }
 
     /// kimi's residual on #76: an ANONYMOUS write must not bind the credential to whoever

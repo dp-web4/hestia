@@ -383,6 +383,21 @@ impl Vault {
         Ok(())
     }
 
+    /// Remove SEVERAL documents as ONE commit — the inverse of [`put_documents`](Self::put_documents),
+    /// with the same all-or-none rule: on a failed save the in-memory index is rolled back, so
+    /// memory and disk agree. Absent names are no-ops. Used to undo a seed whose record failed.
+    pub fn remove_documents(&mut self, namespace: &str, names: &[String]) -> Result<()> {
+        let snapshot = self.data.documents.clone();
+        self.data
+            .documents
+            .retain(|d| !(d.namespace == namespace && names.iter().any(|n| *n == d.name)));
+        if let Err(e) = self.save() {
+            self.data.documents = snapshot;
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Read a master-tier document's bytes. `None` if absent or sealed (use
     /// [`open_document`](Self::open_document) for sealed items).
     pub fn get_document(&self, namespace: &str, name: &str) -> Option<&[u8]> {
