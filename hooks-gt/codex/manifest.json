@@ -22,7 +22,7 @@
     },
     {
       "path": "hooks/pre_tool_use.py",
-      "sha256": "39cc0835e791f229bd8c678f31abcf8e9f200bbd45993394fe21087bd40df620",
+      "sha256": "bf5f85bd2002c4c363aa9b2f72b7c245b7a71095db42ca0e2d2aa23d5e56f2e0",
       "source": "plugins/codex/hooks/pre_tool_use.py"
     },
     {
@@ -33,7 +33,7 @@
   ],
   "engine": {
     "unit": "_shared",
-    "gt_version": "22998b8ccd4eb3bed8a7a05b71be9b22bfe29699accd222792a858f5702f076c",
+    "gt_version": "df5bc936693093f1f591ff598e829a884fd8169f55c0baaf442cad6b1f1fcee3",
     "files": [
       {
         "path": "hestia_gate_core.py",
@@ -41,7 +41,7 @@
       },
       {
         "path": "hestia_gate_mechanism.py",
-        "sha256": "a454fdadfa4616c389699812ebf3a3dbe67fd0b94567355083572fa6f7a6b51e"
+        "sha256": "34611097709af15c85787b96850fb99a8cc25af1a2af940449cbd4221c0ab7d4"
       },
       {
         "path": "hestia_governance_closure.py",
@@ -58,5 +58,5 @@
     ]
   },
   "requires": [],
-  "gt_version": "b524e1ecf3d5799b703d4d99c2fc8cf2880cde84f37babb991404abb0c3b6fcd"
+  "gt_version": "441c127320ed5d32c2211d606eb350abe47e5f9c828a4d9af02123ac5af48878"
 }

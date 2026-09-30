@@ -13480,7 +13480,7 @@ mod tests {
         let claim = |inv: &str| json!({
             "plugin_id": "codex", "session_id": sid, "tool_name": "Bash",
             "marker": "pre_tool_use.py", "reason": "Bash: git apply /tmp/p/fix.patch",
-            "request_key": key, "invocation_key": inv,
+            "request_key": key, "invocation_key": inv, "supersession": "hard_stop",
         });
         let approve = |shared: SharedState, id: String| async move {
             let mut s = shared.lock().await;
@@ -13571,7 +13571,7 @@ mod tests {
         let claim = |inv: &str| json!({
             "plugin_id": "codex", "session_id": sid, "tool_name": "Bash",
             "marker": "pre_tool_use.py", "reason": "Bash: git apply /tmp/p/race.patch",
-            "request_key": key, "invocation_key": inv,
+            "request_key": key, "invocation_key": inv, "supersession": "hard_stop",
         });
         let begin = |inv: &str| json!({"tool_name": "Bash", "session_id": sid, "correlation_key": inv});
         let approve = |shared: SharedState, id: String| async move {
@@ -13645,6 +13645,65 @@ mod tests {
         assert!(h["reclaim_refused"].as_str().unwrap_or("").contains("evicted"), "{h}");
     }
 
+    /// GPT review of ca5f394: a fence is only a cancellation if the superseded invocation's OWN
+    /// hook stops on it in every rollout mode. A spend whose seat did not declare
+    /// `supersession: "hard_stop"` is therefore never reclaimed -- the retry gets a new petition
+    /// instead, and the original keeps its permit unfenced. The declared arm is the control.
+    #[tokio::test]
+    async fn a_reclaim_needs_the_original_seat_to_hard_stop_supersession() {
+        use crate::server::gate_escalation::Channel;
+        let (_dir, shared) = make_shared_state();
+        let sid = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h",
+                                                "host_session_id": "hs-1"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let approve = |shared: SharedState, id: String| async move {
+            let mut s = shared.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            s.gate_escalations.decide(&id, true, "operator", "role:constellation:sovereign",
+                                      Channel::OperatorSession, None, Some("ok"), now).unwrap();
+        };
+        // Each arm has its OWN invocations: a begin for one arm's A is execution evidence that
+        // would (correctly) refuse the other arm's reclaim inside the same second.
+        for (key, declared, a_inv, b_inv) in [("1".repeat(64), false, "inv-A1", "inv-B1"),
+                                              ("2".repeat(64), true, "inv-A2", "inv-B2")] {
+            let claim = |inv: &str, sup: bool| {
+                let mut a = json!({
+                    "plugin_id": "codex", "session_id": sid, "tool_name": "Bash",
+                    "marker": "pre_tool_use.py", "reason": format!("Bash: git apply /tmp/p/{key}.patch"),
+                    "request_key": key, "invocation_key": inv,
+                });
+                if sup {
+                    a["supersession"] = json!("hard_stop");
+                }
+                a
+            };
+            let opened = tool_gate_escalation_claim(&shared, &claim(&format!("{a_inv}-0"), declared)).await.unwrap();
+            approve(shared.clone(), opened["escalation_id"].as_str().unwrap().to_string()).await;
+            let a = tool_gate_escalation_claim(&shared, &claim(a_inv, declared)).await.unwrap();
+            assert_eq!(a["claimed"], json!(true), "{a}");
+            let row = {
+                let s = shared.lock().await;
+                s.chain_store.read_recent(80).unwrap().into_iter()
+                    .filter(|e| e.event_type == "gate_escalation_claimed")
+                    .find(|e| e.event_data["request_key"] == json!(key)).unwrap()
+            };
+            // B ALWAYS declares: the capability that matters is the ORIGINAL's.
+            let b = tool_gate_escalation_claim(&shared, &claim(b_inv, true)).await.unwrap();
+            let begin_a = tool_begin_action(&shared, &json!({"tool_name": "Bash", "session_id": sid,
+                                                              "correlation_key": a_inv})).await.unwrap();
+            if declared {
+                assert_eq!(row.event_data["supersession"], json!("hard_stop"), "recorded on the spend");
+                assert_eq!(b["reclaimed"], json!(true), "control: a declared seat is reclaimable: {b}");
+                assert_eq!(begin_a["_hestia_error"]["code"], json!("hestia.invocation_superseded"));
+            } else {
+                assert_eq!(row.event_data["supersession"], json!(null), "{row:?}");
+                assert_eq!(b["permits_write"], json!(false), "no reclaim without hard-stop: {b}");
+                assert!(b["reclaim_refused"].as_str().unwrap_or("").contains("hard-stops"), "{b}");
+                assert!(begin_a.get("actionId").is_some(), "A was never fenced: {begin_a}");
+            }
+        }
+    }
+
     /// (d) FAIL CLOSED (#1169 P1-2): if the reclaim's witness cannot be appended, nothing is
     /// granted and no reclaimed projection is recorded.
     #[tokio::test]
@@ -13657,6 +13716,7 @@ mod tests {
             at: crate::server::gate_escalation::now_secs(), plugin_id: "codex".into(),
             marker: "pre_tool_use.py".into(), act_digest: None, payload_sha256: None,
             host_session_id: None, invocation_key: Some("inv-1".into()),
+            supersession_hard_stop: true,
         };
         let mut s = shared.lock().await;
         s.gate_escalations.record_request_key(&key, rec.clone());
@@ -21495,6 +21555,11 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // tool_call_id, gemini's content key) -- what makes a retry distinguishable from a repeat.
     let invocation_key = optional_string(args, "invocation_key")
         .filter(|k| super::gate_escalation::valid_correlation_key(k));
+    // THE SEAT'S SUPERSESSION CAPABILITY (GPT review of ca5f394): whether the hook making this
+    // claim stops a superseded invocation in every rollout mode. Recorded on the spend; a spend
+    // whose seat did not declare it is never reclaimed, because the fence would not stop it.
+    let supersession_hard_stop = optional_string(args, "supersession").as_deref()
+        == Some(super::gate_escalation::SUPERSESSION_HARD_STOP);
     let attempted_act_digest = attempted_act
         .as_deref()
         .map(str::trim)
@@ -21691,6 +21756,9 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                 "payload_sha256": esc.payload_sha256,
                 // #1169: the invocation this permit was delivered to.
                 "invocation_key": invocation_key,
+                // ...and whether its seat hard-stops it if a reclaim supersedes it (replayed).
+                "supersession": supersession_hard_stop
+                    .then_some(super::gate_escalation::SUPERSESSION_HARD_STOP),
             }),
         );
         // The key record is a projection of the row: written only if the row is durable, so a
@@ -21708,6 +21776,7 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                     payload_sha256: esc.payload_sha256.clone(),
                     host_session_id: proven_host_session_id.clone(),
                     invocation_key: invocation_key.clone(),
+                    supersession_hard_stop,
                 },
             );
         }
@@ -21832,6 +21901,9 @@ permit for something the approver did not see.",
                         payload_sha256: twin.payload_sha256.clone(),
                         host_session_id: proven_host_session_id.clone(),
                         invocation_key: invocation_key.clone(),
+                        // Only a SPEND's capability is read (by `reclaimable`); the replay of
+                        // this row reads none either, so the projection matches the row.
+                        supersession_hard_stop: false,
                     },
                 );
             }
@@ -21922,6 +21994,9 @@ permit for something the approver did not see.",
                         payload_sha256: esc.payload_sha256.clone(),
                         host_session_id: proven_host_session_id.clone(),
                         invocation_key: invocation_key.clone(),
+                        // Only a SPEND's capability is read (by `reclaimable`); the replay of
+                        // this row reads none either, so the projection matches the row.
+                        supersession_hard_stop: false,
                     },
                 );
             }

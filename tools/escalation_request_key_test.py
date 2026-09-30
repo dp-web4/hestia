@@ -128,6 +128,8 @@ def main() -> int:
           Stub.claims)
     check("A the claim carried the invocation key (#1169)",
           Stub.claims and Stub.claims[0].get("invocation_key") == "toolu_INV1", Stub.claims)
+    check("A the claim declares the seat hard-stops a superseded invocation (#1169, GPT on ca5f394)",
+          Stub.claims and Stub.claims[0].get("supersession") == "hard_stop", Stub.claims)
     check("A verdict is `unknown`, not `unreachable`", v == "unknown", f"{v}: {d}")
     check("A the refusal says OUTCOME UNKNOWN", "OUTCOME UNKNOWN" in err, err)
     check("A ...names the key and the lookup", want_key in err and "hestia gate lookup" in err, err)

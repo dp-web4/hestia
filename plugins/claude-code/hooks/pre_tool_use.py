@@ -1358,6 +1358,10 @@ def request_self_write(marker: str, tool_name: str, attempted: str = "",
         _inv = invocation_key or _INVOCATION_KEY
         if _inv:
             claim_args["invocation_key"] = _inv
+        # SUPERSESSION (GPT review of ca5f394): this gate has no warn-rollout -- a superseded
+        # begin_action is a no-verdict, and `deny_no_verdict` always refuses -- so it may declare
+        # that it hard-stops a superseded invocation. The daemon reclaims only spends whose seat did.
+        claim_args["supersession"] = "hard_stop"
         # WHO is asking, provable — see `_connect_session`. Absent on any failure:
         # the claim accepts its absence and records `asker_basis: "asserted"`.
         sid = _connect_session(client, host_session_id)

@@ -105,6 +105,12 @@ class SafetyVerdict:
     cause: str = "unknown"   # when not decided: "timeout" | "refused" | "unknown"
     kind: str = "none"       # "allow" | "warn" | "deny" | "none" — render hint only
     action_id: Optional[str] = None
+    # SUPERSEDED (#1169, GPT review of ca5f394): begin_action refused this invocation because a
+    # reclaim re-delivered its permit to ANOTHER invocation. Not a policy verdict and not an infra
+    # failure -- an integrity fence. allow=False like any refusal, and a caller must treat it as a
+    # stop in EVERY rollout mode: a warn-rollout that lets it through runs this call beside its
+    # replacement. Keyed on the daemon's machine-readable code, never on message text.
+    superseded: bool = False
 
 
 # ── MCP-over-HTTP client (in-process; MAY open a socket — mechanism, not law) ─────────────────
@@ -339,6 +345,32 @@ def _interpret(decision: dict) -> Optional[SafetyVerdict]:
     return SafetyVerdict(allow=True, decided=True, kind="allow", message="")  # verdict == "allow"
 
 
+#: The daemon's begin_action refusal code for an invocation whose permit a reclaim re-delivered
+#: to another invocation (handler.rs `tool_begin_action`, #1169). Matched on the CODE, never text.
+INVOCATION_SUPERSEDED = "hestia.invocation_superseded"
+
+#: The value a HOOK passes as `supersession=` to `claim_self_write` (claim argument `supersession`,
+#: gate_escalation.rs `SUPERSESSION_HARD_STOP`) to declare that it stops a superseded invocation in
+#: every rollout mode. The daemon never reclaims a spend whose seat did not declare it. There is
+#: deliberately no default here: the declaration must ship in the same file as the stop that makes
+#: it true, so a hook that lacks the stop cannot inherit the declaration from this library.
+SUPERSESSION_HARD_STOP = "hard_stop"
+
+
+def _superseded(err: dict) -> SafetyVerdict:
+    """The refusal for a SUPERSEDED invocation (#1169): an unconditional stop, never a no-verdict.
+    Not recorded as gate unavailability -- the daemon answered, and answered exactly. NEVER raises."""
+    data = err.get("data") if isinstance(err.get("data"), dict) else {}
+    esc = data.get("escalation_id") or "?"
+    msg = (f"hestia: deny [invocation-superseded] — this call's approval was re-delivered to another "
+           f"invocation of the same act by a reclaim of escalation {esc}, so THIS invocation may not "
+           f"run. This is an integrity fence, not a policy verdict and not a daemon failure: it stops "
+           f"the call in every rollout mode, so the act runs at most once. Do not retry this call; "
+           f"the invocation that reclaimed the approval carries it.")
+    return SafetyVerdict(allow=False, decided=False, message=msg, cause="superseded",
+                         kind="deny", superseded=True)
+
+
 def _no_verdict(plugin_id: str, tool_name: str, cause: str, detail: str) -> SafetyVerdict:
     """Compose the fail-closed 'no verdict' result and record the infra failure (never scored as
     member conduct). NEVER raises."""
@@ -457,6 +489,9 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
             begin_args["correlation_key"] = correlation_key
         begin = _unwrap_tool_result(client.call_tool("hestia_begin_action", begin_args))
         if "_hestia_error" in begin:
+            _err = begin.get("_hestia_error")
+            if isinstance(_err, dict) and _err.get("code") == INVOCATION_SUPERSEDED:
+                return _superseded(_err)  # a fence, not a no-verdict: never downgradable to warn
             return _no_verdict(plugin_id, tool_name, "unknown", "begin_action rejected")
         action_id = begin.get("actionId")
         if not action_id:
@@ -1165,7 +1200,8 @@ def witness_gate_self(event_type, marker, tool_name, rule=None, *,
 
 
 def claim_self_write(marker, tool_name, attempted, *,
-                     plugin_id, role, client_name, host_session_id=None, invocation_key=None):
+                     plugin_id, role, client_name, host_session_id=None, invocation_key=None,
+                     supersession=None):
     """Ask ONCE whether a human has already approved this exact (member, marker) write.
     Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
 
@@ -1202,6 +1238,11 @@ def claim_self_write(marker, tool_name, attempted, *,
     claim_args["request_key"] = request_key
     if invocation_key:
         claim_args["invocation_key"] = invocation_key  # #1169: retry vs repeat
+    # The HOOK's declaration that it stops a superseded invocation in every rollout mode (see
+    # SUPERSESSION_HARD_STOP). Forwarded, never defaulted: without it the daemon will not reclaim
+    # this spend, which only costs a lost answer a fresh petition.
+    if supersession:
+        claim_args["supersession"] = supersession
     r = gate_self_call("hestia_gate_escalation_claim", claim_args,
                        plugin_id=plugin_id, role=role, client_name=client_name,
                        host_session_id=host_session_id)

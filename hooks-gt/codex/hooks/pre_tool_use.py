@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 39cc0835e791f229bd8c678f31abcf8e9f200bbd45993394fe21087bd40df620  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: bf5f85bd2002c4c363aa9b2f72b7c245b7a71095db42ca0e2d2aa23d5e56f2e0  (published ground truth; manifest: hooks-gt)
 """Hestia Phase-1 PreToolUse GATE for a foreign member (OpenAI Codex CLI) — reference adapter.
 
 Adapted from the Kimi reference gate. Codex's hook engine is genuine Claude-Code lineage:
@@ -457,7 +457,10 @@ def _claim_self_write(marker, tool_name, attempted):
             marker, tool_name, attempted,
             plugin_id=HESTIA_PLUGIN_ID, role=_role_bridge(),
             client_name='hestia-codex-gate-self', host_session_id=_EVENT.get("session_id"),
-            invocation_key=_m.correlation_key(_EVENT))  # #1169
+            invocation_key=_m.correlation_key(_EVENT),  # #1169
+            # This hook stops a superseded invocation in every MODE (Gate 2 below), so it may
+            # declare it; the daemon reclaims only spends whose seat did.
+            supersession="hard_stop")
     except Exception:
         return "unreachable", "no answer from the daemon — refused", None, None
 
@@ -884,6 +887,18 @@ def main():
                     sys.exit(2)
                 sys.stderr.write("hestia: warn [safety] — society-safety mechanism unavailable "
                                  "(warn-rollout: allowed).\n")
+            if verdict is not None and getattr(verdict, "superseded", False):
+                # SUPERSEDED (#1169, GPT review of ca5f394): a reclaim re-delivered this call's
+                # approval to another invocation. That is an INTEGRITY fence, not a policy verdict,
+                # so it is ALWAYS enforced -- like gate-self, and for the same reason: a warn-rollout
+                # that let it through would run this call beside its replacement. This hook
+                # declares that on every claim (supersession="hard_stop"), and the daemon never
+                # reclaims a spend whose seat did not.
+                witness_decision("deny", "society-safety: invocation superseded by a reclaim",
+                                 False, verdict_available=False, rule="invocation-superseded")
+                sys.stderr.write(verdict.message if verdict.message.endswith("\n")
+                                 else verdict.message + "\n")
+                sys.exit(2)
             if verdict is not None and not verdict.allow:  # enforced deny OR no-verdict -> fail closed
                 msg = (verdict.message
                        or "hestia: deny [safety] — blocked/inconclusive at the society safety gate.")

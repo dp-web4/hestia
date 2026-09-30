@@ -1317,7 +1317,18 @@ pub struct RequestKeyRecord {
     /// The tool INVOCATION the claim answered (its correlation key), when the hook sent one.
     /// A reclaim is only for a DIFFERENT invocation whose predecessor never reached execution.
     pub invocation_key: Option<String>,
+    /// Whether the claiming seat declared it HARD-STOPS a superseded invocation in every rollout
+    /// mode (`supersession: "hard_stop"` on the claim; GPT review of ca5f394). A reclaim fences
+    /// the ORIGINAL invocation, and the fence is only a cancellation if that invocation's own
+    /// hook refuses to run on it -- a hook that downgrades the refusal to a warning would let it
+    /// run beside its replacement. So a claim that did not declare it is never reclaimed.
+    pub supersession_hard_stop: bool,
 }
+
+/// The claim argument `supersession` value by which a seat declares that its hook stops a
+/// superseded invocation (`hestia.invocation_superseded` at begin_action) regardless of rollout
+/// mode. Declared by the hook that enforces it, so the declaration and the stop ship together.
+pub const SUPERSESSION_HARD_STOP: &str = "hard_stop";
 
 /// A request key is sha256 hex: 64 lowercase hex characters. Anything else is refused by
 /// name rather than stored, so a key can never smuggle an arbitrary string into the chain.
@@ -1424,6 +1435,8 @@ impl EscalationStore {
                                 payload_sha256: s(d, "payload_sha256"),
                                 host_session_id: s(d, "host_session_id"),
                                 invocation_key: s(d, "invocation_key"),
+                                supersession_hard_stop: s(d, "supersession").as_deref()
+                                    == Some(SUPERSESSION_HARD_STOP),
                             },
                         );
                     }
@@ -2614,6 +2627,9 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         if retry == original {
             return Err("the same invocation retried: its permit was already delivered to it");
         }
+        if !rec.supersession_hard_stop {
+            return Err("the claimed invocation's seat did not declare that it hard-stops a superseded invocation (supersession: hard_stop), so a fence could not be relied on to stop it");
+        }
         if self.fenced.contains_key(retry) {
             return Err("the retrying invocation is itself fenced by an earlier reclaim");
         }
@@ -2917,6 +2933,7 @@ mod tests {
             payload_sha256: Some(pay.clone()),
             host_session_id: Some("hs-1".into()),
             invocation_key: Some("toolu_A".into()),
+            supersession_hard_stop: true,
         };
         st.record_request_key(&key, rec.clone());
         #[allow(clippy::too_many_arguments)]
@@ -2944,6 +2961,11 @@ mod tests {
         let mut no_inv = st.clone_for_test();
         no_inv.record_request_key(&key, RequestKeyRecord { invocation_key: None, ..rec.clone() });
         assert!(base(&no_inv, T0 + 5).unwrap_err().contains("recorded no invocation"));
+        // GPT review of ca5f394: the ORIGINAL seat must hard-stop a superseded invocation, or
+        // the fence is not a cancellation.
+        let mut soft = st.clone_for_test();
+        soft.record_request_key(&key, RequestKeyRecord { supersession_hard_stop: false, ..rec.clone() });
+        assert!(base(&soft, T0 + 5).unwrap_err().contains("hard-stops"));
         // Execution evidence: a begin for the CLAIMED invocation at/after the claim refuses.
         let mut ran = st.clone_for_test();
         ran.record_begin("toolu_A", T0 + 1);
@@ -2979,6 +3001,7 @@ mod tests {
             outcome: "opened".into(), escalation_id: "E".into(), at,
             plugin_id: "p".into(), marker: "m".into(), act_digest: None,
             payload_sha256: None, host_session_id: None, invocation_key: None,
+            supersession_hard_stop: false,
         };
         for i in 0..=REQUEST_KEY_CAP {
             st.record_request_key(&format!("{:064x}", i), rec(T0 + i as u64));
