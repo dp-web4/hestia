@@ -126,7 +126,7 @@ def dashboard_calls(html: str) -> set[tuple[str, str]]:
 
 
 def app_calls(src: str) -> set[tuple[str, str]]:
-    """Three styles in app/src-tauri/src: daemon::get/send(&state, [Method::X,] "/api/.."),
+    """Three styles in app/src-tauri/src: daemon::get/send/send_checked/request_status(&state, [Method::X,] "/api/.."),
     reqwest `.post(format!("{daemon_url}/api/.."))` (sign-in, remote fleet), and a path built
     with format! into a variable that the NEXT daemon:: call sends."""
     out = set()
@@ -142,12 +142,12 @@ def app_calls(src: str) -> set[tuple[str, str]]:
         else:
             # the daemon:: call this literal is an argument of, or -- for a path built first --
             # the next one after it
-            opens = list(re.finditer(r"daemon::(get|send_checked|send)\b", before[before.rfind(";") + 1:]))
+            opens = list(re.finditer(r"daemon::(get|send_checked|send|request_status)\b", before[before.rfind(";") + 1:]))
             call = None
             if opens:
                 call = (opens[-1].group(1), before[before.rfind(";") + 1:][opens[-1].start():])
             else:
-                nxt = re.search(r"daemon::(get|send_checked|send)\b[^;]*", after)
+                nxt = re.search(r"daemon::(get|send_checked|send|request_status)\b[^;]*", after)
                 if nxt:
                     call = (nxt.group(1), nxt.group(0))
             if call is None:
