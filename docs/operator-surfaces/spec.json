@@ -849,7 +849,7 @@
     },
     {
       "route": "POST /api/agents/:id/ungovern",
-      "why": "removes a harness's hooks with no reason and discards its chain append (let _ = append_chain); must be hardened (required reason, record-or-undo) before ANY surface exposes it"
+      "why": "hardened for #1131 (a reason is required; the intent is recorded before any hook is touched; a failed terminal record is reported, not hidden). Still unsurfaced by choice: removing a gate is the one act no view offers until the owner decides it should"
     },
     {
       "route": "POST /api/scope/floor",
