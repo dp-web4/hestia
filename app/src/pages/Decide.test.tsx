@@ -292,6 +292,58 @@ describe("Decide — scope requests (Sprint 2)", () => {
     expect(screen.getByText(/cannot read \(\/s\/gone\.patch\)/)).toBeTruthy();
   });
 
+  // GPT hold on #1064: a patch summary that omits part of the patch must SAY so, and a patch
+  // over the cap must not be summarised at all.
+  it("shows mode, rename and binary effects, and marks an incomplete summary", async () => {
+    getDashboard.mockResolvedValue({
+      pending_escalations: [
+        escalation({
+          write_effect: {
+            kind: "patch", patch_path: "/s/p/mixed.patch", patch_readable: true, patch_read: true,
+            payload_sha256: "0123456789abcdef", file_count: 3, added_lines: 1, removed_lines: 1,
+            files: [
+              { path: "gate.py", added: 0, removed: 0, created: false, deleted: false, old_mode: "100644", new_mode: "100755" },
+              { path: "new_name.txt", added: 0, removed: 0, created: false, deleted: false, renamed_from: "old_name.txt" },
+              { path: "blob.bin", added: 0, removed: 0, created: false, deleted: false, binary: true },
+            ],
+            diff: ["diff --git a/gate.py b/gate.py"], diff_truncated: false,
+            summary_complete: false,
+            incomplete: ["blob.bin: binary content is changed; it is neither counted nor shown here"],
+          },
+        }),
+      ],
+    });
+    operatorStatus.mockResolvedValue({ signed_in: false, lct_id: null });
+    render(<Decide />);
+    await screen.findByText(/INCOMPLETE summary/);
+    expect(screen.getByText(/blob\.bin: binary content is changed/)).toBeTruthy();
+    expect(screen.getByText(/gate\.py \+0 −0 \(mode 100644 → 100755\)/)).toBeTruthy();
+    expect(screen.getByText(/new_name\.txt \+0 −0 \(renamed from old_name\.txt\)/)).toBeTruthy();
+    expect(screen.getByText(/blob\.bin \+0 −0 \(BINARY — not counted\)/)).toBeTruthy();
+  });
+
+  it("does not summarise a patch it did not read", async () => {
+    getDashboard.mockResolvedValue({
+      pending_escalations: [
+        escalation({
+          write_effect: {
+            kind: "patch", patch_path: "/s/p/huge.patch", patch_readable: true, patch_read: false,
+            patch_bytes: 8388609, payload_sha256: null,
+            payload_unbound_reason: "patch larger than the measurement cap; the approval does not bind its bytes",
+            files: null, file_count: null, added_lines: null, removed_lines: null, diff: [],
+            summary_complete: false,
+            incomplete: ["the patch is 8388609 bytes, above the 8388608-byte measurement cap; it was NOT read"],
+          },
+        }),
+      ],
+    });
+    operatorStatus.mockResolvedValue({ signed_in: false, lct_id: null });
+    const { container } = render(<Decide />);
+    await screen.findByText(/NOT READ/);
+    expect(screen.queryByText(/across 0 file/)).toBeNull();
+    expect(container.querySelector('[data-effect="patch-unread"]')).not.toBeNull();
+  });
+
   it("shows a copy act against the ENFORCING copy, and names a no-op as one", async () => {
     getDashboard.mockResolvedValue({
       pending_escalations: [
