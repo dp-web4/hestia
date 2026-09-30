@@ -168,8 +168,12 @@ def _toml_structural(path: str, flat: bool = False):
         import tomllib  # type: ignore
     except ImportError:
         return None
-    with open(path, "rb") as fh:
-        data = tomllib.load(fh)
+    try:
+        with open(path, "rb") as fh:
+            data = tomllib.load(fh)
+    except tomllib.TOMLDecodeError as e:
+        # not valid TOML: nothing in it can be certified, whichever reader looks
+        raise TomlUnsupported(f"not valid TOML ({e})") from e
     out: dict[str, dict[str, list]] = {}
     if flat:
         for tbl in data.get("hooks") or []:
@@ -212,12 +216,42 @@ _VALUE = re.compile(r"""^(?:"((?:[^"\\]|\\.)*)"|'([^']*)'|([+-]?[0-9_]+)|(true|f
 _KEYSEG = re.compile(_KEY)
 
 
+_TOML_ESCAPES = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", '"': '"', "\\": "\\"}
+
+
 def _toml_basic(s: str) -> str:
-    """Decode a TOML basic string body (the escapes TOML shares with JSON)."""
-    try:
-        return json.loads('"' + s + '"')
-    except ValueError:
-        return s
+    r"""Decode a TOML basic-string body EXACTLY (TOML 1.0: \b \t \n \f \r \" \\ \uXXXX \UXXXXXXXX), or raise
+    TomlUnsupported. Never return the raw spelling: #1142's fourth review showed `"\U0000006datcher"` -- a
+    valid TOML spelling of `matcher` -- decoded by JSON (which has no \U escape), failed, came back raw, and
+    became an unrelated key, so a narrow gate read as all-tools."""
+    out, i, n = [], 0, len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "\\":
+            if i + 1 >= n:
+                raise TomlUnsupported("a basic string ends in a lone backslash")
+            e = s[i + 1]
+            if e in _TOML_ESCAPES:
+                out.append(_TOML_ESCAPES[e])
+                i += 2
+                continue
+            if e in ("u", "U"):
+                width = 4 if e == "u" else 8
+                hexs = s[i + 2:i + 2 + width]
+                if len(hexs) != width or not all(c in "0123456789abcdefABCDEF" for c in hexs):
+                    raise TomlUnsupported(f"a malformed \\{e} escape in a basic string")
+                cp = int(hexs, 16)
+                if cp > 0x10FFFF or 0xD800 <= cp <= 0xDFFF:
+                    raise TomlUnsupported(f"\\{e}{hexs} is not a Unicode scalar value")
+                out.append(chr(cp))
+                i += 2 + width
+                continue
+            raise TomlUnsupported(f"the escape \\{e} is not TOML")
+        if ch != "\t" and (ord(ch) < 0x20 or ord(ch) == 0x7F):
+            raise TomlUnsupported("a control character inside a basic string")
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _segments(keypath: str) -> list[str]:
@@ -565,9 +599,9 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
             try:
                 have = registered_toml(cfg, flat=flat)
             except TomlUnsupported as e:
-                return "refused", [f"{cfg}: the TOML reader on this host (no tomllib) cannot verify this "
-                                   f"config ({e}); nothing registered, nothing certified -- run with "
-                                   f"Python >= 3.11 or register by hand"]
+                return "refused", [f"{cfg}: this config cannot be verified ({e}); nothing registered, "
+                                   f"nothing certified -- fix the file, or, on a host without tomllib, "
+                                   f"run with Python >= 3.11 or register by hand"]
     else:
         have = {}
 

@@ -668,6 +668,72 @@ def test_a_narrow_kimi_flat_matcher_is_narrow_in_both_readers():
                 assert "PreToolUse/pre_tool_use.py is registered only for matcher 'Shell'" in r.stdout, (spelling, scan, r.stdout)
 
 
+def test_escaped_toml_spellings_are_decoded_or_refused():
+    r"""#1142 fourth review: `"\U0000006datcher" = "shell"` is valid TOML for `matcher`. The fallback decoded
+    basic strings with JSON (no \U escape), got the raw spelling back, and certified the narrow gate on the
+    second run. Every escaped spelling of the key or of a header segment must come out NARROW (rc 8) on every
+    run, through the composed path with the fallback forced AND with tomllib, and an escape TOML does not
+    define must be REFUSED (rc 7) by both readers -- never a false `ok`."""
+    narrow = {
+        "U escape in key": ('[[hooks.PreToolUse]]\nmatcher = ".*"', '[[hooks.PreToolUse]]\n"\\U0000006datcher" = "shell"', None),
+        "u escape in key": ('[[hooks.PreToolUse]]\nmatcher = ".*"', '[[hooks.PreToolUse]]\n"\\u006datcher" = "shell"', None),
+        "escape in value": ('[[hooks.PreToolUse]]\nmatcher = ".*"', '[[hooks.PreToolUse]]\nmatcher = "s\\u0068ell"', None),
+        "escaped header segment": ('[[hooks.PreToolUse]]\nmatcher = ".*"', '[[hooks."\\u0050reToolUse"]]\nmatcher = "shell"',
+                                   ("[[hooks.PreToolUse.hooks]]", '[[hooks."\\U00000050reToolUse".hooks]]')),
+    }
+    for name, (a, b, extra) in narrow.items():
+        for scan in (["--toml-line-scan"], []):
+            with tempfile.TemporaryDirectory() as d:
+                tmp = Path(d)
+                plugins = _plugins(tmp)
+                cfg = tmp / ".codex" / "config.toml"
+                cfg.parent.mkdir()
+                text = CODEX_TOML.replace(a, b, 1)
+                if extra:
+                    text = text.replace(extra[0], extra[1], 1)
+                assert text != CODEX_TOML, name
+                cfg.write_text(text)
+                _install(tmp, "codex", "witness.py")
+                for run in (1, 2):
+                    r = _run(tmp, plugins, "--member", "codex", *scan)
+                    assert r.returncode == 8, (name, scan, run, r.returncode, r.stdout)
+                    assert "is registered only for matcher 'shell'" in r.stdout, (name, scan, run, r.stdout)
+                    assert "every templated hook is registered" not in r.stdout, (name, scan, run, r.stdout)
+    refused = {
+        "x escape (not TOML)": '"\\x6datcher" = "shell"',
+        "surrogate code point": '"\\uD800atcher" = "shell"',
+        "truncated u escape": '"\\u6d" = "shell"',
+    }
+    for name, line in refused.items():
+        for scan in (["--toml-line-scan"], []):
+            with tempfile.TemporaryDirectory() as d:
+                tmp = Path(d)
+                plugins = _plugins(tmp)
+                cfg = tmp / ".codex" / "config.toml"
+                cfg.parent.mkdir()
+                text = CODEX_TOML.replace('[[hooks.PreToolUse]]\nmatcher = ".*"', '[[hooks.PreToolUse]]\n' + line, 1)
+                cfg.write_text(text)
+                _install(tmp, "codex", "witness.py")
+                r = _run(tmp, plugins, "--member", "codex", *scan)
+                assert r.returncode == 7 and "REFUSED codex" in r.stdout, (name, scan, r.returncode, r.stdout)
+                assert "every templated hook is registered" not in r.stdout and "REGISTERED" not in r.stdout, (name, scan, r.stdout)
+                assert cfg.read_text() == text, (name, scan)
+
+
+def test_the_strict_decoder_agrees_with_tomllib():
+    """Every basic-string body TOML defines decodes as tomllib decodes it; every other one is refused."""
+    import tomllib
+    for body in (r"\U0000006datcher", r"\u006datcher", r"sh\"ell", r"a\tb\n", "plain", r"\\back", r"\u00e9"):
+        want = next(iter(tomllib.loads('"' + body + '" = 1')))
+        assert RM._toml_basic(body) == want, (body, RM._toml_basic(body), want)
+    for bad in (r"\x6d", r"\U0000d800", r"\U00110000", r"\u12", "ctl\x01", "x\\"):
+        try:
+            RM._toml_basic(bad)
+            raise AssertionError(f"not refused: {bad!r}")
+        except RM.TomlUnsupported:
+            pass
+
+
 def test_mixed_installed_and_missing_targets_exit_pending():
     """#1142 re-review P2: with only witness.py installed, the registrar registered it, printed PENDING
     for the other two, and exited 0. The additions are reported AND the run exits 9."""
@@ -839,6 +905,8 @@ TESTS = [
     test_the_fallback_refuses_toml_it_cannot_verify,
     test_the_left_behind_repair_also_works_through_the_fallback,
     test_a_narrow_kimi_flat_matcher_is_narrow_in_both_readers,
+    test_escaped_toml_spellings_are_decoded_or_refused,
+    test_the_strict_decoder_agrees_with_tomllib,
     test_mixed_installed_and_missing_targets_exit_pending,
     test_the_hooks_dir_it_registers_into_is_made,
     test_a_host_already_left_registered_without_the_dir_repairs,
