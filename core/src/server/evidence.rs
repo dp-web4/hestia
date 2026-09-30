@@ -393,24 +393,141 @@ struct PatchRow {
     renamed_from: Option<String>,
     copied_from: Option<String>,
     binary: bool,
+    /// Path spellings that could not be decoded (a malformed or non-UTF-8 C-quoted name).
+    undecodable: Vec<String>,
 }
 
-fn strip_ab(t: &str) -> String {
+/// Git C-quotes a path that contains a `"`, a backslash, a control character or (under the
+/// default `core.quotePath`) any non-ASCII byte: `"a/sp ace\tx"`, `"\303\251t\303\251.txt"`.
+/// Decode one such token at the start of `s`; return the path and the text after the closing
+/// quote. `None` for an unterminated quote, an escape git does not emit, or bytes that are not
+/// UTF-8 -- the caller reports that, it never shows the escaped spelling as if it were a path.
+fn unquote_c(s: &str) -> Option<(String, &str)> {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'"') {
+        return None;
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 1;
+    while i < b.len() {
+        match b[i] {
+            b'"' => return String::from_utf8(out).ok().map(|p| (p, &s[i + 1..])),
+            b'\\' => {
+                let c = *b.get(i + 1)?;
+                let v = match c {
+                    b'a' => 7,
+                    b'b' => 8,
+                    b't' => 9,
+                    b'n' => 10,
+                    b'v' => 11,
+                    b'f' => 12,
+                    b'r' => 13,
+                    b'"' => b'"',
+                    b'\\' => b'\\',
+                    b'0'..=b'3' => {
+                        let d = b.get(i + 1..i + 4)?;
+                        if !d.iter().all(|x| (b'0'..=b'7').contains(x)) {
+                            return None;
+                        }
+                        i += 2;
+                        (d[0] - b'0') * 64 + (d[1] - b'0') * 8 + (d[2] - b'0')
+                    }
+                    _ => return None,
+                };
+                out.push(v);
+                i += 2;
+            }
+            x => {
+                out.push(x);
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// A path from an EXTENDED header (`rename from/to`, `copy from/to`). These are repo-relative
+/// and carry NO `a/`/`b/` diff prefix, so nothing is stripped: a real top-level directory named
+/// `a/` or `b/` is part of the path. (e0df1c9 ran them through the prefix stripper and reported
+/// `rename a/old.txt => b/new.txt` as `old.txt => new.txt`: GPT re-review, 2026-09-30.)
+fn header_path(v: &str) -> Option<String> {
+    if v.starts_with('"') {
+        let (p, rest) = unquote_c(v)?;
+        return rest.is_empty().then_some(p);
+    }
+    Some(v.to_string())
+}
+
+/// Drop exactly ONE diff prefix (`a/` or `b/`) -- what `git apply`'s default `-p1` removes
+/// from a `diff --git` / `---` / `+++` name. Never applied to an extended-header path.
+fn strip_one_prefix(p: &str) -> String {
+    p.strip_prefix("a/").or_else(|| p.strip_prefix("b/")).unwrap_or(p).to_string()
+}
+
+/// The path named by a `--- ` / `+++ ` line: decoded if C-quoted, a trailing tab-separated
+/// timestamp (plain `diff -u`) dropped, then one diff prefix stripped. `None` if undecodable.
+fn diff_side_path(t: &str) -> Option<String> {
+    if t.starts_with('"') {
+        let (p, rest) = unquote_c(t)?;
+        return (rest.is_empty() || rest.starts_with('\t')).then(|| strip_one_prefix(&p));
+    }
     let t = t.split('\t').next().unwrap_or(t).trim();
-    let t = t.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(t);
-    t.strip_prefix("a/").or_else(|| t.strip_prefix("b/")).unwrap_or(t).to_string()
+    Some(strip_one_prefix(t))
 }
 
-/// The path of a `diff --git <a> <b>` line when both sides name the same file -- the only case
-/// where the line alone is unambiguous (a path may contain spaces, so a rename is read from its
-/// `rename to` header instead). Quoted paths yield `None` and are reported, not guessed.
-fn diff_git_path(rest: &str) -> Option<String> {
-    if rest.starts_with('"') || rest.len() % 2 == 0 {
+/// Consume the name `want` (prefix included) from the start of `s`, in either spelling git may
+/// have used for it: C-quoted, or verbatim.
+fn take_name<'s>(s: &'s str, want: &str) -> Option<&'s str> {
+    if s.starts_with('"') {
+        let (p, rest) = unquote_c(s)?;
+        return (p == want).then_some(rest);
+    }
+    s.strip_prefix(want)
+}
+
+/// Does `diff --git <rest>` name exactly `a/<from>` and `b/<to>`? Used to check a rename or
+/// copy's extended headers against the line that opened its section, so a patch whose two
+/// descriptions of the same file disagree is reported rather than summarised from one of them.
+fn diff_git_names(rest: &str, from: &str, to: &str) -> bool {
+    take_name(rest, &format!("a/{from}"))
+        .and_then(|r| r.strip_prefix(' '))
+        .and_then(|r| take_name(r, &format!("b/{to}")))
+        .map(str::is_empty)
+        .unwrap_or(false)
+}
+
+/// The two names of a `diff --git` line, prefixes intact, when they can be read unambiguously:
+/// either side may be C-quoted; two unquoted sides are split only where they name the same
+/// file (a path may contain spaces, so a differing unquoted pair is not guessed at).
+fn diff_git_sides(rest: &str) -> Option<(String, String)> {
+    if rest.starts_with('"') {
+        let (a, r) = unquote_c(rest)?;
+        let r = r.strip_prefix(' ')?;
+        if r.starts_with('"') {
+            let (b, tail) = unquote_c(r)?;
+            return tail.is_empty().then_some((a, b));
+        }
+        return Some((a, r.to_string()));
+    }
+    if rest.ends_with('"') {
+        let pos = rest.find(" \"")?;
+        let (b, tail) = unquote_c(&rest[pos + 1..])?;
+        return tail.is_empty().then(|| (rest[..pos].to_string(), b));
+    }
+    if rest.len() % 2 == 0 {
         return None;
     }
     let mid = rest.len() / 2;
     let (l, r) = (rest.get(..mid)?, rest.get(mid + 1..)?);
-    (rest.as_bytes()[mid] == b' ' && strip_ab(l) == strip_ab(r)).then(|| strip_ab(r))
+    (rest.as_bytes()[mid] == b' ' && strip_one_prefix(l) == strip_one_prefix(r))
+        .then(|| (l.to_string(), r.to_string()))
+}
+
+/// The file a `diff --git` line names when both sides are the same file (a mode-only change,
+/// a binary change): the only case where the line alone determines the path.
+fn diff_git_path(rest: &str) -> Option<String> {
+    let (a, b) = diff_git_sides(rest)?;
+    (strip_one_prefix(&a) == strip_one_prefix(&b)).then(|| strip_one_prefix(&b))
 }
 
 /// `12a13`, `5,7c5,8`, `3d2` -- a normal-format diff command line (GNU `patch` reads these).
@@ -469,14 +586,38 @@ fn consume_hunk<'a, I: Iterator<Item = &'a str>>(
 
 impl PatchRow {
     fn finish(self, st: &mut PatchStat) {
+        let raw = self.diff_git_raw.clone().unwrap_or_default();
+        for u in &self.undecodable {
+            st.incomplete.push(format!(
+                "a path spelled `{}` could not be decoded (malformed or non-UTF-8 quoting); it \
+                 is not shown as a path",
+                u.chars().take(80).collect::<String>()
+            ));
+        }
+        // A rename or copy is described twice: by `diff --git a/<from> b/<to>` and by its
+        // extended headers. If the two disagree, which file changes is not established.
+        if let (Some(from), Some(to), Some(_)) = (
+            self.renamed_from.as_deref().or(self.copied_from.as_deref()),
+            self.path.as_deref(),
+            self.diff_git_raw.as_deref(),
+        ) {
+            if !diff_git_names(&raw, from, to) {
+                st.incomplete.push(format!(
+                    "`diff --git {}` does not name the same files as its rename/copy headers \
+                     ({from} -> {to})",
+                    raw.chars().take(80).collect::<String>()
+                ));
+            }
+        }
         let path = match self.path.or(self.diff_git) {
             Some(p) => p,
             None => {
-                let raw = self.diff_git_raw.unwrap_or_default();
                 st.incomplete.push(format!(
-                    "could not determine which file `diff --git {raw}` changes"
+                    "could not determine which file `diff --git {}` changes",
+                    raw.chars().take(80).collect::<String>()
                 ));
-                raw
+                // Never the raw (possibly escaped) spelling presented as a path.
+                "<undetermined path>".to_string()
             }
         };
         if self.binary {
@@ -560,7 +701,11 @@ pub fn patch_stat(text: &str) -> PatchStat {
                 if plus.trim().starts_with("/dev/null") {
                     r.deleted = true;
                 }
-                r.path = Some(if r.deleted { strip_ab(minus) } else { strip_ab(&plus) });
+                let side = if r.deleted { minus } else { plus.as_str() };
+                match diff_side_path(side) {
+                    Some(p) => r.path = Some(p),
+                    None => r.undecodable.push(side.to_string()),
+                }
                 while it.peek().map(|n| n.starts_with("@@")).unwrap_or(false) {
                     let h = it.next().unwrap_or_default();
                     if !consume_hunk(h, &mut it, &mut r.added, &mut r.removed) {
@@ -588,13 +733,25 @@ pub fn patch_stat(text: &str) -> PatchStat {
                 r.deleted = true;
                 r.old_mode = Some(m.trim().to_string());
             } else if let Some(p) = l.strip_prefix("rename from ") {
-                r.renamed_from = Some(strip_ab(p));
+                match header_path(p) {
+                    Some(p) => r.renamed_from = Some(p),
+                    None => r.undecodable.push(p.to_string()),
+                }
             } else if let Some(p) = l.strip_prefix("rename to ") {
-                r.path = Some(strip_ab(p));
+                match header_path(p) {
+                    Some(p) => r.path = Some(p),
+                    None => r.undecodable.push(p.to_string()),
+                }
             } else if let Some(p) = l.strip_prefix("copy from ") {
-                r.copied_from = Some(strip_ab(p));
+                match header_path(p) {
+                    Some(p) => r.copied_from = Some(p),
+                    None => r.undecodable.push(p.to_string()),
+                }
             } else if let Some(p) = l.strip_prefix("copy to ") {
-                r.path = Some(strip_ab(p));
+                match header_path(p) {
+                    Some(p) => r.path = Some(p),
+                    None => r.undecodable.push(p.to_string()),
+                }
             } else if l.starts_with("similarity index ")
                 || l.starts_with("dissimilarity index ")
                 || l.starts_with("index ")
@@ -1393,4 +1550,105 @@ index de98044..7be73ce 100644
         std::fs::remove_dir_all(&d).ok();
     }
 
+
+    // ---- GPT re-review hold on e0df1c9: extended-header paths are NOT prefixed, and git
+    // C-quotes some paths. Every fixture below is byte-for-byte `git diff` output from a
+    // throwaway repo (2026-09-30); ground truth from `git log --summary -M -C` on the same
+    // commits: "rename a/old.txt => b/new.txt (100%)", "create mode 100644 b/copy.txt" (copy of
+    // a/src.txt under -C --find-copies-harder), "rename \"sp ace\\tx\" => \"sp ace\\ty\"
+    // (100%)", "mode change 100644 => 100755 \"\\303\\251t\\303\\251.txt\"" (= été.txt).
+
+    /// `git mv a/old.txt b/new.txt` -- `a/` and `b/` are REAL directories here.
+    const GIT_RENAME_AB_DIRS: &str = "diff --git a/a/old.txt b/b/new.txt
+similarity index 100%
+rename from a/old.txt
+rename to b/new.txt
+";
+
+    const GIT_COPY_AB_DIRS: &str = "diff --git a/a/src.txt b/b/copy.txt
+similarity index 100%
+copy from a/src.txt
+copy to b/copy.txt
+";
+
+    /// A rename of a file whose name contains a space and a TAB: git C-quotes every spelling.
+    const GIT_RENAME_QUOTED: &str = "diff --git \"a/sp ace\\tx\" \"b/sp ace\\ty\"
+similarity index 100%
+rename from \"sp ace\\tx\"
+rename to \"sp ace\\ty\"
+";
+
+    /// `été.txt`, chmod +x and one line appended: octal-escaped UTF-8 in every spelling.
+    const GIT_QUOTED_UTF8_EDIT: &str = "diff --git \"a/\\303\\251t\\303\\251.txt\" \"b/\\303\\251t\\303\\251.txt\"
+old mode 100644
+new mode 100755
+index 975fbec..77811bc
+--- \"a/\\303\\251t\\303\\251.txt\"
++++ \"b/\\303\\251t\\303\\251.txt\"
+@@ -1 +1,2 @@
+ y
++y2
+";
+
+    /// Control: an ordinary edit inside a real directory named `a/` (right on e0df1c9 too).
+    const GIT_EDIT_IN_A_DIR: &str = "diff --git a/a/keep.txt b/a/keep.txt
+index b68fde2..ad2705a 100644
+--- a/a/keep.txt
++++ b/a/keep.txt
+@@ -1 +1,2 @@
+ k
++k2
+";
+
+    #[test]
+    fn a_rename_between_real_a_and_b_directories_keeps_them() {
+        let v = effect_of_patch("renameabdirs", GIT_RENAME_AB_DIRS.as_bytes());
+        assert_eq!(v["files"][0]["path"], json!("b/new.txt"), "e0df1c9 said new.txt: {v}");
+        assert_eq!(v["files"][0]["renamed_from"], json!("a/old.txt"), "{v}");
+        assert_eq!(v["summary_complete"], json!(true), "{v}");
+    }
+
+    #[test]
+    fn a_copy_between_real_a_and_b_directories_keeps_them() {
+        let v = effect_of_patch("copyabdirs", GIT_COPY_AB_DIRS.as_bytes());
+        assert_eq!(v["files"][0]["path"], json!("b/copy.txt"), "{v}");
+        assert_eq!(v["files"][0]["copied_from"], json!("a/src.txt"), "{v}");
+        assert_eq!(v["summary_complete"], json!(true), "{v}");
+    }
+
+    #[test]
+    fn quoted_paths_are_decoded_never_shown_in_their_escaped_spelling() {
+        let v = effect_of_patch("renamequoted", GIT_RENAME_QUOTED.as_bytes());
+        assert_eq!(v["files"][0]["path"], json!("sp ace\ty"), "{v}");
+        assert_eq!(v["files"][0]["renamed_from"], json!("sp ace\tx"), "{v}");
+        assert_eq!(v["summary_complete"], json!(true), "{v}");
+
+        let v = effect_of_patch("quotedutf8", GIT_QUOTED_UTF8_EDIT.as_bytes());
+        assert_eq!(v["file_count"], json!(1), "{v}");
+        assert_eq!(v["files"][0]["path"], json!("été.txt"), "e0df1c9 showed the escapes: {v}");
+        assert_eq!(v["files"][0]["new_mode"], json!("100755"));
+        assert_eq!((v["added_lines"].clone(), v["removed_lines"].clone()), (json!(1), json!(0)));
+        assert_eq!(v["summary_complete"], json!(true), "{v}");
+
+        let v = effect_of_patch("editadir", GIT_EDIT_IN_A_DIR.as_bytes());
+        assert_eq!(v["files"][0]["path"], json!("a/keep.txt"), "control: {v}");
+        assert_eq!(v["summary_complete"], json!(true), "{v}");
+    }
+
+    #[test]
+    fn a_path_that_cannot_be_decoded_or_that_disagrees_is_incomplete() {
+        // An unterminated quote, and an octal escape that is not UTF-8: not guessed at.
+        for (tag, body) in [
+            ("unterminated", "diff --git a/x b/y\nsimilarity index 100%\nrename from x\nrename to \"y\n"),
+            ("badutf8", "diff --git \"a/\\377.txt\" \"b/\\377.txt\"\nold mode 100644\nnew mode 100755\n"),
+            // the diff --git line names a/x -> b/y, the rename headers name something else
+            ("disagrees", "diff --git a/x b/y\nsimilarity index 100%\nrename from p\nrename to q\n"),
+        ] {
+            let v = effect_of_patch(tag, body.as_bytes());
+            assert_eq!(v["summary_complete"], json!(false), "{tag}: {v}");
+            let shown = v["files"].to_string();
+            assert!(!shown.contains("\\\\377") && !shown.contains("\\\"y"),
+                    "{tag}: an escaped spelling was shown as a path: {shown}");
+        }
+    }
 }
