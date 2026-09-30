@@ -130,7 +130,7 @@ class _FakeRegistry:
 
 def build(tmp: Path, extra_hooks: list[tuple[str, str]], *,
           post_command: str | None = None, declared: dict | None = None,
-          projection: bool = True) -> dict:
+          projection: bool = True, home_env: bool = True) -> dict:
     """One agent record, from a config holding a LIVE hestia gate plus `extra_hooks`.
 
     The live gate is the control: every case below is governed-but-for the extra hook,
@@ -184,7 +184,10 @@ def build(tmp: Path, extra_hooks: list[tuple[str, str]], *,
     elif proj.exists():
         proj.unlink()
     old_home = os.environ.get("HESTIA_HOME")
-    os.environ["HESTIA_HOME"] = str(home)
+    if home_env:
+        os.environ["HESTIA_HOME"] = str(home)
+    else:
+        os.environ.pop("HESTIA_HOME", None)
     try:
         return inventory.inspect("claude", [])
     finally:
@@ -250,6 +253,18 @@ def test_verdict(tmp: Path):
     g = build(tmp, [], projection=True)
     check("G projection present: not miswired", g["miswired"], False)
     check("G projection present: governed", g["governed"], True)
+
+    # H. kimi-code's #1187 review: the inventory resolves home as the witness does, with no ~/.hestia
+    # fallback. HESTIA_HOME unset where the inventory runs is UNVERIFIABLE (an unknown), not a pass and not
+    # MISWIRED, even with a projection sitting at ~/.hestia.
+    h = build(tmp, [], projection=True, home_env=False)
+    check("H unset home: not miswired", h["miswired"], False)
+    check("H unset home: an UNVERIFIABLE finding",
+          any(x.startswith("UNVERIFIABLE") and "HESTIA_HOME" in x for x in h["findings"]), True)
+    check("H unset home: carried as an unknown", bool(h["unknown"]), True)
+    check("H the finding names both operator acts",
+          any("seed_seat_config.py --add-missing" in x and "install-members.sh" in x
+              for x in h["findings"]), True)
 
 
 # --- unit: where the atlas is, and what a descriptor says ---------------------------
