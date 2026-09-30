@@ -57,6 +57,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
 MARK = "# hestia: registered by deploy/register-members.py"
 _PLACEHOLDER = re.compile(r"@[A-Z_]+@")
+FORCE_LINE_SCAN = False   # tests set this to exercise the fallback reader on a host with tomllib
 _TOML_CMD = re.compile(r"""\s*command\s*=\s*(['"])(.*)\1\s*$""")
 ENV = os.environ
 
@@ -116,75 +117,273 @@ def rendered_groups(template: dict, member: str, dest: str) -> dict[str, list[di
 
 
 # ---------------------------------------------------------------- reading ----------------
-def registered_json(path: str) -> dict[str, set[str]]:
-    """{event: {target basenames}} — json-hook-commands semantics."""
+ALL_MATCHERS = (None, "", "*", ".*", ".+")
+
+
+def covers(have, want) -> bool:
+    """Does an existing registration's matcher cover what the template's matcher asks for?
+    A template matcher that matches every tool (absent, "", "*", ".*") is covered only by an
+    existing matcher that also matches every tool; a specific one is covered by itself or by an
+    all-tools matcher. #1142 review: a gate registered only for `Read` was reported as "every
+    templated hook is registered" because presence was judged by basename and event alone."""
+    if have is UNPARSED:
+        return False                      # never certify a gate whose matcher could not be read
+    if have in ALL_MATCHERS:
+        return True
+    if want in ALL_MATCHERS:
+        return False
+    return have == want
+
+
+def registered_json(path: str) -> dict[str, dict[str, list]]:
+    """{event: {target basename: [matcher of each group that registers it]}} —
+    json-hook-commands semantics. A group with no `matcher` key is recorded as None (all tools)."""
     with open(path, encoding="utf-8") as fh:
         data = json.load(fh)
-    out: dict[str, set[str]] = {}
+    out: dict[str, dict[str, list]] = {}
     for event, groups in (data.get("hooks") or {}).items():
         if not isinstance(groups, list):
             continue
         for g in groups:
-            for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
+            if not isinstance(g, dict):
+                continue
+            m = g.get("matcher")
+            for h in g.get("hooks") or []:
                 if isinstance(h, dict) and isinstance(h.get("command"), str):
                     b = target_basename(h["command"])
                     if b:
-                        out.setdefault(event, set()).add(b)
+                        out.setdefault(event, {}).setdefault(b, []).append(m)
     return out
 
 
-def registered_toml(path: str, flat: bool = False) -> dict[str, set[str]]:
-    """{event: {target basenames}} — toml-hook-commands semantics (a line scan: the installer
-    deliberately does not require tomllib). The event is the nearest preceding
-    `[[hooks.<Event>...]]` header — or, for a FLAT layout (kimi: `[[hooks]]` tables carrying
-    `event = "X"`), the `event` key of the same table, in whichever order the keys appear."""
+UNPARSED = object()   # a matcher line the fallback reader could not decode: covers NOTHING
+
+
+def _toml_structural(path: str, flat: bool = False):
+    """{event: {basename: [matcher]}} from a real TOML parse, or None when no parser is available
+    (or FORCE_LINE_SCAN is set, for the tests of the fallback)."""
+    if FORCE_LINE_SCAN:
+        return None
+    try:
+        import tomllib  # type: ignore
+    except ImportError:
+        return None
+    try:
+        with open(path, "rb") as fh:
+            data = tomllib.load(fh)
+    except tomllib.TOMLDecodeError as e:
+        # not valid TOML: nothing in it can be certified, whichever reader looks
+        raise TomlUnsupported(f"not valid TOML ({e})") from e
+    out: dict[str, dict[str, list]] = {}
     if flat:
-        return _registered_toml_flat(path)
-    out: dict[str, set[str]] = {}
-    event = None
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            m = re.match(r"\s*\[\[\s*hooks\.([A-Za-z_]+)", line)
-            if m:
-                event = m.group(1)
+        for tbl in data.get("hooks") or []:
+            if not isinstance(tbl, dict) or not isinstance(tbl.get("event"), str):
                 continue
-            m = _TOML_CMD.match(line)
-            if m and event:
-                b = target_basename(m.group(2))
+            m = tbl.get("matcher")
+            m = m if (m is None or isinstance(m, str)) else UNPARSED
+            cmd = tbl.get("command")
+            b = target_basename(cmd) if isinstance(cmd, str) else None
+            if b:
+                out.setdefault(tbl["event"], {}).setdefault(b, []).append(m)
+        return out
+    for event, groups in (data.get("hooks") or {}).items():
+        if not isinstance(groups, list):
+            continue
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            m = g.get("matcher")
+            m = m if (m is None or isinstance(m, str)) else UNPARSED
+            for h in g.get("hooks") or []:
+                cmd = h.get("command") if isinstance(h, dict) else None
+                b = target_basename(cmd) if isinstance(cmd, str) else None
                 if b:
-                    out.setdefault(event, set()).add(b)
+                    out.setdefault(event, {}).setdefault(b, []).append(m)
     return out
 
 
-_TOML_EVENT = re.compile(r"""\s*event\s*=\s*(['"])(.*)\1\s*$""")
+class TomlUnsupported(Exception):
+    """The fallback reader met TOML it cannot verify. The registrar refuses to certify anything."""
 
 
-def _registered_toml_flat(path: str) -> dict[str, set[str]]:
-    out: dict[str, set[str]] = {}
-    table: dict[str, list[str]] = {}
+# The fallback's whole grammar. Keys: bare or quoted. Headers: [a.b] / [[a.b]] with bare or quoted
+# segments. Values: one basic or literal string, an integer, or a boolean. Each line may end in a comment.
+_KEY = r"""(?:[A-Za-z0-9_-]+|"(?:[^"\\]|\\.)*"|'[^']*')"""
+_KEYPATH = rf"{_KEY}(?:\s*\.\s*{_KEY})*"
+_HEADER = re.compile(rf"""^\s*(\[\[|\[)\s*({_KEYPATH})\s*(\]\]|\])\s*(?:#.*)?$""")
+_ASSIGN = re.compile(rf"""^\s*({_KEYPATH})\s*=\s*(.*?)\s*$""")
+_VALUE = re.compile(r"""^(?:"((?:[^"\\]|\\.)*)"|'([^']*)'|([+-]?[0-9_]+)|(true|false))\s*(?:#.*)?$""")
+_KEYSEG = re.compile(_KEY)
 
-    def flush() -> None:
-        for ev in table.get("event", []):
-            for cmd in table.get("command", []):
-                b = target_basename(cmd)
-                if b:
-                    out.setdefault(ev, set()).add(b)
 
+_TOML_ESCAPES = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", '"': '"', "\\": "\\"}
+
+
+def _toml_basic(s: str) -> str:
+    r"""Decode a TOML basic-string body EXACTLY (TOML 1.0: \b \t \n \f \r \" \\ \uXXXX \UXXXXXXXX), or raise
+    TomlUnsupported. Never return the raw spelling: #1142's fourth review showed `"\U0000006datcher"` -- a
+    valid TOML spelling of `matcher` -- decoded by JSON (which has no \U escape), failed, came back raw, and
+    became an unrelated key, so a narrow gate read as all-tools."""
+    out, i, n = [], 0, len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "\\":
+            if i + 1 >= n:
+                raise TomlUnsupported("a basic string ends in a lone backslash")
+            e = s[i + 1]
+            if e in _TOML_ESCAPES:
+                out.append(_TOML_ESCAPES[e])
+                i += 2
+                continue
+            if e in ("u", "U"):
+                width = 4 if e == "u" else 8
+                hexs = s[i + 2:i + 2 + width]
+                if len(hexs) != width or not all(c in "0123456789abcdefABCDEF" for c in hexs):
+                    raise TomlUnsupported(f"a malformed \\{e} escape in a basic string")
+                cp = int(hexs, 16)
+                if cp > 0x10FFFF or 0xD800 <= cp <= 0xDFFF:
+                    raise TomlUnsupported(f"\\{e}{hexs} is not a Unicode scalar value")
+                out.append(chr(cp))
+                i += 2 + width
+                continue
+            raise TomlUnsupported(f"the escape \\{e} is not TOML")
+        if ch != "\t" and (ord(ch) < 0x20 or ord(ch) == 0x7F):
+            raise TomlUnsupported("a control character inside a basic string")
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _segments(keypath: str) -> list[str]:
+    out = []
+    for m in _KEYSEG.finditer(keypath):
+        k = m.group(0)
+        if k.startswith('"'):
+            k = _toml_basic(k[1:-1])
+        elif k.startswith("'"):
+            k = k[1:-1]
+        out.append(k)
+    return out
+
+
+def _toml_scan(path: str, flat: bool = False) -> tuple[dict, set]:
+    """The fallback reader: ({event: {basename: [matcher]}}, {absolute target}). Raises TomlUnsupported
+    on anything outside its grammar that could bear on hooks -- it never guesses.
+
+    #1142 third review: `"matcher" = "shell"` (a quoted key, valid TOML) was not recognised, the matcher
+    stayed None, and None is all-tools. Quoted keys and quoted header segments are now read the TOML way,
+    and every other form the scan cannot parse is a refusal, not an absence."""
     with open(path, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            if re.match(r"\s*\[", line):
-                flush()
+        text = fh.read()
+    if '"' * 3 in text or "'" * 3 in text:
+        raise TomlUnsupported("a multi-line string (it can hide table headers from a line scan)")
+    have: dict[str, dict[str, list]] = {}
+    targets: set[str] = set()
+    ctx = None                     # None | ("group", event) | ("entry", event) | ("flat",) | ("other",)
+    matcher = None
+    table: dict = {}               # the current flat [[hooks]] table's keys
+
+    def flush_flat() -> None:
+        ev, cmd = table.get("event"), table.get("command")
+        if isinstance(ev, str) and isinstance(cmd, str):
+            t = target_path(cmd)
+            if t:
+                targets.add(t)
+            b = target_basename(cmd)
+            if b:
+                have.setdefault(ev, {}).setdefault(b, []).append(table.get("matcher"))
+    for n, line in enumerate(text.splitlines(), 1):
+        st = line.strip()
+        if not st or st.startswith("#"):
+            continue
+        h = _HEADER.match(line)
+        if h:
+            segs = _segments(h.group(2))
+            arr = h.group(1) == "[["
+            if ctx == ("flat",):
+                flush_flat()
                 table = {}
+            if flat:
+                if segs and segs[0] == "hooks":
+                    if arr and segs == ["hooks"]:
+                        ctx = ("flat",)
+                        continue
+                    raise TomlUnsupported(f"line {n}: hooks table form {st!r} in a flat layout")
+                ctx = ("other",)
                 continue
-            m = _TOML_EVENT.match(line)
-            if m:
-                table.setdefault("event", []).append(m.group(2))
-                continue
-            m = _TOML_CMD.match(line)
-            if m:
-                table.setdefault("command", []).append(m.group(2))
-    flush()
-    return out
+            if segs and segs[0] == "hooks" and not arr and len(segs) >= 2 and segs[1] == "state":
+                ctx = ("other",)          # codex's per-hook approval state: defines no hooks
+            elif segs and segs[0] == "hooks":
+                if arr and len(segs) == 2:
+                    ctx, matcher = ("group", segs[1]), None
+                elif arr and len(segs) == 3 and segs[2] == "hooks" and ctx and ctx[0] in ("group", "entry") and ctx[1] == segs[1]:
+                    ctx = ("entry", segs[1])
+                else:
+                    raise TomlUnsupported(f"line {n}: hooks table form {st!r}")
+            else:
+                ctx = ("other",)
+            continue
+        if st.startswith("["):
+            raise TomlUnsupported(f"line {n}: unparseable table header {st!r}")
+        a = _ASSIGN.match(line)
+        segs = _segments(a.group(1)) if a else []
+        in_hooks = ctx is not None and ctx[0] in ("group", "entry", "flat")
+        if not a:
+            if in_hooks:
+                raise TomlUnsupported(f"line {n}: {st!r}")
+            continue                              # an unrelated value spanning lines (a multi-line array)
+        if ctx is None and segs and segs[0] == "hooks":
+            raise TomlUnsupported(f"line {n}: hooks set by a top-level key {st!r}")
+        if not in_hooks:
+            continue
+        if len(segs) != 1:
+            raise TomlUnsupported(f"line {n}: dotted key inside a hooks table {st!r}")
+        v = _VALUE.match(a.group(2))
+        if v is None:
+            raise TomlUnsupported(f"line {n}: value the scan cannot read {st!r}")
+        sval = _toml_basic(v.group(1)) if v.group(1) is not None else v.group(2)
+        key = segs[0]
+        if ctx[0] == "flat":
+            if key in ("event", "command", "matcher"):
+                if sval is None:
+                    raise TomlUnsupported(f"line {n}: non-string {key} {st!r}")
+                if key in table:
+                    raise TomlUnsupported(f"line {n}: {key} set twice in one [[hooks]] table")
+                table[key] = sval
+            continue
+        if ctx[0] == "group" and key == "matcher":
+            if sval is None:
+                raise TomlUnsupported(f"line {n}: non-string matcher {st!r}")
+            matcher = sval
+        elif ctx[0] == "entry" and key == "command" and sval is not None:
+            t = target_path(sval)
+            if t:
+                targets.add(t)
+            b = target_basename(sval)
+            if b:
+                have.setdefault(ctx[1], {}).setdefault(b, []).append(matcher)
+    if ctx == ("flat",):
+        flush_flat()
+    return have, targets
+
+
+def registered_toml(path: str, flat: bool = False) -> dict[str, dict[str, list]]:
+    """{event: {target basename: [matcher of each group that registers it]}} -- toml-hook-commands
+    semantics. A structural parse (tomllib) when the host has one; otherwise `_toml_scan`, which
+    refuses (TomlUnsupported) rather than reading an unrecognised matcher as absent -- absent is
+    all-tools, so a misread would certify a narrow gate (#1142 reviews 2 and 3)."""
+    got = _toml_structural(path, flat)
+    if got is not None:
+        return got
+    return _toml_scan(path, flat)[0]
+
+
+def target_path(cmd: str) -> str | None:
+    """The installer's rule, the whole path: the first token that is an absolute path."""
+    for tok in cmd.split():
+        if tok.startswith("/"):
+            return tok
+    return None
 
 
 # ---------------------------------------------------------------- writing ----------------
@@ -229,12 +428,16 @@ def toml_block(member: str, event: str, group: dict, hook: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def toml_block_flat(member: str, event: str, hook: dict) -> str:
-    """One flat `[[hooks]]` table (kimi's layout): the event is a key, not the header."""
+def toml_block_flat(member: str, event: str, hook: dict, group: dict | None = None) -> str:
+    """One flat `[[hooks]]` table (kimi's layout, #1149): the event is a key, not the header. A group
+    matcher that is not all-tools is carried as a `matcher` key -- dropping it would widen the gate."""
     lines = [f"\n{MARK} ({member}) — do not hand-edit; re-run deploy/install-members.sh",
              "[[hooks]]",
-             f"event = {_toml_str(event)}",
-             f"command = {_toml_str(hook['command'])}"]
+             f"event = {_toml_str(event)}"]
+    m = (group or {}).get("matcher")
+    if isinstance(m, str) and m not in ALL_MATCHERS:
+        lines.append(f"matcher = {_toml_str(m)}")
+    lines.append(f"command = {_toml_str(hook['command'])}")
     t = hook.get("timeout")
     if isinstance(t, (int, float)) and not isinstance(t, bool):
         lines.append(f"timeout = {int(t)}")
@@ -273,8 +476,93 @@ def validate_toml(text: str) -> str | None:
         return f"{type(e).__name__}: {e}"
 
 
-def register_member(member: str, spec: dict, template: dict, home: str, dry: bool) -> tuple[str, list[str]]:
-    """-> (verdict, changes). verdict in {registered, ok, skip, refused, failed}."""
+def registered_targets(cfg: str, reader: str, flat: bool = False) -> set[str]:
+    """Every absolute target a config registers (the installer's rule: the first absolute path in the
+    command), read structurally. Empty when the file is absent or unreadable."""
+    out: set[str] = set()
+    try:
+        if reader == "json-hook-commands":
+            with open(cfg, encoding="utf-8") as fh:
+                data = json.load(fh)
+            groups = (data.get("hooks") or {}).values()
+        else:
+            try:
+                if FORCE_LINE_SCAN:
+                    raise ImportError
+                import tomllib  # type: ignore
+            except ImportError:
+                return _toml_scan(cfg, flat)[1]
+            with open(cfg, "rb") as fh:
+                hooks = tomllib.load(fh).get("hooks") or ({} if not flat else [])
+            if flat:
+                for tbl in hooks if isinstance(hooks, list) else []:
+                    c = tbl.get("command") if isinstance(tbl, dict) else None
+                    t = target_path(c) if isinstance(c, str) else None
+                    if t:
+                        out.add(t)
+                return out
+            groups = hooks.values()
+        for gs in groups:
+            for g in gs if isinstance(gs, list) else []:
+                for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
+                    c = h.get("command") if isinstance(h, dict) else None
+                    t = target_path(c) if isinstance(c, str) else None
+                    if t:
+                        out.add(t)
+    except Exception:                     # noqa: BLE001 -- absent, unparseable, or no tomllib: no repair rows
+        return set()
+    return out
+
+
+def _decide(groups: dict, have: dict, dry: bool, plan: bool, own: set | None = None):
+    """For each templated hook: present (a covering registration exists), NARROW (registered only
+    under a matcher that does not cover the template's -- reported, never silently widened, never
+    counted as present), PENDING (its target file is not installed yet -- never registered, so no
+    live registration points at a missing file), or WANT (register it).
+    -> (want [(event, group, hook)], narrow [str], pending [str], planned [(base, target)])"""
+    want, narrow, pending, planned = [], [], [], []
+    own = own or set()
+    for event, gs in groups.items():
+        for g in gs:
+            tm = g.get("matcher")
+            for h in g["hooks"]:
+                b = target_basename(h["command"]) or ""
+                t = target_path(h["command"])
+                existing = have.get(event, {}).get(b)
+                if existing:
+                    if any(covers(m, tm) for m in existing):
+                        # registered -- but a registration is only as good as the file it names. When the
+                        # registration names THIS template's target (one this script wrote) and that file is
+                        # missing -- a host left registered with nothing installed (HUB 2026-09-28, #1153) --
+                        # it is PENDING, not ok, and --plan lists it so the installer puts the file there.
+                        # A registration naming some other path is the installer's to check, as before.
+                        if t is not None and t in own and not os.path.isfile(t):
+                            if plan:
+                                planned.append((b, t))
+                            elif not dry:
+                                pending.append(f"{event}/{b} is registered but {t} is not installed "
+                                               f"(install-members.sh installs it)")
+                        continue
+                    narrow.append(f"{event}/{b} is registered only for matcher "
+                                  f"{', '.join('<unreadable>' if m is UNPARSED else repr(m) for m in existing)}; "
+                                  f"the template wants {tm!r} "
+                                  f"-- left as it is, not reported as registered")
+                    continue
+                planned.append((b, t))
+                if plan:
+                    continue
+                if not dry and (t is None or not os.path.isfile(t)):
+                    pending.append(f"{event}/{b} -> {t} is not installed yet; not registered "
+                                   f"(install-members.sh installs it, then registers)")
+                    continue
+                want.append((event, g, h))
+    return want, narrow, pending, planned
+
+
+def register_member(member: str, spec: dict, template: dict, home: str, dry: bool,
+                    plan: bool = False) -> tuple[str, list[str]]:
+    """-> (verdict, lines). verdict in {registered, ok, skip, refused, failed, narrow, pending, plan}.
+    `lines` are the changes made (or planned: 'base\ttarget'), then any 'NARROW ...' / 'PENDING ...'."""
     reg = spec.get("registration") or {}
     segs, reader = reg.get("path") or [], reg.get("reader", "")
     dest = spec.get("dest") or ""
@@ -291,6 +579,37 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
         return "refused", [f"template carries an unrendered placeholder: {e}"]
     if not groups:
         return "skip", ["template registers no command hooks"]
+    if reader not in ("json-hook-commands", "toml-hook-commands"):
+        return "skip", [f"unknown registration reader {reader!r} — refusing to guess"]
+
+    flat = reg.get("layout") == "flat"
+    raw, data = "", {}
+    if os.path.exists(cfg):
+        with open(cfg, encoding="utf-8", errors="replace") as fh:
+            raw = fh.read()
+        if reader == "json-hook-commands":
+            try:
+                data = json.loads(raw) if raw.strip() else {}
+            except ValueError as e:
+                return "failed", [f"{cfg} is not parseable JSON ({e}); refusing to guess"]
+            if not isinstance(data, dict):
+                return "failed", [f"{cfg} is not a JSON object"]
+            have = registered_json(cfg) if raw.strip() else {}
+        else:
+            try:
+                have = registered_toml(cfg, flat=flat)
+            except TomlUnsupported as e:
+                return "refused", [f"{cfg}: this config cannot be verified ({e}); nothing registered, "
+                                   f"nothing certified -- fix the file, or, on a host without tomllib, "
+                                   f"run with Python >= 3.11 or register by hand"]
+    else:
+        have = {}
+
+    own = registered_targets(cfg, reader, flat) if os.path.exists(cfg) else set()
+    want, narrow, pending, planned = _decide(groups, have, dry, plan, own)
+    notes = [f"NARROW {n}" for n in narrow] + [f"PENDING {p}" for p in pending]
+    if plan:
+        return "plan", [f"{b}\t{t}" for b, t in planned] + notes
 
     def done(verdict: str, changes: list[str]) -> tuple[str, list[str]]:
         # What this script registers points INTO `dest`, and install-members.sh refuses a
@@ -307,94 +626,66 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
 
     changes: list[str] = []
     if reader == "json-hook-commands":
-        if os.path.exists(cfg):
-            with open(cfg, encoding="utf-8") as fh:
-                raw = fh.read()
-            try:
-                data = json.loads(raw)
-            except ValueError as e:
-                return "failed", [f"{cfg} is not parseable JSON ({e}); refusing to guess"]
-            have = registered_json(cfg)
-        else:
-            raw, data, have = "", {}, {}
-        if not isinstance(data, dict):
-            return "failed", [f"{cfg} is not a JSON object"]
         hooks = data.setdefault("hooks", {})
-        for event, gs in groups.items():
-            for g in gs:
-                want = [h for h in g["hooks"]
-                        if target_basename(h["command"]) not in have.get(event, set())]
-                if not want:
-                    continue
-                hooks.setdefault(event, []).append(
-                    {**{k: v for k, v in g.items() if k != "hooks"}, "hooks": want})
-                for h in want:
-                    b = target_basename(h["command"]) or ""
-                    changes.append(f"{event}/{b}")
-                    have.setdefault(event, set()).add(b)
-        if not changes:
-            return done("ok", [])
-        if dry:
-            return "registered", [f"would add {c}" for c in changes]
-        new = json.dumps(data, indent=2) + "\n"
-        json.loads(new)
-        if raw:
-            _backup(cfg)
-        _write_atomic(cfg, new)
-        return done("registered", changes)
-
-    if reader == "toml-hook-commands":
-        flat = reg.get("layout") == "flat"
-        if os.path.exists(cfg):
-            with open(cfg, encoding="utf-8", errors="replace") as fh:
-                raw = fh.read()
-            have = registered_toml(cfg, flat=flat)
-        else:
-            raw, have = "", {}
+        for event, g, h in want:
+            hooks.setdefault(event, []).append({**{k: v for k, v in g.items() if k != "hooks"}, "hooks": [h]})
+            changes.append(f"{event}/{target_basename(h['command'])}")
+        if changes and not dry:
+            new = json.dumps(data, indent=2) + "\n"
+            json.loads(new)
+            if raw:
+                _backup(cfg)
+            _write_atomic(cfg, new)
+    else:
         new = raw
-        for event, gs in groups.items():
-            for g in gs:
-                for h in g["hooks"]:
-                    b = target_basename(h["command"])
-                    if b in have.get(event, set()):
-                        continue
-                    new += (toml_block_flat(member, event, h) if flat
-                            else toml_block(member, event, g, h))
-                    changes.append(f"{event}/{b}")
-                    have.setdefault(event, set()).add(b or "")
+        for event, g, h in want:
+            new += toml_block_flat(member, event, h, g) if flat else toml_block(member, event, g, h)
+            changes.append(f"{event}/{target_basename(h['command'])}")
         new, ensured = toml_ensure(new, reg.get("ensure") or [])
         changes += [f"ensure {e}" for e in ensured]
-        if not changes:
-            return done("ok", [])
-        err = validate_toml(new)
-        if err:
-            return "failed", [f"rendered {cfg} would not parse ({err}); nothing written"]
-        if dry:
-            return "registered", [f"would add {c}" for c in changes]
-        if raw:
-            _backup(cfg)
-        _write_atomic(cfg, new)
-        with open(cfg, encoding="utf-8", errors="replace") as fh:
-            back = fh.read()
-        err = validate_toml(back)
-        if err:
-            # Restore what THIS run read, not `.pre-register.bak`: that backup is written once,
-            # on the first run ever, so restoring it would roll the harness config back past
-            # every edit made since. A file that did not exist goes back to not existing.
-            if raw:
-                _write_atomic(cfg, raw)
-            else:
-                os.remove(cfg)
-            return "failed", [f"{cfg} failed to parse after write ({err}); restored as it was"]
-        return done("registered", changes)
+        if changes:
+            err = validate_toml(new)
+            if err:
+                return "failed", [f"rendered {cfg} would not parse ({err}); nothing written"] + notes
+            if not dry:
+                if raw:
+                    _backup(cfg)
+                _write_atomic(cfg, new)
+                with open(cfg, encoding="utf-8", errors="replace") as fh:
+                    back = fh.read()
+                err = validate_toml(back)
+                if err:
+                    # Restore what THIS run read, not `.pre-register.bak`: that backup is written once,
+                    # on the first run ever, so restoring it would roll the harness config back past
+                    # every edit made since. A file that did not exist goes back to not existing.
+                    if raw:
+                        _write_atomic(cfg, raw)
+                    else:
+                        os.remove(cfg)
+                    return "failed", [f"{cfg} failed to parse after write ({err}); restored as it was"] + notes
 
-    return "skip", [f"unknown registration reader {reader!r} — refusing to guess"]
+    lines = ([f"would add {c}" for c in changes] if dry else changes) + notes
+    # #1142 re-review P2: a run that registered some hooks and left others PENDING returned
+    # "registered" and exited 0. Narrow and pending are unfinished work: they outrank a partial
+    # registration (the additions are still in `lines` and still reported).
+    if narrow:
+        return "narrow", lines
+    if pending:
+        return "pending", lines
+    if changes:
+        return done("registered", lines)
+    return done("ok", lines)
 
 
 def main(argv: list[str]) -> int:
     plugins = os.path.join(REPO_ROOT, "plugins")
     home = os.path.expanduser("~")
+    global FORCE_LINE_SCAN
     only = None
+    plan = False
+    if "--toml-line-scan" in argv:
+        FORCE_LINE_SCAN = True
+        argv = [a for a in argv if a != "--toml-line-scan"]
     it = iter(argv)
     for a in it:
         if a == "--plugins":
@@ -403,12 +694,15 @@ def main(argv: list[str]) -> int:
             home = next(it)
         elif a == "--member":
             only = next(it)
+        elif a == "--plan":
+            plan = True
         elif a in ("-h", "--help"):
             print(__doc__)
             return 0
     dry = ENV.get("DRY_RUN") == "1"
     rc = 0
-    log(f"register-members: plugins={plugins} home={home}{' DRY RUN' if dry else ''}")
+    if not plan:
+        log(f"register-members: plugins={plugins} home={home}{' DRY RUN' if dry else ''}")
     for member in sorted(os.listdir(plugins)):
         if only and member != only:
             continue
@@ -423,25 +717,41 @@ def main(argv: list[str]) -> int:
             log(f"  skip  {member} — expects.json unparseable")
             continue
         if not os.path.isfile(tpl):
-            if spec.get("registration"):
+            if spec.get("registration") and not plan:
                 log(f"  skip  {member} — declares a registration but ships no hooks/hooks.json "
                     "template; its registration stays a hand edit until it does")
             continue
         with open(tpl, encoding="utf-8") as fh:
             template = json.load(fh)
-        verdict, changes = register_member(member, spec, template, home, dry)
-        if verdict == "ok":
-            log(f"  ok    {member} — every templated hook is registered")
-        elif verdict == "registered":
-            for c in changes:
+        verdict, lines = register_member(member, spec, template, home, dry, plan=plan)
+        if plan:
+            # machine-readable, for install-members.sh: member<TAB>basename<TAB>absolute target
+            for ln in lines:
+                if "\t" in ln and not ln.startswith(("NARROW", "PENDING")):
+                    print(f"{member}\t{ln}", flush=True)
+            continue
+        adds = [ln for ln in lines if not ln.startswith(("NARROW ", "PENDING "))]
+        notes = [ln for ln in lines if ln.startswith(("NARROW ", "PENDING "))]
+        if verdict in ("registered", "narrow", "pending", "ok"):
+            for c in adds:
                 log(f"  {'would' if dry else 'REGISTERED'} {member}: {c}")
+            for n in notes:
+                log(f"  {n.split(' ', 1)[0]} {member}: {n.split(' ', 1)[1]}")
+            if verdict == "ok":
+                log(f"  ok    {member} — every templated hook is registered")
+            # the exit code comes from the NOTES, not the headline verdict: a member can be narrow AND
+            # pending, and neither may be hidden behind the other or behind a successful addition
+            if any(n.startswith("NARROW ") for n in notes):
+                rc = rc or 8
+            if any(n.startswith("PENDING ") for n in notes):
+                rc = rc or 9
         elif verdict == "skip":
-            log(f"  skip  {member} — {'; '.join(changes)}")
+            log(f"  skip  {member} — {'; '.join(lines)}")
         elif verdict == "refused":
-            log(f"  REFUSED {member} — {'; '.join(changes)}")
+            log(f"  REFUSED {member} — {'; '.join(lines)}")
             rc = rc or 7
         else:
-            log(f"  FAILED {member} — {'; '.join(changes)}")
+            log(f"  FAILED {member} — {'; '.join(lines)}")
             rc = 6
     return rc
 
