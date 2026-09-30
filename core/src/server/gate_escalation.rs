@@ -112,6 +112,56 @@ pub const DEFAULT_TTL_SECS: u64 = 3600;
 /// an act name /dev/zero and turn a gate check into an unbounded read.
 pub const MAX_MEASURED_PAYLOAD_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Why a bounded read returned no bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundedRead {
+    /// Missing, a directory, a FIFO, a device -- anything that is not a regular file. A FIFO or
+    /// `/dev/zero` is exactly the path an unbounded reader never returns from.
+    NotAFile,
+    /// Larger than the cap: the size metadata reported, or -- if the file grew between the
+    /// `stat` and the read -- the number of bytes read before the reader stopped at cap + 1.
+    TooLarge(u64),
+    /// A regular file the daemon could not open or read.
+    Unreadable,
+}
+
+/// Read a regular file of at most `cap` bytes, and NEVER more than `cap + 1` bytes of it.
+///
+/// WHY (GPT hold on #1064, 2026-09-29): the patch path checked `MAX_MEASURED_PAYLOAD_BYTES`
+/// only after `fs::read` had allocated the whole file, so the cap changed a label and bounded
+/// nothing. The size is checked from metadata BEFORE any allocation, and the read itself is
+/// `take(cap + 1)`, so a file swapped or grown between the check and the read still cannot
+/// make this allocate more than the cap plus one byte. Every measurement a decision surface or
+/// an approval binding makes goes through here, so the bytes shown and the bytes bound share
+/// one bound.
+pub fn read_regular_file_bounded(p: &std::path::Path, cap: u64) -> Result<Vec<u8>, BoundedRead> {
+    use std::io::Read;
+    let meta = std::fs::metadata(p).map_err(|_| BoundedRead::NotAFile)?;
+    if !meta.is_file() {
+        return Err(BoundedRead::NotAFile);
+    }
+    if meta.len() > cap {
+        return Err(BoundedRead::TooLarge(meta.len()));
+    }
+    let f = std::fs::File::open(p).map_err(|_| BoundedRead::Unreadable)?;
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    f.take(cap.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|_| BoundedRead::Unreadable)?;
+    if buf.len() as u64 > cap {
+        return Err(BoundedRead::TooLarge(buf.len() as u64));
+    }
+    Ok(buf)
+}
+
+/// Lower-case hex sha256 -- the one spelling of a payload digest used everywhere it is bound
+/// or shown.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
 /// How long an APPROVAL stays claimable after it is granted.
 ///
 /// This exists because the hook cannot wait. `plugin.json` and the live `settings.json` both
@@ -338,6 +388,40 @@ impl Channel {
 }
 
 
+/// The door an escalation was opened through. Spelled exactly as the `gate_escalation_opened`
+/// chain row has spelled `opened_via` since the doors' payloads were unified, so the struct and
+/// the chain use one vocabulary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenedVia {
+    /// Not recorded: a row restored from before the field, or a mint whose door said nothing.
+    #[default]
+    Unknown,
+    /// `hestia_gate_escalation_open` — the member door. `reason` is a rationale here.
+    Open,
+    /// `hestia_gate_escalation_claim` — the gate hook's claim-or-open door, which takes
+    /// `reason` as the act when no `act` is sent.
+    Claim,
+}
+
+impl OpenedVia {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OpenedVia::Unknown => "unknown",
+            OpenedVia::Open => "open",
+            OpenedVia::Claim => "claim",
+        }
+    }
+
+    pub fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some("open") => OpenedVia::Open,
+            Some("claim") => OpenedVia::Claim,
+            _ => OpenedVia::Unknown,
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Escalation {
     pub id: String,
@@ -400,6 +484,26 @@ pub struct Escalation {
     /// one TTL, and failing closed for that hour is the safe direction for a permit.
     #[serde(default)]
     pub act_digest: Option<String>,
+    /// THE ACT ITSELF — the exact (trimmed) text `act_digest` was computed from (#1066).
+    ///
+    /// Before this field `open` hashed the act and discarded the text, so the only place it
+    /// survived was `stated_reason`, and only on the claim door, which takes `reason` AS the
+    /// act. The evidence bundle read it from there — and on the member door, where `reason` is
+    /// a RATIONALE, a rationale containing some other valid `cp` was shown to the decider as
+    /// the act, with a measured write effect for a write the approval does not bind (GPT,
+    /// review of #1064). Retained at the mint from the same string the digest is computed
+    /// from, so `act_digest_of(act_text) == act_digest` holds by construction: the evidence
+    /// and the permit are about one object. `None` only on rows restored from before this
+    /// field; a reader must render that as unavailable, never recover it from the reason.
+    #[serde(default)]
+    pub act_text: Option<String>,
+    /// WHICH DOOR opened this row, on the struct and not only on the chain row (#1066). The
+    /// door says what `stated_reason` MEANS — a rationale on `open`, possibly the act itself on
+    /// `claim` — so a reader of the struct must not have to guess it from which fields happen
+    /// to be filled. `Unknown` on rows restored from before the chain carried `opened_via`,
+    /// and on any mint whose door did not record itself.
+    #[serde(default)]
+    pub opened_via: OpenedVia,
     /// The sha256 of the BYTES the act would read, when the opener can name them.
     ///
     /// `act_digest` hashes the command TEXT, which for the commonest governed write on this
@@ -1395,6 +1499,16 @@ impl EscalationStore {
                             // Restored from the entry, so a restart keeps the binding.
                             // Absent on legacy rows opened before #539 -> None -> unspendable.
                             act_digest: s(d, "act_digest"),
+                            // The act text (#1066), restored ONLY if it hashes to the row's
+                            // own digest. A text that does not is evidence about some other
+                            // object, and the one property this field exists for is that
+                            // what a decider reads is what the permit binds. Rows written
+                            // before the field restore None -> rendered UNAVAILABLE.
+                            act_text: s(d, "act_text").filter(|t| {
+                                s(d, "act_digest").as_deref()
+                                    == Some(Self::act_digest_of(t).as_str())
+                            }),
+                            opened_via: OpenedVia::parse(s(d, "opened_via").as_deref()),
                             stated_reason: s(d, "stated_reason"),
                             stated_detail: s(d, "stated_detail"),
                             // The seat keys (#542), restored from the entry when present.
@@ -1655,6 +1769,10 @@ impl EscalationStore {
             // Bound at OPEN, from the same text every decision surface renders (#539).
             // From `act`, never from `stated_reason` — see the note on this fn.
             act_digest: act.map(Self::act_digest_of),
+            // The same string, kept (#1066). Not re-derived anywhere: one source for both.
+            act_text: act.map(str::to_string),
+            // The door records itself via `record_opened_via`; `open` takes no view of it.
+            opened_via: OpenedVia::Unknown,
             payload_sha256: binding.and_then(|b| b.sha256.clone()),
             payload_basis: binding.map(|b| b.basis.to_string()),
             payload_stated_but_not_measured: binding
@@ -1940,6 +2058,25 @@ impl EscalationStore {
         }
     }
 
+    /// ASKING IS OBSERVING: the proven asker session's OWN approved grants are observed when it
+    /// asks what it may spend (`hestia_gate_escalation_claimable`). Only escalations whose
+    /// recorded asker session (`host_session_id`, set from the proven session at open) is this
+    /// one, so a sibling session on the same seat never starts another's window (#732); each
+    /// passes through `mark_observed`'s own conjuncts (approved, bar met, unspent, first
+    /// observation). Returns the ids this call observed.
+    pub fn observe_session_grants(&mut self, plugin_id: &str, host_session_id: &str, now: u64) -> Vec<String> {
+        if host_session_id.trim().is_empty() {
+            return Vec::new();
+        }
+        let mine: Vec<String> = self
+            .by_id
+            .values()
+            .filter(|e| e.plugin_id == plugin_id && e.host_session_id.as_deref() == Some(host_session_id))
+            .map(|e| e.id.clone())
+            .collect();
+        mine.into_iter().filter(|id| self.mark_observed(id, plugin_id, now)).collect()
+    }
+
     pub fn claimable_for(&self, plugin_id: &str, now: u64) -> Vec<&Escalation> {
         let mut out: Vec<&Escalation> = self
             .by_id
@@ -2006,6 +2143,20 @@ impl EscalationStore {
     /// registry, and `open`'s existing callers — every one a test with no session to prove
     /// anything by — keep the fail-closed default without a signature change. Returns false
     /// only for an unknown id, which cannot happen from the handler's own flow.
+    /// Record which door opened this escalation (#1066). Separate from `open` for the same
+    /// reason `record_asker_basis` is: `open` is the pure mint and every test that pins it
+    /// still pins it. Each production door calls this before it witnesses the open, so the
+    /// chain row is built from the struct and cannot disagree with it.
+    pub fn record_opened_via(&mut self, id: &str, via: OpenedVia) -> bool {
+        match self.by_id.get_mut(id) {
+            Some(e) => {
+                e.opened_via = via;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn record_asker_basis(&mut self, id: &str, basis: crate::arbiter::AskerBasis) -> bool {
         match self.by_id.get_mut(id) {
             Some(e) => {
@@ -2135,6 +2286,14 @@ impl EscalationStore {
     /// closes that, and this is not that change. What it removes is the four-and-a-half
     /// minutes an operator's approval spent pointing at mutable bytes.
     pub fn measured_payload_for_act(act: &str) -> Option<String> {
+        // A PATCH-APPLICATION act installs the bytes of its patch file, so those are what it
+        // binds (#648, 2026-09-28: codex could not bind an endorsement to `git apply <scratch>/
+        // witness-…` because four sibling patches shared the truncated prefix, and the approval
+        // bound nothing at all). Checked first: `git -C <dir> apply <patch>` would otherwise
+        // read `<dir>` as the copy source, find a directory, and measure nothing.
+        if let Some(patch) = Self::patch_file_of_act(act) {
+            return Self::sha256_of_regular_file(&patch);
+        }
         let toks: Vec<&str> = act.split_whitespace().collect();
         // The destination is what the act WRITES; hashing it would bind the thing being
         // overwritten rather than the thing being installed, which is the opposite record.
@@ -2143,15 +2302,100 @@ impl EscalationStore {
             .iter()
             .find(|t| t.starts_with('/') && !t.contains(".."))
             .map(std::path::Path::new)?;
-        let meta = std::fs::metadata(src).ok()?;
-        if !meta.is_file() || meta.len() > MAX_MEASURED_PAYLOAD_BYTES {
+        Self::sha256_of_regular_file(src)
+    }
+
+/// sha256 of a regular file no larger than `MAX_MEASURED_PAYLOAD_BYTES`, else `None`.
+fn sha256_of_regular_file(p: &std::path::Path) -> Option<String> {
+    read_regular_file_bounded(p, MAX_MEASURED_PAYLOAD_BYTES)
+        .ok()
+        .map(|b| sha256_hex(&b))
+}
+
+/// The patch file a patch-APPLICATION act installs, when the act names exactly one.
+///
+/// Recognised, conservatively (a guess here would bind an approval to the wrong bytes):
+/// - `git [-C <dir>|-c k=v|--opt]… apply|am [--opt]… <patch>`: exactly one non-option operand;
+/// - `patch [--opt]… (-i <patch> | --input=<patch> | < <patch> | <<patch>)`.
+/// The act text may carry the gate's `<Tool>: ` prefix, which is skipped. The patch path must
+/// be ABSOLUTE with no `..` (the daemon does not share the member's working directory), and an
+/// act containing a shell separator (`&&`, `||`, `;`, `|`) is not read at all: which command
+/// the patch belongs to would be a guess. Read-only forms (`--check`, `--stat`, `--numstat`,
+/// `--summary`) are not applications and yield `None`.
+pub fn patch_file_of_act(act: &str) -> Option<std::path::PathBuf> {
+    let mut toks: Vec<&str> = act.split_whitespace().collect();
+    if toks.first().map(|t| t.ends_with(':')).unwrap_or(false) {
+        toks.remove(0);
+    }
+    if toks.iter().any(|t| matches!(*t, "&&" | "||" | ";" | "|") || t.ends_with(';')) {
+        return None;
+    }
+    let abs = |t: &str| -> Option<std::path::PathBuf> {
+        (t.starts_with('/') && !t.contains("..")).then(|| std::path::PathBuf::from(t))
+    };
+    let first = *toks.first()?;
+    if first == "git" {
+        let mut i = 1;
+        // global options before the subcommand; -C and -c take a value
+        while i < toks.len() && toks[i].starts_with('-') {
+            i += if matches!(toks[i], "-C" | "-c") { 2 } else { 1 };
+        }
+        let sub = *toks.get(i)?;
+        if sub != "apply" && sub != "am" {
             return None;
         }
-        let bytes = std::fs::read(src).ok()?;
-        let mut h = Sha256::new();
-        h.update(&bytes);
-        Some(format!("{:x}", h.finalize()))
+        let rest = &toks[i + 1..];
+        if rest.iter().any(|t| matches!(*t, "--check" | "--stat" | "--numstat" | "--summary")) {
+            return None;
+        }
+        // Options that take their value as the NEXT token (`-p 2`, `--directory d`): that
+        // value is not a patch operand. Without this, `git apply -p 2 /p/x.patch` read as two
+        // operands and measured nothing.
+        let mut operands: Vec<&str> = Vec::new();
+        let mut k = 0;
+        while k < rest.len() {
+            let t = rest[k];
+            if matches!(t, "-p" | "--directory" | "--include" | "--exclude") {
+                k += 2;
+                continue;
+            }
+            if !t.starts_with('-') {
+                operands.push(t);
+            }
+            k += 1;
+        }
+        return match operands.as_slice() {
+            [one] => abs(one),
+            _ => None,
+        };
     }
+    if first == "patch" {
+        let mut found: Option<&str> = None;
+        let mut j = 1;
+        while j < toks.len() {
+            let t = toks[j];
+            let v = if t == "-i" || t == "<" {
+                j += 1;
+                toks.get(j).copied()
+            } else if let Some(v) = t.strip_prefix("--input=") {
+                Some(v)
+            } else if let Some(v) = t.strip_prefix('<') {
+                Some(v)
+            } else {
+                None
+            };
+            if let Some(v) = v {
+                if found.is_some() {
+                    return None; // two inputs named: not one patch
+                }
+                found = Some(v);
+            }
+            j += 1;
+        }
+        return abs(found?);
+    }
+    None
+}
 
 /// THE RULE, IN ONE PLACE: measurement is authoritative wherever it is possible.
 ///

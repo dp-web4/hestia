@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { decideGateEscalation, getDashboard, operatorStatus, ruleScopeRequest } from "../lib/tauri";
-import type { OperatorStatus, PendingEscalation, PendingScopeRequest } from "../lib/types";
+import type { OperatorStatus, PendingEscalation, PendingScopeRequest, WriteEffect } from "../lib/types";
 
 /**
  * Decide — governance-surface escalations awaiting this operator.
@@ -98,6 +98,8 @@ function EscalationCard({
           )}
         </dd>
       </dl>
+
+      {esc.write_effect && <WriteEffectView fx={esc.write_effect} />}
 
       {err && <div className="error-banner">{err}</div>}
 
@@ -365,6 +367,124 @@ export function Decide() {
           )}
         </div>
       ))}
+    </div>
+  );
+}
+
+/**
+ * What the act would DO, as the daemon measured it -- spec `decide-escalation` obligations.
+ * A decider identifies the BYTES here (the sha the approval binds), not a path that sibling
+ * files may share (#648: a truncated `git apply .../witness-` matched four patches).
+ */
+export function WriteEffectView({ fx }: { fx: WriteEffect }) {
+  const sha = (fx.payload_sha256 || "").slice(0, 12);
+  const lines = Array.isArray(fx.diff) ? fx.diff : [];
+  const text =
+    lines.length > 0 ? (
+      <details>
+        <summary>
+          {fx.kind === "patch" ? "patch text" : "diff"} (
+          {fx.diff_truncated
+            ? `first ${lines.length} lines — TRUNCATED, open the file for the rest`
+            : `${lines.length} lines`}
+          )
+        </summary>
+        <pre className="pre">{lines.join("\n")}</pre>
+      </details>
+    ) : null;
+
+  if (fx.kind === "patch") {
+    if (fx.patch_readable === false) {
+      return (
+        <div className="write-effect" data-effect="patch-unreadable">
+          <span className="muted">
+            {fx.note} ({fx.patch_path})
+          </span>
+        </div>
+      );
+    }
+    const gaps = fx.incomplete ?? [];
+    if (fx.patch_read === false) {
+      // Over the measurement cap: NOT read. No counts -- "+0 −0 across 0 file(s)" would be a
+      // claim about bytes nobody looked at.
+      return (
+        <div className="write-effect" data-effect="patch-unread">
+          <strong>
+            NOT READ — {gaps.join("; ") || fx.payload_unbound_reason} ({fx.patch_path})
+          </strong>
+        </div>
+      );
+    }
+    return (
+      <div className="write-effect" data-effect="patch">
+        <div>
+          patch +{fx.added_lines ?? 0} −{fx.removed_lines ?? 0} across {fx.file_count ?? 0} file(s)
+          {sha ? (
+            <> — approval binds sha {sha}</>
+          ) : (
+            <strong> — {fx.payload_unbound_reason || "the approval does not bind these bytes"}</strong>
+          )}
+        </div>
+        {fx.summary_complete === false && (
+          <div className="write-effect-incomplete">
+            <strong>INCOMPLETE summary — not the whole patch:</strong>{" "}
+            {gaps.join("; ") || "unrepresented content"}
+          </div>
+        )}
+        <ul className="patch-files">
+          {(fx.files ?? []).map((f, i) => (
+            <li key={`${i}:${f.path}`}>
+              {f.path} +{f.added} −{f.removed}
+              {f.created ? " (new)" : ""}
+              {f.deleted ? " (deleted)" : ""}
+              {f.renamed_from ? ` (renamed from ${f.renamed_from})` : ""}
+              {f.copied_from ? ` (copied from ${f.copied_from})` : ""}
+              {f.old_mode && f.new_mode
+                ? ` (mode ${f.old_mode} → ${f.new_mode})`
+                : f.new_mode
+                  ? ` (mode ${f.new_mode})`
+                  : ""}
+              {f.binary ? " (BINARY — not counted)" : ""}
+            </li>
+          ))}
+        </ul>
+        {text}
+      </div>
+    );
+  }
+  if (fx.source_readable === false || fx.source_read === false) {
+    return (
+      <div className="write-effect" data-effect="copy-unreadable">
+        <span className="muted">
+          {fx.note} ({fx.source})
+        </span>
+      </div>
+    );
+  }
+  return (
+    <div className="write-effect" data-effect="copy">
+      <div>
+        {fx.compared_against && fx.enforcing_read === false ? (
+          <>
+            {fx.source_lines ?? 0} lines, sha {sha} —{" "}
+            <span className="muted">{fx.note || "the enforcing copy could not be read; no diff"}</span>
+          </>
+        ) : fx.compared_against ? (
+          fx.identical_to_enforcing ? (
+            <>no change vs the enforcing copy — {fx.source_lines} lines, sha {sha}</>
+          ) : (
+            <>
+              +{fx.added_lines ?? 0} −{fx.removed_lines ?? 0} vs the copy now ENFORCING — sha {sha}
+            </>
+          )
+        ) : (
+          <>
+            {fx.source_lines ?? 0} lines, sha {sha} —{" "}
+            <span className="muted">{fx.note || "no enforcing copy to compare"}</span>
+          </>
+        )}
+      </div>
+      {text}
     </div>
   );
 }

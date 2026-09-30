@@ -871,6 +871,22 @@ impl ServerState {
         // Self-contained credential the operator loads into their client: the
         // lct_id (so the client knows WHICH operator it is) + the raw Ed25519 seed
         // (hex) the client wraps + imports for signing. 0600, genesis handoff.
+        // Self-witnessing A, and FIRST (#1131 class A: this append's result used to be discarded
+        // after the key and the law were already written). The genesis act is recorded AS a
+        // bootstrap act, with the evidence available at genesis, BEFORE anything is written: a
+        // record that cannot be made leaves no key on disk and no operator in the law, the window
+        // stays open, and the next start retries. Recording first rather than undoing after means
+        // the undo never has to delete an operator.key.
+        self.append_chain(
+            "operator_bootstrap",
+            serde_json::json!({
+                "operator": lct_id,
+                "window": "genesis",
+                "evidence": "sovereign-process-minting-first-operator",
+                "note": "bounded self-terminating bootstrap; no re-entry once operator_access is non-empty",
+            }),
+        )
+        .map_err(|e| anyhow::anyhow!("recording the operator bootstrap: {e}; nothing was minted"))?;
         let key_path = self.home.join("operator.key");
         let cred = serde_json::json!({
             "lct_id": lct_id,
@@ -896,18 +912,6 @@ impl ServerState {
             .set_policy(policy)
             .map_err(|e| anyhow::anyhow!("persisting bootstrapped operator: {e}"))?;
 
-        // Self-witnessing A: the genesis act is recorded AS a bootstrap act, with
-        // the evidence available at genesis (the sovereign process minting the
-        // first operator). The record makes the origin auditable, not silent.
-        let _ = self.append_chain(
-            "operator_bootstrap",
-            serde_json::json!({
-                "operator": lct_id,
-                "window": "genesis",
-                "evidence": "sovereign-process-minting-first-operator",
-                "note": "bounded self-terminating bootstrap; no re-entry once operator_access is non-empty",
-            }),
-        );
         eprintln!(
             "[hestia] OPERATOR BOOTSTRAP: minted genesis operator {lct_id}\n\
              [hestia]   private key written to {} (0600) — load it into your operator client;\n\
