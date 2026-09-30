@@ -22,7 +22,7 @@
     },
     {
       "path": "hooks/pre_tool_use.py",
-      "sha256": "aa8b16d72b73f7120df1dcfe273edc4d4ea8465cf144e2e3f522e13e098e9e75",
+      "sha256": "47b47c0b34c3cbc5a0b4fd9b1111894d614c8b9daadad3d56e68a0141233d7d6",
       "source": "plugins/kimi/hooks/pre_tool_use.py"
     },
     {
@@ -33,7 +33,7 @@
   ],
   "engine": {
     "unit": "_shared",
-    "gt_version": "3b3e685ba1f21092e4ddfbd48a6aeb11c92ada32409d9c66fdd8de664e7c649f",
+    "gt_version": "df5bc936693093f1f591ff598e829a884fd8169f55c0baaf442cad6b1f1fcee3",
     "files": [
       {
         "path": "hestia_gate_core.py",
@@ -41,7 +41,7 @@
       },
       {
         "path": "hestia_gate_mechanism.py",
-        "sha256": "5bb44382c00720fb06439695ad5a0b47fe635601f9cd19e576d203b94b2bed65"
+        "sha256": "34611097709af15c85787b96850fb99a8cc25af1a2af940449cbd4221c0ab7d4"
       },
       {
         "path": "hestia_governance_closure.py",
@@ -58,5 +58,5 @@
     ]
   },
   "requires": [],
-  "gt_version": "c83a06d7f81efac73a426e2f59f80612d9f46fb545104c11cd625b15e17011c6"
+  "gt_version": "bffbf6636fea4c3a1b8f310bc443e059380a03ee852cc7bc533e4c474ac87ff5"
 }

@@ -177,6 +177,13 @@ enum GateCmd {
         wait: Option<u64>,
     },
 
+    /// What the daemon did for a request key (#1166). Read-only: it observes no escalation
+    /// and starts no claim window, so it is safe where `poll` is not (#732).
+    Lookup {
+        /// The 64-hex request key a gate refusal printed
+        request_key: String,
+    },
+
     /// Approve a governance write. Requires --reason; a PEER deny does not (but
     /// withdrawing your OWN escalation does — see `deny`).
     Approve {
@@ -806,6 +813,9 @@ pub fn run() -> AnyResult<()> {
                 }
                 GateCmd::Poll { escalation_id, wait } => {
                     gate_cli::poll(&endpoint, &escalation_id, asserted_id, &role, wait)
+                }
+                GateCmd::Lookup { request_key } => {
+                    gate_cli::lookup(&endpoint, &request_key, asserted_id, &role)
                 }
                 GateCmd::Approve { escalation_id, reason } => gate_cli::arbitrate(
                     &endpoint, &escalation_id, true, Some(reason), asserted_id, &role,

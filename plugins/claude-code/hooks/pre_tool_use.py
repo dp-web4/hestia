@@ -1278,10 +1278,27 @@ def _connect_session(client: "McpHttp", host_session_id: Optional[str]) -> Optio
         return None
 
 
+def escalation_request_key(plugin_id: str, marker: str, act: str,
+                           host_session_id: Optional[str]) -> str:
+    """The claim's request key (#1166): sha256 over member, marker, the exact act string sent,
+    and the host session. Stable across identical re-issues in one session, so a retry after a
+    lost answer names the same request; any change to the act is a different request."""
+    import hashlib
+    basis = "\x1f".join([plugin_id, marker, act, host_session_id or ""])
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
+# THIS CALL'S INVOCATION (#1169): the tool call's correlation key, set by main() from the event
+# through the shared rule (hestia_witness_core.correlation_key). The claim sends it so the daemon
+# can tell a retry of a lost answer from a repeat of a delivered permit. None when unset.
+_INVOCATION_KEY: Optional[str] = None
+
+
 def request_self_write(marker: str, tool_name: str, attempted: str = "",
                        resource: Optional[str] = None, key: Optional[str] = None,
                        dest: Optional[str] = None,
-                       host_session_id: Optional[str] = None) -> Tuple[str, str]:
+                       host_session_id: Optional[str] = None,
+                       invocation_key: Optional[str] = None) -> Tuple[str, str]:
     """One round trip. Returns (verdict, detail); only 'approved' permits the write.
 
     `marker` is what the daemon keys the approval on and is NOT the human-facing
@@ -1302,6 +1319,10 @@ def request_self_write(marker: str, tool_name: str, attempted: str = "",
     is a refusal. A daemon that cannot answer must not be a way to get a governance write
     through.
     """
+    request_key = escalation_request_key(
+        _escalation_plugin_id(), marker, attempted or f"{tool_name} -> {resource or marker}",
+        host_session_id)
+    claim_sent = False
     try:
         endpoint = discover_endpoint() or DEFAULT_ENDPOINT
         client = McpHttp(endpoint, deadline=time.monotonic() + ESCALATION_RPC_TIMEOUT_S)
@@ -1329,20 +1350,53 @@ def request_self_write(marker: str, tool_name: str, attempted: str = "",
                 "because it did not choose to escalate. Approving authorises this one write."
             ),
         }
+        # THE REQUEST KEY (#1166, #774): stable across identical re-issues in one session, so
+        # when this round trip dies the daemon can answer the retry with what it already did.
+        claim_args["request_key"] = request_key
+        # THE INVOCATION (#1169): a reclaim is only for a DIFFERENT invocation whose predecessor
+        # never reached execution, which the daemon learns from the society-safety begin_action.
+        _inv = invocation_key or _INVOCATION_KEY
+        if _inv:
+            claim_args["invocation_key"] = _inv
+        # SUPERSESSION (GPT review of ca5f394): this gate has no warn-rollout -- a superseded
+        # begin_action is a no-verdict, and `deny_no_verdict` always refuses -- so it may declare
+        # that it hard-stops a superseded invocation. The daemon reclaims only spends whose seat did.
+        claim_args["supersession"] = "hard_stop"
         # WHO is asking, provable — see `_connect_session`. Absent on any failure:
         # the claim accepts its absence and records `asker_basis: "asserted"`.
         sid = _connect_session(client, host_session_id)
         if sid:
             claim_args["session_id"] = sid
+        claim_sent = True
         r = client.call_tool("hestia_gate_escalation_claim", claim_args)
     except Exception as e:  # noqa: BLE001
-        return "unreachable", f"no answer from the daemon ({type(e).__name__}) -- refused"
+        if not claim_sent:
+            # The claim never left this process: nothing can have happened on the daemon.
+            return "unreachable", f"no answer from the daemon ({type(e).__name__}) -- refused"
+        # A TIMEOUT AFTER THE CLAIM WAS SENT IS AN UNKNOWN OUTCOME, NOT "NOTHING HAPPENED"
+        # (#1166, GPT). The daemon may have opened an escalation, matched a pending one, or
+        # spent an approval after this deadline passed. Refuse -- the budget cannot grow,
+        # because the harness kills a hook at 5 s and a killed hook fails OPEN -- but say what
+        # is known and how to recover.
+        sys.stderr.write(
+            f"hestia: OUTCOME UNKNOWN — the daemon did not answer within "
+            f"{ESCALATION_RPC_TIMEOUT_S}s ({type(e).__name__}); it may have opened or matched "
+            f"an escalation for this act. request key {request_key[:16]}… — "
+            f"`hestia gate lookup {request_key}`; re-issuing this identical act is safe: it "
+            f"returns the same escalation or the grant already claimed for you.\n"
+        )
+        sys.stderr.flush()
+        return "unknown", f"outcome unknown ({type(e).__name__}); request key {request_key}"
 
     # BOTH flags, and the daemon owns both. Two places deciding what "approved" means is how
     # they come to disagree, so the hook re-derives nothing.
     if _dig(r, "claimed") is True and _dig(r, "permits_write") is True:
         who = _dig(r, "decided_by") or "a human"
         via = _dig(r, "decided_via") or "unknown-channel"
+        if _dig(r, "reclaimed") is True:
+            # The SAME request already spent this grant and its answer was lost (#774).
+            return "approved", (f"re-claimed the approval from {who} via {via} that this "
+                                f"request already spent (its first answer was lost)")
         return "approved", f"claimed an approval from {who} via {via} (single use, now spent)"
 
     esc_id = _dig(r, "escalation_id")
@@ -1723,6 +1777,13 @@ def main() -> int:
     host_session_id = event.get("session_id")
     tool_use_id = event.get("tool_use_id") or event.get("session_id") or "no-id"
     tool_input = event.get("tool_input") or {}
+    # This call's invocation key (#1169), by the one shared rule; best effort -- a claim that
+    # carries none can never be reclaimed, which is the safe direction.
+    global _INVOCATION_KEY
+    try:
+        _INVOCATION_KEY = _load_mechanism().correlation_key(event)
+    except Exception:  # noqa: BLE001
+        _INVOCATION_KEY = None
 
     # SELF-PROTECTION FIRST — before the daemon, and never conditional on it.
     # If this required a verdict, "stop the daemon, then edit the gate" would be
