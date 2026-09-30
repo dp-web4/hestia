@@ -214,9 +214,24 @@ daemon_exe() {
   local pid
   case "$OS" in
     Darwin)
+      # The RUNNING process's image, as on Linux -- not launchd's `program`. The canonical agent
+      # (install.sh, canonicalize-macos-seat.sh) is `/bin/sh -c '... exec <hestia> serve'`, so
+      # `program` is /bin/sh while the process, after the exec, is hestia. Reading `program`
+      # failed every deploy on McNugget after it was canonicalized (2026-09-29, six in a row:
+      # "the daemon ... is executing /bin/sh"). `program` stays the fallback for a daemon that
+      # is not running.
       command -v launchctl >/dev/null 2>&1 || return 0
-      launchctl print "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null \
-        | awk -F' = ' '$1 ~ /^[[:space:]]*program$/ { print $2; exit }' || true ;;
+      local info exe=""
+      info="$(launchctl print "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null || true)"
+      pid="$(printf '%s\n' "$info" | awk -F' = ' '$1 ~ /^[[:space:]]*pid$/ { print $2; exit }' || true)"
+      if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then
+        exe="$(ps -o comm= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)"
+      fi
+      if [ -n "$exe" ]; then
+        printf '%s\n' "$exe"
+      else
+        printf '%s\n' "$info" | awk -F' = ' '$1 ~ /^[[:space:]]*program$/ { print $2; exit }' || true
+      fi ;;
     *)
       command -v systemctl >/dev/null 2>&1 || return 0
       pid="$(systemctl --user show "$UNIT" -p MainPID --value 2>/dev/null || true)"
