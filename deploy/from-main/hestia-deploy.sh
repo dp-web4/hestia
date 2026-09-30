@@ -208,8 +208,9 @@ secret_hygiene() {
 canon() { readlink -f "$1" 2>/dev/null || (cd "$(dirname "$1")" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$(basename "$1")"); }
 
 # The file the daemon is actually executing, when the seat can tell us: /proc on a systemd
-# seat, the agent's registration (`launchctl print` -> `program =`) on launchd. Empty when
-# unknown, and an unknown is not a mismatch — the check below only fires on a known exe.
+# seat, the running pid's image on launchd (and, for a stopped agent, what its registration
+# says it will exec). Empty when unknown, and an unknown is not a mismatch — the check below
+# only fires on a known exe.
 daemon_exe() {
   local pid
   case "$OS" in
@@ -218,10 +219,16 @@ daemon_exe() {
       # (install.sh, canonicalize-macos-seat.sh) is `/bin/sh -c '... exec <hestia> serve'`, so
       # `program` is /bin/sh while the process, after the exec, is hestia. Reading `program`
       # failed every deploy on McNugget after it was canonicalized (2026-09-29, six in a row:
-      # "the daemon ... is executing /bin/sh"). `program` stays the fallback for a daemon that
-      # is not running.
+      # "the daemon ... is executing /bin/sh").
+      #
+      # A daemon that is NOT running (stopped, crashed, pid unseen) has no image to read, and the
+      # deploy is how it gets back. Then: a direct-program agent (legacy) answers its `program`;
+      # a shell wrapper answers the word after `exec` in its -c string, with a literal $HOME
+      # (install.sh writes one) expanded; and a wrapper this cannot read answers NOTHING, which
+      # the guard treats as unknown. It never answers /bin/sh: the wrapper is known not to be the
+      # daemon (GPT on #1185 -- that answer would refuse exactly the deploy that recovers it).
       command -v launchctl >/dev/null 2>&1 || return 0
-      local info exe=""
+      local info exe="" prog target
       info="$(launchctl print "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null || true)"
       pid="$(printf '%s\n' "$info" | awk -F' = ' '$1 ~ /^[[:space:]]*pid$/ { print $2; exit }' || true)"
       if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then
@@ -229,9 +236,25 @@ daemon_exe() {
       fi
       if [ -n "$exe" ]; then
         printf '%s\n' "$exe"
-      else
-        printf '%s\n' "$info" | awk -F' = ' '$1 ~ /^[[:space:]]*program$/ { print $2; exit }' || true
-      fi ;;
+        return 0
+      fi
+      prog="$(printf '%s\n' "$info" | awk -F' = ' '$1 ~ /^[[:space:]]*program$/ { print $2; exit }' || true)"
+      case "${prog##*/}" in
+        sh|bash|zsh|dash)
+          target="$(printf '%s\n' "$info" | sed -n '/^[[:space:]]*arguments = {/,/^[[:space:]]*}/p' \
+            | sed -nE 's/(^|.*[[:space:];])exec[[:space:]]+([^[:space:];]+).*/\2/p' | head -n 1 || true)"
+          target="${target#\'}"; target="${target%\'}"; target="${target#\"}"; target="${target%\"}"
+          case "$target" in
+            '$HOME/'*)   target="$HOME/${target#'$HOME/'}" ;;
+            '${HOME}/'*) target="$HOME/${target#'${HOME}/'}" ;;
+          esac
+          case "$target" in
+            *'$'*|'') ;;                                  # still unexpanded, or none: unknown
+            /*) printf '%s\n' "$target" ;;
+          esac ;;
+        *)
+          if [ -n "$prog" ]; then printf '%s\n' "$prog"; fi ;;
+      esac ;;
     *)
       command -v systemctl >/dev/null 2>&1 || return 0
       pid="$(systemctl --user show "$UNIT" -p MainPID --value 2>/dev/null || true)"
