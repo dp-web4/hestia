@@ -204,6 +204,66 @@ export interface PendingEscalation {
   /** What else the bar still requires when this operator alone does not suffice. */
   still_needs: string[] | null;
   request_id: string | null;
+  /**
+   * What the retained act would DO, measured by the daemon (`evidence::write_effect`), never
+   * the member's description. Absent when the act is not measurable (then nothing is shown,
+   * rather than a guess). Two shapes: a copy (`cp <source> <governed>`) and, with `kind:
+   * "patch"`, a patch application (`git apply|am`, `patch -i|<`).
+   */
+  write_effect?: WriteEffect | null;
+}
+
+export interface PatchFileStat {
+  path: string;
+  added: number;
+  removed: number;
+  created: boolean;
+  deleted: boolean;
+  /** Present when the patch changes (or, on creation, sets) the file mode. */
+  old_mode?: string;
+  new_mode?: string;
+  renamed_from?: string;
+  copied_from?: string;
+  /** Binary content changes: `added`/`removed` do not count them. */
+  binary?: boolean;
+}
+
+export interface WriteEffect {
+  kind?: "patch";
+  // copy-shaped
+  source?: string;
+  source_readable?: boolean;
+  source_lines?: number;
+  /** false: the source was over the measurement cap (or unreadable) and was NOT read. */
+  source_read?: boolean;
+  source_bytes?: number | null;
+  compared_against?: { path: string; what: string } | null;
+  /** false: the enforcing copy could not be read, so no diff is claimed. */
+  enforcing_read?: boolean;
+  identical_to_enforcing?: boolean;
+  // patch-shaped
+  patch_path?: string;
+  patch_readable?: boolean;
+  /** false: the patch was over the measurement cap and was NOT read; counts are null. */
+  patch_read?: boolean;
+  patch_bytes?: number | null;
+  files?: PatchFileStat[] | null;
+  file_count?: number | null;
+  payload_unbound_reason?: string | null;
+  /**
+   * false whenever `incomplete` names something the summary does not represent (binary
+   * content, an unknown header, a cut hunk, an unsupported diff format...). A surface must
+   * say so: an incomplete summary read as the whole patch is an endorsement of unseen bytes.
+   */
+  summary_complete?: boolean;
+  incomplete?: string[];
+  // both
+  payload_sha256?: string | null;
+  added_lines?: number | null;
+  removed_lines?: number | null;
+  diff?: string[] | null;
+  diff_truncated?: boolean;
+  note?: string;
 }
 
 export interface DaemonStatus {
