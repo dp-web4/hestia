@@ -483,10 +483,15 @@ def _witness_gate_self(event_type, marker, tool_name, rule=None):
 def _claim_self_write(marker, tool_name, attempted):
     """Seat wrapper; every failure is a refusal, spelled the way the local copy spelled it."""
     try:
-        return __import__('hestia_gate_mechanism').claim_self_write(
+        _m = __import__('hestia_gate_mechanism')
+        return _m.claim_self_write(
             marker, tool_name, attempted,
             plugin_id=HESTIA_PLUGIN_ID, role=_role_bridge(),
-            client_name='hestia-kimi-gate-self', host_session_id=_EVENT.get("session_id"))
+            client_name='hestia-kimi-gate-self', host_session_id=_EVENT.get("session_id"),
+            invocation_key=_m.correlation_key(_EVENT),  # #1169
+            # This hook stops a superseded invocation in every MODE (Gate 2 below), so it may
+            # declare it; the daemon reclaims only spends whose seat did.
+            supersession="hard_stop")
     except Exception:
         return "unreachable", "no answer from the daemon — refused", None, None
 
@@ -739,6 +744,18 @@ def main():
                     sys.exit(2)
                 sys.stderr.write("hestia: warn [safety] — society-safety mechanism unavailable "
                                  "(warn-rollout: allowed).\n")
+            if verdict is not None and getattr(verdict, "superseded", False):
+                # SUPERSEDED (#1169, GPT review of ca5f394): a reclaim re-delivered this call's
+                # approval to another invocation. That is an INTEGRITY fence, not a policy verdict,
+                # so it is ALWAYS enforced -- like gate-self, and for the same reason: a warn-rollout
+                # that let it through would run this call beside its replacement. This hook
+                # declares that on every claim (supersession="hard_stop"), and the daemon never
+                # reclaims a spend whose seat did not.
+                _record_refusal("deny", "invocation-superseded", False,
+                                attempted="superseded by a reclaim")
+                sys.stderr.write(verdict.message if verdict.message.endswith("\n")
+                                 else verdict.message + "\n")
+                sys.exit(2)
             if verdict is not None and not verdict.allow:  # enforced deny OR no-verdict -> fail closed
                 msg = (verdict.message
                        or "hestia: deny [safety] — blocked/inconclusive at the society safety gate.")

@@ -97,6 +97,7 @@ impl ServerHandler for HestiaServer {
             "hestia_gate_escalation_poll" => tool_gate_escalation_poll(&self.state, &args).await,
             "hestia_escalation_evidence" => tool_escalation_evidence(&self.state, &args).await,
             "hestia_gate_escalation_claim" => tool_gate_escalation_claim(&self.state, &args).await,
+            "hestia_gate_escalation_lookup" => tool_gate_escalation_lookup(&self.state, &args).await,
             "hestia_gate_escalation_corroborate" => {
                 tool_gate_escalation_corroborate(&self.state, &args).await
             }
@@ -431,6 +432,17 @@ fn hestia_tools() -> Vec<Tool> {
             "Claim a human's approval for a write to the governance surface, or open an escalation and REFUSE. One round trip, because a hook that outlives its harness timeout is killed and the tool then runs ANYWAY — so nothing waits in-hook. Either an approval already exists for this exact (member, file) and is spent here (single use), or the write is refused now and a human decides out of band; re-issue the write to use the approval. ONE ACT, ONE RULING (#668): if this exact act is \
              already pending from you, the answer carries THAT escalation_id with `coalesced: true` \
              — no second petition is minted and no peer is woken again; wait on the id you are given",
+        ),
+        t_args(
+            "hestia_gate_escalation_lookup",
+            "What did the daemon do for this request? (#1166) A gate hook sends a `request_key` with every claim; when the hook's deadline passes, the outcome is UNKNOWN -- the daemon may still have opened, coalesced or claimed. This answers from the key: the escalation id, what was done, when, and the escalation's current status. READ-ONLY: it never observes an escalation and never starts or moves a claim window (unlike hestia_gate_escalation_poll, which is an observation, #667/#732). An unknown key is `found: false`, which means only that this daemon holds no record for it.",
+            json!({
+                "type": "object",
+                "required": ["request_key"],
+                "properties": {
+                    "request_key": {"type": "string", "description": "The 64-hex sha256 request key the refusal printed."}
+                }
+            }),
         ),
         t(
             "hestia_gate_escalation_poll",
@@ -891,10 +903,31 @@ pub(crate) async fn tool_begin_action(state: &SharedState, args: &Value) -> Tool
     let intent = optional_string(args, "intent");
     // The host agent's own stable session id (the real audit grain).
     let host_session_id = optional_string(args, "host_session_id");
+    // The tool INVOCATION this begin is for (#1169): its correlation key. The gate sends it
+    // from the society-safety check, which runs BEFORE the tool, so "a begin was seen for K"
+    // is the daemon's own evidence that invocation K reached execution. It can only ever make
+    // a reclaim LESS likely, so a caller naming someone else's key gains nothing.
+    let correlation_key = optional_string(args, "correlation_key")
+        .filter(|k| super::gate_escalation::valid_correlation_key(k));
 
     let mut s = state.lock().await;
     let action_id = Uuid::new_v4();
     let chain_position = s.chain_len();
+    if let Some(k) = &correlation_key {
+        // A FENCED invocation does not begin (#1169): its permit was re-delivered to another
+        // invocation by a reclaim. Refusing here makes the mechanism return no verdict, and the
+        // gate denies -- so the superseded original and its replacement can never both run.
+        if let Some((at, esc)) = s.gate_escalations.fenced_by(k).cloned() {
+            return Ok(hestia_error_envelope(
+                "hestia.invocation_superseded",
+                &format!("invocation {k} was superseded by a reclaim of escalation {esc} at {at}: \
+its permit now belongs to another invocation, so this one may not begin"),
+                Some(json!({"correlation_key": k, "escalation_id": esc, "fenced_at": at})),
+            ));
+        }
+        let now = super::gate_escalation::now_secs();
+        s.gate_escalations.record_begin(k, now);
+    }
 
     let session_id = resolve_session_uuid(&s, session_id_arg.as_deref()).unwrap_or_else(Uuid::nil);
 
@@ -13462,6 +13495,291 @@ mod tests {
     ///
     /// The exclusion is narrow by construction, and the control arm is the point: a member that
     /// declares NOTHING is unknown, not doorless, and is still invited.
+    /// #1166 / #774 / #1169 through the REAL claim handler. A reclaim recovers ONE lost answer;
+    /// it is never repeat authority. GPT's review of #1169: the first version reclaimed on the
+    /// ACT, so an identical command after a delivered, executed permit got a second permit --
+    /// and the test that shipped with it called the handler twice after success, which
+    /// demonstrated the bug. Each arm below is one of the cases that review named.
+    #[tokio::test]
+    async fn a_reclaim_recovers_one_lost_answer_and_never_repeats_a_delivered_permit() {
+        use crate::server::gate_escalation::{Channel, EscalationStore};
+        let (_dir, shared) = make_shared_state();
+        let sid = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h",
+                                                "host_session_id": "hs-1"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let key = "a".repeat(64);
+        let claim = |inv: &str| json!({
+            "plugin_id": "codex", "session_id": sid, "tool_name": "Bash",
+            "marker": "pre_tool_use.py", "reason": "Bash: git apply /tmp/p/fix.patch",
+            "request_key": key, "invocation_key": inv, "supersession": "hard_stop",
+        });
+        let approve = |shared: SharedState, id: String| async move {
+            let mut s = shared.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            s.gate_escalations.decide(&id, true, "operator", "role:constellation:sovereign",
+                                      Channel::OperatorSession, None, Some("ok"), now).unwrap();
+        };
+
+        // The open's answer is lost; the re-issue folds into it and lookup finds it.
+        let first = tool_gate_escalation_claim(&shared, &claim("inv-1")).await.unwrap();
+        let esc_id = first["escalation_id"].as_str().unwrap().to_string();
+        let again = tool_gate_escalation_claim(&shared, &claim("inv-2")).await.unwrap();
+        assert_eq!(again["coalesced"], json!(true), "{again}");
+        let looked = tool_gate_escalation_lookup(&shared, &json!({"request_key": key})).await.unwrap();
+        assert_eq!(looked["escalation_id"], json!(esc_id));
+
+        // (a) DELIVERED AND EXECUTED: the permit is spent by inv-3, whose gate then reaches
+        //     the society-safety begin_action (execution path). A NEW identical invocation
+        //     must NOT inherit it.
+        approve(shared.clone(), esc_id.clone()).await;
+        let spent = tool_gate_escalation_claim(&shared, &claim("inv-3")).await.unwrap();
+        assert_eq!(spent["claimed"], json!(true), "{spent}");
+        tool_begin_action(&shared, &json!({"tool_name": "Bash", "session_id": sid,
+                                           "correlation_key": "inv-3"})).await.unwrap();
+        let repeat = tool_gate_escalation_claim(&shared, &claim("inv-4")).await.unwrap();
+        assert_eq!(repeat["permits_write"], json!(false), "a delivered, executed permit is not inherited: {repeat}");
+        assert!(repeat["reclaim_refused"].as_str().unwrap_or("").contains("reached execution"), "{repeat}");
+
+        // (b) GENUINELY UNRESOLVED: a second approval is spent by inv-5 and no begin for
+        //     inv-5 ever arrives (the hook denied on the lost answer). A new invocation
+        //     reclaims ONCE; a further retry is refused.
+        let esc2 = repeat["escalation_id"].as_str().unwrap().to_string();
+        approve(shared.clone(), esc2.clone()).await;
+        let spent2 = tool_gate_escalation_claim(&shared, &claim("inv-5")).await.unwrap();
+        assert_eq!(spent2["claimed"], json!(true), "{spent2}");
+        let observed_before = shared.lock().await.gate_escalations.get(&esc2).unwrap().observed_at;
+        let re = tool_gate_escalation_claim(&shared, &claim("inv-6")).await.unwrap();
+        assert_eq!(re["reclaimed"], json!(true), "{re}");
+        assert_eq!(re["permits_write"], json!(true));
+        assert_eq!(re["escalation_id"], json!(esc2));
+        assert!(re["witnessEntryHash"].as_str().is_some(), "the reclaim is durably witnessed: {re}");
+        let twice = tool_gate_escalation_claim(&shared, &claim("inv-7")).await.unwrap();
+        assert_eq!(twice["permits_write"], json!(false), "only once: {twice}");
+        assert!(twice["reclaim_refused"].as_str().unwrap_or("").contains("already reclaimed"), "{twice}");
+        // Lookup is read-only.
+        let _ = tool_gate_escalation_lookup(&shared, &json!({"request_key": key})).await.unwrap();
+        assert_eq!(shared.lock().await.gate_escalations.get(&esc2).unwrap().observed_at, observed_before);
+
+        // (c) THE SAME INVOCATION retried: its permit was delivered to it.
+        let esc3 = twice["escalation_id"].as_str().unwrap().to_string();
+        approve(shared.clone(), esc3.clone()).await;
+        let spent3 = tool_gate_escalation_claim(&shared, &claim("inv-8")).await.unwrap();
+        assert_eq!(spent3["claimed"], json!(true), "{spent3}");
+        let same = tool_gate_escalation_claim(&shared, &claim("inv-8")).await.unwrap();
+        assert_eq!(same["permits_write"], json!(false), "{same}");
+        assert!(same["reclaim_refused"].as_str().unwrap_or("").contains("same invocation"), "{same}");
+
+        // A replay rebuilds the key map, and a replayed claim is never reclaimable.
+        let entries = {
+            let s = shared.lock().await;
+            let mut v = s.chain_store.read_recent(400).unwrap();
+            v.sort_by_key(|e| e.timestamp);
+            v
+        };
+        let mut rebuilt = EscalationStore::default();
+        rebuilt.rehydrate(&entries, crate::server::gate_escalation::now_secs() + 1);
+        assert!(rebuilt.request_key(&key).is_some(), "the key survives a restart");
+        let after_restart = rebuilt.reclaimable(&key, "codex", "pre_tool_use.py",
+            Some("Bash: git apply /tmp/p/fix.patch"), None, Some("hs-1"), Some("inv-9"),
+            crate::server::gate_escalation::now_secs() + 1);
+        assert!(after_restart.is_err(), "a claim older than this daemon is not reclaimable");
+    }
+
+    /// THE CLAIM/BEGIN RACE (GPT review of 8056dce). A claims successfully; before A's
+    /// begin_action, B (same request key, different invocation) reclaims -- no begin for A exists
+    /// yet, so the reclaim is permitted. Without a fence, A and B then both reach begin_action and
+    /// both run. With it: the reclaim fences A in the same state change, A's begin is refused,
+    /// B's proceeds -- at most one invocation authorized. Also: the other order (A begins first)
+    /// refuses the reclaim; replay rebuilds the fence; eviction pressure refuses the reclaim.
+    #[tokio::test]
+    async fn a_reclaim_fences_the_superseded_invocation_so_only_one_runs() {
+        use crate::server::gate_escalation::{Channel, EscalationStore, BEGINS_SEEN_CAP};
+        let (_dir, shared) = make_shared_state();
+        let sid = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h",
+                                                "host_session_id": "hs-1"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let key = "f".repeat(64);
+        let claim = |inv: &str| json!({
+            "plugin_id": "codex", "session_id": sid, "tool_name": "Bash",
+            "marker": "pre_tool_use.py", "reason": "Bash: git apply /tmp/p/race.patch",
+            "request_key": key, "invocation_key": inv, "supersession": "hard_stop",
+        });
+        let begin = |inv: &str| json!({"tool_name": "Bash", "session_id": sid, "correlation_key": inv});
+        let approve = |shared: SharedState, id: String| async move {
+            let mut s = shared.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            s.gate_escalations.decide(&id, true, "operator", "role:constellation:sovereign",
+                                      Channel::OperatorSession, None, Some("ok"), now).unwrap();
+        };
+
+        // (a) the race: claim A, reclaim B BEFORE A begins.
+        let opened = tool_gate_escalation_claim(&shared, &claim("inv-A0")).await.unwrap();
+        let esc = opened["escalation_id"].as_str().unwrap().to_string();
+        approve(shared.clone(), esc.clone()).await;
+        let a = tool_gate_escalation_claim(&shared, &claim("inv-A")).await.unwrap();
+        assert_eq!(a["claimed"], json!(true), "{a}");
+        let b = tool_gate_escalation_claim(&shared, &claim("inv-B")).await.unwrap();
+        assert_eq!(b["reclaimed"], json!(true), "B reclaims: A has not begun: {b}");
+        let begin_a = tool_begin_action(&shared, &begin("inv-A")).await.unwrap();
+        assert_eq!(begin_a["_hestia_error"]["code"], json!("hestia.invocation_superseded"),
+                   "A's begin is refused once B holds the permit: {begin_a}");
+        let begin_b = tool_begin_action(&shared, &begin("inv-B")).await.unwrap();
+        assert!(begin_b.get("actionId").is_some(), "B's begin proceeds: {begin_b}");
+        let row = {
+            let s = shared.lock().await;
+            s.chain_store.read_recent(80).unwrap().into_iter()
+                .find(|e| e.event_type == "gate_escalation_reclaimed").unwrap()
+        };
+        assert_eq!(row.event_data["fenced_invocation_key"], json!("inv-A"));
+
+        // A third invocation cannot reclaim again, and B cannot be superseded.
+        let c = tool_gate_escalation_claim(&shared, &claim("inv-C")).await.unwrap();
+        assert_eq!(c["permits_write"], json!(false), "{c}");
+
+        // (e) replay rebuilds the fence from the reclaimed row.
+        let entries = {
+            let s = shared.lock().await;
+            let mut v = s.chain_store.read_recent(400).unwrap();
+            v.sort_by_key(|e| e.timestamp);
+            v
+        };
+        let mut rebuilt = EscalationStore::default();
+        rebuilt.rehydrate(&entries, crate::server::gate_escalation::now_secs());
+        assert!(rebuilt.fenced_by("inv-A").is_some(), "a restart keeps the fence");
+        assert!(rebuilt.fenced_by("inv-B").is_none());
+
+        // (b) the other order: claim D, begin D, then a reclaim is REFUSED.
+        let e2 = c["escalation_id"].as_str().unwrap().to_string();
+        approve(shared.clone(), e2.clone()).await;
+        let d = tool_gate_escalation_claim(&shared, &claim("inv-D")).await.unwrap();
+        assert_eq!(d["claimed"], json!(true), "{d}");
+        let begin_d = tool_begin_action(&shared, &begin("inv-D")).await.unwrap();
+        assert!(begin_d.get("actionId").is_some(), "{begin_d}");
+        let late = tool_gate_escalation_claim(&shared, &claim("inv-E")).await.unwrap();
+        assert_eq!(late["permits_write"], json!(false), "{late}");
+        assert!(late["reclaim_refused"].as_str().unwrap_or("").contains("reached execution"), "{late}");
+
+        // (d) eviction under pressure inside the window refuses the reclaim.
+        let e3 = late["escalation_id"].as_str().unwrap().to_string();
+        approve(shared.clone(), e3.clone()).await;
+        let g = tool_gate_escalation_claim(&shared, &claim("inv-G")).await.unwrap();
+        assert_eq!(g["claimed"], json!(true), "{g}");
+        {
+            let mut s = shared.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            for i in 0..=BEGINS_SEEN_CAP {
+                s.gate_escalations.record_begin(&format!("filler-{i}"), now);
+            }
+        }
+        let h = tool_gate_escalation_claim(&shared, &claim("inv-H")).await.unwrap();
+        assert_eq!(h["permits_write"], json!(false), "evicted evidence is not recovery authority: {h}");
+        assert!(h["reclaim_refused"].as_str().unwrap_or("").contains("evicted"), "{h}");
+    }
+
+    /// GPT review of ca5f394: a fence is only a cancellation if the superseded invocation's OWN
+    /// hook stops on it in every rollout mode. A spend whose seat did not declare
+    /// `supersession: "hard_stop"` is therefore never reclaimed -- the retry gets a new petition
+    /// instead, and the original keeps its permit unfenced. The declared arm is the control.
+    #[tokio::test]
+    async fn a_reclaim_needs_the_original_seat_to_hard_stop_supersession() {
+        use crate::server::gate_escalation::Channel;
+        let (_dir, shared) = make_shared_state();
+        let sid = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h",
+                                                "host_session_id": "hs-1"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let approve = |shared: SharedState, id: String| async move {
+            let mut s = shared.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            s.gate_escalations.decide(&id, true, "operator", "role:constellation:sovereign",
+                                      Channel::OperatorSession, None, Some("ok"), now).unwrap();
+        };
+        // Each arm has its OWN invocations: a begin for one arm's A is execution evidence that
+        // would (correctly) refuse the other arm's reclaim inside the same second.
+        for (key, declared, a_inv, b_inv) in [("1".repeat(64), false, "inv-A1", "inv-B1"),
+                                              ("2".repeat(64), true, "inv-A2", "inv-B2")] {
+            let claim = |inv: &str, sup: bool| {
+                let mut a = json!({
+                    "plugin_id": "codex", "session_id": sid, "tool_name": "Bash",
+                    "marker": "pre_tool_use.py", "reason": format!("Bash: git apply /tmp/p/{key}.patch"),
+                    "request_key": key, "invocation_key": inv,
+                });
+                if sup {
+                    a["supersession"] = json!("hard_stop");
+                }
+                a
+            };
+            let opened = tool_gate_escalation_claim(&shared, &claim(&format!("{a_inv}-0"), declared)).await.unwrap();
+            approve(shared.clone(), opened["escalation_id"].as_str().unwrap().to_string()).await;
+            let a = tool_gate_escalation_claim(&shared, &claim(a_inv, declared)).await.unwrap();
+            assert_eq!(a["claimed"], json!(true), "{a}");
+            let row = {
+                let s = shared.lock().await;
+                s.chain_store.read_recent(80).unwrap().into_iter()
+                    .filter(|e| e.event_type == "gate_escalation_claimed")
+                    .find(|e| e.event_data["request_key"] == json!(key)).unwrap()
+            };
+            // B ALWAYS declares: the capability that matters is the ORIGINAL's.
+            let b = tool_gate_escalation_claim(&shared, &claim(b_inv, true)).await.unwrap();
+            let begin_a = tool_begin_action(&shared, &json!({"tool_name": "Bash", "session_id": sid,
+                                                              "correlation_key": a_inv})).await.unwrap();
+            if declared {
+                assert_eq!(row.event_data["supersession"], json!("hard_stop"), "recorded on the spend");
+                assert_eq!(b["reclaimed"], json!(true), "control: a declared seat is reclaimable: {b}");
+                assert_eq!(begin_a["_hestia_error"]["code"], json!("hestia.invocation_superseded"));
+            } else {
+                assert_eq!(row.event_data["supersession"], json!(null), "{row:?}");
+                assert_eq!(b["permits_write"], json!(false), "no reclaim without hard-stop: {b}");
+                assert!(b["reclaim_refused"].as_str().unwrap_or("").contains("hard-stops"), "{b}");
+                assert!(begin_a.get("actionId").is_some(), "A was never fenced: {begin_a}");
+            }
+        }
+    }
+
+    /// (d) FAIL CLOSED (#1169 P1-2): if the reclaim's witness cannot be appended, nothing is
+    /// granted and no reclaimed projection is recorded.
+    #[tokio::test]
+    async fn a_reclaim_whose_witness_fails_grants_nothing() {
+        use crate::server::gate_escalation::RequestKeyRecord;
+        let (_dir, shared) = make_shared_state();
+        let key = "e".repeat(64);
+        let rec = RequestKeyRecord {
+            outcome: "claimed".into(), escalation_id: "E9".into(),
+            at: crate::server::gate_escalation::now_secs(), plugin_id: "codex".into(),
+            marker: "pre_tool_use.py".into(), act_digest: None, payload_sha256: None,
+            host_session_id: None, invocation_key: Some("inv-1".into()),
+            supersession_hard_stop: true,
+        };
+        let mut s = shared.lock().await;
+        s.gate_escalations.record_request_key(&key, rec.clone());
+        let out = commit_reclaim(&mut s, &rec, &key, "Bash", None, Some("inv-2"),
+                                 crate::server::gate_escalation::now_secs(),
+                                 |_, _, _| Err(anyhow::anyhow!("disk full")))
+            .unwrap();
+        assert_eq!(out["permits_write"], json!(false), "{out}");
+        assert_eq!(out["claimed"], json!(false));
+        assert_eq!(out["refused"], json!("reclaim_not_recorded"));
+        assert!(out["error"].as_str().unwrap().contains("disk full"));
+        assert_eq!(s.gate_escalations.request_key(&key).unwrap().outcome, "claimed",
+                   "no reclaimed projection without its witness");
+        assert!(s.gate_escalations.fenced_by("inv-1").is_none(),
+                "nothing granted, so nothing superseded: the fence is lifted");
+        // Control: the same call with a working append grants.
+        let ok = commit_reclaim(&mut s, &rec, &key, "Bash", None, Some("inv-2"),
+                                crate::server::gate_escalation::now_secs(),
+                                |s, kind, payload| s.append_chain(kind, payload)).unwrap();
+        assert_eq!(ok["permits_write"], json!(true), "{ok}");
+        assert_eq!(s.gate_escalations.request_key(&key).unwrap().outcome, "reclaimed");
+        assert!(s.gate_escalations.fenced_by("inv-1").is_some(), "a granted reclaim fences the original");
+    }
+
+    fn spent_at(entries: &[crate::storage::chain::ChainEntry], esc_id: &str) -> u64 {
+        entries.iter()
+            .find(|e| e.event_type == "gate_escalation_claimed"
+                      && e.event_data["escalation_id"] == json!(esc_id))
+            .map(|e| e.timestamp.timestamp() as u64)
+            .expect("a claimed row")
+    }
+
     #[tokio::test]
     async fn an_invitation_skips_a_member_that_declared_no_review_door() {
         let (_dir, shared) = make_shared_state();
@@ -21564,6 +21882,38 @@ fn shadow_adjudicate(s: &mut crate::server::state::ServerState, escalation_id: &
     }
 }
 
+/// `hestia_gate_escalation_lookup` (#1166): what was done for a request key. READ-ONLY by
+/// construction -- it takes the store by shared reference, so it cannot observe, spend or arm.
+async fn tool_gate_escalation_lookup(state: &SharedState, args: &Value) -> ToolResult {
+    let key = require_string(args, "request_key")?;
+    if !super::gate_escalation::valid_request_key(&key) {
+        return Err(anyhow::anyhow!(
+            "'request_key' must be a sha256 hex digest (64 lowercase hex characters)"
+        ));
+    }
+    let now = crate::server::gate_escalation::now_secs();
+    let s = state.lock().await;
+    let store = &s.gate_escalations;
+    let Some(rec) = store.request_key(&key) else {
+        return Ok(json!({
+            "found": false,
+            "request_key": key,
+            "note": "no record for this key on this daemon: either the request never reached it, or the record predates the replay window",
+        }));
+    };
+    let esc = store.get(&rec.escalation_id);
+    Ok(json!({
+        "found": true,
+        "request_key": key,
+        "outcome": rec.outcome,
+        "escalation_id": rec.escalation_id,
+        "at": rec.at,
+        "status": esc.map(|e| e.status_at(now)),
+        "consumed_at": esc.and_then(|e| e.consumed_at),
+        "note": "read-only: this lookup observed nothing and started no claim window",
+    }))
+}
+
 /// The evidence bundle for one escalation — `PRD_ADJUDICATOR_LADDER` §3.3.
 ///
 /// READ-ONLY AND NOT WITNESSED, for the same reason `tool_gate_escalation_poll` is not:
@@ -21703,6 +22053,102 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
 /// runs the tool anyway (kimi-code, PR #114 review — the in-hook wait failed OPEN). So the hook
 /// never waits: it asks this once, and either an approval was already granted and is spent here,
 /// or the write is refused and a human decides out of band.
+/// Grant a reclaim ONLY if its witness is durable (GPT review of #1169, P1-2). The append is
+/// the record that this permit was handed out a second time for one approval; if it cannot be
+/// written, nothing is granted and no reclaimed projection is recorded. `append` is a parameter
+/// so the failure arm is testable without breaking a real chain store (the apply_ratification
+/// pattern).
+#[allow(clippy::too_many_arguments)]
+fn commit_reclaim(
+    s: &mut super::state::ServerState,
+    prev: &super::gate_escalation::RequestKeyRecord,
+    key: &str,
+    tool_name: &str,
+    proven_host_session_id: Option<&str>,
+    invocation_key: Option<&str>,
+    now: u64,
+    append: impl FnOnce(&mut super::state::ServerState, &str, Value)
+        -> anyhow::Result<crate::storage::chain::ChainEntry>,
+) -> ToolResult {
+    let esc = s.gate_escalations.get(&prev.escalation_id).cloned();
+    // THE FENCE (GPT review of 8056dce): this state change grants the permit to a NEW
+    // invocation, so in the same change the ORIGINAL invocation is barred from beginning. All
+    // of this runs under the one state lock the begin handler also takes, so of {the
+    // original's begin, this reclaim} the first ordered wins: if the begin came first,
+    // `reclaimable` already refused ("reached execution"); if this comes first, the begin is
+    // refused (hestia.invocation_superseded). At most one invocation is ever authorized.
+    let Some(original) = prev.invocation_key.clone() else {
+        return Ok(json!({
+            "claimed": false, "permits_write": false, "request_key": key,
+            "escalation_id": prev.escalation_id, "refused": "reclaim_unfenceable",
+            "error": "the claim recorded no invocation, so the superseded one cannot be fenced; nothing is granted",
+        }));
+    };
+    if !s.gate_escalations.fence(&original, &prev.escalation_id, now) {
+        return Ok(json!({
+            "claimed": false, "permits_write": false, "request_key": key,
+            "escalation_id": prev.escalation_id, "refused": "fence_table_full",
+            "error": "every fence is still inside its lifetime, so the superseded invocation cannot be fenced; nothing is granted (fail closed)",
+        }));
+    }
+    let payload = json!({
+        "escalation_id": prev.escalation_id,
+        "plugin_id": prev.plugin_id,
+        "subject_instance_lct": s.member_lct(&prev.plugin_id),
+        "tool_name": tool_name,
+        "marker": prev.marker,
+        "request_key": key,
+        "act_digest": prev.act_digest,
+        "payload_sha256": prev.payload_sha256,
+        "host_session_id": proven_host_session_id,
+        "first_claimed_at": prev.at,
+        "secs_since_first_claim": now.saturating_sub(prev.at),
+        "reclaim_window_secs": super::gate_escalation::RECLAIM_WINDOW_SECS,
+        "original_invocation_key": prev.invocation_key,
+        // The invocation this reclaim bars from begin_action; replay rebuilds the fence from it.
+        "fenced_invocation_key": original,
+        "invocation_key": invocation_key,
+        "evidence": "the claimed invocation never reached begin_action",
+    });
+    let entry = match append(s, "gate_escalation_reclaimed", payload) {
+        Ok(e) => e,
+        Err(e) => {
+            // Nothing granted, so nothing superseded: lift the fence written above. Keeping it
+            // would bar an invocation whose permit was never re-delivered.
+            s.gate_escalations.unfence(&original, &prev.escalation_id);
+            return Ok(json!({
+                "claimed": false,
+                "permits_write": false,
+                "request_key": key,
+                "escalation_id": prev.escalation_id,
+                "refused": "reclaim_not_recorded",
+                "error": format!("the reclaim could not be witnessed ({e}); nothing is granted. \
+The approval stays spent; a new petition is needed."),
+            }));
+        }
+    };
+    // Recorded only now that the witness is durable. The window stays anchored at the first
+    // claim, and the `reclaimed` outcome refuses any further reclaim of it.
+    s.gate_escalations.record_request_key(
+        key,
+        super::gate_escalation::RequestKeyRecord { outcome: "reclaimed".into(), ..prev.clone() },
+    );
+    Ok(json!({
+        "claimed": true,
+        "permits_write": true,
+        "reclaimed": true,
+        "request_key": key,
+        "escalation_id": prev.escalation_id,
+        "decided_by": esc.as_ref().and_then(|e| e.decided_by.clone()),
+        "decided_via": esc.as_ref().and_then(|e| e.decided_via.clone()),
+        "first_claimed_at": prev.at,
+        "single_use": "this is the SAME permit your request already spent, delivered to a new \
+invocation because the first never reached execution. It is not a second approval, and it \
+cannot be reclaimed again.",
+        "witnessEntryHash": entry.hash,
+    }))
+}
+
 async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::{now_secs, APPROVAL_CLAIM_WINDOW_SECS, DEFAULT_TTL_SECS};
 
@@ -21743,6 +22189,33 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     );
     let attempted_payload = attempted_binding.sha256.clone();
     let stated_detail = optional_string(args, "detail");
+    // THE REQUEST KEY (#1166, #774). The hook's round trip has a 1.5 s deadline; past it the
+    // outcome is UNKNOWN, not "nothing happened". The key -- stable across identical re-issues
+    // in one session -- is how a retry is answered with what the daemon already did. Refused
+    // by name if malformed: it is written to the chain, so it must be exactly a sha256.
+    let request_key = optional_string(args, "request_key");
+    if let Some(k) = &request_key {
+        if !super::gate_escalation::valid_request_key(k) {
+            return Err(anyhow::anyhow!(
+                "'request_key' must be a sha256 hex digest (64 lowercase hex characters); got {} characters",
+                k.len()
+            ));
+        }
+    }
+    // THE INVOCATION (#1169): the tool call's own correlation key (tool_use_id, kimi's
+    // tool_call_id, gemini's content key) -- what makes a retry distinguishable from a repeat.
+    let invocation_key = optional_string(args, "invocation_key")
+        .filter(|k| super::gate_escalation::valid_correlation_key(k));
+    // THE SEAT'S SUPERSESSION CAPABILITY (GPT review of ca5f394): whether the hook making this
+    // claim stops a superseded invocation in every rollout mode. Recorded on the spend; a spend
+    // whose seat did not declare it is never reclaimed, because the fence would not stop it.
+    let supersession_hard_stop = optional_string(args, "supersession").as_deref()
+        == Some(super::gate_escalation::SUPERSESSION_HARD_STOP);
+    let attempted_act_digest = attempted_act
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(super::gate_escalation::EscalationStore::act_digest_of);
     // The durable per-wake key the daemon's own outcome rows carry — the value that joins a
     // spent approval to the act that consumed it. ACCEPTED HERE ONLY TO BE CHECKED, NEVER TO
     // BE BELIEVED: the row written below carries the value DERIVED from the caller's proven
@@ -21928,11 +22401,40 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                 "decided_at": esc.decided_at,
                 "secs_from_decision_to_use": esc.decided_at.map(|d| now.saturating_sub(d)),
                 "secs_from_open_to_use": now.saturating_sub(esc.opened_at),
+                // #1166/#774: the key this spend answered, and what a retry must match.
+                "request_key": request_key,
+                "act_digest": attempted_act_digest,
+                "payload_sha256": esc.payload_sha256,
+                // #1169: the invocation this permit was delivered to.
+                "invocation_key": invocation_key,
+                // ...and whether its seat hard-stops it if a reclaim supersedes it (replayed).
+                "supersession": supersession_hard_stop
+                    .then_some(super::gate_escalation::SUPERSESSION_HARD_STOP),
             }),
         );
+        // The key record is a projection of the row: written only if the row is durable, so a
+        // restart can never hold a reclaim basis the chain does not (#1169, append audit).
+        if let (Some(k), true) = (&request_key, entry.is_ok()) {
+            s.gate_escalations.record_request_key(
+                k,
+                super::gate_escalation::RequestKeyRecord {
+                    outcome: "claimed".into(),
+                    escalation_id: esc.id.clone(),
+                    at: now,
+                    plugin_id: esc.plugin_id.clone(),
+                    marker: esc.marker.clone(),
+                    act_digest: attempted_act_digest.clone(),
+                    payload_sha256: esc.payload_sha256.clone(),
+                    host_session_id: proven_host_session_id.clone(),
+                    invocation_key: invocation_key.clone(),
+                    supersession_hard_stop,
+                },
+            );
+        }
         return Ok(json!({
             "claimed": true,
             "permits_write": true,
+            "request_key": request_key,
             "escalation_id": esc.id,
             "decided_by": esc.decided_by,
             "decided_via": esc.decided_via,
@@ -21940,6 +22442,34 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
             "single_use": "this approval is now spent; the next write needs a new one",
             "witnessEntryHash": entry.ok().map(|e| e.hash),
         }));
+    }
+
+    // THE SAME REQUEST ALREADY SPENT A GRANT, AND ITS ANSWER WAS LOST (#774, #1169). Recovery
+    // of ONE lost answer, never repeat authority: `reclaimable` requires that the claimed
+    // invocation never reached begin_action (the daemon's own execution evidence), that the
+    // retry is a DIFFERENT invocation, and that the claim has not been reclaimed before. When
+    // it refuses, the reason rides on whatever this call answers next.
+    let mut reclaim_refused: Option<&'static str> = None;
+    if let Some(k) = &request_key {
+        match s.gate_escalations.reclaimable(
+            k,
+            &plugin_id,
+            &marker,
+            attempted_act.as_deref(),
+            attempted_payload.as_deref(),
+            proven_host_session_id.as_deref(),
+            invocation_key.as_deref(),
+            now,
+        ) {
+            Ok(prev) => {
+                return commit_reclaim(&mut s, &prev, k, &tool_name, proven_host_session_id.as_deref(),
+                                      invocation_key.as_deref(), now,
+                                      |s, kind, payload| s.append_chain(kind, payload));
+            }
+            // "no record" is the ordinary case (a first claim): not worth saying.
+            Err(why) if why != "no record for this request key" => reclaim_refused = Some(why),
+            Err(_) => {}
+        }
     }
 
     // AN APPROVAL EXISTS FOR THIS ACT AND IT BOUND DIFFERENT BYTES (#1056).
@@ -21976,6 +22506,8 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
         return Ok(json!({
             "claimed": false,
             "refused": "payload_drift",
+            "request_key": request_key,
+            "reclaim_refused": reclaim_refused,
             "escalation_id": esc_id,
             "bound_payload_sha256": bound,
             "presented_payload_sha256": presented,
@@ -22004,13 +22536,36 @@ permit for something the approver did not see.",
         // after the prior ask, each costing the operator a ruling that bought nothing. Fold, witness,
         // and answer with the id that is already waiting.
         Ok(crate::server::gate_escalation::Opened::Coalesced(twin)) => {
-            let payload = coalesced_payload(&s, &twin, "claim", now);
+            let mut payload = coalesced_payload(&s, &twin, "claim", now);
+            payload["request_key"] = json!(request_key);
             let entry = s.append_chain("gate_escalation_coalesced", payload)?;
+            if let Some(k) = &request_key {
+                s.gate_escalations.record_request_key(
+                    k,
+                    super::gate_escalation::RequestKeyRecord {
+                        outcome: "coalesced".into(),
+                        escalation_id: twin.id.clone(),
+                        at: now,
+                        plugin_id: twin.plugin_id.clone(),
+                        marker: twin.marker.clone(),
+                        act_digest: twin.act_digest.clone(),
+                        payload_sha256: twin.payload_sha256.clone(),
+                        host_session_id: proven_host_session_id.clone(),
+                        invocation_key: invocation_key.clone(),
+                        // Only a SPEND's capability is read (by `reclaimable`); the replay of
+                        // this row reads none either, so the projection matches the row.
+                        supersession_hard_stop: false,
+                    },
+                );
+            }
             // Same reason as the member door: a folded ask must not take its disagreement
             // with it. This door is the one the gate hook drives, so it is where a shim that
             // has started asserting hashes would surface first.
             witness_payload_disagreement(&mut s, &twin.id, &attempted_binding, "claim_coalesced")?;
-            Ok(coalesced_response(&twin, &entry.hash, now))
+            let mut resp = coalesced_response(&twin, &entry.hash, now);
+            resp["request_key"] = json!(request_key);
+            resp["reclaim_refused"] = json!(reclaim_refused);
+            Ok(resp)
         }
         Ok(crate::server::gate_escalation::Opened::Minted(esc)) => {
             // THE SEAT KEYS (#542), same write as the member door: the two session
@@ -22076,12 +22631,37 @@ permit for something the approver did not see.",
                 .get("decided_awaiting_claim")
                 .cloned()
                 .unwrap_or_else(|| json!([]));
+            let mut payload = payload;
+            payload["request_key"] = json!(request_key);
             let entry = s.append_chain("gate_escalation_opened", payload)?;
+            if let Some(k) = &request_key {
+                s.gate_escalations.record_request_key(
+                    k,
+                    super::gate_escalation::RequestKeyRecord {
+                        outcome: "opened".into(),
+                        escalation_id: esc.id.clone(),
+                        at: now,
+                        plugin_id: esc.plugin_id.clone(),
+                        marker: esc.marker.clone(),
+                        act_digest: esc.act_digest.clone(),
+                        payload_sha256: esc.payload_sha256.clone(),
+                        host_session_id: proven_host_session_id.clone(),
+                        invocation_key: invocation_key.clone(),
+                        // Only a SPEND's capability is read (by `reclaimable`); the replay of
+                        // this row reads none either, so the projection matches the row.
+                        supersession_hard_stop: false,
+                    },
+                );
+            }
             shadow_adjudicate(&mut s, &esc.id);
             let invitations = deliver_invitations(&mut s, &esc, &inv.invited, &entry.hash);
             Ok(json!({
                 "claimed": false,
                 "permits_write": false,
+                "request_key": request_key,
+                // Why the spent permit this request already holds could not be reused, when it
+                // could not (#1169). Absent on an ordinary first claim.
+                "reclaim_refused": reclaim_refused,
                 "escalation_id": esc.id,
                 "expires_at": esc.expires_at,
                 "decide_within_secs": DEFAULT_TTL_SECS,
@@ -22146,6 +22726,7 @@ permit for something the approver did not see.",
             Ok(json!({
                 "claimed": false,
                 "permits_write": false,
+                "request_key": request_key,
                 "escalation_id": Value::Null,
                 "error": e.to_string(),
                 "then": "the write is refused",

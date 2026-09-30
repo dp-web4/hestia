@@ -507,6 +507,21 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/handler.rs::tool_gate_escalation_claim", &[
         "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
     ], SiteClass::Naming),
+    // ADDED 2026-09-29 (#1169, the reclaim of one lost claim answer, #1166/#774). Red on CI
+    // the moment the site was written, on the integration test `cargo test --lib` never runs
+    // -- the instrument working, and the reason this row exists.
+    //
+    // READING, both questions. (1) Who gets named? The member whose already-spent permit is
+    // being re-delivered -- attribution inside the `gate_escalation_reclaimed` entry, the
+    // same record-whose-permit class as `tool_gate_escalation_claim`'s `claimed` row above,
+    // with the same HST-005 caveat (`prev.plugin_id` is the caller-asserted id recorded at
+    // the first claim). (2) Compared to decide control flow? No -- the reclaim decision is
+    // `EscalationStore::reclaimable` over the request-key record, the begin_action
+    // execution evidence and the proven host session; no derived name is compared anywhere
+    // on that path. Naming, not Predicate. No registry read, so no REGISTRY_CENSUS row.
+    ("server/handler.rs::commit_reclaim", &[
+        "\"subject_instance_lct\": s.member_lct(&prev.plugin_id),",
+    ], SiteClass::Naming),
     ("server/handler.rs::tool_gate_arbitrate_escalation", &[
         "\"subject_instance_lct\": s.member_lct(&decided.plugin_id),",
     ], SiteClass::Naming),
