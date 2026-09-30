@@ -24,6 +24,13 @@ import sys
 import tempfile
 from typing import Any, Iterable
 
+# The projection rewrite is shared with hestia-deploy.sh's claude-code arm, which shells out
+# to the same module: one literal-safe implementation, tested once (sed's replacement side
+# expands `&` to the whole match — a deploy root like `build&review` corrupted the line it was
+# meant to re-point, GPT review of #1176).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from seat_projection_repoint import repoint as _repoint_projection  # noqa: E402
+
 
 def _commands_from_registration(path: Path, reader: str) -> list[str]:
     """Return declared hook commands, or raise for an unreadable declaration.
@@ -137,27 +144,21 @@ def _payload_denies(stdout: str) -> bool:
     )
 
 
-# A line the loader exports can be plain (`KEY=`) or seat-owned (`TOKEN__KEY=`); either spelling
-# must be re-pointed, and the token prefix must survive the rewrite.
-_PROJECTED_KEY = re.compile(r"^([A-Za-z0-9_]+__)?(HESTIA_SHARED_DIR|HESTIA_HOME)=")
-
-
 def _throwaway_seat_home(member: str, environment: dict[str, str], parent: Path) -> Path | None:
     """A seat home whose projection names the CANDIDATE engine, or None if unconfigured.
 
-    The candidate gate loads `$HESTIA_HOME/seats/<member>.env` at import and exports every
-    projected key OVER the probe environment (#944: the vault is the authority, a hook line is
-    not). That silently replaces the HESTIA_SHARED_DIR pin below with the INSTALLED engine
-    path, so the probe pairs the new gate with the old engine and every deploy that adds an
-    engine function the gate uses fails preflight forever (#1171: #1149's correlation_key
-    refused on CBP and Legion identically; nothing repaired it).
+    The candidate gate loads its seat projection at import and exports every projected key
+    OVER the probe environment (#944: the vault is the authority, a hook line is not). That
+    silently replaces the HESTIA_SHARED_DIR pin below with the INSTALLED engine path, so the
+    probe pairs the new gate with the old engine and every deploy that adds an engine function
+    the gate uses fails preflight forever (#1171: #1149's correlation_key refused on CBP and
+    Legion identically; nothing repaired it).
 
     The pairing that exists after install is gate + the tree being installed, so probe under a
-    throwaway home whose projection is the seat's own, with exactly two keys re-pointed:
-    HESTIA_SHARED_DIR at the candidate engine, and HESTIA_HOME at the throwaway (the loader
-    realpath-compares the projection's HESTIA_HOME against the launcher's and calls a mismatch
-    a miswire). A seat with no rendered projection keeps the probe env unchanged: its candidate
-    refuses config.unbacked either way, which is the truth of that seat.
+    throwaway home whose projection is the seat's own, re-pointed by the shared
+    seat_projection_repoint module. A seat with no rendered projection keeps the probe env
+    unchanged: its candidate refuses config.unbacked either way, which is the truth of that
+    seat.
     """
     launcher_home = environment.get(BOOTSTRAP_LOCATOR)
     if not launcher_home:
@@ -165,26 +166,8 @@ def _throwaway_seat_home(member: str, environment: dict[str, str], parent: Path)
     real_projection = Path(launcher_home) / "seats" / f"{member}.env"
     if not real_projection.is_file():
         return None
-    throwaway = parent / member
-    seats = throwaway / "seats"
-    seats.mkdir(parents=True)
-    rewritten: list[str] = []
-    seen: set[str] = set()
-    for line in real_projection.read_text(encoding="utf-8").splitlines():
-        m = _PROJECTED_KEY.match(line)
-        if m:
-            prefix, key = m.group(1) or "", m.group(2)
-            value = environment["HESTIA_SHARED_DIR"] if key == "HESTIA_SHARED_DIR" else str(throwaway)
-            rewritten.append(f"{prefix}{key}={value}")
-            seen.add(key)
-        else:
-            rewritten.append(line)
-    if "HESTIA_SHARED_DIR" not in seen:
-        rewritten.append(f"HESTIA_SHARED_DIR={environment['HESTIA_SHARED_DIR']}")
-    if "HESTIA_HOME" not in seen:
-        rewritten.append(f"HESTIA_HOME={throwaway}")
-    (seats / f"{member}.env").write_text("\n".join(rewritten) + "\n", encoding="utf-8")
-    return throwaway
+    return _repoint_projection(member, real_projection, parent / member,
+                               environment["HESTIA_SHARED_DIR"])
 
 
 def run_probes(
