@@ -811,6 +811,60 @@ def test_a_host_already_left_registered_without_the_dir_repairs():
         assert cfg.read_text() == registered
 
 
+def test_install_publishes_hestia_home_as_an_exact_path():
+    """#1186 (dp 2026-09-30): "that has to be part of the install globally" and "it has to be an exact
+    path for the machine, hestia won't recognise $HOME". The shared witness records nothing unless
+    HESTIA_HOME is in the SEAT's environment, and nothing set it: kimi and codex witnessed nothing all day.
+    The installer now writes the RESOLVED absolute path to environment.d and to a marked block in
+    ~/.profile (and ~/.bashrc when present), idempotently; a changed path updates the block in place."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        root, home, env = _e2e_root(tmp)
+        (home / ".bashrc").write_text("# user bashrc\nalias ll='ls -l'\n")
+        want = str(Path(env["HESTIA_HOME"]).resolve())
+
+        def run():
+            p = subprocess.run(["bash", str(root / "deploy" / "install-members.sh")], capture_output=True,
+                               text=True, env=env)
+            assert p.returncode == 0, (p.stdout + p.stderr)[-3000:]
+            return p.stdout + p.stderr
+
+        run()
+        envd = home / ".config" / "environment.d" / "50-hestia.conf"
+        assert envd.read_text() == f"HESTIA_HOME={want}\n", envd.read_text()
+        for f in (home / ".profile", home / ".bashrc"):
+            text = f.read_text()
+            assert f'export HESTIA_HOME="{want}"' in text, (f, text)
+            assert "$HOME" not in text.split(">>> hestia")[-1] and "~/" not in text.split(">>> hestia")[-1], text
+        assert "alias ll='ls -l'" in (home / ".bashrc").read_text(), "the user's own bashrc lines were lost"
+        before = {f: f.read_text() for f in (home / ".profile", home / ".bashrc", envd)}
+        run()                                                    # idempotent: nothing changes
+        for f, b in before.items():
+            assert f.read_text() == b, f"a second install changed {f}"
+            assert f.read_text().count(">>> hestia") <= 1, f
+        # a moved home updates the block in place (still exactly one block, the new exact path)
+        moved = tmp / "hestia-home-2"
+        moved.mkdir()
+        env2 = dict(env, HESTIA_HOME=str(moved))
+        p = subprocess.run(["bash", str(root / "deploy" / "install-members.sh")], capture_output=True,
+                           text=True, env=env2)
+        assert p.returncode == 0, (p.stdout + p.stderr)[-3000:]
+        prof = (home / ".profile").read_text()
+        assert prof.count(">>> hestia") == 1 and f'export HESTIA_HOME="{moved.resolve()}"' in prof, prof
+        assert envd.read_text() == f"HESTIA_HOME={moved.resolve()}\n"
+
+
+def test_install_without_a_bashrc_does_not_create_one():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        root, home, env = _e2e_root(tmp)
+        p = subprocess.run(["bash", str(root / "deploy" / "install-members.sh")], capture_output=True,
+                           text=True, env=env)
+        assert p.returncode == 0, (p.stdout + p.stderr)[-3000:]
+        assert not (home / ".bashrc").exists(), "the installer created a .bashrc the user never had"
+        assert (home / ".profile").exists()
+
+
 def test_covers():
     assert RM.covers("*", "*") and RM.covers(None, ".*") and RM.covers(".*", "*") and RM.covers("", None)
     assert not RM.covers("Read", "*") and not RM.covers("shell", ".*")
@@ -910,6 +964,8 @@ TESTS = [
     test_mixed_installed_and_missing_targets_exit_pending,
     test_the_hooks_dir_it_registers_into_is_made,
     test_a_host_already_left_registered_without_the_dir_repairs,
+    test_install_publishes_hestia_home_as_an_exact_path,
+    test_install_without_a_bashrc_does_not_create_one,
     test_covers,
     test_install_members_end_to_end_in_an_isolated_home,
     test_install_members_reports_a_narrow_gate_and_leaves_it,
