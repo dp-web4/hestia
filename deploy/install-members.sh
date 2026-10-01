@@ -654,3 +654,43 @@ verify_installed_gates() {
 }
 
 verify_installed_gates || exit 1
+
+# ---- every installed seat gets its seat document (#1186) ------------------------------------
+# A registered, hooked seat with no document in the vault has no rendered projection, and the
+# shared witness then records none of its allowed acts: every one returns `config.unbacked`,
+# silently, because the witness runs detached. On thor, codex and kimi-code were green for a
+# day like that until dp wrote their documents by hand. dp, 2026-09-30: "this all needs to be
+# automated in the install - we can't expect average users to fuss with this stuff."
+#
+# The seeder's --add-missing writes the minimum for each installed seat the vault does not
+# declare. It never modifies an existing document (the daemon re-checks every member is absent
+# under its own lock), and it grants nothing: no role and no scope. A seat with no HESTIA_ROLE
+# connects as the society default, role:constellation:member.
+#
+# NO OUTCOME FAILS THE INSTALL, the same rule as the gate verdict above. The hooks are installed
+# either way; a seat left without a document is named here, with the command that repairs it.
+add_missing_seat_documents() {
+    local seeder="$REPO_ROOT/tools/seed_seat_config.py" out rc=0 apply="--apply"
+    log "SEATS (tools/seed_seat_config.py --add-missing)"
+    if [ ! -f "$seeder" ]; then
+        log "  skipped: no seeder in this checkout ($seeder)"
+        return 0
+    fi
+    if [ ! -f "$HESTIA_HOME/operator.key" ]; then
+        log "  skipped: no operator key at $HESTIA_HOME/operator.key, so seat documents cannot be"
+        log "  written from here. Every hooked seat needs one, or its allowed acts go unwitnessed."
+        log "  As the operator:  HESTIA_HOME=$HESTIA_HOME python3 $seeder --add-missing --apply"
+        return 0
+    fi
+    [ "$DRY_RUN" = "1" ] && apply=""
+    out=$(HESTIA_HOME="$HESTIA_HOME" python3 "$seeder" --add-missing $apply 2>&1) || rc=$?
+    printf '%s\n' "$out" | while IFS= read -r line; do log "  $line"; done
+    if [ "$rc" != "0" ]; then
+        warn "seat documents were not all written (seeder exit $rc). Hooked seats without one"
+        warn "  record none of their allowed acts. Re-run as the operator:"
+        warn "    HESTIA_HOME=$HESTIA_HOME python3 $seeder --add-missing --apply"
+    fi
+    return 0
+}
+
+add_missing_seat_documents || exit 1

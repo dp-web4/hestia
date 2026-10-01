@@ -40,8 +40,19 @@ for the operators whose notes name it. Four lessons it carried came here with it
   * either Ed25519 backend signs the operator challenge (PyNaCl or `cryptography`); a seat
     with one and not the other is still a seat.
 
-    python3 tools/seed_seat_config.py            # measure, print the plan, change nothing
-    python3 tools/seed_seat_config.py --apply    # write, only if the namespace is empty
+ADD-MISSING (#1186). The ratchet above seeds a box ONCE, so a harness installed after that
+first seed never got a document. On thor, codex and kimi-code were registered, hooked and
+green for a day while every allowed act they took returned `config.unbacked`, until the
+operator wrote their documents by hand. `--add-missing` writes the same minimum for each
+installed seat the vault does not declare, and the shared set only if the vault has none. It
+never modifies a document an operator wrote: the daemon's `add_missing` seed mode re-checks
+that every proposed member is absent, under its own lock, and refuses the whole act otherwise.
+It grants nothing. With no HESTIA_ROLE in the document, a seat connects as the society
+default, `role:constellation:member`; any other role stays the operator's act.
+
+    python3 tools/seed_seat_config.py                          # measure, print the plan, change nothing
+    python3 tools/seed_seat_config.py --apply                  # write, only if the namespace is empty
+    python3 tools/seed_seat_config.py --add-missing --apply    # write only the seats the vault lacks
 """
 from __future__ import annotations
 
@@ -172,31 +183,38 @@ def namespace_state(listing: dict | list) -> tuple[bool, list[str]]:
 
 
 def plan(listing, seats: list[dict], home: Path, hestia_home: Path, endpoint: str,
-         host: str, workspace: str | None = None) -> tuple[str, list[tuple[str, dict]]]:
+         host: str, workspace: str | None = None,
+         add_missing: bool = False) -> tuple[str, list[tuple[str, dict]]]:
     """The whole decision, as a pure function so the ratchet can be tested without a daemon.
 
     Returns `(verdict, documents)` where verdict is `seed`, `occupied`, `no-seats`,
     `no-workspace` or `bad-endpoint`. Refusals are ordered by what they cost to learn: an
     occupied namespace first (nothing else matters), then the two facts that would have been
     written WRONG rather than not at all.
+
+    With `add_missing` an occupied namespace is not a refusal: the verdict is `add` with a
+    document for each installed seat the vault does not declare (and the shared set only if it
+    has none), or `complete` when every installed seat already has one.
     """
     shared_configured, configured = namespace_state(listing)
-    if shared_configured or configured:
+    if (shared_configured or configured) and not add_missing:
         return "occupied", []
     if not endpoint_is_mcp(endpoint):
         return "bad-endpoint", []
-    resolved = resolve_workspace(home, workspace)
-    if resolved is None:
-        return "no-workspace", []
-    documents: list[tuple[str, dict]] = [
-        (SHARED_MEMBER, shared_env(home, hestia_home, endpoint, resolved))
-    ]
+    documents: list[tuple[str, dict]] = []
+    if not shared_configured:
+        resolved = resolve_workspace(home, workspace)
+        if resolved is None:
+            return "no-workspace", []
+        documents.append((SHARED_MEMBER, shared_env(home, hestia_home, endpoint, resolved)))
     for seat in seats:
-        if seat["harness_home"].is_dir():
+        if seat["harness_home"].is_dir() and seat["member"] not in configured:
             documents.append((seat["member"], seat_env(seat, host)))
-    if len(documents) == 1:
+    if not any(m != SHARED_MEMBER for m, _ in documents):
+        if add_missing and (shared_configured or configured):
+            return "complete", []
         return "no-seats", []
-    return "seed", documents
+    return ("add" if add_missing else "seed"), documents
 
 
 # ---- the operator surface ------------------------------------------------------------
@@ -294,6 +312,9 @@ def verify_rendered(hestia_home: Path, documents: list[tuple[str, dict]]) -> lis
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Seed an EMPTY seat-config namespace.")
     parser.add_argument("--apply", action="store_true", help="write (default is a dry run)")
+    parser.add_argument("--add-missing", action="store_true",
+                        help="on a configured box, write only the installed seats the vault does "
+                             "not declare (never modifies an existing document)")
     parser.add_argument("--workspace", default=os.environ.get("HESTIA_WORKSPACE"),
                         help="the shared workspace root (else HESTIA_WORKSPACE, else an "
                              "existing ~/ai-workspace or ~/ai-agents; never guessed)")
@@ -347,7 +368,7 @@ def main(argv: list[str] | None = None) -> int:
     for note in skipped:
         print(f"  ! skipped {note}")
     verdict, documents = plan(listing, seats, home, hestia_home, endpoint, host,
-                              workspace=args.workspace)
+                              workspace=args.workspace, add_missing=args.add_missing)
 
     if verdict == "no-workspace":
         print("\nNO WORKSPACE RESOLVED — nothing is written. Pass --workspace, set")
@@ -362,7 +383,11 @@ def main(argv: list[str] | None = None) -> int:
         print("\nNAMESPACE IS NOT EMPTY — nothing is written.")
         print("  This tool seeds a box that has never been configured. A box that is partly")
         print("  configured is one somebody is configuring, and the missing half is a choice")
-        print("  this tool cannot read. Use the operator surface directly.")
+        print("  this tool cannot read. Use the operator surface directly, or pass")
+        print("  --add-missing to write only the installed seats the vault does not declare.")
+        return 0
+    if verdict == "complete":
+        print("\nEVERY INSTALLED SEAT HAS A DOCUMENT — nothing to add.")
         return 0
     if verdict == "no-seats":
         print("\nNO INSTALLED SEAT FOUND — nothing is written. Only the shared set would be,")
@@ -384,12 +409,18 @@ def main(argv: list[str] | None = None) -> int:
     # and this tool's own empty-only ratchet would then refuse to repair it, forever. The
     # daemon owns the compare-and-commit: it re-checks emptiness under its own lock, validates
     # and renders everything, and writes the vault once. This side is the planner.
-    note = f"seeded on {host}: the seat-config namespace was empty (tools/seed_seat_config.py)"
-    status, result = operator.call("POST", "/api/config/seed", {
-        "documents": {member: {"env": env, "note": note} for member, env in documents},
-    })
+    if verdict == "add":
+        note = (f"added on {host}: an installed seat the vault did not declare "
+                f"(tools/seed_seat_config.py --add-missing)")
+    else:
+        note = f"seeded on {host}: the seat-config namespace was empty (tools/seed_seat_config.py)"
+    body = {"documents": {member: {"env": env, "note": note} for member, env in documents}}
+    if verdict == "add":
+        body["mode"] = "add_missing"
+    status, result = operator.call("POST", "/api/config/seed", body)
     if status == 409:
-        print(f"\nREFUSED: the namespace was occupied between the plan and the commit.")
+        print(f"\nREFUSED: {'a seat was declared' if verdict == 'add' else 'the namespace was occupied'}"
+              f" between the plan and the commit.")
         print(f"  {json.dumps(result)[:300]}")
         print("  Nothing was written. Another writer won; that is the ratchet working.")
         return 0
