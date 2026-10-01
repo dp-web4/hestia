@@ -428,6 +428,65 @@ def test_path_grants_keep_their_type_and_match_resolved_boundaries():
     check("shell_path_prefix_sibling_is_not_a_descendant", G.evaluate(ev, narrow, ws).blocks)
 
 
+def test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly():
+    """#953 (third instance: thor 2026-09-30, a venv interpreter under the recursive workspace grant).
+
+    `<ws>/proj/venv/bin/python` is a lexical descendant of `path:<ws>/**` whose realpath is the system
+    interpreter. The command check refused it as "'proj' is not granted": over-refusal (naming the target
+    directly is allowed in a command) and misattribution (`proj` IS granted). The rule now: a reach that a
+    SYMLINK carries out of its grant is judged by its target, exactly as if the caller had named it.
+      - target outside the workspace: allowed, as a direct mention is, unless the target trips the egress
+        list (the symlink must not launder `~/.ssh/...` past a check that only reads command text);
+      - target inside the workspace outside every grant: still denied, and the deny names THAT repo.
+    Read is untouched: a Read outside the workspace is refused whether named directly or through a link.
+    (A NAMED repo grant is judged lexically and never reaches this rule; tightening that is its own
+    policy question, deliberately not changed here.)"""
+    ws = _workspace()
+    outside = tempfile.mkdtemp(dir=os.path.dirname(ws))          # a sibling of ws: OUTSIDE it
+    interp = os.path.realpath(sys.executable)
+    venv_bin = os.path.join(ws, "proj", "venv", "bin")
+    os.makedirs(venv_bin, exist_ok=True)
+    link = os.path.join(venv_bin, "python")
+    os.symlink(interp, link)
+    rec = ["path:" + ws + G.RECURSIVE_SUFFIX]
+
+    ok, tok, _ = G.command_scope_reach(f"{link} -c pass", rec, ws, ws)
+    check("venv_interpreter_under_recursive_grant_allows", ok, f"denied, offending={tok!r}")
+    ok, tok, _ = G.command_scope_reach(f"{interp} -c pass", rec, ws, ws)
+    check("control_naming_the_target_directly_allows", ok, f"denied, offending={tok!r}")
+
+    # the egress list is applied to the RESOLVED target
+    ssh = os.path.join(outside, ".ssh")
+    os.makedirs(ssh, exist_ok=True)
+    key = os.path.join(ssh, "id_test")
+    open(key, "w").close()
+    keylink = os.path.join(ws, "proj", "key")
+    os.symlink(key, keylink)
+    ok, tok, _ = G.command_scope_reach(f"cat {keylink}", rec, ws, ws)
+    check("symlink_to_a_forbidden_target_still_denies", not ok, "allowed a link into .ssh")
+    check("the_forbidden_deny_names_the_resolved_target", bool(tok) and ".ssh" in tok, repr(tok))
+    prof = _profile(ws, rec)
+    v = G.evaluate(G.NormalizedEvent(tool="Bash", command=f"cat {keylink}", cwd=ws), prof, workspace=ws)
+    check("evaluate_denies_the_laundered_secret", v.blocks, repr(v))
+
+    # a link from a PATH-granted repo into one outside every grant: denied, naming where it lands
+    for r in ("granted", "notgranted"):
+        os.makedirs(os.path.join(ws, r), exist_ok=True)
+    secret = os.path.join(ws, "notgranted", "data.txt")
+    open(secret, "w").close()
+    inlink = os.path.join(ws, "granted", "peek")
+    os.symlink(secret, inlink)
+    only = ["path:" + os.path.join(ws, "granted") + G.RECURSIVE_SUFFIX]
+    ok, tok, _ = G.command_scope_reach(f"cat {inlink}", only, ws, ws)
+    check("link_into_an_ungranted_repo_still_denies", not ok, "allowed")
+    check("and_names_the_repo_it_lands_in_not_the_one_it_starts_in", tok == "notgranted", repr(tok))
+
+    # Read is not widened: outside the workspace stays refused through a link, as when named directly
+    check("read_of_the_link_is_unchanged",
+          not G.path_in_scope(link, rec, ws, prof, ws) and not G.path_in_scope(interp, rec, ws, prof, ws),
+          "Read reach widened")
+
+
 def test_temp_root_is_a_path_boundary_not_a_prefix():
     """codex #169 finding 2. `startswith("/tmp")` admits `/tmp-other` — a SIBLING of the temp
     root, and a directory anyone can create. That would hand a member unconditional reach by
@@ -1095,6 +1154,7 @@ ALL_TESTS = [
     "test_path_and_command_scope",
     "test_path_grant_reaches_a_sibling_of_the_repos",
     "test_path_grants_keep_their_type_and_match_resolved_boundaries",
+    "test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly",
     "test_temp_root_is_a_path_boundary_not_a_prefix",
     "test_shims_contain_no_policy",
     "test_unscoped_must_be_declared_never_inferred",
@@ -1173,6 +1233,7 @@ if __name__ == "__main__":
     test_path_and_command_scope()
     test_path_grant_reaches_a_sibling_of_the_repos()
     test_path_grants_keep_their_type_and_match_resolved_boundaries()
+    test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly()
     test_temp_root_is_a_path_boundary_not_a_prefix()
     test_shims_contain_no_policy()
     test_unscoped_must_be_declared_never_inferred()

@@ -896,8 +896,46 @@ def command_in_scope(cmd: str, scopes, workspace: str, cwd: Optional[str] = None
     return ok, offending
 
 
-def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = None):
+def _symlinked_reach_verdict(resolved: str, seg: str, repo_scopes, scopes, workspace: str,
+                             forbidden) -> Optional[tuple]:
+    """A reach a SYMLINK carries out of its grant is judged by its target, as if named directly (#953).
+
+    `_within_path_grant` compares realpaths, so `<ws>/proj/venv/bin/python` under `path:<ws>/**` was
+    refused: its realpath is the system interpreter. That is a true positive of the realpath rule with an
+    unwanted consequence, three times now (HUB 09-05, CBP 09-17, thor 09-30): the caller could have named
+    the target itself and been allowed, and the deny named `proj`, which IS granted, so each seat asked an
+    operator for a grant it already held.
+
+    Returns None when the reach is in scope, else `(offending, refused_path)`:
+      - no symlink on the way (realpath == the lexical path): the lexical refusal stands, unchanged;
+      - target trips the egress list: refused, naming the TARGET. A link must not launder `~/.ssh/...`
+        past a check that reads only command text;
+      - target inside the workspace: judged by the TARGET's repo, and a refusal names that repo
+        (the misattribution half of #953);
+      - target outside the workspace: allowed, because a command naming it directly is not MRH-scoped.
+    Read keeps its own rule (`path_in_scope` refuses outside the workspace either way)."""
+    lexical = os.path.normpath(resolved).replace("\\", "/")
+    target = os.path.realpath(lexical).replace("\\", "/")
+    if target == lexical:
+        return (seg or "<workspace root>"), resolved
+    low = target.lower()
+    if any(f in low for f in forbidden):
+        return target, target
+    wsr = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
+    if target == wsr or target.startswith(wsr + "/"):
+        tseg = target[len(wsr):].lstrip("/").split("/", 1)[0]
+        if tseg in repo_scopes or _within_path_grant(target, scopes, workspace):
+            return None
+        return (tseg or "<workspace root>"), target
+    return None
+
+
+def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = None,
+                        forbidden=None):
     """Returns (ok, offending_token, resolved_path).
+
+    `forbidden` is the egress list applied to a symlink's RESOLVED target (#953); None means
+    FORBIDDEN_DEFAULT, so the seats' two-field adapters keep their call shape and are not weaker.
 
     `resolved_path` is the candidate the check actually judged — absolute, normalised — or
     None when nothing was refused. It is carried rather than reconstructed: the deny text
@@ -927,7 +965,11 @@ def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = N
             return False, (tok or "<workspace root>"), resolved   # traversed out of the workspace
         seg = resolved[len(ws):].lstrip("/").split("/", 1)[0]
         if seg not in repo_scopes and not _within_path_grant(resolved, scopes, workspace):
-            return False, (seg or "<workspace root>"), resolved
+            refused = _symlinked_reach_verdict(resolved, seg, repo_scopes, scopes, workspace,
+                                               FORBIDDEN_DEFAULT if forbidden is None else forbidden)
+            if refused is None:
+                continue
+            return (False,) + refused
 
     # Pass 2 — relative tokens. The event cwd is NOT reliable: the engine may run each command
     # with a per-command workdir the event does not carry (observed live via the Codex gate —
@@ -1137,7 +1179,8 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
                 f"(granted: {'+'.join(scopes)}){hint}",
             )
     if event.command is not None:
-        ok, offending, refused = command_scope_reach(event.command, scopes, ws, event.cwd)
+        ok, offending, refused = command_scope_reach(event.command, scopes, ws, event.cwd,
+                                                     forbidden=forbidden)
         if not ok:
             # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
             # debugging blind (Codex live session, 2026-07-23). The exact-grant hint is
