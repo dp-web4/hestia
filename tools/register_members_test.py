@@ -865,6 +865,72 @@ def test_install_without_a_bashrc_does_not_create_one():
         assert (home / ".profile").exists()
 
 
+def _stub_bin(tmp: Path, os_name: str) -> tuple[Path, Path]:
+    """A PATH dir whose `uname` reports `os_name` and whose `launchctl` / `systemctl` RECORD their argv, so a test
+    can prove the live-session publication runs without ever touching a real session manager."""
+    stub = tmp / "stub-bin"
+    stub.mkdir()
+    rec = tmp / "manager-calls.txt"
+    real_uname = shutil.which("uname") or "/usr/bin/uname"
+    (stub / "uname").write_text(
+        f'#!/bin/sh\nif [ "$1" = "-s" ]; then echo {os_name}; else exec {real_uname} "$@"; fi\n')
+    for tool in ("launchctl", "systemctl"):
+        (stub / tool).write_text(f'#!/bin/sh\necho "{tool} $*" >> "{rec}"\n')
+    for f in stub.iterdir():
+        f.chmod(0o755)
+    return stub, rec
+
+
+def test_install_publishes_to_the_live_session_on_darwin_and_linux():
+    """#1188 review (HOLD): the account-home lookup used `getent`, absent on macOS, so `launchctl setenv` could never
+    run on the platform it exists for. With a portable lookup, and the real-home condition made true through the
+    test-only seam, each OS's live-session call must be INVOKED with the exact path, against stubs, never a real
+    manager."""
+    for os_name, want in (("Darwin", "launchctl setenv HESTIA_HOME "), ("Linux", "systemctl --user set-environment HESTIA_HOME=")):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            root, home, env = _e2e_root(tmp)
+            stub, rec = _stub_bin(tmp, os_name)
+            env = dict(env, PATH=f"{stub}:{env.get('PATH', '')}", _HESTIA_TEST_ACCOUNT_HOME=str(home))
+            p = subprocess.run(["bash", str(root / "deploy" / "install-members.sh")], capture_output=True,
+                               text=True, env=env)
+            assert p.returncode == 0, (os_name, (p.stdout + p.stderr)[-3000:])
+            calls = rec.read_text() if rec.exists() else ""
+            exact = str(Path(env["HESTIA_HOME"]).resolve())
+            assert f"{want}{exact}" in calls, (os_name, calls)
+
+
+def test_install_without_the_seam_never_touches_a_session_manager():
+    """The safety invariant: an isolated-HOME run (HOME is not the account's real home) must not call
+    launchctl or systemctl at all, even when they are on PATH."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        root, home, env = _e2e_root(tmp)
+        stub, rec = _stub_bin(tmp, "Darwin")
+        env = dict(env, PATH=f"{stub}:{env.get('PATH', '')}")
+        env.pop("_HESTIA_TEST_ACCOUNT_HOME", None)
+        p = subprocess.run(["bash", str(root / "deploy" / "install-members.sh")], capture_output=True,
+                           text=True, env=env)
+        assert p.returncode == 0, (p.stdout + p.stderr)[-3000:]
+        assert not rec.exists(), f"a session manager was called from an isolated HOME: {rec.read_text()}"
+
+
+def test_install_refuses_a_home_path_with_shell_special_characters():
+    """#1188 review: the path is written into a sourced ~/.profile and into environment.d; a `$` would be
+    re-expanded when sourced. Refused explicitly, and nothing is written."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        root, home, env = _e2e_root(tmp)
+        odd = tmp / "hestia$HOME"
+        odd.mkdir()
+        env = dict(env, HESTIA_HOME=str(odd))
+        p = subprocess.run(["bash", str(root / "deploy" / "install-members.sh")], capture_output=True,
+                           text=True, env=env)
+        out = p.stdout + p.stderr
+        assert p.returncode != 0 and "will not write" in out, out[-2000:]
+        assert not (home / ".profile").exists() or ">>> hestia" not in (home / ".profile").read_text()
+
+
 def test_covers():
     assert RM.covers("*", "*") and RM.covers(None, ".*") and RM.covers(".*", "*") and RM.covers("", None)
     assert not RM.covers("Read", "*") and not RM.covers("shell", ".*")
@@ -966,6 +1032,9 @@ TESTS = [
     test_a_host_already_left_registered_without_the_dir_repairs,
     test_install_publishes_hestia_home_as_an_exact_path,
     test_install_without_a_bashrc_does_not_create_one,
+    test_install_publishes_to_the_live_session_on_darwin_and_linux,
+    test_install_without_the_seam_never_touches_a_session_manager,
+    test_install_refuses_a_home_path_with_shell_special_characters,
     test_covers,
     test_install_members_end_to_end_in_an_isolated_home,
     test_install_members_reports_a_narrow_gate_and_leaves_it,

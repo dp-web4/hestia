@@ -571,6 +571,13 @@ case "$HESTIA_HOME_ABS" in
   /*) ;;
   *) die "HESTIA_HOME did not resolve to an absolute path ('$HESTIA_HOME' -> '$HESTIA_HOME_ABS')" ;;
 esac
+# THE PATH IS WRITTEN INTO SOURCED SHELL AND INTO environment.d, so it is checked, not trusted (#1188 review):
+# a `$`, backtick, quote, backslash or space would be reinterpreted when ~/.profile is sourced, or split by
+# environment.d. Refused explicitly rather than written and silently changed.
+case "$HESTIA_HOME_ABS" in
+  *[!A-Za-z0-9/._+@,:-]*)
+    die "HESTIA_HOME resolves to '$HESTIA_HOME_ABS', which contains characters this installer will not write into a sourced shell file or environment.d (allowed: letters, digits and / . _ + @ , : -). Move it to such a path." ;;
+esac
 publish_hestia_home() {
   local abs="$1" line="HESTIA_HOME=$1" envd="$HOME/.config/environment.d" f
   local begin="# >>> hestia (managed by deploy/install-members.sh; do not hand-edit) >>>"
@@ -583,8 +590,13 @@ publish_hestia_home() {
       log "  env       : wrote $f ($line)"
     fi
   fi
+  # THE ACCOUNT'S REAL HOME, PORTABLY (#1188 review): `getent` does not exist on macOS, so the old lookup was
+  # always empty there and `launchctl setenv` never ran on the platform it exists for. Python's `pwd` answers
+  # on both. The live session is touched only when $HOME IS that home, so an isolated-HOME test never reaches
+  # it. `_HESTIA_TEST_ACCOUNT_HOME` exists ONLY so a test can make that condition true with `systemctl` /
+  # `launchctl` stubbed on PATH; nothing in the install sets it.
   local real_home
-  real_home="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 || true)"
+  real_home="${_HESTIA_TEST_ACCOUNT_HOME:-$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)' 2>/dev/null || true)}"
   if [ -n "$real_home" ] && [ "$HOME" = "$real_home" ]; then
     if [ "$(uname -s)" = "Linux" ] && command -v systemctl >/dev/null 2>&1; then
       systemctl --user set-environment "$line" 2>/dev/null \
