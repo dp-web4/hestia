@@ -1343,6 +1343,101 @@ pub struct EscalationStore {
     /// not at all). The chain entry is the durable record; this set only dedups
     /// the append within one daemon lifetime.
     lapse_recorded: std::collections::HashSet<String>,
+    /// What the daemon last did for each `request_key` (#1166, #774).
+    ///
+    /// A gate hook gives initialize + connect + claim one 1.5 s deadline, because the harness
+    /// kills a hook at 5 s and a killed hook fails OPEN. When that deadline passes, the outcome
+    /// is UNKNOWN: the daemon may still open an escalation (whose id the asker never learns,
+    /// #1166) or spend an approval (#774: the grant is consumed, the write never happens, and
+    /// the re-issue mints a new petition). The hook sends a key that is stable across identical
+    /// re-issues in one session; this map is how the daemon answers the retry with what it
+    /// already did instead of with a second, different answer.
+    ///
+    /// A projection of the chain like the rest of the store: every outcome row carries its
+    /// `request_key`, and `rehydrate` rebuilds the map from them. Bounded by
+    /// `REQUEST_KEY_CAP`, oldest evicted first.
+    request_keys: HashMap<String, RequestKeyRecord>,
+    /// Execution evidence for #1166/#774 (GPT review of #1169): the daemon's own record that a
+    /// tool INVOCATION reached `hestia_begin_action` -- which every gate reaches, for a permitted
+    /// write, BEFORE the tool runs. Keyed by the invocation's correlation key
+    /// (hestia_witness_core.correlation_key: tool_use_id / kimi tool_call_id / gemini content
+    /// key), valued by the time it was last seen. MEMORY-ONLY, and `booted_at` makes that safe:
+    /// a claim older than this daemon's start is never reclaimable, because its begin may have
+    /// been seen by a process that no longer exists.
+    begins_seen: HashMap<String, u64>,
+    /// When this store was created (daemon start). See `begins_seen`.
+    booted_at: u64,
+    /// The latest begin time ever evicted from `begins_seen` (GPT review of 8056dce). An
+    /// evicted begin is execution evidence this store no longer holds, so any claim at or
+    /// before this mark is refused a reclaim rather than read as "never executed".
+    begins_evicted_hwm: u64,
+    /// FENCES (GPT review of 8056dce, the claim/begin race): an invocation whose permit was
+    /// re-delivered to another invocation by a reclaim. Written in the SAME state change that
+    /// grants the reclaim, and checked by `hestia_begin_action`, which refuses a fenced key --
+    /// so of {the original's begin, the reclaim} whichever the lock orders first wins, and the
+    /// other is refused. Value: (fenced_at, escalation_id).
+    fenced: HashMap<String, (u64, String)>,
+}
+
+/// How long after a spend the SAME request key may be answered with the same permit
+/// (#774). Long enough to cover a lost response and the member's immediate re-issue; short
+/// enough that a key cannot become a standing permit. It never widens anyone else's window:
+/// a different key, act, payload, member, marker or proven session is refused as before.
+pub const RECLAIM_WINDOW_SECS: u64 = 120;
+/// Upper bound on remembered request keys; the oldest are evicted first.
+pub const REQUEST_KEY_CAP: usize = 4096;
+/// Upper bound on remembered begin keys; the oldest are evicted first, and the eviction
+/// high-water mark (`begins_evicted_hwm`) refuses any reclaim that eviction could affect.
+pub const BEGINS_SEEN_CAP: usize = 8192;
+/// Upper bound on live fences. A fence is only EVICTABLE once it is older than `FENCE_TTL_SECS`;
+/// when the table is full of younger fences, a new reclaim is REFUSED rather than a fence
+/// dropped -- the fail-closed direction: losing a fence would let a superseded invocation run.
+pub const FENCE_CAP: usize = 4096;
+/// How long a fence must live. It only has to outlive the fenced invocation's own hook (the
+/// harness kills a hook at 5 s, and a killed hook never reaches begin_action); twice the reclaim
+/// window is far past that.
+pub const FENCE_TTL_SECS: u64 = 2 * RECLAIM_WINDOW_SECS;
+
+/// A correlation key as the witness core emits it: `[A-Za-z0-9_.-]`, at most 200 bytes.
+pub fn valid_correlation_key(k: &str) -> bool {
+    !k.is_empty() && k.len() <= 200 && k.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+}
+
+/// The daemon's record of one request key's last outcome.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RequestKeyRecord {
+    /// `opened` | `coalesced` | `claimed` | `reclaimed`.
+    pub outcome: String,
+    pub escalation_id: String,
+    pub at: u64,
+    pub plugin_id: String,
+    pub marker: String,
+    /// sha256 of the act the request named, as `act_digest_of` computes it.
+    pub act_digest: Option<String>,
+    /// The payload binding the spent escalation carried, if any.
+    pub payload_sha256: Option<String>,
+    /// The PROVEN host session at the time, if the caller had one.
+    pub host_session_id: Option<String>,
+    /// The tool INVOCATION the claim answered (its correlation key), when the hook sent one.
+    /// A reclaim is only for a DIFFERENT invocation whose predecessor never reached execution.
+    pub invocation_key: Option<String>,
+    /// Whether the claiming seat declared it HARD-STOPS a superseded invocation in every rollout
+    /// mode (`supersession: "hard_stop"` on the claim; GPT review of ca5f394). A reclaim fences
+    /// the ORIGINAL invocation, and the fence is only a cancellation if that invocation's own
+    /// hook refuses to run on it -- a hook that downgrades the refusal to a warning would let it
+    /// run beside its replacement. So a claim that did not declare it is never reclaimed.
+    pub supersession_hard_stop: bool,
+}
+
+/// The claim argument `supersession` value by which a seat declares that its hook stops a
+/// superseded invocation (`hestia.invocation_superseded` at begin_action) regardless of rollout
+/// mode. Declared by the hook that enforces it, so the declaration and the stop ship together.
+pub const SUPERSESSION_HARD_STOP: &str = "hard_stop";
+
+/// A request key is sha256 hex: 64 lowercase hex characters. Anything else is refused by
+/// name rather than stored, so a key can never smuggle an arbitrary string into the chain.
+pub fn valid_request_key(k: &str) -> bool {
+    k.len() == 64 && k.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub fn now_secs() -> u64 {
@@ -1388,6 +1483,9 @@ impl EscalationStore {
     /// store cannot describe honestly, and inventing a shell for it would put a governance record
     /// in front of an operator that no witnessed act supports.
     pub fn rehydrate(&mut self, entries: &[crate::storage::chain::ChainEntry], now: u64) -> usize {
+        // Everything replayed below happened before this process existed, and so did any
+        // begin_action that answered it: a replayed claim can never be reclaimed (#1169).
+        self.booted_at = self.booted_at.max(now);
         let s = |v: &serde_json::Value, k: &str| {
             v.get(k).and_then(|x| x.as_str()).map(|x| x.to_string())
         };
@@ -1401,6 +1499,53 @@ impl EscalationStore {
             let entry_ts = e.timestamp.timestamp().max(0) as u64;
             let d = &e.event_data;
             let Some(id) = s(d, "escalation_id") else { continue };
+            // FENCES (#1169) are rebuilt from the reclaimed rows that created them, so a restart
+            // cannot let a superseded invocation begin. (A replayed claim is never reclaimable
+            // anyway -- booted_at -- but a fence written just before a restart must survive it.)
+            if e.event_type == "gate_escalation_reclaimed" {
+                if let Some(orig) = s(d, "fenced_invocation_key").filter(|k| valid_correlation_key(k)) {
+                    self.fenced.insert(orig, (entry_ts, id.clone()));
+                }
+            }
+            // THE REQUEST-KEY MAP (#1166) is rebuilt from the same rows: every outcome the
+            // claim door witnesses carries the key it answered, so a restart keeps "what did
+            // I do for this key" exactly as it keeps "what did the operator rule".
+            if let Some(outcome) = match e.event_type.as_str() {
+                "gate_escalation_opened" => Some("opened"),
+                "gate_escalation_coalesced" => Some("coalesced"),
+                "gate_escalation_claimed" => Some("claimed"),
+                "gate_escalation_reclaimed" => Some("reclaimed"),
+                _ => None,
+            } {
+                if let (Some(key), Some(plugin_id), Some(marker)) =
+                    (s(d, "request_key"), s(d, "plugin_id"), s(d, "marker"))
+                {
+                    if valid_request_key(&key) {
+                        self.record_request_key(
+                            &key,
+                            RequestKeyRecord {
+                                outcome: outcome.to_string(),
+                                escalation_id: id.clone(),
+                                // A reclaim never slides the window: it stays anchored at the
+                                // first spend, which its row carries.
+                                at: if outcome == "reclaimed" {
+                                    u(d, "first_claimed_at").unwrap_or(entry_ts)
+                                } else {
+                                    entry_ts
+                                },
+                                plugin_id,
+                                marker,
+                                act_digest: s(d, "act_digest"),
+                                payload_sha256: s(d, "payload_sha256"),
+                                host_session_id: s(d, "host_session_id"),
+                                invocation_key: s(d, "invocation_key"),
+                                supersession_hard_stop: s(d, "supersession").as_deref()
+                                    == Some(SUPERSESSION_HARD_STOP),
+                            },
+                        );
+                    }
+                }
+            }
             match e.event_type.as_str() {
                 "gate_escalation_opened" => {
                     let (Some(plugin_id), Some(marker), Some(expires_at)) =
@@ -2569,6 +2714,175 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
             .unwrap_or(Status::Expired)
     }
 
+    /// Remember what was done for a request key (#1166). Last write wins; the oldest key is
+    /// evicted once the map passes `REQUEST_KEY_CAP`.
+    pub fn record_request_key(&mut self, key: &str, rec: RequestKeyRecord) {
+        if !valid_request_key(key) {
+            return;
+        }
+        self.request_keys.insert(key.to_string(), rec);
+        if self.request_keys.len() > REQUEST_KEY_CAP {
+            if let Some(oldest) = self
+                .request_keys
+                .iter()
+                .min_by_key(|(_, r)| r.at)
+                .map(|(k, _)| k.clone())
+            {
+                self.request_keys.remove(&oldest);
+            }
+        }
+    }
+
+    /// The last outcome recorded for a key. READ-ONLY: never observes, never arms a fuse.
+    pub fn request_key(&self, key: &str) -> Option<&RequestKeyRecord> {
+        self.request_keys.get(key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clone_for_test(&self) -> EscalationStore {
+        EscalationStore {
+            request_keys: self.request_keys.clone(),
+            begins_seen: self.begins_seen.clone(),
+            booted_at: self.booted_at,
+            begins_evicted_hwm: self.begins_evicted_hwm,
+            fenced: self.fenced.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// Record that a tool invocation reached `hestia_begin_action` (execution evidence).
+    pub fn record_begin(&mut self, correlation_key: &str, now: u64) {
+        if !valid_correlation_key(correlation_key) {
+            return;
+        }
+        self.begins_seen.insert(correlation_key.to_string(), now);
+        if self.begins_seen.len() > BEGINS_SEEN_CAP {
+            if let Some((oldest, t)) = self.begins_seen.iter().min_by_key(|(_, t)| **t)
+                .map(|(k, t)| (k.clone(), *t))
+            {
+                self.begins_seen.remove(&oldest);
+                self.begins_evicted_hwm = self.begins_evicted_hwm.max(t);
+            }
+        }
+    }
+
+    /// Has this invocation reached begin_action at or after `since`?
+    pub fn begin_seen_since(&self, correlation_key: &str, since: u64) -> bool {
+        self.begins_seen.get(correlation_key).is_some_and(|t| *t >= since)
+    }
+
+    /// The reclaim that superseded this invocation, if any: (fenced_at, escalation_id).
+    pub fn fenced_by(&self, correlation_key: &str) -> Option<&(u64, String)> {
+        self.fenced.get(correlation_key)
+    }
+
+    /// Lift a fence this reclaim wrote, only if it is still that reclaim's (append failed).
+    pub fn unfence(&mut self, correlation_key: &str, escalation_id: &str) {
+        if self.fenced.get(correlation_key).is_some_and(|(_, e)| e == escalation_id) {
+            self.fenced.remove(correlation_key);
+        }
+    }
+
+    /// Fence a superseded invocation. Returns false -- and fences nothing -- when the table is
+    /// full of fences still inside their TTL: the caller must then REFUSE the reclaim, because
+    /// granting it without a fence is exactly the race the fence exists to close.
+    pub fn fence(&mut self, correlation_key: &str, escalation_id: &str, now: u64) -> bool {
+        if !valid_correlation_key(correlation_key) {
+            return false;
+        }
+        if self.fenced.len() >= FENCE_CAP && !self.fenced.contains_key(correlation_key) {
+            let expired: Option<String> = self.fenced.iter()
+                .filter(|(_, (t, _))| now.saturating_sub(*t) > FENCE_TTL_SECS)
+                .min_by_key(|(_, (t, _))| *t)
+                .map(|(k, _)| k.clone());
+            match expired {
+                Some(k) => { self.fenced.remove(&k); }
+                None => return false,
+            }
+        }
+        self.fenced.insert(correlation_key.to_string(), (now, escalation_id.to_string()));
+        true
+    }
+
+    /// May THIS retry be answered with the permit its request already spent? (#774, #1169)
+    ///
+    /// A reclaim is recovery of ONE lost answer, never repeat authority. Command equality
+    /// cannot prove a transport failure (GPT review of #1169): an identical command after a
+    /// delivered, executed permit must NOT inherit it. So the evidence is the daemon's own --
+    /// whether the claimed invocation ever reached `hestia_begin_action`, which every gate
+    /// reaches for a permitted write before the tool runs -- and never anything the agent
+    /// asserts. Every conjunct must hold; the error names the first that fails:
+    ///   - the key's record is a spend (`claimed`), not an open, and not already reclaimed;
+    ///   - the claim happened in THIS daemon's lifetime (its begin evidence is held here);
+    ///   - within `RECLAIM_WINDOW_SECS` of that claim;
+    ///   - same member, marker, act digest, bound payload, and proven host session;
+    ///   - the claim recorded its invocation, and the retry names a DIFFERENT invocation;
+    ///   - the claimed invocation has NO begin_action since the claim (it never executed).
+    #[allow(clippy::too_many_arguments)]
+    pub fn reclaimable(
+        &self,
+        key: &str,
+        plugin_id: &str,
+        marker: &str,
+        attempted_act: Option<&str>,
+        attempted_payload: Option<&str>,
+        proven_host_session_id: Option<&str>,
+        invocation_key: Option<&str>,
+        now: u64,
+    ) -> Result<RequestKeyRecord, &'static str> {
+        let rec = self.request_keys.get(key).ok_or("no record for this request key")?;
+        match rec.outcome.as_str() {
+            "claimed" => {}
+            "reclaimed" => return Err("this claim was already reclaimed once"),
+            _ => return Err("this request key's last outcome was not a spend"),
+        }
+        if rec.at < self.booted_at {
+            return Err("the daemon restarted since that claim, so its execution evidence is not held here");
+        }
+        if self.begins_evicted_hwm >= rec.at {
+            return Err("begin evidence at or after that claim was evicted under pressure, so execution cannot be ruled out");
+        }
+        if now.saturating_sub(rec.at) > RECLAIM_WINDOW_SECS {
+            return Err("past the reclaim window of the first claim");
+        }
+        if rec.plugin_id != plugin_id.trim() || rec.marker != marker.trim() {
+            return Err("different member or marker");
+        }
+        let asked = attempted_act
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(Self::act_digest_of)
+            .ok_or("the retry names no act")?;
+        if rec.act_digest.as_deref() != Some(asked.as_str()) {
+            return Err("different act");
+        }
+        if let Some(bound) = &rec.payload_sha256 {
+            if Self::normalize_payload(attempted_payload).as_deref() != Some(bound.as_str()) {
+                return Err("different or absent payload");
+            }
+        }
+        if let Some(sess) = &rec.host_session_id {
+            if proven_host_session_id != Some(sess.as_str()) {
+                return Err("different or unproven host session");
+            }
+        }
+        let original = rec.invocation_key.as_deref().ok_or("the claim recorded no invocation")?;
+        let retry = invocation_key.ok_or("the retry names no invocation")?;
+        if retry == original {
+            return Err("the same invocation retried: its permit was already delivered to it");
+        }
+        if !rec.supersession_hard_stop {
+            return Err("the claimed invocation's seat did not declare that it hard-stops a superseded invocation (supersession: hard_stop), so a fence could not be relied on to stop it");
+        }
+        if self.fenced.contains_key(retry) {
+            return Err("the retrying invocation is itself fenced by an earlier reclaim");
+        }
+        if self.begin_seen_since(original, rec.at) {
+            return Err("the claimed invocation reached execution (begin_action seen): its permit was delivered");
+        }
+        Ok(rec.clone())
+    }
+
     pub fn get(&self, id: &str) -> Option<&Escalation> {
         self.by_id.get(id)
     }
@@ -2844,6 +3158,101 @@ mod tests {
     use super::*;
 
     const T0: u64 = 1_800_000_000;
+
+    /// #774/#1169: a reclaim is recovery of one lost answer. Every conjunct is exercised on its
+    /// own, and the positive arm is the control.
+    #[test]
+    fn a_reclaim_requires_every_conjunct_and_never_outlives_its_window() {
+        let key = "c".repeat(64);
+        let mut st = EscalationStore::default();
+        let act = "Bash: git apply /tmp/p/fix.patch";
+        let pay = "ab".repeat(32);
+        let rec = RequestKeyRecord {
+            outcome: "claimed".into(),
+            escalation_id: "E1".into(),
+            at: T0,
+            plugin_id: "codex".into(),
+            marker: "pre_tool_use.py".into(),
+            act_digest: Some(EscalationStore::act_digest_of(act)),
+            payload_sha256: Some(pay.clone()),
+            host_session_id: Some("hs-1".into()),
+            invocation_key: Some("toolu_A".into()),
+            supersession_hard_stop: true,
+        };
+        st.record_request_key(&key, rec.clone());
+        #[allow(clippy::too_many_arguments)]
+        fn why(st: &EscalationStore, k: &str, pl: &str, mk: &str, a: &str, p: Option<&str>,
+               hs: Option<&str>, inv: Option<&str>, now: u64) -> Result<(), &'static str> {
+            st.reclaimable(k, pl, mk, Some(a), p, hs, inv, now).map(|_| ())
+        }
+        let base = |st: &EscalationStore, now| why(st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), Some("toolu_B"), now);
+        assert_eq!(base(&st, T0 + 5), Ok(()), "control");
+        assert_eq!(base(&st, T0 + RECLAIM_WINDOW_SECS), Ok(()), "the window's last second still holds");
+        assert!(base(&st, T0 + RECLAIM_WINDOW_SECS + 1).unwrap_err().contains("window"));
+        assert!(why(&st, &"d".repeat(64), "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), Some("toolu_B"), T0 + 5).is_err(), "other key");
+        assert!(why(&st, &key, "kimi-code", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), Some("toolu_B"), T0 + 5).unwrap_err().contains("member"));
+        assert!(why(&st, &key, "codex", "other.py", act, Some(&pay), Some("hs-1"), Some("toolu_B"), T0 + 5).unwrap_err().contains("marker"));
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", "Bash: rm x", Some(&pay), Some("hs-1"), Some("toolu_B"), T0 + 5).unwrap_err().contains("act"));
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", act, Some(&"ff".repeat(32)), Some("hs-1"), Some("toolu_B"), T0 + 5).unwrap_err().contains("payload"));
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", act, None, Some("hs-1"), Some("toolu_B"), T0 + 5).unwrap_err().contains("payload"));
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-2"), Some("toolu_B"), T0 + 5).unwrap_err().contains("session"));
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), None, Some("toolu_B"), T0 + 5).unwrap_err().contains("session"));
+        // THE INVOCATION CONJUNCTS (#1169).
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), Some("toolu_A"), T0 + 5)
+                    .unwrap_err().contains("same invocation"), "the same invocation retried");
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), None, T0 + 5)
+                    .unwrap_err().contains("no invocation"), "a retry that names no invocation");
+        let mut no_inv = st.clone_for_test();
+        no_inv.record_request_key(&key, RequestKeyRecord { invocation_key: None, ..rec.clone() });
+        assert!(base(&no_inv, T0 + 5).unwrap_err().contains("recorded no invocation"));
+        // GPT review of ca5f394: the ORIGINAL seat must hard-stop a superseded invocation, or
+        // the fence is not a cancellation.
+        let mut soft = st.clone_for_test();
+        soft.record_request_key(&key, RequestKeyRecord { supersession_hard_stop: false, ..rec.clone() });
+        assert!(base(&soft, T0 + 5).unwrap_err().contains("hard-stops"));
+        // Execution evidence: a begin for the CLAIMED invocation at/after the claim refuses.
+        let mut ran = st.clone_for_test();
+        ran.record_begin("toolu_A", T0 + 1);
+        assert!(base(&ran, T0 + 5).unwrap_err().contains("reached execution"));
+        // ...but a begin from BEFORE the claim is not evidence about this permit.
+        let mut before = st.clone_for_test();
+        before.record_begin("toolu_A", T0 - 1);
+        assert_eq!(base(&before, T0 + 5), Ok(()));
+        // Once reclaimed, never again.
+        let mut once = st.clone_for_test();
+        once.record_request_key(&key, RequestKeyRecord { outcome: "reclaimed".into(), ..rec.clone() });
+        assert!(base(&once, T0 + 5).unwrap_err().contains("already reclaimed"));
+        // An open is not a spend.
+        let mut opened = st.clone_for_test();
+        opened.record_request_key(&key, RequestKeyRecord { outcome: "opened".into(), ..rec.clone() });
+        assert!(base(&opened, T0 + 5).unwrap_err().contains("not a spend"));
+        // A claim older than this daemon (replayed) holds no execution evidence here.
+        let mut restarted = st.clone_for_test();
+        restarted.booted_at = T0 + 1;
+        assert!(base(&restarted, T0 + 5).unwrap_err().contains("restarted"));
+        // Malformed keys are never stored.
+        st.record_request_key("nope", rec.clone());
+        assert!(st.request_key("nope").is_none());
+        assert!(!valid_request_key(&"A".repeat(64)) && valid_request_key(&"0".repeat(64)));
+        assert!(valid_correlation_key("toolu_01ABC") && !valid_correlation_key("a/b") && !valid_correlation_key(""));
+    }
+
+    /// The key map is bounded: the oldest record goes first.
+    #[test]
+    fn the_request_key_map_is_bounded_oldest_first() {
+        let mut st = EscalationStore::default();
+        let rec = |at| RequestKeyRecord {
+            outcome: "opened".into(), escalation_id: "E".into(), at,
+            plugin_id: "p".into(), marker: "m".into(), act_digest: None,
+            payload_sha256: None, host_session_id: None, invocation_key: None,
+            supersession_hard_stop: false,
+        };
+        for i in 0..=REQUEST_KEY_CAP {
+            st.record_request_key(&format!("{:064x}", i), rec(T0 + i as u64));
+        }
+        assert!(st.request_key(&format!("{:064x}", 0)).is_none(), "the oldest was evicted");
+        assert!(st.request_key(&format!("{:064x}", REQUEST_KEY_CAP)).is_some());
+    }
 
     fn chain_entry(event_type: &str, data: serde_json::Value) -> crate::storage::chain::ChainEntry {
         crate::storage::chain::ChainEntry {
