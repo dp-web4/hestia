@@ -210,9 +210,12 @@ def plan(listing, seats: list[dict], home: Path, hestia_home: Path, endpoint: st
     for seat in seats:
         if seat["harness_home"].is_dir() and seat["member"] not in configured:
             documents.append((seat["member"], seat_env(seat, host)))
+    # "complete" means LITERALLY nothing is missing (#1194 review): a vault whose seats are all configured but whose
+    # shared set is absent is a shared-only ADD, not complete. The daemon's add_missing compare writes `_shared`
+    # without touching the seats that exist.
+    if add_missing and (shared_configured or configured):
+        return ("add", documents) if documents else ("complete", [])
     if not any(m != SHARED_MEMBER for m, _ in documents):
-        if add_missing and (shared_configured or configured):
-            return "complete", []
         return "no-seats", []
     return ("add" if add_missing else "seed"), documents
 

@@ -3284,7 +3284,7 @@ async fn config_seed_seats(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "error": match undone {
-                    Ok(()) => format!("the seed was not recorded ({e}); it is undone and the namespace is empty again"),
+                    Ok(()) => format!("the seed was not recorded ({e}); it is undone and the namespace is back to its prior state"),
                     Err(re) => format!("the seed was not recorded ({e}) AND could not be undone ({re}): the \
                                         seat configs in the vault are unwitnessed"),
                 },

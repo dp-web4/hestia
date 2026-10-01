@@ -161,6 +161,10 @@ def main() -> int:
         verdict, docs = seeder.plan(listing(True, ["claude-code"]), seats, *args)
         check("F without the flag an occupied namespace still refuses",
               verdict == "occupied", verdict)
+        # #1194 review: every installed seat configured, shared set ABSENT -> a shared-only add, never "complete"
+        verdict, docs = seeder.plan(listing(False, ["claude-code", "codex"]), seats, *args, add_missing=True)
+        check("F all seats present + shared absent -> add the shared set only",
+              verdict == "add" and [m for m, _ in docs] == ["_shared"], f"{verdict} {[m for m, _ in docs]}")
 
         print("E. the repo's own declarations are read, and gaps are named not guessed")
         repo = Path(__file__).resolve().parent.parent
