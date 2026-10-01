@@ -3,8 +3,10 @@
 #
 # GNU coreutils `timeout` is not on stock macOS. Prefer a real timeout(1) /
 # gtimeout(1) when present (same flags as the fire scripts already use).
-# Otherwise python3 bounds the child the same way: SIGTERM at DURATION, then
-# SIGKILL after KILL_AFTER when -k was given.
+# Otherwise python3 bounds the process group the same way: SIGTERM at
+# DURATION, then SIGKILL after KILL_AFTER when -k was given. The grace wait
+# follows the whole group, not only the direct child: a leader that exits on
+# SIGTERM must not cancel the scheduled SIGKILL while a descendant is alive.
 #
 # Usage (GNU-compatible subset):
 #   mesh-timeout.sh DURATION COMMAND [ARG...]
@@ -53,7 +55,7 @@ command -v python3 >/dev/null 2>&1 || {
 export MESH_TIMEOUT_DURATION="$DURATION"
 export MESH_TIMEOUT_KILL_AFTER="${KILL_AFTER:-}"
 exec python3 - "$@" <<'PY'
-import os, signal, subprocess, sys
+import os, signal, subprocess, sys, time
 
 duration = float(os.environ["MESH_TIMEOUT_DURATION"])
 kill_after = os.environ.get("MESH_TIMEOUT_KILL_AFTER") or ""
@@ -70,28 +72,87 @@ except OSError as e:
         sys.exit(127)
     sys.exit(126)
 
-def kill_tree(sig):
+pgid = proc.pid
+
+def _other_members():
+    # Only needed when killpg is refused. Absolute path: the fire PATH may
+    # not include ps, and a descendant still has to be signaled by pid.
+    ps = "/bin/ps" if os.path.exists("/bin/ps") else "/usr/bin/ps"
     try:
-        os.killpg(proc.pid, sig)
+        out = subprocess.check_output(
+            [ps, "-ax", "-o", "pid=", "-o", "pgid="],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    found = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            pid_i, pgid_i = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        if pgid_i == pgid and pid_i != pgid:
+            found.append(pid_i)
+    return found
+
+def signal_group(sig):
+    try:
+        os.killpg(pgid, sig)
+        return True
     except ProcessLookupError:
-        pass
+        return False
+    except PermissionError:
+        # macOS: killpg(SIGKILL) raises EPERM when SIGTERM is already
+        # tearing the leader down, even though that leader is our child.
+        # Signal it directly, then any descendant still in the group.
+        sent = False
+        for pid in (pgid, *_other_members()):
+            try:
+                os.kill(pid, sig)
+                sent = True
+            except (ProcessLookupError, PermissionError):
+                pass
+        return sent
+
+def group_alive():
+    # The leader must already be reaped. A zombie leader still answers
+    # killpg and would look like a surviving descendant.
+    return signal_group(0)
 
 try:
     rc = proc.wait(timeout=duration)
     sys.exit(rc)
 except subprocess.TimeoutExpired:
-    kill_tree(signal.SIGTERM)
-    grace = float(kill_after) if kill_after else 0.0
-    if grace > 0:
-        try:
-            proc.wait(timeout=grace)
+    pass
+
+signal_group(signal.SIGTERM)
+grace = float(kill_after) if kill_after else 0.0
+if grace > 0:
+    # proc.wait() only reaps the direct child. If that leader exits on
+    # SIGTERM while a descendant ignores it, returning here would skip the
+    # SIGKILL and the descendant would run past the kill deadline.
+    deadline = time.monotonic() + grace
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=min(remaining, 0.05))
+            except subprocess.TimeoutExpired:
+                continue
+        if not group_alive():
             sys.exit(124)
-        except subprocess.TimeoutExpired:
-            pass
-    kill_tree(signal.SIGKILL)
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        pass
-    sys.exit(124)
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+if proc.poll() is None or group_alive():
+    signal_group(signal.SIGKILL)
+try:
+    proc.wait(timeout=5)
+except subprocess.TimeoutExpired:
+    pass
+sys.exit(124)
 PY

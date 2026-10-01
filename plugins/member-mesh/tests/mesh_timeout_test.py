@@ -6,11 +6,13 @@ Stock macOS has no `timeout`. fire-claude/kimi/codex used to call bare
 reached the stub CLI on this host (#1105 follow-up).
 
 This test hides timeout/gtimeout from PATH and drives the helper directly:
-success rc preserved, overdue commands exit 124, and -k still SIGKILLs a
-SIGTERM-ignoring child.
+success rc preserved, overdue commands exit 124, -k still SIGKILLs a
+SIGTERM-ignoring child, and a descendant that ignores SIGTERM is SIGKILLed
+at the grace deadline even if its leader has already exited.
 """
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -83,6 +85,75 @@ with tempfile.TemporaryDirectory() as tmp:
     elapsed = time.monotonic() - t0
     check("4. -k kills a SIGTERM-ignoring child (rc 124)", r.returncode == 124, f"rc={r.returncode}")
     check("4b. -k path finishes near duration+kill-after", 1.5 < elapsed < 6, f"elapsed={elapsed:.2f}s")
+
+    # Leader dies on SIGTERM. Descendant ignores SIGTERM (and SIGHUP, so a
+    # session-leader exit cannot reap it for us) and writes a marker at 1.5s,
+    # after -k 0.3 0.5's kill deadline. The wrapper must SIGKILL the group
+    # at that deadline instead of returning when the leader exits.
+    marker = os.path.join(tmp, "descendant-marker")
+    pidfile = os.path.join(tmp, "descendant-pid")
+    started = os.path.join(tmp, "descendant-started")
+    parent = os.path.join(tmp, "descendant-parent.py")
+    with open(parent, "w") as f:
+        f.write(
+            "#!/usr/bin/env python3\n"
+            "import os, signal, sys, time\n"
+            "marker, pidfile, started = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+            "pid = os.fork()\n"
+            "if pid == 0:\n"
+            "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "    signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+            "    open(pidfile, 'w').write(str(os.getpid()))\n"
+            "    open(started, 'w').write('1\\n')\n"
+            "    time.sleep(1.5)\n"
+            "    open(marker, 'w').write('alive\\n')\n"
+            "    os._exit(0)\n"
+            "os.waitpid(pid, 0)\n"
+        )
+    os.chmod(parent, 0o755)
+    t0 = time.monotonic()
+    r = run([HELPER, "-k", "0.3", "0.5", "python3", parent, marker, pidfile, started], env)
+    elapsed = time.monotonic() - t0
+    check("6. descendant still alive at the deadline is killed (rc 124)",
+          r.returncode == 124, f"rc={r.returncode} err={r.stderr!r}")
+    check("6b. wrapper stays through the grace period after the leader exits",
+          0.7 < elapsed < 1.4, f"elapsed={elapsed:.2f}s")
+    remain = 1.8 - (time.monotonic() - t0)
+    if remain > 0:
+        time.sleep(remain)
+    check("6c. descendant did not write the marker after the deadline",
+          not os.path.exists(marker))
+    check("6e. descendant actually started", os.path.isfile(started))
+    if not os.path.isfile(pidfile):
+        check("6d. descendant pid was recorded", False, "no pidfile")
+    else:
+        pid = int(open(pidfile).read().strip())
+        alive = False
+        poll_until = time.monotonic() + 1.0
+        while time.monotonic() < poll_until:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+            except PermissionError:
+                alive = True
+                time.sleep(0.05)
+                continue
+            st = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                                capture_output=True, text=True)
+            stat = st.stdout.strip()
+            if not stat or stat.startswith("Z"):
+                alive = False
+                break
+            alive = True
+            time.sleep(0.05)
+        if alive:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        check("6d. descendant is dead after the deadline", not alive, f"pid={pid}")
 
 # Fire scripts must not call bare timeout anymore.
 for name in ("fire-claude.sh", "fire-kimi.sh", "fire-codex.sh"):
