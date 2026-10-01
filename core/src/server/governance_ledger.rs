@@ -80,6 +80,13 @@ pub const GOVERNANCE_EVENTS: &[&str] = &[
     // no arm falls into `_ => {}` and is invisible again.
     "gate_escalation_payload_drift",
     "gate_escalation_payload_assertion_mismatch",
+    // What an ADVISORY rung said about an ask (PRD_ADJUDICATOR_LADDER §3.4). It decides
+    // nothing and annotates the open row, like a corroboration — but it must be declared, or
+    // the ledger filters it out and stage A runs where the operator cannot see it. Caught by
+    // `every_escalation_event_a_producer_emits_is_a_declared_governance_event` the first time
+    // the shadow rung ran; declared AND projected below, because a declared event with no arm
+    // falls into `_ => {}` and is invisible all over again.
+    "ladder_advisory_verdict",
     "gate_escalation_refused",
     "gate_escalation_arbiter_refused",
     // The two TERMINAL states that are not decisions. Both were produced by `handler.rs` and
@@ -256,6 +263,12 @@ pub struct LedgerRow {
     /// bytes being written" is not a fact to leave in the raw chain.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub payload_flags: Vec<String>,
+    /// What each advisory rung said, in the order it said it: `rung: decision (confidence)`,
+    /// with the decline reason where there is one. Rendered beside the ask because that is
+    /// where §4.3's comparison happens — the operator's ruling and the rung's view of the same
+    /// case, on one row. Advisory: nothing here permitted or refused anything.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisories: Vec<String>,
     /// The chain entry this row opened at, and the one that decided it. Both, so an operator can
     /// go from the ledger to the witnessed evidence without a search.
     pub opened_hash: String,
@@ -369,6 +382,7 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                     claimed_at: None,
                     coalesced: 0,
                     payload_flags: Vec::new(),
+        advisories: Vec::new(),
                     opened_hash: e.hash.clone(),
                     decided_hash: None,
                     chain_position: e.chain_position,
@@ -402,6 +416,7 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                     claimed_at: None,
                     coalesced: 0,
                     payload_flags: Vec::new(),
+        advisories: Vec::new(),
                     opened_hash: e.hash.clone(),
                     decided_hash: None,
                     chain_position: e.chain_position,
@@ -464,6 +479,7 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                         claimed_at: None,
                     coalesced: 0,
                     payload_flags: Vec::new(),
+        advisories: Vec::new(),
                         opened_hash: e.hash.clone(),
                         decided_hash: Some(e.hash.clone()),
                         chain_position: e.chain_position,
@@ -502,6 +518,21 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                             format!("MISMATCH: member stated {} but the daemon measured {}",
                                     short("stated_payload_sha256"),
                                     short("measured_payload_sha256"))
+                        });
+                    }
+                }
+            }
+            "ladder_advisory_verdict" => {
+                if let Some(id) = s(d, "escalation_id") {
+                    if let Some(row) = keyed.get_mut(&id) {
+                        let rung = s(d, "rung").unwrap_or_else(|| "unknown-rung".into());
+                        let decision = s(d, "decision").unwrap_or_else(|| "?".into());
+                        let conf = d.get("confidence").and_then(serde_json::Value::as_f64);
+                        let why = s(d, "declined_because");
+                        row.advisories.push(match (conf, why) {
+                            (Some(c), Some(w)) => format!("{rung}: {decision} [{w}] ({c:.2})"),
+                            (Some(c), None) => format!("{rung}: {decision} ({c:.2})"),
+                            (None, _) => format!("{rung}: {decision}"),
                         });
                     }
                 }
@@ -703,6 +734,7 @@ fn one_shot(
         claimed_at: None,
                     coalesced: 0,
                     payload_flags: Vec::new(),
+        advisories: Vec::new(),
         opened_hash: e.hash.clone(),
         decided_hash: None,
         chain_position: e.chain_position,
@@ -809,6 +841,45 @@ mod tests {
         assert!(is_governance_event("gate_escalation_payload_assertion_mismatch"));
         // CONTROL: an ordinary ask carries no flags, or every row would look compromised.
         assert!(project(&[opened(1, "clean", 0)], T0 + 60)[0].payload_flags.is_empty());
+    }
+
+    /// AN ADVISORY VERDICT IS VISIBLE ON THE ASK IT IS ABOUT, AND DECIDES NOTHING.
+    ///
+    /// Declared-but-unprojected would fall into `_ => {}` and be invisible all over again — so
+    /// this pins the projection, not the declaration. And it pins the half that keeps
+    /// "advisory" honest: a rung's confident DENY leaves the row's status exactly where the
+    /// operator's ruling (or its absence) puts it.
+    #[test]
+    fn an_advisory_verdict_annotates_its_ask_and_never_moves_its_status() {
+        let advisory = entry(2, 1, "ladder_advisory_verdict", serde_json::json!({
+            "escalation_id": "797ac6cf", "rung": "baseline:v1", "decision": "decline",
+            "declined_because": "abstained", "confidence": 0.2, "permits_write": false,
+        }));
+        let loud_deny = entry(3, 2, "ladder_advisory_verdict", serde_json::json!({
+            "escalation_id": "797ac6cf", "rung": "agent:v0", "decision": "deny",
+            "declined_because": null, "confidence": 0.99, "permits_write": false,
+        }));
+        let rows = project(&[opened(1, "797ac6cf", 0), advisory, loud_deny], T0 + 60);
+        assert_eq!(rows.len(), 1, "an advisory is an annotation, never a second row");
+        assert_eq!(rows[0].advisories, vec![
+            "baseline:v1: decline [abstained] (0.20)".to_string(),
+            "agent:v0: deny (0.99)".to_string(),
+        ]);
+        assert_eq!(rows[0].status, LedgerStatus::Open,
+                   "a 0.99 advisory deny must leave the ask OPEN — it is not a ruling");
+
+        // And when the operator DOES rule, theirs is the status; the rung's view stays beside
+        // it, which is the comparison §4.3 is made of.
+        let ruled = project(
+            &[opened(1, "797ac6cf", 0),
+              entry(2, 1, "ladder_advisory_verdict", serde_json::json!({
+                  "escalation_id": "797ac6cf", "rung": "agent:v0", "decision": "deny",
+                  "confidence": 0.99})),
+              decided(3, "797ac6cf", 5, "approved")],
+            T0 + 60,
+        );
+        assert_eq!(ruled[0].status, LedgerStatus::Approved);
+        assert_eq!(ruled[0].advisories.len(), 1, "the disagreement is preserved, not overwritten");
     }
 
     /// The defect that produced this module: an undecided escalation must still be READABLE after
@@ -1117,6 +1188,7 @@ mod tests {
         "gate_escalation_coalesced",
         "gate_escalation_payload_drift",
         "gate_escalation_payload_assertion_mismatch",
+        "ladder_advisory_verdict",
     ];
 
     #[test]

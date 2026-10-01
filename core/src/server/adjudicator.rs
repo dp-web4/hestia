@@ -318,6 +318,158 @@ impl Adjudicator for BaselineRung {
     }
 }
 
+/// How much an act can cost if it is wrong. Ordered, so `consequence > max` is a comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Consequence {
+    Low,
+    Med,
+    High,
+}
+
+/// Whether a rung's verdict can END the ladder. §4.1's promotion path as a type: a rung starts
+/// `Advisory` and only an operator act makes it `Deciding`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RungMode {
+    /// Recorded, never decisive. "An advisory rung that could block is not advisory" (§4.2).
+    Advisory,
+    Deciding,
+}
+
+/// What the LADDER holds about a rung — deliberately not what the rung holds about itself.
+/// The threshold and the consequence ceiling live here because a rung that set its own would
+/// be grading its own sufficiency.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RungSpec {
+    pub id: String,
+    pub threshold: f64,
+    pub max_consequence: Consequence,
+    pub mode: RungMode,
+}
+
+/// One rung's line in the trail. EVERY rung on the route gets one, asked or not: §3.4 says an
+/// unrecorded advisory verdict is an unmeasurable one, and a rung skipped for consequence must
+/// say so or the trail reads as though it was never on the route.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RungRecord {
+    pub rung: String,
+    pub asked: bool,
+    pub verdict: Option<Verdict>,
+    /// Why the ladder moved PAST this rung. `None` only for the rung that decided.
+    pub passed_because: Option<Decline>,
+}
+
+/// How a run over the in-process rungs ended.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LadderOutcome {
+    /// A `Deciding` rung answered at or above its threshold.
+    Decided { by: String, verdict: Verdict, trail: Vec<RungRecord> },
+    /// Every in-process rung passed and the route continues to a human. This is today's
+    /// behaviour — an escalation pending for the operator — expressed as an outcome.
+    AwaitHuman { trail: Vec<RungRecord> },
+    /// The route had NO human rung and every rung passed. §3.2: this is a DENY, and it is
+    /// witnessed as one — a ladder that silently runs out is worse than one that never ran.
+    Exhausted { trail: Vec<RungRecord> },
+}
+
+impl LadderOutcome {
+    pub fn trail(&self) -> &[RungRecord] {
+        match self {
+            Self::Decided { trail, .. } | Self::AwaitHuman { trail } | Self::Exhausted { trail } => {
+                trail
+            }
+        }
+    }
+
+    /// The `ladder_exhausted` row AC-10 requires: each rung NAMED with its reason, because
+    /// "nobody decided" is not a record anyone can act on.
+    pub fn exhausted_row(&self, escalation_id: &str) -> Option<Value> {
+        let Self::Exhausted { trail } = self else { return None };
+        Some(json!({
+            "escalation_id": escalation_id,
+            "decision": "deny",
+            "why": "every rung on the route passed and the route names no human",
+            "rungs": trail.iter().map(|r| json!({
+                "rung": r.rung,
+                "asked": r.asked,
+                "passed_because": r.passed_because,
+            })).collect::<Vec<_>>(),
+        }))
+    }
+}
+
+/// Walk the route. §3.2's three conditions, each its own branch so each can be tested alone.
+///
+/// `ends_with_human` is the route's last rung being the operator: the human is not an
+/// in-process `Adjudicator` (they decide out of band, through a channel that proves them), so
+/// the walk ends in `AwaitHuman` rather than pretending to ask them.
+pub fn run_ladder(
+    route: &[(RungSpec, &dyn Adjudicator)],
+    bundle: &Value,
+    consequence: Consequence,
+    ends_with_human: bool,
+) -> LadderOutcome {
+    let mut trail: Vec<RungRecord> = Vec::new();
+    for (spec, rung) in route {
+        // CONDITION 2, CHECKED FIRST AND BEFORE ASKING. A rung may be certain and still
+        // unauthorised, and it must never be HANDED a bundle it could not have been permitted
+        // to decide — so this is not a filter on its answer, it is a refusal to pose the
+        // question. Falsifier:
+        // `a_rung_is_never_asked_about_a_consequence_above_its_ceiling`.
+        if consequence > spec.max_consequence {
+            trail.push(RungRecord {
+                rung: spec.id.clone(),
+                asked: false,
+                verdict: None,
+                passed_because: Some(Decline::NotAuthorised),
+            });
+            continue;
+        }
+        let v = rung.adjudicate(bundle);
+        // CONDITION 3: the rung declined. Its own reason is carried through unchanged —
+        // Abstained, TimedOut and Unreachable are different facts (AC-7), and none of them may
+        // read as concurrence.
+        if v.decision == Decision::Decline {
+            let why = v.declined_because;
+            trail.push(RungRecord {
+                rung: spec.id.clone(), asked: true, verdict: Some(v), passed_because: why,
+            });
+            continue;
+        }
+        // CONDITION 1: decided, but under the threshold THE LADDER holds. The comparison
+        // happens here and nowhere else — the rung reports, the ladder compares.
+        if v.confidence < spec.threshold {
+            trail.push(RungRecord {
+                rung: spec.id.clone(),
+                asked: true,
+                verdict: Some(v),
+                passed_because: Some(Decline::BelowThreshold),
+            });
+            continue;
+        }
+        // AN ADVISORY VERDICT IS RECORDED AND NEVER DECISIVE — in either direction (AC-12).
+        // A confident advisory DENY does not end the ladder any more than an approve does:
+        // "an advisory rung that could block is not advisory". Falsifier:
+        // `an_advisory_deny_leaves_the_case_for_the_next_rung`.
+        if spec.mode == RungMode::Advisory {
+            trail.push(RungRecord {
+                rung: spec.id.clone(), asked: true, verdict: Some(v), passed_because: None,
+            });
+            continue;
+        }
+        trail.push(RungRecord {
+            rung: spec.id.clone(), asked: true, verdict: Some(v.clone()), passed_because: None,
+        });
+        return LadderOutcome::Decided { by: spec.id.clone(), verdict: v, trail };
+    }
+    if ends_with_human {
+        LadderOutcome::AwaitHuman { trail }
+    } else {
+        LadderOutcome::Exhausted { trail }
+    }
+}
+
 /// One rung's verdict placed beside what the human actually decided.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Comparison {
@@ -557,6 +709,138 @@ mod tests {
         assert!(with_diff.confidence < 0.5, "a diff-reader with no reasoner is not confident");
         assert!(with_diff.consulted.len() >= 4, "and lists the fields it used: {:?}",
                 with_diff.consulted);
+    }
+
+    /// A stub rung that answers what it is told to and COUNTS how often it was asked — the
+    /// only way to prove a rung was never consulted rather than merely overruled.
+    struct Stub {
+        id: &'static str,
+        answer: Verdict,
+        asked: std::cell::Cell<u32>,
+    }
+    impl Stub {
+        fn deciding(id: &'static str, d: Decision, confidence: f64) -> Self {
+            let v = Verdict::new(id, d, None, Some("read the diff".into()), confidence,
+                                 vec!["write_effect".into()]).unwrap();
+            Self { id, answer: v, asked: std::cell::Cell::new(0) }
+        }
+        fn declining(id: &'static str, why: Decline) -> Self {
+            let v = Verdict::new(id, Decision::Decline, Some(why), None, 0.0,
+                                 vec!["escalation.marker".into()]).unwrap();
+            Self { id, answer: v, asked: std::cell::Cell::new(0) }
+        }
+    }
+    impl Adjudicator for Stub {
+        fn rung_id(&self) -> &str { self.id }
+        fn adjudicate(&self, _bundle: &Value) -> Verdict {
+            self.asked.set(self.asked.get() + 1);
+            self.answer.clone()
+        }
+    }
+    fn spec(id: &str, threshold: f64, max: Consequence, mode: RungMode) -> RungSpec {
+        RungSpec { id: id.into(), threshold, max_consequence: max, mode }
+    }
+
+    /// §3.2 condition 2: consequence is checked BEFORE the rung is asked. Not "its answer is
+    /// discarded" — the question is never posed, because a rung must not be handed a bundle
+    /// it could not have been permitted to decide.
+    #[test]
+    fn a_rung_is_never_asked_about_a_consequence_above_its_ceiling() {
+        let sure = Stub::deciding("agent", Decision::Approve, 0.99);
+        let route: Vec<(RungSpec, &dyn Adjudicator)> =
+            vec![(spec("agent", 0.5, Consequence::Low, RungMode::Deciding), &sure)];
+        let out = run_ladder(&route, &json!({}), Consequence::High, true);
+
+        assert_eq!(sure.asked.get(), 0, "a certain rung above its ceiling must not be ASKED");
+        assert!(matches!(out, LadderOutcome::AwaitHuman { .. }), "{out:?}");
+        let r = &out.trail()[0];
+        assert!(!r.asked);
+        assert_eq!(r.passed_because, Some(Decline::NotAuthorised),
+                   "and the trail must say why nothing was asked, or the rung looks absent");
+
+        // CONTROL: the same rung, a consequence it may decide — asked, and decides.
+        let out2 = run_ladder(&route, &json!({}), Consequence::Low, true);
+        assert_eq!(sure.asked.get(), 1);
+        assert!(matches!(out2, LadderOutcome::Decided { .. }), "{out2:?}");
+    }
+
+    /// §3.2 condition 1: the LADDER compares confidence to the threshold it holds. A decided
+    /// verdict under it is passed up as BelowThreshold — an uncertain rung defers, it does not
+    /// guess — and the verdict is still in the trail, because it is measurement either way.
+    #[test]
+    fn a_decided_verdict_under_the_ladders_threshold_is_passed_up_not_acted_on() {
+        let unsure = Stub::deciding("agent", Decision::Approve, 0.60);
+        let route: Vec<(RungSpec, &dyn Adjudicator)> =
+            vec![(spec("agent", 0.80, Consequence::High, RungMode::Deciding), &unsure)];
+        let out = run_ladder(&route, &json!({}), Consequence::Low, true);
+        assert!(matches!(out, LadderOutcome::AwaitHuman { .. }), "{out:?}");
+        let r = &out.trail()[0];
+        assert_eq!(r.passed_because, Some(Decline::BelowThreshold));
+        assert!(r.verdict.is_some(), "the under-threshold verdict is still RECORDED");
+    }
+
+    /// AC-12: an advisory rung cannot block. A confident advisory DENY is recorded and the
+    /// case goes on to whoever actually decides.
+    #[test]
+    fn an_advisory_deny_leaves_the_case_for_the_next_rung() {
+        let advisor = Stub::deciding("advisor", Decision::Deny, 0.99);
+        let decider = Stub::deciding("decider", Decision::Approve, 0.95);
+        let route: Vec<(RungSpec, &dyn Adjudicator)> = vec![
+            (spec("advisor", 0.5, Consequence::High, RungMode::Advisory), &advisor),
+            (spec("decider", 0.5, Consequence::High, RungMode::Deciding), &decider),
+        ];
+        let out = run_ladder(&route, &json!({}), Consequence::Low, true);
+        match &out {
+            LadderOutcome::Decided { by, verdict, trail } => {
+                assert_eq!(by, "decider", "the advisory deny must not have ended the ladder");
+                assert_eq!(verdict.decision, Decision::Approve);
+                assert_eq!(trail[0].verdict.as_ref().unwrap().decision, Decision::Deny,
+                           "and the advisory verdict is still on the record: it IS the \
+                            measurement");
+            }
+            other => panic!("expected the deciding rung to decide: {other:?}"),
+        }
+        // And alone on a human route, the same advisory deny leaves the case PENDING.
+        let alone: Vec<(RungSpec, &dyn Adjudicator)> =
+            vec![(spec("advisor", 0.5, Consequence::High, RungMode::Advisory), &advisor)];
+        assert!(matches!(run_ladder(&alone, &json!({}), Consequence::Low, true),
+                         LadderOutcome::AwaitHuman { .. }));
+    }
+
+    /// AC-7 + AC-10: three kinds of silence stay three records, and running out is a DENY that
+    /// names every rung and its reason.
+    #[test]
+    fn exhaustion_is_a_witnessed_deny_that_names_each_rung_and_why_it_passed() {
+        let hung = Stub::declining("a", Decline::TimedOut);
+        let gone = Stub::declining("b", Decline::Unreachable);
+        let shrug = Stub::declining("c", Decline::Abstained);
+        let route: Vec<(RungSpec, &dyn Adjudicator)> = vec![
+            (spec("a", 0.5, Consequence::High, RungMode::Deciding), &hung),
+            (spec("b", 0.5, Consequence::High, RungMode::Deciding), &gone),
+            (spec("c", 0.5, Consequence::High, RungMode::Deciding), &shrug),
+        ];
+        // No human on the route: nothing is left to ask.
+        let out = run_ladder(&route, &json!({}), Consequence::Low, false);
+        assert!(matches!(out, LadderOutcome::Exhausted { .. }), "{out:?}");
+        let row = out.exhausted_row("esc1").expect("exhaustion must produce a row");
+        assert_eq!(row["decision"], json!("deny"), "fail-closed, WITH a record");
+        let reasons: Vec<_> = row["rungs"].as_array().unwrap().iter()
+            .map(|r| r["passed_because"].as_str().unwrap().to_string()).collect();
+        assert_eq!(reasons, vec!["timed_out", "unreachable", "abstained"],
+                   "a hang, a dead transport and a shrug must not collapse into one fact");
+
+        // THE ARM THAT MUST NOT FIRE: with one rung answering there is no exhaustion row.
+        let yes = Stub::deciding("d", Decision::Deny, 0.9);
+        let route2: Vec<(RungSpec, &dyn Adjudicator)> = vec![
+            (spec("a", 0.5, Consequence::High, RungMode::Deciding), &hung),
+            (spec("d", 0.5, Consequence::High, RungMode::Deciding), &yes),
+        ];
+        let out2 = run_ladder(&route2, &json!({}), Consequence::Low, false);
+        assert!(out2.exhausted_row("esc1").is_none(), "{out2:?}");
+        // And the same all-declining route WITH a human is pending, not denied: exhaustion is
+        // about routes that have nobody left, not about rungs being quiet.
+        assert!(matches!(run_ladder(&route, &json!({}), Consequence::Low, true),
+                         LadderOutcome::AwaitHuman { .. }));
     }
 
     fn cmp(kind: &str, rung: Decision, human: Decision, id: &str) -> Comparison {
