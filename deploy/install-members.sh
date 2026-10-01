@@ -552,6 +552,83 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
+# HESTIA_HOME REACHES EVERY SEAT, GLOBALLY (#1186; dp 2026-09-30: "that has to be part of the install
+# globally" ... "it has to be an exact path for the machine, hestia won't recognise $HOME").
+# The shared outcome witness records nothing unless HESTIA_HOME is in the SEAT's process environment:
+# it is the bootstrap locator, so the vault's shared config cannot supply it. Nothing set it durably,
+# so a harness launched from any terminal that had not exported it by hand (kimi, codex on 09-30)
+# silently witnessed nothing. The installer now publishes it, as an EXACT ABSOLUTE PATH resolved here
+# once — never `$HOME`, `~` or `%h` in anything written — to every place a seat's environment comes from:
+#   * ~/.config/environment.d (the systemd user manager: terminals and user services it starts),
+#   * the running user manager, at once (`systemctl --user set-environment`) — only when $HOME is this
+#     account's real home, so the isolated-HOME tests never touch a live session,
+#   * macOS: `launchctl setenv` for the GUI session,
+#   * a marked, idempotent block in ~/.profile and ~/.bashrc (GNOME terminals run non-login shells from
+#     an already-running terminal server, which does not see a new user-manager variable until relogin).
+HESTIA_HOME_ABS="$(cd "$HESTIA_HOME" 2>/dev/null && pwd -P || true)"
+[ -z "$HESTIA_HOME_ABS" ] && { mkdir -p "$HESTIA_HOME" && HESTIA_HOME_ABS="$(cd "$HESTIA_HOME" && pwd -P)"; }
+case "$HESTIA_HOME_ABS" in
+  /*) ;;
+  *) die "HESTIA_HOME did not resolve to an absolute path ('$HESTIA_HOME' -> '$HESTIA_HOME_ABS')" ;;
+esac
+# THE PATH IS WRITTEN INTO SOURCED SHELL AND INTO environment.d, so it is checked, not trusted (#1188 review):
+# a `$`, backtick, quote, backslash or space would be reinterpreted when ~/.profile is sourced, or split by
+# environment.d. Refused explicitly rather than written and silently changed.
+case "$HESTIA_HOME_ABS" in
+  *[!A-Za-z0-9/._+@,:-]*)
+    die "HESTIA_HOME resolves to '$HESTIA_HOME_ABS', which contains characters this installer will not write into a sourced shell file or environment.d (allowed: letters, digits and / . _ + @ , : -). Move it to such a path." ;;
+esac
+publish_hestia_home() {
+  local abs="$1" line="HESTIA_HOME=$1" envd="$HOME/.config/environment.d" f
+  local begin="# >>> hestia (managed by deploy/install-members.sh; do not hand-edit) >>>"
+  local end="# <<< hestia <<<"
+  if [ "$(uname -s)" = "Linux" ]; then
+    f="$envd/50-hestia.conf"
+    mkdir -p "$envd"
+    if [ "$(cat "$f" 2>/dev/null)" != "$line" ]; then
+      printf '%s\n' "$line" > "$f"
+      log "  env       : wrote $f ($line)"
+    fi
+  fi
+  # THE ACCOUNT'S REAL HOME, PORTABLY (#1188 review): `getent` does not exist on macOS, so the old lookup was
+  # always empty there and `launchctl setenv` never ran on the platform it exists for. Python's `pwd` answers
+  # on both. The live session is touched only when $HOME IS that home, so an isolated-HOME test never reaches
+  # it. `_HESTIA_TEST_ACCOUNT_HOME` exists ONLY so a test can make that condition true with `systemctl` /
+  # `launchctl` stubbed on PATH; nothing in the install sets it.
+  local real_home
+  real_home="${_HESTIA_TEST_ACCOUNT_HOME:-$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)' 2>/dev/null || true)}"
+  if [ -n "$real_home" ] && [ "$HOME" = "$real_home" ]; then
+    if [ "$(uname -s)" = "Linux" ] && command -v systemctl >/dev/null 2>&1; then
+      systemctl --user set-environment "$line" 2>/dev/null \
+        || warn "could not set HESTIA_HOME in the running user manager; it applies from the next login"
+    elif [ "$(uname -s)" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
+      launchctl setenv HESTIA_HOME "$abs" 2>/dev/null \
+        || warn "launchctl setenv HESTIA_HOME failed; login shells still get it from ~/.profile"
+    fi
+  fi
+  for f in "$HOME/.profile" "$HOME/.bashrc"; do
+    [ "$f" = "$HOME/.bashrc" ] && [ ! -e "$f" ] && continue
+    local block
+    block="$(printf '%s\nexport HESTIA_HOME="%s"\n%s' "$begin" "$abs" "$end")"
+    if [ -e "$f" ] && grep -qF "$begin" "$f"; then
+      if ! grep -qxF "export HESTIA_HOME=\"$abs\"" "$f"; then
+        python3 - "$f" "$begin" "$end" "$block" <<'PY'
+import sys
+path, begin, end, block = sys.argv[1:5]
+text = open(path).read()
+a = text.index(begin); b = text.index(end, a) + len(end)
+open(path, "w").write(text[:a] + block + text[b:])
+PY
+        log "  env       : updated the hestia block in $f"
+      fi
+    else
+      printf '\n%s\n' "$block" >> "$f"
+      log "  env       : added the hestia block to $f"
+    fi
+  done
+}
+publish_hestia_home "$HESTIA_HOME_ABS"
+
 # INVARIANT 4: written last, only after every file verified.
 mkdir -p "$HESTIA_HOME"
 tmp="$AUTHORITY.$$.tmp"
