@@ -177,6 +177,15 @@ jobs:
           RUN_CONFORMANCE: "1"
         run: cargo test -- --nocapture
 
+      # One-gate stage A: the decision witness's receipt contract against the daemon built from
+      # THIS commit (allow/warn/deny commit with a receipt; a daemon-ruled warn/deny comes back
+      # as the daemon's own row). The stub-daemon arms of the same file run in plugin-tests.
+      - name: Decision-witness receipt contract (real daemon)
+        working-directory: hestia
+        env:
+          HESTIA_DECISION_CONTRACT_ENDPOINT: http://127.0.0.1:7799/mcp
+        run: python3 tools/decision_witness_contract_test.py
+
       - name: Daemon log (on failure)
         if: failure()
         run: tail -100 "$SBX_HOME/serve.log" || true

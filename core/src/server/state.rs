@@ -86,6 +86,11 @@ pub struct InFlightAction {
     pub host_session_id: Option<String>,
     pub started_at: DateTime<Utc>,
     pub chain_position: u64,
+    /// The daemon's OWN witness of its own non-allow verdict on this action (`query_policy`'s
+    /// `policy_decision` row), once it is committed. A gate that then witnesses the same verdict
+    /// for the same member through `hestia_witness_decision` is answered with this row instead
+    /// of a second one (one-gate stage A: one verdict, one row, one charge).
+    pub own_decision: Option<super::decision_witness::OwnDecisionWitness>,
 }
 
 /// An operator's scoped exception to society law for one `(plugin_id, role)`.

@@ -6,6 +6,7 @@
 mod agents;
 pub mod adjudicator;
 mod dashboard;
+pub mod decision_witness;
 pub mod evidence;
 pub mod gate_escalation;
 pub mod governance_ledger;

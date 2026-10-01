@@ -468,7 +468,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_witness_decision",
-            "Witness an externally-adjudicated plugin-gate deny/warn (chain + gate-risk trust)",
+            "Witness an externally-adjudicated plugin-gate allow/warn/deny (chain + gate-risk trust; allow charges nothing)",
         ),
         t(
             "hestia_query_policy",
@@ -944,6 +944,7 @@ its permit now belongs to another invocation, so this one may not begin"),
             host_session_id,
             started_at,
             chain_position,
+            own_decision: None,
         },
     );
 
@@ -1569,13 +1570,17 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         );
     }
 
+    // The hash of the daemon's own decision row, when one was written AND committed. Returned
+    // as `decisionEntryHash` and kept on the in-flight action (one-gate stage A): a gate that
+    // then witnesses this same verdict is answered with this row, not a duplicate of it.
+    let mut decision_entry_hash: Option<String> = None;
     if evaluation.decision != crate::policy::PolicyDecision::Allow {
         // A deny blocks before execution, so this is the ONLY witnessed record of a
         // denied action — carry the full accountability WHO (instance + role +
         // session) and WHY (actor intent) here, or they're lost for everything the
         // gate blocks. Computed inside the gate branch so Allow decisions skip it.
         let instance_lct = s.member_lct(&plugin_id_for_chain);
-        let _ = s.append_chain(
+        let own_row = s.append_chain(
             "policy_decision",
             json!({
                 "action_id": action_id_str,
@@ -1611,6 +1616,20 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                     } else { a }),
             }),
         );
+        // The verdict never depends on this append (as before: a failed append was, and is,
+        // not a reason to change the ruling). What changes is that its success is no longer
+        // discarded: only a COMMITTED row is remembered or reported.
+        if let Ok(row) = &own_row {
+            decision_entry_hash = Some(row.hash.clone());
+            let own = super::decision_witness::OwnDecisionWitness {
+                decision: evaluation.decision.as_str().to_string(),
+                entry_hash: row.hash.clone(),
+                plugin_id: plugin_id_for_chain.clone(),
+            };
+            if let Some(a) = s.actions.get_mut(&action_id) {
+                a.own_decision = Some(own);
+            }
+        }
 
         // Wire the gate's risk judgment into trust. Before this, trust evolved
         // ONLY on execution outcomes (all success → it saturated at the ceiling)
@@ -1692,6 +1711,10 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         // Clients surface it verbatim on their deny channel and never parse
         // it; `reason`/`ruleName` stay the machine-readable fields.
         "guidance": evaluation.guidance(),
+        // The chain hash of the daemon's own witness of this verdict: present only when the
+        // verdict was not `allow` AND its `policy_decision` row committed. Absent is not
+        // "witnessed elsewhere" — an allow writes no row here.
+        "decisionEntryHash": decision_entry_hash,
         "ruleId": evaluation.rule_id,
         "ruleName": evaluation.rule_name,
         "policyId": evaluation.rule_id, // alias kept for backward compat with v0 SDKs
@@ -2357,6 +2380,8 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
 const RESERVED_EVENT_TYPES: &[&str] = &[
     "outcome",
     "policy_decision",
+    // The allow half of the one decision witness (one-gate stage A): daemon-written only.
+    super::decision_witness::ALLOW_EVENT,
     "policy_edit",
     "vault_set",
     "orchestrator_connect",
@@ -3926,15 +3951,52 @@ async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
 }
 
 async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult {
+    use super::decision_witness::{bounded_core_digest, existing_witness, Verdict};
     let plugin_id = require_string(args, "plugin_id")?;
     let decision = require_string(args, "decision")?;
-    if decision != "deny" && decision != "warn" {
+    // ONE decision witness for every verdict (one-gate stage A). `allow` was refused here until
+    // the common orchestrator needed it; it lands as its own event type and charges nothing —
+    // see `decision_witness` for why each of those is the correct semantics, not a convenience.
+    let Some(verdict) = Verdict::parse(&decision) else {
         return Ok(hestia_error_envelope(
             "hestia.witness_decision_kind",
-            &format!("decision '{decision}' must be 'deny' or 'warn'"),
+            &format!("decision '{decision}' must be 'allow', 'warn' or 'deny'"),
             Some(json!({"decision": decision})),
         ));
-    }
+    };
+    // THE JOIN KEYS. `action_id` names the action the gate began (decision row ↔ outcome row);
+    // `correlation_key` is the core's Pre/Post key for this tool invocation (C13). Both are
+    // optional — a decision reached before any action began has neither — but a key that was
+    // SENT and is unusable is refused, never dropped: a dropped join key is a receipt that does
+    // not name its input, and the join it was sent for silently fails.
+    let action_id: Option<Uuid> = match args.get("action_id") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_str().and_then(|a| Uuid::parse_str(a).ok()) {
+            Some(u) => Some(u),
+            None => {
+                return Ok(hestia_error_envelope(
+                    "hestia.witness_decision_arg",
+                    "action_id must be the actionId string hestia_begin_action returned",
+                    Some(json!({"arg": "action_id"})),
+                ))
+            }
+        },
+    };
+    let correlation_key: Option<String> = match args.get("correlation_key") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_str().filter(|k| super::gate_escalation::valid_correlation_key(k)) {
+            Some(k) => Some(k.to_string()),
+            None => {
+                return Ok(hestia_error_envelope(
+                    "hestia.witness_decision_arg",
+                    "correlation_key must be 1-200 chars of [A-Za-z0-9_.-] \
+                     (hestia_witness_core.correlation_key)",
+                    Some(json!({"arg": "correlation_key"})),
+                ))
+            }
+        },
+    };
+    let core_digest = bounded_core_digest(args.get("core_digest"));
     let adjudicator = require_string(args, "adjudicator")?;
     let reason = optional_string(args, "reason").unwrap_or_default();
     let tool_name = optional_string(args, "tool_name").unwrap_or_default();
@@ -3998,57 +4060,107 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     let role_lct = crate::reputation::normalize_constellation_role(&declared_role);
 
     let s = state.lock().await;
+    // ONE VERDICT, ONE ROW. The society-safety path already witnessed the daemon's own verdict
+    // on this action (`query_policy`'s row, with its own Conduct charge). The gate's witness of
+    // the same verdict for the same member IS that row: hand back its hash, append nothing,
+    // charge nothing. Before this, a seat that recorded its society deny (codex does) wrote a
+    // second `policy_decision` and charged the member twice for one refusal.
+    let resident = action_id.and_then(|a| s.actions.get(&a));
+    if let Some(hash) =
+        existing_witness(resident.and_then(|a| a.own_decision.as_ref()), &plugin_id, verdict)
+    {
+        return Ok(json!({
+            "witnessEntryHash": hash,
+            "eventType": verdict.event_type(),
+            "decision": verdict.as_str(),
+            "recorded": "existing",
+            "charged": false,
+            "actionId": action_id.map(|a| a.to_string()),
+            "correlationKey": correlation_key,
+            "updatedTrust": Value::Null,
+        }));
+    }
+    let action_resident = resident.is_some();
     let instance_lct = s.member_lct(&plugin_id);
-    let entry = s.append_chain(
-        "policy_decision",
-        json!({
-            "tool_name": tool_name,
-            "target": target,
-            "plugin_id": plugin_id,
-            "instance_lct": instance_lct,
-            "role_lct": role_lct,
-            "session_id": session_id,
-            "decision": decision,
-            "enforced": true,
-            "adjudicator": adjudicator,
-            "reason": reason,
-            "payload_sha256": payload_sha256,
-            "attempted": attempted,
-            "rule_id": rule_id,
-            "verdict_available": verdict_available,
-        }),
-    )?;
-    // Same asymmetric gate-risk trust as the daemon's own gate decisions.
-    let risk_magnitude = if decision == "deny" { 0.5 } else { 0.2 };
-    let gate_reason = format!("gate:{decision} ({adjudicator})");
-    let rep_ctx = crate::reputation::RepContext {
-        // CALLER-REPORTED gate decision from a hook. Hestia did NOT establish
-        // this cause — it received a claim — so it cannot honestly assert
-        // Conduct, and it must NOT infer one from `decision`/`reason`/rule
-        // names: those are descriptive evidence, not causal proof, and
-        // inferring from them is exactly the infrastructure-as-conduct defect
-        // one layer downstream. Held as Unclassified until the hook states a
-        // class of its own; the hub records and counts it either way.
-        class: crate::reputation::DeltaClass::Unclassified,
-        role_lct,
-        action_type: "policy_gate",
-        action_target: &tool_name,
-        action_id: "",
-        // Caller-reported decision (the hook layer's own gate). The `reason`
-        // reaching this row is the daemon-built `gate:{decision} ({adjudicator})`
-        // above — the caller's free text goes to the chain entry, not here — so
-        // attribution rides the dedicated `rule_id` arg, not a parse of the
-        // parenthetical. Empty while no caller sends one, correctly: the day-one
-        // check is that the field VARIES on policy_gate rows, not that it is
-        // never empty.
-        rule_triggered: &rule_id,
-        reason: &gate_reason,
-    };
-    let trust_state = s.apply_outcome_ctx(&plugin_id, false, risk_magnitude, &rep_ctx)?;
+    let mut row = json!({
+        "tool_name": tool_name,
+        "target": target,
+        "plugin_id": plugin_id,
+        "instance_lct": instance_lct,
+        "role_lct": role_lct,
+        "session_id": session_id,
+        "decision": verdict.as_str(),
+        "enforced": true,
+        "adjudicator": adjudicator,
+        "reason": reason,
+        "payload_sha256": payload_sha256,
+        "attempted": attempted,
+        "rule_id": rule_id,
+        "verdict_available": verdict_available,
+    });
+    // Join keys and the deployed-generation attestation ride the row only when SENT, so a
+    // deployed refusal shim that sends none of them writes exactly the row it always wrote.
+    // `core_digest` was sent by every shim since REPAIR 5 and dropped here until now.
+    if let Some(obj) = row.as_object_mut() {
+        if let Some(a) = action_id {
+            obj.insert("action_id".into(), json!(a.to_string()));
+            // Whether the daemon could see the named action when the decision landed. False is
+            // not a refusal (a restart empties the RAM action table); it says the join key was
+            // carried on the caller's word.
+            obj.insert("action_resident".into(), json!(action_resident));
+        }
+        if let Some(k) = &correlation_key {
+            obj.insert("correlation_key".into(), json!(k));
+        }
+        if let Some(d) = &core_digest {
+            obj.insert("core_digest".into(), json!(d));
+        }
+    }
+    // A failed append is an `Err` → `hestia.internal_error` on the wire, with no hash: the
+    // caller's receipt check then reads it as NOT committed, which is the point.
+    let entry = s.append_chain(verdict.event_type(), row)?;
+    let mut trust = Value::Null;
+    if let Some(risk_magnitude) = verdict.risk_magnitude() {
+        // Same asymmetric gate-risk trust as the daemon's own gate decisions.
+        let gate_reason = format!("gate:{} ({adjudicator})", verdict.as_str());
+        let action_id_text = action_id.map(|a| a.to_string()).unwrap_or_default();
+        let rep_ctx = crate::reputation::RepContext {
+            // CALLER-REPORTED gate decision from a hook. Hestia did NOT establish
+            // this cause — it received a claim — so it cannot honestly assert
+            // Conduct, and it must NOT infer one from `decision`/`reason`/rule
+            // names: those are descriptive evidence, not causal proof, and
+            // inferring from them is exactly the infrastructure-as-conduct defect
+            // one layer downstream. Held as Unclassified until the hook states a
+            // class of its own; the hub records and counts it either way.
+            class: crate::reputation::DeltaClass::Unclassified,
+            role_lct,
+            action_type: "policy_gate",
+            action_target: &tool_name,
+            // Empty unless the caller named its action — then the delta row joins it too.
+            action_id: &action_id_text,
+            // Caller-reported decision (the hook layer's own gate). The `reason`
+            // reaching this row is the daemon-built `gate:{decision} ({adjudicator})`
+            // above — the caller's free text goes to the chain entry, not here — so
+            // attribution rides the dedicated `rule_id` arg, not a parse of the
+            // parenthetical.
+            rule_triggered: &rule_id,
+            reason: &gate_reason,
+        };
+        let trust_state = s.apply_outcome_ctx(&plugin_id, false, risk_magnitude, &rep_ctx)?;
+        trust = trust_state_json(&trust_state);
+    }
+    // THE RECEIPT names every input it acted on, so a caller can tell "committed what I sent"
+    // from "committed something" — an older daemon that ignores `action_id` echoes no
+    // `actionId`, and a receipt-checking caller reads that as not committed.
     Ok(json!({
         "witnessEntryHash": entry.hash,
-        "decision": decision,
-        "updatedTrust": trust_state_json(&trust_state),
+        "eventType": verdict.event_type(),
+        "decision": verdict.as_str(),
+        "recorded": "appended",
+        "charged": verdict.risk_magnitude().is_some(),
+        "actionId": action_id.map(|a| a.to_string()),
+        "correlationKey": correlation_key,
+        "updatedTrust": trust,
     }))
 }
 
@@ -27039,5 +27151,254 @@ mod transport_binding_tests {
         assert!(other["note"].as_str().unwrap().contains("unbound"));
         let anon = tool_transport_binding(&state, &json!({})).await.unwrap();
         assert_eq!(anon["_hestia_error"]["code"], "hestia.transport_binding_unattributed");
+    }
+}
+
+// ---------------------------------------------------------------- one decision witness (stage A)
+//
+// The daemon half of one-gate stage A (docs/one-gate-convergence-plan.md): `hestia_witness_decision`
+// takes every final verdict, answers with a receipt that names its inputs, writes ONE row per
+// verdict, and charges `allow` nothing. The Python half (the mechanism's `record_decision`) is
+// pinned against these replies by tools/decision_witness_contract_test.py.
+#[cfg(test)]
+mod decision_witness_tests {
+    use super::inbox_tests::{open_state, seeded_home};
+    use super::*;
+
+    async fn state_with_safety() -> (tempfile::TempDir, SharedState) {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        {
+            let mut s = state.lock().await;
+            s.policy_engine = crate::policy::PolicyEngine::new(
+                crate::policy::get_preset("safety").unwrap().config,
+            );
+        }
+        (dir, state)
+    }
+
+    fn sink_lines(state_sink: &std::path::Path) -> usize {
+        std::fs::read_to_string(state_sink).map(|b| b.lines().count()).unwrap_or(0)
+    }
+
+    fn is_chain_hash(v: &Value) -> bool {
+        v.as_str().is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+    }
+
+    async fn rows_of(state: &SharedState, event_type: &str) -> Vec<crate::storage::chain::ChainEntry> {
+        let s = state.lock().await;
+        s.recent_chain(200).into_iter().filter(|e| e.event_type == event_type).collect()
+    }
+
+    /// Begin + rule an action for `plugin_id` under the safety preset. Returns (actionId, reply).
+    async fn ruled_action(state: &SharedState, plugin_id: &str, command: &str) -> (String, Value) {
+        let connect = tool_connect(state, &json!({"plugin_id": plugin_id, "host_agent": "test"}))
+            .await
+            .unwrap();
+        let sid = connect["sessionId"].as_str().unwrap().to_string();
+        let begin = tool_begin_action(
+            state,
+            &json!({"tool_name": "Bash", "target": command,
+                    "parameters": {"command": command}, "session_id": sid}),
+        )
+        .await
+        .unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        let verdict = tool_query_policy(state, &json!({"action_id": aid})).await.unwrap();
+        (aid, verdict)
+    }
+
+    fn witness_args(plugin_id: &str, decision: &str) -> Value {
+        json!({
+            "plugin_id": plugin_id,
+            "decision": decision,
+            "adjudicator": format!("plugin-gate:{plugin_id}"),
+            "reason": "gate.allow",
+            "rule_id": "gate.allow",
+            "tool_name": "Write",
+            "target": "/tmp/x",
+            "verdict_available": true,
+            "attempted": "Write -> /tmp/x",
+        })
+    }
+
+    #[tokio::test]
+    async fn allow_is_witnessed_as_its_own_event_and_charges_nothing() {
+        let (_d, state) = state_with_safety().await;
+        let sink = { state.lock().await.reputation_sink() };
+        let before = sink_lines(&sink);
+        let decisions_before = rows_of(&state, "policy_decision").await.len();
+        let out = tool_witness_decision(&state, &witness_args("codex", "allow")).await.unwrap();
+        assert!(out.get("_hestia_error").is_none(), "allow must be accepted now: {out}");
+        assert!(is_chain_hash(&out["witnessEntryHash"]), "{out}");
+        assert_eq!(out["eventType"], json!("policy_allow"));
+        assert_eq!(out["decision"], json!("allow"));
+        assert_eq!(out["recorded"], json!("appended"));
+        assert_eq!(out["charged"], json!(false));
+        assert_eq!(out["updatedTrust"], Value::Null);
+        let rows = rows_of(&state, "policy_allow").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hash, out["witnessEntryHash"].as_str().unwrap());
+        assert_eq!(rows[0].event_data["decision"], json!("allow"));
+        assert_eq!(rows[0].event_data["rule_id"], json!("gate.allow"));
+        assert_eq!(rows[0].event_data["verdict_available"], json!(true));
+        assert_eq!(
+            rows_of(&state, "policy_decision").await.len(),
+            decisions_before,
+            "an allow must never be written as a policy_decision (derivation's governance window)"
+        );
+        assert_eq!(sink_lines(&sink), before, "allow must emit no reputation delta");
+    }
+
+    /// A deployed refusal shim sends none of the new keys. Its row and its charge are what they
+    /// were before this change — the property that keeps stage A unwired.
+    #[tokio::test]
+    async fn a_deployed_refusal_call_writes_the_row_it_always_wrote() {
+        let (_d, state) = state_with_safety().await;
+        let sink = { state.lock().await.reputation_sink() };
+        let before = sink_lines(&sink);
+        for decision in ["deny", "warn"] {
+            let out = tool_witness_decision(&state, &witness_args("kimi-code", decision))
+                .await
+                .unwrap();
+            assert!(is_chain_hash(&out["witnessEntryHash"]), "{out}");
+            assert_eq!(out["decision"], json!(decision));
+            assert_eq!(out["eventType"], json!("policy_decision"));
+            assert_eq!(out["charged"], json!(true));
+            assert!(out["updatedTrust"].is_object(), "the trust reply is kept: {out}");
+        }
+        let rows = rows_of(&state, "policy_decision").await;
+        assert_eq!(rows.len(), 2);
+        for r in &rows {
+            let obj = r.event_data.as_object().unwrap();
+            for absent in ["action_id", "action_resident", "correlation_key", "core_digest"] {
+                assert!(!obj.contains_key(absent), "{absent} must ride only when sent: {obj:?}");
+            }
+        }
+        assert_eq!(sink_lines(&sink), before + 2, "warn and deny each still charge once");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_verdict_is_refused_before_any_append() {
+        let (_d, state) = state_with_safety().await;
+        let len = { state.lock().await.chain_len() };
+        for bad in ["escalate", "no-verdict", "Allow", ""] {
+            let out = tool_witness_decision(&state, &witness_args("codex", bad)).await.unwrap();
+            assert_eq!(
+                out["_hestia_error"]["code"], json!("hestia.witness_decision_kind"),
+                "{bad:?}: {out}"
+            );
+            assert!(out.get("witnessEntryHash").is_none());
+        }
+        assert_eq!({ state.lock().await.chain_len() }, len, "a refused verdict appends nothing");
+    }
+
+    #[tokio::test]
+    async fn an_unusable_join_key_is_refused_never_dropped() {
+        let (_d, state) = state_with_safety().await;
+        let len = { state.lock().await.chain_len() };
+        let mut bad: Vec<Value> = Vec::new();
+        for (k, v) in [
+            ("action_id", json!("not-a-uuid")),
+            ("action_id", json!(7)),
+            ("correlation_key", json!("has space")),
+            ("correlation_key", json!("x".repeat(201))),
+            ("correlation_key", json!("")),
+        ] {
+            let mut a = witness_args("codex", "allow");
+            a[k] = v;
+            bad.push(a);
+        }
+        for a in bad {
+            let out = tool_witness_decision(&state, &a).await.unwrap();
+            assert_eq!(out["_hestia_error"]["code"], json!("hestia.witness_decision_arg"), "{a}");
+        }
+        assert_eq!({ state.lock().await.chain_len() }, len);
+    }
+
+    #[tokio::test]
+    async fn join_keys_and_core_digest_ride_the_row_and_the_receipt() {
+        let (_d, state) = state_with_safety().await;
+        let aid = Uuid::new_v4().to_string();
+        let mut a = witness_args("gemini", "allow");
+        a["action_id"] = json!(aid);
+        a["correlation_key"] = json!("content-0123abcd");
+        a["core_digest"] = json!("f".repeat(64));
+        let out = tool_witness_decision(&state, &a).await.unwrap();
+        assert_eq!(out["actionId"], json!(aid), "the receipt names the action it joined");
+        assert_eq!(out["correlationKey"], json!("content-0123abcd"));
+        let row = rows_of(&state, "policy_allow").await.remove(0);
+        assert_eq!(row.event_data["action_id"], json!(aid));
+        assert_eq!(row.event_data["action_resident"], json!(false), "unknown to this daemon");
+        assert_eq!(row.event_data["correlation_key"], json!("content-0123abcd"));
+        assert_eq!(row.event_data["core_digest"], json!("f".repeat(64)));
+    }
+
+    /// The double-record this closes: the daemon already wrote and charged its own deny for the
+    /// action; the seat then witnessed "the same deny" again and was charged twice.
+    #[tokio::test]
+    async fn one_verdict_one_row_when_the_daemon_already_ruled_the_action() {
+        let (_d, state) = state_with_safety().await;
+        let (aid, verdict) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
+        assert_eq!(verdict["decision"], json!("deny"), "precondition: {verdict}");
+        assert!(is_chain_hash(&verdict["decisionEntryHash"]), "query_policy names its row: {verdict}");
+        let sink = { state.lock().await.reputation_sink() };
+        let charged_before = sink_lines(&sink);
+        let rows_before = rows_of(&state, "policy_decision").await.len();
+
+        let mut a = witness_args("codex", "deny");
+        a["action_id"] = json!(aid);
+        let out = tool_witness_decision(&state, &a).await.unwrap();
+        assert_eq!(out["recorded"], json!("existing"), "{out}");
+        assert_eq!(out["witnessEntryHash"], verdict["decisionEntryHash"]);
+        assert_eq!(out["charged"], json!(false));
+        assert_eq!(out["actionId"], json!(aid));
+        assert_eq!(rows_of(&state, "policy_decision").await.len(), rows_before, "no second row");
+        assert_eq!(sink_lines(&sink), charged_before, "no second charge");
+
+        // A DIFFERENT verdict on the same action is a different decision: its own row.
+        let mut w = witness_args("codex", "warn");
+        w["action_id"] = json!(aid);
+        let out = tool_witness_decision(&state, &w).await.unwrap();
+        assert_eq!(out["recorded"], json!("appended"), "{out}");
+        assert_eq!(rows_of(&state, "policy_decision").await.len(), rows_before + 1);
+
+        // And another member is never answered with this member's record.
+        let mut o = witness_args("kimi-code", "deny");
+        o["action_id"] = json!(aid);
+        let out = tool_witness_decision(&state, &o).await.unwrap();
+        assert_eq!(out["recorded"], json!("appended"), "{out}");
+        assert_ne!(out["witnessEntryHash"], verdict["decisionEntryHash"]);
+    }
+
+    /// The allow half of the join: the daemon writes nothing for its own allow, so the gate's
+    /// allow witness is the decision row, and it carries the action id the outcome will close.
+    #[tokio::test]
+    async fn an_allowed_action_is_joined_by_its_allow_row() {
+        let (_d, state) = state_with_safety().await;
+        let (aid, verdict) = ruled_action(&state, "claude-code", "ls -la").await;
+        assert_eq!(verdict["decision"], json!("allow"), "precondition: {verdict}");
+        assert_eq!(verdict["decisionEntryHash"], Value::Null, "the daemon writes no allow row");
+        let mut a = witness_args("claude-code", "allow");
+        a["action_id"] = json!(aid);
+        a["correlation_key"] = json!("toolu_01ABC");
+        let out = tool_witness_decision(&state, &a).await.unwrap();
+        assert_eq!(out["recorded"], json!("appended"), "{out}");
+        let row = rows_of(&state, "policy_allow").await.remove(0);
+        assert_eq!(row.event_data["action_id"], json!(aid));
+        assert_eq!(row.event_data["action_resident"], json!(true));
+        assert_eq!(row.event_data["correlation_key"], json!("toolu_01ABC"));
+    }
+
+    #[tokio::test]
+    async fn the_allow_event_cannot_be_forged_through_request_witness() {
+        let (_d, state) = state_with_safety().await;
+        let out = tool_request_witness(
+            &state,
+            &json!({"event_type": "policy_allow", "event_data": {"decision": "allow"}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["_hestia_error"]["code"], json!("hestia.witness_reserved_event"), "{out}");
     }
 }

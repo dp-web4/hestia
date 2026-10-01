@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 34611097709af15c85787b96850fb99a8cc25af1a2af940449cbd4221c0ab7d4  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: b3e6d0ef2c718f65aaf2e21066f19308920098b5cea007f7b72bca1886303b49  (published ground truth; manifest: hooks-gt)
 """Shared in-process daemon-query mechanism — the society-safety verdict path.
 
 PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
@@ -625,6 +625,222 @@ def witness_decision_unified(client_or_none, *, plugin_id: str, decision: str, r
         _append_deny_fallback(plugin_id, record)
         return False
 
+
+
+# ── ONE decision witness, receipt-validated (one-gate stage A) ──────────────────────────────────
+# docs/one-gate-convergence-plan.md. `witness_decision_unified` above stays exactly as deployed:
+# the four seats call it today, and stage A changes no seat. `record_decision` is the recorder
+# the common orchestrator (stage B) will call for EVERY final verdict, and it differs in the one
+# property C11 turns on:
+#
+#   COMMITTED MEANS A RECEIPT. `witness_decision_unified` returns True when the reply has an outer
+#   `result`. Every daemon tool error — a refused verdict, a failed chain append — arrives as a
+#   successful MCP result carrying `_hestia_error` (handler.rs `call_tool`), so that check reads a
+#   refusal as delivered. Here a decision is committed ONLY when the daemon returns a
+#   `witnessEntryHash` (a chain hash: 64 lowercase hex) AND the receipt names every input it acted
+#   on: the verdict, its event type, and the join keys that were sent. A daemon that ignored a key
+#   (one predating this contract) cannot produce that receipt, so it reads as not committed —
+#   the same rule the outcome witness keeps (hestia_witness_core.witness_one, #1149).
+#
+# Verdict semantics live on the daemon (core/src/server/decision_witness.rs): allow → its own
+# event `policy_allow`, no reputation delta; warn/deny → `policy_decision`, charged as before; a
+# verdict the daemon already witnessed for the same action and member → that row, not a second.
+
+DECISION_VERDICTS = ("allow", "warn", "deny")
+#: The daemon's event type per verdict. The receipt must name the one this verdict lands as.
+DECISION_EVENT_TYPES = {"allow": "policy_allow", "warn": "policy_decision", "deny": "policy_decision"}
+#: The single-shot budget when the caller passes no deadline (the deployed recorder's 1.5 s).
+DECISION_WITNESS_DEFAULT_BUDGET_S = 1.5
+
+
+@dataclass(frozen=True)
+class DecisionReceipt:
+    """What `record_decision` can PROVE about one decision record.
+
+    status:
+      "committed"   the daemon returned a receipt naming this decision; `entry_hash` is its row;
+      "refused"     the daemon RULED (a structured `_hestia_error`) — nothing was committed;
+      "ambiguous"   it answered, but not with a usable receipt (isError, JSON-RPC error, empty,
+                    a missing/malformed hash, a receipt that does not name the inputs);
+      "unreachable" no endpoint, no connection, or no time left to ask.
+    Only "committed" is evidence. The other three are equally NOT evidence; they differ only in
+    what an operator should look at.
+    """
+    status: str
+    entry_hash: Optional[str] = None
+    event_type: Optional[str] = None
+    deduplicated: bool = False      # the daemon answered with its own existing row for this act
+    detail: str = ""
+    fallback_path: Optional[str] = None  # where the uncommitted record was kept, if anywhere
+
+    @property
+    def committed(self) -> bool:
+        return self.status == "committed"
+
+
+def _is_chain_hash(v: Any) -> bool:
+    return (isinstance(v, str) and len(v) == 64
+            and all(c in "0123456789abcdef" for c in v))
+
+
+def _classify_decision_reply(rpc: Any) -> tuple:
+    """("ok"|"ruled"|"ambiguous", payload) — the outcome witness's three-kind rule, ONE rule.
+
+    Delegates to hestia_witness_core._classify_reply so the decision and the outcome halves of
+    the join can never disagree about what the daemon said. If the core cannot be loaded, the
+    reply is unclassifiable and therefore not a receipt."""
+    try:
+        return _witness_core()._classify_reply(rpc)
+    except Exception as e:  # noqa: BLE001
+        return "ambiguous", {"why": f"reply classifier unavailable: {type(e).__name__}"}
+
+
+def _receipt_problem(payload: dict, *, decision: str, action_id: Optional[str],
+                     correlation_key: Optional[str]) -> Optional[str]:
+    """None when `payload` is a receipt for exactly this decision; else what is wrong with it."""
+    if not _is_chain_hash(payload.get("witnessEntryHash")):
+        return "no chain-hash witnessEntryHash in the reply"
+    if payload.get("decision") != decision:
+        return f"receipt names decision {payload.get('decision')!r}, sent {decision!r}"
+    if payload.get("eventType") != DECISION_EVENT_TYPES[decision]:
+        return (f"receipt names event {payload.get('eventType')!r}, "
+                f"expected {DECISION_EVENT_TYPES[decision]!r}")
+    if action_id is not None and payload.get("actionId") != action_id:
+        return "receipt does not name the action_id that was sent"
+    if correlation_key is not None and payload.get("correlationKey") != correlation_key:
+        return "receipt does not name the correlation_key that was sent"
+    return None
+
+
+def _decision_fallback_path(plugin_id: str) -> Optional[Path]:
+    """The uncommitted-decision log. Only under an EXPLICIT HESTIA_HOME: no locator means no
+    authority root, and this path never guesses one (#944; #1139 review)."""
+    home = os.getenv("HESTIA_HOME")
+    if not home:
+        return None
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in (plugin_id or "unknown"))
+    return Path(home) / "telemetry" / f"gate-decisions-{safe}.jsonl"
+
+
+def _keep_uncommitted(plugin_id: str, record: dict, receipt: DecisionReceipt) -> DecisionReceipt:
+    """Keep an uncommitted decision where an operator can find it. Never raises, and never turns
+    the record into evidence: the returned receipt keeps its non-committed status."""
+    path = _decision_fallback_path(plugin_id)
+    if path is None:
+        return receipt
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({**record, "witness_status": receipt.status,
+                                 "witness_detail": receipt.detail}, default=str) + "\n")
+    except Exception:  # noqa: BLE001
+        return receipt
+    return DecisionReceipt(status=receipt.status, detail=receipt.detail,
+                           fallback_path=str(path))
+
+
+def record_decision(client_or_none, *, plugin_id: str, decision: str, rule: str,
+                    tool_name: str, target: Optional[str], session_id: Optional[str],
+                    verdict_available: bool, attempted_summary: str,
+                    action_id: Optional[str] = None,
+                    correlation_key: Optional[str] = None,
+                    deadline: Optional[float] = None) -> DecisionReceipt:
+    """Witness ONE final gate decision — allow, warn or deny — and say whether it COMMITTED.
+
+    `client_or_none`: an initialized `_McpHttp` to reuse, or None to open a single-shot session.
+    `action_id`: the action the gate began (query_society_safety's verdict.action_id), so the
+      decision row joins the outcome row; when the daemon already witnessed this very verdict for
+      this action, the receipt is that row (`deduplicated=True`).
+    `correlation_key`: `correlation_key(raw_event)` — the core's Pre/Post key (C13), computed by
+      the caller from the RAW harness event, carried onto the row.
+    `deadline`: an absolute `time.monotonic()` bound; no request starts after it. The caller's
+      one invocation deadline (stage B) passes straight through — this helper mints no time.
+
+    Returns a DecisionReceipt; `.committed` is True only on a receipt that names this decision.
+    NEVER raises. Never changes the caller's verdict — what to DO with an uncommitted permit is
+    the orchestrator's decision (C11: a consequential allow/warn becomes gate.evidence_uncommitted).
+    """
+    record = {
+        "plugin_id": plugin_id,
+        "decision": decision,
+        "rule": (rule or "")[:300],
+        "tool_name": tool_name or "",
+        "target": target,
+        "session_id": session_id,
+        "verdict_available": bool(verdict_available),
+        "core_digest": _loaded_core_digest(),
+        "attempted": attempted_summary,
+        "action_id": action_id,
+        "correlation_key": correlation_key,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    if decision not in DECISION_VERDICTS:
+        # A verdict the daemon would refuse is refused here, before any wire call: there is no
+        # fourth verdict to witness, and asking would only spend the caller's deadline.
+        return _keep_uncommitted(plugin_id, record, DecisionReceipt(
+            status="refused", detail=f"not a final verdict: {decision!r}"))
+    try:
+        end = deadline if deadline is not None else (
+            time.monotonic() + DECISION_WITNESS_DEFAULT_BUDGET_S)
+        if end - time.monotonic() <= 0:
+            return _keep_uncommitted(plugin_id, record, DecisionReceipt(
+                status="unreachable", detail="deadline exhausted before the witness call"))
+        client = client_or_none
+        if client is None:
+            endpoint = _discover_endpoint()
+            if endpoint is None:
+                return _keep_uncommitted(plugin_id, record, DecisionReceipt(
+                    status="unreachable", detail="no daemon endpoint discovered"))
+            client = _McpHttp(endpoint, end)
+            if "result" not in client.initialize():
+                return _keep_uncommitted(plugin_id, record, DecisionReceipt(
+                    status="unreachable", detail="initialize failed"))
+            client.initialized()
+        args: dict = {
+            "plugin_id": plugin_id,
+            "decision": decision,
+            "adjudicator": f"plugin-gate:{plugin_id}",
+            "reason": (rule or "")[:300],
+            # The rule id rides its own key (handler.rs reads `rule_id` into the row AND the
+            # reputation delta); the deployed recorder sends it only inside `reason`.
+            "rule_id": (rule or "")[:300],
+            "verdict_available": bool(verdict_available),
+            "tool_name": tool_name or "",
+            "target": target,
+            "session_id": session_id,
+            "attempted": attempted_summary,
+            "core_digest": record["core_digest"],
+        }
+        if action_id is not None:
+            args["action_id"] = action_id
+        if correlation_key is not None:
+            args["correlation_key"] = correlation_key
+        rpc = client.call_tool("hestia_witness_decision", args)
+    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as e:
+        return _keep_uncommitted(plugin_id, record, DecisionReceipt(
+            status="unreachable", detail=f"network: {type(e).__name__}: {e}"))
+    except Exception as e:  # noqa: BLE001 — never raises; an unknown failure is not a receipt
+        return _keep_uncommitted(plugin_id, record, DecisionReceipt(
+            status="ambiguous", detail=f"unexpected: {type(e).__name__}: {e}"))
+
+    kind, payload = _classify_decision_reply(rpc)
+    if kind == "ruled":
+        return _keep_uncommitted(plugin_id, record, DecisionReceipt(
+            status="refused", detail=f"{payload.get('code')}: {payload.get('message', '')}"[:300]))
+    if kind != "ok":
+        return _keep_uncommitted(plugin_id, record, DecisionReceipt(
+            status="ambiguous", detail=str(payload.get("why", "unclassified reply"))[:300]))
+    problem = _receipt_problem(payload, decision=decision, action_id=action_id,
+                               correlation_key=correlation_key)
+    if problem is not None:
+        return _keep_uncommitted(plugin_id, record, DecisionReceipt(
+            status="ambiguous", detail=problem))
+    return DecisionReceipt(
+        status="committed",
+        entry_hash=payload["witnessEntryHash"],
+        event_type=payload["eventType"],
+        deduplicated=payload.get("recorded") == "existing",
+    )
 
 # ── Authenticated policy path (Sprint F — PRD §6.F; §7.1 criteria 2/5) ─────────────────
 # fetch_policy_snapshot: the LIVE, in-process fetch of this member's policy from the
