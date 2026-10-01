@@ -285,6 +285,7 @@ MEMBER_ARG = re.compile(r"--member[ =]+[\"']?([A-Za-z0-9][A-Za-z0-9_.-]*)")
 # `being_gate_client._resolve_hestia_shared`). Any other HESTIA_* -- HESTIA_ROLE, say -- does
 # not move law resolution, so it must not quiet LAW-SOURCE.
 LAW_ENV_NAMES = ("HESTIA_GATE_SHARED", "HESTIA_SHARED_DIR", "HESTIA_HOME")
+PROJECTION_SUFFIX = ".env"      # a seat's rendered projection: $HESTIA_HOME/seats/<member> + this (#1186)
 ETC_SYSTEMD, LIB_SYSTEMD = Path("/etc/systemd"), Path("/usr/lib/systemd")
 UNIT_GLOBS = (
     ".config/systemd/user/*.service", ".local/share/systemd/user/*.service",
@@ -1830,6 +1831,37 @@ def inspect(atlas_id: str, roots: list[str]) -> dict:
             rec["findings"].append(
                 "RESIDUE: config dir present, no executable in any searched root, and "
                 "nothing hestia-wired in it — a leftover, not an installed agent")
+
+    # A REGISTERED WITNESS THAT CANNOT WRITE IS NOT A WIRED ONE (#1186, dp 2026-09-30: "not seeing kimi's tool
+    # calls in hestia ... the same is true of codex. yet both show green dots"). The shared outcome witness
+    # records nothing unless its seat has a rendered projection at $HESTIA_HOME/seats/<member> (plus the env
+    # suffix); without one every act returns `config.unbacked` -- silently, because the witness runs detached
+    # with stderr to /dev/null. Registration was correct on both seats, so every check above read green. The
+    # registration is only as good as what the hook can do with it: no projection, MISWIRED.
+    #
+    # HOME IS RESOLVED EXACTLY AS THE WITNESS RESOLVES IT (kimi-code's #1187 review): `HESTIA_HOME`, with NO
+    # default. A `~/.hestia` fallback here read green on a seat whose witness has no home at all, and red on a
+    # healthy seat whenever the inventory itself ran without the variable. Unset is `?`, never a pass and
+    # never MISWIRED: an UNVERIFIABLE finding plus an unknown, so the machine cannot read OK on it.
+    _witness_targets = [t for h in hestia_hooks for t in h.get("targets", []) if Path(t).name == "witness.py"]
+    if exe is not None and _witness_targets and rec.get("member"):
+        _acts = ("Two operator acts back it: the seat document in the vault (seat config; "
+                 "`tools/seed_seat_config.py --add-missing --apply`), and HESTIA_HOME in the seat's "
+                 "launcher environment (`deploy/install-members.sh` publishes it); see #1186")
+        _home_env = os.environ.get("HESTIA_HOME")
+        if not _home_env:
+            rec["findings"].append(
+                f"UNVERIFIABLE: the witness registered for {rec['member']} resolves its home from "
+                "HESTIA_HOME, which is not set where this inventory runs, so whether it can record "
+                f"is unknown here. {_acts}")
+            rec["unknown"].append(f"{rec['member']}: witness home unverifiable (HESTIA_HOME unset)")
+        else:
+            _proj = Path(_home_env) / "seats" / (str(rec["member"]) + PROJECTION_SUFFIX)
+            if not _proj.is_file():
+                rec["findings"].append(
+                    f"MISWIRED: the witness registered for {rec['member']} has no seat projection at "
+                    f"{_proj}; it records nothing (config.unbacked, silently: the witness runs "
+                    f"detached). {_acts}")
 
     # ONE predicate, two consumers. The demotion had two sites — this line and
     # `gaps["miswired"]` — and fixing only one flips the field while the gap report keeps
