@@ -486,6 +486,54 @@ def test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly():
           not G.path_in_scope(link, rec, ws, prof, ws) and not G.path_in_scope(interp, rec, ws, prof, ws),
           "Read reach widened")
 
+    # kimi-code's #1191 review. (a) THE BLOCKER: the two-field adapters passed forbidden=None, which meant the
+    # SHORT list, while their direct-naming scan carries the operator's extras. A link to an extras-listed
+    # target must deny through the adapter exactly as naming it does.
+    xdir = os.path.join(outside, "hestiaextra953")
+    os.makedirs(xdir, exist_ok=True)
+    xkey = os.path.join(xdir, "token.json")
+    open(xkey, "w").close()
+    xlink = os.path.join(ws, "proj", "xlink")
+    os.symlink(xkey, xlink)
+    saved = os.environ.get("HESTIA_FORBIDDEN_EXTRA")
+    os.environ["HESTIA_FORBIDDEN_EXTRA"] = "hestiaextra953"
+    try:
+        ok, tok = G.command_in_scope(f"cat {xlink}", rec, ws, ws)
+        check("adapter_applies_the_operators_extras_to_a_resolved_target", not ok, f"allowed, tok={tok!r}")
+    finally:
+        if saved is None:
+            os.environ.pop("HESTIA_FORBIDDEN_EXTRA", None)
+        else:
+            os.environ["HESTIA_FORBIDDEN_EXTRA"] = saved
+    # (b) a link whose target stays INSIDE the grant is egress-scanned too (it never reached the refusal branch)
+    os.makedirs(os.path.join(ws, "other"), exist_ok=True)
+    envf = os.path.join(ws, "other", ".env")
+    open(envf, "w").close()
+    elink = os.path.join(ws, "proj", "envlink")
+    os.symlink(envf, elink)
+    ok, tok, _ = G.command_scope_reach(f"cat {elink}", rec, ws, ws)
+    check("in_grant_link_to_a_secrets_file_denies", not ok and bool(tok) and tok.endswith("/.env"), repr(tok))
+    # (c) a NAMED repo grant is judged lexically; the egress scan now runs before that, so it is covered too
+    nlink = os.path.join(ws, "granted", "keylink")
+    os.symlink(key, nlink)
+    ok, tok, _ = G.command_scope_reach(f"cat {nlink}", ["repo:granted"], ws, ws)
+    check("named_grant_link_to_a_key_file_denies", not ok, f"allowed, tok={tok!r}")
+    # (d) the stated behaviour change, safe direction: a target whose path CONTAINS a forbidden substring
+    os.makedirs(os.path.join(ws, "granted", "docs"), exist_ok=True)
+    cred = os.path.join(ws, "granted", "docs", "credentials.md")
+    open(cred, "w").close()
+    clink = os.path.join(ws, "proj", "credlink")
+    os.symlink(cred, clink)
+    ok, _, _ = G.command_scope_reach(f"cat {clink}", rec, ws, ws)
+    check("pinned_in_grant_link_to_a_forbidden_substring_denies_like_direct_naming", not ok, "allowed")
+    # (e) control: an ordinary in-grant link is untouched
+    plain = os.path.join(ws, "granted", "plain.txt")
+    open(plain, "w").close()
+    plink = os.path.join(ws, "proj", "plainlink")
+    os.symlink(plain, plink)
+    ok, tok, _ = G.command_scope_reach(f"cat {plink}", rec, ws, ws)
+    check("control_an_ordinary_in_grant_link_allows", ok, f"denied, tok={tok!r}")
+
 
 def test_temp_root_is_a_path_boundary_not_a_prefix():
     """codex #169 finding 2. `startswith("/tmp")` admits `/tmp-other` — a SIBLING of the temp

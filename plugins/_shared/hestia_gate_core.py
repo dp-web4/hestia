@@ -886,18 +886,48 @@ def path_in_scope(path: str, scopes, workspace: str, profile: HarnessProfile,
     return False                  # absolute, outside the workspace, not home/tmp
 
 
-def command_in_scope(cmd: str, scopes, workspace: str, cwd: Optional[str] = None):
+def _default_forbidden() -> tuple:
+    """The egress list a caller gets when it passes none: the built-ins PLUS the operator's extras.
+
+    #1191 shipped `None -> FORBIDDEN_DEFAULT` (the short list), while the shims' direct-naming scan includes
+    `HESTIA_FORBIDDEN_EXTRA` (gemini's `FORBIDDEN = DEFAULT + extras`). So with `.kaggle` in the extras,
+    `cat ~/.kaggle/kaggle.json` was denied by name but a symlink to it passed the adapters (kimi-code's #1191
+    review, probed: main DENY, branch ALLOW). The old realpath refusal needed no list at all; its replacement
+    must not be the weaker one. Every HarnessProfile reads extras from this same variable."""
+    extra = os.environ.get("HESTIA_FORBIDDEN_EXTRA", "")
+    return FORBIDDEN_DEFAULT + tuple(t.strip() for t in extra.split(",") if t.strip())
+
+
+def command_in_scope(cmd: str, scopes, workspace: str, cwd: Optional[str] = None, forbidden=None):
     """Returns (ok, offending_token) — the two-field contract every seat's shim reads.
 
     `command_scope_reach` is the same check carrying the third fact the deny text needs:
     the resolved path that was refused. This wrapper exists so the shims (kimi, gemini,
-    the parity test) keep their contract while `evaluate` reads the richer one."""
-    ok, offending, _resolved = command_scope_reach(cmd, scopes, workspace, cwd)
+    the parity test) keep their contract while `evaluate` reads the richer one. `forbidden`
+    passes through; None means `_default_forbidden()` (built-ins + the operator's extras)."""
+    ok, offending, _resolved = command_scope_reach(cmd, scopes, workspace, cwd, forbidden=forbidden)
     return ok, offending
 
 
-def _symlinked_reach_verdict(resolved: str, seg: str, repo_scopes, scopes, workspace: str,
-                             forbidden) -> Optional[tuple]:
+def _symlink_target_forbidden(resolved: str, forbidden) -> Optional[str]:
+    """The resolved target when a SYMLINK on the way leads to a forbidden path, else None.
+
+    Runs on EVERY absolute workspace token, ahead of the grant check (kimi-code's #1191 review, point 2): a
+    link whose target stays INSIDE a grant never reached the refusal branch, so under `path:<ws>/**`
+    `cat <ws>/granted/env-link` -> `<ws>/other/.env` passed while naming that file directly is denied by
+    gate 1a's text scan. The same order covers NAMED repo grants, whose tokens are judged lexically and
+    never reached the realpath logic at all (#953's disclosed residual). Behaviour change vs main, safe
+    direction: an in-grant link whose target merely CONTAINS a forbidden substring (`.env.example`,
+    `docs/credentials.md`) now denies, the same as naming it directly does."""
+    lexical = os.path.normpath(resolved).replace("\\", "/")
+    target = os.path.realpath(lexical).replace("\\", "/")
+    if target == lexical:
+        return None
+    low = target.lower()
+    return target if any(f in low for f in forbidden) else None
+
+
+def _symlinked_reach_verdict(resolved: str, seg: str, repo_scopes, scopes, workspace: str) -> Optional[tuple]:
     """A reach a SYMLINK carries out of its grant is judged by its target, as if named directly (#953).
 
     `_within_path_grant` compares realpaths, so `<ws>/proj/venv/bin/python` under `path:<ws>/**` was
@@ -906,10 +936,9 @@ def _symlinked_reach_verdict(resolved: str, seg: str, repo_scopes, scopes, works
     the target itself and been allowed, and the deny named `proj`, which IS granted, so each seat asked an
     operator for a grant it already held.
 
-    Returns None when the reach is in scope, else `(offending, refused_path)`:
+    Called only after `_symlink_target_forbidden` has cleared the target (egress is judged first, for every
+    token). Returns None when the reach is in scope, else `(offending, refused_path)`:
       - no symlink on the way (realpath == the lexical path): the lexical refusal stands, unchanged;
-      - target trips the egress list: refused, naming the TARGET. A link must not launder `~/.ssh/...`
-        past a check that reads only command text;
       - target inside the workspace: judged by the TARGET's repo, and a refusal names that repo
         (the misattribution half of #953);
       - target outside the workspace: allowed, because a command naming it directly is not MRH-scoped.
@@ -918,9 +947,6 @@ def _symlinked_reach_verdict(resolved: str, seg: str, repo_scopes, scopes, works
     target = os.path.realpath(lexical).replace("\\", "/")
     if target == lexical:
         return (seg or "<workspace root>"), resolved
-    low = target.lower()
-    if any(f in low for f in forbidden):
-        return target, target
     wsr = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
     if target == wsr or target.startswith(wsr + "/"):
         tseg = target[len(wsr):].lstrip("/").split("/", 1)[0]
@@ -934,8 +960,8 @@ def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = N
                         forbidden=None):
     """Returns (ok, offending_token, resolved_path).
 
-    `forbidden` is the egress list applied to a symlink's RESOLVED target (#953); None means
-    FORBIDDEN_DEFAULT, so the seats' two-field adapters keep their call shape and are not weaker.
+    `forbidden` is the egress list applied to a symlink's RESOLVED target, on every absolute workspace
+    token and before any grant check (#953, #1191 review); None means `_default_forbidden()`.
 
     `resolved_path` is the candidate the check actually judged — absolute, normalised — or
     None when nothing was refused. It is carried rather than reconstructed: the deny text
@@ -954,6 +980,7 @@ def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = N
     escapes string parsing entirely — the engine sandbox, not this check, is the fs boundary."""
     ws = workspace.rstrip("/")
     repo_scopes, _ = _scope_parts(scopes, workspace)
+    egress = _default_forbidden() if forbidden is None else forbidden
     for after in cmd.split(workspace)[1:]:
         # Resolve the whole token before reading a segment off it (kimi #940 B7). Taking the
         # head lexically let `cat <ws>/repo-a/../repo-b/secret` pass on `repo-a` while
@@ -963,10 +990,13 @@ def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = N
         resolved = os.path.normpath(f"{ws}/{tok}").replace("\\", "/")
         if resolved != ws and not resolved.startswith(ws + "/"):
             return False, (tok or "<workspace root>"), resolved   # traversed out of the workspace
+        # EGRESS FIRST, for every token: a symlink must not launder a forbidden target past a grant.
+        hidden = _symlink_target_forbidden(resolved, egress)
+        if hidden is not None:
+            return False, hidden, hidden
         seg = resolved[len(ws):].lstrip("/").split("/", 1)[0]
         if seg not in repo_scopes and not _within_path_grant(resolved, scopes, workspace):
-            refused = _symlinked_reach_verdict(resolved, seg, repo_scopes, scopes, workspace,
-                                               FORBIDDEN_DEFAULT if forbidden is None else forbidden)
+            refused = _symlinked_reach_verdict(resolved, seg, repo_scopes, scopes, workspace)
             if refused is None:
                 continue
             return (False,) + refused
