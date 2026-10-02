@@ -1001,6 +1001,24 @@ def test_install_members_reports_a_narrow_gate_and_leaves_it():
         assert got == narrow["hooks"]["PreToolUse"], got
 
 
+def test_install_names_the_seat_document_step_and_never_fails_on_it():
+    """#1186: the installer runs the seeder's --add-missing after the hooks, so a seat installed after the
+    first seed gets its document without the operator knowing the step exists. Without an operator key it
+    cannot write; it says so, prints the exact repair command, and the install still succeeds."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        root, home, env = _e2e_root(tmp)
+        (root / "tools").mkdir()
+        shutil.copy(REPO / "tools" / "seed_seat_config.py", root / "tools" / "seed_seat_config.py")
+        p = subprocess.run(["bash", str(root / "deploy" / "install-members.sh")], capture_output=True,
+                           text=True, env=env)
+        out = p.stdout + p.stderr
+        assert p.returncode == 0, out[-3000:]
+        assert "SEATS (tools/seed_seat_config.py --add-missing)" in out, out[-3000:]
+        assert "no operator key at" in out and "--add-missing --apply" in out, out[-3000:]
+        assert out.index("REGISTERED claude-code") < out.index("SEATS ("), "seat step must follow the hooks"
+
+
 TESTS = [
     test_thor_case_registers_only_the_missing_witness,
     test_kimi_flat_layout_registers_the_failure_witness_only,
@@ -1038,6 +1056,7 @@ TESTS = [
     test_covers,
     test_install_members_end_to_end_in_an_isolated_home,
     test_install_members_reports_a_narrow_gate_and_leaves_it,
+    test_install_names_the_seat_document_step_and_never_fails_on_it,
 ]
 
 if __name__ == "__main__":

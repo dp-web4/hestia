@@ -145,6 +145,27 @@ def main() -> int:
         check("D no installed seat -> refuses, rather than writing a lone shared set",
               verdict == "no-seats" and docs == [], f"{verdict} {docs}")
 
+        print("F. --add-missing (#1186): a seat installed after the first seed gets its document")
+        verdict, docs = seeder.plan(listing(True, ["claude-code"]), seats, *args, add_missing=True)
+        check("F adds only the installed seat the vault lacks, and no second shared set",
+              verdict == "add" and [m for m, _ in docs] == ["codex"], f"{verdict} {docs}")
+        check("F the added document grants nothing (no role, no scope)",
+              not any("ROLE" in k or "SCOPE" in k for k in dict(docs).get("codex", {})), str(docs))
+        verdict, docs = seeder.plan(listing(True, ["claude-code", "codex"]), seats, *args,
+                                    add_missing=True)
+        check("F every installed seat declared -> complete, nothing written",
+              verdict == "complete" and docs == [], f"{verdict} {docs}")
+        verdict, docs = seeder.plan(listing(False, ["claude-code"]), seats, *args, add_missing=True)
+        check("F a box with seats but no shared set gets the shared set too",
+              verdict == "add" and [m for m, _ in docs] == ["_shared", "codex"], f"{verdict} {docs}")
+        verdict, docs = seeder.plan(listing(True, ["claude-code"]), seats, *args)
+        check("F without the flag an occupied namespace still refuses",
+              verdict == "occupied", verdict)
+        # #1194 review: every installed seat configured, shared set ABSENT -> a shared-only add, never "complete"
+        verdict, docs = seeder.plan(listing(False, ["claude-code", "codex"]), seats, *args, add_missing=True)
+        check("F all seats present + shared absent -> add the shared set only",
+              verdict == "add" and [m for m, _ in docs] == ["_shared"], f"{verdict} {[m for m, _ in docs]}")
+
         print("E. the repo's own declarations are read, and gaps are named not guessed")
         repo = Path(__file__).resolve().parent.parent
         found, skipped = seeder.declared_seats(repo, home)
