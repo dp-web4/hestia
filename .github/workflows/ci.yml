@@ -186,6 +186,17 @@ jobs:
           HESTIA_DECISION_CONTRACT_ENDPOINT: http://127.0.0.1:7799/mcp
         run: python3 tools/decision_witness_contract_test.py
 
+      # One-gate stage B: decide() against the daemon built from THIS commit — a committed
+      # policy_allow, the daemon's own row for its deny, a recorded read, all inside the 3 s
+      # invocation deadline (the first act may meet the cold daemon: an explicit
+      # society.unreachable deny, never a hang). The stub arms and the parity matrix run in
+      # plugin-tests; here only the real-daemon arm is new.
+      - name: decide() contract (real daemon)
+        working-directory: hestia
+        env:
+          HESTIA_DECIDE_CONTRACT_ENDPOINT: http://127.0.0.1:7799/mcp
+        run: python3 tools/one_gate_decide_contract_test.py --only contract
+
       - name: Daemon log (on failure)
         if: failure()
         run: tail -100 "$SBX_HOME/serve.log" || true

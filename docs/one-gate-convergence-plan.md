@@ -160,7 +160,31 @@ like A. `GateEvent` must carry the **raw harness event** (`raw`), unmodified.
 - avoid `globals()` sweeps and set the exec bit, so ci_selfexec and gate_collapse_meter stay green;
 - `hestia_single_gate.py` is not in `RUNTIME_MANIFEST.txt` until C.
 
+### Stage B as built (2026-10-01): where it departs from the design above
+
+Contract suite: `tools/one_gate_decide_contract_test.py`. It runs 12 in-process contract tests, plus a parity matrix that drives every seat's CURRENT gate and `decide()` with the same four real harness event shapes under the same stub policy. Every verdict-class divergence is declared there with its reason, and the test fails on an undeclared divergence and on a stale declaration.
+
+1. **The daemon is asked about the translated act; the key still comes from the raw event (step 8).** `query_society_safety` receives `{"tool_name": event.tool, "tool_input": event.tool_input}`, not `event.raw`. The daemon's target extraction and presets speak lineage names. A raw gemini `run_shell_command` reaches it with `target=None`, which is the "blind governor" gemini's own shim was written to prevent. The correlation key is unchanged: `correlation_key(event.raw)`, computed once and passed explicitly (C13 holds).
+2. **The deadline is coarse in B; stage C makes it exact (step 1).** B does not modify `hestia_gate_mechanism.py`: dp ruled 2026-10-01 that B must stay approvable at the single-approver bar, and the mechanism carries the sovereign bar.
+   - So `query_society_safety`, `fetch_policy_snapshot` and the gate-self calls keep their own budgets.
+   - `decide()` bounds each of them from outside (`_bounded`): it runs the call in a daemon thread, waits only for what the invocation has left, and reads a late call as a no-verdict.
+   - The harness sees the 3 s bound. The daemon may still receive an abandoned request late.
+   - `record_decision` already takes `deadline=` (stage A), so the record is exact.
+3. **gemini asks the daemon as gemini.** Today gemini's Gate 2 spawns claude-code's gate, which hardcodes `PLUGIN_ID="claude-code"`. So every gemini society verdict is attributed to claude-code and is also judged by claude-code's scope and home markers. `decide()` asks as the profile's member. The parity suite pins both halves.
+4. **C11 holds in warn-rollout.** C11 admits no exempt class, so an uncommitted consequential permit is `gate.evidence_uncommitted` in every mode. With the daemon down, a warn-rollout seat that used to let a write through unwitnessed now denies it. **Behaviour change for dp.**
+5. **Degraded reads on claude-code are a LOOSENING that needs dp's ruling.** claude-code asks the daemon about every tool, reads included. So a degraded Read is a no-verdict deny there today, and daemon law can deny a read. `decide()` takes the ratified posture every other seat already has: READ_CLASS is allowed locally and recorded with `verdict_available=false`.
+6. **A daemon `warn` is surfaced on every seat.** kimi and codex read only `verdict.allow`, and gemini reads only its governor's exit code. So a daemon warn reached those members as a silent allow. The act is permitted either way.
+7. **gemini gains the closure layer.** This resolves #1195's one divergent row: the settings write was denied by gemini's scope layer, and is now denied as `gate.self_access`, which is escalatable.
+8. **hooks-gt is unchanged by B.** `hooks_gt.py` publishes `RUNTIME_MANIFEST.txt`, and the new module is outside it until C. So B's republish is a no-op, by design.
+
 ## 4. Stage C: thin-shim cutover and certification (separate PR)
+
+0. **Items carried from B.**
+   - **Thread `deadline=` through the mechanism.** That means `query_society_safety`, `fetch_policy_snapshot` (both attempts and the pause between them), `gate_self_call`, `witness_gate_self` and `claim_self_write`, with a default of `None` meaning today's behaviour. Then no request starts after the invocation deadline, and `_bounded` becomes a belt. This edits `hestia_gate_mechanism.py`, so it goes to dp.
+   - **One rollout knob.** `HESTIA_GATE_MODE` is projected per seat from the vault, replacing the four `HESTIA_<SEAT>_GATE_MODE` names.
+   - **Template profile keys.** The template's `PERMITTED_PROFILE_KEYS` gains `launch_cwd_env` and `declares_review_door`. kimi, codex and gemini scope by the launch-cwd grant, and three seats hold the review door.
+   - **Remedy text.** The remedies `decide()` mints (`invocation.superseded`, `gate.evidence_uncommitted`, `gate.internal_error`) move into the core's REMEDIES table.
+   - **gemini MCP transport.** gemini's command-scoping of the MCP transport (`mcp_context.command/args`) is not in B. B checks those strings for egress only, so this is a C10 item.
 
 1. **Shims become the template.** Each seat's `hooks/pre_tool_use.py` (gemini: `before_tool.py`) is replaced by the certified template:
    - five byte-identical common functions;
