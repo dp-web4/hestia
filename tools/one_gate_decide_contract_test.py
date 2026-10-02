@@ -690,7 +690,9 @@ def test_stage_b_is_unwired(m, g, wc, home):
 #: behaviour check into a timing flake. The real deadline is what the parity arm runs at.
 RELAXED_DEADLINE_SECONDS = 15.0
 DEADLINE_TESTS = {"test_one_deadline_bounds_the_whole_invocation",
-                  "test_the_gate_owns_no_cache_no_client_and_one_recorder"}
+                  "test_the_gate_owns_no_cache_no_client_and_one_recorder",
+                  # The real daemon is where the cold-start caveat lives: it MUST run at 3 s.
+                  "test_against_an_isolated_real_daemon"}
 
 CONTRACT_TESTS = [
     test_c11_the_real_recorder_turns_an_uncommitted_permit_into_a_denial,
