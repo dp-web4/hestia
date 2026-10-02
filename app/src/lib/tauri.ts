@@ -4,6 +4,7 @@ import type {
   DashboardSnapshot,
   DecideOutcome,
   ReachOutcome,
+  StandingActOutcome,
   ScopeGrantRow,
   GateReport,
   DaemonStatus,
@@ -127,6 +128,36 @@ export async function agentGateBypass(member: string, reason: string): Promise<u
 /** Put a bypassed member's gate back exactly as it was registered. */
 export async function agentGateRestore(member: string): Promise<unknown> {
   return invoke("agent_gate_restore", { member });
+}
+
+/**
+ * Make a LIVE grant standing. `seen` is the standing row the page showed on that path (null =
+ * none): promotion replaces it, so the daemon refuses (`moved`) if it changed since.
+ */
+export async function promoteGrant(
+  live: ScopeGrantRow,
+  reason: string | null,
+  seen: ScopeGrantRow | null,
+): Promise<StandingActOutcome> {
+  return invoke("promote_grant", { member: live.plugin_id, path: live.path, reason, seen });
+}
+
+/** Widen a grant to its subtree (reason required) or narrow it to exactly its path. */
+export async function setReach(
+  row: ScopeGrantRow,
+  recursive: boolean,
+  reason: string | null,
+): Promise<StandingActOutcome> {
+  return invoke("set_reach", { member: row.plugin_id, path: row.path, recursive, reason });
+}
+
+/** Move one standing grant to another recorded member, bound to the row as shown. */
+export async function reassignGrant(
+  row: ScopeGrantRow,
+  to: string,
+  reason: string,
+): Promise<StandingActOutcome> {
+  return invoke("reassign_grant", { member: row.plugin_id, path: row.path, to, reason, seen: row });
 }
 
 export async function getDashboard(): Promise<DashboardSnapshot> {

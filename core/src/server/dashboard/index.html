@@ -3817,6 +3817,40 @@
   // have a grant" and "you have a grant until someone restarts the daemon" are different
   // facts and only one of them is what the operator thinks they bought. Standing renders
   // plain. There is no state in which a grant that is about to evaporate renders as calm.
+  // ---- scope-grant binding: what a standing write REPLACES or MOVES, as it was shown ----
+  //
+  // Last edit wins in the engine (ruled 2026-09-25): a grant on a (member, path) that already holds
+  // a standing grant replaces its reason, reach and expiry; make-standing replaces a standing twin;
+  // reassign moves the source row as it is NOW. So each of those writes sends the row this page
+  // SHOWED as `expected_existing` (null = "shown none"), and the daemon compares it under its lock
+  // and refuses (409 `moved`, nothing written) if another view changed it since (spec rule
+  // bound-to-rendered-evidence; the app does the same). PURE, so the contract test runs them.
+  function normScopePath(p) {
+    const t = String(p || '').trim();
+    const out = [];
+    for (const seg of t.split('/')) {
+      if (seg === '' || seg === '.') continue;
+      if (seg === '..') out.pop(); else out.push(seg);
+    }
+    return (t.startsWith('/') ? '/' : '') + out.join('/');
+  }
+  function standingBinding(data, member, path) {
+    const key = normScopePath(path);
+    const row = ((data && data.scope_grants) || []).find(r =>
+      r && r.lifetime === 'standing' && r.plugin_id === member && r.path === key);
+    if (!row) return null;
+    return {
+      reason: row.reason ?? null, recursive: row.recursive ?? null, granted_by: row.granted_by ?? null,
+      expires_at: row.expires_at ?? null, request_id: row.request_id ?? null,
+    };
+  }
+  function scopeMovedMessage(out) {
+    const cur = out && out.current;
+    return 'nothing was done — the standing grant changed since this page showed it'
+      + (cur ? ` (it now reads "${cur.reason ?? ''}", ${cur.recursive ? 'subtree' : 'exact'})` : ' (it is gone)')
+      + '. Review the row and act again.';
+  }
+
   function renderScopeGrants(data) {
     const gen = $('scope-gen');
     if (gen) {
@@ -5708,6 +5742,13 @@
         };
         if (ttl.value) body.expires_in_secs = Number(ttl.value);
         if (ahead) body.grant_ahead_of_connect = true;
+        // Shown before it is replaced, and bound to what was shown.
+        const shown = standingBinding(lastData, body.plugin_id, grantPath);
+        if (shown && !confirm(`This REPLACES the standing grant ${body.plugin_id} already holds on\n${normScopePath(grantPath)}\n\n`
+            + `  reach: ${shown.recursive ? 'this path and everything below' : 'exactly this path'}\n`
+            + `  reason: "${shown.reason ?? ''}"\n  expires: ${shown.expires_at ? new Date(shown.expires_at * 1000).toLocaleString() : 'never'}\n\n`
+            + 'Last edit wins — the old reason and reach will not be kept. Replace it?')) { sync(); return; }
+        body.expected_existing = shown;
         const res = await apiFetch('/api/scope/grant', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
@@ -5726,6 +5767,13 @@
           err.hidden = false;
           offeredFor = formKey();
           sync();
+          return;
+        }
+        if (res.status === 409 && out && out.moved) {
+          err.textContent = `grant: ${scopeMovedMessage(out)}`;
+          err.hidden = false;
+          sync();
+          await tick(); renderScopeGrants(lastData);
           return;
         }
         if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
@@ -5765,15 +5813,19 @@
       const pro = e.target.closest('[data-promote-member]');
       if (pro) {
         const member = pro.dataset.promoteMember, p = pro.dataset.promotePath;
-        const why = prompt(`Make this grant STANDING for ${member}?\n\n${p}\n\nIt will survive daemon restarts until revoked. Reason (blank = keep the live grant's reason):`);
+        const twin = standingBinding(lastData, member, p);
+        const why = prompt(`Make this grant STANDING for ${member}?\n\n${p}\n\nIt will survive daemon restarts until revoked.`
+          + (twin ? `\n\nThis REPLACES the standing grant already on this path (${twin.recursive ? 'subtree' : 'exact'}, reason "${twin.reason ?? ''}"). Last edit wins.` : '')
+          + `\n\nReason (blank = keep the live grant's reason):`);
         if (why === null) return;
         pro.disabled = true; err.hidden = true;
         try {
           const res = await apiFetch('/api/scope/standing/promote', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ plugin_id: member, path: p, reason: why }),
+            body: JSON.stringify({ plugin_id: member, path: p, reason: why, expected_existing: twin }),
           });
           const out = await res.json().catch(() => ({}));
+          if (res.status === 409 && out && out.moved) throw new Error(scopeMovedMessage(out));
           if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
           await tick(); renderScopeGrants(lastData);
         } catch (e2) { err.textContent = `make standing failed: ${e2.message}`; err.hidden = false; pro.disabled = false; }
@@ -5816,6 +5868,9 @@
       if (mv) {
         const from = mv.dataset.moveMember, p2 = mv.dataset.movePath;
         const rec = mv.dataset.moveRecursive === 'true';
+        // Captured at the CLICK: the page refreshes behind the prompts below, and the operator
+        // chose the row as it was when they pressed the button.
+        const shownSrc = standingBinding(lastData, from, p2);
         const seen = [...knownMembers.keys()].filter(id => id !== from);
         if (!seen.length) {
           err.textContent = 'reassign: no other member has connected to this daemon yet.';
@@ -5838,9 +5893,13 @@
         try {
           const r = await apiFetch('/api/scope/standing/reassign', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ plugin_id: from, path: p2, to: dest, reason: why }),
+            // The row as this page showed it: a reassign moves it as it is NOW, so another
+            // view's edit since is refused rather than carried along unseen.
+            body: JSON.stringify({ plugin_id: from, path: p2, to: dest, reason: why,
+                                   expected_existing: shownSrc }),
           });
           const o = await r.json().catch(() => ({}));
+          if (r.status === 409 && o && o.moved) throw new Error(scopeMovedMessage(o));
           if (!r.ok) throw new Error(o?.error || `HTTP ${r.status}`);
           await tick(); renderScopeGrants(lastData);
         } catch (e2) {
