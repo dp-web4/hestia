@@ -6,9 +6,10 @@ Stock macOS has no `timeout`. fire-claude/kimi/codex used to call bare
 reached the stub CLI on this host (#1105 follow-up).
 
 This test hides timeout/gtimeout from PATH and drives the helper directly:
-success rc preserved, overdue commands exit 124, -k still SIGKILLs a
-SIGTERM-ignoring child, and a descendant that ignores SIGTERM is SIGKILLed
-at the grace deadline even if its leader has already exited.
+success rc preserved, overdue commands exit 124, a TERM-ignoring command is
+not SIGKILLed when -k is absent, -k that actually sends SIGKILL exits 137,
+and a descendant that ignores SIGTERM is SIGKILLed at the grace deadline
+even if its leader has already exited.
 """
 import os
 import shutil
@@ -70,6 +71,13 @@ with tempfile.TemporaryDirectory() as tmp:
     check("3. overdue command exits 124", r.returncode == 124, f"rc={r.returncode}")
     check("3b. overdue command returns well before 30s", elapsed < 5, f"elapsed={elapsed:.2f}s")
 
+    t0 = time.monotonic()
+    r = run([HELPER, "-k", "2", "0.4", "sleep", "30"], env)
+    elapsed = time.monotonic() - t0
+    check("3c. -k exits 124 when TERM reaps the command before kill-after",
+          r.returncode == 124, f"rc={r.returncode}")
+    check("3d. that path returns before kill-after", elapsed < 1.5, f"elapsed={elapsed:.2f}s")
+
     # Child ignores SIGTERM; -k must escalate to SIGKILL.
     ignore_term = (
         "#!/usr/bin/env bash\n"
@@ -83,8 +91,46 @@ with tempfile.TemporaryDirectory() as tmp:
     t0 = time.monotonic()
     r = run([HELPER, "-k", "1", "1", stub], env)
     elapsed = time.monotonic() - t0
-    check("4. -k kills a SIGTERM-ignoring child (rc 124)", r.returncode == 124, f"rc={r.returncode}")
+    check("4. -k kills a SIGTERM-ignoring child (rc 137)", r.returncode == 137, f"rc={r.returncode}")
     check("4b. -k path finishes near duration+kill-after", 1.5 < elapsed < 6, f"elapsed={elapsed:.2f}s")
+
+    # Without -k, GNU timeout sends TERM and waits. It must not SIGKILL a
+    # command that ignores TERM, so the helper is still running afterwards
+    # and the command is still alive.
+    nok_pid = os.path.join(tmp, "nok-pid")
+    nok = os.path.join(tmp, "ignore-term-nok")
+    with open(nok, "w") as f:
+        f.write("#!/usr/bin/env bash\ntrap '' TERM\nprintf '%s\\n' \"$$\" > \"$1\"\nwhile true; do sleep 0.2; done\n")
+    os.chmod(nok, 0o755)
+    held = subprocess.Popen([HELPER, "1", nok, nok_pid], env=env)
+    try:
+        time.sleep(1.6)
+        alive_helper = held.poll() is None
+        child_alive = False
+        if os.path.isfile(nok_pid):
+            try:
+                os.kill(int(open(nok_pid).read().strip()), 0)
+                child_alive = True
+            except (ProcessLookupError, ValueError):
+                child_alive = False
+        check("4c. no -k does not return after TERM is ignored", alive_helper)
+        check("4d. no -k does not SIGKILL a TERM-ignoring command", child_alive)
+    finally:
+        if held.poll() is None:
+            try:
+                os.kill(held.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                held.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                held.kill()
+                held.wait(timeout=2)
+        if os.path.isfile(nok_pid):
+            try:
+                os.kill(int(open(nok_pid).read().strip()), signal.SIGKILL)
+            except (ProcessLookupError, ValueError):
+                pass
 
     # Leader dies on SIGTERM. Descendant ignores SIGTERM (and SIGHUP, so a
     # session-leader exit cannot reap it for us) and writes a marker at 1.5s,
@@ -114,8 +160,8 @@ with tempfile.TemporaryDirectory() as tmp:
     t0 = time.monotonic()
     r = run([HELPER, "-k", "0.3", "0.5", "python3", parent, marker, pidfile, started], env)
     elapsed = time.monotonic() - t0
-    check("6. descendant still alive at the deadline is killed (rc 124)",
-          r.returncode == 124, f"rc={r.returncode} err={r.stderr!r}")
+    check("6. descendant still alive at the deadline is killed (rc 137)",
+          r.returncode == 137, f"rc={r.returncode} err={r.stderr!r}")
     check("6b. wrapper stays through the grace period after the leader exits",
           0.7 < elapsed < 1.4, f"elapsed={elapsed:.2f}s")
     remain = 1.8 - (time.monotonic() - t0)

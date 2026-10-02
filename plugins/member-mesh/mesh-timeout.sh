@@ -3,10 +3,13 @@
 #
 # GNU coreutils `timeout` is not on stock macOS. Prefer a real timeout(1) /
 # gtimeout(1) when present (same flags as the fire scripts already use).
-# Otherwise python3 bounds the process group the same way: SIGTERM at
-# DURATION, then SIGKILL after KILL_AFTER when -k was given. The grace wait
-# follows the whole group, not only the direct child: a leader that exits on
-# SIGTERM must not cancel the scheduled SIGKILL while a descendant is alive.
+# Otherwise python3 bounds the process group the same way. SIGTERM at
+# DURATION. Without -k that is the only signal: a command that ignores TERM
+# is not force-killed, matching GNU timeout. With -k, SIGKILL follows after
+# KILL_AFTER, and that force-kill exits 137 (128+9). The grace wait follows
+# the whole group, not only the direct child: a leader that exits on SIGTERM
+# must not cancel the scheduled SIGKILL while a descendant is alive. A TERM
+# timeout that does not send KILL exits 124.
 #
 # Usage (GNU-compatible subset):
 #   mesh-timeout.sh DURATION COMMAND [ARG...]
@@ -129,30 +132,42 @@ except subprocess.TimeoutExpired:
     pass
 
 signal_group(signal.SIGTERM)
-grace = float(kill_after) if kill_after else 0.0
-if grace > 0:
-    # proc.wait() only reaps the direct child. If that leader exits on
-    # SIGTERM while a descendant ignores it, returning here would skip the
-    # SIGKILL and the descendant would run past the kill deadline.
-    deadline = time.monotonic() + grace
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        if proc.poll() is None:
-            try:
-                proc.wait(timeout=min(remaining, 0.05))
-            except subprocess.TimeoutExpired:
-                continue
-        if not group_alive():
-            sys.exit(124)
-        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+if not kill_after:
+    # GNU timeout without --kill-after sends the initial signal and waits.
+    # It does not add a SIGKILL. Exit 124 once the direct child has exited.
+    while proc.poll() is None:
+        try:
+            proc.wait(timeout=0.05)
+        except subprocess.TimeoutExpired:
+            continue
+    sys.exit(124)
+
+# proc.wait() only reaps the direct child. If that leader exits on
+# SIGTERM while a descendant ignores it, returning here would skip the
+# SIGKILL and the descendant would run past the kill deadline.
+grace = float(kill_after)
+deadline = time.monotonic() + grace
+while True:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        break
+    if proc.poll() is None:
+        try:
+            proc.wait(timeout=min(remaining, 0.05))
+        except subprocess.TimeoutExpired:
+            continue
+    if not group_alive():
+        sys.exit(124)
+    time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 if proc.poll() is None or group_alive():
     signal_group(signal.SIGKILL)
-try:
-    proc.wait(timeout=5)
-except subprocess.TimeoutExpired:
-    pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    # GNU timeout keeps 137 when the command is sent KILL, and uses 124
+    # only for the TERM timeout path.
+    sys.exit(137)
 sys.exit(124)
 PY
