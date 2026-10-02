@@ -73,15 +73,20 @@ as before.
 
 - **Join keys.** `action_id` (a UUID from `begin_action`) and `correlation_key` (the core's rule; `valid_correlation_key`) are optional. A key that is sent but unusable is refused with `hestia.witness_decision_arg`, never dropped.
 - **Row fields.** When sent, the keys ride the row as `action_id`, `action_resident` and `correlation_key`. `core_digest` is stored bounded to 128 chars. A deployed refusal call sends none of these and writes the row it always wrote.
-- **One verdict, one row.**
-  - `query_policy` now keeps the hash of its own committed row on the in-flight action. It also returns it as `decisionEntryHash`, which is null for allow or when the append failed.
-  - A decision witness for the same action, member and verdict is answered with that row: `recorded: "existing"`, `charged: false`, nothing appended.
-  - A different verdict (a warn-rollout `warn` for a daemon `deny`) or a different member gets its own row.
+- **One verdict, one row; exactly one charge per (member, action).** A daemon-side ledger (`decision_witness::DecisionLedger`) keeps every committed decision row that carries an `action_id`, keyed by (member, action_id), and which row's charge was applied.
+  - `query_policy` returns its committed row's hash as `decisionEntryHash`. It is null for allow or when the append failed.
+  - The same verdict again for the same member and action, from a seat retry or the daemon's own repeat ruling, is answered with the committed row: `recorded: "existing"`, nothing appended.
+  - Only a committed row can carry the charge. The key's charge belongs to its first committed warn/deny row.
+  - A different verdict (a warn-rollout `warn` for a daemon `deny`) gets its own row with `charge_held_by` naming the charging row, and charges nothing. A different member is its own key.
+  - If the trust write fails after the row commits, the charge stays owed. The next decision call on the key (a retry, another verdict, the daemon's repeat ruling) settles it once. The settle runs under the state lock and is recorded once, so it cannot be applied twice.
+  - Restart: the ledger is rebuilt from the last 24 h of decision rows (at most 16,384) plus the durable settle record `<home>/decision-charges.jsonl` and each row's `charge_held_by`.
+  - Design choice: the first committed chargeable row wins, so a seat `warn` (Unclassified 0.2) that lands before the daemon's `deny` (Conduct 0.5) holds the charge at 0.2.
 - **Receipt.**
   ```
   {witnessEntryHash, eventType, decision, recorded: appended|existing, charged,
-   actionId, correlationKey, updatedTrust}
+   chargedRow, chargeHeldBy, actionId, correlationKey, updatedTrust}
   ```
+  `charged` says whether this call applied the key's charge, and `chargedRow` names the row it belongs to (this row, or an earlier row whose charge was owed).
 
 **Client (`hestia_gate_mechanism.record_decision`)**
 
