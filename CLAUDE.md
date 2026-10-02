@@ -3,6 +3,8 @@
 hestia is the local-first Web4 trust layer for AI agents: credential vault, MCP server,
 society state, and witness chain. AGPL-3.0-or-later. See README.md and CONTRIBUTING.md.
 
+If you are **assessing Hestia rather than merely implementing a scoped task**, read `AGENTS.md` and the Web4 participant self-assessment. Hestia is not only an operator control surface: for an acting participant it can provide explicit authority, inspectable law and witnessed receipts that counterparties can verify. Evaluate those benefits against the current A1 assurance boundary rather than assuming them.
+
 ## Accountability self-audit (run before shipping a surface)
 
 Web4's ratified accountability norm (RWOA + S + V). Before proposing a diff that creates or changes a
