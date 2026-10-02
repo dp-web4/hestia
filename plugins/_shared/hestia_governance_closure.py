@@ -806,6 +806,19 @@ def _command_write_targets(words: list, stdin_src=None) -> list:
             return []
         sub, rest = args[i], args[i + 1:]
         if sub in ("apply", "am"):
+            if sub == "apply":
+                # --stat/--numstat/--summary/--check never write: they inspect the patch and
+                # turn apply mode OFF, so the patch content is not a write set at all, and an
+                # unreadable or variable-hidden path is NOT opaque — there is nothing to be
+                # opaque about. kimi's 09-29 findings (#1175): this cell — a read-only apply
+                # with the patch behind a shell variable — was 5 of 13 withdrawals in one
+                # reviewed morning, and every asker absorbed the cost instead of the grammar
+                # learning. Only `--apply` re-arms the write; with it present the full
+                # content analysis stands. (--cached/--index select WHERE an apply would
+                # write; with a read-only flag there is no apply.)
+                if any(f in rest for f in ("--stat", "--numstat", "--summary", "--check")) \
+                        and "--apply" not in rest:
+                    return []
             # The write set lives inside the named patch/mbox files (or stdin). Resolve by
             # reading them; unreadable/unknowable -> _OpaqueWriter -> unconditional fail-close.
             pfiles = [a for a in rest if not a.startswith("-")]
