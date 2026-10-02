@@ -2,6 +2,8 @@
 
 **Active development.** This file is a deliberately plain-text entry point for human and automated due-diligence readers. Detailed capability maturity remains in the README's [Honest status](README.md#honest-status) section and in `docs/STATUS_AUDIT_2026-08-08.md`; this page adds a dated, reproducible activity statement that does not depend on GitHub's dynamically rendered counters.
 
+Machine-facing repository discovery starts at [`AGENTS.md`](AGENTS.md); participant-side evaluation is deliberately separated from operator-facing product framing.
+
 Current assurance ceiling remains **A1**: cooperative, same-UID governance that is tamper-evident and accountability-oriented, not a claim of adversary-proof enforcement. The repository documents known bypasses explicitly in `docs/GATE_BYPASS_CATALOG.md`.
 
 Current development focus at this snapshot: disposition delivery and escalation lifecycle coherence; Hub membership/public-governance surfaces for the AIC demonstration; contextual law, role authority, and adjudication; continued evidence-driven gate and fleet hardening.
