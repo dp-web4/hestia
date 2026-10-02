@@ -597,6 +597,13 @@ TESTS = [
 ]
 
 
+def teardown_module(module=None):
+    """pytest's channel for the accumulators (tools/ci_selfexec_test.py): a failure recorded in
+    FAILS must fail a pytest run too, not only the bare `python3` run CI uses."""
+    assert not FAILS, FAILS
+    assert isinstance(RAN, list)
+
+
 if __name__ == "__main__":
     for t in TESTS:
         try:
