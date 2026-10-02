@@ -20,13 +20,16 @@
 //!   nothing on allow (`risk_magnitude` 0.0 in `tool_query_policy`) and as scope attestation
 //!   argues ("letting each one count would let a member farm trust"). `warn`/`deny` keep their
 //!   existing Unclassified 0.2/0.5.
-//! - **One verdict, one row.** When the gate names an action the daemon itself already ruled
-//!   and witnessed (the society-safety path: `begin_action` → `query_policy` writes its own
-//!   `policy_decision` and its own Conduct charge), the gate's witness of the SAME verdict for
-//!   the SAME member is that row. The reply hands back its hash; nothing is appended and nothing
-//!   is charged a second time.
+//! - **One verdict, one row; one action, one charge.** When the gate names an action that
+//!   already has a committed decision row for the same member (the society-safety path:
+//!   `begin_action` → `query_policy` writes its own `policy_decision`), the gate's witness of
+//!   the SAME verdict is that row: its hash is handed back, nothing is appended or charged. A
+//!   DIFFERENT verdict is appended as evidence but is not charged when the key was already
+//!   charged. See [`DecisionLedger`] for the rule and its bound.
 
 use serde_json::Value;
+use std::collections::{HashMap, VecDeque};
+use uuid::Uuid;
 
 /// Event type for a witnessed `allow`. Reserved: `hestia_request_witness` cannot forge it.
 pub const ALLOW_EVENT: &str = "policy_allow";
@@ -78,28 +81,102 @@ impl Verdict {
     }
 }
 
-/// The daemon's own witness of its own verdict on one in-flight action, kept on the action so a
-/// later decision witness for the same act can be answered with it instead of a duplicate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnDecisionWitness {
-    pub decision: String,
-    pub entry_hash: String,
-    /// The member the daemon attributed the row to (from the action's session).
-    pub plugin_id: String,
+/// The decision rows witnessed for one `(member, action_id)` and the one that charged, if any.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LedgerEntry {
+    /// The chain hash of the decision row whose reputation movement was applied. At most one.
+    pub charged_by: Option<String>,
+    /// Every committed decision row for this key, in arrival order, with its verdict.
+    pub rows: Vec<(Verdict, String)>,
 }
 
-/// The existing row that already witnesses this verdict, if any.
+/// ONE CHARGE PER (MEMBER, ACTION). The rule this ledger enforces, whatever the order the
+/// verdicts arrive in and whoever writes them (the daemon's own `query_policy`, or a seat's
+/// `hestia_witness_decision` naming the action):
 ///
-/// Same member AND same verdict, or nothing. A different verdict (a warn-rollout seat recording
-/// `warn` for a daemon `deny`, a local deny after a daemon warn) is a different decision and gets
-/// its own row; a different member is never answered with someone else's record.
-pub fn existing_witness<'a>(
-    own: Option<&'a OwnDecisionWitness>,
-    plugin_id: &str,
-    verdict: Verdict,
-) -> Option<&'a str> {
-    own.filter(|w| w.plugin_id == plugin_id && w.decision == verdict.as_str())
-        .map(|w| w.entry_hash.as_str())
+/// - a decision row is charged only if it COMMITTED (decision reputation follows the committed
+///   decision witness — no row, no movement);
+/// - and only if no earlier committed row for the same member and action already charged;
+/// - a later row for the same key is still appended when it is a different verdict (it is
+///   evidence of what the member experienced — a warn-rollout seat's `warn` beside the daemon's
+///   `deny`), but it carries `charge_held_by` naming the row that charged, and moves nothing;
+/// - the same verdict again for the same key is a duplicate delivery: answered with the row
+///   that already witnesses it, nothing appended, nothing charged.
+///
+/// First committed charge wins, so a seat `warn` (Unclassified 0.2) that lands before the
+/// daemon's `deny` (Conduct 0.5) holds the charge at 0.2. Upgrading would need a compensating
+/// delta, and gate deltas only ever lower trust; one bounded charge is the invariant chosen.
+///
+/// A decision with no `action_id` has no key and is not deduplicated (a deployed refusal shim,
+/// or a decision reached before any action began), exactly as before.
+///
+/// Held in RAM and bounded to [`DECISION_LEDGER_CAP`] keys, oldest evicted first. That cap is a
+/// time horizon: the decision witnesses for one action arrive within the same tool call
+/// (seconds), and the cap holds far more than a day of gate decisions at fleet rates. A daemon
+/// restart empties it, as it empties the in-flight action table the same keys come from.
+#[derive(Debug, Clone)]
+pub struct DecisionLedger {
+    keys: HashMap<(String, Uuid), LedgerEntry>,
+    order: VecDeque<(String, Uuid)>,
+    cap: usize,
+}
+
+/// See [`DecisionLedger`]: the number of `(member, action_id)` keys kept.
+pub const DECISION_LEDGER_CAP: usize = 16_384;
+
+impl Default for DecisionLedger {
+    fn default() -> Self {
+        Self::with_cap(DECISION_LEDGER_CAP)
+    }
+}
+
+impl DecisionLedger {
+    pub fn with_cap(cap: usize) -> Self {
+        Self { keys: HashMap::new(), order: VecDeque::new(), cap: cap.max(1) }
+    }
+
+    pub fn entry(&self, member: &str, action_id: Uuid) -> Option<&LedgerEntry> {
+        self.keys.get(&(member.to_string(), action_id))
+    }
+
+    /// The committed row that already witnesses this verdict for this member and action.
+    pub fn existing_row(&self, member: &str, action_id: Uuid, verdict: Verdict) -> Option<&str> {
+        self.entry(member, action_id)?
+            .rows
+            .iter()
+            .find(|(v, _)| *v == verdict)
+            .map(|(_, h)| h.as_str())
+    }
+
+    /// The row whose charge already covers this member and action, if one does. `Some` means a
+    /// new row for the same key must not be charged.
+    pub fn charge_holder(&self, member: &str, action_id: Uuid) -> Option<&str> {
+        self.entry(member, action_id)?.charged_by.as_deref()
+    }
+
+    /// Record a COMMITTED decision row. Call only after the append returned its entry.
+    pub fn record_row(&mut self, member: &str, action_id: Uuid, verdict: Verdict, hash: &str) {
+        let key = (member.to_string(), action_id);
+        if !self.keys.contains_key(&key) {
+            while self.order.len() >= self.cap {
+                if let Some(old) = self.order.pop_front() {
+                    self.keys.remove(&old);
+                }
+            }
+            self.order.push_back(key.clone());
+        }
+        self.keys.entry(key).or_default().rows.push((verdict, hash.to_string()));
+    }
+
+    /// Record that `hash`'s reputation movement was applied. Never overwrites an earlier holder:
+    /// the first applied charge is the one charge.
+    pub fn record_charge(&mut self, member: &str, action_id: Uuid, hash: &str) {
+        if let Some(e) = self.keys.get_mut(&(member.to_string(), action_id)) {
+            if e.charged_by.is_none() {
+                e.charged_by = Some(hash.to_string());
+            }
+        }
+    }
 }
 
 /// `core_digest` as stored: a string, bounded. Absent or non-string → not stored.
@@ -152,16 +229,51 @@ mod tests {
     }
 
     #[test]
-    fn an_existing_witness_answers_only_the_same_member_and_verdict() {
-        let own = OwnDecisionWitness {
-            decision: "deny".into(),
-            entry_hash: "h1".into(),
-            plugin_id: "codex".into(),
-        };
-        assert_eq!(existing_witness(Some(&own), "codex", Verdict::Deny), Some("h1"));
-        assert_eq!(existing_witness(Some(&own), "codex", Verdict::Warn), None, "other verdict");
-        assert_eq!(existing_witness(Some(&own), "kimi-code", Verdict::Deny), None, "other member");
-        assert_eq!(existing_witness(None, "codex", Verdict::Deny), None);
+    fn the_ledger_answers_only_the_same_member_action_and_verdict() {
+        let mut l = DecisionLedger::default();
+        let a = Uuid::new_v4();
+        l.record_row("codex", a, Verdict::Deny, "h1");
+        assert_eq!(l.existing_row("codex", a, Verdict::Deny), Some("h1"));
+        assert_eq!(l.existing_row("codex", a, Verdict::Warn), None, "other verdict");
+        assert_eq!(l.existing_row("kimi-code", a, Verdict::Deny), None, "other member");
+        assert_eq!(l.existing_row("codex", Uuid::new_v4(), Verdict::Deny), None, "other action");
+    }
+
+    /// The charging rule in isolation: a row is a charge holder only once its charge was
+    /// recorded, the first holder is never overwritten, and the key is (member, action).
+    #[test]
+    fn at_most_one_charge_per_member_and_action_in_either_order() {
+        for (first, second) in [(Verdict::Deny, Verdict::Warn), (Verdict::Warn, Verdict::Deny)] {
+            let mut l = DecisionLedger::default();
+            let a = Uuid::new_v4();
+            assert_eq!(l.charge_holder("codex", a), None);
+            l.record_row("codex", a, first, "h-first");
+            assert_eq!(l.charge_holder("codex", a), None, "a row alone is not a charge");
+            l.record_charge("codex", a, "h-first");
+            assert_eq!(l.charge_holder("codex", a), Some("h-first"));
+            l.record_row("codex", a, second, "h-second");
+            l.record_charge("codex", a, "h-second");
+            assert_eq!(l.charge_holder("codex", a), Some("h-first"), "first charge holds");
+            assert_eq!(l.entry("codex", a).unwrap().rows.len(), 2, "both rows are kept");
+            assert_eq!(l.charge_holder("kimi-code", a), None, "another member is its own key");
+        }
+        let mut l = DecisionLedger::default();
+        l.record_charge("codex", Uuid::new_v4(), "h-orphan");
+        assert!(l.keys.is_empty(), "a charge with no committed row records nothing");
+    }
+
+    #[test]
+    fn the_ledger_is_bounded_oldest_first() {
+        let mut l = DecisionLedger::with_cap(2);
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        l.record_row("m", a, Verdict::Deny, "ha");
+        l.record_row("m", b, Verdict::Deny, "hb");
+        l.record_row("m", b, Verdict::Warn, "hb2");
+        l.record_row("m", c, Verdict::Deny, "hc");
+        assert_eq!(l.existing_row("m", a, Verdict::Deny), None, "oldest key evicted");
+        assert_eq!(l.existing_row("m", b, Verdict::Warn), Some("hb2"));
+        assert_eq!(l.existing_row("m", c, Verdict::Deny), Some("hc"));
+        assert_eq!(l.keys.len(), 2);
     }
 
     #[test]
