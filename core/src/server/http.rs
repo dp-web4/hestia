@@ -3022,11 +3022,36 @@ async fn scope_decide(
 /// It seeds DESCRIPTION. Nothing here grants: the documents are seat layout and society
 /// facts, and every authority surface (scope, standing scope, operator sets) is untouched and
 /// unreadable from this handler.
+///
+/// `"mode": "add_missing"` (#1186). The empty-namespace ratchet seeds a box ONCE, so a harness
+/// installed after that first seed never got a document: on thor, codex and kimi-code were
+/// registered, hooked and green for a day while every allowed act they took returned
+/// `config.unbacked`, until dp wrote their documents by hand. This mode is the same act with a
+/// per-member compare instead of a namespace-wide one: every proposed member must be ABSENT from
+/// the vault, under the same lock, or nothing is written. It never modifies a document an operator
+/// wrote; a present member is refused by name. Still all-or-nothing, still one intent and one
+/// result row, still description only.
 async fn config_seed_seats(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     use super::seat_config as sc;
+
+    let add_missing = match body.get("mode").and_then(|v| v.as_str()) {
+        None | Some("namespace_empty") => false,
+        Some("add_missing") => true,
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "mode {other:?} is not a seed mode; use \"namespace_empty\" (the default) \
+                         or \"add_missing\""
+                    )
+                })),
+            );
+        }
+    };
 
     let proposed = match body.get("documents").and_then(|v| v.as_object()) {
         Some(map) if !map.is_empty() => map.clone(),
@@ -3134,7 +3159,61 @@ async fn config_seed_seats(
 
     // THE COMPARE. Under the same lock the commit runs under, so nothing can occupy the
     // namespace between deciding and writing.
-    if !sc::namespace_is_empty(&s.vault) {
+    if add_missing {
+        let present: Vec<String> = parsed
+            .iter()
+            .filter(|(m, _)| s.vault.get_document(sc::SEAT_CONFIG_NS, m).is_some())
+            .map(|(m, _)| m.clone())
+            .collect();
+        if !present.is_empty() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "add_missing writes only members the vault does not declare; {present:?} \
+                         already have a document, and changing one is the operator's act \
+                         (PUT /api/config/seat), not a seed's"
+                    ),
+                    "present": present,
+                    "declared": sc::declared_members(&s.vault),
+                })),
+            );
+        }
+        // Without a shared set in this seed, a seat is checked against the one the vault holds.
+        if shared_proposed.is_none() {
+            match sc::load_shared(&s.vault) {
+                Some(Ok(shared_now)) => {
+                    for (member, cfg) in &parsed {
+                        let owned = sc::keys_owned_by_shared(Some(&shared_now), cfg);
+                        if !owned.is_empty() {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": format!(
+                                        "{member} restates keys {owned:?} that the vault's shared \
+                                         set owns; every seat inherits them"
+                                    ),
+                                    "shared_keys": owned,
+                                })),
+                            );
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "the vault's shared set is unusable ({e}); every seat built on it is \
+                                 unbacked, so repair it before adding seats"
+                            )
+                        })),
+                    );
+                }
+                None => {}
+            }
+        }
+    } else if !sc::namespace_is_empty(&s.vault) {
         let occupied = sc::declared_members(&s.vault);
         return (
             StatusCode::CONFLICT,
@@ -3157,7 +3236,7 @@ async fn config_seed_seats(
             .collect::<std::collections::BTreeMap<_, _>>(),
         "decided_by": "operator",
         "via": "operator_session",
-        "precondition": "namespace_empty",
+        "precondition": if add_missing { "members_absent" } else { "namespace_empty" },
     });
     let intent = match s.append_chain("config_seed_intent", record.clone()) {
         Ok(e) => e,
@@ -3205,7 +3284,7 @@ async fn config_seed_seats(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "error": match undone {
-                    Ok(()) => format!("the seed was not recorded ({e}); it is undone and the namespace is empty again"),
+                    Ok(()) => format!("the seed was not recorded ({e}); it is undone and the namespace is back to its prior state"),
                     Err(re) => format!("the seed was not recorded ({e}) AND could not be undone ({re}): the \
                                         seat configs in the vault are unwitnessed"),
                 },
@@ -8262,6 +8341,90 @@ mod disposition_tests {
         let s = state.lock().await;
         assert_eq!(sc::declared_members(&s.vault), before.0, "and changes nothing");
         assert_eq!(s.chain_store.len().unwrap(), before.1, "not even a chain row");
+    }
+
+    async fn seed_json(state: &SharedState, body: serde_json::Value) -> (StatusCode, String) {
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_seed_seats(axum::extract::State(state.clone()), axum::Json(body)).await,
+        );
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// #1186: a harness installed after the first seed gets its document from `add_missing`, and
+    /// the documents already there are left byte-identical.
+    #[tokio::test]
+    async fn add_missing_writes_only_the_absent_member_into_an_occupied_namespace() {
+        use super::super::seat_config as sc;
+        let (_dir, state) = test_state().await;
+        let (st, _) = seed_json(&state, serde_json::json!({"documents": {
+            "_shared": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""},
+            "claude-code": {"env": {"HESTIA_PLUGIN_ID": "claude-code"}, "note": ""},
+        }})).await;
+        assert_eq!(st, StatusCode::OK);
+        let (shared_before, claude_before) = {
+            let s = state.lock().await;
+            (s.vault.get_document(sc::SEAT_CONFIG_NS, "_shared").unwrap().to_vec(),
+             s.vault.get_document(sc::SEAT_CONFIG_NS, "claude-code").unwrap().to_vec())
+        };
+        let (st, text) = seed_json(&state, serde_json::json!({"mode": "add_missing", "documents": {
+            "kimi-code": {"env": {"HESTIA_PLUGIN_ID": "kimi-code"}, "note": "installed later"},
+        }})).await;
+        assert_eq!(st, StatusCode::OK, "{text}");
+        let s = state.lock().await;
+        assert_eq!(sc::declared_members(&s.vault), vec!["_shared", "claude-code", "kimi-code"]);
+        assert_eq!(s.vault.get_document(sc::SEAT_CONFIG_NS, "_shared").unwrap(), &shared_before[..]);
+        assert_eq!(s.vault.get_document(sc::SEAT_CONFIG_NS, "claude-code").unwrap(), &claude_before[..]);
+        let intent = s.chain_store.read_recent_by_types(None, &["config_seed_intent"], 1)
+            .unwrap().pop().expect("an intent row");
+        assert_eq!(intent.event_data["precondition"], "members_absent", "the chain says which compare ran");
+    }
+
+    /// A present member refuses the WHOLE add, by name: the absent member beside it is not
+    /// written either, and nothing reaches the chain.
+    #[tokio::test]
+    async fn add_missing_refuses_a_present_member_and_writes_nothing() {
+        use super::super::seat_config as sc;
+        let (_dir, state) = test_state().await;
+        let (st, _) = seed_json(&state, serde_json::json!({"documents": {
+            "claude-code": {"env": {"HESTIA_PLUGIN_ID": "claude-code"}, "note": ""},
+        }})).await;
+        assert_eq!(st, StatusCode::OK);
+        let before = {
+            let s = state.lock().await;
+            (sc::declared_members(&s.vault), s.chain_store.len().unwrap())
+        };
+        let (st, text) = seed_json(&state, serde_json::json!({"mode": "add_missing", "documents": {
+            "claude-code": {"env": {"HESTIA_PLUGIN_ID": "claude-code", "EXTRA": "x"}, "note": ""},
+            "codex": {"env": {"HESTIA_PLUGIN_ID": "codex"}, "note": ""},
+        }})).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{text}");
+        assert!(text.contains("claude-code") && text.contains("present"), "{text}");
+        let s = state.lock().await;
+        assert_eq!(sc::declared_members(&s.vault), before.0, "codex was not written either");
+        assert_eq!(s.chain_store.len().unwrap(), before.1, "not even a chain row");
+    }
+
+    /// With no shared set in the add, a seat is still refused for restating a key the VAULT's
+    /// shared set owns; and an unknown mode is a bad request, never a silent default.
+    #[tokio::test]
+    async fn add_missing_checks_the_vaults_shared_set_and_rejects_unknown_modes() {
+        let (_dir, state) = test_state().await;
+        let (st, _) = seed_json(&state, serde_json::json!({"documents": {
+            "_shared": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": ""},
+            "claude-code": {"env": {"HESTIA_PLUGIN_ID": "claude-code"}, "note": ""},
+        }})).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, text) = seed_json(&state, serde_json::json!({"mode": "add_missing", "documents": {
+            "codex": {"env": {"HESTIA_PLUGIN_ID": "codex", "HESTIA_WORKSPACE": "/elsewhere"}, "note": ""},
+        }})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{text}");
+        assert!(text.contains("HESTIA_WORKSPACE"), "{text}");
+        let (st, text) = seed_json(&state, serde_json::json!({"mode": "upsert", "documents": {
+            "codex": {"env": {"HESTIA_PLUGIN_ID": "codex"}, "note": ""},
+        }})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{text}");
     }
 
     /// ONE bad document refuses the WHOLE seed, and the namespace stays empty.
