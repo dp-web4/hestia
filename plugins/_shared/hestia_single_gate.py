@@ -12,19 +12,21 @@ law-bearing is here, in ONE sequence, in this order:
                  claimed with this call's invocation key, else `gate.self_access` (innate);
    2. egress     innate `egress.secret` over the egress surfaces the core's paths/command do
                  not cover (web-tool urls/prompts/queries, the MCP transport context);
-   3. snapshot   the policy snapshot; when it cannot be fetched, the ratified degraded mode;
+   3. snapshot   the policy snapshot; with none, every act is DENIED (degraded), reads included;
    4. law        `core.evaluate` (innate denies always; tunable denies follow the rollout);
-   5. read class allow without the daemon (the ratified read posture);
-   6. society    `mechanism.query_society_safety(..., correlation_key=KEY)` — the ONLY writer
-                 of the action cache (C13). A superseded invocation is denied in EVERY mode;
-   7. finalize   `mechanism.record_decision(...)` for the final verdict, and nothing else
+   5. society    `mechanism.query_society_safety(..., correlation_key=KEY)` for EVERY act, reads
+                 included (dp 2026-10-01: align upward to claude-code's posture) — the ONLY
+                 writer of the action cache (C13). A superseded invocation is denied in EVERY
+                 mode;
+   6. finalize   `mechanism.record_decision(...)` for the final verdict, and nothing else
                  records it. A consequential permit whose receipt is not committed becomes
                  `gate.evidence_uncommitted` (C11), in every rollout mode.
 
 THREE INVARIANTS, each tested in tools/one_gate_decide_contract_test.py:
 
-ONE DEADLINE. `decide()` takes one absolute deadline, GATE_DEADLINE_SECONDS (3 s) after it
-starts, under the shortest measured harness clamp (4 s). The phases (gate-self, snapshot,
+ONE DEADLINE, THE CALLER'S. `decide()` runs inside ONE absolute deadline supplied by its caller
+(`deadline=` absolute monotonic, or `budget_seconds=`); with neither, DEFAULT_DEADLINE_SECONDS.
+The harness timeout behind it is the shim's fact, not the gate's (stage C). The phases (gate-self, snapshot,
 society) must finish by `deadline - WITNESS_RESERVE_SECONDS`, so the final record keeps its own
 slice of the same deadline; `record_decision` takes the deadline itself (stage A). A phase that
 does not answer in time is a no-verdict, which fails closed.
@@ -39,10 +41,12 @@ arrive late (a begin_action recorded, a snapshot fetched for nobody). Stage C th
 explicit `deadline=` through those helpers so that no request STARTS after the deadline, and
 `_bounded` becomes a belt (plan §4).
 
-MEASURED CAVEAT (stage A): a cold DEBUG daemon took 4.4 s for its first society-safety round
-trip, so the first consequential act after a cold daemon start is denied `society.unreachable`
-under this deadline; the retry succeeds. That is the deadline doing its job, and the contract
-suite pins it.
+COLD START. A daemon's first act after start, and a never-seen member's first connect, cost
+~4.6-5.1 s (measured). The default 8 s absorbs one such leg; the deployed mechanism's 5 s
+per-request cap can still fail a single request that is slower, and that is a no-verdict deny
+inside the deadline, never a hang. Stage C warms the daemon for every member before the cutover
+(~/.hestia/daemon-warmup.sh already does this as ExecStartPost) and must keep that warm-up
+covering every registered member id.
 
 ONE KEY. `correlation_key(event.raw)` is computed ONCE, from the RAW harness event (C13): a
 normalized event loses gemini's `source_event` and kimi's `tool_call_id`. The same key goes to
@@ -71,11 +75,24 @@ import hestia_governance_closure as closure
 
 GATE_API_VERSION = "decide/1"
 
-#: The one invocation deadline (plan §3 step 1): under the shortest measured harness clamp (4 s).
-GATE_DEADLINE_SECONDS = 3.0
-#: The tail of that deadline kept for the final decision record. The phases before it are
-#: bounded by `deadline - WITNESS_RESERVE_SECONDS`; the record itself by the deadline.
-WITNESS_RESERVE_SECONDS = 0.5
+# ── THE DEADLINE IS THE CALLER'S ────────────────────────────────────────────────────────────
+# dp, 2026-10-01: "one gate is law. shims are there to match the interface to peculiarities of
+# each harness, timeouts being prime example." How long a harness waits for its hook, and what
+# it does when the wait runs out, is a harness fact: each seat's shim declares its registered
+# timeout and passes `deadline = harness_timeout - margin` (stage C registration contract, plan
+# §4). decide() runs every leg, plus the record's reserve, inside whatever deadline it is given,
+# and fails closed when it runs out. It does not defend against a harness that kills it early:
+# that is the registration's job, sized against measured daemon latency.
+#
+# DEFAULT_DEADLINE_SECONDS is a DEFAULT for a caller that passes nothing, not law: the deployed
+# mechanism's 4000 ms x (1 try + 1 retry), taken as the total across every leg. Measured basis
+# (isolated daemon from this head, 2026-10-01): warm society-safety p99 39 ms (n=40), p99 156 ms
+# under 2x CPU oversubscription (n=30); a never-seen member's first act 4.6-4.8 s (n=8), 5.0 s
+# under load (n=5); a cold daemon's first act 5.1 s (n=1). 8 s absorbs one cold connect.
+DEFAULT_DEADLINE_SECONDS = 8.0
+#: The tail of the deadline kept for the final decision record (warm record ~10 ms), at most a
+#: quarter of a short budget. A cold daemon's stall was measured to swallow a 0.5 s reserve.
+WITNESS_RESERVE_SECONDS = 1.0
 
 #: The rollout knob. ONE name for every seat (the per-seat HESTIA_<SEAT>_GATE_MODE names are
 #: stage C's projection work). Anything other than exactly "warn" is enforce: an unreadable
@@ -163,6 +180,7 @@ class GateDecision:
     evidence_committed: bool = False
     receipt_status: str = ""              # the record_decision status of THIS verdict
     supersedes_uncommitted: Optional[str] = None  # the permit gate.evidence_uncommitted replaced
+    budget_seconds: float = 0.0           # the deadline this verdict was reached inside
 
     @property
     def blocks(self) -> bool:
@@ -183,9 +201,11 @@ class _Invocation:
     notices: list = field(default_factory=list)
     warnings: list = field(default_factory=list)   # [(rule, reason, verdict_available)]
 
+    budget: float = DEFAULT_DEADLINE_SECONDS
+
     @property
     def phase_deadline(self) -> float:
-        return self.deadline - WITNESS_RESERVE_SECONDS
+        return self.deadline - min(WITNESS_RESERVE_SECONDS, 0.25 * self.budget)
 
     def remaining(self) -> float:
         return max(0.0, self.deadline - time.monotonic())
@@ -379,7 +399,7 @@ def _tally(inv: _Invocation, allowed: bool) -> None:
 
 def _finalize(inv: _Invocation, d: GateDecision, *, consequential: bool) -> GateDecision:
     """Record the final verdict and apply C11. The ONLY place a verdict is recorded."""
-    d = replace(d, rollout=inv.rollout, correlation_key=inv.key,
+    d = replace(d, rollout=inv.rollout, correlation_key=inv.key, budget_seconds=round(inv.budget, 3),
                 notices=tuple(inv.notices) + tuple(d.notices))
     receipt = _record(inv, d)
     if consequential and d.decision in ("allow", "warn") and not receipt.committed:
@@ -402,7 +422,8 @@ def _finalize(inv: _Invocation, d: GateDecision, *, consequential: bool) -> Gate
     _tally(inv, d.decision != "deny")
     if receipt.committed:
         return replace(d, evidence_committed=True, receipt_status=receipt.status)
-    # A denial stays a denial without evidence; a read keeps the ratified posture and says so.
+    # A denial stays a denial without evidence; a read permit keeps the C11 read posture (allowed,
+    # its missing record surfaced as an anomaly).
     return replace(d, evidence_committed=False, receipt_status=receipt.status,
                    anomaly=d.anomaly or d.decision != "deny")
 
@@ -543,17 +564,18 @@ def _local_law(inv: _Invocation, nev: core.NormalizedEvent,
             inv.warnings.append((v.rule, v.reason, True))
         return None, False
     if inv.rollout == "enforce":
-        # THE RATIFIED DEGRADED MODE (deny writes, allow reads), computed by the core.
+        # NO SNAPSHOT, NO PERMIT (dp 2026-10-01, "align upward"): with no policy snapshot the
+        # gate cannot certify scope, so EVERY act is denied — reads included, as claude-code does
+        # today. The core's degraded verdict still runs first so an innate egress refusal keeps
+        # its own rule (and counts as conduct); everything else is the infrastructure denial.
         v = core.degraded_verdict(nev, cprofile)
-        if v.blocks:
-            return _verdict_deny(v, verdict_available=bool(v.innate),
-                                 anomaly=not v.innate), True
-        try:
-            core.record_gate_unavailable(prof.member_id, inv.event.tool, "unknown",
-                                         "degraded: policy snapshot fetch failed (allow-read)")
-        except Exception:  # noqa: BLE001
-            pass
-        return None, True
+        if v.blocks and v.innate:
+            return _verdict_deny(v), True
+        reason = (f"'{inv.event.tool}' cannot be judged: the policy daemon did not answer with "
+                  f"this member's policy snapshot, and without it no act, read or write, is "
+                  f"permitted")
+        return _verdict_deny(core._deny("gate.degraded", reason),
+                             verdict_available=False, anomaly=True), True
     # Warn-rollout with no snapshot: a policy that grants NOTHING (never a replica), so every
     # boundary surfaces as a warning and innate ones still deny.
     policy = core.AgentPolicy(member_id=prof.member_id, scope=(),
@@ -632,25 +654,30 @@ def _sequence(inv: _Invocation) -> GateDecision:
     if d is not None:
         return _finalize(inv, d, consequential=False)
 
-    if nev.tool in core.READ_CLASS:
-        if degraded and inv.rollout == "enforce":
-            # DIVERGENCE for claude-code (needs dp's ruling): today that seat asks the daemon
-            # about reads too, so a degraded Read is a no-verdict deny there. Here it takes the
-            # ratified degraded posture, as kimi and codex do.
-            return _finalize(inv, GateDecision(
-                "allow", "gate.degraded.allow_read",
-                "read permitted by the ratified degraded posture (policy snapshot unavailable)",
-                verdict_available=False, anomaly=True), consequential=False)
-        return _finalize(inv, _permit(inv, "gate.allow"), consequential=False)
-
-    # Write/exec class (a degraded read-only shell command included: every seat asks the
-    # governor about it today, and the snapshot failing does not prove the daemon is down).
-    return _finalize(inv, _society(inv), consequential=True)
+    # EVERY act asks the governor, reads included (dp 2026-10-01: align upward). A read-class
+    # permit that fails to commit keeps the C11 read posture (allowed, anomaly surfaced); a
+    # write/exec permit that fails to commit becomes gate.evidence_uncommitted.
+    return _finalize(inv, _society(inv), consequential=nev.tool not in core.READ_CLASS)
 
 
-def decide(event: GateEvent, profile: GateProfile, *, rollout: Optional[str] = None) -> GateDecision:
-    """The one law-bearing sequence for every harness. NEVER raises."""
-    deadline = time.monotonic() + GATE_DEADLINE_SECONDS
+
+def decide(event: GateEvent, profile: GateProfile, *, rollout: Optional[str] = None,
+           deadline: Optional[float] = None,
+           budget_seconds: Optional[float] = None) -> GateDecision:
+    """The one law-bearing sequence for every harness. NEVER raises.
+
+    `deadline`: an absolute `time.monotonic()` bound from the caller (the shim: its harness's
+    registered timeout minus its margin). `budget_seconds`: the same, relative to now. With
+    neither, DEFAULT_DEADLINE_SECONDS. Every leg and the record's reserve run inside it; when it
+    runs out the act fails closed."""
+    start = time.monotonic()
+    if deadline is not None:
+        budget = max(0.0, float(deadline) - start)
+    elif budget_seconds is not None:
+        budget = max(0.0, float(budget_seconds))
+    else:
+        budget = DEFAULT_DEADLINE_SECONDS
+    deadline = start + budget
     mode = rollout_of(rollout)
     inv: Optional[_Invocation] = None
     try:
@@ -659,7 +686,7 @@ def decide(event: GateEvent, profile: GateProfile, *, rollout: Optional[str] = N
         if not isinstance(profile, GateProfile):
             raise TypeError("decide requires a GateProfile")
         inv = _Invocation(event=event, profile=profile, rollout=mode, deadline=deadline,
-                          key=mechanism.correlation_key(event.raw))
+                          key=mechanism.correlation_key(event.raw), budget=budget)
         inv.attempted = attempted_of(event)
         return _sequence(inv)
     except BaseException as exc:  # noqa: BLE001 — a gate that cannot decide must not allow

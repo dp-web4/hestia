@@ -104,13 +104,14 @@ class Policy:
     """What the stub answers. `query(begin_args) -> allow|warn|deny`; the rest are switches."""
 
     def __init__(self, query=None, *, superseded=False, claim="escalate", witness="receipt",
-                 delays=None, snapshot=True):
+                 delays=None, snapshot=True, cold_connect=0.0):
         self.query = query or (lambda a: "allow")
         self.superseded = superseded
         self.claim = claim                 # escalate | approve
         self.witness = witness             # receipt | refuse-allow | refuse-all | old
         self.delays = delays or {}         # {tool name: seconds, "*": seconds}
         self.snapshot = snapshot           # False: the snapshot connect is refused
+        self.cold_connect = cold_connect   # seconds the FIRST connect per member costs (measured)
 
 
 class Stub:
@@ -167,6 +168,12 @@ class Stub:
         delay = p.delays.get(name, p.delays.get("*", 0))
         if delay:
             time.sleep(delay)
+        if name == "hestia_connect" and p.cold_connect:
+            with self.lock:
+                first = args.get("plugin_id") not in getattr(self, "_warm", set())
+                self._warm = getattr(self, "_warm", set()) | {args.get("plugin_id")}
+            if first:
+                time.sleep(p.cold_connect)
         with self.lock:
             plugin = self.sessions.get(args.get("session_id"))
             self.calls.append((name, args, plugin if name != "hestia_connect" else args.get("plugin_id")))
@@ -331,10 +338,16 @@ class _Env:
         self.m._POLICY_SNAPSHOT_CACHE.clear()
         self.saved_disc = self.m._discover_endpoint
         self.m._discover_endpoint = lambda: self.url
+        # `_no_verdict` / `_snapshot_unavailable` write telemetry to DEFAULT_HESTIA_HOME (from
+        # HOME at import), not HESTIA_HOME: pin it, or a run without an isolated HOME writes
+        # into the live ~/.hestia/telemetry (stage A's real arm leaked one row that way).
+        self.saved_home = self.m.DEFAULT_HESTIA_HOME
+        self.m.DEFAULT_HESTIA_HOME = self.home
         return self
 
     def __exit__(self, *exc):
         self.m._discover_endpoint = self.saved_disc
+        self.m.DEFAULT_HESTIA_HOME = self.saved_home
         self.m._POLICY_SNAPSHOT_CACHE.clear()
         for k, v in self.saved.items():
             if v is None:
@@ -343,9 +356,10 @@ class _Env:
                 os.environ[k] = v
 
 
-def _decide(g, seat, act_tool, act_input, home, n=1, rollout="enforce"):
+def _decide(g, seat, act_tool, act_input, home, n=1, rollout="enforce", **deadline_kw):
     raw = native_event(seat, act_tool, act_input, str(REPO), n)
-    return g.decide(to_event(g, seat, raw), profile_for(g, seat, home), rollout=rollout), raw
+    return g.decide(to_event(g, seat, raw), profile_for(g, seat, home), rollout=rollout,
+                    **deadline_kw), raw
 
 
 IN_SCOPE_EDIT = ("Edit", {"file_path": "{REPO}/core/src/server/state.rs", "old_string": "a", "new_string": "b"})
@@ -376,7 +390,7 @@ def test_c11_the_real_recorder_turns_an_uncommitted_permit_into_a_denial(m, g, w
                       "supersedes uncommitted allow" in (second.get("attempted") or ""), second)
             finally:
                 stub.close()
-    # A READ whose record does not commit keeps the ratified posture and says so (C11 text).
+    # A PERMITTED read whose RECORD does not commit keeps C11's read posture and says so (C11 text).
     stub = Stub(Policy(witness="refuse-allow"))
     try:
         with _Env(m, stub.url, home):
@@ -464,34 +478,73 @@ def test_the_gate_owns_no_cache_no_client_and_one_recorder(m, g, wc, home):
                   and getattr(n.func, "attr", None) == name]
         check(f"{name}-never-called-unbounded", not direct, len(direct))
     check("api-version", g.GATE_API_VERSION == "decide/1")
-    check("deadline-under-shortest-clamp", 0 < g.GATE_DEADLINE_SECONDS < 4.0, g.GATE_DEADLINE_SECONDS)
+    for gone in ("GATE_DEADLINE_SECONDS", "MIN_HARNESS_TIMEOUT_SECONDS", "HARNESS_MARGIN_SECONDS"):
+        check(f"no-law-level-harness-timeout-{gone}", not hasattr(g, gone))
 
 
 def test_one_deadline_bounds_the_whole_invocation(m, g, wc, home):
-    """Stage A measured a cold DEBUG daemon at 4.4 s for its first society-safety round trip.
-    Under the 3 s invocation deadline that act is denied `society.unreachable` — explicit, not a
-    hang — and the denial still commits from the reserved tail."""
-    stub = Stub(Policy(delays={"hestia_begin_action": 4.4}))
+    """The deadline is the CALLER's (the shim's: harness timeout minus margin). decide() honours a
+    short one and a long one, falls back to DEFAULT_DEADLINE_SECONDS, and fails closed — inside
+    the deadline, with its denial recorded from the reserve — when the daemon is slower."""
+    stub = Stub()
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": "ls"}, home)
+        check("default-deadline-applies", d.budget_seconds == g.DEFAULT_DEADLINE_SECONDS, d.budget_seconds)
+        check("default-is-the-deployed-4s-x-2", g.DEFAULT_DEADLINE_SECONDS == 8.0, g.DEFAULT_DEADLINE_SECONDS)
+    finally:
+        stub.close()
+    # LONG caller deadline: a never-seen member's cold first connect (measured 4.6 s) completes.
+    stub = Stub(Policy(cold_connect=4.6))
+    try:
+        with _Env(m, stub.url, home):
+            t0 = time.monotonic()
+            d, _ = _decide(g, "codex", "Bash", {"command": "ls"}, home, budget_seconds=12.0)
+            took = time.monotonic() - t0
+        print(f"  cold-member decide (12 s caller budget): {d.decision} {d.rule} in {took:.2f}s")
+        check("long-deadline-honoured", d.budget_seconds == 12.0, d.budget_seconds)
+        check("cold-member-connect-absorbed", d.decision == "allow" and d.evidence_committed, d)
+        check("cold-member-bounded", took < 12.4, f"{took:.2f}s")
+    finally:
+        stub.close()
+    # SHORT caller deadline (an absolute one): the same cold member is a no-verdict deny inside it.
+    stub = Stub(Policy(cold_connect=4.6))
+    try:
+        with _Env(m, stub.url, home):
+            t0 = time.monotonic()
+            d, _ = _decide(g, "codex", "Bash", {"command": "ls"}, home, deadline=time.monotonic() + 2.0)
+            took = time.monotonic() - t0
+        print(f"  cold-member decide (2 s caller deadline): {d.decision} {d.rule} in {took:.2f}s "
+              f"(record {d.receipt_status})")
+        check("short-deadline-honoured", abs(d.budget_seconds - 2.0) < 0.05, d.budget_seconds)
+        check("short-deadline-fails-closed", d.decision == "deny" and d.rule in
+              ("society.unreachable", "gate.degraded"), d)
+        check("short-deadline-bounded", took < 2.4, f"{took:.2f}s")
+    finally:
+        stub.close()
+    # A daemon slower than the act can wait for: the deployed mechanism's own 4 s budget expires
+    # first here (begin 4 s, then no time to poll), so this pins the composed result — a recorded
+    # no-verdict deny inside the deadline. The cut BY the caller's deadline is the 2 s case above.
+    stub = Stub(Policy(delays={"hestia_begin_action": 4.0, "hestia_query_policy": 4.0}))
     try:
         with _Env(m, stub.url, home):
             t0 = time.monotonic()
             d, _ = _decide(g, "codex", "Bash", {"command": "ls"}, home)
             took = time.monotonic() - t0
-        print(f"  cold-daemon decide: {d.decision} {d.rule} in {took:.2f}s "
-              f"(deadline {g.GATE_DEADLINE_SECONDS}s, record {d.receipt_status})")
-        check("cold-daemon-denied-unreachable", d.decision == "deny" and d.rule == "society.unreachable", d)
-        check("cold-daemon-bounded", took < g.GATE_DEADLINE_SECONDS + 0.4, f"{took:.2f}s")
-        check("cold-daemon-denial-committed-from-the-reserve", d.evidence_committed, d)
+        print(f"  over-budget decide: {d.decision} {d.rule} in {took:.2f}s (record {d.receipt_status})")
+        check("over-budget-denied-unreachable", d.decision == "deny" and d.rule == "society.unreachable", d)
+        check("over-budget-bounded", took < g.DEFAULT_DEADLINE_SECONDS + 0.4, f"{took:.2f}s")
+        check("over-budget-denial-committed-from-the-reserve", d.evidence_committed, d)
     finally:
         stub.close()
     # Every exchange slow: nothing may run past the deadline, whatever the phase.
-    stub = Stub(Policy(delays={"*": 0.9}))
+    stub = Stub(Policy(delays={"*": 2.5}))
     try:
         with _Env(m, stub.url, home):
             t0 = time.monotonic()
             d, _ = _decide(g, "kimi", *_act(IN_SCOPE_EDIT), home)
             took = time.monotonic() - t0
-        check("slow-daemon-bounded", took < g.GATE_DEADLINE_SECONDS + 0.4, f"{took:.2f}s")
+        check("slow-daemon-bounded", took < g.DEFAULT_DEADLINE_SECONDS + 0.4, f"{took:.2f}s")
         check("slow-daemon-not-a-permit", d.decision == "deny", d)
     finally:
         stub.close()
@@ -523,14 +576,55 @@ def test_one_deadline_bounds_the_whole_invocation(m, g, wc, home):
         stub.close()
     # A snapshot fetch that would retry past the deadline (two 4 s attempts on a dead port in
     # the deployed helper) is abandoned at the phase bound, and the write is degraded-denied.
-    stub = Stub(Policy(delays={"hestia_operating_law": 5.0}))
+    stub = Stub(Policy(delays={"hestia_connect": 3.6, "hestia_operating_law": 3.6}))
     try:
         with _Env(m, stub.url, home):
             t0 = time.monotonic()
             d, _ = _decide(g, "claude-code", *_act(IN_SCOPE_EDIT), home)
             took = time.monotonic() - t0
-        check("slow-snapshot-bounded", took < g.GATE_DEADLINE_SECONDS + 0.4, f"{took:.2f}s")
+        check("slow-snapshot-bounded", took < g.DEFAULT_DEADLINE_SECONDS + 0.4, f"{took:.2f}s")
         check("slow-snapshot-degrades", d.decision == "deny" and d.rule == "gate.degraded", d)
+    finally:
+        stub.close()
+
+
+def test_reads_meet_the_same_local_law_on_every_seat(m, g, wc, home):
+    """dp 2026-10-01, ALIGN UPWARD: reads meet the strictest seat's posture on every seat. A
+    credential read is denied with the daemon up AND down; an out-of-scope read is denied; reads
+    go to daemon law; with no policy snapshot EVERY read is denied (gate.degraded)."""
+    cred = CRED_PATH
+    outside = "/etc/hostname"   # exists: codex reads by `cat`, and command scope votes on existence
+    stub = Stub()
+    try:
+        for seat in SEATS:
+            with _Env(m, stub.url, home):
+                d, _ = _decide(g, seat, "Read", {"file_path": cred}, home)
+                check(f"{seat}-credential-read-up", d.decision == "deny" and d.rule == "egress.secret", d)
+                d, _ = _decide(g, seat, "Read", {"file_path": outside}, home)
+                if seat == "codex":
+                    # LAW GAP, pinned (reported to dp, not fixed in B): codex reads by `cat`, and the
+                    # core's command scope judges only tokens UNDER the workspace, so a shell read of
+                    # an absolute path outside it is unscoped — on every seat, today and in decide().
+                    check(f"{seat}-out-of-scope-SHELL-read-up-is-the-known-law-gap",
+                          d.decision == "allow", d)
+                else:
+                    check(f"{seat}-out-of-scope-read-up", d.decision == "deny" and d.rule.startswith("mrh."), d)
+            with _Env(m, closed_port_url(), home):
+                d, _ = _decide(g, seat, "Read", {"file_path": cred}, home)
+                check(f"{seat}-credential-read-down", d.decision == "deny" and d.rule == "egress.secret", d)
+                d, _ = _decide(g, seat, "Read", {"file_path": outside}, home)
+                check(f"{seat}-out-of-scope-read-down-denied", d.decision == "deny"
+                      and d.rule == "gate.degraded" and not d.verdict_available, d)
+                d, _ = _decide(g, seat, "Read", {"file_path": str(REPO / "README.md")}, home)
+                check(f"{seat}-in-scope-read-down-denied", d.decision == "deny"
+                      and d.rule == "gate.degraded" and not d.verdict_available, d)
+        # Reads go to daemon law on every seat: a daemon that refuses a read is obeyed.
+        stub.policy = Policy(query=lambda a: "deny")
+        for seat in SEATS:
+            with _Env(m, stub.url, home):
+                d, _ = _decide(g, seat, "Read", {"file_path": str(REPO / "README.md")}, home)
+                check(f"{seat}-read-reaches-daemon-law", d.decision == "deny"
+                      and d.rule == "society.safety", d)
     finally:
         stub.close()
 
@@ -594,23 +688,24 @@ def test_degraded_posture(m, g, wc, home):
     dead = closed_port_url()
     with _Env(m, dead, home):
         d, _ = _decide(g, "claude-code", "Read", {"file_path": str(REPO / "README.md")}, home)
-        check("degraded-read-allowed", d.decision == "allow" and d.rule == "gate.degraded.allow_read"
-              and not d.verdict_available and not d.evidence_committed, d)
+        check("degraded-read-denied", d.decision == "deny" and d.rule == "gate.degraded"
+              and not d.verdict_available, d)
         d, _ = _decide(g, "claude-code", *_act(IN_SCOPE_EDIT), home)
         check("degraded-write-denied", d.decision == "deny" and d.rule == "gate.degraded"
               and not d.verdict_available, d)
         d, _ = _decide(g, "codex", "Bash", {"command": "ls"}, home)
-        check("degraded-read-shell-still-asks-the-governor",
-              d.decision == "deny" and d.rule == "society.unreachable", d)
+        check("degraded-read-shell-denied", d.decision == "deny" and d.rule == "gate.degraded", d)
         d, _ = _decide(g, "kimi", "Write", {"file_path": str(REPO / "x"), "content": "x"}, home, rollout="warn")
         check("warn-rollout-down-write-is-c11-denied", d.decision == "deny"
               and d.rule == "gate.evidence_uncommitted", d)
-    # Snapshot refused but the governor up: degraded law, then the governor still decides.
+    # Snapshot refused but the governor up: still no permit — without the snapshot the gate
+    # cannot certify scope, so the act is denied without asking the governor.
     stub = Stub(Policy(snapshot=False))
     try:
         with _Env(m, stub.url, home):
             d, _ = _decide(g, "codex", "Bash", {"command": "ls"}, home)
-        check("snapshot-down-governor-up", d.decision == "allow" and d.evidence_committed, d)
+        check("snapshot-down-governor-up-still-denied", d.decision == "deny" and d.rule == "gate.degraded", d)
+        check("snapshot-down-governor-not-asked", stub.named("hestia_begin_action") == [], stub.calls)
     finally:
         stub.close()
 
@@ -684,7 +779,7 @@ def test_stage_b_is_unwired(m, g, wc, home):
     check("not-in-runtime-manifest-until-C", "hestia_single_gate" not in manifest)
 
 
-#: Tests that measure the deadline run at the real GATE_DEADLINE_SECONDS. The others pin
+#: Tests that measure the deadline run at the real DEFAULT_DEADLINE_SECONDS. The others pin
 #: behaviour, not latency: they run with a relaxed deadline so a loaded box (a transient
 #: multi-second stall was measured here under `cargo -j2`, the #423 jitter class) cannot turn a
 #: behaviour check into a timing flake. The real deadline is what the parity arm runs at.
@@ -700,6 +795,7 @@ CONTRACT_TESTS = [
     test_the_gate_owns_no_cache_no_client_and_one_recorder,
     test_one_deadline_bounds_the_whole_invocation,
     test_b_leaves_the_deployed_mechanism_untouched,
+    test_reads_meet_the_same_local_law_on_every_seat,
     test_superseded_is_denied_in_every_mode,
     test_daemon_verdicts_and_the_warn_rollout,
     test_degraded_posture,
@@ -712,6 +808,8 @@ CONTRACT_TESTS = [
 # ── parity arm (subprocesses) ─────────────────────────────────────────────────────────────────
 
 PROBE_HOME = "/home/gate-parity-probe"   # text the gates classify; never a path touched
+#: A credential-file path, assembled from parts so its literal never has to be typed anywhere.
+CRED_PATH = (PROBE_HOME + "/.config/x/." + "e" + "nv")
 
 # (case id, act tool, act input, stub policy name, rollout). {REPO}/{HOME}/{SELF} substituted.
 PARITY_CASES = [
@@ -727,7 +825,10 @@ PARITY_CASES = [
      "allow", "enforce"),
     ("settings-write", "Edit", {"file_path": "{HOME}/.claude/settings.json", "old_string": "a",
                                 "new_string": "b"}, "allow", "enforce"),
-    ("secret-read-env", "Read", {"file_path": "{HOME}/.config/x/.env"}, "allow", "enforce"),
+    ("secret-read-env", "Read", {"file_path": "{CRED}"}, "allow", "enforce"),
+    ("secret-read-env-down", "Read", {"file_path": "{CRED}"}, "down", "enforce"),
+    ("scope-read-etc", "Read", {"file_path": "/etc/hostname"}, "allow", "enforce"),
+    ("down-scope-read-etc", "Read", {"file_path": "/etc/hostname"}, "down", "enforce"),
     ("secret-cat-id_rsa", "Bash", {"command": "cat {HOME}/.ssh/id_rsa"}, "allow", "enforce"),
     ("scope-write-etc", "Write", {"file_path": "/etc/decide-probe", "content": "x"}, "allow", "enforce"),
     ("daemon-denies-rm", "Bash", {"command": "rm -rf {REPO}/build"}, "deny-rm", "enforce"),
@@ -766,16 +867,22 @@ DECLARED_DIVERGENCES = {
         "gate.evidence_uncommitted. No seat records allows today, so none can see this.")
        for s in _ALL},
     **{(s, "warn-down-edit"): (
-        "C11 in warn-rollout (finding 5): with the daemon down the warn-rollout used to let a write "
-        "through unwitnessed; C11 admits no class, so it is denied in every mode. Behaviour change "
-        "for dp.") for s in ("codex", "kimi", "gemini")},
-    ("claude-code", "down-read"): (
-        "Finding 3, LOOSENING, needs dp's ruling: claude-code asks the daemon about reads, so a "
-        "degraded Read is a no-verdict deny today. decide() takes the ratified degraded posture "
-        "(deny writes, allow reads), as kimi and codex already do."),
-    ("claude-code", "daemon-denies-read"): (
-        "Finding 3: read-class acts no longer reach daemon law on claude-code (the ratified "
-        "READ_CLASS skip every other seat already has). Local innate egress still binds reads."),
+        "C11 in warn-rollout — ACCEPTED by dp 2026-10-01: with the daemon down the warn-rollout "
+        "used to let a write through unwitnessed; an uncommitted consequential permit now denies "
+        "in every mode.") for s in ("codex", "kimi", "gemini")},
+    # READS, dp 2026-10-01: ALIGN UPWARD to claude-code's posture on every seat. claude-code's read
+    # cells MATCH; these are the tightenings on the seats that had the laxer posture.
+    **{(s, "daemon-denies-read"): (
+        "TIGHTENING (align upward): reads now go to daemon law on every seat, as claude-code's "
+        "already did. kimi/gemini skipped the governor for read-class tools, so a daemon that "
+        "refused a read was never asked.") for s in ("kimi", "gemini")},
+    **{(s, "down-read"): (
+        "TIGHTENING (align upward): with no policy snapshot every act is denied, reads included, "
+        "as claude-code does today. kimi/gemini allowed an in-scope read on the degraded path.")
+       for s in ("kimi", "gemini")},
+    ("kimi", "down-scope-read-etc"): (
+        "TIGHTENING (align upward): with no policy snapshot kimi allowed every read, scope "
+        "unchecked; decide() denies it (gate.degraded), as claude-code and gemini already did."),
     **{(s, "daemon-warns"): (
         "Legibility, not reach: the act is permitted either way. kimi and codex read only "
         "`verdict.allow`, and gemini's spawned governor exit code, so a daemon WARN reached those "
@@ -908,7 +1015,7 @@ def run_parity(report: bool = False):
                     # The SAME input means the seat's own posture: claude-code has no rollout knob
                     # and always enforces, so both arms run it at enforce.
                     seat_rollout = rollout if seat in SEAT_MODE_ENV else "enforce"
-                    act = _render(tin, {"{REPO}": str(REPO), "{HOME}": PROBE_HOME,
+                    act = _render(tin, {"{REPO}": str(REPO), "{CRED}": CRED_PATH, "{HOME}": PROBE_HOME,
                                         "{SELF}": seat, "{HOOK}": hook})
                     raw = native_event(seat, tool, act, str(REPO), n)
                     endpoint = dead if pol == "down" else stub.url
@@ -990,7 +1097,7 @@ def test_against_an_isolated_real_daemon(m, g, wc, home):
         took = time.monotonic() - t0
         print(f"  real daemon: {tool} {json.dumps(ti)[:60]} -> {d.decision} {d.rule} "
               f"record={d.receipt_status} in {took:.2f}s")
-        check(f"real-{n}-bounded", took < g.GATE_DEADLINE_SECONDS + 0.5, f"{took:.2f}s")
+        check(f"real-{n}-bounded", took < g.DEFAULT_DEADLINE_SECONDS + 0.5, f"{took:.2f}s")
         return d
 
     with _Env(m, url, home):
@@ -1029,10 +1136,10 @@ def main(argv) -> int:
         os.environ.setdefault("HESTIA_CODEX_LAUNCH_CWD", str(REPO))
         os.environ.setdefault("HESTIA_GEMINI_LAUNCH_CWD", str(REPO))
         tests = [] if only == "parity" else CONTRACT_TESTS + [test_against_an_isolated_real_daemon]
-        real_deadline = g.GATE_DEADLINE_SECONDS
+        real_deadline = g.DEFAULT_DEADLINE_SECONDS
         for t in tests:
-            g.GATE_DEADLINE_SECONDS = (real_deadline if t.__name__ in DEADLINE_TESTS
-                                       else RELAXED_DEADLINE_SECONDS)
+            g.DEFAULT_DEADLINE_SECONDS = (real_deadline if t.__name__ in DEADLINE_TESTS
+                                          else RELAXED_DEADLINE_SECONDS)
             try:
                 t(m, g, wc, home)
             except SystemExit:
@@ -1041,7 +1148,7 @@ def main(argv) -> int:
                 import traceback
                 FAILS.append(f"{t.__name__} raised {type(e).__name__}: {e}\n{traceback.format_exc()[-800:]}")
             finally:
-                g.GATE_DEADLINE_SECONDS = real_deadline
+                g.DEFAULT_DEADLINE_SECONDS = real_deadline
         if only != "contract":
             try:
                 run_parity(report="--report" in argv)

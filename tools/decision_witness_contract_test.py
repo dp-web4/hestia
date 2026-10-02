@@ -523,7 +523,13 @@ def test_against_an_isolated_real_daemon():
     pid = "decision-contract-test"
     saved = m._discover_endpoint
     saved_budget = m.TOTAL_BUDGET_MS
+    saved_home = m.DEFAULT_HESTIA_HOME
     m._discover_endpoint = lambda: url
+    # A no-verdict here writes telemetry to DEFAULT_HESTIA_HOME (HOME at import), which is the
+    # LIVE ~/.hestia unless HOME was isolated: one `decision-contract-test` timeout row reached
+    # the live gate-unavailable log that way. Keep this arm's telemetry in a scratch home.
+    _tele = tempfile.mkdtemp(prefix="decision-contract-telemetry-")
+    m.DEFAULT_HESTIA_HOME = pathlib.Path(_tele)
     # A fresh DEBUG daemon's first society-safety round trip measured over the hook's 4 s
     # budget (timeout on the first act, the second inside it). That budget is the gate's
     # latency contract, not this witness's, so this arm widens it locally, restores it, and
@@ -572,6 +578,7 @@ def test_against_an_isolated_real_daemon():
     finally:
         m._discover_endpoint = saved
         m.TOTAL_BUDGET_MS = saved_budget
+        m.DEFAULT_HESTIA_HOME = saved_home
 
 
 TESTS = [
