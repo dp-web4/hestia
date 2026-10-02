@@ -1054,7 +1054,10 @@ def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = N
 
 
 #: Roots that are always reachable regardless of MRH — scratch space, not governed territory.
-TEMP_ROOTS = ("/tmp", "/var/tmp")
+#: `/private/tmp` and `/private/var/tmp` are the Darwin destinations of the `/tmp` and
+#: `/var/tmp` symlinks. Claude Code's macOS scratchpad is under `/private/tmp/...` after
+#: resolution; a lexical-only `/tmp` list misses it (#1074).
+TEMP_ROOTS = ("/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp")
 
 
 def _under_temp_root(path: str) -> bool:
@@ -1067,7 +1070,10 @@ def _under_temp_root(path: str) -> bool:
     reach by naming a directory, with no grant, no witness and no operator involved.
 
     Same defect class as the census's `reviewer ⊄ review`: a boundary rule implemented as a
-    substring rule. The fix is the same shape — compare at the separator."""
+    substring rule. The fix is the same shape — compare at the separator.
+
+    On macOS, callers often hand an already-resolved path (`/private/tmp/...`). Those must
+    still count as temp, while `/private/tmp-other` (a sibling of `/private/tmp`) must not."""
     p = os.path.normpath(path.replace("\\", "/")).replace("\\", "/")
     return any(p == r or p.startswith(r + "/") for r in TEMP_ROOTS)
 

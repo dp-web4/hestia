@@ -944,7 +944,6 @@ its permit now belongs to another invocation, so this one may not begin"),
             host_session_id,
             started_at,
             chain_position,
-            own_decision: None,
         },
     );
 
@@ -1580,9 +1579,27 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         // session) and WHY (actor intent) here, or they're lost for everything the
         // gate blocks. Computed inside the gate branch so Allow decisions skip it.
         let instance_lct = s.member_lct(&plugin_id_for_chain);
-        let own_row = s.append_chain(
-            "policy_decision",
-            json!({
+        let verdict = super::decision_witness::Verdict::parse(evaluation.decision.as_str())
+            .expect("a non-allow PolicyDecision is warn or deny");
+        // ONE VERDICT, ONE ROW. The daemon asked to rule the same action again, with the same
+        // verdict for the same member, answers with the row it already committed: no append.
+        // Its owed charge, if a trust write failed earlier, is settled here (once).
+        if let Some(existing) = s
+            .decision_ledger
+            .existing_row(&plugin_id_for_chain, action_id, verdict)
+            .map(str::to_string)
+        {
+            decision_entry_hash = Some(existing);
+            let _ = settle_decision_charge(&mut s, &plugin_id_for_chain, action_id);
+        } else {
+        // Settle an owed charge first, so this row can name the row that holds the charge.
+        let _ = settle_decision_charge(&mut s, &plugin_id_for_chain, action_id);
+        // ONE CHARGE PER (MEMBER, ACTION), known before the append so the row can say so: if a
+        // committed row for this member and action already charged (a seat's witness that
+        // named this action first), this row is evidence only.
+        let charge_held_by =
+            s.decision_ledger.charge_holder(&plugin_id_for_chain, action_id).map(str::to_string);
+        let mut own_data = json!({
                 "action_id": action_id_str,
                 "tool_name": action.tool_name,
                 "target": target,
@@ -1614,21 +1631,18 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                     .map(|a| if a.chars().count() > ATTEMPTED_MAX {
                         a.chars().take(ATTEMPTED_MAX).collect::<String>() + "…[truncated]"
                     } else { a }),
-            }),
-        );
+            });
+        if let Some(h) = &charge_held_by {
+            own_data["charge_held_by"] = json!(h);
+        }
+        let own_row = s.append_chain("policy_decision", own_data);
         // The verdict never depends on this append (as before: a failed append was, and is,
         // not a reason to change the ruling). What changes is that its success is no longer
-        // discarded: only a COMMITTED row is remembered or reported.
+        // discarded: only a COMMITTED row is remembered, reported — or charged (below).
         if let Ok(row) = &own_row {
             decision_entry_hash = Some(row.hash.clone());
-            let own = super::decision_witness::OwnDecisionWitness {
-                decision: evaluation.decision.as_str().to_string(),
-                entry_hash: row.hash.clone(),
-                plugin_id: plugin_id_for_chain.clone(),
-            };
-            if let Some(a) = s.actions.get_mut(&action_id) {
-                a.own_decision = Some(own);
-            }
+            let charge = super::decision_witness::ChargeSpec::from_row(&row.event_data);
+            s.decision_ledger.record_row(&plugin_id_for_chain, action_id, verdict, &row.hash, charge);
         }
 
         // Wire the gate's risk judgment into trust. Before this, trust evolved
@@ -1643,36 +1657,17 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         // action was blocked) is a stronger negative than `warn` (flagged but
         // allowed to proceed — it also gets an execution outcome later, so its
         // weight is intentionally light to avoid over-penalising). Magnitudes are
-        // conservative first-cut defaults; tune if the reliability curve warrants.
-        let risk_magnitude = match evaluation.decision {
-            crate::policy::PolicyDecision::Deny => 0.5,
-            crate::policy::PolicyDecision::Warn => 0.2,
-            _ => 0.0,
-        };
-        if risk_magnitude > 0.0 {
-            // P3a: emit the gate's trust movement as a role-scoped ReputationDelta
-            // to the local bridge sink (the first source of hestia->hub reputation).
-            let reason = format!("gate:{}", evaluation.decision.as_str());
-            let rep_ctx = crate::reputation::RepContext {
-                // The DAEMON's own gate evaluation. Reachability is established by
-                // construction here: if this code is running, the referee answered.
-                // A fail-closed deny (the infra case) never reaches this branch —
-                // it cannot be witnessed through the daemon it could not reach, and
-                // there is no spool (ratified dp 2026-08-04: the chain witnesses
-                // member events, not infra telemetry).
-                class: crate::reputation::DeltaClass::Conduct,
-                role_lct: &role_lct,
-                action_type: "policy_gate",
-                action_target: &action.tool_name,
-                action_id: &action_id_str,
-                // The rule id is in scope HERE — the same `evaluation` whose
-                // rule_id/rule_name go into the policy_decision chain entry
-                // above. Until plumbed, this delta row was the deny record that
-                // could not name the rule that charged the member.
-                rule_triggered: evaluation.rule_id.as_deref().unwrap_or(""),
-                reason: &reason,
-            };
-            let _ = s.apply_outcome_ctx(&plugin_id_for_chain, false, risk_magnitude, &rep_ctx);
+        // conservative first-cut defaults (`Verdict::risk_magnitude`); tune if the reliability
+        // curve warrants.
+        //
+        // DECISION REPUTATION FOLLOWS THE COMMITTED DECISION WITNESS. No committed row → no
+        // movement: a failed append used to leave this charge applied with no row behind it,
+        // and the gate's later witness of the same verdict (finding no row to answer with)
+        // appended one and charged the member a second time. The charge is now the committed
+        // row's own, applied once per (member, action) by `settle_decision_charge` — and a
+        // failed trust write leaves it OWED for the next decision on the key, not lost. The
+        // verdict never depends on it, so its error is not this reply's error.
+        let _ = settle_decision_charge(&mut s, &plugin_id_for_chain, action_id);
         }
     }
 
@@ -3951,7 +3946,7 @@ async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
 }
 
 async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult {
-    use super::decision_witness::{bounded_core_digest, existing_witness, Verdict};
+    use super::decision_witness::{bounded_core_digest, Verdict};
     let plugin_id = require_string(args, "plugin_id")?;
     let decision = require_string(args, "decision")?;
     // ONE decision witness for every verdict (one-gate stage A). `allow` was refused here until
@@ -4059,28 +4054,46 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     let declared_role = optional_string(args, "role").unwrap_or_default();
     let role_lct = crate::reputation::normalize_constellation_role(&declared_role);
 
-    let s = state.lock().await;
-    // ONE VERDICT, ONE ROW. The society-safety path already witnessed the daemon's own verdict
-    // on this action (`query_policy`'s row, with its own Conduct charge). The gate's witness of
-    // the same verdict for the same member IS that row: hand back its hash, append nothing,
-    // charge nothing. Before this, a seat that recorded its society deny (codex does) wrote a
-    // second `policy_decision` and charged the member twice for one refusal.
-    let resident = action_id.and_then(|a| s.actions.get(&a));
-    if let Some(hash) =
-        existing_witness(resident.and_then(|a| a.own_decision.as_ref()), &plugin_id, verdict)
-    {
+    let mut s = state.lock().await;
+    // ONE VERDICT, ONE ROW. A committed row already witnesses this verdict for this member and
+    // action — the daemon's own (`query_policy` on the society-safety path), or this same
+    // witness delivered twice. The gate's witness of the same verdict IS that row: hand back
+    // its hash and append nothing. Before this, a seat that recorded its society deny (codex
+    // does) wrote a second `policy_decision` and charged the member twice. If that row's charge
+    // is still OWED (its trust write failed), this retry settles it — once; a settle that fails
+    // again is an error, so the caller's receipt check retries rather than reading it as done.
+    let existing = action_id
+        .and_then(|a| s.decision_ledger.existing_row(&plugin_id, a, verdict))
+        .map(str::to_string);
+    if let (Some(hash), Some(a)) = (existing, action_id) {
+        let settled = settle_decision_charge(&mut s, &plugin_id, a)?;
         return Ok(json!({
             "witnessEntryHash": hash,
             "eventType": verdict.event_type(),
             "decision": verdict.as_str(),
             "recorded": "existing",
-            "charged": false,
+            "charged": settled.is_some(),
+            "chargedRow": settled.as_ref().map(|(h, _)| h.clone()),
             "actionId": action_id.map(|a| a.to_string()),
             "correlationKey": correlation_key,
-            "updatedTrust": Value::Null,
+            "updatedTrust": settled.map(|(_, t)| trust_state_json(&t)).unwrap_or(Value::Null),
         }));
     }
-    let action_resident = resident.is_some();
+    let action_resident = action_id.is_some_and(|a| s.actions.contains_key(&a));
+    // An OWED charge on this key (an earlier row committed, its trust write failed) is settled
+    // before this row is written, so the row can name the row that holds the charge. Its error is
+    // not this append's error: the charge stays owed and the settle below tries again.
+    let mut settled = None;
+    if let Some(a) = action_id {
+        settled = settle_decision_charge(&mut s, &plugin_id, a).ok().flatten();
+    }
+    // ONE CHARGE PER (MEMBER, ACTION). A DIFFERENT verdict for an action this member was already
+    // charged for (a warn-rollout seat's `warn` after the daemon's charged `deny`, or the reverse
+    // order) is appended — it is real evidence of what the member experienced — but names the
+    // row that charged instead of charging again.
+    let charge_held_by = action_id
+        .and_then(|a| s.decision_ledger.charge_holder(&plugin_id, a))
+        .map(str::to_string);
     let instance_lct = s.member_lct(&plugin_id);
     let mut row = json!({
         "tool_name": tool_name,
@@ -4115,15 +4128,25 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
         if let Some(d) = &core_digest {
             obj.insert("core_digest".into(), json!(d));
         }
+        if let Some(h) = &charge_held_by {
+            obj.insert("charge_held_by".into(), json!(h));
+        }
     }
     // A failed append is an `Err` → `hestia.internal_error` on the wire, with no hash: the
     // caller's receipt check then reads it as NOT committed, which is the point.
     let entry = s.append_chain(verdict.event_type(), row)?;
-    let mut trust = Value::Null;
-    if let Some(risk_magnitude) = verdict.risk_magnitude() {
+    if let Some(a) = action_id {
+        // The row's own charge, read back from what was committed (the same reading the startup
+        // replay makes), applied once per key by the settle — now, or on the next decision.
+        let charge = super::decision_witness::ChargeSpec::from_row(&entry.event_data);
+        s.decision_ledger.record_row(&plugin_id, a, verdict, &entry.hash, charge);
+        if settled.is_none() {
+            settled = settle_decision_charge(&mut s, &plugin_id, a)?;
+        }
+    } else if let Some(risk_magnitude) = verdict.risk_magnitude() {
+        // No action named: no ledger key, so the pre-ledger behaviour — charge this row now.
         // Same asymmetric gate-risk trust as the daemon's own gate decisions.
         let gate_reason = format!("gate:{} ({adjudicator})", verdict.as_str());
-        let action_id_text = action_id.map(|a| a.to_string()).unwrap_or_default();
         let rep_ctx = crate::reputation::RepContext {
             // CALLER-REPORTED gate decision from a hook. Hestia did NOT establish
             // this cause — it received a claim — so it cannot honestly assert
@@ -4136,8 +4159,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
             role_lct,
             action_type: "policy_gate",
             action_target: &tool_name,
-            // Empty unless the caller named its action — then the delta row joins it too.
-            action_id: &action_id_text,
+            action_id: "",
             // Caller-reported decision (the hook layer's own gate). The `reason`
             // reaching this row is the daemon-built `gate:{decision} ({adjudicator})`
             // above — the caller's free text goes to the chain entry, not here — so
@@ -4147,7 +4169,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
             reason: &gate_reason,
         };
         let trust_state = s.apply_outcome_ctx(&plugin_id, false, risk_magnitude, &rep_ctx)?;
-        trust = trust_state_json(&trust_state);
+        settled = Some((entry.hash.clone(), trust_state));
     }
     // THE RECEIPT names every input it acted on, so a caller can tell "committed what I sent"
     // from "committed something" — an older daemon that ignores `action_id` echoes no
@@ -4157,11 +4179,66 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
         "eventType": verdict.event_type(),
         "decision": verdict.as_str(),
         "recorded": "appended",
-        "charged": verdict.risk_magnitude().is_some(),
+        // Whether THIS call applied the key's one charge, and which row it belongs to (this
+        // row, or an earlier row whose charge was owed).
+        "charged": settled.is_some(),
+        "chargedRow": settled.as_ref().map(|(h, _)| h.clone()),
+        // Present only when this row is evidence-only because another row holds this member's
+        // charge for this action: the hash of that row.
+        "chargeHeldBy": charge_held_by,
         "actionId": action_id.map(|a| a.to_string()),
         "correlationKey": correlation_key,
-        "updatedTrust": trust,
+        "updatedTrust": settled.map(|(_, t)| trust_state_json(&t)).unwrap_or(Value::Null),
     }))
+}
+
+/// Settle the OWED decision charge on `(member, action_id)`, if there is one: apply the charging
+/// row's own charge (see `decision_witness::ChargeSpec`), then mark the key settled — in RAM
+/// and in the durable settle record. `Ok(Some((row, trust)))` when this call applied it;
+/// `Ok(None)` when nothing was owed (settled already, or nothing chargeable committed); `Err`
+/// when the trust write failed, leaving it owed for the next decision on the key.
+///
+/// Called with the state lock held, so two settles of one key are serialised and the second
+/// finds nothing owed: exactly one charge per key.
+///
+/// The class is the row's: the DAEMON's own gate evaluation is Conduct — reachability is
+/// established by construction (if this code is running, the referee answered; a fail-closed
+/// deny never reaches it, and there is no spool: ratified dp 2026-08-04, the chain witnesses
+/// member events, not infra telemetry). A CALLER-REPORTED gate decision is Unclassified: hestia
+/// received a claim, did not establish the cause, and must not infer one from decision, reason
+/// or rule names. Either way the delta names the rule that charged the member.
+fn settle_decision_charge(
+    s: &mut super::state::ServerState,
+    member: &str,
+    action_id: Uuid,
+) -> anyhow::Result<Option<(String, EntityTrust)>> {
+    let Some((row, c)) = s.decision_ledger.owed(member, action_id) else {
+        return Ok(None);
+    };
+    let action_id_text = action_id.to_string();
+    let rep_ctx = crate::reputation::RepContext {
+        class: if c.conduct {
+            crate::reputation::DeltaClass::Conduct
+        } else {
+            crate::reputation::DeltaClass::Unclassified
+        },
+        role_lct: &c.role_lct,
+        action_type: "policy_gate",
+        action_target: &c.tool_name,
+        action_id: &action_id_text,
+        rule_triggered: &c.rule_id,
+        reason: &c.reason,
+    };
+    let trust = s.apply_outcome_ctx(member, false, c.magnitude, &rep_ctx)?;
+    if s.decision_ledger.record_charge(member, action_id, &row) {
+        super::decision_witness::persist_settled(
+            &s.home.join(super::decision_witness::SETTLED_FILE),
+            member,
+            action_id,
+            &row,
+        );
+    }
+    Ok(Some((row, trust)))
 }
 
 async fn tool_request_witness(state: &SharedState, args: &Value) -> ToolResult {
@@ -27356,12 +27433,15 @@ mod decision_witness_tests {
         assert_eq!(rows_of(&state, "policy_decision").await.len(), rows_before, "no second row");
         assert_eq!(sink_lines(&sink), charged_before, "no second charge");
 
-        // A DIFFERENT verdict on the same action is a different decision: its own row.
+        // A DIFFERENT verdict on the same action is a different decision: its own row, but
+        // the action was already charged, so no second charge.
         let mut w = witness_args("codex", "warn");
         w["action_id"] = json!(aid);
         let out = tool_witness_decision(&state, &w).await.unwrap();
         assert_eq!(out["recorded"], json!("appended"), "{out}");
+        assert_eq!(out["charged"], json!(false), "{out}");
         assert_eq!(rows_of(&state, "policy_decision").await.len(), rows_before + 1);
+        assert_eq!(sink_lines(&sink), charged_before, "still one charge");
 
         // And another member is never answered with this member's record.
         let mut o = witness_args("kimi-code", "deny");
@@ -27388,6 +27468,355 @@ mod decision_witness_tests {
         assert_eq!(row.event_data["action_id"], json!(aid));
         assert_eq!(row.event_data["action_resident"], json!(true));
         assert_eq!(row.event_data["correlation_key"], json!("toolu_01ABC"));
+    }
+
+    // ------------------------------------------- one charge per (member, action), every order
+
+    /// Make every `policy_decision` insert fail at the SQLite layer. The trust store is a
+    /// different store and keeps working: append fails, trust would succeed.
+    fn fail_decision_appends(dir: &tempfile::TempDir) -> rusqlite::Connection {
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_decision BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'policy_decision' BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Reputation deltas in the sink charged to `plugin_id`'s member LCT for action `aid`.
+    async fn charges_for(state: &SharedState, plugin_id: &str, aid: &str) -> usize {
+        let (sink, lct) = {
+            let s = state.lock().await;
+            (s.reputation_sink(), s.member_lct(plugin_id).expect("a mapped member"))
+        };
+        std::fs::read_to_string(sink)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(aid) && l.contains(lct.as_str()))
+            .count()
+    }
+
+    fn rows_for(rows: &[crate::storage::chain::ChainEntry], aid: &str) -> Vec<Value> {
+        rows.iter()
+            .filter(|e| e.event_data["action_id"] == json!(aid))
+            .map(|e| e.event_data.clone())
+            .collect()
+    }
+
+    /// GPT's arm on #1196, exactly: a deny evaluation; the daemon's own `policy_decision` append
+    /// FAILS while the trust store would succeed; the later common witness finds no row and
+    /// appends one. Before: the daemon's charge had already landed and the witness charged
+    /// again (one row, two charges). Now: no committed row, no daemon charge; one row, one charge.
+    #[tokio::test]
+    async fn append_fails_trust_would_succeed_later_witness_appends_and_charges_once() {
+        let (dir, state) = state_with_safety().await;
+        let sink = { state.lock().await.reputation_sink() };
+        let before = sink_lines(&sink);
+        let conn = fail_decision_appends(&dir);
+        let (aid, verdict) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
+        assert_eq!(verdict["decision"], json!("deny"), "the verdict never depends on the append");
+        assert_eq!(verdict["decisionEntryHash"], Value::Null, "no committed row: {verdict}");
+        assert_eq!(sink_lines(&sink), before, "no committed decision row, no reputation movement");
+        conn.execute_batch("DROP TRIGGER fail_decision;").unwrap();
+
+        let mut a = witness_args("codex", "deny");
+        a["action_id"] = json!(aid);
+        let out = tool_witness_decision(&state, &a).await.unwrap();
+        assert_eq!(out["recorded"], json!("appended"), "{out}");
+        assert_eq!(out["charged"], json!(true), "{out}");
+        assert_eq!(rows_for(&rows_of(&state, "policy_decision").await, &aid).len(), 1);
+        assert_eq!(sink_lines(&sink), before + 1, "one row, one charge");
+        assert_eq!(charges_for(&state, "codex", &aid).await, 1);
+    }
+
+    /// The warn-rollout divergence (PR body, Decisions #3), daemon first: the daemon denies and
+    /// charges; the seat then records `warn` for the same action. Two rows (two decisions the
+    /// member experienced), one charge, and the warn row names the row that charged.
+    #[tokio::test]
+    async fn daemon_deny_then_seat_warn_keeps_both_rows_and_one_charge() {
+        let (_d, state) = state_with_safety().await;
+        let sink = { state.lock().await.reputation_sink() };
+        let before = sink_lines(&sink);
+        let (aid, verdict) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
+        let deny_hash = verdict["decisionEntryHash"].clone();
+        assert!(is_chain_hash(&deny_hash), "{verdict}");
+        assert_eq!(sink_lines(&sink), before + 1, "the daemon's own charge");
+
+        let mut w = witness_args("codex", "warn");
+        w["action_id"] = json!(aid);
+        let out = tool_witness_decision(&state, &w).await.unwrap();
+        assert_eq!(out["recorded"], json!("appended"), "{out}");
+        assert_eq!(out["charged"], json!(false), "{out}");
+        assert_eq!(out["chargeHeldBy"], deny_hash, "{out}");
+        assert_eq!(out["updatedTrust"], Value::Null);
+        let rows = rows_for(&rows_of(&state, "policy_decision").await, &aid);
+        assert_eq!(rows.len(), 2, "both decisions are evidence");
+        let warn_row = rows.iter().find(|r| r["decision"] == json!("warn")).unwrap();
+        assert_eq!(warn_row["charge_held_by"], deny_hash);
+        let deny_row = rows.iter().find(|r| r["decision"] == json!("deny")).unwrap();
+        assert!(deny_row.get("charge_held_by").is_none(), "the charging row holds no pointer");
+        assert_eq!(sink_lines(&sink), before + 1, "one charge");
+        assert_eq!(charges_for(&state, "codex", &aid).await, 1);
+    }
+
+    /// The same divergence, seat first: the seat's `warn` names the action before the daemon
+    /// rules it. The seat's row charged (first committed charge wins, at its 0.2 weight); the
+    /// daemon's `deny` row is appended and moves nothing.
+    #[tokio::test]
+    async fn seat_warn_then_daemon_deny_keeps_both_rows_and_one_charge() {
+        let (_d, state) = state_with_safety().await;
+        let sink = { state.lock().await.reputation_sink() };
+        let before = sink_lines(&sink);
+        let connect = tool_connect(&state, &json!({"plugin_id": "codex", "host_agent": "test"}))
+            .await
+            .unwrap();
+        let sid = connect["sessionId"].as_str().unwrap().to_string();
+        let cmd = "rm -rf /home/user/data";
+        let begin = tool_begin_action(
+            &state,
+            &json!({"tool_name": "Bash", "target": cmd, "parameters": {"command": cmd},
+                    "session_id": sid}),
+        )
+        .await
+        .unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+
+        let mut w = witness_args("codex", "warn");
+        w["action_id"] = json!(aid);
+        let warn = tool_witness_decision(&state, &w).await.unwrap();
+        assert_eq!(warn["charged"], json!(true), "{warn}");
+        assert_eq!(sink_lines(&sink), before + 1);
+
+        let verdict = tool_query_policy(&state, &json!({"action_id": aid})).await.unwrap();
+        assert_eq!(verdict["decision"], json!("deny"), "{verdict}");
+        assert!(is_chain_hash(&verdict["decisionEntryHash"]), "the deny row commits: {verdict}");
+        let rows = rows_for(&rows_of(&state, "policy_decision").await, &aid);
+        assert_eq!(rows.len(), 2);
+        let deny_row = rows.iter().find(|r| r["decision"] == json!("deny")).unwrap();
+        assert_eq!(deny_row["charge_held_by"], warn["witnessEntryHash"]);
+        assert_eq!(sink_lines(&sink), before + 1, "the daemon's deny is not a second charge");
+        assert_eq!(charges_for(&state, "codex", &aid).await, 1);
+
+        // The daemon's deny is now a committed row: the seat's deny is answered with it.
+        let mut d = witness_args("codex", "deny");
+        d["action_id"] = json!(aid);
+        let out = tool_witness_decision(&state, &d).await.unwrap();
+        assert_eq!(out["recorded"], json!("existing"), "{out}");
+        assert_eq!(out["witnessEntryHash"], verdict["decisionEntryHash"]);
+    }
+
+    /// Duplicate deliveries: the same seat witness sent twice (a retry after a lost reply), and
+    /// the daemon asked to rule the same action twice. One row per verdict from the witness,
+    /// and never more than one charge.
+    #[tokio::test]
+    async fn duplicate_deliveries_never_charge_twice() {
+        let (_d, state) = state_with_safety().await;
+        let sink = { state.lock().await.reputation_sink() };
+        let before = sink_lines(&sink);
+
+        // A seat-only action id (no daemon row): the retry is answered with the first row.
+        let aid = Uuid::new_v4().to_string();
+        let mut a = witness_args("gemini", "deny");
+        a["action_id"] = json!(aid);
+        let first = tool_witness_decision(&state, &a).await.unwrap();
+        let second = tool_witness_decision(&state, &a).await.unwrap();
+        assert_eq!(first["recorded"], json!("appended"), "{first}");
+        assert_eq!(second["recorded"], json!("existing"), "{second}");
+        assert_eq!(second["witnessEntryHash"], first["witnessEntryHash"]);
+        assert_eq!(rows_for(&rows_of(&state, "policy_decision").await, &aid).len(), 1);
+        assert_eq!(charges_for(&state, "gemini", &aid).await, 1);
+
+        // The daemon asked twice for one action: one verdict, one row — its repeat ruling is
+        // answered with the row it already committed, and charges nothing.
+        let (aid2, v1) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
+        let v2 = tool_query_policy(&state, &json!({"action_id": aid2})).await.unwrap();
+        assert_eq!(v2["decision"], json!("deny"));
+        assert!(is_chain_hash(&v1["decisionEntryHash"]), "{v1}");
+        assert_eq!(v2["decisionEntryHash"], v1["decisionEntryHash"], "the same committed row");
+        assert_eq!(rows_for(&rows_of(&state, "policy_decision").await, &aid2).len(), 1);
+        assert_eq!(charges_for(&state, "codex", &aid2).await, 1);
+        assert_eq!(sink_lines(&sink), before + 2, "one charge per (member, action)");
+    }
+
+    /// Mismatched verdicts in any interleaving after the daemon's deny: warn, deny, warn again,
+    /// allow, deny again. Still one charge for the member; another member's verdict on the same
+    /// action is its own key.
+    #[tokio::test]
+    async fn mismatched_verdicts_in_any_order_charge_once_per_member() {
+        let (_d, state) = state_with_safety().await;
+        let sink = { state.lock().await.reputation_sink() };
+        let before = sink_lines(&sink);
+        let (aid, _) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
+        for decision in ["warn", "deny", "warn", "allow", "deny"] {
+            let mut a = witness_args("codex", decision);
+            a["action_id"] = json!(aid);
+            let out = tool_witness_decision(&state, &a).await.unwrap();
+            assert_eq!(out["charged"], json!(false), "{decision}: {out}");
+        }
+        assert_eq!(charges_for(&state, "codex", &aid).await, 1, "one charge, whatever the order");
+        let decision_rows = rows_for(&rows_of(&state, "policy_decision").await, &aid);
+        assert_eq!(decision_rows.len(), 2, "one row per distinct verdict: the deny and one warn");
+        assert_eq!(rows_for(&rows_of(&state, "policy_allow").await, &aid).len(), 1);
+
+        let mut o = witness_args("kimi-code", "warn");
+        o["action_id"] = json!(aid);
+        let out = tool_witness_decision(&state, &o).await.unwrap();
+        assert_eq!(out["charged"], json!(true), "another member is its own key: {out}");
+        assert_eq!(charges_for(&state, "kimi-code", &aid).await, 1);
+        assert_eq!(sink_lines(&sink), before + 2);
+    }
+
+    // ------------------------------- exactly once: an owed charge is settled, across restarts too
+
+    /// Make the trust store unwritable: its directory becomes a plain file, so every trust write
+    /// fails while the chain keeps committing (row commits, trust write fails).
+    fn break_trust(dir: &tempfile::TempDir) {
+        std::fs::rename(dir.path().join("trust"), dir.path().join("trust.off")).unwrap();
+        std::fs::write(dir.path().join("trust"), b"not a directory").unwrap();
+    }
+
+    fn heal_trust(dir: &tempfile::TempDir) {
+        std::fs::remove_file(dir.path().join("trust")).unwrap();
+        std::fs::rename(dir.path().join("trust.off"), dir.path().join("trust")).unwrap();
+    }
+
+    /// GPT #2 on #1196, seat path: the row commits, the trust write fails. The call errors (so a
+    /// receipt-checking caller retries). The retry is answered with the committed row — no
+    /// second row — and settles the owed charge. A further retry charges nothing.
+    #[tokio::test]
+    async fn committed_row_failed_trust_write_retry_settles_exactly_one_charge() {
+        let (dir, state) = state_with_safety().await;
+        let aid = Uuid::new_v4().to_string();
+        let mut a = witness_args("gemini", "deny");
+        a["action_id"] = json!(aid);
+        break_trust(&dir);
+        let failed = tool_witness_decision(&state, &a).await;
+        assert!(failed.is_err(), "a failed charge is not a clean receipt: {failed:?}");
+        let rows = rows_of(&state, "policy_decision").await;
+        let row_hash = rows.iter().find(|e| e.event_data["action_id"] == json!(aid)).unwrap().hash.clone();
+        assert_eq!(charges_for(&state, "gemini", &aid).await, 0, "the charge is owed, not applied");
+        heal_trust(&dir);
+
+        let retry = tool_witness_decision(&state, &a).await.unwrap();
+        assert_eq!(retry["recorded"], json!("existing"), "{retry}");
+        assert_eq!(retry["witnessEntryHash"], json!(row_hash));
+        assert_eq!(retry["charged"], json!(true), "the retry settles the owed charge: {retry}");
+        assert_eq!(retry["chargedRow"], json!(row_hash));
+        assert!(retry["updatedTrust"].is_object(), "{retry}");
+        let again = tool_witness_decision(&state, &a).await.unwrap();
+        assert_eq!(again["charged"], json!(false), "{again}");
+        assert_eq!(rows_for(&rows_of(&state, "policy_decision").await, &aid).len(), 1, "one row");
+        assert_eq!(charges_for(&state, "gemini", &aid).await, 1, "exactly one charge");
+    }
+
+    /// The daemon path: query_policy's row commits but its Conduct charge fails. The verdict is
+    /// unchanged and the row is named. The NEXT decision on the key — here the seat's different
+    /// verdict — settles the daemon row's owed charge (Conduct, gate:deny), and its own row is
+    /// evidence-only, naming the deny row.
+    #[tokio::test]
+    async fn an_owed_daemon_charge_is_settled_by_the_next_decision_on_the_key() {
+        let (dir, state) = state_with_safety().await;
+        break_trust(&dir);
+        let (aid, verdict) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
+        heal_trust(&dir);
+        assert_eq!(verdict["decision"], json!("deny"), "{verdict}");
+        let deny_hash = verdict["decisionEntryHash"].clone();
+        assert!(is_chain_hash(&deny_hash), "the row committed: {verdict}");
+        assert_eq!(charges_for(&state, "codex", &aid).await, 0);
+
+        let mut w = witness_args("codex", "warn");
+        w["action_id"] = json!(aid);
+        let out = tool_witness_decision(&state, &w).await.unwrap();
+        assert_eq!(out["recorded"], json!("appended"), "{out}");
+        assert_eq!(out["charged"], json!(true), "{out}");
+        assert_eq!(out["chargedRow"], deny_hash, "the owed charge was the deny row's: {out}");
+        assert_eq!(out["chargeHeldBy"], deny_hash);
+        assert_eq!(charges_for(&state, "codex", &aid).await, 1);
+        let sink = { state.lock().await.reputation_sink() };
+        let line = std::fs::read_to_string(sink).unwrap();
+        let line = line.lines().find(|l| l.contains(aid.as_str())).unwrap().to_string();
+        assert!(line.contains("gate:deny") && line.contains("onduct"), "the daemon's charge: {line}");
+
+        // And the daemon's repeat ruling settles nothing more.
+        let v2 = tool_query_policy(&state, &json!({"action_id": aid})).await.unwrap();
+        assert_eq!(v2["decisionEntryHash"], deny_hash);
+        assert_eq!(charges_for(&state, "codex", &aid).await, 1);
+    }
+
+    /// The daemon's own repeat ruling settles its own owed charge: one row, one charge.
+    #[tokio::test]
+    async fn the_daemons_repeat_ruling_settles_its_owed_charge_once() {
+        let (dir, state) = state_with_safety().await;
+        break_trust(&dir);
+        let (aid, v1) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
+        heal_trust(&dir);
+        assert_eq!(charges_for(&state, "codex", &aid).await, 0);
+        for _ in 0..2 {
+            let v = tool_query_policy(&state, &json!({"action_id": aid})).await.unwrap();
+            assert_eq!(v["decisionEntryHash"], v1["decisionEntryHash"]);
+        }
+        assert_eq!(rows_for(&rows_of(&state, "policy_decision").await, &aid).len(), 1);
+        assert_eq!(charges_for(&state, "codex", &aid).await, 1);
+    }
+
+    /// GPT #3: a restart must not end the idempotency domain. The daemon denies and charges;
+    /// the daemon restarts; the late seat witness of the same deny finds the row, and a
+    /// different verdict is evidence-only. One row per verdict, one charge.
+    #[tokio::test]
+    async fn a_restart_keeps_the_rows_and_the_charge() {
+        let (dir, state) = state_with_safety().await;
+        let (aid, verdict) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
+        let deny_hash = verdict["decisionEntryHash"].clone();
+        assert_eq!(charges_for(&state, "codex", &aid).await, 1);
+        drop(state);
+
+        let state = open_state(&dir);
+        let mut d = witness_args("codex", "deny");
+        d["action_id"] = json!(aid);
+        let out = tool_witness_decision(&state, &d).await.unwrap();
+        assert_eq!(out["recorded"], json!("existing"), "the late witness finds the row: {out}");
+        assert_eq!(out["witnessEntryHash"], deny_hash);
+        assert_eq!(out["charged"], json!(false), "{out}");
+        let mut w = witness_args("codex", "warn");
+        w["action_id"] = json!(aid);
+        let out = tool_witness_decision(&state, &w).await.unwrap();
+        assert_eq!(out["recorded"], json!("appended"), "{out}");
+        assert_eq!(out["charged"], json!(false), "{out}");
+        assert_eq!(out["chargeHeldBy"], deny_hash, "the charge state survived the restart");
+        assert_eq!(out["actionId"], json!(aid));
+        assert_eq!(rows_for(&rows_of(&state, "policy_decision").await, &aid).len(), 2);
+        assert_eq!(charges_for(&state, "codex", &aid).await, 1);
+    }
+
+    /// An OWED charge survives a restart too, and is settled exactly once — the settle record is
+    /// durable, so a second restart does not make it owed again.
+    #[tokio::test]
+    async fn an_owed_charge_survives_a_restart_and_settles_once() {
+        let (dir, state) = state_with_safety().await;
+        let aid = Uuid::new_v4().to_string();
+        let mut a = witness_args("gemini", "warn");
+        a["action_id"] = json!(aid);
+        break_trust(&dir);
+        assert!(tool_witness_decision(&state, &a).await.is_err());
+        drop(state);
+        heal_trust(&dir);
+
+        let state = open_state(&dir);
+        let out = tool_witness_decision(&state, &a).await.unwrap();
+        assert_eq!(out["recorded"], json!("existing"), "{out}");
+        assert_eq!(out["charged"], json!(true), "owed across the restart, settled now: {out}");
+        assert_eq!(charges_for(&state, "gemini", &aid).await, 1);
+        drop(state);
+
+        let state = open_state(&dir);
+        let out = tool_witness_decision(&state, &a).await.unwrap();
+        assert_eq!(out["recorded"], json!("existing"), "{out}");
+        assert_eq!(out["charged"], json!(false), "settled stays settled across restarts: {out}");
+        assert_eq!(rows_for(&rows_of(&state, "policy_decision").await, &aid).len(), 1);
+        assert_eq!(charges_for(&state, "gemini", &aid).await, 1);
     }
 
     #[tokio::test]

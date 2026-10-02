@@ -17,7 +17,7 @@ open() forever, a symlink could redirect the read outside the log dir, a huge
 log was fully loaded before the cap, and the caller's `|| true` covers exit
 status, not blocking. This file's A12–A15 pin the repair (O_NOFOLLOW |
 O_NONBLOCK open, fstat-the-fd regular-file + ownership check, bounded tail
-read), and B4/B6 pin the caller side (`timeout 5` wrap; a delimited DATA-not-
+read), and B4/B6 pin the caller side (`mesh-timeout.sh 5` wrap; a delimited DATA-not-
 instructions envelope — framing, not a security boundary, and labeled as such).
 
 Also repaired from that review: the A5 boolean (an `and … or …` chain that
@@ -193,8 +193,8 @@ for tpl in sorted(templates):
     check(f"B3 {tpl}: splices $LAST_WORDS_BLOCK into PROMPT",
           re.search(r'PROMPT="[^"]*\$LAST_WORDS_BLOCK', src, re.S) is not None
           or "$DIGEST$DEBT_BLOCK$LAST_WORDS_BLOCK" in src, tpl)
-    check(f"B4 {tpl}: helper wrapped in `timeout 5` and failure-tolerated (|| true)",
-          f"$(timeout 5 python3 \"$HERE_DIR/last-words.py\" \"$LOG_DIR\" {prefix} 2>/dev/null || true)" in src, tpl)
+    check(f"B4 {tpl}: helper wrapped in `mesh-timeout.sh 5` and failure-tolerated (|| true)",
+          f"$(\"$HERE_DIR/mesh-timeout.sh\" 5 python3 \"$HERE_DIR/last-words.py\" \"$LOG_DIR\" {prefix} 2>/dev/null || true)" in src, tpl)
     check(f"B5 {tpl}: HERE_DIR derived exactly once",
           src.count('HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"') == 1, tpl)
     check(f"B6 {tpl}: verbatim output sits inside the delimited DATA envelope",

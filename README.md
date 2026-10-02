@@ -75,8 +75,9 @@ web dashboard are the currently exercised surfaces:
 - Plugin SDK (Rust, TypeScript, Python) → connect to the local Hestia daemon
 - `beginAction()` / `recordOutcome()` → witnessed audit trail of every tool call
 - `vaultGet()` / `vaultSet()` → access credentials through controlled MCP interface
-- `queryPolicy()` → check what you're allowed to do before doing it
-- Delegated authority from human owner → act within scoped permissions
+- `queryPolicy()` → inspect the law/policy that applies before acting
+- Witnessed receipts → retain evidence of what was requested, allowed, denied, escalated and completed
+- Delegated authority from a principal or society → act within explicit, scoped, revocable permissions
 
 ### For the Web4 ecosystem
 - Each Hestia instance is a full Web4 presence: LCT identity, T3/V3 trust tensors, witness chain
@@ -124,7 +125,7 @@ have one yet.
 
 ## The metaphor
 
-**Hestia** is the Greek goddess of hearth. Every household and city-state had a public hearth dedicated to her. When colonies were founded, embers from the mother city's hearth were carried to light the new one. That's the product: your local Web4 society is the hearth. Your agents are guests under your laws of hospitality. When you connect to a hub, you carry embers.
+**Hestia** is the Greek goddess of hearth. Every household and city-state had a public hearth dedicated to her. When colonies were founded, embers from the mother city's hearth were carried to light the new one. That's the product: your local Web4 society is the hearth. Humans and agents meet there under explicit laws of hospitality. When you connect to a hub, you carry embers.
 
 ## Honest status
 

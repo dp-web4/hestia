@@ -545,10 +545,18 @@ def test_temp_root_is_a_path_boundary_not_a_prefix():
     check("temp_root_itself", G._under_temp_root("/tmp"))
     check("temp_descendant", G._under_temp_root("/tmp/x/y"))
     check("var_temp_descendant", G._under_temp_root("/var/tmp/x"))
+    # macOS: /tmp -> /private/tmp. Resolved scratchpad paths must still count (#1074).
+    check("darwin_private_tmp_descendant", G._under_temp_root("/private/tmp/x"))
+    check(
+        "darwin_private_tmp_scratchpad",
+        G._under_temp_root("/private/tmp/claude-501/session/scratchpad/a.py"),
+    )
+    check("darwin_private_var_tmp_descendant", G._under_temp_root("/private/var/tmp/x"))
     # The bypasses.
     check("sibling_tmp_denied", not G._under_temp_root("/tmp-other/x"))
     check("sibling_var_tmp_denied", not G._under_temp_root("/var/tmpsecrets/y"))
     check("tmp_prefix_word_denied", not G._under_temp_root("/tmpfoo"))
+    check("darwin_private_tmp_sibling_denied", not G._under_temp_root("/private/tmp-other/x"))
     # And through the real decision path, not just the helper.
     ws = _workspace()
     os.makedirs(os.path.join(ws, "granted"), exist_ok=True)

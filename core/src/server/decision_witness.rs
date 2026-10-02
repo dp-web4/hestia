@@ -20,13 +20,16 @@
 //!   nothing on allow (`risk_magnitude` 0.0 in `tool_query_policy`) and as scope attestation
 //!   argues ("letting each one count would let a member farm trust"). `warn`/`deny` keep their
 //!   existing Unclassified 0.2/0.5.
-//! - **One verdict, one row.** When the gate names an action the daemon itself already ruled
-//!   and witnessed (the society-safety path: `begin_action` → `query_policy` writes its own
-//!   `policy_decision` and its own Conduct charge), the gate's witness of the SAME verdict for
-//!   the SAME member is that row. The reply hands back its hash; nothing is appended and nothing
-//!   is charged a second time.
+//! - **One verdict, one row; one action, one charge.** When the gate names an action that
+//!   already has a committed decision row for the same member (the society-safety path:
+//!   `begin_action` → `query_policy` writes its own `policy_decision`), the gate's witness of
+//!   the SAME verdict is that row: its hash is handed back, nothing is appended or charged. A
+//!   DIFFERENT verdict is appended as evidence but is not charged when the key was already
+//!   charged. See [`DecisionLedger`] for the rule and its bound.
 
 use serde_json::Value;
+use std::collections::{HashMap, VecDeque};
+use uuid::Uuid;
 
 /// Event type for a witnessed `allow`. Reserved: `hestia_request_witness` cannot forge it.
 pub const ALLOW_EVENT: &str = "policy_allow";
@@ -78,28 +81,282 @@ impl Verdict {
     }
 }
 
-/// The daemon's own witness of its own verdict on one in-flight action, kept on the action so a
-/// later decision witness for the same act can be answered with it instead of a duplicate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnDecisionWitness {
-    pub decision: String,
-    pub entry_hash: String,
-    /// The member the daemon attributed the row to (from the action's session).
-    pub plugin_id: String,
+/// What a decision row's one charge IS, derived from the row's own committed `event_data` — so
+/// the charge applied live and the charge settled after a restart are the same charge.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChargeSpec {
+    /// Gate-risk magnitude: warn 0.2, deny 0.5.
+    pub magnitude: f64,
+    /// The daemon's own gate evaluation (Conduct) vs a caller-reported gate decision
+    /// (Unclassified). A daemon row carries no `adjudicator`; a witnessed one always does.
+    pub conduct: bool,
+    pub role_lct: String,
+    pub tool_name: String,
+    pub rule_id: String,
+    /// The reason the delta row carries: `gate:<decision>` (daemon) or
+    /// `gate:<decision> (<adjudicator>)` (witnessed) — exactly what each path wrote before.
+    pub reason: String,
 }
 
-/// The existing row that already witnesses this verdict, if any.
+impl ChargeSpec {
+    /// The charge a committed decision row carries, or `None` for one that charges nothing
+    /// (an allow, or a row with no recognisable verdict).
+    pub fn from_row(data: &Value) -> Option<Self> {
+        let verdict = Verdict::parse(data.get("decision")?.as_str()?)?;
+        let magnitude = verdict.risk_magnitude()?;
+        let s = |k: &str| data.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let adjudicator = data.get("adjudicator").and_then(Value::as_str);
+        Some(Self {
+            magnitude,
+            conduct: adjudicator.is_none(),
+            role_lct: s("role_lct"),
+            tool_name: s("tool_name"),
+            rule_id: s("rule_id"),
+            reason: match adjudicator {
+                None => format!("gate:{}", verdict.as_str()),
+                Some(a) => format!("gate:{} ({a})", verdict.as_str()),
+            },
+        })
+    }
+}
+
+/// One committed decision row on a ledger key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LedgerRow {
+    pub verdict: Verdict,
+    pub hash: String,
+    /// The charge this row carries if it is the key's charging row. `None` for an allow.
+    pub charge: Option<ChargeSpec>,
+}
+
+/// The decision rows witnessed for one `(member, action_id)` and the one that charged, if any.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LedgerEntry {
+    /// The chain hash of the decision row whose reputation movement was applied. At most one,
+    /// and never overwritten: this is the idempotency key for the key's one charge.
+    pub charged_by: Option<String>,
+    /// Every committed decision row for this key, in arrival order.
+    pub rows: Vec<LedgerRow>,
+}
+
+impl LedgerEntry {
+    /// The key's OWED charge: its first committed chargeable row, while nothing has charged.
+    /// `None` when the charge is settled, or when no committed row charges anything.
+    pub fn owed(&self) -> Option<(&str, &ChargeSpec)> {
+        if self.charged_by.is_some() {
+            return None;
+        }
+        self.rows.iter().find_map(|r| r.charge.as_ref().map(|c| (r.hash.as_str(), c)))
+    }
+}
+
+/// EXACTLY ONE CHARGE PER (MEMBER, ACTION), ONE ROW PER VERDICT. The rule this ledger enforces,
+/// whatever order the verdicts arrive in and whoever writes them (the daemon's own
+/// `query_policy`, or a seat's `hestia_witness_decision` naming the action):
 ///
-/// Same member AND same verdict, or nothing. A different verdict (a warn-rollout seat recording
-/// `warn` for a daemon `deny`, a local deny after a daemon warn) is a different decision and gets
-/// its own row; a different member is never answered with someone else's record.
-pub fn existing_witness<'a>(
-    own: Option<&'a OwnDecisionWitness>,
-    plugin_id: &str,
-    verdict: Verdict,
-) -> Option<&'a str> {
-    own.filter(|w| w.plugin_id == plugin_id && w.decision == verdict.as_str())
-        .map(|w| w.entry_hash.as_str())
+/// - **One verdict, one row.** The same verdict again for the same member and action — a seat
+///   retry, or the daemon asked to rule the same action twice — is answered with the committed
+///   row that already witnesses it. Nothing is appended.
+/// - **Decision reputation follows the committed decision witness.** Only a committed row can
+///   carry the charge; no row, no movement.
+/// - **The key's charge belongs to its first committed chargeable (warn/deny) row**, and is
+///   applied once. A later different verdict is appended as evidence with `charge_held_by`
+///   naming the charging row, and moves nothing.
+/// - **An owed charge is settled, not lost.** If the row committed but the trust write failed,
+///   the charge stays OWED on the key; the next decision call on that key (a retry, a different
+///   verdict, the daemon's repeat ruling) settles it once. `charged_by` is set only on a
+///   successful settle and never overwritten, and every settle runs under the state lock, so two
+///   settles cannot both apply it.
+///
+/// First committed chargeable row wins, so a seat `warn` (Unclassified 0.2) that lands before
+/// the daemon's `deny` (Conduct 0.5) holds the charge at 0.2. Upgrading would need a
+/// compensating delta, and gate deltas only ever lower trust.
+///
+/// A decision with no `action_id` has no key and is not deduplicated (a deployed refusal shim,
+/// or a decision reached before any action began), exactly as before.
+///
+/// **Across a restart** the ledger is rebuilt by [`rehydrate`]: decision rows carrying an
+/// `action_id` from the last [`DECISION_LEDGER_REPLAY_HOURS`] of chain (at most
+/// [`DECISION_LEDGER_CAP`] rows), and which of them charged from the settle record
+/// ([`SETTLED_FILE`]) plus every committed row's `charge_held_by`. A late witness for a
+/// pre-restart action therefore finds its row and its charge state.
+///
+/// Held in RAM bounded to [`DECISION_LEDGER_CAP`] keys, oldest evicted first.
+#[derive(Debug, Clone)]
+pub struct DecisionLedger {
+    keys: HashMap<(String, Uuid), LedgerEntry>,
+    order: VecDeque<(String, Uuid)>,
+    cap: usize,
+}
+
+/// See [`DecisionLedger`]: the number of `(member, action_id)` keys kept, and the most decision
+/// rows the startup replay reads.
+pub const DECISION_LEDGER_CAP: usize = 16_384;
+/// How far back the startup replay reaches. The witnesses for one action arrive within the same
+/// tool call (seconds); a day covers a late retry across any deploy restart, and anything older
+/// cannot be a retry of a live decision.
+pub const DECISION_LEDGER_REPLAY_HOURS: i64 = 24;
+/// The durable record of applied decision charges (`<home>/decision-charges.jsonl`), one line
+/// per settled key: `{"member", "action_id", "row"}`. Written after the trust write succeeds.
+pub const SETTLED_FILE: &str = "decision-charges.jsonl";
+
+impl Default for DecisionLedger {
+    fn default() -> Self {
+        Self::with_cap(DECISION_LEDGER_CAP)
+    }
+}
+
+impl DecisionLedger {
+    pub fn with_cap(cap: usize) -> Self {
+        Self { keys: HashMap::new(), order: VecDeque::new(), cap: cap.max(1) }
+    }
+
+    pub fn entry(&self, member: &str, action_id: Uuid) -> Option<&LedgerEntry> {
+        self.keys.get(&(member.to_string(), action_id))
+    }
+
+    /// The committed row that already witnesses this verdict for this member and action.
+    pub fn existing_row(&self, member: &str, action_id: Uuid, verdict: Verdict) -> Option<&str> {
+        self.entry(member, action_id)?
+            .rows
+            .iter()
+            .find(|r| r.verdict == verdict)
+            .map(|r| r.hash.as_str())
+    }
+
+    /// The row whose charge was APPLIED for this member and action, if one was. `Some` means a
+    /// new row for the same key must not be charged.
+    pub fn charge_holder(&self, member: &str, action_id: Uuid) -> Option<&str> {
+        self.entry(member, action_id)?.charged_by.as_deref()
+    }
+
+    /// The key's owed charge (row hash + what to charge), cloned for the settle.
+    pub fn owed(&self, member: &str, action_id: Uuid) -> Option<(String, ChargeSpec)> {
+        self.entry(member, action_id)?
+            .owed()
+            .map(|(h, c)| (h.to_string(), c.clone()))
+    }
+
+    /// Record a COMMITTED decision row. Call only after the append returned its entry.
+    pub fn record_row(
+        &mut self,
+        member: &str,
+        action_id: Uuid,
+        verdict: Verdict,
+        hash: &str,
+        charge: Option<ChargeSpec>,
+    ) {
+        let key = (member.to_string(), action_id);
+        if !self.keys.contains_key(&key) {
+            while self.order.len() >= self.cap {
+                if let Some(old) = self.order.pop_front() {
+                    self.keys.remove(&old);
+                }
+            }
+            self.order.push_back(key.clone());
+        }
+        let e = self.keys.entry(key).or_default();
+        if !e.rows.iter().any(|r| r.hash == hash) {
+            e.rows.push(LedgerRow { verdict, hash: hash.to_string(), charge });
+        }
+    }
+
+    /// Record that `hash`'s charge was applied. Returns false (and changes nothing) when the key
+    /// is unknown or already has a holder: the first applied charge is the one charge.
+    pub fn record_charge(&mut self, member: &str, action_id: Uuid, hash: &str) -> bool {
+        match self.keys.get_mut(&(member.to_string(), action_id)) {
+            Some(e) if e.charged_by.is_none() => {
+                e.charged_by = Some(hash.to_string());
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Append one settled charge to the durable settle record. Best effort: a failed write is
+/// reported, and costs only the restart case (the key would read as owed after a restart).
+pub fn persist_settled(path: &std::path::Path, member: &str, action_id: Uuid, row: &str) {
+    use std::io::Write;
+    let line = serde_json::json!({"member": member, "action_id": action_id.to_string(), "row": row});
+    let res = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| writeln!(f, "{line}"));
+    if let Err(e) = res {
+        eprintln!("hestia: decision charge settle record not written ({}): {e}", path.display());
+    }
+}
+
+/// Rebuild the ledger at startup from the chain and the settle record. See [`DecisionLedger`].
+///
+/// A failed chain read is reported, never silent, and yields an empty ledger — the pre-ledger
+/// behaviour, not a refusal to start.
+pub fn rehydrate(
+    chain: &crate::storage::chain::SqliteChainStore,
+    settled: &std::path::Path,
+) -> DecisionLedger {
+    let cutoff = (chrono::Utc::now() - chrono::Duration::hours(DECISION_LEDGER_REPLAY_HOURS))
+        .to_rfc3339();
+    struct Replayed {
+        member: String,
+        action_id: Uuid,
+        verdict: Verdict,
+        hash: String,
+        charge: Option<ChargeSpec>,
+        held_by: Option<String>,
+    }
+    let rows = chain.scan_recent(
+        Some(&cutoff),
+        Some(&[DECISION_EVENT, ALLOW_EVENT]),
+        DECISION_LEDGER_CAP as u64,
+        |r| {
+            let data: Value = serde_json::from_str(r.event_data).ok()?;
+            let action_id = Uuid::parse_str(data.get("action_id")?.as_str()?).ok()?;
+            Some(Replayed {
+                member: data.get("plugin_id")?.as_str()?.to_string(),
+                action_id,
+                verdict: Verdict::parse(data.get("decision")?.as_str()?)?,
+                hash: r.hash.to_string(),
+                charge: ChargeSpec::from_row(&data),
+                held_by: data.get("charge_held_by").and_then(Value::as_str).map(str::to_string),
+            })
+        },
+    );
+    let mut ledger = DecisionLedger::default();
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("hestia: decision ledger replay failed, starting empty: {e}");
+            return ledger;
+        }
+    };
+    // Newest-first from the store; replay in arrival order so "first committed row" holds.
+    for r in rows.iter().rev() {
+        ledger.record_row(&r.member, r.action_id, r.verdict, &r.hash, r.charge.clone());
+    }
+    // A committed row that names the row holding its key's charge is chain-witnessed proof that
+    // the charge was applied.
+    for r in &rows {
+        if let Some(h) = &r.held_by {
+            ledger.record_charge(&r.member, r.action_id, h);
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string(settled) {
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            let (Some(m), Some(a), Some(h)) = (
+                v.get("member").and_then(Value::as_str),
+                v.get("action_id").and_then(Value::as_str).and_then(|a| Uuid::parse_str(a).ok()),
+                v.get("row").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            ledger.record_charge(m, a, h);
+        }
+    }
+    ledger
 }
 
 /// `core_digest` as stored: a string, bounded. Absent or non-string → not stored.
@@ -151,17 +408,91 @@ mod tests {
         assert_eq!(Verdict::Deny.risk_magnitude(), Some(0.5));
     }
 
+    fn spec(v: Verdict) -> Option<ChargeSpec> {
+        ChargeSpec::from_row(&json!({"decision": v.as_str(), "role_lct": "r", "tool_name": "Bash"}))
+    }
+
     #[test]
-    fn an_existing_witness_answers_only_the_same_member_and_verdict() {
-        let own = OwnDecisionWitness {
-            decision: "deny".into(),
-            entry_hash: "h1".into(),
-            plugin_id: "codex".into(),
-        };
-        assert_eq!(existing_witness(Some(&own), "codex", Verdict::Deny), Some("h1"));
-        assert_eq!(existing_witness(Some(&own), "codex", Verdict::Warn), None, "other verdict");
-        assert_eq!(existing_witness(Some(&own), "kimi-code", Verdict::Deny), None, "other member");
-        assert_eq!(existing_witness(None, "codex", Verdict::Deny), None);
+    fn a_charge_spec_is_read_from_the_committed_row() {
+        let daemon = ChargeSpec::from_row(&json!({"decision": "deny", "rule_id": "safety.rm"})).unwrap();
+        assert_eq!((daemon.magnitude, daemon.conduct), (0.5, true));
+        assert_eq!(daemon.reason, "gate:deny");
+        assert_eq!(daemon.rule_id, "safety.rm");
+        let seat = ChargeSpec::from_row(&json!({"decision": "warn", "adjudicator": "plugin-gate:codex"}))
+            .unwrap();
+        assert_eq!((seat.magnitude, seat.conduct), (0.2, false));
+        assert_eq!(seat.reason, "gate:warn (plugin-gate:codex)");
+        assert_eq!(ChargeSpec::from_row(&json!({"decision": "allow"})), None);
+        assert_eq!(ChargeSpec::from_row(&json!({})), None);
+    }
+
+    /// Exactly once: a committed chargeable row with no applied charge is OWED, and stays owed
+    /// until a charge is recorded; after that nothing is owed and the holder never moves.
+    #[test]
+    fn an_owed_charge_stays_owed_until_settled_once() {
+        let mut l = DecisionLedger::default();
+        let a = Uuid::new_v4();
+        l.record_row("codex", a, Verdict::Allow, "h-allow", spec(Verdict::Allow));
+        assert_eq!(l.owed("codex", a), None, "an allow owes nothing");
+        l.record_row("codex", a, Verdict::Warn, "h-warn", spec(Verdict::Warn));
+        l.record_row("codex", a, Verdict::Deny, "h-deny", spec(Verdict::Deny));
+        let (h, c) = l.owed("codex", a).unwrap();
+        assert_eq!(h, "h-warn", "the first committed chargeable row owns the charge");
+        assert_eq!(c.magnitude, 0.2);
+        assert!(l.record_charge("codex", a, "h-warn"));
+        assert_eq!(l.owed("codex", a), None);
+        assert!(!l.record_charge("codex", a, "h-deny"), "a second settle changes nothing");
+        assert_eq!(l.charge_holder("codex", a), Some("h-warn"));
+        l.record_row("codex", a, Verdict::Warn, "h-warn", spec(Verdict::Warn));
+        assert_eq!(l.entry("codex", a).unwrap().rows.len(), 3, "re-recording a row is a no-op");
+    }
+
+    #[test]
+    fn the_ledger_answers_only_the_same_member_action_and_verdict() {
+        let mut l = DecisionLedger::default();
+        let a = Uuid::new_v4();
+        l.record_row("codex", a, Verdict::Deny, "h1", spec(Verdict::Deny));
+        assert_eq!(l.existing_row("codex", a, Verdict::Deny), Some("h1"));
+        assert_eq!(l.existing_row("codex", a, Verdict::Warn), None, "other verdict");
+        assert_eq!(l.existing_row("kimi-code", a, Verdict::Deny), None, "other member");
+        assert_eq!(l.existing_row("codex", Uuid::new_v4(), Verdict::Deny), None, "other action");
+    }
+
+    /// The charging rule in isolation: a row is a charge holder only once its charge was
+    /// recorded, the first holder is never overwritten, and the key is (member, action).
+    #[test]
+    fn at_most_one_charge_per_member_and_action_in_either_order() {
+        for (first, second) in [(Verdict::Deny, Verdict::Warn), (Verdict::Warn, Verdict::Deny)] {
+            let mut l = DecisionLedger::default();
+            let a = Uuid::new_v4();
+            assert_eq!(l.charge_holder("codex", a), None);
+            l.record_row("codex", a, first, "h-first", spec(first));
+            assert_eq!(l.charge_holder("codex", a), None, "a row alone is not a charge");
+            l.record_charge("codex", a, "h-first");
+            assert_eq!(l.charge_holder("codex", a), Some("h-first"));
+            l.record_row("codex", a, second, "h-second", spec(second));
+            l.record_charge("codex", a, "h-second");
+            assert_eq!(l.charge_holder("codex", a), Some("h-first"), "first charge holds");
+            assert_eq!(l.entry("codex", a).unwrap().rows.len(), 2, "both rows are kept");
+            assert_eq!(l.charge_holder("kimi-code", a), None, "another member is its own key");
+        }
+        let mut l = DecisionLedger::default();
+        assert!(!l.record_charge("codex", Uuid::new_v4(), "h-orphan"));
+        assert!(l.keys.is_empty(), "a charge with no committed row records nothing");
+    }
+
+    #[test]
+    fn the_ledger_is_bounded_oldest_first() {
+        let mut l = DecisionLedger::with_cap(2);
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        l.record_row("m", a, Verdict::Deny, "ha", spec(Verdict::Deny));
+        l.record_row("m", b, Verdict::Deny, "hb", spec(Verdict::Deny));
+        l.record_row("m", b, Verdict::Warn, "hb2", spec(Verdict::Warn));
+        l.record_row("m", c, Verdict::Deny, "hc", spec(Verdict::Deny));
+        assert_eq!(l.existing_row("m", a, Verdict::Deny), None, "oldest key evicted");
+        assert_eq!(l.existing_row("m", b, Verdict::Warn), Some("hb2"));
+        assert_eq!(l.existing_row("m", c, Verdict::Deny), Some("hc"));
+        assert_eq!(l.keys.len(), 2);
     }
 
     #[test]
