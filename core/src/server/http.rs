@@ -5678,27 +5678,59 @@ async fn policy_delete_rule(
 
 /// `POST /api/orchestrators/{id}/connect` — connect a running-but-not-engaged
 /// orchestrator by installing its hestia plugin.
+///
+/// surface: orchestrator_connect   act: write hestia's hooks into an agent's own config
+/// S: med/reversible [construct: `orchestrators::install` merges idempotently; ungovern removes]
+/// R: pass [construct: mounted behind `operator_gate` with the rest of /api/*]
+/// W: pass [construct: operator_gate — a proved operator session]
+/// O: pass [construct: `connect_ordered` — the intent record precedes `install`]
+/// A: pass [construct: intent -> install -> `orchestrator_connect` carrying the intent hash]
+/// V: n/a (adds enforcement; the reversal is `/api/agents/:id/ungovern`)
+/// verdict: PASS
 async fn orchestrator_connect(
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match crate::orchestrators::install(&id) {
-        Ok(msg) => {
-            let s = state.lock().await;
-            let _ = s.append_chain(
-                "orchestrator_connect",
-                serde_json::json!({"id": id, "status": msg}),
-            );
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"ok": true, "message": msg})),
-            )
-        }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": e.to_string()})),
-        ),
+    let mut s = state.lock().await;
+    let out = connect_ordered(
+        &id,
+        |t, d| s.append_chain(t, d).map(|e| e.hash).map_err(|e| e.to_string()),
+        crate::orchestrators::install,
+    );
+    match out {
+        Ok(v) => (StatusCode::OK, Json(v)),
+        Err((code, v)) => (code, Json(v)),
     }
+}
+
+/// INTENT -> ACT -> RECORD, the order `agent_retire` keeps. The first cut installed the hooks
+/// and then discarded the chain append's result (`let _ =`, #1131 class A), so a connect whose
+/// record failed changed an agent's config with nothing on the chain saying so. Now: no intent
+/// record, no install. A failed install leaves the intent unpaired and says so; a success record
+/// that fails is REPORTED (`witnessEntryHash: null`, `recorded: false`), not hidden — the config
+/// was written, and the intent already witnesses that it was attempted.
+fn connect_ordered(
+    id: &str,
+    mut append: impl FnMut(&str, serde_json::Value) -> Result<String, String>,
+    install: impl FnOnce(&str) -> anyhow::Result<String>,
+) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+    let intent = append("orchestrator_connect_intent", serde_json::json!({"id": id}))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({
+            "error": format!("witnessing intent: {e}. Nothing was installed."),
+        })))?;
+    let msg = install(id).map_err(|e| (StatusCode::BAD_REQUEST, serde_json::json!({
+        "error": e.to_string(), "intentEntryHash": intent,
+    })))?;
+    let entry = append("orchestrator_connect", serde_json::json!({
+        "id": id, "status": msg, "intent": intent,
+    }));
+    Ok(serde_json::json!({
+        "ok": true, "message": msg,
+        "intentEntryHash": intent,
+        "recorded": entry.is_ok(),
+        "witnessEntryHash": entry.as_ref().ok(),
+        "recordError": entry.err(),
+    }))
 }
 
 // --- Agent read list (agent-atlas read half) ---
@@ -7838,6 +7870,52 @@ mod disposition_tests {
 
         apply_ratification(&mut s, previous, next.clone(), |_| Ok(())).unwrap();
         assert_eq!(s.vault.gate_expectations(), next);
+    }
+
+    /// #1131 class A: connect installed first and discarded its record. No intent, no install.
+    #[test]
+    fn a_connect_that_cannot_record_its_intent_installs_nothing() {
+        let installed = std::cell::Cell::new(false);
+        let err = connect_ordered(
+            "claude-code",
+            |_, _| Err("chain store refused the append".into()),
+            |_| { installed.set(true); Ok("installed".into()) },
+        ).unwrap_err();
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.1["error"].as_str().unwrap().contains("Nothing was installed"), "{}", err.1);
+        assert!(!installed.get(), "the hooks were written with no record of the attempt");
+    }
+
+    #[test]
+    fn a_connect_is_witnessed_as_intent_then_record_carrying_the_intent() {
+        let mut log: Vec<(String, serde_json::Value)> = Vec::new();
+        let v = connect_ordered(
+            "codex",
+            |t, d| { log.push((t.to_string(), d)); Ok(format!("h{}", log.len())) },
+            |_| Ok("wired".into()),
+        ).unwrap();
+        let types: Vec<&str> = log.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(types, ["orchestrator_connect_intent", "orchestrator_connect"]);
+        assert_eq!(log[1].1["intent"], serde_json::json!("h1"));
+        assert_eq!((v["recorded"].clone(), v["witnessEntryHash"].clone()),
+                   (serde_json::json!(true), serde_json::json!("h2")));
+    }
+
+    #[test]
+    fn a_failed_install_and_a_failed_record_are_both_said() {
+        let mut n = 0;
+        let err = connect_ordered("cursor", |_, _| { n += 1; Ok("h1".into()) },
+                                  |_| Err(anyhow::anyhow!("sandbox denied ~/.cursor"))).unwrap_err();
+        assert_eq!((err.0, err.1["intentEntryHash"].clone()), (StatusCode::BAD_REQUEST, serde_json::json!("h1")));
+        assert_eq!(n, 1, "a failed install must not be recorded as a connect");
+
+        let mut calls = 0;
+        let v = connect_ordered("codex", |_, _| {
+            calls += 1;
+            if calls == 1 { Ok("h1".into()) } else { Err("disk full".into()) }
+        }, |_| Ok("wired".into())).unwrap();
+        assert_eq!(v["recorded"], serde_json::json!(false), "{v}");
+        assert_eq!(v["recordError"], serde_json::json!("disk full"));
     }
 
     /// Last edit wins, bound to what was shown: a grant that names the row it replaces is refused

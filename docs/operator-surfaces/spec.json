@@ -507,8 +507,7 @@
           "status": "required"
         },
         "app": {
-          "status": "planned",
-          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+          "status": "required"
         }
       }
     },
@@ -561,8 +560,8 @@
           "status": "required"
         },
         "app": {
-          "status": "planned",
-          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+          "status": "excluded",
+          "why": "the route wires only a PostToolUse witness hook, not the gate; beside an UNGOVERNED row in the app it would promise governance it does not deliver. Governing is the members' installer's act (SPRINTS_APP_SURFACES.md, Sprint 3b)"
         }
       }
     },
