@@ -375,6 +375,10 @@ pub struct ServerState {
     /// that outer lock. The store's internal `Mutex<Connection>` remains the sole
     /// serialization point, and existing field reads dereference transparently.
     pub chain_store: Arc<SqliteChainStore>,
+    /// One-gate stage A: the committed decision rows per `(member, action_id)` and the one row
+    /// whose charge was applied — exactly one, whatever writes the rows and in whatever order.
+    /// Rebuilt at startup. See `decision_witness::DecisionLedger`.
+    pub decision_ledger: super::decision_witness::DecisionLedger,
     pub trust_store: TrustStore,
     /// Durable inbound mailbox (entity-edge inbox): still-sealed notices parked
     /// by `hestia_notify {defer: true}` before the hub is ACKed, drained by
@@ -738,6 +742,13 @@ impl ServerState {
             vault,
             sessions: HashMap::new(),
             actions: HashMap::new(),
+            // Rebuilt from the chain + settle record, so a late witness for an action from before
+            // this restart finds its row and its charge state (one-gate stage A). Evaluated
+            // before `chain_store` moves into the struct below.
+            decision_ledger: super::decision_witness::rehydrate(
+                &chain_store,
+                &home.join(super::decision_witness::SETTLED_FILE),
+            ),
             chain_store,
             trust_store,
             inbox_store: Arc::new(inbox_store),
