@@ -108,6 +108,234 @@ shadow divergence: yes
 
 This lets the customer review consequences before ratification/enforcement.
 
+
+## 5A. Shadow mode is also a learning surface
+
+Shadow mode MUST do more than compare candidate governance with active behavior.
+
+For each observed act, Hestia should emit **learning evidence** scoped to the MRH/role context in which the act occurred.
+
+Useful observations include:
+
+- actor and active role;
+- society / child-society context;
+- delegated authority present at the time;
+- action/resource/target;
+- consulted or approving roles;
+- actual sequence of handoffs;
+- exception path used;
+- evidence attached;
+- candidate rule result;
+- active policy result;
+- eventual outcome.
+
+This allows the Governance Twin to learn institutional structure from ordinary work instead of asking every participant to document it in advance.
+
+## 5B. Minimum-question elicitation
+
+Hestia SHOULD remain silent on routine, well-explained activity.
+
+It may surface a clarification request when runtime evidence creates a meaningful ambiguity, for example:
+
+- actor performs an action outside the role normally seen for it;
+- candidate and active governance differ materially;
+- escalation goes to a different role than the model predicts;
+- repeated exception appears;
+- parent and child MRH expectations differ;
+- new tool/action pairing appears;
+- high-consequence action has unclear authority.
+
+The question should be local and concrete.
+
+Example:
+
+> "This production deploy is being approved by Security Lead rather than Release Manager. Is that an after-hours delegation, an exception for this service, or a different policy?"
+
+The reply is stored as an **elicited claim with provenance**, not immediately as policy.
+
+## 5C. MRH-scoped runtime learning
+
+Hestia MUST preserve the narrowest known context of an observation.
+
+An action seen on one machine, by one role, in one team MUST NOT become an organization-wide practice merely because it occurred repeatedly there.
+
+Each exported learning event SHOULD carry:
+
+- `origin_mrh`;
+- `society_context`;
+- `role_context`;
+- `seat/device context`;
+- `candidate_parent_mrh` when known;
+- evidence reference;
+- occurrence count / recurrence metadata;
+- any known sibling-MRH agreement or conflict.
+
+The Hub/Governance Twin decides whether multiple local observations compose into a broader candidate pattern.
+
+## 5D. Fractal shadow evaluation
+
+Where nested society law is present, shadow output SHOULD retain the decision at every relevant layer rather than only the final strictest verdict.
+
+Example:
+
+```text
+team law: allow
+department law: escalate to release-manager
+organization law: require independent approval
+local Hestia safety: warn
+final active behavior: allowed today
+
+shadow finding:
+  inherited org requirement applies
+  department resolver is missing
+  team practice currently bypasses inherited requirement
+```
+
+This makes learning compatible with SAL's nested society/law inheritance instead of flattening all contexts into one rule set.
+
+## 5E. Learning evidence never becomes enforcement by recurrence
+
+Repeated behavior can increase confidence that a practice exists.
+
+It MUST NOT increase the authority of that practice.
+
+A pattern may progress:
+
+```text
+observed once
+ -> repeated locally
+ -> corroborated across roles
+ -> corroborated across sibling MRHs
+ -> candidate broader institutional knowledge
+ -> candidate governance
+ -> ratification
+ -> active policy
+```
+
+The first five states are descriptive. Only ratification can cross into governing state.
+
+
+
+## 5F. Hestia Situate role
+
+Hestia needs a durable **Situate** role for ongoing context acquisition.
+
+An **Onboarding** role/profile MAY exist as the high-intensity startup phase, but it should be implemented as a bounded assignment of Situate rather than as the enduring abstraction.
+
+### Responsibilities
+
+Within its delegated MRH, Hestia Situate:
+
+- observes shadow/active action evidence;
+- associates actions with role, society, resource and process context;
+- persists non-authoritative institutional claims;
+- detects ambiguity and contradiction;
+- forms small contextual questions;
+- routes those questions to the relevant role/entity;
+- persists answers and provenance;
+- maintains open knowledge gaps;
+- exports locally learned patterns to the Hub Governance Twin;
+- receives parent/sibling context needed to disambiguate local observations;
+- proposes review/candidate-policy work when evidence warrants it.
+
+### Explicit non-authority
+
+Situate MUST NOT:
+- change active `PolicyConfig`;
+- change society law;
+- grant/revoke authority;
+- convert recurrence into permission;
+- treat an answer from a knowledgeable actor as authoritative unless that actor/role actually carries the relevant authority.
+
+### Persistent state
+
+Situate needs persistent stores for at least:
+
+```text
+observations
+claims
+questions
+answers
+contradictions
+knowledge gaps
+scope hypotheses
+promotion candidates
+source/evidence references
+```
+
+These objects should survive model/session changes and remain separately auditable from the model that interpreted them.
+
+### Runtime loop
+
+```text
+action/event
+  -> shadow observation
+  -> attach origin MRH + role context
+  -> known?
+       yes -> passive evidence update
+       no  -> ambiguity/gap
+                -> form minimal question
+                -> route to likely/authorized respondent
+                -> persist answer + provenance
+                -> update local institutional model
+                -> export candidate pattern/finding
+```
+
+### Question routing
+
+Routing should use current Web4 role/MRH structure rather than a generic "ask admin" destination.
+
+Candidate order:
+1. role responsible for the observed process step;
+2. current role occupant;
+3. delegated authority;
+4. known knowledge broker / experienced peer;
+5. parent MRH Situate;
+6. explicit operator fallback.
+
+A failed route is itself a finding.
+
+### Fractal interaction
+
+A Hestia seat should normally learn at its local MRH.
+
+For example:
+
+```text
+seat / device
+  -> individual role
+  -> team
+  -> department
+  -> organization
+```
+
+The seat reports local evidence upward. It does not decide that local recurrence is organization-wide practice.
+
+Conversely, parent Situate may push a narrow question downward:
+> "Organization law requires independent approval. Who fills that function for this team's after-hours deploys?"
+
+The local Hestia instance can answer from observed work or route the question to the right participant.
+
+### Onboarding profile
+
+During onboarding, Situate MAY:
+- ask at a higher rate;
+- ingest source documents;
+- replay historical actions;
+- deliberately exercise representative workflows;
+- request confirmation of role/process boundaries.
+
+After sufficient coverage, it SHOULD decay to steady-state observation and exception-driven questioning.
+
+The target user experience is:
+
+> **participate normally; answer a small question when the system encounters something genuinely ambiguous.**
+
+Not:
+
+> **fill out the organization's governance model before you can work.**
+
+
 ## 6. Institutional findings Hestia can contribute
 
 Hestia's runtime evidence can feed the Governance Twin with observations such as:
