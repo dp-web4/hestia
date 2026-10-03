@@ -215,6 +215,127 @@ observed once
 The first five states are descriptive. Only ratification can cross into governing state.
 
 
+
+## 5F. Hestia Situate role
+
+Hestia needs a durable **Situate** role for ongoing context acquisition.
+
+An **Onboarding** role/profile MAY exist as the high-intensity startup phase, but it should be implemented as a bounded assignment of Situate rather than as the enduring abstraction.
+
+### Responsibilities
+
+Within its delegated MRH, Hestia Situate:
+
+- observes shadow/active action evidence;
+- associates actions with role, society, resource and process context;
+- persists non-authoritative institutional claims;
+- detects ambiguity and contradiction;
+- forms small contextual questions;
+- routes those questions to the relevant role/entity;
+- persists answers and provenance;
+- maintains open knowledge gaps;
+- exports locally learned patterns to the Hub Governance Twin;
+- receives parent/sibling context needed to disambiguate local observations;
+- proposes review/candidate-policy work when evidence warrants it.
+
+### Explicit non-authority
+
+Situate MUST NOT:
+- change active `PolicyConfig`;
+- change society law;
+- grant/revoke authority;
+- convert recurrence into permission;
+- treat an answer from a knowledgeable actor as authoritative unless that actor/role actually carries the relevant authority.
+
+### Persistent state
+
+Situate needs persistent stores for at least:
+
+```text
+observations
+claims
+questions
+answers
+contradictions
+knowledge gaps
+scope hypotheses
+promotion candidates
+source/evidence references
+```
+
+These objects should survive model/session changes and remain separately auditable from the model that interpreted them.
+
+### Runtime loop
+
+```text
+action/event
+  -> shadow observation
+  -> attach origin MRH + role context
+  -> known?
+       yes -> passive evidence update
+       no  -> ambiguity/gap
+                -> form minimal question
+                -> route to likely/authorized respondent
+                -> persist answer + provenance
+                -> update local institutional model
+                -> export candidate pattern/finding
+```
+
+### Question routing
+
+Routing should use current Web4 role/MRH structure rather than a generic "ask admin" destination.
+
+Candidate order:
+1. role responsible for the observed process step;
+2. current role occupant;
+3. delegated authority;
+4. known knowledge broker / experienced peer;
+5. parent MRH Situate;
+6. explicit operator fallback.
+
+A failed route is itself a finding.
+
+### Fractal interaction
+
+A Hestia seat should normally learn at its local MRH.
+
+For example:
+
+```text
+seat / device
+  -> individual role
+  -> team
+  -> department
+  -> organization
+```
+
+The seat reports local evidence upward. It does not decide that local recurrence is organization-wide practice.
+
+Conversely, parent Situate may push a narrow question downward:
+> "Organization law requires independent approval. Who fills that function for this team's after-hours deploys?"
+
+The local Hestia instance can answer from observed work or route the question to the right participant.
+
+### Onboarding profile
+
+During onboarding, Situate MAY:
+- ask at a higher rate;
+- ingest source documents;
+- replay historical actions;
+- deliberately exercise representative workflows;
+- request confirmation of role/process boundaries.
+
+After sufficient coverage, it SHOULD decay to steady-state observation and exception-driven questioning.
+
+The target user experience is:
+
+> **participate normally; answer a small question when the system encounters something genuinely ambiguous.**
+
+Not:
+
+> **fill out the organization's governance model before you can work.**
+
+
 ## 6. Institutional findings Hestia can contribute
 
 Hestia's runtime evidence can feed the Governance Twin with observations such as:
