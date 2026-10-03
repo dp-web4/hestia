@@ -696,8 +696,9 @@ def test_degraded_posture(m, g, wc, home):
         d, _ = _decide(g, "codex", "Bash", {"command": "ls"}, home)
         check("degraded-read-shell-denied", d.decision == "deny" and d.rule == "gate.degraded", d)
         d, _ = _decide(g, "kimi", "Write", {"file_path": str(REPO / "x"), "content": "x"}, home, rollout="warn")
-        check("warn-rollout-down-write-is-c11-denied", d.decision == "deny"
-              and d.rule == "gate.evidence_uncommitted", d)
+        # No snapshot is a hard stop before any permit exists, so C11 is never reached.
+        check("warn-rollout-down-write-is-degraded-denied", d.decision == "deny"
+              and d.rule == "gate.degraded" and d.innate and not d.verdict_available, d)
     # Snapshot refused but the governor up: still no permit — without the snapshot the gate
     # cannot certify scope, so the act is denied without asking the governor.
     stub = Stub(Policy(snapshot=False))
@@ -706,6 +707,60 @@ def test_degraded_posture(m, g, wc, home):
             d, _ = _decide(g, "codex", "Bash", {"command": "ls"}, home)
         check("snapshot-down-governor-up-still-denied", d.decision == "deny" and d.rule == "gate.degraded", d)
         check("snapshot-down-governor-not-asked", stub.named("hestia_begin_action") == [], stub.calls)
+    finally:
+        stub.close()
+
+
+def test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat(m, g, wc, home):
+    """dp's ruling, "align upward; no snapshot -> no read", INDEPENDENT of rollout (GPT's
+    re-review of 57bcd10: warn rollout evaluated against an empty scope, turned the blocks into
+    warnings and could still permit the read). On claude-code, codex, kimi and gemini:
+
+      warn    x no snapshot x in-scope Read     -> deny gate.degraded, verdict_available=False
+      warn    x no snapshot x out-of-scope Read -> deny gate.degraded (never a permit)
+      enforce x the same two                    -> the same denial (control)
+
+    for both ways of having no snapshot: the daemon down, and the snapshot refused with the
+    governor up (which is then never asked). The denial is innate, as supersession's is: the
+    rollout softens policy disagreements, not a missing integrity precondition. The last block is
+    the control the other way: with a snapshot, an ordinary TUNABLE local deny still exercises the
+    warn rollout as designed."""
+    in_scope = str(REPO / "README.md")
+    outside = "/etc/hostname"
+    stub = Stub(Policy(snapshot=False))
+    try:
+        for seat in SEATS:
+            for mode in ("warn", "enforce"):
+                for how, url in (("daemon-down", closed_port_url()), ("snapshot-refused", stub.url)):
+                    for where, path in (("in-scope", in_scope), ("out-of-scope", outside)):
+                        mark = len(stub.calls)
+                        with _Env(m, url, home):
+                            d, _ = _decide(g, seat, "Read", {"file_path": path}, home, rollout=mode)
+                        check(f"{seat}-{mode}-{how}-{where}-read-denied",
+                              d.decision == "deny" and d.rule == "gate.degraded"
+                              and d.verdict_available is False and d.innate, d)
+                        check(f"{seat}-{mode}-{how}-{where}-read-carries-no-warnings",
+                              not d.warnings, d)
+                        if how == "snapshot-refused":
+                            check(f"{seat}-{mode}-{where}-governor-not-asked",
+                                  not [c for c in stub.calls[mark:] if c[0] == "hestia_begin_action"],
+                                  stub.calls[mark:])
+    finally:
+        stub.close()
+    # Control: a snapshot exists, so a tunable scope deny is a policy disagreement the rollout
+    # may soften (warn) or enforce, on every seat.
+    stub = Stub()
+    try:
+        for seat in SEATS:
+            with _Env(m, stub.url, home):
+                d, _ = _decide(g, seat, "Write", {"file_path": "/etc/decide-probe", "content": "x"},
+                               home, rollout="warn")
+                check(f"{seat}-snapshot-warn-tunable-scope-warns",
+                      d.decision == "warn" and d.rule.startswith("mrh."), d)
+                d, _ = _decide(g, seat, "Write", {"file_path": "/etc/decide-probe", "content": "x"},
+                               home, rollout="enforce")
+                check(f"{seat}-snapshot-enforce-tunable-scope-denies",
+                      d.decision == "deny" and d.rule.startswith("mrh.") and not d.innate, d)
     finally:
         stub.close()
 
@@ -799,6 +854,7 @@ CONTRACT_TESTS = [
     test_superseded_is_denied_in_every_mode,
     test_daemon_verdicts_and_the_warn_rollout,
     test_degraded_posture,
+    test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat,
     test_closure_approval_lifts_only_the_closure_bar,
     test_an_internal_error_fails_closed_through_the_one_recorder,
     test_stage_b_is_unwired,
@@ -845,6 +901,9 @@ PARITY_CASES = [
     ("warn-daemon-denies-rm", "Bash", {"command": "rm -rf {REPO}/build"}, "deny-rm", "warn"),
     ("warn-down-edit", "Edit", {"file_path": "{REPO}/core/src/server/state.rs", "old_string": "a",
                                 "new_string": "b"}, "down", "warn"),
+    # No snapshot under WARN rollout (GPT, 57bcd10): a hard stop, reads included.
+    ("warn-down-read", "Read", {"file_path": "{REPO}/README.md"}, "down", "warn"),
+    ("warn-down-scope-read-etc", "Read", {"file_path": "/etc/hostname"}, "down", "warn"),
 ]
 
 POLICIES = {
@@ -867,9 +926,18 @@ DECLARED_DIVERGENCES = {
         "gate.evidence_uncommitted. No seat records allows today, so none can see this.")
        for s in _ALL},
     **{(s, "warn-down-edit"): (
-        "C11 in warn-rollout — ACCEPTED by dp 2026-10-01: with the daemon down the warn-rollout "
-        "used to let a write through unwitnessed; an uncommitted consequential permit now denies "
-        "in every mode.") for s in ("codex", "kimi", "gemini")},
+        "NO SNAPSHOT IS A HARD STOP in every rollout (dp: align upward; GPT on 57bcd10): with the "
+        "daemon down the warn-rollout used to let a write through unwitnessed. It is now denied "
+        "gate.degraded before any permit exists (C11, accepted by dp 2026-10-01 for warn-rollout, "
+        "would deny it too if a permit were ever reached).") for s in ("codex", "kimi", "gemini")},
+    **{(s, "warn-down-read"): (
+        "TIGHTENING (align upward; no snapshot -> no read, independent of rollout): under warn "
+        "rollout with the daemon down codex warned and kimi/gemini allowed an in-scope read; "
+        "decide() denies it gate.degraded, as claude-code does.") for s in ("codex", "kimi", "gemini")},
+    **{(s, "warn-down-scope-read-etc"): (
+        "TIGHTENING (align upward; no snapshot -> no read, independent of rollout): under warn "
+        "rollout with the daemon down an out-of-scope read was a warning (a permit); decide() "
+        "denies it gate.degraded, as claude-code does.") for s in ("codex", "kimi", "gemini")},
     # READS, dp 2026-10-01: ALIGN UPWARD to claude-code's posture on every seat. claude-code's read
     # cells MATCH; these are the tightenings on the seats that had the laxer posture.
     **{(s, "daemon-denies-read"): (

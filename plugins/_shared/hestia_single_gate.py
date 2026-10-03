@@ -12,7 +12,8 @@ law-bearing is here, in ONE sequence, in this order:
                  claimed with this call's invocation key, else `gate.self_access` (innate);
    2. egress     innate `egress.secret` over the egress surfaces the core's paths/command do
                  not cover (web-tool urls/prompts/queries, the MCP transport context);
-   3. snapshot   the policy snapshot; with none, every act is DENIED (degraded), reads included;
+   3. snapshot   the policy snapshot; with none, every act is DENIED (gate.degraded), reads
+                 included, in EVERY rollout mode — an integrity precondition, not a policy view;
    4. law        `core.evaluate` (innate denies always; tunable denies follow the rollout);
    5. society    `mechanism.query_society_safety(..., correlation_key=KEY)` for EVERY act, reads
                  included (dp 2026-10-01: align upward to claude-code's posture) — the ONLY
@@ -552,40 +553,33 @@ def _local_law(inv: _Invocation, nev: core.NormalizedEvent,
         snapshot = None
     if snapshot is _LATE or not isinstance(snapshot, dict):
         snapshot = None
-    workspace = core.detect_workspace(cprofile)
     if snapshot is not None:
         role = snapshot.get("role") if isinstance(snapshot, dict) else None
         inv.role = _role(inv, role if isinstance(role, str) else None)
         policy = core.resolve_agent_policy(cprofile, vault_reader=lambda _member: snapshot)
-        v = core.evaluate(nev, cprofile, workspace, policy=policy)
+        v = core.evaluate(nev, cprofile, core.detect_workspace(cprofile), policy=policy)
         if v.blocks:
+            # The rollout softens a TUNABLE policy disagreement, and only when there IS a policy.
             if v.innate or inv.rollout == "enforce":
                 return _verdict_deny(v), False
             inv.warnings.append((v.rule, v.reason, True))
         return None, False
-    if inv.rollout == "enforce":
-        # NO SNAPSHOT, NO PERMIT (dp 2026-10-01, "align upward"): with no policy snapshot the
-        # gate cannot certify scope, so EVERY act is denied — reads included, as claude-code does
-        # today. The core's degraded verdict still runs first so an innate egress refusal keeps
-        # its own rule (and counts as conduct); everything else is the infrastructure denial.
-        v = core.degraded_verdict(nev, cprofile)
-        if v.blocks and v.innate:
-            return _verdict_deny(v), True
-        reason = (f"'{inv.event.tool}' cannot be judged: the policy daemon did not answer with "
-                  f"this member's policy snapshot, and without it no act, read or write, is "
-                  f"permitted")
-        return _verdict_deny(core._deny("gate.degraded", reason),
-                             verdict_available=False, anomaly=True), True
-    # Warn-rollout with no snapshot: a policy that grants NOTHING (never a replica), so every
-    # boundary surfaces as a warning and innate ones still deny.
-    policy = core.AgentPolicy(member_id=prof.member_id, scope=(),
-                              source="daemon-unreachable", stale=True)
-    v = core.evaluate(nev, cprofile, workspace, policy=policy)
-    if v.blocks:
-        if v.innate:
-            return _verdict_deny(v), True
-        inv.warnings.append((v.rule, v.reason, False))
-    return None, True
+    # NO SNAPSHOT, NO PERMIT — in EVERY rollout mode, for EVERY act class (dp 2026-10-01, "align
+    # upward; no snapshot -> no read"). Without the member's policy snapshot the gate cannot
+    # certify scope, so the act is denied, reads included, as claude-code does today. This is an
+    # infrastructure INTEGRITY precondition, not a policy opinion, so the rollout does not soften
+    # it — the same posture as invocation supersession and C11 (GPT, 57bcd10 re-review: warn
+    # rollout used to evaluate against an empty scope and let the act continue with warnings).
+    # The core's degraded verdict still runs first so an innate egress refusal keeps its own rule
+    # (and counts as conduct); everything else is the infrastructure denial.
+    v = core.degraded_verdict(nev, cprofile)
+    if v.blocks and v.innate:
+        return _verdict_deny(v), True
+    reason = (f"'{inv.event.tool}' cannot be judged: the policy daemon did not answer with this "
+              f"member's policy snapshot, and without it no act, read or write, is permitted "
+              f"(in every rollout mode)")
+    return _verdict_deny(core._deny("gate.degraded", reason, innate=True),
+                         verdict_available=False, anomaly=True), True
 
 
 def _society(inv: _Invocation) -> GateDecision:
