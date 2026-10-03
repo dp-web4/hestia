@@ -146,11 +146,19 @@ jobs:
           bin="$GITHUB_WORKSPACE/hestia/core/target/debug/hestia"
           "$bin" --home "$home" init --ai
           nohup "$bin" --home "$home" serve --bind 127.0.0.1:7799 >"$home/serve.log" 2>&1 &
-          for _ in $(seq 1 60); do
-            (exec 3<>/dev/tcp/127.0.0.1/7799) 2>/dev/null && exit 0
+          # Ready means an MCP initialize ANSWERS, not that the port is open. The contract step
+          # below also pays its own member's cold path (one warm-up society-safety call) before
+          # it asserts anything.
+          init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci-ready","version":"1"}}}'
+          for _ in $(seq 1 120); do
+            if curl -fsS --max-time 10 -H 'Content-Type: application/json' \
+                 -H 'Accept: application/json, text/event-stream' \
+                 -d "$init" http://127.0.0.1:7799/mcp 2>/dev/null | grep -q '"result"'; then
+              exit 0
+            fi
             sleep 1
           done
-          echo "daemon did not come up"; cat "$home/serve.log"; exit 1
+          echo "daemon never answered initialize"; cat "$home/serve.log"; exit 1
 
       - name: TypeScript SDK
         working-directory: hestia/plugin-sdk/typescript
@@ -180,6 +188,9 @@ jobs:
       # One-gate stage A: the decision witness's receipt contract against the daemon built from
       # THIS commit (allow/warn/deny commit with a receipt; a daemon-ruled warn/deny comes back
       # as the daemon's own row). The stub-daemon arms of the same file run in plugin-tests.
+      # It is a CORRECTNESS test: it waits for readiness plus a per-member warm-up, then asserts
+      # the receipts under generous ceilings and prints every latency. The hook-budget latency
+      # check is the separate, opt-in HESTIA_DECISION_LATENCY_ASSERT=1 test (debug build here).
       - name: Decision-witness receipt contract (real daemon)
         working-directory: hestia
         env:

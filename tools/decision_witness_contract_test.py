@@ -514,34 +514,122 @@ def _real_endpoint():
     return url
 
 
+# The correctness arm's ceilings. They are generous on purpose: this arm asserts WHAT the daemon
+# records, never how fast. Every call's elapsed time is still printed. Speed is a separate,
+# labelled, opt-in check (test_real_daemon_warm_latency_within_hook_budget below).
+#
+# Why both knobs. CI's exact-head run of 7b56c000 failed on the FIRST cold society-safety call at
+# 5.03 s although this arm had already widened TOTAL_BUDGET_MS: the per-request REQUEST_TIMEOUT_S
+# (5.0 s) and the record calls' own 5.0 s deadline were still the hook's numbers.
+CORRECTNESS_CEILING_S = 60.0
+READY_TIMEOUT_S = float(os.getenv("HESTIA_DECISION_CONTRACT_READY_S", "180"))
+REAL_PID = "decision-contract-test"
+WARMUP_COMMAND = "rm -rf /home/user/contract-warmup"
+WARM: dict = {}          # filled by _await_real_daemon_ready and the correctness arm
+
+
+class _Ceilings:
+    """Swap the hook's latency knobs for the correctness ceiling, and put them back."""
+
+    def __init__(self, url, budget_s, request_s):
+        self.url, self.budget_s, self.request_s = url, budget_s, request_s
+
+    def __enter__(self):
+        self.saved = (m._discover_endpoint, m.TOTAL_BUDGET_MS, m.REQUEST_TIMEOUT_S)
+        m._discover_endpoint = lambda: self.url
+        m.TOTAL_BUDGET_MS = int(self.budget_s * 1000)
+        m.REQUEST_TIMEOUT_S = self.request_s
+        return self
+
+    def __exit__(self, *exc):
+        m._discover_endpoint, m.TOTAL_BUDGET_MS, m.REQUEST_TIMEOUT_S = self.saved
+        return False
+
+
+def _society(command):
+    t0 = time.monotonic()
+    v = m.query_society_safety({"tool_name": "Bash", "tool_input": {"command": command}},
+                               plugin_id=REAL_PID, host_agent="contract-test")
+    return v, time.monotonic() - t0
+
+
+def _await_real_daemon_ready(url):
+    """Readiness is a real round trip, not an open port, and it includes the per-member path.
+
+    1. initialize + `tools/list` (a no-op the handler answers) succeeds;
+    2. one society-safety call under REAL_PID returns a decided verdict, so the member's first
+       connect / begin_action / query_policy is paid here, before anything is asserted.
+    Both retry inside READY_TIMEOUT_S. Their times are printed (the cold-start measurement) and
+    never asserted. Returns None when ready, else why not."""
+    if WARM.get("ready"):
+        return None
+    give_up = time.monotonic() + READY_TIMEOUT_S
+    t0 = time.monotonic()
+    last = "never tried"
+    with _Ceilings(url, CORRECTNESS_CEILING_S, CORRECTNESS_CEILING_S):
+        while time.monotonic() < give_up:
+            try:
+                client = m._McpHttp(url, time.monotonic() + CORRECTNESS_CEILING_S)
+                if "result" in client.initialize():
+                    client.initialized()
+                    listed = client._request({"jsonrpc": "2.0", "id": client._id(),
+                                              "method": "tools/list", "params": {}}) or {}
+                    if isinstance(listed.get("result"), dict):
+                        break
+                    last = f"tools/list answered {str(listed)[:200]}"
+                else:
+                    last = "initialize had no result"
+            except Exception as e:  # noqa: BLE001 — not up yet; retry inside the bound
+                last = f"{type(e).__name__}: {e}"
+            time.sleep(0.5)
+        else:
+            return f"no successful no-op call within {READY_TIMEOUT_S:.0f}s ({last})"
+        WARM["noop_s"] = time.monotonic() - t0
+        tries = 0
+        while time.monotonic() < give_up:
+            tries += 1
+            v, took = _society(WARMUP_COMMAND)
+            WARM.setdefault("society_first_s", took)
+            if v.decided and v.action_id:
+                WARM.update(society_warmup_s=took, warmup_tries=tries, ready=True)
+                break
+            last = f"{v.kind}: {getattr(v, 'reason', '')}"
+            time.sleep(1.0)
+        else:
+            return f"warm-up society-safety never decided within {READY_TIMEOUT_S:.0f}s ({last})"
+    print(f"  real daemon ready: no-op after {WARM['noop_s']:.2f}s; member warm-up "
+          f"society-safety first call {WARM['society_first_s']:.2f}s, decided on try "
+          f"{WARM['warmup_tries']} ({WARM['society_warmup_s']:.2f}s)  [measured, not asserted]")
+    return None
+
+
 def test_against_an_isolated_real_daemon():
+    """CORRECTNESS: the receipt contract against a real daemon. Latency printed, not asserted."""
     url = _real_endpoint()
     if url is None:
         print("  (real-daemon arm skipped: HESTIA_DECISION_CONTRACT_ENDPOINT unset)")
         return
     RAN.append("real-daemon")
-    pid = "decision-contract-test"
-    saved = m._discover_endpoint
-    saved_budget = m.TOTAL_BUDGET_MS
-    m._discover_endpoint = lambda: url
-    # A fresh DEBUG daemon's first society-safety round trip measured over the hook's 4 s
-    # budget (timeout on the first act, the second inside it). That budget is the gate's
-    # latency contract, not this witness's, so this arm widens it locally, restores it, and
-    # prints each call's elapsed time instead of hiding it.
-    m.TOTAL_BUDGET_MS = 30000
-    try:
+    not_ready = _await_real_daemon_ready(url)
+    check("real-daemon-ready", not_ready is None, not_ready)
+    if not_ready:
+        return
+    pid = REAL_PID
+    with _Ceilings(url, CORRECTNESS_CEILING_S, CORRECTNESS_CEILING_S):
         def rec(decision, **kw):
             return m.record_decision(None, plugin_id=pid, decision=decision,
                                      rule="contract." + decision, tool_name="Bash",
                                      target=kw.pop("target", "ls"), session_id=None,
                                      verdict_available=True, attempted_summary="contract",
-                                     deadline=time.monotonic() + 5.0, **kw)
+                                     deadline=time.monotonic() + CORRECTNESS_CEILING_S, **kw)
         for d in ("allow", "warn", "deny"):
+            t0 = time.monotonic()
             r = rec(d, correlation_key=f"contract-{d}")
+            print(f"  real daemon: witness {d} -> {r.status} in {time.monotonic() - t0:.2f}s")
             check(f"real-{d}-committed", r.committed, r)
             check(f"real-{d}-event", r.event_type == m.DECISION_EVENT_TYPES[d], r)
         # The daemon itself refuses a fourth verdict (asked directly, past the local check).
-        client = m._McpHttp(url, time.monotonic() + 5.0)
+        client = m._McpHttp(url, time.monotonic() + CORRECTNESS_CEILING_S)
         client.initialize()
         client.initialized()
         kind, payload = wc._classify_reply(client.call_tool("hestia_witness_decision", {
@@ -553,12 +641,9 @@ def test_against_an_isolated_real_daemon():
         # witnesses the final verdict with the action id. A daemon-ruled warn/deny comes back as
         # the daemon's own row; an allow is a new policy_allow row.
         for command in ("rm -rf /home/user/data", "ls -la"):
-            t0 = time.monotonic()
-            v = m.query_society_safety(
-                {"tool_name": "Bash", "tool_input": {"command": command}},
-                plugin_id=pid, host_agent="contract-test")
-            print(f"  real daemon: society-safety {command!r} -> {v.kind} "
-                  f"in {time.monotonic() - t0:.2f}s")
+            v, took = _society(command)
+            print(f"  real daemon: society-safety {command!r} -> {v.kind} in {took:.2f}s")
+            WARM.setdefault("warm_society_s", []).append(took)
             check(f"real-ruled-{command}", v.decided and v.action_id, v)
             if not (v.decided and v.action_id):
                 continue
@@ -569,9 +654,40 @@ def test_against_an_isolated_real_daemon():
                       f"{v.kind} was already witnessed by query_policy: {r}")
             else:
                 check(f"real-allow-appended-{command}", r.deduplicated is False, r)
+
+
+def test_real_daemon_warm_latency_within_hook_budget():
+    """LATENCY, separate from correctness and opt-in: HESTIA_DECISION_LATENCY_ASSERT=1.
+
+    After warm-up, a society-safety decision must fit the hook's own budget (TOTAL_BUDGET_MS,
+    default 4 s; REQUEST_TIMEOUT_S per request) with the knobs left as deployed. Off by default
+    because CI's daemon is a DEBUG build; the one-gate 3 s deadline belongs on the release build
+    (stage B). When off, the warm figures are printed so the trend stays visible."""
+    url = _real_endpoint()
+    if url is None:
+        return
+    if os.getenv("HESTIA_DECISION_LATENCY_ASSERT") != "1":
+        shown = ", ".join(f"{x:.2f}s" for x in WARM.get("warm_society_s") or []) or "none"
+        print(f"  (latency check not asserted; warm society-safety: {shown}; hook budget "
+              f"{m.TOTAL_BUDGET_MS / 1000:.1f}s. HESTIA_DECISION_LATENCY_ASSERT=1 asserts it)")
+        return
+    RAN.append("latency")
+    not_ready = _await_real_daemon_ready(url)
+    check("latency-daemon-ready", not_ready is None, not_ready)
+    if not_ready:
+        return
+    saved = m._discover_endpoint
+    m._discover_endpoint = lambda: url
+    try:
+        for command in ("rm -rf /home/user/latency", "ls -la /"):
+            v, took = _society(command)
+            print(f"  latency: society-safety {command!r} -> {v.kind} in {took:.2f}s "
+                  f"(budget {m.TOTAL_BUDGET_MS / 1000:.1f}s)")
+            check(f"latency-decided-{command}", v.decided, v)
+            check(f"latency-within-budget-{command}", took <= m.TOTAL_BUDGET_MS / 1000.0,
+                  f"{took:.2f}s")
     finally:
         m._discover_endpoint = saved
-        m.TOTAL_BUDGET_MS = saved_budget
 
 
 TESTS = [
@@ -594,6 +710,7 @@ TESTS = [
     test_the_correlation_key_is_the_cores_rule_from_the_raw_event,
     test_stage_a_is_unwired,
     test_against_an_isolated_real_daemon,
+    test_real_daemon_warm_latency_within_hook_budget,
 ]
 
 
