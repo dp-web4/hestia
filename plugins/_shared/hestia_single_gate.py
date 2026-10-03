@@ -17,8 +17,9 @@ law-bearing is here, in ONE sequence, in this order:
    4. law        `core.evaluate` (innate denies always; tunable denies follow the rollout);
    5. society    `mechanism.query_society_safety(..., correlation_key=KEY)` for EVERY act, reads
                  included (dp 2026-10-01: align upward to claude-code's posture) — the ONLY
-                 writer of the action cache (C13). A superseded invocation is denied in EVERY
-                 mode;
+                 writer of the action cache (C13). A superseded invocation, and a society
+                 check that returns NO verdict (`society.unreachable`), are denied in EVERY
+                 mode — no verdict, no act; an internal error (`gate.internal_error`) likewise;
    6. finalize   `mechanism.record_decision(...)` for the final verdict, and nothing else
                  records it. A consequential permit whose receipt is not committed becomes
                  `gate.evidence_uncommitted` (C11), in every rollout mode.
@@ -618,15 +619,14 @@ def _society(inv: _Invocation) -> GateDecision:
             inv.warnings.append(("society.safety", safety.message or "society law refused the act",
                                  True))
             return _permit(inv, "society.safety", action_id=safety.action_id)
-        if inv.rollout == "enforce":
-            return GateDecision("deny", "society.unreachable",
-                                safety.message or "no usable society-safety verdict",
-                                core.REMEDIES["society.unreachable"].text,
-                                verdict_available=False, anomaly=True,
-                                action_id=safety.action_id)
-        inv.warnings.append(("society.unreachable",
-                             safety.message or "no usable society-safety verdict", False))
-        return _permit(inv, "society.unreachable", verdict_available=False, anomaly=True)
+        # NO VERDICT, NO ACT — in EVERY rollout mode, reads included (dp 2026-10-02). A society
+        # check that did not decide is an infrastructure no-verdict, not a policy opinion the
+        # rollout may soften: the same posture as the no-snapshot stop, supersession and C11.
+        return GateDecision("deny", "society.unreachable",
+                            safety.message or "no usable society-safety verdict",
+                            core.REMEDIES["society.unreachable"].text,
+                            verdict_available=False, anomaly=True, innate=True,
+                            action_id=safety.action_id)
     if safety.kind == "warn":
         inv.warnings.append(("society.safety.warn", safety.message or "", True))
     return _permit(inv, "gate.allow", action_id=safety.action_id, message=safety.message or "")
@@ -685,16 +685,16 @@ def decide(event: GateEvent, profile: GateProfile, *, rollout: Optional[str] = N
         return _sequence(inv)
     except BaseException as exc:  # noqa: BLE001 — a gate that cannot decide must not allow
         detail = f"{type(exc).__name__}: {exc}"[:300]
+        # NO VERDICT, NO ACT — a gate that could not decide denies in EVERY rollout mode, for
+        # every act class, reads included (dp 2026-10-02).
         d = GateDecision(
-            "deny" if mode == "enforce" else "warn", "gate.internal_error",
+            "deny", "gate.internal_error",
             "the common gate could not complete the decision: " + detail,
             GATE_REMEDIES["gate.internal_error"],
-            verdict_available=False, anomaly=True, rollout=mode,
-            warnings=(() if mode == "enforce" else (("gate.internal_error", detail),)))
+            verdict_available=False, anomaly=True, innate=True, rollout=mode)
         if inv is None:
             return d
         try:
-            # A warn-rollout permit of a write/exec act is still a permit: C11 applies.
-            return _finalize(inv, d, consequential=event.tool not in core.READ_CLASS)
+            return _finalize(inv, d, consequential=False)
         except BaseException:  # noqa: BLE001
             return d

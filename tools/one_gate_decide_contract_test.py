@@ -765,6 +765,61 @@ def test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat(m, g, wc, hom
         stub.close()
 
 
+def test_no_verdict_is_a_hard_stop_in_every_rollout_on_every_seat(m, g, wc, home):
+    """dp 2026-10-02, the two remaining no-verdict -> permit paths: DENY BOTH, in every rollout
+    mode. No verdict, no act — the same principle as C11 and the no-snapshot stop. On claude-code,
+    codex, kimi and gemini, in warn AND enforce, for a Read and a write:
+
+      snapshot present, society returns NO verdict   -> deny society.unreachable, never a permit
+      the gate raises (internal error), any act class -> deny gate.internal_error, recorded
+
+    The society no-verdict is a malformed decision from a live stub (the mechanism's
+    "unrecognized decision" no-verdict), so the snapshot is really present and the governor
+    really was asked."""
+    acts = (("Read", {"file_path": str(REPO / "README.md")}),
+            ("Write", {"file_path": str(REPO / "decide-probe.txt"), "content": "x"}))
+    stub = Stub(Policy(query=lambda a: "no-verdict"))
+    try:
+        for seat in SEATS:
+            for mode in ("warn", "enforce"):
+                for tool, tin in acts:
+                    mark = len(stub.calls)
+                    with _Env(m, stub.url, home):
+                        d, _ = _decide(g, seat, tool, tin, home, rollout=mode)
+                    asked = [c for c in stub.calls[mark:] if c[0] == "hestia_begin_action"]
+                    check(f"{seat}-{mode}-{tool}-society-no-verdict-asked", bool(asked),
+                          stub.calls[mark:])
+                    check(f"{seat}-{mode}-{tool}-society-no-verdict-denied",
+                          d.decision == "deny" and d.rule == "society.unreachable"
+                          and d.verdict_available is False and d.innate and not d.warnings, d)
+    finally:
+        stub.close()
+    reached = []
+    orig = g.normalized_event
+
+    def boom(ev):
+        reached.append(ev)
+        raise RuntimeError("injected")
+
+    stub = Stub()
+    g.normalized_event = boom
+    try:
+        for seat in SEATS:
+            for mode in ("warn", "enforce"):
+                for tool, tin in acts:
+                    with _Env(m, stub.url, home):
+                        d, _ = _decide(g, seat, tool, tin, home, rollout=mode)
+                    check(f"{seat}-{mode}-{tool}-internal-error-denied",
+                          d.decision == "deny" and d.rule == "gate.internal_error"
+                          and d.verdict_available is False and d.innate and not d.warnings, d)
+                    check(f"{seat}-{mode}-{tool}-internal-error-recorded", d.evidence_committed, d)
+        check("internal-error-seam-reached-every-cell", len(reached) == len(SEATS) * 2 * len(acts),
+              len(reached))
+    finally:
+        g.normalized_event = orig
+        stub.close()
+
+
 def test_closure_approval_lifts_only_the_closure_bar(m, g, wc, home):
     stub = Stub(Policy(claim="approve"))
     try:
@@ -809,7 +864,9 @@ def test_an_internal_error_fails_closed_through_the_one_recorder(m, g, wc, home)
                   and d.anomaly and not d.verdict_available, d)
             check("internal-error-recorded", d.evidence_committed, d)
             d, _ = _decide(g, "codex", "Bash", {"command": "ls"}, home, rollout="warn")
-            check("internal-error-warn-rollout", d.decision == "warn" and d.evidence_committed, d)
+            # No verdict, no act (dp 2026-10-02): the warn rollout no longer softens it.
+            check("internal-error-warn-rollout-denies", d.decision == "deny"
+                  and d.rule == "gate.internal_error" and d.evidence_committed, d)
         d = g.decide("not an event", profile_for(g, "codex", home))
         check("bad-input-denies", d.decision == "deny" and d.rule == "gate.internal_error", d)
     finally:
@@ -855,6 +912,7 @@ CONTRACT_TESTS = [
     test_daemon_verdicts_and_the_warn_rollout,
     test_degraded_posture,
     test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat,
+    test_no_verdict_is_a_hard_stop_in_every_rollout_on_every_seat,
     test_closure_approval_lifts_only_the_closure_bar,
     test_an_internal_error_fails_closed_through_the_one_recorder,
     test_stage_b_is_unwired,
@@ -904,6 +962,11 @@ PARITY_CASES = [
     # No snapshot under WARN rollout (GPT, 57bcd10): a hard stop, reads included.
     ("warn-down-read", "Read", {"file_path": "{REPO}/README.md"}, "down", "warn"),
     ("warn-down-scope-read-etc", "Read", {"file_path": "/etc/hostname"}, "down", "warn"),
+    # Snapshot present, society answers NO verdict (dp 2026-10-02: no verdict, no act).
+    ("society-no-verdict-read", "Read", {"file_path": "{REPO}/README.md"}, "no-verdict", "enforce"),
+    ("warn-society-no-verdict-read", "Read", {"file_path": "{REPO}/README.md"}, "no-verdict", "warn"),
+    ("warn-society-no-verdict-edit", "Edit", {"file_path": "{REPO}/core/src/server/state.rs",
+                                              "old_string": "a", "new_string": "b"}, "no-verdict", "warn"),
 ]
 
 POLICIES = {
@@ -911,6 +974,7 @@ POLICIES = {
     "deny-rm": lambda: Policy(query=lambda a: "deny" if "rm -rf" in json.dumps(a) else "allow"),
     "deny-all": lambda: Policy(query=lambda a: "deny"),
     "warn": lambda: Policy(query=lambda a: "warn"),
+    "no-verdict": lambda: Policy(query=lambda a: "no-verdict"),
     "superseded": lambda: Policy(superseded=True),
     "refuse-allow": lambda: Policy(witness="refuse-allow"),
     "down": None,
@@ -934,6 +998,21 @@ DECLARED_DIVERGENCES = {
         "TIGHTENING (align upward; no snapshot -> no read, independent of rollout): under warn "
         "rollout with the daemon down codex warned and kimi/gemini allowed an in-scope read; "
         "decide() denies it gate.degraded, as claude-code does.") for s in ("codex", "kimi", "gemini")},
+    # NO VERDICT, NO ACT (dp 2026-10-02): a snapshot exists but society answers no verdict.
+    **{(s, "society-no-verdict-read"): (
+        "TIGHTENING (align upward + no verdict, no act): kimi/gemini skipped the governor for "
+        "read-class tools, so a read with no society verdict was allowed; decide() asks for every "
+        "act and denies society.unreachable, as claude-code and codex already did.")
+       for s in ("kimi", "gemini")},
+    **{(s, "warn-society-no-verdict-read"): (
+        "TIGHTENING (no verdict, no act, independent of rollout — dp 2026-10-02): under warn "
+        "rollout a read with no society verdict was a warning (codex) or an unasked allow "
+        "(kimi/gemini); decide() denies society.unreachable, as claude-code does.")
+       for s in ("codex", "kimi", "gemini")},
+    **{(s, "warn-society-no-verdict-edit"): (
+        "TIGHTENING (no verdict, no act, independent of rollout — dp 2026-10-02): under warn "
+        "rollout a write with no society verdict went through with a warning; decide() denies "
+        "society.unreachable, as claude-code does.") for s in ("codex", "kimi", "gemini")},
     **{(s, "warn-down-scope-read-etc"): (
         "TIGHTENING (align upward; no snapshot -> no read, independent of rollout): under warn "
         "rollout with the daemon down an out-of-scope read was a warning (a permit); decide() "
