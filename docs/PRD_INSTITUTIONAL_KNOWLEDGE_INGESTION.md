@@ -108,6 +108,113 @@ shadow divergence: yes
 
 This lets the customer review consequences before ratification/enforcement.
 
+
+## 5A. Shadow mode is also a learning surface
+
+Shadow mode MUST do more than compare candidate governance with active behavior.
+
+For each observed act, Hestia should emit **learning evidence** scoped to the MRH/role context in which the act occurred.
+
+Useful observations include:
+
+- actor and active role;
+- society / child-society context;
+- delegated authority present at the time;
+- action/resource/target;
+- consulted or approving roles;
+- actual sequence of handoffs;
+- exception path used;
+- evidence attached;
+- candidate rule result;
+- active policy result;
+- eventual outcome.
+
+This allows the Governance Twin to learn institutional structure from ordinary work instead of asking every participant to document it in advance.
+
+## 5B. Minimum-question elicitation
+
+Hestia SHOULD remain silent on routine, well-explained activity.
+
+It may surface a clarification request when runtime evidence creates a meaningful ambiguity, for example:
+
+- actor performs an action outside the role normally seen for it;
+- candidate and active governance differ materially;
+- escalation goes to a different role than the model predicts;
+- repeated exception appears;
+- parent and child MRH expectations differ;
+- new tool/action pairing appears;
+- high-consequence action has unclear authority.
+
+The question should be local and concrete.
+
+Example:
+
+> "This production deploy is being approved by Security Lead rather than Release Manager. Is that an after-hours delegation, an exception for this service, or a different policy?"
+
+The reply is stored as an **elicited claim with provenance**, not immediately as policy.
+
+## 5C. MRH-scoped runtime learning
+
+Hestia MUST preserve the narrowest known context of an observation.
+
+An action seen on one machine, by one role, in one team MUST NOT become an organization-wide practice merely because it occurred repeatedly there.
+
+Each exported learning event SHOULD carry:
+
+- `origin_mrh`;
+- `society_context`;
+- `role_context`;
+- `seat/device context`;
+- `candidate_parent_mrh` when known;
+- evidence reference;
+- occurrence count / recurrence metadata;
+- any known sibling-MRH agreement or conflict.
+
+The Hub/Governance Twin decides whether multiple local observations compose into a broader candidate pattern.
+
+## 5D. Fractal shadow evaluation
+
+Where nested society law is present, shadow output SHOULD retain the decision at every relevant layer rather than only the final strictest verdict.
+
+Example:
+
+```text
+team law: allow
+department law: escalate to release-manager
+organization law: require independent approval
+local Hestia safety: warn
+final active behavior: allowed today
+
+shadow finding:
+  inherited org requirement applies
+  department resolver is missing
+  team practice currently bypasses inherited requirement
+```
+
+This makes learning compatible with SAL's nested society/law inheritance instead of flattening all contexts into one rule set.
+
+## 5E. Learning evidence never becomes enforcement by recurrence
+
+Repeated behavior can increase confidence that a practice exists.
+
+It MUST NOT increase the authority of that practice.
+
+A pattern may progress:
+
+```text
+observed once
+ -> repeated locally
+ -> corroborated across roles
+ -> corroborated across sibling MRHs
+ -> candidate broader institutional knowledge
+ -> candidate governance
+ -> ratification
+ -> active policy
+```
+
+The first five states are descriptive. Only ratification can cross into governing state.
+
+
 ## 6. Institutional findings Hestia can contribute
 
 Hestia's runtime evidence can feed the Governance Twin with observations such as:
