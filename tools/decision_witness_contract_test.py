@@ -529,20 +529,31 @@ WARM: dict = {}          # filled by _await_real_daemon_ready and the correctnes
 
 
 class _Ceilings:
-    """Swap the hook's latency knobs for the correctness ceiling, and put them back."""
+    """Swap the hook's latency knobs (None = leave as deployed) and the telemetry home for this
+    arm's, and put them back.
 
-    def __init__(self, url, budget_s, request_s):
+    The telemetry home: a no-verdict writes to DEFAULT_HESTIA_HOME (HOME at import), which is the
+    LIVE ~/.hestia unless HOME was isolated: one `decision-contract-test` timeout row reached the
+    live gate-unavailable log that way. Every real-daemon call here keeps it in a scratch home."""
+
+    def __init__(self, url, budget_s=None, request_s=None):
         self.url, self.budget_s, self.request_s = url, budget_s, request_s
 
     def __enter__(self):
-        self.saved = (m._discover_endpoint, m.TOTAL_BUDGET_MS, m.REQUEST_TIMEOUT_S)
+        self.saved = (m._discover_endpoint, m.TOTAL_BUDGET_MS, m.REQUEST_TIMEOUT_S,
+                      m.DEFAULT_HESTIA_HOME)
         m._discover_endpoint = lambda: self.url
-        m.TOTAL_BUDGET_MS = int(self.budget_s * 1000)
-        m.REQUEST_TIMEOUT_S = self.request_s
+        if self.budget_s is not None:
+            m.TOTAL_BUDGET_MS = int(self.budget_s * 1000)
+        if self.request_s is not None:
+            m.REQUEST_TIMEOUT_S = self.request_s
+        m.DEFAULT_HESTIA_HOME = pathlib.Path(
+            tempfile.mkdtemp(prefix="decision-contract-telemetry-"))
         return self
 
     def __exit__(self, *exc):
-        m._discover_endpoint, m.TOTAL_BUDGET_MS, m.REQUEST_TIMEOUT_S = self.saved
+        (m._discover_endpoint, m.TOTAL_BUDGET_MS, m.REQUEST_TIMEOUT_S,
+         m.DEFAULT_HESTIA_HOME) = self.saved
         return False
 
 
@@ -676,9 +687,7 @@ def test_real_daemon_warm_latency_within_hook_budget():
     check("latency-daemon-ready", not_ready is None, not_ready)
     if not_ready:
         return
-    saved = m._discover_endpoint
-    m._discover_endpoint = lambda: url
-    try:
+    with _Ceilings(url):  # knobs as deployed; only the endpoint and telemetry home are swapped
         for command in ("rm -rf /home/user/latency", "ls -la /"):
             v, took = _society(command)
             print(f"  latency: society-safety {command!r} -> {v.kind} in {took:.2f}s "
@@ -686,8 +695,6 @@ def test_real_daemon_warm_latency_within_hook_budget():
             check(f"latency-decided-{command}", v.decided, v)
             check(f"latency-within-budget-{command}", took <= m.TOTAL_BUDGET_MS / 1000.0,
                   f"{took:.2f}s")
-    finally:
-        m._discover_endpoint = saved
 
 
 TESTS = [

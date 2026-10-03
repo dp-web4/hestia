@@ -141,22 +141,20 @@ like A. `GateEvent` must carry the **raw harness event** (`raw`), unmodified.
    - Anything unclaimed is denied `gate.self_access`.
 4. **Egress precheck** (innate) gives `egress.secret`.
 5. **Policy snapshot** via `fetch_policy_snapshot`.
-   - If it is missing, use `core.degraded_verdict`.
-   - Degraded denies are innate when the core says so, and an anomaly otherwise.
-   - A degraded read becomes `allow gate.degraded.allow_read` with `verdict_available=False`.
+   - If it is missing, every act is denied, reads included, **in every rollout mode** (dp 2026-10-01, align upward; "no snapshot → no read"): an innate `egress.secret` when `core.degraded_verdict` says so, otherwise `gate.degraded` (innate, an anomaly, `verdict_available=False`). A missing snapshot is an integrity precondition, not a policy opinion, so the warn rollout does not soften it, the same posture as supersession and C11. The rollout softens only a tunable local or society disagreement (a DECIDED refusal), and only when a snapshot exists. **No verdict, no act** (dp 2026-10-02) is the general rule: a missing snapshot, a society check that does not decide, and a gate that cannot complete are each a hard deny in every rollout mode.
 6. **Local law** via `core.evaluate`. A block becomes a deny with its rule.
-7. **Read class** gives allow with `require_commit=False` (the ratified degraded-read posture).
-8. **Society safety:** `mechanism.query_society_safety(event.raw, ..., correlation_key=key)`.
+7. **Society safety, for every act, reads included** (dp 2026-10-01, align upward to claude-code): `mechanism.query_society_safety(event.raw, ..., correlation_key=key)`.
    - This is the ONLY writer of the action cache (C13 rule 2). The orchestrator carries **no cache of its own**: no `_cache_action` and no `/tmp/hestia-actions`.
    - A superseded verdict is a hard deny in every mode.
-   - Not decided means `society.unreachable` (anomaly, `verdict_available=False`).
+   - Not decided means `deny society.unreachable` (innate, anomaly, `verdict_available=False`) **in every rollout mode**, reads included (dp 2026-10-02: no verdict, no act).
+   - An exception anywhere in the sequence is `deny gate.internal_error` (innate, recorded) in every rollout mode, for every act class.
    - A decided refusal is a deny with `action_id`.
    - Allow or warn is a permit with `require_commit=True`.
-9. **Finalize.** `_finalize` calls `mechanism.record_decision(..., action_id=verdict.action_id, correlation_key=key, deadline=deadline)` for EVERY final verdict, and nothing else records it.
+8. **Finalize.** `_finalize` calls `mechanism.record_decision(..., action_id=verdict.action_id, correlation_key=key, deadline=deadline)` for EVERY final verdict, and nothing else records it.
    - **C11:** a write/exec allow/warn whose receipt is not `committed` becomes `deny gate.evidence_uncommitted`. That deny is recorded through the same call, and the result names the superseded verdict.
    - A daemon-ruled warn/deny is answered `deduplicated` with the daemon's own row, so the census sees one row per verdict.
-   - Reads that fail to commit stay allowed, surface `evidence_committed=False`, and are flagged as an anomaly.
-10. **Tally** via `tally_scope`, unchanged.
+   - A read-class permit whose record fails to commit keeps C11's read posture: it stands, surfaces `evidence_committed=False`, and is flagged as an anomaly. (That is about a missing RECORD for a permitted read, not about a degraded daemon: with no snapshot the read is never permitted.)
+9. **Tally** via `tally_scope`, unchanged.
 
 **B's acceptance (contract suite in the repo's real runners):**
 - run the real `record_decision` against a refusing stub, requiring `gate.evidence_uncommitted` for a consequential permit (GPT's #1140 HOLD);
@@ -165,7 +163,68 @@ like A. `GateEvent` must carry the **raw harness event** (`raw`), unmodified.
 - avoid `globals()` sweeps and set the exec bit, so ci_selfexec and gate_collapse_meter stay green;
 - `hestia_single_gate.py` is not in `RUNTIME_MANIFEST.txt` until C.
 
+### Stage B as built (2026-10-01): where it departs from the design above
+
+Contract suite: `tools/one_gate_decide_contract_test.py`. It runs 15 in-process contract tests, plus a 29-case parity matrix that drives every seat's CURRENT gate and `decide()` with the same four real harness event shapes under the same stub policy. Every verdict-class divergence is declared there with its reason, and the test fails on an undeclared divergence and on a stale declaration.
+
+1. **The daemon is asked about the translated act; the key still comes from the raw event (step 7).** `query_society_safety` receives `{"tool_name": event.tool, "tool_input": event.tool_input}`, not `event.raw`. The daemon's target extraction and presets speak lineage names. A raw gemini `run_shell_command` reaches it with `target=None`, which is the "blind governor" gemini's own shim was written to prevent. The correlation key is unchanged: `correlation_key(event.raw)`, computed once and passed explicitly (C13 holds).
+2. **The deadline is the caller's; `decide()` has a default (step 1).** dp, 2026-10-01: *"one gate is law. shims are there to match the interface to peculiarities of each harness, timeouts being prime example."*
+   - `decide(..., deadline=<absolute monotonic> | budget_seconds=<s>)` runs every leg, plus the record's reserve, inside the caller's deadline and fails closed when it runs out.
+   - With neither, `DEFAULT_DEADLINE_SECONDS = 8.0` applies: the deployed 4000 ms × (1 + 1 retry), taken as the total across every leg. It is labelled a default, not law. There is no law-level harness-timeout constant.
+   - B does not modify `hestia_gate_mechanism.py` (single-approver bar), so the deployed helpers keep their own budgets. `decide()` bounds them from outside (`_bounded`: a daemon thread waited on only for what remains). The caller sees the bound; the daemon can still receive an abandoned request late.
+   - `record_decision` takes `deadline=` itself (stage A).
+3. **gemini asks the daemon as gemini.** Today gemini's Gate 2 spawns claude-code's gate, which hardcodes `PLUGIN_ID="claude-code"`. So every gemini society verdict is attributed to claude-code and is also judged by claude-code's scope and home markers. `decide()` asks as the profile's member. The parity suite pins both halves.
+4. **C11 holds in warn-rollout — ACCEPTED by dp 2026-10-01.** An uncommitted consequential permit is `gate.evidence_uncommitted` in every mode. With the daemon down, a warn-rollout seat that used to let a write through unwitnessed now denies it; since the no-snapshot fix below, that denial is `gate.degraded`, reached before any permit exists.
+5. **Reads: ALIGN UPWARD (dp ruling 2026-10-01).** On every seat, reads meet the strictest seat's posture, which is claude-code's today. dp: never the laxest reading.
+   - Reads go to daemon law (society safety), as every act does.
+   - With no policy snapshot, every read is denied (`gate.degraded`), **in enforce AND warn rollout**. The first cut (57bcd10) denied only under enforce. Under warn it evaluated against an empty scope, turned the blocks into warnings and continued to society, so a read could still be permitted (GPT's re-review). Now the no-snapshot branch returns the innate `gate.degraded` deny before the rollout is consulted, and the governor is not asked.
+   - The local credential/egress and MRH scope checks still apply, with the daemon up or down.
+   - claude-code's read cells MATCH. The declared tightenings are kimi's and gemini's daemon-refused Read and degraded in-scope Read (allow → deny), kimi's degraded out-of-scope Read (allow → deny), and, under warn rollout with no snapshot, codex's, kimi's and gemini's in-scope and out-of-scope Read (warn/allow → deny).
+   - Pinned by `test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat`: on all four seats, warn × no snapshot × in-scope and out-of-scope Read → `deny gate.degraded`, `verdict_available=False`, innate, no warnings. It covers both ways of having no snapshot (daemon down; snapshot refused with the governor up, which is then never asked), runs the same cells under enforce as the control, and has a counter-control: with a snapshot, a tunable scope deny still warns under warn and denies under enforce.
+   - **Law gap found, not fixed in B:** the core's shell command scope (`command_scope_reach`) judges only tokens under the workspace. So a shell read of an absolute path outside it (`cat /etc/hostname`) is unscoped on every seat, today and in `decide()`. codex reads only through shell. The contract suite pins the current behaviour, so a law change flips it visibly.
+5a. **No verdict, no act, in every rollout mode (dp ruling 2026-10-02).** The no-snapshot fix left two paths where warn rollout still turned a missing verdict into a permit. dp ruled to deny both:
+   - **Snapshot present, society returns no verdict.** This used to be a permit with a `society.unreachable` warning under warn. It is now `deny society.unreachable` (innate, `verdict_available=False`) in every mode, reads included.
+   - **The gate raises (`gate.internal_error`).** This used to be a `warn`, which is a permit, under warn rollout, for any act including reads. It is now a recorded `deny gate.internal_error` (innate) in every mode.
+   - Pinned by `test_no_verdict_is_a_hard_stop_in_every_rollout_on_every_seat`. On all four seats, in warn and enforce, for a Read and a Write, both cases deny with no warnings, and every internal-error denial is recorded. The society no-verdict comes from a live stub, so the snapshot is present and the governor was asked.
+   - Parity adds `society-no-verdict-read` (enforce), `warn-society-no-verdict-read` and `warn-society-no-verdict-edit`. The declared tightenings are kimi's and gemini's enforce Read (their governor was never asked for reads), and codex's, kimi's and gemini's warn-rollout Read and Edit (warn/allow → deny). claude-code matches on every no-verdict cell.
+6. **A daemon `warn` is surfaced on every seat.** kimi and codex read only `verdict.allow`, and gemini reads only its governor's exit code. So a daemon warn reached those members as a silent allow. The act is permitted either way.
+7. **gemini gains the closure layer.** This resolves #1195's one divergent row: the settings write was denied by gemini's scope layer, and is now denied as `gate.self_access`, which is escalatable.
+8. **hooks-gt is unchanged by B.** `hooks_gt.py` publishes `RUNTIME_MANIFEST.txt`, and the new module is outside it until C. So B's republish is a no-op, by design.
+
 ## 4. Stage C: thin-shim cutover and certification (separate PR)
+
+0. **The registration contract: each shim owns its harness's timeout.** One gate is law; the shim matches the interface to its harness, and timeouts are the prime example.
+   - **What each seat's adapter declares:**
+     - its harness's registered hook timeout;
+     - what that harness does when the timeout expires. Today all four fail OPEN (GATE_PROFILE.md §0; codex/gemini/kimi shim headers; Claude Code treats a hook timeout as a non-blocking error);
+     - the deadline it passes: `decide(..., deadline=monotonic() + harness_timeout − margin)`.
+   - **What its registration sets:** a timeout that is realistic for measured daemon latency. The basis, measured 2026-10-01 on an isolated daemon built from B's head through the real mechanism:
+
+     | case | n | p50 | p99 | max |
+     |---|---|---|---|---|
+     | warm society-safety | 40 | 32 ms | 39 ms | 39 ms |
+     | warm, 2× CPU oversubscription | 30 | 88 ms | 156 ms | 156 ms |
+     | warm snapshot | 20 | 10 ms | 14 ms | 14 ms |
+     | first act of a never-seen member | 8 | 4600 ms | 4814 ms | 4814 ms |
+     | same, under load | 5 | 5019 ms | 5028 ms | 5028 ms (no verdict: 5 s per-request cap) |
+     | cold daemon, first act | 1 | — | — | 5073 ms (no verdict: same cap) |
+     | interpreter start + gate imports | 15 | 80 ms | — | 99 ms |
+
+     Live record: 81 timeouts against the deployed 4 s budget between 09-28 and 10-01; 31 of them are a timed-out connect, the per-member cold path.
+   - **The safety invariant, unconditional: the deadline a shim passes is ALWAYS strictly below the timeout its harness actually enforces.** The shim derives it from the real registered value (`harness_timeout − margin`), never from the 8 s default or a template. So whatever the registration says, `decide()` finishes — and fails CLOSED on a slow or cold daemon — before the harness can kill the hook and fail OPEN. A short registration costs availability (more cold-connect denials), never safety. (dp, 2026-10-02: "if the timeouts are real, then your 5s will time out open before 10s.")
+   - **Registration length is the availability knob, not the safety one.** A registration that can absorb one cold member connect plus the margin (≈ 10 s: every template already declares at least that — claude-code 10 s, codex 15 s, kimi 15 s, gemini 15000 ms) avoids denying a member's first act after a daemon restart; warm-up (below) removes most of those anyway.
+   - **Drift this contract fixes on CBP (read from the installed configs):**
+     - claude-code is registered at **5 s**, not its template's 10 s, and runs its hook from `~/.claude/hooks/hestia/` instead of the plugin root.
+     - kimi's registered command adds `HESTIA_PRE_TOTAL_BUDGET_MS=14000` under its 15 s timeout.
+     - Both are live fail-open exposures **today**, because the deployed mechanism's budget (4 s × (1 + 1 retry), and 14 s on kimi) is not derived from the registered timeout; see #1197 "Live fail-open exposure". Under the contract above that exposure disappears by construction even at 5 s: claude-code's shim passes ≈ 4 s and a cold connect becomes a recorded denial, not a timeout. Re-registering claude-code at its template's 10 s and dropping kimi's override are then availability fixes, made in the same cutover.
+   - **Cold start:** keep `~/.hestia/daemon-warmup.sh` (ExecStartPost: warms `hestia_connect` per member) covering every registered member id, and run it before the cutover. Its member list is hard-coded today.
+   - **The mechanism's 5 s per-request cap** (`REQUEST_TIMEOUT_S`) fails a single request slower than 5 s, even inside a longer deadline. Review it together with the `deadline=` threading below.
+0b. **Items carried from B.**
+   - **Thread `deadline=` through the mechanism.** That means `query_society_safety`, `fetch_policy_snapshot` (both attempts and the pause between them), `gate_self_call`, `witness_gate_self` and `claim_self_write`, with a default of `None` meaning today's behaviour. Then no request starts after the invocation deadline, and `_bounded` becomes a belt. This edits `hestia_gate_mechanism.py`, so it goes to dp.
+   - **One rollout knob.** `HESTIA_GATE_MODE` is projected per seat from the vault, replacing the four `HESTIA_<SEAT>_GATE_MODE` names.
+   - **Template profile keys.** The template's `PERMITTED_PROFILE_KEYS` gains `launch_cwd_env` and `declares_review_door`. kimi, codex and gemini scope by the launch-cwd grant, and three seats hold the review door.
+   - **Remedy text.** The remedies `decide()` mints (`invocation.superseded`, `gate.evidence_uncommitted`, `gate.internal_error`) move into the core's REMEDIES table.
+   - **gemini MCP transport.** gemini's command-scoping of the MCP transport (`mcp_context.command/args`) is not in B. B checks those strings for egress only, so this is a C10 item.
 
 1. **Shims become the template.** Each seat's `hooks/pre_tool_use.py` (gemini: `before_tool.py`) is replaced by the certified template:
    - five byte-identical common functions;
