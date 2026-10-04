@@ -935,7 +935,9 @@ impl SqliteInboxStore {
         let mut response = response_template.clone();
         response["queued_id"] = serde_json::json!(queued_id);
         response["egress_queued_to"] = Value::Null;
-        response["replayed"] = serde_json::json!(false);
+        if response.get("replayed").is_none() {
+            response["replayed"] = serde_json::json!(false);
+        }
         let response_json = serde_json::to_string(&response)?;
         let shadow_record_json = shadow_record_template
             .map(|v| serde_json::to_string(v))
@@ -996,7 +998,9 @@ impl SqliteInboxStore {
         let mut response = response_template.clone();
         response["queued_id"] = serde_json::json!(queued_id);
         response["egress_queued_to"] = serde_json::json!(dest_peer);
-        response["replayed"] = serde_json::json!(false);
+        if response.get("replayed").is_none() {
+            response["replayed"] = serde_json::json!(false);
+        }
         let response_json = serde_json::to_string(&response)?;
         let shadow_record_json = shadow_record_template
             .map(|template| {
