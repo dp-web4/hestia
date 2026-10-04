@@ -5573,6 +5573,55 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             })),
         ));
     }
+    // D2d migration rule: explicit legacy carrier/reply promises survive
+    // cutover. The F3 packet separates actor/origin from router carrier, but an
+    // operator-authored direct/relay binding is still law for WHICH Hub identity
+    // may carry the first hop. If F3 cannot prove the same carrier, refuse.
+    if recovered_operation_witness.is_none() {
+        if let (Some(plan), Some(binding)) = (&f3_plan, &transport_binding) {
+            if let Some(reply_to) = binding
+                .reply_to_lct
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                if reply_to != plan.origin_lct {
+                    return Ok(hestia_error_envelope(
+                        "hestia.member_notify_f3_reply_binding_unmet",
+                        "F3 cutover would change the operator-bound reply identity.                          Rebind reply_to_lct to the sender's canonical member LCT                          before moving this edge to F3.",
+                        Some(json!({
+                            "to_plugin_id": to_plugin,
+                            "origin_lct": plan.origin_lct,
+                            "reply_to_lct": reply_to,
+                            "delivery_authority": "f3",
+                        })),
+                    ));
+                }
+            }
+
+            if let Some(first_hop) = &plan.first_hop_hub_member {
+                let promised = binding
+                    .carrier_lct
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty());
+                if promised != Some(first_hop.as_str()) {
+                    return Ok(hestia_error_envelope(
+                        "hestia.member_notify_f3_carrier_binding_unmet",
+                        "F3 cutover selected a first-hop router interface different                          from the transport carrier authorized for this member.                          No packet was originated.",
+                        Some(json!({
+                            "to_plugin_id": to_plugin,
+                            "transport_mode": binding.mode.as_str(),
+                            "authorized_carrier_lct": promised,
+                            "f3_first_hop_hub_member": first_hop,
+                            "delivery_authority": "f3",
+                        })),
+                    ));
+                }
+            }
+        }
+    }
+
     // What the act's record and receipt say about how it will travel: the stamp when bound,
     // the literal "unbound" when routed without a binding, absent when local.
     let transport_record: Option<Value> = if recovered_operation_witness.is_some() {
@@ -5657,6 +5706,21 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             notice_record["f3_shadow"] = shadow.clone();
             notice_record["d2_shadow"] = json!(true);
         }
+        if let Some(plan) = &f3_plan {
+            notice_record["delivery_authority"] = json!("f3");
+            notice_record["f3_origin_lct"] = json!(plan.origin_lct);
+            notice_record["f3_router_lct"] = json!(plan.router_lct);
+            notice_record["f3_destination_lct"] = json!(plan.destination_lct);
+            notice_record["f3_authority_source"] = json!(plan.authority_source);
+            notice_record["f3_authority_reason"] = json!(plan.authority_reason);
+            notice_record["f3_first_hop_hub_member"] =
+                plan.first_hop_hub_member.clone().map(Value::String).unwrap_or(Value::Null);
+            notice_record["d2_migration_rule"] = json!(
+                "F3 strengthens legacy Hub acceptance to witnessed local delivery or durable next-hop mailbox acceptance"
+            );
+        } else if routed {
+            notice_record["delivery_authority"] = json!("legacy");
+        }
         if let (Some(op_id), Some(binding)) = (&operation_id, &operation_binding) {
             notice_record["operation_id"] = json!(op_id);
             notice_record["operation_binding"] = binding.clone();
@@ -5693,6 +5757,19 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     if let Some(note) = liveness_note(&liveness, &to_plugin) {
         response_template["recipient_note"] = json!(note);
     }
+    if let Some(plan) = &f3_plan {
+        response_template["delivery_authority"] = json!("f3");
+        response_template["canonical_destination_lct"] = json!(plan.destination_lct);
+        response_template["acceptance_semantics"] = json!(
+            "witnessed local delivery or durable next-hop mailbox acceptance; not end-recipient read"
+        );
+        response_template["migration_rule"] = json!(
+            "intentional strengthening from legacy Hub witnessed/accepted semantics"
+        );
+    } else if routed {
+        response_template["delivery_authority"] = json!("legacy");
+    }
+
     if let Some(t) = &transport_record {
         if *t == json!("unbound") {
             response_template["transport_note"] = json!(
