@@ -532,10 +532,16 @@ impl ReceiverRoutingTable {
         Ok(())
     }
 
-    pub fn unbind_legacy_alias(&mut self, legacy_address: &str) -> bool {
+    pub fn unbind_legacy_alias(&mut self, legacy_address: &str) -> Result<bool> {
+        if let Some(alias) = self.legacy_alias(legacy_address) {
+            anyhow::ensure!(
+                alias.delivery_authority == LegacyDeliveryAuthority::Legacy,
+                "refusing to remove F3-authoritative alias '{legacy_address}':                  explicitly roll its authority back to legacy first"
+            );
+        }
         let before = self.legacy_aliases.len();
         self.legacy_aliases.retain(|a| a.legacy_address != legacy_address);
-        before != self.legacy_aliases.len()
+        Ok(before != self.legacy_aliases.len())
     }
 
     pub fn legacy_alias(&self, legacy_address: &str) -> Option<&LegacyRouteAlias> {
