@@ -1958,6 +1958,21 @@ impl SqliteInboxStore {
 
     /// Receipt ids that are durably local but whose Hub ACK is not yet recorded.
     /// Includes the lost-ACK-response case; Hub tombstones make the retry safe.
+    /// Any receipt custody not yet confirmed ACKed to the Hub. A local mailbox
+    /// binding must not be removed or retargeted while this is non-zero: doing so
+    /// would strand the only credential/endpoint that can finish the transfer.
+    pub fn hub_receipt_inflight_count(&self, receiver_binding_id: Uuid) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_hub_receipt_schema(&conn)?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM hub_receipt_custody
+              WHERE receiver_binding_id = ?1 AND hub_acked_at IS NULL",
+            params![receiver_binding_id.to_string()],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
     pub fn pending_hub_receipt_acks(&self, receiver_binding_id: Uuid) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_hub_receipt_schema(&conn)?;
