@@ -3606,10 +3606,21 @@ fn cmd_receiver_unalias(
     let mut vault = open_vault(home)?;
     let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
         .context("loading receiver routing table (unreadable is not empty)")?;
+    let alias = table
+        .legacy_alias(legacy_address.trim())
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!(
+            "no legacy route alias for '{}'", legacy_address.trim()
+        ))?;
+    anyhow::ensure!(
+        alias.delivery_authority
+            == hestia::receiver_routing::LegacyDeliveryAuthority::Legacy,
+        "refusing to remove F3-authoritative alias '{}': first switch its authority          back to legacy with receiver-alias-authority and a rollback reason",
+        legacy_address.trim()
+    );
     anyhow::ensure!(
         table.unbind_legacy_alias(legacy_address.trim()),
-        "no legacy route alias for '{}'",
-        legacy_address.trim()
+        "legacy route alias disappeared during removal"
     );
     table.save(&mut vault)?;
     println!("Legacy route alias removed: {}", legacy_address.trim());
@@ -3817,8 +3828,12 @@ fn cmd_receiver_routes(home: &std::path::Path) -> AnyResult<()> {
     }
     for a in &table.legacy_aliases {
         println!(
-            "    {} -> {}  ({})",
-            a.legacy_address, a.destination_lct, a.reason
+            "    {} -> {}  authority={}  binding=({})  cutover=({})",
+            a.legacy_address,
+            a.destination_lct,
+            a.delivery_authority.as_str(),
+            a.reason,
+            a.authority_reason.as_deref().unwrap_or("not explicitly changed"),
         );
     }
     println!("  specific routes:");
