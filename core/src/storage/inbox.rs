@@ -1749,6 +1749,239 @@ pub struct EgressRow {
     pub transport_stamp: Option<String>,
 }
 
+// ---- F3 host receiver custody ------------------------------------------------
+
+/// Durable state for one Hub receipt-mode notice accepted by the machine router.
+/// The Hub notice id is the transport idempotency key. The row survives the
+/// cross-database witness/enqueue steps and the final Hub ACK, so every crash
+/// edge can resume without duplicating a member notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubReceiptCustody {
+    pub hub_connection_id: Uuid,
+    pub notice_id: String,
+    pub child_lct: String,
+    pub to_plugin: String,
+    pub witness_hash: Option<String>,
+    pub member_notice_id: Option<u64>,
+    pub hub_acked_at: Option<DateTime<Utc>>,
+}
+
+impl SqliteInboxStore {
+    fn ensure_hub_receipt_schema(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS hub_receipt_custody (
+                hub_connection_id TEXT NOT NULL,
+                hub_lct           TEXT NOT NULL,
+                hub_member_lct    TEXT NOT NULL,
+                child_lct         TEXT NOT NULL,
+                to_plugin         TEXT NOT NULL,
+                notice_id         TEXT NOT NULL,
+                notice_json       TEXT NOT NULL,
+                kind              TEXT NOT NULL,
+                pointer_uri       TEXT,
+                queued_at         TEXT NOT NULL,
+                witness_hash      TEXT,
+                member_notice_id  INTEGER,
+                hub_acked_at      TEXT,
+                PRIMARY KEY (hub_connection_id, notice_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_hub_receipt_pending_ack
+                 ON hub_receipt_custody(hub_connection_id, hub_acked_at, member_notice_id);",
+        )
+        .context("initializing Hub receipt custody schema")?;
+        Ok(())
+    }
+
+    /// Persist the complete fetched notice before any witness, local enqueue, or ACK.
+    /// Re-fetching the same Hub id is idempotent. If an id ever arrives with different
+    /// immutable bytes, fail closed rather than silently treating two packets as one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_hub_receipt(
+        &self,
+        hub_connection_id: Uuid,
+        hub_lct: Uuid,
+        hub_member_lct: Uuid,
+        child_lct: &str,
+        to_plugin: &str,
+        notice_id: &str,
+        notice_json: &str,
+        kind: &str,
+        pointer_uri: Option<&str>,
+    ) -> Result<HubReceiptCustody> {
+        anyhow::ensure!(
+            notice_id.len() == 64 && notice_id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "Hub receipt notice id must be 64 hex characters"
+        );
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_hub_receipt_schema(&conn)?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO hub_receipt_custody
+                (hub_connection_id, hub_lct, hub_member_lct, child_lct, to_plugin, notice_id,
+                 notice_json, kind, pointer_uri, queued_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                hub_connection_id.to_string(), hub_lct.to_string(), hub_member_lct.to_string(),
+                child_lct, to_plugin, notice_id, notice_json, kind, pointer_uri, now
+            ],
+        )
+        .context("staging Hub receipt notice")?;
+
+        let row = conn.query_row(
+            "SELECT hub_lct, hub_member_lct, child_lct, to_plugin, notice_json, kind,
+                    pointer_uri, witness_hash, member_notice_id, hub_acked_at
+               FROM hub_receipt_custody
+              WHERE hub_connection_id = ?1 AND notice_id = ?2",
+            params![hub_connection_id.to_string(), notice_id],
+            |r| Ok((
+                r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?, r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<i64>>(8)?, r.get::<_, Option<String>>(9)?,
+            )),
+        )?;
+        anyhow::ensure!(
+            row.0 == hub_lct.to_string() && row.1 == hub_member_lct.to_string()
+                && row.2 == child_lct && row.3 == to_plugin && row.4 == notice_json
+                && row.5 == kind && row.6.as_deref() == pointer_uri,
+            "Hub notice id {notice_id} was re-fetched with different immutable content"
+        );
+        Ok(HubReceiptCustody {
+            hub_connection_id,
+            notice_id: notice_id.to_string(),
+            child_lct: row.2,
+            to_plugin: row.3,
+            witness_hash: row.7,
+            member_notice_id: row.8.map(|n| n as u64),
+            hub_acked_at: row.9
+                .map(|s| DateTime::parse_from_rfc3339(&s)
+                    .map(|t| t.with_timezone(&Utc)))
+                .transpose()
+                .context("parsing Hub receipt ack time")?,
+        })
+    }
+
+    /// Complete local acceptance after the witness exists. Member enqueue and the
+    /// custody watermark commit in ONE inbox transaction, so a crash cannot create a
+    /// member notice without recording which Hub receipt produced it.
+    pub fn accept_hub_receipt(
+        &self,
+        hub_connection_id: Uuid,
+        notice_id: &str,
+        witness_hash: &str,
+    ) -> Result<u64> {
+        let mut conn = self.conn.lock().unwrap();
+        Self::ensure_hub_receipt_schema(&conn)?;
+        Self::ensure_member_schema(&conn)?;
+        let tx = conn.transaction().context("starting Hub receipt local acceptance")?;
+        let row = tx.query_row(
+            "SELECT to_plugin, pointer_uri, witness_hash, member_notice_id
+               FROM hub_receipt_custody
+              WHERE hub_connection_id = ?1 AND notice_id = ?2",
+            params![hub_connection_id.to_string(), notice_id],
+            |r| Ok((
+                r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?, r.get::<_, Option<i64>>(3)?,
+            )),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("Hub receipt {notice_id} was not staged"))?;
+        if let Some(existing) = row.2.as_deref() {
+            anyhow::ensure!(
+                existing == witness_hash,
+                "Hub receipt {notice_id} is already bound to a different witness"
+            );
+        }
+        if let Some(id) = row.3 {
+            return Ok(id as u64);
+        }
+        let local_id = Self::enqueue_member_on(
+            &tx,
+            &row.0,
+            "hestia-router",
+            "role:constellation:router",
+            "coordination.hub",
+            row.1.as_deref(),
+            witness_hash,
+            None,
+        )?;
+        tx.execute(
+            "UPDATE hub_receipt_custody
+                SET witness_hash = ?3, member_notice_id = ?4
+              WHERE hub_connection_id = ?1 AND notice_id = ?2",
+            params![
+                hub_connection_id.to_string(), notice_id, witness_hash, local_id as i64
+            ],
+        )
+        .context("recording Hub receipt local acceptance")?;
+        tx.commit().context("committing Hub receipt local acceptance")?;
+        Ok(local_id)
+    }
+
+    /// Receipt ids that are durably local but whose Hub ACK is not yet recorded.
+    /// Includes the lost-ACK-response case; Hub tombstones make the retry safe.
+    pub fn pending_hub_receipt_acks(&self, hub_connection_id: Uuid) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_hub_receipt_schema(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT notice_id FROM hub_receipt_custody
+              WHERE hub_connection_id = ?1
+                AND member_notice_id IS NOT NULL
+                AND hub_acked_at IS NULL
+              ORDER BY queued_at ASC",
+        )?;
+        let rows = stmt.query_map(params![hub_connection_id.to_string()], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
+    pub fn mark_hub_receipt_acked(
+        &self,
+        hub_connection_id: Uuid,
+        notice_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_hub_receipt_schema(&conn)?;
+        let changed = conn.execute(
+            "UPDATE hub_receipt_custody SET hub_acked_at = ?3
+              WHERE hub_connection_id = ?1 AND notice_id = ?2
+                AND member_notice_id IS NOT NULL",
+            params![hub_connection_id.to_string(), notice_id, Utc::now().to_rfc3339()],
+        )?;
+        anyhow::ensure!(changed == 1, "cannot mark Hub receipt {notice_id} ACKed before local acceptance");
+        Ok(())
+    }
+
+    pub fn hub_receipt_custody(
+        &self,
+        hub_connection_id: Uuid,
+        notice_id: &str,
+    ) -> Result<Option<HubReceiptCustody>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_hub_receipt_schema(&conn)?;
+        let row = conn.query_row(
+            "SELECT child_lct, to_plugin, witness_hash, member_notice_id, hub_acked_at
+               FROM hub_receipt_custody
+              WHERE hub_connection_id = ?1 AND notice_id = ?2",
+            params![hub_connection_id.to_string(), notice_id],
+            |r| Ok((
+                r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<i64>>(3)?, r.get::<_, Option<String>>(4)?,
+            )),
+        ).optional()?;
+        row.map(|r| -> Result<HubReceiptCustody> {
+            Ok(HubReceiptCustody {
+                hub_connection_id, notice_id: notice_id.to_string(), child_lct: r.0, to_plugin: r.1,
+                witness_hash: r.2, member_notice_id: r.3.map(|n| n as u64),
+                hub_acked_at: r.4.map(|s| DateTime::parse_from_rfc3339(&s)
+                    .map(|t| t.with_timezone(&Utc))).transpose()
+                    .context("parsing Hub receipt ack time")?,
+            })
+        }).transpose()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
