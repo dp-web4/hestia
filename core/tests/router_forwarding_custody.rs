@@ -243,36 +243,44 @@ fn duplicate_ingress_receipts_share_one_packet_completion() {
 
 
 #[test]
-fn refused_ingress_receipt_can_ack_without_completing_the_packet() {
+fn refused_ingress_cannot_poison_packet_id_namespace() {
     let (_dir, inbox) = store();
     let ingress = Uuid::new_v4();
     let packet = Uuid::new_v4();
     let bad_id = notice_id('1');
     let good_id = notice_id('2');
-    let p = packet_json(packet, "lct:web4:mb32:dest");
 
-    inbox.stage_router_packet(
-        ingress, &bad_id, packet, "bad-neighbor-notice", &p, "sha256-content:p",
-    ).unwrap();
-    inbox.record_router_stage_witness(
-        ingress, &bad_id, packet, "bad-stage",
-    ).unwrap();
-    inbox.record_router_ingress_refusal(
-        ingress, &bad_id, "refusal-witness",
+    // An unconfigured sender claims a legitimate-looking packet id with bytes
+    // that differ from what the real neighbor will later send.
+    inbox.record_router_ingress_rejection(
+        ingress,
+        &bad_id,
+        "bad-neighbor-notice",
+        Some(packet),
+        "refusal-witness",
     ).unwrap();
 
     assert_eq!(
-        inbox.pending_router_ingress_acks(ingress).unwrap(),
+        inbox.pending_router_rejection_acks(ingress).unwrap(),
         vec![bad_id.clone()]
     );
-    let state = inbox.router_packet_state(packet).unwrap().unwrap();
-    assert!(state.completion_witness_hash.is_none(),
-        "per-receipt refusal must not poison the packet globally");
-    inbox.mark_router_ingress_acked(ingress, &bad_id).unwrap();
+    assert!(
+        inbox.router_packet_state(packet).unwrap().is_none(),
+        "refused ingress must never claim packet_id globally"
+    );
+    inbox.mark_router_rejection_acked(ingress, &bad_id).unwrap();
+    assert!(inbox.pending_router_rejection_acks(ingress).unwrap().is_empty());
 
-    // A later legitimate copy of the SAME packet still needs real processing.
+    // The configured neighbor may now present the SAME packet id with its real
+    // bytes; this must stage normally instead of colliding with the rejection.
+    let good = packet_json(packet, "lct:web4:mb32:legitimate-destination");
     inbox.stage_router_packet(
-        ingress, &good_id, packet, "configured-neighbor-notice", &p, "sha256-content:p",
+        ingress,
+        &good_id,
+        packet,
+        "configured-neighbor-notice",
+        &good,
+        "sha256-content:real",
     ).unwrap();
     inbox.record_router_stage_witness(
         ingress, &good_id, packet, "good-stage",
@@ -281,11 +289,11 @@ fn refused_ingress_receipt_can_ack_without_completing_the_packet() {
 
     inbox.record_router_local_decision(
         packet,
-        r#"{"action":"local","child_lct":"lct:web4:mb32:child"}"#,
-        Some("lct:web4:mb32:child"),
+        r#"{"action":"terminal","reason":"test"}"#,
+        None,
     ).unwrap();
     inbox.complete_router_packet(
-        packet, "delivered-local", "completion",
+        packet, "unreachable-terminal", "completion",
     ).unwrap();
 
     assert_eq!(
