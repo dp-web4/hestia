@@ -353,15 +353,19 @@ Existing refusal witnesses are reused rather than multiplied:
 
 `hestia hub receiver-parity` reads these rows through an event-type-indexed chain query, not a
 global tail window. Its classifications are intentionally narrow:
-- `route_selection_match`: legacy chose egress and F3 would choose forward;
+- `both_forward_next_hop_unverifiable`: both chose forwarding, but legacy enqueue has no
+  canonical next-hop LCT evidence yet (`dest_peer_lct` is unwired and the historical drain may
+  prefix-resolve the peer name later); this is **not** route parity;
 - `missing_alias`;
 - `shadow_unavailable`;
 - `route_divergence`;
 - `shared_transport_refusal`;
 - `legacy_queue_refusal`.
 
-A route-selection match is **not** a delivery-parity claim. D2 still has to measure downstream
-durable acceptance, replies/failures, carrier identity and retry behavior before cutover.
+Even `both_forward_next_hop_unverifiable` is **not** a route-selection match: the old path
+has not yet proved which canonical router actually carried the row. D2 still has to measure
+that next-hop identity, downstream durable acceptance, replies/failures, carrier identity and
+retry behavior before cutover. A parity report must never turn missing evidence into equality.
 
 
 ## 5. Roles: pairing external and local agents, citizen by default
