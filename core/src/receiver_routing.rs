@@ -495,7 +495,6 @@ pub enum RouteDecision {
     Local {
         plugin_id: String,
         child_lct: String,
-        binding_id: Uuid,
     },
     /// The destination remains the original addressed LCT. `next_hop_lct` is
     /// transport only, exactly like a gateway/MAC next hop does not replace an
@@ -542,18 +541,14 @@ pub fn decide_route(
 
     match registry.resolve_child_of(router_lct, destination_lct)? {
         LocalChildResolution::Local(m) => {
-            let child_lct = m.lct.lct_id();
-            if let Some(binding) = table.local_binding(&child_lct) {
-                return Ok(RouteDecision::Local {
-                    plugin_id: m.plugin_id.to_string(),
-                    child_lct,
-                    binding_id: binding.binding_id,
-                });
-            }
-            return Ok(RouteDecision::LocalUnavailable {
+            // Parent binding is the local-link fact for router transit. A
+            // LocalMailboxBinding is a child-specific HUB INGRESS interface used
+            // by Slice B; requiring it here would make a locally hosted member
+            // unreachable merely because it receives routed traffic through the
+            // machine router rather than through its own Hub mailbox.
+            return Ok(RouteDecision::Local {
                 plugin_id: m.plugin_id.to_string(),
-                child_lct,
-                reason: "local-child-has-no-mailbox-binding".into(),
+                child_lct: m.lct.lct_id(),
             });
         }
         LocalChildResolution::KnownButNotChild(_) | LocalChildResolution::Unknown => {}
@@ -602,20 +597,11 @@ mod tests {
     }
 
     #[test]
-    fn exact_local_route_beats_specific_and_default() {
+    fn parent_bound_child_is_local_without_a_direct_hub_mailbox() {
         let (_dir, _vault, reg, parent, child) = registry_world();
         let mut t = ReceiverRoutingTable::default();
-        let conn = Uuid::new_v4();
-        t.bind_local(LocalMailboxBinding {
-            binding_id: conn,
-            child_lct: child.clone(),
-            hub_url: "https://hub.test".into(),
-            hub_lct_id: Uuid::new_v4(),
-            rest_endpoint: "https://hub.test/v1".into(),
-            hub_member_lct: Uuid::new_v4(),
-            member_key_source: MemberKeySource::ChannelKeyFile { path: "/tmp/test-key".into() },
-            reason: "test".into(), set_by: "test".into(), set_at: 1,
-        }).unwrap();
+        // Even an explicit remote/default route may not steal a child whose
+        // canonical LCT says this router is its parent.
         t.set_route(StaticRoute {
             destination_lct: child.clone(), next_hop_lct: "wrong-hop".into(),
             metric: 0, reason: "test".into(),
@@ -624,10 +610,11 @@ mod tests {
             next_hop_lct: "default-hop".into(), reason: "test".into(),
             set_by: "test".into(), set_at: 1,
         }));
+        assert!(t.local_mailboxes.is_empty());
         assert_eq!(
             decide_route(&reg, &t, &parent, &child, &RouteTrace::fresh(&t)).unwrap(),
             RouteDecision::Local {
-                plugin_id: "being".into(), child_lct: child, binding_id: conn,
+                plugin_id: "being".into(), child_lct: child,
             }
         );
     }
@@ -660,23 +647,6 @@ mod tests {
             RouteDecision::Forward {
                 destination_lct: "lct:web4:mb32:unknown".into(),
                 next_hop_lct: "upstream".into(), via: "default",
-            }
-        );
-    }
-
-    #[test]
-    fn local_without_transport_does_not_leak_to_default() {
-        let (_dir, _vault, reg, parent, child) = registry_world();
-        let mut t = ReceiverRoutingTable::default();
-        t.set_default(Some(DefaultRoute {
-            next_hop_lct: "upstream".into(), reason: "test".into(),
-            set_by: "test".into(), set_at: 1,
-        }));
-        assert_eq!(
-            decide_route(&reg, &t, &parent, &child, &RouteTrace::fresh(&t)).unwrap(),
-            RouteDecision::LocalUnavailable {
-                plugin_id: "being".into(), child_lct: child,
-                reason: "local-child-has-no-mailbox-binding".into(),
             }
         );
     }
