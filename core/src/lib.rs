@@ -28,6 +28,7 @@ pub mod policy;
 pub mod profile;
 pub mod rdf;
 pub mod reputation;
+pub mod receiver_routing;
 pub mod role_registry;
 pub mod server;
 pub mod sovereign;
