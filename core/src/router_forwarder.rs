@@ -1710,6 +1710,91 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn constrained_origin_refuses_wrong_actual_first_hop_carrier_before_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let router = "lct:web4:mb32:router";
+        let mut registry = load_members(&vault);
+        let origin = crate::member_registry::ensure_member(
+            &mut vault,
+            &mut registry,
+            "origin-being",
+            false,
+            router,
+            "anchor",
+        ).unwrap();
+
+        let destination = "lct:web4:mb32:remote-child";
+        let next_hop = "lct:web4:mb32:remote-router";
+        let interface_id = Uuid::new_v4();
+        let actual_carrier = Uuid::new_v4();
+        let mut routes = ReceiverRoutingTable::default();
+        routes.bind_router_ingress(crate::receiver_routing::RouterIngressBinding {
+            binding_id: interface_id,
+            router_lct: router.to_string(),
+            hub_url: "https://hub.invalid".to_string(),
+            hub_lct_id: Uuid::new_v4(),
+            rest_endpoint: "https://hub.invalid/v1".to_string(),
+            hub_member_lct: actual_carrier,
+            member_key_source: crate::hub::MemberKeySource::ChannelKeyFile {
+                path: "/tmp/not-used-before-carrier-check".to_string(),
+            },
+            reason: "test interface".to_string(),
+            set_by: "test".to_string(),
+            set_at: 1,
+        }).unwrap();
+        routes.bind_neighbor(crate::receiver_routing::RouterNeighbor {
+            link_id: Uuid::new_v4(),
+            next_hop_lct: next_hop.to_string(),
+            interface_binding_id: interface_id,
+            next_hop_hub_member_lct: Uuid::new_v4(),
+            reason: "test neighbor".to_string(),
+            set_by: "test".to_string(),
+            set_at: 1,
+        }).unwrap();
+        routes.set_route(crate::receiver_routing::StaticRoute {
+            destination_lct: destination.to_string(),
+            next_hop_lct: next_hop.to_string(),
+            metric: 1,
+            reason: "test route".to_string(),
+        });
+        routes.save(&mut vault).unwrap();
+
+        let inbox = SqliteInboxStore::open(dir.path().join("inbox.db"), [0x63; 32]).unwrap();
+        let chain = SqliteChainStore::open(dir.path().join("witness.db"), [0x63; 32]).unwrap();
+        let expected_other_carrier = Uuid::new_v4().to_string();
+
+        let err = originate_once_constrained(
+            &vault,
+            router,
+            &origin,
+            destination,
+            "coordination",
+            "shared-context/forum/cutover-test.md",
+            &format!("sha256-pointer:{}", "c".repeat(64)),
+            "legacy-op-carrier-bound",
+            &inbox,
+            &chain,
+            Some(&expected_other_carrier),
+        ).await.unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("does not match transport-bound carrier"), "{msg}");
+        assert!(msg.contains(&actual_carrier.to_string()), "{msg}");
+        assert!(msg.contains(&expected_other_carrier), "{msg}");
+        assert_eq!(
+            inbox.router_packet_state(
+                inbox.router_origin_operation(&origin, "legacy-op-carrier-bound")
+                    .unwrap()
+                    .unwrap()
+                    .packet_id
+            ).unwrap().unwrap().decision_json,
+            None,
+            "carrier mismatch must happen before any route decision/network send is committed"
+        );
+    }
+
     #[test]
     fn final_child_edge_reapplies_member_inbox_kind_and_pointer_contract() {
         assert!(routable_member_notice_kind("coordination"));
