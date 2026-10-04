@@ -369,7 +369,14 @@ impl SqliteChainStore {
                 )
                 .optional()?;
             if let Some(entry) = existing {
-                return Ok((entry?, false));
+                let entry = entry?;
+                anyhow::ensure!(
+                    entry.event_type == event_type
+                        && entry.event_data == event_data
+                        && entry.signer_lct == signer_lct,
+                    "witness event_key '{key}' was replayed with a different fact"
+                );
+                return Ok((entry, false));
             }
         }
 
