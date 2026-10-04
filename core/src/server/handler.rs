@@ -4822,6 +4822,150 @@ mod member_notify_operation_key_tests {
     }
 }
 
+#[derive(Clone, Debug)]
+struct MemberNotifyF3Plan {
+    origin_lct: String,
+    router_lct: String,
+    destination_lct: String,
+    authority_source: String,
+    authority_reason: String,
+    first_hop_hub_member: Option<String>,
+}
+
+/// Resolve ONLY the delivery-plane choice for member_notify after the common
+/// pre-route gates have passed. Bare plugin ids remain local legacy delivery.
+/// Canonical mb32 destinations are intrinsically F3; historical peer/member
+/// spellings become F3 only when their exact alias was explicitly cut over.
+///
+/// This is intentionally pure/read-only. No packet is minted here.
+fn member_notify_f3_plan(
+    s: &crate::server::state::ServerState,
+    sender_plugin: &str,
+    to: &str,
+) -> anyhow::Result<Option<MemberNotifyF3Plan>> {
+    let canonical_destination = to.starts_with("lct:web4:mb32:");
+    let legacy_routed = to.contains('/');
+    if !canonical_destination && !legacy_routed {
+        return Ok(None);
+    }
+
+    let sender = s
+        .member_registry
+        .resolve_reference(sender_plugin)?
+        .ok_or_else(|| anyhow::anyhow!(
+            "sender '{sender_plugin}' has no canonical member LCT"
+        ))?;
+    let origin_lct = sender.lct.lct_id();
+    let parents: Vec<String> = sender
+        .lct
+        .mrh
+        .bound
+        .iter()
+        .filter(|edge| edge.edge_type == "parent")
+        .map(|edge| edge.lct_id.clone())
+        .collect();
+    let router_lct = match parents.as_slice() {
+        [parent] => parent.clone(),
+        [] => anyhow::bail!(
+            "canonical sender {origin_lct} has no parent/router binding"
+        ),
+        _ => anyhow::bail!(
+            "canonical sender {origin_lct} has {} parent/router bindings; expected exactly one",
+            parents.len()
+        ),
+    };
+
+    let table = crate::receiver_routing::ReceiverRoutingTable::load(&s.vault)
+        .map_err(|e| anyhow::anyhow!(
+            "receiver routing table is unavailable; delivery authority cannot be proven: {e}"
+        ))?;
+
+    let (destination_lct, authority_source, authority_reason) =
+        if canonical_destination {
+            (
+                to.to_string(),
+                "canonical_lct".to_string(),
+                "canonical Web4 destination selects F3 routing".to_string(),
+            )
+        } else {
+            let Some(alias) = table.legacy_alias(to) else {
+                return Ok(None);
+            };
+            if alias.delivery_authority
+                != crate::receiver_routing::LegacyDeliveryAuthority::F3
+            {
+                return Ok(None);
+            }
+            (
+                alias.destination_lct.clone(),
+                "legacy_alias_cutover".to_string(),
+                alias.authority_reason.clone().ok_or_else(|| anyhow::anyhow!(
+                    "legacy alias '{to}' is marked f3 without a migration reason"
+                ))?,
+            )
+        };
+
+    let first_hop_hub_member = match crate::receiver_routing::decide_route(
+        &s.member_registry,
+        &table,
+        &router_lct,
+        &destination_lct,
+        &crate::receiver_routing::RouteTrace::fresh(&table),
+    )? {
+        crate::receiver_routing::RouteDecision::Forward { next_hop_lct, .. } => {
+            let neighbor = table.neighbor(&next_hop_lct).ok_or_else(|| anyhow::anyhow!(
+                "F3 route to {destination_lct} selects next hop {next_hop_lct} but no neighbor is bound"
+            ))?;
+            let interface = table
+                .router_ingress_by_id(neighbor.interface_binding_id)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "F3 neighbor {next_hop_lct} references missing interface {}",
+                    neighbor.interface_binding_id
+                ))?;
+            Some(interface.hub_member_lct.to_string())
+        }
+        crate::receiver_routing::RouteDecision::Local { .. } => None,
+        // Let D1 construct/witness the actual unreachable result. There is no
+        // first-hop carrier to compare in these cases.
+        crate::receiver_routing::RouteDecision::LocalUnavailable { .. }
+        | crate::receiver_routing::RouteDecision::Unreachable { .. } => None,
+    };
+
+    Ok(Some(MemberNotifyF3Plan {
+        origin_lct,
+        router_lct,
+        destination_lct,
+        authority_source,
+        authority_reason,
+        first_hop_hub_member,
+    }))
+}
+
+fn member_notify_f3_plan_from_witness(
+    event: &Value,
+) -> anyhow::Result<Option<MemberNotifyF3Plan>> {
+    if event.get("delivery_authority").and_then(Value::as_str) != Some("f3") {
+        return Ok(None);
+    }
+    let required = |key: &str| -> anyhow::Result<String> {
+        event.get(key).and_then(Value::as_str).map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!(
+                "recovered F3 member_notice is missing '{key}'"
+            ))
+    };
+    Ok(Some(MemberNotifyF3Plan {
+        origin_lct: required("f3_origin_lct")?,
+        router_lct: required("f3_router_lct")?,
+        destination_lct: required("f3_destination_lct")?,
+        authority_source: required("f3_authority_source")?,
+        authority_reason: required("f3_authority_reason")?,
+        first_hop_hub_member: event
+            .get("f3_first_hop_hub_member")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }))
+}
+
 async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     let to_plugin = require_string(args, "to_plugin_id")?;
     let kind = require_string(args, "kind")?;
@@ -5201,13 +5345,48 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
         }
     }
     }
-    // TRANSPORT BINDING (#1030), resolved for routed sends only, and BEFORE the limiter
-    // records or anything is witnessed as sent. A member bound `direct_required` must sign
-    // its mesh acts as itself and holds no carrier yet, so there is no identity this host may
-    // put on the envelope: the send is refused in the sender's own turn, where it can be
-    // acted on, instead of being queued for a drain that would sign it with somebody else's
-    // key. That silent fallback is the defect this binding exists to end (falsifier 2).
-    let routed = to_plugin.contains('/');
+    // D2d delivery-plane selection happens only AFTER the common law/flood/reply
+    // gates above. A recovered operation uses the FIRST witnessed authority
+    // decision; changing an alias after a crash cannot reroute the retry.
+    let f3_plan = if let Some(existing) = &recovered_operation_witness {
+        match member_notify_f3_plan_from_witness(&existing.event_data) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_f3_recovery_invalid",
+                    &format!("cannot recover the first F3 delivery decision: {e}"),
+                    Some(json!({
+                        "operation_id": operation_id,
+                        "witnessEntryHash": existing.hash,
+                    })),
+                ));
+            }
+        }
+    } else {
+        match member_notify_f3_plan(&s, &sender.plugin_id, &to_plugin) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_delivery_authority_unavailable",
+                    &format!("cannot prove routed delivery authority: {e}"),
+                    Some(json!({"to_plugin_id": to_plugin})),
+                ));
+            }
+        }
+    };
+
+    if f3_plan.is_some() && operation_id.is_none() {
+        return Ok(hestia_error_envelope(
+            "hestia.member_notify_f3_operation_id_required",
+            "F3-authoritative member_notify requires caller-stable operation_id.              The same id crosses the legacy compatibility adapter into canonical              route origination so a lost response cannot mint a second packet.",
+            Some(json!({"to_plugin_id": to_plugin, "delivery_authority": "f3"})),
+        ));
+    }
+
+    // TRANSPORT BINDING (#1030), resolved for every non-local send and BEFORE
+    // anything is witnessed as sent. F3 does not erase this authorization layer:
+    // an explicit carrier promise must still match the first-hop router interface.
+    let routed = to_plugin.contains('/') || to_plugin.starts_with("lct:web4:mb32:");
     let recovered_transport_record = recovered_operation_witness
         .as_ref()
         .and_then(|entry| entry.event_data.get("transport").cloned());
