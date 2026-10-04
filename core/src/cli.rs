@@ -572,14 +572,25 @@ enum HubCmd {
         target: String,
     },
 
-    /// Bind one canonical local child to the Hub connection/key that receives
-    /// its mailbox. This is a routing-table entry, not a grant of authority.
+    /// Bind one canonical local child to the Hub mailbox identity/key that
+    /// receives for it. The Hub endpoint comes from --target, but the child may
+    /// have its OWN Hub member UUID and key on that same Hub.
     ReceiverBind {
         /// Local member reference: plugin id, canonical LCT, or verified legacy alias.
         child: String,
-        /// Hub URL or connection UUID whose our_lct_id/key belong to this child.
+        /// Existing Hub connection used only as the endpoint/Hub identity template.
+        /// Several receiver children may share this same Hub URL.
         #[arg(long, default_value = "")]
         target: String,
+        /// Hub member UUID whose mailbox belongs to this child. Omit to use the
+        /// template connection's own member identity.
+        #[arg(long)]
+        member_lct: Option<uuid::Uuid>,
+        /// Raw 32-byte Ed25519 channel-key seed file for --member-lct. Required
+        /// when the child uses a different Hub member than the template connection.
+        /// The encrypted routing table stores this PATH/HANDLE, never key bytes.
+        #[arg(long)]
+        channel_key: Option<String>,
         /// Router/parent LCT to verify against (default: persisted local sovereign,
         /// until the machine-entity migration gives the host its distinct LCT).
         #[arg(long)]
@@ -611,6 +622,9 @@ enum HubCmd {
         next_hop: Option<String>,
         #[arg(long, conflicts_with = "next_hop")]
         clear: bool,
+        /// Why this default gateway is the right upstream route.
+        #[arg(long)]
+        reason: String,
     },
 
     /// Show the machine receiver routing table.
@@ -977,15 +991,20 @@ pub fn run() -> AnyResult<()> {
             HubCmd::RecvSecrets { pair_id, target } => {
                 cmd_hub_recv_secrets(&home, pair_id, &target)
             }
-            HubCmd::ReceiverBind { child, target, parent, reason } => {
-                cmd_receiver_bind(&home, &child, &target, parent.as_deref(), &reason)
+            HubCmd::ReceiverBind {
+                child, target, member_lct, channel_key, parent, reason
+            } => {
+                cmd_receiver_bind(
+                    &home, &child, &target, member_lct, channel_key,
+                    parent.as_deref(), &reason,
+                )
             }
             HubCmd::ReceiverUnbind { child } => cmd_receiver_unbind(&home, &child),
             HubCmd::ReceiverRoute { destination, next_hop, metric, reason } => {
                 cmd_receiver_route(&home, &destination, &next_hop, metric, &reason)
             }
-            HubCmd::ReceiverDefault { next_hop, clear } => {
-                cmd_receiver_default(&home, next_hop.as_deref(), clear)
+            HubCmd::ReceiverDefault { next_hop, clear, reason } => {
+                cmd_receiver_default(&home, next_hop.as_deref(), clear, &reason)
             }
             HubCmd::ReceiverRoutes => cmd_receiver_routes(&home),
             HubCmd::ReceiverDrain { parent } => cmd_receiver_drain(&home, parent.as_deref()),
