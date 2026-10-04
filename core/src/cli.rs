@@ -3507,8 +3507,8 @@ fn cmd_receiver_send(
         }
     };
     anyhow::ensure!(
-        destination_lct.starts_with("lct:web4:"),
-        "destination must be a canonical Web4 LCT, not a peer/member legacy address"
+        destination_lct.starts_with("lct:web4:mb32:"),
+        "destination must be a canonical lct:web4:mb32:* identity, not a legacy alias"
     );
 
     let store_key = hestia::storage::storage_key(home, &passphrase)
