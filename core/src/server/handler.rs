@@ -4829,7 +4829,6 @@ struct MemberNotifyF3Plan {
     destination_lct: String,
     authority_source: String,
     authority_reason: String,
-    first_hop_hub_member: Option<String>,
 }
 
 /// Resolve ONLY the delivery-plane choice for member_notify after the common
@@ -4875,7 +4874,11 @@ fn member_notify_f3_plan(
         ),
     };
 
-    let table = crate::receiver_routing::ReceiverRoutingTable::load(&s.vault)
+    let fresh_vault = s.vault.reopen()
+        .map_err(|e| anyhow::anyhow!(
+            "receiver routing vault snapshot is unavailable; delivery authority cannot be proven: {e}"
+        ))?;
+    let table = crate::receiver_routing::ReceiverRoutingTable::load(&fresh_vault)
         .map_err(|e| anyhow::anyhow!(
             "receiver routing table is unavailable; delivery authority cannot be proven: {e}"
         ))?;
@@ -4905,39 +4908,12 @@ fn member_notify_f3_plan(
             )
         };
 
-    let first_hop_hub_member = match crate::receiver_routing::decide_route(
-        &s.member_registry,
-        &table,
-        &router_lct,
-        &destination_lct,
-        &crate::receiver_routing::RouteTrace::fresh(&table),
-    )? {
-        crate::receiver_routing::RouteDecision::Forward { next_hop_lct, .. } => {
-            let neighbor = table.neighbor(&next_hop_lct).ok_or_else(|| anyhow::anyhow!(
-                "F3 route to {destination_lct} selects next hop {next_hop_lct} but no neighbor is bound"
-            ))?;
-            let interface = table
-                .router_ingress_by_id(neighbor.interface_binding_id)
-                .ok_or_else(|| anyhow::anyhow!(
-                    "F3 neighbor {next_hop_lct} references missing interface {}",
-                    neighbor.interface_binding_id
-                ))?;
-            Some(interface.hub_member_lct.to_string())
-        }
-        crate::receiver_routing::RouteDecision::Local { .. } => None,
-        // Let D1 construct/witness the actual unreachable result. There is no
-        // first-hop carrier to compare in these cases.
-        crate::receiver_routing::RouteDecision::LocalUnavailable { .. }
-        | crate::receiver_routing::RouteDecision::Unreachable { .. } => None,
-    };
-
     Ok(Some(MemberNotifyF3Plan {
         origin_lct,
         router_lct,
         destination_lct,
         authority_source,
         authority_reason,
-        first_hop_hub_member,
     }))
 }
 
@@ -4959,10 +4935,6 @@ fn member_notify_f3_plan_from_witness(
         destination_lct: required("f3_destination_lct")?,
         authority_source: required("f3_authority_source")?,
         authority_reason: required("f3_authority_reason")?,
-        first_hop_hub_member: event
-            .get("f3_first_hop_hub_member")
-            .and_then(Value::as_str)
-            .map(str::to_string),
     }))
 }
 
