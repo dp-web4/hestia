@@ -4780,6 +4780,26 @@ const MAX_POINTER_URI_BYTES: usize = 512;
 const MEMBER_NOTIFY_MAX_PER_WINDOW: u32 = 30;
 const MEMBER_NOTIFY_WINDOW_MS: u64 = 600_000;
 
+/// Collision-free witness-key encoding for one member-notify operation.
+///
+/// Member ids forbid '/' but not ':', and operation ids deliberately allow
+/// punctuation. Plain `sender:operation` concatenation therefore aliases
+/// (sender="a:b", op="c") with (sender="a", op="b:c"). Length-prefix every
+/// variable component; the key is opaque and is never parsed back.
+fn member_notify_operation_event_key(
+    namespace: &str,
+    sender_plugin: &str,
+    operation_id: &str,
+) -> String {
+    format!(
+        "member-notify:{namespace}:{}:{}:{}:{}",
+        sender_plugin.len(),
+        sender_plugin,
+        operation_id.len(),
+        operation_id
+    )
+}
+
 async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     let to_plugin = require_string(args, "to_plugin_id")?;
     let kind = require_string(args, "kind")?;
@@ -4963,9 +4983,8 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             } else if let Some(record_json) = op.shadow_record_json {
                 match serde_json::from_str::<Value>(&record_json) {
                     Ok(record) => {
-                        let key = format!(
-                            "member-notify-shadow:{}:{}",
-                            sender.plugin_id, op_id
+                        let key = member_notify_operation_event_key(
+                            "shadow", &sender.plugin_id, op_id
                         );
                         match s.chain_store.append_once(
                             &key,
@@ -5011,7 +5030,7 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     // used by the original act; retry resumes its delivery consequence instead
     // of rebuilding the act under today's mutable state.
     let operation_witness_key = operation_id.as_deref().map(|op_id| {
-        format!("member-notify:{}:{}", sender.plugin_id, op_id)
+        member_notify_operation_event_key("act", &sender.plugin_id, op_id)
     });
     let recovered_operation_witness = match operation_witness_key.as_deref() {
         Some(key) => s
@@ -5606,9 +5625,8 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
                     }
 
                     let refusal = if let Some(op_id) = &operation_id {
-                        let key = format!(
-                            "member-notify-refusal:{}:{}:egress-queue-full",
-                            sender.plugin_id, op_id
+                        let key = member_notify_operation_event_key(
+                            "refusal-egress-queue-full", &sender.plugin_id, op_id
                         );
                         if let Some(existing) = s.chain_store.event_by_key(&key)? {
                             existing
@@ -5690,9 +5708,8 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             } else if let Some(record_json) = &op.shadow_record_json {
                 match serde_json::from_str::<Value>(record_json) {
                     Ok(record) => {
-                        let key = format!(
-                            "member-notify-shadow:{}:{}",
-                            sender.plugin_id, op_id
+                        let key = member_notify_operation_event_key(
+                            "shadow", &sender.plugin_id, op_id
                         );
                         match s.chain_store.append_once(
                             &key,
