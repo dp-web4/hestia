@@ -14,6 +14,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::hub::MemberKeySource;
 use crate::member_registry::{LocalChildResolution, MemberRegistry};
 
 const ROUTES_NAMESPACE: &str = "presence";
@@ -21,13 +22,22 @@ const ROUTES_DOC: &str = "receiver_routes";
 const ROUTES_LEGACY_FILE: &str = "receiver-routes.json";
 const DEFAULT_HOP_LIMIT: u8 = 16;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct LocalMailboxBinding {
+    /// Stable local interface id. Hub receipt custody keys to this id rather than
+    /// to the legacy HubStore, so N child identities may share one Hub endpoint.
+    pub binding_id: Uuid,
     /// Canonical local member LCT (mb32), never a plugin id or legacy label.
     pub child_lct: String,
-    /// Hestia HubStore connection whose `our_lct_id` + key source are the
-    /// transport credential for this child.
-    pub hub_connection_id: Uuid,
+    /// Hub transport identity for this child. The Hub addresses/authenticates the
+    /// UUID member independently of Hestia's local canonical mb32 presence.
+    pub hub_url: String,
+    pub hub_lct_id: Uuid,
+    pub rest_endpoint: String,
+    pub hub_member_lct: Uuid,
+    /// Credential HANDLE only. ChannelKeyFile stores a path, not key bytes; the
+    /// key is resolved at drain time and re-verified against the Hub pin.
+    pub member_key_source: MemberKeySource,
     pub reason: String,
     #[serde(default)]
     pub set_by: String,
@@ -47,13 +57,23 @@ pub struct StaticRoute {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DefaultRoute {
+    pub next_hop_lct: String,
+    pub reason: String,
+    #[serde(default)]
+    pub set_by: String,
+    #[serde(default)]
+    pub set_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ReceiverRoutingTable {
     #[serde(default)]
     pub local_mailboxes: Vec<LocalMailboxBinding>,
     #[serde(default)]
     pub routes: Vec<StaticRoute>,
     #[serde(default)]
-    pub default_next_hop_lct: Option<String>,
+    pub default_route: Option<DefaultRoute>,
     #[serde(default = "default_hop_limit")]
     pub hop_limit: u8,
 }
@@ -67,7 +87,7 @@ impl Default for ReceiverRoutingTable {
         Self {
             local_mailboxes: Vec::new(),
             routes: Vec::new(),
-            default_next_hop_lct: None,
+            default_route: None,
             hop_limit: DEFAULT_HOP_LIMIT,
         }
     }
@@ -82,10 +102,26 @@ impl ReceiverRoutingTable {
         crate::vault::save_doc(vault, ROUTES_NAMESPACE, ROUTES_DOC, ROUTES_LEGACY_FILE, self)
     }
 
-    pub fn bind_local(&mut self, binding: LocalMailboxBinding) {
-        self.local_mailboxes.retain(|b| b.child_lct != binding.child_lct);
+    /// Add one directly-connected local mailbox interface.
+    ///
+    /// A child binding is immutable in place: changing its Hub member/key while
+    /// receipt custody is pending would strand ACK state under the old identity.
+    /// Operators unbind (only when no custody remains) and then bind the new
+    /// interface explicitly.
+    pub fn bind_local(&mut self, binding: LocalMailboxBinding) -> Result<()> {
+        anyhow::ensure!(
+            !self.local_mailboxes.iter().any(|b| b.child_lct == binding.child_lct),
+            "local mailbox route for {} already exists; unbind it before changing transport identity",
+            binding.child_lct
+        );
+        anyhow::ensure!(
+            !self.local_mailboxes.iter().any(|b| b.binding_id == binding.binding_id),
+            "receiver binding id {} is already in use",
+            binding.binding_id
+        );
         self.local_mailboxes.push(binding);
         self.local_mailboxes.sort_by(|a, b| a.child_lct.cmp(&b.child_lct));
+        Ok(())
     }
 
     pub fn unbind_local(&mut self, child_lct: &str) -> bool {
@@ -107,8 +143,8 @@ impl ReceiverRoutingTable {
         });
     }
 
-    pub fn set_default(&mut self, next_hop_lct: Option<String>) {
-        self.default_next_hop_lct = next_hop_lct.filter(|s| !s.trim().is_empty());
+    pub fn set_default(&mut self, route: Option<DefaultRoute>) {
+        self.default_route = route.filter(|r| !r.next_hop_lct.trim().is_empty());
     }
 
     pub fn local_binding(&self, child_lct: &str) -> Option<&LocalMailboxBinding> {
@@ -167,7 +203,7 @@ pub enum RouteDecision {
     Local {
         plugin_id: String,
         child_lct: String,
-        hub_connection_id: Uuid,
+        binding_id: Uuid,
     },
     /// The destination remains the original addressed LCT. `next_hop_lct` is
     /// transport only, exactly like a gateway/MAC next hop does not replace an
@@ -219,7 +255,7 @@ pub fn decide_route(
                 return Ok(RouteDecision::Local {
                     plugin_id: m.plugin_id.to_string(),
                     child_lct,
-                    hub_connection_id: binding.hub_connection_id,
+                    binding_id: binding.binding_id,
                 });
             }
             return Ok(RouteDecision::LocalUnavailable {
@@ -234,7 +270,7 @@ pub fn decide_route(
     let candidate = if let Some(route) = table.best_static_route(destination_lct)? {
         Some((route.next_hop_lct.as_str(), "specific"))
     } else {
-        table.default_next_hop_lct.as_deref().map(|n| (n, "default"))
+        table.default_route.as_ref().map(|r| (r.next_hop_lct.as_str(), "default"))
     };
 
     let Some((next_hop, via)) = candidate else {
@@ -279,18 +315,27 @@ mod tests {
         let mut t = ReceiverRoutingTable::default();
         let conn = Uuid::new_v4();
         t.bind_local(LocalMailboxBinding {
-            child_lct: child.clone(), hub_connection_id: conn,
+            binding_id: conn,
+            child_lct: child.clone(),
+            hub_url: "https://hub.test".into(),
+            hub_lct_id: Uuid::new_v4(),
+            rest_endpoint: "https://hub.test/v1".into(),
+            hub_member_lct: Uuid::new_v4(),
+            member_key_source: MemberKeySource::ChannelKeyFile { path: "/tmp/test-key".into() },
             reason: "test".into(), set_by: "test".into(), set_at: 1,
-        });
+        }).unwrap();
         t.set_route(StaticRoute {
             destination_lct: child.clone(), next_hop_lct: "wrong-hop".into(),
             metric: 0, reason: "test".into(),
         });
-        t.set_default(Some("default-hop".into()));
+        t.set_default(Some(DefaultRoute {
+            next_hop_lct: "default-hop".into(), reason: "test".into(),
+            set_by: "test".into(), set_at: 1,
+        }));
         assert_eq!(
             decide_route(&reg, &t, &parent, &child, &RouteTrace::fresh(&t)).unwrap(),
             RouteDecision::Local {
-                plugin_id: "being".into(), child_lct: child, hub_connection_id: conn,
+                plugin_id: "being".into(), child_lct: child, binding_id: conn,
             }
         );
     }
@@ -307,7 +352,10 @@ mod tests {
             destination_lct: remote.clone(), next_hop_lct: "specific-hop".into(),
             metric: 5, reason: "known route".into(),
         });
-        t.set_default(Some("upstream".into()));
+        t.set_default(Some(DefaultRoute {
+            next_hop_lct: "upstream".into(), reason: "test".into(),
+            set_by: "test".into(), set_at: 1,
+        }));
         let trace = RouteTrace::fresh(&t);
         assert_eq!(
             decide_route(&reg, &t, &parent, &remote, &trace).unwrap(),
@@ -328,7 +376,10 @@ mod tests {
     fn local_without_transport_does_not_leak_to_default() {
         let (_dir, _vault, reg, parent, child) = registry_world();
         let mut t = ReceiverRoutingTable::default();
-        t.set_default(Some("upstream".into()));
+        t.set_default(Some(DefaultRoute {
+            next_hop_lct: "upstream".into(), reason: "test".into(),
+            set_by: "test".into(), set_at: 1,
+        }));
         assert_eq!(
             decide_route(&reg, &t, &parent, &child, &RouteTrace::fresh(&t)).unwrap(),
             RouteDecision::LocalUnavailable {
@@ -347,7 +398,10 @@ mod tests {
             RouteDecision::Unreachable { reason, .. } if reason == "no-route"
         ));
         let mut t = ReceiverRoutingTable::default();
-        t.set_default(Some("upstream".into()));
+        t.set_default(Some(DefaultRoute {
+            next_hop_lct: "upstream".into(), reason: "test".into(),
+            set_by: "test".into(), set_at: 1,
+        }));
         assert!(matches!(
             decide_route(
                 &reg, &t, &parent, "unknown",
