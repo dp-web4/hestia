@@ -967,6 +967,18 @@ PARITY_CASES = [
     ("warn-society-no-verdict-read", "Read", {"file_path": "{REPO}/README.md"}, "no-verdict", "warn"),
     ("warn-society-no-verdict-edit", "Edit", {"file_path": "{REPO}/core/src/server/state.rs",
                                               "old_string": "a", "new_string": "b"}, "no-verdict", "warn"),
+    # TIGHTENING: an unreadable patch on a write-class apply fails closed (hestia #1197, last
+    # comment; corpus cells digest-apply-missing-*). Measured 2026-10-04: every seat's current
+    # gate (governance-closure-opaque-writer) AND decide() (gate.self_access) deny, so these are
+    # MATCHING cells, not DECLARED_DIVERGENCES. kimi's 8 hostile-probe "divergences" came from
+    # comparing a missing-patch run against a baseline measured with the patch present. Pinned
+    # here so neither side can loosen it silently.
+    ("apply-missing-patch", "Bash",
+     {"command": "git -C {REPO} apply {REPO}/scratchpad/decide-parity-missing.patch"},
+     "allow", "enforce"),
+    ("apply-missing-patch-chained", "Bash",
+     {"command": "git -C {REPO} apply {REPO}/scratchpad/decide-parity-missing.patch"
+                 " && git -C {REPO} commit -m x"}, "allow", "enforce"),
 ]
 
 POLICIES = {
@@ -1187,6 +1199,12 @@ def run_parity(report: bool = False):
           [(s, c, next((r["old"], r["old_rule"], r["new"], r["new_rule"], r["old_text"][-200:])
                        for r in rows if (r["seat"], r["case"]) == (s, c))) for s, c in undeclared])
     check("parity-no-stale-declaration", not stale, stale)
+    # Agreement alone would let both arms loosen together; the tightening is a verdict, not a pair.
+    missing = [r for r in rows if r["case"].startswith("apply-missing-patch")]
+    check("tightening-missing-patch-apply-denied-both-arms",
+          missing and all(r["old"] == "deny" and r["new"] == "deny" for r in missing),
+          [(r["seat"], r["case"], r["old"], r["new"]) for r in missing
+           if (r["old"], r["new"]) != ("deny", "deny")])
     check("parity-decide-never-crashed", not any(r["new"] == "CRASH" for r in rows),
           [r for r in rows if r["new"] == "CRASH"][:2])
     # Finding 1: gemini's governor asked the daemon AS claude-code; decide() asks as gemini.
