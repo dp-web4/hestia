@@ -235,6 +235,15 @@ mailbox and do not mutate the first accepted packet.
 A crash at any step retries the same packet and the same persisted decision. A route-table
 change after the first attempt cannot silently redirect an in-flight packet.
 
+The transit plane is deliberately more general than a Hestia child inbox. Intermediate
+routers may carry application kinds they do not understand. **At the final Hestia child
+edge**, however, the receiver re-applies the member-notice write contract before enqueue:
+only the ordinary member-addressable kind families are admitted, and the pointer must remain
+a bounded single-line locator with no control characters. A packet that is valid Web4
+transport but invalid Hestia child mail is not inserted into the child inbox; it becomes a
+structured `unreachable` back to the origin. Daemon-only local kinds such as
+`disposition` cannot therefore be forged by a remote neighbor.
+
 Router→router hops use Web4's receipt-only `route_forward` channel operation. A next hop that
 has not opted into non-destructive fetch/ACK is not routable: using a consume-on-response
 mailbox would reintroduce the packet-loss boundary F3 exists to remove.
