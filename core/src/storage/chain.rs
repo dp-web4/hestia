@@ -243,10 +243,33 @@ impl SqliteChainStore {
                 event_type     TEXT NOT NULL,
                 event_data     TEXT NOT NULL,
                 signer_lct     TEXT NOT NULL,
-                timestamp      TEXT NOT NULL
+                timestamp      TEXT NOT NULL,
+                event_key      TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_chain_event_type ON chain_entries(event_type);
              CREATE INDEX IF NOT EXISTS idx_chain_timestamp  ON chain_entries(timestamp);",
+        )?;
+        // event_key arrived with F3 receipt routing. Existing witness DBs upgrade
+        // in place; NULL preserves every historical row. A partial unique index
+        // makes receipt retries reuse the same witnessed fact after a crash.
+        let has_event_key = {
+            let mut stmt = conn.prepare("PRAGMA table_info(chain_entries)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for row in rows {
+                if row? == "event_key" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_event_key {
+            conn.execute_batch("ALTER TABLE chain_entries ADD COLUMN event_key TEXT;")?;
+        }
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_chain_event_key
+                 ON chain_entries(event_key) WHERE event_key IS NOT NULL;",
         )?;
         let read_conn = Connection::open(&path).with_context(|| {
             format!(
@@ -314,8 +337,50 @@ impl SqliteChainStore {
         event_data: serde_json::Value,
         signer_lct: &str,
     ) -> Result<ChainEntry> {
+        self.append_inner(None, event_type, event_data, signer_lct)
+            .map(|(entry, _inserted)| entry)
+    }
+
+    /// Append one witnessed fact exactly once for a durable caller-defined key.
+    ///
+    /// F3 receipt routing crosses the witness DB and inbox DB, so a crash can land
+    /// between them. Retrying with the same key returns the existing chain row
+    /// instead of appending a duplicate transport fact.
+    pub fn append_once(
+        &self,
+        event_key: &str,
+        event_type: &str,
+        event_data: serde_json::Value,
+        signer_lct: &str,
+    ) -> Result<(ChainEntry, bool)> {
+        anyhow::ensure!(!event_key.trim().is_empty(), "witness event_key must not be empty");
+        self.append_inner(Some(event_key), event_type, event_data, signer_lct)
+    }
+
+    fn append_inner(
+        &self,
+        event_key: Option<&str>,
+        event_type: &str,
+        event_data: serde_json::Value,
+        signer_lct: &str,
+    ) -> Result<(ChainEntry, bool)> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+
+        if let Some(key) = event_key {
+            let existing = tx
+                .query_row(
+                    "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+                       FROM chain_entries WHERE event_key = ?1",
+                    params![key],
+                    row_to_entry,
+                )
+                .optional()?;
+            if let Some(entry) = existing {
+                return Ok((entry?, false));
+            }
+        }
+
         let (prev_hash, chain_position): (String, u64) = {
             let prev: Option<(String, i64)> = tx
                 .query_row(
@@ -337,8 +402,8 @@ impl SqliteChainStore {
 
         tx.execute(
             "INSERT INTO chain_entries
-                (chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp, event_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 chain_position as i64,
                 hash,
@@ -347,11 +412,10 @@ impl SqliteChainStore {
                 event_json,
                 signer_lct,
                 timestamp.to_rfc3339(),
+                event_key,
             ],
         )?;
         tx.commit()?;
-        // Only after the row is durably committed. Serialised by the `conn` mutex we still
-        // hold, so no two appends race; `Release` pairs with the `Acquire` in `len()`.
         self.len.fetch_add(1, Ordering::Release);
 
         let entry = ChainEntry {
@@ -363,12 +427,9 @@ impl SqliteChainStore {
             signer_lct: signer_lct.to_string(),
             chain_position,
         };
-        // After the commit, still under the writer mutex: the row is readable before any
-        // derivation it affects is marked stale, and appends invalidate in chain order.
         self.derivations.observe(&entry);
-        Ok(entry)
+        Ok((entry, true))
     }
-
     /// Most recent `limit` entries in descending chain_position order.
     pub fn read_recent(&self, limit: u64) -> Result<Vec<ChainEntry>> {
         let conn = self.conn.lock().unwrap();
