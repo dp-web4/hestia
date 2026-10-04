@@ -655,6 +655,13 @@ enum HubCmd {
         parent: Option<String>,
     },
 
+    /// Summarize recent LIVE legacy member_notify vs F3 shadow-routing evidence.
+    /// Delivery remains legacy-authoritative; this is observation only.
+    ReceiverParity {
+        #[arg(long, default_value_t = 100)]
+        limit: u64,
+    },
+
     /// Originate one routed member notice from a canonical local child.
     /// This is the additive F3 path; legacy peer/member member_notify is not
     /// translated here.
@@ -1090,6 +1097,9 @@ pub fn run() -> AnyResult<()> {
             }
             HubCmd::ReceiverShadow { legacy_address, parent } => {
                 cmd_receiver_shadow(&home, &legacy_address, parent.as_deref())
+            }
+            HubCmd::ReceiverParity { limit } => {
+                cmd_receiver_parity(&home, limit)
             }
             HubCmd::ReceiverSend {
                 from_member, destination_lct, kind, pointer, operation_id, parent
@@ -3572,6 +3582,24 @@ fn cmd_receiver_shadow(
         legacy_address.trim(),
     )?;
     println!("{}", serde_json::to_string_pretty(&shadow)?);
+    Ok(())
+}
+
+fn cmd_receiver_parity(
+    home: &std::path::Path,
+    limit: u64,
+) -> AnyResult<()> {
+    anyhow::ensure!(limit > 0 && limit <= 10_000, "--limit must be 1..10000");
+    let (_vault, passphrase) = open_vault_with_passphrase(home)?;
+    let store_key = hestia::storage::storage_key(home, &passphrase)
+        .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
+    let chain = hestia::storage::SqliteChainStore::open(
+        home.join("witness.db"),
+        store_key,
+    )?;
+    let rows = chain.read_recent_route_shadow(limit)?;
+    let report = hestia::legacy_parity::summarize(&rows);
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
