@@ -624,17 +624,12 @@ enum HubCmd {
     /// This is the routing-table equivalent of neighbor/ARP resolution.
     ReceiverNeighbor {
         next_hop: String,
-        #[arg(long, default_value = "")]
-        target: String,
-        /// Our signing member on this Hub; defaults to the template connection.
+        /// Router interface UUID from receiver-router-bind.
         #[arg(long)]
-        our_member_lct: Option<uuid::Uuid>,
-        /// The next router's Hub member UUID on this Hub.
+        interface: uuid::Uuid,
+        /// The next router's Hub member UUID on that interface's Hub.
         #[arg(long)]
         next_hop_member_lct: uuid::Uuid,
-        /// Our raw 32-byte channel seed when --our-member-lct differs from the template.
-        #[arg(long)]
-        channel_key: Option<String>,
         #[arg(long)]
         reason: String,
     },
@@ -1040,10 +1035,9 @@ pub fn run() -> AnyResult<()> {
                 &home, &target, member_lct, channel_key, parent.as_deref(), &reason,
             ),
             HubCmd::ReceiverNeighbor {
-                next_hop, target, our_member_lct, next_hop_member_lct, channel_key, reason
+                next_hop, interface, next_hop_member_lct, reason
             } => cmd_receiver_neighbor(
-                &home, &next_hop, &target, our_member_lct, next_hop_member_lct,
-                channel_key, &reason,
+                &home, &next_hop, interface, next_hop_member_lct, &reason,
             ),
             HubCmd::ReceiverRoute { destination, next_hop, metric, reason } => {
                 cmd_receiver_route(&home, &destination, &next_hop, metric, &reason)
