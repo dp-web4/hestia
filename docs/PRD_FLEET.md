@@ -271,7 +271,8 @@ A local child enters the F3 plane by **canonical LCT**, not by the historical
 
 The retry key is scoped by origin LCT. Hestia atomically binds
 `(origin_lct, operation_id)` to one randomly generated packet UUID and an immutable send
-binding. A lost response reuses that first packet; using the same operation id for different
+binding. Two different canonical origins may therefore use the same operation id independently;
+within one origin, a lost response reuses the first packet and using that id for different
 destination/content is refused. The packet's original hop limit and first persisted route
 decision also remain the ones captured on the first attempt — a configuration change between
 retries cannot silently turn one application act into a different network act.
