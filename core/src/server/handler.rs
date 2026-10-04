@@ -5857,7 +5857,7 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
                 )?.0;
                 return Ok(hestia_error_envelope(
                     "hestia.member_notify_transport_unmet",
-                    "this sender is bound direct_required and the canonical F3 destination currently requires a network hop. No route packet was originated. Bind the sender's own carrier, or retry the same operation_id after the destination becomes directly local.",
+                    "this sender is bound direct_required and the canonical F3 destination currently requires a network hop. No route packet was originated. This operation has already frozen the direct_required transport fact: retry the SAME operation_id only if the destination becomes directly local. If you bind a carrier, issue a NEW operation_id so the new act can witness the new transport binding.",
                     Some(json!({
                         "operation_id": op_id,
                         "delivery_authority": "f3",
