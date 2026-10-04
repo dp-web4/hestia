@@ -657,11 +657,6 @@ pub async fn drain_router_once(
                         }
                     };
 
-                // Ingress filtering: route.forward is accepted only from a Hub
-                // member explicitly bound as a canonical neighbor on THIS router
-                // interface. The final packet destination is end-to-end; this
-                // check binds only the immediate upstream hop and prevents an
-                // arbitrary Hub citizen from injecting transit traffic.
                 let upstream_member = match notice
                     .get("from")
                     .and_then(|v| v.as_str())
@@ -670,41 +665,12 @@ pub async fn drain_router_once(
                     Some(v) => v,
                     None => {
                         report.errors.push(format!(
-                            "route notice {notice_id} has no valid immediate sender"
+                            "route notice {notice_id} has no valid authenticated Hub sender"
                         ));
                         batch_failed = true;
                         continue;
                     }
                 };
-                let upstream_neighbor = match routes.ingress_neighbor(
-                    binding.binding_id,
-                    upstream_member,
-                ) {
-                    Ok(Some(v)) => v,
-                    Ok(None) => {
-                        report.errors.push(format!(
-                            "route notice {notice_id} came from unconfigured Hub neighbor {upstream_member} on interface {}",
-                            binding.binding_id
-                        ));
-                        batch_failed = true;
-                        continue;
-                    }
-                    Err(e) => {
-                        report.errors.push(format!(
-                            "route notice {notice_id} neighbor resolution: {e:#}"
-                        ));
-                        batch_failed = true;
-                        continue;
-                    }
-                };
-                anyhow::ensure!(
-                    packet.visited_routers.last().map(String::as_str)
-                        == Some(upstream_neighbor.next_hop_lct.as_str()),
-                    "route notice {notice_id} says its previous router was {:?}, but authenticated Hub sender {} maps to neighbor {}",
-                    packet.visited_routers.last(),
-                    upstream_member,
-                    upstream_neighbor.next_hop_lct
-                );
 
                 let mut state = match inbox.stage_router_packet(
                     binding.binding_id,
@@ -734,9 +700,7 @@ pub async fn drain_router_once(
                     "hub_notice_id": notice_id,
                     "hub_lct": binding.hub_lct_id,
                     "hub_member_lct": binding.hub_member_lct,
-                    "from": notice.get("from"),
-                    "upstream_neighbor_lct": upstream_neighbor.next_hop_lct,
-                    "upstream_link_id": upstream_neighbor.link_id,
+                    "from_hub_member": upstream_member,
                     "destination_lct": packet.destination_lct,
                     "origin_lct": packet.origin_lct,
                     "hops_remaining": packet.hops_remaining,
@@ -764,6 +728,150 @@ pub async fn drain_router_once(
                 ) {
                     report.errors.push(format!("record route stage witness: {e:#}"));
                     batch_failed = true;
+                    continue;
+                }
+
+                // Authenticate the immediate routing neighbor AFTER durable staging.
+                // An unauthorized/misbound packet is not allowed into the transit
+                // graph, but it also must not wedge the receipt mailbox forever:
+                // witness a per-receipt refusal, ACK/drop that receipt, and leave
+                // the packet itself globally uncompleted so a legitimate copy may
+                // still arrive from the configured neighbor.
+                let upstream_neighbor = match routes.ingress_neighbor(
+                    binding.binding_id,
+                    upstream_member,
+                ) {
+                    Ok(Some(n))
+                        if packet.visited_routers.last().map(String::as_str)
+                            == Some(n.next_hop_lct.as_str()) =>
+                    {
+                        Some(n)
+                    }
+                    Ok(Some(n)) => {
+                        let reason = format!(
+                            "trace-neighbor-mismatch: authenticated Hub sender {} maps to {}, packet names previous router {:?}",
+                            upstream_member,
+                            n.next_hop_lct,
+                            packet.visited_routers.last()
+                        );
+                        let key = format!(
+                            "route-ingress-refusal:{}:{}",
+                            binding.binding_id, notice_id
+                        );
+                        let (witness, _) = match chain.append_once(
+                            &key,
+                            "router.packet.ingress-refused",
+                            json!({
+                                "packet_id": packet.packet_id,
+                                "router_lct": router_lct,
+                                "ingress_binding_id": binding.binding_id,
+                                "hub_notice_id": notice_id,
+                                "from_hub_member": upstream_member,
+                                "configured_neighbor_lct": n.next_hop_lct,
+                                "claimed_previous_router": packet.visited_routers.last(),
+                                "reason": reason,
+                                "stage_witness_hash": stage_witness.hash,
+                            }),
+                            router_lct,
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                report.errors.push(format!(
+                                    "witness route ingress refusal {notice_id}: {e:#}"
+                                ));
+                                batch_failed = true;
+                                continue;
+                            }
+                        };
+                        if let Err(e) = inbox.record_router_ingress_refusal(
+                            binding.binding_id,
+                            notice_id,
+                            &witness.hash,
+                        ) {
+                            report.errors.push(format!(
+                                "record route ingress refusal {notice_id}: {e:#}"
+                            ));
+                            batch_failed = true;
+                            continue;
+                        }
+                        None
+                    }
+                    Ok(None) => {
+                        let reason = format!(
+                            "unconfigured-neighbor: Hub member {} is not a neighbor on interface {}",
+                            upstream_member, binding.binding_id
+                        );
+                        let key = format!(
+                            "route-ingress-refusal:{}:{}",
+                            binding.binding_id, notice_id
+                        );
+                        let (witness, _) = match chain.append_once(
+                            &key,
+                            "router.packet.ingress-refused",
+                            json!({
+                                "packet_id": packet.packet_id,
+                                "router_lct": router_lct,
+                                "ingress_binding_id": binding.binding_id,
+                                "hub_notice_id": notice_id,
+                                "from_hub_member": upstream_member,
+                                "reason": reason,
+                                "stage_witness_hash": stage_witness.hash,
+                            }),
+                            router_lct,
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                report.errors.push(format!(
+                                    "witness route ingress refusal {notice_id}: {e:#}"
+                                ));
+                                batch_failed = true;
+                                continue;
+                            }
+                        };
+                        if let Err(e) = inbox.record_router_ingress_refusal(
+                            binding.binding_id,
+                            notice_id,
+                            &witness.hash,
+                        ) {
+                            report.errors.push(format!(
+                                "record route ingress refusal {notice_id}: {e:#}"
+                            ));
+                            batch_failed = true;
+                            continue;
+                        }
+                        None
+                    }
+                    Err(e) => {
+                        report.errors.push(format!(
+                            "route notice {notice_id} neighbor resolution: {e:#}"
+                        ));
+                        batch_failed = true;
+                        continue;
+                    }
+                };
+
+                if upstream_neighbor.is_none() {
+                    report.completed += 1;
+                    match ack_one(&client, &conn, &channel, &keypair, &rest, notice_id).await {
+                        Ok(()) => match inbox.mark_router_ingress_acked(
+                            binding.binding_id,
+                            notice_id,
+                        ) {
+                            Ok(()) => report.acked += 1,
+                            Err(e) => {
+                                report.errors.push(format!(
+                                    "refused route ACK {notice_id} landed but local watermark failed: {e:#}"
+                                ));
+                                batch_failed = true;
+                            }
+                        },
+                        Err(e) => {
+                            report.errors.push(format!(
+                                "ACK refused route {notice_id}: {e:#}"
+                            ));
+                            batch_failed = true;
+                        }
+                    }
                     continue;
                 }
 
