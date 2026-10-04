@@ -64,17 +64,51 @@ fn receipt_retry_reuses_witness_and_member_enqueue() {
 
     let local = inbox.accept_hub_receipt(connection, &id, &first.hash).unwrap();
 
-    // Second crash edge: local acceptance landed, Hub ACK response was lost.
-    // Retrying acceptance returns the same local notice id.
+    // Second crash edge: local acceptance landed but the delivery witness did
+    // not. Retrying acceptance returns the same local notice id, and crucially
+    // the row is NOT ACK-eligible yet.
     assert_eq!(
         inbox.accept_hub_receipt(connection, &id, &first.hash).unwrap(),
         local
     );
+    assert!(inbox.pending_hub_receipt_acks(connection).unwrap().is_empty());
+    assert!(inbox.mark_hub_receipt_acked(connection, &id).is_err());
+
+    let delivery_event = serde_json::json!({
+        "notice_id": id,
+        "member_notice_id": local,
+        "stage_witness_hash": first.hash,
+    });
+    let (delivery, inserted) = chain.append_once(
+        &format!("hub-receive-delivery:{hub}:{hub_member}:{id}"),
+        "hub.notice.delivered-local",
+        delivery_event.clone(),
+        "lct:web4:mb32:router",
+    ).unwrap();
+    assert!(inserted);
+    inbox.record_hub_receipt_delivery_witness(
+        connection, &id, &delivery.hash
+    ).unwrap();
+
+    // Lost ACK response: replaying both the delivery witness and its custody mark
+    // is idempotent, and only now does the pending-ACK surface expose the row.
+    let (delivery_retry, inserted) = chain.append_once(
+        &format!("hub-receive-delivery:{hub}:{hub_member}:{id}"),
+        "hub.notice.delivered-local",
+        delivery_event,
+        "lct:web4:mb32:router",
+    ).unwrap();
+    assert!(!inserted);
+    assert_eq!(delivery_retry.hash, delivery.hash);
+    inbox.record_hub_receipt_delivery_witness(
+        connection, &id, &delivery.hash
+    ).unwrap();
     assert_eq!(inbox.pending_hub_receipt_acks(connection).unwrap(), vec![id.clone()]);
 
     let state = inbox.hub_receipt_custody(connection, &id).unwrap().unwrap();
     assert_eq!(state.member_notice_id, Some(local));
     assert_eq!(state.witness_hash.as_deref(), Some(first.hash.as_str()));
+    assert_eq!(state.delivery_witness_hash.as_deref(), Some(delivery.hash.as_str()));
     assert!(state.hub_acked_at.is_none());
 
     inbox.mark_hub_receipt_acked(connection, &id).unwrap();
@@ -106,7 +140,7 @@ fn same_hub_notice_id_cannot_change_under_custody() {
 }
 
 #[test]
-fn ack_watermark_requires_local_acceptance() {
+fn ack_watermark_requires_witnessed_local_delivery() {
     let dir = tempfile::tempdir().unwrap();
     let inbox = SqliteInboxStore::open(dir.path().join("inbox.db"), [5u8; 32]).unwrap();
     let connection = Uuid::new_v4();
@@ -117,6 +151,11 @@ fn ack_watermark_requires_local_acceptance() {
         r#"{"kind":"coordination"}"#, "coordination", None,
     ).unwrap();
 
-    let err = inbox.mark_hub_receipt_acked(connection, &id).unwrap_err();
+    let err = inbox.record_hub_receipt_delivery_witness(
+        connection, &id, "delivery-hash"
+    ).unwrap_err();
     assert!(format!("{err:#}").contains("before local acceptance"));
+
+    let err = inbox.mark_hub_receipt_acked(connection, &id).unwrap_err();
+    assert!(format!("{err:#}").contains("before witnessed local delivery"));
 }
