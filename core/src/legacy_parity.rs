@@ -2,8 +2,11 @@
 //!
 //! The legacy member_notify path remains authoritative. These reports compare
 //! only the routing/queue seam after the shared legacy gates have already run.
-//! A "route_selection_match" therefore means: legacy chose routed egress and
-//! F3 would choose a forward route. It does NOT claim downstream delivery parity.
+//! Legacy currently does not retain a canonical next-hop LCT at enqueue:
+//! `dest_peer_lct` is unwired and the drain may prefix-resolve a name later.
+//! Therefore "both chose forward" is explicitly NOT called route parity; the
+//! report keeps it in `both_forward_next_hop_unverifiable` until the legacy
+//! hop identity can be measured from transport evidence.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -28,7 +31,9 @@ pub struct LegacyParitySample {
 #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
 pub struct LegacyParityReport {
     pub total: usize,
-    pub route_selection_match: usize,
+    /// Both paths chose to forward, but legacy has no canonical next-hop
+    /// evidence at enqueue today (dest_peer_lct is unwired). This is NOT parity.
+    pub both_forward_next_hop_unverifiable: usize,
     pub missing_alias: usize,
     pub shadow_unavailable: usize,
     pub route_divergence: usize,
@@ -83,7 +88,7 @@ pub fn project_entry(entry: &ChainEntry) -> Option<LegacyParitySample> {
 
     let classification = if entry.event_type == "member_notice_route_shadow" {
         match (f3_status.as_str(), f3_decision.as_deref()) {
-            ("resolved", Some("forward")) => "route_selection_match",
+            ("resolved", Some("forward")) => "both_forward_next_hop_unverifiable",
             ("missing_alias", _) => "missing_alias",
             ("unavailable" | "malformed", _) => "shadow_unavailable",
             _ => "route_divergence",
@@ -123,7 +128,9 @@ pub fn summarize(entries: &[ChainEntry]) -> LegacyParityReport {
         let Some(sample) = project_entry(entry) else { continue };
         report.total += 1;
         match sample.classification.as_str() {
-            "route_selection_match" => report.route_selection_match += 1,
+            "both_forward_next_hop_unverifiable" => {
+                report.both_forward_next_hop_unverifiable += 1
+            },
             "missing_alias" => report.missing_alias += 1,
             "shadow_unavailable" => report.shadow_unavailable += 1,
             "route_divergence" => report.route_divergence += 1,
@@ -154,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_legacy_egress_and_f3_forward_is_route_selection_match() {
+    fn queued_legacy_egress_and_f3_forward_is_not_yet_next_hop_parity() {
         let e = entry(
             "member_notice_route_shadow",
             serde_json::json!({
@@ -177,7 +184,7 @@ mod tests {
         );
         let r = summarize(&[e]);
         assert_eq!(r.total, 1);
-        assert_eq!(r.route_selection_match, 1);
+        assert_eq!(r.both_forward_next_hop_unverifiable, 1);
         assert_eq!(r.route_divergence, 0);
     }
 
@@ -215,7 +222,7 @@ mod tests {
         let r = summarize(&[full, missing]);
         assert_eq!(r.missing_alias, 1);
         assert_eq!(r.legacy_queue_refusal, 1);
-        assert_eq!(r.route_selection_match, 0);
+        assert_eq!(r.both_forward_next_hop_unverifiable, 0);
     }
 
     #[test]
