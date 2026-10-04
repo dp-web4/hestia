@@ -157,6 +157,19 @@ the notice); ack is terminal; every send is a witnessed `member_notice` chain ev
 delivery; recipient-scoped consume-once drains; law can deny who may wake whom
 (gate category `member_notify`).
 
+
+
+### Retry identity on `hestia_member_notify`
+
+`operation_id` is optional during D2 migration and identifies **one send operation**, not a
+message body. If supplied, retry the same uncertain send with the same id; the daemon returns
+the first witnessed/queued result and refuses reuse of that id for different
+recipient/kind/pointer/reply intent. A different operation id deliberately permits an
+identical second notice.
+
+The local `hestia-mesh.py` content resend ledger is only the fallback for sends **without**
+an operation id. It must not block operation-keyed retries before they reach the daemon.
+
 ## id-binding: which notice does this one answer? (2026-07-25)
 
 The convention existed in prose first — forum frontmatter has carried `re: <notice-id>`
