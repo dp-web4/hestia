@@ -55,6 +55,8 @@ enum PersistedAction {
         kind: String,
         pointer_uri: String,
         source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_packet_json: Option<String>,
     },
     Forward {
         next_hop_lct: String,
@@ -208,8 +210,9 @@ fn plan_failure(
                 kind: "unreachable".to_string(),
                 pointer_uri: bounce.pointer_uri.clone(),
                 source: "unreachable-bounce-local".to_string(),
+                delivery_packet_json: Some(serde_json::to_string(&bounce)?),
             },
-            Some(serde_json::to_string(&bounce)?),
+            None,
         )),
         RouteDecision::Forward {
             next_hop_lct,
@@ -285,6 +288,7 @@ fn plan_action(
                 kind: packet.original_kind.clone(),
                 pointer_uri: packet.pointer_uri.clone(),
                 source: "routed-data-local".to_string(),
+                delivery_packet_json: None,
             },
             None,
         )),
@@ -356,6 +360,7 @@ async fn execute_action(
             kind,
             pointer_uri,
             source,
+            delivery_packet_json,
         } => {
             let local_notice_id = inbox.accept_router_packet_local(
                 packet.packet_id,
@@ -374,6 +379,7 @@ async fn execute_action(
                 "member_notice_id": local_notice_id,
                 "stage_witness_hash": stage_witness_hash,
                 "source": source,
+                "delivery_packet_json": delivery_packet_json,
                 "wake": "not-considered",
             });
             let (witness, _) = chain.append_once(
@@ -902,11 +908,12 @@ mod tests {
         let (action, outbound) = plan_action(
             &packet, &registry, &routes, router
         ).unwrap();
-        assert!(outbound.is_some(), "the bounce packet itself is preserved as evidence");
+        assert!(outbound.is_none(), "a local bounce needs no network packet");
         assert!(matches!(
             action,
-            PersistedAction::Local { kind, source, .. }
-                if kind == "unreachable" && source == "unreachable-bounce-local"
+            PersistedAction::Local {
+                kind, source, delivery_packet_json: Some(_), ..
+            } if kind == "unreachable" && source == "unreachable-bounce-local"
         ));
     }
 
