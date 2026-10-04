@@ -4822,6 +4822,122 @@ mod member_notify_operation_key_tests {
     }
 }
 
+#[derive(Clone, Debug)]
+struct MemberNotifyF3Plan {
+    origin_lct: String,
+    router_lct: String,
+    destination_lct: String,
+    authority_source: String,
+    authority_reason: String,
+}
+
+/// Resolve ONLY the delivery-plane choice for member_notify after the common
+/// pre-route gates have passed. Bare plugin ids remain local legacy delivery.
+/// Canonical mb32 destinations are intrinsically F3; historical peer/member
+/// spellings become F3 only when their exact alias was explicitly cut over.
+///
+/// This is intentionally pure/read-only. No packet is minted here.
+fn member_notify_f3_plan(
+    s: &crate::server::state::ServerState,
+    sender_plugin: &str,
+    to: &str,
+) -> anyhow::Result<Option<MemberNotifyF3Plan>> {
+    let canonical_destination = to.starts_with("lct:web4:mb32:");
+    let legacy_routed = to.contains('/');
+    if !canonical_destination && !legacy_routed {
+        return Ok(None);
+    }
+
+    let sender = s
+        .member_registry
+        .resolve_reference(sender_plugin)?
+        .ok_or_else(|| anyhow::anyhow!(
+            "sender '{sender_plugin}' has no canonical member LCT"
+        ))?;
+    let origin_lct = sender.lct.lct_id();
+    let parents: Vec<String> = sender
+        .lct
+        .mrh
+        .bound
+        .iter()
+        .filter(|edge| edge.edge_type == "parent")
+        .map(|edge| edge.lct_id.clone())
+        .collect();
+    let router_lct = match parents.as_slice() {
+        [parent] => parent.clone(),
+        [] => anyhow::bail!(
+            "canonical sender {origin_lct} has no parent/router binding"
+        ),
+        _ => anyhow::bail!(
+            "canonical sender {origin_lct} has {} parent/router bindings; expected exactly one",
+            parents.len()
+        ),
+    };
+
+    let fresh_vault = s.vault.reopen()
+        .map_err(|e| anyhow::anyhow!(
+            "receiver routing vault snapshot is unavailable; delivery authority cannot be proven: {e}"
+        ))?;
+    let table = crate::receiver_routing::ReceiverRoutingTable::load(&fresh_vault)
+        .map_err(|e| anyhow::anyhow!(
+            "receiver routing table is unavailable; delivery authority cannot be proven: {e}"
+        ))?;
+
+    let (destination_lct, authority_source, authority_reason) =
+        if canonical_destination {
+            (
+                to.to_string(),
+                "canonical_lct".to_string(),
+                "canonical Web4 destination selects F3 routing".to_string(),
+            )
+        } else {
+            let Some(alias) = table.legacy_alias(to) else {
+                return Ok(None);
+            };
+            if alias.delivery_authority
+                != crate::receiver_routing::LegacyDeliveryAuthority::F3
+            {
+                return Ok(None);
+            }
+            (
+                alias.destination_lct.clone(),
+                "legacy_alias_cutover".to_string(),
+                alias.authority_reason.clone().ok_or_else(|| anyhow::anyhow!(
+                    "legacy alias '{to}' is marked f3 without a migration reason"
+                ))?,
+            )
+        };
+
+    Ok(Some(MemberNotifyF3Plan {
+        origin_lct,
+        router_lct,
+        destination_lct,
+        authority_source,
+        authority_reason,
+    }))
+}
+
+fn member_notify_f3_plan_from_witness(
+    event: &Value,
+) -> anyhow::Result<Option<MemberNotifyF3Plan>> {
+    if event.get("delivery_authority").and_then(Value::as_str) != Some("f3") {
+        return Ok(None);
+    }
+    let required = |key: &str| -> anyhow::Result<String> {
+        event.get(key).and_then(Value::as_str).map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!(
+                "recovered F3 member_notice is missing '{key}'"
+            ))
+    };
+    Ok(Some(MemberNotifyF3Plan {
+        origin_lct: required("f3_origin_lct")?,
+        router_lct: required("f3_router_lct")?,
+        destination_lct: required("f3_destination_lct")?,
+        authority_source: required("f3_authority_source")?,
+        authority_reason: required("f3_authority_reason")?,
+    }))
+}
+
 async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     let to_plugin = require_string(args, "to_plugin_id")?;
     let kind = require_string(args, "kind")?;
@@ -5201,13 +5317,61 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
         }
     }
     }
-    // TRANSPORT BINDING (#1030), resolved for routed sends only, and BEFORE the limiter
-    // records or anything is witnessed as sent. A member bound `direct_required` must sign
-    // its mesh acts as itself and holds no carrier yet, so there is no identity this host may
-    // put on the envelope: the send is refused in the sender's own turn, where it can be
-    // acted on, instead of being queued for a drain that would sign it with somebody else's
-    // key. That silent fallback is the defect this binding exists to end (falsifier 2).
-    let routed = to_plugin.contains('/');
+    // D2d delivery-plane selection happens only AFTER the common law/flood/reply
+    // gates above. A recovered operation uses the FIRST witnessed authority
+    // decision; changing an alias after a crash cannot reroute the retry.
+    let f3_plan = if let Some(existing) = &recovered_operation_witness {
+        match member_notify_f3_plan_from_witness(&existing.event_data) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_f3_recovery_invalid",
+                    &format!("cannot recover the first F3 delivery decision: {e}"),
+                    Some(json!({
+                        "operation_id": operation_id,
+                        "witnessEntryHash": existing.hash,
+                    })),
+                ));
+            }
+        }
+    } else {
+        match member_notify_f3_plan(&s, &sender.plugin_id, &to_plugin) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_delivery_authority_unavailable",
+                    &format!("cannot prove routed delivery authority: {e}"),
+                    Some(json!({"to_plugin_id": to_plugin})),
+                ));
+            }
+        }
+    };
+
+    if let Some(plan) = &f3_plan {
+        if plan.destination_lct == plan.origin_lct {
+            return Ok(hestia_error_envelope(
+                "hestia.member_notify_self",
+                "notifying your own canonical LCT is the same no-op as notifying your plugin id",
+                Some(json!({
+                    "origin_lct": plan.origin_lct,
+                    "destination_lct": plan.destination_lct,
+                })),
+            ));
+        }
+    }
+
+    if f3_plan.is_some() && operation_id.is_none() {
+        return Ok(hestia_error_envelope(
+            "hestia.member_notify_f3_operation_id_required",
+            "F3-authoritative member_notify requires caller-stable operation_id.              The same id crosses the legacy compatibility adapter into canonical              route origination so a lost response cannot mint a second packet.",
+            Some(json!({"to_plugin_id": to_plugin, "delivery_authority": "f3"})),
+        ));
+    }
+
+    // TRANSPORT BINDING (#1030), resolved for every non-local send and BEFORE
+    // anything is witnessed as sent. F3 does not erase this authorization layer:
+    // an explicit carrier promise must still match the first-hop router interface.
+    let routed = to_plugin.contains('/') || to_plugin.starts_with("lct:web4:mb32:");
     let recovered_transport_record = recovered_operation_witness
         .as_ref()
         .and_then(|entry| entry.event_data.get("transport").cloned());
@@ -5232,7 +5396,7 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     {
         existing.event_data.get("f3_shadow").cloned()
     } else {
-        routed.then(|| {
+        to_plugin.contains('/').then(|| {
         let resolved_origin = s.member_registry.resolve_reference(&sender.plugin_id);
         let (origin_lct, router_lct, identity_error) = match resolved_origin {
             Ok(Some(member)) => {
@@ -5394,6 +5558,35 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             })),
         ));
     }
+    // D2d migration rule: explicit legacy carrier/reply promises survive
+    // cutover. The F3 packet separates actor/origin from router carrier, but an
+    // operator-authored direct/relay binding is still law for WHICH Hub identity
+    // may carry the first hop. If F3 cannot prove the same carrier, refuse.
+    if recovered_operation_witness.is_none() {
+        if let (Some(plan), Some(binding)) = (&f3_plan, &transport_binding) {
+            if let Some(reply_to) = binding
+                .reply_to_lct
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                if reply_to != plan.origin_lct {
+                    return Ok(hestia_error_envelope(
+                        "hestia.member_notify_f3_reply_binding_unmet",
+                        "F3 cutover would change the operator-bound reply identity.                          Rebind reply_to_lct to the sender's canonical member LCT                          before moving this edge to F3.",
+                        Some(json!({
+                            "to_plugin_id": to_plugin,
+                            "origin_lct": plan.origin_lct,
+                            "reply_to_lct": reply_to,
+                            "delivery_authority": "f3",
+                        })),
+                    ));
+                }
+            }
+
+        }
+    }
+
     // What the act's record and receipt say about how it will travel: the stamp when bound,
     // the literal "unbound" when routed without a binding, absent when local.
     let transport_record: Option<Value> = if recovered_operation_witness.is_some() {
@@ -5478,6 +5671,24 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             notice_record["f3_shadow"] = shadow.clone();
             notice_record["d2_shadow"] = json!(true);
         }
+        if let Some(plan) = &f3_plan {
+            notice_record["delivery_authority"] = json!("f3");
+            notice_record["f3_origin_lct"] = json!(plan.origin_lct);
+            notice_record["f3_router_lct"] = json!(plan.router_lct);
+            notice_record["f3_destination_lct"] = json!(plan.destination_lct);
+            notice_record["f3_authority_source"] = json!(plan.authority_source);
+            notice_record["f3_authority_reason"] = json!(plan.authority_reason);
+            notice_record["f3_expected_carrier_lct"] = transport_record
+                .as_ref()
+                .and_then(|v| v.get("carrier_lct"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            notice_record["d2_migration_rule"] = json!(
+                "F3 strengthens legacy Hub acceptance to witnessed local delivery or durable next-hop mailbox acceptance"
+            );
+        } else if routed {
+            notice_record["delivery_authority"] = json!("legacy");
+        }
         if let (Some(op_id), Some(binding)) = (&operation_id, &operation_binding) {
             notice_record["operation_id"] = json!(op_id);
             notice_record["operation_binding"] = binding.clone();
@@ -5514,6 +5725,19 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     if let Some(note) = liveness_note(&liveness, &to_plugin) {
         response_template["recipient_note"] = json!(note);
     }
+    if let Some(plan) = &f3_plan {
+        response_template["delivery_authority"] = json!("f3");
+        response_template["canonical_destination_lct"] = json!(plan.destination_lct);
+        response_template["acceptance_semantics"] = json!(
+            "witnessed local delivery or durable next-hop mailbox acceptance; not end-recipient read"
+        );
+        response_template["migration_rule"] = json!(
+            "intentional strengthening from legacy Hub witnessed/accepted semantics"
+        );
+    } else if routed {
+        response_template["delivery_authority"] = json!("legacy");
+    }
+
     if let Some(t) = &transport_record {
         if *t == json!("unbound") {
             response_template["transport_note"] = json!(
@@ -5528,9 +5752,181 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
         ));
     }
 
-    // peer/member is still the authoritative legacy route in D2. F3 remains
-    // observational until parity/cutover; operation identity strengthens retries
-    // without changing which plane carries the message.
+    // D2d CUTOVER. Everything before this branch is the shared contract:
+    // live attribution, law, structural flood guard, reply ownership/addressing,
+    // transport binding, liveness evidence, and the application-level member_notice
+    // witness. Only the DELIVERY CONSEQUENCE changes here.
+    //
+    // Critically, no Hub I/O happens while SharedState is locked. Vault::reopen()
+    // snapshots the durable authority/credential documents; inbox + chain are Arc
+    // stores with their own internal serialization.
+    if let Some(plan) = f3_plan.clone() {
+        let op_id = operation_id
+            .clone()
+            .expect("F3 plan is refused above without operation_id");
+        let expected_carrier = transport_record
+            .as_ref()
+            .and_then(|v| v.get("carrier_lct"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let vault = match s.vault.reopen() {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_f3_vault_unavailable",
+                    &format!("cannot snapshot F3 routing authority: {e}"),
+                    Some(json!({
+                        "operation_id": op_id,
+                        "witnessEntryHash": entry.hash,
+                    })),
+                ));
+            }
+        };
+        let inbox = std::sync::Arc::clone(&s.inbox_store);
+        let chain = std::sync::Arc::clone(&s.chain_store);
+        let sovereign_lct = s.sovereign_lct.clone();
+        let sender_plugin_id = sender.plugin_id.clone();
+        let member_notice_hash = entry.hash.clone();
+        let pointer = pointer_uri
+            .as_deref()
+            .expect("member_notify pointer was validated above")
+            .to_string();
+        let route_kind = kind.clone();
+        let content_hash = format!(
+            "sha256-pointer:{}",
+            web4_core::sha256_hex(pointer.as_bytes())
+        );
+        let cutover_event_key = member_notify_operation_event_key(
+            "f3-delivery",
+            &sender_plugin_id,
+            &op_id,
+        );
+        let was_recovered = recovered_operation_witness.is_some();
+
+        // Release the daemon-wide state mutex before any network operation.
+        drop(s);
+
+        let route = match crate::router_forwarder::originate_once_constrained(
+            &vault,
+            &plan.router_lct,
+            &plan.origin_lct,
+            &plan.destination_lct,
+            &route_kind,
+            &pointer,
+            &content_hash,
+            &op_id,
+            inbox.as_ref(),
+            chain.as_ref(),
+            expected_carrier.as_deref(),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_f3_incomplete",
+                    &format!(
+                        "F3 delivery did not cross a durable completion boundary yet: {e}. \
+                         Retry with the SAME operation_id; D1 will resume the same packet."
+                    ),
+                    Some(json!({
+                        "operation_id": op_id,
+                        "delivery_authority": "f3",
+                        "canonical_destination_lct": plan.destination_lct,
+                        "witnessEntryHash": member_notice_hash,
+                        "retry": "same_operation_id",
+                    })),
+                ));
+            }
+        };
+
+        let accepted = matches!(
+            route.outcome.as_str(),
+            "destination_local" | "next_hop_durable"
+        );
+        let evidence = json!({
+            "protocol": "hestia-member-notify-f3-cutover-v1",
+            "operation_id": op_id,
+            "from_plugin_id": sender_plugin_id,
+            "member_notice_witness": member_notice_hash,
+            "legacy_address": to_plugin,
+            "origin_lct": plan.origin_lct,
+            "router_lct": plan.router_lct,
+            "destination_lct": plan.destination_lct,
+            "authority_source": plan.authority_source,
+            "authority_reason": plan.authority_reason,
+            "expected_carrier_lct": expected_carrier,
+            "transport": transport_record.clone().unwrap_or_else(|| json!("unbound")),
+            "route_packet_id": route.packet_id,
+            "route_outcome": route.outcome,
+            "route_completion_kind": route.completion_kind,
+            "route_completion_witness_hash": route.completion_witness_hash,
+            "accepted": accepted,
+            "acceptance_semantics":
+                "witnessed local delivery or durable next-hop mailbox acceptance; not end-recipient read",
+            "migration_rule":
+                "F3 intentionally strengthens legacy Hub witnessed/accepted semantics",
+        });
+        let cutover_witness = chain.append_once(
+            &cutover_event_key,
+            "member_notice_f3_delivery",
+            evidence,
+            &sovereign_lct,
+        );
+
+        let cutover_witness_hash = match cutover_witness {
+            Ok((entry, _)) => Some(entry.hash),
+            Err(e) => {
+                // Delivery may already be durably accepted. Do not lie that the
+                // send failed and invite a new operation id; return the acceptance
+                // plus an explicit evidence warning.
+                let mut out = response_template.clone();
+                out["operation_id"] = json!(op_id);
+                out["replayed"] = json!(route.replayed || was_recovered);
+                out["f3_packet_id"] = json!(route.packet_id);
+                out["f3_outcome"] = json!(route.outcome);
+                out["f3_completion_kind"] = json!(route.completion_kind);
+                out["f3_completion_witness_hash"] = json!(route.completion_witness_hash);
+                out["f3_cutover_witness_warning"] = json!(format!(
+                    "delivery crossed its durable F3 boundary but cutover evidence could not be appended: {e}"
+                ));
+                if accepted {
+                    return Ok(out);
+                }
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_f3_unreachable",
+                    "F3 completed with an unreachable outcome; the sender's application act \
+                     is witnessed, but the destination was not durably accepted.",
+                    Some(out),
+                ));
+            }
+        };
+
+        let mut out = response_template;
+        out["operation_id"] = json!(op_id);
+        out["replayed"] = json!(route.replayed || was_recovered);
+        out["f3_packet_id"] = json!(route.packet_id);
+        out["f3_outcome"] = json!(route.outcome);
+        out["f3_completion_kind"] = json!(route.completion_kind);
+        out["f3_completion_witness_hash"] = json!(route.completion_witness_hash);
+        out["f3_cutover_witness_hash"] = json!(cutover_witness_hash);
+        out["egress_queued_to"] = Value::Null;
+        out["queued_id"] = Value::Null;
+
+        if accepted {
+            return Ok(out);
+        }
+        return Ok(hestia_error_envelope(
+            "hestia.member_notify_f3_unreachable",
+            "F3 completed with an unreachable outcome; no legacy egress row was created. \
+             This is the cutover contract: one delivery authority, never fallback-after-failure.",
+            Some(out),
+        ));
+    }
+
+    // Legacy-authoritative peer/member delivery. F3 shadow remains observation
+    // only on this branch; there is never a fallback from an F3-authoritative
+    // attempt into this queue.
     let egress_peer = to_plugin.split_once('/').map(|(peer, _)| peer.to_string());
     let shadow_template = if let (Some(peer), Some(shadow)) = (&egress_peer, &f3_route_shadow) {
         Some(json!({
