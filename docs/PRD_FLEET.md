@@ -380,6 +380,54 @@ measure downstream durable acceptance/read semantics, replies/failures and retry
 before cutover. A parity report must never turn missing evidence into equality.
 
 
+#### 4.5.7 D2c retry identity: named migration rule, not parity
+
+Legacy member-mesh historically had no daemon idempotency key. A client timeout was therefore
+`UNDETERMINED`: the write might have committed, but a blind retry could queue a second copy.
+The CLI added a best-effort content ledger to catch measured human/script re-runs, but that
+ledger is not atomic and, more importantly, **content identity is not operation identity**.
+Two intentional notices may be byte-identical.
+
+D2c adds optional `operation_id` to `hestia_member_notify`. Its scope on the legacy seam is
+the authenticated sender plugin id. One operation binds immutable application intent:
+
+```
+(to_plugin_id, kind, pointer_uri, in_reply_to)
+```
+
+and, once witnessed, the first act's session/role/liveness/transport/shadow evidence. The
+semantics are:
+
+- same sender + same operation id + same intent → recover the first result;
+- same sender + same operation id + different intent → refuse;
+- same content + different operation id → a distinct intentional send;
+- different senders may reuse one operation-id spelling;
+- a crash after the witness but before queue admission recovers the first witness by keyed
+  chain lookup and resumes its delivery consequence without re-running mutable law/flood state;
+- local/egress queue admission and the operation receipt commit atomically in the encrypted
+  inbox store;
+- routed operation admission freezes the transport stamp and D2 shadow join record in that
+  same transaction;
+- a lost response after queue commit returns the first queue id / witness receipt;
+- parity shadow witnessing remains observational and can be completed exactly once on replay.
+
+Calls without an operation id keep the historical behavior. The CLI therefore keeps its local
+content-resend guard only for unkeyed sends; keyed sends must reach the daemon so the daemon's
+operation record can arbitrate the retry.
+
+This is an **intentional semantic strengthening** for cutover, not something D2 should try to
+classify as equality. When legacy `peer/member` finally translates into F3 origination, the
+same caller operation id MUST be propagated into the canonical-origin D1 operation key. It
+must not be regenerated at the adapter, because doing so would turn one retryable application
+act back into two network acts.
+
+The cutover falsifier is simple: force the response to disappear at each boundary
+(witness-before-queue, queue-before-response, parity-witness-after-queue), retry with the same
+operation id, and observe exactly one member-notice witness, exactly one queue row, one stable
+queue id, and at most one parity witness. Then repeat with a new operation id and prove the
+identical payload is admitted as a second act.
+
+
 ## 5. Roles: pairing external and local agents, citizen by default
 
 ### 5.1 Pairing is occupancy — no new mechanism
