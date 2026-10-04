@@ -427,6 +427,12 @@ operation id, and observe exactly one member-notice witness, exactly one queue r
 queue id, and at most one parity witness. Then repeat with a new operation id and prove the
 identical payload is admitted as a second act.
 
+The first D2c slice deliberately does **not** age out `member_send_ops`. An operation tombstone
+cannot be removed merely because it is old while its egress consequence may still be pending,
+and guessing a retention horizon would turn timeout safety into a time-dependent race. Before
+cutover, pruning must be tied to a witnessed terminal queue/route outcome plus an explicit
+retry horizon; until then, bounded correctness takes precedence over premature cleanup.
+
 
 ## 5. Roles: pairing external and local agents, citizen by default
 
