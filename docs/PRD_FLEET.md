@@ -287,6 +287,38 @@ legacy address into a canonical destination preserves sender authorization, repl
 failure reporting, retry identity, and delivery outcomes. Cutover happens only after that
 measurement.
 
+#### 4.5.5 D2 compatibility aliases: names stop at the edge
+
+The historical address `peer/member` contains **two names**. The old peer resolver can prove
+at most the peer/machine LCT; that is not the identity the message is addressed to. F3 packets
+therefore MUST NOT translate `peer/member` by substituting the peer's router LCT, by prefix
+matching a Hub roster, or by synthesizing an LCT from the member name.
+
+During migration, Hestia holds an explicit compatibility alias:
+
+```
+exact legacy peer/member spelling -> canonical end-member lct:web4:mb32:...
+```
+
+Properties:
+
+- aliases are exact; no prefix or fuzzy match;
+- a local/bare member id is not an alias;
+- source-route-shaped names with more than two components are refused;
+- the alias target must already be a canonical `mb32` identity;
+- changing an alias is remove-then-add, so an identity remap is deliberate and reviewable;
+- the alias is an **edge adapter only**. The legacy spelling never enters a route packet,
+  route table, witness identity, or next-hop decision.
+
+D2 starts in shadow mode. Given a legacy address, the compatibility layer resolves its
+canonical target and runs the ordinary F3 `decide_route` function, returning
+local/forward/unreachable without sending anything. A missing alias is a first-class
+`missing_alias` result, not permission to infer one.
+
+The next slice feeds that same pure evaluator from the live legacy `member_notify` path and
+records legacy-vs-F3 outcomes under real traffic. The historical path remains authoritative
+until the parity falsifiers in #1210 are measured equal.
+
 
 ## 5. Roles: pairing external and local agents, citizen by default
 
