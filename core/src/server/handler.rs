@@ -4800,6 +4800,28 @@ fn member_notify_operation_event_key(
     )
 }
 
+#[cfg(test)]
+mod member_notify_operation_key_tests {
+    use super::member_notify_operation_event_key;
+
+    #[test]
+    fn separator_characters_cannot_alias_sender_and_operation_boundaries() {
+        let a = member_notify_operation_event_key("act", "a:b", "c");
+        let b = member_notify_operation_event_key("act", "a", "b:c");
+        assert_ne!(a, b);
+        assert_eq!(
+            a,
+            member_notify_operation_event_key("act", "a:b", "c"),
+            "same pair must remain stable"
+        );
+        assert_ne!(
+            a,
+            member_notify_operation_event_key("shadow", "a:b", "c"),
+            "event namespaces must not alias"
+        );
+    }
+}
+
 async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     let to_plugin = require_string(args, "to_plugin_id")?;
     let kind = require_string(args, "kind")?;
