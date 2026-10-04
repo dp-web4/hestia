@@ -899,6 +899,17 @@ mod tests {
         assert!(alias.authority_reason.as_deref().unwrap().contains("strengthens"));
         assert_eq!(alias.authority_set_by, "operator");
         assert_eq!(alias.authority_set_at, 3);
+
+        let err = t.unbind_legacy_alias("thor/claude-code").unwrap_err();
+        assert!(err.to_string().contains("roll"), "{err}");
+        t.set_legacy_authority(
+            "thor/claude-code",
+            LegacyDeliveryAuthority::Legacy,
+            "explicit rollback after operator review",
+            "operator",
+            4,
+        ).unwrap();
+        assert!(t.unbind_legacy_alias("thor/claude-code").unwrap());
     }
 
     #[test]
