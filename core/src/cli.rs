@@ -634,6 +634,26 @@ enum HubCmd {
         reason: String,
     },
 
+    /// Originate one routed member notice from a canonical local child.
+    /// This is the additive F3 path; legacy peer/member member_notify is not
+    /// translated here.
+    ReceiverSend {
+        /// Local member reference; resolved to its canonical child LCT.
+        #[arg(long = "from")]
+        from_member: String,
+        /// Canonical Web4 destination LCT.
+        destination_lct: String,
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        pointer: String,
+        /// Stable retry key. Reusing it with different send intent is refused.
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        parent: Option<String>,
+    },
+
     /// Add/update an exact remote route: destination LCT -> next-hop LCT.
     /// Local directly-connected children always win over static routes.
     ReceiverRoute {
@@ -1038,6 +1058,17 @@ pub fn run() -> AnyResult<()> {
                 next_hop, interface, next_hop_member_lct, reason
             } => cmd_receiver_neighbor(
                 &home, &next_hop, interface, next_hop_member_lct, &reason,
+            ),
+            HubCmd::ReceiverSend {
+                from_member, destination_lct, kind, pointer, operation_id, parent
+            } => cmd_receiver_send(
+                &home,
+                &from_member,
+                &destination_lct,
+                &kind,
+                &pointer,
+                &operation_id,
+                parent.as_deref(),
             ),
             HubCmd::ReceiverRoute { destination, next_hop, metric, reason } => {
                 cmd_receiver_route(&home, &destination, &next_hop, metric, &reason)
@@ -3446,6 +3477,59 @@ fn cmd_receiver_unbind(home: &std::path::Path, child: &str) -> AnyResult<()> {
     anyhow::ensure!(table.unbind_local(&canonical), "receiver route disappeared during unbind");
     table.save(&mut vault)?;
     println!("Receiver local interface removed: {canonical} ({})", binding.binding_id);
+    Ok(())
+}
+
+fn cmd_receiver_send(
+    home: &std::path::Path,
+    from_member: &str,
+    destination_lct: &str,
+    kind: &str,
+    pointer: &str,
+    operation_id: &str,
+    parent: Option<&str>,
+) -> AnyResult<()> {
+    let (vault, passphrase) = open_vault_with_passphrase(home)?;
+    let router_lct = receiver_router_lct(&vault, parent)?;
+    let registry = hestia::member_registry::load_members(&vault);
+    let origin_lct = match registry.resolve_child_of(&router_lct, from_member)? {
+        hestia::member_registry::LocalChildResolution::Local(member) => member.lct.lct_id(),
+        hestia::member_registry::LocalChildResolution::KnownButNotChild(member) => {
+            anyhow::bail!(
+                "'{from_member}' resolves to '{}' ({}) but is not parent-bound to router {}",
+                member.plugin_id,
+                member.lct.lct_id(),
+                router_lct
+            )
+        }
+        hestia::member_registry::LocalChildResolution::Unknown => {
+            anyhow::bail!("'{from_member}' does not resolve to a registered local member")
+        }
+    };
+    anyhow::ensure!(
+        destination_lct.starts_with("lct:web4:"),
+        "destination must be a canonical Web4 LCT, not a peer/member legacy address"
+    );
+
+    let store_key = hestia::storage::storage_key(home, &passphrase)
+        .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
+    let inbox = hestia::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
+    let chain = hestia::storage::SqliteChainStore::open(home.join("witness.db"), store_key)?;
+    let content_hash = compute_content_hash(pointer);
+    let rt = tokio::runtime::Runtime::new()?;
+    let report = rt.block_on(hestia::router_forwarder::originate_once(
+        &vault,
+        &router_lct,
+        &origin_lct,
+        destination_lct,
+        kind,
+        pointer,
+        &content_hash,
+        operation_id,
+        &inbox,
+        &chain,
+    ))?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
