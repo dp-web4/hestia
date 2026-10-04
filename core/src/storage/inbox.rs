@@ -1763,6 +1763,7 @@ pub struct HubReceiptCustody {
     pub to_plugin: String,
     pub witness_hash: Option<String>,
     pub member_notice_id: Option<u64>,
+    pub delivery_witness_hash: Option<String>,
     pub hub_acked_at: Option<DateTime<Utc>>,
 }
 
@@ -1782,6 +1783,7 @@ impl SqliteInboxStore {
                 queued_at         TEXT NOT NULL,
                 witness_hash      TEXT,
                 member_notice_id  INTEGER,
+                delivery_witness_hash TEXT,
                 hub_acked_at      TEXT,
                 PRIMARY KEY (receiver_binding_id, notice_id)
              );
@@ -1789,6 +1791,28 @@ impl SqliteInboxStore {
                  ON hub_receipt_custody(receiver_binding_id, hub_acked_at, member_notice_id);",
         )
         .context("initializing Hub receipt custody schema")?;
+
+        // Development/dogfood builds may already have created the Slice-B table
+        // before the delivery-witness state was made explicit. Upgrade it in place
+        // rather than interpreting a missing column as "already delivered".
+        let has_delivery_witness = {
+            let mut stmt = conn.prepare("PRAGMA table_info(hub_receipt_custody)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for row in rows {
+                if row? == "delivery_witness_hash" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_delivery_witness {
+            conn.execute_batch(
+                "ALTER TABLE hub_receipt_custody ADD COLUMN delivery_witness_hash TEXT;",
+            )
+            .context("adding Hub receipt delivery-witness column")?;
+        }
         Ok(())
     }
 
@@ -1841,7 +1865,7 @@ impl SqliteInboxStore {
 
         let row = conn.query_row(
             "SELECT hub_lct, hub_member_lct, child_lct, to_plugin, notice_json, kind,
-                    pointer_uri, witness_hash, member_notice_id, hub_acked_at
+                    pointer_uri, witness_hash, member_notice_id, delivery_witness_hash, hub_acked_at
                FROM hub_receipt_custody
               WHERE receiver_binding_id = ?1 AND notice_id = ?2",
             params![receiver_binding_id.to_string(), notice_id],
@@ -1850,6 +1874,7 @@ impl SqliteInboxStore {
                 r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?,
                 r.get::<_, Option<String>>(6)?, r.get::<_, Option<String>>(7)?,
                 r.get::<_, Option<i64>>(8)?, r.get::<_, Option<String>>(9)?,
+                r.get::<_, Option<String>>(10)?,
             )),
         )?;
         anyhow::ensure!(
@@ -1865,7 +1890,8 @@ impl SqliteInboxStore {
             to_plugin: row.3,
             witness_hash: row.7,
             member_notice_id: row.8.map(|n| n as u64),
-            hub_acked_at: row.9
+            delivery_witness_hash: row.9,
+            hub_acked_at: row.10
                 .map(|s| DateTime::parse_from_rfc3339(&s)
                     .map(|t| t.with_timezone(&Utc)))
                 .transpose()
@@ -1973,6 +1999,59 @@ impl SqliteInboxStore {
         Ok(n as u64)
     }
 
+    /// Record the witness that proves durable member-inbox acceptance.
+    ///
+    /// The row may have a member_notice_id before this is set (crash between
+    /// enqueue and witness). Such a row is NOT ACK-eligible. Replaying the same
+    /// delivery witness is idempotent; trying to bind a different witness fails.
+    pub fn record_hub_receipt_delivery_witness(
+        &self,
+        receiver_binding_id: Uuid,
+        notice_id: &str,
+        delivery_witness_hash: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_hub_receipt_schema(&conn)?;
+        let row = conn
+            .query_row(
+                "SELECT member_notice_id, delivery_witness_hash
+                   FROM hub_receipt_custody
+                  WHERE receiver_binding_id = ?1 AND notice_id = ?2",
+                params![receiver_binding_id.to_string(), notice_id],
+                |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("Hub receipt {notice_id} was not staged"))?;
+        anyhow::ensure!(
+            row.0.is_some(),
+            "cannot record delivery witness for Hub receipt {notice_id} before local acceptance"
+        );
+        if let Some(existing) = row.1 {
+            anyhow::ensure!(
+                existing == delivery_witness_hash,
+                "Hub receipt {notice_id} is already bound to a different delivery witness"
+            );
+            return Ok(());
+        }
+        let changed = conn.execute(
+            "UPDATE hub_receipt_custody
+                SET delivery_witness_hash = ?3
+              WHERE receiver_binding_id = ?1 AND notice_id = ?2
+                AND member_notice_id IS NOT NULL
+                AND delivery_witness_hash IS NULL",
+            params![
+                receiver_binding_id.to_string(),
+                notice_id,
+                delivery_witness_hash,
+            ],
+        )?;
+        anyhow::ensure!(
+            changed == 1,
+            "Hub receipt {notice_id} delivery witness state changed concurrently"
+        );
+        Ok(())
+    }
+
     pub fn pending_hub_receipt_acks(&self, receiver_binding_id: Uuid) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_hub_receipt_schema(&conn)?;
@@ -1980,6 +2059,7 @@ impl SqliteInboxStore {
             "SELECT notice_id FROM hub_receipt_custody
               WHERE receiver_binding_id = ?1
                 AND member_notice_id IS NOT NULL
+                AND delivery_witness_hash IS NOT NULL
                 AND hub_acked_at IS NULL
               ORDER BY queued_at ASC",
         )?;
@@ -1999,10 +2079,14 @@ impl SqliteInboxStore {
         let changed = conn.execute(
             "UPDATE hub_receipt_custody SET hub_acked_at = ?3
               WHERE receiver_binding_id = ?1 AND notice_id = ?2
-                AND member_notice_id IS NOT NULL",
+                AND member_notice_id IS NOT NULL
+                AND delivery_witness_hash IS NOT NULL",
             params![receiver_binding_id.to_string(), notice_id, Utc::now().to_rfc3339()],
         )?;
-        anyhow::ensure!(changed == 1, "cannot mark Hub receipt {notice_id} ACKed before local acceptance");
+        anyhow::ensure!(
+            changed == 1,
+            "cannot mark Hub receipt {notice_id} ACKed before witnessed local delivery"
+        );
         Ok(())
     }
 
@@ -2014,20 +2098,23 @@ impl SqliteInboxStore {
         let conn = self.conn.lock().unwrap();
         Self::ensure_hub_receipt_schema(&conn)?;
         let row = conn.query_row(
-            "SELECT child_lct, to_plugin, witness_hash, member_notice_id, hub_acked_at
+            "SELECT child_lct, to_plugin, witness_hash, member_notice_id,
+                    delivery_witness_hash, hub_acked_at
                FROM hub_receipt_custody
               WHERE receiver_binding_id = ?1 AND notice_id = ?2",
             params![receiver_binding_id.to_string(), notice_id],
             |r| Ok((
                 r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?,
                 r.get::<_, Option<i64>>(3)?, r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
             )),
         ).optional()?;
         row.map(|r| -> Result<HubReceiptCustody> {
             Ok(HubReceiptCustody {
                 receiver_binding_id, notice_id: notice_id.to_string(), child_lct: r.0, to_plugin: r.1,
                 witness_hash: r.2, member_notice_id: r.3.map(|n| n as u64),
-                hub_acked_at: r.4.map(|s| DateTime::parse_from_rfc3339(&s)
+                delivery_witness_hash: r.4,
+                hub_acked_at: r.5.map(|s| DateTime::parse_from_rfc3339(&s)
                     .map(|t| t.with_timezone(&Utc))).transpose()
                     .context("parsing Hub receipt ack time")?,
             })
