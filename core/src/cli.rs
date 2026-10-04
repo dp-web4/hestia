@@ -3112,6 +3112,201 @@ fn cmd_hub_notifications(home: &std::path::Path, target: &str) -> AnyResult<()> 
     Ok(())
 }
 
+fn receiver_router_lct(vault: &Vault, explicit: Option<&str>) -> AnyResult<String> {
+    if let Some(v) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(v.to_string());
+    }
+    hestia::sovereign::Sovereign::persisted_lct_id(vault).ok_or_else(|| anyhow::anyhow!(
+        "no persisted router/parent LCT; pass --parent explicitly (the current fallback is the \
+         local sovereign until the machine-entity migration lands)"
+    ))
+}
+
+fn cmd_receiver_bind(
+    home: &std::path::Path,
+    child: &str,
+    target: &str,
+    parent: Option<&str>,
+    reason: &str,
+) -> AnyResult<()> {
+    anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
+    let mut vault = open_vault(home)?;
+    let router_lct = receiver_router_lct(&vault, parent)?;
+    let registry = hestia::member_registry::load_members(&vault);
+    let resolved = registry.resolve_child_of(&router_lct, child)?;
+    let (plugin_id, child_lct) = match resolved {
+        hestia::member_registry::LocalChildResolution::Local(m) => {
+            (m.plugin_id.to_string(), m.lct.lct_id())
+        }
+        hestia::member_registry::LocalChildResolution::KnownButNotChild(m) => anyhow::bail!(
+            "'{child}' resolves to '{}' ({}) but is not parent-bound to router {}; \
+             refusing to create a local mailbox route",
+            m.plugin_id, m.lct.lct_id(), router_lct
+        ),
+        hestia::member_registry::LocalChildResolution::Unknown => anyhow::bail!(
+            "'{child}' does not resolve to a registered local member"
+        ),
+    };
+
+    let hubs = HubStore::load(&vault)?;
+    let conn = pick_connection(&hubs, target)?;
+    let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let pinned = rt
+        .block_on(client.resolve_member_pubkey(&rest, conn.hub_lct_id, conn.our_lct_id))
+        .with_context(|| format!("resolving Hub pin for {}", conn.our_lct_id))?;
+    anyhow::ensure!(
+        pinned.to_hex() == keypair.verifying_key().to_hex(),
+        "refusing receiver bind: connection {} signs with a key different from the Hub pin for {}",
+        conn.id, conn.our_lct_id
+    );
+
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .unwrap_or_default();
+    table.bind_local(hestia::receiver_routing::LocalMailboxBinding {
+        child_lct: child_lct.clone(),
+        hub_connection_id: conn.id,
+        reason: reason.trim().to_string(),
+        set_by: "hestia-cli".into(),
+        set_at: chrono::Utc::now().timestamp().max(0) as u64,
+    });
+    table.save(&mut vault)?;
+
+    println!("Receiver local route bound:");
+    println!("  router:       {router_lct}");
+    println!("  child:        {plugin_id} ({child_lct})");
+    println!("  hub member:   {}", conn.our_lct_id);
+    println!("  connection:   {} ({})", conn.id, conn.url);
+    println!("  credential:   verified against Hub pin");
+    println!("  wake:         none (delivery only)");
+    Ok(())
+}
+
+fn cmd_receiver_unbind(home: &std::path::Path, child: &str) -> AnyResult<()> {
+    let mut vault = open_vault(home)?;
+    let registry = hestia::member_registry::load_members(&vault);
+    let canonical = registry
+        .resolve_reference(child)?
+        .map(|m| m.lct.lct_id())
+        .unwrap_or_else(|| child.to_string());
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .unwrap_or_default();
+    anyhow::ensure!(
+        table.unbind_local(&canonical),
+        "no receiver local mailbox binding for '{child}' ({canonical})"
+    );
+    table.save(&mut vault)?;
+    println!("Receiver local route removed: {canonical}");
+    Ok(())
+}
+
+fn cmd_receiver_route(
+    home: &std::path::Path,
+    destination: &str,
+    next_hop: &str,
+    metric: u32,
+    reason: &str,
+) -> AnyResult<()> {
+    anyhow::ensure!(!destination.trim().is_empty(), "destination is required");
+    anyhow::ensure!(!next_hop.trim().is_empty(), "next_hop is required");
+    anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
+    let mut vault = open_vault(home)?;
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .unwrap_or_default();
+    table.set_route(hestia::receiver_routing::StaticRoute {
+        destination_lct: destination.trim().to_string(),
+        next_hop_lct: next_hop.trim().to_string(),
+        metric,
+        reason: reason.trim().to_string(),
+    });
+    table.save(&mut vault)?;
+    println!(
+        "Receiver route: {} -> {}  metric={} ({})",
+        destination.trim(), next_hop.trim(), metric, reason.trim()
+    );
+    Ok(())
+}
+
+fn cmd_receiver_default(
+    home: &std::path::Path,
+    next_hop: Option<&str>,
+    clear: bool,
+) -> AnyResult<()> {
+    anyhow::ensure!(
+        clear || next_hop.is_some(),
+        "provide NEXT_HOP or --clear"
+    );
+    let mut vault = open_vault(home)?;
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .unwrap_or_default();
+    if clear {
+        table.set_default(None);
+        println!("Receiver default route cleared.");
+    } else {
+        let hop = next_hop.unwrap().trim();
+        anyhow::ensure!(!hop.is_empty(), "default next hop must not be empty");
+        table.set_default(Some(hop.to_string()));
+        println!("Receiver default route: * -> {hop}");
+    }
+    table.save(&mut vault)?;
+    Ok(())
+}
+
+fn cmd_receiver_routes(home: &std::path::Path) -> AnyResult<()> {
+    let vault = open_vault(home)?;
+    let table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .unwrap_or_default();
+    println!("Receiver routing table (hop-limit {}):", table.hop_limit);
+    println!("  directly connected / local mailboxes:");
+    if table.local_mailboxes.is_empty() {
+        println!("    (none)");
+    }
+    for b in &table.local_mailboxes {
+        println!(
+            "    {} -> local inbox via Hub connection {}  ({})",
+            b.child_lct, b.hub_connection_id, b.reason
+        );
+    }
+    println!("  specific routes:");
+    if table.routes.is_empty() {
+        println!("    (none)");
+    }
+    for r in &table.routes {
+        println!(
+            "    {} -> {}  metric={}  ({})",
+            r.destination_lct, r.next_hop_lct, r.metric, r.reason
+        );
+    }
+    println!(
+        "  default: {}",
+        table.default_next_hop_lct.as_deref().unwrap_or("(none; no-route is terminal)")
+    );
+    Ok(())
+}
+
+fn cmd_receiver_drain(home: &std::path::Path, parent: Option<&str>) -> AnyResult<()> {
+    let (vault, passphrase) = open_vault_with_passphrase(home)?;
+    let router_lct = receiver_router_lct(&vault, parent)?;
+    let store_key = hestia::storage::storage_key(home, &passphrase)
+        .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
+    let inbox = hestia::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
+    let chain = hestia::storage::SqliteChainStore::open(home.join("witness.db"), store_key)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    let report = rt.block_on(hestia::fleet_receiver::drain_once(
+        &vault, &router_lct, &inbox, &chain,
+    ))?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    anyhow::ensure!(
+        report.errors == 0,
+        "receiver pass completed with {} error(s); durable state was retained for retry",
+        report.errors
+    );
+    Ok(())
+}
+
+
 /// Bind a notice to a specific version of the pointed-at substance via a
 /// self-describing, scheme-tagged content hash (mesh H-008, tag scheme agreed with
 /// Legion 2026-07-06). Mirrors `hub-mesh/hub-notify.sh`:
