@@ -225,6 +225,7 @@ fn duplicate_ingress_receipts_share_one_packet_completion() {
     inbox.record_router_local_decision(
         packet,
         r#"{"action":"terminal","reason":"test"}"#,
+        None,
     ).unwrap();
     inbox.complete_router_packet(
         packet, "unreachable-terminal", "done-witness",
