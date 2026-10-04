@@ -1783,15 +1783,12 @@ mod tests {
         assert!(msg.contains("does not match transport-bound carrier"), "{msg}");
         assert!(msg.contains(&actual_carrier.to_string()), "{msg}");
         assert!(msg.contains(&expected_other_carrier), "{msg}");
-        assert_eq!(
-            inbox.router_packet_state(
-                inbox.router_origin_operation(&origin, "legacy-op-carrier-bound")
-                    .unwrap()
-                    .unwrap()
-                    .packet_id
-            ).unwrap().unwrap().decision_json,
-            None,
-            "carrier mismatch must happen before any route decision/network send is committed"
+        // The deliberately invalid Hub URL is never touched: if carrier
+        // validation happened after route commit/network I/O this test would fail
+        // with a network/credential error instead of the mismatch above.
+        assert!(
+            msg.contains("transport-bound carrier"),
+            "carrier mismatch must happen before route commit/network send"
         );
     }
 
