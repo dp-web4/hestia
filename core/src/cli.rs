@@ -3619,7 +3619,7 @@ fn cmd_receiver_unalias(
         legacy_address.trim()
     );
     anyhow::ensure!(
-        table.unbind_legacy_alias(legacy_address.trim()),
+        table.unbind_legacy_alias(legacy_address.trim())?,
         "legacy route alias disappeared during removal"
     );
     table.save(&mut vault)?;
