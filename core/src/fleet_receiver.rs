@@ -269,6 +269,24 @@ pub async fn drain_once(
                 };
                 let kind = value_string(notice, "kind").unwrap_or_else(|| "notify".into());
                 let pointer_uri = value_string(notice, "pointer_uri");
+
+                // This slice delivers POINTER-BASED coordination mail into
+                // hestia_member_inbox. A member-sealed secret is a different
+                // release surface: acknowledging it here would transfer Hub
+                // custody into a queue whose consumer cannot open the payload.
+                // Leave it on the Hub until the paired/secret consumer is wired.
+                let member_sealed = notice
+                    .get("sealed_by")
+                    .is_some_and(|v| !v.is_null());
+                if member_sealed || kind == "secret" {
+                    report.errors.push(format!(
+                        "notice {notice_id} kind={kind} carries member-sealed/secret payload; \
+                         receiver Slice B has no secret-release consumer, so it was NOT acked"
+                    ));
+                    batch_failed = true;
+                    continue;
+                }
+
                 let notice_json = match serde_json::to_string(notice) {
                     Ok(v) => v,
                     Err(e) => {
