@@ -5521,7 +5521,13 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
 
     if let Some(b) = transport_binding
         .as_ref()
-        .filter(|b| b.mode == crate::server::transport_binding::TransportMode::DirectRequired)
+        .filter(|b| {
+            b.mode == crate::server::transport_binding::TransportMode::DirectRequired
+                && !matches!(
+                    f3_plan.as_ref(),
+                    Some(plan) if plan.authority_source == "canonical_lct"
+                )
+        })
     {
         let mut refusal_record = json!({
             "reason": "transport_binding_unmet",
@@ -5782,6 +5788,88 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
                 ));
             }
         };
+
+        // Native canonical addressing can still resolve to a directly-connected
+        // child. direct_required means no carrier may sign this member's routed
+        // traffic, not that canonical syntax is forbidden. Decide against the SAME
+        // immutable vault snapshot D1 receives below: local delivery is allowed;
+        // an actual Forward is refused before packet origination/network I/O.
+        if transport_record
+            .as_ref()
+            .and_then(|v| v.get("mode"))
+            .and_then(Value::as_str)
+            == Some("direct_required")
+        {
+            let routes = match crate::receiver_routing::ReceiverRoutingTable::load(&vault) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(hestia_error_envelope(
+                        "hestia.member_notify_f3_vault_unavailable",
+                        &format!("cannot read F3 routes for direct_required check: {e}"),
+                        Some(json!({"operation_id": op_id})),
+                    ));
+                }
+            };
+            let registry = crate::member_registry::load_members(&vault);
+            let decision = match crate::receiver_routing::decide_route(
+                &registry,
+                &routes,
+                &plan.router_lct,
+                &plan.destination_lct,
+                &crate::receiver_routing::RouteTrace::fresh(&routes),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(hestia_error_envelope(
+                        "hestia.member_notify_f3_route_unavailable",
+                        &format!("cannot decide F3 route under direct_required: {e}"),
+                        Some(json!({"operation_id": op_id})),
+                    ));
+                }
+            };
+            if let crate::receiver_routing::RouteDecision::Forward {
+                next_hop_lct,
+                ..
+            } = &decision
+            {
+                let refusal_key = member_notify_operation_event_key(
+                    "refusal-f3-direct-required",
+                    &sender_plugin_id,
+                    &op_id,
+                );
+                let refusal = s.chain_store.append_once(
+                    &refusal_key,
+                    "member_notice_refused",
+                    json!({
+                        "reason": "transport_binding_unmet",
+                        "delivery_authority": "f3",
+                        "operation_id": op_id,
+                        "to_plugin_id": to_plugin,
+                        "canonical_destination_lct": plan.destination_lct,
+                        "from_plugin_id": sender_plugin_id,
+                        "origin_lct": plan.origin_lct,
+                        "router_lct": plan.router_lct,
+                        "next_hop_lct": next_hop_lct,
+                        "transport": transport_record,
+                        "member_notice_witness": member_notice_hash,
+                    }),
+                    &s.sovereign_lct,
+                )?.0;
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_transport_unmet",
+                    "this sender is bound direct_required and the canonical F3 destination currently requires a network hop. No route packet was originated. Bind the sender's own carrier, or retry the same operation_id after the destination becomes directly local.",
+                    Some(json!({
+                        "operation_id": op_id,
+                        "delivery_authority": "f3",
+                        "canonical_destination_lct": plan.destination_lct,
+                        "next_hop_lct": next_hop_lct,
+                        "witnessEntryHash": member_notice_hash,
+                        "refusalEntryHash": refusal.hash,
+                    })),
+                ));
+            }
+        }
+
         let inbox = std::sync::Arc::clone(&s.inbox_store);
         let chain = std::sync::Arc::clone(&s.chain_store);
         let sovereign_lct = s.sovereign_lct.clone();
