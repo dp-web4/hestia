@@ -828,6 +828,255 @@ impl SqliteInboxStore {
         Self::enqueue_member_on(&conn, to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, in_reply_to)
     }
 
+
+    /// Read one already-committed member-notify operation.
+    pub fn member_send_operation(
+        &self,
+        sender_plugin: &str,
+        operation_id: &str,
+    ) -> Result<Option<MemberSendOperation>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        Self::member_send_operation_on(&conn, sender_plugin, operation_id)
+    }
+
+    fn member_send_operation_on(
+        conn: &Connection,
+        sender_plugin: &str,
+        operation_id: &str,
+    ) -> Result<Option<MemberSendOperation>> {
+        conn.query_row(
+            "SELECT binding_json, witness_hash, queued_id, egress_peer, outcome,
+                    response_json, shadow_record_json, shadow_witness_hash, created_at
+               FROM member_send_ops
+              WHERE sender_plugin = ?1 AND operation_id = ?2",
+            params![sender_plugin, operation_id],
+            |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(8)?,
+            )),
+        )
+        .optional()?
+        .map(|r| -> Result<MemberSendOperation> {
+            Ok(MemberSendOperation {
+                sender_plugin: sender_plugin.to_string(),
+                operation_id: operation_id.to_string(),
+                binding_json: r.0,
+                witness_hash: r.1,
+                queued_id: r.2.map(|v| v as u64),
+                egress_peer: r.3,
+                outcome: r.4,
+                response_json: serde_json::from_str(&r.5)
+                    .context("parsing member send operation response")?,
+                shadow_record_json: r.6,
+                shadow_witness_hash: r.7,
+                created_at: DateTime::parse_from_rfc3339(&r.8)
+                    .context("parsing member send operation created_at")?
+                    .with_timezone(&Utc),
+            })
+        })
+        .transpose()
+    }
+
+    fn validate_member_send_replay(
+        op: &MemberSendOperation,
+        binding_json: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            op.binding_json == binding_json,
+            "member-notify operation '{}' for '{}' was already used for different send intent",
+            op.operation_id,
+            op.sender_plugin
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_member_operation(
+        &self,
+        sender_plugin: &str,
+        operation_id: &str,
+        binding_json: &str,
+        to_plugin: &str,
+        from_plugin: &str,
+        from_role: &str,
+        kind: &str,
+        pointer_uri: Option<&str>,
+        chain_hash: &str,
+        in_reply_to: Option<u64>,
+        response_template: &Value,
+        shadow_record_json: Option<&str>,
+    ) -> Result<MemberSendOperation> {
+        let mut conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let tx = conn.transaction().context("starting member-send operation")?;
+        if let Some(op) = Self::member_send_operation_on(&tx, sender_plugin, operation_id)? {
+            Self::validate_member_send_replay(&op, binding_json)?;
+            tx.commit().context("committing member-send replay read")?;
+            return Ok(op);
+        }
+        let queued_id = Self::enqueue_member_on(
+            &tx,
+            to_plugin,
+            from_plugin,
+            from_role,
+            kind,
+            pointer_uri,
+            chain_hash,
+            in_reply_to,
+        )?;
+        let mut response = response_template.clone();
+        response["queued_id"] = serde_json::json!(queued_id);
+        response["egress_queued_to"] = Value::Null;
+        response["replayed"] = serde_json::json!(false);
+        let response_json = serde_json::to_string(&response)?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO member_send_ops
+                (sender_plugin, operation_id, binding_json, witness_hash, queued_id,
+                 egress_peer, outcome, response_json, shadow_record_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'queued', ?6, ?7, ?8)",
+            params![
+                sender_plugin, operation_id, binding_json, chain_hash,
+                queued_id as i64, response_json, shadow_record_json, now,
+            ],
+        )
+        .context("binding local member-send operation")?;
+        tx.commit().context("committing local member-send operation")?;
+        Self::member_send_operation_on(&conn, sender_plugin, operation_id)?
+            .ok_or_else(|| anyhow::anyhow!("member-send operation disappeared after commit"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_egress_operation(
+        &self,
+        sender_plugin: &str,
+        operation_id: &str,
+        binding_json: &str,
+        dest_peer: &str,
+        to_plugin: &str,
+        from_plugin: &str,
+        from_role: &str,
+        kind: &str,
+        pointer_uri: Option<&str>,
+        chain_hash: &str,
+        transport_stamp: Option<&str>,
+        response_template: &Value,
+        shadow_record_json: Option<&str>,
+    ) -> Result<MemberSendOperation> {
+        let mut conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let tx = conn.transaction().context("starting routed member-send operation")?;
+        if let Some(op) = Self::member_send_operation_on(&tx, sender_plugin, operation_id)? {
+            Self::validate_member_send_replay(&op, binding_json)?;
+            tx.commit().context("committing routed member-send replay read")?;
+            return Ok(op);
+        }
+        let queued_id = Self::enqueue_egress_on(
+            &tx,
+            dest_peer,
+            to_plugin,
+            from_plugin,
+            from_role,
+            kind,
+            pointer_uri,
+            chain_hash,
+            transport_stamp,
+        )?;
+        let mut response = response_template.clone();
+        response["queued_id"] = serde_json::json!(queued_id);
+        response["egress_queued_to"] = serde_json::json!(dest_peer);
+        response["replayed"] = serde_json::json!(false);
+        let response_json = serde_json::to_string(&response)?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO member_send_ops
+                (sender_plugin, operation_id, binding_json, witness_hash, queued_id,
+                 egress_peer, outcome, response_json, shadow_record_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9)",
+            params![
+                sender_plugin, operation_id, binding_json, chain_hash,
+                queued_id as i64, dest_peer, response_json, shadow_record_json, now,
+            ],
+        )
+        .context("binding routed member-send operation")?;
+        tx.commit().context("committing routed member-send operation")?;
+        Self::member_send_operation_on(&conn, sender_plugin, operation_id)?
+            .ok_or_else(|| anyhow::anyhow!("routed member-send operation disappeared after commit"))
+    }
+
+    pub fn record_member_send_refusal(
+        &self,
+        sender_plugin: &str,
+        operation_id: &str,
+        binding_json: &str,
+        witness_hash: &str,
+        response: &Value,
+    ) -> Result<MemberSendOperation> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        if let Some(op) = Self::member_send_operation_on(&conn, sender_plugin, operation_id)? {
+            Self::validate_member_send_replay(&op, binding_json)?;
+            return Ok(op);
+        }
+        conn.execute(
+            "INSERT INTO member_send_ops
+                (sender_plugin, operation_id, binding_json, witness_hash, queued_id,
+                 egress_peer, outcome, response_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, 'refused', ?5, ?6)",
+            params![
+                sender_plugin, operation_id, binding_json, witness_hash,
+                serde_json::to_string(response)?, Utc::now().to_rfc3339(),
+            ],
+        )
+        .context("binding refused member-send operation")?;
+        Self::member_send_operation_on(&conn, sender_plugin, operation_id)?
+            .ok_or_else(|| anyhow::anyhow!("refused member-send operation disappeared after insert"))
+    }
+
+    pub fn set_member_send_shadow_witness(
+        &self,
+        sender_plugin: &str,
+        operation_id: &str,
+        witness_hash: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let prior: Option<Option<String>> = conn
+            .query_row(
+                "SELECT shadow_witness_hash FROM member_send_ops
+                  WHERE sender_plugin = ?1 AND operation_id = ?2",
+                params![sender_plugin, operation_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(prior) = prior else {
+            anyhow::bail!("member-send operation '{operation_id}' for '{sender_plugin}' is absent");
+        };
+        if let Some(prior) = prior {
+            anyhow::ensure!(
+                prior == witness_hash,
+                "member-send operation '{operation_id}' is bound to a different shadow witness"
+            );
+            return Ok(());
+        }
+        let n = conn.execute(
+            "UPDATE member_send_ops SET shadow_witness_hash = ?3
+              WHERE sender_plugin = ?1 AND operation_id = ?2
+                AND shadow_witness_hash IS NULL",
+            params![sender_plugin, operation_id, witness_hash],
+        )?;
+        anyhow::ensure!(n == 1, "member-send shadow witness changed concurrently");
+        Ok(())
+    }
+
     /// Retire an egress row AND queue its author's report in one transaction (#1030 review):
     /// either both land or neither does. `None` means the row was not pending (already
     /// forwarded, retired, or never queued), and nothing was written. Before this, a
