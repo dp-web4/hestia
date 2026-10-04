@@ -298,7 +298,8 @@ mod tests {
     #[test]
     fn known_nonlocal_and_unknown_route_instead_of_refusing() {
         let (_dir, _vault, mut reg, parent, _child) = registry_world();
-        let mut vault2 = Vault::init(tempfile::tempdir().unwrap().path().join("v.enc"), "p".into()).unwrap();
+        let remote_dir = tempfile::tempdir().unwrap();
+        let mut vault2 = Vault::init(remote_dir.path().join("v.enc"), "p".into()).unwrap();
         let remote_parent = "lct:web4:mb32:remote-parent";
         let remote = ensure_member(&mut vault2, &mut reg, "remote", false, remote_parent, "remote-anchor").unwrap();
         let mut t = ReceiverRoutingTable::default();
