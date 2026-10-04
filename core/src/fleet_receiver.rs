@@ -13,7 +13,7 @@ use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::hub::{member_signing_keypair, HubClient, HubConnection, HubStore};
+use crate::hub::{member_signing_keypair, HubClient, HubConnection};
 use crate::member_registry::{load_members, LocalChildResolution};
 use crate::receiver_routing::ReceiverRoutingTable;
 use crate::storage::{SqliteChainStore, SqliteInboxStore};
@@ -27,7 +27,7 @@ const MAX_FETCH_PAGES: usize = 20;
 pub struct ReceiverBindingReport {
     pub child_lct: String,
     pub plugin_id: Option<String>,
-    pub hub_connection_id: Uuid,
+    pub binding_id: Uuid,
     pub fetched: usize,
     pub accepted_local: usize,
     pub acked: usize,
@@ -43,6 +43,21 @@ pub struct ReceiverDrainReport {
     pub accepted_local: usize,
     pub acked: usize,
     pub errors: usize,
+}
+
+fn connection_from_binding(binding: &crate::receiver_routing::LocalMailboxBinding) -> HubConnection {
+    HubConnection {
+        id: binding.binding_id,
+        url: binding.hub_url.clone(),
+        hub_lct_id: binding.hub_lct_id,
+        our_lct_id: binding.hub_member_lct,
+        connected_at: chrono::Utc::now(),
+        last_seen: None,
+        api_version: "v1".into(),
+        rest_endpoint: binding.rest_endpoint.clone(),
+        hubs_joined: vec![binding.hub_lct_id],
+        member_key_source: binding.member_key_source.clone(),
+    }
 }
 
 fn abs_rest(conn: &HubConnection) -> String {
@@ -140,7 +155,6 @@ pub async fn drain_once(
 ) -> Result<ReceiverDrainReport> {
     let registry = load_members(vault);
     let routes = ReceiverRoutingTable::load(vault).unwrap_or_default();
-    let hubs = HubStore::load(vault)?;
     let client = HubClient::new();
 
     let mut reports = Vec::new();
@@ -149,7 +163,7 @@ pub async fn drain_once(
         let mut report = ReceiverBindingReport {
             child_lct: binding.child_lct.clone(),
             plugin_id: None,
-            hub_connection_id: binding.hub_connection_id,
+            binding_id: binding.binding_id,
             fetched: 0,
             accepted_local: 0,
             acked: 0,
@@ -186,14 +200,12 @@ pub async fn drain_once(
         };
         let (plugin_id, canonical_child_lct) = local;
 
-        let Some(conn) = hubs.find_by_id(binding.hub_connection_id).cloned() else {
-            report.errors.push(format!(
-                "no Hub connection {} for local child {}",
-                binding.hub_connection_id, canonical_child_lct
-            ));
-            reports.push(report);
-            continue;
-        };
+        // The receiver owns its own hosted-mailbox interface table. Do NOT look
+        // this child up in HubStore: HubStore intentionally models the historical
+        // one-member-per-Hub CLI connection and rejects duplicate URLs, while a
+        // machine router must host N independently-authenticated child identities
+        // against the same Hub endpoint.
+        let conn = connection_from_binding(binding);
 
         let (channel, keypair, rest) = match open_verified_channel(&client, vault, &conn).await {
             Ok(v) => v,
