@@ -172,7 +172,7 @@ accepted the notice. F3 deliberately strengthens this to one witnessed custody b
 Neither claim means the end recipient has read or acted on the notice. Receipts must name this
 strengthening rather than call it parity.
 
-**Transport-binding preservation.** `direct_required` remains a hard refusal. For explicit
+**Transport-binding preservation.** `direct_required` remains a hard refusal when the actual F3 route requires a network hop; a canonical destination that resolves to a directly-connected local child needs no carrier and remains local. For explicit
 direct/relay bindings, D1 constrains the **actual persisted first-hop interface** to the
 authorized carrier; a preflight comparison is insufficient because routing could change
 between check and send. A bound `reply_to_lct` must equal the canonical sender identity for
