@@ -788,6 +788,10 @@ mod tests {
         t.bind_legacy_alias(LegacyRouteAlias {
             legacy_address: "thor/claude-code".into(),
             destination_lct: destination.clone(),
+            delivery_authority: LegacyDeliveryAuthority::Legacy,
+            authority_reason: None,
+            authority_set_by: String::new(),
+            authority_set_at: 0,
             reason: "explicit compatibility mapping".into(),
             set_by: "test".into(),
             set_at: 1,
@@ -829,6 +833,10 @@ mod tests {
         let mk = |addr: &str, dest: &str| LegacyRouteAlias {
             legacy_address: addr.into(),
             destination_lct: dest.into(),
+            delivery_authority: LegacyDeliveryAuthority::Legacy,
+            authority_reason: None,
+            authority_set_by: String::new(),
+            authority_set_at: 0,
             reason: "test".into(),
             set_by: "test".into(),
             set_at: 1,
@@ -842,6 +850,49 @@ mod tests {
         assert!(t.bind_legacy_alias(mk(
             "thor/claude-code", "lct:web4:member:legacy"
         )).unwrap_err().to_string().contains("canonical"));
+    }
+
+    #[test]
+    fn legacy_alias_authority_is_explicit_reasoned_and_per_edge() {
+        let mut t = ReceiverRoutingTable::default();
+        t.bind_legacy_alias(LegacyRouteAlias {
+            legacy_address: "thor/claude-code".into(),
+            destination_lct: "lct:web4:mb32:remote-child".into(),
+            delivery_authority: LegacyDeliveryAuthority::Legacy,
+            authority_reason: None,
+            authority_set_by: String::new(),
+            authority_set_at: 0,
+            reason: "identity compatibility mapping".into(),
+            set_by: "test".into(),
+            set_at: 1,
+        }).unwrap();
+
+        assert_eq!(
+            t.legacy_alias("thor/claude-code").unwrap().delivery_authority,
+            LegacyDeliveryAuthority::Legacy,
+            "an alias does not imply cutover"
+        );
+        assert!(t.set_legacy_authority(
+            "thor/claude-code",
+            LegacyDeliveryAuthority::F3,
+            "",
+            "operator",
+            2,
+        ).is_err(), "cutover without a named migration reason must fail");
+
+        t.set_legacy_authority(
+            "thor/claude-code",
+            LegacyDeliveryAuthority::F3,
+            "D2 measured; F3 durable-next-hop acceptance intentionally strengthens legacy Hub acceptance",
+            "operator",
+            3,
+        ).unwrap();
+
+        let alias = t.legacy_alias("thor/claude-code").unwrap();
+        assert_eq!(alias.delivery_authority, LegacyDeliveryAuthority::F3);
+        assert!(alias.authority_reason.as_deref().unwrap().contains("strengthens"));
+        assert_eq!(alias.authority_set_by, "operator");
+        assert_eq!(alias.authority_set_at, 3);
     }
 
     #[test]
