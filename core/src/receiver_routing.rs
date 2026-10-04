@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::hub::MemberKeySource;
+use crate::addressing::{parse_address, Address};
 use crate::member_registry::{LocalChildResolution, MemberRegistry};
 
 const ROUTES_NAMESPACE: &str = "presence";
@@ -251,6 +252,36 @@ fn valid_content_hash(value: &str) -> bool {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LegacyRouteAlias {
+    /// Exact legacy compatibility spelling, e.g. `thor/claude-code`.
+    /// This is an edge alias only; it never appears in a route packet.
+    pub legacy_address: String,
+    /// Canonical END MEMBER identity. Never the peer-machine/router LCT.
+    pub destination_lct: String,
+    pub reason: String,
+    #[serde(default)]
+    pub set_by: String,
+    #[serde(default)]
+    pub set_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LegacyRouteShadow {
+    NotRouted {
+        legacy_address: String,
+    },
+    MissingAlias {
+        legacy_address: String,
+    },
+    Resolved {
+        legacy_address: String,
+        destination_lct: String,
+        decision: RouteDecision,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StaticRoute {
     /// Exact v1 destination. A future graph route may widen this to a witnessed
     /// subtree predicate without changing RouteDecision.
@@ -279,6 +310,10 @@ pub struct ReceiverRoutingTable {
     pub router_ingress: Vec<RouterIngressBinding>,
     #[serde(default)]
     pub neighbors: Vec<RouterNeighbor>,
+    /// D2 compatibility edge: legacy peer/member spelling -> canonical END member LCT.
+    /// Never inferred from peer names and never written into route packets.
+    #[serde(default)]
+    pub legacy_aliases: Vec<LegacyRouteAlias>,
     #[serde(default)]
     pub routes: Vec<StaticRoute>,
     #[serde(default)]
@@ -297,6 +332,7 @@ impl Default for ReceiverRoutingTable {
             local_mailboxes: Vec::new(),
             router_ingress: Vec::new(),
             neighbors: Vec::new(),
+            legacy_aliases: Vec::new(),
             routes: Vec::new(),
             default_route: None,
             hop_limit: DEFAULT_HOP_LIMIT,
@@ -422,6 +458,83 @@ impl ReceiverRoutingTable {
         self.router_ingress.iter().find(|b| b.binding_id == binding_id)
     }
 
+    pub fn bind_legacy_alias(&mut self, alias: LegacyRouteAlias) -> Result<()> {
+        match parse_address(&alias.legacy_address) {
+            Ok(Address::Routed { .. }) => {}
+            Ok(Address::Local(_)) => anyhow::bail!(
+                "legacy route alias '{}' is local, not peer/member",
+                alias.legacy_address
+            ),
+            Err(e) => anyhow::bail!(
+                "legacy route alias '{}' is malformed: {e:?}",
+                alias.legacy_address
+            ),
+        }
+        anyhow::ensure!(
+            alias.destination_lct.starts_with("lct:web4:mb32:"),
+            "legacy alias destination must be a canonical lct:web4:mb32:* member identity"
+        );
+        anyhow::ensure!(
+            !alias.reason.trim().is_empty(),
+            "legacy route alias requires a reason"
+        );
+        anyhow::ensure!(
+            !self.legacy_aliases.iter().any(|a| a.legacy_address == alias.legacy_address),
+            "legacy route alias '{}' already exists; remove it before changing identity",
+            alias.legacy_address
+        );
+        self.legacy_aliases.push(alias);
+        self.legacy_aliases.sort_by(|a, b| a.legacy_address.cmp(&b.legacy_address));
+        Ok(())
+    }
+
+    pub fn unbind_legacy_alias(&mut self, legacy_address: &str) -> bool {
+        let before = self.legacy_aliases.len();
+        self.legacy_aliases.retain(|a| a.legacy_address != legacy_address);
+        before != self.legacy_aliases.len()
+    }
+
+    pub fn legacy_alias(&self, legacy_address: &str) -> Option<&LegacyRouteAlias> {
+        self.legacy_aliases.iter().find(|a| a.legacy_address == legacy_address)
+    }
+
+    pub fn shadow_legacy_route(
+        &self,
+        registry: &MemberRegistry,
+        router_lct: &str,
+        legacy_address: &str,
+    ) -> Result<LegacyRouteShadow> {
+        match parse_address(legacy_address) {
+            Ok(Address::Local(_)) => {
+                return Ok(LegacyRouteShadow::NotRouted {
+                    legacy_address: legacy_address.to_string(),
+                });
+            }
+            Ok(Address::Routed { .. }) => {}
+            Err(e) => anyhow::bail!(
+                "legacy address '{}' is malformed: {e:?}",
+                legacy_address
+            ),
+        }
+        let Some(alias) = self.legacy_alias(legacy_address) else {
+            return Ok(LegacyRouteShadow::MissingAlias {
+                legacy_address: legacy_address.to_string(),
+            });
+        };
+        let decision = decide_route(
+            registry,
+            self,
+            router_lct,
+            &alias.destination_lct,
+            &RouteTrace::fresh(self),
+        )?;
+        Ok(LegacyRouteShadow::Resolved {
+            legacy_address: legacy_address.to_string(),
+            destination_lct: alias.destination_lct.clone(),
+            decision,
+        })
+    }
+
     pub fn set_route(&mut self, route: StaticRoute) {
         self.routes.retain(|r| {
             !(r.destination_lct == route.destination_lct && r.next_hop_lct == route.next_hop_lct)
@@ -490,7 +603,8 @@ impl RouteTrace {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "decision", rename_all = "snake_case")]
 pub enum RouteDecision {
     Local {
         plugin_id: String,
@@ -594,6 +708,70 @@ mod tests {
         let mut reg = load_members(&vault);
         let child = ensure_member(&mut vault, &mut reg, "being", false, &parent, "parent-anchor").unwrap();
         (dir, vault, reg, parent, child)
+    }
+
+    #[test]
+    fn legacy_alias_is_exact_and_targets_end_member_not_peer_machine() {
+        let (_dir, _vault, reg, parent, _child) = registry_world();
+        let mut t = ReceiverRoutingTable::default();
+        let destination = "lct:web4:mb32:remote-child".to_string();
+        t.bind_legacy_alias(LegacyRouteAlias {
+            legacy_address: "thor/claude-code".into(),
+            destination_lct: destination.clone(),
+            reason: "explicit compatibility mapping".into(),
+            set_by: "test".into(),
+            set_at: 1,
+        }).unwrap();
+        t.set_default(Some(DefaultRoute {
+            next_hop_lct: "lct:web4:mb32:thor-router".into(),
+            reason: "upstream".into(),
+            set_by: "test".into(),
+            set_at: 1,
+        }));
+
+        let shadow = t.shadow_legacy_route(
+            &reg, &parent, "thor/claude-code"
+        ).unwrap();
+        assert_eq!(
+            shadow,
+            LegacyRouteShadow::Resolved {
+                legacy_address: "thor/claude-code".into(),
+                destination_lct: destination.clone(),
+                decision: RouteDecision::Forward {
+                    destination_lct: destination,
+                    next_hop_lct: "lct:web4:mb32:thor-router".into(),
+                    via: "default",
+                },
+            }
+        );
+        assert_eq!(
+            t.shadow_legacy_route(&reg, &parent, "thor/kimi-code").unwrap(),
+            LegacyRouteShadow::MissingAlias {
+                legacy_address: "thor/kimi-code".into()
+            },
+            "member identity is never inferred from the peer/machine alias"
+        );
+    }
+
+    #[test]
+    fn legacy_alias_refuses_local_source_route_and_legacy_identity_targets() {
+        let mut t = ReceiverRoutingTable::default();
+        let mk = |addr: &str, dest: &str| LegacyRouteAlias {
+            legacy_address: addr.into(),
+            destination_lct: dest.into(),
+            reason: "test".into(),
+            set_by: "test".into(),
+            set_at: 1,
+        };
+        assert!(t.bind_legacy_alias(mk(
+            "claude-code", "lct:web4:mb32:remote"
+        )).unwrap_err().to_string().contains("local"));
+        assert!(t.bind_legacy_alias(mk(
+            "fleet/thor/claude-code", "lct:web4:mb32:remote"
+        )).is_err());
+        assert!(t.bind_legacy_alias(mk(
+            "thor/claude-code", "lct:web4:member:legacy"
+        )).unwrap_err().to_string().contains("canonical"));
     }
 
     #[test]
