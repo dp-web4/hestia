@@ -240,3 +240,83 @@ fn duplicate_ingress_receipts_share_one_packet_completion() {
         vec![id2]
     );
 }
+
+
+#[test]
+fn refused_ingress_receipt_can_ack_without_completing_the_packet() {
+    let (_dir, inbox) = store();
+    let ingress = Uuid::new_v4();
+    let packet = Uuid::new_v4();
+    let bad_id = notice_id('1');
+    let good_id = notice_id('2');
+    let p = packet_json(packet, "lct:web4:mb32:dest");
+
+    inbox.stage_router_packet(
+        ingress, &bad_id, packet, "bad-neighbor-notice", &p, "sha256-content:p",
+    ).unwrap();
+    inbox.record_router_stage_witness(
+        ingress, &bad_id, packet, "bad-stage",
+    ).unwrap();
+    inbox.record_router_ingress_refusal(
+        ingress, &bad_id, "refusal-witness",
+    ).unwrap();
+
+    assert_eq!(
+        inbox.pending_router_ingress_acks(ingress).unwrap(),
+        vec![bad_id.clone()]
+    );
+    let state = inbox.router_packet_state(packet).unwrap().unwrap();
+    assert!(state.completion_witness_hash.is_none(),
+        "per-receipt refusal must not poison the packet globally");
+    inbox.mark_router_ingress_acked(ingress, &bad_id).unwrap();
+
+    // A later legitimate copy of the SAME packet still needs real processing.
+    inbox.stage_router_packet(
+        ingress, &good_id, packet, "configured-neighbor-notice", &p, "sha256-content:p",
+    ).unwrap();
+    inbox.record_router_stage_witness(
+        ingress, &good_id, packet, "good-stage",
+    ).unwrap();
+    assert!(inbox.pending_router_ingress_acks(ingress).unwrap().is_empty());
+
+    inbox.record_router_local_decision(
+        packet,
+        r#"{"action":"local","child_lct":"lct:web4:mb32:child"}"#,
+        Some("lct:web4:mb32:child"),
+    ).unwrap();
+    inbox.complete_router_packet(
+        packet, "delivered-local", "completion",
+    ).unwrap();
+
+    assert_eq!(
+        inbox.pending_router_ingress_acks(ingress).unwrap(),
+        vec![good_id]
+    );
+}
+
+#[test]
+fn incomplete_local_transit_decision_pins_child_binding_until_completion() {
+    let (_dir, inbox) = store();
+    let ingress = Uuid::new_v4();
+    let packet = Uuid::new_v4();
+    let child = "lct:web4:mb32:child";
+    let id = notice_id('3');
+    let p = packet_json(packet, child);
+
+    inbox.stage_router_packet(
+        ingress, &id, packet, "notice", &p, "sha256-content:p",
+    ).unwrap();
+    inbox.record_router_local_decision(
+        packet,
+        r#"{"action":"local","child_lct":"lct:web4:mb32:child"}"#,
+        Some(child),
+    ).unwrap();
+
+    assert_eq!(inbox.router_local_inflight_count(child).unwrap(), 1);
+
+    inbox.complete_router_packet(
+        packet, "delivered-local", "completion-witness",
+    ).unwrap();
+
+    assert_eq!(inbox.router_local_inflight_count(child).unwrap(), 0);
+}
