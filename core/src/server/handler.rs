@@ -548,6 +548,12 @@ fn hestia_tools() -> Vec<Tool> {
                         "type": "integer",
                         "description": "Id of the notice this one answers. Expected on reply/ack/review_done — without it your response does not clear the sender's `unanswered` row. You may only bind to mail addressed to you."
                     },
+                    "operation_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Optional stable identity for ONE send operation. Retry the same operation_id after an uncertain response to recover the first witnessed/queued result. Reusing it with different recipient/kind/pointer/reply binding is refused. Identical notices with different operation ids remain distinct."
+                    },
                     "session_id": {
                         "type": "string",
                         "description": "Your own live session_id from hestia_connect. Attribution is never inherited: an unattributable sender cannot notify another member."
@@ -4876,6 +4882,23 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             }
         },
     };
+    let operation_id = match args.get("operation_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(v))
+            if !v.is_empty()
+                && v.len() <= 128
+                && !v.chars().any(char::is_control) =>
+        {
+            Some(v.clone())
+        }
+        Some(v) => {
+            return Ok(hestia_error_envelope(
+                "hestia.member_notify_bad_operation_id",
+                "operation_id must be a 1..128 byte string with no control characters",
+                Some(json!({"operation_id": v})),
+            ));
+        }
+    };
 
     let mut s = state.lock().await;
     // No latest-session fallback here — attribution must be proven, not
@@ -4888,6 +4911,100 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             None,
         ));
     };
+
+    // D2c retry identity. The key is scoped by the authenticated LEGACY actor
+    // (plugin_id); the immutable binding names the application send intent and
+    // deliberately excludes live law/liveness/routing state. If this operation
+    // already committed, this call is a replay, not a new act: do not re-run
+    // mutable policy/flood accounting and do not mint a second witness/queue row.
+    let operation_binding = operation_id.as_ref().map(|_| {
+        json!({
+            "protocol": "hestia-member-notify-op-v1",
+            "to_plugin_id": to_plugin,
+            "kind": kind,
+            "pointer_uri": pointer_uri,
+            "in_reply_to": in_reply_to,
+        })
+    });
+    let operation_binding_json = operation_binding
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+
+    if let (Some(op_id), Some(binding_json)) =
+        (operation_id.as_deref(), operation_binding_json.as_deref())
+    {
+        if let Some(op) = s
+            .inbox_store
+            .member_send_operation(&sender.plugin_id, op_id)
+            .map_err(|e| anyhow::anyhow!("reading member-notify operation: {e}"))?
+        {
+            if op.binding_json != binding_json {
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_operation_conflict",
+                    "this operation_id is already bound to a different send intent; use a new operation_id for a new act",
+                    Some(json!({
+                        "operation_id": op_id,
+                        "sender_plugin_id": sender.plugin_id,
+                    })),
+                ));
+            }
+
+            let mut out = op.response_json.clone();
+            out["operation_id"] = json!(op_id);
+            out["replayed"] = json!(true);
+
+            // Shadow evidence is observational but retryable. If the authoritative
+            // queue committed and the daemon died before the shadow witness, the
+            // exact shadow record was stored in the same queue transaction; replay
+            // can fill the evidence gap without changing delivery.
+            if let Some(hash) = op.shadow_witness_hash {
+                out["f3_shadow_witness_hash"] = json!(hash);
+            } else if let Some(record_json) = op.shadow_record_json {
+                match serde_json::from_str::<Value>(&record_json) {
+                    Ok(record) => {
+                        let key = format!(
+                            "member-notify-shadow:{}:{}",
+                            sender.plugin_id, op_id
+                        );
+                        match s.chain_store.append_once(
+                            &key,
+                            "member_notice_route_shadow",
+                            record,
+                            &s.sovereign_lct,
+                        ) {
+                            Ok((entry, _)) => {
+                                if let Err(e) = s.inbox_store.set_member_send_shadow_witness(
+                                    &sender.plugin_id,
+                                    op_id,
+                                    &entry.hash,
+                                ) {
+                                    out["f3_shadow_warning"] = json!(format!(
+                                        "operation replay recovered shadow witness {}, but could not persist its retry watermark: {e}",
+                                        entry.hash
+                                    ));
+                                } else {
+                                    out["f3_shadow_witness_hash"] = json!(entry.hash);
+                                }
+                            }
+                            Err(e) => {
+                                out["f3_shadow_warning"] = json!(format!(
+                                    "operation replay recovered delivery, but D2 shadow witness is unavailable: {e}"
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        out["f3_shadow_warning"] = json!(format!(
+                            "operation replay recovered delivery, but stored D2 shadow evidence is unreadable: {e}"
+                        ));
+                    }
+                }
+            }
+            return Ok(out);
+        }
+    }
+
     if sender.plugin_id == to_plugin {
         return Ok(hestia_error_envelope(
             "hestia.member_notify_self",
