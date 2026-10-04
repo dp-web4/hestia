@@ -3305,7 +3305,9 @@ fn cmd_receiver_default(
     home: &std::path::Path,
     next_hop: Option<&str>,
     clear: bool,
+    reason: &str,
 ) -> AnyResult<()> {
+    anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
     anyhow::ensure!(
         clear || next_hop.is_some(),
         "provide NEXT_HOP or --clear"
@@ -3315,30 +3317,41 @@ fn cmd_receiver_default(
         .unwrap_or_default();
     if clear {
         table.set_default(None);
-        println!("Receiver default route cleared.");
+        println!("Receiver default route cleared ({})", reason.trim());
     } else {
         let hop = next_hop.unwrap().trim();
         anyhow::ensure!(!hop.is_empty(), "default next hop must not be empty");
-        table.set_default(Some(hop.to_string()));
-        println!("Receiver default route: * -> {hop}");
+        table.set_default(Some(hestia::receiver_routing::DefaultRoute {
+            next_hop_lct: hop.to_string(),
+            reason: reason.trim().to_string(),
+            set_by: "hestia-cli".into(),
+            set_at: chrono::Utc::now().timestamp().max(0) as u64,
+        }));
+        println!("Receiver default route: * -> {hop} ({})", reason.trim());
     }
     table.save(&mut vault)?;
     Ok(())
 }
 
 fn cmd_receiver_routes(home: &std::path::Path) -> AnyResult<()> {
+    use hestia::hub::MemberKeySource;
+
     let vault = open_vault(home)?;
     let table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
         .unwrap_or_default();
     println!("Receiver routing table (hop-limit {}):", table.hop_limit);
-    println!("  directly connected / local mailboxes:");
+    println!("  directly connected / local mailbox interfaces:");
     if table.local_mailboxes.is_empty() {
         println!("    (none)");
     }
     for b in &table.local_mailboxes {
+        let credential = match &b.member_key_source {
+            MemberKeySource::VaultIdentity => "vault-identity",
+            MemberKeySource::ChannelKeyFile { .. } => "channel-key-file",
+        };
         println!(
-            "    {} -> local inbox via Hub connection {}  ({})",
-            b.child_lct, b.hub_connection_id, b.reason
+            "    {} -> local inbox  if={}  hub={} member={} credential={}  ({})",
+            b.child_lct, b.binding_id, b.hub_url, b.hub_member_lct, credential, b.reason
         );
     }
     println!("  specific routes:");
@@ -3351,10 +3364,10 @@ fn cmd_receiver_routes(home: &std::path::Path) -> AnyResult<()> {
             r.destination_lct, r.next_hop_lct, r.metric, r.reason
         );
     }
-    println!(
-        "  default: {}",
-        table.default_next_hop_lct.as_deref().unwrap_or("(none; no-route is terminal)")
-    );
+    match &table.default_route {
+        Some(r) => println!("  default: * -> {}  ({})", r.next_hop_lct, r.reason),
+        None => println!("  default: (none; no-route is terminal)"),
+    }
     Ok(())
 }
 
