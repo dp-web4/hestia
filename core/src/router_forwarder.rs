@@ -329,6 +329,8 @@ async fn execute_action(
     packet: &RoutePacketV1,
     state_outbound: Option<&str>,
     stage_witness_hash: &str,
+    upstream_neighbor_lct: &str,
+    upstream_hub_member: Uuid,
     vault: &Vault,
     routes: &ReceiverRoutingTable,
     router_lct: &str,
@@ -362,6 +364,8 @@ async fn execute_action(
                 "to_plugin": plugin_id,
                 "member_notice_id": local_notice_id,
                 "stage_witness_hash": stage_witness_hash,
+                "upstream_neighbor_lct": upstream_neighbor_lct,
+                "upstream_hub_member": upstream_hub_member,
                 "source": source,
                 "delivery_packet_json": delivery_packet_json,
                 "wake": "not-considered",
@@ -386,6 +390,8 @@ async fn execute_action(
                 "destination_lct": packet.destination_lct,
                 "reason": reason,
                 "stage_witness_hash": stage_witness_hash,
+                "upstream_neighbor_lct": upstream_neighbor_lct,
+                "upstream_hub_member": upstream_hub_member,
                 "terminal": true,
             });
             let (witness, _) = chain.append_once(
@@ -484,6 +490,8 @@ async fn execute_action(
                 "outbound_packet_hash": sha256_content(outbound.as_bytes()),
                 "packet_kind": packet_kind,
                 "stage_witness_hash": stage_witness_hash,
+                "upstream_neighbor_lct": upstream_neighbor_lct,
+                "upstream_hub_member": upstream_hub_member,
             });
             let event_type = if packet_kind == "unreachable-bounce" {
                 "router.packet.unreachable-bounced"
@@ -874,6 +882,8 @@ pub async fn drain_router_once(
                     }
                     continue;
                 }
+                let upstream_neighbor = upstream_neighbor
+                    .expect("non-refused ingress has a configured neighbor");
 
                 if state.completion_witness_hash.is_none() {
                     let action: PersistedAction = if let Some(decision) = &state.decision_json {
@@ -958,6 +968,8 @@ pub async fn drain_router_once(
                         &packet,
                         state.outbound_packet_json.as_deref(),
                         &stage_witness.hash,
+                        &upstream_neighbor.next_hop_lct,
+                        upstream_member,
                         vault,
                         &routes,
                         router_lct,
