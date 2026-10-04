@@ -1100,8 +1100,8 @@ mod tests {
         let packet = RoutePacketV1 {
             protocol: RoutePacketV1::PROTOCOL.to_string(),
             packet_id: Uuid::new_v4(),
-            destination_lct: "missing".to_string(),
-            origin_lct: "also-missing".to_string(),
+            destination_lct: "lct:web4:mb32:missing".to_string(),
+            origin_lct: "lct:web4:mb32:also-missing".to_string(),
             original_kind: "unreachable".to_string(),
             pointer_uri: "hestia://route-error/x".to_string(),
             content_hash: format!("sha256-pointer:{}", "b".repeat(64)),
@@ -1109,8 +1109,8 @@ mod tests {
             visited_routers: vec![],
             failure: Some(crate::receiver_routing::RouteFailure {
                 original_packet_id: Uuid::new_v4(),
-                failed_destination_lct: "x".to_string(),
-                failed_at_router_lct: "r".to_string(),
+                failed_destination_lct: "lct:web4:mb32:x".to_string(),
+                failed_at_router_lct: "lct:web4:mb32:r".to_string(),
                 reason: "no-route".to_string(),
             }),
         };
