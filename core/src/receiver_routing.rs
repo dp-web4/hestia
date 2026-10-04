@@ -45,6 +45,189 @@ pub struct LocalMailboxBinding {
     pub set_at: u64,
 }
 
+/// Mailbox interface addressed to the ROUTER itself, rather than to one hosted
+/// child. Router-to-router route.forward packets arrive here. Keeping this
+/// separate from LocalMailboxBinding preserves the identity distinction:
+/// the machine/router is not its own child.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RouterIngressBinding {
+    pub binding_id: Uuid,
+    pub router_lct: String,
+    pub hub_url: String,
+    pub hub_lct_id: Uuid,
+    pub rest_endpoint: String,
+    pub hub_member_lct: Uuid,
+    pub member_key_source: MemberKeySource,
+    pub reason: String,
+    #[serde(default)]
+    pub set_by: String,
+    #[serde(default)]
+    pub set_at: u64,
+}
+
+/// Layer-2-ish neighbor resolution for a layer-3 Web4 route.
+///
+/// RouteDecision names a canonical next-hop LCT. This record says how THIS
+/// router reaches that next hop on a Hub: which local Hub identity signs the
+/// hop, and which Hub member UUID is the recipient. The end destination never
+/// changes to either UUID.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RouterNeighbor {
+    pub link_id: Uuid,
+    pub next_hop_lct: String,
+    pub hub_url: String,
+    pub hub_lct_id: Uuid,
+    pub rest_endpoint: String,
+    pub our_hub_member_lct: Uuid,
+    pub next_hop_hub_member_lct: Uuid,
+    pub member_key_source: MemberKeySource,
+    pub reason: String,
+    #[serde(default)]
+    pub set_by: String,
+    #[serde(default)]
+    pub set_at: u64,
+}
+
+/// Structured reason carried by an unreachable bounce. The outer route packet
+/// is content-bound per hop; this object makes the terminal reason inspectable
+/// without encoding it into an ad-hoc pointer fragment.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteFailure {
+    pub original_packet_id: Uuid,
+    pub failed_destination_lct: String,
+    pub failed_at_router_lct: String,
+    pub reason: String,
+}
+
+/// The end-to-end routing packet. Intermediate routers may change ONLY the
+/// trace (hops_remaining / visited_routers) and, for a new bounce, construct a
+/// new packet whose failure names the original packet. Every hop content-binds
+/// the exact serialized bytes on its Hub ledger.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutePacketV1 {
+    pub protocol: String,
+    pub packet_id: Uuid,
+    pub destination_lct: String,
+    pub origin_lct: String,
+    pub original_kind: String,
+    pub pointer_uri: String,
+    pub content_hash: String,
+    pub hops_remaining: u8,
+    pub visited_routers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<RouteFailure>,
+}
+
+impl RoutePacketV1 {
+    pub const PROTOCOL: &'static str = "web4-route-v1";
+
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.protocol == Self::PROTOCOL, "route packet protocol must be {}", Self::PROTOCOL);
+        anyhow::ensure!(!self.destination_lct.is_empty() && self.destination_lct.len() <= 256,
+            "route destination_lct must be 1..256 bytes");
+        anyhow::ensure!(!self.origin_lct.is_empty() && self.origin_lct.len() <= 256,
+            "route origin_lct must be 1..256 bytes");
+        anyhow::ensure!(!self.original_kind.is_empty() && self.original_kind.len() <= 128,
+            "route original_kind must be 1..128 bytes");
+        anyhow::ensure!(!self.pointer_uri.is_empty() && self.pointer_uri.len() <= 512,
+            "route pointer_uri must be 1..512 bytes");
+        anyhow::ensure!(valid_content_hash(&self.content_hash),
+            "route content_hash is not a supported scheme-tagged digest");
+        anyhow::ensure!((1..=64).contains(&self.hops_remaining),
+            "route hops_remaining must be 1..64");
+        anyhow::ensure!(self.visited_routers.len() <= 64,
+            "route visited_routers exceeds 64 entries");
+        anyhow::ensure!(self.visited_routers.iter().all(|r| !r.is_empty() && r.len() <= 256),
+            "route visited_routers entries must be 1..256 bytes");
+        if let Some(failure) = &self.failure {
+            anyhow::ensure!(self.original_kind == "unreachable",
+                "route failure is only valid on original_kind=unreachable");
+            anyhow::ensure!(!failure.reason.is_empty() && failure.reason.len() <= 512,
+                "route failure reason must be 1..512 bytes");
+        }
+        Ok(())
+    }
+
+    pub fn trace(&self) -> RouteTrace {
+        RouteTrace {
+            hops_remaining: self.hops_remaining,
+            visited_routers: self.visited_routers.clone(),
+        }
+    }
+
+    /// Packet presented to the next hop. This is the router equivalent of
+    /// decrementing TTL and writing the outgoing interface into a trace.
+    pub fn after_forward(&self, router_lct: &str) -> Result<Self> {
+        self.validate()?;
+        anyhow::ensure!(self.hops_remaining > 1,
+            "cannot forward: hop limit would be exhausted");
+        anyhow::ensure!(!self.visited_routers.iter().any(|r| r == router_lct),
+            "cannot forward: router {router_lct} is already in the route trace");
+        let mut out = self.clone();
+        out.hops_remaining -= 1;
+        out.visited_routers.push(router_lct.to_string());
+        out.validate()?;
+        Ok(out)
+    }
+
+    /// A terminal data-packet failure becomes a NEW packet addressed back to
+    /// the original sender. An unreachable packet is never bounced again; the
+    /// caller must witness its terminal failure locally if its return path dies.
+    pub fn unreachable_bounce(
+        &self,
+        router_lct: &str,
+        reason: impl Into<String>,
+        hop_limit: u8,
+    ) -> Result<Self> {
+        self.validate()?;
+        anyhow::ensure!(self.failure.is_none() && self.original_kind != "unreachable",
+            "an unreachable packet must not recursively generate another unreachable");
+        let reason = reason.into();
+        anyhow::ensure!(!reason.is_empty() && reason.len() <= 512,
+            "route failure reason must be 1..512 bytes");
+        let pointer_uri = format!("hestia://route-error/{}", self.packet_id);
+        let content_hash = format!(
+            "sha256-pointer:{}",
+            sha256_hex(pointer_uri.as_bytes())
+        );
+        let bounce = Self {
+            protocol: Self::PROTOCOL.to_string(),
+            packet_id: Uuid::new_v4(),
+            destination_lct: self.origin_lct.clone(),
+            origin_lct: router_lct.to_string(),
+            original_kind: "unreachable".to_string(),
+            pointer_uri,
+            content_hash,
+            hops_remaining: hop_limit.clamp(1, 64),
+            visited_routers: Vec::new(),
+            failure: Some(RouteFailure {
+                original_packet_id: self.packet_id,
+                failed_destination_lct: self.destination_lct.clone(),
+                failed_at_router_lct: router_lct.to_string(),
+                reason,
+            }),
+        };
+        bounce.validate()?;
+        Ok(bounce)
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn valid_content_hash(value: &str) -> bool {
+    let Some((scheme, digest)) = value.split_once(':') else { return false };
+    match scheme {
+        "git-sha" => digest.len() == 40 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+        "sha256-content" | "sha256-pointer" => {
+            digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StaticRoute {
     /// Exact v1 destination. A future graph route may widen this to a witnessed
@@ -71,6 +254,10 @@ pub struct ReceiverRoutingTable {
     #[serde(default)]
     pub local_mailboxes: Vec<LocalMailboxBinding>,
     #[serde(default)]
+    pub router_ingress: Vec<RouterIngressBinding>,
+    #[serde(default)]
+    pub neighbors: Vec<RouterNeighbor>,
+    #[serde(default)]
     pub routes: Vec<StaticRoute>,
     #[serde(default)]
     pub default_route: Option<DefaultRoute>,
@@ -86,6 +273,8 @@ impl Default for ReceiverRoutingTable {
     fn default() -> Self {
         Self {
             local_mailboxes: Vec::new(),
+            router_ingress: Vec::new(),
+            neighbors: Vec::new(),
             routes: Vec::new(),
             default_route: None,
             hop_limit: DEFAULT_HOP_LIMIT,
@@ -128,6 +317,41 @@ impl ReceiverRoutingTable {
         let before = self.local_mailboxes.len();
         self.local_mailboxes.retain(|b| b.child_lct != child_lct);
         before != self.local_mailboxes.len()
+    }
+
+    pub fn bind_router_ingress(&mut self, binding: RouterIngressBinding) -> Result<()> {
+        anyhow::ensure!(
+            !self.router_ingress.iter().any(|b| b.binding_id == binding.binding_id),
+            "router ingress binding id {} is already in use",
+            binding.binding_id
+        );
+        anyhow::ensure!(
+            !self.router_ingress.iter().any(|b| {
+                b.router_lct == binding.router_lct
+                    && b.hub_lct_id == binding.hub_lct_id
+                    && b.hub_member_lct == binding.hub_member_lct
+            }),
+            "router ingress for {} on Hub member {} already exists",
+            binding.router_lct, binding.hub_member_lct
+        );
+        self.router_ingress.push(binding);
+        self.router_ingress.sort_by(|a, b| {
+            a.router_lct.cmp(&b.router_lct).then(a.hub_member_lct.cmp(&b.hub_member_lct))
+        });
+        Ok(())
+    }
+
+    pub fn set_neighbor(&mut self, neighbor: RouterNeighbor) -> Result<()> {
+        anyhow::ensure!(!neighbor.next_hop_lct.trim().is_empty(),
+            "neighbor next_hop_lct must not be empty");
+        self.neighbors.retain(|n| n.next_hop_lct != neighbor.next_hop_lct);
+        self.neighbors.push(neighbor);
+        self.neighbors.sort_by(|a, b| a.next_hop_lct.cmp(&b.next_hop_lct));
+        Ok(())
+    }
+
+    pub fn neighbor(&self, next_hop_lct: &str) -> Option<&RouterNeighbor> {
+        self.neighbors.iter().find(|n| n.next_hop_lct == next_hop_lct)
     }
 
     pub fn set_route(&mut self, route: StaticRoute) {
