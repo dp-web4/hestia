@@ -70,6 +70,10 @@ struct RouteOriginBinding<'a> {
     original_kind: &'a str,
     pointer_uri: &'a str,
     content_hash: &'a str,
+    /// D2 compatibility constraint. Omitted for native F3 callers so the
+    /// serialized binding remains byte-compatible with pre-D2 D1 operations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_first_hop_hub_member: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -782,6 +786,40 @@ pub async fn originate_once(
     inbox: &SqliteInboxStore,
     chain: &SqliteChainStore,
 ) -> Result<RouteOriginReport> {
+    originate_once_constrained(
+        vault,
+        router_lct,
+        origin_lct,
+        destination_lct,
+        original_kind,
+        pointer_uri,
+        content_hash,
+        operation_id,
+        inbox,
+        chain,
+        None,
+    )
+    .await
+}
+
+/// D2 compatibility entrypoint. When an old transport binding promised a
+/// particular Hub carrier, the actual persisted first-hop route must use that
+/// same Hub member. The constraint is part of the operation binding, so retry
+/// cannot silently weaken/change it.
+#[allow(clippy::too_many_arguments)]
+pub async fn originate_once_constrained(
+    vault: &Vault,
+    router_lct: &str,
+    origin_lct: &str,
+    destination_lct: &str,
+    original_kind: &str,
+    pointer_uri: &str,
+    content_hash: &str,
+    operation_id: &str,
+    inbox: &SqliteInboxStore,
+    chain: &SqliteChainStore,
+    expected_first_hop_hub_member: Option<&str>,
+) -> Result<RouteOriginReport> {
     anyhow::ensure!(
         valid_origin_operation_id(operation_id),
         "route origin operation_id must be 1..128 bytes with no control characters"
@@ -827,6 +865,7 @@ pub async fn originate_once(
         original_kind,
         pointer_uri,
         content_hash,
+        expected_first_hop_hub_member,
     })?;
 
     let candidate = RoutePacketV1 {
@@ -890,6 +929,29 @@ pub async fn originate_once(
 
     if state.decision_json.is_none() {
         let (action, outbound) = plan_action(&packet, &registry, &routes, router_lct)?;
+
+        if let (
+            Some(expected),
+            PersistedAction::Forward { next_hop_lct, link_id, .. },
+        ) = (expected_first_hop_hub_member, &action)
+        {
+            let neighbor = routes.neighbor_by_link(*link_id).ok_or_else(|| anyhow::anyhow!(
+                "F3 route selects next hop {next_hop_lct} on missing neighbor link {link_id}"
+            ))?;
+            let interface = routes
+                .router_ingress_by_id(neighbor.interface_binding_id)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "F3 neighbor {next_hop_lct} references missing interface {}",
+                    neighbor.interface_binding_id
+                ))?;
+            anyhow::ensure!(
+                interface.hub_member_lct.to_string() == expected,
+                "F3 first-hop carrier {} does not match transport-bound carrier {}",
+                interface.hub_member_lct,
+                expected
+            );
+        }
+
         let decision_json = serde_json::to_string(&action)?;
         match &action {
             PersistedAction::Forward {
