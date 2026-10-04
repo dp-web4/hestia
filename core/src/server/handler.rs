@@ -5021,12 +5021,57 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     // routing document, missing alias, or unresolved canonical origin is captured
     // as evidence and the historical path continues unchanged.
     let f3_route_shadow: Option<Value> = routed.then(|| {
-        let router_lct = s.sovereign.lct_id();
-        let origin_lct = match s.member_registry.resolve_reference(&sender.plugin_id) {
-            Ok(Some(member)) => Some(member.lct.lct_id()),
-            Ok(None) => None,
-            Err(_) => None,
+        let resolved_origin = s.member_registry.resolve_reference(&sender.plugin_id);
+        let (origin_lct, router_lct, identity_error) = match resolved_origin {
+            Ok(Some(member)) => {
+                let origin_lct = member.lct.lct_id();
+                let parents: Vec<String> = member
+                    .lct
+                    .mrh
+                    .bound
+                    .iter()
+                    .filter(|edge| edge.edge_type == "parent")
+                    .map(|edge| edge.lct_id.clone())
+                    .collect();
+                match parents.as_slice() {
+                    [parent] => (Some(origin_lct), Some(parent.clone()), None),
+                    [] => (
+                        Some(origin_lct),
+                        None,
+                        Some("canonical sender has no parent/router binding".to_string()),
+                    ),
+                    _ => (
+                        Some(origin_lct),
+                        None,
+                        Some(format!(
+                            "canonical sender has {} parent/router bindings; expected exactly one",
+                            parents.len()
+                        )),
+                    ),
+                }
+            }
+            Ok(None) => (
+                None,
+                None,
+                Some("sender has no canonical member LCT".to_string()),
+            ),
+            Err(e) => (
+                None,
+                None,
+                Some(format!("sender canonical identity is ambiguous/invalid: {e}")),
+            ),
         };
+
+        let Some(router_lct) = router_lct else {
+            return json!({
+                "mode": "shadow",
+                "origin_lct": origin_lct,
+                "legacy_address": to_plugin,
+                "status": "unavailable",
+                "error": identity_error.unwrap_or_else(|| "router identity unavailable".to_string()),
+            });
+        };
+
         match crate::receiver_routing::ReceiverRoutingTable::load(&s.vault) {
             Ok(table) => match table.shadow_legacy_route(
                 &s.member_registry,
