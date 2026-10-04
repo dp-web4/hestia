@@ -203,16 +203,34 @@ already-deployed member mesh code.
 Router transit instead owns a separate durable state machine:
 
 1. receipt-mode Hub fetch is non-destructive;
-2. retain the complete fetched Hub notice and exact route-packet bytes;
-3. verify the packet bytes against the Hub-witnessed hop hash;
-4. witness local receipt staging;
-5. choose and persist one route decision **and exact outbound packet bytes before network I/O**;
-6. cross one custody boundary:
+2. open the Hub-sealed body and verify the **exact packet bytes** against the
+   Hub-witnessed hop hash;
+3. authenticate the clear Hub sender as a configured neighbor on **this exact
+   router interface**, and require the packet trace's last router to be that
+   neighbor's canonical LCT;
+4. only after step 3 may the receipt claim `packet_id` in the router's global
+   idempotency namespace;
+5. retain the complete fetched Hub notice and exact accepted route-packet bytes,
+   then witness local receipt staging;
+6. choose and persist one route decision **and exact outbound packet bytes before network I/O**;
+7. cross one custody boundary:
    - atomic enqueue to the exact local child's inbox,
    - durable acceptance by the next receipt-mode router,
    - or a witnessed terminal unreachable / routed unreachable bounce;
-7. witness that completion;
-8. only then ACK the upstream Hub receipt.
+8. witness that completion;
+9. only then ACK the upstream Hub receipt.
+
+Ingress refused at step 3 is a **per-receipt** fact, not a packet fact. Hestia
+witnesses the refusal, persists the complete rejected Hub notice in a separate
+rejection table, and ACKs that receipt without creating a `router_packets` row.
+This ordering is security-critical: an unconfigured Hub citizen must not be able
+to guess a future packet UUID, send different bytes first, and poison the
+router's packet-id namespace.
+
+The same rule handles an already-known packet id arriving with different bytes
+from an otherwise authorized neighbor (for example an alternate-path duplicate
+with a different trace): witness/refuse/ACK that receipt; do not wedge the
+mailbox and do not mutate the first accepted packet.
 
 A crash at any step retries the same packet and the same persisted decision. A route-table
 change after the first attempt cannot silently redirect an in-flight packet.
