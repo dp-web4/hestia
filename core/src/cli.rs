@@ -3397,7 +3397,7 @@ fn cmd_receiver_neighbor(
         link_id,
         next_hop_lct: next_hop.trim().to_string(),
         interface_binding_id: interface,
-        next_hop_hub_member_lct,
+        next_hop_hub_member_lct: next_hop_member_lct,
         reason: reason.trim().to_string(),
         set_by: "hestia-cli".into(),
         set_at: chrono::Utc::now().timestamp().max(0) as u64,
