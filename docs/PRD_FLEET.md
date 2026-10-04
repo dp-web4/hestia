@@ -139,6 +139,44 @@ Two surfaces, sharply separated by the hub invariant (*witness, don't control; n
 - Cross-seat evidence composition follows **0018 exactly**: evidence graph, never merged histories; `cross_chain_checkpoint_v1` (signed, non-transitive) after the #313 → B2 substrate lands; no trust auto-propagation in the primitive. A fleet control plane is 0018's first real consumer — and 0018's correction stands: this is *construction of the evidence substrate*, not "hub-seam coordination."
 - Deploy/observability: the per-seat `current-build.json` authority files + the ask-the-process route (issue #577) become the fleet deployment truth the manifest work started.
 
+### 4.5 Entity routing is TCP/IP-shaped: unknown means route, not refuse
+
+Web4's graph supplies the addressing semantics; Hestia supplies the local forwarding table.
+The analogy is deliberately broad, but the invariant is the same one that makes packet
+networks composable: **the destination identity is end-to-end; each hop decides only the next
+hop.**
+
+For an addressed LCT, a machine/router resolves in this order:
+
+1. **directly connected child** — a canonical child LCT whose witnessed parent binding names
+   this router; deliver only to that child's inbox;
+2. **specific route** — a known destination (later: a witnessed graph/subtree predicate) has
+   a more-specific next hop;
+3. **default route** — forward to the configured parent/upstream entity most likely to know;
+4. **unreachable** — only when there is no admissible route, a next hop explicitly refuses,
+   or the loop/hop-limit guard is exhausted.
+
+Consequences:
+
+- `Unknown` and `KnownButNotChild` are **demux facts, not terminal transport verdicts**.
+- A router NEVER rewrites the original addressed LCT into its own identity. The next-hop LCT
+  is transport metadata.
+- A directly connected local child whose transport is broken is `local-unavailable`, not
+  default-routed upward; otherwise a stale key/binding can create a loop or deliver the
+  child's mail elsewhere.
+- Every forwarded envelope carries a bounded hop budget / loop evidence. A terminal
+  `unreachable` names the original destination and the router that exhausted/refused the
+  route — ICMP-shaped failure, not silence.
+- The default route is explicit. Parent/upstream is the ordinary configuration, not a name
+  heuristic and not "whichever seat is around."
+- **Routing chooses an inbox; it does not choose a worker.** Delivery remains separate from
+  wake and from the claim-board rule in §4.4.
+
+F3's first implementation is intentionally conservative: direct local child routes, exact
+static routes, one default gateway, and a hop limit. Richer graph-derived routes can replace
+the exact-route matcher later without changing the custody contract or destination identity.
+
+
 ## 5. Roles: pairing external and local agents, citizen by default
 
 ### 5.1 Pairing is occupancy — no new mechanism
