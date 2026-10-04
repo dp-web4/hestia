@@ -2005,6 +2005,13 @@ fn cmd_lct_publish(home: &std::path::Path, send: bool) -> AnyResult<()> {
 }
 
 fn open_vault(home: &std::path::Path) -> AnyResult<Vault> {
+    Ok(open_vault_with_passphrase(home)?.0)
+}
+
+/// Receiver/drain paths also open SQLCipher stores with the SAME passphrase-derived
+/// storage key. Return the passphrase alongside the opened vault so they do not
+/// prompt twice or derive a different key.
+fn open_vault_with_passphrase(home: &std::path::Path) -> AnyResult<(Vault, String)> {
     let path = vault_path(home);
     if !path.exists() {
         anyhow::bail!(
@@ -2013,8 +2020,8 @@ fn open_vault(home: &std::path::Path) -> AnyResult<Vault> {
         );
     }
     let passphrase = prompt_passphrase("Vault passphrase: ")?;
-    let vault = Vault::open(path, passphrase)?;
-    Ok(vault)
+    let vault = Vault::open(path, passphrase.clone())?;
+    Ok((vault, passphrase))
 }
 
 // ---- policy commands ------------------------------------------------------
