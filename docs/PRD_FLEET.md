@@ -319,6 +319,50 @@ The next slice feeds that same pure evaluator from the live legacy `member_notif
 records legacy-vs-F3 outcomes under real traffic. The historical path remains authoritative
 until the parity falsifiers in #1210 are measured equal.
 
+#### 4.5.6 D2 live shadow: one pre-route contract, two route observations
+
+D2b does **not** implement a second copy of the legacy sender checks. That would make parity
+unprovable because the two paths could drift before routing even begins. Instead, live
+`member_notify` keeps one authoritative pre-route path:
+
+1. attributed live sender/session;
+2. member-notify law gate;
+3. structural flood bound;
+4. reply ownership + disposition-address check;
+5. transport-binding lookup/freeze.
+
+Only after those checks does a routed `peer/member` send evaluate the F3 alias+route table.
+The result is attached to the already-existing `member_notice` / refusal evidence as
+`f3_shadow`. **No F3 packet is emitted.** Legacy local/egress delivery remains authoritative.
+
+For a successful legacy routed enqueue, one paired `member_notice_route_shadow` witness records:
+- the authoritative legacy `member_notice` hash;
+- the durable legacy egress row id / peer;
+- sender/session, kind, pointer, reply binding, liveness and frozen transport stamp;
+- the pure F3 shadow result;
+- `delivery_authority: "legacy"`.
+
+If that additional parity witness cannot be written after the legacy row was already queued,
+the send remains successful and the caller is told that the parity evidence has a gap. Shadow
+instrumentation is observational; it must never become a new delivery failure mode.
+
+Existing refusal witnesses are reused rather than multiplied:
+- `transport_binding_unmet` carries the F3 shadow but remains a shared pre-route refusal;
+- `egress_queue_full` carries the F3 shadow so cutover can distinguish a route mismatch from
+  an explicit migration rule replacing the old queue/backpressure mechanism.
+
+`hestia hub receiver-parity` reads these rows through an event-type-indexed chain query, not a
+global tail window. Its classifications are intentionally narrow:
+- `route_selection_match`: legacy chose egress and F3 would choose forward;
+- `missing_alias`;
+- `shadow_unavailable`;
+- `route_divergence`;
+- `shared_transport_refusal`;
+- `legacy_queue_refusal`.
+
+A route-selection match is **not** a delivery-parity claim. D2 still has to measure downstream
+durable acceptance, replies/failures, carrier identity and retry behavior before cutover.
+
 
 ## 5. Roles: pairing external and local agents, citizen by default
 
