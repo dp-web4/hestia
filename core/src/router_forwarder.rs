@@ -273,8 +273,18 @@ fn plan_action(
                 from_lct: packet.origin_lct.clone(),
                 kind: packet.original_kind.clone(),
                 pointer_uri: packet.pointer_uri.clone(),
-                source: "routed-data-local".to_string(),
-                delivery_packet_json: None,
+                source: if packet.failure.is_some() || packet.original_kind == "unreachable" {
+                    "unreachable-routed-local".to_string()
+                } else {
+                    "routed-data-local".to_string()
+                },
+                delivery_packet_json: if packet.failure.is_some()
+                    || packet.original_kind == "unreachable"
+                {
+                    Some(serde_json::to_string(packet)?)
+                } else {
+                    None
+                },
             },
             None,
         )),
@@ -350,13 +360,45 @@ async fn execute_action(
             source,
             delivery_packet_json,
         } => {
+            // A routed unreachable is itself the payload the local recipient
+            // must inspect. The synthetic hestia://route-error/... locator in
+            // the packet is a routing label, not a readable resource. Materialize
+            // a chain-addressable evidence record BEFORE enqueue so every local
+            // unreachable notice points at something the existing resource
+            // resolver can actually dereference.
+            let mut delivered_pointer = pointer_uri.clone();
+            let mut delivery_chain_hash = stage_witness_hash.to_string();
+            let mut failure_evidence_hash: Option<String> = None;
+            if let Some(packet_json) = delivery_packet_json {
+                let evidence_key = format!("route-unreachable-evidence:{}", packet.packet_id);
+                let (evidence, _) = chain.append_once(
+                    &evidence_key,
+                    "router.packet.unreachable-evidence",
+                    json!({
+                        "packet_id": packet.packet_id,
+                        "router_lct": router_lct,
+                        "destination_lct": child_lct,
+                        "to_plugin": plugin_id,
+                        "source": source,
+                        "route_packet_json": packet_json,
+                        "ingress_stage_witness_hash": stage_witness_hash,
+                        "upstream_neighbor_lct": upstream_neighbor_lct,
+                        "upstream_hub_member": upstream_hub_member,
+                    }),
+                    router_lct,
+                )?;
+                delivered_pointer = format!("hestia://chain/{}", evidence.hash);
+                delivery_chain_hash = evidence.hash.clone();
+                failure_evidence_hash = Some(evidence.hash);
+            }
+
             let local_notice_id = inbox.accept_router_packet_local(
                 packet.packet_id,
                 plugin_id,
                 from_lct,
                 kind,
-                pointer_uri,
-                stage_witness_hash,
+                &delivered_pointer,
+                &delivery_chain_hash,
             )?;
             let key = format!("route-complete:{}", packet.packet_id);
             let event = json!({
@@ -369,6 +411,9 @@ async fn execute_action(
                 "upstream_neighbor_lct": upstream_neighbor_lct,
                 "upstream_hub_member": upstream_hub_member,
                 "source": source,
+                "original_pointer_uri": pointer_uri,
+                "delivered_pointer_uri": delivered_pointer,
+                "failure_evidence_hash": failure_evidence_hash,
                 "delivery_packet_json": delivery_packet_json,
                 "wake": "not-considered",
             });
