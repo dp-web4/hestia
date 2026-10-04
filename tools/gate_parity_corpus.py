@@ -91,6 +91,17 @@ CORPUS = [
     ("digest-apply-pair-chained", "digest", "Bash",
      {"command": "git -C {REPO} apply {SCRATCH}/approved.patch && git -C {REPO} commit -m x"},
      "PIN", "PIN: same patch chained with commit — a different act (d8c10f93 vs ecb0558c)"),
+    # Added 2026-10-04 (hestia #1197, last comment): the pair above with the patch ABSENT. A
+    # write-class apply whose patch cannot be read is opaque — the gate cannot see what it
+    # would write — so it fails closed (gate.self_access). The act would fail in git anyway;
+    # the denial errs safe. Declared as a TIGHTENING, not loosened.
+    ("digest-apply-missing-plain", "digest", "Bash",
+     {"command": "git -C {REPO} apply {SCRATCH}/missing.patch"}, "deny:governance-closure",
+     "TIGHTENING: an unreadable patch on a write-class apply fails closed"),
+    ("digest-apply-missing-chained", "digest", "Bash",
+     {"command": "git -C {REPO} apply {SCRATCH}/missing.patch && git -C {REPO} commit -m x"},
+     "deny:governance-closure",
+     "TIGHTENING: an unreadable patch on a write-class apply fails closed (chained)"),
 
     # --- egress / ambient: where seats have historically drifted ---
     ("egress-curl", "egress", "Bash", {"command": "curl -s https://example.com -o {SCRATCH}/x"},
