@@ -2122,6 +2122,614 @@ impl SqliteInboxStore {
     }
 }
 
+// ---- F3 router transit custody -----------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouterPacketState {
+    pub packet_id: Uuid,
+    pub packet_json: String,
+    pub packet_hash: String,
+    pub decision_json: Option<String>,
+    pub local_child_lct: Option<String>,
+    pub outbound_packet_json: Option<String>,
+    pub next_hop_lct: Option<String>,
+    pub forward_link_id: Option<Uuid>,
+    pub forward_operation_id: Option<String>,
+    pub local_notice_id: Option<u64>,
+    pub downstream_notice_id: Option<String>,
+    pub downstream_entry_index: Option<u64>,
+    pub completion_witness_hash: Option<String>,
+    pub completion_kind: Option<String>,
+}
+
+impl SqliteInboxStore {
+    fn ensure_router_packet_schema(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS router_packets (
+                packet_id                TEXT PRIMARY KEY,
+                packet_json              TEXT NOT NULL,
+                packet_hash              TEXT NOT NULL,
+                decision_json            TEXT,
+                local_child_lct          TEXT,
+                outbound_packet_json     TEXT,
+                next_hop_lct             TEXT,
+                forward_link_id          TEXT,
+                forward_operation_id     TEXT,
+                local_notice_id          INTEGER,
+                downstream_notice_id     TEXT,
+                downstream_entry_index   INTEGER,
+                completion_witness_hash  TEXT,
+                completion_kind          TEXT,
+                created_at               TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS router_ingress_receipts (
+                ingress_binding_id TEXT NOT NULL,
+                hub_notice_id      TEXT NOT NULL,
+                packet_id          TEXT NOT NULL,
+                notice_json        TEXT NOT NULL,
+                stage_witness_hash TEXT,
+                hub_acked_at       TEXT,
+                queued_at          TEXT NOT NULL,
+                PRIMARY KEY (ingress_binding_id, hub_notice_id),
+                FOREIGN KEY(packet_id) REFERENCES router_packets(packet_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_router_receipts_packet
+                 ON router_ingress_receipts(packet_id);
+             CREATE INDEX IF NOT EXISTS idx_router_receipts_pending
+                 ON router_ingress_receipts(ingress_binding_id, hub_acked_at);
+             CREATE TABLE IF NOT EXISTS router_ingress_rejections (
+                ingress_binding_id  TEXT NOT NULL,
+                hub_notice_id       TEXT NOT NULL,
+                notice_json         TEXT NOT NULL,
+                claimed_packet_id   TEXT,
+                refusal_witness_hash TEXT NOT NULL,
+                hub_acked_at        TEXT,
+                queued_at           TEXT NOT NULL,
+                PRIMARY KEY (ingress_binding_id, hub_notice_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_router_rejections_pending
+                 ON router_ingress_rejections(ingress_binding_id, hub_acked_at);",
+        )
+        .context("initializing router transit custody schema")?;
+        let has_local_child = {
+            let mut stmt = conn.prepare("PRAGMA table_info(router_packets)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for row in rows {
+                if row? == "local_child_lct" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_local_child {
+            conn.execute_batch(
+                "ALTER TABLE router_packets ADD COLUMN local_child_lct TEXT;",
+            )
+            .context("adding router packet local-child pin")?;
+        }
+        Ok(())
+    }
+
+    fn prune_router_custody_on(conn: &Connection) -> Result<()> {
+        let cutoff = (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
+
+        // Rejected receipts are operational retry state, not the permanent
+        // governance record. Once Hub ACK landed, the witness chain is the
+        // durable history and this row may age out with the ordinary inbox TTL.
+        conn.execute(
+            "DELETE FROM router_ingress_rejections
+              WHERE hub_acked_at IS NOT NULL AND queued_at < ?1",
+            params![cutoff],
+        )
+        .context("pruning acknowledged router ingress rejections")?;
+
+        // Accepted receipts follow the same rule, but never delete an unacked
+        // custody edge. Packet rows are removed only after every receipt row has
+        // aged away and the packet has a witnessed completion.
+        conn.execute(
+            "DELETE FROM router_ingress_receipts
+              WHERE hub_acked_at IS NOT NULL AND queued_at < ?1",
+            params![cutoff],
+        )
+        .context("pruning acknowledged router ingress receipts")?;
+        conn.execute(
+            "DELETE FROM router_packets
+              WHERE completion_witness_hash IS NOT NULL
+                AND created_at < ?1
+                AND NOT EXISTS (
+                    SELECT 1 FROM router_ingress_receipts r
+                     WHERE r.packet_id = router_packets.packet_id
+                )",
+            params![cutoff],
+        )
+        .context("pruning completed router packets")?;
+        Ok(())
+    }
+
+    /// Persist exact packet bytes plus this transport receipt before deciding a route.
+    /// Packet id is globally idempotent inside this router: seeing the same id with
+    /// different bytes is a protocol violation, not a second packet.
+    pub fn stage_router_packet(
+        &self,
+        ingress_binding_id: Uuid,
+        hub_notice_id: &str,
+        packet_id: Uuid,
+        notice_json: &str,
+        packet_json: &str,
+        packet_hash: &str,
+    ) -> Result<RouterPacketState> {
+        let mut conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        Self::prune_router_custody_on(&conn)?;
+        let tx = conn.transaction().context("starting router packet stage")?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT OR IGNORE INTO router_packets
+                (packet_id, packet_json, packet_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![packet_id.to_string(), packet_json, packet_hash, now],
+        )?;
+        let immutable = tx.query_row(
+            "SELECT packet_json, packet_hash FROM router_packets WHERE packet_id = ?1",
+            params![packet_id.to_string()],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        anyhow::ensure!(
+            immutable.0 == packet_json && immutable.1 == packet_hash,
+            "route packet id {packet_id} was replayed with different bytes"
+        );
+
+        tx.execute(
+            "INSERT OR IGNORE INTO router_ingress_receipts
+                (ingress_binding_id, hub_notice_id, packet_id, notice_json, queued_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                ingress_binding_id.to_string(),
+                hub_notice_id,
+                packet_id.to_string(),
+                notice_json,
+                now,
+            ],
+        )?;
+        let mapped: (String, String) = tx.query_row(
+            "SELECT packet_id, notice_json FROM router_ingress_receipts
+              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2",
+            params![ingress_binding_id.to_string(), hub_notice_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        anyhow::ensure!(
+            mapped.0 == packet_id.to_string() && mapped.1 == notice_json,
+            "Hub receipt {hub_notice_id} was replayed with different immutable content"
+        );
+        tx.commit().context("committing router packet stage")?;
+        drop(conn);
+        self.router_packet_state(packet_id)?
+            .ok_or_else(|| anyhow::anyhow!("staged route packet {packet_id} disappeared"))
+    }
+
+    pub fn record_router_stage_witness(
+        &self,
+        ingress_binding_id: Uuid,
+        hub_notice_id: &str,
+        packet_id: Uuid,
+        witness_hash: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        let existing: Option<(String, Option<String>)> = conn.query_row(
+            "SELECT packet_id, stage_witness_hash FROM router_ingress_receipts
+              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2",
+            params![ingress_binding_id.to_string(), hub_notice_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        let Some((mapped, prior)) = existing else {
+            anyhow::bail!("router ingress receipt {hub_notice_id} was not staged");
+        };
+        anyhow::ensure!(mapped == packet_id.to_string(),
+            "router ingress receipt {hub_notice_id} belongs to another packet");
+        if let Some(prior) = prior {
+            anyhow::ensure!(prior == witness_hash,
+                "router ingress receipt {hub_notice_id} is bound to a different stage witness");
+            return Ok(());
+        }
+        let n = conn.execute(
+            "UPDATE router_ingress_receipts SET stage_witness_hash = ?3
+              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2
+                AND stage_witness_hash IS NULL",
+            params![ingress_binding_id.to_string(), hub_notice_id, witness_hash],
+        )?;
+        anyhow::ensure!(n == 1, "router stage witness state changed concurrently");
+        Ok(())
+    }
+
+    /// Persist the route decision AND the exact outbound packet before network I/O.
+    /// Replaying must present byte-identical decision material.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_router_forward_decision(
+        &self,
+        packet_id: Uuid,
+        decision_json: &str,
+        outbound_packet_json: &str,
+        next_hop_lct: &str,
+        forward_link_id: Uuid,
+        operation_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        let state = Self::router_packet_state_on(&conn, packet_id)?
+            .ok_or_else(|| anyhow::anyhow!("route packet {packet_id} was not staged"))?;
+        if let Some(existing) = state.decision_json {
+            anyhow::ensure!(
+                existing == decision_json
+                    && state.outbound_packet_json.as_deref() == Some(outbound_packet_json)
+                    && state.next_hop_lct.as_deref() == Some(next_hop_lct)
+                    && state.forward_link_id == Some(forward_link_id)
+                    && state.forward_operation_id.as_deref() == Some(operation_id),
+                "route packet {packet_id} already has a different persisted decision"
+            );
+            return Ok(());
+        }
+        let n = conn.execute(
+            "UPDATE router_packets
+                SET decision_json = ?2, outbound_packet_json = ?3,
+                    next_hop_lct = ?4, forward_link_id = ?5, forward_operation_id = ?6
+              WHERE packet_id = ?1 AND decision_json IS NULL",
+            params![
+                packet_id.to_string(), decision_json, outbound_packet_json,
+                next_hop_lct, forward_link_id.to_string(), operation_id,
+            ],
+        )?;
+        anyhow::ensure!(n == 1, "route packet decision changed concurrently");
+        Ok(())
+    }
+
+    pub fn record_router_local_decision(
+        &self,
+        packet_id: Uuid,
+        decision_json: &str,
+        local_child_lct: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        let state = Self::router_packet_state_on(&conn, packet_id)?
+            .ok_or_else(|| anyhow::anyhow!("route packet {packet_id} was not staged"))?;
+        if let Some(existing) = state.decision_json {
+            anyhow::ensure!(
+                existing == decision_json
+                    && state.local_child_lct.as_deref() == local_child_lct,
+                "route packet {packet_id} already has a different persisted decision"
+            );
+            return Ok(());
+        }
+        let n = conn.execute(
+            "UPDATE router_packets
+                SET decision_json = ?2, local_child_lct = ?3
+              WHERE packet_id = ?1 AND decision_json IS NULL",
+            params![packet_id.to_string(), decision_json, local_child_lct],
+        )?;
+        anyhow::ensure!(n == 1, "route packet local decision changed concurrently");
+        Ok(())
+    }
+
+    /// Deliver one route packet to a local child exactly once. The member row and
+    /// packet watermark are one SQLite transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_router_packet_local(
+        &self,
+        packet_id: Uuid,
+        to_plugin: &str,
+        from_lct: &str,
+        kind: &str,
+        pointer_uri: &str,
+        chain_hash: &str,
+    ) -> Result<u64> {
+        let mut conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        Self::ensure_member_schema(&conn)?;
+        let tx = conn.transaction().context("starting routed local acceptance")?;
+        let existing: Option<i64> = tx.query_row(
+            "SELECT local_notice_id FROM router_packets WHERE packet_id = ?1",
+            params![packet_id.to_string()],
+            |r| r.get(0),
+        ).optional()?.flatten();
+        if let Some(id) = existing {
+            return Ok(id as u64);
+        }
+        let id = Self::enqueue_member_on(
+            &tx,
+            to_plugin,
+            from_lct,
+            "role:constellation:router",
+            kind,
+            Some(pointer_uri),
+            chain_hash,
+            None,
+        )?;
+        let n = tx.execute(
+            "UPDATE router_packets SET local_notice_id = ?2
+              WHERE packet_id = ?1 AND local_notice_id IS NULL",
+            params![packet_id.to_string(), id as i64],
+        )?;
+        anyhow::ensure!(n == 1, "route packet local acceptance changed concurrently");
+        tx.commit().context("committing routed local acceptance")?;
+        Ok(id)
+    }
+
+    pub fn record_router_downstream_receipt(
+        &self,
+        packet_id: Uuid,
+        notice_id: &str,
+        entry_index: u64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        let state = Self::router_packet_state_on(&conn, packet_id)?
+            .ok_or_else(|| anyhow::anyhow!("route packet {packet_id} was not staged"))?;
+        if let Some(existing) = state.downstream_notice_id {
+            anyhow::ensure!(
+                existing == notice_id && state.downstream_entry_index == Some(entry_index),
+                "route packet {packet_id} is bound to a different downstream receipt"
+            );
+            return Ok(());
+        }
+        let n = conn.execute(
+            "UPDATE router_packets
+                SET downstream_notice_id = ?2, downstream_entry_index = ?3
+              WHERE packet_id = ?1 AND downstream_notice_id IS NULL",
+            params![packet_id.to_string(), notice_id, entry_index as i64],
+        )?;
+        anyhow::ensure!(n == 1, "route packet downstream receipt changed concurrently");
+        Ok(())
+    }
+
+    pub fn complete_router_packet(
+        &self,
+        packet_id: Uuid,
+        completion_kind: &str,
+        witness_hash: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        let state = Self::router_packet_state_on(&conn, packet_id)?
+            .ok_or_else(|| anyhow::anyhow!("route packet {packet_id} was not staged"))?;
+        if let Some(existing) = state.completion_witness_hash {
+            anyhow::ensure!(
+                existing == witness_hash && state.completion_kind.as_deref() == Some(completion_kind),
+                "route packet {packet_id} is already completed differently"
+            );
+            return Ok(());
+        }
+        let n = conn.execute(
+            "UPDATE router_packets
+                SET completion_witness_hash = ?2, completion_kind = ?3
+              WHERE packet_id = ?1 AND completion_witness_hash IS NULL",
+            params![packet_id.to_string(), witness_hash, completion_kind],
+        )?;
+        anyhow::ensure!(n == 1, "route packet completion changed concurrently");
+        Ok(())
+    }
+
+    /// Persist an ingress rejection independently of router_packets. This is
+    /// the anti-poisoning boundary: an unconfigured Hub citizen must not be
+    /// able to claim a packet_id in the router's global idempotency namespace.
+    pub fn record_router_ingress_rejection(
+        &self,
+        ingress_binding_id: Uuid,
+        hub_notice_id: &str,
+        notice_json: &str,
+        claimed_packet_id: Option<Uuid>,
+        witness_hash: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        Self::prune_router_custody_on(&conn)?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO router_ingress_rejections
+                (ingress_binding_id, hub_notice_id, notice_json, claimed_packet_id,
+                 refusal_witness_hash, queued_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                ingress_binding_id.to_string(),
+                hub_notice_id,
+                notice_json,
+                claimed_packet_id.map(|v| v.to_string()),
+                witness_hash,
+                now,
+            ],
+        )?;
+        let row: (String, Option<String>, String) = conn.query_row(
+            "SELECT notice_json, claimed_packet_id, refusal_witness_hash
+               FROM router_ingress_rejections
+              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2",
+            params![ingress_binding_id.to_string(), hub_notice_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        anyhow::ensure!(
+            row.0 == notice_json
+                && row.1 == claimed_packet_id.map(|v| v.to_string())
+                && row.2 == witness_hash,
+            "router ingress rejection {hub_notice_id} was replayed with different immutable content"
+        );
+        Ok(())
+    }
+
+    /// Normal transit receipts are ACK-eligible only after local stage evidence
+    /// and one witnessed packet completion. Rejections live in a separate table
+    /// and therefore cannot create or complete a router_packets row.
+    pub fn pending_router_ingress_acks(
+        &self,
+        ingress_binding_id: Uuid,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT r.hub_notice_id
+               FROM router_ingress_receipts r
+               JOIN router_packets p ON p.packet_id = r.packet_id
+              WHERE r.ingress_binding_id = ?1
+                AND r.hub_acked_at IS NULL
+                AND r.stage_witness_hash IS NOT NULL
+                AND p.completion_witness_hash IS NOT NULL
+              ORDER BY r.queued_at ASC",
+        )?;
+        let rows = stmt.query_map(params![ingress_binding_id.to_string()], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
+    pub fn mark_router_ingress_acked(
+        &self,
+        ingress_binding_id: Uuid,
+        hub_notice_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        let eligible: i64 = conn.query_row(
+            "SELECT COUNT(*)
+               FROM router_ingress_receipts r
+               JOIN router_packets p ON p.packet_id = r.packet_id
+              WHERE r.ingress_binding_id = ?1 AND r.hub_notice_id = ?2
+                AND r.stage_witness_hash IS NOT NULL
+                AND p.completion_witness_hash IS NOT NULL",
+            params![ingress_binding_id.to_string(), hub_notice_id],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(
+            eligible == 1,
+            "cannot ACK router ingress {hub_notice_id} before witnessed completion"
+        );
+        conn.execute(
+            "UPDATE router_ingress_receipts SET hub_acked_at = COALESCE(hub_acked_at, ?3)
+              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2",
+            params![
+                ingress_binding_id.to_string(), hub_notice_id, Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_router_rejection_acks(
+        &self,
+        ingress_binding_id: Uuid,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT hub_notice_id
+               FROM router_ingress_rejections
+              WHERE ingress_binding_id = ?1
+                AND hub_acked_at IS NULL
+                AND refusal_witness_hash IS NOT NULL
+              ORDER BY queued_at ASC",
+        )?;
+        let rows = stmt.query_map(params![ingress_binding_id.to_string()], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
+    pub fn mark_router_rejection_acked(
+        &self,
+        ingress_binding_id: Uuid,
+        hub_notice_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        let eligible: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM router_ingress_rejections
+              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2
+                AND refusal_witness_hash IS NOT NULL",
+            params![ingress_binding_id.to_string(), hub_notice_id],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(
+            eligible == 1,
+            "cannot ACK router ingress rejection {hub_notice_id} before witnessed refusal"
+        );
+        conn.execute(
+            "UPDATE router_ingress_rejections
+                SET hub_acked_at = COALESCE(hub_acked_at, ?3)
+              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2",
+            params![
+                ingress_binding_id.to_string(), hub_notice_id, Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn router_packet_state(&self, packet_id: Uuid) -> Result<Option<RouterPacketState>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        Self::router_packet_state_on(&conn, packet_id)
+    }
+
+    fn router_packet_state_on(
+        conn: &Connection,
+        packet_id: Uuid,
+    ) -> Result<Option<RouterPacketState>> {
+        conn.query_row(
+            "SELECT packet_json, packet_hash, decision_json, local_child_lct,
+                    outbound_packet_json, next_hop_lct, forward_link_id,
+                    forward_operation_id, local_notice_id, downstream_notice_id,
+                    downstream_entry_index, completion_witness_hash, completion_kind
+               FROM router_packets WHERE packet_id = ?1",
+            params![packet_id.to_string()],
+            |r| Ok((
+                r.get::<_, String>(0)?, r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?, r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?, r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<i64>>(8)?, r.get::<_, Option<String>>(9)?,
+                r.get::<_, Option<i64>>(10)?, r.get::<_, Option<String>>(11)?,
+                r.get::<_, Option<String>>(12)?,
+            )),
+        ).optional()?.map(|r| -> Result<RouterPacketState> {
+            Ok(RouterPacketState {
+                packet_id,
+                packet_json: r.0,
+                packet_hash: r.1,
+                decision_json: r.2,
+                local_child_lct: r.3,
+                outbound_packet_json: r.4,
+                next_hop_lct: r.5,
+                forward_link_id: r.6.map(|v| Uuid::parse_str(&v))
+                    .transpose().context("parsing router forward_link_id")?,
+                forward_operation_id: r.7,
+                local_notice_id: r.8.map(|v| v as u64),
+                downstream_notice_id: r.9,
+                downstream_entry_index: r.10.map(|v| v as u64),
+                completion_witness_hash: r.11,
+                completion_kind: r.12,
+            })
+        }).transpose()
+    }
+
+    pub fn router_ingress_inflight_count(&self, ingress_binding_id: Uuid) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        let accepted: i64 = conn.query_row(
+            "SELECT COUNT(*)
+               FROM router_ingress_receipts
+              WHERE ingress_binding_id = ?1 AND hub_acked_at IS NULL",
+            params![ingress_binding_id.to_string()],
+            |r| r.get(0),
+        )?;
+        let rejected: i64 = conn.query_row(
+            "SELECT COUNT(*)
+               FROM router_ingress_rejections
+              WHERE ingress_binding_id = ?1 AND hub_acked_at IS NULL",
+            params![ingress_binding_id.to_string()],
+            |r| r.get(0),
+        )?;
+        Ok((accepted + rejected) as u64)
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

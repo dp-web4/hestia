@@ -31,6 +31,7 @@ pub mod rdf;
 pub mod reputation;
 pub mod receiver_routing;
 pub mod role_registry;
+pub mod router_forwarder;
 pub mod server;
 pub mod sovereign;
 pub mod storage;

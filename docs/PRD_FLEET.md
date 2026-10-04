@@ -176,6 +176,89 @@ F3's first implementation is intentionally conservative: direct local child rout
 static routes, one default gateway, and a hop limit. Richer graph-derived routes can replace
 the exact-route matcher later without changing the custody contract or destination identity.
 
+#### 4.5.1 Route, interface and neighbor are different facts
+
+The forwarding implementation keeps the same separation as an IP stack:
+
+- **Route:** end-destination LCT → canonical next-hop LCT. This is a graph/reachability
+  decision and contains no key material.
+- **Router interface:** this router's own Hub member identity + credential handle on one Hub.
+  A router may have several interfaces; an interface may serve several neighbors.
+- **Neighbor:** next-hop LCT → (router interface, next-hop Hub member UUID). This is
+  link/transport resolution, not identity substitution.
+- **Packet:** retains the original destination and origin end-to-end. The next-hop Hub UUID
+  never becomes the packet destination.
+
+The route table may therefore change independently of how a known neighbor is reached, while
+a retry already in custody remains pinned to the interface/link and exact outbound packet that
+were persisted before the first network attempt.
+
+#### 4.5.2 Router transit has its own custody plane
+
+Do **not** reuse the historical member-egress rows for third-party routing. That older plane
+deliberately enforces split horizon: a seat/member forwarding drain is not an arbitrary
+third-party transit router. Relaxing it in place would silently change a security property of
+already-deployed member mesh code.
+
+Router transit instead owns a separate durable state machine:
+
+1. receipt-mode Hub fetch is non-destructive;
+2. open the Hub-sealed body and verify the **exact packet bytes** against the
+   Hub-witnessed hop hash;
+3. authenticate the clear Hub sender as a configured neighbor on **this exact
+   router interface**, and require the packet trace's last router to be that
+   neighbor's canonical LCT;
+4. only after step 3 may the receipt claim `packet_id` in the router's global
+   idempotency namespace;
+5. retain the complete fetched Hub notice and exact accepted route-packet bytes,
+   then witness local receipt staging;
+6. choose and persist one route decision **and exact outbound packet bytes before network I/O**;
+7. cross one custody boundary:
+   - atomic enqueue to the exact local child's inbox,
+   - durable acceptance by the next receipt-mode router,
+   - or a witnessed terminal unreachable / routed unreachable bounce;
+8. witness that completion;
+9. only then ACK the upstream Hub receipt.
+
+Ingress refused at step 3 is a **per-receipt** fact, not a packet fact. Hestia
+witnesses the refusal, persists the complete rejected Hub notice in a separate
+rejection table, and ACKs that receipt without creating a `router_packets` row.
+This ordering is security-critical: an unconfigured Hub citizen must not be able
+to guess a future packet UUID, send different bytes first, and poison the
+router's packet-id namespace.
+
+The same rule handles an already-known packet id arriving with different bytes
+from an otherwise authorized neighbor (for example an alternate-path duplicate
+with a different trace): witness/refuse/ACK that receipt; do not wedge the
+mailbox and do not mutate the first accepted packet.
+
+A crash at any step retries the same packet and the same persisted decision. A route-table
+change after the first attempt cannot silently redirect an in-flight packet.
+
+The transit plane is deliberately more general than a Hestia child inbox. Intermediate
+routers may carry application kinds they do not understand. **At the final Hestia child
+edge**, however, the receiver re-applies the member-notice write contract before enqueue:
+only the ordinary member-addressable kind families are admitted, and the pointer must remain
+a bounded single-line locator with no control characters. A packet that is valid Web4
+transport but invalid Hestia child mail is not inserted into the child inbox; it becomes a
+structured `unreachable` back to the origin. Daemon-only local kinds such as
+`disposition` cannot therefore be forged by a remote neighbor.
+
+Router→router hops use Web4's receipt-only `route_forward` channel operation. A next hop that
+has not opted into non-destructive fetch/ACK is not routable: using a consume-on-response
+mailbox would reintroduce the packet-loss boundary F3 exists to remove.
+
+#### 4.5.3 Unreachable is a packet, not an exception
+
+When a data packet reaches a terminal routing failure, the router creates one structured
+`unreachable` packet addressed back to the original origin. It names the original packet,
+failed destination, router that exhausted/refused the route, and reason. That bounce follows
+the same route/default/neighbor machinery as any other packet.
+
+An unreachable packet is never recursively bounced. If its own return route fails, the router
+witnesses that terminal failure locally. This bounds failure traffic and prevents two default
+gateways from generating an error storm about each other's errors.
+
 
 ## 5. Roles: pairing external and local agents, citizen by default
 

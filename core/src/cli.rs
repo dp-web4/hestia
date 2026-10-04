@@ -605,6 +605,35 @@ enum HubCmd {
         child: String,
     },
 
+    /// Bind a receipt-mode Hub mailbox to the router identity itself. Route
+    /// packets arrive here; this is not a child/member inbox.
+    ReceiverRouterBind {
+        #[arg(long, default_value = "")]
+        target: String,
+        #[arg(long)]
+        member_lct: Option<uuid::Uuid>,
+        #[arg(long)]
+        channel_key: Option<String>,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Bind one canonical next-hop router LCT to its Hub transport address.
+    /// This is the routing-table equivalent of neighbor/ARP resolution.
+    ReceiverNeighbor {
+        next_hop: String,
+        /// Router interface UUID from receiver-router-bind.
+        #[arg(long)]
+        interface: uuid::Uuid,
+        /// The next router's Hub member UUID on that interface's Hub.
+        #[arg(long)]
+        next_hop_member_lct: uuid::Uuid,
+        #[arg(long)]
+        reason: String,
+    },
+
     /// Add/update an exact remote route: destination LCT -> next-hop LCT.
     /// Local directly-connected children always win over static routes.
     ReceiverRoute {
@@ -1000,6 +1029,16 @@ pub fn run() -> AnyResult<()> {
                 )
             }
             HubCmd::ReceiverUnbind { child } => cmd_receiver_unbind(&home, &child),
+            HubCmd::ReceiverRouterBind {
+                target, member_lct, channel_key, parent, reason
+            } => cmd_receiver_router_bind(
+                &home, &target, member_lct, channel_key, parent.as_deref(), &reason,
+            ),
+            HubCmd::ReceiverNeighbor {
+                next_hop, interface, next_hop_member_lct, reason
+            } => cmd_receiver_neighbor(
+                &home, &next_hop, interface, next_hop_member_lct, &reason,
+            ),
             HubCmd::ReceiverRoute { destination, next_hop, metric, reason } => {
                 cmd_receiver_route(&home, &destination, &next_hop, metric, &reason)
             }
@@ -3239,9 +3278,145 @@ fn cmd_receiver_bind(
     Ok(())
 }
 
+fn cmd_receiver_router_bind(
+    home: &std::path::Path,
+    target: &str,
+    member_lct: Option<uuid::Uuid>,
+    channel_key: Option<String>,
+    parent: Option<&str>,
+    reason: &str,
+) -> AnyResult<()> {
+    use hestia::hub::MemberKeySource;
+
+    anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
+    let mut vault = open_vault(home)?;
+    let router_lct = receiver_router_lct(&vault, parent)?;
+    let hubs = HubStore::load(&vault)?;
+    let template = pick_connection(&hubs, target)?;
+    let hub_member_lct = member_lct.unwrap_or(template.our_lct_id);
+    let key_source = match channel_key {
+        Some(path) => MemberKeySource::ChannelKeyFile { path },
+        None if hub_member_lct == template.our_lct_id => template.member_key_source.clone(),
+        None => anyhow::bail!(
+            "--member-lct {hub_member_lct} differs from the template connection's member {}; \
+             provide --channel-key so the router does not guess a credential",
+            template.our_lct_id
+        ),
+    };
+
+    let keypair = member_signing_keypair(&vault, &key_source)
+        .context("resolving router interface credential")?;
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+    let rest = abs_rest(&template.url, &template.rest_endpoint);
+    let discovered = rt.block_on(client.discover(&template.url))
+        .context("re-discovering Hub before router interface bind")?;
+    anyhow::ensure!(
+        discovered.hub_lct_id == template.hub_lct_id,
+        "refusing router bind: endpoint {} now advertises Hub {}, expected {}",
+        template.url, discovered.hub_lct_id, template.hub_lct_id
+    );
+    let pinned = rt.block_on(
+        client.resolve_member_pubkey(&rest, template.hub_lct_id, hub_member_lct)
+    ).with_context(|| format!("resolving Hub pin for router member {hub_member_lct}"))?;
+    anyhow::ensure!(
+        pinned.to_hex() == keypair.verifying_key().to_hex(),
+        "refusing router bind: configured key differs from Hub pin for {hub_member_lct}"
+    );
+
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    let binding_id = uuid::Uuid::new_v4();
+    table.bind_router_ingress(hestia::receiver_routing::RouterIngressBinding {
+        binding_id,
+        router_lct: router_lct.clone(),
+        hub_url: template.url.clone(),
+        hub_lct_id: template.hub_lct_id,
+        rest_endpoint: rest,
+        hub_member_lct,
+        member_key_source: key_source,
+        reason: reason.trim().to_string(),
+        set_by: "hestia-cli".into(),
+        set_at: chrono::Utc::now().timestamp().max(0) as u64,
+    })?;
+    table.save(&mut vault)?;
+
+    println!("Router interface bound:");
+    println!("  router:       {router_lct}");
+    println!("  interface:    {binding_id}");
+    println!("  hub:          {} ({})", template.hub_lct_id, template.url);
+    println!("  hub member:   {hub_member_lct}");
+    println!("  credential:   verified against Hub pin");
+    println!("  delivery:     receipt-mode route.forward only");
+    Ok(())
+}
+
+fn cmd_receiver_neighbor(
+    home: &std::path::Path,
+    next_hop: &str,
+    interface: uuid::Uuid,
+    next_hop_member_lct: uuid::Uuid,
+    reason: &str,
+) -> AnyResult<()> {
+    anyhow::ensure!(!next_hop.trim().is_empty(), "next_hop is required");
+    anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
+    let mut vault = open_vault(home)?;
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    let iface = table.router_ingress_by_id(interface).cloned()
+        .ok_or_else(|| anyhow::anyhow!("router interface {interface} does not exist"))?;
+    anyhow::ensure!(
+        iface.router_lct != next_hop.trim(),
+        "a router cannot install itself as its own next hop"
+    );
+
+    // Re-prove the local interface credential and prove the neighbor is a known
+    // Hub member before recording the link. Receipt-mode enrollment is checked
+    // by route_forward itself because the public resolver does not expose it.
+    let keypair = member_signing_keypair(&vault, &iface.member_key_source)
+        .context("resolving router neighbor interface credential")?;
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+    let rest = abs_rest(&iface.hub_url, &iface.rest_endpoint);
+    let ours = rt.block_on(
+        client.resolve_member_pubkey(&rest, iface.hub_lct_id, iface.hub_member_lct)
+    ).with_context(|| format!("resolving Hub pin for {}", iface.hub_member_lct))?;
+    anyhow::ensure!(
+        ours.to_hex() == keypair.verifying_key().to_hex(),
+        "router interface {interface} credential no longer matches its Hub pin"
+    );
+    rt.block_on(
+        client.resolve_member_pubkey(&rest, iface.hub_lct_id, next_hop_member_lct)
+    ).with_context(|| format!(
+        "next-hop Hub member {next_hop_member_lct} is not resolvable on {}",
+        iface.hub_url
+    ))?;
+
+    let link_id = uuid::Uuid::new_v4();
+    table.bind_neighbor(hestia::receiver_routing::RouterNeighbor {
+        link_id,
+        next_hop_lct: next_hop.trim().to_string(),
+        interface_binding_id: interface,
+        next_hop_hub_member_lct: next_hop_member_lct,
+        reason: reason.trim().to_string(),
+        set_by: "hestia-cli".into(),
+        set_at: chrono::Utc::now().timestamp().max(0) as u64,
+    })?;
+    table.save(&mut vault)?;
+
+    println!("Router neighbor bound:");
+    println!("  next hop:     {}", next_hop.trim());
+    println!("  link:         {link_id}");
+    println!("  interface:    {interface}");
+    println!("  Hub member:   {next_hop_member_lct}");
+    println!("  note:         route_forward will require receipt-mode enrollment");
+    Ok(())
+}
+
+
 fn cmd_receiver_unbind(home: &std::path::Path, child: &str) -> AnyResult<()> {
-    // Route removal can strand a fetched/staged notice, so it needs the inbox
-    // custody state before changing the vault routing table.
+    // This removes a CHILD-SPECIFIC HUB INGRESS interface, not the child's
+    // parent/local route. Only direct Hub receipt custody pins this resource.
     let (mut vault, passphrase) = open_vault_with_passphrase(home)?;
     let registry = hestia::member_registry::load_members(&vault);
     let canonical = registry
@@ -3263,7 +3438,7 @@ fn cmd_receiver_unbind(home: &std::path::Path, child: &str) -> AnyResult<()> {
     let inflight = inbox.hub_receipt_inflight_count(binding.binding_id)?;
     anyhow::ensure!(
         inflight == 0,
-        "refusing to remove receiver interface {} for {}: {inflight} Hub receipt(s) \
+        "refusing to remove receiver Hub ingress interface {} for {}: {inflight} direct Hub receipt(s) \
          are still in flight; drain/ACK them first",
         binding.binding_id, canonical
     );
@@ -3354,6 +3529,31 @@ fn cmd_receiver_routes(home: &std::path::Path) -> AnyResult<()> {
             b.child_lct, b.binding_id, b.hub_url, b.hub_member_lct, credential, b.reason
         );
     }
+    println!("  router interfaces:");
+    if table.router_ingress.is_empty() {
+        println!("    (none)");
+    }
+    for b in &table.router_ingress {
+        let credential = match &b.member_key_source {
+            MemberKeySource::VaultIdentity => "vault-identity",
+            MemberKeySource::ChannelKeyFile { .. } => "channel-key-file",
+        };
+        println!(
+            "    {}  if={}  hub={} member={} credential={}  ({})",
+            b.router_lct, b.binding_id, b.hub_url, b.hub_member_lct, credential, b.reason
+        );
+    }
+    println!("  neighbors:");
+    if table.neighbors.is_empty() {
+        println!("    (none)");
+    }
+    for n in &table.neighbors {
+        println!(
+            "    {} -> hub-member {} via if={} link={}  ({})",
+            n.next_hop_lct, n.next_hop_hub_member_lct,
+            n.interface_binding_id, n.link_id, n.reason
+        );
+    }
     println!("  specific routes:");
     if table.routes.is_empty() {
         println!("    (none)");
@@ -3379,14 +3579,20 @@ fn cmd_receiver_drain(home: &std::path::Path, parent: Option<&str>) -> AnyResult
     let inbox = hestia::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
     let chain = hestia::storage::SqliteChainStore::open(home.join("witness.db"), store_key)?;
     let rt = tokio::runtime::Runtime::new()?;
-    let report = rt.block_on(hestia::fleet_receiver::drain_once(
+    let local = rt.block_on(hestia::fleet_receiver::drain_once(
         &vault, &router_lct, &inbox, &chain,
     ))?;
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    let router = rt.block_on(hestia::router_forwarder::drain_router_once(
+        &vault, &router_lct, &inbox, &chain,
+    ))?;
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        "local": local,
+        "router": router,
+    }))?);
     anyhow::ensure!(
-        report.errors == 0,
-        "receiver pass completed with {} error(s); durable state was retained for retry",
-        report.errors
+        local.errors + router.errors == 0,
+        "receiver pass completed with {} local + {} router error(s); durable state was retained for retry",
+        local.errors, router.errors
     );
     Ok(())
 }
