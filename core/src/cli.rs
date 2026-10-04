@@ -3529,6 +3529,31 @@ fn cmd_receiver_routes(home: &std::path::Path) -> AnyResult<()> {
             b.child_lct, b.binding_id, b.hub_url, b.hub_member_lct, credential, b.reason
         );
     }
+    println!("  router interfaces:");
+    if table.router_ingress.is_empty() {
+        println!("    (none)");
+    }
+    for b in &table.router_ingress {
+        let credential = match &b.member_key_source {
+            MemberKeySource::VaultIdentity => "vault-identity",
+            MemberKeySource::ChannelKeyFile { .. } => "channel-key-file",
+        };
+        println!(
+            "    {}  if={}  hub={} member={} credential={}  ({})",
+            b.router_lct, b.binding_id, b.hub_url, b.hub_member_lct, credential, b.reason
+        );
+    }
+    println!("  neighbors:");
+    if table.neighbors.is_empty() {
+        println!("    (none)");
+    }
+    for n in &table.neighbors {
+        println!(
+            "    {} -> hub-member {} via if={} link={}  ({})",
+            n.next_hop_lct, n.next_hop_hub_member_lct,
+            n.interface_binding_id, n.link_id, n.reason
+        );
+    }
     println!("  specific routes:");
     if table.routes.is_empty() {
         println!("    (none)");
@@ -3554,14 +3579,20 @@ fn cmd_receiver_drain(home: &std::path::Path, parent: Option<&str>) -> AnyResult
     let inbox = hestia::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
     let chain = hestia::storage::SqliteChainStore::open(home.join("witness.db"), store_key)?;
     let rt = tokio::runtime::Runtime::new()?;
-    let report = rt.block_on(hestia::fleet_receiver::drain_once(
+    let local = rt.block_on(hestia::fleet_receiver::drain_once(
         &vault, &router_lct, &inbox, &chain,
     ))?;
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    let router = rt.block_on(hestia::router_forwarder::drain_router_once(
+        &vault, &router_lct, &inbox, &chain,
+    ))?;
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        "local": local,
+        "router": router,
+    }))?);
     anyhow::ensure!(
-        report.errors == 0,
-        "receiver pass completed with {} error(s); durable state was retained for retry",
-        report.errors
+        local.errors + router.errors == 0,
+        "receiver pass completed with {} local + {} router error(s); durable state was retained for retry",
+        local.errors, router.errors
     );
     Ok(())
 }
