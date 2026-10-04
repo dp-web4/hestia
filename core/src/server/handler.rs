@@ -10915,6 +10915,110 @@ mod member_mesh_tests {
         assert_eq!(kimi_mail["notices"][0]["from_plugin"], json!("claude-code"));
     }
 
+    #[tokio::test]
+    async fn routed_member_notify_records_resolved_f3_shadow_but_still_uses_legacy_queue() {
+        let (_dir, state) = test_state().await;
+        let alice = connect(&state, "claude-code").await;
+
+        {
+            let mut s = state.lock().await;
+            let mut table = crate::receiver_routing::ReceiverRoutingTable::load(&s.vault)
+                .unwrap_or_default();
+            table.bind_legacy_alias(crate::receiver_routing::LegacyRouteAlias {
+                legacy_address: "thor/kimi-code".into(),
+                destination_lct: "lct:web4:mb32:remote-kimi".into(),
+                reason: "shadow parity test".into(),
+                set_by: "test".into(),
+                set_at: 1,
+            }).unwrap();
+            table.set_default(Some(crate::receiver_routing::DefaultRoute {
+                next_hop_lct: "lct:web4:mb32:thor-router".into(),
+                reason: "shadow parity test".into(),
+                set_by: "test".into(),
+                set_at: 1,
+            }));
+            table.save(&mut s.vault).unwrap();
+        }
+
+        let sent = tool_member_notify(
+            &state,
+            &json!({
+                "to_plugin_id": "thor/kimi-code",
+                "kind": "coordination",
+                "pointer_uri": "shared-context/forum/shadow.md",
+                "session_id": alice,
+            }),
+        ).await.unwrap();
+
+        // The authoritative result is STILL the historical egress queue.
+        assert!(sent["queued_id"].is_number(), "{sent}");
+        assert_eq!(sent["egress_queued_to"], "thor", "{sent}");
+        assert_eq!(sent["f3_shadow_mode"], "observe_only", "{sent}");
+        assert_eq!(sent["f3_shadow"]["status"], "resolved", "{sent}");
+        assert_eq!(
+            sent["f3_shadow"]["destination_lct"],
+            "lct:web4:mb32:remote-kimi",
+            "{sent}"
+        );
+        assert_eq!(
+            sent["f3_shadow"]["decision"]["decision"],
+            "forward",
+            "{sent}"
+        );
+        assert_eq!(
+            sent["f3_shadow"]["decision"]["next_hop_lct"],
+            "lct:web4:mb32:thor-router",
+            "{sent}"
+        );
+
+        let s = state.lock().await;
+        let pending = s.inbox_store.pending_egress(10).unwrap();
+        assert_eq!(pending.len(), 1, "shadow mode must not dual-send or bypass legacy");
+        assert_eq!(pending[0].dest_peer, "thor");
+        assert_eq!(pending[0].to_member, "kimi-code");
+
+        let chain = s.recent_chain(30);
+        let shadow = chain.iter()
+            .find(|e| e.event_type == "member_notice_f3_shadow")
+            .expect("live routed send left no durable shadow observation");
+        assert_eq!(shadow.event_data["mode"], "observe_only");
+        assert_eq!(shadow.event_data["legacy_outcome"], "egress_queued");
+        assert_eq!(shadow.event_data["legacy_address"], "thor/kimi-code");
+        assert_eq!(shadow.event_data["f3_shadow"]["status"], "resolved");
+        let witnessed = shadow.event_data["witnessed_entry"].as_str().unwrap();
+        assert!(chain.iter().any(|e| e.event_type == "member_notice" && e.hash == witnessed));
+    }
+
+    #[tokio::test]
+    async fn missing_f3_alias_never_blocks_the_legacy_routed_send() {
+        let (_dir, state) = test_state().await;
+        let alice = connect(&state, "claude-code").await;
+
+        let sent = tool_member_notify(
+            &state,
+            &json!({
+                "to_plugin_id": "thor/kimi-code",
+                "kind": "coordination",
+                "pointer_uri": "shared-context/forum/shadow-missing.md",
+                "session_id": alice,
+            }),
+        ).await.unwrap();
+
+        assert!(sent["queued_id"].is_number(), "legacy send must remain authoritative: {sent}");
+        assert_eq!(sent["egress_queued_to"], "thor", "{sent}");
+        assert_eq!(sent["f3_shadow"]["status"], "missing_alias", "{sent}");
+        assert!(sent["f3_shadow_witness"].is_string(), "{sent}");
+
+        let s = state.lock().await;
+        assert_eq!(s.inbox_store.pending_egress(10).unwrap().len(), 1);
+        let chain = s.recent_chain(30);
+        let shadow = chain.iter()
+            .find(|e| e.event_type == "member_notice_f3_shadow")
+            .expect("missing alias was not measured");
+        assert_eq!(shadow.event_data["legacy_outcome"], "egress_queued");
+        assert_eq!(shadow.event_data["f3_shadow"]["status"], "missing_alias");
+    }
+
     /// T3 (McNugget on `17a928d`): a REFUSED forward must be distinguishable from an
     /// accepted one **on the chain**, not just in an ephemeral tool response.
     ///
@@ -10968,6 +11072,15 @@ mod member_mesh_tests {
         let refusal = refused["_hestia_error"]["data"]["refusalEntryHash"].as_str()
             .expect("the refusal must carry its own chain entry hash");
         assert_ne!(witness, refusal, "the refusal reused the witness entry");
+        assert_eq!(
+            refused["_hestia_error"]["data"]["f3_shadow"]["status"],
+            "missing_alias",
+            "shadow must observe the refusal path without changing it: {refused}"
+        );
+        assert_eq!(
+            refused["_hestia_error"]["data"]["f3_shadow_mode"],
+            "observe_only"
+        );
 
         let s = state.lock().await;
         let chain = s.recent_chain(20);
@@ -10980,6 +11093,14 @@ mod member_mesh_tests {
         assert_eq!(e.event_data["witnessed_entry"], json!(witness));
         assert_eq!(e.event_data["reason"], json!("egress_queue_full"));
         assert_eq!(e.event_data["dest_peer"], json!("thor"));
+        let shadow = chain
+            .iter()
+            .find(|e| e.event_type == "member_notice_f3_shadow")
+            .expect("queue-full refusal left no parity observation");
+        assert_eq!(shadow.event_data["legacy_outcome"], "egress_refused");
+        assert_eq!(shadow.event_data["legacy_reason"], "egress_queue_full");
+        assert_eq!(shadow.event_data["refusal_entry"], json!(refusal));
+        assert_eq!(shadow.event_data["f3_shadow"]["status"], "missing_alias");
         // And the accepted-looking witness is still there — the pair is the record,
         // not the refusal alone.
         assert!(chain.iter().any(|e| e.event_type == "member_notice"),
@@ -27028,6 +27149,10 @@ mod transport_binding_tests {
         assert_eq!(refused.len(), 1);
         assert_eq!(refused[0]["reason"], "transport_binding_unmet");
         assert!(events(&state, "member_notice").await.is_empty(), "a refused act is not witnessed as a send");
+        assert!(
+            events(&state, "member_notice_f3_shadow").await.is_empty(),
+            "shadow routing must not run past a legacy transport-binding refusal"
+        );
 
         let local = send(&state, &being, "kimi-code").await;
         assert!(local["queued_id"].is_number(), "a local notice needs no carrier: {local}");
