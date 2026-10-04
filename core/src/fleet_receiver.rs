@@ -400,13 +400,27 @@ pub async fn drain_once(
                     "wake": "not-considered",
                     "custody": "member-inbox",
                 });
-                if let Err(e) = chain.append_once(
+                let delivery_witness = match chain.append_once(
                     &delivery_key,
                     "hub.notice.delivered-local",
                     delivery_event,
                     router_lct,
                 ) {
-                    report.errors.push(format!("delivery witness {notice_id}: {e:#}"));
+                    Ok((entry, _inserted)) => entry,
+                    Err(e) => {
+                        report.errors.push(format!("delivery witness {notice_id}: {e:#}"));
+                        batch_failed = true;
+                        continue;
+                    }
+                };
+                if let Err(e) = inbox.record_hub_receipt_delivery_witness(
+                    conn.id,
+                    notice_id,
+                    &delivery_witness.hash,
+                ) {
+                    report.errors.push(format!(
+                        "record delivery witness {notice_id}: {e:#}"
+                    ));
                     batch_failed = true;
                     continue;
                 }
