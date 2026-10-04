@@ -930,10 +930,20 @@ pub async fn drain_router_once(
                                 *link_id,
                                 operation_id,
                             ),
-                            _ => inbox.record_router_local_decision(
-                                packet.packet_id,
-                                &decision_json,
-                            ),
+                            PersistedAction::Local { child_lct, .. } => {
+                                inbox.record_router_local_decision(
+                                    packet.packet_id,
+                                    &decision_json,
+                                    Some(child_lct),
+                                )
+                            }
+                            PersistedAction::Terminal { .. } => {
+                                inbox.record_router_local_decision(
+                                    packet.packet_id,
+                                    &decision_json,
+                                    None,
+                                )
+                            }
                         };
                         if let Err(e) = persist {
                             report.errors.push(format!(
