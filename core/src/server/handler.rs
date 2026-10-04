@@ -5396,160 +5396,112 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
         let (state, evidence) = recipient_liveness(&s.inbox_store, &to_plugin);
         (state.to_string(), evidence)
     };
+
     // Witness FIRST (the act is the send; delivery is a consequence), then queue
     // with the chain hash so every parked notice is anchored to its witnessed act.
-    let mut notice_record = json!({
+    // A half-commit retry reuses the exact first witness and therefore its first
+    // session/role/evidence rather than rewriting history with the retrying session.
+    let effective_from_role = recovered_operation_witness
+        .as_ref()
+        .and_then(|entry| entry.event_data.get("from_role_lct"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| sender.role_lct.clone());
+    let effective_from_session = recovered_operation_witness
+        .as_ref()
+        .and_then(|entry| entry.event_data.get("from_session_id"))
+        .cloned()
+        .unwrap_or_else(|| json!(sender.session_uuid));
+
+    let mut notice_record = if let Some(existing) = &recovered_operation_witness {
+        existing.event_data.clone()
+    } else {
+        json!({
+            "to_plugin_id": to_plugin,
+            "from_plugin_id": sender.plugin_id,
+            "from_role_lct": effective_from_role,
+            "from_session_id": effective_from_session,
+            "kind": kind,
+            "pointer_uri": pointer_uri,
+            "in_reply_to": in_reply_to,
+            "binding_verified": binding_verified,
+            "recipient_liveness": liveness,
+            "recipient_liveness_evidence": liveness_evidence,
+        })
+    };
+    if recovered_operation_witness.is_none() {
+        if let Some(t) = &transport_record {
+            notice_record["transport"] = t.clone();
+        }
+        if let Some(shadow) = &f3_route_shadow {
+            notice_record["f3_shadow"] = shadow.clone();
+            notice_record["d2_shadow"] = json!(true);
+        }
+        if let (Some(op_id), Some(binding)) = (&operation_id, &operation_binding) {
+            notice_record["operation_id"] = json!(op_id);
+            notice_record["operation_binding"] = binding.clone();
+        }
+    }
+
+    let entry = if let Some(existing) = recovered_operation_witness.clone() {
+        existing
+    } else if let Some(key) = operation_witness_key.as_deref() {
+        s.chain_store
+            .append_once(key, "member_notice", notice_record, &s.sovereign_lct)
+            .map_err(|e| anyhow::anyhow!("witnessing operation-keyed member notice: {e}"))?
+            .0
+    } else {
+        s.append_chain("member_notice", notice_record)?
+    };
+
+    // Build the first receipt BEFORE queue admission. Operation-keyed queue
+    // methods add queued_id/egress_queued_to and persist this receipt in the SAME
+    // transaction as admission, so a lost response can be reproduced exactly.
+    let mut response_template = json!({
+        "witnessEntryHash": entry.hash,
         "to_plugin_id": to_plugin,
-        "from_plugin_id": sender.plugin_id,
-        "from_role_lct": sender.role_lct,
-        "from_session_id": sender.session_uuid,
         "kind": kind,
-        "pointer_uri": pointer_uri,
         "in_reply_to": in_reply_to,
         "binding_verified": binding_verified,
         "recipient_liveness": liveness,
         "recipient_liveness_evidence": liveness_evidence,
+        "replayed": recovered_operation_witness.is_some(),
     });
+    if let Some(op_id) = &operation_id {
+        response_template["operation_id"] = json!(op_id);
+    }
+    if let Some(note) = liveness_note(&liveness, &to_plugin) {
+        response_template["recipient_note"] = json!(note);
+    }
     if let Some(t) = &transport_record {
-        notice_record["transport"] = t.clone();
-    }
-    if let Some(shadow) = &f3_route_shadow {
-        notice_record["f3_shadow"] = shadow.clone();
-        notice_record["d2_shadow"] = json!(true);
-    }
-    let entry = s.append_chain("member_notice", notice_record)?;
-    // ---- r6-routing branch 2: is it for someone I know? then forward ------------
-    // `peer/member` addresses a member on ANOTHER machine. A bare id stays local,
-    // so no existing caller changes. Explicit rather than inferred: the sender
-    // states the scale it is crossing, and `/` is the fractal seam made syntactic.
-    //
-    // SPLIT-HORIZON, not TTL. Only a notice from a LOCAL sender is egressed, so a
-    // packet that arrived from outside can never be forwarded back outside. Thor
-    // refuted the per-packet hop counter this proposal originally carried — a bound
-    // the sender writes is not a bound. Sender identity here is
-    // transport-authenticated, so the loop bound contains no forgeable field.
-    // Cost: no third-party transit in v1. Deliberate.
-    let egress_peer = to_plugin.split_once('/').map(|(peer, _)| peer.to_string());
-    let queued_id = match &egress_peer {
-        Some(peer) => {
-            let remote_member = to_plugin.split_once('/').map(|(_, m)| m).unwrap_or("");
-            if peer.is_empty() || remote_member.is_empty() {
-                return Ok(hestia_error_envelope(
-                    "hestia.member_notify_bad_address",
-                    "a routed address is `peer/member`; both halves must be non-empty",
-                    Some(json!({ "to_plugin_id": to_plugin })),
-                ));
-            }
-            // The egress plane's admission bound (`MAX_EGRESS_QUEUE`) refuses rather
-            // than evicting: a parked forward has no report path on this branch, so
-            // dropping one is a silent loss, while refusing the newest send reaches a
-            // caller who is live and holds the receipt. Named error, not a bare
-            // anyhow — "the forwarding plane is backed up" is a fact the sender can
-            // act on (and it says how backed up).
-            match s.inbox_store.enqueue_egress(
-                peer,
-                remote_member,
-                &sender.plugin_id,
-                &sender.role_lct,
-                &kind,
-                pointer_uri.as_deref(),
-                &entry.hash,
-            ) {
-                Ok(id) => {
-                    // Stamped under the same server lock as the enqueue, so no drainer can
-                    // list the row between the two writes. If the stamp write itself fails
-                    // the row is left unstamped while its sender IS bound, which the list
-                    // arm reads as a changed binding and fails toward the sender, so the
-                    // error below cannot become a seat-signed send.
-                    if let Some(b) = &transport_binding {
-                        s.inbox_store
-                            .set_egress_transport_stamp(id, &b.stamp().to_string())
-                            .map_err(|e| anyhow::anyhow!("stamping egress row {id} with its transport binding: {e}"))?;
-                    }
-                    id
-                }
-                Err(e) => {
-                    // The refusal gets its OWN chain entry (McNugget T3 on `17a928d`).
-                    // The witness above says `member_notice` and reads, to any third
-                    // party, as an accepted send — the chain cannot distinguish "queued"
-                    // from "refused" without this. The envelope used to assert "the
-                    // refusal is on record too" while appending nothing, which made the
-                    // one path built to keep backpressure attributable the one path that
-                    // left no evidence, and made the claim in its own error text false.
-                    // Appending here rather than moving the witness below the queue
-                    // decision keeps the existing shape deliberate — the act IS the send,
-                    // delivery is a consequence — and `witnessed_entry` joins the two.
-                    //
-                    // Cheap under flood by construction: this fires only when admission
-                    // is REFUSED, i.e. at most once per send that produced no row, and
-                    // the refusal is what a flooding sender is already being told to stop
-                    // doing. That is the opposite of the eviction-counter case, which is
-                    // a mark rather than a witness precisely because evictions happen at
-                    // flood rates.
-                    let depth = s.inbox_store.egress_queued().unwrap_or(0);
-                    let refusal = s.append_chain(
-                        "member_notice_refused",
-                        {
-                            let mut record = json!({
-                                "reason": "egress_queue_full",
-                                "to_plugin_id": to_plugin,
-                                "dest_peer": peer,
-                                "from_plugin_id": sender.plugin_id,
-                                "from_role_lct": sender.role_lct,
-                                "egress_queued": depth,
-                                "d2_shadow": true,
-                                // the `member_notice` entry this refusal voids
-                                "witnessed_entry": entry.hash,
-                            });
-                            if let Some(shadow) = &f3_route_shadow {
-                                record["f3_shadow"] = shadow.clone();
-                            }
-                            record
-                        },
-                    )?;
-                    return Ok(hestia_error_envelope(
-                        "hestia.member_notify_egress_queue_full",
-                        &format!(
-                            "the forwarding plane is not draining, so this notice was \
-                             NOT queued: {e}. Both the act and its refusal are on the \
-                             chain — see witnessEntryHash and refusalEntryHash."
-                        ),
-                        Some(json!({
-                            "to_plugin_id": to_plugin,
-                            "dest_peer": peer,
-                            "egress_queued": depth,
-                            "witnessEntryHash": entry.hash,
-                            "refusalEntryHash": refusal.hash,
-                        })),
-                    ));
-                }
-            }
+        if *t == json!("unbound") {
+            response_template["transport_note"] = json!(
+                "no transport binding: the forwarding drain chooses which hub identity signs                  this notice, and a reply follows THAT identity, so it may not come back to                  you. See hestia_transport_binding."
+            );
         }
-        None => s
-            .inbox_store
-            .enqueue_member(
-                &to_plugin,
-                &sender.plugin_id,
-                &sender.role_lct,
-                &kind,
-                pointer_uri.as_deref(),
-                &entry.hash,
-                in_reply_to,
-            )
-            .map_err(|e| anyhow::anyhow!("queueing member notice: {e}"))?,
-    };
-    let mut f3_shadow_witness_hash: Option<String> = None;
-    let mut f3_shadow_warning: Option<String> = None;
-    if let (Some(peer), Some(shadow)) = (&egress_peer, &f3_route_shadow) {
-        let record = json!({
+        response_template["transport"] = t.clone();
+    }
+    if in_reply_to.is_none() && kind_under(MEMBER_KINDS_ARE_DISPOSITIONS, &kind) {
+        response_template["unbound_notice"] = json!(format!(
+            "kind '{kind}' is a disposition — pass in_reply_to:<notice id> so the notice              it answers stops counting as unanswered"
+        ));
+    }
+
+    // peer/member is still the authoritative legacy route in D2. F3 remains
+    // observational until parity/cutover; operation identity strengthens retries
+    // without changing which plane carries the message.
+    let egress_peer = to_plugin.split_once('/').map(|(peer, _)| peer.to_string());
+    let shadow_template = if let (Some(peer), Some(shadow)) = (&egress_peer, &f3_route_shadow) {
+        Some(json!({
             "legacy_member_notice": entry.hash,
             "legacy_outcome": "egress_queued",
-            "legacy_egress_row_id": queued_id,
+            // The operation-keyed storage transaction fills this with the row id.
+            "legacy_egress_row_id": Value::Null,
             "legacy_dest_peer": peer,
             "legacy_address": to_plugin,
             "from_plugin_id": sender.plugin_id,
-            "from_role_lct": sender.role_lct,
-            "from_session_id": sender.session_uuid,
+            "from_role_lct": effective_from_role,
+            "from_session_id": effective_from_session,
             "kind": kind,
             "pointer_uri": pointer_uri,
             "in_reply_to": in_reply_to,
@@ -5558,72 +5510,270 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             "transport": transport_record.clone().unwrap_or_else(|| json!("unbound")),
             "f3_shadow": shadow,
             "delivery_authority": "legacy",
-        });
-        match s.append_chain("member_notice_route_shadow", record) {
-            Ok(witness) => f3_shadow_witness_hash = Some(witness.hash),
-            Err(e) => {
-                // Shadow/parity instrumentation is observational. If its extra
-                // witness cannot be written, the already-queued legacy send
-                // remains authoritative and successful; surface the evidence gap.
-                f3_shadow_warning = Some(format!(
-                    "legacy send queued, but D2 parity witness could not be written: {e}"
+        }))
+    } else {
+        None
+    };
+
+    let mut operation_result: Option<crate::storage::inbox::MemberSendOperation> = None;
+    let queued_id = match &egress_peer {
+        Some(peer) => {
+            let remote_member = to_plugin.split_once('/').map(|(_, m)| m).unwrap_or("");
+            if peer.is_empty() || remote_member.is_empty() {
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_bad_address",
+                    "a routed address is peer/member; both halves must be non-empty",
+                    Some(json!({ "to_plugin_id": to_plugin })),
                 ));
+            }
+
+            let operation_attempt = if let (Some(op_id), Some(binding_json)) =
+                (operation_id.as_deref(), operation_binding_json.as_deref())
+            {
+                let frozen_stamp = transport_record
+                    .as_ref()
+                    .filter(|v| v.is_object())
+                    .map(Value::to_string);
+                Some(s.inbox_store.enqueue_egress_operation(
+                    &sender.plugin_id,
+                    op_id,
+                    binding_json,
+                    peer,
+                    remote_member,
+                    &sender.plugin_id,
+                    &effective_from_role,
+                    &kind,
+                    pointer_uri.as_deref(),
+                    &entry.hash,
+                    frozen_stamp.as_deref(),
+                    &response_template,
+                    shadow_template.as_ref(),
+                ))
+            } else {
+                None
+            };
+
+            let admission = match operation_attempt {
+                Some(result) => result.map(|op| {
+                    let id = op.queued_id.expect("queued operation carries a row id");
+                    operation_result = Some(op);
+                    id
+                }),
+                None => s.inbox_store.enqueue_egress(
+                    peer,
+                    remote_member,
+                    &sender.plugin_id,
+                    &effective_from_role,
+                    &kind,
+                    pointer_uri.as_deref(),
+                    &entry.hash,
+                ),
+            };
+
+            match admission {
+                Ok(id) => {
+                    // No-key legacy sends preserve the historical separate stamp
+                    // write. Keyed sends froze the stamp inside the queue/op
+                    // transaction above.
+                    if operation_id.is_none() {
+                        if let Some(b) = &transport_binding {
+                            s.inbox_store
+                                .set_egress_transport_stamp(id, &b.stamp().to_string())
+                                .map_err(|e| anyhow::anyhow!(
+                                    "stamping egress row {id} with its transport binding: {e}"
+                                ))?;
+                        }
+                    }
+                    id
+                }
+                Err(e) => {
+                    let depth = s.inbox_store.egress_queued().unwrap_or(0);
+                    let mut refusal_record = json!({
+                        "reason": "egress_queue_full",
+                        "to_plugin_id": to_plugin,
+                        "dest_peer": peer,
+                        "from_plugin_id": sender.plugin_id,
+                        "from_role_lct": effective_from_role,
+                        "egress_queued": depth,
+                        "d2_shadow": true,
+                        "witnessed_entry": entry.hash,
+                    });
+                    if let Some(shadow) = &f3_route_shadow {
+                        refusal_record["f3_shadow"] = shadow.clone();
+                    }
+                    if let Some(op_id) = &operation_id {
+                        refusal_record["operation_id"] = json!(op_id);
+                    }
+
+                    let refusal = if let Some(op_id) = &operation_id {
+                        let key = format!(
+                            "member-notify-refusal:{}:{}:egress-queue-full",
+                            sender.plugin_id, op_id
+                        );
+                        if let Some(existing) = s.chain_store.event_by_key(&key)? {
+                            existing
+                        } else {
+                            s.chain_store
+                                .append_once(
+                                    &key,
+                                    "member_notice_refused",
+                                    refusal_record,
+                                    &s.sovereign_lct,
+                                )?
+                                .0
+                        }
+                    } else {
+                        s.append_chain("member_notice_refused", refusal_record)?
+                    };
+                    return Ok(hestia_error_envelope(
+                        "hestia.member_notify_egress_queue_full",
+                        &format!(
+                            "the forwarding plane is not draining, so this notice was                              NOT queued: {e}. Both the act and its refusal are on the                              chain — see witnessEntryHash and refusalEntryHash."
+                        ),
+                        Some(json!({
+                            "to_plugin_id": to_plugin,
+                            "dest_peer": peer,
+                            "egress_queued": depth,
+                            "witnessEntryHash": entry.hash,
+                            "refusalEntryHash": refusal.hash,
+                            "operation_id": operation_id,
+                        })),
+                    ));
+                }
+            }
+        }
+        None => {
+            if let (Some(op_id), Some(binding_json)) =
+                (operation_id.as_deref(), operation_binding_json.as_deref())
+            {
+                let op = s.inbox_store.enqueue_member_operation(
+                    &sender.plugin_id,
+                    op_id,
+                    binding_json,
+                    &to_plugin,
+                    &sender.plugin_id,
+                    &effective_from_role,
+                    &kind,
+                    pointer_uri.as_deref(),
+                    &entry.hash,
+                    in_reply_to,
+                    &response_template,
+                    None,
+                ).map_err(|e| anyhow::anyhow!("queueing operation-keyed member notice: {e}"))?;
+                let id = op.queued_id.expect("queued operation carries a row id");
+                operation_result = Some(op);
+                id
+            } else {
+                s.inbox_store
+                    .enqueue_member(
+                        &to_plugin,
+                        &sender.plugin_id,
+                        &effective_from_role,
+                        &kind,
+                        pointer_uri.as_deref(),
+                        &entry.hash,
+                        in_reply_to,
+                    )
+                    .map_err(|e| anyhow::anyhow!("queueing member notice: {e}"))?
+            }
+        }
+    };
+
+    let mut f3_shadow_witness_hash: Option<String> = None;
+    let mut f3_shadow_warning: Option<String> = None;
+    if let (Some(_peer), Some(shadow)) = (&egress_peer, &f3_route_shadow) {
+        if let (Some(op_id), Some(op)) = (operation_id.as_deref(), operation_result.as_mut()) {
+            // For a keyed send the exact shadow record (including the egress
+            // row id) was persisted atomically with queue admission.
+            if let Some(hash) = &op.shadow_witness_hash {
+                f3_shadow_witness_hash = Some(hash.clone());
+            } else if let Some(record_json) = &op.shadow_record_json {
+                match serde_json::from_str::<Value>(record_json) {
+                    Ok(record) => {
+                        let key = format!(
+                            "member-notify-shadow:{}:{}",
+                            sender.plugin_id, op_id
+                        );
+                        match s.chain_store.append_once(
+                            &key,
+                            "member_notice_route_shadow",
+                            record,
+                            &s.sovereign_lct,
+                        ) {
+                            Ok((witness, _)) => {
+                                match s.inbox_store.set_member_send_shadow_witness(
+                                    &sender.plugin_id,
+                                    op_id,
+                                    &witness.hash,
+                                ) {
+                                    Ok(()) => {
+                                        op.shadow_witness_hash = Some(witness.hash.clone());
+                                        f3_shadow_witness_hash = Some(witness.hash);
+                                    }
+                                    Err(e) => {
+                                        f3_shadow_warning = Some(format!(
+                                            "legacy send queued and D2 shadow witnessed, but its retry watermark could not be persisted: {e}"
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                f3_shadow_warning = Some(format!(
+                                    "legacy send queued, but D2 parity witness could not be written: {e}"
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        f3_shadow_warning = Some(format!(
+                            "legacy send queued, but its persisted D2 shadow record is unreadable: {e}"
+                        ));
+                    }
+                }
+            }
+        } else {
+            let record = json!({
+                "legacy_member_notice": entry.hash,
+                "legacy_outcome": "egress_queued",
+                "legacy_egress_row_id": queued_id,
+                "legacy_dest_peer": egress_peer,
+                "legacy_address": to_plugin,
+                "from_plugin_id": sender.plugin_id,
+                "from_role_lct": effective_from_role,
+                "from_session_id": effective_from_session,
+                "kind": kind,
+                "pointer_uri": pointer_uri,
+                "in_reply_to": in_reply_to,
+                "binding_verified": binding_verified,
+                "recipient_liveness": liveness,
+                "transport": transport_record.clone().unwrap_or_else(|| json!("unbound")),
+                "f3_shadow": shadow,
+                "delivery_authority": "legacy",
+            });
+            match s.append_chain("member_notice_route_shadow", record) {
+                Ok(witness) => f3_shadow_witness_hash = Some(witness.hash),
+                Err(e) => {
+                    f3_shadow_warning = Some(format!(
+                        "legacy send queued, but D2 parity witness could not be written: {e}"
+                    ));
+                }
             }
         }
     }
 
-    let mut out = json!({
-        "queued_id": queued_id,
-        "witnessEntryHash": entry.hash,
-        "to_plugin_id": to_plugin,
-        // `egress_queued_to` present => this took the forwarding branch (branch 2)
-        // and its `queued_id` is an EGRESS row, not a local inbox row. Absent =>
-        // local. Naming which branch fired is the point: a receipt that cannot say
-        // how it was routed is the black hole with a success code.
-        //
-        // Was `forwarded_to` until 2026-07-27 (Kimi, notice 123 §3). At this line
-        // nothing has been forwarded: the row is parked for a drain that runs when
-        // it runs, against a hub that may be down. The commit that shipped the field
-        // named the distinction in its own message — "'the mesh accepted it' and
-        // 'the recipient read it' are different facts" — and then gave the field the
-        // name of the fact it was warning about. This thread is the one about
-        // receipts that overclaim; a receipt is exactly where the overclaim does its
-        // damage, because it is the only artifact the sender keeps.
-        "egress_queued_to": egress_peer,
-        "kind": kind,
-        "in_reply_to": in_reply_to,
-        "binding_verified": binding_verified,
-        // The send still succeeds and still returns a queued_id; it just stops
-        // reading like uniform success. `queued` never meant `delivered`, and
-        // until now nothing in the receipt said so.
-        "recipient_liveness": liveness,
-        "recipient_liveness_evidence": liveness_evidence,
-    });
-    if let Some(note) = liveness_note(liveness, &to_plugin) {
-        out["recipient_note"] = json!(note);
-    }
-    // How the act will travel, told to the author at the moment it acts (#1030 falsifier 9).
-    // Unbound is reported, not refused: every seat on the fleet mesh is unbound today, and
-    // enforcement arrives per member, by binding.
-    if let Some(t) = transport_record {
-        if t == json!("unbound") {
-            out["transport_note"] = json!(
-                "no transport binding: the forwarding drain chooses which hub identity signs \
-                 this notice, and a reply follows THAT identity, so it may not come back to \
-                 you. See hestia_transport_binding."
-            );
-        }
-        out["transport"] = t;
-    }
-    // Nudge, not a gate: for the two kinds whose disposition IS a response, an
-    // unbound send is what leaves the sender's notice sitting "unanswered"
-    // forever. Refusing it would be worse — a member with something to say and
-    // a lost id would be silenced by the bookkeeping.
-    if in_reply_to.is_none() && kind_under(MEMBER_KINDS_ARE_DISPOSITIONS, &kind) {
-        out["unbound_notice"] = json!(format!(
-            "kind '{kind}' is a disposition — pass in_reply_to:<notice id> so the notice \
-             it answers stops counting as unanswered"
-        ));
+    let mut out = if let Some(op) = &operation_result {
+        op.response_json.clone()
+    } else {
+        let mut response = response_template;
+        response["queued_id"] = json!(queued_id);
+        response["egress_queued_to"] = match &egress_peer {
+            Some(peer) => json!(peer),
+            None => Value::Null,
+        };
+        response
+    };
+    if let Some(op_id) = &operation_id {
+        out["operation_id"] = json!(op_id);
     }
     if let Some(hash) = f3_shadow_witness_hash {
         out["f3_shadow_witness_hash"] = json!(hash);
