@@ -352,20 +352,32 @@ Existing refusal witnesses are reused rather than multiplied:
   an explicit migration rule replacing the old queue/backpressure mechanism.
 
 `hestia hub receiver-parity` reads these rows through an event-type-indexed chain query, not a
-global tail window. Its classifications are intentionally narrow:
-- `both_forward_next_hop_unverifiable`: both chose forwarding, but legacy enqueue has no
-  canonical next-hop LCT evidence yet (`dest_peer_lct` is unwired and the historical drain may
-  prefix-resolve the peer name later); this is **not** route parity;
+global tail window. For successful enqueues it also joins the later `egress_forwarded`
+witness by durable legacy row id. That join is how the report learns what transport actually
+happened; it never re-resolves the old peer name after the fact.
+
+The shadow also projects F3's canonical next-hop router through its configured
+`RouterNeighbor` to the Hub-member UUID F3 would actually address. This keeps the comparison
+namespace-correct: **legacy measured Hub recipient UUID ↔ F3 configured Hub neighbor UUID**,
+not Hub UUID ↔ canonical Web4 LCT.
+
+Classifications:
+- `next_hop_match`: both Hub-member next-hop identities are measured and equal;
+- `next_hop_mismatch`;
+- `legacy_queued_not_forwarded_yet`;
+- `legacy_recipient_unmeasured`: the old drain reported acceptance but not the actual
+  recipient LCT (expected until the corresponding SAGE drain instrumentation is deployed);
+- `f3_missing_neighbor`: F3 selected a canonical next-hop router but cannot resolve it to
+  an executable Hub neighbor;
 - `missing_alias`;
 - `shadow_unavailable`;
 - `route_divergence`;
 - `shared_transport_refusal`;
 - `legacy_queue_refusal`.
 
-Even `both_forward_next_hop_unverifiable` is **not** a route-selection match: the old path
-has not yet proved which canonical router actually carried the row. D2 still has to measure
-that next-hop identity, downstream durable acceptance, replies/failures, carrier identity and
-retry behavior before cutover. A parity report must never turn missing evidence into equality.
+Even `next_hop_match` is **next-hop parity only**, not delivery parity. D2 still has to
+measure downstream durable acceptance/read semantics, replies/failures and retry identity
+before cutover. A parity report must never turn missing evidence into equality.
 
 
 ## 5. Roles: pairing external and local agents, citizen by default
