@@ -75,12 +75,10 @@ pub struct RouterIngressBinding {
 pub struct RouterNeighbor {
     pub link_id: Uuid,
     pub next_hop_lct: String,
-    pub hub_url: String,
-    pub hub_lct_id: Uuid,
-    pub rest_endpoint: String,
-    pub our_hub_member_lct: Uuid,
+    /// Existing router ingress/egress interface whose Hub identity/key signs
+    /// this hop. One interface may have many neighbors.
+    pub interface_binding_id: Uuid,
     pub next_hop_hub_member_lct: Uuid,
-    pub member_key_source: MemberKeySource,
     pub reason: String,
     #[serde(default)]
     pub set_by: String,
@@ -365,6 +363,10 @@ impl ReceiverRoutingTable {
 
     pub fn neighbor_by_link(&self, link_id: Uuid) -> Option<&RouterNeighbor> {
         self.neighbors.iter().find(|n| n.link_id == link_id)
+    }
+
+    pub fn router_ingress_by_id(&self, binding_id: Uuid) -> Option<&RouterIngressBinding> {
+        self.router_ingress.iter().find(|b| b.binding_id == binding_id)
     }
 
     pub fn set_route(&mut self, route: StaticRoute) {
