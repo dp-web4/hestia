@@ -605,6 +605,40 @@ enum HubCmd {
         child: String,
     },
 
+    /// Bind a receipt-mode Hub mailbox to the router identity itself. Route
+    /// packets arrive here; this is not a child/member inbox.
+    ReceiverRouterBind {
+        #[arg(long, default_value = "")]
+        target: String,
+        #[arg(long)]
+        member_lct: Option<uuid::Uuid>,
+        #[arg(long)]
+        channel_key: Option<String>,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Bind one canonical next-hop router LCT to its Hub transport address.
+    /// This is the routing-table equivalent of neighbor/ARP resolution.
+    ReceiverNeighbor {
+        next_hop: String,
+        #[arg(long, default_value = "")]
+        target: String,
+        /// Our signing member on this Hub; defaults to the template connection.
+        #[arg(long)]
+        our_member_lct: Option<uuid::Uuid>,
+        /// The next router's Hub member UUID on this Hub.
+        #[arg(long)]
+        next_hop_member_lct: uuid::Uuid,
+        /// Our raw 32-byte channel seed when --our-member-lct differs from the template.
+        #[arg(long)]
+        channel_key: Option<String>,
+        #[arg(long)]
+        reason: String,
+    },
+
     /// Add/update an exact remote route: destination LCT -> next-hop LCT.
     /// Local directly-connected children always win over static routes.
     ReceiverRoute {
@@ -1000,6 +1034,17 @@ pub fn run() -> AnyResult<()> {
                 )
             }
             HubCmd::ReceiverUnbind { child } => cmd_receiver_unbind(&home, &child),
+            HubCmd::ReceiverRouterBind {
+                target, member_lct, channel_key, parent, reason
+            } => cmd_receiver_router_bind(
+                &home, &target, member_lct, channel_key, parent.as_deref(), &reason,
+            ),
+            HubCmd::ReceiverNeighbor {
+                next_hop, target, our_member_lct, next_hop_member_lct, channel_key, reason
+            } => cmd_receiver_neighbor(
+                &home, &next_hop, &target, our_member_lct, next_hop_member_lct,
+                channel_key, &reason,
+            ),
             HubCmd::ReceiverRoute { destination, next_hop, metric, reason } => {
                 cmd_receiver_route(&home, &destination, &next_hop, metric, &reason)
             }
