@@ -154,7 +154,7 @@ pub async fn drain_once(
     chain: &SqliteChainStore,
 ) -> Result<ReceiverDrainReport> {
     let registry = load_members(vault);
-    let routes = ReceiverRoutingTable::load(vault).unwrap_or_default();
+    let routes = ReceiverRoutingTable::load(vault)\n        .context("loading receiver routing table (unreadable is not empty)")?;
     let client = HubClient::new();
 
     let mut reports = Vec::new();
