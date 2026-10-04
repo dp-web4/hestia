@@ -1,8 +1,8 @@
 //! F3 one-host receiver: Hub receipt-mode mailbox -> exact local member inbox.
 //!
 //! Custody order is non-negotiable:
-//!   FETCH (non-destructive) -> durable stage -> idempotent witness ->
-//!   durable member enqueue -> Hub ACK.
+//!   FETCH (non-destructive) -> durable stage -> idempotent receipt witness ->
+//!   durable member enqueue -> idempotent local-delivery witness -> Hub ACK.
 //!
 //! Wake/session launch is deliberately absent. Address chooses the inbox; local
 //! law chooses whether anything wakes. Routing of non-local destinations is in
@@ -325,11 +325,15 @@ pub async fn drain_once(
                     continue;
                 }
 
-                let event_key = format!(
-                    "hub-receive:{}:{}:{}",
+                // First witness only what is already true: Hestia has durably
+                // staged the fetched Hub envelope for this exact local route. Do
+                // NOT call this "delivered" yet — the member inbox transaction has
+                // not happened.
+                let stage_key = format!(
+                    "hub-receive-stage:{}:{}:{}",
                     conn.hub_lct_id, conn.our_lct_id, notice_id
                 );
-                let event = json!({
+                let stage_event = json!({
                     "notice_id": notice_id,
                     "router_lct": router_lct,
                     "destination_lct": canonical_child_lct,
@@ -343,28 +347,69 @@ pub async fn drain_once(
                     "queued_at": notice.get("queued_at"),
                     "route": "local-direct",
                     "wake": "not-considered",
-                    "custody": "member-inbox",
+                    "custody": "staged-local",
                 });
-                let witness = match chain.append_once(
-                    &event_key,
-                    "hub.notice.received",
-                    event,
+                let stage_witness = match chain.append_once(
+                    &stage_key,
+                    "hub.notice.receipt-staged",
+                    stage_event,
                     router_lct,
                 ) {
                     Ok((entry, _inserted)) => entry,
                     Err(e) => {
-                        report.errors.push(format!("witness {notice_id}: {e:#}"));
+                        report.errors.push(format!("stage witness {notice_id}: {e:#}"));
                         batch_failed = true;
                         continue;
                     }
                 };
 
-                if let Err(e) = inbox.accept_hub_receipt(conn.id, notice_id, &witness.hash) {
-                    report.errors.push(format!("local enqueue {notice_id}: {e:#}"));
+                let local_notice_id = match inbox.accept_hub_receipt(
+                    conn.id,
+                    notice_id,
+                    &stage_witness.hash,
+                ) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        report.errors.push(format!("local enqueue {notice_id}: {e:#}"));
+                        batch_failed = true;
+                        continue;
+                    }
+                };
+                report.accepted_local += 1;
+
+                // Now witness the delivery fact that the member inbox transaction
+                // actually committed. This second keyed witness closes the semantic
+                // gap between "we received it" and "the addressed child has local
+                // custody". A crash after this append simply reuses the same fact on
+                // retry; Hub ACK remains last.
+                let delivery_key = format!(
+                    "hub-receive-delivery:{}:{}:{}",
+                    conn.hub_lct_id, conn.our_lct_id, notice_id
+                );
+                let delivery_event = json!({
+                    "notice_id": notice_id,
+                    "router_lct": router_lct,
+                    "destination_lct": canonical_child_lct,
+                    "to_plugin": plugin_id,
+                    "hub_connection_id": conn.id,
+                    "hub_lct": conn.hub_lct_id,
+                    "hub_member_lct": conn.our_lct_id,
+                    "member_notice_id": local_notice_id,
+                    "stage_witness_hash": stage_witness.hash,
+                    "route": "local-direct",
+                    "wake": "not-considered",
+                    "custody": "member-inbox",
+                });
+                if let Err(e) = chain.append_once(
+                    &delivery_key,
+                    "hub.notice.delivered-local",
+                    delivery_event,
+                    router_lct,
+                ) {
+                    report.errors.push(format!("delivery witness {notice_id}: {e:#}"));
                     batch_failed = true;
                     continue;
                 }
-                report.accepted_local += 1;
 
                 match ack_one(&client, &conn, &channel, &keypair, &rest, notice_id).await {
                     Ok(()) => match inbox.mark_hub_receipt_acked(conn.id, notice_id) {
