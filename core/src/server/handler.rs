@@ -5005,6 +5005,40 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
         }
     }
 
+    // The second crash boundary: the witness DB may have committed while the
+    // queue/op transaction did not. Recover the FIRST witnessed fact by its
+    // operation key. That fact owns first-session attribution and all evidence
+    // used by the original act; retry resumes its delivery consequence instead
+    // of rebuilding the act under today's mutable state.
+    let operation_witness_key = operation_id.as_deref().map(|op_id| {
+        format!("member-notify:{}:{}", sender.plugin_id, op_id)
+    });
+    let recovered_operation_witness = match operation_witness_key.as_deref() {
+        Some(key) => s
+            .chain_store
+            .event_by_key(key)
+            .map_err(|e| anyhow::anyhow!("recovering member-notify witness: {e}"))?,
+        None => None,
+    };
+    if let Some(existing) = &recovered_operation_witness {
+        let expected_binding = operation_binding.as_ref().expect("operation binding exists");
+        let recorded_binding = existing.event_data.get("operation_binding");
+        if existing.event_type != "member_notice"
+            || recorded_binding != Some(expected_binding)
+            || existing.event_data.get("from_plugin_id").and_then(Value::as_str)
+                != Some(sender.plugin_id.as_str())
+        {
+            return Ok(hestia_error_envelope(
+                "hestia.member_notify_operation_conflict",
+                "this operation_id already names a different witnessed act; use a new operation_id for a new act",
+                Some(json!({
+                    "operation_id": operation_id,
+                    "witnessEntryHash": existing.hash,
+                })),
+            ));
+        }
+    }
+
     if sender.plugin_id == to_plugin {
         return Ok(hestia_error_envelope(
             "hestia.member_notify_self",
@@ -5012,11 +5046,15 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             None,
         ));
     }
-    // Law-gated: role overlays can deny who may wake whom.
-    if let Some(denied) =
-        gate_direct_tool(&mut s, &sender, "hestia_member_notify", "member_notify", &kind)
-    {
-        return Ok(denied);
+    // Law is evaluated on the first execution. A recovered witnessed
+    // operation already passed the gate before that witness existed; replay is
+    // recovery of its delivery consequence, not a new authorization request.
+    if recovered_operation_witness.is_none() {
+        if let Some(denied) =
+            gate_direct_tool(&mut s, &sender, "hestia_member_notify", "member_notify", &kind)
+        {
+            return Ok(denied);
+        }
     }
     // Structural flood guard (Kimi review 2026-07-24, Findings 2+5): the gate
     // above is law and default-allow on a permissive base; this bound is
@@ -5031,23 +5069,25 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     // configuration. Denials are deliberately NOT witnessed per-deny: under
     // flood, per-deny chain writes would turn the guard itself into a
     // chain-growth vector.
-    let flood = s.member_notify_limiter.check(
-        &sender.plugin_id,
-        MEMBER_NOTIFY_MAX_PER_WINDOW,
-        MEMBER_NOTIFY_WINDOW_MS,
-    );
-    if !flood.allowed {
-        return Ok(hestia_error_envelope(
-            "hestia.member_notify_rate_limited",
-            &format!(
-                "sender '{}' exceeded {} notices per {}s — the mesh is a wake channel, \
-                 not a payload channel; batch pointers into one notice",
-                sender.plugin_id,
-                flood.limit,
-                MEMBER_NOTIFY_WINDOW_MS / 1000
-            ),
-            Some(json!({"current": flood.current, "limit": flood.limit})),
-        ));
+    if recovered_operation_witness.is_none() {
+        let flood = s.member_notify_limiter.check(
+            &sender.plugin_id,
+            MEMBER_NOTIFY_MAX_PER_WINDOW,
+            MEMBER_NOTIFY_WINDOW_MS,
+        );
+        if !flood.allowed {
+            return Ok(hestia_error_envelope(
+                "hestia.member_notify_rate_limited",
+                &format!(
+                    "sender '{}' exceeded {} notices per {}s — the mesh is a wake channel, \
+                     not a payload channel; batch pointers into one notice",
+                    sender.plugin_id,
+                    flood.limit,
+                    MEMBER_NOTIFY_WINDOW_MS / 1000
+                ),
+                Some(json!({"current": flood.current, "limit": flood.limit})),
+            ));
+        }
     }
     // You may only answer mail that was addressed to YOU. Without this, any
     // member could mark another member's notice answered and the unanswered
