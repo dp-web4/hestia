@@ -5834,7 +5834,7 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             {
                 let refusal_key = member_notify_operation_event_key(
                     "refusal-f3-direct-required",
-                    &sender_plugin_id,
+                    &sender.plugin_id,
                     &op_id,
                 );
                 let refusal = s.chain_store.append_once(
@@ -5846,12 +5846,12 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
                         "operation_id": op_id,
                         "to_plugin_id": to_plugin,
                         "canonical_destination_lct": plan.destination_lct,
-                        "from_plugin_id": sender_plugin_id,
+                        "from_plugin_id": sender.plugin_id.clone(),
                         "origin_lct": plan.origin_lct,
                         "router_lct": plan.router_lct,
                         "next_hop_lct": next_hop_lct,
                         "transport": transport_record,
-                        "member_notice_witness": member_notice_hash,
+                        "member_notice_witness": entry.hash.clone(),
                     }),
                     &s.sovereign_lct,
                 )?.0;
@@ -5863,7 +5863,7 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
                         "delivery_authority": "f3",
                         "canonical_destination_lct": plan.destination_lct,
                         "next_hop_lct": next_hop_lct,
-                        "witnessEntryHash": member_notice_hash,
+                        "witnessEntryHash": entry.hash.clone(),
                         "refusalEntryHash": refusal.hash,
                     })),
                 ));
