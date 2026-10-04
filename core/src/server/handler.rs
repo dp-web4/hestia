@@ -5011,21 +5011,82 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     } else {
         None
     };
+
+    // D2 SHADOW ONLY. Everything above this point is the SAME legacy pre-route
+    // contract the eventual cutover must preserve: attributed live session, law,
+    // structural flood bound, reply ownership/disposition address, and transport
+    // binding lookup. We compare only the routing/queue decision below.
+    //
+    // Shadow evaluation must never change legacy delivery. A missing/corrupt
+    // routing document, missing alias, or unresolved canonical origin is captured
+    // as evidence and the historical path continues unchanged.
+    let f3_route_shadow: Option<Value> = routed.then(|| {
+        let router_lct = s.sovereign.lct_id();
+        let origin_lct = match s.member_registry.resolve_reference(&sender.plugin_id) {
+            Ok(Some(member)) => Some(member.lct.lct_id()),
+            Ok(None) => None,
+            Err(_) => None,
+        };
+        match crate::receiver_routing::ReceiverRoutingTable::load(&s.vault) {
+            Ok(table) => match table.shadow_legacy_route(
+                &s.member_registry,
+                &router_lct,
+                &to_plugin,
+            ) {
+                Ok(shadow) => json!({
+                    "mode": "shadow",
+                    "router_lct": router_lct,
+                    "origin_lct": origin_lct,
+                    "legacy_address": to_plugin,
+                    "result": shadow,
+                    "shared_pre_route": {
+                        "sender_plugin_id": sender.plugin_id,
+                        "from_session_id": sender.session_uuid,
+                        "law_gate": "passed",
+                        "flood_guard": "passed",
+                        "reply_binding_verified": binding_verified,
+                    }
+                }),
+                Err(e) => json!({
+                    "mode": "shadow",
+                    "router_lct": router_lct,
+                    "origin_lct": origin_lct,
+                    "legacy_address": to_plugin,
+                    "status": "unavailable",
+                    "error": format!("route evaluation failed: {e}"),
+                }),
+            },
+            Err(e) => json!({
+                "mode": "shadow",
+                "router_lct": router_lct,
+                "origin_lct": origin_lct,
+                "legacy_address": to_plugin,
+                "status": "unavailable",
+                "error": format!("routing table unavailable: {e}"),
+            }),
+        }
+    });
+
     if let Some(b) = transport_binding
         .as_ref()
         .filter(|b| b.mode == crate::server::transport_binding::TransportMode::DirectRequired)
     {
+        let mut refusal_record = json!({
+            "reason": "transport_binding_unmet",
+            "to_plugin_id": to_plugin,
+            "from_plugin_id": sender.plugin_id,
+            "from_role_lct": sender.role_lct,
+            "kind": kind,
+            "transport": b.stamp(),
+            "binding_reason": b.reason,
+            "d2_shadow": true,
+        });
+        if let Some(shadow) = &f3_route_shadow {
+            refusal_record["f3_shadow"] = shadow.clone();
+        }
         let refusal = s.append_chain(
             "member_notice_refused",
-            json!({
-                "reason": "transport_binding_unmet",
-                "to_plugin_id": to_plugin,
-                "from_plugin_id": sender.plugin_id,
-                "from_role_lct": sender.role_lct,
-                "kind": kind,
-                "transport": b.stamp(),
-                "binding_reason": b.reason,
-            }),
+            refusal_record,
         )?;
         return Ok(hestia_error_envelope(
             "hestia.member_notify_transport_unmet",
@@ -5079,6 +5140,10 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     });
     if let Some(t) = &transport_record {
         notice_record["transport"] = t.clone();
+    }
+    if let Some(shadow) = &f3_route_shadow {
+        notice_record["f3_shadow"] = shadow.clone();
+        notice_record["d2_shadow"] = json!(true);
     }
     let entry = s.append_chain("member_notice", notice_record)?;
     // ---- r6-routing branch 2: is it for someone I know? then forward ------------
@@ -5152,16 +5217,23 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
                     let depth = s.inbox_store.egress_queued().unwrap_or(0);
                     let refusal = s.append_chain(
                         "member_notice_refused",
-                        json!({
-                            "reason": "egress_queue_full",
-                            "to_plugin_id": to_plugin,
-                            "dest_peer": peer,
-                            "from_plugin_id": sender.plugin_id,
-                            "from_role_lct": sender.role_lct,
-                            "egress_queued": depth,
-                            // the `member_notice` entry this refusal voids
-                            "witnessed_entry": entry.hash,
-                        }),
+                        {
+                            let mut record = json!({
+                                "reason": "egress_queue_full",
+                                "to_plugin_id": to_plugin,
+                                "dest_peer": peer,
+                                "from_plugin_id": sender.plugin_id,
+                                "from_role_lct": sender.role_lct,
+                                "egress_queued": depth,
+                                "d2_shadow": true,
+                                // the `member_notice` entry this refusal voids
+                                "witnessed_entry": entry.hash,
+                            });
+                            if let Some(shadow) = &f3_route_shadow {
+                                record["f3_shadow"] = shadow.clone();
+                            }
+                            record
+                        },
                     )?;
                     return Ok(hestia_error_envelope(
                         "hestia.member_notify_egress_queue_full",
@@ -5194,6 +5266,40 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             )
             .map_err(|e| anyhow::anyhow!("queueing member notice: {e}"))?,
     };
+    let mut f3_shadow_witness_hash: Option<String> = None;
+    let mut f3_shadow_warning: Option<String> = None;
+    if let (Some(peer), Some(shadow)) = (&egress_peer, &f3_route_shadow) {
+        let record = json!({
+            "legacy_member_notice": entry.hash,
+            "legacy_outcome": "egress_queued",
+            "legacy_egress_row_id": queued_id,
+            "legacy_dest_peer": peer,
+            "legacy_address": to_plugin,
+            "from_plugin_id": sender.plugin_id,
+            "from_role_lct": sender.role_lct,
+            "from_session_id": sender.session_uuid,
+            "kind": kind,
+            "pointer_uri": pointer_uri,
+            "in_reply_to": in_reply_to,
+            "binding_verified": binding_verified,
+            "recipient_liveness": liveness,
+            "transport": transport_record.clone().unwrap_or_else(|| json!("unbound")),
+            "f3_shadow": shadow,
+            "delivery_authority": "legacy",
+        });
+        match s.append_chain("member_notice_route_shadow", record) {
+            Ok(witness) => f3_shadow_witness_hash = Some(witness.hash),
+            Err(e) => {
+                // Shadow/parity instrumentation is observational. If its extra
+                // witness cannot be written, the already-queued legacy send
+                // remains authoritative and successful; surface the evidence gap.
+                f3_shadow_warning = Some(format!(
+                    "legacy send queued, but D2 parity witness could not be written: {e}"
+                ));
+            }
+        }
+    }
+
     let mut out = json!({
         "queued_id": queued_id,
         "witnessEntryHash": entry.hash,
@@ -5246,6 +5352,12 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             "kind '{kind}' is a disposition — pass in_reply_to:<notice id> so the notice \
              it answers stops counting as unanswered"
         ));
+    }
+    if let Some(hash) = f3_shadow_witness_hash {
+        out["f3_shadow_witness_hash"] = json!(hash);
+    }
+    if let Some(warning) = f3_shadow_warning {
+        out["f3_shadow_warning"] = json!(warning);
     }
     Ok(out)
 }
