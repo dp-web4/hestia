@@ -3212,7 +3212,7 @@ fn cmd_receiver_bind(
     );
 
     let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
-        .unwrap_or_default();
+        .context("loading receiver routing table (unreadable is not empty)")?;
     let binding_id = uuid::Uuid::new_v4();
     table.bind_local(hestia::receiver_routing::LocalMailboxBinding {
         binding_id,
@@ -3249,7 +3249,7 @@ fn cmd_receiver_unbind(home: &std::path::Path, child: &str) -> AnyResult<()> {
         .map(|m| m.lct.lct_id())
         .unwrap_or_else(|| child.to_string());
     let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
-        .unwrap_or_default();
+        .context("loading receiver routing table (unreadable is not empty)")?;
     let binding = table
         .local_binding(&canonical)
         .cloned()
@@ -3286,7 +3286,7 @@ fn cmd_receiver_route(
     anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
     let mut vault = open_vault(home)?;
     let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
-        .unwrap_or_default();
+        .context("loading receiver routing table (unreadable is not empty)")?;
     table.set_route(hestia::receiver_routing::StaticRoute {
         destination_lct: destination.trim().to_string(),
         next_hop_lct: next_hop.trim().to_string(),
@@ -3314,7 +3314,7 @@ fn cmd_receiver_default(
     );
     let mut vault = open_vault(home)?;
     let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
-        .unwrap_or_default();
+        .context("loading receiver routing table (unreadable is not empty)")?;
     if clear {
         table.set_default(None);
         println!("Receiver default route cleared ({})", reason.trim());
@@ -3338,7 +3338,7 @@ fn cmd_receiver_routes(home: &std::path::Path) -> AnyResult<()> {
 
     let vault = open_vault(home)?;
     let table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
-        .unwrap_or_default();
+        .context("loading receiver routing table (unreadable is not empty)")?;
     println!("Receiver routing table (hop-limit {}):", table.hop_limit);
     println!("  directly connected / local mailbox interfaces:");
     if table.local_mailboxes.is_empty() {
