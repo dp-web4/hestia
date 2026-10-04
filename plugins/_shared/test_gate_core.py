@@ -1116,18 +1116,23 @@ def test_a_forbidden_token_inside_a_longer_word_is_pinned_open():
     def verdict(command):
         return G.evaluate(G.NormalizedEvent(tool="Bash", command=command, cwd=ws), prof, ws)
 
-    # THE FALSE DENY, pinned as it behaves TODAY. Flip these to `not v.blocks` in the commit
-    # that narrows the matcher.
-    for name, cmd in (
-        ("reading_an_env_var_in_python", "python3 -c 'import os; print(os.environ)'"),
-        ("grepping_the_rules_own_source",
-         'grep -n "SECRET\\|\\' + tok + '" plugins/_shared/hestia_gate_core.py'),
-    ):
-        v = verdict(cmd)
-        check("fp_token_substring_still_open__" + name,
-              v.blocks and v.rule == "egress.secret",
-              "this no longer denies — the matcher was narrowed and nobody moved the row. "
-              "If that was earned, the red arms below must pass in the same commit")
+    # THE NARROWING, EARNED (#1192, 2026-10-04): a dot-file token embedded BETWEEN identifier
+    # characters (`os.environ`, `vllm.envs`) is an identifier, not a file. Every red arm below
+    # still denies in this same commit.
+    v = verdict("python3 -c 'import os; print(os.environ)'")
+    check("fp_token_substring_closed__reading_an_env_var_in_python", not v.blocks,
+          "an identifier containing the dot-env token must not be refused as a secret path")
+    v = verdict("python3 -c 'import vllm.envs as e; print(e)'")
+    check("fp_token_substring_closed__importing_a_module_named_envs", not v.blocks,
+          "a module path containing the dot-env token must not be refused as a secret path")
+
+    # STILL PINNED AS IT BEHAVES TODAY: an escaped token in a grep pattern is preceded by a
+    # backslash (a non-word character), so the narrowing above does not open it. Quoting-aware
+    # matching is #639/#1025's decision, not this one's.
+    v = verdict('grep -n "SECRET\\|\\' + tok + '" plugins/_shared/hestia_gate_core.py')
+    check("fp_token_substring_still_open__grepping_the_rules_own_source",
+          v.blocks and v.rule == "egress.secret",
+          "this no longer denies — the matcher was narrowed further and nobody moved the row")
 
     # THE RED ARMS. A narrowing that greens the rows above and ANY of these is a hole, not a
     # fix: each names a real secret, and only the first carries a leading separator.

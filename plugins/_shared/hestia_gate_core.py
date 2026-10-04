@@ -1108,6 +1108,37 @@ def _offending_segment(path: str, workspace: str, cwd: Optional[str] = None) -> 
     return None
 
 
+_WORD = re.compile(r"[a-z0-9_]")
+
+
+def names_forbidden_token(low: str, token: str) -> bool:
+    """True when `low` (already lower-cased) names the forbidden `token`.
+
+    A DOT-FILE TOKEN EMBEDDED IN AN IDENTIFIER IS NOT A FILE (#1192). Gate 1a matched every token as a
+    raw substring, so the dot-env token was found inside `os.environ`, `vllm.envs` and `environ.get`:
+    two seats logged ~8 false egress denials on 2026-10-04 alone (#1192 comment), each "fixed" by
+    re-routing through an editor tool, which is the silent workaround the law asks to be reported.
+
+    Narrow and conservative: only tokens that START with "." change, and an occurrence is skipped
+    only when it sits BETWEEN identifier characters on both sides (`os.environ`, `vllm.envs`).
+    A non-word character on EITHER side still denies, so every file spelling keeps its deny:
+    `cat .env`, `a/.env`, `.env.local`, `.envrc` (non-word on the left) and `prod.env`,
+    `config.env` (non-word on the right). Path tokens (`/.ssh`) and plain words (`credentials`,
+    `secrets`) are unchanged: their false positives are #983/#1019 and a different decision."""
+    if not token.startswith("."):
+        return token in low
+    start = 0
+    while True:
+        i = low.find(token, start)
+        if i < 0:
+            return False
+        left = low[i - 1] if i > 0 else ""
+        right = low[i + len(token)] if i + len(token) < len(low) else ""
+        if not (left and right and _WORD.match(left) and _WORD.match(right)):
+            return True
+        start = i + 1
+
+
 def forbidden_tokens(profile: HarnessProfile) -> tuple:
     extra = os.environ.get(profile.forbidden_extra_env, "")
     return FORBIDDEN_DEFAULT + tuple(t.strip() for t in extra.split(",") if t.strip())
@@ -1140,7 +1171,7 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
                  + ([event.command] if event.command else [])):
         low = blob.lower()
         for f in forbidden:
-            if f in low:
+            if names_forbidden_token(low, f):
                 return _deny(
                     "egress.secret",
                     f"'{event.tool}' touches a forbidden path (secret/credential or "
@@ -1353,7 +1384,7 @@ def degraded_verdict(event: NormalizedEvent,
                  + ([event.command] if event.command else [])):
         low = blob.lower()
         for f in forbidden:
-            if f in low:
+            if names_forbidden_token(low, f):
                 return _deny(
                     "egress.secret",
                     f"'{event.tool}' touches a forbidden path (secret/credential or "
