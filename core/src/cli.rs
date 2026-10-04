@@ -634,6 +634,27 @@ enum HubCmd {
         reason: String,
     },
 
+    /// Bind one historical peer/member spelling to the canonical END
+    /// member LCT used by F3. Exact alias only; no prefix/name inference.
+    ReceiverAlias {
+        legacy_address: String,
+        destination_lct: String,
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Remove one legacy compatibility alias.
+    ReceiverUnalias {
+        legacy_address: String,
+    },
+
+    /// Evaluate how F3 WOULD route one legacy address without sending anything.
+    ReceiverShadow {
+        legacy_address: String,
+        #[arg(long)]
+        parent: Option<String>,
+    },
+
     /// Originate one routed member notice from a canonical local child.
     /// This is the additive F3 path; legacy peer/member member_notify is not
     /// translated here.
@@ -1059,6 +1080,17 @@ pub fn run() -> AnyResult<()> {
             } => cmd_receiver_neighbor(
                 &home, &next_hop, interface, next_hop_member_lct, &reason,
             ),
+            HubCmd::ReceiverAlias {
+                legacy_address, destination_lct, reason
+            } => cmd_receiver_alias(
+                &home, &legacy_address, &destination_lct, &reason,
+            ),
+            HubCmd::ReceiverUnalias { legacy_address } => {
+                cmd_receiver_unalias(&home, &legacy_address)
+            }
+            HubCmd::ReceiverShadow { legacy_address, parent } => {
+                cmd_receiver_shadow(&home, &legacy_address, parent.as_deref())
+            }
             HubCmd::ReceiverSend {
                 from_member, destination_lct, kind, pointer, operation_id, parent
             } => cmd_receiver_send(
@@ -3480,6 +3512,69 @@ fn cmd_receiver_unbind(home: &std::path::Path, child: &str) -> AnyResult<()> {
     Ok(())
 }
 
+fn cmd_receiver_alias(
+    home: &std::path::Path,
+    legacy_address: &str,
+    destination_lct: &str,
+    reason: &str,
+) -> AnyResult<()> {
+    anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
+    let mut vault = open_vault(home)?;
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    table.bind_legacy_alias(hestia::receiver_routing::LegacyRouteAlias {
+        legacy_address: legacy_address.trim().to_string(),
+        destination_lct: destination_lct.trim().to_string(),
+        reason: reason.trim().to_string(),
+        set_by: "hestia-cli".into(),
+        set_at: chrono::Utc::now().timestamp().max(0) as u64,
+    })?;
+    table.save(&mut vault)?;
+    println!(
+        "Legacy route alias: {} -> {}  ({})",
+        legacy_address.trim(),
+        destination_lct.trim(),
+        reason.trim()
+    );
+    Ok(())
+}
+
+fn cmd_receiver_unalias(
+    home: &std::path::Path,
+    legacy_address: &str,
+) -> AnyResult<()> {
+    let mut vault = open_vault(home)?;
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    anyhow::ensure!(
+        table.unbind_legacy_alias(legacy_address.trim()),
+        "no legacy route alias for '{}'",
+        legacy_address.trim()
+    );
+    table.save(&mut vault)?;
+    println!("Legacy route alias removed: {}", legacy_address.trim());
+    Ok(())
+}
+
+fn cmd_receiver_shadow(
+    home: &std::path::Path,
+    legacy_address: &str,
+    parent: Option<&str>,
+) -> AnyResult<()> {
+    let vault = open_vault(home)?;
+    let router_lct = receiver_router_lct(&vault, parent)?;
+    let registry = hestia::member_registry::load_members(&vault);
+    let table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    let shadow = table.shadow_legacy_route(
+        &registry,
+        &router_lct,
+        legacy_address.trim(),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&shadow)?);
+    Ok(())
+}
+
 fn cmd_receiver_send(
     home: &std::path::Path,
     from_member: &str,
@@ -3636,6 +3731,16 @@ fn cmd_receiver_routes(home: &std::path::Path) -> AnyResult<()> {
             "    {} -> hub-member {} via if={} link={}  ({})",
             n.next_hop_lct, n.next_hop_hub_member_lct,
             n.interface_binding_id, n.link_id, n.reason
+        );
+    }
+    println!("  legacy compatibility aliases (shadow/cutover edge only):");
+    if table.legacy_aliases.is_empty() {
+        println!("    (none)");
+    }
+    for a in &table.legacy_aliases {
+        println!(
+            "    {} -> {}  ({})",
+            a.legacy_address, a.destination_lct, a.reason
         );
     }
     println!("  specific routes:");
