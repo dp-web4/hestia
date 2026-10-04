@@ -2212,6 +2212,42 @@ impl SqliteInboxStore {
         Ok(())
     }
 
+    fn prune_router_custody_on(conn: &Connection) -> Result<()> {
+        let cutoff = (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
+
+        // Rejected receipts are operational retry state, not the permanent
+        // governance record. Once Hub ACK landed, the witness chain is the
+        // durable history and this row may age out with the ordinary inbox TTL.
+        conn.execute(
+            "DELETE FROM router_ingress_rejections
+              WHERE hub_acked_at IS NOT NULL AND queued_at < ?1",
+            params![cutoff],
+        )
+        .context("pruning acknowledged router ingress rejections")?;
+
+        // Accepted receipts follow the same rule, but never delete an unacked
+        // custody edge. Packet rows are removed only after every receipt row has
+        // aged away and the packet has a witnessed completion.
+        conn.execute(
+            "DELETE FROM router_ingress_receipts
+              WHERE hub_acked_at IS NOT NULL AND queued_at < ?1",
+            params![cutoff],
+        )
+        .context("pruning acknowledged router ingress receipts")?;
+        conn.execute(
+            "DELETE FROM router_packets
+              WHERE completion_witness_hash IS NOT NULL
+                AND created_at < ?1
+                AND NOT EXISTS (
+                    SELECT 1 FROM router_ingress_receipts r
+                     WHERE r.packet_id = router_packets.packet_id
+                )",
+            params![cutoff],
+        )
+        .context("pruning completed router packets")?;
+        Ok(())
+    }
+
     /// Persist exact packet bytes plus this transport receipt before deciding a route.
     /// Packet id is globally idempotent inside this router: seeing the same id with
     /// different bytes is a protocol violation, not a second packet.
@@ -2226,6 +2262,7 @@ impl SqliteInboxStore {
     ) -> Result<RouterPacketState> {
         let mut conn = self.conn.lock().unwrap();
         Self::ensure_router_packet_schema(&conn)?;
+        Self::prune_router_custody_on(&conn)?;
         let tx = conn.transaction().context("starting router packet stage")?;
         let now = Utc::now().to_rfc3339();
         tx.execute(
@@ -2504,6 +2541,7 @@ impl SqliteInboxStore {
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_router_packet_schema(&conn)?;
+        Self::prune_router_custody_on(&conn)?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT OR IGNORE INTO router_ingress_rejections
