@@ -341,10 +341,19 @@ impl ReceiverRoutingTable {
         Ok(())
     }
 
-    pub fn set_neighbor(&mut self, neighbor: RouterNeighbor) -> Result<()> {
+    pub fn bind_neighbor(&mut self, neighbor: RouterNeighbor) -> Result<()> {
         anyhow::ensure!(!neighbor.next_hop_lct.trim().is_empty(),
             "neighbor next_hop_lct must not be empty");
-        self.neighbors.retain(|n| n.next_hop_lct != neighbor.next_hop_lct);
+        anyhow::ensure!(
+            !self.neighbors.iter().any(|n| n.next_hop_lct == neighbor.next_hop_lct),
+            "neighbor {} already exists; remove it only after transit custody is clear",
+            neighbor.next_hop_lct
+        );
+        anyhow::ensure!(
+            !self.neighbors.iter().any(|n| n.link_id == neighbor.link_id),
+            "router neighbor link id {} is already in use",
+            neighbor.link_id
+        );
         self.neighbors.push(neighbor);
         self.neighbors.sort_by(|a, b| a.next_hop_lct.cmp(&b.next_hop_lct));
         Ok(())
@@ -352,6 +361,10 @@ impl ReceiverRoutingTable {
 
     pub fn neighbor(&self, next_hop_lct: &str) -> Option<&RouterNeighbor> {
         self.neighbors.iter().find(|n| n.next_hop_lct == next_hop_lct)
+    }
+
+    pub fn neighbor_by_link(&self, link_id: Uuid) -> Option<&RouterNeighbor> {
+        self.neighbors.iter().find(|n| n.link_id == link_id)
     }
 
     pub fn set_route(&mut self, route: StaticRoute) {
