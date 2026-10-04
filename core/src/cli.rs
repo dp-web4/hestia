@@ -571,6 +571,57 @@ enum HubCmd {
         #[arg(long, default_value = "")]
         target: String,
     },
+
+    /// Bind one canonical local child to the Hub connection/key that receives
+    /// its mailbox. This is a routing-table entry, not a grant of authority.
+    ReceiverBind {
+        /// Local member reference: plugin id, canonical LCT, or verified legacy alias.
+        child: String,
+        /// Hub URL or connection UUID whose our_lct_id/key belong to this child.
+        #[arg(long, default_value = "")]
+        target: String,
+        /// Router/parent LCT to verify against (default: persisted local sovereign,
+        /// until the machine-entity migration gives the host its distinct LCT).
+        #[arg(long)]
+        parent: Option<String>,
+        /// Why this hosting/transport binding is correct.
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Remove a child's local mailbox route.
+    ReceiverUnbind {
+        child: String,
+    },
+
+    /// Add/update an exact remote route: destination LCT -> next-hop LCT.
+    /// Local directly-connected children always win over static routes.
+    ReceiverRoute {
+        destination: String,
+        next_hop: String,
+        #[arg(long, default_value_t = 100)]
+        metric: u32,
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Set or clear the receiver's default gateway. Unknown destinations route
+    /// here after exact local/specific routes; they are not refused immediately.
+    ReceiverDefault {
+        next_hop: Option<String>,
+        #[arg(long, conflicts_with = "next_hop")]
+        clear: bool,
+    },
+
+    /// Show the machine receiver routing table.
+    ReceiverRoutes,
+
+    /// Run one receipt-mode receive pass for every locally bound child.
+    /// Delivery is durable; this does NOT wake sessions.
+    ReceiverDrain {
+        #[arg(long)]
+        parent: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -926,6 +977,18 @@ pub fn run() -> AnyResult<()> {
             HubCmd::RecvSecrets { pair_id, target } => {
                 cmd_hub_recv_secrets(&home, pair_id, &target)
             }
+            HubCmd::ReceiverBind { child, target, parent, reason } => {
+                cmd_receiver_bind(&home, &child, &target, parent.as_deref(), &reason)
+            }
+            HubCmd::ReceiverUnbind { child } => cmd_receiver_unbind(&home, &child),
+            HubCmd::ReceiverRoute { destination, next_hop, metric, reason } => {
+                cmd_receiver_route(&home, &destination, &next_hop, metric, &reason)
+            }
+            HubCmd::ReceiverDefault { next_hop, clear } => {
+                cmd_receiver_default(&home, next_hop.as_deref(), clear)
+            }
+            HubCmd::ReceiverRoutes => cmd_receiver_routes(&home),
+            HubCmd::ReceiverDrain { parent } => cmd_receiver_drain(&home, parent.as_deref()),
         },
         Command::Constellation(c) => match c {
             ConstellationCmd::Add { name, device_type } => cmd_constellation_add(&home, &name, &device_type),
