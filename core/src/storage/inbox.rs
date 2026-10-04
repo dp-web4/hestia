@@ -639,6 +639,7 @@ impl SqliteInboxStore {
     /// transport-authenticated, not caller-supplied, so there is no forgeable field
     /// in the loop bound at all. Cost: no third-party transit in v1, which is a
     /// deliberate limit, not an oversight.
+
     #[allow(clippy::too_many_arguments)]
     pub fn enqueue_egress(
         &self,
@@ -652,21 +653,31 @@ impl SqliteInboxStore {
     ) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
-        // The forwarding plane carries its OWN bound, because it no longer borrows
-        // the local plane's (see `enqueue_member`: the TTL prune and the cap used to
-        // reach across the seam and delete queued forwards). A bound that EVICTS needs
-        // a report path to stay honest. This comment used to justify the choice by
-        // saying the egress seam HAS none — no attempt counter, nothing that can say a
-        // forward was dropped. That is no longer true: `mark_failed`,
-        // `MAX_EGRESS_ATTEMPTS` and `retire_and_report_egress` now retire, witness and
-        // report exhausted rows to their sender. The choice stands on the surviving
-        // half of the argument, which never depended on the missing path: refusing
-        // admission tells a caller that is LIVE and holding the receipt, at the moment
-        // it can still do something about it, while evicting a parked row reports to a
-        // sender that has long since gone. The report path bounds how long a row may
-        // FAIL, not how many rows may be admitted; the two bounds do not substitute.
-        // Backpressure to a present sender is attributable; eviction of a parked row
-        // is the black hole.
+        Self::enqueue_egress_on(
+            &conn,
+            dest_peer,
+            to_plugin,
+            from_plugin,
+            from_role,
+            kind,
+            pointer_uri,
+            chain_hash,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_egress_on(
+        conn: &Connection,
+        dest_peer: &str,
+        to_plugin: &str,
+        from_plugin: &str,
+        from_role: &str,
+        kind: &str,
+        pointer_uri: Option<&str>,
+        chain_hash: &str,
+        transport_stamp: Option<&str>,
+    ) -> Result<u64> {
         let queued: i64 = conn.query_row(
             "SELECT COUNT(*) FROM member_notices
               WHERE dest_peer IS NOT NULL AND drained_at IS NULL",
@@ -679,15 +690,6 @@ impl SqliteInboxStore {
                  refusing admission rather than evicting a queued forward"
             );
         }
-        // PER-PEER, and the reason it is a SECOND clause rather than a replacement: the
-        // global bound protects the STORE (unbounded growth), this one protects the other
-        // PEERS (one wedged link starving every healthy one). Both are real and neither
-        // implies the other, so both are tested.
-        //
-        // Ordered after the global check so that when the plane is genuinely full the
-        // caller still gets the plane-full message; this clause speaks only when the plane
-        // has room and THIS destination does not, which is the case the old code answered
-        // with a message about the total.
         let queued_peer: i64 = conn.query_row(
             "SELECT COUNT(*) FROM member_notices
               WHERE dest_peer = ?1 AND drained_at IS NULL",
@@ -704,10 +706,20 @@ impl SqliteInboxStore {
         }
         conn.execute(
             "INSERT INTO member_notices
-                (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at, dest_peer)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![to_plugin, from_plugin, from_role, kind, pointer_uri,
-                    chain_hash, Utc::now().to_rfc3339(), dest_peer],
+                (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at,
+                 dest_peer, transport_stamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                to_plugin,
+                from_plugin,
+                from_role,
+                kind,
+                pointer_uri,
+                chain_hash,
+                Utc::now().to_rfc3339(),
+                dest_peer,
+                transport_stamp,
+            ],
         )
         .context("enqueueing egress notice")?;
         Ok(conn.last_insert_rowid() as u64)
