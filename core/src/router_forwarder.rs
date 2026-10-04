@@ -657,6 +657,55 @@ pub async fn drain_router_once(
                         }
                     };
 
+                // Ingress filtering: route.forward is accepted only from a Hub
+                // member explicitly bound as a canonical neighbor on THIS router
+                // interface. The final packet destination is end-to-end; this
+                // check binds only the immediate upstream hop and prevents an
+                // arbitrary Hub citizen from injecting transit traffic.
+                let upstream_member = match notice
+                    .get("from")
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| Uuid::parse_str(v).ok())
+                {
+                    Some(v) => v,
+                    None => {
+                        report.errors.push(format!(
+                            "route notice {notice_id} has no valid immediate sender"
+                        ));
+                        batch_failed = true;
+                        continue;
+                    }
+                };
+                let upstream_neighbor = match routes.ingress_neighbor(
+                    binding.binding_id,
+                    upstream_member,
+                ) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        report.errors.push(format!(
+                            "route notice {notice_id} came from unconfigured Hub neighbor {upstream_member} on interface {}",
+                            binding.binding_id
+                        ));
+                        batch_failed = true;
+                        continue;
+                    }
+                    Err(e) => {
+                        report.errors.push(format!(
+                            "route notice {notice_id} neighbor resolution: {e:#}"
+                        ));
+                        batch_failed = true;
+                        continue;
+                    }
+                };
+                anyhow::ensure!(
+                    packet.visited_routers.last().map(String::as_str)
+                        == Some(upstream_neighbor.next_hop_lct.as_str()),
+                    "route notice {notice_id} says its previous router was {:?}, but authenticated Hub sender {} maps to neighbor {}",
+                    packet.visited_routers.last(),
+                    upstream_member,
+                    upstream_neighbor.next_hop_lct
+                );
+
                 let mut state = match inbox.stage_router_packet(
                     binding.binding_id,
                     notice_id,
@@ -686,6 +735,8 @@ pub async fn drain_router_once(
                     "hub_lct": binding.hub_lct_id,
                     "hub_member_lct": binding.hub_member_lct,
                     "from": notice.get("from"),
+                    "upstream_neighbor_lct": upstream_neighbor.next_hop_lct,
+                    "upstream_link_id": upstream_neighbor.link_id,
                     "destination_lct": packet.destination_lct,
                     "origin_lct": packet.origin_lct,
                     "hops_remaining": packet.hops_remaining,
