@@ -121,10 +121,14 @@ impl RoutePacketV1 {
 
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.protocol == Self::PROTOCOL, "route packet protocol must be {}", Self::PROTOCOL);
-        anyhow::ensure!(!self.destination_lct.is_empty() && self.destination_lct.len() <= 256,
-            "route destination_lct must be 1..256 bytes");
-        anyhow::ensure!(!self.origin_lct.is_empty() && self.origin_lct.len() <= 256,
-            "route origin_lct must be 1..256 bytes");
+        anyhow::ensure!(
+            self.destination_lct.starts_with("lct:web4:") && self.destination_lct.len() <= 256,
+            "route destination_lct must be a canonical lct:web4:* id of <=256 bytes"
+        );
+        anyhow::ensure!(
+            self.origin_lct.starts_with("lct:web4:") && self.origin_lct.len() <= 256,
+            "route origin_lct must be a canonical lct:web4:* id of <=256 bytes"
+        );
         anyhow::ensure!(!self.original_kind.is_empty() && self.original_kind.len() <= 128,
             "route original_kind must be 1..128 bytes");
         anyhow::ensure!(!self.pointer_uri.is_empty() && self.pointer_uri.len() <= 512,
@@ -135,17 +139,31 @@ impl RoutePacketV1 {
             "route hops_remaining must be 1..64");
         anyhow::ensure!(self.visited_routers.len() <= 64,
             "route visited_routers exceeds 64 entries");
-        anyhow::ensure!(self.visited_routers.iter().all(|r| !r.is_empty() && r.len() <= 256),
-            "route visited_routers entries must be 1..256 bytes");
+        anyhow::ensure!(
+            self.visited_routers.iter().all(|r| r.starts_with("lct:web4:") && r.len() <= 256),
+            "route visited_routers entries must be canonical lct:web4:* ids of <=256 bytes"
+        );
         let unique: std::collections::BTreeSet<&str> =
             self.visited_routers.iter().map(String::as_str).collect();
         anyhow::ensure!(
             unique.len() == self.visited_routers.len(),
             "route visited_routers contains a duplicate router"
         );
+        anyhow::ensure!(
+            (self.original_kind == "unreachable") == self.failure.is_some(),
+            "route original_kind=unreachable requires exactly one failure object"
+        );
         if let Some(failure) = &self.failure {
-            anyhow::ensure!(self.original_kind == "unreachable",
-                "route failure is only valid on original_kind=unreachable");
+            anyhow::ensure!(
+                failure.failed_destination_lct.starts_with("lct:web4:")
+                    && failure.failed_destination_lct.len() <= 256,
+                "route failure failed_destination_lct must be a canonical lct:web4:* id"
+            );
+            anyhow::ensure!(
+                failure.failed_at_router_lct.starts_with("lct:web4:")
+                    && failure.failed_at_router_lct.len() <= 256,
+                "route failure failed_at_router_lct must be a canonical lct:web4:* id"
+            );
             anyhow::ensure!(!failure.reason.is_empty() && failure.reason.len() <= 512,
                 "route failure reason must be 1..512 bytes");
         }
