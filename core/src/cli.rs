@@ -643,6 +643,18 @@ enum HubCmd {
         reason: String,
     },
 
+    /// Change which delivery plane owns one exact legacy peer/member edge.
+    ///
+    /// New aliases default to legacy. F3 cutover is always an explicit,
+    /// reasoned operator action after measured parity.
+    ReceiverAliasAuthority {
+        legacy_address: String,
+        /// legacy | f3
+        authority: String,
+        #[arg(long)]
+        reason: String,
+    },
+
     /// Remove one legacy compatibility alias.
     ReceiverUnalias {
         legacy_address: String,
@@ -1091,6 +1103,11 @@ pub fn run() -> AnyResult<()> {
                 legacy_address, destination_lct, reason
             } => cmd_receiver_alias(
                 &home, &legacy_address, &destination_lct, &reason,
+            ),
+            HubCmd::ReceiverAliasAuthority {
+                legacy_address, authority, reason
+            } => cmd_receiver_alias_authority(
+                &home, &legacy_address, &authority, &reason,
             ),
             HubCmd::ReceiverUnalias { legacy_address } => {
                 cmd_receiver_unalias(&home, &legacy_address)
@@ -3535,6 +3552,10 @@ fn cmd_receiver_alias(
     table.bind_legacy_alias(hestia::receiver_routing::LegacyRouteAlias {
         legacy_address: legacy_address.trim().to_string(),
         destination_lct: destination_lct.trim().to_string(),
+        delivery_authority: hestia::receiver_routing::LegacyDeliveryAuthority::Legacy,
+        authority_reason: None,
+        authority_set_by: String::new(),
+        authority_set_at: 0,
         reason: reason.trim().to_string(),
         set_by: "hestia-cli".into(),
         set_at: chrono::Utc::now().timestamp().max(0) as u64,
@@ -3544,6 +3565,35 @@ fn cmd_receiver_alias(
         "Legacy route alias: {} -> {}  ({})",
         legacy_address.trim(),
         destination_lct.trim(),
+        reason.trim()
+    );
+    Ok(())
+}
+
+fn cmd_receiver_alias_authority(
+    home: &std::path::Path,
+    legacy_address: &str,
+    authority: &str,
+    reason: &str,
+) -> AnyResult<()> {
+    let authority = hestia::receiver_routing::LegacyDeliveryAuthority::parse(authority)
+        .ok_or_else(|| anyhow::anyhow!("authority must be 'legacy' or 'f3'"))?;
+    anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
+    let mut vault = open_vault(home)?;
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    table.set_legacy_authority(
+        legacy_address.trim(),
+        authority,
+        reason,
+        "hestia-cli",
+        chrono::Utc::now().timestamp().max(0) as u64,
+    )?;
+    table.save(&mut vault)?;
+    println!(
+        "Legacy route authority: {} -> {}  ({})",
+        legacy_address.trim(),
+        authority.as_str(),
         reason.trim()
     );
     Ok(())
