@@ -3436,10 +3436,11 @@ fn cmd_receiver_unbind(home: &std::path::Path, child: &str) -> AnyResult<()> {
         .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
     let inbox = hestia::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
     let inflight = inbox.hub_receipt_inflight_count(binding.binding_id)?;
+    let routed_inflight = inbox.router_local_inflight_count(&canonical)?;
     anyhow::ensure!(
-        inflight == 0,
-        "refusing to remove receiver interface {} for {}: {inflight} Hub receipt(s) \
-         are still in flight; drain/ACK them first",
+        inflight == 0 && routed_inflight == 0,
+        "refusing to remove receiver interface {} for {}: {inflight} direct Hub receipt(s) \
+         and {routed_inflight} routed packet(s) are still in flight; drain/complete them first",
         binding.binding_id, canonical
     );
 
