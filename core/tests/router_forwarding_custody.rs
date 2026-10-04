@@ -27,6 +27,84 @@ fn packet_json(packet: Uuid, destination: &str) -> String {
 }
 
 #[test]
+fn origin_operation_returns_first_packet_even_if_retry_candidate_changes() {
+    let (_dir, inbox) = store();
+    let first_id = Uuid::new_v4();
+    let retry_candidate = Uuid::new_v4();
+    let first_packet = packet_json(first_id, "lct:web4:mb32:destination");
+    let retry_packet = serde_json::json!({
+        "protocol": "web4-route-v1",
+        "packet_id": retry_candidate,
+        "destination_lct": "lct:web4:mb32:destination",
+        "origin_lct": "lct:web4:mb32:origin",
+        "original_kind": "coordination",
+        "pointer_uri": "shared-context/forum/router-test.md",
+        "content_hash": format!("sha256-pointer:{}", "a".repeat(64)),
+        "hops_remaining": 3,
+        "visited_routers": [],
+    }).to_string();
+    let binding = r#"{"protocol":"hestia-route-origin-v1","destination":"same-intent"}"#;
+
+    let (first, inserted) = inbox.stage_router_origin(
+        "lct:web4:mb32:origin",
+        "op-1",
+        binding,
+        first_id,
+        &first_packet,
+        "sha256-content:first",
+    ).unwrap();
+    assert!(inserted);
+    assert_eq!(first.packet_id, first_id);
+
+    // Same application act, but a retry generated a different random candidate
+    // and today's route config would have produced a different hop limit.
+    // The first admitted packet must win byte-for-byte.
+    let (again, inserted) = inbox.stage_router_origin(
+        "lct:web4:mb32:origin",
+        "op-1",
+        binding,
+        retry_candidate,
+        &retry_packet,
+        "sha256-content:retry",
+    ).unwrap();
+    assert!(!inserted);
+    assert_eq!(again.packet_id, first_id);
+    assert_eq!(again.packet_json, first_packet);
+
+    let err = inbox.stage_router_origin(
+        "lct:web4:mb32:origin",
+        "op-1",
+        r#"{"protocol":"hestia-route-origin-v1","destination":"DIFFERENT"}"#,
+        Uuid::new_v4(),
+        &retry_packet,
+        "sha256-content:retry",
+    ).unwrap_err();
+    assert!(format!("{err:#}").contains("different send intent"), "{err:#}");
+}
+
+#[test]
+fn same_operation_id_is_scoped_by_canonical_origin() {
+    let (_dir, inbox) = store();
+    let a_id = Uuid::new_v4();
+    let b_id = Uuid::new_v4();
+    let a_packet = packet_json(a_id, "lct:web4:mb32:destination");
+    let b_packet = packet_json(b_id, "lct:web4:mb32:destination");
+    let binding = r#"{"protocol":"hestia-route-origin-v1","destination":"same-intent"}"#;
+
+    let (a, a_inserted) = inbox.stage_router_origin(
+        "lct:web4:mb32:origin-a", "same-op", binding,
+        a_id, &a_packet, "sha256-content:a",
+    ).unwrap();
+    let (b, b_inserted) = inbox.stage_router_origin(
+        "lct:web4:mb32:origin-b", "same-op", binding,
+        b_id, &b_packet, "sha256-content:b",
+    ).unwrap();
+
+    assert!(a_inserted && b_inserted);
+    assert_ne!(a.packet_id, b.packet_id);
+}
+
+#[test]
 fn packet_id_is_immutable_across_ingress_retries() {
     let (_dir, inbox) = store();
     let ingress = Uuid::new_v4();
