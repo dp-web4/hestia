@@ -912,7 +912,7 @@ impl SqliteInboxStore {
         chain_hash: &str,
         in_reply_to: Option<u64>,
         response_template: &Value,
-        shadow_record_json: Option<&str>,
+        shadow_record_template: Option<&Value>,
     ) -> Result<MemberSendOperation> {
         let mut conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
@@ -937,6 +937,9 @@ impl SqliteInboxStore {
         response["egress_queued_to"] = Value::Null;
         response["replayed"] = serde_json::json!(false);
         let response_json = serde_json::to_string(&response)?;
+        let shadow_record_json = shadow_record_template
+            .map(|v| serde_json::to_string(v))
+            .transpose()?;
         let now = Utc::now().to_rfc3339();
         tx.execute(
             "INSERT INTO member_send_ops
@@ -969,7 +972,7 @@ impl SqliteInboxStore {
         chain_hash: &str,
         transport_stamp: Option<&str>,
         response_template: &Value,
-        shadow_record_json: Option<&str>,
+        shadow_record_template: Option<&Value>,
     ) -> Result<MemberSendOperation> {
         let mut conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
@@ -995,6 +998,13 @@ impl SqliteInboxStore {
         response["egress_queued_to"] = serde_json::json!(dest_peer);
         response["replayed"] = serde_json::json!(false);
         let response_json = serde_json::to_string(&response)?;
+        let shadow_record_json = shadow_record_template
+            .map(|template| {
+                let mut record = template.clone();
+                record["legacy_egress_row_id"] = serde_json::json!(queued_id);
+                serde_json::to_string(&record)
+            })
+            .transpose()?;
         let now = Utc::now().to_rfc3339();
         tx.execute(
             "INSERT INTO member_send_ops
