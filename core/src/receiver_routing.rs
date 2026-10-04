@@ -251,6 +251,35 @@ fn valid_content_hash(value: &str) -> bool {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyDeliveryAuthority {
+    /// Historical peer/member queue + member-mesh drain remains authoritative.
+    #[default]
+    Legacy,
+    /// Exact alias translates into canonical F3 origination.
+    ///
+    /// This is per-alias and opt-in: adding an alias never cuts traffic over.
+    F3,
+}
+
+impl LegacyDeliveryAuthority {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "legacy" => Some(Self::Legacy),
+            "f3" => Some(Self::F3),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::F3 => "f3",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LegacyRouteAlias {
     /// Exact legacy compatibility spelling, e.g. `thor/claude-code`.
@@ -258,6 +287,13 @@ pub struct LegacyRouteAlias {
     pub legacy_address: String,
     /// Canonical END MEMBER identity. Never the peer-machine/router LCT.
     pub destination_lct: String,
+    /// Which delivery plane owns this exact compatibility edge.
+    ///
+    /// Serde-default LEGACY is load-bearing: old routing documents and newly
+    /// added aliases stay observational until the operator explicitly cuts
+    /// this one edge over after measured D2 evidence.
+    #[serde(default)]
+    pub delivery_authority: LegacyDeliveryAuthority,
     pub reason: String,
     #[serde(default)]
     pub set_by: String,
@@ -496,6 +532,22 @@ impl ReceiverRoutingTable {
 
     pub fn legacy_alias(&self, legacy_address: &str) -> Option<&LegacyRouteAlias> {
         self.legacy_aliases.iter().find(|a| a.legacy_address == legacy_address)
+    }
+
+    pub fn set_legacy_authority(
+        &mut self,
+        legacy_address: &str,
+        authority: LegacyDeliveryAuthority,
+    ) -> Result<()> {
+        let alias = self
+            .legacy_aliases
+            .iter_mut()
+            .find(|a| a.legacy_address == legacy_address)
+            .ok_or_else(|| anyhow::anyhow!(
+                "legacy route alias '{legacy_address}' does not exist"
+            ))?;
+        alias.delivery_authority = authority;
+        Ok(())
     }
 
     pub fn shadow_legacy_route(
