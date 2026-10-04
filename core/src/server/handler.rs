@@ -5053,6 +5053,37 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             .map(|b| b.stamp())
             .unwrap_or_else(|| json!("unbound"))
     });
+
+    // F3 D2b SHADOW ONLY. This deliberately runs after every legacy sender/law/
+    // reply/transport precondition above. It cannot permit a send legacy refused,
+    // and it cannot refuse a send legacy accepted: any routing-table/evaluation
+    // failure becomes telemetry rather than control flow. The old egress queue
+    // remains the only delivery path in this function until measured parity.
+    let f3_shadow: Option<Value> = routed.then(|| {
+        let router_lct = s.sovereign.lct_id();
+        match crate::receiver_routing::ReceiverRoutingTable::load(&s.vault)
+            .and_then(|table| {
+                table.shadow_legacy_route(
+                    &s.member_registry,
+                    &router_lct,
+                    &to_plugin,
+                )
+            })
+        {
+            Ok(shadow) => serde_json::to_value(shadow).unwrap_or_else(|e| {
+                json!({
+                    "status": "shadow_error",
+                    "stage": "serialize",
+                    "error": e.to_string(),
+                })
+            }),
+            Err(e) => json!({
+                "status": "shadow_error",
+                "stage": "evaluate",
+                "error": e.to_string(),
+            }),
+        }
+    });
     s.member_notify_limiter.record(&sender.plugin_id);
     // What is known about the recipient's reachability, resolved BEFORE the
     // witness so the chain entry carries it (an act's record must include the
@@ -5076,9 +5107,17 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
         "binding_verified": binding_verified,
         "recipient_liveness": liveness,
         "recipient_liveness_evidence": liveness_evidence,
+        "f3_shadow": f3_shadow,
+        "f3_shadow_mode": if routed { Some("observe_only") } else { None },
+        "f3_shadow_witness": f3_shadow_witness,
+        "f3_shadow_witness_error": f3_shadow_witness_error,
     });
     if let Some(t) = &transport_record {
         notice_record["transport"] = t.clone();
+    }
+    if let Some(shadow) = &f3_shadow {
+        notice_record["f3_shadow"] = shadow.clone();
+        notice_record["f3_shadow_mode"] = json!("observe_only");
     }
     let entry = s.append_chain("member_notice", notice_record)?;
     // ---- r6-routing branch 2: is it for someone I know? then forward ------------
@@ -5163,6 +5202,26 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
                             "witnessed_entry": entry.hash,
                         }),
                     )?;
+                    let (f3_shadow_witness, f3_shadow_witness_error) =
+                        if let Some(shadow) = &f3_shadow {
+                            match s.append_chain(
+                                "member_notice_f3_shadow",
+                                json!({
+                                    "mode": "observe_only",
+                                    "legacy_address": to_plugin,
+                                    "legacy_outcome": "egress_refused",
+                                    "legacy_reason": "egress_queue_full",
+                                    "witnessed_entry": entry.hash,
+                                    "refusal_entry": refusal.hash,
+                                    "f3_shadow": shadow,
+                                }),
+                            ) {
+                                Ok(observation) => (Some(observation.hash), None),
+                                Err(err) => (None, Some(err.to_string())),
+                            }
+                        } else {
+                            (None, None)
+                        };
                     return Ok(hestia_error_envelope(
                         "hestia.member_notify_egress_queue_full",
                         &format!(
@@ -5176,6 +5235,10 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
                             "egress_queued": depth,
                             "witnessEntryHash": entry.hash,
                             "refusalEntryHash": refusal.hash,
+                            "f3_shadow": f3_shadow,
+                            "f3_shadow_mode": "observe_only",
+                            "f3_shadow_witness": f3_shadow_witness,
+                            "f3_shadow_witness_error": f3_shadow_witness_error,
                         })),
                     ));
                 }
@@ -5194,6 +5257,27 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             )
             .map_err(|e| anyhow::anyhow!("queueing member notice: {e}"))?,
     };
+    let (f3_shadow_witness, f3_shadow_witness_error) =
+        if let (Some(shadow), Some(peer)) = (&f3_shadow, &egress_peer) {
+            match s.append_chain(
+                "member_notice_f3_shadow",
+                json!({
+                    "mode": "observe_only",
+                    "legacy_address": to_plugin,
+                    "legacy_outcome": "egress_queued",
+                    "legacy_queued_id": queued_id,
+                    "legacy_dest_peer": peer,
+                    "witnessed_entry": entry.hash,
+                    "f3_shadow": shadow,
+                }),
+            ) {
+                Ok(observation) => (Some(observation.hash), None),
+                Err(err) => (None, Some(err.to_string())),
+            }
+        } else {
+            (None, None)
+        };
+
     let mut out = json!({
         "queued_id": queued_id,
         "witnessEntryHash": entry.hash,
