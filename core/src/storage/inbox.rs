@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -356,9 +357,25 @@ impl SqliteInboxStore {
              -- whole column would be wrong even if it were possible — NULLs never
              -- conflict in SQLite, but the index would still tax every insert.
              CREATE UNIQUE INDEX IF NOT EXISTS idx_member_notices_disposition_key
-                 ON member_notices(disposition_key) WHERE disposition_key IS NOT NULL;",
+                 ON member_notices(disposition_key) WHERE disposition_key IS NOT NULL;
+             CREATE TABLE IF NOT EXISTS member_send_ops (
+                 sender_plugin       TEXT NOT NULL,
+                 operation_id        TEXT NOT NULL,
+                 binding_json        TEXT NOT NULL,
+                 witness_hash        TEXT NOT NULL,
+                 queued_id           INTEGER,
+                 egress_peer         TEXT,
+                 outcome             TEXT NOT NULL,
+                 response_json       TEXT NOT NULL,
+                 shadow_record_json  TEXT,
+                 shadow_witness_hash TEXT,
+                 created_at          TEXT NOT NULL,
+                 PRIMARY KEY (sender_plugin, operation_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_member_send_ops_created
+                 ON member_send_ops(created_at);",
         )
-        .context("indexing member_notices.in_reply_to")?;
+        .context("indexing member_notices and member-send operations")?;
         Self::ensure_touch_schema(conn)?;
         // The projector's cursor (same revised review): one row per projection
         // name, the chain position safely processed THROUGH. Living here rather
@@ -1748,6 +1765,26 @@ pub struct EgressRow {
     /// The sender's transport binding when the row was queued (#1030); None = unbound.
     pub transport_stamp: Option<String>,
 }
+
+/// One daemon-level idempotency record for hestia_member_notify.
+///
+/// operation_id identifies ONE caller operation, not one message body. Two
+/// intentionally identical notices with different operation ids are distinct.
+#[derive(Debug, Clone)]
+pub struct MemberSendOperation {
+    pub sender_plugin: String,
+    pub operation_id: String,
+    pub binding_json: String,
+    pub witness_hash: String,
+    pub queued_id: Option<u64>,
+    pub egress_peer: Option<String>,
+    pub outcome: String,
+    pub response_json: Value,
+    pub shadow_record_json: Option<String>,
+    pub shadow_witness_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 
 // ---- F3 host receiver custody ------------------------------------------------
 
