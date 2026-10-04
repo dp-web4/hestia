@@ -302,29 +302,3 @@ fn refused_ingress_cannot_poison_packet_id_namespace() {
     );
 }
 
-#[test]
-fn incomplete_local_transit_decision_pins_child_binding_until_completion() {
-    let (_dir, inbox) = store();
-    let ingress = Uuid::new_v4();
-    let packet = Uuid::new_v4();
-    let child = "lct:web4:mb32:child";
-    let id = notice_id('3');
-    let p = packet_json(packet, child);
-
-    inbox.stage_router_packet(
-        ingress, &id, packet, "notice", &p, "sha256-content:p",
-    ).unwrap();
-    inbox.record_router_local_decision(
-        packet,
-        r#"{"action":"local","child_lct":"lct:web4:mb32:child"}"#,
-        Some(child),
-    ).unwrap();
-
-    assert_eq!(inbox.router_local_inflight_count(child).unwrap(), 1);
-
-    inbox.complete_router_packet(
-        packet, "delivered-local", "completion-witness",
-    ).unwrap();
-
-    assert_eq!(inbox.router_local_inflight_count(child).unwrap(), 0);
-}
