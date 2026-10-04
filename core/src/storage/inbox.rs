@@ -2413,23 +2413,6 @@ impl SqliteInboxStore {
         Ok(())
     }
 
-    /// Local child bindings are routing authority. Refuse their removal while
-    /// an incomplete transit packet has already committed a local decision to
-    /// that child; otherwise a retry could deliver under a binding the operator
-    /// believes was removed.
-    pub fn router_local_inflight_count(&self, child_lct: &str) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
-        Self::ensure_router_packet_schema(&conn)?;
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM router_packets
-              WHERE local_child_lct = ?1
-                AND completion_witness_hash IS NULL",
-            params![child_lct],
-            |r| r.get(0),
-        )?;
-        Ok(n as u64)
-    }
-
     /// Deliver one route packet to a local child exactly once. The member row and
     /// packet watermark are one SQLite transaction.
     #[allow(clippy::too_many_arguments)]
