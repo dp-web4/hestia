@@ -2166,6 +2166,7 @@ impl SqliteInboxStore {
                 packet_id          TEXT NOT NULL,
                 notice_json        TEXT NOT NULL,
                 stage_witness_hash TEXT,
+                refusal_witness_hash TEXT,
                 hub_acked_at       TEXT,
                 queued_at          TEXT NOT NULL,
                 PRIMARY KEY (ingress_binding_id, hub_notice_id),
@@ -2177,6 +2178,24 @@ impl SqliteInboxStore {
                  ON router_ingress_receipts(ingress_binding_id, hub_acked_at);",
         )
         .context("initializing router transit custody schema")?;
+        let has_refusal_witness = {
+            let mut stmt = conn.prepare("PRAGMA table_info(router_ingress_receipts)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for row in rows {
+                if row? == "refusal_witness_hash" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_refusal_witness {
+            conn.execute_batch(
+                "ALTER TABLE router_ingress_receipts ADD COLUMN refusal_witness_hash TEXT;",
+            )
+            .context("adding router ingress refusal-witness column")?;
+        }
         Ok(())
     }
 
@@ -2437,7 +2456,49 @@ impl SqliteInboxStore {
         Ok(())
     }
 
-    /// Every ingress receipt mapped to a completed packet is ACK-eligible.
+    /// Settle one ingress receipt as refused without completing the packet
+    /// globally. This matters when an unconfigured Hub sender copied a valid
+    /// packet: that receipt can be dropped after a witnessed refusal while a
+    /// later receipt from the configured neighbor may still process the packet.
+    pub fn record_router_ingress_refusal(
+        &self,
+        ingress_binding_id: Uuid,
+        hub_notice_id: &str,
+        witness_hash: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        let row: Option<Option<String>> = conn.query_row(
+            "SELECT refusal_witness_hash FROM router_ingress_receipts
+              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2",
+            params![ingress_binding_id.to_string(), hub_notice_id],
+            |r| r.get(0),
+        ).optional()?;
+        let Some(prior) = row else {
+            anyhow::bail!("router ingress receipt {hub_notice_id} was not staged");
+        };
+        if let Some(prior) = prior {
+            anyhow::ensure!(
+                prior == witness_hash,
+                "router ingress receipt {hub_notice_id} is bound to a different refusal witness"
+            );
+            return Ok(());
+        }
+        let n = conn.execute(
+            "UPDATE router_ingress_receipts
+                SET refusal_witness_hash = ?3
+              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2
+                AND refusal_witness_hash IS NULL",
+            params![ingress_binding_id.to_string(), hub_notice_id, witness_hash],
+        )?;
+        anyhow::ensure!(n == 1, "router ingress refusal state changed concurrently");
+        Ok(())
+    }
+
+    /// An ingress receipt is ACK-eligible after either:
+    /// - this receipt was explicitly refused and that refusal was witnessed; or
+    /// - it was accepted for transit and the shared packet reached a witnessed
+    ///   custody completion.
     pub fn pending_router_ingress_acks(
         &self,
         ingress_binding_id: Uuid,
@@ -2451,7 +2512,10 @@ impl SqliteInboxStore {
               WHERE r.ingress_binding_id = ?1
                 AND r.hub_acked_at IS NULL
                 AND r.stage_witness_hash IS NOT NULL
-                AND p.completion_witness_hash IS NOT NULL
+                AND (
+                    r.refusal_witness_hash IS NOT NULL
+                    OR p.completion_witness_hash IS NOT NULL
+                )
               ORDER BY r.queued_at ASC",
         )?;
         let rows = stmt.query_map(params![ingress_binding_id.to_string()], |r| r.get(0))?;
@@ -2473,12 +2537,15 @@ impl SqliteInboxStore {
                JOIN router_packets p ON p.packet_id = r.packet_id
               WHERE r.ingress_binding_id = ?1 AND r.hub_notice_id = ?2
                 AND r.stage_witness_hash IS NOT NULL
-                AND p.completion_witness_hash IS NOT NULL",
+                AND (
+                    r.refusal_witness_hash IS NOT NULL
+                    OR p.completion_witness_hash IS NOT NULL
+                )",
             params![ingress_binding_id.to_string(), hub_notice_id],
             |r| r.get(0),
         )?;
         anyhow::ensure!(eligible == 1,
-            "cannot ACK router ingress {hub_notice_id} before witnessed completion");
+            "cannot ACK router ingress {hub_notice_id} before witnessed completion/refusal");
         conn.execute(
             "UPDATE router_ingress_receipts SET hub_acked_at = COALESCE(hub_acked_at, ?3)
               WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2",
