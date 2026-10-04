@@ -5347,6 +5347,19 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
         }
     };
 
+    if let Some(plan) = &f3_plan {
+        if plan.destination_lct == plan.origin_lct {
+            return Ok(hestia_error_envelope(
+                "hestia.member_notify_self",
+                "notifying your own canonical LCT is the same no-op as notifying your plugin id",
+                Some(json!({
+                    "origin_lct": plan.origin_lct,
+                    "destination_lct": plan.destination_lct,
+                })),
+            ));
+        }
+    }
+
     if f3_plan.is_some() && operation_id.is_none() {
         return Ok(hestia_error_envelope(
             "hestia.member_notify_f3_operation_id_required",
@@ -5383,7 +5396,7 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     {
         existing.event_data.get("f3_shadow").cloned()
     } else {
-        routed.then(|| {
+        to_plugin.contains('/').then(|| {
         let resolved_origin = s.member_registry.resolve_reference(&sender.plugin_id);
         let (origin_lct, router_lct, identity_error) = match resolved_origin {
             Ok(Some(member)) => {
@@ -5571,26 +5584,6 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
                 }
             }
 
-            if let Some(first_hop) = &plan.first_hop_hub_member {
-                let promised = binding
-                    .carrier_lct
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty());
-                if promised != Some(first_hop.as_str()) {
-                    return Ok(hestia_error_envelope(
-                        "hestia.member_notify_f3_carrier_binding_unmet",
-                        "F3 cutover selected a first-hop router interface different                          from the transport carrier authorized for this member.                          No packet was originated.",
-                        Some(json!({
-                            "to_plugin_id": to_plugin,
-                            "transport_mode": binding.mode.as_str(),
-                            "authorized_carrier_lct": promised,
-                            "f3_first_hop_hub_member": first_hop,
-                            "delivery_authority": "f3",
-                        })),
-                    ));
-                }
-            }
         }
     }
 
@@ -5685,8 +5678,11 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             notice_record["f3_destination_lct"] = json!(plan.destination_lct);
             notice_record["f3_authority_source"] = json!(plan.authority_source);
             notice_record["f3_authority_reason"] = json!(plan.authority_reason);
-            notice_record["f3_first_hop_hub_member"] =
-                plan.first_hop_hub_member.clone().map(Value::String).unwrap_or(Value::Null);
+            notice_record["f3_expected_carrier_lct"] = transport_record
+                .as_ref()
+                .and_then(|v| v.get("carrier_lct"))
+                .cloned()
+                .unwrap_or(Value::Null);
             notice_record["d2_migration_rule"] = json!(
                 "F3 strengthens legacy Hub acceptance to witnessed local delivery or durable next-hop mailbox acceptance"
             );
@@ -5768,6 +5764,11 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
         let op_id = operation_id
             .clone()
             .expect("F3 plan is refused above without operation_id");
+        let expected_carrier = transport_record
+            .as_ref()
+            .and_then(|v| v.get("carrier_lct"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let vault = match s.vault.reopen() {
             Ok(v) => v,
             Err(e) => {
@@ -5805,7 +5806,7 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
         // Release the daemon-wide state mutex before any network operation.
         drop(s);
 
-        let route = match crate::router_forwarder::originate_once(
+        let route = match crate::router_forwarder::originate_once_constrained(
             &vault,
             &plan.router_lct,
             &plan.origin_lct,
@@ -5816,6 +5817,7 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             &op_id,
             inbox.as_ref(),
             chain.as_ref(),
+            expected_carrier.as_deref(),
         )
         .await
         {
@@ -5853,7 +5855,7 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             "destination_lct": plan.destination_lct,
             "authority_source": plan.authority_source,
             "authority_reason": plan.authority_reason,
-            "first_hop_hub_member": plan.first_hop_hub_member,
+            "expected_carrier_lct": expected_carrier,
             "transport": transport_record.clone().unwrap_or_else(|| json!("unbound")),
             "route_packet_id": route.packet_id,
             "route_outcome": route.outcome,
