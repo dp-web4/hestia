@@ -291,6 +291,27 @@ Router→router hops use Web4's receipt-only `route_forward` channel operation. 
 has not opted into non-destructive fetch/ACK is not routable: using a consume-on-response
 mailbox would reintroduce the packet-loss boundary F3 exists to remove.
 
+**Receipt-mode router memberships are dedicated transport identities.** Enrollment is one-way:
+once a Hub member opts into receipt fetch/ACK, the historical destructive `notifications`
+consumer is refused. Therefore a machine/seat member still drained by legacy `hub-watch`
+MUST NOT be reused as an F3 router interface for an incremental edge cutover. Doing so would
+silently turn a one-edge pilot into a whole-mailbox migration.
+
+For migration, each machine provisions a distinct Hub membership/key for its router plane:
+
+- canonical machine/router LCT remains the routed identity;
+- dedicated Hub member UUID is only that router's transport membership;
+- its raw channel key is an unattended credential handle, distinct from seat/member keys;
+- join/admission follows ordinary Hub law;
+- receipt mode is enabled by a separate explicit Hub-operator act after admission;
+- the old seat/machine Hub membership remains untouched until its own measured retirement.
+
+Router membership bootstrap is retry-stable: the UUID/key are persisted **before** the network
+join request. Lost response, pending Sovereign admission, and retry all reuse the same identity;
+the primary Hestia Hub connection is never re-keyed or repointed. After admission, Hestia
+re-resolves the Hub pin and only then binds the dedicated member as a router interface.
+
+
 #### 4.5.3 Unreachable is a packet, not an exception
 
 When a data packet reaches a terminal routing failure, the router creates one structured
