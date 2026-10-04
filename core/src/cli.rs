@@ -3145,9 +3145,13 @@ fn cmd_receiver_bind(
     home: &std::path::Path,
     child: &str,
     target: &str,
+    member_lct: Option<uuid::Uuid>,
+    channel_key: Option<String>,
     parent: Option<&str>,
     reason: &str,
 ) -> AnyResult<()> {
+    use hestia::hub::MemberKeySource;
+
     anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
     let mut vault = open_vault(home)?;
     let router_lct = receiver_router_lct(&vault, parent)?;
@@ -3167,44 +3171,78 @@ fn cmd_receiver_bind(
         ),
     };
 
+    // HubStore is only an ENDPOINT template here. It historically models one CLI
+    // identity per Hub URL and therefore deliberately rejects a second connection
+    // to the same URL. The receiver interface below carries its OWN Hub member
+    // identity/key, so N children can share this endpoint without changing that
+    // older contract.
     let hubs = HubStore::load(&vault)?;
-    let conn = pick_connection(&hubs, target)?;
-    let keypair = member_signing_keypair(&vault, &conn.member_key_source)?;
+    let template = pick_connection(&hubs, target)?;
+    let hub_member_lct = member_lct.unwrap_or(template.our_lct_id);
+    let key_source = match channel_key {
+        Some(path) => MemberKeySource::ChannelKeyFile { path },
+        None if hub_member_lct == template.our_lct_id => template.member_key_source.clone(),
+        None => anyhow::bail!(
+            "--member-lct {hub_member_lct} differs from the template connection's member {}; \
+             provide --channel-key <raw-32-byte-seed-file> so Hestia does not guess a credential",
+            template.our_lct_id
+        ),
+    };
+
+    let keypair = member_signing_keypair(&vault, &key_source)
+        .context("resolving receiver mailbox credential")?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
-    let rest = abs_rest(&conn.url, &conn.rest_endpoint);
+    let rest = abs_rest(&template.url, &template.rest_endpoint);
+
+    // Verify both halves NOW; drain re-verifies them every pass.
+    let discovered = rt.block_on(client.discover(&template.url))
+        .context("re-discovering Hub before receiver bind")?;
+    anyhow::ensure!(
+        discovered.hub_lct_id == template.hub_lct_id,
+        "refusing receiver bind: endpoint {} now advertises Hub {}, expected {}",
+        template.url, discovered.hub_lct_id, template.hub_lct_id
+    );
     let pinned = rt
-        .block_on(client.resolve_member_pubkey(&rest, conn.hub_lct_id, conn.our_lct_id))
-        .with_context(|| format!("resolving Hub pin for {}", conn.our_lct_id))?;
+        .block_on(client.resolve_member_pubkey(&rest, template.hub_lct_id, hub_member_lct))
+        .with_context(|| format!("resolving Hub pin for {hub_member_lct}"))?;
     anyhow::ensure!(
         pinned.to_hex() == keypair.verifying_key().to_hex(),
-        "refusing receiver bind: connection {} signs with a key different from the Hub pin for {}",
-        conn.id, conn.our_lct_id
+        "refusing receiver bind: configured key differs from the Hub pin for {hub_member_lct}"
     );
 
     let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
         .unwrap_or_default();
+    let binding_id = uuid::Uuid::new_v4();
     table.bind_local(hestia::receiver_routing::LocalMailboxBinding {
+        binding_id,
         child_lct: child_lct.clone(),
-        hub_connection_id: conn.id,
+        hub_url: template.url.clone(),
+        hub_lct_id: template.hub_lct_id,
+        rest_endpoint: rest,
+        hub_member_lct,
+        member_key_source: key_source,
         reason: reason.trim().to_string(),
         set_by: "hestia-cli".into(),
         set_at: chrono::Utc::now().timestamp().max(0) as u64,
-    });
+    })?;
     table.save(&mut vault)?;
 
-    println!("Receiver local route bound:");
+    println!("Receiver local interface bound:");
     println!("  router:       {router_lct}");
     println!("  child:        {plugin_id} ({child_lct})");
-    println!("  hub member:   {}", conn.our_lct_id);
-    println!("  connection:   {} ({})", conn.id, conn.url);
+    println!("  interface:    {binding_id}");
+    println!("  hub:          {} ({})", template.hub_lct_id, template.url);
+    println!("  hub member:   {hub_member_lct}");
     println!("  credential:   verified against Hub pin");
     println!("  wake:         none (delivery only)");
     Ok(())
 }
 
 fn cmd_receiver_unbind(home: &std::path::Path, child: &str) -> AnyResult<()> {
-    let mut vault = open_vault(home)?;
+    // Route removal can strand a fetched/staged notice, so it needs the inbox
+    // custody state before changing the vault routing table.
+    let (mut vault, passphrase) = open_vault_with_passphrase(home)?;
     let registry = hestia::member_registry::load_members(&vault);
     let canonical = registry
         .resolve_reference(child)?
@@ -3212,12 +3250,27 @@ fn cmd_receiver_unbind(home: &std::path::Path, child: &str) -> AnyResult<()> {
         .unwrap_or_else(|| child.to_string());
     let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
         .unwrap_or_default();
+    let binding = table
+        .local_binding(&canonical)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!(
+            "no receiver local mailbox binding for '{child}' ({canonical})"
+        ))?;
+
+    let store_key = hestia::storage::storage_key(home, &passphrase)
+        .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
+    let inbox = hestia::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
+    let inflight = inbox.hub_receipt_inflight_count(binding.binding_id)?;
     anyhow::ensure!(
-        table.unbind_local(&canonical),
-        "no receiver local mailbox binding for '{child}' ({canonical})"
+        inflight == 0,
+        "refusing to remove receiver interface {} for {}: {inflight} Hub receipt(s) \
+         are still in flight; drain/ACK them first",
+        binding.binding_id, canonical
     );
+
+    anyhow::ensure!(table.unbind_local(&canonical), "receiver route disappeared during unbind");
     table.save(&mut vault)?;
-    println!("Receiver local route removed: {canonical}");
+    println!("Receiver local interface removed: {canonical} ({})", binding.binding_id);
     Ok(())
 }
 
