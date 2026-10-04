@@ -605,6 +605,26 @@ enum HubCmd {
         child: String,
     },
 
+    /// Provision/request a DEDICATED Hub membership for the F3 machine router.
+    ///
+    /// This never reuses or rewrites the primary/legacy seat membership. The
+    /// UUID + raw unattended key are persisted before the join request so retry
+    /// after a lost response or pending Sovereign approval is identity-stable.
+    ReceiverRouterJoin {
+        /// Existing Hub connection used only as endpoint/Hub identity template.
+        #[arg(long, default_value = "")]
+        target: String,
+        /// Hub display name for the dedicated router member (e.g. legion-router).
+        #[arg(long)]
+        name: String,
+        /// Router/parent canonical LCT (default: persisted local sovereign).
+        #[arg(long)]
+        parent: Option<String>,
+        /// Why this dedicated router membership is being created.
+        #[arg(long)]
+        reason: String,
+    },
+
     /// Bind a receipt-mode Hub mailbox to the router identity itself. Route
     /// packets arrive here; this is not a child/member inbox.
     ReceiverRouterBind {
@@ -1089,6 +1109,11 @@ pub fn run() -> AnyResult<()> {
                 )
             }
             HubCmd::ReceiverUnbind { child } => cmd_receiver_unbind(&home, &child),
+            HubCmd::ReceiverRouterJoin {
+                target, name, parent, reason
+            } => cmd_receiver_router_join(
+                &home, &target, &name, parent.as_deref(), &reason,
+            ),
             HubCmd::ReceiverRouterBind {
                 target, member_lct, channel_key, parent, reason
             } => cmd_receiver_router_bind(
@@ -3365,6 +3390,235 @@ fn cmd_receiver_bind(
     println!("  hub member:   {hub_member_lct}");
     println!("  credential:   verified against Hub pin");
     println!("  wake:         none (delivery only)");
+    Ok(())
+}
+
+fn write_new_router_channel_key(
+    home: &std::path::Path,
+    member_lct: uuid::Uuid,
+    seed: &[u8; 32],
+) -> AnyResult<String> {
+    use std::io::Write;
+
+    let dir = home.join("router-memberships");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating router membership directory {}", dir.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("securing router membership directory {}", dir.display()))?;
+    }
+
+    let path = dir.join(format!("{member_lct}.key"));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(&path)
+        .with_context(|| format!("creating dedicated router key {}", path.display()))?;
+    file.write_all(seed)
+        .with_context(|| format!("writing dedicated router key {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing dedicated router key {}", path.display()))?;
+
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn cmd_receiver_router_join(
+    home: &std::path::Path,
+    target: &str,
+    name: &str,
+    parent: Option<&str>,
+    reason: &str,
+) -> AnyResult<()> {
+    use hestia::hub::MemberKeySource;
+    use hestia::router_membership::{RouterMembership, RouterMembershipStore};
+
+    anyhow::ensure!(!name.trim().is_empty(), "--name is required");
+    anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
+
+    let mut vault = open_vault(home)?;
+    let router_lct = receiver_router_lct(&vault, parent)?;
+    anyhow::ensure!(
+        router_lct.starts_with("lct:web4:mb32:"),
+        "router identity must be canonical lct:web4:mb32:*, got {router_lct}"
+    );
+
+    let hubs = HubStore::load(&vault)?;
+    let template = pick_connection(&hubs, target)?;
+    let rest = abs_rest(&template.url, &template.rest_endpoint);
+
+    let mut memberships = RouterMembershipStore::load(&vault)?;
+    let existing = memberships
+        .find(template.hub_lct_id, &router_lct)
+        .cloned();
+
+    let membership = if let Some(existing) = existing {
+        anyhow::ensure!(
+            existing.name == name.trim(),
+            "router membership already exists as name '{}' on Hub {}; retry with that exact --name",
+            existing.name,
+            existing.hub_lct_id
+        );
+        anyhow::ensure!(
+            existing.reason == reason.trim(),
+            "router membership already exists with reason '{}'; retries must not rewrite provenance",
+            existing.reason
+        );
+        existing
+    } else {
+        let keypair = web4_core::crypto::KeyPair::generate();
+        let member_lct = uuid::Uuid::new_v4();
+        let seed = keypair.secret_key_bytes();
+        let key_path = write_new_router_channel_key(home, member_lct, &seed)?;
+
+        let created = RouterMembership {
+            router_lct: router_lct.clone(),
+            hub_lct_id: template.hub_lct_id,
+            hub_url: template.url.clone(),
+            rest_endpoint: rest.clone(),
+            hub_member_lct: member_lct,
+            channel_key_path: key_path,
+            name: name.trim().to_string(),
+            reason: reason.trim().to_string(),
+            requested_at: chrono::Utc::now().timestamp().max(0) as u64,
+            admitted_at: None,
+            interface_binding_id: None,
+        };
+
+        // Persist identity BEFORE network I/O. A dropped join response must not
+        // mint a second UUID/key when the operator retries this command.
+        memberships.insert_new(created.clone())?;
+        memberships.save(&mut vault)?;
+        created
+    };
+
+    let key_source = MemberKeySource::ChannelKeyFile {
+        path: membership.channel_key_path.clone(),
+    };
+    let keypair = member_signing_keypair(&vault, &key_source)
+        .context("loading persisted dedicated router key")?;
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+
+    let discovered = rt
+        .block_on(client.discover(&template.url))
+        .context("re-discovering Hub before router join")?;
+    anyhow::ensure!(
+        discovered.hub_lct_id == membership.hub_lct_id,
+        "refusing router join: endpoint {} advertises Hub {}, persisted request belongs to {}",
+        template.url,
+        discovered.hub_lct_id,
+        membership.hub_lct_id
+    );
+
+    let outcome = rt.block_on(client.join(
+        &rest,
+        membership.hub_lct_id,
+        membership.hub_member_lct,
+        &keypair,
+        Some(membership.name.clone()),
+    ))?;
+
+    match outcome {
+        hestia::hub::JoinOutcome::Escalated { reason: escalation } => {
+            println!("Dedicated router membership submitted — pending Sovereign approval:");
+            println!("  router LCT:   {}", membership.router_lct);
+            println!("  Hub:          {} ({})", membership.hub_lct_id, membership.hub_url);
+            println!("  Hub member:   {}", membership.hub_member_lct);
+            println!("  display name: {}", membership.name);
+            println!("  key handle:   {}", membership.channel_key_path);
+            println!("  status:       pending ({escalation})");
+            println!();
+            println!("After the Hub operator admits THIS SAME member UUID, rerun this exact command.");
+            println!("The persisted UUID/key will be reused; no second router identity is minted.");
+            return Ok(());
+        }
+        hestia::hub::JoinOutcome::Admitted(_resp) => {}
+    }
+
+    // Admission is not trusted merely because /join said success: resolve the
+    // pinned key back from the Hub and compare it to the persisted unattended
+    // key before binding any routing interface.
+    let pinned = rt
+        .block_on(client.resolve_member_pubkey(
+            &rest,
+            membership.hub_lct_id,
+            membership.hub_member_lct,
+        ))
+        .context("resolving admitted router member pin")?;
+    anyhow::ensure!(
+        pinned.to_hex() == keypair.verifying_key().to_hex(),
+        "admitted router member {} is pinned to a different key",
+        membership.hub_member_lct
+    );
+
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+
+    let existing_interface = table
+        .router_ingress
+        .iter()
+        .find(|b| {
+            b.router_lct == membership.router_lct
+                && b.hub_lct_id == membership.hub_lct_id
+                && b.hub_member_lct == membership.hub_member_lct
+        })
+        .map(|b| b.binding_id);
+
+    let interface_binding_id = if let Some(id) = existing_interface {
+        id
+    } else {
+        let id = uuid::Uuid::new_v4();
+        table.bind_router_ingress(hestia::receiver_routing::RouterIngressBinding {
+            binding_id: id,
+            router_lct: membership.router_lct.clone(),
+            hub_url: template.url.clone(),
+            hub_lct_id: membership.hub_lct_id,
+            rest_endpoint: rest.clone(),
+            hub_member_lct: membership.hub_member_lct,
+            member_key_source: key_source,
+            reason: membership.reason.clone(),
+            set_by: "hestia-cli:receiver-router-join".into(),
+            set_at: chrono::Utc::now().timestamp().max(0) as u64,
+        })?;
+        table.save(&mut vault)?;
+        id
+    };
+
+    {
+        let stored = memberships
+            .find_mut(membership.hub_lct_id, &membership.router_lct)
+            .ok_or_else(|| anyhow::anyhow!("persisted router membership disappeared"))?;
+        stored.admitted_at.get_or_insert_with(|| {
+            chrono::Utc::now().timestamp().max(0) as u64
+        });
+        stored.interface_binding_id = Some(interface_binding_id);
+    }
+    memberships.save(&mut vault)?;
+
+    println!("Dedicated router membership admitted and bound:");
+    println!("  router LCT:   {}", membership.router_lct);
+    println!("  Hub:          {} ({})", membership.hub_lct_id, template.url);
+    println!("  Hub member:   {}", membership.hub_member_lct);
+    println!("  interface:    {interface_binding_id}");
+    println!("  key handle:   {}", membership.channel_key_path);
+    println!("  primary Hub connection: unchanged");
+    println!();
+    println!("REQUIRED operator step (one-way, run on the Hub operator plane):");
+    println!(
+        "  POST /admin/api/members/{}/mailbox-receipts  {{\"reason\":\"F3 dedicated router interface for {}\"}}",
+        membership.hub_member_lct,
+        membership.router_lct
+    );
+    println!("Do NOT substitute the legacy seat/machine member UUID here.");
+    println!("After enrollment, hestia hub receiver-drain is the receipt-mode proof.");
     Ok(())
 }
 
