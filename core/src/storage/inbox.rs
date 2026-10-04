@@ -1041,6 +1041,43 @@ impl SqliteInboxStore {
             .ok_or_else(|| anyhow::anyhow!("refused member-send operation disappeared after insert"))
     }
 
+
+    pub fn set_member_send_shadow_record(
+        &self,
+        sender_plugin: &str,
+        operation_id: &str,
+        shadow_record_json: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let prior: Option<Option<String>> = conn
+            .query_row(
+                "SELECT shadow_record_json FROM member_send_ops
+                  WHERE sender_plugin = ?1 AND operation_id = ?2",
+                params![sender_plugin, operation_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(prior) = prior else {
+            anyhow::bail!("member-send operation '{operation_id}' for '{sender_plugin}' is absent");
+        };
+        if let Some(prior) = prior {
+            anyhow::ensure!(
+                prior == shadow_record_json,
+                "member-send operation '{operation_id}' is bound to different shadow evidence"
+            );
+            return Ok(());
+        }
+        let n = conn.execute(
+            "UPDATE member_send_ops SET shadow_record_json = ?3
+              WHERE sender_plugin = ?1 AND operation_id = ?2
+                AND shadow_record_json IS NULL",
+            params![sender_plugin, operation_id, shadow_record_json],
+        )?;
+        anyhow::ensure!(n == 1, "member-send shadow record changed concurrently");
+        Ok(())
+    }
+
     pub fn set_member_send_shadow_witness(
         &self,
         sender_plugin: &str,
