@@ -5099,7 +5099,12 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     // A binding to an id that is no longer on record is ACCEPTED, not rejected:
     // notices age out on the TTL, so "not found" means unverifiable, not forged
     // — and `binding_verified` in the witnessed event says which one it was.
-    let mut binding_verified = false;
+    let mut binding_verified = recovered_operation_witness
+        .as_ref()
+        .and_then(|entry| entry.event_data.get("binding_verified"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if recovered_operation_witness.is_none() {
     if let Some(rid) = in_reply_to {
         match s
             .inbox_store
@@ -5154,6 +5159,7 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             }
         }
     }
+    }
     // TRANSPORT BINDING (#1030), resolved for routed sends only, and BEFORE the limiter
     // records or anything is witnessed as sent. A member bound `direct_required` must sign
     // its mesh acts as itself and holds no carrier yet, so there is no identity this host may
@@ -5161,7 +5167,10 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     // acted on, instead of being queued for a drain that would sign it with somebody else's
     // key. That silent fallback is the defect this binding exists to end (falsifier 2).
     let routed = to_plugin.contains('/');
-    let transport_binding = if routed {
+    let recovered_transport_record = recovered_operation_witness
+        .as_ref()
+        .and_then(|entry| entry.event_data.get("transport").cloned());
+    let transport_binding = if routed && recovered_operation_witness.is_none() {
         s.transport_bindings
             .get(&sender.plugin_id, crate::server::transport_binding::ANY_HUB)
             .cloned()
@@ -5177,7 +5186,12 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     // Shadow evaluation must never change legacy delivery. A missing/corrupt
     // routing document, missing alias, or unresolved canonical origin is captured
     // as evidence and the historical path continues unchanged.
-    let f3_route_shadow: Option<Value> = routed.then(|| {
+    let f3_route_shadow: Option<Value> = if let Some(existing) =
+        &recovered_operation_witness
+    {
+        existing.event_data.get("f3_shadow").cloned()
+    } else {
+        routed.then(|| {
         let resolved_origin = s.member_registry.resolve_reference(&sender.plugin_id);
         let (origin_lct, router_lct, identity_error) = match resolved_origin {
             Ok(Some(member)) => {
@@ -5297,7 +5311,8 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
                 "error": format!("routing table unavailable: {e}"),
             }),
         }
-    });
+        })
+    };
 
     if let Some(b) = transport_binding
         .as_ref()
@@ -5340,13 +5355,19 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     }
     // What the act's record and receipt say about how it will travel: the stamp when bound,
     // the literal "unbound" when routed without a binding, absent when local.
-    let transport_record: Option<Value> = routed.then(|| {
-        transport_binding
-            .as_ref()
-            .map(|b| b.stamp())
-            .unwrap_or_else(|| json!("unbound"))
-    });
-    s.member_notify_limiter.record(&sender.plugin_id);
+    let transport_record: Option<Value> = if recovered_operation_witness.is_some() {
+        recovered_transport_record
+    } else {
+        routed.then(|| {
+            transport_binding
+                .as_ref()
+                .map(|b| b.stamp())
+                .unwrap_or_else(|| json!("unbound"))
+        })
+    };
+    if recovered_operation_witness.is_none() {
+        s.member_notify_limiter.record(&sender.plugin_id);
+    }
     // What is known about the recipient's reachability, resolved BEFORE the
     // witness so the chain entry carries it (an act's record must include the
     // evidence relied upon — CLAUDE.md clause A). Same shape as
@@ -5355,7 +5376,26 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     // relocate the failure rather than remove it (a member setting up a new
     // watcher would be silenced by the bookkeeping, which is the
     // `unbound_notice` argument verbatim).
-    let (liveness, liveness_evidence) = recipient_liveness(&s.inbox_store, &to_plugin);
+    let (liveness, liveness_evidence) = if let Some(existing) =
+        &recovered_operation_witness
+    {
+        (
+            existing
+                .event_data
+                .get("recipient_liveness")
+                .and_then(Value::as_str)
+                .unwrap_or("unavailable")
+                .to_string(),
+            existing
+                .event_data
+                .get("recipient_liveness_evidence")
+                .cloned()
+                .unwrap_or(Value::Null),
+        )
+    } else {
+        let (state, evidence) = recipient_liveness(&s.inbox_store, &to_plugin);
+        (state.to_string(), evidence)
+    };
     // Witness FIRST (the act is the send; delivery is a consequence), then queue
     // with the chain hash so every parked notice is anchored to its witnessed act.
     let mut notice_record = json!({
