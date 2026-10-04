@@ -251,6 +251,35 @@ fn valid_content_hash(value: &str) -> bool {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyDeliveryAuthority {
+    /// Historical peer/member queue + member-mesh drain remains authoritative.
+    #[default]
+    Legacy,
+    /// Exact alias translates into canonical F3 origination.
+    ///
+    /// This is per-alias and opt-in: adding an alias never cuts traffic over.
+    F3,
+}
+
+impl LegacyDeliveryAuthority {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "legacy" => Some(Self::Legacy),
+            "f3" => Some(Self::F3),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::F3 => "f3",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LegacyRouteAlias {
     /// Exact legacy compatibility spelling, e.g. `thor/claude-code`.
@@ -258,6 +287,21 @@ pub struct LegacyRouteAlias {
     pub legacy_address: String,
     /// Canonical END MEMBER identity. Never the peer-machine/router LCT.
     pub destination_lct: String,
+    /// Which delivery plane owns this exact compatibility edge.
+    ///
+    /// Serde-default LEGACY is load-bearing: old routing documents and newly
+    /// added aliases stay observational until the operator explicitly cuts
+    /// this one edge over after measured D2 evidence.
+    #[serde(default)]
+    pub delivery_authority: LegacyDeliveryAuthority,
+    /// Why this edge changed delivery authority. None means the serde-default
+    /// legacy posture has never been deliberately cut over.
+    #[serde(default)]
+    pub authority_reason: Option<String>,
+    #[serde(default)]
+    pub authority_set_by: String,
+    #[serde(default)]
+    pub authority_set_at: u64,
     pub reason: String,
     #[serde(default)]
     pub set_by: String,
@@ -488,14 +532,46 @@ impl ReceiverRoutingTable {
         Ok(())
     }
 
-    pub fn unbind_legacy_alias(&mut self, legacy_address: &str) -> bool {
+    pub fn unbind_legacy_alias(&mut self, legacy_address: &str) -> Result<bool> {
+        if let Some(alias) = self.legacy_alias(legacy_address) {
+            anyhow::ensure!(
+                alias.delivery_authority == LegacyDeliveryAuthority::Legacy,
+                "refusing to remove F3-authoritative alias '{legacy_address}':                  explicitly roll its authority back to legacy first"
+            );
+        }
         let before = self.legacy_aliases.len();
         self.legacy_aliases.retain(|a| a.legacy_address != legacy_address);
-        before != self.legacy_aliases.len()
+        Ok(before != self.legacy_aliases.len())
     }
 
     pub fn legacy_alias(&self, legacy_address: &str) -> Option<&LegacyRouteAlias> {
         self.legacy_aliases.iter().find(|a| a.legacy_address == legacy_address)
+    }
+
+    pub fn set_legacy_authority(
+        &mut self,
+        legacy_address: &str,
+        authority: LegacyDeliveryAuthority,
+        reason: &str,
+        set_by: &str,
+        set_at: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !reason.trim().is_empty(),
+            "changing legacy delivery authority requires a named migration reason"
+        );
+        let alias = self
+            .legacy_aliases
+            .iter_mut()
+            .find(|a| a.legacy_address == legacy_address)
+            .ok_or_else(|| anyhow::anyhow!(
+                "legacy route alias '{legacy_address}' does not exist"
+            ))?;
+        alias.delivery_authority = authority;
+        alias.authority_reason = Some(reason.trim().to_string());
+        alias.authority_set_by = set_by.to_string();
+        alias.authority_set_at = set_at;
+        Ok(())
     }
 
     pub fn shadow_legacy_route(
@@ -718,6 +794,10 @@ mod tests {
         t.bind_legacy_alias(LegacyRouteAlias {
             legacy_address: "thor/claude-code".into(),
             destination_lct: destination.clone(),
+            delivery_authority: LegacyDeliveryAuthority::Legacy,
+            authority_reason: None,
+            authority_set_by: String::new(),
+            authority_set_at: 0,
             reason: "explicit compatibility mapping".into(),
             set_by: "test".into(),
             set_at: 1,
@@ -759,6 +839,10 @@ mod tests {
         let mk = |addr: &str, dest: &str| LegacyRouteAlias {
             legacy_address: addr.into(),
             destination_lct: dest.into(),
+            delivery_authority: LegacyDeliveryAuthority::Legacy,
+            authority_reason: None,
+            authority_set_by: String::new(),
+            authority_set_at: 0,
             reason: "test".into(),
             set_by: "test".into(),
             set_at: 1,
@@ -772,6 +856,60 @@ mod tests {
         assert!(t.bind_legacy_alias(mk(
             "thor/claude-code", "lct:web4:member:legacy"
         )).unwrap_err().to_string().contains("canonical"));
+    }
+
+    #[test]
+    fn legacy_alias_authority_is_explicit_reasoned_and_per_edge() {
+        let mut t = ReceiverRoutingTable::default();
+        t.bind_legacy_alias(LegacyRouteAlias {
+            legacy_address: "thor/claude-code".into(),
+            destination_lct: "lct:web4:mb32:remote-child".into(),
+            delivery_authority: LegacyDeliveryAuthority::Legacy,
+            authority_reason: None,
+            authority_set_by: String::new(),
+            authority_set_at: 0,
+            reason: "identity compatibility mapping".into(),
+            set_by: "test".into(),
+            set_at: 1,
+        }).unwrap();
+
+        assert_eq!(
+            t.legacy_alias("thor/claude-code").unwrap().delivery_authority,
+            LegacyDeliveryAuthority::Legacy,
+            "an alias does not imply cutover"
+        );
+        assert!(t.set_legacy_authority(
+            "thor/claude-code",
+            LegacyDeliveryAuthority::F3,
+            "",
+            "operator",
+            2,
+        ).is_err(), "cutover without a named migration reason must fail");
+
+        t.set_legacy_authority(
+            "thor/claude-code",
+            LegacyDeliveryAuthority::F3,
+            "D2 measured; F3 durable-next-hop acceptance intentionally strengthens legacy Hub acceptance",
+            "operator",
+            3,
+        ).unwrap();
+
+        let alias = t.legacy_alias("thor/claude-code").unwrap();
+        assert_eq!(alias.delivery_authority, LegacyDeliveryAuthority::F3);
+        assert!(alias.authority_reason.as_deref().unwrap().contains("strengthens"));
+        assert_eq!(alias.authority_set_by, "operator");
+        assert_eq!(alias.authority_set_at, 3);
+
+        let err = t.unbind_legacy_alias("thor/claude-code").unwrap_err();
+        assert!(err.to_string().contains("roll"), "{err}");
+        t.set_legacy_authority(
+            "thor/claude-code",
+            LegacyDeliveryAuthority::Legacy,
+            "explicit rollback after operator review",
+            "operator",
+            4,
+        ).unwrap();
+        assert!(t.unbind_legacy_alias("thor/claude-code").unwrap());
     }
 
     #[test]
