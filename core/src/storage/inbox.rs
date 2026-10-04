@@ -2168,7 +2168,6 @@ impl SqliteInboxStore {
                 packet_id          TEXT NOT NULL,
                 notice_json        TEXT NOT NULL,
                 stage_witness_hash TEXT,
-                refusal_witness_hash TEXT,
                 hub_acked_at       TEXT,
                 queued_at          TEXT NOT NULL,
                 PRIMARY KEY (ingress_binding_id, hub_notice_id),
@@ -2177,27 +2176,21 @@ impl SqliteInboxStore {
              CREATE INDEX IF NOT EXISTS idx_router_receipts_packet
                  ON router_ingress_receipts(packet_id);
              CREATE INDEX IF NOT EXISTS idx_router_receipts_pending
-                 ON router_ingress_receipts(ingress_binding_id, hub_acked_at);",
+                 ON router_ingress_receipts(ingress_binding_id, hub_acked_at);
+             CREATE TABLE IF NOT EXISTS router_ingress_rejections (
+                ingress_binding_id  TEXT NOT NULL,
+                hub_notice_id       TEXT NOT NULL,
+                notice_json         TEXT NOT NULL,
+                claimed_packet_id   TEXT,
+                refusal_witness_hash TEXT NOT NULL,
+                hub_acked_at        TEXT,
+                queued_at           TEXT NOT NULL,
+                PRIMARY KEY (ingress_binding_id, hub_notice_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_router_rejections_pending
+                 ON router_ingress_rejections(ingress_binding_id, hub_acked_at);",
         )
         .context("initializing router transit custody schema")?;
-        let has_refusal_witness = {
-            let mut stmt = conn.prepare("PRAGMA table_info(router_ingress_receipts)")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            let mut found = false;
-            for row in rows {
-                if row? == "refusal_witness_hash" {
-                    found = true;
-                    break;
-                }
-            }
-            found
-        };
-        if !has_refusal_witness {
-            conn.execute_batch(
-                "ALTER TABLE router_ingress_receipts ADD COLUMN refusal_witness_hash TEXT;",
-            )
-            .context("adding router ingress refusal-witness column")?;
-        }
         let has_local_child = {
             let mut stmt = conn.prepare("PRAGMA table_info(router_packets)")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -2498,49 +2491,53 @@ impl SqliteInboxStore {
         Ok(())
     }
 
-    /// Settle one ingress receipt as refused without completing the packet
-    /// globally. This matters when an unconfigured Hub sender copied a valid
-    /// packet: that receipt can be dropped after a witnessed refusal while a
-    /// later receipt from the configured neighbor may still process the packet.
-    pub fn record_router_ingress_refusal(
+    /// Persist an ingress rejection independently of router_packets. This is
+    /// the anti-poisoning boundary: an unconfigured Hub citizen must not be
+    /// able to claim a packet_id in the router's global idempotency namespace.
+    pub fn record_router_ingress_rejection(
         &self,
         ingress_binding_id: Uuid,
         hub_notice_id: &str,
+        notice_json: &str,
+        claimed_packet_id: Option<Uuid>,
         witness_hash: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_router_packet_schema(&conn)?;
-        let row: Option<Option<String>> = conn.query_row(
-            "SELECT refusal_witness_hash FROM router_ingress_receipts
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO router_ingress_rejections
+                (ingress_binding_id, hub_notice_id, notice_json, claimed_packet_id,
+                 refusal_witness_hash, queued_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                ingress_binding_id.to_string(),
+                hub_notice_id,
+                notice_json,
+                claimed_packet_id.map(|v| v.to_string()),
+                witness_hash,
+                now,
+            ],
+        )?;
+        let row: (String, Option<String>, String) = conn.query_row(
+            "SELECT notice_json, claimed_packet_id, refusal_witness_hash
+               FROM router_ingress_rejections
               WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2",
             params![ingress_binding_id.to_string(), hub_notice_id],
-            |r| r.get(0),
-        ).optional()?;
-        let Some(prior) = row else {
-            anyhow::bail!("router ingress receipt {hub_notice_id} was not staged");
-        };
-        if let Some(prior) = prior {
-            anyhow::ensure!(
-                prior == witness_hash,
-                "router ingress receipt {hub_notice_id} is bound to a different refusal witness"
-            );
-            return Ok(());
-        }
-        let n = conn.execute(
-            "UPDATE router_ingress_receipts
-                SET refusal_witness_hash = ?3
-              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2
-                AND refusal_witness_hash IS NULL",
-            params![ingress_binding_id.to_string(), hub_notice_id, witness_hash],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        anyhow::ensure!(n == 1, "router ingress refusal state changed concurrently");
+        anyhow::ensure!(
+            row.0 == notice_json
+                && row.1 == claimed_packet_id.map(|v| v.to_string())
+                && row.2 == witness_hash,
+            "router ingress rejection {hub_notice_id} was replayed with different immutable content"
+        );
         Ok(())
     }
 
-    /// An ingress receipt is ACK-eligible after either:
-    /// - this receipt was explicitly refused and that refusal was witnessed; or
-    /// - it was accepted for transit and the shared packet reached a witnessed
-    ///   custody completion.
+    /// Normal transit receipts are ACK-eligible only after local stage evidence
+    /// and one witnessed packet completion. Rejections live in a separate table
+    /// and therefore cannot create or complete a router_packets row.
     pub fn pending_router_ingress_acks(
         &self,
         ingress_binding_id: Uuid,
@@ -2554,10 +2551,7 @@ impl SqliteInboxStore {
               WHERE r.ingress_binding_id = ?1
                 AND r.hub_acked_at IS NULL
                 AND r.stage_witness_hash IS NOT NULL
-                AND (
-                    r.refusal_witness_hash IS NOT NULL
-                    OR p.completion_witness_hash IS NOT NULL
-                )
+                AND p.completion_witness_hash IS NOT NULL
               ORDER BY r.queued_at ASC",
         )?;
         let rows = stmt.query_map(params![ingress_binding_id.to_string()], |r| r.get(0))?;
@@ -2579,17 +2573,65 @@ impl SqliteInboxStore {
                JOIN router_packets p ON p.packet_id = r.packet_id
               WHERE r.ingress_binding_id = ?1 AND r.hub_notice_id = ?2
                 AND r.stage_witness_hash IS NOT NULL
-                AND (
-                    r.refusal_witness_hash IS NOT NULL
-                    OR p.completion_witness_hash IS NOT NULL
-                )",
+                AND p.completion_witness_hash IS NOT NULL",
             params![ingress_binding_id.to_string(), hub_notice_id],
             |r| r.get(0),
         )?;
-        anyhow::ensure!(eligible == 1,
-            "cannot ACK router ingress {hub_notice_id} before witnessed completion/refusal");
+        anyhow::ensure!(
+            eligible == 1,
+            "cannot ACK router ingress {hub_notice_id} before witnessed completion"
+        );
         conn.execute(
             "UPDATE router_ingress_receipts SET hub_acked_at = COALESCE(hub_acked_at, ?3)
+              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2",
+            params![
+                ingress_binding_id.to_string(), hub_notice_id, Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_router_rejection_acks(
+        &self,
+        ingress_binding_id: Uuid,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT hub_notice_id
+               FROM router_ingress_rejections
+              WHERE ingress_binding_id = ?1
+                AND hub_acked_at IS NULL
+                AND refusal_witness_hash IS NOT NULL
+              ORDER BY queued_at ASC",
+        )?;
+        let rows = stmt.query_map(params![ingress_binding_id.to_string()], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
+    pub fn mark_router_rejection_acked(
+        &self,
+        ingress_binding_id: Uuid,
+        hub_notice_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        let eligible: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM router_ingress_rejections
+              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2
+                AND refusal_witness_hash IS NOT NULL",
+            params![ingress_binding_id.to_string(), hub_notice_id],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(
+            eligible == 1,
+            "cannot ACK router ingress rejection {hub_notice_id} before witnessed refusal"
+        );
+        conn.execute(
+            "UPDATE router_ingress_rejections
+                SET hub_acked_at = COALESCE(hub_acked_at, ?3)
               WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2",
             params![
                 ingress_binding_id.to_string(), hub_notice_id, Utc::now().to_rfc3339()
@@ -2648,14 +2690,21 @@ impl SqliteInboxStore {
     pub fn router_ingress_inflight_count(&self, ingress_binding_id: Uuid) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_router_packet_schema(&conn)?;
-        let n: i64 = conn.query_row(
+        let accepted: i64 = conn.query_row(
             "SELECT COUNT(*)
                FROM router_ingress_receipts
               WHERE ingress_binding_id = ?1 AND hub_acked_at IS NULL",
             params![ingress_binding_id.to_string()],
             |r| r.get(0),
         )?;
-        Ok(n as u64)
+        let rejected: i64 = conn.query_row(
+            "SELECT COUNT(*)
+               FROM router_ingress_rejections
+              WHERE ingress_binding_id = ?1 AND hub_acked_at IS NULL",
+            params![ingress_binding_id.to_string()],
+            |r| r.get(0),
+        )?;
+        Ok((accepted + rejected) as u64)
     }
 }
 
