@@ -39,15 +39,28 @@ fn receipt_retry_reuses_witness_and_member_enqueue() {
     assert!(inserted);
 
     // Retry returns the exact same witness row, not a second chain event.
+    let event = serde_json::json!({
+        "notice_id": id,
+        "destination_lct": "lct:web4:mb32:child"
+    });
     let (retry, inserted) = chain.append_once(
         &format!("hub-receive:{hub}:{hub_member}:{id}"),
         "hub.notice.received",
-        serde_json::json!({"this body is ignored on idempotent replay": true}),
+        event.clone(),
         "lct:web4:mb32:router",
     ).unwrap();
     assert!(!inserted);
     assert_eq!(retry.hash, first.hash);
     assert_eq!(retry.chain_position, first.chain_position);
+
+    // Idempotency is not permission to change history under the same key.
+    let err = chain.append_once(
+        &format!("hub-receive:{hub}:{hub_member}:{id}"),
+        "hub.notice.received",
+        serde_json::json!({"notice_id": id, "destination_lct": "lct:web4:mb32:someone-else"}),
+        "lct:web4:mb32:router",
+    ).unwrap_err();
+    assert!(format!("{err:#}").contains("different fact"));
 
     let local = inbox.accept_hub_receipt(connection, &id, &first.hash).unwrap();
 
