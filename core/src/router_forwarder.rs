@@ -782,6 +782,10 @@ pub async fn originate_once(
         "route origin operation_id must be 1..128 bytes with no control characters"
     );
     anyhow::ensure!(
+        destination_lct.starts_with("lct:web4:mb32:"),
+        "route destination must be a canonical lct:web4:mb32:* identity"
+    );
+    anyhow::ensure!(
         routable_member_notice_kind(original_kind),
         "route origin kind '{original_kind}' is not a Hestia member-notice kind"
     );
@@ -1496,6 +1500,34 @@ mod tests {
                 kind, source, delivery_packet_json: Some(_), ..
             } if kind == "unreachable" && source == "unreachable-bounce-local"
         ));
+    }
+
+    #[tokio::test]
+    async fn route_origin_refuses_legacy_destination_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let router = "lct:web4:mb32:router";
+        let mut registry = load_members(&vault);
+        let origin = crate::member_registry::ensure_member(
+            &mut vault, &mut registry, "origin-being", false, router, "anchor",
+        ).unwrap();
+        ReceiverRoutingTable::default().save(&mut vault).unwrap();
+        let inbox = SqliteInboxStore::open(dir.path().join("inbox.db"), [0x53; 32]).unwrap();
+        let chain = SqliteChainStore::open(dir.path().join("witness.db"), [0x53; 32]).unwrap();
+
+        let err = originate_once(
+            &vault,
+            router,
+            &origin,
+            "lct:web4:member:legacy-name",
+            "coordination",
+            "shared-context/forum/origin-test.md",
+            &format!("sha256-pointer:{}", "a".repeat(64)),
+            "legacy-destination",
+            &inbox,
+            &chain,
+        ).await.unwrap_err();
+        assert!(format!("{err:#}").contains("canonical lct:web4:mb32"), "{err:#}");
     }
 
     #[tokio::test]
