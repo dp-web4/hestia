@@ -294,6 +294,14 @@ pub struct LegacyRouteAlias {
     /// this one edge over after measured D2 evidence.
     #[serde(default)]
     pub delivery_authority: LegacyDeliveryAuthority,
+    /// Why this edge changed delivery authority. None means the serde-default
+    /// legacy posture has never been deliberately cut over.
+    #[serde(default)]
+    pub authority_reason: Option<String>,
+    #[serde(default)]
+    pub authority_set_by: String,
+    #[serde(default)]
+    pub authority_set_at: u64,
     pub reason: String,
     #[serde(default)]
     pub set_by: String,
@@ -538,7 +546,14 @@ impl ReceiverRoutingTable {
         &mut self,
         legacy_address: &str,
         authority: LegacyDeliveryAuthority,
+        reason: &str,
+        set_by: &str,
+        set_at: u64,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !reason.trim().is_empty(),
+            "changing legacy delivery authority requires a named migration reason"
+        );
         let alias = self
             .legacy_aliases
             .iter_mut()
@@ -547,6 +562,9 @@ impl ReceiverRoutingTable {
                 "legacy route alias '{legacy_address}' does not exist"
             ))?;
         alias.delivery_authority = authority;
+        alias.authority_reason = Some(reason.trim().to_string());
+        alias.authority_set_by = set_by.to_string();
+        alias.authority_set_at = set_at;
         Ok(())
     }
 
