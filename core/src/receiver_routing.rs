@@ -137,6 +137,12 @@ impl RoutePacketV1 {
             "route visited_routers exceeds 64 entries");
         anyhow::ensure!(self.visited_routers.iter().all(|r| !r.is_empty() && r.len() <= 256),
             "route visited_routers entries must be 1..256 bytes");
+        let unique: std::collections::BTreeSet<&str> =
+            self.visited_routers.iter().map(String::as_str).collect();
+        anyhow::ensure!(
+            unique.len() == self.visited_routers.len(),
+            "route visited_routers contains a duplicate router"
+        );
         if let Some(failure) = &self.failure {
             anyhow::ensure!(self.original_kind == "unreachable",
                 "route failure is only valid on original_kind=unreachable");
@@ -352,6 +358,15 @@ impl ReceiverRoutingTable {
             "router neighbor link id {} is already in use",
             neighbor.link_id
         );
+        anyhow::ensure!(
+            !self.neighbors.iter().any(|n| {
+                n.interface_binding_id == neighbor.interface_binding_id
+                    && n.next_hop_hub_member_lct == neighbor.next_hop_hub_member_lct
+            }),
+            "Hub member {} on interface {} is already bound to another canonical neighbor",
+            neighbor.next_hop_hub_member_lct,
+            neighbor.interface_binding_id
+        );
         self.neighbors.push(neighbor);
         self.neighbors.sort_by(|a, b| a.next_hop_lct.cmp(&b.next_hop_lct));
         Ok(())
@@ -363,6 +378,26 @@ impl ReceiverRoutingTable {
 
     pub fn neighbor_by_link(&self, link_id: Uuid) -> Option<&RouterNeighbor> {
         self.neighbors.iter().find(|n| n.link_id == link_id)
+    }
+
+    pub fn ingress_neighbor(
+        &self,
+        interface_binding_id: Uuid,
+        hub_member_lct: Uuid,
+    ) -> Result<Option<&RouterNeighbor>> {
+        let matches: Vec<&RouterNeighbor> = self
+            .neighbors
+            .iter()
+            .filter(|n| {
+                n.interface_binding_id == interface_binding_id
+                    && n.next_hop_hub_member_lct == hub_member_lct
+            })
+            .collect();
+        anyhow::ensure!(
+            matches.len() <= 1,
+            "Hub member {hub_member_lct} on interface {interface_binding_id} maps to more than one canonical neighbor"
+        );
+        Ok(matches.into_iter().next())
     }
 
     pub fn router_ingress_by_id(&self, binding_id: Uuid) -> Option<&RouterIngressBinding> {
