@@ -52,6 +52,11 @@ pub struct RouteOriginReport {
     pub packet_id: Uuid,
     pub replayed: bool,
     pub completed: bool,
+    /// Semantic outcome, deliberately stronger than the internal completion
+    /// watermark. "delivered-local" alone is ambiguous because it can describe
+    /// either DATA delivered to its destination or an UNREACHABLE bounce
+    /// delivered back to the origin.
+    pub outcome: String,
     pub completion_kind: Option<String>,
     pub completion_witness_hash: Option<String>,
     pub decision_json: Option<String>,
@@ -65,6 +70,10 @@ struct RouteOriginBinding<'a> {
     original_kind: &'a str,
     pointer_uri: &'a str,
     content_hash: &'a str,
+    /// D2 compatibility constraint. Omitted for native F3 callers so the
+    /// serialized binding remains byte-compatible with pre-D2 D1 operations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_first_hop_hub_member: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -777,6 +786,40 @@ pub async fn originate_once(
     inbox: &SqliteInboxStore,
     chain: &SqliteChainStore,
 ) -> Result<RouteOriginReport> {
+    originate_once_constrained(
+        vault,
+        router_lct,
+        origin_lct,
+        destination_lct,
+        original_kind,
+        pointer_uri,
+        content_hash,
+        operation_id,
+        inbox,
+        chain,
+        None,
+    )
+    .await
+}
+
+/// D2 compatibility entrypoint. When an old transport binding promised a
+/// particular Hub carrier, the actual persisted first-hop route must use that
+/// same Hub member. The constraint is part of the operation binding, so retry
+/// cannot silently weaken/change it.
+#[allow(clippy::too_many_arguments)]
+pub async fn originate_once_constrained(
+    vault: &Vault,
+    router_lct: &str,
+    origin_lct: &str,
+    destination_lct: &str,
+    original_kind: &str,
+    pointer_uri: &str,
+    content_hash: &str,
+    operation_id: &str,
+    inbox: &SqliteInboxStore,
+    chain: &SqliteChainStore,
+    expected_first_hop_hub_member: Option<&str>,
+) -> Result<RouteOriginReport> {
     anyhow::ensure!(
         valid_origin_operation_id(operation_id),
         "route origin operation_id must be 1..128 bytes with no control characters"
@@ -822,6 +865,7 @@ pub async fn originate_once(
         original_kind,
         pointer_uri,
         content_hash,
+        expected_first_hop_hub_member,
     })?;
 
     let candidate = RoutePacketV1 {
@@ -885,6 +929,29 @@ pub async fn originate_once(
 
     if state.decision_json.is_none() {
         let (action, outbound) = plan_action(&packet, &registry, &routes, router_lct)?;
+
+        if let (
+            Some(expected),
+            PersistedAction::Forward { next_hop_lct, link_id, .. },
+        ) = (expected_first_hop_hub_member, &action)
+        {
+            let neighbor = routes.neighbor_by_link(*link_id).ok_or_else(|| anyhow::anyhow!(
+                "F3 route selects next hop {next_hop_lct} on missing neighbor link {link_id}"
+            ))?;
+            let interface = routes
+                .router_ingress_by_id(neighbor.interface_binding_id)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "F3 neighbor {next_hop_lct} references missing interface {}",
+                    neighbor.interface_binding_id
+                ))?;
+            anyhow::ensure!(
+                interface.hub_member_lct.to_string() == expected,
+                "F3 first-hop carrier {} does not match transport-bound carrier {}",
+                interface.hub_member_lct,
+                expected
+            );
+        }
+
         let decision_json = serde_json::to_string(&action)?;
         match &action {
             PersistedAction::Forward {
@@ -945,11 +1012,35 @@ pub async fn originate_once(
             ))?;
     }
 
+    let outcome = match state
+        .decision_json
+        .as_deref()
+        .and_then(|v| serde_json::from_str::<PersistedAction>(v).ok())
+    {
+        Some(PersistedAction::Local { kind, source, .. })
+            if kind == "unreachable" || source == "unreachable-bounce-local" =>
+        {
+            "unreachable_bounced"
+        }
+        Some(PersistedAction::Local { .. }) => "destination_local",
+        Some(PersistedAction::Forward { packet_kind, .. })
+            if packet_kind == "unreachable-bounce" =>
+        {
+            "unreachable_bounced"
+        }
+        Some(PersistedAction::Forward { .. }) => "next_hop_durable",
+        Some(PersistedAction::Terminal { .. }) => "unreachable_terminal",
+        None if state.completion_witness_hash.is_none() => "incomplete",
+        None => "completed_unknown",
+    }
+    .to_string();
+
     Ok(RouteOriginReport {
         operation_id: operation_id.to_string(),
         packet_id: packet.packet_id,
         replayed: !inserted,
         completed: state.completion_witness_hash.is_some(),
+        outcome,
         completion_kind: state.completion_kind,
         completion_witness_hash: state.completion_witness_hash,
         decision_json: state.decision_json,
@@ -1574,6 +1665,7 @@ mod tests {
         ).await.unwrap();
         assert!(!first.replayed);
         assert!(first.completed);
+        assert_eq!(first.outcome, "destination_local");
         assert_eq!(first.completion_kind.as_deref(), Some("delivered-local"));
 
         let again = originate_once(
@@ -1615,6 +1707,91 @@ mod tests {
         assert!(
             format!("{err:#}").contains("different send intent"),
             "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn constrained_origin_refuses_wrong_actual_first_hop_carrier_before_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let router = "lct:web4:mb32:router";
+        let mut registry = load_members(&vault);
+        let origin = crate::member_registry::ensure_member(
+            &mut vault,
+            &mut registry,
+            "origin-being",
+            false,
+            router,
+            "anchor",
+        ).unwrap();
+
+        let destination = "lct:web4:mb32:remote-child";
+        let next_hop = "lct:web4:mb32:remote-router";
+        let interface_id = Uuid::new_v4();
+        let actual_carrier = Uuid::new_v4();
+        let mut routes = ReceiverRoutingTable::default();
+        routes.bind_router_ingress(crate::receiver_routing::RouterIngressBinding {
+            binding_id: interface_id,
+            router_lct: router.to_string(),
+            hub_url: "https://hub.invalid".to_string(),
+            hub_lct_id: Uuid::new_v4(),
+            rest_endpoint: "https://hub.invalid/v1".to_string(),
+            hub_member_lct: actual_carrier,
+            member_key_source: crate::hub::MemberKeySource::ChannelKeyFile {
+                path: "/tmp/not-used-before-carrier-check".to_string(),
+            },
+            reason: "test interface".to_string(),
+            set_by: "test".to_string(),
+            set_at: 1,
+        }).unwrap();
+        routes.bind_neighbor(crate::receiver_routing::RouterNeighbor {
+            link_id: Uuid::new_v4(),
+            next_hop_lct: next_hop.to_string(),
+            interface_binding_id: interface_id,
+            next_hop_hub_member_lct: Uuid::new_v4(),
+            reason: "test neighbor".to_string(),
+            set_by: "test".to_string(),
+            set_at: 1,
+        }).unwrap();
+        routes.set_route(crate::receiver_routing::StaticRoute {
+            destination_lct: destination.to_string(),
+            next_hop_lct: next_hop.to_string(),
+            metric: 1,
+            reason: "test route".to_string(),
+        });
+        routes.save(&mut vault).unwrap();
+
+        let inbox = SqliteInboxStore::open(dir.path().join("inbox.db"), [0x63; 32]).unwrap();
+        let chain = SqliteChainStore::open(dir.path().join("witness.db"), [0x63; 32]).unwrap();
+        let expected_other_carrier = Uuid::new_v4().to_string();
+
+        let err = originate_once_constrained(
+            &vault,
+            router,
+            &origin,
+            destination,
+            "coordination",
+            "shared-context/forum/cutover-test.md",
+            &format!("sha256-pointer:{}", "c".repeat(64)),
+            "legacy-op-carrier-bound",
+            &inbox,
+            &chain,
+            Some(&expected_other_carrier),
+        ).await.unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("does not match transport-bound carrier"), "{msg}");
+        assert!(msg.contains(&actual_carrier.to_string()), "{msg}");
+        assert!(msg.contains(&expected_other_carrier), "{msg}");
+        assert_eq!(
+            inbox.router_packet_state(
+                inbox.router_origin_operation(&origin, "legacy-op-carrier-bound")
+                    .unwrap()
+                    .unwrap()
+                    .packet_id
+            ).unwrap().unwrap().decision_json,
+            None,
+            "carrier mismatch must happen before any route decision/network send is committed"
         );
     }
 
