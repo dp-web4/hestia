@@ -1814,7 +1814,19 @@ impl SqliteInboxStore {
         );
         let conn = self.conn.lock().unwrap();
         Self::ensure_hub_receipt_schema(&conn)?;
-        let now = Utc::now().to_rfc3339();
+        let now_dt = Utc::now();
+        let now = now_dt.to_rfc3339();
+        // ACKed transport-custody rows are retry metadata, not the member's
+        // retained mail. Keep them for the same seven-day horizon as the Hub
+        // ACK tombstone, then reclaim them. Pending/unacked rows never age out:
+        // their whole purpose is to remember custody until the Hub agrees.
+        let cutoff = (now_dt - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
+        conn.execute(
+            "DELETE FROM hub_receipt_custody
+              WHERE hub_acked_at IS NOT NULL AND hub_acked_at < ?1",
+            params![cutoff],
+        )
+        .context("pruning completed Hub receipt custody rows")?;
         conn.execute(
             "INSERT OR IGNORE INTO hub_receipt_custody
                 (hub_connection_id, hub_lct, hub_member_lct, child_lct, to_plugin, notice_id,
@@ -1895,6 +1907,32 @@ impl SqliteInboxStore {
         if let Some(id) = row.3 {
             return Ok(id as u64);
         }
+
+        // A Hub ACK means the packet is now safely in LOCAL custody. The ordinary
+        // member-inbox admission rule is allowed to evict that recipient's oldest
+        // pending notice at capacity; transport receipt admission is NOT. Refuse
+        // here and leave the Hub copy unacked instead of buying the new packet by
+        // silently deleting an older one.
+        //
+        // Count only rows that survive enqueue_member_on's TTL prune, plus
+        // undrained dispositions (which that prune explicitly exempts). Egress
+        // rows are a different plane and do not spend the local recipient budget.
+        let cutoff = (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
+        let pending: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM member_notices
+              WHERE to_plugin = ?1
+                AND drained_at IS NULL
+                AND dest_peer IS NULL
+                AND (queued_at >= ?2 OR kind = 'disposition')",
+            params![row.0, cutoff],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(
+            pending < MAX_INBOX_NOTICES as i64,
+            "local inbox for '{}' is full ({pending}/{MAX_INBOX_NOTICES}); Hub notice {notice_id} NOT acked",
+            row.0
+        );
+
         let local_id = Self::enqueue_member_on(
             &tx,
             &row.0,
