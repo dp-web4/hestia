@@ -2130,6 +2130,7 @@ pub struct RouterPacketState {
     pub packet_json: String,
     pub packet_hash: String,
     pub decision_json: Option<String>,
+    pub local_child_lct: Option<String>,
     pub outbound_packet_json: Option<String>,
     pub next_hop_lct: Option<String>,
     pub forward_link_id: Option<Uuid>,
@@ -2149,6 +2150,7 @@ impl SqliteInboxStore {
                 packet_json              TEXT NOT NULL,
                 packet_hash              TEXT NOT NULL,
                 decision_json            TEXT,
+                local_child_lct          TEXT,
                 outbound_packet_json     TEXT,
                 next_hop_lct             TEXT,
                 forward_link_id          TEXT,
@@ -2195,6 +2197,24 @@ impl SqliteInboxStore {
                 "ALTER TABLE router_ingress_receipts ADD COLUMN refusal_witness_hash TEXT;",
             )
             .context("adding router ingress refusal-witness column")?;
+        }
+        let has_local_child = {
+            let mut stmt = conn.prepare("PRAGMA table_info(router_packets)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for row in rows {
+                if row? == "local_child_lct" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_local_child {
+            conn.execute_batch(
+                "ALTER TABLE router_packets ADD COLUMN local_child_lct TEXT;",
+            )
+            .context("adding router packet local-child pin")?;
         }
         Ok(())
     }
@@ -2339,23 +2359,45 @@ impl SqliteInboxStore {
         &self,
         packet_id: Uuid,
         decision_json: &str,
+        local_child_lct: Option<&str>,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_router_packet_schema(&conn)?;
         let state = Self::router_packet_state_on(&conn, packet_id)?
             .ok_or_else(|| anyhow::anyhow!("route packet {packet_id} was not staged"))?;
         if let Some(existing) = state.decision_json {
-            anyhow::ensure!(existing == decision_json,
-                "route packet {packet_id} already has a different persisted decision");
+            anyhow::ensure!(
+                existing == decision_json
+                    && state.local_child_lct.as_deref() == local_child_lct,
+                "route packet {packet_id} already has a different persisted decision"
+            );
             return Ok(());
         }
         let n = conn.execute(
-            "UPDATE router_packets SET decision_json = ?2
+            "UPDATE router_packets
+                SET decision_json = ?2, local_child_lct = ?3
               WHERE packet_id = ?1 AND decision_json IS NULL",
-            params![packet_id.to_string(), decision_json],
+            params![packet_id.to_string(), decision_json, local_child_lct],
         )?;
         anyhow::ensure!(n == 1, "route packet local decision changed concurrently");
         Ok(())
+    }
+
+    /// Local child bindings are routing authority. Refuse their removal while
+    /// an incomplete transit packet has already committed a local decision to
+    /// that child; otherwise a retry could deliver under a binding the operator
+    /// believes was removed.
+    pub fn router_local_inflight_count(&self, child_lct: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM router_packets
+              WHERE local_child_lct = ?1
+                AND completion_witness_hash IS NULL",
+            params![child_lct],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
     }
 
     /// Deliver one route packet to a local child exactly once. The member row and
@@ -2567,19 +2609,20 @@ impl SqliteInboxStore {
         packet_id: Uuid,
     ) -> Result<Option<RouterPacketState>> {
         conn.query_row(
-            "SELECT packet_json, packet_hash, decision_json, outbound_packet_json,
-                    next_hop_lct, forward_link_id, forward_operation_id, local_notice_id,
-                    downstream_notice_id, downstream_entry_index,
-                    completion_witness_hash, completion_kind
+            "SELECT packet_json, packet_hash, decision_json, local_child_lct,
+                    outbound_packet_json, next_hop_lct, forward_link_id,
+                    forward_operation_id, local_notice_id, downstream_notice_id,
+                    downstream_entry_index, completion_witness_hash, completion_kind
                FROM router_packets WHERE packet_id = ?1",
             params![packet_id.to_string()],
             |r| Ok((
                 r.get::<_, String>(0)?, r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?,
                 r.get::<_, Option<String>>(4)?, r.get::<_, Option<String>>(5)?,
-                r.get::<_, Option<String>>(6)?, r.get::<_, Option<i64>>(7)?,
-                r.get::<_, Option<String>>(8)?, r.get::<_, Option<i64>>(9)?,
-                r.get::<_, Option<String>>(10)?, r.get::<_, Option<String>>(11)?,
+                r.get::<_, Option<String>>(6)?, r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<i64>>(8)?, r.get::<_, Option<String>>(9)?,
+                r.get::<_, Option<i64>>(10)?, r.get::<_, Option<String>>(11)?,
+                r.get::<_, Option<String>>(12)?,
             )),
         ).optional()?.map(|r| -> Result<RouterPacketState> {
             Ok(RouterPacketState {
@@ -2587,16 +2630,17 @@ impl SqliteInboxStore {
                 packet_json: r.0,
                 packet_hash: r.1,
                 decision_json: r.2,
-                outbound_packet_json: r.3,
-                next_hop_lct: r.4,
-                forward_link_id: r.5.map(|v| Uuid::parse_str(&v))
+                local_child_lct: r.3,
+                outbound_packet_json: r.4,
+                next_hop_lct: r.5,
+                forward_link_id: r.6.map(|v| Uuid::parse_str(&v))
                     .transpose().context("parsing router forward_link_id")?,
-                forward_operation_id: r.6,
-                local_notice_id: r.7.map(|v| v as u64),
-                downstream_notice_id: r.8,
-                downstream_entry_index: r.9.map(|v| v as u64),
-                completion_witness_hash: r.10,
-                completion_kind: r.11,
+                forward_operation_id: r.7,
+                local_notice_id: r.8.map(|v| v as u64),
+                downstream_notice_id: r.9,
+                downstream_entry_index: r.10.map(|v| v as u64),
+                completion_witness_hash: r.11,
+                completion_kind: r.12,
             })
         }).transpose()
     }
