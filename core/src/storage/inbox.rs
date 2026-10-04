@@ -2164,6 +2164,7 @@ impl SqliteInboxStore {
                 ingress_binding_id TEXT NOT NULL,
                 hub_notice_id      TEXT NOT NULL,
                 packet_id          TEXT NOT NULL,
+                notice_json        TEXT NOT NULL,
                 stage_witness_hash TEXT,
                 hub_acked_at       TEXT,
                 queued_at          TEXT NOT NULL,
@@ -2187,6 +2188,7 @@ impl SqliteInboxStore {
         ingress_binding_id: Uuid,
         hub_notice_id: &str,
         packet_id: Uuid,
+        notice_json: &str,
         packet_json: &str,
         packet_hash: &str,
     ) -> Result<RouterPacketState> {
@@ -2212,24 +2214,25 @@ impl SqliteInboxStore {
 
         tx.execute(
             "INSERT OR IGNORE INTO router_ingress_receipts
-                (ingress_binding_id, hub_notice_id, packet_id, queued_at)
-             VALUES (?1, ?2, ?3, ?4)",
+                (ingress_binding_id, hub_notice_id, packet_id, notice_json, queued_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 ingress_binding_id.to_string(),
                 hub_notice_id,
                 packet_id.to_string(),
+                notice_json,
                 now,
             ],
         )?;
-        let mapped: String = tx.query_row(
-            "SELECT packet_id FROM router_ingress_receipts
+        let mapped: (String, String) = tx.query_row(
+            "SELECT packet_id, notice_json FROM router_ingress_receipts
               WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2",
             params![ingress_binding_id.to_string(), hub_notice_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         anyhow::ensure!(
-            mapped == packet_id.to_string(),
-            "Hub receipt {hub_notice_id} was rebound to another route packet"
+            mapped.0 == packet_id.to_string() && mapped.1 == notice_json,
+            "Hub receipt {hub_notice_id} was replayed with different immutable content"
         );
         tx.commit().context("committing router packet stage")?;
         drop(conn);
