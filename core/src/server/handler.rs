@@ -5506,10 +5506,10 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
         "binding_verified": binding_verified,
         "recipient_liveness": liveness,
         "recipient_liveness_evidence": liveness_evidence,
-        "replayed": recovered_operation_witness.is_some(),
     });
     if let Some(op_id) = &operation_id {
         response_template["operation_id"] = json!(op_id);
+        response_template["replayed"] = json!(recovered_operation_witness.is_some());
     }
     if let Some(note) = liveness_note(&liveness, &to_plugin) {
         response_template["recipient_note"] = json!(note);
