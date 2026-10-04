@@ -5011,21 +5011,157 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     } else {
         None
     };
+
+    // D2 SHADOW ONLY. Everything above this point is the SAME legacy pre-route
+    // contract the eventual cutover must preserve: attributed live session, law,
+    // structural flood bound, reply ownership/disposition address, and transport
+    // binding lookup. We compare only the routing/queue decision below.
+    //
+    // Shadow evaluation must never change legacy delivery. A missing/corrupt
+    // routing document, missing alias, or unresolved canonical origin is captured
+    // as evidence and the historical path continues unchanged.
+    let f3_route_shadow: Option<Value> = routed.then(|| {
+        let resolved_origin = s.member_registry.resolve_reference(&sender.plugin_id);
+        let (origin_lct, router_lct, identity_error) = match resolved_origin {
+            Ok(Some(member)) => {
+                let origin_lct = member.lct.lct_id();
+                let parents: Vec<String> = member
+                    .lct
+                    .mrh
+                    .bound
+                    .iter()
+                    .filter(|edge| edge.edge_type == "parent")
+                    .map(|edge| edge.lct_id.clone())
+                    .collect();
+                match parents.as_slice() {
+                    [parent] => (Some(origin_lct), Some(parent.clone()), None),
+                    [] => (
+                        Some(origin_lct),
+                        None,
+                        Some("canonical sender has no parent/router binding".to_string()),
+                    ),
+                    _ => (
+                        Some(origin_lct),
+                        None,
+                        Some(format!(
+                            "canonical sender has {} parent/router bindings; expected exactly one",
+                            parents.len()
+                        )),
+                    ),
+                }
+            }
+            Ok(None) => (
+                None,
+                None,
+                Some("sender has no canonical member LCT".to_string()),
+            ),
+            Err(e) => (
+                None,
+                None,
+                Some(format!("sender canonical identity is ambiguous/invalid: {e}")),
+            ),
+        };
+
+        let Some(router_lct) = router_lct else {
+            return json!({
+                "mode": "shadow",
+                "origin_lct": origin_lct,
+                "legacy_address": to_plugin,
+                "status": "unavailable",
+                "error": identity_error.unwrap_or_else(|| "router identity unavailable".to_string()),
+            });
+        };
+
+        match crate::receiver_routing::ReceiverRoutingTable::load(&s.vault) {
+            Ok(table) => match table.shadow_legacy_route(
+                &s.member_registry,
+                &router_lct,
+                &to_plugin,
+            ) {
+                Ok(shadow) => {
+                    // Resolve the F3 L3 next-hop into the actual Hub member UUID
+                    // the router would use. This is the value D2 can compare with
+                    // legacy hub-notify's measured recipient_lct; comparing the
+                    // canonical router LCT to a Hub UUID would cross namespaces
+                    // and manufacture a mismatch.
+                    let neighbor = match &shadow {
+                        crate::receiver_routing::LegacyRouteShadow::Resolved {
+                            decision: crate::receiver_routing::RouteDecision::Forward {
+                                next_hop_lct,
+                                ..
+                            },
+                            ..
+                        } => match table.neighbor(next_hop_lct) {
+                            Some(n) => json!({
+                                "status": "resolved",
+                                "next_hop_lct": next_hop_lct,
+                                "hub_member_lct": n.next_hop_hub_member_lct,
+                                "link_id": n.link_id,
+                                "interface_binding_id": n.interface_binding_id,
+                            }),
+                            None => json!({
+                                "status": "missing_neighbor",
+                                "next_hop_lct": next_hop_lct,
+                            }),
+                        },
+                        _ => json!({"status": "not_applicable"}),
+                    };
+                    json!({
+                        "mode": "shadow",
+                        "router_lct": router_lct,
+                        "origin_lct": origin_lct,
+                        "legacy_address": to_plugin,
+                        "result": shadow,
+                        "f3_neighbor": neighbor,
+                        "shared_pre_route": {
+                            "sender_plugin_id": sender.plugin_id,
+                            "from_session_id": sender.session_uuid,
+                            "law_gate": "passed",
+                            "flood_guard": "passed",
+                            "reply_binding_verified": binding_verified,
+                        }
+                    })
+                },
+                Err(e) => json!({
+                    "mode": "shadow",
+                    "router_lct": router_lct,
+                    "origin_lct": origin_lct,
+                    "legacy_address": to_plugin,
+                    "status": "unavailable",
+                    "error": format!("route evaluation failed: {e}"),
+                }),
+            },
+            Err(e) => json!({
+                "mode": "shadow",
+                "router_lct": router_lct,
+                "origin_lct": origin_lct,
+                "legacy_address": to_plugin,
+                "status": "unavailable",
+                "error": format!("routing table unavailable: {e}"),
+            }),
+        }
+    });
+
     if let Some(b) = transport_binding
         .as_ref()
         .filter(|b| b.mode == crate::server::transport_binding::TransportMode::DirectRequired)
     {
+        let mut refusal_record = json!({
+            "reason": "transport_binding_unmet",
+            "to_plugin_id": to_plugin,
+            "from_plugin_id": sender.plugin_id,
+            "from_role_lct": sender.role_lct,
+            "kind": kind,
+            "transport": b.stamp(),
+            "binding_reason": b.reason,
+            "d2_shadow": true,
+        });
+        if let Some(shadow) = &f3_route_shadow {
+            refusal_record["f3_shadow"] = shadow.clone();
+        }
         let refusal = s.append_chain(
             "member_notice_refused",
-            json!({
-                "reason": "transport_binding_unmet",
-                "to_plugin_id": to_plugin,
-                "from_plugin_id": sender.plugin_id,
-                "from_role_lct": sender.role_lct,
-                "kind": kind,
-                "transport": b.stamp(),
-                "binding_reason": b.reason,
-            }),
+            refusal_record,
         )?;
         return Ok(hestia_error_envelope(
             "hestia.member_notify_transport_unmet",
@@ -5079,6 +5215,10 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     });
     if let Some(t) = &transport_record {
         notice_record["transport"] = t.clone();
+    }
+    if let Some(shadow) = &f3_route_shadow {
+        notice_record["f3_shadow"] = shadow.clone();
+        notice_record["d2_shadow"] = json!(true);
     }
     let entry = s.append_chain("member_notice", notice_record)?;
     // ---- r6-routing branch 2: is it for someone I know? then forward ------------
@@ -5152,16 +5292,23 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
                     let depth = s.inbox_store.egress_queued().unwrap_or(0);
                     let refusal = s.append_chain(
                         "member_notice_refused",
-                        json!({
-                            "reason": "egress_queue_full",
-                            "to_plugin_id": to_plugin,
-                            "dest_peer": peer,
-                            "from_plugin_id": sender.plugin_id,
-                            "from_role_lct": sender.role_lct,
-                            "egress_queued": depth,
-                            // the `member_notice` entry this refusal voids
-                            "witnessed_entry": entry.hash,
-                        }),
+                        {
+                            let mut record = json!({
+                                "reason": "egress_queue_full",
+                                "to_plugin_id": to_plugin,
+                                "dest_peer": peer,
+                                "from_plugin_id": sender.plugin_id,
+                                "from_role_lct": sender.role_lct,
+                                "egress_queued": depth,
+                                "d2_shadow": true,
+                                // the `member_notice` entry this refusal voids
+                                "witnessed_entry": entry.hash,
+                            });
+                            if let Some(shadow) = &f3_route_shadow {
+                                record["f3_shadow"] = shadow.clone();
+                            }
+                            record
+                        },
                     )?;
                     return Ok(hestia_error_envelope(
                         "hestia.member_notify_egress_queue_full",
@@ -5194,6 +5341,40 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             )
             .map_err(|e| anyhow::anyhow!("queueing member notice: {e}"))?,
     };
+    let mut f3_shadow_witness_hash: Option<String> = None;
+    let mut f3_shadow_warning: Option<String> = None;
+    if let (Some(peer), Some(shadow)) = (&egress_peer, &f3_route_shadow) {
+        let record = json!({
+            "legacy_member_notice": entry.hash,
+            "legacy_outcome": "egress_queued",
+            "legacy_egress_row_id": queued_id,
+            "legacy_dest_peer": peer,
+            "legacy_address": to_plugin,
+            "from_plugin_id": sender.plugin_id,
+            "from_role_lct": sender.role_lct,
+            "from_session_id": sender.session_uuid,
+            "kind": kind,
+            "pointer_uri": pointer_uri,
+            "in_reply_to": in_reply_to,
+            "binding_verified": binding_verified,
+            "recipient_liveness": liveness,
+            "transport": transport_record.clone().unwrap_or_else(|| json!("unbound")),
+            "f3_shadow": shadow,
+            "delivery_authority": "legacy",
+        });
+        match s.append_chain("member_notice_route_shadow", record) {
+            Ok(witness) => f3_shadow_witness_hash = Some(witness.hash),
+            Err(e) => {
+                // Shadow/parity instrumentation is observational. If its extra
+                // witness cannot be written, the already-queued legacy send
+                // remains authoritative and successful; surface the evidence gap.
+                f3_shadow_warning = Some(format!(
+                    "legacy send queued, but D2 parity witness could not be written: {e}"
+                ));
+            }
+        }
+    }
+
     let mut out = json!({
         "queued_id": queued_id,
         "witnessEntryHash": entry.hash,
@@ -5246,6 +5427,12 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             "kind '{kind}' is a disposition — pass in_reply_to:<notice id> so the notice \
              it answers stops counting as unanswered"
         ));
+    }
+    if let Some(hash) = f3_shadow_witness_hash {
+        out["f3_shadow_witness_hash"] = json!(hash);
+    }
+    if let Some(warning) = f3_shadow_warning {
+        out["f3_shadow_warning"] = json!(warning);
     }
     Ok(out)
 }

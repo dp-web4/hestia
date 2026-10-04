@@ -319,6 +319,66 @@ The next slice feeds that same pure evaluator from the live legacy `member_notif
 records legacy-vs-F3 outcomes under real traffic. The historical path remains authoritative
 until the parity falsifiers in #1210 are measured equal.
 
+#### 4.5.6 D2 live shadow: one pre-route contract, two route observations
+
+D2b does **not** implement a second copy of the legacy sender checks. That would make parity
+unprovable because the two paths could drift before routing even begins. Instead, live
+`member_notify` keeps one authoritative pre-route path:
+
+1. attributed live sender/session;
+2. member-notify law gate;
+3. structural flood bound;
+4. reply ownership + disposition-address check;
+5. transport-binding lookup/freeze.
+
+Only after those checks does a routed `peer/member` send evaluate the F3 alias+route table.
+The result is attached to the already-existing `member_notice` / refusal evidence as
+`f3_shadow`. **No F3 packet is emitted.** Legacy local/egress delivery remains authoritative.
+
+For a successful legacy routed enqueue, one paired `member_notice_route_shadow` witness records:
+- the authoritative legacy `member_notice` hash;
+- the durable legacy egress row id / peer;
+- sender/session, kind, pointer, reply binding, liveness and frozen transport stamp;
+- the pure F3 shadow result;
+- `delivery_authority: "legacy"`.
+
+If that additional parity witness cannot be written after the legacy row was already queued,
+the send remains successful and the caller is told that the parity evidence has a gap. Shadow
+instrumentation is observational; it must never become a new delivery failure mode.
+
+Existing refusal witnesses are reused rather than multiplied:
+- `transport_binding_unmet` carries the F3 shadow but remains a shared pre-route refusal;
+- `egress_queue_full` carries the F3 shadow so cutover can distinguish a route mismatch from
+  an explicit migration rule replacing the old queue/backpressure mechanism.
+
+`hestia hub receiver-parity` reads these rows through an event-type-indexed chain query, not a
+global tail window. For successful enqueues it also joins the later `egress_forwarded`
+witness by durable legacy row id. That join is how the report learns what transport actually
+happened; it never re-resolves the old peer name after the fact.
+
+The shadow also projects F3's canonical next-hop router through its configured
+`RouterNeighbor` to the Hub-member UUID F3 would actually address. This keeps the comparison
+namespace-correct: **legacy measured Hub recipient UUID ↔ F3 configured Hub neighbor UUID**,
+not Hub UUID ↔ canonical Web4 LCT.
+
+Classifications:
+- `next_hop_match`: both Hub-member next-hop identities are measured and equal;
+- `next_hop_mismatch`;
+- `legacy_queued_not_forwarded_yet`;
+- `legacy_recipient_unmeasured`: the old drain reported acceptance but not the actual
+  recipient LCT (expected until the corresponding SAGE drain instrumentation is deployed);
+- `f3_missing_neighbor`: F3 selected a canonical next-hop router but cannot resolve it to
+  an executable Hub neighbor;
+- `missing_alias`;
+- `shadow_unavailable`;
+- `route_divergence`;
+- `shared_transport_refusal`;
+- `legacy_queue_refusal`.
+
+Even `next_hop_match` is **next-hop parity only**, not delivery parity. D2 still has to
+measure downstream durable acceptance/read semantics, replies/failures and retry identity
+before cutover. A parity report must never turn missing evidence into equality.
+
 
 ## 5. Roles: pairing external and local agents, citizen by default
 

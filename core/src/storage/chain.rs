@@ -694,6 +694,50 @@ impl SqliteChainStore {
         Ok(out)
     }
 
+    /// Most recent D2 live-shadow parity rows, newest first.
+    ///
+    /// Uses the event-type index plus JSON presence rather than a global tail
+    /// window: fleet chain churn must not make quiet routing evidence disappear
+    /// from the report merely because unrelated acts were busy.
+    pub fn read_recent_route_shadow(&self, limit: u64) -> Result<Vec<ChainEntry>> {
+        let conn = self.conn.lock().unwrap();
+        // First choose exactly N parity samples. Then pull the legacy transport
+        // disposition for successful samples by durable egress row id. Forward
+        // events do not consume the sample limit.
+        let mut stmt = conn.prepare(
+            "WITH shadow AS (
+                SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+                  FROM chain_entries
+                 WHERE event_type IN ('member_notice_route_shadow', 'member_notice_refused')
+                   AND json_type(event_data, '$.f3_shadow') IS NOT NULL
+                 ORDER BY chain_position DESC
+                 LIMIT ?1
+             ),
+             routed_rows AS (
+                SELECT DISTINCT CAST(json_extract(event_data, '$.legacy_egress_row_id') AS INTEGER) AS row_id
+                  FROM shadow
+                 WHERE event_type = 'member_notice_route_shadow'
+                   AND json_type(event_data, '$.legacy_egress_row_id') IS NOT NULL
+             )
+             SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+               FROM shadow
+             UNION ALL
+             SELECT c.chain_position, c.hash, c.prev_hash, c.event_type, c.event_data,
+                    c.signer_lct, c.timestamp
+               FROM chain_entries c
+              WHERE c.event_type = 'egress_forwarded'
+                AND CAST(json_extract(c.event_data, '$.row_id') AS INTEGER)
+                    IN (SELECT row_id FROM routed_rows)
+             ORDER BY chain_position DESC",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], row_to_entry)?;
+        let mut out = Vec::with_capacity((limit as usize).saturating_mul(2));
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
     /// Most-recent "didn't succeed" entries (descending). Includes both
     /// failed outcomes (`event_type='outcome'`, success=false) and
     /// policy denials (`event_type='policy_decision'`, decision='deny').
