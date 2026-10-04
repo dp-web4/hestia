@@ -52,6 +52,11 @@ pub struct RouteOriginReport {
     pub packet_id: Uuid,
     pub replayed: bool,
     pub completed: bool,
+    /// Semantic outcome, deliberately stronger than the internal completion
+    /// watermark. "delivered-local" alone is ambiguous because it can describe
+    /// either DATA delivered to its destination or an UNREACHABLE bounce
+    /// delivered back to the origin.
+    pub outcome: String,
     pub completion_kind: Option<String>,
     pub completion_witness_hash: Option<String>,
     pub decision_json: Option<String>,
@@ -945,11 +950,35 @@ pub async fn originate_once(
             ))?;
     }
 
+    let outcome = match state
+        .decision_json
+        .as_deref()
+        .and_then(|v| serde_json::from_str::<PersistedAction>(v).ok())
+    {
+        Some(PersistedAction::Local { kind, source, .. })
+            if kind == "unreachable" || source == "unreachable-bounce-local" =>
+        {
+            "unreachable_bounced"
+        }
+        Some(PersistedAction::Local { .. }) => "destination_local",
+        Some(PersistedAction::Forward { packet_kind, .. })
+            if packet_kind == "unreachable-bounce" =>
+        {
+            "unreachable_bounced"
+        }
+        Some(PersistedAction::Forward { .. }) => "next_hop_durable",
+        Some(PersistedAction::Terminal { .. }) => "unreachable_terminal",
+        None if state.completion_witness_hash.is_none() => "incomplete",
+        None => "completed_unknown",
+    }
+    .to_string();
+
     Ok(RouteOriginReport {
         operation_id: operation_id.to_string(),
         packet_id: packet.packet_id,
         replayed: !inserted,
         completed: state.completion_witness_hash.is_some(),
+        outcome,
         completion_kind: state.completion_kind,
         completion_witness_hash: state.completion_witness_hash,
         decision_json: state.decision_json,
@@ -1574,6 +1603,7 @@ mod tests {
         ).await.unwrap();
         assert!(!first.replayed);
         assert!(first.completed);
+        assert_eq!(first.outcome, "destination_local");
         assert_eq!(first.completion_kind.as_deref(), Some("delivered-local"));
 
         let again = originate_once(
