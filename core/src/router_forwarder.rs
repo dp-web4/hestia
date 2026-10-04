@@ -15,7 +15,6 @@ use crate::hub::{member_signing_keypair, HubChannel, HubClient, HubConnection};
 use crate::member_registry::{load_members, MemberRegistry};
 use crate::receiver_routing::{
     decide_route, ReceiverRoutingTable, RouteDecision, RoutePacketV1, RouterIngressBinding,
-    RouterNeighbor,
 };
 use crate::storage::{SqliteChainStore, SqliteInboxStore};
 use crate::vault::Vault;
@@ -82,21 +81,6 @@ fn ingress_connection(binding: &RouterIngressBinding) -> HubConnection {
         rest_endpoint: binding.rest_endpoint.clone(),
         hubs_joined: vec![binding.hub_lct_id],
         member_key_source: binding.member_key_source.clone(),
-    }
-}
-
-fn neighbor_connection(neighbor: &RouterNeighbor) -> HubConnection {
-    HubConnection {
-        id: neighbor.link_id,
-        url: neighbor.hub_url.clone(),
-        hub_lct_id: neighbor.hub_lct_id,
-        our_lct_id: neighbor.our_hub_member_lct,
-        connected_at: chrono::Utc::now(),
-        last_seen: None,
-        api_version: "v1".into(),
-        rest_endpoint: neighbor.rest_endpoint.clone(),
-        hubs_joined: vec![neighbor.hub_lct_id],
-        member_key_source: neighbor.member_key_source.clone(),
     }
 }
 
@@ -440,7 +424,18 @@ async fn execute_action(
                 neighbor.next_hop_lct,
                 next_hop_lct
             );
-            let conn = neighbor_connection(neighbor);
+            let interface = routes
+                .router_ingress_by_id(neighbor.interface_binding_id)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "neighbor link {} references missing router interface {}",
+                    link_id, neighbor.interface_binding_id
+                ))?;
+            anyhow::ensure!(
+                interface.router_lct == router_lct,
+                "neighbor link {} uses interface {} belonging to router {}, not {}",
+                link_id, interface.binding_id, interface.router_lct, router_lct
+            );
+            let conn = ingress_connection(interface);
             let (channel, keypair, rest) = open_verified_channel(client, vault, &conn).await?;
             let out = client
                 .channel_query(
