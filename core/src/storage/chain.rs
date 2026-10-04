@@ -243,33 +243,21 @@ impl SqliteChainStore {
                 event_type     TEXT NOT NULL,
                 event_data     TEXT NOT NULL,
                 signer_lct     TEXT NOT NULL,
-                timestamp      TEXT NOT NULL,
-                event_key      TEXT
+                timestamp      TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_chain_event_type ON chain_entries(event_type);
-             CREATE INDEX IF NOT EXISTS idx_chain_timestamp  ON chain_entries(timestamp);",
-        )?;
-        // event_key arrived with F3 receipt routing. Existing witness DBs upgrade
-        // in place; NULL preserves every historical row. A partial unique index
-        // makes receipt retries reuse the same witnessed fact after a crash.
-        let has_event_key = {
-            let mut stmt = conn.prepare("PRAGMA table_info(chain_entries)")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            let mut found = false;
-            for row in rows {
-                if row? == "event_key" {
-                    found = true;
-                    break;
-                }
-            }
-            found
-        };
-        if !has_event_key {
-            conn.execute_batch("ALTER TABLE chain_entries ADD COLUMN event_key TEXT;")?;
-        }
-        conn.execute_batch(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_chain_event_key
-                 ON chain_entries(event_key) WHERE event_key IS NOT NULL;",
+             CREATE INDEX IF NOT EXISTS idx_chain_timestamp  ON chain_entries(timestamp);
+
+             -- Idempotency metadata is deliberately OUTSIDE the hashed witness row.
+             -- The mapping commits in the same transaction as its row, but changing
+             -- this retry index cannot alter what the witness chain says happened.
+             CREATE TABLE IF NOT EXISTS chain_event_keys (
+                event_key      TEXT PRIMARY KEY,
+                chain_position INTEGER NOT NULL,
+                entry_hash     TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_chain_event_key_position
+                 ON chain_event_keys(chain_position);",
         )?;
         let read_conn = Connection::open(&path).with_context(|| {
             format!(
@@ -370,8 +358,12 @@ impl SqliteChainStore {
         if let Some(key) = event_key {
             let existing = tx
                 .query_row(
-                    "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
-                       FROM chain_entries WHERE event_key = ?1",
+                    "SELECT e.chain_position, e.hash, e.prev_hash, e.event_type, e.event_data,
+                            e.signer_lct, e.timestamp
+                       FROM chain_event_keys k
+                       JOIN chain_entries e
+                         ON e.chain_position = k.chain_position AND e.hash = k.entry_hash
+                      WHERE k.event_key = ?1",
                     params![key],
                     row_to_entry,
                 )
@@ -402,8 +394,8 @@ impl SqliteChainStore {
 
         tx.execute(
             "INSERT INTO chain_entries
-                (chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp, event_key)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 chain_position as i64,
                 hash,
@@ -412,9 +404,15 @@ impl SqliteChainStore {
                 event_json,
                 signer_lct,
                 timestamp.to_rfc3339(),
-                event_key,
             ],
         )?;
+        if let Some(key) = event_key {
+            tx.execute(
+                "INSERT INTO chain_event_keys (event_key, chain_position, entry_hash)
+                 VALUES (?1, ?2, ?3)",
+                params![key, chain_position as i64, hash],
+            )?;
+        }
         tx.commit()?;
         self.len.fetch_add(1, Ordering::Release);
 
