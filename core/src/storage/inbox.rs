@@ -2188,7 +2188,16 @@ impl SqliteInboxStore {
                 PRIMARY KEY (ingress_binding_id, hub_notice_id)
              );
              CREATE INDEX IF NOT EXISTS idx_router_rejections_pending
-                 ON router_ingress_rejections(ingress_binding_id, hub_acked_at);",
+                 ON router_ingress_rejections(ingress_binding_id, hub_acked_at);
+             CREATE TABLE IF NOT EXISTS router_origin_ops (
+                origin_lct    TEXT NOT NULL,
+                operation_id  TEXT NOT NULL,
+                binding_json  TEXT NOT NULL,
+                packet_id     TEXT NOT NULL UNIQUE,
+                created_at    TEXT NOT NULL,
+                PRIMARY KEY (origin_lct, operation_id),
+                FOREIGN KEY(packet_id) REFERENCES router_packets(packet_id)
+             );",
         )
         .context("initializing router transit custody schema")?;
         let has_local_child = {
@@ -2234,6 +2243,25 @@ impl SqliteInboxStore {
             params![cutoff],
         )
         .context("pruning acknowledged router ingress receipts")?;
+
+        // Origin operation ids are retry tombstones for the same operational
+        // horizon. Remove the op mapping immediately before its completed packet,
+        // never while the packet is pending.
+        conn.execute(
+            "DELETE FROM router_origin_ops
+              WHERE packet_id IN (
+                    SELECT p.packet_id FROM router_packets p
+                     WHERE p.completion_witness_hash IS NOT NULL
+                       AND p.created_at < ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM router_ingress_receipts r
+                            WHERE r.packet_id = p.packet_id
+                       )
+              )",
+            params![cutoff],
+        )
+        .context("pruning completed router origin operations")?;
+
         conn.execute(
             "DELETE FROM router_packets
               WHERE completion_witness_hash IS NOT NULL
@@ -2241,6 +2269,10 @@ impl SqliteInboxStore {
                 AND NOT EXISTS (
                     SELECT 1 FROM router_ingress_receipts r
                      WHERE r.packet_id = router_packets.packet_id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM router_origin_ops o
+                     WHERE o.packet_id = router_packets.packet_id
                 )",
             params![cutoff],
         )
@@ -2307,6 +2339,87 @@ impl SqliteInboxStore {
         drop(conn);
         self.router_packet_state(packet_id)?
             .ok_or_else(|| anyhow::anyhow!("staged route packet {packet_id} disappeared"))
+    }
+
+    /// Atomically bind a caller retry key to ONE randomly-minted packet and
+    /// admit that packet into router custody. The retry namespace is per origin
+    /// LCT, and binding_json is the immutable application send intent
+    /// (destination/kind/pointer/hash), deliberately excluding live route-table
+    /// details such as hop_limit.
+    ///
+    /// On retry, candidate_* are ignored: the first packet bytes win. This is
+    /// what keeps a hop-limit/config change between attempts from mutating an
+    /// already-originated packet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_router_origin(
+        &self,
+        origin_lct: &str,
+        operation_id: &str,
+        binding_json: &str,
+        candidate_packet_id: Uuid,
+        candidate_packet_json: &str,
+        candidate_packet_hash: &str,
+    ) -> Result<(RouterPacketState, bool)> {
+        let mut conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        Self::prune_router_custody_on(&conn)?;
+        let tx = conn.transaction().context("starting router origin admission")?;
+
+        let existing: Option<(String, String)> = tx.query_row(
+            "SELECT packet_id, binding_json
+               FROM router_origin_ops
+              WHERE origin_lct = ?1 AND operation_id = ?2",
+            params![origin_lct, operation_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+
+        if let Some((packet_id_s, first_binding)) = existing {
+            anyhow::ensure!(
+                first_binding == binding_json,
+                "route origin operation '{operation_id}' for {origin_lct} was already used for different send intent"
+            );
+            let packet_id = Uuid::parse_str(&packet_id_s)
+                .context("parsing persisted route origin packet id")?;
+            let state = Self::router_packet_state_on(&tx, packet_id)?
+                .ok_or_else(|| anyhow::anyhow!(
+                    "route origin operation '{operation_id}' points at missing packet {packet_id}"
+                ))?;
+            tx.commit().context("committing router origin retry read")?;
+            return Ok((state, false));
+        }
+
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO router_packets
+                (packet_id, packet_json, packet_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                candidate_packet_id.to_string(),
+                candidate_packet_json,
+                candidate_packet_hash,
+                now,
+            ],
+        )
+        .context("admitting originated router packet")?;
+        tx.execute(
+            "INSERT INTO router_origin_ops
+                (origin_lct, operation_id, binding_json, packet_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                origin_lct,
+                operation_id,
+                binding_json,
+                candidate_packet_id.to_string(),
+                now,
+            ],
+        )
+        .context("binding router origin operation")?;
+        let state = Self::router_packet_state_on(&tx, candidate_packet_id)?
+            .ok_or_else(|| anyhow::anyhow!(
+                "originated route packet {candidate_packet_id} disappeared during admission"
+            ))?;
+        tx.commit().context("committing router origin admission")?;
+        Ok((state, true))
     }
 
     pub fn record_router_stage_witness(

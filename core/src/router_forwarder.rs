@@ -12,7 +12,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::hub::{member_signing_keypair, HubChannel, HubClient, HubConnection};
-use crate::member_registry::{load_members, MemberRegistry};
+use crate::member_registry::{load_members, LocalChildResolution, MemberRegistry};
 use crate::receiver_routing::{
     decide_route, ReceiverRoutingTable, RouteDecision, RoutePacketV1, RouterIngressBinding,
 };
@@ -44,6 +44,27 @@ pub struct RouterDrainReport {
     pub refused: usize,
     pub acked: usize,
     pub errors: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteOriginReport {
+    pub operation_id: String,
+    pub packet_id: Uuid,
+    pub replayed: bool,
+    pub completed: bool,
+    pub completion_kind: Option<String>,
+    pub completion_witness_hash: Option<String>,
+    pub decision_json: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RouteOriginBinding<'a> {
+    protocol: &'static str,
+    origin_lct: &'a str,
+    destination_lct: &'a str,
+    original_kind: &'a str,
+    pointer_uri: &'a str,
+    content_hash: &'a str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -398,8 +419,8 @@ async fn execute_action(
     packet: &RoutePacketV1,
     state_outbound: Option<&str>,
     stage_witness_hash: &str,
-    upstream_neighbor_lct: &str,
-    upstream_hub_member: Uuid,
+    upstream_neighbor_lct: Option<&str>,
+    upstream_hub_member: Option<Uuid>,
     vault: &Vault,
     routes: &ReceiverRoutingTable,
     router_lct: &str,
@@ -713,6 +734,226 @@ async fn refuse_ingress_receipt(
     ack_one(client, conn, channel, keypair, rest, notice_id).await?;
     inbox.mark_router_rejection_acked(binding.binding_id, notice_id)?;
     Ok(())
+}
+
+fn valid_origin_operation_id(operation_id: &str) -> bool {
+    !operation_id.is_empty()
+        && operation_id.len() <= 128
+        && !operation_id.chars().any(char::is_control)
+}
+
+fn persisted_action(
+    packet: &RoutePacketV1,
+    state: &crate::storage::RouterPacketState,
+) -> Result<PersistedAction> {
+    let decision = state
+        .decision_json
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!(
+            "route packet {} has no persisted decision", packet.packet_id
+        ))?;
+    serde_json::from_str(decision)
+        .with_context(|| format!(
+            "decoding persisted route decision for {}", packet.packet_id
+        ))
+}
+
+/// Originate one Web4 route packet from a canonical local child.
+///
+/// operation_id is a caller-stable retry key scoped by origin_lct. The first
+/// call atomically binds it to one random packet UUID and immutable send intent.
+/// A lost caller response can therefore retry without minting a second packet;
+/// reusing the key for different destination/content is refused.
+#[allow(clippy::too_many_arguments)]
+pub async fn originate_once(
+    vault: &Vault,
+    router_lct: &str,
+    origin_lct: &str,
+    destination_lct: &str,
+    original_kind: &str,
+    pointer_uri: &str,
+    content_hash: &str,
+    operation_id: &str,
+    inbox: &SqliteInboxStore,
+    chain: &SqliteChainStore,
+) -> Result<RouteOriginReport> {
+    anyhow::ensure!(
+        valid_origin_operation_id(operation_id),
+        "route origin operation_id must be 1..128 bytes with no control characters"
+    );
+    anyhow::ensure!(
+        destination_lct.starts_with("lct:web4:mb32:"),
+        "route destination must be a canonical lct:web4:mb32:* identity"
+    );
+    anyhow::ensure!(
+        routable_member_notice_kind(original_kind),
+        "route origin kind '{original_kind}' is not a Hestia member-notice kind"
+    );
+    anyhow::ensure!(
+        routable_member_pointer(pointer_uri),
+        "route origin pointer_uri must be a non-empty single-line pointer <=512 bytes"
+    );
+
+    let registry = load_members(vault);
+    match registry.resolve_child_of(router_lct, origin_lct)? {
+        LocalChildResolution::Local(member) => {
+            anyhow::ensure!(
+                member.lct.lct_id() == origin_lct
+                    && origin_lct.starts_with("lct:web4:mb32:"),
+                "route origin must be the canonical LCT of a child of router {router_lct}"
+            );
+        }
+        LocalChildResolution::KnownButNotChild(member) => anyhow::bail!(
+            "route origin {} ({}) is known but is not a child of router {}",
+            member.plugin_id, member.lct.lct_id(), router_lct
+        ),
+        LocalChildResolution::Unknown => anyhow::bail!(
+            "route origin {origin_lct} is not a registered local child of router {router_lct}"
+        ),
+    }
+
+    let routes = ReceiverRoutingTable::load(vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+
+    let binding_json = serde_json::to_string(&RouteOriginBinding {
+        protocol: "hestia-route-origin-v1",
+        origin_lct,
+        destination_lct,
+        original_kind,
+        pointer_uri,
+        content_hash,
+    })?;
+
+    let candidate = RoutePacketV1 {
+        protocol: RoutePacketV1::PROTOCOL.to_string(),
+        packet_id: Uuid::new_v4(),
+        destination_lct: destination_lct.to_string(),
+        origin_lct: origin_lct.to_string(),
+        original_kind: original_kind.to_string(),
+        pointer_uri: pointer_uri.to_string(),
+        content_hash: content_hash.to_string(),
+        hops_remaining: routes.hop_limit,
+        visited_routers: Vec::new(),
+        failure: None,
+    };
+    candidate.validate()?;
+    let candidate_json = serde_json::to_string(&candidate)?;
+    let candidate_hash = sha256_content(candidate_json.as_bytes());
+
+    let (mut state, inserted) = inbox.stage_router_origin(
+        origin_lct,
+        operation_id,
+        &binding_json,
+        candidate.packet_id,
+        &candidate_json,
+        &candidate_hash,
+    )?;
+
+    // On a retry the FIRST packet wins, including its original hop limit. Never
+    // reconstruct an already-originated packet from today's routing config.
+    let packet: RoutePacketV1 = serde_json::from_str(&state.packet_json)
+        .context("decoding originated route packet from custody")?;
+    packet.validate()?;
+    anyhow::ensure!(
+        packet.origin_lct == origin_lct
+            && packet.destination_lct == destination_lct
+            && packet.original_kind == original_kind
+            && packet.pointer_uri == pointer_uri
+            && packet.content_hash == content_hash,
+        "persisted route-origin operation does not match requested send intent"
+    );
+
+    let origin_key = format!("route-origin:{}", packet.packet_id);
+    let (origin_witness, _) = chain.append_once(
+        &origin_key,
+        "router.packet.originated",
+        json!({
+            "packet_id": packet.packet_id,
+            "packet_hash": state.packet_hash,
+            "operation_id": operation_id,
+            "router_lct": router_lct,
+            "origin_lct": packet.origin_lct,
+            "destination_lct": packet.destination_lct,
+            "original_kind": packet.original_kind,
+            "pointer_uri": packet.pointer_uri,
+            "content_hash": packet.content_hash,
+            "hops_remaining": packet.hops_remaining,
+            "custody": "router-origin",
+        }),
+        router_lct,
+    )?;
+
+    if state.decision_json.is_none() {
+        let (action, outbound) = plan_action(&packet, &registry, &routes, router_lct)?;
+        let decision_json = serde_json::to_string(&action)?;
+        match &action {
+            PersistedAction::Forward {
+                next_hop_lct,
+                link_id,
+                operation_id,
+                ..
+            } => inbox.record_router_forward_decision(
+                packet.packet_id,
+                &decision_json,
+                outbound.as_deref().expect("forward plan carries packet bytes"),
+                next_hop_lct,
+                *link_id,
+                operation_id,
+            )?,
+            PersistedAction::Local { child_lct, .. } => {
+                inbox.record_router_local_decision(
+                    packet.packet_id,
+                    &decision_json,
+                    Some(child_lct),
+                )?
+            }
+            PersistedAction::Terminal { .. } => {
+                inbox.record_router_local_decision(
+                    packet.packet_id,
+                    &decision_json,
+                    None,
+                )?
+            }
+        }
+        state = inbox.router_packet_state(packet.packet_id)?
+            .ok_or_else(|| anyhow::anyhow!(
+                "originated route packet {} disappeared after route decision",
+                packet.packet_id
+            ))?;
+    }
+
+    if state.completion_witness_hash.is_none() {
+        let action = persisted_action(&packet, &state)?;
+        execute_action(
+            &action,
+            &packet,
+            state.outbound_packet_json.as_deref(),
+            &origin_witness.hash,
+            None,
+            None,
+            vault,
+            &routes,
+            router_lct,
+            inbox,
+            chain,
+            &HubClient::new(),
+        ).await?;
+        state = inbox.router_packet_state(packet.packet_id)?
+            .ok_or_else(|| anyhow::anyhow!(
+                "originated route packet {} disappeared after execution",
+                packet.packet_id
+            ))?;
+    }
+
+    Ok(RouteOriginReport {
+        operation_id: operation_id.to_string(),
+        packet_id: packet.packet_id,
+        replayed: !inserted,
+        completed: state.completion_witness_hash.is_some(),
+        completion_kind: state.completion_kind,
+        completion_witness_hash: state.completion_witness_hash,
+        decision_json: state.decision_json,
+    })
 }
 
 pub async fn drain_router_once(
@@ -1144,8 +1385,8 @@ pub async fn drain_router_once(
                         &packet,
                         state.outbound_packet_json.as_deref(),
                         &stage_witness.hash,
-                        &upstream_neighbor.next_hop_lct,
-                        upstream_member,
+                        Some(&upstream_neighbor.next_hop_lct),
+                        Some(upstream_member),
                         vault,
                         &routes,
                         router_lct,
@@ -1259,6 +1500,122 @@ mod tests {
                 kind, source, delivery_packet_json: Some(_), ..
             } if kind == "unreachable" && source == "unreachable-bounce-local"
         ));
+    }
+
+    #[tokio::test]
+    async fn route_origin_refuses_legacy_destination_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let router = "lct:web4:mb32:router";
+        let mut registry = load_members(&vault);
+        let origin = crate::member_registry::ensure_member(
+            &mut vault, &mut registry, "origin-being", false, router, "anchor",
+        ).unwrap();
+        ReceiverRoutingTable::default().save(&mut vault).unwrap();
+        let inbox = SqliteInboxStore::open(dir.path().join("inbox.db"), [0x53; 32]).unwrap();
+        let chain = SqliteChainStore::open(dir.path().join("witness.db"), [0x53; 32]).unwrap();
+
+        let err = originate_once(
+            &vault,
+            router,
+            &origin,
+            "lct:web4:member:legacy-name",
+            "coordination",
+            "shared-context/forum/origin-test.md",
+            &format!("sha256-pointer:{}", "a".repeat(64)),
+            "legacy-destination",
+            &inbox,
+            &chain,
+        ).await.unwrap_err();
+        assert!(format!("{err:#}").contains("canonical lct:web4:mb32"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn local_origin_retry_is_one_packet_one_local_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let router = "lct:web4:mb32:router";
+        let mut registry = load_members(&vault);
+        let origin = crate::member_registry::ensure_member(
+            &mut vault,
+            &mut registry,
+            "origin-being",
+            false,
+            router,
+            "anchor",
+        ).unwrap();
+        let destination = crate::member_registry::ensure_member(
+            &mut vault,
+            &mut registry,
+            "destination-being",
+            false,
+            router,
+            "anchor",
+        ).unwrap();
+
+        let mut routes = ReceiverRoutingTable::default();
+        routes.save(&mut vault).unwrap();
+
+        let inbox = SqliteInboxStore::open(dir.path().join("inbox.db"), [0x52; 32]).unwrap();
+        let chain = SqliteChainStore::open(dir.path().join("witness.db"), [0x52; 32]).unwrap();
+        let hash = format!("sha256-pointer:{}", "a".repeat(64));
+
+        let first = originate_once(
+            &vault,
+            router,
+            &origin,
+            &destination,
+            "coordination",
+            "shared-context/forum/origin-test.md",
+            &hash,
+            "origin-op-1",
+            &inbox,
+            &chain,
+        ).await.unwrap();
+        assert!(!first.replayed);
+        assert!(first.completed);
+        assert_eq!(first.completion_kind.as_deref(), Some("delivered-local"));
+
+        let again = originate_once(
+            &vault,
+            router,
+            &origin,
+            &destination,
+            "coordination",
+            "shared-context/forum/origin-test.md",
+            &hash,
+            "origin-op-1",
+            &inbox,
+            &chain,
+        ).await.unwrap();
+        assert!(again.replayed);
+        assert_eq!(again.packet_id, first.packet_id);
+        assert_eq!(inbox.member_pending("destination-being").unwrap(), 1);
+
+        let mail = inbox.drain_member("destination-being").unwrap();
+        assert_eq!(mail.len(), 1);
+        assert_eq!(mail[0].kind, "coordination");
+        assert_eq!(
+            mail[0].pointer_uri.as_deref(),
+            Some("shared-context/forum/origin-test.md")
+        );
+
+        let err = originate_once(
+            &vault,
+            router,
+            &origin,
+            &destination,
+            "coordination",
+            "shared-context/forum/CHANGED.md",
+            &hash,
+            "origin-op-1",
+            &inbox,
+            &chain,
+        ).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("different send intent"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -1401,8 +1758,8 @@ mod tests {
             &packet,
             None,
             "stage-hash",
-            "lct:web4:mb32:previous-router",
-            Uuid::new_v4(),
+            Some("lct:web4:mb32:previous-router"),
+            Some(Uuid::new_v4()),
             &vault,
             &ReceiverRoutingTable::default(),
             router,

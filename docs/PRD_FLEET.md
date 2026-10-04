@@ -259,6 +259,34 @@ An unreachable packet is never recursively bounced. If its own return route fail
 witnesses that terminal failure locally. This bounds failure traffic and prevents two default
 gateways from generating an error storm about each other's errors.
 
+#### 4.5.4 Origination: operation identity before legacy cutover
+
+A local child enters the F3 plane by **canonical LCT**, not by the historical
+`peer/member` edge syntax. The first additive origination surface therefore takes:
+
+- the canonical origin child LCT;
+- the canonical end-destination LCT;
+- member-notice kind + pointer + content hash;
+- a caller-stable `operation_id`.
+
+The retry key is scoped by origin LCT. Hestia atomically binds
+`(origin_lct, operation_id)` to one randomly generated packet UUID and an immutable send
+binding. Two different canonical origins may therefore use the same operation id independently;
+within one origin, a lost response reuses the first packet and using that id for different
+destination/content is refused. The packet's original hop limit and first persisted route
+decision also remain the ones captured on the first attempt — a configuration change between
+retries cannot silently turn one application act into a different network act.
+
+The operation mapping and packet are operational custody, not a second permanent ledger.
+After witnessed completion and the same retention horizon used by the receive plane, they may
+age out; the witness chain remains the durable evidence.
+
+This slice is intentionally **additive**. The old `peer/member` member-notice path and
+`egress-drain.sh` remain authoritative until a parity slice proves that translating that
+legacy address into a canonical destination preserves sender authorization, reply behavior,
+failure reporting, retry identity, and delivery outcomes. Cutover happens only after that
+measurement.
+
 
 ## 5. Roles: pairing external and local agents, citizen by default
 
