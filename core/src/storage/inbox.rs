@@ -1757,7 +1757,7 @@ pub struct EgressRow {
 /// edge can resume without duplicating a member notice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubReceiptCustody {
-    pub hub_connection_id: Uuid,
+    pub receiver_binding_id: Uuid,
     pub notice_id: String,
     pub child_lct: String,
     pub to_plugin: String,
@@ -1770,7 +1770,7 @@ impl SqliteInboxStore {
     fn ensure_hub_receipt_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS hub_receipt_custody (
-                hub_connection_id TEXT NOT NULL,
+                receiver_binding_id TEXT NOT NULL,
                 hub_lct           TEXT NOT NULL,
                 hub_member_lct    TEXT NOT NULL,
                 child_lct         TEXT NOT NULL,
@@ -1783,10 +1783,10 @@ impl SqliteInboxStore {
                 witness_hash      TEXT,
                 member_notice_id  INTEGER,
                 hub_acked_at      TEXT,
-                PRIMARY KEY (hub_connection_id, notice_id)
+                PRIMARY KEY (receiver_binding_id, notice_id)
              );
              CREATE INDEX IF NOT EXISTS idx_hub_receipt_pending_ack
-                 ON hub_receipt_custody(hub_connection_id, hub_acked_at, member_notice_id);",
+                 ON hub_receipt_custody(receiver_binding_id, hub_acked_at, member_notice_id);",
         )
         .context("initializing Hub receipt custody schema")?;
         Ok(())
@@ -1798,7 +1798,7 @@ impl SqliteInboxStore {
     #[allow(clippy::too_many_arguments)]
     pub fn stage_hub_receipt(
         &self,
-        hub_connection_id: Uuid,
+        receiver_binding_id: Uuid,
         hub_lct: Uuid,
         hub_member_lct: Uuid,
         child_lct: &str,
@@ -1829,11 +1829,11 @@ impl SqliteInboxStore {
         .context("pruning completed Hub receipt custody rows")?;
         conn.execute(
             "INSERT OR IGNORE INTO hub_receipt_custody
-                (hub_connection_id, hub_lct, hub_member_lct, child_lct, to_plugin, notice_id,
+                (receiver_binding_id, hub_lct, hub_member_lct, child_lct, to_plugin, notice_id,
                  notice_json, kind, pointer_uri, queued_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
-                hub_connection_id.to_string(), hub_lct.to_string(), hub_member_lct.to_string(),
+                receiver_binding_id.to_string(), hub_lct.to_string(), hub_member_lct.to_string(),
                 child_lct, to_plugin, notice_id, notice_json, kind, pointer_uri, now
             ],
         )
@@ -1843,8 +1843,8 @@ impl SqliteInboxStore {
             "SELECT hub_lct, hub_member_lct, child_lct, to_plugin, notice_json, kind,
                     pointer_uri, witness_hash, member_notice_id, hub_acked_at
                FROM hub_receipt_custody
-              WHERE hub_connection_id = ?1 AND notice_id = ?2",
-            params![hub_connection_id.to_string(), notice_id],
+              WHERE receiver_binding_id = ?1 AND notice_id = ?2",
+            params![receiver_binding_id.to_string(), notice_id],
             |r| Ok((
                 r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?,
@@ -1859,7 +1859,7 @@ impl SqliteInboxStore {
             "Hub notice id {notice_id} was re-fetched with different immutable content"
         );
         Ok(HubReceiptCustody {
-            hub_connection_id,
+            receiver_binding_id,
             notice_id: notice_id.to_string(),
             child_lct: row.2,
             to_plugin: row.3,
@@ -1878,7 +1878,7 @@ impl SqliteInboxStore {
     /// member notice without recording which Hub receipt produced it.
     pub fn accept_hub_receipt(
         &self,
-        hub_connection_id: Uuid,
+        receiver_binding_id: Uuid,
         notice_id: &str,
         witness_hash: &str,
     ) -> Result<u64> {
@@ -1889,8 +1889,8 @@ impl SqliteInboxStore {
         let row = tx.query_row(
             "SELECT to_plugin, pointer_uri, witness_hash, member_notice_id
                FROM hub_receipt_custody
-              WHERE hub_connection_id = ?1 AND notice_id = ?2",
-            params![hub_connection_id.to_string(), notice_id],
+              WHERE receiver_binding_id = ?1 AND notice_id = ?2",
+            params![receiver_binding_id.to_string(), notice_id],
             |r| Ok((
                 r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?,
                 r.get::<_, Option<String>>(2)?, r.get::<_, Option<i64>>(3)?,
@@ -1946,9 +1946,9 @@ impl SqliteInboxStore {
         tx.execute(
             "UPDATE hub_receipt_custody
                 SET witness_hash = ?3, member_notice_id = ?4
-              WHERE hub_connection_id = ?1 AND notice_id = ?2",
+              WHERE receiver_binding_id = ?1 AND notice_id = ?2",
             params![
-                hub_connection_id.to_string(), notice_id, witness_hash, local_id as i64
+                receiver_binding_id.to_string(), notice_id, witness_hash, local_id as i64
             ],
         )
         .context("recording Hub receipt local acceptance")?;
@@ -1958,17 +1958,17 @@ impl SqliteInboxStore {
 
     /// Receipt ids that are durably local but whose Hub ACK is not yet recorded.
     /// Includes the lost-ACK-response case; Hub tombstones make the retry safe.
-    pub fn pending_hub_receipt_acks(&self, hub_connection_id: Uuid) -> Result<Vec<String>> {
+    pub fn pending_hub_receipt_acks(&self, receiver_binding_id: Uuid) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_hub_receipt_schema(&conn)?;
         let mut stmt = conn.prepare(
             "SELECT notice_id FROM hub_receipt_custody
-              WHERE hub_connection_id = ?1
+              WHERE receiver_binding_id = ?1
                 AND member_notice_id IS NOT NULL
                 AND hub_acked_at IS NULL
               ORDER BY queued_at ASC",
         )?;
-        let rows = stmt.query_map(params![hub_connection_id.to_string()], |r| r.get(0))?;
+        let rows = stmt.query_map(params![receiver_binding_id.to_string()], |r| r.get(0))?;
         let mut out = Vec::new();
         for row in rows { out.push(row?); }
         Ok(out)
@@ -1976,16 +1976,16 @@ impl SqliteInboxStore {
 
     pub fn mark_hub_receipt_acked(
         &self,
-        hub_connection_id: Uuid,
+        receiver_binding_id: Uuid,
         notice_id: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_hub_receipt_schema(&conn)?;
         let changed = conn.execute(
             "UPDATE hub_receipt_custody SET hub_acked_at = ?3
-              WHERE hub_connection_id = ?1 AND notice_id = ?2
+              WHERE receiver_binding_id = ?1 AND notice_id = ?2
                 AND member_notice_id IS NOT NULL",
-            params![hub_connection_id.to_string(), notice_id, Utc::now().to_rfc3339()],
+            params![receiver_binding_id.to_string(), notice_id, Utc::now().to_rfc3339()],
         )?;
         anyhow::ensure!(changed == 1, "cannot mark Hub receipt {notice_id} ACKed before local acceptance");
         Ok(())
@@ -1993,7 +1993,7 @@ impl SqliteInboxStore {
 
     pub fn hub_receipt_custody(
         &self,
-        hub_connection_id: Uuid,
+        receiver_binding_id: Uuid,
         notice_id: &str,
     ) -> Result<Option<HubReceiptCustody>> {
         let conn = self.conn.lock().unwrap();
@@ -2001,8 +2001,8 @@ impl SqliteInboxStore {
         let row = conn.query_row(
             "SELECT child_lct, to_plugin, witness_hash, member_notice_id, hub_acked_at
                FROM hub_receipt_custody
-              WHERE hub_connection_id = ?1 AND notice_id = ?2",
-            params![hub_connection_id.to_string(), notice_id],
+              WHERE receiver_binding_id = ?1 AND notice_id = ?2",
+            params![receiver_binding_id.to_string(), notice_id],
             |r| Ok((
                 r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?,
                 r.get::<_, Option<i64>>(3)?, r.get::<_, Option<String>>(4)?,
@@ -2010,7 +2010,7 @@ impl SqliteInboxStore {
         ).optional()?;
         row.map(|r| -> Result<HubReceiptCustody> {
             Ok(HubReceiptCustody {
-                hub_connection_id, notice_id: notice_id.to_string(), child_lct: r.0, to_plugin: r.1,
+                receiver_binding_id, notice_id: notice_id.to_string(), child_lct: r.0, to_plugin: r.1,
                 witness_hash: r.2, member_notice_id: r.3.map(|n| n as u64),
                 hub_acked_at: r.4.map(|s| DateTime::parse_from_rfc3339(&s)
                     .map(|t| t.with_timezone(&Utc))).transpose()
