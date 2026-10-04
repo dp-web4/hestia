@@ -561,6 +561,58 @@ fn parse_route_notice(
     Ok((packet, packet_json, packet_hash))
 }
 
+async fn refuse_ingress_receipt(
+    inbox: &SqliteInboxStore,
+    chain: &SqliteChainStore,
+    client: &HubClient,
+    conn: &HubConnection,
+    channel: &HubChannel,
+    keypair: &web4_core::crypto::KeyPair,
+    rest: &str,
+    binding: &RouterIngressBinding,
+    router_lct: &str,
+    notice_id: &str,
+    notice_json: &str,
+    packet: &RoutePacketV1,
+    packet_hash: &str,
+    upstream_member: Uuid,
+    configured_neighbor_lct: Option<&str>,
+    reason: &str,
+) -> Result<()> {
+    let key = format!(
+        "route-ingress-refusal:{}:{}",
+        binding.binding_id, notice_id
+    );
+    let (witness, _) = chain.append_once(
+        &key,
+        "router.packet.ingress-refused",
+        json!({
+            "packet_id": packet.packet_id,
+            "packet_hash": packet_hash,
+            "notice_hash": sha256_content(notice_json.as_bytes()),
+            "router_lct": router_lct,
+            "ingress_binding_id": binding.binding_id,
+            "hub_notice_id": notice_id,
+            "from_hub_member": upstream_member,
+            "configured_neighbor_lct": configured_neighbor_lct,
+            "claimed_previous_router": packet.visited_routers.last(),
+            "destination_lct": packet.destination_lct,
+            "reason": reason,
+        }),
+        router_lct,
+    )?;
+    inbox.record_router_ingress_rejection(
+        binding.binding_id,
+        notice_id,
+        notice_json,
+        Some(packet.packet_id),
+        &witness.hash,
+    )?;
+    ack_one(client, conn, channel, keypair, rest, notice_id).await?;
+    inbox.mark_router_rejection_acked(binding.binding_id, notice_id)?;
+    Ok(())
+}
+
 pub async fn drain_router_once(
     vault: &Vault,
     router_lct: &str,
@@ -748,69 +800,31 @@ pub async fn drain_router_once(
                 let upstream_neighbor = match ingress_auth {
                     Ok(n) => n,
                     Err((reason, configured_neighbor_lct)) => {
-                        let key = format!(
-                            "route-ingress-refusal:{}:{}",
-                            binding.binding_id, notice_id
-                        );
-                        let (witness, _) = match chain.append_once(
-                            &key,
-                            "router.packet.ingress-refused",
-                            json!({
-                                "packet_id": packet.packet_id,
-                                "packet_hash": packet_hash,
-                                "notice_hash": sha256_content(notice_json.as_bytes()),
-                                "router_lct": router_lct,
-                                "ingress_binding_id": binding.binding_id,
-                                "hub_notice_id": notice_id,
-                                "from_hub_member": upstream_member,
-                                "configured_neighbor_lct": configured_neighbor_lct,
-                                "claimed_previous_router": packet.visited_routers.last(),
-                                "destination_lct": packet.destination_lct,
-                                "reason": reason,
-                            }),
+                        match refuse_ingress_receipt(
+                            inbox,
+                            chain,
+                            &client,
+                            &conn,
+                            &channel,
+                            &keypair,
+                            &rest,
+                            binding,
                             router_lct,
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                report.errors.push(format!(
-                                    "witness route ingress refusal {notice_id}: {e:#}"
-                                ));
-                                batch_failed = true;
-                                continue;
-                            }
-                        };
-                        if let Err(e) = inbox.record_router_ingress_rejection(
-                            binding.binding_id,
                             notice_id,
                             &notice_json,
-                            Some(packet.packet_id),
-                            &witness.hash,
-                        ) {
-                            report.errors.push(format!(
-                                "record route ingress rejection {notice_id}: {e:#}"
-                            ));
-                            batch_failed = true;
-                            continue;
-                        }
-                        report.refused += 1;
-                        match ack_one(
-                            &client, &conn, &channel, &keypair, &rest, notice_id
+                            &packet,
+                            &packet_hash,
+                            upstream_member,
+                            configured_neighbor_lct,
+                            &reason,
                         ).await {
-                            Ok(()) => match inbox.mark_router_rejection_acked(
-                                binding.binding_id,
-                                notice_id,
-                            ) {
-                                Ok(()) => report.acked += 1,
-                                Err(e) => {
-                                    report.errors.push(format!(
-                                        "refused route ACK {notice_id} landed but local watermark failed: {e:#}"
-                                    ));
-                                    batch_failed = true;
-                                }
-                            },
+                            Ok(()) => {
+                                report.refused += 1;
+                                report.acked += 1;
+                            }
                             Err(e) => {
                                 report.errors.push(format!(
-                                    "ACK refused route {notice_id}: {e:#}"
+                                    "refuse route ingress {notice_id}: {e:#}"
                                 ));
                                 batch_failed = true;
                             }
@@ -818,6 +832,61 @@ pub async fn drain_router_once(
                         continue;
                     }
                 };
+
+                // A packet id is immutable once THIS router has accepted it.
+                // A later authorized arrival with different hop/trace bytes may
+                // be an alternate-path duplicate or a hostile replay; either way
+                // it is a per-receipt refusal, not a reason to wedge the mailbox.
+                match inbox.router_packet_state(packet.packet_id) {
+                    Ok(Some(existing))
+                        if existing.packet_json != packet_json
+                            || existing.packet_hash != packet_hash =>
+                    {
+                        let reason = format!(
+                            "packet-id-conflict: {} already names different bytes at this router",
+                            packet.packet_id
+                        );
+                        match refuse_ingress_receipt(
+                            inbox,
+                            chain,
+                            &client,
+                            &conn,
+                            &channel,
+                            &keypair,
+                            &rest,
+                            binding,
+                            router_lct,
+                            notice_id,
+                            &notice_json,
+                            &packet,
+                            &packet_hash,
+                            upstream_member,
+                            Some(upstream_neighbor.next_hop_lct.as_str()),
+                            &reason,
+                        ).await {
+                            Ok(()) => {
+                                report.refused += 1;
+                                report.acked += 1;
+                            }
+                            Err(e) => {
+                                report.errors.push(format!(
+                                    "refuse packet-id conflict {notice_id}: {e:#}"
+                                ));
+                                batch_failed = true;
+                            }
+                        }
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        report.errors.push(format!(
+                            "load packet {} before stage: {e:#}",
+                            packet.packet_id
+                        ));
+                        batch_failed = true;
+                        continue;
+                    }
+                }
 
                 let mut state = match inbox.stage_router_packet(
                     binding.binding_id,
