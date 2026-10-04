@@ -1204,6 +1204,81 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn local_unreachable_notice_points_at_dereferenceable_chain_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let inbox = SqliteInboxStore::open(dir.path().join("inbox.db"), [0x51; 32]).unwrap();
+        let chain = SqliteChainStore::open(dir.path().join("witness.db"), [0x51; 32]).unwrap();
+        let router = "lct:web4:mb32:router";
+        let packet = RoutePacketV1 {
+            protocol: RoutePacketV1::PROTOCOL.to_string(),
+            packet_id: Uuid::new_v4(),
+            destination_lct: "lct:web4:mb32:origin".to_string(),
+            origin_lct: "lct:web4:mb32:failed-router".to_string(),
+            original_kind: "unreachable".to_string(),
+            pointer_uri: "hestia://route-error/original".to_string(),
+            content_hash: format!("sha256-pointer:{}", "a".repeat(64)),
+            hops_remaining: 7,
+            visited_routers: vec!["lct:web4:mb32:previous-router".to_string()],
+            failure: Some(crate::receiver_routing::RouteFailure {
+                original_packet_id: Uuid::new_v4(),
+                failed_destination_lct: "lct:web4:mb32:missing".to_string(),
+                failed_at_router_lct: "lct:web4:mb32:failed-router".to_string(),
+                reason: "no-route".to_string(),
+            }),
+        };
+        let packet_json = serde_json::to_string(&packet).unwrap();
+        let ingress = Uuid::new_v4();
+        inbox.stage_router_packet(
+            ingress,
+            "route-test-notice",
+            packet.packet_id,
+            "route-test-envelope",
+            &packet_json,
+            &sha256_content(packet_json.as_bytes()),
+        ).unwrap();
+
+        let action = PersistedAction::Local {
+            plugin_id: "origin-being".to_string(),
+            child_lct: packet.destination_lct.clone(),
+            from_lct: packet.origin_lct.clone(),
+            kind: "unreachable".to_string(),
+            pointer_uri: packet.pointer_uri.clone(),
+            source: "unreachable-routed-local".to_string(),
+            delivery_packet_json: Some(packet_json.clone()),
+        };
+
+        execute_action(
+            &action,
+            &packet,
+            None,
+            "stage-hash",
+            "lct:web4:mb32:previous-router",
+            Uuid::new_v4(),
+            &vault,
+            &ReceiverRoutingTable::default(),
+            router,
+            &inbox,
+            &chain,
+            &HubClient::new(),
+        ).await.unwrap();
+
+        let mail = inbox.drain_member("origin-being").unwrap();
+        assert_eq!(mail.len(), 1);
+        assert_eq!(mail[0].kind, "unreachable");
+        let pointer = mail[0].pointer_uri.as_deref().unwrap();
+        let hash = pointer.strip_prefix("hestia://chain/")
+            .expect("unreachable notice must point at the existing chain resolver");
+        let evidence = chain.read_by_hash(hash).unwrap().expect("evidence entry exists");
+        assert_eq!(evidence.event_type, "router.packet.unreachable-evidence");
+        assert_eq!(evidence.event_data["route_packet_json"], packet_json);
+
+        let state = inbox.router_packet_state(packet.packet_id).unwrap().unwrap();
+        assert_eq!(state.completion_kind.as_deref(), Some("delivered-local"));
+        assert!(state.completion_witness_hash.is_some());
+    }
+
     #[test]
     fn unreachable_packet_never_recursively_bounces() {
         let registry = MemberRegistry::default();
