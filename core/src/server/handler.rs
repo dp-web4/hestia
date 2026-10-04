@@ -5849,7 +5849,7 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             "operation_id": op_id,
             "from_plugin_id": sender_plugin_id,
             "member_notice_witness": member_notice_hash,
-            "legacy_address": to_plugin,
+            "requested_address": to_plugin,
             "origin_lct": plan.origin_lct,
             "router_lct": plan.router_lct,
             "destination_lct": plan.destination_lct,
