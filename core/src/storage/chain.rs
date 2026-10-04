@@ -329,6 +329,27 @@ impl SqliteChainStore {
             .map(|(entry, _inserted)| entry)
     }
 
+    /// Resolve the exact witness already bound to an idempotency key.
+    ///
+    /// Used when a crash landed the witness but not the queue-side operation
+    /// tombstone. The caller can validate immutable application binding against
+    /// the first witness instead of rebuilding it with a new session id.
+    pub fn event_by_key(&self, event_key: &str) -> Result<Option<ChainEntry>> {
+        let conn = self.read_conn.lock().unwrap();
+        conn.query_row(
+            "SELECT e.chain_position, e.hash, e.prev_hash, e.event_type, e.event_data,
+                    e.signer_lct, e.timestamp
+               FROM chain_event_keys k
+               JOIN chain_entries e
+                 ON e.chain_position = k.chain_position AND e.hash = k.entry_hash
+              WHERE k.event_key = ?1",
+            params![event_key],
+            row_to_entry,
+        )
+        .optional()?
+        .transpose()
+    }
+
     /// Append one witnessed fact exactly once for a durable caller-defined key.
     ///
     /// F3 receipt routing crosses the witness DB and inbox DB, so a crash can land
