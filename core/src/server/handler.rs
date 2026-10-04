@@ -5078,20 +5078,50 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
                 &router_lct,
                 &to_plugin,
             ) {
-                Ok(shadow) => json!({
-                    "mode": "shadow",
-                    "router_lct": router_lct,
-                    "origin_lct": origin_lct,
-                    "legacy_address": to_plugin,
-                    "result": shadow,
-                    "shared_pre_route": {
-                        "sender_plugin_id": sender.plugin_id,
-                        "from_session_id": sender.session_uuid,
-                        "law_gate": "passed",
-                        "flood_guard": "passed",
-                        "reply_binding_verified": binding_verified,
-                    }
-                }),
+                Ok(shadow) => {
+                    // Resolve the F3 L3 next-hop into the actual Hub member UUID
+                    // the router would use. This is the value D2 can compare with
+                    // legacy hub-notify's measured recipient_lct; comparing the
+                    // canonical router LCT to a Hub UUID would cross namespaces
+                    // and manufacture a mismatch.
+                    let neighbor = match &shadow {
+                        crate::receiver_routing::LegacyRouteShadow::Resolved {
+                            decision: crate::receiver_routing::RouteDecision::Forward {
+                                next_hop_lct,
+                                ..
+                            },
+                            ..
+                        } => match table.neighbor(next_hop_lct) {
+                            Some(n) => json!({
+                                "status": "resolved",
+                                "next_hop_lct": next_hop_lct,
+                                "hub_member_lct": n.next_hop_hub_member_lct,
+                                "link_id": n.link_id,
+                                "interface_binding_id": n.interface_binding_id,
+                            }),
+                            None => json!({
+                                "status": "missing_neighbor",
+                                "next_hop_lct": next_hop_lct,
+                            }),
+                        },
+                        _ => json!({"status": "not_applicable"}),
+                    };
+                    json!({
+                        "mode": "shadow",
+                        "router_lct": router_lct,
+                        "origin_lct": origin_lct,
+                        "legacy_address": to_plugin,
+                        "result": shadow,
+                        "f3_neighbor": neighbor,
+                        "shared_pre_route": {
+                            "sender_plugin_id": sender.plugin_id,
+                            "from_session_id": sender.session_uuid,
+                            "law_gate": "passed",
+                            "flood_guard": "passed",
+                            "reply_binding_verified": binding_verified,
+                        }
+                    })
+                },
                 Err(e) => json!({
                     "mode": "shadow",
                     "router_lct": router_lct,
