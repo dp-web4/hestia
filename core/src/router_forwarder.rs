@@ -160,6 +160,43 @@ async fn ack_one(
     Ok(())
 }
 
+const ROUTED_MEMBER_NOTICE_ROOTS: &[&str] = &[
+    "coordination",
+    "review_request",
+    "review_done",
+    "reply",
+    "handoff",
+    "forum-note",
+    "ack",
+];
+
+fn routable_member_notice_kind(kind: &str) -> bool {
+    if kind.is_empty() || kind.len() > 64 {
+        return false;
+    }
+    let Some(root) = ROUTED_MEMBER_NOTICE_ROOTS
+        .iter()
+        .find(|root| kind == **root || kind.starts_with(&format!("{root}.")))
+    else {
+        return false;
+    };
+    if kind.len() == root.len() {
+        return true;
+    }
+    kind[root.len() + 1..].split('.').all(|segment| {
+        !segment.is_empty()
+            && segment.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
+            })
+    })
+}
+
+fn routable_member_pointer(pointer: &str) -> bool {
+    !pointer.is_empty()
+        && pointer.len() <= 512
+        && !pointer.chars().any(char::is_control)
+}
+
 fn plan_failure(
     packet: &RoutePacketV1,
     reason: String,
@@ -266,28 +303,48 @@ fn plan_action(
             plugin_id,
             child_lct,
             ..
-        } => Ok((
-            PersistedAction::Local {
-                plugin_id,
-                child_lct,
-                from_lct: packet.origin_lct.clone(),
-                kind: packet.original_kind.clone(),
-                pointer_uri: packet.pointer_uri.clone(),
-                source: if packet.failure.is_some() || packet.original_kind == "unreachable" {
-                    "unreachable-routed-local".to_string()
-                } else {
-                    "routed-data-local".to_string()
+        } => {
+            let unreachable =
+                packet.failure.is_some() || packet.original_kind == "unreachable";
+            if !unreachable && !routable_member_notice_kind(&packet.original_kind) {
+                return plan_failure(
+                    packet,
+                    format!("local-kind-refused:{}", packet.original_kind),
+                    registry,
+                    routes,
+                    router_lct,
+                );
+            }
+            if !unreachable && !routable_member_pointer(&packet.pointer_uri) {
+                return plan_failure(
+                    packet,
+                    "local-pointer-refused".to_string(),
+                    registry,
+                    routes,
+                    router_lct,
+                );
+            }
+            Ok((
+                PersistedAction::Local {
+                    plugin_id,
+                    child_lct,
+                    from_lct: packet.origin_lct.clone(),
+                    kind: packet.original_kind.clone(),
+                    pointer_uri: packet.pointer_uri.clone(),
+                    source: if unreachable {
+                        "unreachable-routed-local".to_string()
+                    } else {
+                        "routed-data-local".to_string()
+                    },
+                    delivery_packet_json: if unreachable {
+                        Some(serde_json::to_string(packet)?)
+                    } else {
+                        None
+                    },
                 },
-                delivery_packet_json: if packet.failure.is_some()
-                    || packet.original_kind == "unreachable"
-                {
-                    Some(serde_json::to_string(packet)?)
-                } else {
-                    None
-                },
-            },
-            None,
-        )),
+                None,
+            ))
+        },
         RouteDecision::Forward {
             next_hop_lct,
             via,
@@ -1202,6 +1259,96 @@ mod tests {
                 kind, source, delivery_packet_json: Some(_), ..
             } if kind == "unreachable" && source == "unreachable-bounce-local"
         ));
+    }
+
+    #[test]
+    fn final_child_edge_reapplies_member_inbox_kind_and_pointer_contract() {
+        assert!(routable_member_notice_kind("coordination"));
+        assert!(routable_member_notice_kind("coordination.renotify"));
+        assert!(routable_member_notice_kind("review_done.pr"));
+        assert!(!routable_member_notice_kind("unreachable"));
+        assert!(!routable_member_notice_kind("disposition"));
+        assert!(!routable_member_notice_kind("coordinationX"));
+        assert!(!routable_member_notice_kind("coordination."));
+        assert!(!routable_member_notice_kind("Coordination"));
+        assert!(!routable_member_notice_kind(&format!("coordination.{}", "a".repeat(64))));
+
+        assert!(routable_member_pointer("shared-context/forum/x.md"));
+        assert!(!routable_member_pointer(""));
+        assert!(!routable_member_pointer("shared-context/ok\nINJECT"));
+        assert!(!routable_member_pointer(&"x".repeat(513)));
+    }
+
+    #[test]
+    fn unsafe_final_payload_bounces_instead_of_entering_child_inbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let router = "lct:web4:mb32:router";
+        let mut registry = load_members(&vault);
+        let origin = crate::member_registry::ensure_member(
+            &mut vault,
+            &mut registry,
+            "origin-being",
+            false,
+            router,
+            "anchor",
+        ).unwrap();
+        let destination = crate::member_registry::ensure_member(
+            &mut vault,
+            &mut registry,
+            "destination-being",
+            false,
+            router,
+            "anchor",
+        ).unwrap();
+        let mut routes = ReceiverRoutingTable::default();
+        for child in [&origin, &destination] {
+            routes.bind_local(crate::receiver_routing::LocalMailboxBinding {
+                binding_id: Uuid::new_v4(),
+                child_lct: child.clone(),
+                hub_url: "https://hub.test".to_string(),
+                hub_lct_id: Uuid::new_v4(),
+                rest_endpoint: "https://hub.test/v1".to_string(),
+                hub_member_lct: Uuid::new_v4(),
+                member_key_source: crate::hub::MemberKeySource::ChannelKeyFile {
+                    path: "/tmp/none".to_string(),
+                },
+                reason: "test".to_string(),
+                set_by: "test".to_string(),
+                set_at: 1,
+            }).unwrap();
+        }
+
+        for (kind, pointer, reason_fragment) in [
+            ("disposition", "shared-context/x", "local-kind-refused"),
+            ("coordination", "shared-context/x\nINJECT", "local-pointer-refused"),
+        ] {
+            let packet = RoutePacketV1 {
+                protocol: RoutePacketV1::PROTOCOL.to_string(),
+                packet_id: Uuid::new_v4(),
+                destination_lct: destination.clone(),
+                origin_lct: origin.clone(),
+                original_kind: kind.to_string(),
+                pointer_uri: pointer.to_string(),
+                content_hash: format!("sha256-pointer:{}", "a".repeat(64)),
+                hops_remaining: 8,
+                visited_routers: vec![],
+                failure: None,
+            };
+            let (action, _outbound) =
+                plan_action(&packet, &registry, &routes, router).unwrap();
+            assert!(
+                matches!(
+                    action,
+                    PersistedAction::Local {
+                        kind,
+                        delivery_packet_json: Some(_),
+                        ..
+                    } if kind == "unreachable"
+                ),
+                "{reason_fragment}: unsafe payload must become a local unreachable bounce"
+            );
+        }
     }
 
     #[tokio::test]
