@@ -139,6 +139,49 @@ Two surfaces, sharply separated by the hub invariant (*witness, don't control; n
 - Cross-seat evidence composition follows **0018 exactly**: evidence graph, never merged histories; `cross_chain_checkpoint_v1` (signed, non-transitive) after the #313 → B2 substrate lands; no trust auto-propagation in the primitive. A fleet control plane is 0018's first real consumer — and 0018's correction stands: this is *construction of the evidence substrate*, not "hub-seam coordination."
 - Deploy/observability: the per-seat `current-build.json` authority files + the ask-the-process route (issue #577) become the fleet deployment truth the manifest work started.
 
+### 4.4.1 D2 cutover is per edge, explicit, and monotonic
+
+The historical `peer/member` compatibility surface does not disappear in one global
+flag flip. Each exact legacy alias carries a delivery authority:
+
+- `legacy` (default): historical queue/drain remains authoritative; F3 is shadow evidence only.
+- `f3`: the alias translates to its canonical end-member LCT and F3 is the **only**
+  delivery authority. Failure never falls back into the legacy queue.
+
+Changing authority is a separate operator act from creating the alias and requires a reason.
+Deleting an F3-authoritative alias is refused: rollback must first be an explicit
+`f3 -> legacy` authority change with its own reason. This prevents configuration deletion
+from silently moving traffic backwards.
+
+The cutover adapter preserves the shared pre-route contract before choosing a plane:
+authenticated live sender/session, law, structural flood bound, reply ownership/address,
+recipient-liveness evidence, and transport binding. The first witnessed `member_notice`
+freezes the chosen authority, canonical origin/destination, migration reason, and operation
+binding. A retry therefore resumes that first decision even if the alias changes later.
+
+**Retry identity migration.** F3-authoritative `hestia_member_notify` requires caller-stable
+`operation_id`. The exact same value crosses the adapter into D1
+`(canonical origin LCT, operation_id)`; the adapter never derives a packet-local replacement.
+
+**Acceptance migration.** A successful legacy send historically meant the Hub/egress path
+accepted the notice. F3 deliberately strengthens this to one witnessed custody boundary:
+
+- exact destination child durably accepted into its local inbox; or
+- the selected next-hop router's receipt-mode mailbox durably accepted the route packet.
+
+Neither claim means the end recipient has read or acted on the notice. Receipts must name this
+strengthening rather than call it parity.
+
+**Transport-binding preservation.** `direct_required` remains a hard refusal when the actual F3 route requires a network hop; a canonical destination that resolves to a directly-connected local child needs no carrier and remains local. For explicit
+direct/relay bindings, D1 constrains the **actual persisted first-hop interface** to the
+authorized carrier; a preflight comparison is insufficient because routing could change
+between check and send. A bound `reply_to_lct` must equal the canonical sender identity for
+the current F3 packet model; otherwise cutover refuses rather than changing reply identity.
+
+Canonical `lct:web4:mb32:...` destinations are first-class F3 addresses on the same
+`member_notify` surface. This is how an F3-delivered notice can be answered without reviving
+a historical peer/member spelling.
+
 ### 4.5 Entity routing is TCP/IP-shaped: unknown means route, not refuse
 
 Web4's graph supplies the addressing semantics; Hestia supplies the local forwarding table.
