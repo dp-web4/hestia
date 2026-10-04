@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -356,9 +357,25 @@ impl SqliteInboxStore {
              -- whole column would be wrong even if it were possible — NULLs never
              -- conflict in SQLite, but the index would still tax every insert.
              CREATE UNIQUE INDEX IF NOT EXISTS idx_member_notices_disposition_key
-                 ON member_notices(disposition_key) WHERE disposition_key IS NOT NULL;",
+                 ON member_notices(disposition_key) WHERE disposition_key IS NOT NULL;
+             CREATE TABLE IF NOT EXISTS member_send_ops (
+                 sender_plugin       TEXT NOT NULL,
+                 operation_id        TEXT NOT NULL,
+                 binding_json        TEXT NOT NULL,
+                 witness_hash        TEXT NOT NULL,
+                 queued_id           INTEGER,
+                 egress_peer         TEXT,
+                 outcome             TEXT NOT NULL,
+                 response_json       TEXT NOT NULL,
+                 shadow_record_json  TEXT,
+                 shadow_witness_hash TEXT,
+                 created_at          TEXT NOT NULL,
+                 PRIMARY KEY (sender_plugin, operation_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_member_send_ops_created
+                 ON member_send_ops(created_at);",
         )
-        .context("indexing member_notices.in_reply_to")?;
+        .context("indexing member_notices and member-send operations")?;
         Self::ensure_touch_schema(conn)?;
         // The projector's cursor (same revised review): one row per projection
         // name, the chain position safely processed THROUGH. Living here rather
@@ -622,6 +639,7 @@ impl SqliteInboxStore {
     /// transport-authenticated, not caller-supplied, so there is no forgeable field
     /// in the loop bound at all. Cost: no third-party transit in v1, which is a
     /// deliberate limit, not an oversight.
+
     #[allow(clippy::too_many_arguments)]
     pub fn enqueue_egress(
         &self,
@@ -635,21 +653,31 @@ impl SqliteInboxStore {
     ) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
-        // The forwarding plane carries its OWN bound, because it no longer borrows
-        // the local plane's (see `enqueue_member`: the TTL prune and the cap used to
-        // reach across the seam and delete queued forwards). A bound that EVICTS needs
-        // a report path to stay honest. This comment used to justify the choice by
-        // saying the egress seam HAS none — no attempt counter, nothing that can say a
-        // forward was dropped. That is no longer true: `mark_failed`,
-        // `MAX_EGRESS_ATTEMPTS` and `retire_and_report_egress` now retire, witness and
-        // report exhausted rows to their sender. The choice stands on the surviving
-        // half of the argument, which never depended on the missing path: refusing
-        // admission tells a caller that is LIVE and holding the receipt, at the moment
-        // it can still do something about it, while evicting a parked row reports to a
-        // sender that has long since gone. The report path bounds how long a row may
-        // FAIL, not how many rows may be admitted; the two bounds do not substitute.
-        // Backpressure to a present sender is attributable; eviction of a parked row
-        // is the black hole.
+        Self::enqueue_egress_on(
+            &conn,
+            dest_peer,
+            to_plugin,
+            from_plugin,
+            from_role,
+            kind,
+            pointer_uri,
+            chain_hash,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_egress_on(
+        conn: &Connection,
+        dest_peer: &str,
+        to_plugin: &str,
+        from_plugin: &str,
+        from_role: &str,
+        kind: &str,
+        pointer_uri: Option<&str>,
+        chain_hash: &str,
+        transport_stamp: Option<&str>,
+    ) -> Result<u64> {
         let queued: i64 = conn.query_row(
             "SELECT COUNT(*) FROM member_notices
               WHERE dest_peer IS NOT NULL AND drained_at IS NULL",
@@ -662,15 +690,6 @@ impl SqliteInboxStore {
                  refusing admission rather than evicting a queued forward"
             );
         }
-        // PER-PEER, and the reason it is a SECOND clause rather than a replacement: the
-        // global bound protects the STORE (unbounded growth), this one protects the other
-        // PEERS (one wedged link starving every healthy one). Both are real and neither
-        // implies the other, so both are tested.
-        //
-        // Ordered after the global check so that when the plane is genuinely full the
-        // caller still gets the plane-full message; this clause speaks only when the plane
-        // has room and THIS destination does not, which is the case the old code answered
-        // with a message about the total.
         let queued_peer: i64 = conn.query_row(
             "SELECT COUNT(*) FROM member_notices
               WHERE dest_peer = ?1 AND drained_at IS NULL",
@@ -687,10 +706,20 @@ impl SqliteInboxStore {
         }
         conn.execute(
             "INSERT INTO member_notices
-                (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at, dest_peer)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![to_plugin, from_plugin, from_role, kind, pointer_uri,
-                    chain_hash, Utc::now().to_rfc3339(), dest_peer],
+                (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at,
+                 dest_peer, transport_stamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                to_plugin,
+                from_plugin,
+                from_role,
+                kind,
+                pointer_uri,
+                chain_hash,
+                Utc::now().to_rfc3339(),
+                dest_peer,
+                transport_stamp,
+            ],
         )
         .context("enqueueing egress notice")?;
         Ok(conn.last_insert_rowid() as u64)
@@ -797,6 +826,240 @@ impl SqliteInboxStore {
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
         Self::enqueue_member_on(&conn, to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, in_reply_to)
+    }
+
+
+    /// Read one already-committed member-notify operation.
+    pub fn member_send_operation(
+        &self,
+        sender_plugin: &str,
+        operation_id: &str,
+    ) -> Result<Option<MemberSendOperation>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        Self::member_send_operation_on(&conn, sender_plugin, operation_id)
+    }
+
+    fn member_send_operation_on(
+        conn: &Connection,
+        sender_plugin: &str,
+        operation_id: &str,
+    ) -> Result<Option<MemberSendOperation>> {
+        conn.query_row(
+            "SELECT binding_json, witness_hash, queued_id, egress_peer, outcome,
+                    response_json, shadow_record_json, shadow_witness_hash, created_at
+               FROM member_send_ops
+              WHERE sender_plugin = ?1 AND operation_id = ?2",
+            params![sender_plugin, operation_id],
+            |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(8)?,
+            )),
+        )
+        .optional()?
+        .map(|r| -> Result<MemberSendOperation> {
+            Ok(MemberSendOperation {
+                sender_plugin: sender_plugin.to_string(),
+                operation_id: operation_id.to_string(),
+                binding_json: r.0,
+                witness_hash: r.1,
+                queued_id: r.2.map(|v| v as u64),
+                egress_peer: r.3,
+                outcome: r.4,
+                response_json: serde_json::from_str(&r.5)
+                    .context("parsing member send operation response")?,
+                shadow_record_json: r.6,
+                shadow_witness_hash: r.7,
+                created_at: DateTime::parse_from_rfc3339(&r.8)
+                    .context("parsing member send operation created_at")?
+                    .with_timezone(&Utc),
+            })
+        })
+        .transpose()
+    }
+
+    fn validate_member_send_replay(
+        op: &MemberSendOperation,
+        binding_json: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            op.binding_json == binding_json,
+            "member-notify operation '{}' for '{}' was already used for different send intent",
+            op.operation_id,
+            op.sender_plugin
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_member_operation(
+        &self,
+        sender_plugin: &str,
+        operation_id: &str,
+        binding_json: &str,
+        to_plugin: &str,
+        from_plugin: &str,
+        from_role: &str,
+        kind: &str,
+        pointer_uri: Option<&str>,
+        chain_hash: &str,
+        in_reply_to: Option<u64>,
+        response_template: &Value,
+        shadow_record_template: Option<&Value>,
+    ) -> Result<MemberSendOperation> {
+        let mut conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let tx = conn.transaction().context("starting member-send operation")?;
+        if let Some(op) = Self::member_send_operation_on(&tx, sender_plugin, operation_id)? {
+            Self::validate_member_send_replay(&op, binding_json)?;
+            tx.commit().context("committing member-send replay read")?;
+            return Ok(op);
+        }
+        let queued_id = Self::enqueue_member_on(
+            &tx,
+            to_plugin,
+            from_plugin,
+            from_role,
+            kind,
+            pointer_uri,
+            chain_hash,
+            in_reply_to,
+        )?;
+        let mut response = response_template.clone();
+        response["queued_id"] = serde_json::json!(queued_id);
+        response["egress_queued_to"] = Value::Null;
+        if response.get("replayed").is_none() {
+            response["replayed"] = serde_json::json!(false);
+        }
+        let response_json = serde_json::to_string(&response)?;
+        let shadow_record_json = shadow_record_template
+            .map(|v| serde_json::to_string(v))
+            .transpose()?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO member_send_ops
+                (sender_plugin, operation_id, binding_json, witness_hash, queued_id,
+                 egress_peer, outcome, response_json, shadow_record_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'queued', ?6, ?7, ?8)",
+            params![
+                sender_plugin, operation_id, binding_json, chain_hash,
+                queued_id as i64, response_json, shadow_record_json, now,
+            ],
+        )
+        .context("binding local member-send operation")?;
+        tx.commit().context("committing local member-send operation")?;
+        Self::member_send_operation_on(&conn, sender_plugin, operation_id)?
+            .ok_or_else(|| anyhow::anyhow!("member-send operation disappeared after commit"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_egress_operation(
+        &self,
+        sender_plugin: &str,
+        operation_id: &str,
+        binding_json: &str,
+        dest_peer: &str,
+        to_plugin: &str,
+        from_plugin: &str,
+        from_role: &str,
+        kind: &str,
+        pointer_uri: Option<&str>,
+        chain_hash: &str,
+        transport_stamp: Option<&str>,
+        response_template: &Value,
+        shadow_record_template: Option<&Value>,
+    ) -> Result<MemberSendOperation> {
+        let mut conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let tx = conn.transaction().context("starting routed member-send operation")?;
+        if let Some(op) = Self::member_send_operation_on(&tx, sender_plugin, operation_id)? {
+            Self::validate_member_send_replay(&op, binding_json)?;
+            tx.commit().context("committing routed member-send replay read")?;
+            return Ok(op);
+        }
+        let queued_id = Self::enqueue_egress_on(
+            &tx,
+            dest_peer,
+            to_plugin,
+            from_plugin,
+            from_role,
+            kind,
+            pointer_uri,
+            chain_hash,
+            transport_stamp,
+        )?;
+        let mut response = response_template.clone();
+        response["queued_id"] = serde_json::json!(queued_id);
+        response["egress_queued_to"] = serde_json::json!(dest_peer);
+        if response.get("replayed").is_none() {
+            response["replayed"] = serde_json::json!(false);
+        }
+        let response_json = serde_json::to_string(&response)?;
+        let shadow_record_json = shadow_record_template
+            .map(|template| {
+                let mut record = template.clone();
+                record["legacy_egress_row_id"] = serde_json::json!(queued_id);
+                serde_json::to_string(&record)
+            })
+            .transpose()?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO member_send_ops
+                (sender_plugin, operation_id, binding_json, witness_hash, queued_id,
+                 egress_peer, outcome, response_json, shadow_record_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9)",
+            params![
+                sender_plugin, operation_id, binding_json, chain_hash,
+                queued_id as i64, dest_peer, response_json, shadow_record_json, now,
+            ],
+        )
+        .context("binding routed member-send operation")?;
+        tx.commit().context("committing routed member-send operation")?;
+        Self::member_send_operation_on(&conn, sender_plugin, operation_id)?
+            .ok_or_else(|| anyhow::anyhow!("routed member-send operation disappeared after commit"))
+    }
+
+    pub fn set_member_send_shadow_witness(
+        &self,
+        sender_plugin: &str,
+        operation_id: &str,
+        witness_hash: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        let prior: Option<Option<String>> = conn
+            .query_row(
+                "SELECT shadow_witness_hash FROM member_send_ops
+                  WHERE sender_plugin = ?1 AND operation_id = ?2",
+                params![sender_plugin, operation_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(prior) = prior else {
+            anyhow::bail!("member-send operation '{operation_id}' for '{sender_plugin}' is absent");
+        };
+        if let Some(prior) = prior {
+            anyhow::ensure!(
+                prior == witness_hash,
+                "member-send operation '{operation_id}' is bound to a different shadow witness"
+            );
+            return Ok(());
+        }
+        let n = conn.execute(
+            "UPDATE member_send_ops SET shadow_witness_hash = ?3
+              WHERE sender_plugin = ?1 AND operation_id = ?2
+                AND shadow_witness_hash IS NULL",
+            params![sender_plugin, operation_id, witness_hash],
+        )?;
+        anyhow::ensure!(n == 1, "member-send shadow witness changed concurrently");
+        Ok(())
     }
 
     /// Retire an egress row AND queue its author's report in one transaction (#1030 review):
@@ -1748,6 +2011,26 @@ pub struct EgressRow {
     /// The sender's transport binding when the row was queued (#1030); None = unbound.
     pub transport_stamp: Option<String>,
 }
+
+/// One daemon-level idempotency record for hestia_member_notify.
+///
+/// operation_id identifies ONE caller operation, not one message body. Two
+/// intentionally identical notices with different operation ids are distinct.
+#[derive(Debug, Clone)]
+pub struct MemberSendOperation {
+    pub sender_plugin: String,
+    pub operation_id: String,
+    pub binding_json: String,
+    pub witness_hash: String,
+    pub queued_id: Option<u64>,
+    pub egress_peer: Option<String>,
+    pub outcome: String,
+    pub response_json: Value,
+    pub shadow_record_json: Option<String>,
+    pub shadow_witness_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 
 // ---- F3 host receiver custody ------------------------------------------------
 

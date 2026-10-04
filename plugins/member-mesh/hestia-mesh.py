@@ -4,7 +4,7 @@
 Usage:
   hestia-mesh.py peek                                    # non-consuming inbox list
   hestia-mesh.py drain                                   # consume-once drain (act on results!)
-  hestia-mesh.py send <to_plugin_id> <kind> <pointer_uri> [re_notice_id]  # witnessed notify
+  hestia-mesh.py send <to_plugin_id> <kind> <pointer_uri> [re_notice_id] [--operation-id ID]
   hestia-mesh.py unanswered [older_than_secs]            # what has no bound response
 
 Env: HESTIA_ENDPOINT (default http://127.0.0.1:7711/mcp),
@@ -22,8 +22,9 @@ Discipline: forum post = record, mesh notice = wake; content lives at the pointe
 Bind your dispositions: pass the id of the notice you are answering as the 4th
 arg to `send` (reply/ack/review_done), or it stays "unanswered" forever.
 Exit codes: 0 ok | 1 never got there (refused/DNS) | 2 usage | 3 daemon answered and
-declined | 4 UNDETERMINED — no answer in time, the write MAY have landed; do not
-blind-retry a `send` on 4 (issue #523) | 5 REFUSED LOCALLY — this seat already queued a
+declined | 4 UNDETERMINED — no answer in time, the write MAY have landed. A send with
+--operation-id may be retried safely with the SAME id; without one, do not blind-retry
+(issue #523) | 5 REFUSED LOCALLY — this seat already queued a
 byte-identical notice inside the resend window; nothing was sent, and NO SESSION WAS
 OPENED — the guard runs before connect(), so a local refusal costs the daemon nothing.
 Override with HESTIA_MESH_RESEND=1, or widen/narrow with HESTIA_MESH_RESEND_WINDOW
@@ -414,9 +415,9 @@ def already_sent(args, now=None):
     so a genuine second disposition on the same pointer, or the same pointer bound to a
     different notice, is NOT refused. Only the byte-identical repeat is.
 
-    Deliberately NOT an idempotency key on the daemon: that is the right fix and needs a
-    protocol field (`hestia_member_notify` has none). This closes the measured hole from
-    the caller side today and does not preclude it.
+    This is now the LEGACY fallback only. When send carries --operation-id, the daemon
+    owns retry identity and this content guard is skipped: operation identity and content
+    identity are different things, and two intentional identical sends must remain possible.
 
     TWO NON-PROPERTIES, named so nobody has to rediscover them.
 
@@ -517,6 +518,18 @@ def record_sent(args, out):
               f"({e}) — a byte-identical resend will NOT be caught.", file=sys.stderr)
 
 
+def send_operation_id_from_argv():
+    """Return the explicit send operation id, if present, without interpreting other args."""
+    if len(sys.argv) < 2 or sys.argv[1] != "send":
+        return None
+    for i, token in enumerate(sys.argv[5:], start=5):
+        if token == "--operation-id":
+            return sys.argv[i + 1] if i + 1 < len(sys.argv) else None
+        if token.startswith("--operation-id="):
+            return token.split("=", 1)[1]
+    return None
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in ("peek", "drain", "send", "unanswered"):
         print(__doc__); sys.exit(2)
@@ -529,11 +542,17 @@ def main():
         summarize(r.payload)
         sys.exit(3)
     except Undetermined as u:
-        # NOT rc=1. The caller must be able to tell "never left" from "may have landed",
-        # because only the first one is safe to retry blind.
-        print(f"hestia-mesh: UNDETERMINED — {EP} did not answer in time: {u}\n"
-              f"  The request may have been COMMITTED. `send` has no idempotency key,\n"
-              f"  so retrying may duplicate it. Check `unanswered` (or `peek`) first.",
+        # NOT rc=1. With a stable operation id, an uncertain response is retryable:
+        # the daemon recovers the first witness/queue result. Without one, the
+        # historical duplicate risk remains.
+        op_id = send_operation_id_from_argv()
+        if op_id:
+            advice = (f"  The request may have been COMMITTED. Retry the SAME send with "
+                      f"--operation-id {op_id!r}; the daemon will recover the first result.")
+        else:
+            advice = ("  The request may have been COMMITTED. This send has no operation id, "
+                      "so retrying may duplicate it. Check unanswered (or peek) first.")
+        print(f"hestia-mesh: UNDETERMINED — {EP} did not answer in time: {u}\n{advice}",
               file=sys.stderr)
         sys.exit(4)
     except Unreachable as u:
@@ -551,20 +570,61 @@ def act(cmd):
     # The key holds no session_id, so there is nothing to wait for the daemon to tell us.
     if cmd == "send":
         if len(sys.argv) < 5:
-            print("usage: hestia-mesh.py send <to_plugin_id> <kind> <pointer_uri> [re_notice_id]")
+            print("usage: hestia-mesh.py send <to_plugin_id> <kind> <pointer_uri> "
+                  "[re_notice_id] [--operation-id ID]")
             sys.exit(2)
         sendargs = {"to_plugin_id": sys.argv[2], "kind": sys.argv[3],
                     "pointer_uri": sys.argv[4]}
-        if len(sys.argv) > 5:
-            sendargs["in_reply_to"] = int(sys.argv[5])
-        dup = already_sent(sendargs)
-        if dup is not None:
-            age = int(time.time() - float(dup.get("at", 0)))
-            print(f"hestia-mesh: REFUSED LOCALLY — this seat queued a byte-identical "
-                  f"notice {age}s ago (queued_id={dup.get('queued_id')}). NOTHING WAS "
-                  f"SENT, and no session was opened. If you meant to send it twice: "
-                  f"HESTIA_MESH_RESEND=1 {' '.join(sys.argv)}", file=sys.stderr)
-            sys.exit(5)
+        positional = []
+        operation_id = None
+        rest = sys.argv[5:]
+        i = 0
+        while i < len(rest):
+            token = rest[i]
+            if token == "--operation-id":
+                if operation_id is not None or i + 1 >= len(rest):
+                    print("usage: --operation-id requires exactly one value", file=sys.stderr)
+                    sys.exit(2)
+                operation_id = rest[i + 1]
+                i += 2
+                continue
+            if token.startswith("--operation-id="):
+                if operation_id is not None:
+                    print("usage: --operation-id may be specified only once", file=sys.stderr)
+                    sys.exit(2)
+                operation_id = token.split("=", 1)[1]
+                i += 1
+                continue
+            if token.startswith("--"):
+                print(f"usage: unknown send option {token!r}", file=sys.stderr)
+                sys.exit(2)
+            positional.append(token)
+            i += 1
+        if len(positional) > 1:
+            print("usage: at most one re_notice_id may be supplied", file=sys.stderr)
+            sys.exit(2)
+        if positional:
+            sendargs["in_reply_to"] = int(positional[0])
+        if operation_id is not None:
+            if (not operation_id or len(operation_id.encode("utf-8")) > 128
+                    or any(ord(ch) < 32 or ord(ch) == 127 for ch in operation_id)):
+                print("usage: --operation-id must be 1..128 bytes with no control characters",
+                      file=sys.stderr)
+                sys.exit(2)
+            sendargs["operation_id"] = operation_id
+
+        # A stable operation id supersedes the local content guard. Retrying one
+        # operation must reach the daemon; an intentional identical send uses a
+        # DIFFERENT operation id and remains a different act.
+        if operation_id is None:
+            dup = already_sent(sendargs)
+            if dup is not None:
+                age = int(time.time() - float(dup.get("at", 0)))
+                print(f"hestia-mesh: REFUSED LOCALLY — this seat queued a byte-identical "
+                      f"notice {age}s ago (queued_id={dup.get('queued_id')}). NOTHING WAS "
+                      f"SENT, and no session was opened. If you meant to send it twice: "
+                      f"HESTIA_MESH_RESEND=1 {' '.join(sys.argv)}", file=sys.stderr)
+                sys.exit(5)
     h, s = connect()
     if cmd in ("peek", "drain"):
         out = rpc(h, "hestia_member_inbox", {"session_id": s, "peek": cmd == "peek"})
@@ -580,7 +640,7 @@ def act(cmd):
         # deliberately NOT part of resend_key(): a fresh session is not a new act.
         args = dict(sendargs, session_id=s)
         out = rpc(h, "hestia_member_notify", args)
-        if not failed(out):
+        if not failed(out) and not args.get("operation_id"):
             record_sent(args, out)
     # stdout keeps carrying the full payload either way — callers parse it as JSON and
     # the error body is the diagnostic. Only the exit code changes: 3 = the daemon
@@ -645,6 +705,9 @@ def confirm(cmd, out):
                     + ("" if out.get("binding_verified") else " (UNVERIFIED)"))
     if out.get("recipient_liveness"):
         bits.append(f"liveness={out['recipient_liveness']}")
+    if out.get("operation_id") is not None:
+        bits.append(f"operation_id={out['operation_id']}")
+        bits.append("replayed=yes" if out.get("replayed") else "replayed=no")
     # ABSENT is not hypothetical: an egress-routed send returns a payload with no
     # queued_id at all, and saying "queued_id=ABSENT" beats printing a bare success.
     print("hestia-mesh: sent — " + " ".join(bits), file=sys.stderr)
