@@ -640,16 +640,31 @@ enum HubCmd {
         reason: String,
     },
 
+    /// Issue a dual-signed router-interface certificate after re-verifying the
+    /// Hub pin and proving receipt mode with a non-destructive fetch.
+    ReceiverRouterCertify {
+        /// Existing Hub connection used only to identify the Hub endpoint.
+        #[arg(long, default_value = "")]
+        target: String,
+        /// Router/parent canonical LCT (default: persisted local Society).
+        #[arg(long)]
+        parent: Option<String>,
+        /// Optional JSON file to write atomically; certificate is always printed.
+        #[arg(long)]
+        out: Option<String>,
+    },
+
     /// Bind one canonical next-hop router LCT to its Hub transport address.
-    /// This is the routing-table equivalent of neighbor/ARP resolution.
+    /// Peer Hub-member identity is derived from a verified router certificate,
+    /// not typed independently.
     ReceiverNeighbor {
         next_hop: String,
-        /// Router interface UUID from receiver-router-bind.
+        /// Local router interface UUID used to reach this neighbor's Hub.
         #[arg(long)]
         interface: uuid::Uuid,
-        /// The next router's Hub member UUID on that interface's Hub.
+        /// JSON router-interface certificate exported by the peer.
         #[arg(long)]
-        next_hop_member_lct: uuid::Uuid,
+        peer_certificate: String,
         #[arg(long)]
         reason: String,
     },
@@ -1140,10 +1155,15 @@ pub fn run() -> AnyResult<()> {
             } => cmd_receiver_router_bind(
                 &home, &target, member_lct, channel_key, parent.as_deref(), &reason,
             ),
+            HubCmd::ReceiverRouterCertify { target, parent, out } => {
+                cmd_receiver_router_certify(
+                    &home, &target, parent.as_deref(), out.as_deref(),
+                )
+            }
             HubCmd::ReceiverNeighbor {
-                next_hop, interface, next_hop_member_lct, reason
+                next_hop, interface, peer_certificate, reason
             } => cmd_receiver_neighbor(
-                &home, &next_hop, interface, next_hop_member_lct, &reason,
+                &home, &next_hop, interface, &peer_certificate, &reason,
             ),
             HubCmd::ReceiverAlias {
                 legacy_address, destination_lct, reason
