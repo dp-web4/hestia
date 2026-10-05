@@ -1,0 +1,71 @@
+{
+  "notice_id": 17054,
+  "reviewer": "codex",
+  "verdict": "request_changes",
+  "artifact_sha256": "01e68a1cd2d3f980021fd73c5d882697b8887b8ddab10380d5ab3b0dca3bae20",
+  "source_slice_sha256": "75759e979d878fdc9cfdc6fbe6cf7366c692f30ed99aa8a28aeaa15cbb543e59",
+  "base": "d3c050065aa98b1db4ae80bc148462a7612ec9ef",
+  "review_method": "Static review of the full patch and relevant base code; harmless shell semantics probes. Candidate gate code was not executed.",
+  "validation": {
+    "patch_digest": "matches notice",
+    "source_slice_digest": "matches filename prefix",
+    "source_slice_apply_check": "passed against files archived from the declared base",
+    "candidate_tests": "not run: PreToolUse denied git apply in the temporary review tree under governance-closure-write; no alternate write or execution route attempted",
+    "shell_semantics_probes": [
+      {
+        "argv": ["bash", "-c", "printf '%s\\n' \"'$(printf EXPANDED)'\""],
+        "observed_stdout": "'EXPANDED'\n"
+      },
+      {
+        "argv": ["date", "+/scope-review/outside.txt"],
+        "observed_stdout": "/scope-review/outside.txt\n"
+      },
+      {
+        "argv": ["find", ".", "-maxdepth", "0", "-printf", "/scope-review/outside.txt"],
+        "observed_stdout": "/scope-review/outside.txt"
+      }
+    ],
+    "probe_limit": "Probes only produced fixed text or inspected the temporary review directory. They did not read any outside-scope target. Predicted candidate verdicts below are static conclusions, not measured gate verdicts."
+  },
+  "findings": [
+    {
+      "id": "P1-quote-context",
+      "priority": 1,
+      "location": "plugins/_shared/hestia_gate_core.py:1397 (patched line)",
+      "title": "Preserve quote provenance when collecting executed substitutions",
+      "reproducer": "printf '%s\\n' \"'$(cat /outside-scope/data.txt)'\"",
+      "precondition": "Use an existing, ungranted outside-scope fixture without an egress-forbidden spelling.",
+      "explanation": "_tokenize removes the outer double quotes while preserving the apostrophes as ordinary characters. _shell_words passes that dequoted word to _substitution_bodies with quotes=True. The second parser now mistakes those literal apostrophes for shell single-quote delimiters and skips the live substitution. The printf positional-string exception then skips the enclosing argument. Bash does execute the substitution, as the harmless marker probe confirms. This leaves an outside read absent from the candidates.",
+      "requested_change": "Collect live substitution spans while original quote state is available, or scan the already-tokenized representation without interpreting literal apostrophes as new quoting syntax. Add equivalent printf and echo cases to both reach and core.evaluate regression coverage."
+    },
+    {
+      "id": "P1-output-model",
+      "priority": 1,
+      "location": "plugins/_shared/hestia_gate_core.py:1554-1573 and _expand_pipeline (patched lines)",
+      "title": "Restrict output models by command options and operands",
+      "reproducers": [
+        "cat \"$(date +/outside-scope/data.txt)\"",
+        "cat \"$(find . -maxdepth 0 -printf /outside-scope/data.txt)\"",
+        "cat \"$(find . -maxdepth 0 | head -n1 paths.txt)\""
+      ],
+      "precondition": "The target is an existing ungranted fixture. For the third case, an allowed paths.txt contains its absolute pathname, and cwd is granted.",
+      "explanation": "The date branch returns the opaque value 0 regardless of its format, although +FORMAT can output a literal absolute pathname. The find branch returns roots' subtrees regardless of -printf, while _CMD_SPECS deliberately excludes the format from path judging. Neither model bounds the actual output. Likewise _expand_pipeline accepts head with a file operand: head then reads that file instead of selecting the lister's stdin. All three can feed an outside pathname to the outer cat while the inferred candidate is 0 or a granted subtree. The date and find output behaviors were independently verified without performing the outer read.",
+      "requested_change": "Model only option/operand shapes with a proven output constraint; treat the rest as incomplete. For line filters, reject independent input operands and output-transforming modes. Add these cases through core.evaluate as well as the helper."
+    },
+    {
+      "id": "P2-reservation-outcome",
+      "priority": 2,
+      "location": "plugins/_shared/hestia_single_gate.py:798-823 and plugins/_shared/hestia_gate_mechanism.py:1639 (patched lines)",
+      "title": "Do not equate unknown or settled reservations with confirmed non-consumption",
+      "explanation": "After a lost reserve response, lookup=unknown is converted to not_reserved and reported as nothing consumed, without cancelling or fencing a still-in-flight reserve. An unknown lookup is only absence at lookup time. The release paths also accept settled as proof of non-consumption. At the declared base, core/src/server/handler.rs:23807 returns settled for any existing operation with no open reservations, including states=[committed] or states=[lapsed]. scope_batch discards those states and permits fields, so the caller cannot distinguish those consumed outcomes from released. These branches can make the certainty claim that the new protocol was intended to eliminate.",
+      "requested_change": "Carry structured settlement evidence through scope_batch and assert non-consumption only for a confirmed release or terminal cancellation. Keep a lost reserve plus unknown lookup uncertain unless the daemon provides an ordered cancellation/tombstone preventing a late reserve. Test both reserve-after-unknown ordering and settled responses with committed, lapsed, and released states."
+    }
+  ],
+  "acknowledged_changes": [
+    "The complete-act digest replaces the masked display summary as the approval binding.",
+    "Path-budget overflow and unresolved expansions now have explicit incomplete refusal paths.",
+    "The source slice adds coverage corresponding to notices 17029 and 17009.",
+    "Reservation is deferred until after society permission, with settlement after finalization."
+  ],
+  "scope_limit": "This is a review verdict, not an authorization to deploy or modify the live gate. The acknowledged changes have not been runtime-certified in this review."
+}
