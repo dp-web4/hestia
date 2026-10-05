@@ -23163,10 +23163,9 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
             None,
         ));
     };
-    // ATOMIC BATCH SPEND (Codex review of #1232, P2): `paths` + `spend: true` consumes every
-    // one-time approval the act needs, or none — the gate calls it once, after every path was
-    // peeked and society law permitted the act.
-    if args.get("paths").is_some() {
+    // RESERVE / COMMIT (Codex reviews of #1232, P2): `op` = reserve | commit | release | lookup
+    // over every one-time approval the act needs — all or none, never consumed by a denied act.
+    if args.get("op").is_some() || args.get("paths").is_some() {
         return scope_claim_spend_all(state, args, &asserted, &act_digest).await;
     }
     let raw_path = require_string(args, "path")?;
@@ -23415,34 +23414,69 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
     }))
 }
 
-/// `hestia_scope_claim` with `paths`: ONE atomic spend for an act refused on several paths.
+/// How long a RESERVED one-time approval waits for the gate's commit or release before it lapses
+/// into spent. Longer than any gate deadline (seconds), short enough that a dead gate does not
+/// hold an operator's approval hostage for long.
+pub const SCOPE_RESERVATION_SECS: u64 = 120;
+
+/// `hestia_scope_claim` with `op` — the RESERVE / COMMIT protocol for the one-time approvals an
+/// act needs (Codex reviews of #1232, P2 and re-review P2).
 ///
-/// Under one lock, every path must be either covered by a grant in force or hold an unspent
-/// one-time approval bound to THIS act digest; then all such approvals are spent with ONE
-/// witnessed `scope_once_spent` row, or — if any path fails — nothing is spent and the answer
-/// names what was missing. Opens nothing (the gate's per-path peeks already did). Codex review
-/// of #1232, P2: the old peek-then-spend-per-path shape could consume four approvals and deny on
-/// the fifth, or spend before society law refused the act; a denied act now consumes nothing.
+///   * `reserve` (`paths`, `op_key`): under one lock, every path must be covered by a grant in
+///     force or hold an unspent one-time approval bound to THIS act digest; then all such
+///     approvals are RESERVED for `op_key` with one witnessed `scope_once_reserved` row — or
+///     nothing is reserved and the missing paths are named. Idempotent per `op_key`: a retried
+///     reserve finds its own reservation instead of reserving twice. Opens nothing.
+///   * `commit` (`op_key`): the act was permitted and its final evidence recorded — the reserved
+///     approvals become SPENT (one `scope_once_spent` row).
+///   * `release` (`op_key`): the act was denied after all — the approvals are spendable again
+///     (one `scope_once_released` row).
+///   * `lookup` (`op_key`): what became of an operation whose answer was lost — `reserved`,
+///     `committed`, `released`, `lapsed` (consumed), or `unknown`. Read-only.
+///
+/// A reservation neither committed nor released by `SCOPE_RESERVATION_SECS` LAPSES INTO SPENT: a
+/// gate that went silent may have let the act run, so its approval is never spendable twice.
 async fn scope_claim_spend_all(state: &SharedState, args: &Value, asserted: &str,
                                act_digest: &str) -> ToolResult {
     use crate::server::gate_escalation::now_secs;
     use crate::server::state::normalize_scope_path;
 
-    let Some(raw_paths) = args.get("paths").and_then(Value::as_array) else {
-        return Err(anyhow::anyhow!("paths must be an array of absolute paths"));
-    };
-    if args.get("spend").and_then(Value::as_bool) != Some(true) {
-        return Err(anyhow::anyhow!(
-            "a batch claim only SPENDS (spend: true); peek one path at a time"
-        ));
-    }
-    if raw_paths.is_empty() || raw_paths.len() > 16 {
-        return Err(anyhow::anyhow!("paths must hold 1..=16 entries"));
+    let op = optional_string(args, "op").unwrap_or_default();
+    let op_key = optional_string(args, "op_key").unwrap_or_default();
+    if op_key.len() < 16 || op_key.len() > 128 {
+        return Err(anyhow::anyhow!("op_key (16..=128 chars) is required for a batch operation"));
     }
     let host_session_id = optional_string(args, "host_session_id");
     let session_id_arg = optional_session_id(args);
     let now = now_secs();
     let mut s = state.lock().await;
+    if matches!(op.as_str(), "commit" | "release" | "lookup") {
+        return scope_claim_settle(&mut s, &op, &op_key, act_digest, asserted,
+                                  session_id_arg.as_deref(), host_session_id, now);
+    }
+    if op != "reserve" {
+        return Err(anyhow::anyhow!("op must be reserve, commit, release or lookup"));
+    }
+    let Some(raw_paths) = args.get("paths").and_then(Value::as_array) else {
+        return Err(anyhow::anyhow!("paths must be an array of absolute paths"));
+    };
+    if raw_paths.is_empty() || raw_paths.len() > 16 {
+        return Err(anyhow::anyhow!("paths must hold 1..=16 entries"));
+    }
+    // IDEMPOTENT: a retried reserve for the same operation reports what it already holds.
+    let held: Vec<String> = s
+        .scope_requests
+        .values()
+        .filter(|r| r.ext.reserved_by.as_deref() == Some(op_key.as_str()) && r.ext.reservation_open()
+                && !r.ext.reservation_lapsed(now))
+        .map(|r| r.id.clone())
+        .collect();
+    if !held.is_empty() {
+        return Ok(json!({
+            "verdict": "reserved", "permits": true, "reserved": held, "op_key": op_key,
+            "detail": "this operation already holds its reservation (retry)",
+        }));
+    }
     let plugin_id = match resolve_attributed_caller(&s, session_id_arg.as_deref()) {
         Some(who) if who.plugin_id != asserted => {
             return Ok(hestia_error_envelope(
@@ -23489,41 +23523,134 @@ async fn scope_claim_spend_all(state: &SharedState, args: &Value, asserted: &str
         return Ok(json!({
             "verdict": "not_all",
             "permits": false,
-            "spent": [],
+            "reserved": [],
             "missing": missing,
             "detail": "not every path is covered by a grant in force or a one-time approval for \
-                       this exact act; NOTHING was spent",
+                       this exact act; NOTHING was reserved",
         }));
     }
-    // Witness, then spend — every approval in one row, so the spend is one fact.
+    // Witness, then reserve — every approval in one row, so the reservation is one fact.
+    let until = now + SCOPE_RESERVATION_SECS;
     let mut entry_hash = serde_json::Value::Null;
     if !to_spend.is_empty() {
         let entry = s.append_chain(
-            "scope_once_spent",
+            "scope_once_reserved",
             json!({
                 "request_ids": to_spend,
+                "op_key": op_key,
                 "plugin_id": plugin_id,
                 "subject_instance_lct": s.member_lct(&plugin_id),
                 "act_digest": act_digest,
                 "host_session_id": host_session_id,
                 "in_force_paths": in_force,
+                "reserved_until": until,
             }),
         )?;
         entry_hash = json!(entry.hash);
         for id in &to_spend {
             if let Some(r) = s.scope_requests.get_mut(id) {
-                r.ext.spent_at = Some(now);
+                r.ext.reserved_by = Some(op_key.clone());
+                r.ext.reserved_until = Some(until);
+                r.ext.released_at = None;
             }
         }
     }
     Ok(json!({
-        "verdict": "approved",
+        "verdict": "reserved",
         "permits": true,
-        "spent": to_spend,
+        "reserved": to_spend,
         "in_force": in_force,
+        "op_key": op_key,
+        "reserved_until": until,
         "witnessEntryHash": entry_hash,
-        "detail": "every path is covered; the one-time approvals this act needed are spent \
-                   (single use)",
+        "detail": "every path is covered; the one-time approvals this act needs are RESERVED — \
+                   commit after the act's evidence is recorded, release if it is denied; \
+                   unreported, they lapse into spent",
+    }))
+}
+
+/// `commit` / `release` / `lookup` of a reservation (see `scope_claim_spend_all`).
+#[allow(clippy::too_many_arguments)]
+fn scope_claim_settle(s: &mut crate::server::state::ServerState, op: &str, op_key: &str,
+                      act_digest: &str, asserted: &str, session_id_arg: Option<&str>,
+                      host_session_id: Option<String>, now: u64) -> ToolResult {
+    let plugin_id = match resolve_attributed_caller(s, session_id_arg) {
+        Some(who) if who.plugin_id != asserted => {
+            return Ok(hestia_error_envelope(
+                "hestia.scope_claim_asker_mismatch",
+                "the session you presented belongs to a different member than the plugin_id \
+                 you asserted; nothing changed",
+                Some(json!({ "asserted": asserted, "session_member": who.plugin_id })),
+            ));
+        }
+        Some(who) => who.plugin_id,
+        None => asserted.to_string(),
+    };
+    let mine: Vec<String> = s
+        .scope_requests
+        .values()
+        .filter(|r| r.plugin_id == plugin_id && r.ext.reserved_by.as_deref() == Some(op_key))
+        .filter(|r| r.ext.gate.as_ref().is_some_and(|g| g.act_digest == act_digest))
+        .map(|r| r.id.clone())
+        .collect();
+    let state_of = |s: &crate::server::state::ServerState, id: &str| -> &'static str {
+        let r = &s.scope_requests[id];
+        if r.ext.spent_at.is_some() { "committed" }
+        else if r.ext.released_at.is_some() { "released" }
+        else if r.ext.reservation_lapsed(now) { "lapsed" }
+        else { "reserved" }
+    };
+    if op == "lookup" {
+        let states: Vec<&str> = mine.iter().map(|id| state_of(s, id)).collect();
+        let overall = if states.is_empty() {
+            "unknown"
+        } else if states.iter().all(|x| *x == states[0]) {
+            states[0]
+        } else {
+            "mixed"
+        };
+        return Ok(json!({ "verdict": overall, "op_key": op_key, "request_ids": mine,
+                          "consumed": matches!(overall, "committed" | "lapsed") }));
+    }
+    let open: Vec<String> = mine.iter().filter(|id| state_of(s, id) == "reserved").cloned().collect();
+    if open.is_empty() {
+        // Nothing open: report what happened instead of pretending to act.
+        let states: Vec<&str> = mine.iter().map(|id| state_of(s, id)).collect();
+        return Ok(json!({
+            "verdict": if mine.is_empty() { "unknown" } else { "settled" },
+            "op_key": op_key, "states": states, "permits": op == "commit"
+                && !states.is_empty() && states.iter().all(|x| *x == "committed"),
+            "detail": "no open reservation for this operation",
+        }));
+    }
+    let (event, done) = if op == "commit" {
+        ("scope_once_spent", "committed")
+    } else {
+        ("scope_once_released", "released")
+    };
+    let entry = s.append_chain(
+        event,
+        json!({
+            "request_ids": open,
+            "op_key": op_key,
+            "plugin_id": plugin_id,
+            "subject_instance_lct": s.member_lct(&plugin_id),
+            "act_digest": act_digest,
+            "host_session_id": host_session_id,
+        }),
+    )?;
+    for id in &open {
+        if let Some(r) = s.scope_requests.get_mut(id) {
+            if op == "commit" {
+                r.ext.spent_at = Some(now);
+            } else {
+                r.ext.released_at = Some(now);
+            }
+        }
+    }
+    Ok(json!({
+        "verdict": done, "permits": op == "commit", "op_key": op_key, "request_ids": open,
+        "witnessEntryHash": entry.hash,
     }))
 }
 

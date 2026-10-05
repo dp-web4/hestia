@@ -10732,11 +10732,24 @@ mod disposition_tests {
         })).await.expect("claim answers")
     }
 
-    async fn spend_all(state: &SharedState, member: &str, paths: &[&str], act: &str)
-        -> serde_json::Value {
+    async fn batch(state: &SharedState, member: &str, op: &str, op_key: &str, paths: &[&str],
+                   act: &str) -> serde_json::Value {
         crate::server::handler::tool_scope_claim(state, &serde_json::json!({
-            "plugin_id": member, "paths": paths, "spend": true, "act_digest": digest_of(act),
+            "plugin_id": member, "op": op, "op_key": op_key, "paths": paths,
+            "act_digest": digest_of(act),
         })).await.expect("batch answers")
+    }
+
+    /// Two paths, both once-approved for `act`; returns their request ids.
+    async fn two_once_approvals(state: &SharedState, act: &str) -> Vec<String> {
+        let mut ids = Vec::new();
+        for p in ["/srv/a", "/srv/b"] {
+            let id = claim(state, "codex", p, act, false).await["request_id"].as_str().unwrap().to_string();
+            assert_eq!(decide(state, serde_json::json!({
+                "request_id": &id, "granted": true, "reason": "r", "once": true})).await.0, StatusCode::OK);
+            ids.push(id);
+        }
+        ids
     }
 
     /// Codex review of #1232, P1-1: the binding is a digest of the COMPLETE act, required, and
@@ -10769,43 +10782,91 @@ mod disposition_tests {
                 "the complete act is never stored in clear");
     }
 
-    /// Codex review of #1232, P2: one atomic spend — all approvals or none, and nothing opened.
+    /// Codex reviews of #1232, P2: RESERVE is all-or-none through the real handler's batch
+    /// branch, binds to the complete-act digest, opens nothing, and is idempotent per op_key;
+    /// COMMIT spends exactly the reserved approvals once, witnessed as one row.
     #[tokio::test]
-    async fn scope_claim_batch_spends_all_or_nothing() {
+    async fn scope_claim_reserve_is_all_or_none_and_commit_spends_once() {
         let (_dir, state) = test_state().await;
         let act = "cat /srv/a /srv/b";
-        let mut ids = Vec::new();
-        for p in ["/srv/a", "/srv/b"] {
-            ids.push(claim(&state, "codex", p, act, false).await["request_id"].as_str().unwrap().to_string());
-        }
-        // Only /srv/a approved: the batch spends NOTHING.
+        // Only /srv/a approved: reserve takes NOTHING.
+        let a = claim(&state, "codex", "/srv/a", act, false).await["request_id"].as_str().unwrap().to_string();
         assert_eq!(decide(&state, serde_json::json!({
-            "request_id": &ids[0], "granted": true, "reason": "r", "once": true})).await.0, StatusCode::OK);
-        let r = spend_all(&state, "codex", &["/srv/a", "/srv/b"], act).await;
+            "request_id": &a, "granted": true, "reason": "r", "once": true})).await.0, StatusCode::OK);
+        let b = claim(&state, "codex", "/srv/b", act, false).await["request_id"].as_str().unwrap().to_string();
+        let r = batch(&state, "codex", "reserve", "op-under-test-0001", &["/srv/a", "/srv/b"], act).await;
         assert_eq!(r["verdict"], "not_all", "{r}");
         assert_eq!(r["missing"], serde_json::json!(["/srv/b"]));
+        assert!(!state.lock().await.scope_requests[&a].ext.reservation_open(), "nothing reserved");
+        assert_eq!(state.lock().await.scope_requests.len(), 2, "a batch opens nothing");
+        assert_eq!(decide(&state, serde_json::json!({
+            "request_id": &b, "granted": true, "reason": "r", "once": true})).await.0, StatusCode::OK);
+        // The digest of a DIFFERENT complete act reserves nothing, even with the same paths.
+        let wrong = batch(&state, "codex", "reserve", "op-under-test-0002", &["/srv/a", "/srv/b"],
+                          "cat /srv/a /srv/b # different complete input").await;
+        assert_eq!(wrong["verdict"], "not_all", "{wrong}");
+        let ok = batch(&state, "codex", "reserve", "op-under-test-0003", &["/srv/a", "/srv/b"], act).await;
+        assert_eq!(ok["verdict"], "reserved", "{ok}");
+        assert_eq!(ok["reserved"].as_array().unwrap().len(), 2);
+        let retry = batch(&state, "codex", "reserve", "op-under-test-0003", &["/srv/a", "/srv/b"], act).await;
+        assert_eq!(retry["verdict"], "reserved", "an identical retry finds its own reservation");
+        let rival = batch(&state, "codex", "reserve", "op-under-test-0004", &["/srv/a", "/srv/b"], act).await;
+        assert_eq!(rival["verdict"], "not_all", "a reserved approval is not reservable twice: {rival}");
+        assert_eq!(state.lock().await.scope_requests[&a].status(crate::server::gate_escalation::now_secs()),
+                   "reserved");
+        let c = batch(&state, "codex", "commit", "op-under-test-0003", &[], act).await;
+        assert_eq!(c["verdict"], "committed", "{c}");
+        let again = batch(&state, "codex", "commit", "op-under-test-0003", &[], act).await;
+        assert_eq!(again["verdict"], "settled", "a second commit spends nothing more: {again}");
+        let look = batch(&state, "codex", "lookup", "op-under-test-0003", &[], act).await;
+        assert_eq!(look["verdict"], "committed");
+        assert_eq!(look["consumed"], true);
+        let s = state.lock().await;
+        let spent: Vec<_> = s.recent_chain(30).into_iter()
+            .filter(|e| e.event_type == "scope_once_spent").collect();
+        assert_eq!(spent.len(), 1, "one commit, one row");
+        assert_eq!(spent[0].event_data["request_ids"].as_array().unwrap().len(), 2);
+        assert!(s.scope_requests.values().all(|r| r.ext.spent_at.is_some()));
+    }
+
+    /// RELEASE returns a denied act's approvals; LOOKUP reports a lost answer honestly; an
+    /// unreported reservation LAPSES INTO SPENT (never spendable twice).
+    #[tokio::test]
+    async fn scope_claim_release_lookup_and_lapse() {
+        let (_dir, state) = test_state().await;
+        let act = "cat /srv/a /srv/b";
+        let ids = two_once_approvals(&state, act).await;
+        assert_eq!(batch(&state, "codex", "lookup", "op-never-dispatched-01", &[], act).await["verdict"],
+                   "unknown");
+        let r = batch(&state, "codex", "reserve", "op-release-test-0001", &["/srv/a", "/srv/b"], act).await;
+        assert_eq!(r["verdict"], "reserved", "{r}");
+        let rel = batch(&state, "codex", "release", "op-release-test-0001", &[], act).await;
+        assert_eq!(rel["verdict"], "released", "{rel}");
+        assert_eq!(batch(&state, "codex", "lookup", "op-release-test-0001", &[], act).await["consumed"], false);
         {
             let s = state.lock().await;
-            assert!(s.scope_requests[&ids[0]].ext.spent_at.is_none(), "nothing spent on not_all");
-            assert_eq!(s.scope_requests.len(), 2, "a batch opens nothing");
+            let now = crate::server::gate_escalation::now_secs();
+            assert!(ids.iter().all(|id| s.scope_requests[id].once_spendable(now)),
+                    "released approvals are spendable again");
         }
-        // Both approved: one call spends both, witnessed as ONE row; a second call finds none.
-        assert_eq!(decide(&state, serde_json::json!({
-            "request_id": &ids[1], "granted": true, "reason": "r", "once": true})).await.0, StatusCode::OK);
-        let wrong = spend_all(&state, "codex", &["/srv/a", "/srv/b"], "cat /srv/a /srv/b /srv/c").await;
-        assert_eq!(wrong["verdict"], "not_all", "another act's digest spends nothing: {wrong}");
-        let ok = spend_all(&state, "codex", &["/srv/a", "/srv/b"], act).await;
-        assert_eq!(ok["verdict"], "approved", "{ok}");
-        assert_eq!(ok["spent"].as_array().unwrap().len(), 2);
-        let again = spend_all(&state, "codex", &["/srv/a", "/srv/b"], act).await;
-        assert_eq!(again["verdict"], "not_all", "single use: {again}");
+        // Reserve again and go silent: past SCOPE_RESERVATION_SECS the reservation is consumed.
+        let r2 = batch(&state, "codex", "reserve", "op-lapse-test-00001", &["/srv/a", "/srv/b"], act).await;
+        assert_eq!(r2["verdict"], "reserved");
+        {
+            let mut s = state.lock().await;
+            for id in &ids {
+                s.scope_requests.get_mut(id).unwrap().ext.reserved_until = Some(1);
+            }
+        }
+        let look = batch(&state, "codex", "lookup", "op-lapse-test-00001", &[], act).await;
+        assert_eq!(look["verdict"], "lapsed", "{look}");
+        assert_eq!(look["consumed"], true);
+        let rival = batch(&state, "codex", "reserve", "op-lapse-test-00002", &["/srv/a", "/srv/b"], act).await;
+        assert_eq!(rival["verdict"], "not_all", "a lapsed reservation is spent, not free: {rival}");
         let s = state.lock().await;
-        let rows: Vec<_> = s.recent_chain(20).into_iter()
-            .filter(|e| e.event_type == "scope_once_spent").collect();
-        assert_eq!(rows.len(), 1, "one spend, one row");
-        assert_eq!(rows[0].event_data["request_ids"].as_array().unwrap().len(), 2);
-        // A peek (single path, spend:false) never spends either.
-        assert!(s.scope_requests.values().all(|r| r.ext.spent_at.is_some()));
+        let now = crate::server::gate_escalation::now_secs();
+        assert!(ids.iter().all(|id| s.scope_requests[id].status(now) == "spent"));
+        assert!(s.recent_chain(30).iter().any(|e| e.event_type == "scope_once_released"));
     }
 
     /// The refusal OPENS a request in the existing store, carrying what was refused, and a

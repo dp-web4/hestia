@@ -208,6 +208,29 @@ pub struct ScopeRequestExt {
     /// the asked path). `None` = exactly the asked path. The asked path is never rewritten.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_path: Option<String>,
+    /// RESERVE / COMMIT (Codex re-review of #1232, P2): the gate's operation key holding this
+    /// one-time approval while the act's final evidence is recorded. A reservation is released
+    /// (the act was denied), committed (the act was permitted), or — if neither arrives before
+    /// `reserved_until` — it LAPSES INTO SPENT: an outcome nobody reported is treated as an act
+    /// that may have run, so the approval can never be spent twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_until: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<u64>,
+}
+
+impl ScopeRequestExt {
+    /// A reservation that is neither released nor committed.
+    pub fn reservation_open(&self) -> bool {
+        self.reserved_by.is_some() && self.released_at.is_none() && self.spent_at.is_none()
+    }
+
+    /// An open reservation past its deadline: consumed (see `reserved_by`).
+    pub fn reservation_lapsed(&self, now: u64) -> bool {
+        self.reservation_open() && self.reserved_until.is_some_and(|t| now >= t)
+    }
 }
 
 /// What the gate knew when it opened a request: the refusal it is answering.
@@ -277,6 +300,7 @@ impl ScopeRequest {
         self.ext.once
             && self.granted == Some(true)
             && self.ext.spent_at.is_none()
+            && !self.ext.reservation_open()
             && self.revoked.is_none()
             && now < self.expires_at
     }
@@ -299,8 +323,11 @@ impl ScopeRequest {
         if self.revoked.is_some() {
             return "revoked";
         }
-        if self.ext.once && self.ext.spent_at.is_some() {
+        if self.ext.once && (self.ext.spent_at.is_some() || self.ext.reservation_lapsed(now)) {
             return "spent";
+        }
+        if self.ext.once && self.ext.reservation_open() {
+            return "reserved";
         }
         match self.granted {
             Some(true) if now < self.expires_at => "granted",
