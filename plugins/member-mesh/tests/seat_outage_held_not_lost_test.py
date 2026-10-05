@@ -150,6 +150,7 @@ def section_a():
 class Stub:
     def __init__(self):
         self.queue, self.notify, self.lock = [], [], threading.Lock()
+        self.delivered, self.fail_marker, self.fail_left = [], "", 0
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -188,7 +189,13 @@ class Stub:
                              "kinds_counted": ["review_request", "reply"]}
                     elif tool == "hestia_member_notify":
                         outer.notify.append(args)
-                        p = {"queued_id": 9000 + len(outer.notify), "recipient_liveness": "live"}
+                        ptr = args.get("pointer_uri", "")
+                        if outer.fail_marker and outer.fail_marker in ptr and outer.fail_left > 0:
+                            outer.fail_left -= 1
+                            p = {"_hestia_error": {"code": "hestia.stub_deny", "message": "stub refuses"}}
+                        else:
+                            outer.delivered.append(args)
+                            p = {"queued_id": 9000 + len(outer.notify), "recipient_liveness": "live"}
                     else:
                         p = {}
                 rpc = {"jsonrpc": "2.0", "id": req.get("id", 9),
@@ -215,6 +222,24 @@ def notice(nid, frm="cbp-being", kind="coordination"):
             "queued_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
+LIVE_RIGS = []
+
+
+def _reap(*_):
+    """A killed suite (CI timeout, ^C) must not orphan its watchers: one outlived a
+    `timeout 300` here by six minutes, polling a stub that no longer existed."""
+    for rig in list(LIVE_RIGS):
+        try:
+            rig.stopw()
+        except Exception:
+            pass
+    sys.exit(1)
+
+
+signal.signal(signal.SIGTERM, _reap)
+signal.signal(signal.SIGINT, _reap)
+
+
 class Rig:
     """A temp state dir, a fire stub the test can flip between down and up, a watcher."""
 
@@ -229,10 +254,15 @@ class Rig:
         with open(self.fire, "w") as f:
             f.write(f"""#!/usr/bin/env bash
 LOG="{self.state}/logs/stub-$(date +%Y%m%d-%H%M%S)-$$.log"
-python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(sorted(n["id"] for n in d.get("notices",[]))))' "$1" >> "{self.fired}"
-if [ "$(cat "{self.mode}")" = down ]; then
-  printf '%s\\n' "{CREDITS}" > "$LOG"; exit 1
-fi
+IDS=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(sorted(n["id"] for n in d.get("notices",[]))))' "$1")
+echo "$IDS" >> "{self.fired}"
+case "$(cat "{self.mode}")" in
+  down) printf '%s\\n' "{CREDITS}" > "$LOG"; exit 1 ;;
+  # An ack-only batch: the template exits 0 WITHOUT starting a CLI, so no log is written.
+  ackonly) exit 0 ;;
+  # Seat is up, but the coalesced backlog (more than one notice) dies of a generic rc=1.
+  flaky) case "$IDS" in *,*) echo "something nobody has a pattern for" > "$LOG"; exit 1 ;; esac ;;
+esac
 echo "wake ran; replied to everything" > "$LOG"; exit 0
 """)
         os.chmod(self.fire, 0o755)
@@ -249,7 +279,21 @@ echo "wake ran; replied to everything" > "$LOG"; exit 0
         self.stub = Stub()
         self.probe = probe_secs
         self.proc = None
-        self.out = ""
+        # The watcher's journal goes to a FILE, not a pipe. A pipe nobody reads until the
+        # end fills at 64 KiB and the watcher blocks on its next echo: with the discharge
+        # sweep forced to every second that happened mid-case, and read as a recovery that
+        # never came (two flaky F/G runs while this file was being written).
+        self.journal = os.path.join(self.tmp, "watch.log")
+
+    @property
+    def out(self):
+        try:
+            with open(self.journal, encoding="utf-8", errors="replace") as f:
+                return f.read()[-6000:]
+        except FileNotFoundError:
+            return ""
+
+        LIVE_RIGS.append(self)
 
     def set_mode(self, m):
         with open(self.mode, "w") as f:
@@ -261,22 +305,28 @@ echo "wake ran; replied to everything" > "$LOG"; exit 0
                     "HESTIA_MESH_STATE": self.state, "WATCH_INTERVAL": "1",
                     "UNANSWERED_EVERY": "3600", "DISCHARGE_SWEEP_EVERY": "1",
                     "OUTAGE_PROBE_SECS": self.probe})
+        self._jf = open(self.journal, "a")
         self.proc = subprocess.Popen(["bash", WATCHER, PLUGIN, "dest-agent", self.fire], env=env,
-                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                     stdout=self._jf, stderr=subprocess.STDOUT,
                                      start_new_session=True)
 
     def stopw(self):
         if self.proc:
             os.killpg(self.proc.pid, signal.SIGTERM)
             try:
-                self.out += self.proc.communicate(timeout=20)[0] or ""
+                self.proc.wait(timeout=20)
             except subprocess.TimeoutExpired:
                 os.killpg(self.proc.pid, signal.SIGKILL)
-                self.out += self.proc.communicate()[0] or ""
+                self.proc.wait(timeout=20)
             self.proc = None
+            self._jf.close()
 
     def wait(self, pred, secs=20):
-        end = time.time() + secs          # bounded: every wait in this file has a deadline
+        # Bounded: every wait in this file has a deadline. Scaled (x3 by default) because a
+        # watcher tick is several RPCs and a git check, and a loaded box stretches it: the
+        # deadlines only cost time when a property FAILS, since a met predicate returns early.
+        secs *= float(os.environ.get("SEAT_TEST_WAIT_SCALE") or 3)
+        end = time.time() + secs
         while time.time() < end:
             if pred():
                 return True
@@ -308,6 +358,8 @@ echo "wake ran; replied to everything" > "$LOG"; exit 0
     def close(self):
         self.stopw()
         self.stub.stop()
+        if self in LIVE_RIGS:
+            LIVE_RIGS.remove(self)
 
 
 def section_bcd():
@@ -412,7 +464,10 @@ def section_e():
         r.wait(lambda: len(r.fires()) >= 3, secs=25)   # 1 fresh fire + >=2 probes
         check("E: a held list is re-fired as a probe while the seat is out", len(r.fires()) >= 3,
               f"fires={r.fires()}\n{r.out}")
-        check("E: probes never charge .attempts", not r.sidecars(".attempts"),
+        # The budget is debited before a fire and REFUNDED after a seat-down one, so the
+        # sidecar exists for the length of a probe; charged means it is still there after.
+        check("E: probes never charge .attempts",
+              r.wait(lambda: not r.sidecars(".attempts"), secs=3),
               f"attempts={r.sidecars('.attempts')}")
         check("E: probes never re-notify", len(r.notes("#seat-unavailable:")) == 1,
               json.dumps(r.stub.notify))
@@ -437,15 +492,99 @@ def section_f():
         time.sleep(1)
         r.set_mode("up")
         r.stub.push(notice(16502))
-        r.wait(lambda: r.notes("#seat-back:"), secs=15)
-        time.sleep(1)
-        lines = open(r.hooklog).read().splitlines() if os.path.exists(r.hooklog) else []
+        hook_lines = lambda: (open(r.hooklog).read().splitlines()
+                              if os.path.exists(r.hooklog) else [])
+        r.wait(lambda: len(hook_lines()) >= 4, secs=25)   # hooks run after the mesh send
+        time.sleep(1)                                     # ...and no fifth may follow
+        lines = hook_lines()
         ev = [" ".join(l.split(" | ")[0].split()[:2]) for l in lines]
         check("F: member hook and operator hook each run once on down and once on up",
               sorted(ev) == sorted(["cbp-being down", "_operator down", "cbp-being up", "_operator up"]),
               f"hook calls={lines}\n{r.out}")
         check("F: the member hook receives the same sentence the mesh note carries",
               any(l.startswith("cbp-being down") and "HELD, not lost" in l for l in lines), f"{lines}")
+    finally:
+        r.close()
+
+
+def go_down(r, ids):
+    """Seat down; each id arrives in its own drain, so each becomes its own held primer."""
+    for i, nid in enumerate(ids, 1):
+        r.stub.push(notice(nid))
+        r.wait(lambda: len(r.fires()) >= i)
+
+
+def section_g():
+    print("\n=== G. A FAILED SEAT-BACK IS RETRIED UNTIL DELIVERED (review of #1206) ===")
+    r = Rig()
+    r.stub.fail_marker, r.stub.fail_left = "#seat-back:", 1
+    try:
+        r.start()
+        go_down(r, [16600, 16601])
+        r.set_mode("up")
+        r.stub.push(notice(16602))
+        # recovery fire -> seat-back FAILS; next tick the coalesced backlog runs -> retry.
+        r.wait(lambda: len([a for a in r.stub.delivered if "#seat-back:" in a["pointer_uri"]]) >= 1,
+               secs=25)
+        tries = r.notes("#seat-back:", "cbp-being")
+        got = [a for a in r.stub.delivered if "#seat-back:" in a["pointer_uri"]]
+        sdir = os.path.join(r.state, "seat-status")
+        check("G: the first seat-back notify failed and was attempted again", len(tries) >= 2,
+              f"attempts={len(tries)}\n{r.out}")
+        check("G: the seat-back reached cbp-being exactly once", len(got) == 1, json.dumps(got))
+        r.wait(lambda: os.path.exists(os.path.join(sdir, f"{PLUGIN}.up-delivered.json")), secs=10)
+        check("G: the pending queue is cleared only after delivery (receipt kept)",
+              not os.path.exists(os.path.join(sdir, f"{PLUGIN}.up-pending.json"))
+              and os.path.exists(os.path.join(sdir, f"{PLUGIN}.up-delivered.json")),
+              f"{os.listdir(sdir)}")
+        before = len(r.notes("#seat-back:"))
+        r.stub.push(notice(16603))
+        r.wait(lambda: any(16603 in f for f in r.fires()))
+        time.sleep(1)
+        check("G: once delivered, a later wake sends no further seat-back",
+              len(r.notes("#seat-back:")) == before, json.dumps(r.notes("#seat-back:")))
+    finally:
+        r.close()
+
+
+def section_h():
+    print("\n=== H. AFTER RECOVERY A HELD LIST KEEPS THE ORDINARY BACKOFF (review of #1206) ===")
+    r = Rig()
+    try:
+        r.start()
+        go_down(r, [16700, 16701])
+        r.set_mode("flaky")              # seat up; the coalesced 2-notice backlog dies rc=1
+        r.stub.push(notice(16702))
+        backlog = lambda: [f for f in r.fires() if {16700, 16701} <= set(f)]
+        r.wait(lambda: len(backlog()) >= 1, secs=20)
+        time.sleep(6)                    # ~5 more quiet ticks: none may re-fire it
+        att = r.sidecars(".attempts")
+        val = open(att[0]).read().strip() if att else ""
+        check("H: the coalesced backlog was fired once, then held to STALE_RETRY_BACKOFF_SECS",
+              len(backlog()) == 1, f"backlog fires={backlog()}\n{r.out}")
+        check("H: exactly one attempt charged, the list still live, nothing .exhausted",
+              val == "1" and len(r.primers()) == 1 and not r.primers(".json.exhausted"),
+              f"attempts={val!r} live={r.primers()} exhausted={r.primers('.json.exhausted')}")
+    finally:
+        r.close()
+
+
+def section_i():
+    print("\n=== I. AN ACK-ONLY rc=0 IS NOT A RECOVERY ===")
+    r = Rig()
+    try:
+        r.start()
+        go_down(r, [16800])
+        r.set_mode("ackonly")            # exits 0 and starts no CLI: no fresh log
+        r.stub.push(notice(16801))
+        r.wait(lambda: any(16801 in f for f in r.fires()))
+        time.sleep(2)
+        check("I: rc=0 without a fresh log sends no seat-back and keeps the outage open",
+              not r.notes("#seat-back:")
+              and os.path.exists(os.path.join(r.state, "seat-status", f"{PLUGIN}.json")),
+              f"notify={json.dumps(r.stub.notify)}\n{r.out}")
+        check("I: and the held list stays held", len(r.sidecars(".unrun")) == 1,
+              f"unrun={r.sidecars('.unrun')}")
     finally:
         r.close()
 
@@ -458,6 +597,9 @@ def main():
     if extract("fire_class_unavailable"):
         section_e()
         section_f()
+        section_g()
+        section_h()
+        section_i()
     print()
     if failures:
         print(f"{len(failures)} FAILED: {failures}")

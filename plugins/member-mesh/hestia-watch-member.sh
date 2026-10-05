@@ -887,10 +887,14 @@ retry_stale_primers() {
 # measured from the previous attempt (the `.attempts` file's mtime).
 stale_primer_due() {
   local attempts_file="$1.attempts" last now
-  # A held list (SEAT OUTAGE) runs on the seat's clock, not its own: a recovery probe
-  # every OUTAGE_PROBE_SECS while the seat is out, and immediately once it is back.
-  if [ -e "$1.unrun" ]; then
-    seat_outage_active || return 0
+  # A held list (SEAT OUTAGE) runs on the seat's clock while the seat is out: one probe
+  # per held list every OUTAGE_PROBE_SECS, never charged. Once the outage is closed it
+  # falls through to the ordinary budget below: due at once if it has never been charged
+  # (the usual case — outage fires are refunded), else STALE_RETRY_BACKOFF_SECS after the
+  # last charged attempt. Without the fall-through (review of #1206, legion-claude) one
+  # generic rc=1 after recovery re-fired the coalesced backlog on consecutive ticks and
+  # spent all STALE_MAX_ATTEMPTS in minutes: the outage's mail ended `.exhausted`.
+  if [ -e "$1.unrun" ] && seat_outage_active; then
     last="$(stat -c %Y "$1.unrun" 2>/dev/null || echo 0)"
     now="$(date +%s)"
     [ $((now - last)) -ge "$OUTAGE_PROBE_SECS" ]
@@ -920,7 +924,7 @@ fire_one_stale_primer() {
     [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
     echo $((attempts + 1)) > "$attempts_file"
     echo "[hestia-watch] RETRYING stale primer (attempt $((attempts + 1))/$STALE_MAX_ATTEMPTS): $stale"
-    t0=$(date +%s)
+    t0=$(fire_log_mark)
     if "$FIRE" "$stale"; then
       rm -f "$stale" "$attempts_file" "$stale.unrun"
       echo "[hestia-watch] stale primer DELIVERED on retry: $stale"
@@ -1443,16 +1447,35 @@ fire_class_unavailable() {
   return 1
 }
 
-# fire_ran <rc> <t0-epoch>: 0 when the member's CLI provably ran. rc=124 is the launcher
-# bound cutting a running CLI short. rc=0 counts only with a log written after t0: an
-# ack-only batch exits 0 without starting anything and is no evidence of recovery.
+# fire_log_mark: the member's recent fire logs as sorted "<mtime> <path>" lines, taken
+# just before a fire (recent = touched in the last 2 h, to keep the listing small).
+fire_log_mark() {
+  local PREFIX
+  PREFIX=$(basename "${FIRE:-}" .sh); PREFIX="${PREFIX#fire-}"
+  [ -n "$PREFIX" ] || return 0
+  # `|| true`: no logs directory yet (a fresh state, the first fire) makes `find` fail,
+  # pipefail carries that out, and under `set -e` the caller's assignment would EXIT the
+  # watcher before its first fire. Measured: rc124_is_not_unreachable_test.py, 6 red.
+  find "$STATE/logs" -maxdepth 1 -name "$PREFIX-*.log" -mmin -120 -printf '%T@ %p\n' 2>/dev/null | LC_ALL=C sort || true
+}
+
+# fire_ran <rc> <mark>: 0 when the member's CLI provably ran. rc=124 is the launcher
+# bound cutting a running CLI short. rc=0 counts only if THIS fire wrote a log: some
+# "<mtime> <path>" line exists now that the pre-fire mark did not have. An ack-only batch
+# exits 0 without starting anything and is no evidence of recovery.
+#
+# A SET DIFFERENCE, NOT A CLOCK COMPARISON. Two cheaper forms were tried and both failed
+# in this suite: "a log newer than t0-1" read the seat-down fire one second earlier as
+# this fire's run (a recovery that never happened, case I); "the newest log changed"
+# missed a real run because the WSL clock stepped back ~2 s between two fires, so the new
+# log sorted OLDER than the previous one (a recovery that did happen went unseen for a
+# whole extra wake, case G).
 fire_ran() {
-  local RC="$1" T0="$2" PREFIX
+  local RC="$1" MARK="$2" NOW
   [ "$RC" = "124" ] && return 0
   [ "$RC" = "0" ] || return 1
-  PREFIX=$(basename "${FIRE:-}" .sh); PREFIX="${PREFIX#fire-}"
-  [ -n "$PREFIX" ] || return 1
-  [ -n "$(find "$STATE/logs" -maxdepth 1 -name "$PREFIX-*.log" -newermt "@$((T0 - 1))" -print -quit 2>/dev/null)" ]
+  NOW=$(fire_log_mark)
+  [ -n "$(LC_ALL=C comm -13 <(printf '%s\n' "$MARK") <(printf '%s\n' "$NOW") | grep -v '^$')" ]
 }
 
 # seat_unavailable_class <rc>: the class when this failure is a seat outage, else empty.
@@ -1521,9 +1544,32 @@ def pointer(frag, prose):
 
 def row(member, frag, prose):
     msg = " ".join(prose.split())
-    print(json.dumps({"member": member, "message": msg,
-                      "args": {"to_plugin_id": member, "kind": "forum-note",
-                               "pointer_uri": pointer(frag, msg)}}))
+    r = {"member": member, "message": msg,
+         "args": {"to_plugin_id": member, "kind": "forum-note",
+                  "pointer_uri": pointer(frag, msg)}}
+    print(json.dumps(r))
+    return r
+
+# PENDING SEAT-BACK (review of #1206, legion-claude): closing the record before the
+# seat-back notes were delivered made "will retry" a false receipt — a failed notify was
+# never sent again. The rows now live in <seat>.up-pending.json until each member's
+# delivery succeeds (`up-done`); every later wake that runs re-sends what is left
+# (`up-retry`). A NEW outage supersedes them: "back" is no longer true.
+pending_path = os.path.join(sdir, f"{seat}.up-pending.json")
+
+def load_pending():
+    try:
+        with open(pending_path, encoding="utf-8") as f:
+            p = json.load(f)
+        return p if isinstance(p, dict) else {}
+    except Exception:
+        return {}
+
+def save_pending(p):
+    fd, tmp = tempfile.mkstemp(dir=sdir, prefix=f".{seat}.up.")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(p, f, indent=1, sort_keys=True)
+    os.replace(tmp, pending_path)
 
 def operator(event, prose):
     print(json.dumps({"operator": True, "event": event, "message": " ".join(prose.split())}))
@@ -1535,6 +1581,8 @@ if cmd == "down":
     if new:
         d = {"seat": seat, "since": now, "told": {}, "held": {}, "fires": 0}
         history({"event": "down", "seat": seat, "at": now, "why": cls, "rc": rc})
+        if os.path.exists(pending_path):  # undelivered "back" notes are no longer true
+            os.replace(pending_path, os.path.join(sdir, f"{seat}.up-superseded.json"))
     d.update({"why": cls, "rc": rc, "last_fire": now, "fires": int(d.get("fires", 0)) + 1})
     try:
         notices = json.load(open(primer, encoding="utf-8")).get("notices") or []
@@ -1574,18 +1622,33 @@ elif cmd == "up":
         raise SystemExit(0)
     since, why = d.get("since", "?"), d.get("why", "?")
     held = d.get("held", {})
+    pending = {}
     for member in sorted(d.get("told", {})):
         t = ids_text(held.get(member, []))
-        row(member,
+        pending[member] = row(member,
             f"hestia://seat/{seat}#seat-back:since={since};until={now};held={t};via=watch-{seat}",
             f"{seat} is running wakes again as of {now} (unavailable since {since}, {why}). "
             f"Your held notice(s) {t} are queued for its next wake.")
+    if pending:
+        save_pending({"since": since, "until": now, "rows": pending})
     operator("up", f"{seat} is back as of {now} after an outage since {since} ({why}, "
                    f"{d.get('fires', 0)} failed fire(s), "
                    f"{sum(len(v) for v in held.values())} notice(s) held).")
     history({"event": "up", "seat": seat, "at": now, "since": since, "why": why,
              "fires": d.get("fires", 0), "held": held, "told": sorted(d.get("told", {}))})
     os.replace(path, os.path.join(sdir, f"{seat}.last.json"))
+elif cmd == "up-done":
+    p = load_pending()
+    rows = p.get("rows") or {}
+    if args[0] in rows:
+        rows.pop(args[0])
+        p.setdefault("delivered", {})[args[0]] = {"at": now, "via": args[1]}
+        save_pending(p)
+        if not rows:                     # all delivered: keep the receipt, clear the queue
+            os.replace(pending_path, os.path.join(sdir, f"{seat}.up-delivered.json"))
+elif cmd == "up-retry":
+    for r in (load_pending().get("rows") or {}).values():
+        print(json.dumps(r))
 elif cmd == "coalesce":
     pdir = args[0]
     held = sorted((os.path.join(pdir, f) for f in os.listdir(pdir)
@@ -1659,11 +1722,21 @@ seat_send() {
       CH="mesh"
       echo "[hestia-watch] SEAT ${EVENT^^} told $MEMBER: $ARGS"
     else
-      echo "[hestia-watch] seat-$EVENT notice FAILED for $MEMBER (will retry next fire): $ARGS"
+      if [ "$EVENT" = "down" ]; then
+        echo "[hestia-watch] seat-down notice FAILED for $MEMBER (retried on the next seat-down fire): $ARGS"
+      else
+        echo "[hestia-watch] seat-up notice FAILED for $MEMBER (kept in $SEAT_STATUS_DIR/$PLUGIN.up-pending.json; retried after the next wake that runs): $ARGS"
+      fi
     fi
     run_seat_hook "$MEMBER" "$EVENT" "$MEMBER" "$MSG" && CH="${CH:+$CH+}hook"
-    if [ "$EVENT" = "down" ] && [ -n "$CH" ]; then
-      seat_status told "$MEMBER" "$CH" || true
+    if [ -n "$CH" ]; then
+      # The rate limit / the pending queue advance only on a delivery, so a failed
+      # send is retried instead of being recorded as told.
+      if [ "$EVENT" = "down" ]; then
+        seat_status told "$MEMBER" "$CH" || true
+      else
+        seat_status up-done "$MEMBER" "$CH" || true
+      fi
     fi
   done < <(printf '%s\n' "$ROWS" | python3 -c '
 import json,sys
@@ -1685,13 +1758,21 @@ seat_unavailable() {
 }
 
 # seat_recovered: called after a fire that provably ran the CLI.
+# Also the retry point for seat-back notes that failed to deliver: every later wake that
+# runs re-sends what is still in <seat>.up-pending.json.
 seat_recovered() {
   local ROWS
-  seat_outage_active || return 0
-  ROWS=$(seat_status up 2>/dev/null) || ROWS=""
-  echo "[hestia-watch] SEAT BACK: $PLUGIN ran a wake; outage closed"
-  seat_send "$ROWS" up
-  seat_status coalesce "$PRIMERS" || true
+  if seat_outage_active; then
+    ROWS=$(seat_status up 2>/dev/null) || ROWS=""
+    echo "[hestia-watch] SEAT BACK: $PLUGIN ran a wake; outage closed"
+    seat_send "$ROWS" up
+    seat_status coalesce "$PRIMERS" || true
+  elif [ -e "$SEAT_STATUS_DIR/$PLUGIN.up-pending.json" ]; then
+    ROWS=$(seat_status up-retry 2>/dev/null) || ROWS=""
+    echo "[hestia-watch] retrying undelivered seat-back notice(s)"
+    seat_send "$ROWS" up
+  fi
+  return 0
 }
 
 # rc=124 IS NOT A DELIVERY VERDICT — IT IS THE ONE RC THAT PROVES DELIVERY.
@@ -1913,10 +1994,10 @@ json.dump(d,sys.stdout)
     if [ -n "$FIRE" ]; then
       # Success: primer is spent, remove it. Failure: KEEP it — the drain was
       # consume-once, so the primer is the only copy of the work list.
-      FIRE_T0=$(date +%s)
+      FIRE_MARK=$(fire_log_mark)
       if "$FIRE" "$PRIMER"; then
         rm -f "$PRIMER" "$PRIMER.unrun"
-        if fire_ran 0 "$FIRE_T0"; then seat_recovered; fi
+        if fire_ran 0 "$FIRE_MARK"; then seat_recovered; fi
       else
         RC=$?
         WHY=$(classify_fire_failure "$RC")
@@ -1927,7 +2008,7 @@ json.dump(d,sys.stdout)
           seat_unavailable "$DOWN" "$RC" "$PRIMER"
         else
           report_unreachable "$PRIMER" "fire-rc=$RC;why=$WHY" "$RC"
-          if fire_ran "$RC" "$FIRE_T0"; then seat_recovered; fi
+          if fire_ran "$RC" "$FIRE_MARK"; then seat_recovered; fi
         fi
       fi
     else
