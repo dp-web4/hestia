@@ -694,6 +694,109 @@ Session grants revoke through `POST /api/allowlist/session/revoke`; one-time end
 expiry or deny. Each moves its counter, is witnessed, and triggers an export refresh — and each
 does so the same way on both axes.
 
+### 5.4 Scope refusals ARE escalations, with the three durations (2026-10-05) — the FILES axis, built
+
+dp, 2026-10-05: *"yes on gate gap, let's fix it. escalation should allow standing grants (i recall
+it being discussed but it's not implemented that i can see)."* It was discussed — §5 above — and
+not built for the files axis: an `mrh.path` / `mrh.command` refusal was a plain deny. Nothing
+reached the operator unless the member chose to call `hestia_request_scope`, and many never did.
+
+**The gap that made this urgent.** `command_scope_reach` judged only shell tokens UNDER the
+workspace. A Read of an absolute path outside it was refused `mrh.path`; `cat` of the same path
+passed, on every seat (stage B pinned it as a known law gap in
+`tools/one_gate_decide_contract_test.py`). Measured live the same day: a session whose workspace
+resolved to a project directory on a Windows mount listed and read a mail client's profile
+directory under the user's AppData through the shell; the core returned `(True, None, None)`.
+
+**Measured before the law changed** (31,397 shell commands, 2026-09-20..10-04, claude-code /
+codex / kimi transcripts on CBP; the table is in the PR): applying the Read rule to shell as-is
+would refuse 9.0% / 2.4% / 11.5% of each seat's commands — and 25% without a device allowance,
+because `2>/dev/null` alone appears in 5,408 commands. About 10% of would-be refusals sit only in
+heredoc bodies (prose, fixtures). Most of the rest is legitimate and recurring: the mesh's state
+directory, hestia's own state, cross-seat reads of peer homes, tools invoked by absolute path.
+
+**The rule.**
+
+1. A shell path that lands OUTSIDE the workspace — absolute, `~`/`$HOME`, a relative escape, a
+   redirection target, a `$( … )` body, an interpreter heredoc — is judged exactly like a Read
+   path: temp roots, the member's home markers, `path:` grants (exact, or `/**` recursive) by
+   realpath. A glob is judged as its directory's subtree.
+2. The POSIX device sinks (`/dev/null`, `/dev/std*`, `/dev/fd/*`, `/dev/tty`, `/dev/zero`,
+   `/dev/*random`, `/dev/full`) are LAW, like the temp roots: always reachable, fixed by POSIX,
+   no operator configuration. `/dev/tcp/*` and raw disks stay judged.
+3. Data heredoc bodies (fed to anything but an interpreter) are not reach — but only a QUOTED
+   delimiter (`<<'EOF'`, `<<"EOF"`, `<<\EOF`) makes a body literal. With an unquoted delimiter
+   the shell expands the body first, so its `$( … )` / backtick substitutions are judged as
+   executed commands (Codex review of #1232, P1-2).
+3a. DEFAULT-JUDGE (Codex re-review of #1232; dp: "the shell is a grammar, and skip-lists keep
+   leaking"). Every word that could be a path — contains `/`, starts with `~` or `.`, carries an
+   unquoted glob, or is an expansion whose value the parser must resolve — is judged. A word is
+   skipped only under a precise (command, argument position / option) exception: `tr` sets,
+   `echo`/`printf` strings without an unquoted glob, the pattern position of `grep`/`rg`/`sed`/
+   `awk` (unless an option supplied the pattern), and the values of delimiter / pattern / string
+   options of the command that defines them (`cut -d`, `awk -F`, `find -name`, `git -m`, …).
+   Quoting is tracked per character (`"/"*` expands) and never exempts by itself.
+3b'. Anything the parser does not model — an unbalanced quote or substitution, an unknown heredoc
+   form, an expansion it cannot resolve inside a path (an unknown variable, `$1`, the output of an
+   arbitrary command) — is INCOMPLETE classification and refused, never skipped. Modelled:
+   assignments and `for` loop variables in the same command, the environment, `$PWD`/`$(pwd)`,
+   `${V:-default}`, special parameters and arithmetic, value commands (`$(date …)`), echo, and
+   listers (`$(find R …)`, `$(ls R)`, `$(grep -l … R)` → R's subtree).
+3b. Past the judging budget (128 distinct spellings per pass) the classification is INCOMPLETE,
+   and incomplete is a refusal, never an allow of the unjudged rest (P1-3).
+4. Nothing else is hardcoded. Every default the fleet needs is a grant the operator issues
+   through the existing standing store — BEFORE the change deploys (the PR names the set).
+
+**The escalation.** On an `mrh.path` / `mrh.command` refusal the gate (the one-gate orchestrator,
+`hestia_single_gate._scope_escalation`) asks the daemon once — `hestia_scope_claim` — and the
+answer comes from the EXISTING scope-request store, not a new one:
+
+| daemon finds | answer | the act |
+|---|---|---|
+| a live or standing grant already covering the path | `in_force` | proceeds (the snapshot raced) |
+| an unspent ONE-TIME approval for exactly this act (`act_digest`), inside the claim window | `approved`, spent | proceeds, once |
+| a pending request for (member, path) | `pending`, same id | refused; no second ask (#956's nine ids for three paths cannot recur) |
+| a refusal inside its window | `refused` | refused; re-issuing does not reopen it |
+| none of these | `opened`, new id, carrying rule, tool, act, act digest, request key, session | refused, naming the id |
+
+**The act binding (Codex review of #1232, P1-1; the #1229 / #627 remedy).** A one-time approval
+binds to `act_digest` = sha256 over the canonical COMPLETE act — the whole tool input (Write/Edit
+contents, the unmasked command), cwd and host session — computed at the gate and sent as a
+digest only. The masked summary travels for the operator's eyes and is never an authorisation
+preimage. The daemon refuses a claim without a well-formed digest.
+
+**Nothing is consumed by a denied act (P2, and the re-review's ordering).** The gate collects
+every refused path locally (refusing outright past 8, before asking anything), PEEKS each
+(`spend: false`), re-judges the act, asks society law, then RESERVES every one-time approval the
+act needs in one all-or-none call keyed by an operation key, records the final verdict and its
+evidence, and only then COMMITS (the act stands) or RELEASES (it was denied after all). Every RPC
+carries the absolute deadline, checked before each request. A lost answer is looked up by its
+operation key; an outcome that stays unknown is reported as UNCERTAIN, never as "nothing was
+consumed". A reservation nobody settles lapses into spent after 120 s, so an approval is never
+spendable twice.
+
+The deny text names the id; `hestia_scope_status` shows it to the member with its act and fuse.
+The request key is `sha256("hestia:scope-request-key" ␟ member ␟ path)`; a re-issued identical act
+after approval proceeds — through the snapshot for session/standing (no claim, §5.2 holds), and
+through the claim for one-time (the gate escalations' own `APPROVAL_CLAIM_WINDOW_SECS`). An act
+refused on several paths PEEKS at all of them first, so a one-time approval is never spent on an
+act another path still refuses.
+
+**The operator's answer** (`POST /api/scope/decide`, both surfaces, `docs/operator-surfaces`):
+duration — `once` (gate-opened requests only: they recorded an act to bind), session (memory,
+expires), or standing (vault, survives restart, revocable) — and, for session and standing,
+breadth: the asked path, or a directory above it (`grant_path`, always recursive; never the root).
+Refusing needs no reason. A glob reach admits only a recursive grant. The CLI lists the queue
+(`hestia scope pending`); it does not decide — deciding stays on the challenge-signed surface or a
+delegated seat's signed `hestia scope arbitrate`.
+
+**What this does not fix, said here so it is not rediscovered:** pending requests are still
+memory-only and die with the daemon (#908); the 8 h request window is still shorter than the
+mesh's delivery latency (#956); the member still cannot ask for recursion itself (#1022's member
+half); grants carry reach, not mode (#1098 §2); and a shell path the parser cannot see (code
+inside `python -c`, a variable set earlier in the same command, `cd` followed by relative paths)
+is still judged only where it is spelled.
+
 ---
 
 ## 6. The UI

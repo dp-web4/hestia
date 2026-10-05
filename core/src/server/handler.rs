@@ -93,6 +93,7 @@ impl ServerHandler for HestiaServer {
             "hestia_my_appeals" => tool_my_appeals(&self.state, &args).await,
             "hestia_request_scope" => tool_request_scope(&self.state, &args).await,
             "hestia_scope_status" => tool_scope_status(&self.state, &args).await,
+            "hestia_scope_claim" => tool_scope_claim(&self.state, &args).await,
             "hestia_gate_escalation_open" => tool_gate_escalation_open(&self.state, &args).await,
             "hestia_gate_escalation_poll" => tool_gate_escalation_poll(&self.state, &args).await,
             "hestia_escalation_evidence" => tool_escalation_evidence(&self.state, &args).await,
@@ -330,6 +331,10 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_scope_status",
             "What you may reach beyond your standing MRH right now, and every scope request you have filed with its ruling. Read-only and deliberately unwitnessed — reading your own permissions is not an act",
+        ),
+        t(
+            "hestia_scope_claim",
+            "The GATE's question after it refuses you a path (mrh.path / mrh.command) — your gate calls this, you normally do not. It ASKS and READS; it never decides: a grant already in force answers in_force; a one-time approval the operator made for exactly this act (same act string) answers approved and is spent (single use, claim window); a request still pending for this path answers pending with the SAME id (a re-issue never mints a second ask); a refusal inside its window answers refused; otherwise a scope request is opened on the operator's queue, carrying the refused act, and the operator rules it once, for the session, or standing, at the breadth they choose. Watch it with hestia_scope_status and re-issue the identical act afterwards. Not the appeal channel: hestia_appeal disputes whether the deny was right",
         ),
         t(
             "hestia_gate_escalation_open",
@@ -1271,7 +1276,7 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         "scope_grants": s.live_scope_grants(&who.plugin_id)
             .iter()
             .map(|r| json!({
-                "path": r.path,
+                "path": r.reach_path(),
                 "granted_by": r.decided_by,
                 "requested_because": r.reason,
                 "decision_reason": r.decision_reason,
@@ -13000,10 +13005,15 @@ mod tests {
             if !l.contains("scope") {
                 continue;
             }
+            // `hestia_scope_claim` (2026-10-05) ASKS and READS on the gate's behalf after a scope
+            // refusal; the behavioural tests `scope_claim_*` hold the line this name cannot:
+            // it never sets `granted`, never reaches the standing store, and spends only an
+            // operator's one-time approval for this member's own act.
             assert!(
                 l == "hestia_request_scope"
                     || l == "hestia_scope_status"
-                    || l == "hestia_scope_arbitrate",
+                    || l == "hestia_scope_arbitrate"
+                    || l == "hestia_scope_claim",
                 "MCP tool `{n}` reaches the scope surface. Member-callable doors are ASKING \
                  (hestia_request_scope), READING (hestia_scope_status), and ruling ANOTHER \
                  member's request under an operator delegation (hestia_scope_arbitrate). \
@@ -13096,7 +13106,7 @@ mod tests {
             decided_at: Some(110),
             decision_reason: Some("yes, that file".into()),
             recursive: false,
-            revoked: None,
+            revoked: None, ext: Default::default(),
         };
         assert!(r.grants("/mnt/c/exe/dpx/notes.md", 150));
         // The sibling, the parent and the child are all OUTSIDE the grant.
@@ -13152,7 +13162,7 @@ mod tests {
             decided_at: None,
             decision_reason: None,
             recursive: false,
-            revoked: None,
+            revoked: None, ext: Default::default(),
         };
         assert_eq!(r.status(50), "pending");
         assert_eq!(r.status(100), "expired");
@@ -20648,7 +20658,7 @@ mod appeal_tests {
                 decided_at: Some(now),
                 decision_reason: Some("yes, that file".into()),
                 recursive: false,
-                revoked: None,
+                revoked: None, ext: Default::default(),
             });
         }
         let body = read_resource_body(&state, "hestia://scope/scope-test459a")
@@ -22895,7 +22905,7 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
         decided_at: None,
         decision_reason: None,
         recursive: false,
-        revoked: None,
+        revoked: None, ext: Default::default(),
     };
     s.scope_requests.insert(id.clone(), req);
 
@@ -22989,6 +22999,16 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
                 "revoked_at": r.revoked.as_ref().map(|v| v.at),
                 "revoked_by": r.revoked.as_ref().map(|v| v.by.clone()),
                 "revoke_reason": r.revoked.as_ref().map(|v| v.reason.clone()),
+                // 2026-10-05: a request your GATE opened on a refusal says so, and a one-time
+                // answer says whether it is still yours to spend — re-issue the identical act
+                // (`act`) inside `expires_at` to spend it.
+                "origin": if r.ext.gate.is_some() { "gate_deny" } else { "member_request" },
+                "act": r.ext.gate.as_ref().map(|g| g.act.clone()),
+                "once": r.ext.once,
+                "spent_at": r.ext.spent_at,
+                "secs_remaining": r.expires_at.saturating_sub(now),
+                "grant_path": r.reach_path(),
+                "recursive": r.recursive,
             })
         })
         .collect();
@@ -23001,7 +23021,7 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         // permission.
         "live_grants": s.live_scope_grants(&plugin_id)
             .iter()
-            .map(|r| json!({"path": r.path, "expires_at": r.expires_at, "granted_by": r.decided_by,
+            .map(|r| json!({"path": r.reach_path(), "expires_at": r.expires_at, "granted_by": r.decided_by,
                             "recursive": r.recursive}))
             .collect::<Vec<_>>(),
         // The DURABLE list, additive beside live_grants (Sprint F R1): operator-promoted
@@ -23075,6 +23095,562 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
                      durable, applies to EVERY member identically, and is not yours to lose — \
                      effective(you) = society_floor ∪ your grants, additive only. None of the \
                      three is ever written to your identity file.",
+    }))
+}
+
+/// How many GATE-OPENED scope requests one member may hold pending at once. A refusal storm (a
+/// loop re-issuing many distinct outside paths) must not bury the operator's queue; past the cap
+/// the gate still refuses, says so, and names `hestia_request_scope` for the one that matters.
+pub const SCOPE_CLAIM_MAX_PENDING: usize = 32;
+
+/// The scope request key: member and resolved path. The gate computes the same string
+/// (`hestia_gate_mechanism.scope_request_key`) for its deny text; this one decides.
+pub fn scope_request_key(plugin_id: &str, path: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(format!("hestia:scope-request-key\u{1f}{plugin_id}\u{1f}{path}").as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// The act binding a ONE-TIME approval is spent against: a sha256 the GATE computes over the
+/// canonical, COMPLETE act — the whole tool input (Write/Edit contents, the unmasked command),
+/// the working directory and the host session — never over the masked display summary (Codex
+/// review of #1232, P1-1: two Writes to one path with different contents, two commands that mask
+/// or truncate alike, collided on the summary digest). The daemon never sees the input in clear;
+/// it stores and compares the digest. Same remedy class as #1229 / #627: an authorisation key
+/// must never be computed from the scrubbed preview a human reads.
+fn valid_act_digest(args: &Value) -> Option<String> {
+    let d = optional_string(args, "act_digest")?;
+    let d = d.trim().to_ascii_lowercase();
+    (d.len() == 64 && d.chars().all(|c| c.is_ascii_hexdigit())).then_some(d)
+}
+
+/// `hestia_scope_claim` — the gate's ONE question after a scope refusal (dp, 2026-10-05:
+/// *"yes on gate gap, let's fix it. escalation should allow standing grants"*).
+///
+/// An `mrh.path` / `mrh.command` refusal used to be a plain deny: nothing reached the operator
+/// unless the member chose to call `hestia_request_scope`. This verb makes the refusal an
+/// ESCALATION in the existing scope-request store (not a new store), with the same re-issue
+/// and claim semantics the governance escalations have:
+///
+///   * a grant already IN FORCE for the path (live or standing) answers `in_force` — the
+///     member's snapshot raced the operator;
+///   * a ONE-TIME approval for exactly this act (its `act_digest`), unspent and inside the
+///     claim window, answers `approved` and is SPENT (unless `spend: false`, a peek);
+///   * a request still PENDING for (member, path) answers `pending` with ITS id — a re-issue
+///     never mints a second ask (legion-being, #956: nine ids for three paths);
+///   * a REFUSED request inside its window answers `refused` — re-issuing does not reopen it;
+///   * otherwise a request is OPENED, carrying the act, the rule, the tool and the session,
+///     and the operator rules it once / for the session / standing, at the breadth they choose.
+///
+/// WHAT IT CANNOT DO, by construction (`no_mcp_tool_can_decide_a_scope_request` and the
+/// behavioural tests below): it never sets `granted`, never touches the standing store, and
+/// spends only a one-time approval an operator made for this member and this act.
+pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::server::gate_escalation::now_secs;
+    use crate::server::state::{
+        normalize_scope_path, GateDenyOrigin, ScopeRequest, ScopeRequestExt,
+        SCOPE_REQUEST_TTL_SECS,
+    };
+
+    let asserted = require_string(args, "plugin_id")?;
+    let Some(act_digest) = valid_act_digest(args) else {
+        return Ok(hestia_error_envelope(
+            "hestia.scope_claim_act_digest_required",
+            "act_digest (sha256 hex over the canonical complete act: tool input, cwd, host \
+             session) is required — a one-time approval binds to the whole act, never to its \
+             masked summary; nothing was opened or spent",
+            None,
+        ));
+    };
+    // RESERVE / COMMIT (Codex reviews of #1232, P2): `op` = reserve | commit | release | lookup
+    // over every one-time approval the act needs — all or none, never consumed by a denied act.
+    if args.get("op").is_some() || args.get("paths").is_some() {
+        return scope_claim_spend_all(state, args, &asserted, &act_digest).await;
+    }
+    let raw_path = require_string(args, "path")?;
+    let rule = optional_string(args, "rule").unwrap_or_default();
+    if rule != "mrh.path" && rule != "mrh.command" {
+        return Err(anyhow::anyhow!(
+            "rule must be mrh.path or mrh.command — this verb answers a SCOPE refusal, and a \
+             request opened for any other refusal would ask the operator the wrong question"
+        ));
+    }
+    let tool = optional_string(args, "tool_name").unwrap_or_default();
+    let act: String = optional_string(args, "act").unwrap_or_default().chars().take(400).collect();
+    let spend = args.get("spend").and_then(Value::as_bool).unwrap_or(true);
+    let role = optional_string(args, "role").unwrap_or_default();
+    let host_session_id = optional_string(args, "host_session_id");
+    let session_id_arg = optional_session_id(args);
+
+    let trimmed = raw_path.trim();
+    let subtree = trimmed.ends_with("/*");
+    let path = normalize_scope_path(if subtree { &trimmed[..trimmed.len() - 2] } else { trimmed });
+    let now = now_secs();
+    let mut s = state.lock().await;
+
+    // ATTRIBUTION. A resolved session names the member; an asserted id that disagrees with it
+    // is refused rather than believed. Without a session the id is asserted (A1), exactly as
+    // `hestia_request_scope` takes it — and what an impostor can do with it is bounded: open an
+    // ask in another member's name, or spend that member's one-time approval for that member's
+    // own act string.
+    let plugin_id = match resolve_attributed_caller(&s, session_id_arg.as_deref()) {
+        Some(who) if who.plugin_id != asserted => {
+            return Ok(hestia_error_envelope(
+                "hestia.scope_claim_asker_mismatch",
+                "the session you presented belongs to a different member than the plugin_id \
+                 you asserted; nothing was opened or spent",
+                Some(json!({ "asserted": asserted, "session_member": who.plugin_id })),
+            ));
+        }
+        Some(who) => who.plugin_id,
+        None => asserted,
+    };
+    if !path.starts_with('/') || path == "/" {
+        return Ok(json!({
+            "verdict": "not_opened",
+            "permits": false,
+            "path": path,
+            "detail": "a scope request names one absolute path below the root; the root itself \
+                       is not grantable, so no request was opened",
+        }));
+    }
+    let key = scope_request_key(&plugin_id, &path);
+    let probe = if subtree { format!("{path}/*") } else { path.clone() };
+
+    // (1) IN FORCE — live or standing (or the society floor) already covers it.
+    if s.has_scope_grant(&plugin_id, &probe) {
+        return Ok(json!({
+            "verdict": "in_force",
+            "permits": true,
+            "path": path,
+            "request_key": key,
+            "detail": "a grant in force already covers this path (your snapshot predates it)",
+        }));
+    }
+
+    // (2) A ONE-TIME approval for exactly this act.
+    let once_id = s
+        .scope_requests
+        .values()
+        .filter(|r| r.plugin_id == plugin_id && r.path == path && r.once_spendable(now))
+        .filter(|r| r.ext.gate.as_ref().is_some_and(|g| g.act_digest == act_digest))
+        .min_by_key(|r| r.requested_at)
+        .map(|r| r.id.clone());
+    if let Some(id) = once_id {
+        if !spend {
+            return Ok(json!({
+                "verdict": "approved", "permits": true, "spent": false, "request_id": id,
+                "path": path, "request_key": key,
+                "detail": "a one-time approval for this act stands (peek: not spent)",
+            }));
+        }
+        // ORDER: WITNESS, THEN SPEND. A spend nothing recorded is an act nothing authorised.
+        let decided_by = s.scope_requests.get(&id).and_then(|r| r.decided_by.clone());
+        let entry = s.append_chain(
+            "scope_once_spent",
+            json!({
+                "request_id": id,
+                "plugin_id": plugin_id,
+                "subject_instance_lct": s.member_lct(&plugin_id),
+                "path": path,
+                "act_digest": act_digest,
+                "host_session_id": host_session_id,
+                "decided_by": decided_by,
+            }),
+        )?;
+        if let Some(r) = s.scope_requests.get_mut(&id) {
+            r.ext.spent_at = Some(now);
+        }
+        return Ok(json!({
+            "verdict": "approved", "permits": true, "spent": true, "request_id": id,
+            "path": path, "request_key": key, "witnessEntryHash": entry.hash,
+            "detail": format!("claimed a one-time approval from {} (single use, now spent)",
+                              decided_by.unwrap_or_else(|| "the operator".into())),
+        }));
+    }
+
+    // (3) PENDING for (member, path) — the same id, never a second ask.
+    let pending_id = s
+        .scope_requests
+        .values()
+        .filter(|r| r.plugin_id == plugin_id && r.path == path && r.status(now) == "pending")
+        .min_by_key(|r| r.requested_at)
+        .map(|r| r.id.clone());
+    if let Some(id) = pending_id {
+        let mut expires_at = 0;
+        if let Some(r) = s.scope_requests.get_mut(&id) {
+            expires_at = r.expires_at;
+            if let Some(g) = r.ext.gate.as_mut() {
+                g.reissues = g.reissues.saturating_add(1);
+            }
+        }
+        return Ok(json!({
+            "verdict": "pending", "permits": false, "request_id": id, "path": path,
+            "request_key": key, "expires_at": expires_at,
+            "secs_remaining": expires_at.saturating_sub(now),
+            "detail": "the request for this path is still waiting on the operator",
+        }));
+    }
+
+    // (4) REFUSED inside its window — re-issuing does not reopen it.
+    let refused = s
+        .scope_requests
+        .values()
+        .filter(|r| r.plugin_id == plugin_id && r.path == path && r.status(now) == "refused"
+                && now < r.expires_at)
+        .max_by_key(|r| r.decided_at.unwrap_or(0))
+        .map(|r| (r.id.clone(), r.decision_reason.clone(), r.expires_at));
+    if let Some((id, why, until)) = refused {
+        return Ok(json!({
+            "verdict": "refused", "permits": false, "request_id": id, "path": path,
+            "request_key": key, "until": until,
+            "detail": why.unwrap_or_else(|| "refused, no reason given".into()),
+        }));
+    }
+
+    // (5) THE CAP.
+    let open_by_gate = s
+        .scope_requests
+        .values()
+        .filter(|r| r.plugin_id == plugin_id && r.ext.gate.is_some() && r.status(now) == "pending")
+        .count();
+    if open_by_gate >= SCOPE_CLAIM_MAX_PENDING {
+        return Ok(json!({
+            "verdict": "not_opened", "permits": false, "path": path, "request_key": key,
+            "detail": format!("{open_by_gate} gate-opened requests from you are already pending \
+                               (cap {SCOPE_CLAIM_MAX_PENDING}); none was opened — ask for the \
+                               one that matters with hestia_request_scope"),
+        }));
+    }
+
+    // (6) OPEN. Same id construction as `hestia_request_scope`.
+    let id = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"hestia:scope-request:");
+        h.update(now.to_be_bytes());
+        h.update((s.scope_requests.len() as u64).to_be_bytes());
+        h.update(plugin_id.as_bytes());
+        h.update(path.as_bytes());
+        let hex: String = h.finalize()[..6].iter().map(|b| format!("{b:02x}")).collect();
+        format!("scope-{hex}")
+    };
+    // The record's `reason` says what happened, in the gate's voice — never presented as the
+    // member's rationale, because the member did not choose to ask.
+    let reason = format!(
+        "opened by the gate on a refused {} ({rule}){}; act: {act}",
+        if tool.is_empty() { "act" } else { tool.as_str() },
+        if subtree { " — a glob over this directory: only a recursive grant covers it" } else { "" }
+    );
+    let expires_at = now + SCOPE_REQUEST_TTL_SECS;
+    let origin = GateDenyOrigin {
+        rule: rule.clone(),
+        tool: tool.clone(),
+        act: act.clone(),
+        act_digest: act_digest.clone(),
+        request_key: key.clone(),
+        host_session_id: host_session_id.clone(),
+        subtree,
+        reissues: 0,
+    };
+    let entry = s.append_chain(
+        "scope_requested",
+        json!({
+            "request_id": id,
+            "plugin_id": plugin_id,
+            "subject_instance_lct": s.member_lct(&plugin_id),
+            "role": role,
+            "path": path,
+            "path_as_asked": raw_path,
+            "reason": reason,
+            "expires_at": expires_at,
+            "origin": "gate_deny",
+            "rule": rule,
+            "tool_name": tool,
+            "act": act,
+            "act_digest": act_digest,
+            "request_key": key,
+            "host_session_id": host_session_id,
+            "subtree": subtree,
+            "assurance": "A1 — opened by the plugin gate on a refusal; the member asked nothing. \
+                          Tamper-EVIDENT, not tamper-proof.",
+        }),
+    )?;
+    s.scope_requests.insert(
+        id.clone(),
+        ScopeRequest {
+            id: id.clone(),
+            plugin_id: plugin_id.clone(),
+            role,
+            path: path.clone(),
+            reason,
+            requested_at: now,
+            expires_at,
+            granted: None,
+            decided_by: None,
+            decided_at: None,
+            decision_reason: None,
+            recursive: false,
+            revoked: None,
+            ext: ScopeRequestExt { gate: Some(origin), ..Default::default() },
+        },
+    );
+    Ok(json!({
+        "verdict": "opened",
+        "permits": false,
+        "request_id": id,
+        "path": path,
+        "subtree": subtree,
+        "request_key": key,
+        "expires_at": expires_at,
+        "witnessEntryHash": entry.hash,
+        "on_timeout": "REFUSED — no answer within the window is a refusal, not a retry",
+        "how_to_decide": "the operator rules it on the dashboard (Activity → Reach requested) or \
+                          the app's Decide page: this act once, for the session, or standing — \
+                          exact, or recursive at a directory they choose. A delegated seat may \
+                          rule it with `hestia scope arbitrate`.",
+        "detail": "refused; a scope request was opened for the operator",
+    }))
+}
+
+/// How long a RESERVED one-time approval waits for the gate's commit or release before it lapses
+/// into spent. Longer than any gate deadline (seconds), short enough that a dead gate does not
+/// hold an operator's approval hostage for long.
+pub const SCOPE_RESERVATION_SECS: u64 = 120;
+
+/// `hestia_scope_claim` with `op` — the RESERVE / COMMIT protocol for the one-time approvals an
+/// act needs (Codex reviews of #1232, P2 and re-review P2).
+///
+///   * `reserve` (`paths`, `op_key`): under one lock, every path must be covered by a grant in
+///     force or hold an unspent one-time approval bound to THIS act digest; then all such
+///     approvals are RESERVED for `op_key` with one witnessed `scope_once_reserved` row — or
+///     nothing is reserved and the missing paths are named. Idempotent per `op_key`: a retried
+///     reserve finds its own reservation instead of reserving twice. Opens nothing.
+///   * `commit` (`op_key`): the act was permitted and its final evidence recorded — the reserved
+///     approvals become SPENT (one `scope_once_spent` row).
+///   * `release` (`op_key`): the act was denied after all — the approvals are spendable again
+///     (one `scope_once_released` row).
+///   * `lookup` (`op_key`): what became of an operation whose answer was lost — `reserved`,
+///     `committed`, `released`, `lapsed` (consumed), or `unknown`. Read-only.
+///
+/// A reservation neither committed nor released by `SCOPE_RESERVATION_SECS` LAPSES INTO SPENT: a
+/// gate that went silent may have let the act run, so its approval is never spendable twice.
+async fn scope_claim_spend_all(state: &SharedState, args: &Value, asserted: &str,
+                               act_digest: &str) -> ToolResult {
+    use crate::server::gate_escalation::now_secs;
+    use crate::server::state::normalize_scope_path;
+
+    let op = optional_string(args, "op").unwrap_or_default();
+    let op_key = optional_string(args, "op_key").unwrap_or_default();
+    if op_key.len() < 16 || op_key.len() > 128 {
+        return Err(anyhow::anyhow!("op_key (16..=128 chars) is required for a batch operation"));
+    }
+    let host_session_id = optional_string(args, "host_session_id");
+    let session_id_arg = optional_session_id(args);
+    let now = now_secs();
+    let mut s = state.lock().await;
+    if matches!(op.as_str(), "commit" | "release" | "lookup") {
+        return scope_claim_settle(&mut s, &op, &op_key, act_digest, asserted,
+                                  session_id_arg.as_deref(), host_session_id, now);
+    }
+    if op != "reserve" {
+        return Err(anyhow::anyhow!("op must be reserve, commit, release or lookup"));
+    }
+    let Some(raw_paths) = args.get("paths").and_then(Value::as_array) else {
+        return Err(anyhow::anyhow!("paths must be an array of absolute paths"));
+    };
+    if raw_paths.is_empty() || raw_paths.len() > 16 {
+        return Err(anyhow::anyhow!("paths must hold 1..=16 entries"));
+    }
+    // IDEMPOTENT: a retried reserve for the same operation reports what it already holds.
+    let held: Vec<String> = s
+        .scope_requests
+        .values()
+        .filter(|r| r.ext.reserved_by.as_deref() == Some(op_key.as_str()) && r.ext.reservation_open()
+                && !r.ext.reservation_lapsed(now))
+        .map(|r| r.id.clone())
+        .collect();
+    if !held.is_empty() {
+        return Ok(json!({
+            "verdict": "reserved", "permits": true, "reserved": held, "op_key": op_key,
+            "detail": "this operation already holds its reservation (retry)",
+        }));
+    }
+    let plugin_id = match resolve_attributed_caller(&s, session_id_arg.as_deref()) {
+        Some(who) if who.plugin_id != asserted => {
+            return Ok(hestia_error_envelope(
+                "hestia.scope_claim_asker_mismatch",
+                "the session you presented belongs to a different member than the plugin_id \
+                 you asserted; nothing was spent",
+                Some(json!({ "asserted": asserted, "session_member": who.plugin_id })),
+            ));
+        }
+        Some(who) => who.plugin_id,
+        None => asserted.to_string(),
+    };
+
+    // Plan, without mutating anything.
+    let mut to_spend: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    let mut in_force: Vec<String> = Vec::new();
+    for v in raw_paths {
+        let Some(raw) = v.as_str() else {
+            return Err(anyhow::anyhow!("paths must be strings"));
+        };
+        let t = raw.trim();
+        let subtree = t.ends_with("/*");
+        let path = normalize_scope_path(if subtree { &t[..t.len() - 2] } else { t });
+        let probe = if subtree { format!("{path}/*") } else { path.clone() };
+        if path.starts_with('/') && path != "/" && s.has_scope_grant(&plugin_id, &probe) {
+            in_force.push(path);
+            continue;
+        }
+        let once = s
+            .scope_requests
+            .values()
+            .filter(|r| r.plugin_id == plugin_id && r.path == path && r.once_spendable(now))
+            .filter(|r| r.ext.gate.as_ref().is_some_and(|g| g.act_digest == act_digest))
+            .filter(|r| !to_spend.contains(&r.id))
+            .min_by_key(|r| r.requested_at)
+            .map(|r| r.id.clone());
+        match once {
+            Some(id) => to_spend.push(id),
+            None => missing.push(path),
+        }
+    }
+    if !missing.is_empty() {
+        return Ok(json!({
+            "verdict": "not_all",
+            "permits": false,
+            "reserved": [],
+            "missing": missing,
+            "detail": "not every path is covered by a grant in force or a one-time approval for \
+                       this exact act; NOTHING was reserved",
+        }));
+    }
+    // Witness, then reserve — every approval in one row, so the reservation is one fact.
+    let until = now + SCOPE_RESERVATION_SECS;
+    let mut entry_hash = serde_json::Value::Null;
+    if !to_spend.is_empty() {
+        let entry = s.append_chain(
+            "scope_once_reserved",
+            json!({
+                "request_ids": to_spend,
+                "op_key": op_key,
+                "plugin_id": plugin_id,
+                "subject_instance_lct": s.member_lct(&plugin_id),
+                "act_digest": act_digest,
+                "host_session_id": host_session_id,
+                "in_force_paths": in_force,
+                "reserved_until": until,
+            }),
+        )?;
+        entry_hash = json!(entry.hash);
+        for id in &to_spend {
+            if let Some(r) = s.scope_requests.get_mut(id) {
+                r.ext.reserved_by = Some(op_key.clone());
+                r.ext.reserved_until = Some(until);
+                r.ext.released_at = None;
+            }
+        }
+    }
+    Ok(json!({
+        "verdict": "reserved",
+        "permits": true,
+        "reserved": to_spend,
+        "in_force": in_force,
+        "op_key": op_key,
+        "reserved_until": until,
+        "witnessEntryHash": entry_hash,
+        "detail": "every path is covered; the one-time approvals this act needs are RESERVED — \
+                   commit after the act's evidence is recorded, release if it is denied; \
+                   unreported, they lapse into spent",
+    }))
+}
+
+/// `commit` / `release` / `lookup` of a reservation (see `scope_claim_spend_all`).
+#[allow(clippy::too_many_arguments)]
+fn scope_claim_settle(s: &mut crate::server::state::ServerState, op: &str, op_key: &str,
+                      act_digest: &str, asserted: &str, session_id_arg: Option<&str>,
+                      host_session_id: Option<String>, now: u64) -> ToolResult {
+    let plugin_id = match resolve_attributed_caller(s, session_id_arg) {
+        Some(who) if who.plugin_id != asserted => {
+            return Ok(hestia_error_envelope(
+                "hestia.scope_claim_asker_mismatch",
+                "the session you presented belongs to a different member than the plugin_id \
+                 you asserted; nothing changed",
+                Some(json!({ "asserted": asserted, "session_member": who.plugin_id })),
+            ));
+        }
+        Some(who) => who.plugin_id,
+        None => asserted.to_string(),
+    };
+    let mine: Vec<String> = s
+        .scope_requests
+        .values()
+        .filter(|r| r.plugin_id == plugin_id && r.ext.reserved_by.as_deref() == Some(op_key))
+        .filter(|r| r.ext.gate.as_ref().is_some_and(|g| g.act_digest == act_digest))
+        .map(|r| r.id.clone())
+        .collect();
+    let state_of = |s: &crate::server::state::ServerState, id: &str| -> &'static str {
+        let r = &s.scope_requests[id];
+        if r.ext.spent_at.is_some() { "committed" }
+        else if r.ext.released_at.is_some() { "released" }
+        else if r.ext.reservation_lapsed(now) { "lapsed" }
+        else { "reserved" }
+    };
+    if op == "lookup" {
+        let states: Vec<&str> = mine.iter().map(|id| state_of(s, id)).collect();
+        let overall = if states.is_empty() {
+            "unknown"
+        } else if states.iter().all(|x| *x == states[0]) {
+            states[0]
+        } else {
+            "mixed"
+        };
+        return Ok(json!({ "verdict": overall, "op_key": op_key, "request_ids": mine,
+                          "consumed": matches!(overall, "committed" | "lapsed") }));
+    }
+    let open: Vec<String> = mine.iter().filter(|id| state_of(s, id) == "reserved").cloned().collect();
+    if open.is_empty() {
+        // Nothing open: report what happened instead of pretending to act.
+        let states: Vec<&str> = mine.iter().map(|id| state_of(s, id)).collect();
+        return Ok(json!({
+            "verdict": if mine.is_empty() { "unknown" } else { "settled" },
+            "op_key": op_key, "states": states, "permits": op == "commit"
+                && !states.is_empty() && states.iter().all(|x| *x == "committed"),
+            "detail": "no open reservation for this operation",
+        }));
+    }
+    let (event, done) = if op == "commit" {
+        ("scope_once_spent", "committed")
+    } else {
+        ("scope_once_released", "released")
+    };
+    let entry = s.append_chain(
+        event,
+        json!({
+            "request_ids": open,
+            "op_key": op_key,
+            "plugin_id": plugin_id,
+            "subject_instance_lct": s.member_lct(&plugin_id),
+            "act_digest": act_digest,
+            "host_session_id": host_session_id,
+        }),
+    )?;
+    for id in &open {
+        if let Some(r) = s.scope_requests.get_mut(id) {
+            if op == "commit" {
+                r.ext.spent_at = Some(now);
+            } else {
+                r.ext.released_at = Some(now);
+            }
+        }
+    }
+    Ok(json!({
+        "verdict": done, "permits": op == "commit", "op_key": op_key, "request_ids": open,
+        "witnessEntryHash": entry.hash,
     }))
 }
 
@@ -24262,6 +24838,10 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
                     "requested_at": r.requested_at,
                     "expires_at": r.expires_at,
                     "secs_remaining": r.expires_at.saturating_sub(now),
+                    "origin": if r.ext.gate.is_some() { "gate_deny" } else { "member_request" },
+                    "rule": r.ext.gate.as_ref().map(|g| g.rule.clone()),
+                    "act": r.ext.gate.as_ref().map(|g| g.act.clone()),
+                    "reissues": r.ext.gate.as_ref().map(|g| g.reissues).unwrap_or(0),
                 })
             })
             .collect()
@@ -24800,7 +25380,7 @@ mod standing_scope_surface_tests {
             decided_at: Some(now),
             decision_reason: None,
             recursive: false,
-            revoked: None,
+            revoked: None, ext: Default::default(),
         }
     }
 
@@ -25954,6 +26534,7 @@ mod disposition_durability_tests {
                 revoked: Some(crate::server::state::ScopeRevocation {
                     at: now, by: "lct:web4:review-operator".into(), reason: "done".into(),
                 }),
+                ext: Default::default(),
             });
         }
         let live = read(state.clone()).await;
@@ -27589,7 +28170,7 @@ mod delegated_scope_arbitration_tests {
                 decided_at: None,
                 decision_reason: None,
                 recursive: false,
-                revoked: None,
+                revoked: None, ext: Default::default(),
             },
         );
         id

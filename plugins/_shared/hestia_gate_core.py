@@ -108,9 +108,11 @@ over to evaluate() — decided from a policy snapshot fetched LIVE from the daem
 """
 from __future__ import annotations
 
+import glob as _glob
 import json
 import os
 import re
+import shlex
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -200,18 +202,25 @@ class Remedy:
 REMEDIES: dict[str, Remedy] = {
     # ── scope ────────────────────────────────────────────────────────────────────────────
     "mrh.path": Remedy(
-        "Adjust to work within scope. If the path is genuinely needed, ask for it with "
-        "hestia_request_scope (one path, with a reason) — a human decides, the grant is "
-        "memory-only and expires. Do NOT appeal this: hestia_appeal asks whether the deny was "
-        "WRONG and returns a verdict on conduct; it cannot and must not hand you a file. If "
-        "you believe the deny itself was wrong, that is the appeal, and it is a separate act.",
-        ("hestia_request_scope", "hestia_appeal"),
+        "Adjust to work within scope. If the path is genuinely needed: when this refusal names "
+        "a scope request id, the gate already opened it for you — a human decides (this act "
+        "once, for the session, or standing), you can watch it with hestia_scope_status, and "
+        "you re-issue this identical act afterwards. When no id is named, ask with "
+        "hestia_request_scope (one path, with a reason). Do NOT appeal this: hestia_appeal asks "
+        "whether the deny was WRONG and returns a verdict on conduct; it cannot and must not "
+        "hand you a file. If you believe the deny itself was wrong, that is the appeal, and it "
+        "is a separate act.",
+        ("hestia_request_scope", "hestia_scope_status", "hestia_appeal"),
     ),
     "mrh.command": Remedy(
-        "Scope the command to a granted repo. If the path is genuinely needed, ask for it with "
-        "hestia_request_scope (one path, with a reason). An appeal cannot deliver a path — "
+        "Scope the command to a granted path. If the path is genuinely needed: when this "
+        "refusal names a scope request id, the gate already opened it for you — a human decides "
+        "(this act once, for the session, or standing), you can watch it with "
+        "hestia_scope_status, and you re-issue this identical command afterwards. When no id "
+        "is named, ask with hestia_request_scope (one path, with a reason). Do not rephrase the "
+        "command to reach the same path another way. An appeal cannot deliver a path — "
         "hestia_appeal disputes whether the deny was right, which is a different question.",
-        ("hestia_request_scope", "hestia_appeal"),
+        ("hestia_request_scope", "hestia_scope_status", "hestia_appeal"),
     ),
     # An MCP connector call names a REPOSITORY, not a path — the codex gate scopes on that
     # name (see mcp_repo_target there). Same door as mrh.path, worded for a repo so the
@@ -424,6 +433,11 @@ class Verdict:
     reason: str = ""       # what tripped, naming the offending token
     remedy: str = ""       # from REMEDIES — never authored at a call site
     innate: bool = False   # true = not relaxable by warn-mode or by any grant
+    #: The resolved absolute path a SCOPE refusal judged (mrh.path / mrh.command), carried as
+    #: data so the escalation path can open a scope request for exactly what was refused
+    #: (2026-10-05, dp: "escalation should allow standing grants"). Rebuilding it from the
+    #: reason text is the #1003 defect (right repo, wrong depth); the checker knows the path.
+    target: str = ""
 
     @property
     def blocks(self) -> bool:
@@ -440,7 +454,7 @@ UNREGISTERED_RULE_REMEDY = (
 )
 
 
-def _deny(rule: str, reason: str, innate: bool = False) -> Verdict:
+def _deny(rule: str, reason: str, innate: bool = False, target: str = "") -> Verdict:
     """The ONLY constructor of a refusal. Takes a rule id, not a sentence — which is what
     makes 'a remedy naming a door nobody built' unwriteable rather than merely discouraged.
 
@@ -458,8 +472,8 @@ def _deny(rule: str, reason: str, innate: bool = False) -> Verdict:
     if r is None:
         return Verdict("deny", rule or "gate.internal",
                        f"{reason} [gate defect: no remedy registered for rule '{rule}']",
-                       UNREGISTERED_RULE_REMEDY, innate)
-    return Verdict("deny", rule, reason, r.text, innate)
+                       UNREGISTERED_RULE_REMEDY, innate, target)
+    return Verdict("deny", rule, reason, r.text, innate, target)
 
 
 ALLOW = Verdict("allow")
@@ -898,14 +912,18 @@ def _default_forbidden() -> tuple:
     return FORBIDDEN_DEFAULT + tuple(t.strip() for t in extra.split(",") if t.strip())
 
 
-def command_in_scope(cmd: str, scopes, workspace: str, cwd: Optional[str] = None, forbidden=None):
+def command_in_scope(cmd: str, scopes, workspace: str, cwd: Optional[str] = None, forbidden=None,
+                     home_markers=None):
     """Returns (ok, offending_token) — the two-field contract every seat's shim reads.
 
     `command_scope_reach` is the same check carrying the third fact the deny text needs:
     the resolved path that was refused. This wrapper exists so the shims (kimi, gemini,
     the parity test) keep their contract while `evaluate` reads the richer one. `forbidden`
-    passes through; None means `_default_forbidden()` (built-ins + the operator's extras)."""
-    ok, offending, _resolved = command_scope_reach(cmd, scopes, workspace, cwd, forbidden=forbidden)
+    passes through; None means `_default_forbidden()` (built-ins + the operator's extras).
+    `home_markers` passes through too; a caller that passes none gets no home allowance for
+    shell paths OUTSIDE the workspace (the narrow direction)."""
+    ok, offending, _resolved = command_scope_reach(cmd, scopes, workspace, cwd, forbidden=forbidden,
+                                                   home_markers=home_markers)
     return ok, offending
 
 
@@ -941,7 +959,14 @@ def _symlinked_reach_verdict(resolved: str, seg: str, repo_scopes, scopes, works
       - no symlink on the way (realpath == the lexical path): the lexical refusal stands, unchanged;
       - target inside the workspace: judged by the TARGET's repo, and a refusal names that repo
         (the misattribution half of #953);
-      - target outside the workspace: allowed, because a command naming it directly is not MRH-scoped.
+      - target outside the workspace: allowed — the venv interpreter case this function exists for.
+        AMENDED 2026-10-05: the old reason ("a command naming it directly is not MRH-scoped") is
+        no longer true; pass 3 now judges a direct naming. The allowance is KEPT anyway, for the
+        reach a pre-existing link carries out of a granted tree (venvs, toolchains): refusing it
+        would re-open #953 on every seat holding a `path:<ws>/**` grant. What keeps it from being
+        the way around pass 3 is that MAKING such a link names its target (`ln -s /outside …`),
+        and that naming is judged. Residual, stated: a link made by code pass 3 cannot read
+        (an interpreter one-liner) carries reach out. Read shares the lexical half of this.
     Read keeps its own rule (`path_in_scope` refuses outside the workspace either way)."""
     lexical = os.path.normpath(resolved).replace("\\", "/")
     target = os.path.realpath(lexical).replace("\\", "/")
@@ -956,9 +981,273 @@ def _symlinked_reach_verdict(resolved: str, seg: str, repo_scopes, scopes, works
     return None
 
 
+#: POSIX stream and device sinks: always reachable, never a scope question. EXACT paths plus the
+#: `/dev/fd/<n>` family — deliberately not `/dev/**`: a raw disk (`/dev/sda`) or bash's
+#: `/dev/tcp/<host>/<port>` network pseudo-device is reach, and stays judged. Measured
+#: 2026-10-05 over 31,397 shell commands: `/dev/null` alone appears in 5,408 of them, so a
+#: shell scope check without this allowance would refuse a quarter of every seat's work for
+#: plumbing that touches no file. Law, like TEMP_ROOTS, not operator config: these names are
+#: fixed by POSIX and carry no data a grant could be about.
+DEVICE_SINKS = frozenset((
+    "/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/tty",
+    "/dev/zero", "/dev/random", "/dev/urandom", "/dev/full",
+))
+DEVICE_FD_ROOT = "/dev/fd"
+
+
+def _device_sink(path: str) -> bool:
+    """Lexical, on purpose: `/dev/stderr` realpaths to `/proc/self/fd/2` -> `/dev/pts/N`, and
+    judging the target would refuse the sink this allowance exists for."""
+    p = os.path.normpath(path.replace("\\", "/")).replace("\\", "/")
+    return p in DEVICE_SINKS or p == DEVICE_FD_ROOT or p.startswith(DEVICE_FD_ROOT + "/")
+
+
+#: Heredoc bodies fed to these heads are CODE and are judged; a body fed to anything else
+#: (`cat > f <<EOF`, a commit message, a JSON payload) is DATA and is not a reach. Measured
+#: 2026-10-05: ~10% of would-be denials sat only inside heredoc bodies — prose and fixtures.
+#: A SHELL body is judged as shell; any other interpreter's body is judged by its quoted
+#: absolute-path string literals only (`open('/etc/x')`) — shell-tokenising Python or JS
+#: manufactures "paths" out of regexes and comment openers (measured on the same replay).
+_HEREDOC_SHELL = re.compile(r"^(?:ba|z|da|k|fi)?sh$")
+_HEREDOC_INTERPRETER = re.compile(
+    r"^(?:(?:ba|z|da|k|fi)?sh|python[0-9.]*|pypy[0-9.]*|node|deno|bun|ruby|perl|php|lua|Rscript"
+    r"|osascript|tclsh|awk|gawk)$")
+_CODE_PATH_LITERAL = re.compile(r"""(?<![\w])(['"])((?:/|~/|\$HOME/|\$\{HOME\}/)[^'"\s]*)\1""")
+#: Words that run the NEXT word as the command (`sudo bash <<EOF` feeds bash).
+_HEREDOC_WRAPPERS = frozenset(("sudo", "env", "nice", "nohup", "timeout", "exec", "command",
+                               "time", "doas", "stdbuf", "ionice", "xargs"))
+_HEREDOC_OP = re.compile(r"""(?<!<)<<(?!<)(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_.-]*)\2""")
+
+
+def _heredoc_head(before: str) -> str:
+    """The command word that consumes a heredoc opened at the end of `before`."""
+    seg = re.split(r"\|\||&&|[|;&(]|\$\(|`", before)[-1]
+    try:
+        words = shlex.split(seg, posix=True)
+    except ValueError:
+        words = seg.split()
+    for w in words:
+        if "=" in w and not w.startswith(("-", "/", ".")) and w.split("=", 1)[0].isidentifier():
+            continue                       # an env assignment prefix
+        base = os.path.basename(w)
+        if base in _HEREDOC_WRAPPERS or w.startswith("-") or w.isdigit():
+            continue
+        return base
+    return ""
+
+
+def _strip_data_heredocs(cmd: str) -> str:
+    """The command with every heredoc body handled by what consumes it: a SHELL body stays in
+    place and is judged as shell; another interpreter's body is replaced by its quoted
+    absolute-path literals (one per line, quoted again so they stay one word); a DATA body is
+    removed. See `_HEREDOC_INTERPRETER`."""
+    if "<<" not in cmd:
+        return cmd
+    lines = cmd.split("\n")
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        for m in _HEREDOC_OP.finditer(line):
+            dash, word = m.group(1), m.group(3)
+            head = _heredoc_head(line[:m.start()])
+            shell = bool(_HEREDOC_SHELL.match(head))
+            code = not shell and bool(_HEREDOC_INTERPRETER.match(head))
+            literals = []
+            while i < len(lines):
+                body = lines[i]
+                i += 1
+                if (body.lstrip("\t") if dash else body) == word:
+                    break
+                if shell:
+                    out.append(body)
+                elif code:
+                    literals.extend(lit for _q, lit in _CODE_PATH_LITERAL.findall(body))
+            out.extend(shlex.quote(lit) for lit in literals)
+            out.append(word)
+    return "\n".join(out)
+
+
+#: The shell's own home spellings at a word start: `~`, `~/x`, `$HOME/x`, `${HOME}/x`.
+_HOME_WORD = re.compile(r"""(?:^|(?<=[\s=;|&(<>'"`:]))(?:~|\$HOME|\$\{HOME\})(?=/|$|[\s;|&)<>'"`:])""",
+                        re.MULTILINE)
+
+
+def _expand_home_words(cmd: str) -> str:
+    """Expand the home spellings the shell would expand, so `~/<ws>/x` meets the workspace
+    rule and `~/.x` meets the outside rule. Expanded inside single quotes too, where the shell
+    would not: over-judging a quoted mention is the narrow direction."""
+    if "~" not in cmd and "HOME" not in cmd:
+        return cmd
+    # Exactly the shell's own source for `~` and `$HOME`: the HOME variable, else the account's
+    # passwd entry (what bash falls back to). No path literal (tools/no_path_literals_test.py).
+    home = os.getenv("HOME")
+    if not home:
+        try:
+            import pwd
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except Exception:
+            return cmd
+    home = home.replace("\\", "/").rstrip("/")
+    return _HOME_WORD.sub(lambda _m: home, cmd)
+
+
+def _shell_words(cmd: str, depth: int = 0) -> list:
+    """Every word of a command, redirection targets and `$( … )` / backtick bodies included.
+
+    shlex with punctuation splitting gives redirections (`2>/x`, `&>/x`, `|`, `<<<`) their own
+    tokens; `commenters` is cleared so a `#` inside a word cannot swallow the rest of the line
+    (shlex's punctuation mode treats `a#b` as a comment start, the shell does not). A quoted
+    `"$(cat /x)"` arrives as ONE word, so substitution bodies are lifted out and re-split —
+    otherwise quoting a substitution would hide its reach. Unbalanced quotes fall back to a
+    plain split, which over-reports rather than under-reports."""
+    # A newline separates commands (so the next word is a command head again); a backslash-
+    # newline continues one.
+    text = re.sub(r"\\\n", " ", cmd).replace("\n", " ;\n")
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        lex.commenters = ""
+        words = list(lex)
+    except ValueError:
+        words = [w for w in re.split(r"""[\s<>'"`]+|([;|&()])""", text) if w]
+    if depth < 3:
+        extra = []
+        for w in words:
+            if "$(" in w or "`" in w:
+                for inner in re.findall(r"\$\(([^()]*)\)|`([^`]*)`", w):
+                    body = inner[0] or inner[1]
+                    if body:
+                        extra.append(";")
+                        extra.extend(_shell_words(body, depth + 1))
+        words.extend(extra)
+    return words
+
+
+#: A word made only of slashes (and glob stars) — `/`, `//`, `/*` — is a filesystem reach only as
+#: a standalone argument of a command that walks it (`find /`, `du -sh /*`). Everywhere else it
+#: is a delimiter: `tr / _`, `cut -d/`, `IFS=/`, `awk -F/`, a C comment opener in a heredoc.
+#: Measured 2026-10-05: ~310 of 31,397 real commands carried such a word; judging all of them
+#: would refuse delimiters, judging none would admit `find /`.
+#: (grep/rg are NOT here: their first positional is a pattern, and `grep -v '//'` is the common
+#: shape; `grep -r x /` is the rare one, and is a residual.)
+_ROOT_WALKERS = frozenset(("find", "du", "tree", "ls", "fd", "locate", "rsync", "tar", "chmod",
+                           "chown", "rm", "cp", "mv", "stat", "df", "zip", "ncdu", "getfacl",
+                           "lsattr"))
+_SHELL_SEPARATORS = frozenset(("|", "||", "&&", ";", "&", "(", ")", "|&", ";;", ";&", "{", "}"))
+
+
+#: An attached short option carrying a path: `-I/usr/include`, `-C/elsewhere`, `-o/out`.
+_ATTACHED_OPT = re.compile(r"^-[A-Za-z](/.*)$")
+_GLOB_CHARS = re.compile(r"[*?\[]")
+
+
+def _outside_candidates(cmd: str) -> list:
+    """`(spelling, kind)` for every word that names a path ABSOLUTELY or by a relative escape:
+    kind is "abs" or "rel". Assignments and `--opt=value` are split on `=`; a value carrying
+    `:` (a `PATH=` list, `host:/path`) is not a local path and is skipped, as pass 2 does."""
+    out = []
+    head = None
+    for w in _shell_words(cmd):
+        if w in _SHELL_SEPARATORS or (w and set(w) <= set("|&;()")):
+            head = None
+            continue
+        if head is None:
+            assign = "=" in w and w.split("=", 1)[0].isidentifier()
+            if not assign and os.path.basename(w) not in _HEREDOC_WRAPPERS and not w.startswith("-"):
+                head = os.path.basename(w)
+        parts = w.split("=") if "=" in w else [w]
+        for p in parts:
+            p = p.strip()
+            if not p or ":" in p or "://" in w:
+                continue
+            m = _ATTACHED_OPT.match(p)
+            if m:
+                p = m.group(1)
+            if p.startswith("$") and not p.startswith("$("):
+                p = os.path.expandvars(p)     # $XDG_STATE_HOME/x; an unknown var stays `$…`
+            if p.startswith("//"):
+                p = "/" + p.lstrip("/")          # `$X//.git` with $X empty: one root, not two
+            if p.startswith("/") and set(_glob_probe(os.path.normpath(p))) <= set("/*"):
+                # Resolves to the root (or a glob over it): a reach only as a standalone argument
+                # of a walker — `/.`, `//`, `/*` elsewhere are delimiters or code fragments.
+                if m or len(parts) > 1 or head not in _ROOT_WALKERS or w == head:
+                    continue
+            if p.startswith("/"):
+                out.append((p, "abs"))
+            elif "/" in p and not p.startswith(("-", "$", "~")):
+                out.append((p, "rel"))
+    return out
+
+
+def _is_reach(path: str) -> bool:
+    """Whether an absolute spelling plausibly names a filesystem object: it exists, or its
+    nearest existing ancestor is below `/`. `/` itself is a reach (`find /`). A spelling whose
+    only existing ancestor is the root — a sed address `/^#/d`, a regex, prose — is not."""
+    if path == "/":
+        return True
+    p = path
+    for _ in range(40):
+        if os.path.lexists(p):
+            return p != "/" or path == "/"
+        parent = os.path.dirname(p)
+        if parent == p:
+            return False
+        p = parent
+    return False
+
+
+def _glob_probe(path: str) -> str:
+    """The path a glob is judged as: its literal directory plus a `*` child, so a glob reaches
+    only what a RECURSIVE grant (or temp/home) covers — an exact grant on one file under the
+    directory does not authorise `dir/*`."""
+    comps = path.split("/")
+    for i, c in enumerate(comps):
+        if _GLOB_CHARS.search(c):
+            base = "/".join(comps[:i]) or "/"
+            return base.rstrip("/") + "/*"
+    return path
+
+
+def _outside_reach_refused(resolved: str, scopes, workspace: str, cwd: Optional[str], egress,
+                           home_markers) -> Optional[tuple]:
+    """Judge one absolute candidate exactly like a Read path (`path_in_scope`: temp roots, the
+    member's home markers, `path:` grants by realpath, the workspace's segment rule) — and,
+    when a symlink is on the way, judge where it LANDS as well. Returns None when the reach is
+    in scope, else `(offending, refused_path)`."""
+    if _device_sink(resolved):
+        return None
+    prof = HarnessProfile(member_id="", identity_path="", home_markers=tuple(home_markers or ()))
+    lexical = os.path.normpath(resolved).replace("\\", "/")
+    target = os.path.realpath(lexical).replace("\\", "/")
+    if target != lexical:
+        low = target.lower()
+        hidden = next((f for f in egress if f in low), None)
+        if hidden is not None:
+            return target, target
+    if not path_in_scope(lexical, scopes, workspace, prof, cwd):
+        return _elide(lexical), lexical
+    if target != lexical and not _device_sink(target) and not path_in_scope(target, scopes,
+                                                                            workspace, prof, cwd):
+        return _elide(target), target
+    return None
+
+
 def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = None,
-                        forbidden=None):
+                        forbidden=None, home_markers=None):
     """Returns (ok, offending_token, resolved_path).
+
+    OUTSIDE THE WORKSPACE (2026-10-05, dp: "yes on gate gap, let's fix it"). Until this pass the
+    check judged only tokens UNDER the workspace, so `cat /abs/path/outside` passed on every seat
+    while a Read of the same path was refused `mrh.path` — measured live the same day, a session
+    listed and read a mail client's profile directory on a Windows mount through the shell. Pass 3
+    judges every absolute spelling (and every relative escape) that lands outside the workspace by
+    the SAME rule as a Read path — temp roots, the member's home markers, `path:` grants by
+    realpath — plus the POSIX device sinks, which are law. `home_markers` comes from the
+    caller's HarnessProfile; `evaluate` passes it. Heredoc bodies fed to a non-interpreter are
+    data and are not judged (see `_strip_data_heredocs`).
 
     `forbidden` is the egress list applied to a symlink's RESOLVED target, on every absolute workspace
     token and before any grant check (#953, #1191 review); None means `_default_forbidden()`.
@@ -981,6 +1270,9 @@ def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = N
     ws = workspace.rstrip("/")
     repo_scopes, _ = _scope_parts(scopes, workspace)
     egress = _default_forbidden() if forbidden is None else forbidden
+    # Pass 0 — the shell's home spellings, expanded before anything reads the text, so a
+    # workspace path spelled `~/…` or `$HOME/…` meets pass 1 like its literal spelling does.
+    cmd = _expand_home_words(cmd)
     for after in cmd.split(workspace)[1:]:
         # Resolve the whole token before reading a segment off it (kimi #940 B7). Taking the
         # head lexically let `cat <ws>/repo-a/../repo-b/secret` pass on `repo-a` while
@@ -989,7 +1281,15 @@ def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = N
         tok = re.split(r"""[\s"'`);&|<>]""", after.lstrip("/"), 1)[0]
         resolved = os.path.normpath(f"{ws}/{tok}").replace("\\", "/")
         if resolved != ws and not resolved.startswith(ws + "/"):
-            return False, (tok or "<workspace root>"), resolved   # traversed out of the workspace
+            # Traversed out of the workspace: judged WHERE IT LANDS, by the outside rule (pass 3),
+            # so a grant the operator makes for the landing path is honoured however it is
+            # spelled. Before 2026-10-05 this refused unconditionally, which made a granted
+            # outside path unreachable through a `<ws>/../…` spelling — a grant that could never
+            # be spent, re-escalating forever.
+            refused = _outside_reach_refused(resolved, scopes, workspace, cwd, egress, home_markers)
+            if refused is None:
+                continue
+            return False, (tok or "<workspace root>"), refused[1]
         # EGRESS FIRST, for every token: a symlink must not launder a forbidden target past a grant.
         hidden = _symlink_target_forbidden(resolved, egress)
         if hidden is not None:
@@ -1050,6 +1350,51 @@ def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = N
                     break
             if not in_scope_vote and oos_vote:
                 return False, oos_vote, oos_path
+
+    # Pass 3 — OUTSIDE the workspace (2026-10-05). Every absolute spelling, and every relative
+    # escape, that lands outside the workspace is judged like a Read path. Data heredoc bodies
+    # are removed first; the bound keeps filesystem probing inside the engine's hook clamp.
+    judged = 0
+    for spelling, kind in _outside_candidates(_strip_data_heredocs(cmd)):
+        if judged >= 64:
+            break
+        if kind == "abs":
+            cand = os.path.normpath(spelling).replace("\\", "/")
+            if cand == ws or cand.startswith(ws + "/"):
+                continue                      # inside: passes 1 and 2 own it
+            if _device_sink(cand) or not _is_reach(_glob_probe(cand).rstrip("*").rstrip("/") or "/"):
+                continue
+            judged += 1
+            refused = _outside_reach_refused(_glob_probe(cand), scopes, workspace, cwd, egress,
+                                             home_markers)
+            if refused is not None:
+                return (False,) + refused
+            continue
+        # A relative spelling, voted like pass 2 over its plausible bases (the event cwd plus
+        # every granted repo root): it is refused only when an interpretation that EXISTS lands
+        # outside the workspace un-granted and no existing interpretation is in scope.
+        in_scope, refused = False, None
+        for base in bases:
+            cand = os.path.normpath(os.path.join(base, spelling)).replace("\\", "/")
+            probe = _glob_probe(cand)
+            if not _is_reach(probe.rstrip("*").rstrip("/") or "/"):
+                continue
+            if not os.path.lexists(os.path.dirname(probe.rstrip("*").rstrip("/")) or "/"):
+                continue
+            if cand == ws or cand.startswith(ws + "/"):
+                seg = cand[len(ws):].lstrip("/").split("/", 1)[0]
+                if seg and (seg in repo_scopes or _within_path_grant(cand, scopes, workspace)):
+                    in_scope = True
+                    break
+                continue                      # an inside interpretation: pass 2's to refuse
+            judged += 1
+            r = _outside_reach_refused(probe, scopes, workspace, cwd, egress, home_markers)
+            if r is None:
+                in_scope = True
+                break
+            refused = refused or r
+        if refused is not None and not in_scope:
+            return (False,) + refused
     return True, None, None
 
 
@@ -1213,10 +1558,12 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
                 "mrh.path",
                 f"'{event.tool}' targets '{_elide(p)}' outside your granted scope: {where} "
                 f"(granted: {'+'.join(scopes)}){hint}",
+                target=os.path.normpath(os.path.expanduser(absolute)).replace("\\", "/"),
             )
     if event.command is not None:
         ok, offending, refused = command_scope_reach(event.command, scopes, ws, event.cwd,
-                                                     forbidden=forbidden)
+                                                     forbidden=forbidden,
+                                                     home_markers=profile.home_markers)
         if not ok:
             # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
             # debugging blind (Codex live session, 2026-07-23). The exact-grant hint is
@@ -1224,10 +1571,15 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
             # not rebuilt from the display token, which has the right repo and the wrong
             # depth (GPT review of #1003).
             hint = _exact_grant_hint(refused, scopes, ws) if refused else ""
+            wsn = ws.replace("\\", "/").rstrip("/")
+            outside = bool(refused) and not (refused == wsn or refused.startswith(wsn + "/"))
+            what = (f"'{offending}' is outside the workspace and no grant reaches it" if outside
+                    else f"'{offending}' is not granted")
             return _deny(
                 "mrh.command",
-                f"'{event.tool}' command reaches outside your granted scope: '{offending}' "
-                f"is not granted (granted: {'+'.join(scopes)}){hint}",
+                f"'{event.tool}' command reaches outside your granted scope: {what} "
+                f"(granted: {'+'.join(scopes)}){hint}",
+                target=refused or "",
             )
 
     return ALLOW

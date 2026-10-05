@@ -166,6 +166,20 @@ export interface PendingScopeRequest {
   requested_at: number;
   expires_at: number;
   secs_remaining: number;
+  /**
+   * `gate_deny` when the GATE opened this on a refused act (2026-10-05); then `act` is what the
+   * operator rules on and `reason` is the gate's own sentence, not the member's. Absent on an
+   * older daemon, which reads as a member-filed ask.
+   */
+  origin?: "gate_deny" | "member_request";
+  rule?: string | null;
+  tool?: string | null;
+  act?: string | null;
+  reissues?: number;
+  /** The refused reach was a glob over this directory: only a recursive grant covers it. */
+  subtree?: boolean;
+  /** "This act once" is a choice only when the gate recorded an act to bind. */
+  once_available?: boolean;
 }
 
 /**

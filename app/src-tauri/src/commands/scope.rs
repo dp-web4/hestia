@@ -29,6 +29,32 @@ struct Ruling {
     reason: Option<String>,
     standing: bool,
     recursive: bool,
+    once: bool,
+    grant_path: Option<String>,
+}
+
+/// The breadth rule the daemon enforces (2026-10-05): `grant_path` is the asked path or a
+/// directory ABOVE it at a separator, never the root, and an ancestor is always recursive.
+fn check_breadth(asked: &str, grant_path: Option<&str>, recursive: bool) -> Result<Option<String>, String> {
+    let Some(gp) = grant_path.map(str::trim).filter(|g| !g.is_empty()) else {
+        return Ok(None);
+    };
+    let gp = gp.trim_end_matches('/');
+    if gp == asked.trim_end_matches('/') {
+        return Ok(None);
+    }
+    let is_ancestor = gp.starts_with('/') && !gp.is_empty() && asked.starts_with(&format!("{gp}/"));
+    if !is_ancestor {
+        return Err(format!(
+            "the grant must reach from the asked path ({asked}) or a directory above it, never the root; got {gp}"
+        ));
+    }
+    if !recursive {
+        return Err("a grant on a directory above the asked path must include everything below it — \
+                    an exact grant there would not reach what was asked"
+            .to_string());
+    }
+    Ok(Some(gp.to_string()))
 }
 
 fn check_ruling(
@@ -37,6 +63,30 @@ fn check_ruling(
     standing: bool,
     recursive: bool,
 ) -> Result<Ruling, String> {
+    check_ruling_full(granted, reason, standing, recursive, false, None, "")
+}
+
+fn check_ruling_full(
+    granted: bool,
+    reason: Option<&str>,
+    standing: bool,
+    recursive: bool,
+    once: bool,
+    grant_path: Option<&str>,
+    asked: &str,
+) -> Result<Ruling, String> {
+    if once && (!granted || standing || recursive || grant_path.is_some_and(|g| !g.trim().is_empty())) {
+        return Err(
+            "\"this act once\" approves the refused act exactly once — it is a grant, never standing, \
+             never recursive, and has no breadth"
+                .to_string(),
+        );
+    }
+    let grant_path = if granted && !once {
+        check_breadth(asked, grant_path, recursive)?
+    } else {
+        None
+    };
     let trimmed = reason.map(str::trim).unwrap_or("");
     if trimmed.len() > REASON_MAX {
         return Err(format!(
@@ -65,6 +115,8 @@ fn check_ruling(
         reason: (!trimmed.is_empty()).then(|| trimmed.to_string()),
         standing,
         recursive,
+        once,
+        grant_path,
     })
 }
 
@@ -80,17 +132,23 @@ pub async fn rule_scope_request(
     reason: Option<String>,
     standing: Option<bool>,
     recursive: Option<bool>,
+    once: Option<bool>,
+    grant_path: Option<String>,
+    asked_path: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let request_id = request_id.trim().to_string();
     if request_id.is_empty() {
         return Err("no scope request id".to_string());
     }
-    // Both default to false, as the daemon's do: exact, and not standing.
-    let r = check_ruling(
+    // All default to false/absent, as the daemon's do: exact, not standing, not once.
+    let r = check_ruling_full(
         granted,
         reason.as_deref(),
         standing.unwrap_or(false),
         recursive.unwrap_or(false),
+        once.unwrap_or(false),
+        grant_path.as_deref(),
+        asked_path.as_deref().unwrap_or(""),
     )?;
 
     let mut body = serde_json::json!({
@@ -99,6 +157,12 @@ pub async fn rule_scope_request(
         "standing": r.standing,
         "recursive": r.recursive,
     });
+    if r.once {
+        body["once"] = serde_json::Value::Bool(true);
+    }
+    if let Some(gp) = r.grant_path {
+        body["grant_path"] = serde_json::Value::String(gp);
+    }
     if let Some(reason) = r.reason {
         body["reason"] = serde_json::Value::String(reason);
     }
@@ -145,5 +209,40 @@ mod tests {
     fn exact_and_not_standing_by_default() {
         let r = check_ruling(true, Some("read-only probe"), false, false).unwrap();
         assert!(!r.recursive && !r.standing);
+        assert!(!r.once && r.grant_path.is_none());
+    }
+
+    /// "This act once" (2026-10-05) is a grant with no duration choice and no breadth.
+    #[test]
+    fn once_is_a_bare_grant() {
+        let asked = "/etc/hostname";
+        assert!(check_ruling_full(true, Some("one read"), false, false, true, None, asked).unwrap().once);
+        for (granted, standing, recursive, gp) in [
+            (false, false, false, None),
+            (true, true, false, None),
+            (true, false, true, None),
+            (true, false, false, Some("/etc")),
+        ] {
+            let e = check_ruling_full(granted, Some("r"), standing, recursive, true, gp, asked);
+            assert!(e.is_err(), "{granted} {standing} {recursive} {gp:?}");
+        }
+    }
+
+    /// Breadth: the asked path, or a directory above it — recursive, never the root, never a
+    /// sibling that merely shares a prefix.
+    #[test]
+    fn breadth_is_the_asked_path_or_a_recursive_ancestor() {
+        let asked = "/home/u/.local/state/mesh/x.log";
+        let ok = |gp, rec| check_ruling_full(true, Some("r"), true, rec, false, Some(gp), asked);
+        assert_eq!(ok("/home/u/.local/state/mesh", true).unwrap().grant_path.as_deref(),
+                   Some("/home/u/.local/state/mesh"));
+        assert_eq!(ok(asked, false).unwrap().grant_path, None, "the asked path itself needs no field");
+        assert!(ok("/home/u/.local/state/mesh", false).is_err(), "an ancestor must be recursive");
+        assert!(ok("/", true).is_err(), "never the root");
+        assert!(ok("/home/u/.local/state/me", true).is_err(), "a prefix is not an ancestor");
+        assert!(ok("/srv", true).is_err(), "nor an unrelated directory");
+        // A refusal ignores breadth entirely.
+        assert_eq!(check_ruling_full(false, None, false, false, false, Some("/srv"), asked)
+                       .unwrap().grant_path, None);
     }
 }

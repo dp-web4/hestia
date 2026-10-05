@@ -223,6 +223,8 @@
       "rules": [
         "reason-to-permit",
         "already-decided-409",
+        "bound-to-rendered-evidence",
+        "member-id",
         "signed-in-only"
       ],
       "surfaces": {
@@ -233,7 +235,14 @@
           "status": "required"
         }
       },
-      "notes": "The app sends standing/recursive at decide time; the dashboard makes those separate witnessed acts. Reconcile."
+      "obligations": [
+        "a request the GATE opened on a refused act (origin gate_deny) is shown as that: the rule (mrh.path / mrh.command), the tool, and the refused act verbatim, labelled as the act the operator is ruling on and never as the member's reason; how many times the member re-issued it is shown beside it",
+        "the operator chooses the DURATION at decide time, from exactly these: this act once (once:true; offered only when once_available, i.e. the gate recorded an act to bind), for the session (memory-only, expires), or standing (vault, survives restart); refusing is a separate control that needs no reason",
+        "the operator chooses the BREADTH at decide time for session and standing grants: the exact asked path (the default), or a directory above it, which is always recursive (grant_path + recursive:true); every offered directory is an ancestor of the asked path at a separator and never the root, and the control shows the path the grant will reach before it is sent",
+        "a request whose refused reach was a glob over a directory (subtree:true) says that only a recursive grant covers it, and the surface does not offer an exact session or standing grant for it",
+        "a one-time approval says that it is spent by the identical act, once, inside the claim window, and is never served as standing policy"
+      ],
+      "notes": "Reconciled 2026-10-05 (scope refusal -> escalation with a standing option): both surfaces send duration (once / session / standing) and breadth (grant_path, recursive) in the one decide call, as the app already did for standing/recursive."
     },
     {
       "id": "scope-grant",
