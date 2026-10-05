@@ -64,6 +64,37 @@ pub struct LegacyParityReport {
     pub samples: Vec<LegacyParitySample>,
 }
 
+/// Edge-specific cutover evidence. READY means only what it says:
+/// the recent measured legacy next hop agrees with the executable F3 next hop,
+/// with no unresolved parity classes in the selected window. It does NOT claim
+/// byte-for-byte semantic equality; the two intentional migration strengthenings
+/// remain named explicitly below.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LegacyCutoverCheck {
+    pub legacy_address: String,
+    pub min_matches: usize,
+    pub ready: bool,
+    pub blockers: Vec<String>,
+    pub named_migration_rules: Vec<String>,
+    pub parity: LegacyParityReport,
+}
+
+impl LegacyCutoverCheck {
+    pub fn require_ready(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.ready,
+            "F3 cutover for '{}' is not ready: {}",
+            self.legacy_address,
+            if self.blockers.is_empty() {
+                "unspecified parity blocker".to_string()
+            } else {
+                self.blockers.join("; ")
+            }
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct ForwardEvidence {
     carrier_lct: Option<String>,
@@ -263,6 +294,24 @@ fn project_entry(
     })
 }
 
+fn tally(report: &mut LegacyParityReport, sample: LegacyParitySample) {
+    report.total += 1;
+    match sample.classification.as_str() {
+        "next_hop_match" => report.next_hop_match += 1,
+        "next_hop_mismatch" => report.next_hop_mismatch += 1,
+        "legacy_queued_not_forwarded_yet" => report.legacy_queued_not_forwarded_yet += 1,
+        "legacy_recipient_unmeasured" => report.legacy_recipient_unmeasured += 1,
+        "f3_missing_neighbor" => report.f3_missing_neighbor += 1,
+        "missing_alias" => report.missing_alias += 1,
+        "shadow_unavailable" => report.shadow_unavailable += 1,
+        "route_divergence" => report.route_divergence += 1,
+        "shared_transport_refusal" => report.shared_transport_refusal += 1,
+        "legacy_queue_refusal" => report.legacy_queue_refusal += 1,
+        _ => report.other_refusal += 1,
+    }
+    report.samples.push(sample);
+}
+
 pub fn summarize(entries: &[ChainEntry]) -> LegacyParityReport {
     let forwarded = forwarded_by_row(entries);
     let mut report = LegacyParityReport::default();
@@ -270,23 +319,124 @@ pub fn summarize(entries: &[ChainEntry]) -> LegacyParityReport {
         let Some(sample) = project_entry(entry, &forwarded) else {
             continue;
         };
-        report.total += 1;
-        match sample.classification.as_str() {
-            "next_hop_match" => report.next_hop_match += 1,
-            "next_hop_mismatch" => report.next_hop_mismatch += 1,
-            "legacy_queued_not_forwarded_yet" => report.legacy_queued_not_forwarded_yet += 1,
-            "legacy_recipient_unmeasured" => report.legacy_recipient_unmeasured += 1,
-            "f3_missing_neighbor" => report.f3_missing_neighbor += 1,
-            "missing_alias" => report.missing_alias += 1,
-            "shadow_unavailable" => report.shadow_unavailable += 1,
-            "route_divergence" => report.route_divergence += 1,
-            "shared_transport_refusal" => report.shared_transport_refusal += 1,
-            "legacy_queue_refusal" => report.legacy_queue_refusal += 1,
-            _ => report.other_refusal += 1,
-        }
-        report.samples.push(sample);
+        tally(&mut report, sample);
     }
     report
+}
+
+/// Project one exact legacy compatibility edge. Forward evidence is still read
+/// from the full window before the samples are filtered; filtering the raw chain
+/// first would accidentally discard the egress_forwarded rows needed to prove
+/// which Hub member legacy actually reached.
+pub fn summarize_address(
+    entries: &[ChainEntry],
+    legacy_address: &str,
+) -> LegacyParityReport {
+    let full = summarize(entries);
+    let mut out = LegacyParityReport::default();
+    for sample in full.samples {
+        if sample.legacy_address.as_deref() == Some(legacy_address) {
+            tally(&mut out, sample);
+        }
+    }
+    out
+}
+
+/// Mechanical D3 preflight for one remote compatibility edge.
+///
+/// READY requires measured equality on the property D2 can actually prove:
+/// legacy and F3 resolve to the same Hub next-hop member. Missing evidence is a
+/// blocker, not equality. Shared pre-route transport refusals may coexist with
+/// good samples because both planes were refused before routing; they do not
+/// substitute for a successful measured match.
+///
+/// Two intentional semantic differences are always named rather than hidden:
+/// F3's stronger durable-acceptance boundary, and its stable retry identity.
+/// Refuse to borrow historical parity from a route/neighbor different from
+/// the one the edge would use now. Every next_hop_match counted in the selected
+/// evidence window must agree with the current route; a window straddling a
+/// config edit is intentionally HOLD until a clean window is measured.
+pub fn current_route_evidence_blockers(
+    parity: &LegacyParityReport,
+    current_next_hop_lct: &str,
+    current_hub_member_lct: &str,
+) -> Vec<String> {
+    let stale: Vec<&LegacyParitySample> = parity
+        .samples
+        .iter()
+        .filter(|s| s.classification == "next_hop_match")
+        .filter(|s| {
+            s.f3_next_hop_lct.as_deref() != Some(current_next_hop_lct)
+                || s.f3_expected_hub_member_lct.as_deref() != Some(current_hub_member_lct)
+        })
+        .collect();
+    if stale.is_empty() {
+        return Vec::new();
+    }
+    let examples: Vec<String> = stale
+        .iter()
+        .take(3)
+        .map(|sample| format!(
+            "next-hop={} Hub-member={}",
+            sample.f3_next_hop_lct.as_deref().unwrap_or("(missing)"),
+            sample.f3_expected_hub_member_lct.as_deref().unwrap_or("(missing)")
+        ))
+        .collect();
+    vec![format!(
+        "{} measured match sample(s) belong to a different route/neighbor than current next-hop={} Hub-member={}: {}",
+        stale.len(),
+        current_next_hop_lct,
+        current_hub_member_lct,
+        examples.join(", ")
+    )]
+}
+
+pub fn cutover_check(
+    entries: &[ChainEntry],
+    legacy_address: &str,
+    min_matches: usize,
+) -> LegacyCutoverCheck {
+    let parity = summarize_address(entries, legacy_address);
+    let mut blockers = Vec::new();
+
+    if parity.total == 0 {
+        blockers.push("no parity samples for this exact legacy address".to_string());
+    }
+    if parity.next_hop_match < min_matches {
+        blockers.push(format!(
+            "only {} measured next-hop match(es); require at least {min_matches}",
+            parity.next_hop_match
+        ));
+    }
+
+    let unresolved = [
+        ("next-hop mismatch", parity.next_hop_mismatch),
+        ("legacy queued but not forwarded yet", parity.legacy_queued_not_forwarded_yet),
+        ("legacy Hub recipient unmeasured", parity.legacy_recipient_unmeasured),
+        ("F3 missing neighbor", parity.f3_missing_neighbor),
+        ("missing alias", parity.missing_alias),
+        ("shadow unavailable/malformed", parity.shadow_unavailable),
+        ("route divergence", parity.route_divergence),
+        ("legacy queue refusal", parity.legacy_queue_refusal),
+        ("other refusal", parity.other_refusal),
+    ];
+    for (name, count) in unresolved {
+        if count > 0 {
+            blockers.push(format!("{count} sample(s): {name}"));
+        }
+    }
+
+    LegacyCutoverCheck {
+        legacy_address: legacy_address.to_string(),
+        min_matches,
+        ready: blockers.is_empty(),
+        blockers,
+        named_migration_rules: vec![
+            "acceptance-strengthening: F3 acknowledges only witnessed local delivery or durable receipt-mode next-hop acceptance; legacy Hub witness/acceptance is weaker".to_string(),
+            "retry-identity-strengthening: F3 carries one stable immutable operation id across retry; historical legacy delivery could duplicate, with #1219 defining the migration contract".to_string(),
+        ],
+        parity,
+    }
 }
 
 #[cfg(test)]
@@ -444,6 +594,116 @@ mod tests {
         let r = summarize(&[full, missing]);
         assert_eq!(r.missing_alias, 1);
         assert_eq!(r.legacy_queue_refusal, 1);
+    }
+
+    #[test]
+    fn edge_cutover_ready_requires_exact_measured_matches_and_no_unknowns() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        let rows = vec![
+            forwarded(7, Some(id)),
+            queued(7, Some(id)),
+            // A different edge in the same window must not contaminate this check.
+            entry(
+                "member_notice_route_shadow",
+                serde_json::json!({
+                    "legacy_address": "other/claude-code",
+                    "legacy_outcome": "egress_queued",
+                    "legacy_egress_row_id": 99,
+                    "f3_shadow": {
+                        "result": {"status":"missing_alias"},
+                        "f3_neighbor": {"status":"not_applicable"}
+                    }
+                }),
+                99,
+            ),
+        ];
+        let check = cutover_check(&rows, "thor/claude-code", 1);
+        assert!(check.ready, "{:?}", check.blockers);
+        assert_eq!(check.parity.total, 1);
+        assert_eq!(check.parity.next_hop_match, 1);
+        assert_eq!(check.named_migration_rules.len(), 2);
+    }
+
+    #[test]
+    fn current_route_check_rejects_a_window_that_straddles_a_route_change() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        let mut parity = summarize(&[
+            forwarded(7, Some(id)),
+            queued(7, Some(id)),
+        ]);
+        assert_eq!(parity.next_hop_match, 1);
+        let mut stale = parity.samples[0].clone();
+        stale.chain_position += 1;
+        stale.f3_next_hop_lct = Some("lct:web4:mb32:old-router".to_string());
+        stale.f3_expected_hub_member_lct =
+            Some("22222222-2222-4222-8222-222222222222".to_string());
+        parity.next_hop_match += 1;
+        parity.total += 1;
+        parity.samples.push(stale);
+
+        let blockers = current_route_evidence_blockers(
+            &parity,
+            "lct:web4:mb32:thor-router",
+            id,
+        );
+        assert_eq!(blockers.len(), 1);
+        assert!(blockers[0].contains("1 measured match sample"));
+        assert!(blockers[0].contains("old-router"));
+
+        // A clean window over the current route is accepted by this structural check.
+        let clean = summarize(&[
+            forwarded(9, Some(id)),
+            queued(9, Some(id)),
+        ]);
+        assert!(current_route_evidence_blockers(
+            &clean,
+            "lct:web4:mb32:thor-router",
+            id,
+        ).is_empty());
+    }
+
+    #[test]
+    fn edge_cutover_missing_or_unresolved_evidence_is_hold_not_equality() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        let pending = cutover_check(
+            &[queued(7, Some(id))],
+            "thor/claude-code",
+            1,
+        );
+        assert!(!pending.ready);
+        assert!(pending.blockers.iter().any(|b| b.contains("not forwarded")));
+
+        let absent = cutover_check(&[], "thor/claude-code", 1);
+        assert!(!absent.ready);
+        assert!(absent.blockers.iter().any(|b| b.contains("no parity samples")));
+    }
+
+    #[test]
+    fn edge_cutover_shared_pre_route_refusal_does_not_erase_real_match() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        let shared = entry(
+            "member_notice_refused",
+            serde_json::json!({
+                "reason": "transport_binding_unmet",
+                "to_plugin_id": "thor/claude-code",
+                "f3_shadow": {
+                    "result": {
+                        "status": "resolved",
+                        "destination_lct": "lct:web4:mb32:end-member",
+                        "decision": {"decision":"forward"}
+                    }
+                }
+            }),
+            4,
+        );
+        let check = cutover_check(
+            &[forwarded(7, Some(id)), queued(7, Some(id)), shared],
+            "thor/claude-code",
+            1,
+        );
+        assert!(check.ready, "{:?}", check.blockers);
+        assert_eq!(check.parity.shared_transport_refusal, 1);
+        assert_eq!(check.parity.next_hop_match, 1);
     }
 
     #[test]
