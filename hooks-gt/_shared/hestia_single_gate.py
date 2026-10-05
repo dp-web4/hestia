@@ -1,3 +1,4 @@
+# hestia-gt-sha256: c7cfe50bd717ecb1470f1bce6d00d1ebb030d8f4daf05330dee1b3229a0a38da  (published ground truth; manifest: hooks-gt)
 """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
 
 One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's

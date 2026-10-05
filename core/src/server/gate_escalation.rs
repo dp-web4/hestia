@@ -318,7 +318,53 @@ pub fn bar_for(marker: &str) -> Bar {
         // it" the governance-class declaration named. Live clause: the name is not shadowed in the
         // matcher tuple, so this is the deciding branch for its own marker (governance_class_drift).
         || marker.contains("hestia_gate_mechanism.py")
+        // THE common gate (one-gate stage C): since the thin-shim cutover every seat's shim
+        // delegates its whole decision to it, so it is the enforcement path for all four seats
+        // at once — priced like the gate it replaced (align upward), never single-approver by
+        // omission (the governance-class declaration's "DECIDE before the shims land").
+        || marker.contains("hestia_single_gate.py")
     {
+        Bar::SovereignPlusPeer
+    } else {
+        Bar::SingleApprover
+    }
+}
+
+/// The files whose silent compromise ends the model, by basename — the sovereign half of
+/// `bar_for`. One list, so `bar_for` and `markers_of` cannot disagree about what is sovereign.
+pub const SOVEREIGN_FILES: &[&str] = &[
+    "pre_tool_use.py",
+    "post_tool_use.py",
+    "witness.py",
+    "hestia_gate_mechanism.py",
+    "hestia_single_gate.py",
+];
+
+/// Every marker an escalation's act reaches: the closure's reported `marker` first, then the
+/// basename of every target in the act text that is a sovereign file (deduplicated, in order).
+/// Targets are read the way they are written — whitespace, quotes, `=`, `,`, `;`, shell
+/// punctuation and escaped newlines split them, a `/` separates segments — so a path inside a
+/// command, an Edit target or an apply_patch body is found wherever the closure's directory
+/// marker shadowed it. Reads text only; it never widens a bar below what `marker` asks for.
+pub fn markers_of(marker: &str, act: Option<&str>) -> Vec<String> {
+    let mut out = vec![marker.trim().to_string()];
+    if let Some(text) = act {
+        let split = |c: char| {
+            c.is_whitespace() || "\"'`=,;:()<>|&{}[]\\".contains(c)
+        };
+        for tok in text.split(split) {
+            let base = tok.rsplit('/').next().unwrap_or("");
+            if SOVEREIGN_FILES.contains(&base) && !out.iter().any(|m| m == base) {
+                out.push(base.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The bar an act must clear: the HIGHEST `bar_for` over every marker it reaches.
+pub fn bar_for_markers(markers: &[String]) -> Bar {
+    if markers.iter().any(|m| bar_for(m) == Bar::SovereignPlusPeer) {
         Bar::SovereignPlusPeer
     } else {
         Bar::SingleApprover
@@ -570,6 +616,13 @@ pub struct Escalation {
     pub tool_name: String,
     /// Which governance file the write would reach.
     pub marker: String,
+    /// EVERY closure marker the act reaches, the reported `marker` first, then each target in
+    /// the act text whose basename is a sovereign file (`SOVEREIGN_FILES`). `bar` is the highest
+    /// over all of them (one-gate stage C governance fix): the shared closure matches
+    /// directories before filenames, so a write to `plugins/_shared/hestia_gate_mechanism.py`
+    /// arrives with `marker = "plugins/_shared"` — escalation 9c433571 (stage A) did exactly
+    /// that — and `bar_for(marker)` alone priced the mechanism single-approver.
+    pub matched_markers: Vec<String>,
     /// WHY the member says it needs this, in its own words. Caller-asserted like everything
     /// else here, and worth exactly what a self-declaration is worth — which is more than
     /// nothing, because it is the only account of intent the decider gets.
@@ -1018,6 +1071,8 @@ impl Escalation {
             "decided_by": self.decided_by,
             "decided_role": self.decided_role,
             "bar": self.bar,
+            // Every marker the act reaches; `bar` is the highest over them (stage C).
+            "matched_markers": self.matched_markers,
             "bar_met": bar_met,
             // The same conjunction `is_claimable` enforces — the SAME FOUR, evaluated
             // against the same clock, not two of them re-derived without one.
@@ -1663,7 +1718,10 @@ impl EscalationStore {
                             gate_path: s(d, "gate_path"),
                             host_session_id: s(d, "host_session_id"),
                             session_id: s(d, "session_id"),
-                            bar: bar_for(&marker),
+                            // Over EVERY marker the act reaches, from the row's own act text
+                            // (stage C). An unverified act text can only RAISE the bar here.
+                            bar: bar_for_markers(&markers_of(&marker, s(d, "act_text").as_deref())),
+                            matched_markers: markers_of(&marker, s(d, "act_text").as_deref()),
                             marker,
                             // The open time is the ENTRY's time, not the restart's. The
                             // payload carries it as of this change; rows written before
@@ -1952,8 +2010,11 @@ impl EscalationStore {
             consumed_at: None,
             // The bar is stated AT OPEN and copied from policy, so the record carries the
             // criterion in force at the time — a later tightening of `bar_for` must not
-            // rewrite what this escalation was judged against.
-            bar: bar_for(marker),
+            // rewrite what this escalation was judged against. Since one-gate stage C it is the
+            // HIGHEST bar over every marker the act reaches, not the first marker the closure
+            // matched (a directory marker shadowed the sovereign file inside it).
+            bar: bar_for_markers(&markers_of(marker, act)),
+            matched_markers: markers_of(marker, act),
             factors: Vec::new(),
         };
         self.by_id.insert(id, esc.clone());
@@ -3158,6 +3219,63 @@ mod tests {
     use super::*;
 
     const T0: u64 = 1_800_000_000;
+
+    /// One-gate stage C: the common gate every seat delegates to is priced like the enforcement
+    /// path it replaced, wherever its marker names it (the installed copy's marker is its
+    /// basename). Control: the law renderer stays single-approver.
+    #[test]
+    fn the_common_gate_is_priced_like_the_enforcement_path() {
+        assert_eq!(bar_for("hestia_single_gate.py"), Bar::SovereignPlusPeer);
+        assert_eq!(bar_for("pre_tool_use.py"), Bar::SovereignPlusPeer);
+        assert_eq!(bar_for("law_inject.py"), Bar::SingleApprover);
+        // One list: every sovereign file is priced sovereign by `bar_for` itself.
+        for f in SOVEREIGN_FILES {
+            assert_eq!(bar_for(f), Bar::SovereignPlusPeer, "{f}");
+        }
+    }
+
+    fn open_act(marker: &str, act: &str) -> Escalation {
+        let mut s = EscalationStore::default();
+        s.open("codex", "role:constellation:member", "Edit", marker, Some(act), None, None, T0, 120)
+            .expect("open")
+    }
+
+    /// One-gate stage C governance fix. The shared closure matches DIRECTORIES before filenames,
+    /// so a write to the mechanism under plugins/_shared reaches the bar as marker
+    /// "plugins/_shared" (stage A's escalation 9c433571 recorded exactly that) and was priced
+    /// single-approver. The bar is now the highest over every marker the act reaches.
+    #[test]
+    fn a_mechanism_write_via_a_shared_path_prices_sovereign() {
+        let e = open_act("plugins/_shared",
+                         "/w/hestia/plugins/_shared/hestia_gate_mechanism.py");
+        assert_eq!(e.bar, Bar::SovereignPlusPeer);
+        assert_eq!(e.matched_markers, vec!["plugins/_shared".to_string(),
+                                           "hestia_gate_mechanism.py".to_string()]);
+        // The same through every act shape the gate sends: a shell command, an apply_patch
+        // body (JSON-escaped newlines), and the common gate's installed copy.
+        for act in [
+            "sed -i s/a/b/ plugins/_shared/hestia_gate_mechanism.py",
+            r#"{"input": "*** Begin Patch\n*** Update File: /w/plugins/_shared/hestia_single_gate.py\n+x"}"#,
+            "cp /tmp/p/x.py \"/w/plugins/kimi/hooks/pre_tool_use.py\"",
+        ] {
+            let e = open_act("plugins/_shared", act);
+            assert_eq!(e.bar, Bar::SovereignPlusPeer, "{act}");
+            assert!(e.matched_markers.len() == 2, "{act}: {:?}", e.matched_markers);
+        }
+    }
+
+    #[test]
+    fn a_non_sovereign_shared_file_stays_single_approver() {
+        let e = open_act("plugins/_shared", "/w/hestia/plugins/_shared/hestia_gate_core.py");
+        assert_eq!(e.bar, Bar::SingleApprover);
+        assert_eq!(e.matched_markers, vec!["plugins/_shared".to_string()]);
+        // A name that merely CONTAINS a sovereign basename is not one.
+        let e = open_act("plugins/_shared", "/w/plugins/_shared/not_witness.py.bak");
+        assert_eq!(e.bar, Bar::SingleApprover);
+        // And a directory marker for hooks prices by the file it names.
+        let e = open_act("plugins/*/hooks", "/w/plugins/claude-code/hooks/law_inject.py");
+        assert_eq!(e.bar, Bar::SingleApprover);
+    }
 
     /// #774/#1169: a reclaim is recovery of one lost answer. Every conjunct is exercised on its
     /// own, and the positive arm is the control.

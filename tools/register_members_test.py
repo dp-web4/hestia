@@ -285,13 +285,17 @@ def test_json_member_merges_without_disturbing_other_keys():
         cfg.write_text(json.dumps(existing, indent=2))
         _install(tmp, "claude-code", "witness.py")
         r = _run(tmp, plugins, "--member", "claude-code")
-        assert r.returncode == 0, r.stdout + r.stderr
+        # One-gate stage C: the gate's existing registration declares NO timeout, which the
+        # registrar now reports SHORT (exit 10) — the gate's bound should be explicit. It is a
+        # report: nothing about the registration is rewritten without --raise-timeouts.
+        assert r.returncode == 10, r.stdout + r.stderr
+        assert "SHORT claude-code: PreToolUse/pre_tool_use.py is registered with timeout None" in r.stdout
         data = json.loads(cfg.read_text())
         assert data["permissions"] == existing["permissions"]
         assert data["hooks"]["PreCompact"] == existing["hooks"]["PreCompact"]
         # the gate was already registered (by basename, at a different path): left alone
         assert data["hooks"]["PreToolUse"] == existing["hooks"]["PreToolUse"]
-        assert "PreToolUse/pre_tool_use.py" not in r.stdout
+        assert "REGISTERED claude-code: PreToolUse/pre_tool_use.py" not in r.stdout
         posts = [h["command"] for g in data["hooks"]["PostToolUse"] for h in g["hooks"]]
         assert posts == ["python3 " + str(tmp / ".claude" / "hooks" / "hestia" / "witness.py")], posts
         r2 = _run(tmp, plugins, "--member", "claude-code")
@@ -1019,7 +1023,106 @@ def test_install_names_the_seat_document_step_and_never_fails_on_it():
         assert out.index("REGISTERED claude-code") < out.index("SEATS ("), "seat step must follow the hooks"
 
 
+# ---- one-gate stage C: the registered timeout is the gate's bound -----------------------------
+# Fixture members with NEUTRAL hook names (`gate_hook.py`): the registrar locates hooks by the
+# basename its template renders, so nothing here needs a governed filename.
+
+def _neutral_plugins(tmp: Path) -> Path:
+    """Three fixture members, one per registration reader/layout, each templating gate_hook.py
+    on PreToolUse at a 10 s floor."""
+    p = tmp / "plugins"
+    shapes = {"jseat": ([".jseat", "settings.json"], "json-hook-commands", None),
+              "nseat": ([".nseat", "config.toml"], "toml-hook-commands", None),
+              "fseat": ([".fseat", "config.toml"], "toml-hook-commands", "flat")}
+    for m, (segs, reader, layout) in shapes.items():
+        (p / m / "hooks").mkdir(parents=True)
+        reg = {"reader": reader, "path": segs}
+        if layout:
+            reg["layout"] = layout
+        (p / m / "expects.json").write_text(json.dumps({"install": {
+            "member": m, "dest": f"~/{segs[0]}/hooks", "registration": reg,
+            "files": ["hooks/gate_hook.py"]}}))
+        (p / m / "hooks" / "hooks.json").write_text(json.dumps({"hooks": {"PreToolUse": [
+            {"matcher": "*", "hooks": [{"type": "command", "timeout": 10,
+                                        "command": f"python3 @HESTIA_PLUGIN_ROOT@/{m}/hooks/gate_hook.py"}]}]}}))
+        (tmp / segs[0] / "hooks").mkdir(parents=True)
+        (tmp / segs[0] / "hooks" / "gate_hook.py").write_text("# fixture\n")
+    return p
+
+
+def _neutral_configs(tmp: Path, timeout: int, stray: str = "") -> None:
+    h = lambda seat: f"{tmp}/.{seat}/hooks/gate_hook.py"  # noqa: E731
+    (tmp / ".jseat" / "settings.json").write_text(json.dumps({"hooks": {"PreToolUse": [
+        {"matcher": "*", "hooks": [{"type": "command", "command": f"{stray}python3 {h('jseat')}",
+                                    "timeout": timeout}]}]}}))
+    (tmp / ".nseat" / "config.toml").write_text(
+        f'model = "x"\n\n[[hooks.PreToolUse]]\nmatcher = "*"\n\n[[hooks.PreToolUse.hooks]]\n'
+        f'type = "command"\ncommand = "{stray}python3 {h("nseat")}"\ntimeout = {timeout}\n')
+    (tmp / ".fseat" / "config.toml").write_text(
+        f'[[hooks]]\nevent = "PreToolUse"\ncommand = "{stray}python3 {h("fseat")}"\ntimeout = {timeout}\n'
+        f'\n[[hooks]]\nevent = "SessionStart"\ncommand = "/x/other.sh"\ntimeout = 3\n')
+
+
+def test_a_short_registered_timeout_is_reported_in_every_reader():
+    """A templated hook registered BELOW its template's timeout is SHORT (exit 10) in JSON, nested
+    TOML and flat TOML; at or above it, nothing is reported."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _neutral_plugins(tmp)
+        _neutral_configs(tmp, 5)
+        before = {s: (tmp / f".{s}" / n).read_text() for s, n in
+                  (("jseat", "settings.json"), ("nseat", "config.toml"), ("fseat", "config.toml"))}
+        r = _run(tmp, plugins)
+        for seat in ("jseat", "nseat", "fseat"):
+            assert f"SHORT {seat}: PreToolUse/gate_hook.py is registered with timeout 5" in r.stdout, r.stdout
+        assert r.returncode == 10, (r.returncode, r.stdout)
+        for s, n in (("jseat", "settings.json"), ("nseat", "config.toml"), ("fseat", "config.toml")):
+            assert (tmp / f".{s}" / n).read_text() == before[s], f"{s}: a report must write nothing"
+        _neutral_configs(tmp, 10)
+        r = _run(tmp, plugins)
+        assert "SHORT" not in r.stdout and r.returncode == 0, (r.returncode, r.stdout)
+
+
+def test_raise_timeouts_raises_only_the_short_hook_and_never_lowers():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _neutral_plugins(tmp)
+        _neutral_configs(tmp, 5)
+        r = _run(tmp, plugins, "--raise-timeouts")
+        assert r.returncode == 0, (r.returncode, r.stdout)
+        j = json.loads((tmp / ".jseat" / "settings.json").read_text())
+        assert j["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] == 10, j
+        n = (tmp / ".nseat" / "config.toml").read_text()
+        assert "timeout = 10" in n and "timeout = 5" not in n and 'model = "x"' in n, n
+        f = (tmp / ".fseat" / "config.toml").read_text()
+        assert "timeout = 10" in f and "timeout = 3" in f, f"only the gate's table moves: {f}"
+        assert _run(tmp, plugins).returncode == 0
+        # never lowered: a registration above the template's value is left exactly as it is
+        _neutral_configs(tmp, 30)
+        before = (tmp / ".nseat" / "config.toml").read_text()
+        _run(tmp, plugins, "--raise-timeouts")
+        assert (tmp / ".nseat" / "config.toml").read_text() == before
+
+
+def test_an_untimed_registration_is_short_and_an_inert_override_is_named():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _neutral_plugins(tmp)
+        _neutral_configs(tmp, 10, stray="HESTIA_PRE_TOTAL_BUDGET_MS=14000 ")
+        (tmp / ".fseat" / "config.toml").write_text(
+            f'[[hooks]]\nevent = "PreToolUse"\ncommand = "python3 {tmp}/.fseat/hooks/gate_hook.py"\n')
+        r = _run(tmp, plugins)
+        assert "SHORT fseat: PreToolUse/gate_hook.py is registered with timeout None" in r.stdout, r.stdout
+        assert "INERT jseat" in r.stdout and "HESTIA_PRE_TOTAL_BUDGET_MS=14000" in r.stdout, r.stdout
+        assert "INERT nseat" in r.stdout, r.stdout
+        _run(tmp, plugins, "--raise-timeouts")
+        assert "timeout = 10" in (tmp / ".fseat" / "config.toml").read_text()
+
+
 TESTS = [
+    test_a_short_registered_timeout_is_reported_in_every_reader,
+    test_raise_timeouts_raises_only_the_short_hook_and_never_lowers,
+    test_an_untimed_registration_is_short_and_an_inert_override_is_named,
     test_thor_case_registers_only_the_missing_witness,
     test_kimi_flat_layout_registers_the_failure_witness_only,
     test_ensure_adds_the_feature_flag_when_absent,

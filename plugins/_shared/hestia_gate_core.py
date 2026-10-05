@@ -180,6 +180,9 @@ GOVERNANCE_FILES = (
     "hestia_gate_core.py",
     "hestia_gate_mechanism.py",
     "gate_self_protection_test.py",
+    # THE common gate (one-gate stage C): every seat's shim delegates its whole decision to
+    # it, so after the cutover it is the single file whose edit changes all four seats.
+    "hestia_single_gate.py",
 )
 
 
@@ -263,13 +266,54 @@ REMEDIES: dict[str, Remedy] = {
         (),
     ),
     # ── degraded mode (Sprint F — §7.1 criterion 9; semantics ratified dp 2026-08-11) ────
+    # Re-ruled 2026-10-01/02 (dp, one-gate stage B, live since stage C): "align upward; no
+    # snapshot -> no read" and "no verdict, no act". Without the member's policy snapshot the
+    # common gate denies EVERY act, reads included, in every rollout mode. `degraded_verdict`
+    # below still runs first so an innate egress refusal keeps its own rule.
     "gate.degraded": Remedy(
-        "The policy authority could not be consulted (the daemon is unreachable), so the "
-        "gate is in the ratified degraded mode: deny-writes-allow-reads. This is fault "
-        "isolation, not a judgement of your act — the referee is missing, not ruling "
-        "against you. Retry when the daemon returns; if it stays down, that is an operator "
-        "matter and not something to work around. A shim may tighten this posture locally; "
-        "it may never loosen it.",
+        "The policy authority could not be consulted (the daemon did not answer with this "
+        "member's policy snapshot), so no act is permitted, reads included: without the "
+        "snapshot the gate cannot certify scope. This is fault isolation, not a judgement of "
+        "your act — the referee is missing, not ruling against you. Retry when the daemon "
+        "returns; if it stays down, that is an operator matter and not something to work "
+        "around.",
+        (),
+    ),
+    # ── the common gate's own refusals (hestia_single_gate.decide; moved here from that
+    # module's GATE_REMEDIES in one-gate stage C, so every sentence a member reads after a
+    # refusal comes from this one table) ─────────────────────────────────────────────────
+    "invocation.superseded": Remedy(
+        "This call's approval was re-delivered to another invocation of the same act. Do not "
+        "retry this call; the invocation that reclaimed the approval carries it.",
+        (),
+    ),
+    "gate.evidence_uncommitted": Remedy(
+        "The gate reached a permit but could not commit its decision record before the "
+        "deadline, and a consequential act may not run unwitnessed (C11). This is not a "
+        "judgement of the act: retry once the daemon's witness path is answering.",
+        (),
+    ),
+    "gate.internal_error": Remedy(
+        "This is an infrastructure fault in the gate, not a judgement of the attempted act. "
+        "The gate fails closed until the decision path is healthy; please report it.",
+        (),
+    ),
+    # The shim could not establish how long its harness waits for it, so it cannot keep the
+    # safety invariant (the gate's deadline strictly below the timeout the harness enforces).
+    "gate.harness_timeout_unknown": Remedy(
+        "The gate could not read how long this harness waits for it, so it refuses rather than "
+        "risk being killed mid-decision (which this harness would treat as an allow). This is "
+        "an installation fault, not a judgement of your act: an operator registers the hook "
+        "with an explicit timeout (deploy/register-members.py). A non-harness caller declares "
+        "the timeout it enforces in HESTIA_HOOK_TIMEOUT_S.",
+        (),
+    ),
+    # The seat's vault projection does not authorise the role it was launched under
+    # (launch_role_verdict, #1084).
+    "config.miswired": Remedy(
+        "This seat's configuration does not match what the vault authorises for it. That is an "
+        "operator repair (Govern -> Runtime config), not a judgement of your act; retrying "
+        "will not help.",
         (),
     ),
 }

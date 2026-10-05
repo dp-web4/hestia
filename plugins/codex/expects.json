@@ -27,9 +27,7 @@
     ],
     "gate_probe": {
       "entry": "hooks/pre_tool_use.py",
-      "environment": {
-        "HESTIA_CODEX_GATE_MODE": "enforce"
-      },
+      "environment": {},
       "events": [
         {
           "label": "read recovery scratch",

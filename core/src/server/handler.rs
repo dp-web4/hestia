@@ -8897,6 +8897,8 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
             "stated_reason": esc.stated_reason,
             "stated_detail": esc.stated_detail,
             "bar": esc.bar,
+            // Every marker the act reaches; the bar is the highest over them (stage C).
+            "matched_markers": esc.matched_markers,
             "factors_present": esc.factors,
             "invited_peers": esc.invited_peers,
             "asker_basis": esc.asker_basis,
@@ -17660,6 +17662,45 @@ mod tests {
     /// the weakest evidence the system can hold. RED before this change: every assertion
     /// below passed with the arms reversed (peer decide ALLOWED, corroborate ALLOWED,
     /// `you_may_rule` true).
+    /// One-gate stage C: the pending queue shows the BAR and every marker it was priced over.
+    /// Before this the queue carried the marker alone, so a reader inferred the bar from it —
+    /// the inference the stage-A mispricing made wrong (escalation 9c433571: a mechanism write
+    /// recorded under `plugins/_shared`, single approver).
+    #[tokio::test]
+    async fn the_pending_queue_shows_the_bar_and_the_markers_it_was_priced_over() {
+        let (_dir, shared) = make_shared_state();
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "tool_name": "Bash",
+                "marker": "plugins/_shared",
+                "act": "Bash: cp /tmp/x.py plugins/_shared/hestia_gate_mechanism.py",
+            }),
+        )
+        .await
+        .unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap().to_string();
+        let pending = tool_gate_pending_escalations(&shared, &json!({})).await.unwrap();
+        let item = pending["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["escalation_id"] == esc_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(item["bar"], opened["bar"], "the queue shows the opened bar: {item}");
+        assert_eq!(item["bar"], "sovereign_plus_peer", "a mechanism write prices sovereign: {item}");
+        let markers: Vec<&str> = item["matched_markers"]
+            .as_array()
+            .expect("matched_markers is a list")
+            .iter()
+            .filter_map(|m| m.as_str())
+            .collect();
+        assert!(markers.contains(&"plugins/_shared") && markers.contains(&"hestia_gate_mechanism.py"),
+                "every marker the act reaches is listed: {item}");
+    }
+
     #[tokio::test]
     async fn an_asserted_asker_collects_no_peer_factor_at_decide_or_corroborate() {
         let (_dir, shared) = make_shared_state();
@@ -22273,6 +22314,9 @@ fn opened_payload(
         // unauditable. Stated at open, evaluated at decision. Absent from every claim-path
         // entry until now, which is why 0 of 362 opened payloads could be read for it.
         "bar": esc.bar,
+        // ...and the markers it was computed over (one-gate stage C: the HIGHEST bar over
+        // every marker the act reaches, so a directory marker cannot shadow a sovereign file).
+        "matched_markers": esc.matched_markers,
         // WHO WAS ASKED. The field whose absence made "invited and absent" and "never
         // asked" the same row. Both bars populate it: `single_approver` is satisfied by a
         // NOT-SAME peer acting alone, so it is the bar an invitation helps MOST — reading it
@@ -24222,6 +24266,13 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
                 "stated_reason": e.stated_reason,
                 "stated_detail": e.stated_detail,
                 "marker": e.marker,
+                // The criterion this ask must meet, and every marker it was priced over (stage
+                // C: the HIGHEST bar across them). A queue that shows the marker but not the
+                // bar lets a reader infer the bar from the marker — the exact inference the
+                // stage-A mispricing (a mechanism write recorded under `plugins/_shared`,
+                // single approver) made wrong.
+                "bar": e.bar,
+                "matched_markers": e.matched_markers,
                 "opened_at": e.opened_at,
                 "secs_remaining": e.secs_remaining(now),
                 "you_may_rule": may_rule,

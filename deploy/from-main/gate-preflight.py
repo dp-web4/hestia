@@ -75,6 +75,9 @@ def _commands_from_registration(path: Path, reader: str) -> list[str]:
 # consumes the vault projection refuses to act without it, so the preflight must probe under
 # what the SEAT's launcher supplies, not under what the deploy unit happens to carry.
 BOOTSTRAP_LOCATOR = "HESTIA_HOME"
+#: How long the preflight lets one candidate probe run (its subprocess timeout), declared to the
+#: candidate as HESTIA_HOOK_TIMEOUT_S so the candidate decides inside it.
+PROBE_TIMEOUT_S = 12
 
 
 def _launcher_env(commands: Iterable[str], entry: str) -> dict[str, str]:
@@ -271,6 +274,12 @@ def _run_probes(
         environment.update(_launcher_env(commands, entry))
         environment.update(declared_env)
         environment.update({"HESTIA_ENDPOINT": endpoint, "HESTIA_WORKSPACE": workspace_text})
+        # THE PROBE DECLARES THE TIMEOUT IT ENFORCES (one-gate stage C). A candidate gate bounds
+        # its decision by the timeout its harness REALLY enforces, read from the registration —
+        # and this probe is not the harness: it runs the candidate from the tree, under its own
+        # subprocess timeout below. A non-harness invoker declares that bound; when the candidate
+        # also finds a registration of itself, the smaller wins, so this can only shorten it.
+        environment["HESTIA_HOOK_TIMEOUT_S"] = str(PROBE_TIMEOUT_S)
         # THE CANDIDATE GATE IS PROBED AGAINST THE CANDIDATE ENGINE, not the installed one.
         # Since #742/#747 a seat loads shared law only from HESTIA_SHARED_DIR or the installed
         # $HESTIA_HOME/shared, with no fallback. The first cycle after #747 merged (CBP,
@@ -308,7 +317,7 @@ def _run_probes(
                     capture_output=True,
                     cwd=repo,
                     env=environment,
-                    timeout=12,
+                    timeout=PROBE_TIMEOUT_S,
                     check=False,
                 )
             except subprocess.TimeoutExpired:
