@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: cd797980c479cb858359757273c575f6ba2e9ad0268a99773d10a3c9deea9855  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: c53057dc7595e36884d6c5628259d83897db525562e7bdd32134129b1745eb57  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -1001,6 +1001,100 @@ def _symlinked_reach_verdict(resolved: str, seg: str, repo_scopes, scopes, works
     return None
 
 
+#: Operator-declared TOOLCHAIN roots (colon- or comma-separated absolute paths), e.g. a conda
+#: install under the home: `HESTIA_TOOL_ROOTS=/home/dp/miniforge3`. A command's reach under one
+#: is not MRH-scoped, the way TEMP_ROOTS are not: an interpreter and its libraries are the tool,
+#: not the territory. Why (SAGE #368, 2026-10-05): with a being judged under its seat's workspace
+#: (`/home/dp`), every sandboxed `check` (`bwrap --ro-bind /home/dp/miniforge3 ...`, PATH=...) and
+#: every `game` (`/home/dp/miniforge3/bin/python3 ...`) was denied "'miniforge3' is not granted":
+#: a grant for an interpreter would be a grant of nothing the member owns. DECLARED, never
+#: inferred, and egress still applies: a root that is `/`, the workspace, or an ancestor of it is
+#: ignored, so a misconfiguration cannot ungovern the territory it was meant to sit beside.
+TOOL_ROOTS_ENV = "HESTIA_TOOL_ROOTS"
+
+
+def _tool_roots(workspace: str) -> tuple:
+    raw = os.environ.get(TOOL_ROOTS_ENV, "")
+    ws = os.path.normpath(os.path.expanduser(workspace or "/")).replace("\\", "/").rstrip("/") or "/"
+    out = []
+    for part in re.split(r"[:,]", raw):
+        part = part.strip()
+        if not part:
+            continue
+        r = os.path.normpath(os.path.expanduser(part)).replace("\\", "/").rstrip("/")
+        if not r.startswith("/") or r in ("", "/"):
+            continue
+        if ws == r or ws.startswith(r + "/"):
+            continue                      # the workspace or an ancestor: never a tool root
+        out.append(r)
+    return tuple(out)
+
+
+def _under_any(path: str, roots) -> bool:
+    p = os.path.normpath(path.replace("\\", "/")).replace("\\", "/")
+    return any(p == r or p.startswith(r + "/") for r in roots)
+
+
+_PATTERN_TOOLS = frozenset(("grep", "egrep", "fgrep", "rg"))
+_SHELL_OPS = frozenset((";", "&&", "||", "|", "&", "(", ")"))
+
+
+def _mask_pattern_operands(cmd: str) -> str:
+    """The command with each grep-family PATTERN operand replaced by a placeholder, for the
+    scope scan only. `-e P`, `-eP`, `--regexp P`, `--regexp=P`; without any of those (and
+    without `-f`/`--file`, whose operand IS a file) the first positional operand is the pattern.
+    Covers grep/egrep/fgrep/rg and `git ... grep`, per simple command. A line shlex cannot split
+    is returned unchanged: the scan then judges it exactly as before, never less."""
+    import shlex as _shlex
+    if not any(t in cmd for t in ("grep", "rg")):
+        return cmd
+    try:
+        lex = _shlex.shlex(cmd, posix=True, punctuation_chars=";&|()")
+        lex.whitespace_split = True
+        toks = list(lex)
+    except ValueError:
+        return cmd
+    out, i, masked = [], 0, False
+    while i < len(toks):
+        j = i
+        while j < len(toks) and toks[j] not in _SHELL_OPS:
+            j += 1
+        argv = toks[i:j]
+        start = None
+        if argv:
+            base = os.path.basename(argv[0])
+            if base in _PATTERN_TOOLS:
+                start = 1
+            elif base == "git" and "grep" in argv:
+                start = argv.index("grep") + 1
+        if start is not None:
+            argv = list(argv)
+            explicit = any(a in ("-e", "--regexp", "-f", "--file") or a.startswith(("--regexp=", "--file="))
+                           or (a.startswith("-e") and not a.startswith("--") and len(a) > 2)
+                           for a in argv[start:])
+            k, positional_done = start, False
+            while k < len(argv):
+                a = argv[k]
+                if a == "--":
+                    break
+                if a in ("-e", "--regexp") and k + 1 < len(argv):
+                    argv[k + 1] = "PATTERN"; masked = True; k += 1
+                elif a.startswith("--regexp="):
+                    argv[k] = "--regexp=PATTERN"; masked = True
+                elif a.startswith("-e") and not a.startswith("--") and len(a) > 2:
+                    argv[k] = "-ePATTERN"; masked = True
+                elif not explicit and not positional_done and not a.startswith("-"):
+                    argv[k] = "PATTERN"; masked = True; positional_done = True
+                k += 1
+        out.extend(argv)
+        if j < len(toks):
+            out.append(toks[j])
+        i = j + 1
+    if not masked:
+        return cmd
+    return " ".join(t if t in _SHELL_OPS else _shlex.quote(t) for t in out)
+
+
 def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = None,
                         forbidden=None):
     """Returns (ok, offending_token, resolved_path).
@@ -1021,11 +1115,21 @@ def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = N
     absolute path; (b) it matched generic dir names ('scripts', 'logs') that exist both at the
     root and inside granted repos, denying in-repo relative paths.
 
+    Two things are NOT a reach (SAGE #368, 2026-10-05): a grep-family PATTERN operand, which
+    the tool matches against and never opens; and a path under an operator-declared toolchain
+    root (HESTIA_TOOL_ROOTS). Both are judged by egress exactly as before.
+
     Residual, documented and accepted: relative traversal that never names a path (`grep -r .`)
     escapes string parsing entirely — the engine sandbox, not this check, is the fs boundary."""
     ws = workspace.rstrip("/")
     repo_scopes, _ = _scope_parts(scopes, workspace)
     egress = _default_forbidden() if forbidden is None else forbidden
+    # A grep-family PATTERN is text the tool matches against, never a file it opens; scanning it
+    # as a path denied a being's own regex (`-e '/home/dp[^ ]*ft09\.py'` -> "'[^' is not granted").
+    # Masked for THIS scan only: gate 1a's egress scan of the whole command, earlier in evaluate(),
+    # still reads every byte.
+    cmd = _mask_pattern_operands(cmd)
+    tool_roots = _tool_roots(workspace)
     for after in cmd.split(workspace)[1:]:
         # Resolve the whole token before reading a segment off it (kimi #940 B7). Taking the
         # head lexically let `cat <ws>/repo-a/../repo-b/secret` pass on `repo-a` while
@@ -1039,6 +1143,10 @@ def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = N
         hidden = _symlink_target_forbidden(resolved, egress)
         if hidden is not None:
             return False, hidden, hidden
+        # A DECLARED TOOLCHAIN is not governed territory (HESTIA_TOOL_ROOTS): judged after egress,
+        # so a forbidden symlink target under a tool root still denies.
+        if _under_any(resolved, tool_roots):
+            continue
         seg = resolved[len(ws):].lstrip("/").split("/", 1)[0]
         if seg not in repo_scopes and not _within_path_grant(resolved, scopes, workspace):
             refused = _symlinked_reach_verdict(resolved, seg, repo_scopes, scopes, workspace)
