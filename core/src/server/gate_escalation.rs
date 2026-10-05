@@ -285,7 +285,7 @@ pub enum Channel {
 /// so a met bar is *stated sufficiency*, not proof. What it changes is that a reader can now
 /// see the criterion, the factors present, and whether they met it — the mismatch becomes a
 /// recorded fact instead of an implicit one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Bar {
     /// One decision from a sovereign channel (operator session / operator CLI) OR a NOT-SAME
@@ -295,6 +295,10 @@ pub enum Bar {
     /// silent compromise is the whole model.
     SovereignPlusPeer,
 }
+// The DECLARATION ORDER above is the strength order (SingleApprover < SovereignPlusPeer), and
+// `bar_for_markers` takes the max over it — a reorder is a policy change, not a style edit.
+// Deserialize exists so replay can RESTORE the recorded criterion (`rehydrate`; #812 review
+// hold 2) instead of repricing it under today's policy.
 
 /// The bar a governance file's write must clear. This is POLICY, stated in one place so a
 /// change is a reviewed diff — and copied onto every escalation at open, so the record
@@ -308,6 +312,9 @@ pub enum Bar {
 /// which makes enforcement-path writes wait rather than proceed under a weaker bar. That is
 /// the honest state, and it is visible here rather than implicit. If that is the wrong
 /// trade, this is the one line to change.
+///
+/// WHAT THIS IS FED is stated once, at `price`: every marker the act reaches, never the
+/// closure's first-matched marker alone.
 pub fn bar_for(marker: &str) -> Bar {
     if marker.contains("pre_tool_use.py")
         || marker.contains("post_tool_use.py")
@@ -340,35 +347,101 @@ pub const SOVEREIGN_FILES: &[&str] = &[
     "hestia_single_gate.py",
 ];
 
-/// Every marker an escalation's act reaches: the closure's reported `marker` first, then the
-/// basename of every target in the act text that is a sovereign file (deduplicated, in order).
-/// Targets are read the way they are written — whitespace, quotes, `=`, `,`, `;`, shell
-/// punctuation and escaped newlines split them, a `/` separates segments — so a path inside a
-/// command, an Edit target or an apply_patch body is found wherever the closure's directory
-/// marker shadowed it. Reads text only; it never widens a bar below what `marker` asks for.
-pub fn markers_of(marker: &str, act: Option<&str>) -> Vec<String> {
+/// THE ESCALATION PRICING RULE. This is the one place it is stated; `open` calls it, and
+/// `rehydrate` calls it only for a row that recorded no readable bar.
+///
+/// **An escalation's bar is the HIGHEST `bar_for` over every marker the act reaches.** The
+/// markers, in order, deduplicated (`markers_of`):
+///   1. the closure's reported `marker` — always present, always first;
+///   2. the basename of the act's RESOLVED TARGET, when the caller sent one;
+///   3. every sovereign file (`SOVEREIGN_FILES`, by exact basename) named in the ACT TEXT.
+///
+/// (1) and (2) are names the GATE resolved for this write — the closure element that fired,
+/// and the write-position argument that fired it — so both are priced by `bar_for` as they
+/// stand. (3) is free text: it also names sources, flags and look-alikes, so only an exact
+/// sovereign basename counts there (`not_witness.py.bak` in a command is not the witness).
+///
+/// Why each input is there:
+///   - (1) alone was the pre-stage-C rule, and it was unpriceable-strong for exactly the
+///     in-tree paths the strong bar exists for: the closure matches DIRECTORIES first, so a
+///     hook or mechanism write arrived as `plugins/*/hooks` / `plugins/_shared` and priced
+///     one approver (#206 diagnosed it; #810 filed it; 166 strong-named hook writes priced
+///     weak in the 27 days between).
+///   - (3) is one-gate stage C's fix (#1231): read the file out of the act text.
+///   - (2) is #810's repair as #812 built it (kimi-code): the act text is a bounded,
+///     self-censoring SUMMARY (220 chars for a shell command, the whole command withheld if it
+///     is credential-shaped, a multi-target patch cut from the front), so the filename can be
+///     cut out of (3) while the closure still holds it. The resolved target is that argument,
+///     sent as its own field — and priced like a marker, so a hook-dir file the bar reaches
+///     only through `bar_for`'s `contains` (the society gate) prices as its own name would.
+///
+/// MONOTONIC BY CONSTRUCTION. Every input after (1) can only ADD markers, and the bar is the
+/// max over them, so the target and the act text may STRENGTHEN the marker-derived bar and
+/// can never weaken it (#812 review hold 1: a first cut that priced from the target alone let
+/// a fabricated `/tmp/ordinary.txt` lower a bar the marker priced two-factor). Both are
+/// caller-asserted (A1, HST-005) — the failure direction of a lie in either is a stricter bar
+/// on the liar's own escalation.
+///
+/// FROZEN AT OPEN. The bar and the markers are copied onto the record and witnessed on the
+/// `gate_escalation_opened` entry; replay RESTORES them rather than repricing (#812 review hold
+/// 2), so a later change to this rule never rewrites what an open escalation is judged against.
+/// A row with no target (every row before #810, every old hook) prices exactly as stage C did.
+pub fn price(marker: &str, act: Option<&str>, resolved_target: Option<&str>) -> (Bar, Vec<String>) {
+    let markers = markers_of(marker, act, resolved_target);
+    (bar_for_markers(&markers), markers)
+}
+
+/// The markers `price` takes the max over: the closure's reported `marker` first, then the
+/// basename of the resolved target, then the basename of every sovereign file named in the act
+/// text (deduplicated, in order). Act text is read the way it is written — whitespace, quotes,
+/// `=`, `,`, `;`, shell punctuation and escaped newlines split it, a `/` separates segments —
+/// so a path inside a command, an Edit target or an apply_patch body is found wherever the
+/// closure's directory marker shadowed it. Reads text only; it can add markers, never remove one.
+pub fn markers_of(marker: &str, act: Option<&str>, resolved_target: Option<&str>) -> Vec<String> {
     let mut out = vec![marker.trim().to_string()];
+    let add = |name: &str, out: &mut Vec<String>| {
+        if !name.is_empty() && !out.iter().any(|m| m == name) {
+            out.push(name.to_string());
+        }
+    };
+    if let Some(t) = resolved_target {
+        let t = t.trim().trim_end_matches('/');
+        add(t.rsplit('/').next().unwrap_or("").trim(), &mut out);
+    }
     if let Some(text) = act {
-        let split = |c: char| {
-            c.is_whitespace() || "\"'`=,;:()<>|&{}[]\\".contains(c)
-        };
+        let split = |c: char| c.is_whitespace() || "\"'`=,;:()<>|&{}[]\\".contains(c);
         for tok in text.split(split) {
             let base = tok.rsplit('/').next().unwrap_or("");
-            if SOVEREIGN_FILES.contains(&base) && !out.iter().any(|m| m == base) {
-                out.push(base.to_string());
+            if SOVEREIGN_FILES.contains(&base) {
+                add(base, &mut out);
             }
         }
     }
     out
 }
 
-/// The bar an act must clear: the HIGHEST `bar_for` over every marker it reaches.
+/// The bar an act must clear: the HIGHEST `bar_for` over every marker it reaches (`Bar`'s
+/// declaration order is its strength order). No markers prices the everyday bar.
 pub fn bar_for_markers(markers: &[String]) -> Bar {
-    if markers.iter().any(|m| bar_for(m) == Bar::SovereignPlusPeer) {
-        Bar::SovereignPlusPeer
-    } else {
-        Bar::SingleApprover
+    markers.iter().map(|m| bar_for(m)).max().unwrap_or(Bar::SingleApprover)
+}
+
+/// The longest resolved target recorded, in chars. A path's governed filename is at its END,
+/// so an over-long value keeps its tail.
+pub const RESOLVED_TARGET_MAX: usize = 512;
+
+/// A caller's `resolved_target`, as recorded: whitespace collapsed, empty is absent, tail-capped.
+pub fn normalize_resolved_target(t: Option<&str>) -> Option<String> {
+    let collapsed = t?.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
     }
+    let n = collapsed.chars().count();
+    Some(if n > RESOLVED_TARGET_MAX {
+        collapsed.chars().skip(n - RESOLVED_TARGET_MAX).collect()
+    } else {
+        collapsed
+    })
 }
 
 /// One piece of evidence present for a decision. The channels ARE the factor types
@@ -616,12 +689,25 @@ pub struct Escalation {
     pub tool_name: String,
     /// Which governance file the write would reach.
     pub marker: String,
-    /// EVERY closure marker the act reaches, the reported `marker` first, then each target in
-    /// the act text whose basename is a sovereign file (`SOVEREIGN_FILES`). `bar` is the highest
-    /// over all of them (one-gate stage C governance fix): the shared closure matches
-    /// directories before filenames, so a write to `plugins/_shared/hestia_gate_mechanism.py`
-    /// arrives with `marker = "plugins/_shared"` — escalation 9c433571 (stage A) did exactly
-    /// that — and `bar_for(marker)` alone priced the mechanism single-approver.
+    /// The act's RESOLVED TARGET (#810, recut of #812): the write-position argument the
+    /// gate's closure matched — `ClosureVerdict.resource` — carried ALONGSIDE the marker. The
+    /// marker is WHY (which closure element fired; the claim join key); the target is WHAT the
+    /// write reaches, and it joins the pricing (`price`, input 3) because the act text it
+    /// would otherwise be read from is a bounded summary that can cut the filename out.
+    ///
+    /// CALLER-ASSERTED, like `marker` (A1, HST-005): the hook self-reports it and the daemon has
+    /// nothing to check it against. It can only ADD a marker, so a fabricated target raises the
+    /// asker's own bar and can never lower it. `None` on every row opened before the field
+    /// existed and on every call from a hook that does not send it — those price exactly as
+    /// stage C priced them.
+    pub resolved_target: Option<String>,
+    /// EVERY marker the act reaches — the reported `marker` first, then the basename of
+    /// `resolved_target`, then each sovereign file (`SOVEREIGN_FILES`) named in the act text.
+    /// `bar` is the highest over all of them; the rule is stated once, at `price`. The shared
+    /// closure matches directories before filenames, so a write to
+    /// `plugins/_shared/hestia_gate_mechanism.py` arrives with `marker = "plugins/_shared"` —
+    /// escalation 9c433571 (stage A) did exactly that — and `bar_for(marker)` alone priced the
+    /// mechanism single-approver.
     pub matched_markers: Vec<String>,
     /// WHY the member says it needs this, in its own words. Caller-asserted like everything
     /// else here, and worth exactly what a self-declaration is worth — which is more than
@@ -737,9 +823,10 @@ pub struct Escalation {
     /// that was refused, not a standing permit on the governance surface. Without this, one
     /// approval would license every subsequent edit until the daemon restarted.
     pub consumed_at: Option<u64>,
-    /// The stated bar this escalation must clear — copied from `bar_for(marker)` at open, so
-    /// the record carries the criterion in force at the time. See Bar's doc: this is what
-    /// makes "sufficient for this context" auditable.
+    /// The stated bar this escalation must clear — priced by `price` at open, so the record
+    /// carries the criterion in force at the time. See Bar's doc: this is what makes
+    /// "sufficient for this context" auditable. Replay RESTORES this value from the opened
+    /// entry rather than recomputing it (#812 review hold 2).
     pub bar: Bar,
     /// The evidence present, in arrival order. `decide` always appends the decider's factor;
     /// `corroborate` can add a peer factor while Pending. The bar is evaluated against this
@@ -1071,8 +1158,9 @@ impl Escalation {
             "decided_by": self.decided_by,
             "decided_role": self.decided_role,
             "bar": self.bar,
-            // Every marker the act reaches; `bar` is the highest over them (stage C).
+            // Every marker the act reaches; `bar` is the highest over them (`price`).
             "matched_markers": self.matched_markers,
+            "resolved_target": self.resolved_target,
             "bar_met": bar_met,
             // The same conjunction `is_claimable` enforces — the SAME FOUR, evaluated
             // against the same clock, not two of them re-derived without one.
@@ -1613,6 +1701,36 @@ impl EscalationStore {
                     if expires_at <= now {
                         continue;
                     }
+                    // THE PRICE, RESTORED — NOT REPRICED (#812 review hold 2). The opened
+                    // entry records the bar and the markers it was priced over; replay keeps
+                    // them, so a later change to `price` cannot rewrite the criterion an
+                    // already-open escalation is judged against across a restart. Before this,
+                    // the code claimed criterion-frozen-at-open while replay rebuilt the bar
+                    // from current policy. Only a row that recorded no readable bar (written
+                    // before the claim path emitted one, or an unparseable value) is priced
+                    // here, by the same rule `open` uses, from what the row itself carries.
+                    let resolved_target =
+                        normalize_resolved_target(s(d, "resolved_target").as_deref());
+                    // The row's act text, verified or not, exactly as stage C read it here: an
+                    // unverified text can only ADD markers, so it can only raise the fallback.
+                    let (fallback_bar, fallback_markers) = price(
+                        &marker,
+                        s(d, "act_text").as_deref(),
+                        resolved_target.as_deref(),
+                    );
+                    let recorded_bar = d
+                        .get("bar")
+                        .and_then(|v| serde_json::from_value::<Bar>(v.clone()).ok());
+                    let recorded_markers = d
+                        .get("matched_markers")
+                        .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                        .filter(|m| !m.is_empty());
+                    // A row that recorded a bar but no markers predates stage C, when the bar
+                    // was priced over the closure marker alone — so that is what it lists.
+                    let (bar, matched_markers) = match recorded_bar {
+                        Some(b) => (b, recorded_markers.unwrap_or_else(|| vec![marker.trim().to_string()])),
+                        None => (fallback_bar, fallback_markers),
+                    };
                     self.by_id.insert(
                         id.clone(),
                         Escalation {
@@ -1718,10 +1836,11 @@ impl EscalationStore {
                             gate_path: s(d, "gate_path"),
                             host_session_id: s(d, "host_session_id"),
                             session_id: s(d, "session_id"),
-                            // Over EVERY marker the act reaches, from the row's own act text
-                            // (stage C). An unverified act text can only RAISE the bar here.
-                            bar: bar_for_markers(&markers_of(&marker, s(d, "act_text").as_deref())),
-                            matched_markers: markers_of(&marker, s(d, "act_text").as_deref()),
+                            // Restored as recorded; priced by `price` only when unrecorded
+                            // (see above).
+                            bar,
+                            matched_markers,
+                            resolved_target,
                             marker,
                             // The open time is the ENTRY's time, not the restart's. The
                             // payload carries it as of this change; rows written before
@@ -1885,7 +2004,7 @@ impl EscalationStore {
         now: u64,
         ttl_secs: u64,
     ) -> Result<Escalation, OpenError> {
-        self.open_with_payload(plugin_id, role, tool_name, marker, act, stated_reason,
+        self.open_with_payload(plugin_id, role, tool_name, marker, act, None, stated_reason,
                                stated_detail, None, now, ttl_secs)
     }
 
@@ -1898,6 +2017,7 @@ impl EscalationStore {
         tool_name: &str,
         marker: &str,
         act: Option<&str>,
+        resolved_target: Option<&str>,
         stated_reason: Option<&str>,
         stated_detail: Option<&str>,
         binding: Option<&PayloadBinding>,
@@ -1965,6 +2085,9 @@ impl EscalationStore {
         h.update(marker.as_bytes());
         let id: String = h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect();
 
+        let resolved_target = normalize_resolved_target(resolved_target);
+        let (bar, matched_markers) = price(marker, act, resolved_target.as_deref());
+
         let esc = Escalation {
             id: id.clone(),
             invited_peers: Vec::new(),
@@ -2008,13 +2131,14 @@ impl EscalationStore {
             independence: None,
             observed_at: None,
             consumed_at: None,
-            // The bar is stated AT OPEN and copied from policy, so the record carries the
-            // criterion in force at the time — a later tightening of `bar_for` must not
-            // rewrite what this escalation was judged against. Since one-gate stage C it is the
-            // HIGHEST bar over every marker the act reaches, not the first marker the closure
-            // matched (a directory marker shadowed the sovereign file inside it).
-            bar: bar_for_markers(&markers_of(marker, act)),
-            matched_markers: markers_of(marker, act),
+            // The bar is stated AT OPEN, priced by THE rule (`price`), and copied onto the
+            // record, so it carries the criterion in force at the time — a later change to the
+            // rule must not rewrite what this escalation was judged against (and replay
+            // restores it rather than repricing). Monotonic: the act text and the resolved
+            // target can only add markers to the closure's, so they strengthen, never weaken.
+            bar,
+            matched_markers,
+            resolved_target,
             factors: Vec::new(),
         };
         self.by_id.insert(id, esc.clone());
@@ -2039,7 +2163,7 @@ impl EscalationStore {
         act_digest: &str,
         now: u64,
     ) -> Option<&Escalation> {
-        self.pending_twin_bound(plugin_id, marker, act_digest, None, now)
+        self.pending_twin_bound(plugin_id, marker, act_digest, None, now, Bar::SingleApprover)
     }
 
     /// `pending_twin` where the PAYLOAD is part of the identity (#1056).
@@ -2050,6 +2174,9 @@ impl EscalationStore {
         act_digest: &str,
         payload_sha256: Option<&str>,
         now: u64,
+        // The price the new ask carries. A twin priced BELOW it is not the same ask: folding
+        // into it would drop the stronger bar (see `open_or_coalesce_with_payload`).
+        at_least: Bar,
     ) -> Option<&Escalation> {
         let want_payload = Self::normalize_payload(payload_sha256);
         self.by_id
@@ -2064,6 +2191,7 @@ impl EscalationStore {
                     // authorise the second — the exact substitution the field exists to stop,
                     // arriving through the de-duplicator instead of through the claim.
                     && e.payload_sha256 == want_payload
+                    && e.bar >= at_least
                     && e.status_at(now) == Status::Pending
             })
             .min_by(|a, b| a.opened_at.cmp(&b.opened_at).then_with(|| a.id.cmp(&b.id)))
@@ -2095,7 +2223,7 @@ impl EscalationStore {
         now: u64,
         ttl_secs: u64,
     ) -> Result<Opened, OpenError> {
-        self.open_or_coalesce_with_payload(plugin_id, role, tool_name, marker, act,
+        self.open_or_coalesce_with_payload(plugin_id, role, tool_name, marker, act, None,
                                            stated_reason, stated_detail, None, now, ttl_secs)
     }
 
@@ -2107,6 +2235,7 @@ impl EscalationStore {
         tool_name: &str,
         marker: &str,
         act: Option<&str>,
+        resolved_target: Option<&str>,
         stated_reason: Option<&str>,
         stated_detail: Option<&str>,
         binding: Option<&PayloadBinding>,
@@ -2115,15 +2244,22 @@ impl EscalationStore {
     ) -> Result<Opened, OpenError> {
         if let Some(a) = act.map(str::trim).filter(|v| !v.is_empty()) {
             let digest = Self::act_digest_of(a);
+            // A FOLD MUST NOT LOWER THE PRICE. The twin was priced from what ITS ask carried; an
+            // ask for the same act that prices HIGHER (a resolved target the first ask lacked —
+            // an old hook then a new one, across an upgrade) is not folded into the weaker row,
+            // or coalescing would be the one path on which the target could not strengthen.
+            let (asked_bar, _) = price(
+                marker.trim(), Some(a),
+                normalize_resolved_target(resolved_target).as_deref());
             if let Some(twin) = self.pending_twin_bound(
                 plugin_id.trim(), marker.trim(), &digest,
-                binding.and_then(|b| b.sha256.as_deref()), now)
+                binding.and_then(|b| b.sha256.as_deref()), now, asked_bar)
             {
                 return Ok(Opened::Coalesced(twin.clone()));
             }
         }
-        self.open_with_payload(plugin_id, role, tool_name, marker, act, stated_reason,
-                               stated_detail, binding, now, ttl_secs)
+        self.open_with_payload(plugin_id, role, tool_name, marker, act, resolved_target,
+                               stated_reason, stated_detail, binding, now, ttl_secs)
             .map(Opened::Minted)
     }
 
@@ -4177,7 +4313,7 @@ mod tests {
 
         let mut s = EscalationStore::default();
         let e = s
-            .open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(ACT),
+            .open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(ACT), None,
                                Some(ACT), None, Some(&stated(APPROVED_BYTES)), T0, DEFAULT_TTL_SECS)
             .unwrap();
         s.decide(&e.id, true, "operator", "role:constellation:sovereign",
@@ -4305,7 +4441,7 @@ mod tests {
                    "and the disagreement must be observable — the whole point");
 
         let mut s = EscalationStore::default();
-        let e = s.open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(&act),
+        let e = s.open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(&act), None,
                                     Some(&act), None, Some(&b1), T0, DEFAULT_TTL_SECS)
             .unwrap();
         s.decide(&e.id, true, "operator", "role:constellation:sovereign",
@@ -4393,17 +4529,17 @@ mod tests {
         let mut s = EscalationStore::default();
         let first = s
             .open_or_coalesce_with_payload("claude-code", "r", "Bash", "pre_tool_use.py",
-                                           Some(ACT), Some(ACT), None, Some(&stated("aaaa1111")),
+                                           Some(ACT), None, Some(ACT), None, Some(&stated("aaaa1111")),
                                            T0, DEFAULT_TTL_SECS)
             .unwrap();
         let same = s
             .open_or_coalesce_with_payload("claude-code", "r", "Bash", "pre_tool_use.py",
-                                           Some(ACT), Some(ACT), None, Some(&stated("aaaa1111")),
+                                           Some(ACT), None, Some(ACT), None, Some(&stated("aaaa1111")),
                                            T0 + 9, DEFAULT_TTL_SECS)
             .unwrap();
         let moved = s
             .open_or_coalesce_with_payload("claude-code", "r", "Bash", "pre_tool_use.py",
-                                           Some(ACT), Some(ACT), None, Some(&stated("bbbb2222")),
+                                           Some(ACT), None, Some(ACT), None, Some(&stated("bbbb2222")),
                                            T0 + 18, DEFAULT_TTL_SECS)
             .unwrap();
         // CONTROL FIRST: identical bytes still coalesce, or this test would pass on a store
@@ -4437,7 +4573,7 @@ mod tests {
         const OTHER_ACT: &str = "Bash -> cp /tmp/other.txt plugins/kimi/hooks/pre_tool_use.py";
         let mut s = EscalationStore::default();
         let e = s
-            .open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(ACT),
+            .open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(ACT), None,
                                Some(ACT), None, Some(&stated("aaaa1111")), T0, DEFAULT_TTL_SECS)
             .unwrap();
         s.decide(&e.id, true, "operator", "role:constellation:sovereign",
@@ -6202,5 +6338,255 @@ mod coalesce_tests {
         let _ = open2(&mut s, ACT, "m", T0);
         let r = s.open_or_coalesce("claude-code", "r", "Bash", "m", None, None, None, T0 + 1, 3600);
         assert!(matches!(r, Err(OpenError::MissingField("act"))));
+    }
+}
+
+#[cfg(test)]
+mod resolved_target_tests {
+    //! #810, as #812 built it (kimi-code), recut onto one-gate stage C (#1231). The bar is ONE
+    //! rule (`price`): the highest `bar_for` over the closure marker, every sovereign file the
+    //! act text names, and the one the resolved target names. These pin what the target adds
+    //! beyond stage C, the monotonicity #812's review demanded, and replay restoring the
+    //! recorded price instead of repricing it.
+    use super::*;
+
+    const T0: u64 = 1_800_000_000;
+    /// The marker the closure emits for any in-tree hook path: a directory, no filename.
+    const HOOKS: &str = "plugins/*/hooks";
+    const TARGET: &str = "/wt/plugins/kimi/hooks/pre_tool_use.py";
+
+    /// The act as the common gate actually summarises a long shell command: 220 chars of it,
+    /// then ` …` (mechanism `attempted_summary`, ATTEMPTED_MAX). The scratch path is long, so
+    /// the governed filename at the END of the command is exactly what the cut removes.
+    fn truncated_shell_act() -> String {
+        let full = format!(
+            "cd /w/hestia && cp /tmp/claude-1000/scratchpad/{}/staged/new_gate.py {}",
+            "s".repeat(160), TARGET);
+        let cut: String = full.chars().take(220).collect();
+        assert!(!cut.contains("pre_tool_use.py"), "the fixture must cut the filename out");
+        format!("Bash: {cut} …")
+    }
+
+    fn open_t(marker: &str, act: &str, target: Option<&str>) -> Escalation {
+        let mut s = EscalationStore::default();
+        s.open_with_payload("kimi-code", "role:constellation:member", "Bash", marker, Some(act),
+                            target, None, None, None, T0, 3600)
+            .expect("open")
+    }
+
+    /// What #812 adds beyond stage C. Stage C reads the file out of the act TEXT; when the
+    /// text is a summary that cut the filename (a long command, a credential-shaped command
+    /// withheld whole), the act text has nothing to give and the directory marker prices one
+    /// approver. The resolved target still names the file. RED on the stage C rule.
+    #[test]
+    fn a_target_the_act_summary_cut_out_still_prices_the_strong_bar() {
+        let act = truncated_shell_act();
+        let stage_c = open_t(HOOKS, &act, None);
+        assert_eq!(stage_c.bar, Bar::SingleApprover, "control: stage C alone cannot see it");
+
+        let e = open_t(HOOKS, &act, Some(TARGET));
+        assert_eq!(e.bar, Bar::SovereignPlusPeer,
+                   "the target carries the filename the summary lost");
+        assert_eq!(e.matched_markers, vec![HOOKS.to_string(), "pre_tool_use.py".to_string()]);
+        assert_eq!(e.marker, HOOKS, "the marker stays the claim join key");
+        assert_eq!(e.resolved_target.as_deref(), Some(TARGET));
+
+        // A credential-shaped command reaches the daemon withheld whole: no path at all.
+        let redacted = "Bash [REDACTED — names a credential-shaped token; 312 chars withheld \
+                        rather than copied into the record]";
+        assert_eq!(open_t(HOOKS, redacted, None).bar, Bar::SingleApprover);
+        assert_eq!(open_t(HOOKS, redacted, Some(TARGET)).bar, Bar::SovereignPlusPeer);
+    }
+
+    /// #812 review hold 1, all four arms: the target may STRENGTHEN the marker-derived bar,
+    /// never weaken it. (The arm that was wrong in #812's first cut is the second.)
+    #[test]
+    fn the_resolved_target_can_strengthen_but_never_weaken_the_bar() {
+        let act = "Edit -> act";
+        // weak marker + strong target => strong (the #810 repair itself)
+        assert_eq!(open_t(HOOKS, act, Some(TARGET)).bar, Bar::SovereignPlusPeer);
+        // STRONG marker + weak/fabricated target => STILL strong
+        assert_eq!(open_t("pre_tool_use.py", act, Some("/tmp/ordinary.txt")).bar,
+                   Bar::SovereignPlusPeer,
+                   "a fabricated or ordinary target must never LOWER the marker-derived bar");
+        // strong ACT TEXT + weak target => still strong (the stage C input is not displaced)
+        assert_eq!(open_t(HOOKS, "Edit -> /w/plugins/_shared/hestia_gate_mechanism.py",
+                          Some("/tmp/ordinary.txt")).bar,
+                   Bar::SovereignPlusPeer);
+        // weak + weak => weak
+        assert_eq!(open_t(HOOKS, act, Some("/tmp/ordinary.txt")).bar, Bar::SingleApprover);
+        // target absent or empty => exactly the stage C price
+        assert_eq!(open_t(HOOKS, act, None).bar, Bar::SingleApprover);
+        let blank = open_t("pre_tool_use.py", act, Some("   "));
+        assert_eq!(blank.bar, Bar::SovereignPlusPeer);
+        assert_eq!(blank.resolved_target, None, "an empty target is no target");
+    }
+
+    /// #812's negative arms, carried forward: a target naming no file the bar prices two-factor
+    /// changes nothing about the bar (its basename is listed as a marker it reached, and priced
+    /// one approver like any other).
+    #[test]
+    fn a_target_naming_no_sovereign_file_changes_nothing() {
+        let act = "Edit -> act";
+        for (t, base) in [("/wt/plugins/kimi/hooks/README.md", "README.md"),
+                          ("/wt/plugins/claude-code/hooks/law_inject.py", "law_inject.py"),
+                          ("/wt/plugins/_shared/hestia_gate_core.py", "hestia_gate_core.py"),
+                          ("/tmp/ordinary.txt", "ordinary.txt")] {
+            let e = open_t(HOOKS, act, Some(t));
+            assert_eq!(e.bar, Bar::SingleApprover, "{t}");
+            assert_eq!(e.matched_markers, vec![HOOKS.to_string(), base.to_string()], "{t}");
+        }
+    }
+
+    /// The reconciliation, pinned. The resolved target is a name the GATE resolved, so it is
+    /// priced like the closure marker (`bar_for`, as #812 priced it): the society gate, which
+    /// the bar reaches through `contains`, prices two-factor when it is the target. The act
+    /// text is free text, so stage C's exact-basename rule still governs it: the same name, or
+    /// a look-alike, merely MENTIONED in the act prices nothing.
+    #[test]
+    fn the_target_is_priced_like_a_marker_and_the_act_text_like_stage_c() {
+        let society = "/wt/plugins/kimi/hooks/society_pre_tool_use.py";
+        assert_eq!(open_t(HOOKS, "Edit -> act", Some(society)).bar, Bar::SovereignPlusPeer,
+                   "#812 priced this from the target; the recut keeps it");
+        assert_eq!(open_t(HOOKS, &format!("Edit -> {society}"), None).bar, Bar::SingleApprover,
+                   "stage C's act-text rule is unchanged: no target, no change");
+        assert_eq!(open_t("plugins/_shared", "cp a /w/plugins/_shared/not_witness.py.bak", None).bar,
+                   Bar::SingleApprover, "a look-alike in the act text is not the witness");
+        // A trailing slash is not a basename-less target.
+        assert_eq!(open_t(HOOKS, "Edit -> act", Some("/wt/plugins/kimi/hooks/")).matched_markers,
+                   vec![HOOKS.to_string(), "hooks".to_string()]);
+    }
+
+    /// ONE rule: `price` is what `open` records, for every combination of the three inputs.
+    /// Absent target is bit-for-bit the stage C rule.
+    #[test]
+    fn open_records_exactly_what_the_one_rule_prices() {
+        let acts = ["Edit -> act", "sed -i s/a/b/ plugins/_shared/hestia_single_gate.py"];
+        let targets = [None, Some(TARGET), Some("/tmp/ordinary.txt")];
+        for marker in [HOOKS, "plugins/_shared", "witness.py"] {
+            for act in acts {
+                for t in targets {
+                    let e = open_t(marker, act, t);
+                    let (bar, markers) = price(marker, Some(act), t);
+                    assert_eq!((e.bar, &e.matched_markers), (bar, &markers), "{marker} {act} {t:?}");
+                    // Monotonic: never below the marker alone, nor below the marker + act.
+                    assert!(e.bar >= bar_for(marker));
+                    assert!(e.bar >= price(marker, Some(act), None).0);
+                }
+                // No target is the stage C rule exactly.
+                assert_eq!(price(marker, Some(act), None).1,
+                           markers_of(marker, Some(act), None));
+            }
+        }
+    }
+
+    /// The target is a path; an over-long one keeps its TAIL, where the filename is.
+    #[test]
+    fn an_over_long_target_keeps_the_filename() {
+        let long = format!("/{}/plugins/kimi/hooks/pre_tool_use.py", "d".repeat(2000));
+        let n = normalize_resolved_target(Some(&long)).unwrap();
+        assert_eq!(n.chars().count(), RESOLVED_TARGET_MAX);
+        assert!(n.ends_with("/pre_tool_use.py"));
+        assert_eq!(open_t(HOOKS, "Edit -> act", Some(&long)).bar, Bar::SovereignPlusPeer);
+        assert_eq!(normalize_resolved_target(Some(" a \n b ")).as_deref(), Some("a b"));
+        assert_eq!(normalize_resolved_target(Some(" \t ")), None);
+    }
+
+    fn opened(id: &str, marker: &str, extra: serde_json::Value) -> crate::storage::chain::ChainEntry {
+        let mut data = serde_json::json!({
+            "escalation_id": id, "plugin_id": "kimi-code",
+            "role": "role:constellation:member", "tool_name": "Edit",
+            "marker": marker, "opened_at": T0, "expires_at": T0 + 3600,
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            data[k] = v.clone();
+        }
+        crate::storage::chain::ChainEntry {
+            chain_position: 0,
+            hash: String::new(),
+            prev_hash: String::new(),
+            event_type: "gate_escalation_opened".into(),
+            event_data: data,
+            signer_lct: "test".into(),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// #812 review hold 2: replay RESTORES the recorded bar; it does not reprice history. The
+    /// recorded value deliberately contradicts what today's rule derives (a marker `price`
+    /// prices two-factor, recorded single-approver) — standing in for any future rule change.
+    #[test]
+    fn replay_restores_the_recorded_bar_not_todays_policy() {
+        let mut s = EscalationStore::default();
+        assert_eq!(s.rehydrate(&[opened("rec1", "pre_tool_use.py",
+                                        serde_json::json!({"bar": "single_approver",
+                                                           "matched_markers": ["pre_tool_use.py"]}))],
+                               T0 + 20), 1);
+        assert_eq!(s.get("rec1").unwrap().bar, Bar::SingleApprover,
+                   "the record carries the criterion in force at the time");
+        // And the other direction: a row priced strong from its target stays strong.
+        assert_eq!(s.rehydrate(&[opened("rec2", HOOKS,
+                                        serde_json::json!({"bar": "sovereign_plus_peer",
+                                                           "resolved_target": TARGET,
+                                                           "matched_markers": [HOOKS, "pre_tool_use.py"]}))],
+                               T0 + 20), 1);
+        let r2 = s.get("rec2").unwrap();
+        assert_eq!(r2.bar, Bar::SovereignPlusPeer);
+        assert_eq!(r2.resolved_target.as_deref(), Some(TARGET));
+        assert_eq!(r2.matched_markers, vec![HOOKS.to_string(), "pre_tool_use.py".to_string()]);
+    }
+
+    /// The fallback, for rows that recorded no readable bar: priced by THE rule, from what the
+    /// row carries — its marker, its act text and (if any) its target. A legacy row (no target,
+    /// no bar) prices exactly as stage C priced it; an unparseable bar is no bar.
+    #[test]
+    fn a_row_with_no_readable_bar_is_priced_by_the_one_rule() {
+        let mut s = EscalationStore::default();
+        s.rehydrate(&[
+            opened("leg1", HOOKS, serde_json::json!({})),
+            opened("leg2", HOOKS, serde_json::json!({"act_text": "Edit -> /w/plugins/x/hooks/witness.py"})),
+            opened("tgt1", HOOKS, serde_json::json!({"resolved_target": TARGET})),
+            opened("bad1", HOOKS, serde_json::json!({"bar": "two_humans_and_a_dog",
+                                                     "resolved_target": TARGET})),
+            // Pre-stage-C: a bar recorded, no markers — it was priced over the marker alone.
+            opened("pre1", HOOKS, serde_json::json!({"bar": "single_approver",
+                                                     "act_text": "Edit -> /w/plugins/x/hooks/witness.py"})),
+        ], T0 + 20);
+        let g = |id: &str| s.get(id).unwrap().clone();
+        assert_eq!(g("leg1").bar, Bar::SingleApprover);
+        assert_eq!(g("leg1").resolved_target, None, "absent restores absent, never fails");
+        assert_eq!(g("leg2").bar, Bar::SovereignPlusPeer, "stage C's act-text fallback, unchanged");
+        assert_eq!(g("tgt1").bar, Bar::SovereignPlusPeer);
+        assert_eq!(g("bad1").bar, Bar::SovereignPlusPeer, "an unreadable criterion is recomputed");
+        assert_eq!(g("pre1").bar, Bar::SingleApprover, "recorded, so restored — not repriced");
+        assert_eq!(g("pre1").matched_markers, vec![HOOKS.to_string()]);
+    }
+
+    /// Coalescing (#668) must not be the one path on which the target cannot strengthen: an
+    /// ask that prices HIGHER than its pending twin is minted, not folded into the weaker row.
+    /// The reverse fold (a weaker ask onto a stronger twin) loses nothing and still coalesces.
+    #[test]
+    fn a_fold_never_lowers_the_price() {
+        let act = truncated_shell_act();
+        let mut s = EscalationStore::default();
+        let weak = s.open_or_coalesce_with_payload("kimi-code", "r", "Bash", HOOKS, Some(&act),
+                                                   None, None, None, None, T0, 3600).unwrap();
+        assert_eq!(weak.escalation().bar, Bar::SingleApprover);
+        let strong = s.open_or_coalesce_with_payload("kimi-code", "r", "Bash", HOOKS, Some(&act),
+                                                     Some(TARGET), None, None, None, T0 + 5, 3600)
+            .unwrap();
+        assert!(!strong.coalesced(), "a stronger ask is not folded into a weaker twin");
+        assert_eq!(strong.escalation().bar, Bar::SovereignPlusPeer);
+        // Same act again, with the target: folds onto the strong row (equal price).
+        let again = s.open_or_coalesce_with_payload("kimi-code", "r", "Bash", HOOKS, Some(&act),
+                                                    Some(TARGET), None, None, None, T0 + 9, 3600)
+            .unwrap();
+        assert!(again.coalesced());
+        assert_eq!(again.escalation().id, strong.escalation().id);
+        // And a targetless re-ask folds too: the oldest pending twin at or above its price.
+        let old_hook = s.open_or_coalesce_with_payload("kimi-code", "r", "Bash", HOOKS, Some(&act),
+                                                       None, None, None, None, T0 + 12, 3600)
+            .unwrap();
+        assert!(old_hook.coalesced());
     }
 }
