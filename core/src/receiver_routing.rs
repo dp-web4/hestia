@@ -80,6 +80,13 @@ pub struct RouterNeighbor {
     /// this hop. One interface may have many neighbors.
     pub interface_binding_id: Uuid,
     pub next_hop_hub_member_lct: Uuid,
+    /// Remote proof that next_hop_lct, its dedicated Hub membership/key, and
+    /// that router's receipt-mode interface are one dual-signed fact.
+    ///
+    /// Old/manual rows deserialize as None for recovery visibility, but they
+    /// cannot be created by bind_neighbor and cannot authorize D3 cutover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_certificate: Option<crate::router_certificate::RouterInterfaceCertificate>,
     pub reason: String,
     #[serde(default)]
     pub set_by: String,
@@ -446,6 +453,36 @@ impl ReceiverRoutingTable {
     pub fn bind_neighbor(&mut self, neighbor: RouterNeighbor) -> Result<()> {
         anyhow::ensure!(!neighbor.next_hop_lct.trim().is_empty(),
             "neighbor next_hop_lct must not be empty");
+        let iface = self
+            .router_ingress_by_id(neighbor.interface_binding_id)
+            .ok_or_else(|| anyhow::anyhow!(
+                "neighbor interface {} does not exist",
+                neighbor.interface_binding_id
+            ))?;
+        let cert = neighbor.peer_certificate.as_ref().ok_or_else(|| anyhow::anyhow!(
+            "neighbor {} requires a verified router-interface certificate",
+            neighbor.next_hop_lct
+        ))?;
+        cert.verify()?;
+        anyhow::ensure!(
+            cert.payload.router_lct == neighbor.next_hop_lct,
+            "neighbor LCT {} differs from certificate router {}",
+            neighbor.next_hop_lct,
+            cert.payload.router_lct
+        );
+        anyhow::ensure!(
+            cert.payload.hub_member_lct == neighbor.next_hop_hub_member_lct,
+            "neighbor Hub member {} differs from certificate member {}",
+            neighbor.next_hop_hub_member_lct,
+            cert.payload.hub_member_lct
+        );
+        anyhow::ensure!(
+            cert.payload.hub_lct_id == iface.hub_lct_id,
+            "neighbor certificate is for Hub {}, but interface {} belongs to Hub {}",
+            cert.payload.hub_lct_id,
+            iface.binding_id,
+            iface.hub_lct_id
+        );
         anyhow::ensure!(
             !self.neighbors.iter().any(|n| n.next_hop_lct == neighbor.next_hop_lct),
             "neighbor {} already exists; remove it only after transit custody is clear",
