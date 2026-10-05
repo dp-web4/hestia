@@ -673,6 +673,27 @@ enum HubCmd {
         authority: String,
         #[arg(long)]
         reason: String,
+        /// Recent witness rows inspected before a legacy -> F3 transition.
+        #[arg(long, default_value_t = 100)]
+        parity_limit: u64,
+        /// Minimum exact measured legacy/F3 Hub next-hop matches required.
+        #[arg(long, default_value_t = 1)]
+        min_matches: usize,
+        /// Router/parent LCT override for the current-route recheck.
+        #[arg(long)]
+        parent: Option<String>,
+    },
+
+    /// Mechanical D3 readiness check for one exact legacy compatibility edge.
+    /// Does not mutate delivery authority.
+    ReceiverCutoverCheck {
+        legacy_address: String,
+        #[arg(long, default_value_t = 100)]
+        limit: u64,
+        #[arg(long, default_value_t = 1)]
+        min_matches: usize,
+        #[arg(long)]
+        parent: Option<String>,
     },
 
     /// Remove one legacy compatibility alias.
@@ -1130,9 +1151,24 @@ pub fn run() -> AnyResult<()> {
                 &home, &legacy_address, &destination_lct, &reason,
             ),
             HubCmd::ReceiverAliasAuthority {
-                legacy_address, authority, reason
+                legacy_address, authority, reason, parity_limit, min_matches, parent
             } => cmd_receiver_alias_authority(
-                &home, &legacy_address, &authority, &reason,
+                &home,
+                &legacy_address,
+                &authority,
+                &reason,
+                parity_limit,
+                min_matches,
+                parent.as_deref(),
+            ),
+            HubCmd::ReceiverCutoverCheck {
+                legacy_address, limit, min_matches, parent
+            } => cmd_receiver_cutover_check(
+                &home,
+                &legacy_address,
+                limit,
+                min_matches,
+                parent.as_deref(),
             ),
             HubCmd::ReceiverUnalias { legacy_address } => {
                 cmd_receiver_unalias(&home, &legacy_address)
@@ -3836,16 +3872,205 @@ fn cmd_receiver_alias(
     Ok(())
 }
 
+fn receiver_cutover_preflight(
+    home: &std::path::Path,
+    vault: &Vault,
+    passphrase: &str,
+    legacy_address: &str,
+    limit: u64,
+    min_matches: usize,
+    parent: Option<&str>,
+) -> AnyResult<serde_json::Value> {
+    anyhow::ensure!(limit > 0 && limit <= 10_000, "--limit/--parity-limit must be 1..10000");
+    anyhow::ensure!(min_matches > 0 && min_matches <= 10_000, "--min-matches must be 1..10000");
+
+    let legacy_address = legacy_address.trim();
+    let router_lct = receiver_router_lct(vault, parent)?;
+    let registry = hestia::member_registry::load_members(vault);
+    let table = hestia::receiver_routing::ReceiverRoutingTable::load(vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    let alias = table.legacy_alias(legacy_address).cloned();
+
+    let shadow = table.shadow_legacy_route(&registry, &router_lct, legacy_address)?;
+    let mut structural_blockers = Vec::<String>::new();
+    let mut current_next_hop_lct: Option<String> = None;
+    let mut current_hub_member_lct: Option<String> = None;
+
+    let authority = match alias.as_ref() {
+        Some(a) => {
+            if a.delivery_authority
+                != hestia::receiver_routing::LegacyDeliveryAuthority::Legacy
+            {
+                structural_blockers.push(format!(
+                    "edge authority is already '{}'; D3 cutover preflight requires legacy-authoritative shadow traffic",
+                    a.delivery_authority.as_str()
+                ));
+            }
+            Some(a.delivery_authority.as_str().to_string())
+        }
+        None => {
+            structural_blockers.push("exact legacy alias is not configured".to_string());
+            None
+        }
+    };
+
+    match &shadow {
+        hestia::receiver_routing::LegacyRouteShadow::Resolved { decision, .. } => {
+            match decision {
+                hestia::receiver_routing::RouteDecision::Forward {
+                    next_hop_lct, ..
+                } => {
+                    current_next_hop_lct = Some(next_hop_lct.clone());
+                    match table.neighbor(next_hop_lct) {
+                        Some(n) => {
+                            current_hub_member_lct =
+                                Some(n.next_hop_hub_member_lct.to_string());
+                        }
+                        None => structural_blockers.push(format!(
+                            "current F3 route chooses next hop '{next_hop_lct}' but no neighbor binding exists"
+                        )),
+                    }
+                }
+                hestia::receiver_routing::RouteDecision::Local { .. } => {
+                    structural_blockers.push(
+                        "D3 parity cutover guard currently requires a remote forward edge; local compatibility-edge cutover needs its own measured delivery parity".to_string()
+                    );
+                }
+                hestia::receiver_routing::RouteDecision::LocalUnavailable { reason, .. } => {
+                    structural_blockers.push(format!(
+                        "current F3 shadow route is local-unavailable: {reason}"
+                    ));
+                }
+                hestia::receiver_routing::RouteDecision::Unreachable { reason, .. } => {
+                    structural_blockers.push(format!(
+                        "current F3 shadow route is unreachable: {reason}"
+                    ));
+                }
+            }
+        }
+        hestia::receiver_routing::LegacyRouteShadow::MissingAlias { .. } => {
+            if !structural_blockers.iter().any(|b| b.contains("alias")) {
+                structural_blockers.push("current F3 shadow has no exact alias".to_string());
+            }
+        }
+        hestia::receiver_routing::LegacyRouteShadow::NotRouted { .. } => {
+            structural_blockers.push(
+                "legacy address is not a routed peer/member edge; D3 remote cutover guard does not apply"
+                    .to_string(),
+            );
+        }
+    }
+
+    let store_key = hestia::storage::storage_key(home, passphrase)
+        .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
+    let chain = hestia::storage::SqliteChainStore::open(
+        home.join("witness.db"),
+        store_key,
+    )?;
+    let rows = chain.read_recent_route_shadow(limit)?;
+    let parity = hestia::legacy_parity::cutover_check(
+        &rows,
+        legacy_address,
+        min_matches,
+    );
+
+    // Parity evidence proves the route that existed WHEN THE SAMPLE WAS
+    // MEASURED. Re-check it against the route/neighbor we would use NOW.
+    // Otherwise a config edit after a successful shadow run could silently
+    // borrow stale evidence for a different next hop.
+    if let (Some(now_hop), Some(now_member)) = (
+        current_next_hop_lct.as_deref(),
+        current_hub_member_lct.as_deref(),
+    ) {
+        structural_blockers.extend(
+            hestia::legacy_parity::current_route_evidence_blockers(
+                &parity.parity,
+                now_hop,
+                now_member,
+            ),
+        );
+    }
+
+
+    let ready = parity.ready && structural_blockers.is_empty();
+    Ok(serde_json::json!({
+        "legacy_address": legacy_address,
+        "router_lct": router_lct,
+        "authority": authority,
+        "alias_destination_lct": alias.as_ref().map(|a| a.destination_lct.clone()),
+        "current_shadow": shadow,
+        "current_next_hop_lct": current_next_hop_lct,
+        "current_hub_member_lct": current_hub_member_lct,
+        "parity": parity,
+        "structural_blockers": structural_blockers,
+        "ready": ready,
+    }))
+}
+
+fn cmd_receiver_cutover_check(
+    home: &std::path::Path,
+    legacy_address: &str,
+    limit: u64,
+    min_matches: usize,
+    parent: Option<&str>,
+) -> AnyResult<()> {
+    let (vault, passphrase) = open_vault_with_passphrase(home)?;
+    let report = receiver_cutover_preflight(
+        home,
+        &vault,
+        &passphrase,
+        legacy_address,
+        limit,
+        min_matches,
+        parent,
+    )?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    anyhow::ensure!(
+        report.get("ready").and_then(serde_json::Value::as_bool) == Some(true),
+        "F3 cutover preflight HOLD for '{}'",
+        legacy_address.trim()
+    );
+    Ok(())
+}
+
 fn cmd_receiver_alias_authority(
     home: &std::path::Path,
     legacy_address: &str,
     authority: &str,
     reason: &str,
+    parity_limit: u64,
+    min_matches: usize,
+    parent: Option<&str>,
 ) -> AnyResult<()> {
     let authority = hestia::receiver_routing::LegacyDeliveryAuthority::parse(authority)
         .ok_or_else(|| anyhow::anyhow!("authority must be 'legacy' or 'f3'"))?;
     anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
-    let mut vault = open_vault(home)?;
+
+    let (mut vault, passphrase) = open_vault_with_passphrase(home)?;
+
+    if authority == hestia::receiver_routing::LegacyDeliveryAuthority::F3 {
+        let report = receiver_cutover_preflight(
+            home,
+            &vault,
+            &passphrase,
+            legacy_address,
+            parity_limit,
+            min_matches,
+            parent,
+        )?;
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "cutover_preflight": report
+        }))?);
+        anyhow::ensure!(
+            report.get("ready").and_then(serde_json::Value::as_bool) == Some(true),
+            "refusing legacy -> F3 authority transition for '{}': cutover preflight is HOLD",
+            legacy_address.trim()
+        );
+    }
+
+    // Rollback (F3 -> legacy) deliberately has no parity gate. If a live
+    // falsifier trips, returning authority to the known legacy plane must stay
+    // immediate and explicit rather than waiting for more observations.
     let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
         .context("loading receiver routing table (unreadable is not empty)")?;
     table.set_legacy_authority(
