@@ -451,10 +451,13 @@ impl ReceiverRoutingTable {
     }
 
     pub fn bind_neighbor(&mut self, neighbor: RouterNeighbor) -> Result<()> {
-        anyhow::ensure!(!neighbor.next_hop_lct.trim().is_empty(),
-            "neighbor next_hop_lct must not be empty");
-        let iface = self
+        anyhow::ensure!(
+            !neighbor.next_hop_lct.trim().is_empty(),
+            "neighbor next_hop_lct must not be empty"
+        );
+        let iface_hub = self
             .router_ingress_by_id(neighbor.interface_binding_id)
+            .map(|iface| (iface.binding_id, iface.hub_lct_id))
             .ok_or_else(|| anyhow::anyhow!(
                 "neighbor interface {} does not exist",
                 neighbor.interface_binding_id
@@ -477,17 +480,41 @@ impl ReceiverRoutingTable {
             cert.payload.hub_member_lct
         );
         anyhow::ensure!(
-            cert.payload.hub_lct_id == iface.hub_lct_id,
+            cert.payload.hub_lct_id == iface_hub.1,
             "neighbor certificate is for Hub {}, but interface {} belongs to Hub {}",
             cert.payload.hub_lct_id,
-            iface.binding_id,
-            iface.hub_lct_id
+            iface_hub.0,
+            iface_hub.1
         );
-        anyhow::ensure!(
-            !self.neighbors.iter().any(|n| n.next_hop_lct == neighbor.next_hop_lct),
-            "neighbor {} already exists; remove it only after transit custody is clear",
-            neighbor.next_hop_lct
-        );
+
+        // Migration-only ratchet: a shadow-era/manual row with the SAME
+        // topology may be certified in place. Preserve its link_id so any
+        // persisted transit decision pinned to that link remains valid.
+        if let Some(existing) = self
+            .neighbors
+            .iter_mut()
+            .find(|n| n.next_hop_lct == neighbor.next_hop_lct)
+        {
+            anyhow::ensure!(
+                existing.interface_binding_id == neighbor.interface_binding_id
+                    && existing.next_hop_hub_member_lct == neighbor.next_hop_hub_member_lct,
+                "neighbor {} already exists with a different topology tuple; \
+                 refuse in-place replacement",
+                neighbor.next_hop_lct
+            );
+            anyhow::ensure!(
+                existing.peer_certificate.is_none(),
+                "neighbor {} is already certificate-backed; remove/rotate it through a \
+                 custody-aware operation rather than overwriting evidence",
+                neighbor.next_hop_lct
+            );
+            existing.peer_certificate = neighbor.peer_certificate;
+            existing.reason = neighbor.reason;
+            existing.set_by = neighbor.set_by;
+            existing.set_at = neighbor.set_at;
+            return Ok(());
+        }
+
         anyhow::ensure!(
             !self.neighbors.iter().any(|n| n.link_id == neighbor.link_id),
             "router neighbor link id {} is already in use",
