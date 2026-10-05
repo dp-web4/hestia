@@ -282,6 +282,36 @@ describe("Decide — scope requests (Sprint 2)", () => {
     });
   });
 
+  // dp, 2026-10-05: "scope escalations should go to peers not to me".
+  it("shows a peer-routed request as awaiting a NOT-SAME peer, with OVERRIDE controls", async () => {
+    getDashboard.mockResolvedValue({
+      pending_escalations: [],
+      pending_scope_requests: [gateScopeRequest({ invited_peers: ["kimi-code", "claude-code"] })],
+    });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+    render(<Decide />);
+    const route = await waitFor(() => {
+      const el = document.querySelector("[data-scope-route]");
+      if (!el) throw new Error("no route");
+      return el;
+    });
+    expect(route.textContent).toContain("NOT-SAME peer");
+    expect(route.textContent).toContain("kimi-code, claude-code");
+    expect(screen.getByRole("button", { name: /override: grant/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /override: refuse/i })).toBeTruthy();
+  });
+
+  it("shows a request no peer can clear as the operator's own", async () => {
+    getDashboard.mockResolvedValue({
+      pending_escalations: [],
+      pending_scope_requests: [gateScopeRequest({ invited_peers: [], asker_basis: "asserted" })],
+    });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+    render(<Decide />);
+    await screen.findByText(/no NOT-SAME peer can clear this/);
+    expect(screen.queryByRole("button", { name: /override/i })).toBeNull();
+  });
+
   it("offers no exact grant for a glob reach", async () => {
     getDashboard.mockResolvedValue({
       pending_escalations: [],

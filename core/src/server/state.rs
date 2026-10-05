@@ -219,6 +219,14 @@ pub struct ScopeRequestExt {
     pub reserved_until: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub released_at: Option<u64>,
+    /// dp, 2026-10-05: *"scope escalations should go to peers not to me."* The NOT-SAME peers
+    /// invited to rule a gate-opened request (mesh `review_request` notices).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invited_peers: Vec<String>,
+    /// For a request a PEER decided: `{"arbiter", "asker", "asker_basis", "independence"}` — the
+    /// NOT-SAME basis the ruling rested on. `None` for an operator ruling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_basis: Option<serde_json::Value>,
 }
 
 impl ScopeRequestExt {
@@ -255,6 +263,11 @@ pub struct GateDenyOrigin {
     /// How many times the member re-issued the refused act while this was pending.
     #[serde(default)]
     pub reissues: u32,
+    /// Whether the asker was resolved from a live session (`session`) or asserted. NOT-SAME
+    /// peers may rule only a PROVEN asker's request (`arbiter::eligibility_for` clause 0); an
+    /// asserted asker's request is the operator's. Rows written before this field are asserted.
+    #[serde(default)]
+    pub asker_basis: crate::arbiter::AskerBasis,
 }
 
 /// What a retirement actually removed, by channel.

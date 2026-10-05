@@ -6,6 +6,7 @@ import {
   scopeBreadthOptions,
   scopeDurations,
   scopeRulingOpts,
+  scopeAwaitsOperator,
   type ScopeDuration,
 } from "../lib/scope";
 
@@ -169,6 +170,8 @@ function ScopeRequestCard({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const fromGate = req.origin === "gate_deny";
+  // A peer-routed request: the operator's controls are an OVERRIDE (dp, 2026-10-05).
+  const override = !scopeAwaitsOperator(req);
 
   const rule = async (granted: boolean) => {
     setBusy(true);
@@ -228,6 +231,12 @@ function ScopeRequestCard({
                 <dd>a glob over this directory — only a recursive grant covers it</dd>
               </>
             )}
+            <dt>decided by</dt>
+            <dd data-scope-route>
+              {override
+                ? `a NOT-SAME peer — invited: ${(req.invited_peers ?? []).join(", ")} · the controls below are your OVERRIDE`
+                : "no NOT-SAME peer can clear this (unproven asker, or no admissible peer) — it is yours to decide"}
+            </dd>
           </>
         ) : (
           <>
@@ -286,10 +295,10 @@ function ScopeRequestCard({
             </select>
           </label>
           <button disabled={busy} onClick={() => rule(true)}>
-            Grant
+            {override ? "Override: grant" : "Grant"}
           </button>
           <button disabled={busy} onClick={() => rule(false)}>
-            Refuse
+            {override ? "Override: refuse" : "Refuse"}
           </button>
         </div>
       ) : (

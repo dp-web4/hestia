@@ -240,9 +240,11 @@
         "the operator chooses the DURATION at decide time, from exactly these: this act once (once:true; offered only when once_available, i.e. the gate recorded an act to bind), for the session (memory-only, expires), or standing (vault, survives restart); refusing is a separate control that needs no reason",
         "the operator chooses the BREADTH at decide time for session and standing grants: the exact asked path (the default), or a directory above it, which is always recursive (grant_path + recursive:true); every offered directory is an ancestor of the asked path at a separator and never the root, and the control shows the path the grant will reach before it is sent",
         "a request whose refused reach was a glob over a directory (subtree:true) says that only a recursive grant covers it, and the surface does not offer an exact session or standing grant for it",
-        "a one-time approval says that it is spent by the identical act, once, inside the claim window, and is never served as standing policy"
+        "a one-time approval says that it is spent by the identical act, once, inside the claim window, and is never served as standing policy",
+        "PEER ROUTING (dp, 2026-10-05: \"scope escalations should go to peers not to me\"): a gate-opened request from a proven asker is decided by a NOT-SAME peer (hestia_scope_peer_decide / hestia scope decide --as). The surface shows the invited peers and labels the queue as awaiting a peer, read-only; the decide controls are labelled as the OPERATOR OVERRIDE, never as the default route, and the queue is not announced as awaiting the operator. A request no peer can clear (asserted asker, or no admissible peer) is labelled as the operator's",
+        "a ruling made by a peer is shown read-only with the deciding peer (granted_by peer:<id>) and its NOT-SAME basis (independence, asker basis); the operator can revoke it (scope-revoke) like any grant"
       ],
-      "notes": "Reconciled 2026-10-05 (scope refusal -> escalation with a standing option): both surfaces send duration (once / session / standing) and breadth (grant_path, recursive) in the one decide call, as the app already did for standing/recursive."
+      "notes": "Reconciled 2026-10-05 (scope refusal -> escalation with a standing option): both surfaces send duration (once / session / standing) and breadth (grant_path, recursive) in the one decide call. Peer routing 2026-10-05: the operator's decide is the override; peers decide through the MCP door, not this route."
     },
     {
       "id": "scope-grant",

@@ -782,7 +782,22 @@ through the claim for one-time (the gate escalations' own `APPROVAL_CLAIM_WINDOW
 refused on several paths PEEKS at all of them first, so a one-time approval is never spent on an
 act another path still refuses.
 
-**The operator's answer** (`POST /api/scope/decide`, both surfaces, `docs/operator-surfaces`):
+**WHO DECIDES — peers, not the operator (dp, 2026-10-05: *"scope escalations should go to peers
+not to me"*).** A gate-opened request from a PROVEN asker (session-resolved at the claim) invites
+up to three NOT-SAME peers over the mesh (`review_request`, `hestia://scope/<id>#peer-decide`),
+chosen like gate-escalation invitations: recorded members other than the asker and its aliases,
+with a review door, admitted by `arbiter::eligibility_for` in the granting direction. A peer rules
+with `hestia_scope_peer_decide` (or `hestia scope decide <id> --as <seat>`): once, session or
+standing, at the breadth it picks, with a reason — through the SAME decision function the
+operator's override uses. The asker can never decide its own request (either direction); an
+ASSERTED asker's request invites nobody and cannot be peer-cleared (eligibility clause 0), so it
+is the operator's. The record names the peer (`granted_by: peer:<id>`), the channel
+(`peer_not_same`) and the NOT-SAME basis (independence, asker basis). The operator surfaces show
+the queue and peer rulings read-only and keep the operator's override and revoke; the queue is
+announced as awaiting the operator only for requests no peer can clear.
+
+**The decision** (`POST /api/scope/decide` for the operator's override, both surfaces,
+`docs/operator-surfaces`; the same rules for a peer):
 duration — `once` (gate-opened requests only: they recorded an act to bind), session (memory,
 expires), or standing (vault, survives restart, revocable) — and, for session and standing,
 breadth: the asked path, or a directory above it (`grant_path`, always recursive; never the root).

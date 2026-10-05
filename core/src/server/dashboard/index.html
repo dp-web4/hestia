@@ -3559,12 +3559,16 @@
 
   function renderScopeRequests(data) {
     const pend = data?.pending_scope_requests ?? [];
+    // dp, 2026-10-05: "scope escalations should go to peers not to me". Only requests NO peer
+    // can clear (an unproven asker, or no admissible peer) await the operator; the rest await a
+    // NOT-SAME peer and are shown here read-only with the operator's OVERRIDE.
+    const mine = pend.filter(r => scopeAwaitsOperator(r));
     const banner = $('scope-banner');
-    banner.hidden = pend.length === 0;
-    if (pend.length) {
-      const n = pend.length;
+    banner.hidden = mine.length === 0;
+    if (mine.length) {
+      const n = mine.length;
       $('scope-banner-text').textContent =
-        `${n} scope request${n > 1 ? 's' : ''} awaiting your decision`;
+        `${n} scope request${n > 1 ? 's' : ''} no peer can clear — awaiting your decision`;
     }
     $('scope-count').textContent = pend.length ? `${pend.length} pending` : '';
 
@@ -3609,7 +3613,8 @@
            <pre class="esc-why scope-act">${escapeHtml(String(r.act ?? ''))}</pre>
            <div class="esc-meta">opened by the gate; the member stated no reason${
              (r.reissues ?? 0) > 0 ? ` · re-issued ${Number(r.reissues)}×` : ''}${
-             r.subtree ? ' · a glob over this directory: only a recursive grant covers it' : ''}</div>`
+             r.subtree ? ' · a glob over this directory: only a recursive grant covers it' : ''}</div>
+           <div class="esc-meta scope-route">${scopeRouteText(r)}</div>`
         : `<div class="esc-why">why: ${why ? escapeHtml(why) : '(none stated)'}</div>`;
       row.innerHTML = `
         <div class="esc-row-head">
@@ -3669,7 +3674,9 @@
 
       const grantBtn = document.createElement('button');
       grantBtn.className = 'esc-approve';
-      grantBtn.textContent = 'grant';
+      // A peer-routed request: the operator's control is an OVERRIDE, labelled as one.
+      const override = !scopeAwaitsOperator(r);
+      grantBtn.textContent = override ? 'override: grant' : 'grant';
       grantBtn.disabled = !note.value.trim();
       grantBtn.title = 'A note is required to grant — it is recorded as the reason.';
       note.addEventListener('input', () => {
@@ -3707,7 +3714,7 @@
 
       const refuseBtn = document.createElement('button');
       refuseBtn.className = 'esc-deny';
-      refuseBtn.textContent = 'refuse';
+      refuseBtn.textContent = override ? 'override: refuse' : 'refuse';
       grantBtn.addEventListener('click', () => decide(grantBtn, true));
       refuseBtn.addEventListener('click', () => decide(refuseBtn, false));
 
@@ -3724,6 +3731,21 @@
 
   // ---- scope decide: duration, breadth, body (pure; pinned by
   // tools/dashboard_scope_decide_contract_test.py, which also runs them under node) ----
+  // dp, 2026-10-05: a gate-opened request from a proven asker is decided by a NOT-SAME PEER;
+  // only one no peer can clear (no invited peer) awaits the operator.
+  function scopeAwaitsOperator(r) {
+    return !(r && r.origin === 'gate_deny' && Array.isArray(r.invited_peers)
+             && r.invited_peers.length > 0);
+  }
+
+  function scopeRouteText(r) {
+    if (scopeAwaitsOperator(r)) {
+      return 'no NOT-SAME peer can clear this (unproven asker, or no admissible peer) — it is yours to decide';
+    }
+    return 'awaiting a NOT-SAME peer — invited: ' + r.invited_peers.map(p => escapeHtml(String(p))).join(', ')
+      + ' · the controls below are your OVERRIDE';
+  }
+
   function scopeDurationOptions(r) {
     const out = [];
     if (r && r.once_available === true) {
@@ -3944,7 +3966,13 @@
       const when = live
         ? `dies on restart · ${escFmtAge(secs ?? 0)} left`
         : (secs === null || secs === undefined ? 'until revoked' : `${escFmtAge(secs)} left`);
-      const origin = g.origin === 'operator_initiated' ? 'you granted this directly' : 'answered a request';
+      // A PEER's ruling (dp, 2026-10-05) is shown read-only with who decided and on what NOT-SAME
+      // basis; revoke stays available to the operator like any grant.
+      const byPeer = typeof g.granted_by === 'string' && g.granted_by.startsWith('peer:');
+      const pb = g.peer_basis || {};
+      const origin = g.origin === 'operator_initiated' ? 'you granted this directly'
+        : byPeer ? `decided by ${g.granted_by.slice(5)} (NOT-SAME peer, ${pb.independence ?? 'basis unknown'}, asker ${pb.asker_basis ?? '?'})`
+        : 'answered a request';
       return `
         <div class="grant-row">
           <span class="grant-who">${memberName(g.plugin_id ?? '?')}</span>

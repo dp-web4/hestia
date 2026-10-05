@@ -326,6 +326,13 @@ fn print_scope_requests(r: &Value) {
             let reissues = q.get("reissues").and_then(Value::as_u64).unwrap_or(0);
             println!("      opened by the gate ({}); re-issued {reissues}x", s("rule"));
             println!("      act: {}", s("act"));
+            let peers: Vec<&str> = q.get("invited_peers").and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+            if peers.is_empty() {
+                println!("      decided by: the operator (no admissible NOT-SAME peer)");
+            } else {
+                println!("      decided by: a NOT-SAME peer — invited {}", peers.join(", "));
+            }
         } else {
             println!("      why: {}", s("reason"));
         }
@@ -361,12 +368,31 @@ pub fn scope_pending(endpoint: &str, asserted_id: Option<String>, role: &str, js
             println!("{n} pending scope request(s):");
             print_scope_requests(&r);
             println!(
-                "\nrule them on the dashboard (Activity -> Reach requested) or the app's Decide \
-                 page: this act once, for the session, or standing (exact, or recursive at a \
-                 directory you choose). A delegated seat: hestia scope arbitrate <id>."
+                "\na NOT-SAME peer decides a gate-opened request: hestia scope decide <id> --as \
+                 <peer-seat> --once|--session|--standing|--refuse [--grant-path <dir> \
+                 --recursive] --reason '...'. The asker cannot decide its own. The operator may \
+                 override on the dashboard or the app."
             );
         }
     }
+    Ok(())
+}
+
+/// `hestia scope decide <id> --as <seat> --once|--session|--standing|--refuse` — a NOT-SAME
+/// peer rules a gate-opened scope request (dp, 2026-10-05). The daemon resolves the seat from
+/// this session and refuses the asker, an unproven asker's request, and an unrecognised seat.
+pub fn scope_peer_decide(endpoint: &str, as_member: &str, request_id: &str, decision: &str,
+                         grant_path: Option<String>, recursive: bool, reason: &str) -> Result<()> {
+    let mut m = Mcp::connect(endpoint)?;
+    let (sid, who) = open_session(&mut m, as_member, "role:constellation:member")?;
+    banner(&who);
+    let mut args = json!({"session_id": sid, "request_id": request_id, "decision": decision,
+                          "reason": reason, "recursive": recursive});
+    if let Some(gp) = grant_path {
+        args["grant_path"] = json!(gp);
+    }
+    let r = m.tool("hestia_scope_peer_decide", args)?;
+    println!("{}", serde_json::to_string_pretty(&r).context("encoding the ruling")?);
     Ok(())
 }
 

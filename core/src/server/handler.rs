@@ -94,6 +94,7 @@ impl ServerHandler for HestiaServer {
             "hestia_request_scope" => tool_request_scope(&self.state, &args).await,
             "hestia_scope_status" => tool_scope_status(&self.state, &args).await,
             "hestia_scope_claim" => tool_scope_claim(&self.state, &args).await,
+            "hestia_scope_peer_decide" => tool_scope_peer_decide(&self.state, &args).await,
             "hestia_gate_escalation_open" => tool_gate_escalation_open(&self.state, &args).await,
             "hestia_gate_escalation_poll" => tool_gate_escalation_poll(&self.state, &args).await,
             "hestia_escalation_evidence" => tool_escalation_evidence(&self.state, &args).await,
@@ -331,6 +332,10 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_scope_status",
             "What you may reach beyond your standing MRH right now, and every scope request you have filed with its ruling. Read-only and deliberately unwitnessed — reading your own permissions is not an act",
+        ),
+        t(
+            "hestia_scope_peer_decide",
+            "Rule ANOTHER member's gate-opened scope request as a NOT-SAME PEER (dp, 2026-10-05: scope escalations go to peers, the operator is the override). Pass your own live session_id, the request_id, decision = once | session | standing | refuse, a reason (the asker reads it), and for session/standing optionally grant_path (the asked path or a directory above it, never the root) with recursive=true. Refused by name when: you are the asker (in either direction — the asker can never decide its own request); the asker was never proven against a session (NOT-SAME cannot peer-clear an asserted name, eligibility clause 0); you are not a recognised reasoner; the request was filed by the member rather than opened by the gate. The record names you (granted_by peer:<you>), the channel (peer_not_same) and your NOT-SAME basis",
         ),
         t(
             "hestia_scope_claim",
@@ -13013,7 +13018,11 @@ mod tests {
                 l == "hestia_request_scope"
                     || l == "hestia_scope_status"
                     || l == "hestia_scope_arbitrate"
-                    || l == "hestia_scope_claim",
+                    || l == "hestia_scope_claim"
+                    // dp 2026-10-05: gate-opened scope requests go to NOT-SAME peers. Held by
+                    // the behavioural tests `scope_peer_decide_*` (self refused in both
+                    // directions, asserted asker refused, record names peer and basis).
+                    || l == "hestia_scope_peer_decide",
                 "MCP tool `{n}` reaches the scope surface. Member-callable doors are ASKING \
                  (hestia_request_scope), READING (hestia_scope_status), and ruling ANOTHER \
                  member's request under an operator delegation (hestia_scope_arbitrate). \
@@ -23194,7 +23203,7 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
     // `hestia_request_scope` takes it — and what an impostor can do with it is bounded: open an
     // ask in another member's name, or spend that member's one-time approval for that member's
     // own act string.
-    let plugin_id = match resolve_attributed_caller(&s, session_id_arg.as_deref()) {
+    let (plugin_id, asker_basis) = match resolve_attributed_caller(&s, session_id_arg.as_deref()) {
         Some(who) if who.plugin_id != asserted => {
             return Ok(hestia_error_envelope(
                 "hestia.scope_claim_asker_mismatch",
@@ -23203,8 +23212,8 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
                 Some(json!({ "asserted": asserted, "session_member": who.plugin_id })),
             ));
         }
-        Some(who) => who.plugin_id,
-        None => asserted,
+        Some(who) => (who.plugin_id, crate::arbiter::AskerBasis::Session),
+        None => (asserted, crate::arbiter::AskerBasis::Asserted),
     };
     if !path.starts_with('/') || path == "/" {
         return Ok(json!({
@@ -23353,10 +23362,24 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
         host_session_id: host_session_id.clone(),
         subtree,
         reissues: 0,
+        asker_basis,
+    };
+    // WHO DECIDES (dp, 2026-10-05: "scope escalations should go to peers not to me"): the
+    // NOT-SAME peers, invited exactly as gate escalations invite them. An asserted asker cannot
+    // be peer-cleared (eligibility clause 0), so nobody is invited and the record says the
+    // operator's override is the only route.
+    let invited = if asker_basis == crate::arbiter::AskerBasis::Session {
+        scope_peer_pool(&s, &plugin_id)
+    } else {
+        Vec::new()
     };
     let entry = s.append_chain(
         "scope_requested",
         json!({
+            "invited_peers": invited,
+            "asker_basis": asker_basis,
+            "decided_by_default": if invited.is_empty() { "operator (no admissible peer)" }
+                                  else { "a NOT-SAME peer (the operator may override)" },
             "request_id": id,
             "plugin_id": plugin_id,
             "subject_instance_lct": s.member_lct(&plugin_id),
@@ -23382,7 +23405,7 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
         ScopeRequest {
             id: id.clone(),
             plugin_id: plugin_id.clone(),
-            role,
+            role: role.clone(),
             path: path.clone(),
             reason,
             requested_at: now,
@@ -23393,9 +23416,25 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
             decision_reason: None,
             recursive: false,
             revoked: None,
-            ext: ScopeRequestExt { gate: Some(origin), ..Default::default() },
+            ext: ScopeRequestExt {
+                gate: Some(origin),
+                invited_peers: invited.clone(),
+                ..Default::default()
+            },
         },
     );
+    // DELIVER the invitations — a wake, not a vote: the peer reads the request and rules with
+    // `hestia_scope_peer_decide`. A failed queue does not void the invitation; it is recorded.
+    let pointer = format!("hestia://scope/{id}#peer-decide");
+    let mut invitations = Vec::new();
+    for peer in &invited {
+        match s.inbox_store.enqueue_member(peer, &plugin_id, &role, "review_request",
+                                           Some(pointer.as_str()), &entry.hash, None) {
+            Ok(qid) => invitations.push(json!({"peer": peer, "queued_id": qid})),
+            Err(e) => invitations.push(json!({"peer": peer, "queued_id": null,
+                                              "dispatch_error": e.to_string()})),
+        }
+    }
     Ok(json!({
         "verdict": "opened",
         "permits": false,
@@ -23405,13 +23444,161 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
         "request_key": key,
         "expires_at": expires_at,
         "witnessEntryHash": entry.hash,
+        "invited_peers": invited,
+        "invitations": invitations,
         "on_timeout": "REFUSED — no answer within the window is a refusal, not a retry",
-        "how_to_decide": "the operator rules it on the dashboard (Activity → Reach requested) or \
-                          the app's Decide page: this act once, for the session, or standing — \
-                          exact, or recursive at a directory they choose. A delegated seat may \
-                          rule it with `hestia scope arbitrate`.",
-        "detail": "refused; a scope request was opened for the operator",
+        "how_to_decide": scope_how_to_decide(&id, invited.is_empty()),
+        "detail": if invited.is_empty() {
+            "refused; a scope request was opened — no NOT-SAME peer can clear it (the asker is \
+             unproven or no admissible peer exists), so the operator decides"
+        } else {
+            "refused; a scope request was opened and NOT-SAME peers were invited to decide it"
+        },
     }))
+}
+
+/// The recipe a gate-opened scope request names. Peers first (dp, 2026-10-05); the operator is
+/// the override, not the default route.
+fn scope_how_to_decide(id: &str, no_peer: bool) -> String {
+    if no_peer {
+        return format!("the operator decides (dashboard Activity → Reach requested, or the app's \
+                        Decide page) — no NOT-SAME peer can clear {id}");
+    }
+    format!(
+        "a NOT-SAME peer decides: hestia scope decide {id} --as <peer-seat> \
+         --once|--session|--standing|--refuse [--grant-path <dir> --recursive] --reason '...' \
+         (or hestia_scope_peer_decide). The asker cannot decide its own request. The operator \
+         may override on the dashboard or the app."
+    )
+}
+
+/// The NOT-SAME peers invited to decide `asker`'s scope request: recorded members other than
+/// the asker (and its aliases), with a declared review door, that `arbiter::eligibility_for`
+/// admits in the GRANTING direction. Ordered as the registry orders them; capped at 3.
+fn scope_peer_pool(s: &super::state::ServerState, asker: &str) -> Vec<String> {
+    use crate::arbiter::{eligibility_for, AppealParties, AskerBasis, Disposition, Eligibility};
+    s.member_registry
+        .iter_sorted()
+        .into_iter()
+        .map(|(id, _)| id.clone())
+        .filter(|id| id != asker && !s.same_entity(asker, id))
+        .filter(|id| review_capability(s, id).is_ok())
+        .filter(|id| matches!(
+            eligibility_for(&AppealParties {
+                appellant: asker,
+                appellant_basis: AskerBasis::Session,
+                deny_adjudicator: None,
+                arbiter: id,
+            }, Disposition::ForAppellant),
+            Eligibility::Eligible { .. }
+        ))
+        .take(3)
+        .collect()
+}
+
+/// `hestia_scope_peer_decide` — a NOT-SAME PEER rules another member's GATE-OPENED scope request
+/// (dp, 2026-10-05: "scope escalations should go to peers not to me").
+///
+/// The same choices the operator has — this act once, for the session, or standing; exact, or
+/// recursive at a directory above the asked path (never the root) — through the SAME decision
+/// function (`http::scope_decide_as`), so the rules cannot drift. What a peer needs that the
+/// operator does not:
+///   * a live session (the arbiter is resolved, never asserted);
+///   * NOT-SAME by `arbiter::eligibility_for`: never the asker (in EITHER direction — dp: "the
+///     asker can never decide its own request"), never an asserted asker's request (clause 0),
+///     a recognised reasoner;
+///   * a reason, in both directions — the asker reads it.
+/// The record names the peer (`peer:<id>`), its channel (`peer_not_same`) and its basis.
+pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::arbiter::{eligibility_for, AppealParties, Disposition, Eligibility};
+    let request_id = require_string(args, "request_id")?;
+    let decision = require_string(args, "decision")?;
+    let reason = require_string(args, "reason")?;
+    if reason.trim().len() < 8 {
+        return Err(anyhow::anyhow!("reason is too thin — the asker reads it"));
+    }
+    let session_id_arg = optional_session_id(args);
+    let (arbiter, asker, basis) = {
+        let s = state.lock().await;
+        let Some(arb) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+            return Err(anyhow::anyhow!(
+                "deciding a scope request requires your own live session_id (from \
+                 hestia_connect): NOT-SAME compares you to the asker, and an asserted name \
+                 proves nothing"
+            ));
+        };
+        let Some(req) = s.scope_requests.get(&request_id) else {
+            return Ok(hestia_error_envelope("hestia.scope_request_unknown",
+                "no such scope request (memory-only: it may have expired or the daemon \
+                 restarted, #908 / #1233)", Some(json!({ "request_id": request_id }))));
+        };
+        let Some(gate) = req.ext.gate.as_ref() else {
+            return Ok(hestia_error_envelope("hestia.scope_peer_decide_member_filed",
+                "peers decide GATE-OPENED scope requests; a member-filed ask is the operator's \
+                 (or a delegated seat's `hestia scope arbitrate`)", None));
+        };
+        if arb.plugin_id == req.plugin_id || s.same_entity(&arb.plugin_id, &req.plugin_id) {
+            return Ok(hestia_error_envelope("hestia.scope_peer_decide_self",
+                "the asker can never decide its own scope request — in either direction",
+                Some(json!({ "asker": req.plugin_id }))));
+        }
+        let disposition = if decision == "refuse" { Disposition::AgainstAppellant }
+                          else { Disposition::ForAppellant };
+        let parties = AppealParties {
+            appellant: &req.plugin_id,
+            appellant_basis: gate.asker_basis,
+            deny_adjudicator: None,
+            arbiter: &arb.plugin_id,
+        };
+        let independence = match eligibility_for(&parties, disposition) {
+            Eligibility::Eligible { independence } => independence,
+            Eligibility::Refused { reason } => {
+                return Ok(hestia_error_envelope("hestia.scope_peer_decide_ineligible", &reason,
+                    Some(json!({ "asker": req.plugin_id, "arbiter": arb.plugin_id }))));
+            }
+            Eligibility::SelfWithdrawal { .. } => {
+                return Ok(hestia_error_envelope("hestia.scope_peer_decide_self",
+                    "the asker can never decide its own scope request", None));
+            }
+        };
+        let basis = json!({
+            "arbiter": arb.plugin_id,
+            "asker": req.plugin_id,
+            "asker_basis": gate.asker_basis,
+            "independence": independence,
+            "eligibility": "arbiter::eligibility_for (NOT-SAME)",
+        });
+        (arb.plugin_id, req.plugin_id.clone(), basis)
+    };
+    let mut body = json!({ "request_id": request_id, "reason": reason });
+    match decision.as_str() {
+        "refuse" => { body["granted"] = json!(false); }
+        "once" => { body["granted"] = json!(true); body["once"] = json!(true); }
+        "session" | "standing" => {
+            body["granted"] = json!(true);
+            body["standing"] = json!(decision == "standing");
+            body["recursive"] = json!(args.get("recursive").and_then(Value::as_bool).unwrap_or(false));
+            if let Some(gp) = optional_string(args, "grant_path") {
+                body["grant_path"] = json!(gp);
+            }
+        }
+        _ => return Err(anyhow::anyhow!("decision must be once, session, standing or refuse")),
+    }
+    let decider = super::http::ScopeDecider {
+        by: format!("peer:{arbiter}"),
+        via: "peer_not_same",
+        basis: Some(basis.clone()),
+    };
+    let (status, axum::Json(out)) = super::http::scope_decide_as(state.clone(), body, decider).await;
+    if !status.is_success() {
+        return Ok(hestia_error_envelope("hestia.scope_peer_decide_refused",
+            out.get("error").and_then(Value::as_str).unwrap_or("the decision was refused"),
+            Some(json!({ "status": status.as_u16(), "asker": asker }))));
+    }
+    let mut out = out;
+    out["decided_by"] = json!(format!("peer:{arbiter}"));
+    out["peer_basis"] = basis;
+    Ok(out)
 }
 
 /// How long a RESERVED one-time approval waits for the gate's commit or release before it lapses
@@ -24842,6 +25029,7 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
                     "rule": r.ext.gate.as_ref().map(|g| g.rule.clone()),
                     "act": r.ext.gate.as_ref().map(|g| g.act.clone()),
                     "reissues": r.ext.gate.as_ref().map(|g| g.reissues).unwrap_or(0),
+                    "invited_peers": r.ext.invited_peers,
                 })
             })
             .collect()
@@ -26077,7 +26265,7 @@ mod standing_scope_surface_tests {
         // Reachability, not spelling: every tool that can reach the standing store must be on
         // this list. A name-based check alone is vacuous against a tool named otherwise —
         // which is precisely how `hestia_scope_arbitrate` slipped past it on first writing.
-        const MAY_REACH_STANDING: &[&str] = &["hestia_scope_arbitrate"];
+        const MAY_REACH_STANDING: &[&str] = &["hestia_scope_arbitrate", "hestia_scope_peer_decide"];
         for n in &names {
             let l = n.to_ascii_lowercase();
             if MAY_REACH_STANDING.contains(&n.as_str()) {

@@ -180,6 +180,13 @@ export interface PendingScopeRequest {
   subtree?: boolean;
   /** "This act once" is a choice only when the gate recorded an act to bind. */
   once_available?: boolean;
+  /**
+   * dp, 2026-10-05: NOT-SAME peers invited to decide a gate-opened request. Non-empty = the
+   * request awaits a PEER and the operator's controls are an override; empty = no peer can
+   * clear it (an unproven asker, or no admissible peer) and it is the operator's.
+   */
+  invited_peers?: string[];
+  asker_basis?: "session" | "asserted" | null;
 }
 
 /**

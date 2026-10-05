@@ -2598,6 +2598,8 @@ async fn scope_list_requests(State(state): State<SharedState>) -> impl IntoRespo
                 "spent_at": r.ext.spent_at,
                 "grant_path": r.reach_path(),
                 "recursive": r.recursive,
+                "invited_peers": r.ext.invited_peers,
+                "peer_basis": r.ext.peer_basis,
             })
         })
         .collect();
@@ -2624,6 +2626,38 @@ async fn scope_decide(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    scope_decide_as(state, body, ScopeDecider::operator()).await
+}
+
+/// WHO rules a scope request, carried into every record the ruling writes.
+///
+/// dp, 2026-10-05: *"scope escalations should go to peers not to me."* A gate-opened scope
+/// request is decided by a NOT-SAME PEER (`hestia_scope_peer_decide`, eligibility by
+/// `arbiter::eligibility_for`); the operator keeps the override through this HTTP surface. Both
+/// land through ONE decision function so the duration / breadth / once rules cannot drift
+/// between them, and the record names the decider, its channel and — for a peer — its NOT-SAME
+/// basis.
+#[derive(Debug, Clone)]
+pub(crate) struct ScopeDecider {
+    /// `operator`, or `peer:<member>`.
+    pub by: String,
+    /// `operator_session` | `peer_not_same`.
+    pub via: &'static str,
+    /// For a peer: `{"arbiter", "asker", "asker_basis", "independence"}`.
+    pub basis: Option<serde_json::Value>,
+}
+
+impl ScopeDecider {
+    pub(crate) fn operator() -> Self {
+        Self { by: "operator".into(), via: "operator_session", basis: None }
+    }
+}
+
+pub(crate) async fn scope_decide_as(
+    state: SharedState,
+    body: serde_json::Value,
+    decider: ScopeDecider,
+) -> (StatusCode, Json<serde_json::Value>) {
     use crate::server::state::SCOPE_REQUEST_TTL_SECS;
     let request_id = body
         .get("request_id")
@@ -2841,8 +2875,9 @@ async fn scope_decide(
             // the whole evidentiary value of the record.
             "requested_because": ask,
             "decision_reason": reason,
-            "granted_by": "operator",
-            "via": "operator_session",
+            "granted_by": decider.by,
+            "via": decider.via,
+            "peer_basis": decider.basis,
             "expires_at": expires_at,
             // The promotion is part of the record, not a separate act: the standing grant's
             // expiry and the generation it will mint travel with the ruling that made it.
@@ -2919,10 +2954,11 @@ async fn scope_decide(
         let standing_prior = s.standing_scope.clone();
         let grant = crate::server::standing_scope::StandingGrant {
             member: plugin_id.clone(),
-            // The breadth the operator chose (the asked path or a directory above it).
+            // The breadth the decider chose (the asked path or a directory above it).
             path: reach_path.clone(),
             granted_at: now,
-            granted_by: "operator".to_string(),
+            // `operator`, or `peer:<member>` — the record names who ruled.
+            granted_by: decider.by.clone(),
             reason: reason.clone(),
             expires_at: standing_expires_at,
             request_id: Some(request_id.clone()),
@@ -2957,8 +2993,9 @@ async fn scope_decide(
                 "asked_path": path,
                 "recursive": recursive,
                 "decision_reason": reason,
-                "granted_by": "operator",
-                "via": "operator_session",
+                "granted_by": decider.by,
+                "via": decider.via,
+                "peer_basis": decider.basis,
                 "origin": if gate_origin.is_some() { "gate_deny" } else { "member_request" },
                 "standing": true,
                 "standing_expires_at": standing_expires_at,
@@ -3011,7 +3048,8 @@ async fn scope_decide(
 
     if let Some(req) = s.scope_requests.get_mut(&request_id) {
         req.granted = Some(granted);
-        req.decided_by = Some("operator".to_string());
+        req.decided_by = Some(decider.by.clone());
+        req.ext.peer_basis = decider.basis.clone();
         req.decided_at = Some(now);
         req.decision_reason = if reason.is_empty() {
             None
@@ -10780,6 +10818,135 @@ mod disposition_tests {
         assert!(s.scope_requests[&id].ext.spent_at.is_none());
         assert!(!serde_json::to_string(&s.scope_requests[&id]).unwrap().contains("content: one"),
                 "the complete act is never stored in clear");
+    }
+
+    // ---- dp, 2026-10-05: "scope escalations should go to peers not to me" ----
+
+    async fn connect(state: &SharedState, member: &str) -> String {
+        crate::server::handler::tool_connect(state, &serde_json::json!({
+            "plugin_id": member, "host_agent": member,
+        })).await.unwrap()["sessionId"].as_str().unwrap().to_string()
+    }
+
+    /// Open a gate request as a PROVEN asker (session) and return (id, invited peers, response).
+    async fn proven_claim(state: &SharedState, member: &str, sid: &str, path: &str)
+        -> (String, Vec<String>, serde_json::Value) {
+        let r = crate::server::handler::tool_scope_claim(state, &serde_json::json!({
+            "plugin_id": member, "session_id": sid, "path": path, "rule": "mrh.command",
+            "tool_name": "Bash", "act": format!("cat {path}"), "act_digest": digest_of(&format!("cat {path}")),
+            "spend": false,
+        })).await.unwrap();
+        let invited = r["invited_peers"].as_array().cloned().unwrap_or_default().iter()
+            .map(|v| v.as_str().unwrap().to_string()).collect();
+        (r["request_id"].as_str().unwrap().to_string(), invited, r)
+    }
+
+    async fn peer(state: &SharedState, sid: &str, body: serde_json::Value) -> serde_json::Value {
+        let mut b = body;
+        b["session_id"] = serde_json::json!(sid);
+        crate::server::handler::tool_scope_peer_decide(state, &b).await.unwrap()
+    }
+
+    /// A gate-opened request from a PROVEN asker invites NOT-SAME peers over the mesh, never the
+    /// asker; the asker cannot decide its own request in either direction.
+    #[tokio::test]
+    async fn scope_peer_decide_invites_peers_and_refuses_the_asker() {
+        let (_dir, state) = test_state().await;
+        let asker = connect(&state, "codex").await;
+        let _k = connect(&state, "kimi-code").await;
+        let _c = connect(&state, "claude-code").await;
+        let (id, invited, r) = proven_claim(&state, "codex", &asker, "/srv/peer/a.txt").await;
+        assert!(invited.contains(&"kimi-code".to_string()) && invited.contains(&"claude-code".to_string()),
+                "{r}");
+        assert!(!invited.contains(&"codex".to_string()), "never the asker: {invited:?}");
+        assert_eq!(r["invitations"].as_array().unwrap().len(), invited.len(), "{r}");
+        assert!(r["invitations"].as_array().unwrap().iter().all(|i| !i["queued_id"].is_null()),
+                "each invitation is queued on the mesh: {r}");
+        assert!(r["how_to_decide"].as_str().unwrap().contains("NOT-SAME peer"), "{r}");
+        for d in ["once", "refuse", "standing"] {
+            let own = peer(&state, &asker, serde_json::json!({
+                "request_id": &id, "decision": d, "reason": "my own request"})).await;
+            assert_eq!(own["_hestia_error"]["code"], "hestia.scope_peer_decide_self", "{d}: {own}");
+        }
+        assert_eq!(state.lock().await.scope_requests[&id].granted, None, "nothing decided");
+    }
+
+    /// A peer decides ONCE, SESSION and STANDING (at a chosen recursive directory); the record
+    /// names the peer and its NOT-SAME basis, on the request and on the standing grant.
+    #[tokio::test]
+    async fn scope_peer_decide_once_session_standing_records_peer_and_basis() {
+        let (_dir, state) = test_state().await;
+        let asker = connect(&state, "codex").await;
+        let kimi = connect(&state, "kimi-code").await;
+        let (once_id, _, _) = proven_claim(&state, "codex", &asker, "/srv/peer/once.txt").await;
+        let o = peer(&state, &kimi, serde_json::json!({
+            "request_id": &once_id, "decision": "once", "reason": "one read, reviewed"})).await;
+        assert_eq!(o["decided_by"], "peer:kimi-code", "{o}");
+        assert_eq!(o["peer_basis"]["independence"], "cross_vendor");
+        {
+            let s = state.lock().await;
+            let r = &s.scope_requests[&once_id];
+            assert!(r.ext.once && r.decided_by.as_deref() == Some("peer:kimi-code"));
+            assert_eq!(r.ext.peer_basis.as_ref().unwrap()["asker_basis"], "session");
+        }
+        let (sess_id, _, _) = proven_claim(&state, "codex", &asker, "/srv/peer/sess.txt").await;
+        let ss = peer(&state, &kimi, serde_json::json!({
+            "request_id": &sess_id, "decision": "session", "reason": "for this session"})).await;
+        assert_eq!(ss["granted"], true, "{ss}");
+        assert!(state.lock().await.has_scope_grant("codex", "/srv/peer/sess.txt"));
+        let (st_id, _, _) = proven_claim(&state, "codex", &asker, "/srv/peer/tree/x.log").await;
+        let st = peer(&state, &kimi, serde_json::json!({
+            "request_id": &st_id, "decision": "standing", "grant_path": "/srv/peer/tree",
+            "recursive": true, "reason": "the whole log tree"})).await;
+        assert_eq!(st["standing"], true, "{st}");
+        let s = state.lock().await;
+        let g = s.standing_scope.grants.iter().find(|g| g.member == "codex").expect("standing");
+        assert_eq!(g.path, "/srv/peer/tree");
+        assert!(g.recursive);
+        assert_eq!(g.granted_by, "peer:kimi-code", "the standing grant names the peer");
+        let granted = s.recent_chain(40).into_iter()
+            .find(|e| e.event_type == "scope_granted" && e.event_data["standing"] == true).unwrap();
+        assert_eq!(granted.event_data["via"], "peer_not_same");
+        assert_eq!(granted.event_data["peer_basis"]["arbiter"], "kimi-code");
+        // A breadth past the root is refused for a peer exactly as for the operator.
+        drop(s);
+        let (r_id, _, _) = proven_claim(&state, "codex", &asker, "/srv/peer/root.txt").await;
+        let bad = peer(&state, &kimi, serde_json::json!({
+            "request_id": &r_id, "decision": "standing", "grant_path": "/", "recursive": true,
+            "reason": "everything please"})).await;
+        assert_eq!(bad["_hestia_error"]["code"], "hestia.scope_peer_decide_refused", "{bad}");
+    }
+
+    /// An ASSERTED asker (no session) invites nobody and cannot be peer-cleared (clause 0); the
+    /// operator can still decide it — and can override and revoke a peer's grant.
+    #[tokio::test]
+    async fn scope_peer_decide_refuses_an_asserted_asker_and_the_operator_still_overrides() {
+        let (_dir, state) = test_state().await;
+        let kimi = connect(&state, "kimi-code").await;
+        let r = claim(&state, "codex", "/srv/asserted/a.txt", "cat /srv/asserted/a.txt", false).await;
+        let id = r["request_id"].as_str().unwrap().to_string();
+        assert_eq!(r["invited_peers"], serde_json::json!([]), "no peer can clear it: {r}");
+        assert!(r["how_to_decide"].as_str().unwrap().contains("the operator decides"), "{r}");
+        let p = peer(&state, &kimi, serde_json::json!({
+            "request_id": &id, "decision": "session", "reason": "looks fine to me"})).await;
+        assert_eq!(p["_hestia_error"]["code"], "hestia.scope_peer_decide_ineligible", "{p}");
+        // The operator decides it (override).
+        let (st, _) = decide(&state, serde_json::json!({
+            "request_id": &id, "granted": true, "reason": "operator override"})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(state.lock().await.scope_requests[&id].decided_by.as_deref(), Some("operator"));
+        // A peer-decided request the operator then overrides by REVOKING the live grant.
+        let asker = connect(&state, "codex").await;
+        let (pid, _, _) = proven_claim(&state, "codex", &asker, "/srv/asserted/b.txt").await;
+        let ok = peer(&state, &kimi, serde_json::json!({
+            "request_id": &pid, "decision": "session", "reason": "for this session"})).await;
+        assert_eq!(ok["granted"], true, "{ok}");
+        let resp = scope_live_revoke(State(state.clone()), None, Json(serde_json::json!({
+            "request_id": &pid, "reason": "operator revokes"})))
+            .await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!state.lock().await.has_scope_grant("codex", "/srv/asserted/b.txt"),
+                "the operator's revoke ends the peer's grant");
     }
 
     /// Codex reviews of #1232, P2: RESERVE is all-or-none through the real handler's batch

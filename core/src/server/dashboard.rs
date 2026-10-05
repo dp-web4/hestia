@@ -1526,6 +1526,15 @@ impl ServerState {
                             "reissues": r.ext.gate.as_ref().map(|g| g.reissues).unwrap_or(0),
                             "subtree": r.ext.gate.as_ref().is_some_and(|g| g.subtree),
                             "once_available": r.ext.gate.is_some(),
+                            // dp, 2026-10-05: NOT-SAME peers decide gate-opened requests; the
+                            // operator surfaces show who was invited and offer the OVERRIDE.
+                            "invited_peers": r.ext.invited_peers,
+                            "asker_basis": r.ext.gate.as_ref().map(|g| g.asker_basis),
+                            "decided_by_default": if r.ext.gate.is_some() && !r.ext.invited_peers.is_empty() {
+                                "peer"
+                            } else {
+                                "operator"
+                            },
                         })
                     })
                     .collect();
@@ -1559,6 +1568,8 @@ impl ServerState {
                             "granted_by": r.decided_by,
                             "request_id": r.id,
                             "origin": if r.ext.gate.is_some() { "gate_deny" } else { "member_request" },
+                            // A PEER's ruling shows who and on what NOT-SAME basis (read-only).
+                            "peer_basis": r.ext.peer_basis,
                             "expires_at": r.expires_at,
                             "secs_remaining": r.expires_at.saturating_sub(now),
                             "recursive": r.recursive,
@@ -1594,6 +1605,11 @@ impl ServerState {
                             "granted_by": g.granted_by,
                             "request_id": g.request_id,
                             "recursive": g.recursive,
+                            // A peer's standing grant shows its NOT-SAME basis while the request
+                            // it answered is still in memory (the chain row keeps it for good).
+                            "peer_basis": g.request_id.as_ref()
+                                .and_then(|id| self.scope_requests.get(id))
+                                .and_then(|r| r.ext.peer_basis.clone()),
                             // The distinction the route table argues for: a grant that
                             // ratified a member's ask carries that ask's id; one the operator
                             // originated carries none. Derived, never stored twice.

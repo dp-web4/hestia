@@ -826,6 +826,40 @@ enum ScopeCmd {
         #[arg(long, default_value = "http://127.0.0.1:7711")]
         endpoint: String,
     },
+    /// Decide ANOTHER member's gate-opened scope request as a NOT-SAME PEER (dp, 2026-10-05:
+    /// scope escalations go to peers; the operator is the override). The asker can never decide
+    /// its own request, and an asserted (unproven) asker's request is the operator's.
+    Decide {
+        /// The pending request id (from the deny text, the mesh invitation, or `scope pending`)
+        request_id: String,
+        /// Approve THIS refused act once (claim window)
+        #[arg(long, group = "decision")]
+        once: bool,
+        /// Grant for the session (memory-only, expires)
+        #[arg(long, group = "decision")]
+        session: bool,
+        /// Grant standing (vault; survives restart until revoked)
+        #[arg(long, group = "decision")]
+        standing: bool,
+        /// Refuse it
+        #[arg(long, group = "decision")]
+        refuse: bool,
+        /// Grant at a directory ABOVE the asked path (needs --recursive; never the root)
+        #[arg(long)]
+        grant_path: Option<String>,
+        /// Include everything below the granted path
+        #[arg(long)]
+        recursive: bool,
+        /// Why — the asker reads it. Required in both directions.
+        #[arg(long)]
+        reason: String,
+        /// Which seat is deciding (its member id). Must not be the asker.
+        #[arg(long = "as")]
+        as_member: String,
+        /// Daemon MCP endpoint
+        #[arg(long, default_value = "http://127.0.0.1:7711")]
+        endpoint: String,
+    },
     /// Rule a pending scope request under an operator delegation (#952). Signs the ruling
     /// with this seat's member key from the vault and calls `hestia_scope_arbitrate`.
     Arbitrate {
@@ -969,6 +1003,18 @@ pub fn run() -> AnyResult<()> {
                 anyhow::bail!("say exactly one of --grant or --deny — an omitted verdict is not a verdict");
             }
             cmd_scope_arbitrate(&home, &endpoint, &request_id, grant, reason, &as_member, &target)
+        }
+        Command::Scope(ScopeCmd::Decide { request_id, once, session, standing, refuse, grant_path,
+                                          recursive, reason, as_member, endpoint }) => {
+            let decision = match (once, session, standing, refuse) {
+                (true, false, false, false) => "once",
+                (false, true, false, false) => "session",
+                (false, false, true, false) => "standing",
+                (false, false, false, true) => "refuse",
+                _ => anyhow::bail!("say exactly one of --once, --session, --standing or --refuse"),
+            };
+            hestia::gate_cli::scope_peer_decide(&endpoint, &as_member, &request_id, decision,
+                                                grant_path, recursive, &reason)
         }
         Command::Scope(ScopeCmd::Pending { json, as_member, endpoint }) => {
             hestia::gate_cli::scope_pending(&endpoint, as_member, "role:constellation:member", json)

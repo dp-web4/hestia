@@ -7,6 +7,16 @@ import type { PendingScopeRequest } from "./types";
 
 export type ScopeDuration = "once" | "session" | "standing";
 
+/**
+ * dp, 2026-10-05: "scope escalations should go to peers not to me". A gate-opened request with
+ * invited peers awaits a NOT-SAME peer; only a request no peer can clear awaits the operator.
+ */
+export function scopeAwaitsOperator(
+  req: Pick<PendingScopeRequest, "origin" | "invited_peers">,
+): boolean {
+  return !(req.origin === "gate_deny" && (req.invited_peers?.length ?? 0) > 0);
+}
+
 /** "This act once" is a choice only when the gate recorded an act to bind. */
 export function scopeDurations(req: Pick<PendingScopeRequest, "once_available">): ScopeDuration[] {
   return req.once_available === true ? ["once", "session", "standing"] : ["session", "standing"];

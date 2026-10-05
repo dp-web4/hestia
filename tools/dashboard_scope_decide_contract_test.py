@@ -37,7 +37,7 @@ def block() -> str:
 
 
 def helpers() -> str:
-    a = UI.index("function scopeDurationOptions(")
+    a = UI.index("function scopeAwaitsOperator(")
     b = UI.index("function scopeDecideBody(", a)
     c = UI.index("\n  }\n", b) + 4
     return UI[a:c]
@@ -68,9 +68,20 @@ def main() -> int:
     check("one decide call carries duration and breadth",
           g.count("apiFetch('/api/scope/decide'") == 1 and "scopeDecideBody(r, granted" in g)
     check("a grant still needs a note; refusing does not", "grantBtn.disabled = !note.value.trim()" in g)
+    # dp, 2026-10-05: "scope escalations should go to peers not to me".
+    check("the banner counts only what no peer can clear",
+          "pend.filter(r => scopeAwaitsOperator(r))" in g and "no peer can clear" in g)
+    check("a peer-routed row says who was invited and labels the controls as override",
+          "scopeRouteText(r)" in g and "'override: grant'" in g and "'override: refuse'" in g)
+    check("a peer's ruling shows the peer and its NOT-SAME basis on the reach row",
+          "g.granted_by.startsWith('peer:')" in UI and "pb.independence" in UI)
 
-    js = helpers() + r"""
+    js = "function escapeHtml(s){return String(s);}\n" + helpers() + r"""
 const out = {};
+out.awaitPeer = scopeAwaitsOperator({origin: 'gate_deny', invited_peers: ['kimi-code']});
+out.awaitOpNoPeer = scopeAwaitsOperator({origin: 'gate_deny', invited_peers: []});
+out.awaitOpMember = scopeAwaitsOperator({origin: 'member_request'});
+out.route = scopeRouteText({origin: 'gate_deny', invited_peers: ['kimi-code', 'codex']});
 out.durGate = scopeDurationOptions({once_available: true}).map(x => x[0]);
 out.durMember = scopeDurationOptions({once_available: false}).map(x => x[0]);
 out.breadth = scopeBreadthOptions('/home/u/.local/state/mesh/x.log', false);
@@ -85,6 +96,10 @@ process.stdout.write(JSON.stringify(out));
 """
     o = run_node(js)
     if o is not None:
+        check("a gate request with invited peers awaits a PEER, not the operator",
+              o["awaitPeer"] is False and o["awaitOpNoPeer"] is True and o["awaitOpMember"] is True, o)
+        check("the route text names the invited peers and the override",
+              "kimi-code, codex" in o["route"] and "OVERRIDE" in o["route"], o["route"])
         check("once is offered only when the gate recorded an act",
               o["durGate"] == ["once", "session", "standing"] and o["durMember"] == ["session", "standing"], o)
         paths = [(b["grant_path"], b["recursive"]) for b in o["breadth"]]
