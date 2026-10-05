@@ -713,18 +713,24 @@ def test_shims_contain_no_policy():
 
     Reports what it checked. With no shims present it says so rather than passing silently —
     a green meaning 'nothing was inspected' is indistinguishable from 'inspected and clean',
-    which is the null-state twin this thread keeps meeting."""
+    which is the null-state twin this thread keeps meeting.
+
+    One-gate stage C: the population is the REAL shims — the four seats' hook modules and the
+    template they are certified against — not a `shim_*.py` glob inside `_shared/`, which never
+    matched a shim (see the next test) and, once `shim_structure_test.py` landed, matched a test
+    whose job is to spell the banned tokens. A missing shim is reported, never skipped."""
     here = os.path.dirname(os.path.abspath(__file__))
-    shims = sorted(f for f in os.listdir(here)
-                   if f.startswith("shim_") and f.endswith(".py"))
-    if not shims:
-        print("  note  shims_contain_no_policy: 0 shims present — NOTHING CHECKED "
-              "(live the moment a shim_*.py lands)")
-        return
+    plugins = os.path.dirname(here)
+    shims = [os.path.join(plugins, *rel) for rel in (
+        ("claude-code", "hooks", "pre_" + "tool_use.py"), ("codex", "hooks", "pre_" + "tool_use.py"),
+        ("kimi", "hooks", "pre_" + "tool_use.py"), ("gemini", "hooks", "before_tool.py"),
+        ("_template", "shim_template.py"))]
+    missing = [s for s in shims if not os.path.isfile(s)]
+    check("shims_present", not missing, f"shim(s) to inspect are missing: {missing}")
     banned = ("in_scope", "FORBIDDEN", "REMEDIES", "Remedy(", "_deny(", "remedy=")
     bad = []
-    for f in shims:
-        code = _strip_prose(open(os.path.join(here, f), encoding="utf-8").read())
+    for f in (s for s in shims if s not in missing):
+        code = _strip_prose(open(f, encoding="utf-8").read())
         hits = [b for b in banned if b in code]
         if hits:
             bad.append((f, hits))
