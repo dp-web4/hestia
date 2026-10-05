@@ -423,6 +423,44 @@ fn plan_action(
     }
 }
 
+fn verify_neighbor_certificate_live(
+    neighbor: &crate::receiver_routing::RouterNeighbor,
+    interface: &RouterIngressBinding,
+    live_peer_key: &web4_core::crypto::PublicKey,
+) -> Result<String> {
+    let cert = neighbor.peer_certificate.as_ref().ok_or_else(|| anyhow::anyhow!(
+        "neighbor {} has no router-interface certificate",
+        neighbor.next_hop_lct
+    ))?;
+    cert.verify()
+        .context("verifying neighbor router-interface certificate")?;
+    anyhow::ensure!(
+        cert.payload.router_lct == neighbor.next_hop_lct,
+        "neighbor certificate router {} differs from configured {}",
+        cert.payload.router_lct,
+        neighbor.next_hop_lct
+    );
+    anyhow::ensure!(
+        cert.payload.hub_member_lct == neighbor.next_hop_hub_member_lct,
+        "neighbor certificate Hub member {} differs from configured {}",
+        cert.payload.hub_member_lct,
+        neighbor.next_hop_hub_member_lct
+    );
+    anyhow::ensure!(
+        cert.payload.hub_lct_id == interface.hub_lct_id,
+        "neighbor certificate Hub {} differs from egress interface Hub {}",
+        cert.payload.hub_lct_id,
+        interface.hub_lct_id
+    );
+    anyhow::ensure!(
+        live_peer_key.to_hex() == cert.payload.hub_member_pubkey_hex,
+        "neighbor {} certificate key no longer matches live Hub pin for {}",
+        neighbor.next_hop_lct,
+        neighbor.next_hop_hub_member_lct
+    );
+    cert.fingerprint()
+}
+
 async fn execute_action(
     action: &PersistedAction,
     packet: &RoutePacketV1,
@@ -577,6 +615,19 @@ async fn execute_action(
             );
             let conn = ingress_connection(interface);
             let (channel, keypair, rest) = open_verified_channel(client, vault, &conn).await?;
+            let live_peer_key = client
+                .resolve_member_pubkey(
+                    &rest,
+                    interface.hub_lct_id,
+                    neighbor.next_hop_hub_member_lct,
+                )
+                .await
+                .with_context(|| format!(
+                    "re-resolving live Hub pin for next-hop router {} ({})",
+                    next_hop_lct, neighbor.next_hop_hub_member_lct
+                ))?;
+            let neighbor_certificate_fingerprint =
+                verify_neighbor_certificate_live(neighbor, interface, &live_peer_key)?;
             let out = client
                 .channel_query(
                     &rest,
@@ -618,6 +669,7 @@ async fn execute_action(
                 "next_hop_lct": next_hop_lct,
                 "via": via,
                 "link_id": link_id,
+                "neighbor_certificate_fingerprint": neighbor_certificate_fingerprint,
                 "operation_id": operation_id,
                 "downstream_notice_id": notice_id,
                 "downstream_entry_index": entry_index,
