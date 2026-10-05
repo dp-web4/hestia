@@ -3426,6 +3426,18 @@ fn write_new_router_channel_key(
         .with_context(|| format!("writing dedicated router key {}", path.display()))?;
     file.sync_all()
         .with_context(|| format!("syncing dedicated router key {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        // The vault record written next makes this pathname authoritative.
+        // fsync the directory entry before that record can commit, otherwise a
+        // power loss can leave "membership persisted, key filename vanished"
+        // even though the key file's own bytes were synced.
+        let dir_handle = std::fs::File::open(&dir)
+            .with_context(|| format!("opening router membership directory {}", dir.display()))?;
+        dir_handle
+            .sync_all()
+            .with_context(|| format!("syncing router membership directory {}", dir.display()))?;
+    }
 
     Ok(path.to_string_lossy().into_owned())
 }
