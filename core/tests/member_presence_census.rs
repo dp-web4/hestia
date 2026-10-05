@@ -823,6 +823,71 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("cli.rs::cmd_lct_publish", &[
         "let members = hestia::member_registry::load_members(&vault);",
     ]),
+    // F3 ROUTING PRESENCE READING, 2026-10-04 (GPT seat, D3 recovery pass).
+    // These consumers landed across #1211-#1221 without being added to this census;
+    // the census is correctly red now. Each site was re-read rather than copied from
+    // the observed set:
+    //
+    // * receiver-bind and receiver-send are SAFETY gates. They require the named
+    //   identity to resolve as an exact child of this router before an interface is
+    //   bound or a packet is originated. Missing/non-child => refusal, no mutation/send.
+    // * receiver-shadow is OBSERVATION ONLY. Presence determines whether the shadow can
+    //   produce comparable evidence; it never changes the legacy-authoritative delivery.
+    // * receiver-unbind uses presence only to canonicalize an operator spelling; removal
+    //   still requires an exact existing binding and zero in-flight custody. A miss does
+    //   not authorize removal.
+    // * fleet_receiver::drain_once is a SAFETY delivery confinement: only an identity
+    //   that still resolves as this router's child is polled/delivered; stale/non-local
+    //   bindings are refused rather than reinterpreted.
+    // * router_forwarder::drain_router_once is SAFETY-bearing route classification:
+    //   presence distinguishes exact local delivery from forwarding/unreachable, and
+    //   configured-neighbor ingress is checked independently.
+    // * originate_once_constrained is a SAFETY origin gate: the origin must be the
+    //   canonical LCT of a directly-connected child or no packet is minted.
+    // * member_notify_f3_plan is a SAFETY identity/authority gate: F3 delivery requires
+    //   a canonical sender with exactly one parent/router. Absence/ambiguity refuses the
+    //   F3 plan; a legacy spelling remains legacy unless explicitly cut over.
+    // * tool_member_notify has two OBSERVATION-ONLY D2 registry reads (shadow identity
+    //   and shadow route evaluation), plus one SAFETY read from a fresh vault for the
+    //   direct_required check. The latter refuses a network hop before origination;
+    //   failure to read/decide is loud and no F3 packet is sent.
+    ("cli.rs::cmd_receiver_bind", &[
+        "let registry = hestia::member_registry::load_members(&vault);",
+    ]),
+    ("cli.rs::cmd_receiver_send", &[
+        "let registry = hestia::member_registry::load_members(&vault);",
+    ]),
+    ("cli.rs::cmd_receiver_shadow", &[
+        "let registry = hestia::member_registry::load_members(&vault);",
+    ]),
+    ("cli.rs::cmd_receiver_unbind", &[
+        "let registry = hestia::member_registry::load_members(&vault);",
+    ]),
+    // SAFETY CUTOVER GATE (D3): re-run the exact F3 route against CURRENT
+    // membership/parentage before legacy -> F3 authority can change. Missing
+    // alias, unavailable/local/unreachable route, missing neighbor, stale parity,
+    // or measured/current next-hop disagreement => HOLD. Rollback remains a
+    // separate immediate path and does not consult this reader.
+    ("cli.rs::receiver_cutover_preflight", &[
+        "let registry = hestia::member_registry::load_members(vault);",
+    ]),
+    ("fleet_receiver.rs::drain_once", &[
+        "let registry = load_members(vault);",
+    ]),
+    ("router_forwarder.rs::drain_router_once", &[
+        "let registry = load_members(vault);",
+    ]),
+    ("router_forwarder.rs::originate_once_constrained", &[
+        "let registry = load_members(vault);",
+    ]),
+    ("server/handler.rs::member_notify_f3_plan", &[
+        ".member_registry",
+    ]),
+    ("server/handler.rs::tool_member_notify", &[
+        "&s.member_registry,",
+        "let registry = crate::member_registry::load_members(&vault);",
+        "let resolved_origin = s.member_registry.resolve_reference(&sender.plugin_id);",
+    ]),
     // READING for `cmd_scope_arbitrate`: presence, used to PREFLIGHT the signer against the
     // key the daemon will verify with. The command holds a vault key and is about to sign a
     // ruling; this read answers "would the daemon accept this signature for `--as <seat>`?"

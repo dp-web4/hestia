@@ -172,7 +172,10 @@ PY
 )
 case " $IDS " in
   *" {SUBJECT} "*) exit {rc} ;;
-  *) exit 0 ;;
+  # The sentinel lingers after its id is logged, so the window between "id in the log"
+  # and "watcher deleted the delivered primer" is a full second on every run, not a
+  # scheduling accident: the settle wait in run_case must cover it deterministically.
+  *) sleep 1; exit 0 ;;
 esac
 ''')
     os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
@@ -220,6 +223,29 @@ def run_case(tmp, ep, label, rc, kind="review_done"):
     while time.time() < deadline and SENTINEL not in fired_ids(log):
         if p.poll() is not None:
             break
+        time.sleep(0.2)
+    # ...and then let the sentinel's fire CYCLE finish before the kill. The sentinel id
+    # lands in the fire log while its fire script is still running; the watcher deletes
+    # the delivered primer only after the script returns. Killing on the id's first
+    # appearance raced that `rm` and left the sentinel's primer behind, failing 1c
+    # (measured 1 in 10 runs at load ~10). Bounded, like every wait here.
+    primers_dir = os.path.join(state, "primers", PLUGIN)
+
+    def sentinel_primer_left():
+        for f in os.listdir(primers_dir):
+            if not f.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(primers_dir, f)) as fh:
+                    if any(n.get("id") == SENTINEL for n in json.load(fh).get("notices", [])):
+                        return True
+            except (OSError, ValueError):
+                return True                   # mid-write: not settled yet
+        return False
+
+    settle = time.time() + 30
+    while (SENTINEL in fired_ids(log) and p.poll() is None
+           and time.time() < settle and sentinel_primer_left()):
         time.sleep(0.2)
     p.kill()
     out, _ = p.communicate()
