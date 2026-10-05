@@ -502,12 +502,21 @@ impl ReceiverRoutingTable {
                  refuse in-place replacement",
                 neighbor.next_hop_lct
             );
-            anyhow::ensure!(
-                existing.peer_certificate.is_none(),
-                "neighbor {} is already certificate-backed; remove/rotate it through a \
-                 custody-aware operation rather than overwriting evidence",
-                neighbor.next_hop_lct
-            );
+            if let (Some(old_cert), Some(new_cert)) = (
+                existing.peer_certificate.as_ref(),
+                neighbor.peer_certificate.as_ref(),
+            ) {
+                anyhow::ensure!(
+                    new_cert.payload.issued_at >= old_cert.payload.issued_at,
+                    "neighbor {} certificate renewal would move issued_at backwards ({} -> {})",
+                    neighbor.next_hop_lct,
+                    old_cert.payload.issued_at,
+                    new_cert.payload.issued_at
+                );
+            }
+            // Same-topology certificate attachment/renewal is custody-safe:
+            // persisted packet decisions pin link_id + Hub member UUID, neither
+            // of which changes. Keep link_id stable and ratchet only the proof.
             existing.peer_certificate = neighbor.peer_certificate;
             existing.reason = neighbor.reason;
             existing.set_by = neighbor.set_by;
