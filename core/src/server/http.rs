@@ -10716,12 +10716,96 @@ mod disposition_tests {
 
     // ---- scope refusal → escalation with a standing option (dp, 2026-10-05) ----
 
+    /// The gate's complete-act digest, modelled in tests as sha256 of the act text (the real
+    /// gate hashes the canonical complete tool input + cwd + session; the daemon only compares).
+    fn digest_of(act: &str) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(format!("complete-act\u{1f}{act}").as_bytes()))
+    }
+
     async fn claim(state: &SharedState, member: &str, path: &str, act: &str, spend: bool)
         -> serde_json::Value {
         crate::server::handler::tool_scope_claim(state, &serde_json::json!({
             "plugin_id": member, "path": path, "rule": "mrh.command", "tool_name": "Bash",
-            "act": act, "spend": spend, "host_session_id": "sess-under-test",
+            "act": act, "act_digest": digest_of(act), "spend": spend,
+            "host_session_id": "sess-under-test",
         })).await.expect("claim answers")
+    }
+
+    async fn spend_all(state: &SharedState, member: &str, paths: &[&str], act: &str)
+        -> serde_json::Value {
+        crate::server::handler::tool_scope_claim(state, &serde_json::json!({
+            "plugin_id": member, "paths": paths, "spend": true, "act_digest": digest_of(act),
+        })).await.expect("batch answers")
+    }
+
+    /// Codex review of #1232, P1-1: the binding is a digest of the COMPLETE act, required, and
+    /// two acts that share a display summary but differ in content do not share an approval.
+    #[tokio::test]
+    async fn scope_claim_requires_a_complete_act_digest_and_binds_to_it() {
+        let (_dir, state) = test_state().await;
+        let r = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+            "plugin_id": "codex", "path": "/etc/review-probe", "rule": "mrh.command",
+            "tool_name": "Write", "act": "Write -> /etc/review-probe"})).await.unwrap();
+        assert_eq!(r["_hestia_error"]["code"], "hestia.scope_claim_act_digest_required", "{r}");
+        assert!(state.lock().await.scope_requests.is_empty(), "nothing opened without a digest");
+        // Same display summary, different complete act (Write contents): distinct digests.
+        let summary = "Write -> /etc/review-probe";
+        let id = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+            "plugin_id": "codex", "path": "/etc/review-probe", "rule": "mrh.path",
+            "tool_name": "Write", "act": summary, "act_digest": digest_of("content: one"),
+            "spend": false})).await.unwrap()["request_id"].as_str().unwrap().to_string();
+        assert_eq!(decide(&state, serde_json::json!({
+            "request_id": &id, "granted": true, "reason": "one write", "once": true})).await.0,
+            StatusCode::OK);
+        let other = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+            "plugin_id": "codex", "path": "/etc/review-probe", "rule": "mrh.path",
+            "tool_name": "Write", "act": summary, "act_digest": digest_of("content: two"),
+            "spend": true})).await.unwrap();
+        assert_ne!(other["verdict"], "approved", "a different complete act cannot spend it: {other}");
+        let s = state.lock().await;
+        assert!(s.scope_requests[&id].ext.spent_at.is_none());
+        assert!(!serde_json::to_string(&s.scope_requests[&id]).unwrap().contains("content: one"),
+                "the complete act is never stored in clear");
+    }
+
+    /// Codex review of #1232, P2: one atomic spend — all approvals or none, and nothing opened.
+    #[tokio::test]
+    async fn scope_claim_batch_spends_all_or_nothing() {
+        let (_dir, state) = test_state().await;
+        let act = "cat /srv/a /srv/b";
+        let mut ids = Vec::new();
+        for p in ["/srv/a", "/srv/b"] {
+            ids.push(claim(&state, "codex", p, act, false).await["request_id"].as_str().unwrap().to_string());
+        }
+        // Only /srv/a approved: the batch spends NOTHING.
+        assert_eq!(decide(&state, serde_json::json!({
+            "request_id": &ids[0], "granted": true, "reason": "r", "once": true})).await.0, StatusCode::OK);
+        let r = spend_all(&state, "codex", &["/srv/a", "/srv/b"], act).await;
+        assert_eq!(r["verdict"], "not_all", "{r}");
+        assert_eq!(r["missing"], serde_json::json!(["/srv/b"]));
+        {
+            let s = state.lock().await;
+            assert!(s.scope_requests[&ids[0]].ext.spent_at.is_none(), "nothing spent on not_all");
+            assert_eq!(s.scope_requests.len(), 2, "a batch opens nothing");
+        }
+        // Both approved: one call spends both, witnessed as ONE row; a second call finds none.
+        assert_eq!(decide(&state, serde_json::json!({
+            "request_id": &ids[1], "granted": true, "reason": "r", "once": true})).await.0, StatusCode::OK);
+        let wrong = spend_all(&state, "codex", &["/srv/a", "/srv/b"], "cat /srv/a /srv/b /srv/c").await;
+        assert_eq!(wrong["verdict"], "not_all", "another act's digest spends nothing: {wrong}");
+        let ok = spend_all(&state, "codex", &["/srv/a", "/srv/b"], act).await;
+        assert_eq!(ok["verdict"], "approved", "{ok}");
+        assert_eq!(ok["spent"].as_array().unwrap().len(), 2);
+        let again = spend_all(&state, "codex", &["/srv/a", "/srv/b"], act).await;
+        assert_eq!(again["verdict"], "not_all", "single use: {again}");
+        let s = state.lock().await;
+        let rows: Vec<_> = s.recent_chain(20).into_iter()
+            .filter(|e| e.event_type == "scope_once_spent").collect();
+        assert_eq!(rows.len(), 1, "one spend, one row");
+        assert_eq!(rows[0].event_data["request_ids"].as_array().unwrap().len(), 2);
+        // A peek (single path, spend:false) never spends either.
+        assert!(s.scope_requests.values().all(|r| r.ext.spent_at.is_some()));
     }
 
     /// The refusal OPENS a request in the existing store, carrying what was refused, and a

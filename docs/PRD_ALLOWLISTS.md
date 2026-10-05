@@ -724,7 +724,15 @@ directory, hestia's own state, cross-seat reads of peer homes, tools invoked by 
 2. The POSIX device sinks (`/dev/null`, `/dev/std*`, `/dev/fd/*`, `/dev/tty`, `/dev/zero`,
    `/dev/*random`, `/dev/full`) are LAW, like the temp roots: always reachable, fixed by POSIX,
    no operator configuration. `/dev/tcp/*` and raw disks stay judged.
-3. Data heredoc bodies (fed to anything but an interpreter) are not reach.
+3. Data heredoc bodies (fed to anything but an interpreter) are not reach — but only a QUOTED
+   delimiter (`<<'EOF'`, `<<"EOF"`, `<<\EOF`) makes a body literal. With an unquoted delimiter
+   the shell expands the body first, so its `$( … )` / backtick substitutions are judged as
+   executed commands (Codex review of #1232, P1-2).
+3a. A word resolving to the root (`/`, `/*`, `/.`) is judged by argument position: an unquoted
+   glob expands for every command; a literal one is a delimiter only for `tr`/`echo`/`printf`,
+   a delimiter option's value, an assignment, or a quoted string to a non-walker (P1-4).
+3b. Past the judging budget (128 distinct spellings per pass) the classification is INCOMPLETE,
+   and incomplete is a refusal, never an allow of the unjudged rest (P1-3).
 4. Nothing else is hardcoded. Every default the fleet needs is a grant the operator issues
    through the existing standing store — BEFORE the change deploys (the PR names the set).
 
@@ -739,6 +747,17 @@ answer comes from the EXISTING scope-request store, not a new one:
 | a pending request for (member, path) | `pending`, same id | refused; no second ask (#956's nine ids for three paths cannot recur) |
 | a refusal inside its window | `refused` | refused; re-issuing does not reopen it |
 | none of these | `opened`, new id, carrying rule, tool, act, act digest, request key, session | refused, naming the id |
+
+**The act binding (Codex review of #1232, P1-1; the #1229 / #627 remedy).** A one-time approval
+binds to `act_digest` = sha256 over the canonical COMPLETE act — the whole tool input (Write/Edit
+contents, the unmasked command), cwd and host session — computed at the gate and sent as a
+digest only. The masked summary travels for the operator's eyes and is never an authorisation
+preimage. The daemon refuses a claim without a well-formed digest.
+
+**Nothing is consumed by a denied act (P2).** The gate collects every refused path locally
+(refusing outright past 8, before asking anything), PEEKS each (`spend: false`), re-judges the act
+with all of them, asks society law, and only then makes ONE atomic call (`paths` + `spend: true`)
+that spends every one-time approval the act needs or none.
 
 The deny text names the id; `hestia_scope_status` shows it to the member with its act and fuse.
 The request key is `sha256("hestia:scope-request-key" ␟ member ␟ path)`; a re-issued identical act

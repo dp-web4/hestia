@@ -23112,11 +23112,17 @@ pub fn scope_request_key(plugin_id: &str, path: &str) -> String {
     hex::encode(h.finalize())
 }
 
-fn scope_act_digest(tool: &str, act: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(format!("{tool}\u{1f}{act}").as_bytes());
-    hex::encode(h.finalize())
+/// The act binding a ONE-TIME approval is spent against: a sha256 the GATE computes over the
+/// canonical, COMPLETE act — the whole tool input (Write/Edit contents, the unmasked command),
+/// the working directory and the host session — never over the masked display summary (Codex
+/// review of #1232, P1-1: two Writes to one path with different contents, two commands that mask
+/// or truncate alike, collided on the summary digest). The daemon never sees the input in clear;
+/// it stores and compares the digest. Same remedy class as #1229 / #627: an authorisation key
+/// must never be computed from the scrubbed preview a human reads.
+fn valid_act_digest(args: &Value) -> Option<String> {
+    let d = optional_string(args, "act_digest")?;
+    let d = d.trim().to_ascii_lowercase();
+    (d.len() == 64 && d.chars().all(|c| c.is_ascii_hexdigit())).then_some(d)
 }
 
 /// `hestia_scope_claim` — the gate's ONE question after a scope refusal (dp, 2026-10-05:
@@ -23148,6 +23154,21 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
     };
 
     let asserted = require_string(args, "plugin_id")?;
+    let Some(act_digest) = valid_act_digest(args) else {
+        return Ok(hestia_error_envelope(
+            "hestia.scope_claim_act_digest_required",
+            "act_digest (sha256 hex over the canonical complete act: tool input, cwd, host \
+             session) is required — a one-time approval binds to the whole act, never to its \
+             masked summary; nothing was opened or spent",
+            None,
+        ));
+    };
+    // ATOMIC BATCH SPEND (Codex review of #1232, P2): `paths` + `spend: true` consumes every
+    // one-time approval the act needs, or none — the gate calls it once, after every path was
+    // peeked and society law permitted the act.
+    if args.get("paths").is_some() {
+        return scope_claim_spend_all(state, args, &asserted, &act_digest).await;
+    }
     let raw_path = require_string(args, "path")?;
     let rule = optional_string(args, "rule").unwrap_or_default();
     if rule != "mrh.path" && rule != "mrh.command" {
@@ -23196,7 +23217,6 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
         }));
     }
     let key = scope_request_key(&plugin_id, &path);
-    let act_digest = scope_act_digest(&tool, &act);
     let probe = if subtree { format!("{path}/*") } else { path.clone() };
 
     // (1) IN FORCE — live or standing (or the society floor) already covers it.
@@ -23392,6 +23412,118 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
                           exact, or recursive at a directory they choose. A delegated seat may \
                           rule it with `hestia scope arbitrate`.",
         "detail": "refused; a scope request was opened for the operator",
+    }))
+}
+
+/// `hestia_scope_claim` with `paths`: ONE atomic spend for an act refused on several paths.
+///
+/// Under one lock, every path must be either covered by a grant in force or hold an unspent
+/// one-time approval bound to THIS act digest; then all such approvals are spent with ONE
+/// witnessed `scope_once_spent` row, or — if any path fails — nothing is spent and the answer
+/// names what was missing. Opens nothing (the gate's per-path peeks already did). Codex review
+/// of #1232, P2: the old peek-then-spend-per-path shape could consume four approvals and deny on
+/// the fifth, or spend before society law refused the act; a denied act now consumes nothing.
+async fn scope_claim_spend_all(state: &SharedState, args: &Value, asserted: &str,
+                               act_digest: &str) -> ToolResult {
+    use crate::server::gate_escalation::now_secs;
+    use crate::server::state::normalize_scope_path;
+
+    let Some(raw_paths) = args.get("paths").and_then(Value::as_array) else {
+        return Err(anyhow::anyhow!("paths must be an array of absolute paths"));
+    };
+    if args.get("spend").and_then(Value::as_bool) != Some(true) {
+        return Err(anyhow::anyhow!(
+            "a batch claim only SPENDS (spend: true); peek one path at a time"
+        ));
+    }
+    if raw_paths.is_empty() || raw_paths.len() > 16 {
+        return Err(anyhow::anyhow!("paths must hold 1..=16 entries"));
+    }
+    let host_session_id = optional_string(args, "host_session_id");
+    let session_id_arg = optional_session_id(args);
+    let now = now_secs();
+    let mut s = state.lock().await;
+    let plugin_id = match resolve_attributed_caller(&s, session_id_arg.as_deref()) {
+        Some(who) if who.plugin_id != asserted => {
+            return Ok(hestia_error_envelope(
+                "hestia.scope_claim_asker_mismatch",
+                "the session you presented belongs to a different member than the plugin_id \
+                 you asserted; nothing was spent",
+                Some(json!({ "asserted": asserted, "session_member": who.plugin_id })),
+            ));
+        }
+        Some(who) => who.plugin_id,
+        None => asserted.to_string(),
+    };
+
+    // Plan, without mutating anything.
+    let mut to_spend: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    let mut in_force: Vec<String> = Vec::new();
+    for v in raw_paths {
+        let Some(raw) = v.as_str() else {
+            return Err(anyhow::anyhow!("paths must be strings"));
+        };
+        let t = raw.trim();
+        let subtree = t.ends_with("/*");
+        let path = normalize_scope_path(if subtree { &t[..t.len() - 2] } else { t });
+        let probe = if subtree { format!("{path}/*") } else { path.clone() };
+        if path.starts_with('/') && path != "/" && s.has_scope_grant(&plugin_id, &probe) {
+            in_force.push(path);
+            continue;
+        }
+        let once = s
+            .scope_requests
+            .values()
+            .filter(|r| r.plugin_id == plugin_id && r.path == path && r.once_spendable(now))
+            .filter(|r| r.ext.gate.as_ref().is_some_and(|g| g.act_digest == act_digest))
+            .filter(|r| !to_spend.contains(&r.id))
+            .min_by_key(|r| r.requested_at)
+            .map(|r| r.id.clone());
+        match once {
+            Some(id) => to_spend.push(id),
+            None => missing.push(path),
+        }
+    }
+    if !missing.is_empty() {
+        return Ok(json!({
+            "verdict": "not_all",
+            "permits": false,
+            "spent": [],
+            "missing": missing,
+            "detail": "not every path is covered by a grant in force or a one-time approval for \
+                       this exact act; NOTHING was spent",
+        }));
+    }
+    // Witness, then spend — every approval in one row, so the spend is one fact.
+    let mut entry_hash = serde_json::Value::Null;
+    if !to_spend.is_empty() {
+        let entry = s.append_chain(
+            "scope_once_spent",
+            json!({
+                "request_ids": to_spend,
+                "plugin_id": plugin_id,
+                "subject_instance_lct": s.member_lct(&plugin_id),
+                "act_digest": act_digest,
+                "host_session_id": host_session_id,
+                "in_force_paths": in_force,
+            }),
+        )?;
+        entry_hash = json!(entry.hash);
+        for id in &to_spend {
+            if let Some(r) = s.scope_requests.get_mut(id) {
+                r.ext.spent_at = Some(now);
+            }
+        }
+    }
+    Ok(json!({
+        "verdict": "approved",
+        "permits": true,
+        "spent": to_spend,
+        "in_force": in_force,
+        "witnessEntryHash": entry_hash,
+        "detail": "every path is covered; the one-time approvals this act needed are spent \
+                   (single use)",
     }))
 }
 
