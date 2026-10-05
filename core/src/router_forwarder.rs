@@ -1592,6 +1592,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_neighbor_certificate_rejects_live_key_rotation_until_renewed() {
+        let peer_router_key = web4_core::crypto::KeyPair::generate();
+        let peer_member_key = web4_core::crypto::KeyPair::generate();
+        let peer_router = web4_core::derive_lct_id(&peer_router_key.verifying_key());
+        let hub = Uuid::new_v4();
+        let peer_member = Uuid::new_v4();
+        let cert = crate::router_certificate::RouterInterfaceCertificate::issue(
+            crate::router_certificate::RouterInterfaceCertificatePayload {
+                protocol: crate::router_certificate::ROUTER_CERT_PROTOCOL.into(),
+                router_lct: peer_router.clone(),
+                router_pubkey_hex: peer_router_key.verifying_key().to_hex(),
+                hub_lct_id: hub,
+                hub_member_lct: peer_member,
+                hub_member_pubkey_hex: peer_member_key.verifying_key().to_hex(),
+                interface_binding_id: Uuid::new_v4(),
+                receipt_protocol: crate::router_certificate::RECEIPT_PROTOCOL.into(),
+                issued_at: 9,
+            },
+            &peer_router_key,
+            &peer_member_key,
+        ).unwrap();
+        let interface = RouterIngressBinding {
+            binding_id: Uuid::new_v4(),
+            router_lct: web4_core::derive_lct_id(
+                &web4_core::crypto::KeyPair::generate().verifying_key(),
+            ),
+            hub_url: "https://hub.test".into(),
+            hub_lct_id: hub,
+            rest_endpoint: "https://hub.test/v1".into(),
+            hub_member_lct: Uuid::new_v4(),
+            member_key_source: crate::hub::MemberKeySource::VaultIdentity,
+            reason: "test".into(),
+            set_by: "test".into(),
+            set_at: 1,
+        };
+        let neighbor = crate::receiver_routing::RouterNeighbor {
+            link_id: Uuid::new_v4(),
+            next_hop_lct: peer_router,
+            interface_binding_id: interface.binding_id,
+            next_hop_hub_member_lct: peer_member,
+            peer_certificate: Some(cert),
+            reason: "test".into(),
+            set_by: "test".into(),
+            set_at: 1,
+        };
+
+        assert!(verify_neighbor_certificate_live(
+            &neighbor,
+            &interface,
+            &peer_member_key.verifying_key(),
+        ).is_ok());
+
+        let rotated = web4_core::crypto::KeyPair::generate();
+        let err = verify_neighbor_certificate_live(
+            &neighbor,
+            &interface,
+            &rotated.verifying_key(),
+        ).unwrap_err();
+        assert!(format!("{err:#}").contains("no longer matches live Hub pin"));
+    }
+
+    #[test]
     fn no_route_becomes_a_bounded_unreachable_packet_when_return_path_exists() {
         let dir = tempfile::tempdir().unwrap();
         let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
