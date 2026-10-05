@@ -728,9 +728,20 @@ directory, hestia's own state, cross-seat reads of peer homes, tools invoked by 
    delimiter (`<<'EOF'`, `<<"EOF"`, `<<\EOF`) makes a body literal. With an unquoted delimiter
    the shell expands the body first, so its `$( … )` / backtick substitutions are judged as
    executed commands (Codex review of #1232, P1-2).
-3a. A word resolving to the root (`/`, `/*`, `/.`) is judged by argument position: an unquoted
-   glob expands for every command; a literal one is a delimiter only for `tr`/`echo`/`printf`,
-   a delimiter option's value, an assignment, or a quoted string to a non-walker (P1-4).
+3a. DEFAULT-JUDGE (Codex re-review of #1232; dp: "the shell is a grammar, and skip-lists keep
+   leaking"). Every word that could be a path — contains `/`, starts with `~` or `.`, carries an
+   unquoted glob, or is an expansion whose value the parser must resolve — is judged. A word is
+   skipped only under a precise (command, argument position / option) exception: `tr` sets,
+   `echo`/`printf` strings without an unquoted glob, the pattern position of `grep`/`rg`/`sed`/
+   `awk` (unless an option supplied the pattern), and the values of delimiter / pattern / string
+   options of the command that defines them (`cut -d`, `awk -F`, `find -name`, `git -m`, …).
+   Quoting is tracked per character (`"/"*` expands) and never exempts by itself.
+3b'. Anything the parser does not model — an unbalanced quote or substitution, an unknown heredoc
+   form, an expansion it cannot resolve inside a path (an unknown variable, `$1`, the output of an
+   arbitrary command) — is INCOMPLETE classification and refused, never skipped. Modelled:
+   assignments and `for` loop variables in the same command, the environment, `$PWD`/`$(pwd)`,
+   `${V:-default}`, special parameters and arithmetic, value commands (`$(date …)`), echo, and
+   listers (`$(find R …)`, `$(ls R)`, `$(grep -l … R)` → R's subtree).
 3b. Past the judging budget (128 distinct spellings per pass) the classification is INCOMPLETE,
    and incomplete is a refusal, never an allow of the unjudged rest (P1-3).
 4. Nothing else is hardcoded. Every default the fleet needs is a grant the operator issues
@@ -754,10 +765,15 @@ contents, the unmasked command), cwd and host session — computed at the gate a
 digest only. The masked summary travels for the operator's eyes and is never an authorisation
 preimage. The daemon refuses a claim without a well-formed digest.
 
-**Nothing is consumed by a denied act (P2).** The gate collects every refused path locally
-(refusing outright past 8, before asking anything), PEEKS each (`spend: false`), re-judges the act
-with all of them, asks society law, and only then makes ONE atomic call (`paths` + `spend: true`)
-that spends every one-time approval the act needs or none.
+**Nothing is consumed by a denied act (P2, and the re-review's ordering).** The gate collects
+every refused path locally (refusing outright past 8, before asking anything), PEEKS each
+(`spend: false`), re-judges the act, asks society law, then RESERVES every one-time approval the
+act needs in one all-or-none call keyed by an operation key, records the final verdict and its
+evidence, and only then COMMITS (the act stands) or RELEASES (it was denied after all). Every RPC
+carries the absolute deadline, checked before each request. A lost answer is looked up by its
+operation key; an outcome that stays unknown is reported as UNCERTAIN, never as "nothing was
+consumed". A reservation nobody settles lapses into spent after 120 s, so an approval is never
+spendable twice.
 
 The deny text names the id; `hestia_scope_status` shows it to the member with its act and fuse.
 The request key is `sha256("hestia:scope-request-key" ␟ member ␟ path)`; a re-issued identical act
