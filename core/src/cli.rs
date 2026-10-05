@@ -640,16 +640,31 @@ enum HubCmd {
         reason: String,
     },
 
+    /// Issue a dual-signed router-interface certificate after re-verifying the
+    /// Hub pin and proving receipt mode with a non-destructive fetch.
+    ReceiverRouterCertify {
+        /// Existing Hub connection used only to identify the Hub endpoint.
+        #[arg(long, default_value = "")]
+        target: String,
+        /// Router/parent canonical LCT (default: persisted local Society).
+        #[arg(long)]
+        parent: Option<String>,
+        /// Optional JSON file to write atomically; certificate is always printed.
+        #[arg(long)]
+        out: Option<String>,
+    },
+
     /// Bind one canonical next-hop router LCT to its Hub transport address.
-    /// This is the routing-table equivalent of neighbor/ARP resolution.
+    /// Peer Hub-member identity is derived from a verified router certificate,
+    /// not typed independently.
     ReceiverNeighbor {
         next_hop: String,
-        /// Router interface UUID from receiver-router-bind.
+        /// Local router interface UUID used to reach this neighbor's Hub.
         #[arg(long)]
         interface: uuid::Uuid,
-        /// The next router's Hub member UUID on that interface's Hub.
+        /// JSON router-interface certificate exported by the peer.
         #[arg(long)]
-        next_hop_member_lct: uuid::Uuid,
+        peer_certificate: String,
         #[arg(long)]
         reason: String,
     },
@@ -1140,10 +1155,15 @@ pub fn run() -> AnyResult<()> {
             } => cmd_receiver_router_bind(
                 &home, &target, member_lct, channel_key, parent.as_deref(), &reason,
             ),
+            HubCmd::ReceiverRouterCertify { target, parent, out } => {
+                cmd_receiver_router_certify(
+                    &home, &target, parent.as_deref(), out.as_deref(),
+                )
+            }
             HubCmd::ReceiverNeighbor {
-                next_hop, interface, next_hop_member_lct, reason
+                next_hop, interface, peer_certificate, reason
             } => cmd_receiver_neighbor(
-                &home, &next_hop, interface, next_hop_member_lct, &reason,
+                &home, &next_hop, interface, &peer_certificate, &reason,
             ),
             HubCmd::ReceiverAlias {
                 legacy_address, destination_lct, reason
@@ -3538,6 +3558,7 @@ fn cmd_receiver_router_join(
             requested_at: chrono::Utc::now().timestamp().max(0) as u64,
             admitted_at: None,
             interface_binding_id: None,
+            certificate: None,
         };
 
         // Persist identity BEFORE network I/O. A dropped join response must not
@@ -3743,15 +3764,197 @@ fn cmd_receiver_router_bind(
     Ok(())
 }
 
+fn write_public_evidence_atomic(path: &std::path::Path, bytes: &[u8]) -> AnyResult<()> {
+    use std::io::Write;
+
+    anyhow::ensure!(
+        !path.exists(),
+        "refusing to overwrite public certificate evidence {}; choose a new --out path",
+        path.display()
+    );
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating certificate directory {}", parent.display()))?;
+    let tmp = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name().and_then(|v| v.to_str()).unwrap_or("router-cert"),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp)
+        .with_context(|| format!("creating temporary certificate {}", tmp.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing temporary certificate {}", tmp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("fsync temporary certificate {}", tmp.display()))?;
+    drop(file);
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("publishing router certificate {}", path.display()))?;
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+fn cmd_receiver_router_certify(
+    home: &std::path::Path,
+    target: &str,
+    parent: Option<&str>,
+    out: Option<&str>,
+) -> AnyResult<()> {
+    use hestia::hub::MemberKeySource;
+    use hestia::router_certificate::{
+        RouterInterfaceCertificate, RouterInterfaceCertificatePayload,
+        RECEIPT_PROTOCOL, ROUTER_CERT_PROTOCOL,
+    };
+    use hestia::router_membership::RouterMembershipStore;
+
+    let mut vault = open_vault(home)?;
+    let router_lct = receiver_router_lct(&vault, parent)?;
+    let hubs = HubStore::load(&vault)?;
+    let template = pick_connection(&hubs, target)?;
+    let mut memberships = RouterMembershipStore::load(&vault)?;
+    let membership = memberships
+        .find(template.hub_lct_id, &router_lct)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!(
+            "no dedicated router membership for {} on Hub {}; run receiver-router-join first",
+            router_lct, template.hub_lct_id
+        ))?;
+    anyhow::ensure!(
+        membership.admitted_at.is_some(),
+        "dedicated router membership {} is not recorded as admitted",
+        membership.hub_member_lct
+    );
+    let interface_id = membership.interface_binding_id.ok_or_else(|| anyhow::anyhow!(
+        "dedicated router membership {} has no bound router interface",
+        membership.hub_member_lct
+    ))?;
+
+    let table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    let iface = table.router_ingress_by_id(interface_id)
+        .ok_or_else(|| anyhow::anyhow!(
+            "router membership points at missing interface {interface_id}"
+        ))?;
+    anyhow::ensure!(
+        iface.router_lct == membership.router_lct
+            && iface.hub_lct_id == membership.hub_lct_id
+            && iface.hub_member_lct == membership.hub_member_lct,
+        "router membership/interface identity tuple does not match"
+    );
+
+    let member_source = MemberKeySource::ChannelKeyFile {
+        path: membership.channel_key_path.clone(),
+    };
+    let member_key = member_signing_keypair(&vault, &member_source)
+        .context("loading dedicated router membership key")?;
+    let router_key = hestia::sovereign::Sovereign::persisted_signing_keypair(&vault)
+        .context("loading persisted canonical router/Society key")?;
+    anyhow::ensure!(
+        web4_core::derive_lct_id(&router_key.verifying_key()) == membership.router_lct,
+        "persisted router/Society key does not derive {}",
+        membership.router_lct
+    );
+
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+    let discovered = rt.block_on(client.discover(&membership.hub_url))
+        .context("re-discovering Hub before router certification")?;
+    anyhow::ensure!(
+        discovered.hub_lct_id == membership.hub_lct_id,
+        "router certificate endpoint advertises Hub {}, expected {}",
+        discovered.hub_lct_id, membership.hub_lct_id
+    );
+    let rest = abs_rest(&membership.hub_url, &membership.rest_endpoint);
+    let pinned = rt.block_on(client.resolve_member_pubkey(
+        &rest,
+        membership.hub_lct_id,
+        membership.hub_member_lct,
+    )).context("resolving dedicated router Hub-member pin")?;
+    anyhow::ensure!(
+        pinned.to_hex() == member_key.verifying_key().to_hex(),
+        "dedicated router member {} is pinned to a different key",
+        membership.hub_member_lct
+    );
+
+    // Capability proof is intentionally non-destructive. On a legacy mailbox
+    // notifications_fetch refuses; on a receipt mailbox it returns the current
+    // page without consuming or ACKing any notice.
+    let channel = rt.block_on(client.open_channel(&membership.hub_url, uuid::Uuid::new_v4()))
+        .context("opening Hub channel for receipt-mode proof")?;
+    anyhow::ensure!(
+        channel.hub_lct_id == membership.hub_lct_id,
+        "receipt probe opened the wrong Hub identity"
+    );
+    let probe = rt.block_on(client.channel_query(
+        &rest,
+        &channel,
+        &member_key,
+        membership.hub_member_lct,
+        "notifications_fetch",
+        serde_json::json!({"limit": 1}),
+    )).context("probing dedicated router receipt-mode mailbox")?;
+    anyhow::ensure!(
+        probe.get("protocol").and_then(serde_json::Value::as_str) == Some(RECEIPT_PROTOCOL),
+        "dedicated router mailbox did not return receipt protocol {RECEIPT_PROTOCOL}"
+    );
+    anyhow::ensure!(
+        probe.get("notifications").is_some_and(serde_json::Value::is_array),
+        "receipt-mode proof returned no notifications array"
+    );
+
+    let payload = RouterInterfaceCertificatePayload {
+        protocol: ROUTER_CERT_PROTOCOL.to_string(),
+        router_lct: membership.router_lct.clone(),
+        router_pubkey_hex: router_key.verifying_key().to_hex(),
+        hub_lct_id: membership.hub_lct_id,
+        hub_member_lct: membership.hub_member_lct,
+        hub_member_pubkey_hex: pinned.to_hex(),
+        interface_binding_id: interface_id,
+        receipt_protocol: RECEIPT_PROTOCOL.to_string(),
+        issued_at: chrono::Utc::now().timestamp().max(1) as u64,
+    };
+    let cert = RouterInterfaceCertificate::issue(payload, &router_key, &member_key)?;
+    let fingerprint = cert.fingerprint()?;
+
+    memberships
+        .find_mut(membership.hub_lct_id, &membership.router_lct)
+        .ok_or_else(|| anyhow::anyhow!("persisted router membership disappeared"))?
+        .certificate = Some(cert.clone());
+    memberships.save(&mut vault)?;
+
+    let bytes = serde_json::to_vec_pretty(&cert)?;
+    if let Some(path) = out.map(str::trim).filter(|v| !v.is_empty()) {
+        write_public_evidence_atomic(std::path::Path::new(path), &bytes)?;
+    }
+    println!("{}", String::from_utf8(bytes).expect("certificate JSON is UTF-8"));
+    eprintln!("router certificate fingerprint: {fingerprint}");
+    eprintln!("receipt-mode capability: verified non-destructively");
+    Ok(())
+}
+
 fn cmd_receiver_neighbor(
     home: &std::path::Path,
     next_hop: &str,
     interface: uuid::Uuid,
-    next_hop_member_lct: uuid::Uuid,
+    peer_certificate: &str,
     reason: &str,
 ) -> AnyResult<()> {
     anyhow::ensure!(!next_hop.trim().is_empty(), "next_hop is required");
     anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
+    let cert_bytes = std::fs::read(peer_certificate)
+        .with_context(|| format!("reading peer router certificate {peer_certificate}"))?;
+    let cert = hestia::router_certificate::RouterInterfaceCertificate::from_json_bytes(&cert_bytes)
+        .context("verifying peer router-interface certificate")?;
+    anyhow::ensure!(
+        cert.payload.router_lct == next_hop.trim(),
+        "--next-hop {} does not match certificate router {}",
+        next_hop.trim(), cert.payload.router_lct
+    );
+
     let mut vault = open_vault(home)?;
     let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
         .context("loading receiver routing table (unreadable is not empty)")?;
@@ -3761,47 +3964,69 @@ fn cmd_receiver_neighbor(
         iface.router_lct != next_hop.trim(),
         "a router cannot install itself as its own next hop"
     );
+    anyhow::ensure!(
+        iface.hub_lct_id == cert.payload.hub_lct_id,
+        "peer certificate belongs to Hub {}, local interface {} belongs to Hub {}",
+        cert.payload.hub_lct_id, interface, iface.hub_lct_id
+    );
 
-    // Re-prove the local interface credential and prove the neighbor is a known
-    // Hub member before recording the link. Receipt-mode enrollment is checked
-    // by route_forward itself because the public resolver does not expose it.
+    // Re-prove our side of the link and compare the peer certificate against
+    // the Hub's live key projection. The certificate proves possession at
+    // issuance; the live pin check prevents accepting a stale cert after rekey.
     let keypair = member_signing_keypair(&vault, &iface.member_key_source)
-        .context("resolving router neighbor interface credential")?;
+        .context("resolving local router interface credential")?;
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
     let rest = abs_rest(&iface.hub_url, &iface.rest_endpoint);
     let ours = rt.block_on(
         client.resolve_member_pubkey(&rest, iface.hub_lct_id, iface.hub_member_lct)
-    ).with_context(|| format!("resolving Hub pin for {}", iface.hub_member_lct))?;
+    ).with_context(|| format!("resolving local Hub pin for {}", iface.hub_member_lct))?;
     anyhow::ensure!(
         ours.to_hex() == keypair.verifying_key().to_hex(),
         "router interface {interface} credential no longer matches its Hub pin"
     );
-    rt.block_on(
-        client.resolve_member_pubkey(&rest, iface.hub_lct_id, next_hop_member_lct)
-    ).with_context(|| format!(
-        "next-hop Hub member {next_hop_member_lct} is not resolvable on {}",
-        iface.hub_url
+    let peer_pin = rt.block_on(client.resolve_member_pubkey(
+        &rest,
+        iface.hub_lct_id,
+        cert.payload.hub_member_lct,
+    )).with_context(|| format!(
+        "peer Hub member {} is not resolvable on {}",
+        cert.payload.hub_member_lct, iface.hub_url
     ))?;
+    anyhow::ensure!(
+        peer_pin.to_hex() == cert.payload.hub_member_pubkey_hex,
+        "peer certificate key is stale or does not match the live Hub pin for {}",
+        cert.payload.hub_member_lct
+    );
 
-    let link_id = uuid::Uuid::new_v4();
+    let fingerprint = cert.fingerprint()?;
+    let candidate_link_id = uuid::Uuid::new_v4();
     table.bind_neighbor(hestia::receiver_routing::RouterNeighbor {
-        link_id,
-        next_hop_lct: next_hop.trim().to_string(),
+        link_id: candidate_link_id,
+        next_hop_lct: cert.payload.router_lct.clone(),
         interface_binding_id: interface,
-        next_hop_hub_member_lct: next_hop_member_lct,
+        next_hop_hub_member_lct: cert.payload.hub_member_lct,
+        peer_certificate: Some(cert.clone()),
         reason: reason.trim().to_string(),
-        set_by: "hestia-cli".into(),
+        set_by: "hestia-cli:verified-router-certificate".into(),
         set_at: chrono::Utc::now().timestamp().max(0) as u64,
     })?;
+    let link_id = table
+        .neighbor(&cert.payload.router_lct)
+        .map(|n| n.link_id)
+        .ok_or_else(|| anyhow::anyhow!(
+            "certified neighbor disappeared before save"
+        ))?;
     table.save(&mut vault)?;
 
-    println!("Router neighbor bound:");
-    println!("  next hop:     {}", next_hop.trim());
+    println!("Router neighbor bound from certificate:");
+    println!("  next hop:     {}", cert.payload.router_lct);
     println!("  link:         {link_id}");
-    println!("  interface:    {interface}");
-    println!("  Hub member:   {next_hop_member_lct}");
-    println!("  note:         route_forward will require receipt-mode enrollment");
+    println!("  local iface:  {interface}");
+    println!("  peer iface:   {}", cert.payload.interface_binding_id);
+    println!("  Hub member:   {}", cert.payload.hub_member_lct);
+    println!("  certificate:  {fingerprint}");
+    println!("  live Hub pin: verified");
     Ok(())
 }
 
@@ -3895,6 +4120,10 @@ fn receiver_cutover_preflight(
     let mut structural_blockers = Vec::<String>::new();
     let mut current_next_hop_lct: Option<String> = None;
     let mut current_hub_member_lct: Option<String> = None;
+    let mut current_peer_certificate_fingerprint: Option<String> = None;
+    let mut current_peer_certificate_issued_at: Option<u64> = None;
+    let mut current_local_certificate_fingerprint: Option<String> = None;
+    let mut current_local_certificate_issued_at: Option<u64> = None;
 
     let authority = match alias.as_ref() {
         Some(a) => {
@@ -3925,6 +4154,213 @@ fn receiver_cutover_preflight(
                         Some(n) => {
                             current_hub_member_lct =
                                 Some(n.next_hop_hub_member_lct.to_string());
+
+                            if let Some(iface) =
+                                table.router_ingress_by_id(n.interface_binding_id)
+                            {
+                                let client = HubClient::new();
+                                let rest = abs_rest(&iface.hub_url, &iface.rest_endpoint);
+                                let runtime = tokio::runtime::Runtime::new();
+
+                                // Peer proof: dual signatures + exact routing
+                                // tuple + current Hub pin. A certificate whose
+                                // key was later rotated is stale evidence.
+                                match n.peer_certificate.as_ref() {
+                                    None => structural_blockers.push(format!(
+                                        "neighbor '{}' has no router-interface certificate",
+                                        next_hop_lct
+                                    )),
+                                    Some(cert) => {
+                                        let mut peer_ok = true;
+                                        if let Err(e) = cert.verify() {
+                                            structural_blockers.push(format!(
+                                                "neighbor '{}' router certificate does not verify: {e:#}",
+                                                next_hop_lct
+                                            ));
+                                            peer_ok = false;
+                                        }
+                                        if cert.payload.router_lct != *next_hop_lct {
+                                            structural_blockers.push(format!(
+                                                "neighbor '{}' certificate names router '{}'",
+                                                next_hop_lct, cert.payload.router_lct
+                                            ));
+                                            peer_ok = false;
+                                        }
+                                        if cert.payload.hub_member_lct
+                                            != n.next_hop_hub_member_lct
+                                        {
+                                            structural_blockers.push(format!(
+                                                "neighbor '{}' certificate Hub member {} differs from configured {}",
+                                                next_hop_lct,
+                                                cert.payload.hub_member_lct,
+                                                n.next_hop_hub_member_lct
+                                            ));
+                                            peer_ok = false;
+                                        }
+                                        if cert.payload.hub_lct_id != iface.hub_lct_id {
+                                            structural_blockers.push(format!(
+                                                "neighbor '{}' certificate is for Hub {}, local interface uses Hub {}",
+                                                next_hop_lct,
+                                                cert.payload.hub_lct_id,
+                                                iface.hub_lct_id
+                                            ));
+                                            peer_ok = false;
+                                        }
+
+                                        if peer_ok {
+                                            match &runtime {
+                                                Err(e) => {
+                                                    structural_blockers.push(format!(
+                                                        "could not create runtime for live neighbor pin verification: {e}"
+                                                    ));
+                                                    peer_ok = false;
+                                                }
+                                                Ok(rt) => match rt.block_on(
+                                                    client.resolve_member_pubkey(
+                                                        &rest,
+                                                        iface.hub_lct_id,
+                                                        n.next_hop_hub_member_lct,
+                                                    ),
+                                                ) {
+                                                    Ok(live_peer_key) => {
+                                                        if live_peer_key.to_hex()
+                                                            != cert.payload.hub_member_pubkey_hex
+                                                        {
+                                                            structural_blockers.push(format!(
+                                                                "neighbor '{}' certificate key no longer matches live Hub pin for {}",
+                                                                next_hop_lct,
+                                                                n.next_hop_hub_member_lct
+                                                            ));
+                                                            peer_ok = false;
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        structural_blockers.push(format!(
+                                                            "could not re-verify live Hub pin for neighbor '{}': {e:#}",
+                                                            next_hop_lct
+                                                        ));
+                                                        peer_ok = false;
+                                                    }
+                                                },
+                                            }
+                                        }
+                                        if peer_ok {
+                                            match cert.fingerprint() {
+                                                Ok(fp) => {
+                                                    current_peer_certificate_fingerprint =
+                                                        Some(fp);
+                                                    current_peer_certificate_issued_at =
+                                                        Some(cert.payload.issued_at);
+                                                }
+                                                Err(e) => structural_blockers.push(format!(
+                                                    "neighbor '{}' certificate fingerprint failed: {e:#}",
+                                                    next_hop_lct
+                                                )),
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Local proof: same exact local interface/member
+                                // tuple, dual signatures, and CURRENT Hub pin.
+                                match hestia::router_membership::RouterMembershipStore::load(vault) {
+                                    Err(e) => structural_blockers.push(format!(
+                                        "could not load local router membership evidence: {e:#}"
+                                    )),
+                                    Ok(store) => {
+                                        match store.find(iface.hub_lct_id, &router_lct) {
+                                            None => structural_blockers.push(format!(
+                                                "local router {} has no dedicated membership record on Hub {}",
+                                                router_lct, iface.hub_lct_id
+                                            )),
+                                            Some(m) => match m.certificate.as_ref() {
+                                                None => structural_blockers.push(format!(
+                                                    "local router interface {} has no issued router certificate",
+                                                    iface.binding_id
+                                                )),
+                                                Some(cert) => {
+                                                    let mut local_ok = true;
+                                                    if let Err(e) = cert.verify() {
+                                                        structural_blockers.push(format!(
+                                                            "local router certificate does not verify: {e:#}"
+                                                        ));
+                                                        local_ok = false;
+                                                    }
+                                                    if cert.payload.router_lct != router_lct
+                                                        || cert.payload.hub_lct_id
+                                                            != iface.hub_lct_id
+                                                        || cert.payload.hub_member_lct
+                                                            != iface.hub_member_lct
+                                                        || cert.payload.interface_binding_id
+                                                            != iface.binding_id
+                                                    {
+                                                        structural_blockers.push(
+                                                            "local router certificate does not bind the current interface/member tuple"
+                                                                .to_string(),
+                                                        );
+                                                        local_ok = false;
+                                                    }
+
+                                                    if local_ok {
+                                                        match &runtime {
+                                                            Err(e) => {
+                                                                structural_blockers.push(format!(
+                                                                    "could not create runtime for live local pin verification: {e}"
+                                                                ));
+                                                                local_ok = false;
+                                                            }
+                                                            Ok(rt) => match rt.block_on(
+                                                                client.resolve_member_pubkey(
+                                                                    &rest,
+                                                                    iface.hub_lct_id,
+                                                                    iface.hub_member_lct,
+                                                                ),
+                                                            ) {
+                                                                Ok(live_local_key) => {
+                                                                    if live_local_key.to_hex()
+                                                                        != cert.payload.hub_member_pubkey_hex
+                                                                    {
+                                                                        structural_blockers.push(format!(
+                                                                            "local router certificate key no longer matches live Hub pin for {}",
+                                                                            iface.hub_member_lct
+                                                                        ));
+                                                                        local_ok = false;
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    structural_blockers.push(format!(
+                                                                        "could not re-verify live Hub pin for local router member {}: {e:#}",
+                                                                        iface.hub_member_lct
+                                                                    ));
+                                                                    local_ok = false;
+                                                                }
+                                                            },
+                                                        }
+                                                    }
+                                                    if local_ok {
+                                                        match cert.fingerprint() {
+                                                            Ok(fp) => {
+                                                                current_local_certificate_fingerprint =
+                                                                    Some(fp);
+                                                                current_local_certificate_issued_at =
+                                                                    Some(cert.payload.issued_at);
+                                                            }
+                                                            Err(e) => structural_blockers.push(format!(
+                                                                "local router certificate fingerprint failed: {e:#}"
+                                                            )),
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        }
+                                    }
+                                }
+                            } else {
+                                structural_blockers.push(format!(
+                                    "neighbor '{}' references missing local router interface {}",
+                                    next_hop_lct, n.interface_binding_id
+                                ));
+                            }
                         }
                         None => structural_blockers.push(format!(
                             "current F3 route chooses next hop '{next_hop_lct}' but no neighbor binding exists"
@@ -4001,6 +4437,10 @@ fn receiver_cutover_preflight(
         "current_shadow": shadow,
         "current_next_hop_lct": current_next_hop_lct,
         "current_hub_member_lct": current_hub_member_lct,
+        "current_peer_certificate_fingerprint": current_peer_certificate_fingerprint,
+        "current_peer_certificate_issued_at": current_peer_certificate_issued_at,
+        "current_local_certificate_fingerprint": current_local_certificate_fingerprint,
+        "current_local_certificate_issued_at": current_local_certificate_issued_at,
         "parity": parity,
         "structural_blockers": structural_blockers,
         "ready": ready,
@@ -4307,10 +4747,16 @@ fn cmd_receiver_routes(home: &std::path::Path) -> AnyResult<()> {
         println!("    (none)");
     }
     for n in &table.neighbors {
+        let cert = match n.peer_certificate.as_ref() {
+            Some(cert) => cert
+                .fingerprint()
+                .unwrap_or_else(|e| format!("INVALID:{e}")),
+            None => "UNCERTIFIED".to_string(),
+        };
         println!(
-            "    {} -> hub-member {} via if={} link={}  ({})",
+            "    {} -> hub-member {} via if={} link={} cert={}  ({})",
             n.next_hop_lct, n.next_hop_hub_member_lct,
-            n.interface_binding_id, n.link_id, n.reason
+            n.interface_binding_id, n.link_id, cert, n.reason
         );
     }
     println!("  legacy compatibility aliases (shadow/cutover edge only):");
