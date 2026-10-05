@@ -4144,20 +4144,214 @@ fn receiver_cutover_preflight(
                             current_hub_member_lct =
                                 Some(n.next_hop_hub_member_lct.to_string());
 
-                            let iface = table.router_ingress_by_id(n.interface_binding_id);
-                            let Some(iface) = iface else {
+                            if let Some(iface) =
+                                table.router_ingress_by_id(n.interface_binding_id)
+                            {
+                                let client = HubClient::new();
+                                let rest = abs_rest(&iface.hub_url, &iface.rest_endpoint);
+                                let runtime = tokio::runtime::Runtime::new();
+
+                                // Peer proof: dual signatures + exact routing
+                                // tuple + current Hub pin. A certificate whose
+                                // key was later rotated is stale evidence.
+                                match n.peer_certificate.as_ref() {
+                                    None => structural_blockers.push(format!(
+                                        "neighbor '{}' has no router-interface certificate",
+                                        next_hop_lct
+                                    )),
+                                    Some(cert) => {
+                                        let mut peer_ok = true;
+                                        if let Err(e) = cert.verify() {
+                                            structural_blockers.push(format!(
+                                                "neighbor '{}' router certificate does not verify: {e:#}",
+                                                next_hop_lct
+                                            ));
+                                            peer_ok = false;
+                                        }
+                                        if cert.payload.router_lct != *next_hop_lct {
+                                            structural_blockers.push(format!(
+                                                "neighbor '{}' certificate names router '{}'",
+                                                next_hop_lct, cert.payload.router_lct
+                                            ));
+                                            peer_ok = false;
+                                        }
+                                        if cert.payload.hub_member_lct
+                                            != n.next_hop_hub_member_lct
+                                        {
+                                            structural_blockers.push(format!(
+                                                "neighbor '{}' certificate Hub member {} differs from configured {}",
+                                                next_hop_lct,
+                                                cert.payload.hub_member_lct,
+                                                n.next_hop_hub_member_lct
+                                            ));
+                                            peer_ok = false;
+                                        }
+                                        if cert.payload.hub_lct_id != iface.hub_lct_id {
+                                            structural_blockers.push(format!(
+                                                "neighbor '{}' certificate is for Hub {}, local interface uses Hub {}",
+                                                next_hop_lct,
+                                                cert.payload.hub_lct_id,
+                                                iface.hub_lct_id
+                                            ));
+                                            peer_ok = false;
+                                        }
+
+                                        if peer_ok {
+                                            match &runtime {
+                                                Err(e) => {
+                                                    structural_blockers.push(format!(
+                                                        "could not create runtime for live neighbor pin verification: {e}"
+                                                    ));
+                                                    peer_ok = false;
+                                                }
+                                                Ok(rt) => match rt.block_on(
+                                                    client.resolve_member_pubkey(
+                                                        &rest,
+                                                        iface.hub_lct_id,
+                                                        n.next_hop_hub_member_lct,
+                                                    ),
+                                                ) {
+                                                    Ok(live_peer_key) => {
+                                                        if live_peer_key.to_hex()
+                                                            != cert.payload.hub_member_pubkey_hex
+                                                        {
+                                                            structural_blockers.push(format!(
+                                                                "neighbor '{}' certificate key no longer matches live Hub pin for {}",
+                                                                next_hop_lct,
+                                                                n.next_hop_hub_member_lct
+                                                            ));
+                                                            peer_ok = false;
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        structural_blockers.push(format!(
+                                                            "could not re-verify live Hub pin for neighbor '{}': {e:#}",
+                                                            next_hop_lct
+                                                        ));
+                                                        peer_ok = false;
+                                                    }
+                                                },
+                                            }
+                                        }
+                                        if peer_ok {
+                                            match cert.fingerprint() {
+                                                Ok(fp) => {
+                                                    current_peer_certificate_fingerprint =
+                                                        Some(fp);
+                                                    current_peer_certificate_issued_at =
+                                                        Some(cert.payload.issued_at);
+                                                }
+                                                Err(e) => structural_blockers.push(format!(
+                                                    "neighbor '{}' certificate fingerprint failed: {e:#}",
+                                                    next_hop_lct
+                                                )),
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Local proof: same exact local interface/member
+                                // tuple, dual signatures, and CURRENT Hub pin.
+                                match hestia::router_membership::RouterMembershipStore::load(vault) {
+                                    Err(e) => structural_blockers.push(format!(
+                                        "could not load local router membership evidence: {e:#}"
+                                    )),
+                                    Ok(store) => {
+                                        match store.find(iface.hub_lct_id, &router_lct) {
+                                            None => structural_blockers.push(format!(
+                                                "local router {} has no dedicated membership record on Hub {}",
+                                                router_lct, iface.hub_lct_id
+                                            )),
+                                            Some(m) => match m.certificate.as_ref() {
+                                                None => structural_blockers.push(format!(
+                                                    "local router interface {} has no issued router certificate",
+                                                    iface.binding_id
+                                                )),
+                                                Some(cert) => {
+                                                    let mut local_ok = true;
+                                                    if let Err(e) = cert.verify() {
+                                                        structural_blockers.push(format!(
+                                                            "local router certificate does not verify: {e:#}"
+                                                        ));
+                                                        local_ok = false;
+                                                    }
+                                                    if cert.payload.router_lct != router_lct
+                                                        || cert.payload.hub_lct_id
+                                                            != iface.hub_lct_id
+                                                        || cert.payload.hub_member_lct
+                                                            != iface.hub_member_lct
+                                                        || cert.payload.interface_binding_id
+                                                            != iface.binding_id
+                                                    {
+                                                        structural_blockers.push(
+                                                            "local router certificate does not bind the current interface/member tuple"
+                                                                .to_string(),
+                                                        );
+                                                        local_ok = false;
+                                                    }
+
+                                                    if local_ok {
+                                                        match &runtime {
+                                                            Err(e) => {
+                                                                structural_blockers.push(format!(
+                                                                    "could not create runtime for live local pin verification: {e}"
+                                                                ));
+                                                                local_ok = false;
+                                                            }
+                                                            Ok(rt) => match rt.block_on(
+                                                                client.resolve_member_pubkey(
+                                                                    &rest,
+                                                                    iface.hub_lct_id,
+                                                                    iface.hub_member_lct,
+                                                                ),
+                                                            ) {
+                                                                Ok(live_local_key) => {
+                                                                    if live_local_key.to_hex()
+                                                                        != cert.payload.hub_member_pubkey_hex
+                                                                    {
+                                                                        structural_blockers.push(format!(
+                                                                            "local router certificate key no longer matches live Hub pin for {}",
+                                                                            iface.hub_member_lct
+                                                                        ));
+                                                                        local_ok = false;
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    structural_blockers.push(format!(
+                                                                        "could not re-verify live Hub pin for local router member {}: {e:#}",
+                                                                        iface.hub_member_lct
+                                                                    ));
+                                                                    local_ok = false;
+                                                                }
+                                                            },
+                                                        }
+                                                    }
+                                                    if local_ok {
+                                                        match cert.fingerprint() {
+                                                            Ok(fp) => {
+                                                                current_local_certificate_fingerprint =
+                                                                    Some(fp);
+                                                                current_local_certificate_issued_at =
+                                                                    Some(cert.payload.issued_at);
+                                                            }
+                                                            Err(e) => structural_blockers.push(format!(
+                                                                "local router certificate fingerprint failed: {e:#}"
+                                                            )),
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        }
+                                    }
+                                }
+                            } else {
                                 structural_blockers.push(format!(
                                     "neighbor '{}' references missing local router interface {}",
                                     next_hop_lct, n.interface_binding_id
                                 ));
-                                continue;
-                            };
-
-                            // Peer identity proof: the neighbor row must carry the
-                            // dual-signed remote certificate, and its dedicated
-                            // membership key must STILL equal the live Hub pin.
-                            match n.peer_certificate.as_ref() {
-                                None => structural_blockers.push(format!(
+                            }
+                        }
+                        None => structural_blockers.push(format!(
                                     "neighbor '{}' has no router-interface certificate",
                                     next_hop_lct
                                 )),
