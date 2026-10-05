@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: a4b57237e3702e80ce462836f888568f81d7cca8043091fa71c29e81115f3a58  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: dd48f4c4ff9eb5a0271968dd5c22802dc69214406af53bd56c8c77c92942306b  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -1082,7 +1082,16 @@ def _expand_home_words(cmd: str) -> str:
     would not: over-judging a quoted mention is the narrow direction."""
     if "~" not in cmd and "HOME" not in cmd:
         return cmd
-    home = os.path.expanduser("~").replace("\\", "/").rstrip("/")
+    # Exactly the shell's own source for `~` and `$HOME`: the HOME variable, else the account's
+    # passwd entry (what bash falls back to). No path literal (tools/no_path_literals_test.py).
+    home = os.getenv("HOME")
+    if not home:
+        try:
+            import pwd
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except Exception:
+            return cmd
+    home = home.replace("\\", "/").rstrip("/")
     return _HOME_WORD.sub(lambda _m: home, cmd)
 
 

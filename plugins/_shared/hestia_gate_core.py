@@ -1081,7 +1081,16 @@ def _expand_home_words(cmd: str) -> str:
     would not: over-judging a quoted mention is the narrow direction."""
     if "~" not in cmd and "HOME" not in cmd:
         return cmd
-    home = os.path.expanduser("~").replace("\\", "/").rstrip("/")
+    # Exactly the shell's own source for `~` and `$HOME`: the HOME variable, else the account's
+    # passwd entry (what bash falls back to). No path literal (tools/no_path_literals_test.py).
+    home = os.getenv("HOME")
+    if not home:
+        try:
+            import pwd
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except Exception:
+            return cmd
+    home = home.replace("\\", "/").rstrip("/")
     return _HOME_WORD.sub(lambda _m: home, cmd)
 
 
