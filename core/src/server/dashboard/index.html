@@ -3599,20 +3599,53 @@
       row.className = 'esc-row';
       const path = String(r.path ?? '');
       const why = String(r.reason ?? '');
+      // A GATE-OPENED request (2026-10-05) is a refused act, not an ask: show the act the
+      // operator is ruling on, verbatim and labelled as the act — never as the member's reason,
+      // because the member did not choose to ask.
+      const fromGate = r.origin === 'gate_deny';
+      const basis = fromGate
+        ? `<div class="esc-why">refused act (${escapeHtml(String(r.rule ?? ''))}, ${
+            escapeHtml(String(r.tool ?? ''))}) — this is what you are ruling on:</div>
+           <pre class="esc-why scope-act">${escapeHtml(String(r.act ?? ''))}</pre>
+           <div class="esc-meta">opened by the gate; the member stated no reason${
+             (r.reissues ?? 0) > 0 ? ` · re-issued ${Number(r.reissues)}×` : ''}${
+             r.subtree ? ' · a glob over this directory: only a recursive grant covers it' : ''}</div>`
+        : `<div class="esc-why">why: ${why ? escapeHtml(why) : '(none stated)'}</div>`;
       row.innerHTML = `
         <div class="esc-row-head">
-          <span class="esc-tool">read</span>
-          <span class="esc-who">claimed by ${memberName(r.claimed_by ?? '?')}${
+          <span class="esc-tool">${fromGate ? 'refused' : 'read'}</span>
+          <span class="esc-who">${fromGate ? 'member' : 'claimed by'} ${memberName(r.claimed_by ?? '?')}${
             r.role ? ' · ' + escapeHtml(String(r.role)) : ''}</span>
           <span class="esc-ttl" id="scope-ttl-${escapeHtml(String(r.request_id))}">${
             escapeHtml(`expires in ${escFmtAge(r.secs_remaining ?? 0)}`)}</span>
         </div>
         <div class="esc-marker">${escapeHtml(path)}</div>
-        <div class="esc-why">why: ${why ? escapeHtml(why) : '(none stated)'}</div>
-        <div class="esc-meta">id ${escapeHtml(String(r.request_id))} · grant is memory-only and expires</div>`;
+        ${basis}
+        <div class="esc-meta">id ${escapeHtml(String(r.request_id))}</div>`;
 
       const controls = document.createElement('div');
       controls.className = 'esc-controls';
+      // DURATION, chosen at decide time (spec decide-scope-request): this act once — only when
+      // the gate recorded an act to bind (once_available) — for the session, or standing.
+      const duration = document.createElement('select');
+      duration.className = 'scope-duration';
+      for (const [v, label] of scopeDurationOptions(r)) {
+        const o = document.createElement('option');
+        o.value = v; o.textContent = label;
+        duration.appendChild(o);
+      }
+      // BREADTH, for session and standing: the exact path, or a directory above it (always
+      // recursive, never the root). The option text IS the path the grant will reach.
+      const breadth = document.createElement('select');
+      breadth.className = 'scope-breadth';
+      for (const opt of scopeBreadthOptions(path, !!r.subtree)) {
+        const o = document.createElement('option');
+        o.value = JSON.stringify(opt); o.textContent = opt.label;
+        breadth.appendChild(o);
+      }
+      const syncBreadth = () => { breadth.disabled = duration.value === 'once'; };
+      duration.addEventListener('change', syncBreadth);
+      syncBreadth();
       const note = document.createElement('input');
       note.type = 'text';
       note.placeholder = 'note (required to grant)';
@@ -3651,11 +3684,8 @@
           const res = await apiFetch('/api/scope/decide', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              request_id: r.request_id,
-              granted,
-              reason: note.value.trim() || null,
-            }),
+            body: JSON.stringify(scopeDecideBody(r, granted, note.value.trim(), duration.value,
+                                                 JSON.parse(breadth.value))),
           });
           if (!res.ok) {
             let msg = `HTTP ${res.status}`;
@@ -3681,6 +3711,8 @@
       grantBtn.addEventListener('click', () => decide(grantBtn, true));
       refuseBtn.addEventListener('click', () => decide(refuseBtn, false));
 
+      controls.appendChild(duration);
+      controls.appendChild(breadth);
       controls.appendChild(note);
       controls.appendChild(grantBtn);
       controls.appendChild(refuseBtn);
@@ -3688,6 +3720,44 @@
       row.appendChild(err);
       list.appendChild(row);
     }
+  }
+
+  // ---- scope decide: duration, breadth, body (pure; pinned by
+  // tools/dashboard_scope_decide_contract_test.py, which also runs them under node) ----
+  function scopeDurationOptions(r) {
+    const out = [];
+    if (r && r.once_available === true) {
+      out.push(['once', 'this act once (spent by the identical act, inside the claim window)']);
+    }
+    out.push(['session', 'for the session (memory-only, expires)']);
+    out.push(['standing', 'standing (vault; survives restart until revoked)']);
+    return out;
+  }
+
+  // Every option reaches the asked path: the path itself (exact unless the reach was a glob),
+  // the path and everything below it, and each directory ABOVE it, recursive — never the root.
+  function scopeBreadthOptions(path, subtree) {
+    const p = String(path || '').replace(/\/+$/, '');
+    const out = [];
+    if (!p.startsWith('/') || p === '') return out;
+    if (!subtree) out.push({ grant_path: null, recursive: false, label: `exactly ${p}` });
+    out.push({ grant_path: null, recursive: true, label: `${p}/** (this path and everything below)` });
+    const parts = p.split('/').filter(Boolean);
+    for (let i = parts.length - 1; i >= 1; i--) {
+      const anc = '/' + parts.slice(0, i).join('/');
+      out.push({ grant_path: anc, recursive: true, label: `${anc}/** (directory above, recursive)` });
+    }
+    return out;
+  }
+
+  function scopeDecideBody(r, granted, reason, duration, breadth) {
+    const body = { request_id: r.request_id, granted, reason: reason || null };
+    if (!granted) return body;              // a refusal carries no duration and no breadth
+    if (duration === 'once') { body.once = true; return body; }
+    body.standing = duration === 'standing';
+    body.recursive = !!(breadth && breadth.recursive);
+    if (breadth && breadth.grant_path) body.grant_path = breadth.grant_path;
+    return body;
   }
 
   // THE GOVERN CHIP BADGE — driven from the SNAPSHOT, on every tick.
