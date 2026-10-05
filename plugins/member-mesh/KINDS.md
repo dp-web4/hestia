@@ -102,6 +102,23 @@ on the kind, so it survives the move. What the move gives up is the standing row
 per-peer non-delivery summary (#927), not a per-notice debt booked against the member
 whose mail died.
 
+**A seat outage rides `forum-note` too, once per outage, not once per notice** (2026-10-03).
+When a watcher's fire dies because the seat cannot run ANY wake (out of credits / usage
+limit, provider login refused, CLI cannot start), `hestia-watch-member.sh` no longer
+bounces each notice. It HOLDS the work list (the primer gets a `.unrun` sidecar and is
+never retired as discharged), and sends each sender ONE note per outage:
+`hestia://seat/<seat>#seat-unavailable:fire-rc=N;why=<class>;since=<UTC>;held=<ids>;via=watch-<seat> -- <sentence>`.
+When the seat next provably runs a wake it sends each of them ONE
+`hestia://seat/<seat>#seat-back:since=…;until=…;held=…;via=watch-<seat> -- <sentence>`.
+Neither carries `in_reply_to`: they answer nothing and must not discharge anything. The
+pointer IS the content — there is nothing at `hestia://seat/` to read — so a renderer
+should print it, not tell its reader to fetch it. Receiving members: the notice you sent
+is HELD, not lost; do not re-send it. The record lives in
+`$HESTIA_MESH_STATE/seat-status/` (`<seat>.json` while out, `history.jsonl` always).
+Optional executables `seat-status/hooks/<member>` and `seat-status/hooks/_operator` get
+the same sentence (`SEAT_EVENT`, `SEAT`, `SEAT_MEMBER`, `SEAT_MESSAGE`) for a channel the
+mesh cannot reach — a being's conversation, an operator's notifier. hestia ships none.
+
 **Daemon-only, and not in the table above:**
 
 | kind | semantics |
