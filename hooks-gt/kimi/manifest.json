@@ -7,7 +7,7 @@
   "files": [
     {
       "path": "hooks/hooks.json",
-      "sha256": "a40fc68686096fc0088094b0270d634f43d9714d269575c2de7e9fe09b5c8029",
+      "sha256": "ff6a6b61e99bbac86dbf0d38e6113b627c8214d0cf8e797295854e5ff4400671",
       "source": "plugins/kimi/hooks/hooks.json"
     },
     {
@@ -22,7 +22,7 @@
     },
     {
       "path": "hooks/pre_tool_use.py",
-      "sha256": "47b47c0b34c3cbc5a0b4fd9b1111894d614c8b9daadad3d56e68a0141233d7d6",
+      "sha256": "eb8969c817fb4fb6d60db00a2ecc26e38bd8debfd02bf54be29e05636f3268b1",
       "source": "plugins/kimi/hooks/pre_tool_use.py"
     },
     {
@@ -33,23 +33,27 @@
   ],
   "engine": {
     "unit": "_shared",
-    "gt_version": "17f675c2b1d7f981b03e63a350e951cee778aa8cea071c3d005c9e13937bd6d7",
+    "gt_version": "43c25182d697f72ccde867962752f5718563f9ef674dec659851f8959e77e632",
     "files": [
       {
         "path": "hestia_gate_core.py",
-        "sha256": "3fbd8342c1f75a1015d7c12e709921f3a1e575f625c87e338b221a4f10ec07f5"
+        "sha256": "cd797980c479cb858359757273c575f6ba2e9ad0268a99773d10a3c9deea9855"
       },
       {
         "path": "hestia_gate_mechanism.py",
-        "sha256": "b3e6d0ef2c718f65aaf2e21066f19308920098b5cea007f7b72bca1886303b49"
+        "sha256": "dfd35e65cd5366ce7dffec0d0addf8879c8888a65d030c4e706d13645e310e86"
       },
       {
         "path": "hestia_governance_closure.py",
-        "sha256": "2f759e13985a8e14cf2c41b2402c902eb57e4fa6e69d2cb36fb933209d51134b"
+        "sha256": "40ac543f269f4f6667d2220769dc650e0963bee3c3e80899387ad6fbb0ae7ee1"
       },
       {
         "path": "hestia_shell_classifier.py",
         "sha256": "b3f508899069c0b894c792838d9d43925121ec4605cc7e30df22c7d7b425bce2"
+      },
+      {
+        "path": "hestia_single_gate.py",
+        "sha256": "c7cfe50bd717ecb1470f1bce6d00d1ebb030d8f4daf05330dee1b3229a0a38da"
       },
       {
         "path": "hestia_witness_core.py",
@@ -58,5 +62,5 @@
     ]
   },
   "requires": [],
-  "gt_version": "51ec75931abab2b516d3c5747520f94ac754c554c0771c1b3c50c2318c114778"
+  "gt_version": "269b0f529232edc10c2b7cf7e551198dd1fad3441610e49e5d5b424c0c6c008e"
 }

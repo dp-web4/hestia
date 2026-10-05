@@ -15,7 +15,6 @@ WORKSPACE="${1:-${HESTIA_WORKSPACE:-}}"
 EXT4_DEST="${2:-$HOME/.gemini/hestia-plugins}"
 SRC="$(cd "$(dirname "$0")/.." && pwd)"          # hestia/plugins
 GEMINI_HOME="$HOME/.gemini"
-GOVERNOR="$WORKSPACE/hestia/plugins/claude-code/hooks/pre_tool_use.py"
 
 [ -n "$WORKSPACE" ] || {
   echo "[install] FATAL: pass WORKSPACE or set HESTIA_WORKSPACE; public installers do not guess host layout" >&2
@@ -23,15 +22,19 @@ GOVERNOR="$WORKSPACE/hestia/plugins/claude-code/hooks/pre_tool_use.py"
 }
 
 echo "[install] source=$SRC  workspace=$WORKSPACE  ext4=$EXT4_DEST"
-[ -f "$GOVERNOR" ] || { echo "[install] FATAL: society governor not found at $GOVERNOR" >&2; exit 1; }
+# One-gate stage C: the gate is the certified shim over the COMMON gate, loaded from the
+# installed engine ($HESTIA_HOME/shared, deploy/install-members.sh) through the seat's vault
+# projection ($HESTIA_HOME/seats/gemini.env). It no longer spawns claude-code's gate as a
+# governor, and no longer imports the ../../lib path_scope copy.
+[ -n "${HESTIA_HOME:-}" ] || { echo "[install] FATAL: HESTIA_HOME is not set; the gate's projection and engine live there" >&2; exit 1; }
+[ -f "$HESTIA_HOME/shared/hestia_single_gate.py" ] || { echo "[install] FATAL: no common gate at $HESTIA_HOME/shared (run deploy/install-members.sh first)" >&2; exit 1; }
 
-# 1. Copy gate + instance + shared lib to ext4, preserving the gate's ../../lib import structure.
-mkdir -p "$EXT4_DEST/gemini/hooks" "$EXT4_DEST/gemini/instance" "$EXT4_DEST/lib"
+# 1. Copy the gate + instance to ext4.
+mkdir -p "$EXT4_DEST/gemini/hooks" "$EXT4_DEST/gemini/instance"
 cp "$SRC/gemini/hooks/before_tool.py" "$SRC/gemini/hooks/witness.py" "$SRC/gemini/hooks/observe.sh" "$SRC/gemini/hooks/hydrate.sh" "$EXT4_DEST/gemini/hooks/"
 cp "$SRC/gemini/instance/identity.seed.json" "$EXT4_DEST/gemini/instance/"
-cp "$SRC/lib/path_scope.py" "$EXT4_DEST/lib/"
 chmod +x "$EXT4_DEST/gemini/hooks/"*.sh "$EXT4_DEST/gemini/hooks/before_tool.py"
-echo "[install] gate+lib copied to ext4"
+echo "[install] gate copied to ext4"
 
 # 2. Seed the live member identity (do NOT clobber an existing live one - it accrues state).
 mkdir -p "$GEMINI_HOME/hestia-instance"
@@ -47,7 +50,7 @@ cp "$SRC/gemini/GEMINI.md" "$GEMINI_HOME/GEMINI.md"
 echo "[install] GEMINI.md deployed to $GEMINI_HOME"
 
 # 4. Merge the hooks block into settings.json (USER level), pinning hooksConfig.enabled.
-GATE="HESTIA_WORKSPACE=$WORKSPACE HESTIA_SOCIETY_GATE=$GOVERNOR python3 $EXT4_DEST/gemini/hooks/before_tool.py"
+GATE="HESTIA_WORKSPACE=$WORKSPACE python3 $EXT4_DEST/gemini/hooks/before_tool.py"
 OBS="$EXT4_DEST/gemini/hooks/observe.sh"
 # The witness is the hook that reaches the daemon; observe.sh only appends to a local file.
 # Before 2026-09-28 only observe.sh sat on AfterTool, so no gemini outcome reached the chain.
@@ -74,4 +77,5 @@ PY
 
 echo "[install] DONE. Gate is wired at USER level on ext4."
 echo "[install] NEXT (operator): authenticate gemini-cli once ('gemini' then follow the Google login),"
-echo "[install]       then a BeforeTool call will run this gate. Governor: $GOVERNOR (hestia daemon must be up)."
+echo "[install]       then a BeforeTool call will run this gate (the hestia daemon must be up; the gate"
+echo "[install]       reads its 15000 ms timeout from settings.json and decides inside it)."

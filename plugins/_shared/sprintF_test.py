@@ -7,13 +7,17 @@ exit code as the verdict — against a stub MCP daemon, inside a synthetic works
 is deliberately NOT under /tmp (the temp roots are unconditionally in scope, so a /tmp
 workspace greens every scope assertion for the wrong reason).
 
+One-gate stage C: the hooks are now the certified shims over the common gate, run with their
+own projection (the only config source) and a copy of the runtime set under test as their
+engine. Two arms follow the law as re-ruled since this sprint (both noted at the arm).
+
 Arms (explicit-ALL convention):
-  (5)   policy unavailable in enforce -> the ratified DEGRADED mode: a Write is denied, a
-        Read is allowed, and a plain allow of the Write is impossible (criterion 5 — the
-        test injects an unreachable daemon, which is exactly `policy=None` at the
-        evaluate() seam: the shim must not fall back to any local replica);
-  (9c)  every degraded deny is RECORDED: the per-shim diagnostic log gains a row with
-        verdict_available=False, and the gate-availability telemetry gains a row;
+  (5)   policy unavailable -> NO PERMIT: a Write is denied, and since dp's 2026-10-01 ruling
+        ("align upward; no snapshot -> no read") the Read is denied too (gate.degraded) — a
+        plain allow is impossible (the test injects an unreachable daemon, which is exactly
+        `policy=None` at the evaluate() seam: no local replica may stand in);
+  (9c)  every degraded deny is RECORDED: record_decision's fallback log gains an uncommitted
+        row with verdict_available=False, and the gate-availability telemetry gains a row;
   (2)   the §3.3 differential inputs get the SAME verdict from the kimi and codex paths
         (convergence pre-proof; the full fleet convergence proof is Sprint G's);
   (no-regression) an ordinary in-scope write is allowed with a live (stubbed) policy
@@ -54,13 +58,16 @@ DEAD = "http://127.0.0.1:9/mcp"        # port 9 (discard) is closed by conventio
 SHIMS = {
     "claude": {"hook": os.path.join(TREE, "plugins", "claude-code", "hooks", HOOK),
                "plugin_id": "claude-code", "bash_tool": "Bash",
-               "identity_env": "HESTIA_CLAUDE_IDENTITY",
-               "mode_env": "HESTIA_PRE_FAIL_CLOSED", "mode_value": "1"},
+               "identity_env": "HESTIA_CLAUDE_IDENTITY"},
     "kimi": {"hook": KIMI_HOOK, "plugin_id": "kimi-code", "bash_tool": "Bash",
-             "identity_env": "HESTIA_KIMI_IDENTITY", "mode_env": "HESTIA_KIMI_GATE_MODE"},
+             "identity_env": "HESTIA_KIMI_IDENTITY"},
     "codex": {"hook": CODEX_HOOK, "plugin_id": "codex", "bash_tool": "bash",
-              "identity_env": "HESTIA_CODEX_IDENTITY", "mode_env": "HESTIA_CODEX_GATE_MODE"},
+              "identity_env": "HESTIA_CODEX_IDENTITY"},
 }
+SHIM_KEYS = {"claude": "claude-code", "kimi": "kimi", "codex": "codex"}
+# Staging seams (unset in the repo and in CI), shared with the one-gate contract suites.
+_OVERLAY = json.loads(os.environ.get("HESTIA_CONTRACT_OVERLAY") or "{}")
+_SHIMS = json.loads(os.environ.get("HESTIA_CONTRACT_SHIMS") or "{}")
 
 
 def check(name, cond, detail=""):
@@ -105,7 +112,14 @@ class StubDaemon:
             return {"claimed": False, "permits_write": False,
                     "escalation_id": "esc-stub-1",
                     "how_to_decide": "hestia gate approve esc-stub-1"}
-        if name in ("hestia_request_witness", "hestia_witness_decision"):
+        if name == "hestia_witness_decision":
+            # A stage-A receipt: a consequential permit stands only on a committed record (C11).
+            d = args.get("decision")
+            return {"witnessEntryHash": "b" * 64, "decision": d,
+                    "eventType": "policy_allow" if d == "allow" else "policy_decision",
+                    "recorded": "appended", "actionId": args.get("action_id"),
+                    "correlationKey": args.get("correlation_key")}
+        if name == "hestia_request_witness":
             return {"ok": True}
         return {}
 
@@ -166,60 +180,58 @@ class Server:
 
 
 def make_workspace():
-    """A scratch workspace NOT under /tmp, holding granted/notgranted repos and a
-    hestia/plugins/_shared copy of the PATCHED shared modules (what the shims import)."""
+    """A scratch workspace NOT under /tmp (temp roots are always in scope), holding
+    granted/notgranted repos, beside an `engine` dir: a copy of the runtime set under test
+    (RUNTIME_MANIFEST.txt), which is what a stage-C seat loads its common gate from."""
     base = os.path.expanduser("~/.cache/hestia-sprintF-tests")
     os.makedirs(base, exist_ok=True)
     tmp = tempfile.mkdtemp(dir=base)
     ws = os.path.join(tmp, "ws")
-    shared_dst = os.path.join(ws, "hestia", "plugins", "_shared")
-    os.makedirs(shared_dst)
-    for f in (MECH, CORE, CLOSURE):
-        src = os.path.join(SHARED, f)
-        if os.path.isfile(src):
-            shutil.copy(src, shared_dst)
+    engine = os.path.join(tmp, "engine")
+    os.makedirs(engine)
+    with open(os.path.join(SHARED, "RUNTIME_MANIFEST.txt"), encoding="utf-8") as fh:
+        names = [ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
+    for name in dict.fromkeys(names + [m + ".py" for m in _OVERLAY]):
+        shutil.copyfile(_OVERLAY.get(name[:-3]) or os.path.join(SHARED, name),
+                        os.path.join(engine, name))
     for d in ("granted", "notgranted"):
         os.makedirs(os.path.join(ws, d), exist_ok=True)
-    os.makedirs(os.path.join(ws, "hestia", "plugins", "kimi", "hooks"), exist_ok=True)
-    os.makedirs(os.path.join(ws, "hestia", "plugins", "codex", "hooks"), exist_ok=True)
+    os.makedirs(os.path.join(ws, "hestia", "docs"), exist_ok=True)
     with open(os.path.join(ws, "identity.json"), "w", encoding="utf-8") as fh:
         json.dump({"role": "role:constellation:member",
                    "mrh": {"in_scope": ["repo:hestia"]}}, fh)
     return tmp, ws
 
 
-def project(home, plugin_id):
-    """The seat's rendered config projection under a fixture home (#944). Carries ONLY the
-    locator, so every other variable this harness sets stays the launcher's: the projection
-    wins over the environment for the keys it holds, and these arms are about scope, not
-    about which value won."""
+def project(home, shim, ws, endpoint):
+    """The seat's rendered config projection under a fixture home (#944) — its ONLY config
+    source since one-gate stage C: the engine to load, the workspace it polices, the endpoint,
+    its identity, and the rollout (enforce)."""
+    cfg = SHIMS[shim]
+    token = "".join(c.upper() if c.isalnum() else "_" for c in cfg["plugin_id"])
     seats = os.path.join(home, "seats")
     os.makedirs(seats, exist_ok=True)
-    with open(os.path.join(seats, plugin_id + "." + "env"), "w", encoding="utf-8") as fh:
-        fh.write(f"# member: {plugin_id}\nHESTIA_HOME={home}\n")
+    engine = os.path.join(os.path.dirname(ws), "engine")
+    with open(os.path.join(seats, cfg["plugin_id"] + "." + "env"), "w", encoding="utf-8") as fh:
+        fh.write(f"# member: {cfg['plugin_id']}\nHESTIA_HOME={home}\nHESTIA_SHARED_DIR={engine}\n"
+                 f"HESTIA_WORKSPACE={ws}\nHESTIA_ENDPOINT={endpoint}\n"
+                 f"{token}__{cfg['identity_env']}={os.path.join(ws, 'identity.json')}\n"
+                 f"{token}__HESTIA_OBSERVE_DIR={os.path.join(ws, 'observe-' + shim)}\n"
+                 f"{token}__HESTIA_GATE_MODE=enforce\n")
 
 
 def run_hook(shim, ws, event, endpoint, home=None, cwd=None):
     cfg = SHIMS[shim]
-    env = dict(os.environ)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HESTIA_")}
     env.pop("PYTHONPATH", None)
-    env.update({"HESTIA_WORKSPACE": ws,
-                cfg["identity_env"]: os.path.join(ws, "identity.json"),
-                "HESTIA_OBSERVE_DIR": os.path.join(ws, "observe-" + shim),
-                cfg["mode_env"]: cfg.get("mode_value", "enforce"),
-                # Exercise the tree under test, never an installed or per-vendor copy.
-                "HESTIA_SHARED_DIR": SHARED,
-                "HESTIA_ENDPOINT": endpoint})
-    # A seat that consumes the vault projection refuses with no locator or no projection
-    # (#944 step 5, claude first). Every arm therefore runs against a home that HAS one --
-    # the one the arm asked for, or a scratch one -- so the refusal an arm asserts is the
-    # refusal it gets. The ambient HESTIA_HOME is never inherited: a fixture that borrowed
-    # the box's real home would be testing the box.
-    home = home or os.path.join(ws, "hestia-home")
-    project(home, cfg["plugin_id"])
+    # The ambient HESTIA_HOME is never inherited: a fixture that borrowed the box's real home
+    # would be testing the box. The invoker declares the timeout it enforces (60 s here).
+    home = home or os.path.join(ws, "hestia-home-" + shim)
+    project(home, shim, ws, endpoint)
     env["HESTIA_HOME"] = home
-    p = subprocess.run([sys.executable, cfg["hook"]], input=json.dumps(event),
-                       capture_output=True, text=True, timeout=60,
+    env["HESTIA_HOOK_TIMEOUT_S"] = "20"
+    p = subprocess.run([sys.executable, _SHIMS.get(SHIM_KEYS[shim], cfg["hook"])],
+                       input=json.dumps(event), capture_output=True, text=True, timeout=60,
                        cwd=cwd or os.path.join(ws, "granted"), env=env)
     return p.returncode, p.stderr
 
@@ -230,7 +242,10 @@ def _event(tool, tool_input):
 
 
 # ---- criterion 5: unreachable policy authority -> degraded, NEVER plain allow ----
-def test_criterion5_daemon_down_degrades_deny_write_allow_read():
+# Re-ruled by dp (one-gate stage B, live since C): "align upward; no snapshot -> no read".
+# The degraded posture is no longer deny-writes-allow-reads: with no policy snapshot EVERY act
+# is denied (gate.degraded), the read included, as claude-code always did.
+def test_criterion5_daemon_down_denies_every_act():
     tmp, ws = make_workspace()
     try:
         for shim in ("kimi", "codex"):
@@ -238,12 +253,12 @@ def test_criterion5_daemon_down_degrades_deny_write_allow_read():
                                _event("Write", {"file_path": os.path.join(ws, "granted", "a.md"),
                                                 "content": "x"}), DEAD)
             check(f"{shim}-write-denied", rc == 2, f"rc={rc} stderr={err}")
-            check(f"{shim}-degraded-class", "[degraded]" in err, err)
-            check(f"{shim}-names-the-trigger", "unreachable" in err, err)
+            check(f"{shim}-degraded-class", "gate.degraded" in err, err)
+            check(f"{shim}-names-the-trigger", "did not answer" in err, err)
             rc, err = run_hook(shim, ws,
                                _event("Read", {"file_path": os.path.join(ws, "granted", "a.md")}),
                                DEAD)
-            check(f"{shim}-read-allowed", rc == 0, f"rc={rc} stderr={err}")
+            check(f"{shim}-read-denied-too", rc == 2 and "gate.degraded" in err, f"rc={rc} stderr={err}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -274,13 +289,16 @@ def test_degraded_denies_are_recorded():
                                _event("Write", {"file_path": os.path.join(ws, "granted", "b.md"),
                                                 "content": "x"}), DEAD, home=home)
             check(f"{shim}-denied", rc == 2, f"rc={rc} stderr={err}")
+            # Since stage C the uncommitted record is record_decision's fallback, kept only under
+            # an explicit HESTIA_HOME (the Sprint E gate-denies-<member>.jsonl log is retired).
             deny_log = os.path.join(home, "telemetry",
-                                    f"gate-denies-{SHIMS[shim]['plugin_id']}.jsonl")
+                                    f"gate-decisions-{SHIMS[shim]['plugin_id']}.jsonl")
             check(f"{shim}-diagnostic-log-exists", os.path.isfile(deny_log),
                   f"missing {deny_log}; stderr={err}")
             row = json.loads(open(deny_log, encoding="utf-8").readlines()[-1])
             check(f"{shim}-row-not-conduct", row.get("verdict_available") is False, str(row))
             check(f"{shim}-row-is-deny", row.get("decision") == "deny", str(row))
+            check(f"{shim}-row-is-not-evidence", row.get("witness_status") == "unreachable", str(row))
             avail_log = os.path.join(home, "telemetry", "gate-unavailable.jsonl")
             check(f"{shim}-availability-row", os.path.isfile(avail_log),
                   f"missing {avail_log}")
@@ -385,7 +403,8 @@ def test_claude_workspace_root_standing_grant_admits_absolute_bash_path():
 # ---- the fetch itself: composition, thin daemon, unreachable daemon ----
 def _load_mechanism_module():
     import importlib.util
-    spec = importlib.util.spec_from_file_location("sprintF_mech", os.path.join(SHARED, MECH))
+    spec = importlib.util.spec_from_file_location(
+        "sprintF_mech", _OVERLAY.get(MECH[:-3]) or os.path.join(SHARED, MECH))
     m = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = m
     spec.loader.exec_module(m)
@@ -448,13 +467,14 @@ def test_gate_self_write_daemon_down_stays_gate_self():
             rc, err = run_hook(shim, ws, _event("Write", {"file_path": target,
                                                           "content": "x"}), DEAD)
             check(f"{shim}-refused", rc == 2, f"rc={rc} stderr={err}")
-            check(f"{shim}-gate-self-not-degraded", "gate-self" in err, err)
+            check(f"{shim}-gate-self-not-degraded", "gate.self_access" in err
+                  and "gate.degraded" not in err, err)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
 ALL = [
-    test_criterion5_daemon_down_degrades_deny_write_allow_read,
+    test_criterion5_daemon_down_denies_every_act,
     test_criterion5_degraded_never_relaxes_egress,
     test_degraded_denies_are_recorded,
     test_differential_inputs_converge,

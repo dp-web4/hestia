@@ -182,12 +182,13 @@ def test_a_permitted_role_passes_and_an_unbounded_one_says_it_is_unbounded() -> 
             "HESTIA_ROLE_PERMITTED": "role:constellation:interactive-dev,role:constellation:mesh-worker",
         })
         env = projection_env(home, HESTIA_ROLE="role:constellation:mesh-worker")
-        got = probe_env(env, ["HESTIA_ROLE", "HESTIA_ROLE_VERIFIED", "HESTIA_ROLE_PERMITTED"])
+        # One-gate stage C: the verdict is the common gate's (step 0 of decide()), reached per
+        # act, so the import-time HESTIA_ROLE_VERIFIED marker the pre-C loader exported (read by
+        # nothing) is retired; the bound's effect is asserted on the hook's answer instead.
+        got = probe_env(env, ["HESTIA_ROLE", "HESTIA_ROLE_PERMITTED"])
         check("permitted_role_loads", got["err"] is None, str(got["err"]))
         check("permitted_role_survives", got["env"].get("HESTIA_ROLE") == "role:constellation:mesh-worker",
               f"the bound overrode the launch role: {got['env']}")
-        check("permitted_role_marked_verified", got["env"].get("HESTIA_ROLE_VERIFIED") == "1",
-              f"a bounded role must be legible as bounded: {got['env']}")
         check("the_bound_is_not_exported_as_config",
               got["env"].get("HESTIA_ROLE_PERMITTED") in (None, ""),
               f"the permitted set leaked into the seat's environment: {got['env']}")
@@ -198,12 +199,12 @@ def test_a_permitted_role_passes_and_an_unbounded_one_says_it_is_unbounded() -> 
         home = stage_home(Path(raw))
         write_projection(home, env={})          # no set declared: today's behaviour, unchanged
         env = projection_env(home, HESTIA_ROLE="role:anything:at:all")
-        got = probe_env(env, ["HESTIA_ROLE", "HESTIA_ROLE_VERIFIED"])
+        got = probe_env(env, ["HESTIA_ROLE"])
         check("unbounded_role_still_runs", got["err"] is None, str(got["err"]))
         check("unbounded_role_survives", got["env"].get("HESTIA_ROLE") == "role:anything:at:all",
               f"an undeclared set must not start refusing roles: {got['env']}")
-        check("unbounded_role_marked_unverified", got["env"].get("HESTIA_ROLE_VERIFIED") == "0",
-              f"silence must mean something: {got['env']}")
+        r = run_hook(env)
+        check("unbounded_role_not_refused", "[config.miswired]" not in r.stderr, r.stderr[-300:])
 
 
 def test_an_old_core_without_the_verdict_fails_closed_not_open() -> None:
@@ -225,7 +226,9 @@ def test_an_old_core_without_the_verdict_fails_closed_not_open() -> None:
         check("old_core_is_not_exit_1", r.returncode != 1,
               f"rc 1 is fail-OPEN in Claude Code: {r.stderr[-300:]!r}")
         check("old_core_denies_rc2", r.returncode == 2, f"rc {r.returncode}: {r.stderr[-300:]!r}")
-        check("old_core_names_the_rule", "[gate.core_unavailable]" in r.stderr, r.stderr[-300:])
+        # Since one-gate stage C the common gate evaluates the bound per act; a core that cannot
+        # is a recorded `gate.internal_error` deny (no verdict, no act), never an exit 1.
+        check("old_core_names_the_rule", "[gate.internal_error]" in r.stderr, r.stderr[-300:])
         check("old_core_no_traceback", "Traceback" not in r.stderr, r.stderr[-300:])
     # CONTROL: with no declared set, the same old core is not consulted at import, so this
     # check cannot be what refuses (whatever main later does with a stale core is its own path).
@@ -236,7 +239,7 @@ def test_an_old_core_without_the_verdict_fails_closed_not_open() -> None:
         if "def launch_role_verdict" in src:
             core.write_text(src[:src.index("def launch_role_verdict")])
         write_projection(home, env={})
-        got = probe_env(projection_env(home, HESTIA_ROLE="role:anything"), ["HESTIA_ROLE_VERIFIED"])
+        got = probe_env(projection_env(home, HESTIA_ROLE="role:anything"), ["HESTIA_ROLE"])
         check("no_set_does_not_consult_the_core", got["err"] is None, str(got["err"]))
 
 
@@ -256,10 +259,8 @@ def test_a_declared_set_does_not_refuse_an_absent_role() -> None:
         })
         env = projection_env(home)
         env.pop("HESTIA_ROLE", None)
-        got = probe_env(env, ["HESTIA_ROLE", "HESTIA_ROLE_VERIFIED"])
+        got = probe_env(env, ["HESTIA_ROLE"])
         check("absent_role_still_runs", got["err"] is None, str(got["err"]))
-        check("absent_role_marked_unverified", got["env"].get("HESTIA_ROLE_VERIFIED") == "0",
-              f"an absent role was not checked, so it must not read as verified: {got['env']}")
         r = run_hook(env)
         check("absent_role_not_refused", "[config.miswired]" not in r.stderr, r.stderr[-300:])
 

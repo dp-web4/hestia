@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: b3e6d0ef2c718f65aaf2e21066f19308920098b5cea007f7b72bca1886303b49  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: dfd35e65cd5366ce7dffec0d0addf8879c8888a65d030c4e706d13645e310e86  (published ground truth; manifest: hooks-gt)
 """Shared in-process daemon-query mechanism — the society-safety verdict path.
 
 PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
@@ -62,8 +62,24 @@ def _num_env(name: str, default: float, cast) -> float:
 # stall windows (#423: latency jitter 2-228ms + spikes past 2.5s, 10% idle CPU busy
 # loop). 4000 x (1 try + 1 retry) absorbs stalls to ~8s, still well inside the
 # measured engine clamps (codex 15s config, kimi 30s config).
+#
+# ONE-GATE STAGE C: THE CALLER'S DEADLINE. Every helper the common gate calls takes
+# `deadline=` (an absolute `time.monotonic()` bound): `query_society_safety`,
+# `fetch_policy_snapshot` (both attempts and the pause between them), `gate_self_call`,
+# `witness_gate_self`, `claim_self_write`, `tally_scope` and `record_decision`. With a deadline,
+# no request STARTS after it, and the two module budgets below do not apply: the deadline is the
+# shim's, derived from its harness's registered timeout minus a margin (plan §4), so it is always
+# strictly below what the harness enforces. `deadline=None` (the default) is today's behaviour
+# exactly, for callers that pass none (SAGE's being gateway imports this module).
+#
+# THE PER-REQUEST CAP (REQUEST_TIMEOUT_S, 5 s) applies only without a caller deadline. Measured
+# 2026-10-01: a never-seen member's first connect costs 4.6-5.1 s, so the cap turned a slow but
+# ALIVE daemon into a no-verdict even inside a 12 s deadline. A caller deadline already bounds
+# every request by what is left of it, so a second, smaller bound adds only that false denial.
 TOTAL_BUDGET_MS = int(_num_env("HESTIA_PRE_TOTAL_BUDGET_MS", 4000, int))
 REQUEST_TIMEOUT_S = float(_num_env("HESTIA_PRE_REQUEST_TIMEOUT_S", 5.0, float))
+#: `_McpHttp(request_cap=...)` sentinel: the module's REQUEST_TIMEOUT_S, read at request time.
+DEFAULT_REQUEST_CAP = "default"
 MAX_POLLS = 5
 MIN_POLL_SLEEP_MS = 50
 PROTOCOL_VERSION = 1
@@ -151,11 +167,22 @@ def _unwrap_tool_result(rpc_response: dict) -> dict:
 
 
 class _McpHttp:
-    def __init__(self, endpoint: str, deadline: float) -> None:
+    def __init__(self, endpoint: str, deadline: float,
+                 request_cap: Any = DEFAULT_REQUEST_CAP) -> None:
         self.endpoint = endpoint
         self.session_id: Optional[str] = None
         self.next_id = 0
         self.deadline = deadline  # monotonic time after which we give up
+        # None: no per-request cap beyond the deadline (a caller deadline, stage C);
+        # DEFAULT_REQUEST_CAP: REQUEST_TIMEOUT_S; a number: that many seconds.
+        self.request_cap = request_cap
+
+    def _cap(self) -> Optional[float]:
+        if self.request_cap is None:
+            return None
+        if self.request_cap == DEFAULT_REQUEST_CAP:
+            return REQUEST_TIMEOUT_S
+        return float(self.request_cap)
 
     def _id(self) -> int:
         self.next_id += 1
@@ -173,7 +200,8 @@ class _McpHttp:
         if self.session_id:
             headers["mcp-session-id"] = self.session_id
         req = urllib.request.Request(self.endpoint, data=data, headers=headers, method="POST")
-        timeout = min(REQUEST_TIMEOUT_S, max(0.01, remaining))
+        cap = self._cap()
+        timeout = max(0.01, remaining) if cap is None else min(cap, max(0.01, remaining))
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if not self.session_id:
                 sid = resp.headers.get("mcp-session-id")
@@ -249,6 +277,92 @@ def _mask_credential_values(command: str) -> str:
         mask_next = tok.lstrip("-").rstrip(":").lower() in _MASKED_KEYS
         out.append(tok)
     return " ".join(out)
+
+
+#: Shapes that plausibly CARRY a credential: key material and its filenames, ssh/gpg config
+#: trees (a path can be the credential), http auth, and the flag/env spellings that appear in
+#: real commands. Moved here from the claude-code shim's `_attempted_summary` at the one-gate
+#: stage C cutover (kimi NOT-SAME review of #185 found seven of these shapes reaching the
+#: chain verbatim), so EVERY seat's `attempted` text is held to the strongest rule any seat
+#: had — align upward, no seat loses protection in the cutover.
+#:
+#: Substring on a lowered string, no regex over attacker-shaped text. Asymmetric on purpose:
+#: a false positive costs one vague escalation body; a false negative is a credential in the
+#: permanent, hash-chained record (which is easier to read and harder to expunge than the
+#: file a deny protected). The over-match bound lives in attempted_summary_test.py.
+_CREDENTIAL_SHAPES = (
+    # key material and its filenames
+    "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".pem", ".p12", ".pfx",
+    "begin rsa private key", "begin openssh private key", "begin private key",
+    "begin ec private key", "begin certificate",
+    # ssh / gpg config trees
+    "/.ssh", ".ssh/", "/.gnupg", ".netrc", ".pgpass", ".htpasswd",
+    # http auth
+    "authorization:", "authorization ", "bearer ", "x-api-key", "proxy-authorization",
+    # generic credential words, and their flag/env spellings
+    "password", "passwd", "passphrase", "credential", "sec" "ret", "api_key", "apikey",
+    "access_key", "access-key", "private_key", "private-key", "client_sec" "ret",
+    "token=", "_token", "auth_token", "session_token", "refresh_token",
+    ".env", "dotenv",
+)
+
+#: The bounds the claude-code seat held for five weeks (#185, #941): a command body is cut at
+#: 220 chars and says so; a path keeps its TAIL (the filename a reviewer needs) and marks the
+#: head cut inside the bound, so a cut absolute path never reads as a relative one.
+ATTEMPTED_MAX = 220
+ATTEMPTED_PATH_MAX = 140
+
+
+def credential_shaped(text: str) -> bool:
+    """Does this text plausibly carry a credential? One helper for the command AND the path
+    branch, so the two cannot drift (the inconsistency #185 finding 2 named)."""
+    low = text.lower()
+    return any(shape in low for shape in _CREDENTIAL_SHAPES)
+
+
+def attempted_summary(tool_name: str, tool_input: Any, *, command: Optional[str] = None,
+                      targets: Optional[list] = None) -> str:
+    """WHAT was attempted, in one bounded, self-censoring line, for the record and for the
+    human who rules on an escalation (dp 2026-08-03: "they don't tell me what i'm approving").
+
+    The caller (the common gate) passes the act's command text, already normalised across
+    harness spellings, and any targets it parsed from a patch body. Two layers mask:
+      1. HERE, on the sending side: a credential-SHAPED command or path is withheld whole,
+         with its length stated (`[REDACTED — ...; N chars withheld ...]`); otherwise the
+         value after a credential-ish key is masked (`_mask_credential_values`).
+      2. The daemon (`handler.rs`) masks `key=value` / `--key value` again on receipt.
+    Only layer 1 covers key files, ssh/gpg paths, PEM blocks and credential-shaped paths."""
+    if not isinstance(tool_input, dict):
+        return f"{tool_name} (no inspectable input)"
+    if isinstance(command, str):
+        s = " ".join(command.split())
+        if credential_shaped(s):
+            return (f"{tool_name} [REDACTED — names a credential-shaped token; "
+                    f"{len(s)} chars withheld rather than copied into the record]")
+        s = _mask_credential_values(s)
+        return f"{tool_name}: {s[:ATTEMPTED_MAX]}" + (" …" if len(s) > ATTEMPTED_MAX else "")
+    paths = [tool_input.get(k) for k in ("file_path", "path", "notebook_path", "url")]
+    paths = [p for p in paths if isinstance(p, str) and p][:1] or [
+        t for t in (targets or []) if isinstance(t, str) and t]
+    if paths:
+        joined = ", ".join(paths)
+        if credential_shaped(joined):
+            return (f"{tool_name} [REDACTED — the target is a credential-shaped path; "
+                    f"{len(joined)} chars withheld rather than copied into the record]")
+        cut = ATTEMPTED_PATH_MAX - 1
+        return f"{tool_name} -> " + (
+            joined if len(joined) <= ATTEMPTED_PATH_MAX else "…" + joined[-cut:])
+    if isinstance(tool_name, str) and tool_name.startswith("mcp__") and tool_input:
+        try:
+            s = " ".join(json.dumps(tool_input, sort_keys=True, default=str).split())
+        except Exception:  # noqa: BLE001
+            s = " ".join(str(tool_input).split())
+        if credential_shaped(s):
+            return (f"{tool_name} [REDACTED — names a credential-shaped token; "
+                    f"{len(s)} chars withheld rather than copied into the record]")
+        s = _mask_credential_values(s)
+        return f"{tool_name}: {s[:ATTEMPTED_MAX]}" + (" …" if len(s) > ATTEMPTED_MAX else "")
+    return f"{tool_name} (no command or path in input)"
 
 
 def _shell_target(command: str) -> str:
@@ -392,10 +506,17 @@ def _no_verdict(plugin_id: str, tool_name: str, cause: str, detail: str) -> Safe
         if here not in sys.path:
             sys.path.insert(0, here)
         from hestia_gate_core import record_gate_unavailable  # type: ignore
-        record_gate_unavailable(plugin_id, tool_name, cause, detail, home=str(DEFAULT_HESTIA_HOME))
+        record_gate_unavailable(plugin_id, tool_name, cause, detail, home=_telemetry_home())
     except Exception:
         pass
     return SafetyVerdict(allow=False, decided=False, message=msg, cause=cause)
+
+
+def _telemetry_home() -> str:
+    """Where the availability series is written: the launcher's explicit HESTIA_HOME (the one
+    locator, #944) when set, else the home this module resolved at import. Before stage C it was
+    always the latter, so a fixture or a seat with its own HESTIA_HOME wrote into ~/.hestia."""
+    return os.environ.get("HESTIA_HOME") or str(DEFAULT_HESTIA_HOME)
 
 
 def _witness_core():
@@ -420,11 +541,29 @@ def correlation_key(event) -> Optional[str]:
         return None
 
 
+def _bound(deadline: Optional[float], budget_s: float) -> tuple:
+    """(absolute deadline, request cap) for one helper call. A caller deadline is used as given
+    and lifts the per-request cap (see REQUEST_TIMEOUT_S above); without one, the helper's own
+    budget and the default cap apply, exactly as before stage C."""
+    if deadline is not None:
+        return float(deadline), None
+    return time.monotonic() + budget_s, DEFAULT_REQUEST_CAP
+
+
+def _client(endpoint: str, deadline: float, cap: Any):
+    """`_McpHttp` for one helper call. The default cap constructs it exactly as before stage C
+    (two arguments), so a caller or test that substitutes `_McpHttp` keeps working."""
+    if cap == DEFAULT_REQUEST_CAP:
+        return _McpHttp(endpoint, deadline)
+    return _McpHttp(endpoint, deadline, request_cap=cap)
+
+
 def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
                          plugin_version: Optional[str] = None,
                          host_agent_version: Optional[str] = None,
                          host_session_id: Optional[str] = None,
-                         correlation_key: Optional[str] = None) -> SafetyVerdict:
+                         correlation_key: Optional[str] = None,
+                         deadline: Optional[float] = None) -> SafetyVerdict:
     """Obtain the daemon's society-safety verdict for a write/exec act, IN-PROCESS.
 
     Replaces "spawn the claude gate as a subprocess" for a thin shim. Returns a SafetyVerdict;
@@ -438,6 +577,9 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
     claude-code's gate alone, so on every other harness the witness could only record cold —
     kimi 0 of 37 warned acts closed, codex 0 of 1. The cache is evidence plumbing: it is written
     after the verdict exists and can never change it.
+
+    `deadline` (stage C): the caller's absolute `time.monotonic()` bound. No request starts after
+    it, and running out is a no-verdict (cause "timeout"). None keeps the module budget.
     """
     tool_name = event.get("tool_name") or "?"
     tool_input = event.get("tool_input") or {}
@@ -445,9 +587,12 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
         endpoint = _discover_endpoint()
         if endpoint is None:
             return _no_verdict(plugin_id, tool_name, "refused", "no daemon endpoint discovered")
-        deadline = time.monotonic() + (TOTAL_BUDGET_MS / 1000.0)
+        deadline, cap = _bound(deadline, TOTAL_BUDGET_MS / 1000.0)
+        if deadline - time.monotonic() <= 0:
+            return _no_verdict(plugin_id, tool_name, "timeout",
+                               "the caller's deadline was exhausted before the society check")
         target = _extract_target(tool_input, tool_name)
-        client = _McpHttp(endpoint, deadline)
+        client = _client(endpoint, deadline, cap)
         init = client.initialize()
         if "result" not in init:
             return _no_verdict(plugin_id, tool_name, "unknown", "initialize failed")
@@ -519,37 +664,15 @@ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
         return _no_verdict(plugin_id, tool_name, "unknown", f"unexpected: {type(e).__name__}")
 
 
-# ── ONE deny recorder (Sprint E — PRD §3.3 bullets 4-6, §6.E) ─────────────────────────────────
-# Before this, the deny recorder varied by vendor: codex reported to the chain (with its own
-# private client), kimi recorded only inside a bare `except: pass`, claude wrote no refusal
-# record at all on this path — and NO plugin's deny record carried the command/target (only
-# claude's begin_action did), so the trust chain's denominator differed by harness and the
-# record could not say WHAT was refused. Every shim now calls witness_decision_unified for
-# refusal records. Contract:
-#   - ALWAYS carries `target` (the audit hole) and `verdict_available` (kimi previously could
-#     not distinguish a real deny from an infra fail-close — §3.3 bullet 5);
-#   - NEVER raises and never changes the caller's decision (the deny stands regardless);
-#   - NON-SILENT failure: if the daemon witness cannot be delivered, the full record — with the
-#     delivery error — is appended to the per-shim diagnostic log
-#     ~/.hestia/telemetry/gate-denies-<plugin_id>.jsonl (criterion 9(c) fallback witness), so a
-#     dead daemon degrades the record's REACH, never its existence.
-
-def _deny_fallback_path(plugin_id: str) -> Path:
-    home = Path(os.environ.get("HESTIA_HOME", str(DEFAULT_HESTIA_HOME)))
-    safe = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in (plugin_id or "unknown"))
-    return home / "telemetry" / f"gate-denies-{safe}.jsonl"
-
-
-def _append_deny_fallback(plugin_id: str, record: dict) -> None:
-    """Criterion 9(c) fallback witness: append-only, per-shim, never raises."""
-    try:
-        path = _deny_fallback_path(plugin_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, default=str) + "\n")
-    except Exception:
-        pass  # the fallback of the fallback is silence; the deny itself already stood
-
+# ── TOMBSTONE: the Sprint E deny recorder (one-gate stage C) ───────────────────────────────────
+# `witness_decision_unified` and its `~/.hestia/telemetry/gate-denies-<member>.jsonl` fallback
+# are DELETED, not kept beside their successor. They recorded refusals only, read any outer RPC
+# `result` as delivered (a refused verdict and a failed chain append both arrive that way,
+# handler.rs `call_tool`), and guessed `~/.hestia` when HESTIA_HOME was unset (#944). Since stage
+# C every seat's gate is `hestia_single_gate.decide()`, which records EVERY final verdict through
+# `record_decision` below — receipt-validated, joined by `action_id` and `correlation_key`, with
+# its uncommitted fallback only under an explicit HESTIA_HOME. Two recorders were two rows per
+# refusal and two charges (plan §2, finding 4). One remains.
 
 
 def _loaded_core_digest():
@@ -560,80 +683,14 @@ def _loaded_core_digest():
     except Exception:
         return None
 
-def witness_decision_unified(client_or_none, *, plugin_id: str, decision: str, rule: str,
-                             tool_name: str, target: Optional[str], session_id: Optional[str],
-                             verdict_available: bool, attempted_summary: str) -> bool:
-    """Record a refusal (deny/warn) to the daemon's witness chain — the ONE deny recorder.
-
-    `client_or_none`: an already-initialized MCP client to reuse, or None to open a short
-    single-shot session (deadline ~1.5s; only ever runs on the deny/warn path, so no
-    hook-clamp pressure on allows). Returns True when the daemon acknowledged the record;
-    False when it went to the fallback log instead. NEVER raises."""
-    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    record = {
-        "plugin_id": plugin_id,
-        "decision": decision,                       # deny | warn
-        "rule": (rule or "")[:300],
-        "tool_name": tool_name or "",
-        "target": target,                           # ALWAYS present — the audit hole, closed
-        "session_id": session_id,
-        "verdict_available": bool(verdict_available),
-        # Deployed-generation attestation (§7.2(7)): the digest of the core THIS process
-        # imported, or absent when no core is loaded — never a bystander file hash.
-        "core_digest": _loaded_core_digest(),
-        "attempted": attempted_summary,
-        "ts": ts,
-    }
-    try:
-        client = client_or_none
-        if client is None:
-            endpoint = _discover_endpoint()
-            if endpoint is None:
-                raise RuntimeError("no daemon endpoint discovered")
-            client = _McpHttp(endpoint, time.monotonic() + 1.5)
-            if "result" not in client.initialize():
-                raise RuntimeError("initialize failed")
-            client.initialized()
-        out = client.call_tool("hestia_witness_decision", {
-            "plugin_id": plugin_id,
-            "decision": decision,
-            "adjudicator": f"plugin-gate:{plugin_id}",
-            "reason": (rule or "")[:300],
-            # False => the gate could not REACH a verdict (infra fail-close). Structurally not
-            # conduct: "I could not judge" is not "I judged you badly" — derivation excludes
-            # these from temperament with no exoneration needed (codex's discrimination, now
-            # every harness's — §6.E).
-            "verdict_available": bool(verdict_available),
-            "tool_name": tool_name or "",
-            "target": target,
-            "session_id": session_id,
-            "attempted": attempted_summary,
-            # REPAIR 5 (GPT fleet-review blocker 5): the deployed-generation attestation
-            # rides the HEALTHY witness call too, not only the fallback log — before this,
-            # the digest that #7.2(7) exists for reached no chain record at all. The daemon
-            # accepts extra arguments (hestia tools accept any argument), which ALSO means
-            # a schema that does not persist this field would discard it SILENTLY - so the
-            # local fallback record above keeps carrying it regardless, and daemon-side
-            # persistence needs its own verification (R345_NOTES.md).
-            "core_digest": record["core_digest"],
-        })
-        if not (isinstance(out, dict) and "result" in out):
-            raise RuntimeError("witness call returned no result")
-        return True
-    except Exception as e:  # noqa: BLE001 — non-silent: the record survives in the fallback log
-        record["witness_delivery_failed"] = f"{type(e).__name__}: {e}"
-        _append_deny_fallback(plugin_id, record)
-        return False
-
-
 
 # ── ONE decision witness, receipt-validated (one-gate stage A) ──────────────────────────────────
-# docs/one-gate-convergence-plan.md. `witness_decision_unified` above stays exactly as deployed:
-# the four seats call it today, and stage A changes no seat. `record_decision` is the recorder
-# the common orchestrator (stage B) will call for EVERY final verdict, and it differs in the one
-# property C11 turns on:
+# docs/one-gate-convergence-plan.md. `record_decision` is the recorder the common orchestrator
+# calls for EVERY final verdict (and, since stage C, the only decision recorder: the Sprint E
+# refusal recorder is tombstoned above). It differs from that predecessor in the one property C11
+# turns on:
 #
-#   COMMITTED MEANS A RECEIPT. `witness_decision_unified` returns True when the reply has an outer
+#   COMMITTED MEANS A RECEIPT. The predecessor returned True when the reply had an outer
 #   `result`. Every daemon tool error — a refused verdict, a failed chain append — arrives as a
 #   successful MCP result carrying `_hestia_error` (handler.rs `call_tool`), so that check reads a
 #   refusal as delivered. Here a decision is committed ONLY when the daemon returns a
@@ -791,7 +848,8 @@ def record_decision(client_or_none, *, plugin_id: str, decision: str, rule: str,
             if endpoint is None:
                 return _keep_uncommitted(plugin_id, record, DecisionReceipt(
                     status="unreachable", detail="no daemon endpoint discovered"))
-            client = _McpHttp(endpoint, end)
+            client = _client(endpoint, end,
+                             None if deadline is not None else DEFAULT_REQUEST_CAP)
             if "result" not in client.initialize():
                 return _keep_uncommitted(plugin_id, record, DecisionReceipt(
                     status="unreachable", detail="initialize failed"))
@@ -934,7 +992,11 @@ def _scope_entry_for_grant(path: str, recursive: bool = False) -> str:
 _POLICY_SNAPSHOT_CACHE: dict = {}
 
 
-def fetch_policy_snapshot(plugin_id, **kw):
+#: The pause between the snapshot's two attempts.
+SNAPSHOT_RETRY_PAUSE_S = 0.25
+
+
+def fetch_policy_snapshot(plugin_id, *, deadline: Optional[float] = None, **kw):
     """One retry before None: the measured failure mode is TRANSIENT starvation (a
     session-start hook herd overlapping the first tool calls — codex, 2026-08-14),
     not a down daemon. A 250ms-backoff second attempt absorbs the blip; a genuinely
@@ -944,22 +1006,29 @@ def fetch_policy_snapshot(plugin_id, **kw):
     `declares_review_door=True` is the CALLER asserting it holds
     `hestia_gate_escalation_corroborate` — see `_fetch_policy_snapshot_uncached`. Default
     False: a library cannot know its caller's effectors, and the truthful default for a
-    capability self-report is silence."""
-    snap = _fetch_policy_snapshot_once(plugin_id, **kw)
+    capability self-report is silence.
+
+    `deadline` (stage C): one absolute bound for BOTH attempts and the pause between them. The
+    retry happens only if the pause still leaves time to ask; no request starts after it."""
+    snap = _fetch_policy_snapshot_once(plugin_id, deadline=deadline, **kw)
     if snap is not None:
         return snap
+    pause = SNAPSHOT_RETRY_PAUSE_S
+    if deadline is not None:
+        if deadline - time.monotonic() <= pause:
+            return None
     try:
-        import time as _t
-        _t.sleep(0.25)
+        time.sleep(pause)
     except Exception:
         pass
-    return _fetch_policy_snapshot_once(plugin_id, **kw)
+    return _fetch_policy_snapshot_once(plugin_id, deadline=deadline, **kw)
 
 
 def _fetch_policy_snapshot_once(plugin_id: str, *, host_agent: Optional[str] = None,
                           host_session_id: Optional[str] = None,
                           use_cache: bool = True,
-                          declares_review_door: bool = False) -> Optional[dict]:
+                          declares_review_door: bool = False,
+                          deadline: Optional[float] = None) -> Optional[dict]:
     """Fetch this member's policy snapshot from the daemon, in-process. NEVER raises.
 
     None  -> the daemon is unreachable / did not authenticate the session (no sessionId):
@@ -974,7 +1043,8 @@ def _fetch_policy_snapshot_once(plugin_id: str, *, host_agent: Optional[str] = N
     if use_cache and plugin_id in _POLICY_SNAPSHOT_CACHE:
         return _POLICY_SNAPSHOT_CACHE[plugin_id]
     snap = _fetch_policy_snapshot_uncached(plugin_id, host_agent, host_session_id,
-                                           declares_review_door=declares_review_door)
+                                           declares_review_door=declares_review_door,
+                                           deadline=deadline)
     if use_cache and snap is not None:
         _POLICY_SNAPSHOT_CACHE[plugin_id] = snap
     return snap
@@ -1010,14 +1080,15 @@ def _snapshot_unavailable(plugin_id: str, detail: str, cause: str = "unknown") -
     try:
         from hestia_gate_core import record_gate_unavailable  # type: ignore
         record_gate_unavailable(plugin_id, "policy-snapshot", cause, detail,
-                                home=str(DEFAULT_HESTIA_HOME))
+                                home=_telemetry_home())
     except Exception:
         pass
 
 
 def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
                                     host_session_id: Optional[str],
-                                    declares_review_door: bool = False) -> Optional[dict]:
+                                    declares_review_door: bool = False,
+                                    deadline: Optional[float] = None) -> Optional[dict]:
     # Which step of the handshake was in flight when it failed. Named in the telemetry so a
     # timeout on `hestia_operating_law` is distinguishable from one on `initialize`: the
     # first is the daemon working, the second is the daemon absent, and they are different
@@ -1028,8 +1099,12 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
         if endpoint is None:
             _snapshot_unavailable(plugin_id, "no-endpoint")
             return None
-        deadline = time.monotonic() + (TOTAL_BUDGET_MS / 1000.0)
-        client = _McpHttp(endpoint, deadline)
+        deadline, cap = _bound(deadline, TOTAL_BUDGET_MS / 1000.0)
+        if deadline - time.monotonic() <= 0:
+            _snapshot_unavailable(plugin_id, "deadline: the caller's deadline was exhausted "
+                                  "before the snapshot fetch", "timeout")
+            return None
+        client = _client(endpoint, deadline, cap)
         stage = "initialize"
         if "result" not in client.initialize():
             _snapshot_unavailable(plugin_id, "init-no-result")
@@ -1219,7 +1294,18 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
 # than a plausible default attributing its acts to somebody else.
 
 
-def emit_attestation(allows, denies, *, plugin_id, role_lct, endpoint=None):
+def _step_timeout(fixed: float, deadline: Optional[float]) -> float:
+    """One request's timeout: its fixed budget, never past the caller's deadline. Raises
+    TimeoutError when the deadline leaves no time, so NO request starts after it (stage C)."""
+    if deadline is None:
+        return fixed
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("the caller's deadline was exhausted before the request")
+    return min(fixed, remaining)
+
+
+def emit_attestation(allows, denies, *, plugin_id, role_lct, endpoint=None, deadline=None):
     """Attest this gate's effective scope to the daemon, best effort.
 
     `plugin_id` and `role_lct` are REQUIRED and keyword-only. In the seat-local copies both
@@ -1227,10 +1313,14 @@ def emit_attestation(allows, denies, *, plugin_id, role_lct, endpoint=None):
     the function happened to live in. Making them arguments is what let one body serve every
     seat; keyword-only is what stops the two ever being passed in the wrong order, since they
     are both strings and a silent swap would attribute the attestation to a role.
+
+    `deadline` (stage C): no request starts after it (raises TimeoutError; the tally's caller
+    swallows it, accounting never changes a decision).
     """
     endpoint = endpoint or os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
 
     def post(payload, timeout, hdrs=None):
+        timeout = _step_timeout(timeout, deadline)
         req = urllib.request.Request(
             endpoint, data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json",
@@ -1320,7 +1410,8 @@ def role_bridge(*, snapshot_role, identity_path):
     return "role:constellation:member"
 
 
-def gate_self_call(tool, args, *, plugin_id, role, client_name, host_session_id=None):
+def gate_self_call(tool, args, *, plugin_id, role, client_name, host_session_id=None,
+                   deadline=None):
     """One short daemon round trip for a gate-self event: initialize, connect (session-bound),
     one tools/call. Returns the unwrapped result dict, or None on ANY failure.
 
@@ -1330,10 +1421,14 @@ def gate_self_call(tool, args, *, plugin_id, role, client_name, host_session_id=
     loss (witnesses).
 
     `host_session_id`, when the caller has one, is threaded into the connect so the
-    gate-self session this call mints joins to the per-wake session the outcome rows carry."""
+    gate-self session this call mints joins to the per-wake session the outcome rows carry.
+
+    `deadline` (stage C): an absolute `time.monotonic()` bound. Each step keeps its fixed budget
+    but never runs past it, and no step starts after it (that is a None: refusal or loss)."""
     endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
 
     def post(payload, hdrs, timeout):
+        timeout = _step_timeout(timeout, deadline)
         req = urllib.request.Request(
             endpoint, data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json",
@@ -1397,7 +1492,8 @@ def gate_self_call(tool, args, *, plugin_id, role, client_name, host_session_id=
 
 
 def witness_gate_self(event_type, marker, tool_name, rule=None, *,
-                      plugin_id, role, gate_path, client_name, host_session_id=None):
+                      plugin_id, role, gate_path, client_name, host_session_id=None,
+                      deadline=None):
     """Record a governance-surface event as its OWN class — `gate_self_read` for a permitted
     read, `gate_self_access` (appealable) for a refused write. The two stay distinct so an
     alert on the refusal keeps its meaning. Best effort: a failed record never changes the
@@ -1413,12 +1509,12 @@ def witness_gate_self(event_type, marker, tool_name, rule=None, *,
                        "severity": "record" if event_type == "gate_self_read" else "escalate",
                        "role_lct": role}},
         plugin_id=plugin_id, role=role, client_name=client_name,
-        host_session_id=host_session_id) is not None
+        host_session_id=host_session_id, deadline=deadline) is not None
 
 
 def claim_self_write(marker, tool_name, attempted, *,
                      plugin_id, role, client_name, host_session_id=None, invocation_key=None,
-                     supersession=None):
+                     supersession=None, deadline=None):
     """Ask ONCE whether a human has already approved this exact (member, marker) write.
     Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
 
@@ -1462,7 +1558,7 @@ def claim_self_write(marker, tool_name, attempted, *,
         claim_args["supersession"] = supersession
     r = gate_self_call("hestia_gate_escalation_claim", claim_args,
                        plugin_id=plugin_id, role=role, client_name=client_name,
-                       host_session_id=host_session_id)
+                       host_session_id=host_session_id, deadline=deadline)
     if not isinstance(r, dict):
         # A TIMEOUT IS AN UNKNOWN OUTCOME, NOT "NOTHING HAPPENED" (#1166): the daemon may have
         # opened, matched or spent after the call's budget passed. Refuse, and say how to recover.
@@ -1493,8 +1589,11 @@ def claim_self_write(marker, tool_name, attempted, *,
             esc_id, r.get("how_to_decide") or f"hestia gate approve {esc_id}")
 
 
-def tally_scope(allowed, *, tally_dir, tally_path, attest_every, plugin_id, role_lct):
-    """Count this decision; emit an attestation when the window closes."""
+def tally_scope(allowed, *, tally_dir, tally_path, attest_every, plugin_id, role_lct,
+                deadline=None):
+    """Count this decision; emit an attestation when the window closes. `deadline` (stage C)
+    bounds the attestation's requests; an attestation that cannot finish in time keeps the
+    window open (the count is not reset), so the next invocation attests it."""
     try:
         os.makedirs(tally_dir, exist_ok=True)
         try:
@@ -1503,9 +1602,12 @@ def tally_scope(allowed, *, tally_dir, tally_path, attest_every, plugin_id, role
             t = {"allows": 0, "denies": 0}
         t["allows" if allowed else "denies"] += 1
         if t["allows"] + t["denies"] >= attest_every:
-            emit_attestation(t["allows"], t["denies"],
-                             plugin_id=plugin_id, role_lct=role_lct)
-            t = {"allows": 0, "denies": 0}
+            try:
+                emit_attestation(t["allows"], t["denies"],
+                                 plugin_id=plugin_id, role_lct=role_lct, deadline=deadline)
+                t = {"allows": 0, "denies": 0}
+            except TimeoutError:
+                pass   # out of time: keep the window and its counts for the next invocation
         json.dump(t, open(tally_path, "w"))
     except Exception:
         pass  # accounting must never change a decision

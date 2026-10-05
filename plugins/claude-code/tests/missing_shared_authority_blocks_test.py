@@ -40,7 +40,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 HOOK = ROOT / "plugins" / "claude-code" / "hooks" / "pre_tool_use.py"
 REAL_SHARED = ROOT / "plugins" / "_shared"
-MARK = "no-shared-authority"
+# One-gate stage C: the certified shim's refusal when its common gate cannot be loaded from the
+# selected authority (the pre-C hook named it `no-shared-authority`).
+MARK = "gate.bootstrap_unavailable"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from projection_fixture import projection_env, write_projection  # noqa: E402
 
 WRITE_EVENT = {
     "tool_name": "Bash",
@@ -50,21 +54,21 @@ WRITE_EVENT = {
 
 
 def run(shared_dir: str) -> subprocess.CompletedProcess:
-    env = dict(os.environ)
-    env["HESTIA_SHARED_DIR"] = shared_dir
-    # An installed home that is also absent, so neither name can resolve by accident.
-    env["HESTIA_HOME"] = os.path.join(tempfile.gettempdir(), "hestia-747-no-such-home")
-    # Closed port: the run cannot depend on a live daemon. The authority check under test
-    # happens before any of that matters.
-    env["HESTIA_ENDPOINT"] = "http://127.0.0.1:1"
-    return subprocess.run(
-        [sys.executable, str(HOOK)],
-        input=json.dumps(WRITE_EVENT),
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=60,
-    )
+    # Since one-gate stage C the seat reads its authority from its vault PROJECTION (the only
+    # config source; a launcher's HESTIA_SHARED_DIR is overridden by it), so the selected
+    # authority is staged where the seat really reads it. The home itself has no `shared`, so
+    # nothing can resolve by accident. Closed port: no live daemon can matter.
+    with tempfile.TemporaryDirectory() as home:
+        write_projection(home, env={"HESTIA_SHARED_DIR": shared_dir,
+                                    "HESTIA_ENDPOINT": "http://127.0.0.1:1"})
+        return subprocess.run(
+            [sys.executable, str(HOOK)],
+            input=json.dumps(WRITE_EVENT),
+            capture_output=True,
+            text=True,
+            env=projection_env(home),
+            timeout=60,
+        )
 
 
 def expect_refusal(label: str, got: subprocess.CompletedProcess, failures: list) -> None:

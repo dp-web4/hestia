@@ -503,6 +503,49 @@ def hook_sources():
     return out
 
 
+def common_gate_identity_reads(call_summaries):
+    """What the common gate reads off a seat's identity, when the seat hands it the path.
+
+    One-gate stage C: a seat's shim decides nothing itself; it passes its PROFILE (whose
+    `identity_path` the vault projection names, so no identity.json literal exists to taint)
+    to `gate.decide`, and the common gate calls `role_bridge(identity_path=
+    <profile>.identity_path)`. Both halves are proven structurally, as the slice-3 seam
+    requires: the common gate's call binds role_bridge's identity parameter to the profile's
+    `identity_path` attribute, and role_bridge's body was summarized as reading the field."""
+    summary = call_summaries.get("role_bridge")
+    path = REPO / "plugins" / "_shared" / "hestia_single_gate.py"
+    if not summary:
+        return set()
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeError):
+        return set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "role_bridge"):
+            arg = next((k.value for k in node.keywords if k.arg == summary["identity_param"]), None)
+            if isinstance(arg, ast.Attribute) and arg.attr == "identity_path":
+                return set(summary["reads"])
+    return set()
+
+
+def hands_identity_to_the_common_gate(src: str) -> bool:
+    """The shim calls `gate.decide(...)` and its PROFILE binds an `identity_path`."""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return False
+    calls = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "decide" for n in ast.walk(tree))
+    profile = any(isinstance(n, ast.Assign) and any(getattr(t, "id", None) == "PROFILE"
+                                                     for t in n.targets)
+                  and isinstance(n.value, ast.Dict)
+                  and any(isinstance(k, ast.Constant) and k.value == "identity_path"
+                          for k in n.value.keys)
+                  for n in ast.walk(tree))
+    return calls and profile
+
+
 def access_map():
     """member -> {'reads', 'writes'}, and per-file detail.
 
@@ -511,12 +554,16 @@ def access_map():
     """
     per_member, per_file = {}, {}
     call_summaries = shared_identity_call_summaries()
+    gate_reads = common_gate_identity_reads(call_summaries)
     for rel, member, src, argv, decides in hook_sources():
         try:
             reads, writes = (identity_field_access(
                 src, argv, call_summaries=call_summaries) if src else (set(), set()))
         except SyntaxError:
             continue
+        if src and hands_identity_to_the_common_gate(src):
+            decides = True              # its verdict is the common gate's, rendered here
+            reads = reads | gate_reads
         per_file[rel] = (reads, writes, decides)
         m = per_member.setdefault(member, {"reads": set(), "writes": set(), "files": []})
         if decides:

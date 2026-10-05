@@ -37,13 +37,27 @@ Reader semantics are the installer's (json-hook-commands / toml-hook-commands: t
 the absolute-path token of a `command` value); this script reads registration exactly the way
 install-members.sh does, so what it writes is what the installer will see.
 
-    DRY_RUN=1      print what would change, write nothing (exit 0)
-    --plugins DIR  read plugin dirs from DIR (tests); default: this checkout's plugins/
-    --home DIR     treat DIR as the home directory (tests); default: ~
-    --member NAME  only this member
+  6. THE TIMEOUT IS THE GATE'S BOUND (one-gate stage C). Every seat's gate READS the timeout
+     its harness registered and decides inside `start + timeout - margin`, so it always fails
+     closed before the harness kills it and fails open. Registration length is therefore the
+     AVAILABILITY knob: a template's value (claude-code 10 s, codex 15 s, kimi 15 s, gemini
+     15000 ms) absorbs one cold member connect (measured 4.6-5.1 s); a shorter one turns that
+     connect into a recorded denial. A templated hook already registered with a SHORTER timeout
+     (or none) is reported SHORT (exit 10) and, with --raise-timeouts, raised to the template's
+     value in place — raised only, never lowered, nothing else on the line touched. A registered
+     gate command carrying an env override no gate reads any more (HESTIA_PRE_TOTAL_BUDGET_MS,
+     HESTIA_PRE_REQUEST_TIMEOUT_S, a per-seat HESTIA_<SEAT>_GATE_MODE) is reported INERT; the
+     script never rewrites a command, so removing it is the operator's edit.
+
+    DRY_RUN=1        print what would change, write nothing (exit 0)
+    --plugins DIR    read plugin dirs from DIR (tests); default: this checkout's plugins/
+    --home DIR       treat DIR as the home directory (tests); default: ~
+    --member NAME    only this member
+    --raise-timeouts raise every SHORT templated hook's timeout to the template's value
 
 Exit: 0 clean (registered or nothing to do); 6 a write failed validation and was restored;
-7 a template carries an unrendered placeholder (that member skipped, others proceed).
+7 a template carries an unrendered placeholder (that member skipped, others proceed); 8 narrow;
+9 pending; 10 a templated hook is registered with a timeout below its template's.
 """
 from __future__ import annotations
 
@@ -514,6 +528,126 @@ def registered_targets(cfg: str, reader: str, flat: bool = False) -> set[str]:
     return out
 
 
+# ---------------------------------------------------------------- timeouts ---------------
+#: Env overrides on a registered gate command that no gate reads since one-gate stage C (the
+#: deadline is the registration's). Reported INERT, never rewritten.
+INERT_GATE_ENV = re.compile(r"\b(HESTIA_PRE_TOTAL_BUDGET_MS|HESTIA_PRE_REQUEST_TIMEOUT_S|"
+                            r"HESTIA_[A-Z]+_GATE_MODE)=\S*")
+
+
+def registered_timeouts(cfg: str, reader: str, flat: bool = False):
+    """{event: {basename: [(timeout or None, command)]}} read structurally, or None when the
+    file cannot be read that way (absent, unparseable, or TOML without tomllib)."""
+    try:
+        if reader == "json-hook-commands":
+            with open(cfg, encoding="utf-8") as fh:
+                hooks = (json.load(fh).get("hooks") or {})
+        else:
+            if FORCE_LINE_SCAN:
+                return None
+            import tomllib  # type: ignore
+            with open(cfg, "rb") as fh:
+                hooks = tomllib.load(fh).get("hooks") or ({} if not flat else [])
+    except Exception:  # noqa: BLE001
+        return None
+    out: dict[str, dict[str, list]] = {}
+
+    def add(event, h):
+        cmd = h.get("command") if isinstance(h, dict) else None
+        b = target_basename(cmd) if isinstance(cmd, str) else None
+        if b:
+            out.setdefault(event, {}).setdefault(b, []).append((h.get("timeout"), cmd))
+    if flat:
+        for tbl in hooks if isinstance(hooks, list) else []:
+            if isinstance(tbl, dict) and isinstance(tbl.get("event"), str):
+                add(tbl["event"], tbl)
+        return out
+    for event, gs in (hooks.items() if isinstance(hooks, dict) else []):
+        for g in gs if isinstance(gs, list) else []:
+            for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
+                add(event, h)
+    return out
+
+
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def timeout_findings(groups: dict, registered) -> tuple[list, list]:
+    """(short, inert). short: (event, basename, registered timeout or None, template timeout)
+    for each templated hook registered below its template's timeout (or with none); inert:
+    (event, basename, [stray env assignments]) for registered gate commands carrying one."""
+    short, inert = [], []
+    if not registered:
+        return short, inert
+    for event, gs in groups.items():
+        for g in gs:
+            for h in g["hooks"]:
+                want = h.get("timeout")
+                base = target_basename(h["command"]) or ""
+                for t, cmd in registered.get(event, {}).get(base, []):
+                    if _is_num(want) and not (_is_num(t) and t >= want):
+                        short.append((event, base, t, want))
+                    stray = [m.group(0) for m in INERT_GATE_ENV.finditer(cmd or "")]
+                    if stray:
+                        inert.append((event, base, sorted(set(stray))))
+    return short, inert
+
+
+def raise_json_timeouts(data: dict, short: list) -> list[str]:
+    """Raise each SHORT hook's timeout in a parsed JSON config. Returns what changed."""
+    changed = []
+    want = {(e, b): w for e, b, _t, w in short}
+    for event, gs in (data.get("hooks") or {}).items():
+        for g in gs if isinstance(gs, list) else []:
+            for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
+                b = target_basename(h.get("command") or "") if isinstance(h, dict) else None
+                w = want.get((event, b))
+                if w is not None and not (_is_num(h.get("timeout")) and h["timeout"] >= w):
+                    changed.append(f"timeout {event}/{b} {h.get('timeout')} -> {w}")
+                    h["timeout"] = w
+    return changed
+
+
+def raise_toml_timeouts(text: str, short: list, flat: bool) -> tuple[str, list[str]]:
+    """Raise each SHORT hook's `timeout =` line in TOML text, inside the table that carries its
+    command (inserting one after the command when the table has none). Only lines of tables
+    whose command names a SHORT basename are touched; every other byte is kept."""
+    lines = text.split("\n")
+    changed = []
+    bases = {b: w for _e, b, _t, w in short}
+    i = 0
+    while i < len(lines):
+        m = _TOML_CMD.match(lines[i])
+        b = target_basename(m.group(2)) if m else None
+        if b in bases:
+            w = bases[b]
+            j, found = i + 1, None
+            start = i
+            while start > 0 and not lines[start - 1].lstrip().startswith("["):
+                start -= 1
+            for k in list(range(start, i)) + list(range(i + 1, len(lines))):
+                if k > i and lines[k].lstrip().startswith("["):
+                    break
+                tm = re.match(r"^(\s*timeout\s*=\s*)([0-9]+)(.*)$", lines[k])
+                if tm:
+                    found = k
+                    break
+            if found is None:
+                lines.insert(i + 1, f"timeout = {int(w)}")
+                changed.append(f"timeout {b} (none) -> {int(w)}")
+                j = i + 2
+            else:
+                tm = re.match(r"^(\s*timeout\s*=\s*)([0-9]+)(.*)$", lines[found])
+                if int(tm.group(2)) < w:
+                    lines[found] = f"{tm.group(1)}{int(w)}{tm.group(3)}"
+                    changed.append(f"timeout {b} {tm.group(2)} -> {int(w)}")
+            i = j
+            continue
+        i += 1
+    return "\n".join(lines), changed
+
+
 def _decide(groups: dict, have: dict, dry: bool, plan: bool, own: set | None = None):
     """For each templated hook: present (a covering registration exists), NARROW (registered only
     under a matcher that does not cover the template's -- reported, never silently widened, never
@@ -560,9 +694,10 @@ def _decide(groups: dict, have: dict, dry: bool, plan: bool, own: set | None = N
 
 
 def register_member(member: str, spec: dict, template: dict, home: str, dry: bool,
-                    plan: bool = False) -> tuple[str, list[str]]:
+                    plan: bool = False, raise_timeouts: bool = False) -> tuple[str, list[str]]:
     """-> (verdict, lines). verdict in {registered, ok, skip, refused, failed, narrow, pending, plan}.
-    `lines` are the changes made (or planned: 'base\ttarget'), then any 'NARROW ...' / 'PENDING ...'."""
+    `lines` are the changes made (or planned: 'base\ttarget'), then any 'NARROW ...' / 'PENDING ...'
+    / 'SHORT ...' / 'INERT ...' notes."""
     reg = spec.get("registration") or {}
     segs, reader = reg.get("path") or [], reg.get("reader", "")
     dest = spec.get("dest") or ""
@@ -610,6 +745,9 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
     notes = [f"NARROW {n}" for n in narrow] + [f"PENDING {p}" for p in pending]
     if plan:
         return "plan", [f"{b}\t{t}" for b, t in planned] + notes
+    # The registered timeout is the bound the gate decides inside (stage C): read it.
+    short, inert = timeout_findings(
+        groups, registered_timeouts(cfg, reader, flat) if os.path.exists(cfg) else None)
 
     def done(verdict: str, changes: list[str]) -> tuple[str, list[str]]:
         # What this script registers points INTO `dest`, and install-members.sh refuses a
@@ -630,6 +768,9 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
         for event, g, h in want:
             hooks.setdefault(event, []).append({**{k: v for k, v in g.items() if k != "hooks"}, "hooks": [h]})
             changes.append(f"{event}/{target_basename(h['command'])}")
+        if raise_timeouts and short:
+            changes += raise_json_timeouts(data, short)
+            short = []
         if changes and not dry:
             new = json.dumps(data, indent=2) + "\n"
             json.loads(new)
@@ -643,6 +784,10 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
             changes.append(f"{event}/{target_basename(h['command'])}")
         new, ensured = toml_ensure(new, reg.get("ensure") or [])
         changes += [f"ensure {e}" for e in ensured]
+        if raise_timeouts and short:
+            new, raised = raise_toml_timeouts(new, short, flat)
+            changes += raised
+            short = []
         if changes:
             err = validate_toml(new)
             if err:
@@ -664,6 +809,12 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
                         os.remove(cfg)
                     return "failed", [f"{cfg} failed to parse after write ({err}); restored as it was"] + notes
 
+    notes += [f"SHORT {e}/{b} is registered with timeout {t!r}, below the template's {w!r}: the "
+              f"gate decides inside the registered value, so a cold member connect (4.6-5.1 s) "
+              f"becomes a denial -- re-run with --raise-timeouts" for e, b, t, w in short]
+    notes += [f"INERT {e}/{b} command carries {', '.join(s)}, which no gate reads since one-gate "
+              f"stage C (the deadline is the registration's); remove it from the registered "
+              f"command" for e, b, s in inert]
     lines = ([f"would add {c}" for c in changes] if dry else changes) + notes
     # #1142 re-review P2: a run that registered some hooks and left others PENDING returned
     # "registered" and exited 0. Narrow and pending are unfinished work: they outrank a partial
@@ -683,6 +834,8 @@ def main(argv: list[str]) -> int:
     global FORCE_LINE_SCAN
     only = None
     plan = False
+    raise_timeouts = "--raise-timeouts" in argv
+    argv = [a for a in argv if a != "--raise-timeouts"]
     if "--toml-line-scan" in argv:
         FORCE_LINE_SCAN = True
         argv = [a for a in argv if a != "--toml-line-scan"]
@@ -723,15 +876,17 @@ def main(argv: list[str]) -> int:
             continue
         with open(tpl, encoding="utf-8") as fh:
             template = json.load(fh)
-        verdict, lines = register_member(member, spec, template, home, dry, plan=plan)
+        verdict, lines = register_member(member, spec, template, home, dry, plan=plan,
+                                         raise_timeouts=raise_timeouts)
         if plan:
             # machine-readable, for install-members.sh: member<TAB>basename<TAB>absolute target
             for ln in lines:
                 if "\t" in ln and not ln.startswith(("NARROW", "PENDING")):
                     print(f"{member}\t{ln}", flush=True)
             continue
-        adds = [ln for ln in lines if not ln.startswith(("NARROW ", "PENDING "))]
-        notes = [ln for ln in lines if ln.startswith(("NARROW ", "PENDING "))]
+        kinds = ("NARROW ", "PENDING ", "SHORT ", "INERT ")
+        adds = [ln for ln in lines if not ln.startswith(kinds)]
+        notes = [ln for ln in lines if ln.startswith(kinds)]
         if verdict in ("registered", "narrow", "pending", "ok"):
             for c in adds:
                 log(f"  {'would' if dry else 'REGISTERED'} {member}: {c}")
@@ -745,6 +900,8 @@ def main(argv: list[str]) -> int:
                 rc = rc or 8
             if any(n.startswith("PENDING ") for n in notes):
                 rc = rc or 9
+            if any(n.startswith("SHORT ") for n in notes):
+                rc = rc or 10
         elif verdict == "skip":
             log(f"  skip  {member} — {'; '.join(lines)}")
         elif verdict == "refused":

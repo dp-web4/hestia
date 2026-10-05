@@ -632,28 +632,35 @@ def test_the_review_door_comment_names_the_seats_own_identity():
     Measured over all three shims when this was written: 2 correct, 1 wrong. A singleton,
     not a class, which is why this is a six-line predicate and not a repo-wide lint.
     """
+    import json as _json
     import re
     here = os.path.dirname(os.path.abspath(__file__))
+    shims = _json.loads(os.environ.get("HESTIA_CONTRACT_SHIMS") or "{}")   # staging seam
     declaring = 0
-    for seat in ("claude-code", "codex", "kimi"):
-        path = os.path.join(here, "..", seat, "hooks", "pre_tool_use.py")
+    for seat in ("claude-code", "codex", "kimi", "gemini"):
+        hook = "before_tool.py" if seat == "gemini" else "pre_tool_use.py"
+        path = shims.get(seat) or os.path.join(here, "..", seat, "hooks", hook)
         if not os.path.exists(path):
             continue
         with open(path, encoding="utf-8", errors="replace") as fh:
             shim = fh.read()
-        if "declares_review_door=True" not in shim:
+        # Since one-gate stage C the declaration is a PROFILE entry the common gate passes on
+        # (`"declares_review_door": True`); before it, a call-site keyword. Both read the same.
+        if not re.search(r'declares_review_door(?:"\s*:\s*|\s*=\s*)True', shim):
             continue          # this seat does not claim the door; it has nothing to name
         declaring += 1
-        # The seat's asserted identity: the LAST string literal on its identity assignment.
-        # That is the bare literal in one spelling and the environment default in the other,
-        # and it is what every witness call on the seat passes.
+        # The seat's asserted identity: its PLUGIN_ID / MEMBER_ID assignment's last literal
+        # (pre-C) or its PROFILE `member_id` (stage C) — what every witness call passes.
         own = []
         for line in shim.splitlines():
-            head = re.match(r'^(?:HESTIA_)?PLUGIN_ID\s*=\s*(.+)$', line)
+            head = re.match(r'^(?:HESTIA_)?(?:PLUGIN|MEMBER)_ID\s*=\s*(.+)$', line)
             if head:
                 lits = re.findall(r'"([^"]+)"', head.group(1))
                 if lits:
                     own.append(lits[-1])
+            prof = re.match(r'^\s*"member_id"\s*:\s*"([^"]+)"', line)
+            if prof:
+                own.append(prof.group(1))
         check(f"{seat}_asserts_exactly_one_identity", len(set(own)) == 1, repr(own))
         named = re.findall(r"This seat HOLDS the review door:\s*([A-Za-z0-9_-]+)\s+reaches",
                            shim)

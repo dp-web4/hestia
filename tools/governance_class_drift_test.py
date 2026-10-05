@@ -132,9 +132,13 @@ DECLARED = (
 
     # ---- the three the bar has never been asked about ----
 
-    dict(key="soci", label="<society-gate>", intended=AWAITING, via=SHADOWED,
+    dict(key="soci", label="<society-gate>", intended=AWAITING, via=SUBSTRING,
          tracked=False,
-         why="CORRECTED 2026-08-05 -- the row shipped in 8552e4e said this name "
+         why="ONE-GATE STAGE C: no longer shadowed. The shared closure matches this file by its "
+             "own exact basename, so its marker is its own and an approval for <gate> cannot be "
+             "spent on it; it reaches the strong bar because `bar_for` tests `contains` and this "
+             "basename ends with <gate>'s. Still AWAITING the class decision. The history: "
+             "CORRECTED 2026-08-05 -- the row shipped in 8552e4e said this name "
              "reaches the strong bar by a substring accident IN THE BAR, and that "
              "the remedy was one rust line. Both are wrong, and the second is the "
              "expensive error: the bar never receives this name. The matcher's "
@@ -187,6 +191,14 @@ DECLARED = (
              "so neither moves silently), plus hestia_appeal for a specific deny -- STRONG is a "
              "starting posture, not a lock."),
 
+    dict(key="hestia_s", label="<common-gate>", intended=STRONG, via=EXACT, tracked=True,
+         why="THE common gate (one-gate stage C): every seat's shim delegates its whole "
+             "decision to it, so it is the enforcement path for all four seats at once. Priced "
+             "like <gate> and <policy-mechanism> (align upward): editing the one file that "
+             "decides for every seat must not be the cheapest act on the surface -- the "
+             "'DECIDE before the shims land' the <policy-core> row asks, answered for this file "
+             "in the same change that lands the shims. Named in `bar_for` as a live clause."),
+
     dict(key="gate_self", label="<exemption-ledger>", intended=AWAITING, via=UNNAMED,
          tracked=True,
          why="One approver today, same inheritance. This file holds the list of "
@@ -209,7 +221,13 @@ REPO = pathlib.Path(
 
 # Segments, never a joined literal: the joined form is itself a marker the matcher
 # scans for, which would make this file unwritable under a live gate.
-_MATCHER_SEGMENTS = ("plugins", "claude-code", "hooks")
+#
+# ONE-GATE STAGE C: the matcher is no longer one adapter's `_GOVERNANCE_FILES` (that gate is
+# now the certified template and carries no closure of its own). Every seat's gate applies the
+# shared closure, whose canonical name list is the core's `GOVERNANCE_FILES`; the closure floor
+# must enforce every name in it (plugins/claude-code/tests/gate_self_protection_test.py).
+_MATCHER_SEGMENTS = ("plugins", "_shared")
+MATCHER_TUPLE = "GOVERNANCE_FILES"
 _BAR_SEGMENTS = ("core", "src", "server")
 
 
@@ -236,7 +254,7 @@ def _matcher_path():
             tree = ast.parse((REPO / p).read_text(encoding="utf-8", errors="replace"))
         except SyntaxError:
             continue
-        if _tuple_from(tree, "_GOVERNANCE_FILES") is not None:
+        if _tuple_from(tree, MATCHER_TUPLE) is not None:
             found.append(p)
     return found
 
@@ -304,8 +322,15 @@ def _emitted_marker(name, governed):
     trusted: imported in-process and called for all 7 governed names on a
     `/.../hooks/<name>` path, 2026-08-05 -- 7/7 agreement, exactly one shadowed.
     That probe is not run here; importing the matcher is what this file's docstring
-    promises not to do."""
-    return next((f for f in governed if f in name), None)
+    promises not to do.
+
+    ONE-GATE STAGE C REPLACED THAT MATCHER. The shared closure matches a governed file by its
+    EXACT basename (no first-substring loop), and since the stage C bar fix the escalation's bar
+    is the highest over every marker the act reaches — a directory marker matched first no
+    longer hides the file's own name from `bar_for`. So every governed name now reaches the bar
+    as itself: shadowing is gone by construction (the `<society-gate>` row's permit-pool
+    question is answered by exact matching: its marker is its own)."""
+    return name if name in governed else None
 
 
 def _tracked_basenames():
@@ -349,7 +374,7 @@ def audit(matcher_text=None, bar_text=None, declared=DECLARED):
     except SyntaxError:
         bad("the matcher does not parse")
         return fails, out
-    got = _tuple_from(tree, "_GOVERNANCE_FILES")
+    got = _tuple_from(tree, MATCHER_TUPLE)
     if got is None:
         bad("the matcher defines no governed tuple")
         return fails, out
@@ -529,23 +554,29 @@ def audit(matcher_text=None, bar_text=None, declared=DECLARED):
     #     (no set), so the diff moves ungoverned -> weak, not strong -> weak.
     #     The message conflates the two; fixing it is follow-up against main,
     #     not a blocker here.
-    if markers is None:
-        bad("the marker tuple is unreadable; the directory-element pin below could "
-            "not be checked and a silent widening would not show up here")
-    else:
-        lits, computed = markers
-        dir_lits = [m for m in lits if not any(g in m for g in governed)]
-        out.append("")
-        out.append(f"marker tuple: {len(lits) + computed} elements "
-                   f"({computed} computed from __file__, {len(lits)} literal); "
-                   f"{len(dir_lits)} literal element(s) name no governed file and "
-                   f"therefore price at one approver whatever the bar says")
-        if len(dir_lits) != 4 or computed != 2:
-            bad(f"the marker tuple's shape moved (expected 2 computed + 4 literal "
-                f"directory elements, measured {computed} computed + "
-                f"{len(dir_lits)} literal). Every directory element is an act that "
-                f"cannot reach the two-factor bar; adding one widens the weak set "
-                f"and nothing else in the repo would say so.")
+    #
+    # ONE-GATE STAGE C REPLACED THIS PIN WITH THE FIX IT DOCUMENTED. "A marker that names no
+    # file cannot match a bar testing for filenames" was a live defect, not only a pin: the
+    # shared closure matches DIRECTORIES first, so a write to the mechanism under
+    # plugins/_shared arrived as marker `plugins/_shared` and priced single-approver (stage A's
+    # escalation 9c433571). The bar is now the HIGHEST over every marker the act reaches
+    # (`bar_for_markers(&markers_of(marker, act))`), and the sovereign file list is ONE list
+    # (`SOVEREIGN_FILES`) that `bar_for` and `markers_of` share. F now binds exactly that:
+    # every escalation's bar is computed over its markers, and the sovereign list IS the bar's.
+    del markers   # the adapter marker tuple no longer exists
+    sov = re.search(r"pub const SOVEREIGN_FILES: &\[&str\] = &\[(.*?)\];", btext, re.S)
+    sov_names = re.findall(r'"([^"]+)"', sov.group(1)) if sov else []
+    out.append("")
+    out.append(f"sovereign list: {len(sov_names)} names; bar over every marker: "
+               f"{btext.count('bar_for_markers(&markers_of(')} computation site(s)")
+    if sorted(sov_names) != sorted(strong):
+        bad(f"the sovereign file list and `bar_for` disagree (list {sorted(sov_names)}, bar "
+            f"{sorted(strong)}): a name priced two-factor by one is invisible to the other, so "
+            f"a directory marker can shadow it again")
+    if btext.count("bar_for_markers(&markers_of(") < 2:
+        bad("an escalation's bar is not computed over EVERY marker its act reaches (expected "
+            "`bar_for_markers(&markers_of(...))` at open and at restore): a directory marker "
+            "matched first prices the sovereign file inside it single-approver again")
 
     if awaiting:
         out.append("")
@@ -613,8 +644,7 @@ def selftest():
         return 1
     mt = (REPO / mpaths[0]).read_text(encoding="utf-8", errors="replace")
     bt = bars[0][1]
-    governed, _ = _tuple_from(ast.parse(mt), "_GOVERNANCE_FILES")
-    marker_lits, _n = _tuple_from(ast.parse(mt), "_SELF_MARKERS")
+    governed, _ = _tuple_from(ast.parse(mt), MATCHER_TUPLE)
     strong = _bar_names(bt)
 
     # A bar literal that a row declares STRONG/EXACT -- the one whose removal must
@@ -622,15 +652,15 @@ def selftest():
     exact_rows = [r for r in DECLARED if r["intended"] is STRONG and r["via"] is EXACT]
     exact_name = next(g for g in governed
                       if any(g.startswith(r["key"]) for r in exact_rows) and g in strong)
-    # The row whose name never reaches the bar as itself, and that governed name.
-    shadow_row = next(r for r in DECLARED if r["via"] is SHADOWED)
-    shadow_name = next(g for g in governed if g.startswith(shadow_row["key"]))
-    # The declaration with that row's `via` put back to what 8552e4e shipped. The
-    # error this file corrects lived in the DECLARATION, not in either source, so a
-    # sabotage set that only ever mutates the sources cannot reach its own class of
-    # defect -- and this file shipped one.
-    was_substring = tuple(dict(r, via=SUBSTRING) if r is shadow_row else r
-                          for r in DECLARED)
+    # The row that reaches the strong bar by SUBSTRING, and its declaration mis-stated as
+    # EXACT. The error this file once corrected lived in the DECLARATION, not in either
+    # source, so a sabotage set that only mutates the sources cannot reach that class.
+    sub_row = next(r for r in DECLARED if r["via"] is SUBSTRING)
+    was_exact = tuple(dict(r, via=EXACT) if r is sub_row else r for r in DECLARED)
+    # The stage C bar fix, undone two ways (derived from the bar text, never spelled).
+    open_site = re.search(r"bar: bar_for_markers\(&markers_of\(marker, act\)\)", bt)
+    sov_line = next(ln for ln in bt.splitlines(keepends=True)
+                    if ln.strip() == f'"{exact_name}",')
     # A row to collide a key against, and a victim name to rename onto its key.
     other_row = next(r for r in DECLARED if r["intended"] is SINGLE)
     other_name = next(g for g in governed if g.startswith(other_row["key"]))
@@ -655,37 +685,25 @@ def selftest():
                             f'        || marker.contains("{unknown}")\n'),
          DECLARED, "does not govern"),
 
-        ("a new DIRECTORY marker widens the set that cannot reach the strong bar",
-         _insert_before(mt, f'"{marker_lits[0]}"', '    "zz/dir/marker",\n'), bt,
-         DECLARED, "marker tuple's shape moved"),
-
-        ("a rename lifts a shadowed name out from under the one pricing it",
-         _rename(mt, shadow_name,
-                 shadow_name[:len(shadow_row["key"])] + "_renamed.py"), bt,
-         DECLARED, "DIFFERENT mechanism"),
-
         ("a rename makes two governed names collide on one declaration key",
          _rename(mt, other_name, collide_key + other_name), bt, DECLARED,
          "matches 2 governed names"),
-
-        ("a rename puts a name UNDER an earlier one, so the bar never sees it",
-         _rename(mt, other_name, other_row["key"] + exact_name), bt, DECLARED,
-         "never emits this name"),
 
         ("a governed name loses the last tracked file that carries it",
          _rename(mt, other_name, other_name[:-3] + "zz.py"), bt, DECLARED,
          "measured tracked=False"),
 
-        ("the DECLARATION mis-states the mechanism (the 8552e4e row, restored)",
-         mt, bt, was_substring, "DIFFERENT mechanism"),
+        ("the DECLARATION mis-states the mechanism (a SUBSTRING row declared EXACT)",
+         mt, bt, was_exact, "DIFFERENT mechanism"),
 
-        # The proposed remedy for the shadowed row, applied. It must red, and that is
-        # the point of the check it trips: the fix is a no-op and the test says so
-        # instead of greening on it.
-        ("the 'one rust line' remedy: a bar clause for the SHADOWED name",
-         mt, _insert_before(bt, 'contains("',
-                            f'        || marker.contains("{shadow_name}")\n'),
-         DECLARED, "NO ESCALATION CAN EVER REACH"),
+        # The stage C bar fix, undone: the open path goes back to the first marker alone...
+        ("the open path prices by the FIRST marker again (stage C fix reverted)",
+         mt, bt.replace(open_site.group(0), "bar: bar_for(marker)", 1) if open_site else bt + "\n",
+         DECLARED, "not computed over EVERY marker"),
+
+        # ...and the sovereign list loses a name `bar_for` still prices two-factor.
+        ("the sovereign list drops a name the bar still prices",
+         mt, bt.replace(sov_line, "", 1), DECLARED, "sovereign file list and `bar_for` disagree"),
     ]
 
     base_fails, _ = audit()

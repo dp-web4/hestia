@@ -771,7 +771,10 @@ def test_the_core_is_not_the_only_copy_of_the_scope_rule():
     # (§7.2(6)), never a hand-fork that would grow this number back.
     # Slice 4: gemini's copy is deleted — its scope predicates are fail-closed delegates
     # into the core now, so a fix to the core reaches gemini too. kimi is the last owner.
-    KNOWN_DUPLICATE_OWNERS = {"kimi": 1}
+    # One-gate stage C: kimi's adapter pair left with the rest of the pre-template shim (every
+    # seat's gate is the template, and the common gate calls the core). The scope rule is
+    # defined in exactly one place now; a new entry here is a fork, said aloud in its PR.
+    KNOWN_DUPLICATE_OWNERS = {}
 
     owners = {}
     for root, _dirs, files in os.walk(plugins_dir):

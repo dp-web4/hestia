@@ -1,6 +1,7 @@
 {
   "_comment": "NON-RUNNABLE INSTALLATION TEMPLATE for Codex CLI hooks. Codex loads hooks from a hooks.json or inline hook tables in its user configuration. Requires codex_hooks enabled. Replace both placeholders with verified absolute paths before installing; unrendered placeholders must never be deployed.",
   "_paths_note": "Replace @HESTIA_WORKSPACE@ and @HESTIA_PLUGIN_ROOT@ at install time. The public repository carries no operator-specific workspace path.",
+  "_timeout_contract": "One-gate stage C. The PreToolUse gate READS its timeout from the registration this template becomes (seconds; an entry without one is refused, since Codex's default is not documented here) and decides inside start + timeout - 1.5 s, so it always fails closed before Codex kills it (Codex marks a timed-out hook failed and the tool call continues, i.e. fail-open). 15 s absorbs a cold member connect (measured 4.6-5.1 s). A shorter registration costs availability, never safety; deploy/register-members.py reports one below this floor.",
   "hooks": {
     "PreToolUse": [
       {

@@ -41,5 +41,8 @@ def projection_env(home: Path | str, base: dict | None = None, **extra) -> dict:
     env["HESTIA_HOME"] = str(home)
     for k in ("HESTIA_SHARED_DIR", "HESTIA_WORKSPACE", "HESTIA_ENDPOINT", "HESTIA_STATE_DIR"):
         env.pop(k, None)
+    # One-gate stage C: the test is the hook's invoker, not a registered harness, so it declares
+    # the timeout it enforces (its subprocess timeouts are 60 s) and the gate decides inside it.
+    env.setdefault("HESTIA_HOOK_TIMEOUT_S", "20")
     env.update(extra)
     return env
