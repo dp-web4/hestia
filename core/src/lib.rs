@@ -33,6 +33,7 @@ pub mod reputation;
 pub mod receiver_routing;
 pub mod role_registry;
 pub mod router_forwarder;
+pub mod router_membership;
 pub mod server;
 pub mod sovereign;
 pub mod storage;
