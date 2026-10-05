@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: b3e6d0ef2c718f65aaf2e21066f19308920098b5cea007f7b72bca1886303b49  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 0ce99a681728bdff97c6d2eaf093ced839f4edd255692bf00319d331f24ded08  (published ground truth; manifest: hooks-gt)
 """Shared in-process daemon-query mechanism — the society-safety verdict path.
 
 PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
@@ -1491,6 +1491,68 @@ def claim_self_write(marker, tool_name, attempted, *,
         return "no-channel", f"refused, and NO escalation was opened — {why}", None, None
     return ("escalated", "refused; escalation opened for out-of-band decision",
             esc_id, r.get("how_to_decide") or f"hestia gate approve {esc_id}")
+
+
+#: Scope refusals that open (or re-find) a scope request on the operator's queue. `mrh.repo` is
+#: not here: it names a repository, not a path, and the scope store holds paths.
+SCOPE_ESCALATING_RULES = ("mrh.path", "mrh.command")
+
+
+def scope_request_key(plugin_id: str, path: str) -> str:
+    """THE SCOPE REQUEST KEY: member and resolved path. Re-issuing a refused act that reaches the
+    same path finds the same request instead of minting a new id each time (legion-being, #956:
+    nine ids for three paths in one night). The daemon recomputes it; this copy is for the deny
+    text and `hestia gate lookup`-style recovery, never for deciding."""
+    import hashlib
+    return hashlib.sha256("\x1f".join(["hestia:scope-request-key", plugin_id, path])
+                          .encode("utf-8")).hexdigest()
+
+
+def claim_scope(path, tool_name, attempted, rule, *, plugin_id, role, client_name,
+                host_session_id=None, spend=True):
+    """After a SCOPE refusal (dp, 2026-10-05: "escalation should allow standing grants"), ask the
+    daemon ONCE what stands for this (member, path). Returns (verdict, detail, request_id).
+
+    Verdicts — the daemon owns every one; this function re-derives nothing:
+      * "approved"   — an operator granted THIS act once; spent now (single use, claim window).
+      * "in_force"   — a live or standing grant already covers the path (the snapshot raced).
+      * "opened"     — no request stood; one was opened on the operator's queue.
+      * "pending"    — the request for this path is still waiting; same id, no new record.
+      * "refused"    — the operator refused it; re-issuing does not re-open it inside the window.
+      * "not_opened" — the daemon declined to open one (its cap, or it predates the verb).
+      * "unknown"    — no answer inside the budget; the act stays refused.
+    Only "approved" and "in_force" lift the refusal, and the caller re-judges the act with that
+    one path added before anything proceeds. `spend=False` PEEKS: a one-time approval is reported
+    as "approved" but not spent (the caller has other refused paths to clear first). Never
+    raises, never waits."""
+    args = {
+        "plugin_id": plugin_id,
+        "role": role,
+        "path": path,
+        "rule": rule,
+        "tool_name": tool_name,
+        # The ATTEMPTED ACT, as the operator will read it — not a rationale. The member did not
+        # choose to ask; the gate opened this on a refusal, and the record says so.
+        "act": (attempted or f"{tool_name} -> {path}")[:400],
+        "request_key": scope_request_key(plugin_id, path),
+        "spend": bool(spend),
+    }
+    if host_session_id:
+        args["host_session_id"] = host_session_id
+    r = gate_self_call("hestia_scope_claim", args, plugin_id=plugin_id, role=role,
+                       client_name=client_name, host_session_id=host_session_id)
+    if not isinstance(r, dict):
+        return ("unknown", "the daemon did not answer in time; the act stays refused, and "
+                "re-issuing it is safe — it finds the same request rather than opening another",
+                None)
+    verdict = r.get("verdict")
+    rid = r.get("request_id")
+    if verdict in ("approved", "in_force") and r.get("permits") is True:
+        return verdict, str(r.get("detail") or verdict), rid
+    if verdict in ("opened", "pending", "refused") and isinstance(rid, str) and rid:
+        return verdict, str(r.get("detail") or verdict), rid
+    why = r.get("detail") or r.get("error") or "this daemon has no scope-claim verb (is it upgraded?)"
+    return "not_opened", str(why), None
 
 
 def tally_scope(allowed, *, tally_dir, tally_path, attest_every, plugin_id, role_lct):

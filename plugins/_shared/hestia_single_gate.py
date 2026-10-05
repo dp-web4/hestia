@@ -562,6 +562,8 @@ def _local_law(inv: _Invocation, nev: core.NormalizedEvent,
         if v.blocks:
             # The rollout softens a TUNABLE policy disagreement, and only when there IS a policy.
             if v.innate or inv.rollout == "enforce":
+                if v.rule in mechanism.SCOPE_ESCALATING_RULES and getattr(v, "target", ""):
+                    return _scope_escalation(inv, nev, cprofile, policy, v), False
                 return _verdict_deny(v), False
             inv.warnings.append((v.rule, v.reason, True))
         return None, False
@@ -581,6 +583,100 @@ def _local_law(inv: _Invocation, nev: core.NormalizedEvent,
               f"(in every rollout mode)")
     return _verdict_deny(core._deny("gate.degraded", reason, innate=True),
                          verdict_available=False, anomaly=True), True
+
+
+#: How many distinct refused paths one act may carry into the scope escalation. Each is one local
+#: re-evaluation and at most two daemon round trips, all inside the phase deadline.
+SCOPE_CLAIM_MAX_PATHS = 4
+
+
+def _claimed_scope_entry(target: str) -> str:
+    """The `in_scope` entry a lifted refusal adds for THIS act's re-evaluation only. A glob reach
+    (`dir/*`, see the core's `_glob_probe`) needs the subtree; anything else exactly its path."""
+    if target.endswith("/*"):
+        return "path:" + (target[:-2] or "/") + core.RECURSIVE_SUFFIX
+    return "path:" + target
+
+
+def _scope_escalation(inv: _Invocation, nev: core.NormalizedEvent,
+                      cprofile: core.HarnessProfile, policy, v: core.Verdict) -> Optional[GateDecision]:
+    """A scope refusal becomes an ESCALATION (dp, 2026-10-05: "escalation should allow standing
+    grants"). Returns None when every refused path is lifted (the act proceeds to society law),
+    else the refusal naming the scope request(s) the operator now holds.
+
+    1. Collect, LOCALLY, every path this act is refused on: re-evaluate with each refused path
+       provisionally added, up to SCOPE_CLAIM_MAX_PATHS. No daemon call, nothing spent.
+    2. Ask the daemon about each (`claim_scope`). With more than one path the first pass only
+       PEEKS (`spend: false`), so a one-time approval for path A is not spent on an act that
+       path B still refuses — the approval would be gone and the act still denied.
+    3. Lifted only if every path is `approved` or `in_force`; then the one-time approvals are
+       spent and the act is re-judged once more with all of them added. Anything else denies,
+       and the deny text names each request id so the member can watch it and re-issue."""
+    import dataclasses
+    ws = core.detect_workspace(cprofile)
+    targets, cur = [], v
+    while cur.blocks and cur.rule in mechanism.SCOPE_ESCALATING_RULES and getattr(cur, "target", ""):
+        if cur.target in targets or len(targets) >= SCOPE_CLAIM_MAX_PATHS:
+            break
+        targets.append(cur.target)
+        trial = dataclasses.replace(policy, scope=tuple(policy.scope)
+                                    + tuple(_claimed_scope_entry(t) for t in targets))
+        cur = core.evaluate(nev, cprofile, ws, policy=trial)
+    if cur.blocks and cur.rule not in mechanism.SCOPE_ESCALATING_RULES:
+        return _verdict_deny(cur)          # another rule refuses regardless; nothing to escalate
+
+    prof, ev = inv.profile, inv.event
+
+    def ask(target: str, spend: bool):
+        try:
+            got = _bounded(inv.phase_deadline, mechanism.claim_scope, target, ev.tool,
+                           inv.attempted, v.rule, plugin_id=prof.member_id, role=_role(inv),
+                           client_name=_client_name(prof), host_session_id=ev.session_id,
+                           spend=spend)
+        except Exception:  # noqa: BLE001 — an unusable mechanism opens nothing and lifts nothing
+            got = None
+        if got is _LATE or not isinstance(got, tuple):
+            return ("unknown", "the daemon did not answer inside the gate's deadline; re-issuing "
+                    "this identical act is safe — it finds the same request", None)
+        return got
+
+    spend_first = len(targets) == 1
+    answers = [(t,) + ask(t, spend_first) for t in targets]
+    lifted = all(a[1] in ("approved", "in_force") for a in answers)
+    if lifted and not spend_first:
+        answers = [(t, verdict, detail, rid) if verdict == "in_force" else (t,) + ask(t, True)
+                   for (t, verdict, detail, rid) in answers]
+        lifted = all(a[1] in ("approved", "in_force") for a in answers)
+    if lifted:
+        final = dataclasses.replace(policy, scope=tuple(policy.scope)
+                                    + tuple(_claimed_scope_entry(t) for t in targets))
+        again = core.evaluate(nev, cprofile, ws, policy=final)
+        if not again.blocks:
+            for t, verdict, detail, _rid in answers:
+                inv.notices.append(f"hestia: scope {verdict} for {t} — {detail}")
+            return None
+        return _verdict_deny(again)
+
+    notes, first_id = [], None
+    for t, verdict, detail, rid in answers:
+        if verdict in ("approved", "in_force"):
+            continue
+        if rid and first_id is None:
+            first_id = rid
+        if verdict in ("opened", "pending"):
+            notes.append(f"Scope request {rid} is {'open' if verdict == 'opened' else 'still pending'} "
+                         f"for '{t}' — the operator decides (this act once, for the session, or "
+                         f"standing; exact or recursive). Watch it with hestia_scope_status and "
+                         f"re-issue this identical act afterwards.")
+        elif verdict == "refused":
+            notes.append(f"Scope request {rid} for '{t}' was REFUSED by the operator ({detail}); "
+                         f"re-issuing does not re-open it inside its window.")
+        else:
+            notes.append(f"No scope request could be opened for '{t}' ({detail}); ask with "
+                         f"hestia_request_scope (one path, with a reason).")
+    reason = v.reason + " " + " ".join(notes)
+    return GateDecision("deny", v.rule, reason, v.remedy, innate=bool(v.innate),
+                        escalation_id=first_id)
 
 
 def _society(inv: _Invocation) -> GateDecision:

@@ -452,8 +452,19 @@ def test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly():
 
     ok, tok, _ = G.command_scope_reach(f"{link} -c pass", rec, ws, ws)
     check("venv_interpreter_under_recursive_grant_allows", ok, f"denied, offending={tok!r}")
+    # FLIPPED 2026-10-05 (the shell-scope gap, dp: "yes on gate gap, let's fix it"). This control
+    # asserted that naming an outside interpreter DIRECTLY was allowed — which was the gap itself:
+    # shell paths outside the workspace were never judged. A direct naming is now judged like a
+    # Read path, so it is refused unless a grant reaches it (or it lies under a temp root, where
+    # some CI interpreters live). The link above keeps its #953 allowance; see the core's
+    # `_symlinked_reach_verdict` for why.
     ok, tok, _ = G.command_scope_reach(f"{interp} -c pass", rec, ws, ws)
-    check("control_naming_the_target_directly_allows", ok, f"denied, offending={tok!r}")
+    check("control_naming_the_target_directly_is_judged",
+          ok == G._under_temp_root(interp), f"ok={ok}, offending={tok!r}, interp={interp}")
+    ok, tok, _ = G.command_scope_reach(f"{interp} -c pass",
+                                       rec + ["path:" + os.path.dirname(interp) + G.RECURSIVE_SUFFIX],
+                                       ws, ws)
+    check("control_naming_the_target_directly_allows_once_granted", ok, f"denied, offending={tok!r}")
 
     # the egress list is applied to the RESOLVED target
     ssh = os.path.join(outside, ".ssh")

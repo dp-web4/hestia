@@ -104,10 +104,12 @@ class Policy:
     """What the stub answers. `query(begin_args) -> allow|warn|deny`; the rest are switches."""
 
     def __init__(self, query=None, *, superseded=False, claim="escalate", witness="receipt",
-                 delays=None, snapshot=True, cold_connect=0.0):
+                 delays=None, snapshot=True, cold_connect=0.0, scope_claim=None):
         self.query = query or (lambda a: "allow")
         self.superseded = superseded
         self.claim = claim                 # escalate | approve
+        # hestia_scope_claim: path -> opened | pending | approved | in_force | refused | absent
+        self.scope_claim = scope_claim or (lambda path: "opened")
         self.witness = witness             # receipt | refuse-allow | refuse-all | old
         self.delays = delays or {}         # {tool name: seconds, "*": seconds}
         self.snapshot = snapshot           # False: the snapshot connect is refused
@@ -210,6 +212,15 @@ class Stub:
             return _ok(rid, {"claimed": False, "permits_write": False,
                              "escalation_id": "stub-esc-" + uuid.uuid4().hex[:8],
                              "how_to_decide": "stub: nobody decides"})
+        if name == "hestia_scope_claim":
+            path = args.get("path") or ""
+            verdict = p.scope_claim(path)
+            if verdict == "absent":            # an older daemon: no such verb
+                return _ok(rid, {"ok": True})
+            rid_ = "scope-stub" + str(abs(hash(path)) % 10**6)
+            permits = verdict in ("in_force", "approved")
+            return _ok(rid, {"verdict": verdict, "request_id": rid_, "permits": permits,
+                             "detail": f"stub {verdict}", "path": path})
         if name == "hestia_request_witness":
             return _ok(rid, {"ok": True, "witnessEntryHash": "c" * 64})
         if name == "hestia_witness_decision":
@@ -601,14 +612,12 @@ def test_reads_meet_the_same_local_law_on_every_seat(m, g, wc, home):
                 d, _ = _decide(g, seat, "Read", {"file_path": cred}, home)
                 check(f"{seat}-credential-read-up", d.decision == "deny" and d.rule == "egress.secret", d)
                 d, _ = _decide(g, seat, "Read", {"file_path": outside}, home)
+                # The LAW GAP stage B pinned here is CLOSED (2026-10-05, dp: "yes on gate gap,
+                # let's fix it"): codex reads by `cat`, and the core's command scope now judges a
+                # shell path outside the workspace exactly like a Read path. Every seat agrees.
+                check(f"{seat}-out-of-scope-read-up", d.decision == "deny" and d.rule.startswith("mrh."), d)
                 if seat == "codex":
-                    # LAW GAP, pinned (reported to dp, not fixed in B): codex reads by `cat`, and the
-                    # core's command scope judges only tokens UNDER the workspace, so a shell read of
-                    # an absolute path outside it is unscoped — on every seat, today and in decide().
-                    check(f"{seat}-out-of-scope-SHELL-read-up-is-the-known-law-gap",
-                          d.decision == "allow", d)
-                else:
-                    check(f"{seat}-out-of-scope-read-up", d.decision == "deny" and d.rule.startswith("mrh."), d)
+                    check(f"{seat}-out-of-scope-SHELL-read-is-mrh-command", d.rule == "mrh.command", d)
             with _Env(m, closed_port_url(), home):
                 d, _ = _decide(g, seat, "Read", {"file_path": cred}, home)
                 check(f"{seat}-credential-read-down", d.decision == "deny" and d.rule == "egress.secret", d)
@@ -680,6 +689,105 @@ def test_daemon_verdicts_and_the_warn_rollout(m, g, wc, home):
         with _Env(m, stub.url, home):
             d, _ = _decide(g, "claude-code", "Bash", {"command": "touch x"}, home)
         check("daemon-warn", d.decision == "warn" and d.rule == "society.safety.warn" and d.evidence_committed, d)
+    finally:
+        stub.close()
+
+
+def test_a_scope_refusal_is_an_escalation_with_a_standing_option(m, g, wc, home):
+    """dp, 2026-10-05: "escalation should allow standing grants". An `mrh.path` / `mrh.command`
+    refusal asks the daemon ONCE (`hestia_scope_claim`): a request is opened (or re-found) on the
+    operator's queue and the deny names its id; an operator's one-time approval or a grant in
+    force lifts exactly the refused path for this act; a refusal stays refused."""
+    one, two = "/etc/hostname", "/etc/os-release"
+    # (1) opened: the deny names the request, carries it as escalation_id, and the claim carried
+    # the resolved path, the act, the rule and the request key.
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "claude-code", "Bash", {"command": f"cat {one}"}, home)
+        claims = [a for a, _ in stub.named("hestia_scope_claim")]
+        check("scope-opened-denies", d.decision == "deny" and d.rule == "mrh.command", d)
+        check("scope-opened-one-claim", len(claims) == 1, claims)
+        c = claims[0] if claims else {}
+        check("scope-claim-carries-path", c.get("path") == one, c)
+        check("scope-claim-carries-act", one in (c.get("act") or ""), c)
+        check("scope-claim-carries-rule", c.get("rule") == "mrh.command", c)
+        check("scope-claim-carries-key", c.get("request_key") == m.scope_request_key("claude-code", one), c)
+        check("scope-claim-spends-a-single-path", c.get("spend") is True, c)
+        check("scope-deny-names-the-request", d.escalation_id and d.escalation_id in d.reason, d)
+        check("scope-deny-says-reissue", "re-issue this identical act" in d.reason, d.reason)
+        # A Read refusal escalates the same way (mrh.path).
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "kimi", "Read", {"file_path": one}, home)
+        check("scope-read-escalates", d.decision == "deny" and d.rule == "mrh.path" and d.escalation_id, d)
+    finally:
+        stub.close()
+    # (2) approved once / in force: lifted, and the act goes on to society law.
+    for verdict in ("approved", "in_force"):
+        stub = Stub(Policy(scope_claim=lambda p, v=verdict: v))
+        try:
+            with _Env(m, stub.url, home):
+                d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home)
+            check(f"scope-{verdict}-lifts", d.decision == "allow", d)
+            check(f"scope-{verdict}-asks-society", len(stub.named("hestia_begin_action")) == 1)
+            check(f"scope-{verdict}-notice", any("scope " + verdict in n for n in d.notices), d.notices)
+        finally:
+            stub.close()
+    # (3) refused: stays refused and says so.
+    stub = Stub(Policy(scope_claim=lambda p: "refused"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home)
+        check("scope-refused-denies", d.decision == "deny" and "REFUSED" in d.reason, d)
+        check("scope-refused-no-society", not stub.named("hestia_begin_action"))
+    finally:
+        stub.close()
+    # (4) an older daemon without the verb: still refused, and the remedy door is named.
+    stub = Stub(Policy(scope_claim=lambda p: "absent"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home)
+        check("scope-old-daemon-denies", d.decision == "deny" and "hestia_request_scope" in d.reason, d)
+        check("scope-old-daemon-no-id", d.escalation_id is None, d)
+    finally:
+        stub.close()
+    # (5) two refused paths: PEEK both first, spend only when both lift; one un-approved path
+    # spends nothing (a one-time approval is not burned on an act that is still refused).
+    stub = Stub(Policy(scope_claim=lambda p: "approved"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one} {two}"}, home)
+        spends = [a.get("spend") for a, _ in stub.named("hestia_scope_claim")]
+        check("scope-two-paths-lift", d.decision == "allow", d)
+        check("scope-two-paths-peek-then-spend", spends == [False, False, True, True], spends)
+    finally:
+        stub.close()
+    stub = Stub(Policy(scope_claim=lambda p: "approved" if p == one else "opened"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one} {two}"}, home)
+        spends = [a.get("spend") for a, _ in stub.named("hestia_scope_claim")]
+        check("scope-partial-denies", d.decision == "deny" and d.escalation_id, d)
+        check("scope-partial-spends-nothing", True not in spends, spends)
+        check("scope-partial-names-the-open-path", two in d.reason, d.reason)
+    finally:
+        stub.close()
+    # (6) the warn rollout softens the scope refusal into a warning and opens nothing.
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home, rollout="warn")
+        check("scope-warn-rollout-warns", d.decision == "warn" and d.rule.startswith("mrh."), d)
+        check("scope-warn-rollout-opens-nothing", not stub.named("hestia_scope_claim"))
+    finally:
+        stub.close()
+    # (7) device sinks and temp roots are never escalated.
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": "ls 2>/dev/null >/tmp/x"}, home)
+        check("scope-sinks-allowed", d.decision == "allow", d)
+        check("scope-sinks-open-nothing", not stub.named("hestia_scope_claim"))
     finally:
         stub.close()
 
@@ -910,6 +1018,7 @@ CONTRACT_TESTS = [
     test_reads_meet_the_same_local_law_on_every_seat,
     test_superseded_is_denied_in_every_mode,
     test_daemon_verdicts_and_the_warn_rollout,
+    test_a_scope_refusal_is_an_escalation_with_a_standing_option,
     test_degraded_posture,
     test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat,
     test_no_verdict_is_a_hard_stop_in_every_rollout_on_every_seat,
@@ -1257,11 +1366,24 @@ def test_against_an_isolated_real_daemon(m, g, wc, home):
         d = run("Bash", {"command": "ls -la"}, 2)
         check("real-allow-committed-as-policy_allow", d.decision == "allow" and d.evidence_committed
               and d.action_id, d)
-        d = run("Bash", {"command": "rm -rf /home/user/data"}, 3)
+        # A relative target that exists nowhere: SCOPE has nothing to judge and the daemon's law
+        # refuses it (safety preset `rm -rf v21out`). Since 2026-10-05 the old
+        # `rm -rf /home/user/data` is refused by scope first, before the law is asked.
+        d = run("Bash", {"command": "rm -rf decide-contract-probe-out"}, 3)
         check("real-daemon-deny", d.decision == "deny" and d.rule == "society.safety", d)
         check("real-daemon-deny-one-row", d.evidence_committed, d)
         d = run("Read", {"file_path": str(REPO / "README.md")}, 4)
         check("real-read-allowed-and-recorded", d.decision == "allow" and d.evidence_committed, d)
+        # A scope refusal against the REAL daemon opens a request, and a re-issue finds it
+        # (hestia_scope_claim, 2026-10-05). An older daemon answers no-channel; say so.
+        d = run("Bash", {"command": "cat /etc/hostname"}, 5)
+        check("real-scope-refusal-is-mrh-command", d.decision == "deny" and d.rule == "mrh.command", d)
+        check("real-scope-refusal-opens-a-request", bool(d.escalation_id)
+              and str(d.escalation_id).startswith("scope-"), d)
+        again = run("Bash", {"command": "cat /etc/hostname"}, 6)
+        check("real-scope-reissue-finds-the-same-request", again.escalation_id == d.escalation_id,
+              (d.escalation_id, again.escalation_id))
+        check("real-scope-reissue-says-pending", "still pending" in again.reason, again.reason)
 
 
 def teardown_module(module=None):
