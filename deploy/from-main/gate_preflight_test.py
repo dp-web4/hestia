@@ -19,7 +19,8 @@ SPEC.loader.exec_module(gate_preflight)
 
 def make_member(repo: Path, home: Path, name: str, *, registered: bool = True,
                 outcome: str = "allow", reader: str = "json-hook-commands",
-                advisory: bool = False, body: str | None = None) -> None:
+                advisory: bool = False, body: str | None = None,
+                seat: str | None = None) -> None:
     plugin = repo / "plugins" / name
     hooks = plugin / "hooks"
     hooks.mkdir(parents=True)
@@ -34,6 +35,8 @@ def make_member(repo: Path, home: Path, name: str, *, registered: bool = True,
             "gate_probe": {"entry": "hooks/pre_tool_use.py", "events": [declared]},
         }
     }
+    if seat is not None:
+        spec["install"]["member"] = seat
     (plugin / "expects.json").write_text(json.dumps(spec), encoding="utf-8")
     if body is not None:
         pass
@@ -293,6 +296,40 @@ def test_a_projection_consuming_candidate_is_probed_against_the_candidate_engine
         assert rows == [{"member": "alpha", "probe": "read", "status": "ok"}]
 
 
+def test_the_throwaway_projection_is_keyed_by_the_seat_id_not_the_plugin_dir():
+    """kimi's plugin dir is `kimi` but its seat (install.member) and projection are `kimi-code`.
+    Keyed by the dir, the throwaway lookup missed `seats/kimi.env`, the probe kept the real
+    home, and the candidate loaded the INSTALLED engine (CBP 2026-10-05T22:20Z: kimi refused
+    `gate.bootstrap_unavailable`, codex and gemini -- whose names match -- passed)."""
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        repo, home = root / "repo", root / "home"
+        launcher_home = root / "launcher-home"
+        seats = launcher_home / "seats"
+        seats.mkdir(parents=True)
+        (seats / "beta-code.env").write_text(
+            f"HESTIA_HOME={launcher_home}\nHESTIA_SHARED_DIR={root / 'installed-shared'}\n",
+            encoding="utf-8",
+        )
+        expected = str((repo / "plugins" / "_shared").resolve())
+        body = (
+            "import os, sys; sys.stdin.read()\n"
+            "for line in open(os.path.join(os.environ['HESTIA_HOME'], 'seats', 'beta-code.env')):\n"
+            "    line = line.strip()\n"
+            "    if line and '=' in line:\n"
+            "        k, v = line.split('=', 1); os.environ[k] = v\n"
+            f"raise SystemExit(0 if os.environ.get('HESTIA_SHARED_DIR') == {expected!r} else 2)\n"
+        )
+        make_member(repo, home, "beta", body=body, seat="beta-code")
+        config = home / ".beta" / "settings.json"
+        installed = home / ".beta" / "hooks" / "pre_tool_use.py"
+        config.write_text(json.dumps({"hooks": [{"command": f'HESTIA_HOME="{launcher_home}" python3 {installed}'}]}),
+                          encoding="utf-8")
+        rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+        assert good, rows
+        assert rows == [{"member": "beta", "probe": "read", "status": "ok"}]
+
+
 if __name__ == "__main__":
     test_registered_candidate_must_allow_the_declared_probe()
     test_registered_refusal_blocks_the_set_before_installation()
@@ -307,4 +344,5 @@ if __name__ == "__main__":
     test_every_shipped_gate_declares_its_own_probe_shape()
     test_a_projection_consumer_is_probed_under_the_launcher_env_not_the_deploy_units()
     test_a_projection_consuming_candidate_is_probed_against_the_candidate_engine()
-    print("ok: 12 gate-preflight checks")
+    test_the_throwaway_projection_is_keyed_by_the_seat_id_not_the_plugin_dir()
+    print("ok: 13 gate-preflight checks")

@@ -292,8 +292,13 @@ def _run_probes(
         environment["HESTIA_SHARED_DIR"] = str(repo / "plugins" / "_shared")
         # ...and for a candidate that CONSUMES the vault projection the pin above is not
         # enough: the projection overrides it at import. Probe under a throwaway seat home
-        # whose projection names the candidate engine (#1171).
-        throwaway = _throwaway_seat_home(member, environment, homes)
+        # whose projection names the candidate engine (#1171). The projection is keyed by the
+        # SEAT id the gate loads (`install.member`: kimi's plugin dir is `kimi`, its seat and
+        # projection are `kimi-code`), not by the plugin directory. Keyed by the directory, the
+        # kimi lookup missed, the probe kept the real home, and the candidate was paired with the
+        # INSTALLED engine -- the #1171 failure again, for the one member whose names differ.
+        seat = install.get("member") if isinstance(install.get("member"), str) else member
+        throwaway = _throwaway_seat_home(seat, environment, homes)
         if throwaway is not None:
             environment[BOOTSTRAP_LOCATOR] = str(throwaway)
 
