@@ -1179,6 +1179,53 @@ mod tests {
         assert!(upgraded.peer_certificate.is_some());
         assert_eq!(upgraded.reason, "certificate upgrade");
         assert_eq!(upgraded.set_at, 2);
+
+        let cert_at = |issued_at| {
+            crate::router_certificate::RouterInterfaceCertificate::issue(
+                crate::router_certificate::RouterInterfaceCertificatePayload {
+                    protocol: crate::router_certificate::ROUTER_CERT_PROTOCOL.into(),
+                    router_lct: peer_router.clone(),
+                    router_pubkey_hex: peer_router_key.verifying_key().to_hex(),
+                    hub_lct_id: hub,
+                    hub_member_lct: peer_member,
+                    hub_member_pubkey_hex: peer_member_key.verifying_key().to_hex(),
+                    interface_binding_id: Uuid::new_v4(),
+                    receipt_protocol: crate::router_certificate::RECEIPT_PROTOCOL.into(),
+                    issued_at,
+                },
+                &peer_router_key,
+                &peer_member_key,
+            ).unwrap()
+        };
+
+        let err = t.bind_neighbor(RouterNeighbor {
+            link_id: Uuid::new_v4(),
+            next_hop_lct: peer_router.clone(),
+            interface_binding_id: local_if,
+            next_hop_hub_member_lct: peer_member,
+            peer_certificate: Some(cert_at(10)),
+            reason: "stale cert".into(),
+            set_by: "test".into(),
+            set_at: 3,
+        }).unwrap_err();
+        assert!(err.to_string().contains("issued_at backwards"), "{err}");
+
+        t.bind_neighbor(RouterNeighbor {
+            link_id: Uuid::new_v4(),
+            next_hop_lct: peer_router.clone(),
+            interface_binding_id: local_if,
+            next_hop_hub_member_lct: peer_member,
+            peer_certificate: Some(cert_at(12)),
+            reason: "renewed cert".into(),
+            set_by: "test".into(),
+            set_at: 4,
+        }).unwrap();
+        let renewed = t.neighbor(&peer_router).unwrap();
+        assert_eq!(renewed.link_id, old_link);
+        assert_eq!(
+            renewed.peer_certificate.as_ref().unwrap().payload.issued_at,
+            12
+        );
     }
 
     #[test]
