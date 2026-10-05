@@ -1100,6 +1100,79 @@ mod tests {
     }
 
     #[test]
+    fn same_topology_manual_neighbor_upgrades_to_certificate_without_changing_link() {
+        let local_router = web4_core::derive_lct_id(
+            &web4_core::crypto::KeyPair::generate().verifying_key(),
+        );
+        let peer_router_key = web4_core::crypto::KeyPair::generate();
+        let peer_member_key = web4_core::crypto::KeyPair::generate();
+        let peer_router = web4_core::derive_lct_id(&peer_router_key.verifying_key());
+        let hub = Uuid::new_v4();
+        let peer_member = Uuid::new_v4();
+        let local_if = Uuid::new_v4();
+        let old_link = Uuid::new_v4();
+
+        let mut t = ReceiverRoutingTable::default();
+        t.bind_router_ingress(RouterIngressBinding {
+            binding_id: local_if,
+            router_lct: local_router,
+            hub_url: "https://hub.test".into(),
+            hub_lct_id: hub,
+            rest_endpoint: "https://hub.test/v1".into(),
+            hub_member_lct: Uuid::new_v4(),
+            member_key_source: MemberKeySource::VaultIdentity,
+            reason: "test".into(),
+            set_by: "test".into(),
+            set_at: 1,
+        }).unwrap();
+
+        // Simulate a pre-#1230 shadow/manual row already persisted in the vault.
+        t.neighbors.push(RouterNeighbor {
+            link_id: old_link,
+            next_hop_lct: peer_router.clone(),
+            interface_binding_id: local_if,
+            next_hop_hub_member_lct: peer_member,
+            peer_certificate: None,
+            reason: "old manual shadow".into(),
+            set_by: "old".into(),
+            set_at: 1,
+        });
+
+        let cert = crate::router_certificate::RouterInterfaceCertificate::issue(
+            crate::router_certificate::RouterInterfaceCertificatePayload {
+                protocol: crate::router_certificate::ROUTER_CERT_PROTOCOL.into(),
+                router_lct: peer_router.clone(),
+                router_pubkey_hex: peer_router_key.verifying_key().to_hex(),
+                hub_lct_id: hub,
+                hub_member_lct: peer_member,
+                hub_member_pubkey_hex: peer_member_key.verifying_key().to_hex(),
+                interface_binding_id: Uuid::new_v4(),
+                receipt_protocol: crate::router_certificate::RECEIPT_PROTOCOL.into(),
+                issued_at: 11,
+            },
+            &peer_router_key,
+            &peer_member_key,
+        ).unwrap();
+
+        t.bind_neighbor(RouterNeighbor {
+            link_id: Uuid::new_v4(), // must be ignored for same-topology upgrade
+            next_hop_lct: peer_router.clone(),
+            interface_binding_id: local_if,
+            next_hop_hub_member_lct: peer_member,
+            peer_certificate: Some(cert),
+            reason: "certificate upgrade".into(),
+            set_by: "new".into(),
+            set_at: 2,
+        }).unwrap();
+
+        let upgraded = t.neighbor(&peer_router).unwrap();
+        assert_eq!(upgraded.link_id, old_link);
+        assert!(upgraded.peer_certificate.is_some());
+        assert_eq!(upgraded.reason, "certificate upgrade");
+        assert_eq!(upgraded.set_at, 2);
+    }
+
+    #[test]
     fn no_route_loop_and_hop_limit_are_terminal() {
         let (_dir, _vault, reg, parent, _child) = registry_world();
         let t = ReceiverRoutingTable::default();
