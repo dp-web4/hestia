@@ -4873,10 +4873,16 @@ fn cmd_receiver_routes(home: &std::path::Path) -> AnyResult<()> {
         println!("    (none)");
     }
     for n in &table.neighbors {
+        let cert = match n.peer_certificate.as_ref() {
+            Some(cert) => cert
+                .fingerprint()
+                .unwrap_or_else(|e| format!("INVALID:{e}")),
+            None => "UNCERTIFIED".to_string(),
+        };
         println!(
-            "    {} -> hub-member {} via if={} link={}  ({})",
+            "    {} -> hub-member {} via if={} link={} cert={}  ({})",
             n.next_hop_lct, n.next_hop_hub_member_lct,
-            n.interface_binding_id, n.link_id, n.reason
+            n.interface_binding_id, n.link_id, cert, n.reason
         );
     }
     println!("  legacy compatibility aliases (shadow/cutover edge only):");
