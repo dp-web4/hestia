@@ -174,6 +174,64 @@ pub struct ScopeRequest {
     /// facts, and the member's `hestia_scope_status` must be able to say which.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked: Option<ScopeRevocation>,
+    /// What 2026-10-05 added: the gate-opened origin, the one-time answer, and the breadth the
+    /// operator chose. One struct so every existing construction stays a one-line default.
+    #[serde(default)]
+    pub ext: ScopeRequestExt,
+}
+
+/// The fields a GATE-OPENED scope request carries, and the operator's answer shape.
+///
+/// dp, 2026-10-05: *"yes on gate gap, let's fix it. escalation should allow standing grants (i
+/// recall it being discussed but it's not implemented that i can see)."* It was discussed:
+/// PRD_ALLOWLISTS §5 — *"on denial escalation, the operator should have the choice of expansion
+/// being one-time, session, or member-permanent."* An `mrh.path` / `mrh.command` refusal used to
+/// be a plain deny: nothing reached the operator unless the member chose to file. Now the gate
+/// asks `hestia_scope_claim`, which opens a request in THIS store (not a new one) carrying what
+/// was refused, and the operator answers with one of the three durations — and, for session and
+/// standing, the breadth.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ScopeRequestExt {
+    /// `Some` when the gate opened this request on a refusal; `None` when the member filed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<GateDenyOrigin>,
+    /// The operator answered ONE-TIME: this exact act (`gate.act_digest`), once, inside the
+    /// claim window. Never a live grant: it is not served in `live_grants`, so no snapshot
+    /// carries it; only `hestia_scope_claim` can spend it.
+    #[serde(default)]
+    pub once: bool,
+    /// When the one-time approval was spent. A spent approval permits nothing more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spent_at: Option<u64>,
+    /// The breadth the operator granted, when it differs from the asked path: the asked path or
+    /// an ANCESTOR of it (always recursive then — an exact grant on an ancestor would not reach
+    /// the asked path). `None` = exactly the asked path. The asked path is never rewritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_path: Option<String>,
+}
+
+/// What the gate knew when it opened a request: the refusal it is answering.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GateDenyOrigin {
+    /// `mrh.path` | `mrh.command`.
+    pub rule: String,
+    pub tool: String,
+    /// The attempted act as the gate rendered it (masked, truncated at the gate). This is what
+    /// the operator rules on — not a rationale: the member did not choose to ask.
+    pub act: String,
+    /// sha256 over `tool \x1f act`: a one-time approval is spent only by the act it was shown.
+    pub act_digest: String,
+    /// sha256 over `"hestia:scope-request-key" \x1f member \x1f path` — re-issues find this row.
+    pub request_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_session_id: Option<String>,
+    /// The refused reach was a glob over this directory (`dir/*`): only a recursive grant
+    /// covers it, and the operator is told so.
+    #[serde(default)]
+    pub subtree: bool,
+    /// How many times the member re-issued the refused act while this was pending.
+    #[serde(default)]
+    pub reissues: u32,
 }
 
 /// What a retirement actually removed, by channel.
@@ -201,7 +259,26 @@ impl ScopeRequest {
     /// inline now asks this, so a revocation cannot be honoured in one place and missed in
     /// another.
     pub fn is_live(&self, now: u64) -> bool {
-        self.granted == Some(true) && now < self.expires_at && self.revoked.is_none()
+        // A ONE-TIME approval is not a grant of reach: it is spent by one act through
+        // `hestia_scope_claim`, and must never ride a policy snapshot (where every act in the
+        // window would pass). PRD_ALLOWLISTS §5.2: "no code path for session or permanent calls
+        // the claim verb" — and, the converse, no one-time answer is served as policy.
+        self.granted == Some(true) && now < self.expires_at && self.revoked.is_none() && !self.ext.once
+    }
+
+    /// The path a live grant reaches from: the operator's chosen breadth, else the asked path.
+    pub fn reach_path(&self) -> &str {
+        self.ext.granted_path.as_deref().unwrap_or(&self.path)
+    }
+
+    /// A one-time approval that can still be spent: approved, not spent, not revoked, inside
+    /// its claim window (`expires_at` is set to decided_at + the claim window at decide time).
+    pub fn once_spendable(&self, now: u64) -> bool {
+        self.ext.once
+            && self.granted == Some(true)
+            && self.ext.spent_at.is_none()
+            && self.revoked.is_none()
+            && now < self.expires_at
     }
 
     /// Live = granted, and not past its window. A refused or expired request grants nothing,
@@ -210,7 +287,7 @@ impl ScopeRequest {
     /// recursive — the same rule the standing store uses, so the two channels agree.
     pub fn grants(&self, path: &str, now: u64) -> bool {
         self.is_live(now)
-            && crate::server::standing_scope::covers_path(&self.path, self.recursive, path)
+            && crate::server::standing_scope::covers_path(self.reach_path(), self.recursive, path)
     }
 
     /// One word for the whole record. `expires_at` means the same thing in both phases — the
@@ -221,6 +298,9 @@ impl ScopeRequest {
     pub fn status(&self, now: u64) -> &'static str {
         if self.revoked.is_some() {
             return "revoked";
+        }
+        if self.ext.once && self.ext.spent_at.is_some() {
+            return "spent";
         }
         match self.granted {
             Some(true) if now < self.expires_at => "granted",

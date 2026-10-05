@@ -813,6 +813,19 @@ enum PolicyCmd {
 
 #[derive(Subcommand, Debug)]
 enum ScopeCmd {
+    /// List pending scope requests, including the ones the GATE opened on a refused act (with
+    /// the act). Read-only: the operator rules them on the dashboard or the app.
+    Pending {
+        /// Print the daemon's scope-queue fields as one JSON value
+        #[arg(long)]
+        json: bool,
+        /// Asserted member id for the read session (default: the CLI's own)
+        #[arg(long = "as")]
+        as_member: Option<String>,
+        /// Daemon MCP endpoint
+        #[arg(long, default_value = "http://127.0.0.1:7711")]
+        endpoint: String,
+    },
     /// Rule a pending scope request under an operator delegation (#952). Signs the ruling
     /// with this seat's member key from the vault and calls `hestia_scope_arbitrate`.
     Arbitrate {
@@ -956,6 +969,9 @@ pub fn run() -> AnyResult<()> {
                 anyhow::bail!("say exactly one of --grant or --deny — an omitted verdict is not a verdict");
             }
             cmd_scope_arbitrate(&home, &endpoint, &request_id, grant, reason, &as_member, &target)
+        }
+        Command::Scope(ScopeCmd::Pending { json, as_member, endpoint }) => {
+            hestia::gate_cli::scope_pending(&endpoint, as_member, "role:constellation:member", json)
         }
         Command::Gate { cmd, endpoint, asserted_id, role } => {
             use hestia::gate_cli;

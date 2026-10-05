@@ -295,24 +295,77 @@ pub fn pending(
         Some(0) => println!("no pending scope requests"),
         Some(n) => {
             println!("{n} pending scope request(s) — a daemon restart would drop them:");
-            if let Some(list) = r.get("pending_scope_requests").and_then(Value::as_array) {
-                for q in list {
-                    let s = |k: &str| q.get(k).and_then(Value::as_str).unwrap_or("-").to_string();
-                    println!(
-                        "  {:<24} {:<16} {:>6}s  {}",
-                        s("request_id"),
-                        s("claimed_by"),
-                        q.get("secs_remaining").and_then(Value::as_u64).unwrap_or(0),
-                        s("path")
-                    );
-                }
-            }
+            print_scope_requests(&r);
         }
     }
     // The daemon ships a caveat with this answer explaining that `you_may_rule` reflects
     // NOT-SAME only. Swallowing it would let a reader mistake NOT-SAME for a boundary.
     if let Some(c) = r.get("caveat").and_then(Value::as_str) {
         println!("\ncaveat: {c}");
+    }
+    Ok(())
+}
+
+/// One line per pending scope request, plus — for a request the GATE opened on a refusal
+/// (2026-10-05) — the rule and the refused act on their own line: that act is what the
+/// operator rules on, and an id + path row cannot carry it.
+fn print_scope_requests(r: &Value) {
+    let Some(list) = r.get("pending_scope_requests").and_then(Value::as_array) else {
+        return;
+    };
+    for q in list {
+        let s = |k: &str| q.get(k).and_then(Value::as_str).unwrap_or("-").to_string();
+        println!(
+            "  {:<24} {:<16} {:>6}s  {}",
+            s("request_id"),
+            s("claimed_by"),
+            q.get("secs_remaining").and_then(Value::as_u64).unwrap_or(0),
+            s("path")
+        );
+        if q.get("origin").and_then(Value::as_str) == Some("gate_deny") {
+            let reissues = q.get("reissues").and_then(Value::as_u64).unwrap_or(0);
+            println!("      opened by the gate ({}); re-issued {reissues}x", s("rule"));
+            println!("      act: {}", s("act"));
+        } else {
+            println!("      why: {}", s("reason"));
+        }
+    }
+}
+
+/// `hestia scope pending` — the scope queue alone, with what each gate-opened request refused.
+///
+/// READ-ONLY, and deliberately not a decide verb: ruling a scope request is the operator's act
+/// on the challenge-signed surface (dashboard or app: this act once, for the session, or
+/// standing, at the breadth they choose), or a delegated seat's signed `hestia scope
+/// arbitrate`. A CLI that could decide from an asserted identity would be the door the
+/// operator wall exists to close.
+pub fn scope_pending(endpoint: &str, asserted_id: Option<String>, role: &str, json_output: bool)
+    -> Result<()> {
+    let asserted = asserted_id.unwrap_or_else(|| DEFAULT_ASSERTED_ID.to_string());
+    let mut m = Mcp::connect(endpoint)?;
+    let (sid, who) = open_session(&mut m, &asserted, role)?;
+    banner(&who);
+    let r = m.tool("hestia_gate_pending_escalations", json!({"session_id": sid}))?;
+    if json_output {
+        let out = json!({
+            "pending_scope_requests": r.get("pending_scope_requests").cloned().unwrap_or(Value::Null),
+            "pending_scope_count": r.get("pending_scope_count").cloned().unwrap_or(Value::Null),
+        });
+        println!("{}", serde_json::to_string(&out).context("encoding scope requests as JSON")?);
+        return Ok(());
+    }
+    match r.get("pending_scope_count").and_then(Value::as_u64) {
+        None => println!("this daemon does not report pending scope requests"),
+        Some(0) => println!("no pending scope requests"),
+        Some(n) => {
+            println!("{n} pending scope request(s):");
+            print_scope_requests(&r);
+            println!(
+                "\nrule them on the dashboard (Activity -> Reach requested) or the app's Decide \
+                 page: this act once, for the session, or standing (exact, or recursive at a \
+                 directory you choose). A delegated seat: hestia scope arbitrate <id>."
+            );
+        }
     }
     Ok(())
 }
