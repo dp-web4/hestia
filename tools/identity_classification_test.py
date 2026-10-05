@@ -503,48 +503,73 @@ def hook_sources():
     return out
 
 
-def common_gate_identity_reads(call_summaries):
-    """What the common gate reads off a seat's identity, when the seat hands it the path.
+def _common_gate_identity_reads_from_source(src: str, call_summaries):
+    """Identity reads reached by the stage-C common-gate role bridge.
 
-    One-gate stage C: a seat's shim decides nothing itself; it passes its PROFILE (whose
-    `identity_path` the vault projection names, so no identity.json literal exists to taint)
-    to `gate.decide`, and the common gate calls `role_bridge(identity_path=
-    <profile>.identity_path)`. Both halves are proven structurally, as the slice-3 seam
-    requires: the common gate's call binds role_bridge's identity parameter to the profile's
-    `identity_path` attribute, and role_bridge's body was summarized as reading the field."""
+    Both halves are structural: the reviewed callee summary must exist, and this source must
+    call that callee with the profile's actual identity_path. A same-named call on another
+    attribute is not evidence that the identity participates in the decision.
+    """
     summary = call_summaries.get("role_bridge")
-    path = REPO / "plugins" / "_shared" / "hestia_single_gate.py"
     if not summary:
         return set()
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-    except (OSError, SyntaxError, UnicodeError):
+        tree = ast.parse(src)
+    except SyntaxError:
         return set()
     for node in ast.walk(tree):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "role_bridge"):
-            arg = next((k.value for k in node.keywords if k.arg == summary["identity_param"]), None)
-            if isinstance(arg, ast.Attribute) and arg.attr == "identity_path":
-                return set(summary["reads"])
+            continue
+        arg = next((k.value for k in node.keywords
+                    if k.arg == summary["identity_param"]), None)
+        if not (isinstance(arg, ast.Attribute) and arg.attr == "identity_path"):
+            continue
+        owner = arg.value
+        if not (isinstance(owner, ast.Attribute) and owner.attr == "profile"):
+            continue
+        return set(summary["reads"])
     return set()
 
 
+def common_gate_identity_reads(call_summaries):
+    """What the common gate reads off a seat's identity, when the seat hands it the path."""
+    path = REPO / "plugins" / "_shared" / "hestia_single_gate.py"
+    try:
+        src = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return set()
+    return _common_gate_identity_reads_from_source(src, call_summaries)
+
+
 def hands_identity_to_the_common_gate(src: str) -> bool:
-    """The shim calls `gate.decide(...)` and its PROFILE binds an `identity_path`."""
+    """The shim constructs GateProfile from PROFILE and hands that exact profile to decide()."""
     try:
         tree = ast.parse(src)
     except SyntaxError:
         return False
-    calls = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                and n.func.attr == "decide" for n in ast.walk(tree))
-    profile = any(isinstance(n, ast.Assign) and any(getattr(t, "id", None) == "PROFILE"
-                                                     for t in n.targets)
+
+    profile = any(isinstance(n, ast.Assign)
+                  and any(getattr(t, "id", None) == "PROFILE" for t in n.targets)
                   and isinstance(n.value, ast.Dict)
                   and any(isinstance(k, ast.Constant) and k.value == "identity_path"
                           for k in n.value.keys)
                   for n in ast.walk(tree))
-    return calls and profile
+    if not profile:
+        return False
 
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "decide" and len(node.args) >= 2):
+            continue
+        passed = node.args[1]
+        if not (isinstance(passed, ast.Call) and isinstance(passed.func, ast.Attribute)
+                and passed.func.attr == "GateProfile"):
+            continue
+        if any(k.arg is None and isinstance(k.value, ast.Name) and k.value.id == "PROFILE"
+               for k in passed.keywords):
+            return True
+    return False
 
 def access_map():
     """member -> {'reads', 'writes'}, and per-file detail.
@@ -741,6 +766,37 @@ def prop_e_selftest():
     reads, _ = identity_field_access(src, call_summaries=summary)
     if "role" in reads:
         failures.append("E6: a non-identity path counted as an identity read")
+
+    # E7: stage-C's second interprocedural seam. The common gate must call the reviewed
+    # role_bridge with inv.profile.identity_path, and the shim must pass its exact PROFILE
+    # through GateProfile into decide(). These negative controls prevent a refactor from leaving
+    # property B green after either half of the chain is severed.
+    gate_summary = {"role_bridge": {"identity_param": "identity_path", "reads": {"role"}}}
+    gate_src = ("def f(inv):\n"
+                "    return mechanism.role_bridge(snapshot_role=None, "
+                "identity_path=inv.profile.identity_path)\n")
+    if "role" not in _common_gate_identity_reads_from_source(gate_src, gate_summary):
+        failures.append("E7: real common-gate role_bridge call did not carry the role read")
+    if _common_gate_identity_reads_from_source(gate_src, {}):
+        failures.append("E7: call survived loss of the reviewed callee summary")
+    no_call = "def f(inv):\n    return inv.profile.identity_path\n"
+    if _common_gate_identity_reads_from_source(no_call, gate_summary):
+        failures.append("E7: role read survived loss of the common-gate role_bridge call")
+    wrong_attr = ("def f(inv):\n"
+                  "    return mechanism.role_bridge(snapshot_role=None, "
+                  "identity_path=inv.profile.observe_dir)\n")
+    if _common_gate_identity_reads_from_source(wrong_attr, gate_summary):
+        failures.append("E7: wrong profile attribute counted as identity_path")
+
+    shim = ("PROFILE = {'identity_path': 'projected'}\n"
+            "decision = gate.decide(event, gate.GateProfile(**PROFILE))\n")
+    if not hands_identity_to_the_common_gate(shim):
+        failures.append("E7: exact PROFILE -> GateProfile -> decide handoff was not recognized")
+    wrong_profile = ("PROFILE = {'identity_path': 'projected'}\n"
+                     "OTHER = {'identity_path': 'other'}\n"
+                     "decision = gate.decide(event, gate.GateProfile(**OTHER))\n")
+    if hands_identity_to_the_common_gate(wrong_profile):
+        failures.append("E7: a different profile passed to decide satisfied the shim handoff")
 
     return failures
 
