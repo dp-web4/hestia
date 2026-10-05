@@ -44,6 +44,11 @@ pub struct RouterMembership {
     /// Set after Hestia binds this admitted membership as a router interface.
     #[serde(default)]
     pub interface_binding_id: Option<Uuid>,
+    /// Last dual-signed interface certificate issued after a live Hub-pin +
+    /// receipt-mode probe. Re-issuance replaces this artifact; the dedicated
+    /// membership UUID/key itself remains stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<crate::router_certificate::RouterInterfaceCertificate>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -131,6 +136,7 @@ mod tests {
             requested_at: 1,
             admitted_at: None,
             interface_binding_id: None,
+            certificate: None,
         }
     }
 
