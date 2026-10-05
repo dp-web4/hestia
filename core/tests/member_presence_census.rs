@@ -863,6 +863,14 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("cli.rs::cmd_receiver_unbind", &[
         "let registry = hestia::member_registry::load_members(&vault);",
     ]),
+    // SAFETY CUTOVER GATE (D3): re-run the exact F3 route against CURRENT
+    // membership/parentage before legacy -> F3 authority can change. Missing
+    // alias, unavailable/local/unreachable route, missing neighbor, stale parity,
+    // or measured/current next-hop disagreement => HOLD. Rollback remains a
+    // separate immediate path and does not consult this reader.
+    ("cli.rs::receiver_cutover_preflight", &[
+        "let registry = hestia::member_registry::load_members(vault);",
+    ]),
     ("fleet_receiver.rs::drain_once", &[
         "let registry = load_members(vault);",
     ]),
