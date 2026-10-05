@@ -1726,7 +1726,26 @@ mod tests {
         ).unwrap();
 
         let destination = "lct:web4:mb32:remote-child";
-        let next_hop = "lct:web4:mb32:remote-router";
+        let peer_router_key = web4_core::crypto::KeyPair::generate();
+        let next_hop = web4_core::derive_lct_id(&peer_router_key.verifying_key());
+        let peer_member_key = web4_core::crypto::KeyPair::generate();
+        let next_hop_member = Uuid::new_v4();
+        let hub_lct = Uuid::new_v4();
+        let peer_cert = crate::router_certificate::RouterInterfaceCertificate::issue(
+            crate::router_certificate::RouterInterfaceCertificatePayload {
+                protocol: crate::router_certificate::ROUTER_CERT_PROTOCOL.to_string(),
+                router_lct: next_hop.clone(),
+                router_pubkey_hex: peer_router_key.verifying_key().to_hex(),
+                hub_lct_id: hub_lct,
+                hub_member_lct: next_hop_member,
+                hub_member_pubkey_hex: peer_member_key.verifying_key().to_hex(),
+                interface_binding_id: Uuid::new_v4(),
+                receipt_protocol: crate::router_certificate::RECEIPT_PROTOCOL.to_string(),
+                issued_at: 1,
+            },
+            &peer_router_key,
+            &peer_member_key,
+        ).unwrap();
         let interface_id = Uuid::new_v4();
         let actual_carrier = Uuid::new_v4();
         let mut routes = ReceiverRoutingTable::default();
@@ -1734,7 +1753,7 @@ mod tests {
             binding_id: interface_id,
             router_lct: router.to_string(),
             hub_url: "https://hub.invalid".to_string(),
-            hub_lct_id: Uuid::new_v4(),
+            hub_lct_id: hub_lct,
             rest_endpoint: "https://hub.invalid/v1".to_string(),
             hub_member_lct: actual_carrier,
             member_key_source: crate::hub::MemberKeySource::ChannelKeyFile {
@@ -1746,16 +1765,17 @@ mod tests {
         }).unwrap();
         routes.bind_neighbor(crate::receiver_routing::RouterNeighbor {
             link_id: Uuid::new_v4(),
-            next_hop_lct: next_hop.to_string(),
+            next_hop_lct: next_hop.clone(),
             interface_binding_id: interface_id,
-            next_hop_hub_member_lct: Uuid::new_v4(),
+            next_hop_hub_member_lct: next_hop_member,
+            peer_certificate: Some(peer_cert),
             reason: "test neighbor".to_string(),
             set_by: "test".to_string(),
             set_at: 1,
         }).unwrap();
         routes.set_route(crate::receiver_routing::StaticRoute {
             destination_lct: destination.to_string(),
-            next_hop_lct: next_hop.to_string(),
+            next_hop_lct: next_hop.clone(),
             metric: 1,
             reason: "test route".to_string(),
         });
