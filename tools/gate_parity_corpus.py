@@ -62,21 +62,25 @@ CORPUS = [
     # --- FP15-FP18 (hestia #931), re-measured 2026-10-04 on the closure every seat now
     # decides with. #931 pinned them against hestia_shell_classifier, which is claude-code's
     # Tier-2 fallback only on main. FP15/FP17/FP18 and `continue`/`break` already classify
-    # read on all four seats; FP16 (a `case` arm sharing the header's segment) still refused.
+    # read on all four seats; FP16 (a `case` arm sharing the header's segment) still refused,
+    # and that refusal is ACCEPTED (2026-10-05): four review rounds showed the blanket
+    # out-of-grammar refusal of case forms is what keeps the closure walker's incomplete
+    # state model (#1225) unreachable. The FP16 rows pin the refusal; flip them only with
+    # #1225 fixed first.
     ("closure-fp15-awk-pipe", "closure-fp", "Bash",
      {"command": "ls -la {REPO}/plugins/_shared/hestia_gate_core.py | awk '{print $1}'"},
      "allow", "FP15: awk as a pipe head over a read"),
     ("closure-fp16-case-arm", "closure-fp", "Bash",
      {"command": 'case "$f" in x) grep -c def {REPO}/plugins/_shared/hestia_gate_core.py;; esac'},
-     "allow", "FP16: the first arm shares the header's segment; the arm body is a read"),
+     "deny:governance-closure", "FP16: known false refusal, accepted 2026-10-05; the blanket case refusal is load-bearing for walker state, see #1225 (first arm on the header's segment)"),
     ("closure-fp16-case-arm-in-loop", "closure-fp", "Bash",
      {"command": 'for f in a b; do case "$f" in x) grep -c def '
                  '{REPO}/plugins/_shared/hestia_gate_core.py;; esac; done'},
-     "allow", "FP16 as reproduced live 2026-09-03 (inside a for loop)"),
+     "deny:governance-closure", "FP16: known false refusal, accepted 2026-10-05; the blanket case refusal is load-bearing for walker state, see #1225 (live 2026-09-03 shape, in a for loop)"),
     ("closure-fp16-case-two-read-arms", "closure-fp", "Bash",
      {"command": "case x in a) grep -c def {REPO}/plugins/_shared/hestia_gate_core.py;; "
                  "b) wc -l {REPO}/plugins/_shared/hestia_gate_core.py;; esac"},
-     "allow", "the half of FP16 #931 left open; `)` and `;;` separate arms in the closure"),
+     "deny:governance-closure", "FP16: known false refusal, accepted 2026-10-05; the blanket case refusal is load-bearing for walker state, see #1225 (two read arms)"),
     ("closure-fp17-substitution-read", "closure-fp", "Bash",
      {"command": "n=$(grep -c def {REPO}/plugins/_shared/hestia_gate_core.py); echo $n"},
      "allow", "FP17: a substitution wrapping a read"),
