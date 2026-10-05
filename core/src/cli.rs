@@ -3767,6 +3767,11 @@ fn cmd_receiver_router_bind(
 fn write_public_evidence_atomic(path: &std::path::Path, bytes: &[u8]) -> AnyResult<()> {
     use std::io::Write;
 
+    anyhow::ensure!(
+        !path.exists(),
+        "refusing to overwrite public certificate evidence {}; choose a new --out path",
+        path.display()
+    );
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     std::fs::create_dir_all(parent)
         .with_context(|| format!("creating certificate directory {}", parent.display()))?;
@@ -3995,9 +4000,9 @@ fn cmd_receiver_neighbor(
     );
 
     let fingerprint = cert.fingerprint()?;
-    let link_id = uuid::Uuid::new_v4();
+    let candidate_link_id = uuid::Uuid::new_v4();
     table.bind_neighbor(hestia::receiver_routing::RouterNeighbor {
-        link_id,
+        link_id: candidate_link_id,
         next_hop_lct: cert.payload.router_lct.clone(),
         interface_binding_id: interface,
         next_hop_hub_member_lct: cert.payload.hub_member_lct,
@@ -4006,6 +4011,12 @@ fn cmd_receiver_neighbor(
         set_by: "hestia-cli:verified-router-certificate".into(),
         set_at: chrono::Utc::now().timestamp().max(0) as u64,
     })?;
+    let link_id = table
+        .neighbor(&cert.payload.router_lct)
+        .map(|n| n.link_id)
+        .ok_or_else(|| anyhow::anyhow!(
+            "certified neighbor disappeared before save"
+        ))?;
     table.save(&mut vault)?;
 
     println!("Router neighbor bound from certificate:");
