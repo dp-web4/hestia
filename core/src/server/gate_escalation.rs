@@ -483,7 +483,17 @@ pub const SOVEREIGN_FILES: &[&str] = &[
 /// 2), so a later change to this rule never rewrites what an open escalation is judged against.
 /// A row with no target (every row before #810, every old hook) prices exactly as stage C did.
 pub fn price(marker: &str, act: Option<&str>, resolved_target: Option<&str>) -> (Bar, Vec<String>) {
-    let markers = markers_of(marker, act, resolved_target);
+    price_targets(marker, act, resolved_target, &[])
+}
+
+/// `price` over EVERY write target the gate resolved, not only the first. One act can write
+/// several closure files (`cp a b DIR/`, a multi-file patch); the closure reports the first match
+/// as `resolved_target` and the rest arrive as `also_resolved`. Each is read exactly as the
+/// first is, so the bar is the highest over the whole target set, whatever order the act
+/// names them in and whatever its summary kept.
+pub fn price_targets(marker: &str, act: Option<&str>, resolved_target: Option<&str>,
+                     also_resolved: &[String]) -> (Bar, Vec<String>) {
+    let markers = markers_of_targets(marker, act, resolved_target, also_resolved);
     (bar_for_markers(&markers), markers)
 }
 
@@ -494,13 +504,19 @@ pub fn price(marker: &str, act: Option<&str>, resolved_target: Option<&str>) -> 
 /// so a path inside a command, an Edit target or an apply_patch body is found wherever the
 /// closure's directory marker shadowed it. Reads text only; it can add markers, never remove one.
 pub fn markers_of(marker: &str, act: Option<&str>, resolved_target: Option<&str>) -> Vec<String> {
+    markers_of_targets(marker, act, resolved_target, &[])
+}
+
+/// `markers_of` with every further resolved target read the way the first one is.
+pub fn markers_of_targets(marker: &str, act: Option<&str>, resolved_target: Option<&str>,
+                          also_resolved: &[String]) -> Vec<String> {
     let mut out = vec![marker.trim().to_string()];
     let add = |name: &str, out: &mut Vec<String>| {
         if !name.is_empty() && !out.iter().any(|m| m == name) {
             out.push(name.to_string());
         }
     };
-    if let Some(t) = resolved_target {
+    for t in resolved_target.into_iter().chain(also_resolved.iter().map(String::as_str)) {
         let t = t.trim().trim_end_matches('/');
         let base = t.rsplit('/').next().unwrap_or("").trim();
         add(base, &mut out);
@@ -565,6 +581,27 @@ pub fn normalize_resolved_target(t: Option<&str>) -> Option<String> {
     } else {
         collapsed
     })
+}
+
+/// The most further targets recorded. A command naming more closure files than this is
+/// still refused; it is priced over the first `ALSO_RESOLVED_MAX` + 1 of them.
+pub const ALSO_RESOLVED_MAX: usize = 32;
+
+/// A caller's `also_resolved`, as recorded: each normalised like `resolved_target`, empties and
+/// repeats (of each other and of the first target) dropped, order kept, count-capped.
+pub fn normalize_also_resolved(first: Option<&str>, ts: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in ts {
+        if let Some(n) = normalize_resolved_target(Some(t)) {
+            if Some(n.as_str()) != first && !out.contains(&n) {
+                out.push(n);
+            }
+        }
+        if out.len() >= ALSO_RESOLVED_MAX {
+            break;
+        }
+    }
+    out
 }
 
 /// One piece of evidence present for a decision. The channels ARE the factor types
@@ -824,6 +861,12 @@ pub struct Escalation {
     /// existed and on every call from a hook that does not send it — those price exactly as
     /// stage C priced them.
     pub resolved_target: Option<String>,
+    /// Every FURTHER location the same act writes into the closure, after `resolved_target`
+    /// (a multi-target command, a multi-file patch), in the order the act names them. Priced
+    /// exactly as `resolved_target` is (`price_targets`): without it, the bar was set by
+    /// whichever closure target the act happened to name first. Caller-asserted and add-only,
+    /// like `resolved_target`. Empty on every row opened before the field existed.
+    pub also_resolved: Vec<String>,
     /// EVERY marker the act reaches — the reported `marker` first, then the basename of
     /// `resolved_target`, then each sovereign file (`SOVEREIGN_FILES`) named in the act text.
     /// `bar` is the highest over all of them; the rule is stated once, at `price`. The shared
@@ -1284,6 +1327,7 @@ impl Escalation {
             // Every marker the act reaches; `bar` is the highest over them (`price`).
             "matched_markers": self.matched_markers,
             "resolved_target": self.resolved_target,
+            "also_resolved": self.also_resolved,
             "bar_met": bar_met,
             // The same conjunction `is_claimable` enforces — the SAME FOUR, evaluated
             // against the same clock, not two of them re-derived without one.
@@ -1843,12 +1887,18 @@ impl EscalationStore {
                     // here, by the same rule `open` uses, from what the row itself carries.
                     let resolved_target =
                         normalize_resolved_target(s(d, "resolved_target").as_deref());
+                    let also_resolved = normalize_also_resolved(
+                        resolved_target.as_deref(),
+                        &d.get("also_resolved")
+                            .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                            .unwrap_or_default());
                     // The row's act text, verified or not, exactly as stage C read it here: an
                     // unverified text can only ADD markers, so it can only raise the fallback.
-                    let (fallback_bar, fallback_markers) = price(
+                    let (fallback_bar, fallback_markers) = price_targets(
                         &marker,
                         s(d, "act_text").as_deref(),
                         resolved_target.as_deref(),
+                        &also_resolved,
                     );
                     let recorded_bar = d
                         .get("bar")
@@ -1973,6 +2023,7 @@ impl EscalationStore {
                             bar,
                             matched_markers,
                             resolved_target,
+                            also_resolved,
                             marker,
                             // The open time is the ENTRY's time, not the restart's. The
                             // payload carries it as of this change; rows written before
@@ -2156,6 +2207,28 @@ impl EscalationStore {
         now: u64,
         ttl_secs: u64,
     ) -> Result<Escalation, OpenError> {
+        self.open_with_targets(plugin_id, role, tool_name, marker, act, resolved_target, &[],
+                               stated_reason, stated_detail, binding, now, ttl_secs)
+    }
+
+    /// `open_with_payload`, priced over every further write target the act reaches
+    /// (`also_resolved`), not only the first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_targets(
+        &mut self,
+        plugin_id: &str,
+        role: &str,
+        tool_name: &str,
+        marker: &str,
+        act: Option<&str>,
+        resolved_target: Option<&str>,
+        also_resolved: &[String],
+        stated_reason: Option<&str>,
+        stated_detail: Option<&str>,
+        binding: Option<&PayloadBinding>,
+        now: u64,
+        ttl_secs: u64,
+    ) -> Result<Escalation, OpenError> {
         // The mint-site guard. An escalation with no act cannot be spent by anything, so
         // minting one produces a row that is approvable and unspendable — the loop above.
         let act = act.map(str::trim).filter(|v| !v.is_empty());
@@ -2218,7 +2291,9 @@ impl EscalationStore {
         let id: String = h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect();
 
         let resolved_target = normalize_resolved_target(resolved_target);
-        let (bar, matched_markers) = price(marker, act, resolved_target.as_deref());
+        let also_resolved = normalize_also_resolved(resolved_target.as_deref(), also_resolved);
+        let (bar, matched_markers) =
+            price_targets(marker, act, resolved_target.as_deref(), &also_resolved);
 
         let esc = Escalation {
             id: id.clone(),
@@ -2271,6 +2346,7 @@ impl EscalationStore {
             bar,
             matched_markers,
             resolved_target,
+            also_resolved,
             factors: Vec::new(),
         };
         self.by_id.insert(id, esc.clone());
@@ -2374,15 +2450,40 @@ impl EscalationStore {
         now: u64,
         ttl_secs: u64,
     ) -> Result<Opened, OpenError> {
+        self.open_or_coalesce_with_targets(plugin_id, role, tool_name, marker, act,
+                                           resolved_target, &[], stated_reason, stated_detail,
+                                           binding, now, ttl_secs)
+    }
+
+    /// `open_or_coalesce_with_payload` over every write target the act reaches. The fold
+    /// test prices the whole set too, so a pending twin priced from fewer targets is never the
+    /// row a stronger ask folds into.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_or_coalesce_with_targets(
+        &mut self,
+        plugin_id: &str,
+        role: &str,
+        tool_name: &str,
+        marker: &str,
+        act: Option<&str>,
+        resolved_target: Option<&str>,
+        also_resolved: &[String],
+        stated_reason: Option<&str>,
+        stated_detail: Option<&str>,
+        binding: Option<&PayloadBinding>,
+        now: u64,
+        ttl_secs: u64,
+    ) -> Result<Opened, OpenError> {
         if let Some(a) = act.map(str::trim).filter(|v| !v.is_empty()) {
             let digest = Self::act_digest_of(a);
             // A FOLD MUST NOT LOWER THE PRICE. The twin was priced from what ITS ask carried; an
             // ask for the same act that prices HIGHER (a resolved target the first ask lacked —
             // an old hook then a new one, across an upgrade) is not folded into the weaker row,
             // or coalescing would be the one path on which the target could not strengthen.
-            let (asked_bar, _) = price(
-                marker.trim(), Some(a),
-                normalize_resolved_target(resolved_target).as_deref());
+            let first = normalize_resolved_target(resolved_target);
+            let (asked_bar, _) = price_targets(
+                marker.trim(), Some(a), first.as_deref(),
+                &normalize_also_resolved(first.as_deref(), also_resolved));
             if let Some(twin) = self.pending_twin_bound(
                 plugin_id.trim(), marker.trim(), &digest,
                 binding.and_then(|b| b.sha256.as_deref()), now, asked_bar)
@@ -2390,8 +2491,9 @@ impl EscalationStore {
                 return Ok(Opened::Coalesced(twin.clone()));
             }
         }
-        self.open_with_payload(plugin_id, role, tool_name, marker, act, resolved_target,
-                               stated_reason, stated_detail, binding, now, ttl_secs)
+        self.open_with_targets(plugin_id, role, tool_name, marker, act, resolved_target,
+                               also_resolved, stated_reason, stated_detail, binding, now,
+                               ttl_secs)
             .map(Opened::Minted)
     }
 
@@ -6683,6 +6785,43 @@ mod resolved_target_tests {
     /// Outside every declared location, a file named like an entry is not promoted by its
     /// resolved target either; a sovereign basename keeps its stage C markers (no location
     /// is double-listed for it).
+    /// One act, several closure targets: the bar is the highest over ALL of them, whatever
+    /// order the act names them in. Before `also_resolved`, an ordinary file in a protected
+    /// directory named FIRST set the target, and the gate entry named second was never priced.
+    #[test]
+    fn every_resolved_target_is_priced_in_either_order() {
+        const ORDINARY: &str = "/home/u/.gemini/hestia-plugins/gemini/hooks/notes.txt";
+        let open_all = |first: &str, rest: &[&str]| {
+            let mut s = EscalationStore::default();
+            let rest: Vec<String> = rest.iter().map(|t| t.to_string()).collect();
+            s.open_with_targets("kimi-code", "role:constellation:member", "Bash", ENTRY_DIR,
+                                Some("Bash: …"), Some(first), &rest, None, None, None, T0, 3600)
+                .expect("open")
+        };
+        // Control: the ordinary file alone is one approver.
+        assert_eq!(open_all(ORDINARY, &[]).bar, Bar::SingleApprover);
+        // Both orders, and the entry at a later of several positions, price two factors.
+        for e in [open_all(ENTRY, &[ORDINARY]), open_all(ORDINARY, &[ENTRY]),
+                  open_all(ORDINARY, &[ORDINARY, "/home/u/.gemini/hestia-plugins/gemini/hooks/b.txt", ENTRY])] {
+            assert_eq!(e.bar, Bar::SovereignPlusPeer, "{:?} + {:?}", e.resolved_target, e.also_resolved);
+            assert!(e.matched_markers.iter().any(|m| m == ENTRY_LOC), "{:?}", e.matched_markers);
+        }
+        // The later targets are recorded, deduplicated against the first and each other.
+        assert_eq!(open_all(ORDINARY, &[ORDINARY, ENTRY, ENTRY]).also_resolved, vec![ENTRY.to_string()]);
+        // Outside every location, a same-named later target does not promote the act.
+        assert_eq!(open_all(ORDINARY, &["/srv/proj/hooks/before_tool.py"]).bar, Bar::SingleApprover);
+        // A pending twin priced from the first target alone is not the row a stronger ask folds into.
+        let mut s = EscalationStore::default();
+        let weak = s.open_or_coalesce_with_targets("kimi-code", "role:constellation:member", "Bash",
+            ENTRY_DIR, Some("Bash: cp a b"), Some(ORDINARY), &[], None, None, None, T0, 3600)
+            .expect("open").into_escalation();
+        let strong = s.open_or_coalesce_with_targets("kimi-code", "role:constellation:member", "Bash",
+            ENTRY_DIR, Some("Bash: cp a b"), Some(ORDINARY), &[ENTRY.to_string()], None, None, None,
+            T0 + 1, 3600).expect("open").into_escalation();
+        assert_ne!(weak.id, strong.id);
+        assert_eq!(strong.bar, Bar::SovereignPlusPeer);
+    }
+
     #[test]
     fn an_entry_named_target_outside_every_location_stays_single() {
         for t in ["/srv/proj/hooks/before_tool.py", "/home/u/.gemini/before_tool.py",

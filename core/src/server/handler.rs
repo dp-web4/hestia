@@ -8906,6 +8906,7 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
             // Every marker the act reaches; the bar is the highest over them (`price`).
             "matched_markers": esc.matched_markers,
             "resolved_target": esc.resolved_target,
+            "also_resolved": esc.also_resolved,
             "factors_present": esc.factors,
             "invited_peers": esc.invited_peers,
             "asker_basis": esc.asker_basis,
@@ -9234,6 +9235,14 @@ fn require_string(args: &Value, key: &str) -> Result<String, anyhow::Error> {
 
 fn optional_string(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(String::from)
+}
+
+/// An optional array of strings; absent, non-array, or non-string members read as nothing.
+fn optional_string_list(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+        .unwrap_or_default()
 }
 
 /// The session id, under EITHER spelling the surface uses.
@@ -22397,6 +22406,7 @@ fn opened_payload(
         // What the act reaches, as the caller sent it (#810) — one of the inputs the bar was
         // priced from. Explicit null when absent (an old hook, the member door without it).
         "resolved_target": esc.resolved_target,
+        "also_resolved": esc.also_resolved,
         // WHO WAS ASKED. The field whose absence made "invited and absent" and "never
         // asked" the same row. Both bars populate it: `single_approver` is satisfied by a
         // NOT-SAME peer acting alone, so it is the bar an invitation helps MOST — reading it
@@ -22662,6 +22672,8 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // member names it. Optional and caller-asserted; it joins the pricing as one more marker
     // source, so it can raise this escalation's bar and never lower it (`price`).
     let resolved_target = optional_string(args, "resolved_target");
+    // Every FURTHER target the same act writes (a multi-file act): priced like the first.
+    let also_resolved = optional_string_list(args, "also_resolved");
     // #128 (release blocker per #224, closed "superseded for coordination" rather than fixed):
     // this surface has always taken its asker as a bare string and accepted no session at all,
     // so `arbiter::eligibility` compares an ASSERTION (`appellant: &esc.plugin_id`) against an
@@ -22727,12 +22739,13 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     let proven_session_uuid = proven_asker.as_ref().and_then(|who| who.session_uuid);
     let opened = match s
         .gate_escalations
-        .open_or_coalesce_with_payload(&plugin_id, &role, &tool_name, &marker,
+        .open_or_coalesce_with_targets(&plugin_id, &role, &tool_name, &marker,
               // The act, from its own field. No fallback to `reason` on this door.
               act.as_deref(),
               // What the act reaches, when the member names it (#810): priced with the marker
               // and the act, and can only strengthen the bar (`gate_escalation::price`).
               resolved_target.as_deref(),
+              &also_resolved,
               stated_reason.as_deref(), stated_detail.as_deref(),
               Some(&binding), now, DEFAULT_TTL_SECS)
     {
@@ -23560,6 +23573,9 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // filename the bar needs can be cut out of it, and this field is where it survives. Old
     // hooks send nothing and price exactly as before; it can raise the bar, never lower it.
     let resolved_target = optional_string(args, "resolved_target");
+    // Every FURTHER closure target of the same act, after the first. Without it the bar was
+    // priced from whichever target the act happened to name first; see `price_targets`.
+    let also_resolved = optional_string_list(args, "also_resolved");
     // The bytes about to be written, when the gate could hash them (#1056). A shim that does
     // not send this claims exactly as before; the binding only engages on approvals that
     // recorded one.
@@ -23907,13 +23923,14 @@ permit for something the approver did not see.",
     // the paperwork attached to a refusal that already happened.
     match s
         .gate_escalations
-        .open_or_coalesce_with_payload(&plugin_id, &role, &tool_name, &marker,
+        .open_or_coalesce_with_targets(&plugin_id, &role, &tool_name, &marker,
               // The gate hook composes `reason` AS the act, and has always done so, so it is
               // the act here. `act` still wins if a caller sends both.
               attempted_act.as_deref(),
               // The closure's write-position argument, when the hook sends it (#810): the act
               // above is a bounded summary that can cut the filename out; this cannot.
               resolved_target.as_deref(),
+              &also_resolved,
               stated_reason.as_deref(), stated_detail.as_deref(),
               Some(&attempted_binding), now, DEFAULT_TTL_SECS)
     {
@@ -24373,6 +24390,7 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
                 // What the write reaches (#810), when the asker's hook sent it — the decider's
                 // view names the file, not only the closure element that fired.
                 "resolved_target": e.resolved_target,
+                "also_resolved": e.also_resolved,
                 "opened_at": e.opened_at,
                 "secs_remaining": e.secs_remaining(now),
                 "you_may_rule": may_rule,
