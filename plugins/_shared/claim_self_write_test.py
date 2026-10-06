@@ -176,5 +176,38 @@ if claim and connect:
     check("the reason is the ATTEMPTED ACT, not a rationale", a.get("reason") == "Edit: x -> y", a)
 check("the verdict path is unchanged by threading", v == "escalated", v)
 
+# --- the resolved target rides the claim (#810; recut of #812) ----------------------------------------
+# The daemon prices the bar over the marker, the act AND this target, highest wins; the act is a
+# bounded summary that can cut the filename out, so the target is sent as its own field.
+_HOOK = "pre_" + "tool_use.py"
+
+
+def _claim_args(**kw):
+    claim_with(REFUSED, **kw)
+    return [r["params"]["arguments"] for r in _Stub.seen
+            if (r.get("params") or {}).get("name") == "hestia_gate_escalation_claim"]
+
+
+a = _claim_args(resolved_target=f"/w/plugins/kimi/hooks/{_HOOK}")
+check("the claim carries the resolved target when the gate has one",
+      a and a[0].get("resolved_target") == f"/w/plugins/kimi/hooks/{_HOOK}", a)
+a = _claim_args()
+check("no target, no key on the wire (an old caller changes nothing)",
+      a and "resolved_target" not in a[0], a)
+a = _claim_args(resolved_target="   ")
+check("a blank target is no target", a and "resolved_target" not in a[0], a)
+a = _claim_args(resolved_target="/home/m/" + "." + "ssh/authorized_keys")
+check("a credential-shaped target is withheld whole, like the attempted summary",
+      a and "resolved_target" not in a[0], a)
+_long = "/" + "d" * 900 + f"/plugins/kimi/hooks/{_HOOK}"
+a = _claim_args(resolved_target=_long)
+check("an over-long target is tail-capped and keeps its filename",
+      a and len(a[0].get("resolved_target", "")) == mech.RESOLVED_TARGET_MAX
+      and a[0]["resolved_target"].endswith(f"/{_HOOK}"), a and len(a[0].get("resolved_target", "")))
+a1 = _claim_args(resolved_target=f"/w/plugins/kimi/hooks/{_HOOK}")
+a2 = _claim_args()
+check("the target is not part of the request key (it is derived from the same act)",
+      a1 and a2 and a1[0]["request_key"] == a2[0]["request_key"], (a1, a2))
+
 print(f"\n{'FAIL' if FAILS else 'all'} claim checks: {len(RAN) - len(FAILS)}/{len(RAN)} passed")
 sys.exit(1 if FAILS else 0)

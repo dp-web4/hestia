@@ -1,4 +1,4 @@
-# hestia-gt-sha256: c7cfe50bd717ecb1470f1bce6d00d1ebb030d8f4daf05330dee1b3229a0a38da  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 3b44948aadb50caa216915ef393ee7f7a2e7b9e96ff6f18b88878c3b4ec59abe  (published ground truth; manifest: hooks-gt)
 """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
 
 One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
@@ -713,7 +713,13 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
             # THIS module stops a superseded invocation in every rollout mode (step 5), so it
             # may make the declaration that lets the daemon reclaim a lost answer (#1169).
             supersession=mechanism.SUPERSESSION_HARD_STOP,
-            deadline=inv.phase_deadline)
+            deadline=inv.phase_deadline,
+            # THE ACT'S RESOLVED TARGET (#810; recut of #812, kimi-code): the write-position
+            # argument the closure matched. The daemon prices the bar over the marker, the act
+            # and this, highest wins — `inv.attempted` is a bounded summary that can cut the
+            # filename out; this cannot. Sent only when it matched a closure element: an
+            # opaque/internal verdict's resource ("stdin", "internal:…") names no target.
+            resolved_target=cv.resource if cv.marker else None)
         if claimed is _LATE:
             # Unknown, not "nothing happened": the daemon may have opened or matched an
             # escalation after the bound (#1166). Re-issuing the identical act is safe.

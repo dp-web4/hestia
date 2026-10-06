@@ -307,6 +307,10 @@ def test_gate_file_write_refused_before_the_daemon():
             check(f"{seat}-claim-carries-host-session",
                   claims and claims[0].get("host_session_id") == "seat-boundary-session", claims)
             check(f"{seat}-claim-declares-hard-stop", claims and claims[0].get("supersession") == "hard_stop", claims)
+            # #810 (recut of #812): the claim carries the closure's resolved target — the
+            # write-position path, which names the file even when the marker is a directory.
+            check(f"{seat}-claim-carries-resolved-target",
+                  claims and claims[0].get("resolved_target") == gate_file(fx, seat), claims)
             check(f"{seat}-witnessed", any(a.get("event_type") == "gate_self_access"
                                            for a in stub.args("hestia_request_witness")), stub.calls)
             check(f"{seat}-pre-daemon", "hestia_begin_action" not in stub.names(), stub.names())
@@ -323,6 +327,10 @@ def test_gate_file_shell_write_refused():
             v, text, _ = run(seat, home, native(seat, "Bash", {"command": f"echo pwned > {gate_file(fx, seat)}"}))
             check(f"{seat}-denied", v == "deny" and "gate.self_access" in text, text)
             check(f"{seat}-claim-made", "hestia_gate_escalation_claim" in stub.names(), stub.names())
+            claims = stub.args("hestia_gate_escalation_claim")
+            check(f"{seat}-shell-claim-carries-resolved-target",
+                  claims and str(claims[0].get("resolved_target", "")).endswith(
+                      os.path.basename(gate_file(fx, seat))), claims)
             if seat == "codex":
                 patch = (f"*** Begin Patch\n*** Update File: {gate_file(fx, seat)}\n@@\n-a\n+b\n"
                          "*** End Patch\n")
