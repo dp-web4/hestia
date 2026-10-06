@@ -144,6 +144,23 @@
      the half nobody develops at is the half that ships broken. `dvh` rather than `vh`
      because mobile browsers shrink the visual viewport as their chrome retracts. */
   .govern-scroll { max-height: 70dvh; overflow-y: auto; }
+
+  /* Hubs membership list (dp 2026-09-01; recut of #787): the hubs you are in, or could be.
+     Promoted from a collapsed <details> of URLs, because "which hubs am I a member of" is the
+     question this screen exists to answer and a URL list does not answer it. */
+  .hub-list { display: flex; flex-direction: column; gap: 0.4rem; margin: 0.6rem 0 0.9rem; }
+  .hub-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem;
+             border: 1px solid var(--border); border-radius: 4px; padding: 0.5rem 0.65rem; }
+  .hub-row .hub-name { font-weight: 600; color: var(--fg); }
+  .hub-row .hub-url { color: var(--fg-dim); font-size: 0.85rem; }
+  .hub-row .spacer { flex: 1 1 auto; }
+  .hub-badge { font-size: 0.75rem; letter-spacing: 0.04em; text-transform: uppercase;
+               padding: 0.1rem 0.45rem; border-radius: 3px; border: 1px solid var(--border); }
+  .hub-badge.enrolled { color: var(--accent); border-color: var(--accent); }
+  .hub-badge.notmember { color: var(--fg-dim); }
+  /* "we could not ask" must never look like "no" */
+  .hub-badge.unknown { color: var(--warn, #d9a441); border-color: var(--warn, #d9a441); }
+  .btn-unimpl { opacity: 0.55; }
   .govern-pane-head { display: flex; align-items: baseline; gap: 0.6rem; margin-bottom: 0.5rem; }
   .govern-pane-head h2 { margin: 0; font-size: 0.95rem; }
   .policy-state { font-size: 0.72rem; color: var(--fg-dim); margin-left: auto; }
@@ -1205,8 +1222,17 @@
       <!-- Known-hub list (#307 API): view/retarget without rebuild or relaunch.
            Collapsed by default — retargeting is an occasional operator act, not
            part of the daily read path. -->
+      <!-- The hubs you are in, or could be. `enrolled` is ASKED OF THE HUB
+           (/api/hub/memberships), never inferred from holding a local identity. -->
+      <div class="hub-list" id="hub-list"><div class="empty">checking hubs…</div></div>
+      <div class="hub-compose">
+        <button class="policy-btn btn-unimpl" id="hub-discover-btn"
+                title="Not implemented: there is no registry to search yet. Add a hub by URL below.">discover…</button>
+        <span class="hub-note" id="hub-list-note"></span>
+      </div>
+
       <details class="hub-urls" id="hub-urls-box">
-        <summary id="hub-urls-summary">hubs…</summary>
+        <summary id="hub-urls-summary">manage hub URLs…</summary>
         <div class="hub-compose">
           <select id="hub-urls-select"></select>
           <button class="policy-btn" id="hub-urls-activate">set active</button>
@@ -6234,7 +6260,122 @@
   // hubUrls included (codex review, PR #384): without it, the pre-sign-in 401
   // left the hub list permanently "unavailable" — status/topics recover via
   // this hook and the poll, and the list must recover with them.
-  window.__hubRefresh = () => { hubStatus(); hubTopics(); hubUrls(); };
+  // Which hubs am I actually a member of? Asked of each hub, not inferred from the
+  // presence of a local identity — holding an identity says nothing about who admitted it.
+  async function hubMemberships() {
+    const box = $('hub-list'); if (!box) return;
+    let d;
+    try {
+      const r = await hubFetch('/api/hub/memberships');
+      d = await r.json();
+      if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    } catch (e) {
+      box.innerHTML = '<div class="empty">could not read hub list</div>'; return;
+    }
+    const sup = d.supported || {};
+    const rows = (d.hubs || []);
+    if (!rows.length) { box.innerHTML = '<div class="empty">no hubs known yet — add one below</div>'; return; }
+    box.innerHTML = '';
+    for (const h of rows) {
+      const row = document.createElement('div');
+      row.className = 'hub-row';
+      // null enrollment is UNKNOWN, not "no". Three unknowns, not interchangeable: never asked
+      // (hub down), asked but the answer was not about membership (probe_error), or no reading.
+      // Each keeps the amber badge and carries its reason on hover.
+      const st = h.enrolled === true ? ['enrolled','enrolled']
+               : h.enrolled === false ? ['notmember','not a member']
+               : !h.reachable ? ['unknown','unreachable']
+               : h.probe_error ? ['unknown','undetermined']
+               : ['unknown','unknown'];
+      const name = h.hub_name || h.label || '(unnamed hub)';
+      row.innerHTML =
+        '<span class="hub-name"></span>' +
+        '<span class="hub-badge ' + st[0] + '"' +
+          (h.probe_error ? ' title="' + escapeHtml(h.probe_error) + '"' : '') + '>' + st[1] + '</span>' +
+        '<span class="hub-url"></span><span class="spacer"></span>';
+      row.querySelector('.hub-name').textContent = name + (h.active ? ' ·  active' : '');
+      row.querySelector('.hub-url').textContent = h.url;
+
+      // apply — the member-initiated join. Join targets the ACTIVE hub, so the row is made
+      // active first, and a failed retarget ABORTS (applying to B and joining A is the worst
+      // available outcome). PUT: /api/hub/urls/active is PUT-only.
+      if (h.enrolled !== true) {
+        const b = document.createElement('button');
+        b.className = 'policy-btn'; b.textContent = 'apply';
+        // HESTIA_HUB_URL pins the target: retargeting this row would not change where join
+        // goes, so only the pinned (active) row can apply.
+        const pinnedElsewhere = d.active_source === 'env' && !h.active;
+        b.disabled = !h.reachable || pinnedElsewhere;
+        if (pinnedElsewhere) b.title = 'HESTIA_HUB_URL pins this daemon to another hub; applying here would join that one instead.';
+        b.onclick = async () => {
+          note('hub-list-note', '', 'applying…');
+          try {
+            if (!h.active) {
+              const a = await hubFetch('/api/hub/urls/active', { method: 'PUT',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ url: h.url }) });
+              if (!a.ok) {
+                const ad = await a.json().catch(() => ({}));
+                note('hub-list-note', 'err',
+                  'could not target ' + h.url + ' — ' + (ad.error || ('HTTP ' + a.status)) +
+                  '. Not applying, so the request cannot reach the wrong hub.');
+                return;
+              }
+            }
+            const r = await hubFetch('/api/hub/join', { method: 'POST',
+              headers: { 'content-type': 'application/json' }, body: JSON.stringify({}) });
+            const j = await r.json().catch(() => ({}));
+            if (r.ok && j.status === 'admitted') note('hub-list-note', 'ok', 'admitted to ' + name);
+            else if (r.ok && j.status === 'pending') note('hub-list-note', 'warn', 'pending — queued for the hub operator');
+            else note('hub-list-note', 'err', j.error || ('HTTP ' + r.status));
+          } catch (e) { note('hub-list-note', 'err', e.message); }
+          hubMemberships();
+        };
+        row.appendChild(b);
+      }
+
+      // withdraw — real since web4#804 (R8.2 exit without penalty): this node ends its OWN
+      // membership; the hub cannot decline. Shown only where the hub says you are a member.
+      if (h.enrolled === true && sup.withdraw) {
+        const w = document.createElement('button');
+        w.className = 'policy-btn'; w.textContent = 'withdraw';
+        w.title = 'End your membership of this hub. The hub cannot refuse, and re-joining later is a new application.';
+        w.onclick = async () => {
+          if (!confirm('Withdraw from ' + name + '?\n\nThis ends your membership now. Re-joining is a new application, not an undo.')) return;
+          const reason = prompt('Reason (optional, recorded by the hub):', '') ;
+          if (reason === null) return;
+          note('hub-list-note', '', 'withdrawing…');
+          try {
+            const r = await hubFetch('/api/hub/withdraw', { method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ url: h.url, reason }) });
+            const j = await r.json().catch(() => ({}));
+            if (r.ok && j.status === 'withdrawn') {
+              const vac = ((j.detail || {}).roles_vacated || []);
+              note('hub-list-note', 'ok', 'withdrawn from ' + name +
+                (vac.length ? ' — roles left vacant: ' + vac.join(', ') : ''));
+            } else if (r.ok && j.status === 'not_a_member') {
+              note('hub-list-note', 'warn', 'already not a member of ' + name + ' — ' + (j.detail || ''));
+            } else note('hub-list-note', 'err', j.error || ('HTTP ' + r.status));
+          } catch (e) { note('hub-list-note', 'err', e.message); }
+          hubMemberships();
+        };
+        row.appendChild(w);
+      }
+
+      // remove from list — local only, and labelled so it cannot be read as leaving
+      const rm = document.createElement('button');
+      rm.className = 'policy-btn'; rm.textContent = 'remove from list';
+      rm.title = 'Forgets this hub\'s URL on this device. It does NOT end your membership — ' +
+                 'use withdraw for that.';
+      rm.onclick = async () => { await hubUrlsRemove(h.url, 'hub-list-note'); hubMemberships(); };
+      row.appendChild(rm);
+
+      box.appendChild(row);
+    }
+  }
+
+  window.__hubRefresh = () => { hubStatus(); hubTopics(); hubUrls(); hubMemberships(); };
 
   // ---- known-hub list (#307): view + retarget, no rebuild/relaunch ----------
   async function hubUrls() {
@@ -6276,17 +6417,21 @@
       else note('hub-urls-note', 'err', d.error || ('HTTP ' + r.status));
     } catch (e) { note('hub-urls-note', 'err', e.message); }
   });
-  $('hub-urls-remove').addEventListener('click', async () => {
-    const url = $('hub-urls-select').value;
-    if (!url) { note('hub-urls-note', 'warn', 'nothing selected'); return; }
+  // Forgetting a hub URL is reachable from two places (the select below and each membership
+  // row), so it is ONE function; `noteId` keeps feedback next to the control used.
+  async function hubUrlsRemove(url, noteId) {
+    noteId = noteId || 'hub-urls-note';
+    if (!url) { note(noteId, 'warn', 'nothing selected'); return; }
     try {
       const r = await hubFetch('/api/hub/urls', { method: 'DELETE',
         headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url }) });
       const d = await r.json().catch(() => ({}));
       if (r.ok) hubRetargeted('removed: ' + url);
-      else note('hub-urls-note', 'err', d.error || ('HTTP ' + r.status));
-    } catch (e) { note('hub-urls-note', 'err', e.message); }
-  });
+      else note(noteId, 'err', d.error || ('HTTP ' + r.status));
+    } catch (e) { note(noteId, 'err', e.message); }
+  }
+  $('hub-urls-remove').addEventListener('click',
+    () => hubUrlsRemove($('hub-urls-select').value));
   $('hub-urls-add').addEventListener('click', async () => {
     const url = $('hub-urls-add-url').value.trim();
     if (!url) { note('hub-urls-note', 'warn', 'enter a URL'); return; }

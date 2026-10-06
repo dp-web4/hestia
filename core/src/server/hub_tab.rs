@@ -20,7 +20,7 @@ use axum::{extract::State, response::IntoResponse, Json};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::hub::{HubClient, JoinOutcome, SignedEnvelope};
+use crate::hub::{HubClient, JoinOutcome, SignedEnvelope, WithdrawOutcome};
 use crate::server::state::SharedState;
 use crate::vault::{Vault, VaultEntry};
 use web4_core::crypto::KeyPair;
@@ -227,6 +227,168 @@ async fn discover_with_timeout(
     tokio::time::timeout(NET_TIMEOUT, client.discover(url))
         .await
         .map_err(|_| anyhow::anyhow!("hub discovery timed out after {:?}", NET_TIMEOUT))?
+}
+
+/// GET /api/hub/memberships — every known hub, with whether this node is ACTUALLY
+/// ENROLLED in it, asked of the hub rather than inferred locally (recut of #787).
+///
+/// Holding a member identity in the vault says only that this node has *an* identity; it
+/// says nothing about whether any particular hub admitted it. So enrollment is probed:
+/// `GET /v1/hubs/{hub}/members/{me}/pubkey` answers 200 when the hub has this LCT pinned and
+/// 404 when it does not. Only those two answers set `enrolled`. Anything else leaves it
+/// `null` with a `probe_error`: a 500, or the same route's 404 for a mismatched hub id, says
+/// nothing about membership and must not render as "not a member".
+///
+/// Known limits of the probe, stated rather than hidden (hub-side `get_member_pubkey` reads
+/// `member_pubkeys` only): a council holder or a member admitted without a key reads `false`,
+/// and an application still awaiting the Sovereign reads `false` until admitted.
+///
+/// Read-only; every network step is bounded by `NET_TIMEOUT`. An unreachable hub reports
+/// `reachable: false` and `enrolled: null` — "we could not ask" is never "you are not in it".
+pub async fn hub_memberships(State(state): State<SharedState>) -> impl IntoResponse {
+    let (entries, active, active_source, me) = {
+        let s = state.lock().await;
+        let list = HubUrls::load(&s.vault);
+        let me = read_member_identity(&s.vault).map(|(lct, _)| lct);
+        // The EFFECTIVE target (an env override wins), not just the stored selection, so the
+        // `active` marker names the hub `join` would actually reach.
+        let (active, source) = resolve_hub_url(&s.vault);
+        (list.entries, active, source, me)
+    };
+
+    let http = reqwest::Client::new();
+    let mut out = Vec::new();
+    for e in entries {
+        let mut row = serde_json::json!({
+            "url": e.url,
+            "label": e.label,
+            "active": e.url == active,
+            "reachable": false,
+            "hub_lct_id": serde_json::Value::Null,
+            "hub_name": serde_json::Value::Null,
+            // `null` means UNASKED/UNKNOWN, never "no". Only an answered probe sets a bool.
+            "enrolled": serde_json::Value::Null,
+        });
+        if let Ok(info) = discover_with_timeout(&e.url).await {
+            row["reachable"] = serde_json::json!(true);
+            row["hub_lct_id"] = serde_json::json!(info.hub_lct_id);
+            if let Some(h) = info.hubs.first() {
+                row["hub_name"] = serde_json::json!(h.name);
+            }
+            if let Some(me) = me {
+                let probe = format!(
+                    "{}/hubs/{}/members/{}/pubkey",
+                    abs_rest(&e.url, &info.endpoints.rest).trim_end_matches('/'),
+                    info.hub_lct_id, me
+                );
+                match tokio::time::timeout(NET_TIMEOUT, http.get(&probe).send()).await {
+                    Ok(Ok(resp)) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            row["enrolled"] = serde_json::json!(true);
+                        } else if status.as_u16() == 404 {
+                            let body = resp.text().await.unwrap_or_default();
+                            if body.contains("does not match this hub") {
+                                row["probe_error"] = serde_json::json!(
+                                    "hub id mismatch — enrollment not determined");
+                            } else {
+                                row["enrolled"] = serde_json::json!(false);
+                            }
+                        } else {
+                            row["probe_error"] = serde_json::json!(format!("probe HTTP {status}"));
+                        }
+                    }
+                    Ok(Err(e)) => row["probe_error"] = serde_json::json!(format!("probe failed: {e}")),
+                    Err(_) => row["probe_error"] = serde_json::json!("probe timed out"),
+                }
+            } else {
+                row["probe_error"] = serde_json::json!(
+                    "this node has no member identity yet — apply to create one");
+            }
+        }
+        out.push(row);
+    }
+
+    Json(serde_json::json!({
+        "member_lct": me.map(|m| m.to_string()),
+        // Where the active hub comes from. `env` (HESTIA_HUB_URL) wins over the stored
+        // selection, so retargeting a row cannot change where `join` goes: the UI must not
+        // offer apply on any other row then, or "apply to B" would join A.
+        "active_source": active_source,
+        "hubs": out,
+        // Capabilities this build actually has, so the UI renders honest controls.
+        "supported": {
+            "apply": true,
+            "remove_from_list": true,
+            // Member-initiated exit exists hub-side since web4#804 (R8.2).
+            "withdraw": true,
+            // Discovery today is "paste a URL"; there is no registry to search.
+            "discover": false
+        }
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct WithdrawReq {
+    /// The hub to leave, by its URL in the known list. Explicit, never "the active hub":
+    /// ending a membership must not depend on which hub happens to be selected.
+    pub url: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// POST /api/hub/withdraw — end THIS node's membership of one hub (web4#804, R8.2).
+///
+/// Signs `member_withdraw` with the member keypair the hub pinned at admission. Never
+/// provisions an identity: with none, there is nothing to withdraw. The hub cannot decline
+/// an exit, so the answers are `withdrawn` (with the witnessed entry and any roles vacated),
+/// `not_a_member` (already gone — perhaps removed by an operator), or an error. The URL stays
+/// in the local list; forgetting it is a separate, local act.
+pub async fn hub_withdraw(
+    State(state): State<SharedState>,
+    Json(req): Json<WithdrawReq>,
+) -> impl IntoResponse {
+    let (url, ident) = {
+        let s = state.lock().await;
+        let Some(url) = normalise_hub_url(&req.url) else {
+            return err_json(axum::http::StatusCode::BAD_REQUEST, format!("not an http(s) URL: {}", req.url));
+        };
+        if !HubUrls::load(&s.vault).contains(&url) {
+            return err_json(axum::http::StatusCode::NOT_FOUND,
+                format!("not in the known hub list: {url}"));
+        }
+        (url, read_member_identity(&s.vault))
+    };
+    let Some((member_lct, keypair)) = ident else {
+        return err_json(axum::http::StatusCode::CONFLICT,
+            "this node has no member identity, so it is a member of no hub".into());
+    };
+    let reason = req.reason.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+
+    let info = match discover_with_timeout(&url).await {
+        Ok(i) => i,
+        Err(e) => return err_json(axum::http::StatusCode::BAD_GATEWAY, e.to_string()),
+    };
+    let rest = abs_rest(&url, &info.endpoints.rest);
+    let client = HubClient::new();
+    match tokio::time::timeout(
+        NET_TIMEOUT,
+        client.withdraw(&rest, info.hub_lct_id, member_lct, &keypair, reason),
+    )
+    .await
+    {
+        Err(_) => err_json(axum::http::StatusCode::GATEWAY_TIMEOUT, "withdraw timed out".into()),
+        Ok(Err(e)) => err_json(axum::http::StatusCode::BAD_GATEWAY, e.to_string()),
+        Ok(Ok(WithdrawOutcome::Withdrawn(detail))) => Json(serde_json::json!({
+            "status": "withdrawn", "url": url, "member_lct": member_lct, "detail": detail,
+        }))
+        .into_response(),
+        Ok(Ok(WithdrawOutcome::NotAMember(msg))) => Json(serde_json::json!({
+            "status": "not_a_member", "url": url, "member_lct": member_lct, "detail": msg,
+        }))
+        .into_response(),
+    }
 }
 
 /// GET /api/hub/status — hub reachability + our identity state. Read-only.
