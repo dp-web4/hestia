@@ -78,6 +78,10 @@ approved = true
 
 #: The hooks that load the seat projection, so carry the bootstrap locator on their line.
 _LOCATOR_HOOKS = ("pre_tool_use.py", "before_tool.py", "witness.py")
+#: What the governed template patch puts in front of each of them: the locator, and the launch role
+#: as a pass-through whose default is the member's install.default_role.
+_LOCATOR = 'HESTIA_HOME=@HESTIA_HOME@ HESTIA_ROLE="${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}" '
+_ROLE_DEFAULT = "role:constellation:interactive-dev"
 
 
 def _with_locator(text: str) -> str:
@@ -91,7 +95,10 @@ def _with_locator(text: str) -> str:
             for h in g.get("hooks") or []:
                 c = h.get("command") or ""
                 if c.split("/")[-1] in _LOCATOR_HOOKS and "@HESTIA_HOME@" not in c:
-                    h["command"] = "HESTIA_HOME=@HESTIA_HOME@ " + c
+                    h["command"] = _LOCATOR + c
+                if c.endswith("@HESTIA_PLUGIN_ROOT@/codex/hooks/hydrate.sh") and "CODEX_PLUGIN_ROOT" not in c:
+                    h["command"] = c.replace("@HESTIA_PLUGIN_ROOT@/codex/hooks/hydrate.sh",
+                                             "CODEX_PLUGIN_ROOT=@HESTIA_PLUGIN_SOURCE@ @HESTIA_PLUGIN_ROOT@/codex/hooks/hydrate.sh")
     return json.dumps(doc, indent=2) + "\n"
 
 
@@ -255,7 +262,7 @@ def test_kimi_flat_layout_registers_the_failure_witness_and_reconciles_owned_lin
         assert "REGISTERED kimi: PreToolUse/pre_tool_use.py" not in r.stdout, "a key-order-swapped table was not read"
         hh = os.path.realpath(_hh(tmp))
         assert f"REWROTE kimi: PreToolUse/pre_tool_use.py: command 'python3 {tmp}/.kimi-code/hooks/pre_tool_use.py' " \
-               f"-> 'HESTIA_HOME={hh} python3 {tmp}/.kimi-code/hooks/pre_tool_use.py'" in r.stdout, r.stdout
+               f"-> 'HESTIA_HOME={hh} HESTIA_ROLE=\"${{HESTIA_ROLE:-{_ROLE_DEFAULT}}}\" python3 {tmp}/.kimi-code/hooks/pre_tool_use.py'" in r.stdout, r.stdout
         assert "REWROTE kimi: PostToolUse/witness.py: command 'HESTIA_PLUGIN_ID=kimi-code python3" in r.stdout, r.stdout
         after = cfg.read_text()
         # in place: the same lines, in the same order, but the two owned commands
@@ -419,7 +426,7 @@ def test_a_failed_write_restores_what_this_run_read_not_the_first_backup():
         RM.validate_toml = lambda text: calls.append(1) or (None if len(calls) == 1 else "forced: after-write parse failure")
         try:
             verdict, changes = RM.register_member("codex", spec, template, str(tmp), False,
-                                                  env={"HESTIA_HOME": _hh(tmp)})
+                                                  env={"HESTIA_HOME": _hh(tmp)}, source=str(plugins / "codex"))
         finally:
             RM.validate_toml = orig
         assert verdict == "failed" and "restored as it was" in changes[0], (verdict, changes)
@@ -469,7 +476,8 @@ def test_claude_code_template_registers_the_gate_and_law_inject_beside_an_existi
         assert data["permissions"] == existing["permissions"]
         dest = tmp / ".claude" / "hooks" / "hestia"
         pre = [h["command"] for g in data["hooks"]["PreToolUse"] for h in g["hooks"]]
-        assert pre == [f"HESTIA_HOME={os.path.realpath(_hh(tmp))} python3 {dest}/pre_tool_use.py"], pre
+        assert pre == [f'HESTIA_HOME={os.path.realpath(_hh(tmp))} HESTIA_ROLE="${{HESTIA_ROLE:-{_ROLE_DEFAULT}}}" '
+                       f'python3 {dest}/pre_tool_use.py'], pre
         assert data["hooks"]["PreToolUse"][0]["matcher"] == "*"
         posts = [h["command"] for g in data["hooks"]["PostToolUse"] for h in g["hooks"]]
         assert posts == ["python3 /elsewhere/hestia/witness.py"], posts
@@ -1423,7 +1431,8 @@ def _template_cmds(plugins: Path, member: str, tmp: Path) -> dict[tuple, str]:
     spec = json.loads((plugins / member / "expects.json").read_text())["install"]
     dest = str(tmp.joinpath(*_REAL_DEST[member]))
     groups = RM.rendered_groups(json.loads((plugins / member / "hooks" / "hooks.json").read_text()), member, dest,
-                                {"HESTIA_HOME": _hh(tmp)})
+                                {"HESTIA_HOME": _hh(tmp)}, default_role=spec.get("default_role"),
+                                source=str(plugins / member))
     assert spec["dest"]
     return {(e, RM.target_basename(h["command"])): h["command"] for e, gs in groups.items() for g in gs for h in g["hooks"]}
 
@@ -1582,7 +1591,8 @@ def test_a_failed_write_of_a_rewrite_restores_what_this_run_read():
         orig = RM.validate_toml
         RM.validate_toml = lambda text: calls.append(1) or (None if len(calls) == 1 else "forced: after-write parse failure")
         try:
-            verdict, lines = RM.register_member("kimi", spec, template, str(tmp), False, env={"HESTIA_HOME": _hh(tmp)})
+            verdict, lines = RM.register_member("kimi", spec, template, str(tmp), False, env={"HESTIA_HOME": _hh(tmp)},
+                                                source=str(plugins / "kimi"))
         finally:
             RM.validate_toml = orig
         assert verdict == "failed" and "restored as it was" in lines[0], (verdict, lines)
@@ -1624,6 +1634,68 @@ def test_reconciled_commands_is_the_line_the_install_will_write():
         assert RM.reconciled_commands(str(plugins / "codex"), str(tmp), env)[0] == "absent"
 
 
+def test_the_launch_role_is_a_pass_through_with_the_members_declared_default():
+    """HESTIA_ROLE is launch context, never config: the seat loader refuses it from the vault
+    projection (plugins/kimi/hooks/pre_tool_use.py), so the hook line is the ONLY place it can come
+    from. Dropping it would silently move claude and kimi to the daemon default (member) and split
+    their trust record. It renders as `HESTIA_ROLE="${HESTIA_ROLE:-<install.default_role>}"` -- a
+    launcher's own value still wins -- and a member that declares no default gets no token (the
+    daemon default, as today). The rendered `${...}` is shell text, never an unrendered placeholder.
+    claude's CBP hand line already carries exactly this token: the reconcile keeps it byte for byte."""
+    c = _LOCATOR + "python3 @HESTIA_PLUGIN_ROOT@/kimi/hooks/witness.py"
+    env = {"HESTIA_HOME": "/srv/hh"}
+    got = RM.render_command(c, "kimi", "/d", env, default_role=_ROLE_DEFAULT)
+    assert got == f'HESTIA_HOME=/srv/hh HESTIA_ROLE="${{HESTIA_ROLE:-{_ROLE_DEFAULT}}}" python3 /d/witness.py', got
+    assert RM.render_command(c, "kimi", "/d", env) == "HESTIA_HOME=/srv/hh python3 /d/witness.py"
+    for bad in ("interactive-dev", 'role:x" ; touch /tmp/injected ; "', "role:a b", "role:$(id)"):
+        try:
+            RM.render_command(c, "kimi", "/d", env, default_role=bad)
+            raise AssertionError(f"accepted default_role {bad!r}")
+        except RM.Unrendered:
+            pass
+    # the declarations: claude-code and kimi registered interactive-dev by hand; codex and gemini
+    # declared none (their lines carried no role; their seeds say role:constellation:member, the
+    # daemon default), so they get no token
+    decl = {m: json.loads((REPO / "plugins" / m / "expects.json").read_text())["install"].get("default_role")
+            for m in ("claude-code", "kimi", "codex", "gemini")}
+    assert decl == {"claude-code": _ROLE_DEFAULT, "kimi": _ROLE_DEFAULT, "codex": None, "gemini": None}, decl
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins, cfgs = _real_host(tmp)
+        r = _run(tmp, plugins)
+        assert r.returncode == 0, r.stdout + r.stderr
+        role = f'HESTIA_ROLE="${{HESTIA_ROLE:-{_ROLE_DEFAULT}}}"'
+        c = json.loads(cfgs["claude-code"].read_text())
+        gate = c["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        assert role in gate and role in CLAUDE_REAL["hooks"]["PreToolUse"][0]["hooks"][0]["command"], gate
+        kimi = {RM.target_basename(t["command"]) + t["event"]: t["command"]
+                for t in RM.toml_hooks(cfgs["kimi"].read_text(), True)}
+        assert role in kimi["pre_tool_use.pyPreToolUse"] and role in kimi["witness.pyPostToolUse"], kimi
+        assert "HESTIA_ROLE" not in cfgs["codex"].read_text() and "HESTIA_ROLE" not in cfgs["gemini"].read_text()
+
+
+def test_codex_hydrate_is_pointed_at_the_plugin_source_where_its_seed_lives():
+    """hydrate.sh seeds a fresh identity from ${CODEX_PLUGIN_ROOT:-$(dirname "$0")/..}/instance/
+    identity.seed.json. The installer copies hooks into the dest and never the seed, so the fallback
+    (<dest>/..) holds no seed (measured on CBP 2026-10-06: absent at ~/.codex/instance/); rendering
+    the root from install.dest would name that same empty place. The line names the deployed plugin
+    directory instead, which carries the seed."""
+    assert (REPO / "plugins" / "codex" / "instance" / "identity.seed.json").is_file()
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins, cfgs = _real_host(tmp)
+        r = _run(tmp, plugins, "--member", "codex")
+        assert r.returncode == 0, r.stdout + r.stderr
+        src = os.path.realpath(plugins / "codex")
+        hyd = [h["command"] for h in _reg_cmds(cfgs["codex"], "codex")[("SessionEnd", "hydrate.sh")]]
+        assert hyd == [f"CODEX_PLUGIN_ROOT={src} {tmp}/.codex/hooks/hydrate.sh"], hyd
+        try:
+            RM.render_command("CODEX_PLUGIN_ROOT=@HESTIA_PLUGIN_SOURCE@ /x/hydrate.sh", "codex", "/d", {"HESTIA_HOME": "/h"})
+            raise AssertionError("rendered a plugin source nobody supplied")
+        except RM.Unrendered:
+            pass
+
+
 def test_shipped_templates_render_the_locator_onto_gate_and_witness():
     """The governed half of this change: every member's gate and witness line carries
     `HESTIA_HOME=@HESTIA_HOME@` (the post-#1231 shims refuse without it, #1237 #1242), and no other
@@ -1638,7 +1710,7 @@ def test_shipped_templates_render_the_locator_onto_gate_and_witness():
                 for h in g["hooks"]:
                     base = h["command"].split("/")[-1]
                     if base in (gate, "witness.py"):
-                        assert h["command"].startswith("HESTIA_HOME=@HESTIA_HOME@ "), (m, h["command"])
+                        assert h["command"].startswith(_LOCATOR), (m, h["command"])
                         seen.add(base)
                     else:
                         assert "@HESTIA_HOME@" not in h["command"], (m, h["command"])
@@ -1695,6 +1767,8 @@ TESTS = [
     test_a_failed_write_of_a_rewrite_restores_what_this_run_read,
     test_a_rewrite_the_text_cannot_place_is_refused_not_guessed,
     test_reconciled_commands_is_the_line_the_install_will_write,
+    test_the_launch_role_is_a_pass_through_with_the_members_declared_default,
+    test_codex_hydrate_is_pointed_at_the_plugin_source_where_its_seed_lives,
     test_shipped_templates_render_the_locator_onto_gate_and_witness,
 ]
 

@@ -339,16 +339,22 @@ def _templated_member(repo: Path, home: Path, name: str, *, with_registrar: bool
     (plugin / "hooks").mkdir(parents=True)
     event = {"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {"file_path": "{scratch}"}}
     (plugin / "expects.json").write_text(json.dumps({"install": {
-        "member": name, "dest": f"~/.{name}/hooks",
+        "member": name, "dest": f"~/.{name}/hooks", "default_role": "role:constellation:interactive-dev",
         "registration": {"path": [f".{name}", "settings.json"], "reader": "json-hook-commands"},
         "files": ["hooks/pre_tool_use.py"],
         "gate_probe": {"entry": "hooks/pre_tool_use.py", "events": [{"label": "read", "event": event}]},
     }}), encoding="utf-8")
     (plugin / "hooks" / "hooks.json").write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
         {"type": "command", "timeout": 10,
-         "command": f"HESTIA_HOME=@HESTIA_HOME@ python3 @HESTIA_PLUGIN_ROOT@/{name}/hooks/pre_tool_use.py"}]}]}}),
+         "command": f'HESTIA_HOME=@HESTIA_HOME@ HESTIA_ROLE="${{HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}}" '
+                    f'python3 @HESTIA_PLUGIN_ROOT@/{name}/hooks/pre_tool_use.py'}]}]}}),
         encoding="utf-8")
-    (plugin / "hooks" / "pre_tool_use.py").write_text(_consumer_body(), encoding="utf-8")
+    # the candidate also needs the launch role the line passes through (default: the declaration)
+    (plugin / "hooks" / "pre_tool_use.py").write_text(
+        _consumer_body().replace("raise SystemExit(0)\n",
+                                 "raise SystemExit(0 if os.environ.get('HESTIA_ROLE') == "
+                                 "os.environ.get('WANT_ROLE', 'role:constellation:interactive-dev') else 3)\n"),
+        encoding="utf-8")
     if with_registrar:
         (repo / "deploy").mkdir(parents=True, exist_ok=True)
         shutil.copy(REPO / "deploy" / "register-members.py", repo / "deploy" / "register-members.py")
@@ -381,6 +387,13 @@ def test_the_preflight_judges_the_rendered_line_not_the_stale_registered_one():
             assert good, rows
             assert rows == [{"member": "alpha", "probe": "read", "status": "ok"}], rows
             assert config.read_bytes() == before, "the preflight wrote the registration"
+            # the role is a pass-through: a launcher's own HESTIA_ROLE wins over the declared default
+            os.environ["HESTIA_ROLE"] = os.environ["WANT_ROLE"] = "role:constellation:mesh-worker"
+            try:
+                rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+                assert good, rows
+            finally:
+                del os.environ["HESTIA_ROLE"], os.environ["WANT_ROLE"]
             # the harness present with no config file yet: the gate the install will add is probed
             config.unlink()
             rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")

@@ -30,6 +30,10 @@ For each `plugins/<member>/expects.json` that declares `install.registration` an
      gate line without it is the #1237 outage. `HESTIA_WORKSPACE=@HESTIA_WORKSPACE@` renders from
      the environment when set and is dropped when not (every hook has a default). Any other
      placeholder left unrendered REFUSES the member.
+     `HESTIA_ROLE="${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}"` renders the member's declared
+     `install.default_role` as a PASS-THROUGH default (launch context, never config: the vault
+     projection cannot carry it, and a launcher that sets HESTIA_ROLE still wins); no declaration
+     drops the token. `@HESTIA_PLUGIN_SOURCE@` renders to the plugin directory being deployed.
   3. OWNERSHIP. A registered hook is HESTIA'S when its target (the first absolute-path token of
      its command, the installer's rule) is exactly `<install.dest>/<basename>` for a basename the
      template registers on that event. Nothing else is owned: a hook whose target lies anywhere
@@ -139,11 +143,44 @@ def hestia_home_value(env=None) -> str:
     return path
 
 
-def render_command(cmd: str, member: str, dest: str, env=None) -> str:
+#: A member's declared default launch role (install.default_role): it lands inside a double-quoted
+#: `${HESTIA_ROLE:-...}` on a shell line, so it is held to the role grammar.
+_ROLE = re.compile(r"^role:[A-Za-z0-9._:-]+$")
+_ROLE_TOKEN = re.compile(r'\bHESTIA_ROLE="\$\{HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@\}"\s+')
+
+
+def render_command(cmd: str, member: str, dest: str, env=None, *, default_role=None,
+                   source=None) -> str:
+    """Render one template command.
+
+    `@HESTIA_DEFAULT_ROLE@` sits inside a PASS-THROUGH, `HESTIA_ROLE="${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}"`:
+    HESTIA_ROLE is launch context, never config -- the seat loader refuses it from the vault
+    projection (plugins/kimi/hooks/pre_tool_use.py: "HESTIA_ROLE (launch context, never config)"),
+    so the hook line is the only place a default can live, and a launcher that knows better (a
+    watcher unit, a mesh fire exporting mesh-worker) still overrides it. The default is the member's
+    own declaration, `install.default_role`; a member that declares none gets the whole token
+    dropped, and the daemon's default (role:constellation:member) applies, as it does today.
+    The rendered `${VAR:-default}` is shell text the harness expands, not a placeholder.
+
+    `@HESTIA_PLUGIN_SOURCE@` is the absolute plugin directory being deployed (where files the
+    installer does not copy, such as `instance/identity.seed.json`, live)."""
     env = ENV if env is None else env
     cmd = cmd.replace(f"@HESTIA_PLUGIN_ROOT@/{member}/hooks/", dest.rstrip("/") + "/")
     if "@HESTIA_HOME@" in cmd:
         cmd = cmd.replace("@HESTIA_HOME@", hestia_home_value(env))
+    if "@HESTIA_DEFAULT_ROLE@" in cmd:
+        if default_role is None:
+            cmd = _ROLE_TOKEN.sub("", cmd)
+        elif isinstance(default_role, str) and _ROLE.match(default_role):
+            cmd = cmd.replace("@HESTIA_DEFAULT_ROLE@", default_role)
+        else:
+            raise Unrendered(f"@HESTIA_DEFAULT_ROLE@: install.default_role {default_role!r} is not a role "
+                             "(role:<letters, digits, . _ : ->)")
+    if "@HESTIA_PLUGIN_SOURCE@" in cmd:
+        src = os.path.realpath(source) if source else None
+        if not src or not _SAFE_PATH.match(src):
+            raise Unrendered(f"@HESTIA_PLUGIN_SOURCE@: no plugin source directory to render ({src!r})")
+        cmd = cmd.replace("@HESTIA_PLUGIN_SOURCE@", src)
     ws = env.get("HESTIA_WORKSPACE")
     if "@HESTIA_WORKSPACE@" in cmd:
         if ws:
@@ -171,7 +208,8 @@ def target_path(cmd: str) -> str | None:
     return None
 
 
-def rendered_groups(template: dict, member: str, dest: str, env=None) -> dict[str, list[dict]]:
+def rendered_groups(template: dict, member: str, dest: str, env=None, *, default_role=None,
+                    source=None) -> dict[str, list[dict]]:
     """{event: [{matcher?, hooks:[{type, command, statusMessage?, timeout?}]}]} with commands
     rendered. Raises Unrendered."""
     hooks = template.get("hooks", template)
@@ -188,7 +226,8 @@ def rendered_groups(template: dict, member: str, dest: str, env=None) -> dict[st
                 if not isinstance(h, dict) or not isinstance(h.get("command"), str):
                     continue
                 nh = dict(h)
-                nh["command"] = render_command(h["command"], member, dest, env)
+                nh["command"] = render_command(h["command"], member, dest, env,
+                                               default_role=default_role, source=source)
                 ng["hooks"].append(nh)
             if ng["hooks"]:
                 out.setdefault(event, []).append(ng)
@@ -1009,7 +1048,7 @@ class Loaded:
         self.raw, self.data, self.hooks, self.desired, self.reg = raw, data, hooks, desired, reg
 
 
-def _load(member: str, spec: dict, template: dict, home: str, env=None):
+def _load(member: str, spec: dict, template: dict, home: str, env=None, source=None):
     """-> Loaded, or (verdict, lines) when the member stops here."""
     reg = spec.get("registration") or {}
     segs, reader = reg.get("path") or [], reg.get("reader", "")
@@ -1022,7 +1061,8 @@ def _load(member: str, spec: dict, template: dict, home: str, env=None):
         return "skip", [f"{cfg_dir} absent — harness not on this host"]
     dest = os.path.join(home, dest[2:]) if dest.startswith("~/") else os.path.expanduser(dest)
     try:
-        groups = rendered_groups(template, member, dest, env)
+        groups = rendered_groups(template, member, dest, env, default_role=spec.get("default_role"),
+                                 source=source)
         desired = desired_hooks(groups)
     except Unrendered as e:
         return "refused", [f"template cannot be rendered: {e}"]
@@ -1073,7 +1113,7 @@ def reconciled_commands(member_dir: str, home: str, env=None) -> tuple[str, list
             template = json.load(fh)
     except (OSError, ValueError) as e:
         return "refused", [], f"hooks/hooks.json unreadable ({type(e).__name__})"
-    got = _load(member, spec, template, home, env)
+    got = _load(member, spec, template, home, env, source=member_dir)
     if not isinstance(got, Loaded):
         verdict, lines = got
         return ("absent" if verdict == "skip" else "refused"), [], "; ".join(lines)
@@ -1086,12 +1126,13 @@ def reconciled_commands(member_dir: str, home: str, env=None) -> tuple[str, list
 
 
 def register_member(member: str, spec: dict, template: dict, home: str, dry: bool,
-                    plan: bool = False, raise_timeouts: bool = False, env=None) -> tuple[str, list[str]]:
+                    plan: bool = False, raise_timeouts: bool = False, env=None,
+                    source=None) -> tuple[str, list[str]]:
     """-> (verdict, lines). verdict in {registered, ok, skip, refused, failed, narrow, pending, plan}.
     `lines`: the changes made (or planned: 'base\\ttarget'), each 'add ...' / 'rewrite ...' /
     'remove ...' / 'ensure ...', then any NARROW / PENDING / SHORT / INERT / FOREIGN notes.
     `raise_timeouts` is accepted and ignored: the reconcile sets every owned timeout."""
-    got = _load(member, spec, template, home, env)
+    got = _load(member, spec, template, home, env, source=source)
     if not isinstance(got, Loaded):
         return got
     L = got
@@ -1223,7 +1264,8 @@ def main(argv: list[str]) -> int:
             continue
         with open(tpl, encoding="utf-8") as fh:
             template = json.load(fh)
-        verdict, lines = register_member(member, spec, template, home, dry, plan=plan)
+        verdict, lines = register_member(member, spec, template, home, dry, plan=plan,
+                                         source=os.path.join(plugins, member))
         if plan:
             # machine-readable, for install-members.sh: member<TAB>basename<TAB>absolute target
             for ln in lines:
