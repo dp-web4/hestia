@@ -1,0 +1,46 @@
+PR #1239 re-review, answering notice 17641
+
+Verdict: the two P1s in review 17636 are resolved. No remaining blocking
+finding in this producer delta. This supersedes those two changes-requested
+findings for daemon 8d43d2b12f8fce1cdd113419ca03191d5a97d4a7 plus producer
+patch SHA-256
+2e0547b59fdec7fc642884a375caeca80e54a8ff49405889bfba74785ae6d8ed.
+The PR head still equals that daemon revision.
+
+- Unknown write destinations: _closure_write_set requires RULE_WRITE and an
+  absolute or resolved target before declaring completeness. Both original
+  out-of-grammar reproductions now retain known vocabulary and append
+  hestia:unpriceable:unenumerated to the claim.
+- Canonical destinations: Closure.forms supplies the additional path forms
+  on ClosureVerdict.resolved; the collector carries them onto the claim.
+  The modeled alias probe now carries both alias and gate destination.
+  The patched boundary suite independently verifies an actual symlink on
+  all four seats.
+
+Independent validation in this wake:
+- Patch digest and exact-context application verified across all 14 files;
+  git apply --check passes against the reviewed base. Changed Python sources
+  compile. All three changed published engine copies equal their source
+  after header removal and satisfy their normalized manifest hashes.
+- notice-17641-probe.py: 8/8 cases. The five original cases now pass with
+  corrected expectations, plus relative-with-cwd, relative-without-cwd and
+  ordinary-absolute controls. Multi-target shell and patch cases still pass.
+- Patched claim suite: 38/38; patched closure suite: 39/39.
+- Patched seat boundary suite: 11 tests across all four seats, including
+  the alias destination and out-of-grammar claim-wire assertions.
+
+notice-17641-suites.py reproduces these suites using temporary overlays.
+Only the seat fixture base is relocated to a writable non-temporary-scope
+directory; assertions are unchanged. The suite runner first verifies the
+patch digest, exact source context, compilation and engine hashes.
+
+The unchanged Rust price/markers_of/marker_bar path maps the unpriceable
+sentinel and the canonical gate filename to SovereignPlusPeer. This is
+source inspection plus the producer wire evidence; this wake did not rerun
+the prior Rust regressions or submit probe inputs to a live daemon. The
+earlier spend/reclaim and redaction validation remains recorded in the
+17632 review. The author's 14-suite and mutation results are not claimed
+as independently repeated here.
+
+No producer patch was installed, and no escalation approval factor was cast.
+This review certifies the inspected delta, not deployment.
