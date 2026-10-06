@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 40ac543f269f4f6667d2220769dc650e0963bee3c3e80899387ad6fbb0ae7ee1  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 6bfb11858f3c35be4b738af5371b5af13aba4299d77704e0d4458c21b0826be5  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -55,6 +55,24 @@ loosen it. An unreadable vault yields the floor, never an empty (open) closure. 
 same reasoning as the core's "mirrored, not imported" note: a load failure must not disarm
 the check.
 
+EACH MEMBER'S INSTALLED SURFACE IS DERIVED FROM ITS INSTALL DECLARATION
+-----------------------------------------------------------------------
+A member's gate runs from where the installer put it, under the entry name its harness
+invokes, wired in by a harness config file — expects.json `install.dest`,
+`install.gate_probe.entry` and `install.registration.path`. Those three declarations ARE the
+member's governance surface on a running seat, so the closure derives it from them
+(_closure_from_install) instead of hoping each member's names match a basename list written
+before it existed: the dest dir becomes a dir marker, the entry basename a hooks-dir name,
+the registration path an exact path. A list keyed on names is a list of the members its
+author knew; a member with a different entry name or harness home falls outside it silently.
+
+The installed module has no manifests beside it ($HESTIA_HOME/shared holds the engine only),
+so its registry is empty and only the floor holds there. The floor therefore carries a
+SNAPSHOT of every member's install declaration (MEMBER_INSTALL_DECLARATIONS), derived by the
+same function, and a drift test pins that snapshot equal to the manifests — a member whose
+gate moves or is renamed without the snapshot following is red in CI, not open on a seat.
+Literal names stay in LITERAL_FLOOR too, as the backstop under both.
+
 FAIL-CLOSED CONTRACT — WITH A DELIBERATE, LOAD-BEARING ASYMMETRY
 ----------------------------------------------------------------
 classify() NEVER raises to the caller and this module never calls sys.exit (it returns a
@@ -101,6 +119,8 @@ __all__ = [
     "ClosureVerdict",
     "Closure",
     "LITERAL_FLOOR",
+    "FAILSAFE_CLOSURE",
+    "MEMBER_INSTALL_DECLARATIONS",
     "RULE_WRITE",
     "RULE_WRITE_UNPARSEABLE",
     "RULE_OUT_OF_GRAMMAR",
@@ -290,6 +310,9 @@ LITERAL_FLOOR = Closure(
         "post_tool_use.py",
         "witness.py",
         "law_inject.py",
+        # A harness whose gate entry is not named like the others. Also derived from that
+        # member's install declaration (below); listed here as the literal backstop.
+        "before_tool.py",
     ),
     exact_paths=(
         # The hub's STAGED EXECUTABLE (#415): deliberately a segment path, not a
@@ -301,9 +324,108 @@ LITERAL_FLOOR = Closure(
         (".codex", "config.toml"),
         (".kimi-code", "config.toml"),
         (".kimi", "config.toml"),
+        (".gemini", "settings.json"),
     ),
     source="floor",
 )
+
+
+# ── Install-declared surfaces — derived, so a member cannot fall outside by naming ──────────
+def _home_relative(path: str) -> tuple:
+    """Segments of an install path with its home anchor removed: `~/.x/hooks` -> (.x, hooks).
+    The closure matches by segment run / suffix, so the home it lands in does not matter."""
+    segs = _segments(path)
+    if segs and segs[0] in ("~", "$HOME", "${HOME}"):
+        segs = segs[1:]
+    return segs
+
+
+def _install_declaration(install: Any) -> Optional[dict]:
+    """The governance-relevant part of one expects.json `install` block, normalised:
+    {"dest": str, "entry": str, "registration": [segments]}. None when unusable."""
+    if not isinstance(install, dict):
+        return None
+    dest = install.get("dest")
+    probe = install.get("gate_probe")
+    entry = probe.get("entry") if isinstance(probe, dict) else None
+    reg = install.get("registration")
+    reg_path = reg.get("path") if isinstance(reg, dict) else None
+    out: dict = {}
+    if isinstance(dest, str) and dest:
+        out["dest"] = dest
+    if isinstance(entry, str) and entry:
+        out["entry"] = entry
+    if isinstance(reg_path, list) and reg_path and all(isinstance(s, str) for s in reg_path):
+        out["registration"] = list(reg_path)
+    return out or None
+
+
+def _closure_from_install(install: Any) -> Optional[Closure]:
+    """One member's installed governance surface, from its expects.json `install` block."""
+    return _closure_from_declaration(_install_declaration(install))
+
+
+def _closure_from_declaration(decl: Optional[dict]) -> Optional[Closure]:
+    """Derive one member's installed governance surface from its normalised declaration.
+
+    * dest  -> dir marker: every file the installer puts there (gate entry, witness, helpers,
+               and a NEW file dropped beside them) is a closure write.
+    * entry -> hooks-dir name: the entry basename governs under any hooks/ segment, as the
+               conventionally named entries already do (repo copies, published copies).
+    * registration -> exact path: the harness config that selects which gate runs.
+    A dest or registration of fewer than two segments is IGNORED, not widened: `hooks` or
+    `settings.json` alone would govern every same-named dir or file anywhere."""
+    if not isinstance(decl, dict):
+        return None
+    dirs, hooks_only, paths = [], [], []
+    dest = decl.get("dest")
+    if isinstance(dest, str):
+        segs = _home_relative(dest)
+        if len(segs) >= 2:
+            dirs.append(segs)
+    entry = decl.get("entry")
+    if isinstance(entry, str) and _segments(entry):
+        hooks_only.append(_segments(entry)[-1])
+    reg = decl.get("registration")
+    if isinstance(reg, (list, tuple)):
+        segs = tuple(s for s in reg if isinstance(s, str) and s not in ("", ".", "~"))
+        if len(segs) >= 2:
+            paths.append(segs)
+    if not (dirs or hooks_only or paths):
+        return None
+    return Closure(dir_markers=tuple(dirs), files_hooks_only=tuple(hooks_only),
+                   exact_paths=tuple(paths), source="install")
+
+
+# Snapshot of every member's install declaration, for the INSTALLED module (which has no
+# manifests beside it). Generated from plugins/*/expects.json by _install_declaration and
+# pinned equal to them by member_install_surface_test.py — edit the manifest, then this.
+MEMBER_INSTALL_DECLARATIONS = {
+    "claude-code": {"dest": "~/.claude/hooks/hestia", "entry": "hooks/pre_tool_use.py",
+                    "registration": [".claude", "settings.json"]},
+    "codex": {"dest": "~/.codex/hooks", "entry": "hooks/pre_tool_use.py",
+              "registration": [".codex", "config.toml"]},
+    "gemini": {"dest": "~/.gemini/hestia-plugins/gemini/hooks", "entry": "hooks/before_tool.py",
+               "registration": [".gemini", "settings.json"]},
+    "kimi": {"dest": "~/.kimi-code/hooks", "entry": "hooks/pre_tool_use.py",
+             "registration": [".kimi-code", "config.toml"]},
+}
+
+
+def _failsafe_closure() -> Closure:
+    out = LITERAL_FLOOR
+    for _name, decl in sorted(MEMBER_INSTALL_DECLARATIONS.items()):
+        extra = _closure_from_declaration(decl)
+        if extra is not None:
+            out = out.union(extra)
+    return Closure(out.dir_markers, out.files_anywhere, out.files_hooks_only, out.exact_paths,
+                   source="floor")
+
+
+try:
+    FAILSAFE_CLOSURE = _failsafe_closure()
+except Exception:  # noqa: BLE001 — never let the derivation disarm the literal floor
+    FAILSAFE_CLOSURE = LITERAL_FLOOR
 
 
 def _closure_from_manifest(manifest: dict) -> Optional[Closure]:
@@ -340,7 +462,8 @@ def _read_manifests_fs(plugins_root: str) -> dict:
 
 def load_closure(plugins_root: Optional[str] = None,
                  manifest_reader: Optional[Callable[[], dict]] = None) -> Closure:
-    """Assemble the closure: LITERAL_FLOOR ∪ every plugin manifest's declared closure.
+    """Assemble the closure: the fail-safe floor (LITERAL_FLOOR ∪ the install snapshot) ∪
+    every plugin manifest's declared closure ∪ every manifest's install-derived surface.
 
     `manifest_reader` (tests, vault-backed readers) returns {plugin_name: manifest_dict}.
     Default reads plugins/*/expects.json beside this module. NEVER raises; total failure
@@ -352,16 +475,24 @@ def load_closure(plugins_root: Optional[str] = None,
             root = plugins_root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             manifests = _read_manifests_fs(root)
         if not isinstance(manifests, dict):
-            return LITERAL_FLOOR
-        result = LITERAL_FLOOR
+            return FAILSAFE_CLOSURE
+        result = FAILSAFE_CLOSURE
         for _name, manifest in sorted(manifests.items()):
-            extra = _closure_from_manifest(manifest)
-            if extra is not None:
-                result = result.union(extra)
+            for derive in (_closure_from_manifest, _closure_from_install_of):
+                try:
+                    extra = derive(manifest)
+                except Exception:  # noqa: BLE001 — a bad manifest adds nothing, removes nothing
+                    extra = None
+                if extra is not None:
+                    result = result.union(extra)
         return Closure(result.dir_markers, result.files_anywhere, result.files_hooks_only,
                        result.exact_paths, source="registry+floor")
     except Exception:
-        return LITERAL_FLOOR
+        return FAILSAFE_CLOSURE
+
+
+def _closure_from_install_of(manifest: Any) -> Optional[Closure]:
+    return _closure_from_install(manifest.get("install")) if isinstance(manifest, dict) else None
 
 
 _DEFAULT_CLOSURE: Optional[Closure] = None
@@ -1082,7 +1213,7 @@ def classify(tool_name: str, tool_input: Any, *, cwd: Optional[str] = None,
             closure = default_closure()
         src = closure.source
     except Exception:
-        closure, src = LITERAL_FLOOR, LITERAL_FLOOR.source
+        closure, src = FAILSAFE_CLOSURE, FAILSAFE_CLOSURE.source
 
     # Phase 1 — WRITE positions. Internal errors here fail CLOSED.
     try:

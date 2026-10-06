@@ -199,6 +199,18 @@ DECLARED = (
              "'DECIDE before the shims land' the <policy-core> row asks, answered for this file "
              "in the same change that lands the shims. Named in `bar_for` as a live clause."),
 
+    dict(key="befo", label="<gate-alt-entry>", intended=AWAITING, via=UNNAMED, tracked=True,
+         why="One seat's gate ENTRY under a different basename from <gate>: the same role (the "
+             "file its harness invokes before every tool call), a different name. Added to the "
+             "canonical list when the closure began deriving each member's installed surface "
+             "from its install declaration -- before that the name was in no list at all, so "
+             "a write to that seat's installed entry was not escalated. Now it escalates, and "
+             "it is priced at one approver because `bar_for` names <gate>'s basename and not "
+             "this one -- inherited from omission, not chosen. Measured, not decided. DECIDE: "
+             "whether one seat's gate entry should be cheaper to approve than the other seats' "
+             "(aligning upward means a `bar_for` clause for it, and this row moving to STRONG "
+             "with via=EXACT in the same change)."),
+
     dict(key="gate_self", label="<exemption-ledger>", intended=AWAITING, via=UNNAMED,
          tracked=True,
          why="One approver today, same inheritance. This file holds the list of "

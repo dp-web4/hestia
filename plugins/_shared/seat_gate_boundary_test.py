@@ -19,6 +19,9 @@ Arms, every seat (explicit list at the bottom):
   - a write whose destination is a gate file is refused before the daemon is asked: an
     escalation is claimed with the host session, `gate_self_access` witnessed, no begin_action;
   - the same through the seat's shell tool (and codex's apply_patch);
+  - the seat's INSTALLED gate entry, witness and registration config (read from its own
+    expects.json install declaration, under the fixture HOME) are refused the same way, through
+    Write, Edit and every shell write form; every declared member must have a seat row here;
   - a claimed human approval lifts the closure bar for that one call, and ordinary law runs;
   - a distinctive governance name (the mechanism, the common gate) governs anywhere, while a
     hooks-dir-only name outside a hooks dir is ordinary work;
@@ -335,6 +338,74 @@ def test_gate_file_shell_write_refused():
     _each_seat(arm)
 
 
+def _declared_members():
+    plugins = os.path.join(REPO, "plugins")
+    return sorted(d for d in os.listdir(plugins)
+                  if os.path.isfile(os.path.join(plugins, d, "expects.json")))
+
+
+def _install_surfaces(seat, home):
+    """{label: path}: the seat's INSTALLED gate entry, witness and registration config, read
+    from its own expects.json install declaration and placed under this fixture's HOME — where
+    the installer puts them on a running seat, not the repo copy under plugins/<seat>/hooks."""
+    with open(os.path.join(REPO, "plugins", seat, "expects.json"), encoding="utf-8") as fh:
+        inst = json.load(fh)["install"]
+    dest = inst["dest"]
+    dest = os.path.join(home, dest[2:]) if dest.startswith("~/") else dest
+    out = {"entry": os.path.join(dest, os.path.basename(inst["gate_probe"]["entry"])),
+           "registration": os.path.join(home, *inst["registration"]["path"])}
+    wit = [f for f in inst.get("files") or [] if os.path.basename(f).startswith("witness")]
+    if wit:
+        out["witness"] = os.path.join(dest, os.path.basename(wit[0]))
+    return out
+
+
+def test_every_declared_member_is_exercised_here():
+    """Covered by construction: a member with an expects.json and no seat row here would have
+    its installed surface go untested. Red until the seat is added to SEATS."""
+    missing = [m for m in _declared_members() if m not in SEATS]
+    check("every-declared-member-has-a-seat", not missing, f"declared but not exercised: {missing}")
+
+
+def test_installed_gate_entry_witness_and_registration_refused():
+    """Every seat, against its OWN installed surface: the gate entry the harness invokes, its
+    witness, and the harness config that registers it. Each write form is refused as
+    gate.self_access before the daemon is asked — the same strength the repo copy gets."""
+    def arm(seat, fx):
+        stub = Stub()
+        try:
+            home = fx.home(seat, stub.url)
+            src = os.path.join(fx.repo, "docs", "src.txt")
+            with open(src, "w", encoding="utf-8") as fh:
+                fh.write("x\n")
+            n = 0
+            for label, target in _install_surfaces(seat, home).items():
+                forms = [
+                    ("Write", {"file_path": target, "content": "x"}),
+                    ("Edit", {"file_path": target, "old_string": "a", "new_string": "b"}),
+                    ("Bash", {"command": f"touch {target}"}),
+                    ("Bash", {"command": f"echo x > {target}"}),
+                    ("Bash", {"command": f"cp {src} {target}"}),
+                    ("Bash", {"command": f"mv {src} {target}"}),
+                    ("Bash", {"command": f"install -m 0755 {src} {target}"}),
+                    ("Bash", {"command": f"echo x | tee {target}"}),
+                    ("Bash", {"command": f"sed -i s/a/b/ {target}"}),
+                ]
+                for tool, ti in forms:
+                    n += 1
+                    form = tool if tool != "Bash" else ti["command"].split()[0] + (
+                        ">" if " > " in ti["command"] else "")
+                    mark = len(stub.calls)
+                    v, text, _ = run(seat, home, native(seat, tool, ti, n=n))
+                    check(f"{seat}-{label}-{form}-denied", v == "deny" and "gate.self_access" in text,
+                          f"{target}: {text}")
+                    check(f"{seat}-{label}-{form}-pre-daemon",
+                          "hestia_begin_action" not in [c for c, _ in stub.calls[mark:]], stub.calls[mark:])
+        finally:
+            stub.close()
+    _each_seat(arm)
+
+
 def test_approved_gate_write_proceeds_to_ordinary_law():
     def arm(seat, fx):
         stub = Stub(claim={"claimed": True, "permits_write": True, "decided_by": "test-operator",
@@ -503,6 +574,8 @@ def test_no_event_and_no_projection_are_refused_first():
 ALL = [
     test_gate_file_write_refused_before_the_daemon,
     test_gate_file_shell_write_refused,
+    test_every_declared_member_is_exercised_here,
+    test_installed_gate_entry_witness_and_registration_refused,
     test_approved_gate_write_proceeds_to_ordinary_law,
     test_distinctive_names_govern_anywhere_hooks_only_names_do_not,
     test_ordinary_write_is_asked_allowed_and_recorded,
