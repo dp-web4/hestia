@@ -347,19 +347,28 @@ pub const SOVEREIGN_FILES: &[&str] = &[
     "hestia_single_gate.py",
 ];
 
-/// THE ESCALATION PRICING RULE. This is the one place it is stated; `open` calls it, and
-/// `rehydrate` calls it only for a row that recorded no readable bar.
+/// THE ESCALATION PRICING RULE. This is the one place it is stated. `open` calls it to price a
+/// new ask; the claim door calls it to price the INCOMING act before any approval may be spent
+/// or reclaimed for it; `rehydrate` calls it only for a row that recorded no readable bar.
 ///
-/// **An escalation's bar is the HIGHEST `bar_for` over every marker the act reaches.** The
-/// markers, in order, deduplicated (`markers_of`):
+/// **An escalation's bar is the HIGHEST bar over every marker the act reaches.** The markers,
+/// in order, deduplicated (`markers_of`):
 ///   1. the closure's reported `marker` — always present, always first;
-///   2. the basename of the act's RESOLVED TARGET, when the caller sent one;
+///   2. for EACH of the act's RESOLVED TARGETS (every governed write-position path the gate's
+///      closure resolved — all of them, not the first), its basename;
 ///   3. every sovereign file (`SOVEREIGN_FILES`, by exact basename) named in the ACT TEXT.
 ///
 /// (1) and (2) are names the GATE resolved for this write — the closure element that fired,
-/// and the write-position argument that fired it — so both are priced by `bar_for` as they
-/// stand. (3) is free text: it also names sources, flags and look-alikes, so only an exact
-/// sovereign basename counts there (`not_witness.py.bak` in a command is not the witness).
+/// and the write-position arguments that resolved into the closure — so each is priced by
+/// `bar_for` as it stands. (3) is free text: it also names sources, flags and look-alikes, so
+/// only an exact sovereign basename counts there (`not_witness.py.bak` is not the witness).
+///
+/// UNPRICEABLE IS THE HIGHEST BAR, never the lowest. A resolved target that arrives as an
+/// `UNPRICEABLE_PREFIX` sentinel — the gate could not enumerate the whole write set (an
+/// opaque writer, an internal error, more targets than `MAX_RESOLVED_TARGETS`), or a target
+/// path was itself credential-shaped and withheld — is a marker that prices
+/// `SovereignPlusPeer` (`marker_bar`). Missing pricing evidence must not imply the weaker bar
+/// (Codex review of #1239, P1-2/P1-3).
 ///
 /// Why each input is there:
 ///   - (1) alone was the pre-stage-C rule, and it was unpriceable-strong for exactly the
@@ -370,43 +379,54 @@ pub const SOVEREIGN_FILES: &[&str] = &[
 ///   - (3) is one-gate stage C's fix (#1231): read the file out of the act text.
 ///   - (2) is #810's repair as #812 built it (kimi-code): the act text is a bounded,
 ///     self-censoring SUMMARY (220 chars for a shell command, the whole command withheld if it
-///     is credential-shaped, a multi-target patch cut from the front), so the filename can be
-///     cut out of (3) while the closure still holds it. The resolved target is that argument,
-///     sent as its own field — and priced like a marker, so a hook-dir file the bar reaches
-///     only through `bar_for`'s `contains` (the society gate) prices as its own name would.
+///     is credential-shaped, a multi-target patch cut from the front), so a filename can be
+///     cut out of (3) while the closure still holds it. The resolved targets are those
+///     arguments, sent as their own field, independent of the summary's redaction — and priced
+///     like markers, so a hook-dir file the bar reaches only through `bar_for`'s `contains`
+///     (the society gate) prices as its own name would.
 ///
 /// MONOTONIC BY CONSTRUCTION. Every input after (1) can only ADD markers, and the bar is the
-/// max over them, so the target and the act text may STRENGTHEN the marker-derived bar and
+/// max over them, so the targets and the act text may STRENGTHEN the marker-derived bar and
 /// can never weaken it (#812 review hold 1: a first cut that priced from the target alone let
-/// a fabricated `/tmp/ordinary.txt` lower a bar the marker priced two-factor). Both are
-/// caller-asserted (A1, HST-005) — the failure direction of a lie in either is a stricter bar
-/// on the liar's own escalation.
+/// a fabricated `/tmp/ordinary.txt` lower a bar the marker priced two-factor). All are
+/// caller-asserted (A1, HST-005) — the failure direction of a lie in any is a stricter bar on
+/// the liar's own escalation.
 ///
-/// FROZEN AT OPEN. The bar and the markers are copied onto the record and witnessed on the
-/// `gate_escalation_opened` entry; replay RESTORES them rather than repricing (#812 review hold
-/// 2), so a later change to this rule never rewrites what an open escalation is judged against.
-/// A row with no target (every row before #810, every old hook) prices exactly as stage C did.
-pub fn price(marker: &str, act: Option<&str>, resolved_target: Option<&str>) -> (Bar, Vec<String>) {
-    let markers = markers_of(marker, act, resolved_target);
+/// FROZEN AT OPEN, ENFORCED AT SPEND. The bar and the markers are copied onto the record and
+/// witnessed on the `gate_escalation_opened` entry; replay RESTORES them rather than repricing
+/// (#812 review hold 2). And an approval is spent (or reclaimed) only for an incoming act whose
+/// price does not exceed the bar it was approved under — the record is never repriced; a
+/// stronger ask needs its own, sufficient authorization (Codex review of #1239, P1-1).
+/// No targets (every row before #810, every old hook) prices exactly as stage C did.
+///
+/// The targets are FULL PATHS here, not basenames, so a location-qualified rule can read them.
+pub fn price(marker: &str, act: Option<&str>, resolved_targets: &[String]) -> (Bar, Vec<String>) {
+    let markers = markers_of(marker, act, resolved_targets);
     (bar_for_markers(&markers), markers)
 }
 
 /// The markers `price` takes the max over: the closure's reported `marker` first, then the
-/// basename of the resolved target, then the basename of every sovereign file named in the act
-/// text (deduplicated, in order). Act text is read the way it is written — whitespace, quotes,
-/// `=`, `,`, `;`, shell punctuation and escaped newlines split it, a `/` separates segments —
-/// so a path inside a command, an Edit target or an apply_patch body is found wherever the
-/// closure's directory marker shadowed it. Reads text only; it can add markers, never remove one.
-pub fn markers_of(marker: &str, act: Option<&str>, resolved_target: Option<&str>) -> Vec<String> {
+/// basename of each resolved target (an `UNPRICEABLE_PREFIX` sentinel is kept whole, as its
+/// own marker), then the basename of every sovereign file named in the act text (deduplicated,
+/// in order). Act text is read the way it is written — whitespace, quotes, `=`, `,`, `;`,
+/// shell punctuation and escaped newlines split it, a `/` separates segments — so a path inside
+/// a command, an Edit target or an apply_patch body is found wherever the closure's directory
+/// marker shadowed it. Reads text only; it can add markers, never remove one.
+pub fn markers_of(marker: &str, act: Option<&str>, resolved_targets: &[String]) -> Vec<String> {
     let mut out = vec![marker.trim().to_string()];
     let add = |name: &str, out: &mut Vec<String>| {
         if !name.is_empty() && !out.iter().any(|m| m == name) {
             out.push(name.to_string());
         }
     };
-    if let Some(t) = resolved_target {
-        let t = t.trim().trim_end_matches('/');
-        add(t.rsplit('/').next().unwrap_or("").trim(), &mut out);
+    for t in resolved_targets {
+        let t = t.trim();
+        if t.starts_with(UNPRICEABLE_PREFIX) {
+            add(t, &mut out);
+        } else {
+            let t = t.trim_end_matches('/');
+            add(t.rsplit('/').next().unwrap_or("").trim(), &mut out);
+        }
     }
     if let Some(text) = act {
         let split = |c: char| c.is_whitespace() || "\"'`=,;:()<>|&{}[]\\".contains(c);
@@ -420,17 +440,35 @@ pub fn markers_of(marker: &str, act: Option<&str>, resolved_target: Option<&str>
     out
 }
 
-/// The bar an act must clear: the HIGHEST `bar_for` over every marker it reaches (`Bar`'s
+/// One marker's bar: `bar_for`, except that an unpriceable-target sentinel is the HIGHEST bar.
+pub fn marker_bar(m: &str) -> Bar {
+    if m.starts_with(UNPRICEABLE_PREFIX) {
+        Bar::SovereignPlusPeer
+    } else {
+        bar_for(m)
+    }
+}
+
+/// The bar an act must clear: the HIGHEST `marker_bar` over every marker it reaches (`Bar`'s
 /// declaration order is its strength order). No markers prices the everyday bar.
 pub fn bar_for_markers(markers: &[String]) -> Bar {
-    markers.iter().map(|m| bar_for(m)).max().unwrap_or(Bar::SingleApprover)
+    markers.iter().map(|m| marker_bar(m)).max().unwrap_or(Bar::SingleApprover)
 }
+
+/// A resolved target the gate could not price, said in-band so it cannot be dropped silently:
+/// `hestia:unpriceable:<why>` (`credential-path`, `unenumerated`, `overflow`, `malformed`).
+/// Shared with the producer (`hestia_gate_mechanism.UNPRICEABLE_PREFIX`).
+pub const UNPRICEABLE_PREFIX: &str = "hestia:unpriceable:";
 
 /// The longest resolved target recorded, in chars. A path's governed filename is at its END,
 /// so an over-long value keeps its tail.
 pub const RESOLVED_TARGET_MAX: usize = 512;
 
-/// A caller's `resolved_target`, as recorded: whitespace collapsed, empty is absent, tail-capped.
+/// The most resolved targets one escalation records. More than this is an `overflow` sentinel,
+/// which prices the highest bar: a write set too large to carry is not a reason to price less.
+pub const MAX_RESOLVED_TARGETS: usize = 16;
+
+/// One resolved target, as recorded: whitespace collapsed, empty is absent, tail-capped.
 pub fn normalize_resolved_target(t: Option<&str>) -> Option<String> {
     let collapsed = t?.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
@@ -442,6 +480,57 @@ pub fn normalize_resolved_target(t: Option<&str>) -> Option<String> {
     } else {
         collapsed
     })
+}
+
+/// A caller's resolved targets, as recorded: each normalized, empties dropped, deduplicated in
+/// order, and capped at `MAX_RESOLVED_TARGETS` — the excess replaced by one `overflow`
+/// sentinel rather than discarded.
+pub fn normalize_resolved_targets<'a>(ts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut overflow = false;
+    for t in ts {
+        let Some(n) = normalize_resolved_target(Some(t)) else { continue };
+        if out.contains(&n) {
+            continue;
+        }
+        if out.len() >= MAX_RESOLVED_TARGETS {
+            overflow = true;
+            continue;
+        }
+        out.push(n);
+    }
+    if overflow {
+        out.push(format!("{UNPRICEABLE_PREFIX}overflow"));
+    }
+    out
+}
+
+/// The resolved targets a tool call names, as ONE list of full paths. The canonical key is
+/// `resolved_targets` (an array of strings). Also accepted and joined, in this order, so every
+/// producer spelling prices identically: the single-string `resolved_target`, and
+/// `also_resolved` (an array — the spelling #1247's producer uses for the targets after the
+/// first). Anything present but malformed (a wrong type, a non-string element) is an
+/// `UNPRICEABLE_PREFIX` sentinel, never silently nothing.
+pub fn resolved_targets_from_args(args: &serde_json::Value) -> Vec<String> {
+    let mal = || format!("{UNPRICEABLE_PREFIX}malformed");
+    let mut raw: Vec<String> = Vec::new();
+    let array = |key: &str, raw: &mut Vec<String>| match args.get(key) {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Array(items)) => {
+            for v in items {
+                raw.push(v.as_str().map(str::to_string).unwrap_or_else(mal));
+            }
+        }
+        Some(_) => raw.push(mal()),
+    };
+    array("resolved_targets", &mut raw);
+    match args.get("resolved_target") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(s)) => raw.push(s.clone()),
+        Some(_) => raw.push(mal()),
+    }
+    array("also_resolved", &mut raw);
+    normalize_resolved_targets(raw.iter().map(String::as_str))
 }
 
 /// One piece of evidence present for a decision. The channels ARE the factor types
@@ -689,18 +778,21 @@ pub struct Escalation {
     pub tool_name: String,
     /// Which governance file the write would reach.
     pub marker: String,
-    /// The act's RESOLVED TARGET (#810, recut of #812): the write-position argument the
-    /// gate's closure matched — `ClosureVerdict.resource` — carried ALONGSIDE the marker. The
-    /// marker is WHY (which closure element fired; the claim join key); the target is WHAT the
-    /// write reaches, and it joins the pricing (`price`, input 3) because the act text it
-    /// would otherwise be read from is a bounded summary that can cut the filename out.
+    /// The act's RESOLVED TARGETS (#810, recut of #812): EVERY governed write-position path the
+    /// gate's closure resolved for this act (`write_verdicts`), full paths, in order — carried
+    /// ALONGSIDE the marker. The marker is WHY (which closure element fired; the claim join
+    /// key); the targets are WHAT the write reaches, and they join the pricing (`price`, input
+    /// 2) because the act text they would otherwise be read from is a bounded summary that can
+    /// cut a filename out. A target the gate could not price arrives as an
+    /// `UNPRICEABLE_PREFIX` sentinel, which prices the highest bar.
     ///
-    /// CALLER-ASSERTED, like `marker` (A1, HST-005): the hook self-reports it and the daemon has
-    /// nothing to check it against. It can only ADD a marker, so a fabricated target raises the
-    /// asker's own bar and can never lower it. `None` on every row opened before the field
-    /// existed and on every call from a hook that does not send it — those price exactly as
-    /// stage C priced them.
-    pub resolved_target: Option<String>,
+    /// CALLER-ASSERTED, like `marker` (A1, HST-005): the hook self-reports them and the daemon
+    /// has nothing to check them against. Each can only ADD a marker, so a fabricated target
+    /// raises the asker's own bar and can never lower it. Empty on every row opened before the
+    /// field existed and on every call from a hook that sends none — those price exactly as
+    /// stage C priced them. (Wire: `resolved_targets`, an array; a single-string
+    /// `resolved_target` is accepted and joined.)
+    pub resolved_targets: Vec<String>,
     /// EVERY marker the act reaches — the reported `marker` first, then the basename of
     /// `resolved_target`, then each sovereign file (`SOVEREIGN_FILES`) named in the act text.
     /// `bar` is the highest over all of them; the rule is stated once, at `price`. The shared
@@ -1160,7 +1252,7 @@ impl Escalation {
             "bar": self.bar,
             // Every marker the act reaches; `bar` is the highest over them (`price`).
             "matched_markers": self.matched_markers,
-            "resolved_target": self.resolved_target,
+            "resolved_targets": self.resolved_targets,
             "bar_met": bar_met,
             // The same conjunction `is_claimable` enforces — the SAME FOUR, evaluated
             // against the same clock, not two of them re-derived without one.
@@ -1718,14 +1810,15 @@ impl EscalationStore {
                     // from current policy. Only a row that recorded no readable bar (written
                     // before the claim path emitted one, or an unparseable value) is priced
                     // here, by the same rule `open` uses, from what the row itself carries.
-                    let resolved_target =
-                        normalize_resolved_target(s(d, "resolved_target").as_deref());
+                    // The array the opened entry records; a single-string `resolved_target`
+                    // (an entry written by the first cut of this change) is read the same way.
+                    let resolved_targets = resolved_targets_from_args(d);
                     // The row's act text, verified or not, exactly as stage C read it here: an
                     // unverified text can only ADD markers, so it can only raise the fallback.
                     let (fallback_bar, fallback_markers) = price(
                         &marker,
                         s(d, "act_text").as_deref(),
-                        resolved_target.as_deref(),
+                        &resolved_targets,
                     );
                     let recorded_bar = d
                         .get("bar")
@@ -1849,7 +1942,7 @@ impl EscalationStore {
                             // (see above).
                             bar,
                             matched_markers,
-                            resolved_target,
+                            resolved_targets,
                             marker,
                             // The open time is the ENTRY's time, not the restart's. The
                             // payload carries it as of this change; rows written before
@@ -2013,7 +2106,7 @@ impl EscalationStore {
         now: u64,
         ttl_secs: u64,
     ) -> Result<Escalation, OpenError> {
-        self.open_with_payload(plugin_id, role, tool_name, marker, act, None, stated_reason,
+        self.open_with_payload(plugin_id, role, tool_name, marker, act, &[], stated_reason,
                                stated_detail, None, now, ttl_secs)
     }
 
@@ -2026,7 +2119,7 @@ impl EscalationStore {
         tool_name: &str,
         marker: &str,
         act: Option<&str>,
-        resolved_target: Option<&str>,
+        resolved_targets: &[String],
         stated_reason: Option<&str>,
         stated_detail: Option<&str>,
         binding: Option<&PayloadBinding>,
@@ -2094,8 +2187,8 @@ impl EscalationStore {
         h.update(marker.as_bytes());
         let id: String = h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect();
 
-        let resolved_target = normalize_resolved_target(resolved_target);
-        let (bar, matched_markers) = price(marker, act, resolved_target.as_deref());
+        let resolved_targets = normalize_resolved_targets(resolved_targets.iter().map(String::as_str));
+        let (bar, matched_markers) = price(marker, act, &resolved_targets);
 
         let esc = Escalation {
             id: id.clone(),
@@ -2147,7 +2240,7 @@ impl EscalationStore {
             // target can only add markers to the closure's, so they strengthen, never weaken.
             bar,
             matched_markers,
-            resolved_target,
+            resolved_targets,
             factors: Vec::new(),
         };
         self.by_id.insert(id, esc.clone());
@@ -2232,7 +2325,7 @@ impl EscalationStore {
         now: u64,
         ttl_secs: u64,
     ) -> Result<Opened, OpenError> {
-        self.open_or_coalesce_with_payload(plugin_id, role, tool_name, marker, act, None,
+        self.open_or_coalesce_with_payload(plugin_id, role, tool_name, marker, act, &[],
                                            stated_reason, stated_detail, None, now, ttl_secs)
     }
 
@@ -2244,7 +2337,7 @@ impl EscalationStore {
         tool_name: &str,
         marker: &str,
         act: Option<&str>,
-        resolved_target: Option<&str>,
+        resolved_targets: &[String],
         stated_reason: Option<&str>,
         stated_detail: Option<&str>,
         binding: Option<&PayloadBinding>,
@@ -2259,7 +2352,7 @@ impl EscalationStore {
             // or coalescing would be the one path on which the target could not strengthen.
             let (asked_bar, _) = price(
                 marker.trim(), Some(a),
-                normalize_resolved_target(resolved_target).as_deref());
+                &normalize_resolved_targets(resolved_targets.iter().map(String::as_str)));
             if let Some(twin) = self.pending_twin_bound(
                 plugin_id.trim(), marker.trim(), &digest,
                 binding.and_then(|b| b.sha256.as_deref()), now, asked_bar)
@@ -2267,7 +2360,7 @@ impl EscalationStore {
                 return Ok(Opened::Coalesced(twin.clone()));
             }
         }
-        self.open_with_payload(plugin_id, role, tool_name, marker, act, resolved_target,
+        self.open_with_payload(plugin_id, role, tool_name, marker, act, resolved_targets,
                                stated_reason, stated_detail, binding, now, ttl_secs)
             .map(Opened::Minted)
     }
@@ -2800,7 +2893,7 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         attempted_act: Option<&str>,
         now: u64,
     ) -> Option<Escalation> {
-        self.claim_bound(plugin_id, marker, attempted_act, None, now)
+        self.claim_bound(plugin_id, marker, attempted_act, None, Bar::SingleApprover, now)
     }
 
     /// `claim` with the PAYLOAD the caller is about to write, so an approval rendered for one
@@ -2811,12 +2904,19 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
     /// escalation that bound one demands a match. So the field ships inert, every existing row
     /// keeps its behaviour, and the binding switches on per-seat as shims begin to send it —
     /// instead of a flag day where every un-wired seat loses its approvals at once.
+    ///
+    /// `at_least` is the price of the INCOMING act (`price` over its marker, act and resolved
+    /// targets). An approval granted under a LOWER bar is not spent for it: the record keeps
+    /// its historical bar (it is never repriced), and a stronger ask needs its own, sufficient
+    /// authorization (Codex review of #1239, P1-1: a weak approval for an act whose summary cut
+    /// the sovereign filename out must not be spendable once the target names it).
     pub fn claim_bound(
         &mut self,
         plugin_id: &str,
         marker: &str,
         attempted_act: Option<&str>,
         attempted_payload: Option<&str>,
+        at_least: Bar,
         now: u64,
     ) -> Option<Escalation> {
         let plugin_id = plugin_id.trim();
@@ -2860,6 +2960,8 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
                         (Some(_), None) => false,
                         (None, _) => true,
                     }
+                    // The incoming act's price must not exceed the bar this approval met.
+                    && e.bar >= at_least
                     && e.is_claimable(now)
             })
             .map(|e| (e.opened_at, e.id.clone()))
@@ -2869,6 +2971,40 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         let esc = self.by_id.get_mut(&id)?;
         esc.consumed_at = Some(now);
         Some(esc.clone())
+    }
+
+    /// A claimable approval for THIS act (same member, marker, act digest, payload rule) that was
+    /// granted under a bar BELOW the incoming act's price — so `claim_bound` refused to spend it.
+    /// Named so the refusal can say why, instead of reading as "no approval found".
+    pub fn approved_below_bar(
+        &self,
+        plugin_id: &str,
+        marker: &str,
+        attempted_act: Option<&str>,
+        attempted_payload: Option<&str>,
+        at_least: Bar,
+        now: u64,
+    ) -> Option<&Escalation> {
+        let want_digest = attempted_act
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(Self::act_digest_of)?;
+        let want_payload = Self::normalize_payload(attempted_payload);
+        self.by_id
+            .values()
+            .filter(|e| {
+                e.plugin_id == plugin_id.trim()
+                    && e.marker == marker.trim()
+                    && e.act_digest.as_deref() == Some(want_digest.as_str())
+                    && match (&e.payload_sha256, &want_payload) {
+                        (Some(bound), Some(asked)) => bound == asked,
+                        (Some(_), None) => false,
+                        (None, _) => true,
+                    }
+                    && e.bar < at_least
+                    && e.is_claimable(now)
+            })
+            .min_by(|a, b| a.opened_at.cmp(&b.opened_at).then_with(|| a.id.cmp(&b.id)))
     }
 
     /// A claimable approval for THIS act whose bound payload is not the one being presented.
@@ -3034,6 +3170,9 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         attempted_payload: Option<&str>,
         proven_host_session_id: Option<&str>,
         invocation_key: Option<&str>,
+        // The INCOMING act's price (see `claim_bound`): a lost answer is recovered only for an
+        // act that prices no higher than the approval the first claim spent.
+        at_least: Bar,
         now: u64,
     ) -> Result<RequestKeyRecord, &'static str> {
         let rec = self.request_keys.get(key).ok_or("no record for this request key")?;
@@ -3085,6 +3224,15 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         }
         if self.begin_seen_since(original, rec.at) {
             return Err("the claimed invocation reached execution (begin_action seen): its permit was delivered");
+        }
+        // Fail closed when the spent row is gone: its bar cannot be read, so it can be shown to
+        // cover only the everyday bar every approval meets, never a stronger ask.
+        let covers = match self.by_id.get(&rec.escalation_id) {
+            Some(e) => e.bar >= at_least,
+            None => at_least == Bar::SingleApprover,
+        };
+        if !covers {
+            return Err("the retry prices above the bar the spent approval was granted under (its resolved targets reach a stronger bar): a stronger ask needs its own approval");
         }
         Ok(rec.clone())
     }
@@ -3446,7 +3594,7 @@ mod tests {
         #[allow(clippy::too_many_arguments)]
         fn why(st: &EscalationStore, k: &str, pl: &str, mk: &str, a: &str, p: Option<&str>,
                hs: Option<&str>, inv: Option<&str>, now: u64) -> Result<(), &'static str> {
-            st.reclaimable(k, pl, mk, Some(a), p, hs, inv, now).map(|_| ())
+            st.reclaimable(k, pl, mk, Some(a), p, hs, inv, Bar::SingleApprover, now).map(|_| ())
         }
         let base = |st: &EscalationStore, now| why(st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), Some("toolu_B"), now);
         assert_eq!(base(&st, T0 + 5), Ok(()), "control");
@@ -4322,7 +4470,7 @@ mod tests {
 
         let mut s = EscalationStore::default();
         let e = s
-            .open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(ACT), None,
+            .open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(ACT), &[],
                                Some(ACT), None, Some(&stated(APPROVED_BYTES)), T0, DEFAULT_TTL_SECS)
             .unwrap();
         s.decide(&e.id, true, "operator", "role:constellation:sovereign",
@@ -4333,11 +4481,11 @@ mod tests {
         // digest cannot be what refuses — exactly the isolation #539's test uses one axis up.
         assert!(
             s.claim_bound("claude-code", "pre_tool_use.py", Some(ACT),
-                          Some(SUBSTITUTED_BYTES), T0 + 10).is_none(),
+                          Some(SUBSTITUTED_BYTES), Bar::SingleApprover, T0 + 10).is_none(),
             "an approval rendered for one payload must not be spendable on another"
         );
         assert!(
-            s.claim_bound("claude-code", "pre_tool_use.py", Some(ACT), None, T0 + 11)
+            s.claim_bound("claude-code", "pre_tool_use.py", Some(ACT), None, Bar::SingleApprover, T0 + 11)
                 .is_none(),
             "nor by a caller that simply stops naming the bytes — silence must not be a \
              skeleton key for a permit that bound a payload"
@@ -4345,12 +4493,12 @@ mod tests {
         // POSITIVE CONTROL. Without it a store that refused every bound claim would pass.
         assert!(
             s.claim_bound("claude-code", "pre_tool_use.py", Some(ACT),
-                          Some(APPROVED_BYTES), T0 + 12).is_some(),
+                          Some(APPROVED_BYTES), Bar::SingleApprover, T0 + 12).is_some(),
             "the bytes it was granted for still claim it"
         );
         assert!(
             s.claim_bound("claude-code", "pre_tool_use.py", Some(ACT),
-                          Some(APPROVED_BYTES), T0 + 13).is_none(),
+                          Some(APPROVED_BYTES), Bar::SingleApprover, T0 + 13).is_none(),
             "and only once — binding the payload does not make a permit reusable"
         );
     }
@@ -4450,7 +4598,7 @@ mod tests {
                    "and the disagreement must be observable — the whole point");
 
         let mut s = EscalationStore::default();
-        let e = s.open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(&act), None,
+        let e = s.open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(&act), &[],
                                     Some(&act), None, Some(&b1), T0, DEFAULT_TTL_SECS)
             .unwrap();
         s.decide(&e.id, true, "operator", "role:constellation:sovereign",
@@ -4464,7 +4612,7 @@ mod tests {
         let b2 = EscalationStore::bind_payload(Some(&act), Some(LIE));
         assert!(
             s.claim_bound("claude-code", "pre_tool_use.py", Some(&act), b2.sha256.as_deref(),
-                          T0 + 10).is_none(),
+                          Bar::SingleApprover, T0 + 10).is_none(),
             "repeating a caller assertion satisfied a measured permit — the bytes moved and \
              the permit spent anyway"
         );
@@ -4482,7 +4630,7 @@ mod tests {
         assert_eq!(honest.basis, "measured");
         assert!(
             s.claim_bound("claude-code", "pre_tool_use.py", Some(&act), honest.sha256.as_deref(),
-                          T0 + 11).is_some(),
+                          Bar::SingleApprover, T0 + 11).is_some(),
             "the approved bytes still claim the permit"
         );
 
@@ -4519,7 +4667,7 @@ mod tests {
         // approval demanded nothing, so presenting more than nothing cannot be a mismatch.
         assert!(
             s.claim_bound("kimi-code", "pre_tool_use.py", Some(ACT), Some("cccc3333"),
-                          T0 + 10).is_some(),
+                          Bar::SingleApprover, T0 + 10).is_some(),
             "an unbound approval is claimed by any payload, including a named one"
         );
     }
@@ -4538,17 +4686,17 @@ mod tests {
         let mut s = EscalationStore::default();
         let first = s
             .open_or_coalesce_with_payload("claude-code", "r", "Bash", "pre_tool_use.py",
-                                           Some(ACT), None, Some(ACT), None, Some(&stated("aaaa1111")),
+                                           Some(ACT), &[], Some(ACT), None, Some(&stated("aaaa1111")),
                                            T0, DEFAULT_TTL_SECS)
             .unwrap();
         let same = s
             .open_or_coalesce_with_payload("claude-code", "r", "Bash", "pre_tool_use.py",
-                                           Some(ACT), None, Some(ACT), None, Some(&stated("aaaa1111")),
+                                           Some(ACT), &[], Some(ACT), None, Some(&stated("aaaa1111")),
                                            T0 + 9, DEFAULT_TTL_SECS)
             .unwrap();
         let moved = s
             .open_or_coalesce_with_payload("claude-code", "r", "Bash", "pre_tool_use.py",
-                                           Some(ACT), None, Some(ACT), None, Some(&stated("bbbb2222")),
+                                           Some(ACT), &[], Some(ACT), None, Some(&stated("bbbb2222")),
                                            T0 + 18, DEFAULT_TTL_SECS)
             .unwrap();
         // CONTROL FIRST: identical bytes still coalesce, or this test would pass on a store
@@ -4582,7 +4730,7 @@ mod tests {
         const OTHER_ACT: &str = "Bash -> cp /tmp/other.txt plugins/kimi/hooks/pre_tool_use.py";
         let mut s = EscalationStore::default();
         let e = s
-            .open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(ACT), None,
+            .open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(ACT), &[],
                                Some(ACT), None, Some(&stated("aaaa1111")), T0, DEFAULT_TTL_SECS)
             .unwrap();
         s.decide(&e.id, true, "operator", "role:constellation:sovereign",
@@ -6390,16 +6538,21 @@ mod coalesce_tests {
 #[cfg(test)]
 mod resolved_target_tests {
     //! #810, as #812 built it (kimi-code), recut onto one-gate stage C (#1231). The bar is ONE
-    //! rule (`price`): the highest `bar_for` over the closure marker, every sovereign file the
-    //! act text names, and the one the resolved target names. These pin what the target adds
-    //! beyond stage C, the monotonicity #812's review demanded, and replay restoring the
-    //! recorded price instead of repricing it.
+    //! rule (`price`): the highest bar over the closure marker, every resolved target, and every
+    //! sovereign file the act text names. These pin what the targets add beyond stage C, the
+    //! monotonicity #812's review demanded, replay restoring the recorded price, and Codex's
+    //! three P1s on #1239: the incoming price is enforced before a spend or reclaim; EVERY
+    //! target is priced, not the first; an unpriceable target is the highest bar, not none.
     use super::*;
 
     const T0: u64 = 1_800_000_000;
     /// The marker the closure emits for any in-tree hook path: a directory, no filename.
     const HOOKS: &str = "plugins/*/hooks";
     const TARGET: &str = "/wt/plugins/kimi/hooks/pre_tool_use.py";
+
+    fn v(ts: &[&str]) -> Vec<String> {
+        ts.iter().map(|t| t.to_string()).collect()
+    }
 
     /// The act as the common gate actually summarises a long shell command: 220 chars of it,
     /// then ` …` (mechanism `attempted_summary`, ATTEMPTED_MAX). The scratch path is long, so
@@ -6413,64 +6566,132 @@ mod resolved_target_tests {
         format!("Bash: {cut} …")
     }
 
-    fn open_t(marker: &str, act: &str, target: Option<&str>) -> Escalation {
+    fn open_t(marker: &str, act: &str, targets: &[&str]) -> Escalation {
         let mut s = EscalationStore::default();
         s.open_with_payload("kimi-code", "role:constellation:member", "Bash", marker, Some(act),
-                            target, None, None, None, T0, 3600)
+                            &v(targets), None, None, None, T0, 3600)
             .expect("open")
     }
 
     /// What #812 adds beyond stage C. Stage C reads the file out of the act TEXT; when the
-    /// text is a summary that cut the filename (a long command, a credential-shaped command
-    /// withheld whole), the act text has nothing to give and the directory marker prices one
-    /// approver. The resolved target still names the file. RED on the stage C rule.
+    /// text is a summary that cut the filename, the directory marker prices one approver. The
+    /// resolved target still names the file. RED on the stage C rule (the control arm).
     #[test]
     fn a_target_the_act_summary_cut_out_still_prices_the_strong_bar() {
         let act = truncated_shell_act();
-        let stage_c = open_t(HOOKS, &act, None);
-        assert_eq!(stage_c.bar, Bar::SingleApprover, "control: stage C alone cannot see it");
-
-        let e = open_t(HOOKS, &act, Some(TARGET));
-        assert_eq!(e.bar, Bar::SovereignPlusPeer,
-                   "the target carries the filename the summary lost");
-        assert_eq!(e.matched_markers, vec![HOOKS.to_string(), "pre_tool_use.py".to_string()]);
+        assert_eq!(open_t(HOOKS, &act, &[]).bar, Bar::SingleApprover,
+                   "control: stage C alone cannot see it");
+        let e = open_t(HOOKS, &act, &[TARGET]);
+        assert_eq!(e.bar, Bar::SovereignPlusPeer, "the target carries the filename the summary lost");
+        assert_eq!(e.matched_markers, v(&[HOOKS, "pre_tool_use.py"]));
         assert_eq!(e.marker, HOOKS, "the marker stays the claim join key");
-        assert_eq!(e.resolved_target.as_deref(), Some(TARGET));
-
-        // A credential-shaped command reaches the daemon withheld whole: no path at all.
-        let redacted = "Bash [REDACTED — names a credential-shaped token; 312 chars withheld \
-                        rather than copied into the record]";
-        assert_eq!(open_t(HOOKS, redacted, None).bar, Bar::SingleApprover);
-        assert_eq!(open_t(HOOKS, redacted, Some(TARGET)).bar, Bar::SovereignPlusPeer);
+        assert_eq!(e.resolved_targets, v(&[TARGET]), "the full path is recorded, not the basename");
     }
 
-    /// #812 review hold 1, all four arms: the target may STRENGTHEN the marker-derived bar,
+    /// Codex P1-2 on #1239: a multi-target act whose SECOND target is sovereign and lies beyond
+    /// the summary's bound. The first target (what `classify` reports) is ordinary; every
+    /// target is priced, so the act prices two-factor whatever the order.
+    #[test]
+    fn a_later_sovereign_target_beyond_the_summary_prices_the_strong_bar() {
+        let first = "/w/hestia/plugins/_shared/ordinary.txt";
+        let sovereign = "/w/hestia/plugins/_shared/hestia_single_gate.py";
+        let pad: Vec<String> = (0..25).map(|i| format!("/w/x/pad{i}.txt")).collect();
+        let full = format!("touch {first} {} {sovereign}", pad.join(" "));
+        let cut: String = full.chars().take(220).collect();
+        assert!(!cut.contains("hestia_single_gate.py"), "the summary must lose the sovereign target");
+        let act = format!("Bash: {cut} …");
+        assert_eq!(open_t("plugins/_shared", &act, &[first]).bar, Bar::SingleApprover,
+                   "control: the first target alone (the pre-fix producer) prices weak");
+        for order in [[first, sovereign], [sovereign, first]] {
+            let e = open_t("plugins/_shared", &act, &order);
+            assert_eq!(e.bar, Bar::SovereignPlusPeer, "{order:?}");
+            assert_eq!(e.resolved_targets, v(&order));
+        }
+    }
+
+    /// Codex P1-3 on #1239: a credential-shaped command reaches the daemon with its summary
+    /// withheld whole, and the producer no longer drops the target with it — the target is a
+    /// path the gate resolved, carried independently. And when the target path ITSELF is
+    /// credential-shaped, the producer sends the `credential-path` sentinel instead: missing
+    /// pricing evidence is the HIGHEST bar, never the lowest.
+    #[test]
+    fn a_redacted_summary_or_a_redacted_target_still_prices_the_strong_bar() {
+        let redacted = "Bash [REDACTED — names a credential-shaped token; 312 chars withheld \
+                        rather than copied into the record]";
+        assert_eq!(open_t(HOOKS, redacted, &[]).bar, Bar::SingleApprover, "control");
+        assert_eq!(open_t(HOOKS, redacted, &[TARGET]).bar, Bar::SovereignPlusPeer);
+        let sentinel = format!("{UNPRICEABLE_PREFIX}credential-path");
+        let e = open_t(HOOKS, redacted, &[&sentinel]);
+        assert_eq!(e.bar, Bar::SovereignPlusPeer, "an unpriceable target is the highest bar");
+        assert_eq!(e.matched_markers, v(&[HOOKS, &sentinel]), "and the record says why");
+        for why in ["unenumerated", "overflow", "malformed"] {
+            let s = format!("{UNPRICEABLE_PREFIX}{why}");
+            assert_eq!(open_t(HOOKS, "Edit -> act", &[&s]).bar, Bar::SovereignPlusPeer, "{why}");
+        }
+    }
+
+    /// Codex P1-1 on #1239, store half: an approved SingleApprover escalation (opened from a
+    /// summary that cut the filename out) is NOT spent for an incoming act whose resolved
+    /// target prices two-factor — nor reclaimed for one. The approval's record keeps its bar.
+    #[test]
+    fn an_approved_weak_escalation_is_not_spent_for_a_stronger_incoming_act() {
+        let act = truncated_shell_act();
+        let mut s = EscalationStore::default();
+        let e = s.open_with_payload("kimi-code", "r", "Bash", HOOKS, Some(&act), &[], None, None,
+                                    None, T0, 3600).unwrap();
+        assert_eq!(e.bar, Bar::SingleApprover);
+        s.decide(&e.id, true, "operator", "role:constellation:sovereign",
+                 Channel::OperatorSession, None, Some("ok"), T0 + 5).unwrap();
+        let (incoming, _) = price(HOOKS, Some(&act), &v(&[TARGET]));
+        assert_eq!(incoming, Bar::SovereignPlusPeer);
+        let found = s.approved_below_bar("kimi-code", HOOKS, Some(&act), None, incoming, T0 + 6)
+            .map(|e| e.id.clone());
+        assert_eq!(found.as_deref(), Some(e.id.as_str()), "the shortfall is nameable");
+        assert!(s.claim_bound("kimi-code", HOOKS, Some(&act), None, incoming, T0 + 6).is_none(),
+                "a weak approval must not be spent for a stronger act");
+        assert_eq!(s.get(&e.id).unwrap().consumed_at, None, "and it is not consumed");
+        assert_eq!(s.get(&e.id).unwrap().bar, Bar::SingleApprover, "nor repriced");
+
+        // Reclaim: the first claim (a targetless re-issue) spent it; the retry carries the
+        // target. Recovery of a lost answer never covers a stronger act.
+        let spent = s.claim_bound("kimi-code", HOOKS, Some(&act), None, Bar::SingleApprover, T0 + 7)
+            .expect("control: the same act at its own price spends it");
+        let key = "e".repeat(64);
+        s.record_request_key(&key, RequestKeyRecord {
+            outcome: "claimed".into(), escalation_id: spent.id.clone(), at: T0 + 7,
+            plugin_id: "kimi-code".into(), marker: HOOKS.into(),
+            act_digest: spent.act_digest.clone(), payload_sha256: None,
+            host_session_id: Some("hs".into()), invocation_key: Some("inv-1".into()),
+            supersession_hard_stop: true,
+        });
+        let retry = |b: Bar| s.reclaimable(&key, "kimi-code", HOOKS, Some(&act), None, Some("hs"),
+                                           Some("inv-2"), b, T0 + 8);
+        assert!(retry(Bar::SingleApprover).is_ok(), "control: a same-priced retry reclaims");
+        assert!(retry(incoming).unwrap_err().contains("prices above"),
+                "a retry that prices higher is not a lost answer to recover");
+    }
+
+    /// #812 review hold 1, all four arms: the targets may STRENGTHEN the marker-derived bar,
     /// never weaken it. (The arm that was wrong in #812's first cut is the second.)
     #[test]
     fn the_resolved_target_can_strengthen_but_never_weaken_the_bar() {
         let act = "Edit -> act";
-        // weak marker + strong target => strong (the #810 repair itself)
-        assert_eq!(open_t(HOOKS, act, Some(TARGET)).bar, Bar::SovereignPlusPeer);
-        // STRONG marker + weak/fabricated target => STILL strong
-        assert_eq!(open_t("pre_tool_use.py", act, Some("/tmp/ordinary.txt")).bar,
+        assert_eq!(open_t(HOOKS, act, &[TARGET]).bar, Bar::SovereignPlusPeer);
+        assert_eq!(open_t("pre_tool_use.py", act, &["/tmp/ordinary.txt"]).bar,
                    Bar::SovereignPlusPeer,
                    "a fabricated or ordinary target must never LOWER the marker-derived bar");
-        // strong ACT TEXT + weak target => still strong (the stage C input is not displaced)
         assert_eq!(open_t(HOOKS, "Edit -> /w/plugins/_shared/hestia_gate_mechanism.py",
-                          Some("/tmp/ordinary.txt")).bar,
+                          &["/tmp/ordinary.txt"]).bar,
                    Bar::SovereignPlusPeer);
-        // weak + weak => weak
-        assert_eq!(open_t(HOOKS, act, Some("/tmp/ordinary.txt")).bar, Bar::SingleApprover);
-        // target absent or empty => exactly the stage C price
-        assert_eq!(open_t(HOOKS, act, None).bar, Bar::SingleApprover);
-        let blank = open_t("pre_tool_use.py", act, Some("   "));
+        assert_eq!(open_t(HOOKS, act, &["/tmp/ordinary.txt"]).bar, Bar::SingleApprover);
+        assert_eq!(open_t(HOOKS, act, &[]).bar, Bar::SingleApprover);
+        let blank = open_t("pre_tool_use.py", act, &["   "]);
         assert_eq!(blank.bar, Bar::SovereignPlusPeer);
-        assert_eq!(blank.resolved_target, None, "an empty target is no target");
+        assert!(blank.resolved_targets.is_empty(), "an empty target is no target");
     }
 
     /// #812's negative arms, carried forward: a target naming no file the bar prices two-factor
-    /// changes nothing about the bar (its basename is listed as a marker it reached, and priced
-    /// one approver like any other).
+    /// changes nothing about the bar.
     #[test]
     fn a_target_naming_no_sovereign_file_changes_nothing() {
         let act = "Edit -> act";
@@ -6478,64 +6699,90 @@ mod resolved_target_tests {
                           ("/wt/plugins/claude-code/hooks/law_inject.py", "law_inject.py"),
                           ("/wt/plugins/_shared/hestia_gate_core.py", "hestia_gate_core.py"),
                           ("/tmp/ordinary.txt", "ordinary.txt")] {
-            let e = open_t(HOOKS, act, Some(t));
+            let e = open_t(HOOKS, act, &[t]);
             assert_eq!(e.bar, Bar::SingleApprover, "{t}");
-            assert_eq!(e.matched_markers, vec![HOOKS.to_string(), base.to_string()], "{t}");
+            assert_eq!(e.matched_markers, v(&[HOOKS, base]), "{t}");
         }
     }
 
-    /// The reconciliation, pinned. The resolved target is a name the GATE resolved, so it is
-    /// priced like the closure marker (`bar_for`, as #812 priced it): the society gate, which
-    /// the bar reaches through `contains`, prices two-factor when it is the target. The act
-    /// text is free text, so stage C's exact-basename rule still governs it: the same name, or
-    /// a look-alike, merely MENTIONED in the act prices nothing.
+    /// The reconciliation: a resolved target is priced like the closure marker (`bar_for`, as
+    /// #812 priced it); the act text keeps stage C's exact-basename rule.
     #[test]
     fn the_target_is_priced_like_a_marker_and_the_act_text_like_stage_c() {
         let society = "/wt/plugins/kimi/hooks/society_pre_tool_use.py";
-        assert_eq!(open_t(HOOKS, "Edit -> act", Some(society)).bar, Bar::SovereignPlusPeer,
+        assert_eq!(open_t(HOOKS, "Edit -> act", &[society]).bar, Bar::SovereignPlusPeer,
                    "#812 priced this from the target; the recut keeps it");
-        assert_eq!(open_t(HOOKS, &format!("Edit -> {society}"), None).bar, Bar::SingleApprover,
+        assert_eq!(open_t(HOOKS, &format!("Edit -> {society}"), &[]).bar, Bar::SingleApprover,
                    "stage C's act-text rule is unchanged: no target, no change");
-        assert_eq!(open_t("plugins/_shared", "cp a /w/plugins/_shared/not_witness.py.bak", None).bar,
+        assert_eq!(open_t("plugins/_shared", "cp a /w/plugins/_shared/not_witness.py.bak", &[]).bar,
                    Bar::SingleApprover, "a look-alike in the act text is not the witness");
-        // A trailing slash is not a basename-less target.
-        assert_eq!(open_t(HOOKS, "Edit -> act", Some("/wt/plugins/kimi/hooks/")).matched_markers,
-                   vec![HOOKS.to_string(), "hooks".to_string()]);
+        assert_eq!(open_t(HOOKS, "Edit -> act", &["/wt/plugins/kimi/hooks/"]).matched_markers,
+                   v(&[HOOKS, "hooks"]));
     }
 
-    /// ONE rule: `price` is what `open` records, for every combination of the three inputs.
-    /// Absent target is bit-for-bit the stage C rule.
+    /// ONE rule: `price` is what `open` records, for every combination of the inputs. No
+    /// targets is bit-for-bit the stage C rule.
     #[test]
     fn open_records_exactly_what_the_one_rule_prices() {
         let acts = ["Edit -> act", "sed -i s/a/b/ plugins/_shared/hestia_single_gate.py"];
-        let targets = [None, Some(TARGET), Some("/tmp/ordinary.txt")];
+        let targets: [&[&str]; 4] = [&[], &[TARGET], &["/tmp/ordinary.txt"],
+                                     &["/tmp/ordinary.txt", TARGET]];
         for marker in [HOOKS, "plugins/_shared", "witness.py"] {
             for act in acts {
                 for t in targets {
                     let e = open_t(marker, act, t);
-                    let (bar, markers) = price(marker, Some(act), t);
+                    let (bar, markers) = price(marker, Some(act), &v(t));
                     assert_eq!((e.bar, &e.matched_markers), (bar, &markers), "{marker} {act} {t:?}");
-                    // Monotonic: never below the marker alone, nor below the marker + act.
                     assert!(e.bar >= bar_for(marker));
-                    assert!(e.bar >= price(marker, Some(act), None).0);
+                    assert!(e.bar >= price(marker, Some(act), &[]).0);
                 }
-                // No target is the stage C rule exactly.
-                assert_eq!(price(marker, Some(act), None).1,
-                           markers_of(marker, Some(act), None));
+                assert_eq!(price(marker, Some(act), &[]).1, markers_of(marker, Some(act), &[]));
             }
         }
     }
 
-    /// The target is a path; an over-long one keeps its TAIL, where the filename is.
+    /// Bounds: an over-long target keeps its TAIL (the filename); more than
+    /// `MAX_RESOLVED_TARGETS` is an `overflow` sentinel — the highest bar — never a silent cut.
     #[test]
-    fn an_over_long_target_keeps_the_filename() {
+    fn bounds_keep_the_filename_and_fail_closed_on_overflow() {
         let long = format!("/{}/plugins/kimi/hooks/pre_tool_use.py", "d".repeat(2000));
         let n = normalize_resolved_target(Some(&long)).unwrap();
         assert_eq!(n.chars().count(), RESOLVED_TARGET_MAX);
         assert!(n.ends_with("/pre_tool_use.py"));
-        assert_eq!(open_t(HOOKS, "Edit -> act", Some(&long)).bar, Bar::SovereignPlusPeer);
+        assert_eq!(open_t(HOOKS, "Edit -> act", &[&long]).bar, Bar::SovereignPlusPeer);
         assert_eq!(normalize_resolved_target(Some(" a \n b ")).as_deref(), Some("a b"));
         assert_eq!(normalize_resolved_target(Some(" \t ")), None);
+
+        let many: Vec<String> = (0..MAX_RESOLVED_TARGETS + 3)
+            .map(|i| format!("/wt/plugins/kimi/hooks/f{i}.txt")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let e = open_t(HOOKS, "Edit -> act", &refs);
+        assert_eq!(e.resolved_targets.len(), MAX_RESOLVED_TARGETS + 1);
+        assert_eq!(e.resolved_targets.last().unwrap(), &format!("{UNPRICEABLE_PREFIX}overflow"));
+        assert_eq!(e.bar, Bar::SovereignPlusPeer, "a write set too large to carry prices highest");
+    }
+
+    /// The wire: `resolved_targets` (array) and the single-string `resolved_target` are joined;
+    /// anything malformed is a sentinel, never silently nothing.
+    #[test]
+    fn the_wire_accepts_both_spellings_and_never_drops_a_malformed_one() {
+        let j = serde_json::json!({"resolved_targets": ["/a/x.py", "/a/y.py"], "resolved_target": "/a/z.py"});
+        assert_eq!(resolved_targets_from_args(&j), v(&["/a/x.py", "/a/y.py", "/a/z.py"]));
+        assert!(resolved_targets_from_args(&serde_json::json!({})).is_empty());
+        let mal = format!("{UNPRICEABLE_PREFIX}malformed");
+        assert_eq!(resolved_targets_from_args(&serde_json::json!({"resolved_targets": "/a/x.py"})),
+                   v(&[&mal]));
+        assert_eq!(resolved_targets_from_args(&serde_json::json!({"resolved_targets": ["/a", 3]})),
+                   v(&["/a", &mal]));
+        assert_eq!(resolved_targets_from_args(&serde_json::json!({"resolved_target": 7})), v(&[&mal]));
+        // #1247's producer spelling (`resolved_target` + `also_resolved`) prices as the same
+        // list, so both branches' producers agree with this daemon.
+        let j = serde_json::json!({"resolved_target": "/a/x.py", "also_resolved": ["/a/y.py", "/a/x.py"]});
+        assert_eq!(resolved_targets_from_args(&j), v(&["/a/x.py", "/a/y.py"]));
+        let order = serde_json::json!({"resolved_target": "/w/plugins/_shared/ordinary.txt",
+                                       "also_resolved": ["/w/plugins/_shared/hestia_single_gate.py"]});
+        assert_eq!(price("plugins/_shared", Some("Bash: …"), &resolved_targets_from_args(&order)).0,
+                   Bar::SovereignPlusPeer);
     }
 
     fn opened(id: &str, marker: &str, extra: serde_json::Value) -> crate::storage::chain::ChainEntry {
@@ -6558,9 +6805,7 @@ mod resolved_target_tests {
         }
     }
 
-    /// #812 review hold 2: replay RESTORES the recorded bar; it does not reprice history. The
-    /// recorded value deliberately contradicts what today's rule derives (a marker `price`
-    /// prices two-factor, recorded single-approver) — standing in for any future rule change.
+    /// #812 review hold 2: replay RESTORES the recorded bar; it does not reprice history.
     #[test]
     fn replay_restores_the_recorded_bar_not_todays_policy() {
         let mut s = EscalationStore::default();
@@ -6570,68 +6815,64 @@ mod resolved_target_tests {
                                T0 + 20), 1);
         assert_eq!(s.get("rec1").unwrap().bar, Bar::SingleApprover,
                    "the record carries the criterion in force at the time");
-        // And the other direction: a row priced strong from its target stays strong.
         assert_eq!(s.rehydrate(&[opened("rec2", HOOKS,
                                         serde_json::json!({"bar": "sovereign_plus_peer",
-                                                           "resolved_target": TARGET,
+                                                           "resolved_targets": [TARGET],
                                                            "matched_markers": [HOOKS, "pre_tool_use.py"]}))],
                                T0 + 20), 1);
         let r2 = s.get("rec2").unwrap();
         assert_eq!(r2.bar, Bar::SovereignPlusPeer);
-        assert_eq!(r2.resolved_target.as_deref(), Some(TARGET));
-        assert_eq!(r2.matched_markers, vec![HOOKS.to_string(), "pre_tool_use.py".to_string()]);
+        assert_eq!(r2.resolved_targets, v(&[TARGET]));
+        assert_eq!(r2.matched_markers, v(&[HOOKS, "pre_tool_use.py"]));
     }
 
     /// The fallback, for rows that recorded no readable bar: priced by THE rule, from what the
-    /// row carries — its marker, its act text and (if any) its target. A legacy row (no target,
-    /// no bar) prices exactly as stage C priced it; an unparseable bar is no bar.
+    /// row carries. A legacy row prices exactly as stage C priced it; an unparseable bar is no
+    /// bar; the first cut's single-string `resolved_target` is read too.
     #[test]
     fn a_row_with_no_readable_bar_is_priced_by_the_one_rule() {
         let mut s = EscalationStore::default();
         s.rehydrate(&[
             opened("leg1", HOOKS, serde_json::json!({})),
             opened("leg2", HOOKS, serde_json::json!({"act_text": "Edit -> /w/plugins/x/hooks/witness.py"})),
-            opened("tgt1", HOOKS, serde_json::json!({"resolved_target": TARGET})),
+            opened("tgt1", HOOKS, serde_json::json!({"resolved_targets": ["/x/a.txt", TARGET]})),
+            opened("tgt2", HOOKS, serde_json::json!({"resolved_target": TARGET})),
             opened("bad1", HOOKS, serde_json::json!({"bar": "two_humans_and_a_dog",
-                                                     "resolved_target": TARGET})),
-            // Pre-stage-C: a bar recorded, no markers — it was priced over the marker alone.
+                                                     "resolved_targets": [TARGET]})),
             opened("pre1", HOOKS, serde_json::json!({"bar": "single_approver",
                                                      "act_text": "Edit -> /w/plugins/x/hooks/witness.py"})),
         ], T0 + 20);
         let g = |id: &str| s.get(id).unwrap().clone();
         assert_eq!(g("leg1").bar, Bar::SingleApprover);
-        assert_eq!(g("leg1").resolved_target, None, "absent restores absent, never fails");
+        assert!(g("leg1").resolved_targets.is_empty(), "absent restores absent, never fails");
         assert_eq!(g("leg2").bar, Bar::SovereignPlusPeer, "stage C's act-text fallback, unchanged");
-        assert_eq!(g("tgt1").bar, Bar::SovereignPlusPeer);
+        assert_eq!(g("tgt1").bar, Bar::SovereignPlusPeer, "every target, not the first");
+        assert_eq!(g("tgt2").bar, Bar::SovereignPlusPeer);
         assert_eq!(g("bad1").bar, Bar::SovereignPlusPeer, "an unreadable criterion is recomputed");
         assert_eq!(g("pre1").bar, Bar::SingleApprover, "recorded, so restored — not repriced");
-        assert_eq!(g("pre1").matched_markers, vec![HOOKS.to_string()]);
+        assert_eq!(g("pre1").matched_markers, v(&[HOOKS]));
     }
 
-    /// Coalescing (#668) must not be the one path on which the target cannot strengthen: an
-    /// ask that prices HIGHER than its pending twin is minted, not folded into the weaker row.
-    /// The reverse fold (a weaker ask onto a stronger twin) loses nothing and still coalesces.
+    /// Coalescing (#668) must not be the one path on which a target cannot strengthen.
     #[test]
     fn a_fold_never_lowers_the_price() {
         let act = truncated_shell_act();
         let mut s = EscalationStore::default();
         let weak = s.open_or_coalesce_with_payload("kimi-code", "r", "Bash", HOOKS, Some(&act),
-                                                   None, None, None, None, T0, 3600).unwrap();
+                                                   &[], None, None, None, T0, 3600).unwrap();
         assert_eq!(weak.escalation().bar, Bar::SingleApprover);
         let strong = s.open_or_coalesce_with_payload("kimi-code", "r", "Bash", HOOKS, Some(&act),
-                                                     Some(TARGET), None, None, None, T0 + 5, 3600)
+                                                     &v(&[TARGET]), None, None, None, T0 + 5, 3600)
             .unwrap();
         assert!(!strong.coalesced(), "a stronger ask is not folded into a weaker twin");
         assert_eq!(strong.escalation().bar, Bar::SovereignPlusPeer);
-        // Same act again, with the target: folds onto the strong row (equal price).
         let again = s.open_or_coalesce_with_payload("kimi-code", "r", "Bash", HOOKS, Some(&act),
-                                                    Some(TARGET), None, None, None, T0 + 9, 3600)
+                                                    &v(&[TARGET]), None, None, None, T0 + 9, 3600)
             .unwrap();
         assert!(again.coalesced());
         assert_eq!(again.escalation().id, strong.escalation().id);
-        // And a targetless re-ask folds too: the oldest pending twin at or above its price.
         let old_hook = s.open_or_coalesce_with_payload("kimi-code", "r", "Bash", HOOKS, Some(&act),
-                                                       None, None, None, None, T0 + 12, 3600)
+                                                       &[], None, None, None, T0 + 12, 3600)
             .unwrap();
         assert!(old_hook.coalesced());
     }
