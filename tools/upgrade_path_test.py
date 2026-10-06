@@ -93,6 +93,43 @@ BAD_OUTCOMES = ("HALF-DEPLOYED", "REFUSED", "FAIL ")
 PASSTHROUGH = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "SYSTEMROOT", "PYTHONDONTWRITEBYTECODE")
 
 
+#: Installed into every Python process the simulated machine starts (via PYTHONPATH): any
+#: connect to the guarded port is REFUSED before it leaves the process, and logged, and the
+#: harness fails the run if the log is not empty. WHY (measured on this harness's first runs,
+#: 2026-10-06): previous-release gates default HESTIA_ENDPOINT to 127.0.0.1:7711 when no
+#: projection loads (hestia_gate_mechanism.py, at 588684d6 and still on main), so a gate probed
+#: under a registered line without HESTIA_HOME reached the LIVE daemon and opened real
+#: escalations under codex's and kimi-code's names. An isolated daemon is not isolation while
+#: any code path still carries the live default; this makes the default unreachable and visible.
+GUARD_SOURCE = """\
+import os, socket, sys
+_PORT = int(os.environ.get("UPGRADE_PATH_GUARD_PORT", "0") or 0)
+_LOG = os.environ.get("UPGRADE_PATH_GUARD_LOG")
+if _PORT:
+    _connect, _connect_ex = socket.socket.connect, socket.socket.connect_ex
+    def _guard(addr):
+        try:
+            port = addr[1]
+        except Exception:
+            return
+        if port == _PORT:
+            if _LOG:
+                try:
+                    with open(_LOG, "a") as f:
+                        f.write("blocked pid=%d %s:%s argv=%s\\n" % (os.getpid(), addr[0], port, " ".join(sys.argv)[:300]))
+                except OSError:
+                    pass
+            raise ConnectionRefusedError("upgrade-path guard: port %d is the live daemon's" % port)
+    def connect(self, addr):
+        _guard(addr)
+        return _connect(self, addr)
+    def connect_ex(self, addr):
+        _guard(addr)
+        return _connect_ex(self, addr)
+    socket.socket.connect, socket.socket.connect_ex = connect, connect_ex
+"""
+
+
 class SetupError(Exception):
     """The simulation could not be built. Not a verdict on the candidate."""
 
@@ -312,6 +349,8 @@ class Machine:
         self.endpoint = f"http://127.0.0.1:{self.port}/mcp"
         self.passphrase = secrets.token_hex(16)
         self.unit = f"hestia-upgrade-sim-{os.getpid()}.service"
+        self.guard_dir = root / "guard"
+        self.guard_log = root / "live-port-connects.log"
         self.daemon: subprocess.Popen | None = None
         self.transcript: list[str] = []
 
@@ -321,7 +360,32 @@ class Machine:
         env["HOME"] = str(self.home)
         env["USER"] = os.environ.get("USER", "sim")
         env["PATH"] = f"{self.home}/.local/bin:" + env.get("PATH", "/usr/bin:/bin")
+        # Isolation, twice over: every process is told the isolated endpoint (a projection
+        # overrides it with the same value), and every Python process carries the live-port guard.
+        env["HESTIA_ENDPOINT"] = self.endpoint
+        env["PYTHONPATH"] = str(self.guard_dir)
+        env["UPGRADE_PATH_GUARD_PORT"] = str(LIVE_PORT)
+        env["UPGRADE_PATH_GUARD_LOG"] = str(self.guard_log)
         return env
+
+    def install_guard(self) -> None:
+        self.guard_dir.mkdir(parents=True, exist_ok=True)
+        (self.guard_dir / "sitecustomize.py").write_text(GUARD_SOURCE)
+
+    def live_port_attempts(self) -> list[str]:
+        try:
+            return [ln for ln in self.guard_log.read_text().splitlines() if ln.strip()]
+        except OSError:
+            return []
+
+    def check_projection_endpoints(self) -> None:
+        """Every rendered projection must name the isolated daemon, or gates would follow it."""
+        for proj in sorted((self.hestia_home / "seats").iterdir()):
+            for line in proj.read_text().splitlines():
+                key, _, value = line.partition("=")
+                if key.split("__")[-1] == "HESTIA_ENDPOINT" and value != self.endpoint:
+                    raise SetupError(f"projection {proj.name} names endpoint {value!r}, not the "
+                                     f"isolated daemon's {self.endpoint!r}")
 
     def deploy_env(self) -> dict[str, str]:
         """What hestia-deploy.service gives the timer, re-rooted at the fake HOME."""
@@ -375,6 +439,7 @@ class Machine:
     # -- the box ------------------------------------------------------------------------------
     def build_box(self) -> None:
         """Four harnesses installed, hestia not yet: their config dirs and empty configs."""
+        self.install_guard()
         for d in (self.home, self.workspace, self.scratch_dir, self.origin, self.home / ".local" / "bin"):
             d.mkdir(parents=True, exist_ok=True)
         (self.home / ".claude").mkdir()
@@ -665,6 +730,7 @@ def scenario(args: argparse.Namespace) -> int:
               f"{json.loads((m.hestia_home / 'current-build.json').read_text()).get('build_id')}; "
               f"seat projections: {', '.join(seats) or 'NONE'}")
         report["previous_seats"] = seats
+        m.check_projection_endpoints()
 
         # ---- 2. the candidate, via the timer's path -------------------------------------------
         m.move_main(candidate)
@@ -729,6 +795,13 @@ def scenario(args: argparse.Namespace) -> int:
                             "not a no-op")
     finally:
         m.stop_daemon()
+        attempts = m.live_port_attempts()
+        report["live_port_attempts"] = attempts
+        if attempts:
+            failures.append(f"d. {len(attempts)} connection attempt(s) to 127.0.0.1:{LIVE_PORT} "
+                            "(blocked by the guard; the simulation is NOT isolated)")
+            for a in attempts[:10]:
+                m.log(f"   | {a}")
         report["seconds"] = round(time.monotonic() - t0, 1)
         report["failures"] = failures
         if args.json:

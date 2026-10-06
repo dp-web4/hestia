@@ -141,6 +141,8 @@ with tempfile.TemporaryDirectory() as raw:
     m.workspace = m.home / "ai-workspace"
     m.endpoint = "http://127.0.0.1:1/mcp"
     m.unit = "sim.service"
+    m.guard_dir = Path(raw) / "guard"
+    m.guard_log = Path(raw) / "live-port-connects.log"
     saved = {k: os.environ.get(k) for k in ("HESTIA_HOME", "CLAUDECODE", "HESTIA_ROLE")}
     os.environ.update({"HESTIA_HOME": "/real/.hestia", "CLAUDECODE": "1", "HESTIA_ROLE": "r"})
     try:
@@ -149,6 +151,9 @@ with tempfile.TemporaryDirectory() as raw:
         check("a governed session's CLAUDECODE does not leak into the machine", "CLAUDECODE" not in base)
         check("HESTIA_ROLE does not leak into the machine", "HESTIA_ROLE" not in base)
         check("HOME is the fake one", base["HOME"] == str(m.home))
+        check("every process is told the isolated endpoint", base["HESTIA_ENDPOINT"] == m.endpoint)
+        check("every Python process carries the live-port guard",
+              base["PYTHONPATH"] == str(m.guard_dir) and base["UPGRADE_PATH_GUARD_PORT"] == str(h.LIVE_PORT))
         dep = m.deploy_env()
         check("the deploy never restarts anything", dep["HESTIA_RESTART_CMD"] == "false")
         check("the deploy endpoint is never the live daemon's", ":7711" not in dep["HESTIA_ENDPOINT"])
@@ -166,6 +171,39 @@ with tempfile.TemporaryDirectory() as raw:
                 os.environ[k] = v
 
 check("free_port never answers the live daemon's port", h.free_port() != h.LIVE_PORT)
+
+# ---- the live-port guard actually refuses, and says so -----------------------------------------
+# Exercised on a FREE port nothing listens on, never on the live one: if the guard failed to
+# load, the worst case is a natural "connection refused" from an empty port, which the checks
+# below tell apart from the guard's refusal by its message and its log line.
+import subprocess  # noqa: E402
+with tempfile.TemporaryDirectory() as raw:
+    guard = Path(raw) / "guard"
+    guard.mkdir()
+    (guard / "sitecustomize.py").write_text(h.GUARD_SOURCE)
+    log = Path(raw) / "connects.log"
+    port = h.free_port()
+    probe = ("import socket, urllib.request\n"
+             "for f in (lambda: socket.create_connection(('127.0.0.1', %d), timeout=2),\n"
+             "          lambda: urllib.request.urlopen('http://127.0.0.1:%d/mcp', timeout=2)):\n"
+             "    try:\n"
+             "        f(); print('CONNECTED')\n"
+             "    except Exception as e:\n"
+             "        print('REFUSED', e)\n") % (port, port)
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONPATH": str(guard),
+           "UPGRADE_PATH_GUARD_PORT": str(port), "UPGRADE_PATH_GUARD_LOG": str(log)}
+    out = subprocess.run([sys.executable, "-c", probe], env=env, capture_output=True, text=True, timeout=30)
+    check("the guard refuses a raw socket connect to the guarded port",
+          out.stdout.count("upgrade-path guard") >= 1, out.stdout + out.stderr)
+    check("the guard refuses an HTTP request to the guarded port (urllib)",
+          out.stdout.count("upgrade-path guard") == 2, out.stdout + out.stderr)
+    logged = log.read_text().splitlines() if log.exists() else []
+    check("the guard logs every blocked attempt", len(logged) == 2, str(logged))
+    env["UPGRADE_PATH_GUARD_PORT"] = str(h.free_port())
+    log.unlink(missing_ok=True)
+    out = subprocess.run([sys.executable, "-c", probe], env=env, capture_output=True, text=True, timeout=30)
+    check("the guard leaves other ports alone", "upgrade-path guard" not in out.stdout and not log.exists(),
+          out.stdout)
 
 print()
 if FAILS:
