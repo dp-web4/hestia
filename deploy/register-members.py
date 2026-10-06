@@ -558,6 +558,7 @@ def plan_reconcile(desired: list[Desired], regs: list[Reg], hooks, layout: str, 
     flat = layout == "flat"
     norm = lambda p: os.path.normpath(p) if p else p  # noqa: E731
     dropped: set[int] = set()
+    dropped_at: set[tuple] = set()               # (event, gi, hi) of every dropped duplicate
     moved: set[int] = set()
     regroup: dict[tuple, list] = {}               # (event, gi) -> [(Reg, Desired)] needing a matcher
     sets: list[tuple] = []
@@ -575,6 +576,7 @@ def plan_reconcile(desired: list[Desired], regs: list[Reg], hooks, layout: str, 
             for r in owned:
                 if r is not keep:
                     dropped.add(id(r))
+                    dropped_at.add((r.event, r.gi, r.hi))
                     P.ops.append(("drop", r))
                     P.changes.append(("remove", f"{key}: duplicate owned entry {_show(r.hook.get('command'))}"
                                                 f" (kept one; {len(owned)} were registered)"))
@@ -629,9 +631,13 @@ def plan_reconcile(desired: list[Desired], regs: list[Reg], hooks, layout: str, 
     # surviving hook in it is an owned hook wanting that same matcher; otherwise move each owned hook
     # out to its own group, so no foreign hook's matcher ever moves.
     for (event, gi), pairs in regroup.items():
-        members = [r for r in regs if r.event == event and r.gi == gi and id(r) not in dropped]
+        # EVERY entry of the group counts, whatever its type (Codex review 17401 P2): the index skips
+        # entries without a `command` (a `type: prompt` / agent hook), so counting indexed hooks read a
+        # group shared with a foreign prompt as wholly owned and moved the prompt's matcher with it.
+        entries = (hooks.get(event) or [])[gi].get("hooks") or [] if isinstance(hooks, dict) else []
+        surviving = {hi for hi in range(len(entries)) if (event, gi, hi) not in dropped_at}
         wants = {repr(d.matcher) for _r, d in pairs}
-        if len(members) == len(pairs) and len(wants) == 1:
+        if surviving == {r.hi for r, _d in pairs} and len(wants) == 1:
             m = pairs[0][1].matcher
             P.ops.append(("gmatch", event, gi, DELETE if m is None else m))
             for r, d in pairs:
@@ -1093,11 +1099,73 @@ def _load(member: str, spec: dict, template: dict, home: str, env=None, source=N
     return Loaded(cfg, dest, reader, layout, raw, data, hooks, desired, reg)
 
 
+class Prepared:
+    """A member's registration, fully prepared and PROVED, nothing written: the reconcile planned,
+    the edit placed on the text (TOML) or the document (JSON), `ensure` applied, the result parsed
+    back and proved. `new` is the config text to write (None: nothing changes); `hooks` the hooks
+    structure the config will carry once it is written."""
+    def __init__(self, L, P, changes, new, hooks):
+        self.L, self.P, self.changes, self.new, self.hooks = L, P, changes, new, hooks
+
+
+def prepare_member(member: str, spec: dict, template: dict, home: str, *, dry: bool, plan: bool = False,
+                   env=None, source=None, installed=os.path.isfile):
+    """THE ONE side-effect-free preparation, shared by the installer (register_member) and the deploy
+    preflight (reconciled_commands). Codex review 17401 P1: the preflight once ran only the structural
+    reconcile and certified a TOML edit the installer then refused to place -- the new gate would run
+    under the stale line. Everything that can refuse lives here, so neither caller can certify what
+    the other refuses. -> Prepared, or (verdict, lines) when the member stops (skip/refused/failed/plan)."""
+    got = _load(member, spec, template, home, env, source=source)
+    if not isinstance(got, Loaded):
+        return got
+    L = got
+    flat = L.layout == "flat"
+    regs = index_hooks(L.hooks, flat)
+    P = plan_reconcile(L.desired, regs, L.hooks, L.layout, installed=installed, dry=dry, plan_mode=plan)
+    if plan:
+        return "plan", [f"{b}\t{t}" for b, t in P.planned] + \
+            [n for n in P.notes if n.startswith(("NARROW", "PENDING"))]
+    changes = [f"{verb} {text}" for verb, text in P.changes]
+    if L.layout == "json":
+        if not P.ops:
+            return Prepared(L, P, changes, None, L.hooks)
+        data = copy.deepcopy(L.data)
+        data["hooks"] = apply_structural(L.hooks, P.ops, "json")
+        new = json.dumps(data, indent=2) + "\n"
+        if json.loads(new).get("hooks") != data["hooks"]:
+            return "failed", [f"rendered {L.cfg} does not reload to the reconciled hooks; nothing written"] + P.notes
+        return Prepared(L, P, changes, new, data["hooks"])
+    new = L.raw
+    if P.ops:
+        expected = apply_structural(L.hooks, P.ops, L.layout)
+        try:
+            new = apply_toml_text(L.raw, L.hooks, P.ops, L.layout, member)
+        except Unlocatable as e:
+            return "refused", [f"{L.cfg}: the reconcile cannot be placed on this file's text ({e}); "
+                               f"nothing written -- hestia's lines here need a hand repair once"] + P.notes
+        why = verify_toml_edit(L.raw, new, expected, flat)
+        if why:
+            return "refused", [f"{L.cfg}: the edit could not be proved ({why}); nothing written"] + P.notes
+    new, ensured = toml_ensure(new, L.reg.get("ensure") or [])
+    changes += [f"ensure {e}" for e in ensured]
+    if not changes:
+        return Prepared(L, P, changes, None, L.hooks)
+    err = validate_toml(new)
+    if err:
+        return "failed", [f"rendered {L.cfg} would not parse ({err}); nothing written"] + P.notes
+    try:
+        hooks = toml_hooks(new, flat)
+    except TomlUnsupported as e:
+        return "failed", [f"rendered {L.cfg} cannot be read back ({e}); nothing written"] + P.notes
+    return Prepared(L, P, changes, new, hooks)
+
+
 def reconciled_commands(member_dir: str, home: str, env=None) -> tuple[str, list[str], str]:
     """The hook commands this member's registration will carry AFTER the install (every planned file
-    assumed installed, which is what install-members.sh does before it registers).
-    -> (status, commands, reason); status in {ok, absent, refused}. Shared with the deploy
-    preflight, so the probe judges the line that will be written, by the same renderer."""
+    assumed installed, which is what install-members.sh does before it registers), read back from the
+    PROVED edit `prepare_member` produces -- the installer's own preparation, so a registration the
+    installer would refuse is refused here too. -> (status, commands, reason); status in
+    {ok, absent, refused}."""
     member = os.path.basename(os.path.normpath(member_dir))
     expects = os.path.join(member_dir, "expects.json")
     tpl = os.path.join(member_dir, "hooks", "hooks.json")
@@ -1113,15 +1181,12 @@ def reconciled_commands(member_dir: str, home: str, env=None) -> tuple[str, list
             template = json.load(fh)
     except (OSError, ValueError) as e:
         return "refused", [], f"hooks/hooks.json unreadable ({type(e).__name__})"
-    got = _load(member, spec, template, home, env, source=member_dir)
-    if not isinstance(got, Loaded):
+    got = prepare_member(member, spec, template, home, dry=False, env=env, source=member_dir,
+                         installed=lambda t: True)
+    if not isinstance(got, Prepared):
         verdict, lines = got
         return ("absent" if verdict == "skip" else "refused"), [], "; ".join(lines)
-    regs = index_hooks(got.hooks, got.layout == "flat")
-    P = plan_reconcile(got.desired, regs, got.hooks, got.layout, installed=lambda t: True,
-                       dry=False, plan_mode=False)
-    new = apply_structural(got.hooks, P.ops, got.layout)
-    return "ok", [r.hook["command"] for r in index_hooks(new, got.layout == "flat")
+    return "ok", [r.hook["command"] for r in index_hooks(got.hooks, got.L.layout == "flat")
                   if isinstance(r.hook.get("command"), str)], ""
 
 
@@ -1131,18 +1196,13 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
     """-> (verdict, lines). verdict in {registered, ok, skip, refused, failed, narrow, pending, plan}.
     `lines`: the changes made (or planned: 'base\\ttarget'), each 'add ...' / 'rewrite ...' /
     'remove ...' / 'ensure ...', then any NARROW / PENDING / SHORT / INERT / FOREIGN notes.
-    `raise_timeouts` is accepted and ignored: the reconcile sets every owned timeout."""
-    got = _load(member, spec, template, home, env, source=source)
-    if not isinstance(got, Loaded):
+    `raise_timeouts` is accepted and ignored: the reconcile sets every owned timeout.
+    The preparation is prepare_member()'s; this function only writes what it proved."""
+    got = prepare_member(member, spec, template, home, dry=dry, plan=plan, env=env, source=source)
+    if not isinstance(got, Prepared):
         return got
-    L = got
+    L, P, changes = got.L, got.P, got.changes
     exists = os.path.exists(L.cfg)
-    flat = L.layout == "flat"
-    regs = index_hooks(L.hooks, flat)
-    P = plan_reconcile(L.desired, regs, L.hooks, L.layout, installed=os.path.isfile, dry=dry, plan_mode=plan)
-    if plan:
-        return "plan", [f"{b}\t{t}" for b, t in P.planned] + \
-            [n for n in P.notes if n.startswith(("NARROW", "PENDING"))]
 
     def done(verdict: str, out: list[str]) -> tuple[str, list[str]]:
         # What this script registers points INTO `dest`; install-members.sh refuses a registration
@@ -1153,52 +1213,22 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
             log(f"  made  {member}: {L.dest} — the directory its registration points into")
         return verdict, out
 
-    changes = [f"{verb} {text}" for verb, text in P.changes]
-    if L.layout == "json":
-        if P.ops:
-            data = L.data
-            data["hooks"] = apply_structural(L.hooks, P.ops, "json")
-            new = json.dumps(data, indent=2) + "\n"
-            back = json.loads(new)
-            if back.get("hooks") != data["hooks"]:
-                return "failed", [f"rendered {L.cfg} does not reload to the reconciled hooks; nothing written"] + P.notes
-            if not dry:
-                if L.raw:
-                    _backup(L.cfg)
-                _write_atomic(L.cfg, new)
-    else:
-        new = L.raw
-        if P.ops:
-            expected = apply_structural(L.hooks, P.ops, L.layout)
-            try:
-                new = apply_toml_text(L.raw, L.hooks, P.ops, L.layout, member)
-            except Unlocatable as e:
-                return "refused", [f"{L.cfg}: the reconcile cannot be placed on this file's text ({e}); "
-                                   f"nothing written -- hestia's lines here need a hand repair once"] + P.notes
-            why = verify_toml_edit(L.raw, new, expected, flat)
-            if why:
-                return "refused", [f"{L.cfg}: the edit could not be proved ({why}); nothing written"] + P.notes
-        new, ensured = toml_ensure(new, L.reg.get("ensure") or [])
-        changes += [f"ensure {e}" for e in ensured]
-        if changes:
-            err = validate_toml(new)
+    if got.new is not None and not dry:
+        if L.raw:
+            _backup(L.cfg)
+        _write_atomic(L.cfg, got.new)
+        if L.layout != "json":
+            with open(L.cfg, encoding="utf-8", errors="replace") as fh:
+                back = fh.read()
+            err = validate_toml(back)
             if err:
-                return "failed", [f"rendered {L.cfg} would not parse ({err}); nothing written"] + P.notes
-            if not dry:
-                if L.raw:
-                    _backup(L.cfg)
-                _write_atomic(L.cfg, new)
-                with open(L.cfg, encoding="utf-8", errors="replace") as fh:
-                    back = fh.read()
-                err = validate_toml(back)
-                if err:
-                    # Restore what THIS run read, not `.pre-register.bak` (written once, on the first
-                    # run ever). A file that did not exist goes back to not existing.
-                    if exists:
-                        _write_atomic(L.cfg, L.raw)
-                    else:
-                        os.remove(L.cfg)
-                    return "failed", [f"{L.cfg} failed to parse after write ({err}); restored as it was"] + P.notes
+                # Restore what THIS run read, not `.pre-register.bak` (written once, on the first
+                # run ever). A file that did not exist goes back to not existing.
+                if exists:
+                    _write_atomic(L.cfg, L.raw)
+                else:
+                    os.remove(L.cfg)
+                return "failed", [f"{L.cfg} failed to parse after write ({err}); restored as it was"] + P.notes
     lines = changes + P.notes
     # #1142 re-review P2: narrow and pending are unfinished work: they outrank a partial registration.
     if P.narrow:

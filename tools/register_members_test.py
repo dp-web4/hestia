@@ -589,6 +589,42 @@ def test_an_owned_hook_sharing_a_group_is_moved_never_the_foreign_hooks_matcher(
         assert again.returncode == 0 and "REWROTE" not in again.stdout and "ok    claude-code" in again.stdout, again.stdout
 
 
+def test_a_foreign_hook_without_a_command_keeps_its_group_and_matcher():
+    """Codex review 17401 P2: group ownership was counted from the hooks the reader INDEXES, and the
+    index skips entries with no `command` -- a `type: prompt` (or agent) hook. A group holding an
+    owned narrow gate and a foreign prompt read as wholly owned, so the matcher was rewritten on the
+    GROUP and the unrelated prompt started running for every tool. Every entry counts: the owned
+    hook moves to its own group, and the foreign one stays byte-identical under its own matcher."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        dest = _install(tmp, "claude-code", "pre_tool_use.py", "witness.py", "law_inject.py")
+        cfg = tmp / ".claude" / "settings.json"
+        prompt = {"type": "prompt", "prompt": "Review this read request."}
+        cfg.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "Read", "hooks": [
+            {"type": "command", "command": f"python3 {dest}/pre_tool_use.py", "timeout": 10}, prompt]}]}}, indent=2))
+        r = _run(tmp, plugins, "--member", "claude-code")
+        assert r.returncode == 0, (r.returncode, r.stdout)
+        pre = json.loads(cfg.read_text())["hooks"]["PreToolUse"]
+        assert pre[0] == {"matcher": "Read", "hooks": [prompt]}, pre
+        assert pre[1]["matcher"] == "*" and [h["command"].split("/")[-1] for h in pre[1]["hooks"]] == ["pre_tool_use.py"], pre
+        assert "moved to its own group" in r.stdout, r.stdout
+        # nested TOML: the same shape, a foreign entry with no command
+        _plugins(tmp, ("codex",))
+        _install(tmp, "codex", "pre_tool_use.py", "witness.py", "observe.sh", "hydrate.sh")
+        toml = tmp / ".codex" / "config.toml"
+        foreign = '[[hooks.PreToolUse.hooks]]\ntype = "prompt"\nprompt = "Review this shell call."\n'
+        toml.write_text('[[hooks.PreToolUse]]\nmatcher = "shell"\n\n[[hooks.PreToolUse.hooks]]\ntype = "command"\n'
+                        f'command = "python3 {tmp}/.codex/hooks/pre_tool_use.py"\ntimeout = 15\n\n' + foreign)
+        r = _run(tmp, plugins, "--member", "codex")
+        assert r.returncode == 0, (r.returncode, r.stdout)
+        import tomllib
+        g = tomllib.loads(toml.read_text())["hooks"]["PreToolUse"]
+        assert g[0] == {"matcher": "shell", "hooks": [{"type": "prompt", "prompt": "Review this shell call."}]}, g
+        assert any(gg.get("matcher") == ".*" and gg["hooks"][0]["command"].endswith("/pre_tool_use.py") for gg in g[1:]), g
+        assert foreign in toml.read_text(), toml.read_text()
+
+
 def test_a_narrow_toml_matcher_is_read_from_its_group():
     """The TOML reader takes the matcher from the GROUP header, not the `.hooks` entry header."""
     with tempfile.TemporaryDirectory() as d:
@@ -1735,6 +1771,7 @@ TESTS = [
     test_plan_names_every_hook_to_add_with_its_target,
     test_a_read_only_gate_is_narrow_when_foreign_and_widened_when_owned,
     test_an_owned_hook_sharing_a_group_is_moved_never_the_foreign_hooks_matcher,
+    test_a_foreign_hook_without_a_command_keeps_its_group_and_matcher,
     test_a_narrow_toml_matcher_is_read_from_its_group,
     test_an_inline_comment_on_a_narrow_toml_matcher_is_still_narrow,
     test_the_fallback_line_scan_cannot_widen_a_matcher,
