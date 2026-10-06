@@ -671,13 +671,21 @@ def _closure_view(event: GateEvent):
     tool, ti = event.tool, event.tool_input if isinstance(event.tool_input, dict) else {}
     targets = _patch_targets(tool, ti)
     if targets or (isinstance(tool, str) and tool.lower() == "apply_patch"):
-        found = None
+        found, write, also = None, None, []
         for p in targets:
             cv = closure.classify("Write", {"file_path": p}, cwd=event.cwd)
             if cv.classification == "write":
-                return cv
-            if cv.classification == "read" and found is None:
+                # Every file of a multi-file patch that writes the closure is priced, not only
+                # the first: the first verdict decides the refusal, the rest ride along.
+                if write is None:
+                    write = cv
+                for loc in (cv.resolved, *cv.also_resolved):
+                    if loc and loc != write.resolved and loc not in also:
+                        also.append(loc)
+            elif cv.classification == "read" and found is None:
                 found = cv
+        if write is not None:
+            return replace(write, also_resolved=tuple(also))
         return found
     if _shell_tool(tool) and tool not in ("Bash", "Shell"):
         tool = "Bash"
@@ -721,7 +729,10 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
             # The LOCATION the closure resolved (cwd-joined, symlinks and `..` resolved), not the
             # argument as written: the daemon prices a member's gate entry by where it is, and a
             # relative or `cd`-qualified spelling names no location.
-            resolved_target=(cv.resolved or cv.resource) if cv.marker else None)
+            resolved_target=(cv.resolved or cv.resource) if cv.marker else None,
+            # Every further closure location the same act writes. The daemon prices the bar over
+            # all of them, so it does not depend on which one the act named first.
+            also_resolved=list(cv.also_resolved) if cv.marker else None)
         if claimed is _LATE:
             # Unknown, not "nothing happened": the daemon may have opened or matched an
             # escalation after the bound (#1166). Re-issuing the identical act is safe.

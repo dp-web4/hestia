@@ -111,7 +111,7 @@ import json
 import os
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 from typing import Any, Callable, Iterable, Optional
 
 __all__ = [
@@ -177,6 +177,11 @@ class ClosureVerdict:
     # lands. Set on a resolved write only. It is what the daemon prices a member's gate entry
     # from, by location, so the price never depends on how the act was spelled or summarised.
     resolved: Optional[str] = None
+    # EVERY FURTHER location the same act writes into the closure, after `resolved`, in the
+    # order the act names them. One command or patch can reach several closure files; the
+    # verdict reports the first match, and the daemon prices the bar over ALL of these, so the
+    # price never depends on which closure file the act happened to name first.
+    also_resolved: tuple = ()
 
 
 # ── The closure — segment-pattern matchers, tighten-only union ──────────────────────────────
@@ -1251,18 +1256,32 @@ def classify(tool_name: str, tool_input: Any, *, cwd: Optional[str] = None,
             return ClosureVerdict("write", RULE_OPAQUE_WRITER, None,
                                   targets[0] if targets else "stdin", src)
         position = "read" if note == "out-of-grammar" else "write"
+        first = None
+        also: list = []
         for t in targets:
             marker = closure.match(t, cwd=cwd, position=position)
-            if marker:
+            if not marker:
+                continue
+            if first is None:
                 if note == "out-of-grammar":
                     rule = RULE_OUT_OF_GRAMMAR
                 elif note == "unparseable":
                     rule = RULE_WRITE_UNPARSEABLE
                 else:
                     rule = RULE_WRITE
-                return ClosureVerdict("write", rule, marker, t, src,
-                                      resolved=resolve_location(t, cwd) if rule == RULE_WRITE
-                                      else None)
+                first = ClosureVerdict("write", rule, marker, t, src,
+                                       resolved=resolve_location(t, cwd) if rule == RULE_WRITE
+                                       else None)
+                if rule != RULE_WRITE:
+                    return first  # no resolved write positions to carry
+                continue
+            # Keep classifying past the first match: the refusal is decided, but the PRICE is
+            # the highest over every closure target, so each one must reach the daemon.
+            loc = resolve_location(t, cwd)
+            if loc and loc != first.resolved and loc not in also:
+                also.append(loc)
+        if first is not None:
+            return _dc_replace(first, also_resolved=tuple(also)) if also else first
     except Exception as e:  # noqa: BLE001 — fail-closed: a broken write classifier must not admit
         return ClosureVerdict("write", RULE_INTERNAL, None,
                               f"internal:{type(e).__name__}", src)

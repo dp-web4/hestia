@@ -1529,7 +1529,8 @@ def resolved_target_for_claim(target):
 
 def claim_self_write(marker, tool_name, attempted, *,
                      plugin_id, role, client_name, host_session_id=None, invocation_key=None,
-                     supersession=None, deadline=None, resolved_target=None):
+                     supersession=None, deadline=None, resolved_target=None,
+                     also_resolved=None):
     """Ask ONCE whether a human has already approved this exact (member, marker) write.
     Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
 
@@ -1545,7 +1546,12 @@ def claim_self_write(marker, tool_name, attempted, *,
     target, highest wins (core `gate_escalation::price`), so it can only strengthen the bar.
     It matters because `attempted` is a bounded, self-censoring summary that can cut the
     filename out. Not part of the request key: it is derived from the same act. Old daemons
-    ignore the key; callers that omit it price exactly as before."""
+    ignore the key; callers that omit it price exactly as before.
+
+    `also_resolved` is every FURTHER closure location the same act writes, after the first. The
+    daemon prices them exactly like `resolved_target` (`price_targets`), so a multi-target act
+    is priced by its strongest target whatever order it names them in. Each item gets the
+    same cap and credential discipline as `resolved_target`."""
     claim_args = {
         "plugin_id": plugin_id,
         "role": role,
@@ -1582,6 +1588,9 @@ def claim_self_write(marker, tool_name, attempted, *,
     rt = resolved_target_for_claim(resolved_target)
     if rt:
         claim_args["resolved_target"] = rt
+    more = [m for m in (resolved_target_for_claim(t) for t in (also_resolved or ())) if m]
+    if more:
+        claim_args["also_resolved"] = more
     r = gate_self_call("hestia_gate_escalation_claim", claim_args,
                        plugin_id=plugin_id, role=role, client_name=client_name,
                        host_session_id=host_session_id, deadline=deadline)
