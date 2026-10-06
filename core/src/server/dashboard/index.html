@@ -6290,9 +6290,10 @@
       const name = h.hub_name || h.label || '(unnamed hub)';
       row.innerHTML =
         '<span class="hub-name"></span>' +
-        '<span class="hub-badge ' + st[0] + '"' +
-          (h.probe_error ? ' title="' + escapeHtml(h.probe_error) + '"' : '') + '>' + st[1] + '</span>' +
+        '<span class="hub-badge ' + st[0] + '">' + st[1] + '</span>' +
         '<span class="hub-url"></span><span class="spacer"></span>';
+      // Set through the DOM: escapeHtml lives in the first <script> block, out of scope here.
+      if (h.probe_error) row.querySelector('.hub-badge').title = h.probe_error;
       row.querySelector('.hub-name').textContent = name + (h.active ? ' ·  active' : '');
       row.querySelector('.hub-url').textContent = h.url;
 
