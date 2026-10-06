@@ -123,6 +123,18 @@ log "  home      : $HESTIA_HOME"
 [ "$DRY_RUN" = "1" ] && log "  MODE      : DRY RUN (nothing will be written)"
 log ""
 
+# THE LOCATOR IS CHECKED BEFORE ANYTHING IS PLANNED, INSTALLED OR REGISTERED (Codex review 17401 of #1245).
+# deploy/register-members.py renders HESTIA_HOME onto every gate and witness line and refuses a path it will
+# not write onto a shell line; that refusal used to arrive first, at PLAN, so nothing was planned, nothing
+# installed, and the run took the "no member installed" exit 0 -- the same unsafe path that the publication
+# step below refuses (#1188 review) was swallowed. Same allowlist, checked here once, before any write
+# (DRY_RUN included); a home that does not exist yet is checked as spelled (the step below creates it).
+_hh_early="$(cd "$HESTIA_HOME" 2>/dev/null && pwd -P || printf '%s' "$HESTIA_HOME")"
+case "$_hh_early" in
+  *[!A-Za-z0-9/._+@,:-]*)
+    die "HESTIA_HOME resolves to '$_hh_early', which contains characters this installer will not write onto a hook line, into a sourced shell file or environment.d (allowed: letters, digits and / . _ + @ , : -). Move it to such a path." ;;
+esac
+
 # ORDER IS LOAD-BEARING: the engine is installed and $HESTIA_HOME/shared is repointed
 # BEFORE any hook entrypoint is written. Hooks import their decision engine from that
 # symlink, so installing a hook first opens a window in which the installed hook is newer
@@ -310,7 +322,10 @@ declare -A planned=()
 if [ "${HESTIA_SKIP_REGISTER:-0}" != "1" ]; then
   log "PLAN (deploy/register-members.py --plan)"
   plan_rc=0
-  plan_out="$(python3 "$REPO_ROOT/deploy/register-members.py" --plan 2>&1)" || plan_rc=$?
+  # HESTIA_HOME is passed explicitly: the registrar renders it onto every gate and witness line
+  # (@HESTIA_HOME@, resolved to an absolute path) and refuses when it is unset, and this script's
+  # env-first-else-standard resolution above does not export a defaulted value.
+  plan_out="$(HESTIA_HOME="$HESTIA_HOME" python3 "$REPO_ROOT/deploy/register-members.py" --plan 2>&1)" || plan_rc=$?
   if [ "$plan_rc" != "0" ]; then
     log "  WARN register-members.py --plan failed (rc=$plan_rc): ${plan_out:0:200}"
     any_skipped=1
@@ -520,18 +535,22 @@ done
 installed_json="$installed_json]"
 log ""
 
-# (3) REGISTER, now that every planned file is on disk. The registrar refuses a target that is
-# not (PENDING, rc 9), reports a narrower matcher (NARROW, rc 8) without touching it, and fails
-# closed on a config it cannot parse or re-read (rc 6). Any of those is a gap in this deploy,
+# (3) REGISTER, now that every planned file is on disk. Since dp's 2026-10-06 ruling the registrar
+# is a RECONCILER: every hook line hestia installed (target = <install.dest>/<templated basename>)
+# is rewritten to the rendered template -- command, timeout, matcher -- and duplicates reduced to
+# one; lines it did not install are never touched. It refuses a target that is not on disk
+# (PENDING, rc 9), reports a FOREIGN line narrower than the template (NARROW, rc 8) without
+# touching it, refuses a config whose edit it cannot prove (rc 7), and fails closed on a config
+# it cannot parse or re-read (rc 6). Any of those is a gap in this deploy,
 # said loudly; none of them rolls back what installed correctly.
 if [ "${HESTIA_SKIP_REGISTER:-0}" != "1" ]; then
   log "REGISTER (deploy/register-members.py)"
   reg_rc=0
-  reg_log="$(DRY_RUN="$DRY_RUN" python3 "$REPO_ROOT/deploy/register-members.py" 2>&1)" || reg_rc=$?
+  reg_log="$(DRY_RUN="$DRY_RUN" HESTIA_HOME="$HESTIA_HOME" python3 "$REPO_ROOT/deploy/register-members.py" 2>&1)" || reg_rc=$?
   printf '%s\n' "$reg_log" | sed 's/^/  /'
   case "$reg_rc" in
     0) ;;
-    8) warn "a hestia hook is registered under a matcher narrower than its template's (NARROW above) — not widened, not counted as registered"; any_skipped=1 ;;
+    8) warn "a hook hestia does not own is registered under a matcher narrower than its template's (NARROW above) — not widened, not counted as registered"; any_skipped=1 ;;
     9) warn "a planned hook's file is not on disk after install (PENDING above) — it was NOT registered"; any_skipped=1 ;;
     *) warn "register-members.py failed (rc=$reg_rc) — installed files stand; their registration did not happen"; any_skipped=1 ;;
   esac

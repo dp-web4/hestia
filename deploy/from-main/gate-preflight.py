@@ -5,7 +5,9 @@
 all member hooks.  That made its green preflight a statement about one harness,
 not the set the installer was about to change.  This runner keeps the harness
 details in each plugin's ``expects.json`` and tests only gates whose registration
-is present on this host.
+is present on this host -- since 2026-10-06, the registration the install WILL
+write (the candidate's own ``deploy/register-members.py`` renders and reconciles
+it in memory), not the one on disk, which the install is about to rewrite.
 
 It deliberately proves availability, not entitlement: a member may have an empty
 standing scope and still retain its temp-root read and deploy-hold escape hatch.
@@ -15,6 +17,7 @@ The candidate must allow both acts while its normal enforce posture is active.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -114,6 +117,22 @@ def _launcher_env(commands: Iterable[str], entry: str) -> dict[str, str]:
     return {}
 
 
+def _load_registrar(repo: Path):
+    """The CANDIDATE tree's deploy/register-members.py, loaded as a module: the one renderer and
+    reconciler install-members.sh will run after this preflight. Shared, never re-implemented here,
+    so the line the probe judges is byte-for-byte the line the install writes (dp 2026-10-06).
+    None when the candidate predates the reconciler (then the registered line is what will run)."""
+    path = repo / "deploy" / "register-members.py"
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("hestia_register_members_candidate", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module if hasattr(module, "reconciled_commands") else None
+
+
 def _registered(commands: Iterable[str], entry: str) -> bool:
     """Whether a registration invokes exactly this gate entrypoint basename."""
     wanted = Path(entry).name
@@ -189,9 +208,11 @@ def run_probes(
     workspace_text = str((workspace or repo.parent).resolve())
     # One temp root for every throwaway seat home this run builds; the probes are
     # synchronous, so the homes can leave with the run.
+    registrar = _load_registrar(repo)
     with tempfile.TemporaryDirectory(prefix="gate-preflight-homes-") as homes_raw:
         homes = Path(homes_raw)
-        rows, good = _run_probes(repo, home, endpoint, scratch, hold, excluded, workspace_text, homes)
+        rows, good = _run_probes(repo, home, endpoint, scratch, hold, excluded, workspace_text, homes,
+                                 registrar)
     return rows, good
 
 
@@ -204,6 +225,7 @@ def _run_probes(
     excluded: set[str],
     workspace_text: str,
     homes: Path,
+    registrar: Any = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     rows: list[dict[str, Any]] = []
     good = True
@@ -232,16 +254,38 @@ def _run_probes(
             good = False
             continue
 
-        registration_path = home.joinpath(*segments)
-        if not registration_path.exists():
-            rows.append({"member": member, "status": "not-registered"})
-            continue
-        try:
-            commands = _commands_from_registration(registration_path, reader)
-        except ValueError as exc:
-            rows.append({"member": member, "status": "unmeasured", "reason": str(exc)})
-            good = False
-            continue
+        # PROBE THE REGISTRATION THE INSTALL WILL WRITE (dp 2026-10-06, #1237 #1242). Since the
+        # registrar became a reconciler, hestia's own hook lines are rewritten to the rendered
+        # template on every deploy -- so the line on disk now is NOT the line the candidate will run
+        # under. Probing the current line refused forever on every host whose line predated a
+        # template change (stage C's HESTIA_HOME): the install that would have fixed the line was
+        # the install the preflight blocked. For a member that ships a template, the commands come
+        # from the candidate's own register-members.py (render + reconcile, in memory, every planned
+        # file assumed installed). A member without one is never touched by the install, so its
+        # registered line is still the truth.
+        template = expects_path.parent / "hooks" / "hooks.json"
+        if registrar is not None and template.is_file() and install.get("dest"):
+            status, commands, why = registrar.reconciled_commands(str(expects_path.parent), str(home),
+                                                                  os.environ)
+            if status == "absent":
+                rows.append({"member": member, "status": "not-registered"})
+                continue
+            if status != "ok":
+                rows.append({"member": member, "status": "unmeasured",
+                             "reason": f"the install would not register this member: {why}"[:300]})
+                good = False
+                continue
+        else:
+            registration_path = home.joinpath(*segments)
+            if not registration_path.exists():
+                rows.append({"member": member, "status": "not-registered"})
+                continue
+            try:
+                commands = _commands_from_registration(registration_path, reader)
+            except ValueError as exc:
+                rows.append({"member": member, "status": "unmeasured", "reason": str(exc)})
+                good = False
+                continue
         if not _registered(commands, entry):
             rows.append({"member": member, "status": "not-registered"})
             continue
@@ -270,6 +314,9 @@ def _run_probes(
         # LAUNCHER supplies: the assignments on its registered hook line. So: the deploy's
         # locator is stripped, the launcher's assignments are applied, and a candidate that
         # cannot act under them is refused -- with the candidate's own reason on the row.
+        # (Since 2026-10-06 "the registered hook line" is the RENDERED one, above: the deploy
+        # unit's HESTIA_HOME reaches the probe only by being rendered onto that line, which is
+        # exactly how it reaches the seat.)
         environment = {k: v for k, v in os.environ.items() if k != BOOTSTRAP_LOCATOR}
         environment.update(_launcher_env(commands, entry))
         environment.update(declared_env)
@@ -292,8 +339,13 @@ def _run_probes(
         environment["HESTIA_SHARED_DIR"] = str(repo / "plugins" / "_shared")
         # ...and for a candidate that CONSUMES the vault projection the pin above is not
         # enough: the projection overrides it at import. Probe under a throwaway seat home
-        # whose projection names the candidate engine (#1171).
-        throwaway = _throwaway_seat_home(member, environment, homes)
+        # whose projection names the candidate engine (#1171). The projection is keyed by the
+        # SEAT id the gate loads (`install.member`: kimi's plugin dir is `kimi`, its seat and
+        # projection are `kimi-code`), not by the plugin directory. Keyed by the directory, the
+        # kimi lookup missed, the probe kept the real home, and the candidate was paired with the
+        # INSTALLED engine -- the #1171 failure again, for the one member whose names differ.
+        seat = install.get("member") if isinstance(install.get("member"), str) else member
+        throwaway = _throwaway_seat_home(seat, environment, homes)
         if throwaway is not None:
             environment[BOOTSTRAP_LOCATOR] = str(throwaway)
 

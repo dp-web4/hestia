@@ -1372,6 +1372,15 @@ impl std::fmt::Display for OpenError {
                 "{n} escalations already pending (max {MAX_PENDING}) — refusing rather than \
                  evicting, because evicting the oldest lets a flood erase a pending decision"
             ),
+            OpenError::MissingField(name) if *name == "act" => {
+                write!(
+                    f,
+                    "'act' is required — an unattributable escalation is not actionable. \
+                     Copy it VERBATIM from the deny text that refused the write; the gate derives \
+                     and truncates the act, so retyping it can produce a different digest and an \
+                     approval that cannot be claimed"
+                )
+            }
             OpenError::MissingField(name) => {
                 write!(f, "'{name}' is required — an unattributable escalation is not actionable")
             }
@@ -4625,6 +4634,9 @@ mod tests {
             err, OpenError::MissingField("act"),
             "an approval bound to a rationale can never be claimed, so it must not be minted"
         );
+        let refusal = err.to_string();
+        assert!(refusal.contains("VERBATIM"), "the refusal must say not to reconstruct the act: {refusal}");
+        assert!(refusal.contains("deny text"), "the refusal must say where the canonical act comes from: {refusal}");
         assert_eq!(s.len(), 0, "and nothing was minted — no MAX_PENDING burn, no loop");
 
         // With the act stated, the same open succeeds and the permit is spendable.
@@ -6176,6 +6188,40 @@ mod bar_factor_tests {
             .corroborate(&id, "kimi-code", "r", None, false, None, T0 + 121)
             .expect_err("expired is expired");
         assert_eq!(err, DecideError::Expired);
+    }
+
+    #[test]
+    fn a_ruled_escalation_still_takes_evidence_long_after_its_record_horizon() {
+        let (mut s, id) = open_with("law_inject.py");
+        s.decide(
+            &id,
+            true,
+            "dp",
+            "role:constellation:sovereign",
+            Channel::OperatorSession,
+            None,
+            Some("ruled inside the window"),
+            T0 + 5,
+        )
+        .expect("decided while pending");
+
+        let late = T0 + 12_000;
+        assert_eq!(s.status_of(&id, late), Status::Approved, "a ruling does not lapse");
+
+        let after = s
+            .corroborate(
+                &id,
+                "codex",
+                "role:constellation:member",
+                None,
+                true,
+                Some("late review remains evidence, not a new ruling"),
+                late,
+            )
+            .expect("a decided record keeps accepting evidence after the pending horizon");
+
+        assert_eq!(after.peer_participation().dissented, 1, "the late dissent is on the record");
+        assert_eq!(after.stored_status(), Status::Approved, "late evidence does not rewrite the ruling");
     }
 }
 
