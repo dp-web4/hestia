@@ -334,7 +334,10 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_gate_escalation_open",
             "Ask a HUMAN to approve a write to the governance surface (gate, witness, law_inject, the registration). Stage 2 of dp's 2026-07-29 ruling: the gate refuses these writes, and this is the channel that un-refuses a legitimate one. Returns an escalation_id and a deadline; NO DECISION WITHIN THE WINDOW IS A DENY, not a retry. Witnessed on open. Assurance A1: the operator shares this UID, so approval is tamper-EVIDENT, not tamper-proof. PASS answers_deny = the chain hash of the deny you are escalating (hestia_witness_decision returns it as witnessEntryHash): without it the escalation is witnessed but UNLINKED, and unlinked escalations cannot be credited as conduct — escalating instead of routing around is the top of the Temperament scale (1.0 on approval), and the link is what makes it readable. It is never inferred from timing. PASS act = the exact write you intend to perform, e.g. 'Edit -> plugins/<seat>/hooks/<file>'. REQUIRED: the approval is bound to this string (#539), and you must re-issue the SAME string to claim it. `reason` is your rationale and is NOT the act — an approval bound to a rationale can never be claimed, so an open without `act` is refused rather than granted-and-unspendable. ONE ACT, ONE RULING (#668): if this exact act is already \
-             pending from you, you get THAT escalation_id back with `coalesced: true` and nothing new is minted",
+             pending from you, you get THAT escalation_id back with `coalesced: true` and nothing new is minted. \
+             OPTIONAL resolved_target = the path the write reaches (#810): the bar is priced over \
+             the marker, the act and this target, highest wins, so naming it can raise the bar \
+             and never lower it",
         ),
         t(
             "hestia_gate_pending_escalations",
@@ -431,7 +434,10 @@ fn hestia_tools() -> Vec<Tool> {
             "hestia_gate_escalation_claim",
             "Claim a human's approval for a write to the governance surface, or open an escalation and REFUSE. One round trip, because a hook that outlives its harness timeout is killed and the tool then runs ANYWAY — so nothing waits in-hook. Either an approval already exists for this exact (member, file) and is spent here (single use), or the write is refused now and a human decides out of band; re-issue the write to use the approval. ONE ACT, ONE RULING (#668): if this exact act is \
              already pending from you, the answer carries THAT escalation_id with `coalesced: true` \
-             — no second petition is minted and no peer is woken again; wait on the id you are given",
+             — no second petition is minted and no peer is woken again; wait on the id you are given. \
+             OPTIONAL resolved_target = the write-position path the gate's closure matched \
+             (#810): the bar is priced over the marker, the act and this target, highest wins, \
+             so it can raise the bar and never lower it; omitted, pricing is unchanged",
         ),
         t_args(
             "hestia_gate_escalation_lookup",
@@ -8897,8 +8903,9 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
             "stated_reason": esc.stated_reason,
             "stated_detail": esc.stated_detail,
             "bar": esc.bar,
-            // Every marker the act reaches; the bar is the highest over them (stage C).
+            // Every marker the act reaches; the bar is the highest over them (`price`).
             "matched_markers": esc.matched_markers,
+            "resolved_target": esc.resolved_target,
             "factors_present": esc.factors,
             "invited_peers": esc.invited_peers,
             "asker_basis": esc.asker_basis,
@@ -15215,6 +15222,75 @@ mod tests {
         );
     }
 
+
+    /// #810 (recut of #812, kimi-code), through the door the gate hook actually calls. The
+    /// hook's act is a 220-char summary that can cut the filename out; the claim's
+    /// `resolved_target` still names it, and the bar is priced from it. The opened chain
+    /// entry carries the target and the strong bar; a targetless claim prices exactly as
+    /// before; and a restart restores what the entry recorded.
+    #[tokio::test]
+    async fn the_claim_door_prices_the_bar_from_the_resolved_target() {
+        let (_dir, shared) = make_shared_state();
+        let out = tool_connect(&shared, &json!({ "plugin_id": "claude-code", "host_agent": "h" }))
+            .await
+            .unwrap();
+        let sid = out["sessionId"].as_str().expect("a session").to_string();
+        let target = "/w/hestia/plugins/claude-code/hooks/pre_tool_use.py";
+        // The filename is past the summary's cut.
+        let act = "Bash: cd /w/hestia && cp /tmp/scratch/staged/long/path/new_gate.py /w/hes …";
+        let ask = |reason: &'static str, target: Option<&'static str>| {
+            let shared = shared.clone();
+            let sid = sid.clone();
+            async move {
+                let mut args = json!({
+                    "plugin_id": "claude-code",
+                    "tool_name": "Bash",
+                    "marker": "plugins/*/hooks",
+                    "reason": reason,
+                    "session_id": sid,
+                });
+                if let Some(t) = target {
+                    args["resolved_target"] = json!(t);
+                }
+                tool_gate_escalation_claim(&shared, &args).await.unwrap()
+            }
+        };
+        let strong = ask(act, Some(target)).await;
+        let strong_id = strong["escalation_id"].as_str().expect("an id").to_string();
+        // A different act text, no target: the stage C price, unchanged.
+        let weak = ask("Bash: cd /w/hestia && cp a b …", None).await;
+        let weak_id = weak["escalation_id"].as_str().expect("an id").to_string();
+
+        let s = shared.lock().await;
+        let chain = s.recent_chain(200);
+        let opened = |id: &str| {
+            chain
+                .iter()
+                .find(|e| e.event_type == "gate_escalation_opened" && e.event_data["escalation_id"] == id)
+                .expect("the open is witnessed")
+                .event_data
+                .clone()
+        };
+        let o = opened(&strong_id);
+        assert_eq!(o["bar"], "sovereign_plus_peer", "{o}");
+        assert_eq!(o["resolved_target"], target, "{o}");
+        assert_eq!(o["matched_markers"], json!(["plugins/*/hooks", "pre_tool_use.py"]), "{o}");
+        let w = opened(&weak_id);
+        assert_eq!(w["bar"], "single_approver", "{w}");
+        assert!(w["resolved_target"].is_null(), "explicit null when absent: {w}");
+
+        // Replay restores the recorded price.
+        let entries: Vec<_> = chain
+            .iter()
+            .filter(|e| e.event_type == "gate_escalation_opened")
+            .cloned()
+            .collect();
+        let mut replay = crate::server::gate_escalation::EscalationStore::default();
+        replay.rehydrate(&entries, crate::server::gate_escalation::now_secs());
+        let r = replay.get(&strong_id).expect("restored");
+        assert_eq!(r.bar, crate::server::gate_escalation::Bar::SovereignPlusPeer);
+        assert_eq!(r.resolved_target.as_deref(), Some(target));
+    }
 
     /// #668, ONE ACT ONE RULING, through the door the gate hook actually calls. The hook
     /// re-trips on the same refused act (25 of 49 same-digest re-opens in the 08-02..09-01
@@ -22314,9 +22390,13 @@ fn opened_payload(
         // unauditable. Stated at open, evaluated at decision. Absent from every claim-path
         // entry until now, which is why 0 of 362 opened payloads could be read for it.
         "bar": esc.bar,
-        // ...and the markers it was computed over (one-gate stage C: the HIGHEST bar over
-        // every marker the act reaches, so a directory marker cannot shadow a sovereign file).
+        // ...and the markers it was computed over (`gate_escalation::price`: the HIGHEST bar
+        // over every marker the act reaches, so a directory marker cannot shadow a sovereign
+        // file). Replay restores both rather than repricing.
         "matched_markers": esc.matched_markers,
+        // What the act reaches, as the caller sent it (#810) — one of the inputs the bar was
+        // priced from. Explicit null when absent (an old hook, the member door without it).
+        "resolved_target": esc.resolved_target,
         // WHO WAS ASKED. The field whose absence made "invited and absent" and "never
         // asked" the same row. Both bars populate it: `single_approver` is satisfied by a
         // NOT-SAME peer acting alone, so it is the bar an invitation helps MOST — reading it
@@ -22578,6 +22658,10 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // states only a why gets `MissingField("act")` from the mint site and a message saying
     // which field to add, rather than an approval that can never be claimed.
     let act = optional_string(args, "act");
+    // THE ACT'S RESOLVED TARGET (#810, recut of #812): the path the act writes, when the
+    // member names it. Optional and caller-asserted; it joins the pricing as one more marker
+    // source, so it can raise this escalation's bar and never lower it (`price`).
+    let resolved_target = optional_string(args, "resolved_target");
     // #128 (release blocker per #224, closed "superseded for coordination" rather than fixed):
     // this surface has always taken its asker as a bare string and accepted no session at all,
     // so `arbiter::eligibility` compares an ASSERTION (`appellant: &esc.plugin_id`) against an
@@ -22646,6 +22730,9 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
         .open_or_coalesce_with_payload(&plugin_id, &role, &tool_name, &marker,
               // The act, from its own field. No fallback to `reason` on this door.
               act.as_deref(),
+              // What the act reaches, when the member names it (#810): priced with the marker
+              // and the act, and can only strengthen the bar (`gate_escalation::price`).
+              resolved_target.as_deref(),
               stated_reason.as_deref(), stated_detail.as_deref(),
               Some(&binding), now, DEFAULT_TTL_SECS)
     {
@@ -23466,6 +23553,13 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // the claim hashed and recorded `reason`. An approval could therefore be correct in the
     // store and permanently unspendable by the member-door caller that created it.
     let attempted_act = act.clone().or_else(|| stated_reason.clone());
+    // THE ACT'S RESOLVED TARGET (#810, recut of #812): the closure verdict's `resource` — the
+    // write-position argument that matched — as the gate hook sends it. Priced with the marker
+    // and the act (`gate_escalation::price`): `attempted_act` is a bounded, self-censoring
+    // summary (220 chars for a shell command; withheld whole when credential-shaped), so the
+    // filename the bar needs can be cut out of it, and this field is where it survives. Old
+    // hooks send nothing and price exactly as before; it can raise the bar, never lower it.
+    let resolved_target = optional_string(args, "resolved_target");
     // The bytes about to be written, when the gate could hash them (#1056). A shim that does
     // not send this claims exactly as before; the binding only engages on approvals that
     // recorded one.
@@ -23817,6 +23911,9 @@ permit for something the approver did not see.",
               // The gate hook composes `reason` AS the act, and has always done so, so it is
               // the act here. `act` still wins if a caller sends both.
               attempted_act.as_deref(),
+              // The closure's write-position argument, when the hook sends it (#810): the act
+              // above is a bounded summary that can cut the filename out; this cannot.
+              resolved_target.as_deref(),
               stated_reason.as_deref(), stated_detail.as_deref(),
               Some(&attempted_binding), now, DEFAULT_TTL_SECS)
     {
@@ -24273,6 +24370,9 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
                 // single approver) made wrong.
                 "bar": e.bar,
                 "matched_markers": e.matched_markers,
+                // What the write reaches (#810), when the asker's hook sent it — the decider's
+                // view names the file, not only the closure element that fired.
+                "resolved_target": e.resolved_target,
                 "opened_at": e.opened_at,
                 "secs_remaining": e.secs_remaining(now),
                 "you_may_rule": may_rule,

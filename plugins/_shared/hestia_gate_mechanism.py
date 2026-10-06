@@ -1511,9 +1511,25 @@ def witness_gate_self(event_type, marker, tool_name, rule=None, *,
         host_session_id=host_session_id, deadline=deadline) is not None
 
 
+RESOLVED_TARGET_MAX = 400
+
+
+def resolved_target_for_claim(target):
+    """The resolved target as it may ride a claim, or None. Whitespace-collapsed; tail-capped,
+    because the governed filename sits at the END of a path and a cap must cut the head; and
+    withheld whole when credential-shaped, by the same discipline as `attempted_summary` — the
+    claim lands on the witness chain."""
+    if not isinstance(target, str):
+        return None
+    t = " ".join(target.split())
+    if not t or credential_shaped(t):
+        return None
+    return t[-RESOLVED_TARGET_MAX:]
+
+
 def claim_self_write(marker, tool_name, attempted, *,
                      plugin_id, role, client_name, host_session_id=None, invocation_key=None,
-                     supersession=None, deadline=None):
+                     supersession=None, deadline=None, resolved_target=None):
     """Ask ONCE whether a human has already approved this exact (member, marker) write.
     Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
 
@@ -1521,7 +1537,15 @@ def claim_self_write(marker, tool_name, attempted, *,
     decides out of band; the member RE-ISSUES the write and the second attempt claims the
     approval. Every failure — unreachable, malformed, a daemon with no escalation channel —
     is a refusal: a daemon that cannot answer must not be a way to get a governance write
-    through."""
+    through.
+
+    `resolved_target` (#810; recut of #812, kimi-code) is the act's concrete target — on the
+    live path the closure verdict's `resource`, the WRITE-POSITION argument that matched, never
+    payload text. The daemon prices the escalation's bar over the marker, the act and this
+    target, highest wins (core `gate_escalation::price`), so it can only strengthen the bar.
+    It matters because `attempted` is a bounded, self-censoring summary that can cut the
+    filename out. Not part of the request key: it is derived from the same act. Old daemons
+    ignore the key; callers that omit it price exactly as before."""
     claim_args = {
         "plugin_id": plugin_id,
         "role": role,
@@ -1555,6 +1579,9 @@ def claim_self_write(marker, tool_name, attempted, *,
     # this spend, which only costs a lost answer a fresh petition.
     if supersession:
         claim_args["supersession"] = supersession
+    rt = resolved_target_for_claim(resolved_target)
+    if rt:
+        claim_args["resolved_target"] = rt
     r = gate_self_call("hestia_gate_escalation_claim", claim_args,
                        plugin_id=plugin_id, role=role, client_name=client_name,
                        host_session_id=host_session_id, deadline=deadline)

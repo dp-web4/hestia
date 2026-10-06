@@ -712,7 +712,13 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
             # THIS module stops a superseded invocation in every rollout mode (step 5), so it
             # may make the declaration that lets the daemon reclaim a lost answer (#1169).
             supersession=mechanism.SUPERSESSION_HARD_STOP,
-            deadline=inv.phase_deadline)
+            deadline=inv.phase_deadline,
+            # THE ACT'S RESOLVED TARGET (#810; recut of #812, kimi-code): the write-position
+            # argument the closure matched. The daemon prices the bar over the marker, the act
+            # and this, highest wins — `inv.attempted` is a bounded summary that can cut the
+            # filename out; this cannot. Sent only when it matched a closure element: an
+            # opaque/internal verdict's resource ("stdin", "internal:…") names no target.
+            resolved_target=cv.resource if cv.marker else None)
         if claimed is _LATE:
             # Unknown, not "nothing happened": the daemon may have opened or matched an
             # escalation after the bound (#1166). Re-issuing the identical act is safe.
