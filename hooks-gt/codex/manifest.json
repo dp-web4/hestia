@@ -7,7 +7,7 @@
   "files": [
     {
       "path": "hooks/hooks.json",
-      "sha256": "2ba6fe7def97f86e3dfa66bab31a5c10bb739704e8c540ed0dc3afea72f9ffd3",
+      "sha256": "501ba4ed4c864dfddb102db3189c2aa93f92cd30bd71292e133c3e8856428f29",
       "source": "plugins/codex/hooks/hooks.json"
     },
     {
@@ -62,5 +62,5 @@
     ]
   },
   "requires": [],
-  "gt_version": "fbc49de2c2047f24d6295da3bde42c9b6b0020f62107832b15adede4b7ffc60d"
+  "gt_version": "723371a4bb0e46ce0a82be05fc4cdcb07df990496d97aa4f401d0cb647e30cf1"
 }
