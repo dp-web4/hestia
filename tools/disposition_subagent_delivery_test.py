@@ -173,6 +173,29 @@ def test_a_parent_addressed_row_is_not_a_subagents():
         assert "e-parent" in p and FRAME not in p, p
 
 
+def test_an_agent_addressed_row_with_no_session_address_is_still_one_agents():
+    """codex on 1248 (patch fbe9113c): with `for_session` null or ABSENT, the first patch read the
+    row as unaddressed and showed it to every agent past the boundary, `for_agent` ignored. The
+    agent test must stand without the session test. Every reader fires first, so the row lands
+    after each one's boundary: the case where the unaddressed path would render it."""
+    for label, row in (("null", lane_row("e-nosess", None, "APPROVED - escalation e-nosess.", for_agent=AGENT)),
+                       ("absent", lane_row("e-nosess", PARENT, "APPROVED - escalation e-nosess.", for_agent=AGENT)
+                        .replace(f'"for_session": "{PARENT}", ', ""))):
+        assert label == "null" or '"for_session"' not in row, row
+        with tempfile.TemporaryDirectory() as d:
+            seat = Seat(d)
+            seat.append("")    # the lane exists, so each first sight records a boundary
+            for ev in (parent_event(), subagent_event(tool="Read", agent=SIBLING),
+                       subagent_event(tool="Read", path="/tmp/y")):
+                assert seat.fire(ev) == ""
+            seat.append(row)
+            assert seat.fire(parent_event()) == "", f"for_session {label}: the parent rendered child-A's row"
+            assert seat.fire(subagent_event(tool="Read", agent=SIBLING)) == "", \
+                f"for_session {label}: a sibling rendered child-A's row"
+            s = seat.fire(subagent_event(tool="Read", path="/tmp/y"))
+            assert "e-nosess" in s, f"for_session {label}: the named agent did not see its row"
+
+
 def test_another_sessions_row_reaches_no_agent_of_this_one():
     with tempfile.TemporaryDirectory() as d:
         seat = Seat(d)
@@ -186,6 +209,7 @@ TESTS = [
     test_parent_and_subagent_cursors_are_distinct_and_the_parents_key_is_unchanged,
     test_an_agent_addressed_row_reaches_only_its_agent,
     test_a_parent_addressed_row_is_not_a_subagents,
+    test_an_agent_addressed_row_with_no_session_address_is_still_one_agents,
     test_another_sessions_row_reaches_no_agent_of_this_one,
 ]
 
