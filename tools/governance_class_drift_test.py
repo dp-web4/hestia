@@ -85,6 +85,9 @@ AWAITING = None  # declared open: measured, not yet decided
 EXACT = "the bar names it exactly"
 SUBSTRING = "the bar names a DIFFERENT file whose basename this one ends with"
 UNNAMED = "the bar never names it"
+INSTALL_DECLARED = ("the bar prices it at every location a member's install declaration puts "
+                    "a gate entry (location-qualified, derived from the bar's member-entry "
+                    "table), not by name anywhere")
 SHADOWED = ("the matcher never emits this name at all -- an EARLIER tuple entry is a "
             "substring of it, so an act on this file carries that other name's marker "
             "and that other name's price")
@@ -199,17 +202,18 @@ DECLARED = (
              "'DECIDE before the shims land' the <policy-core> row asks, answered for this file "
              "in the same change that lands the shims. Named in `bar_for` as a live clause."),
 
-    dict(key="befo", label="<gate-alt-entry>", intended=AWAITING, via=UNNAMED, tracked=True,
+    dict(key="befo", label="<gate-alt-entry>", intended=STRONG, via=INSTALL_DECLARED,
+         tracked=True,
          why="One seat's gate ENTRY under a different basename from <gate>: the same role (the "
-             "file its harness invokes before every tool call), a different name. Added to the "
-             "canonical list when the closure began deriving each member's installed surface "
-             "from its install declaration -- before that the name was in no list at all, so "
-             "a write to that seat's installed entry was not escalated. Now it escalates, and "
-             "it is priced at one approver because `bar_for` names <gate>'s basename and not "
-             "this one -- inherited from omission, not chosen. Measured, not decided. DECIDE: "
-             "whether one seat's gate entry should be cheaper to approve than the other seats' "
-             "(aligning upward means a `bar_for` clause for it, and this row moving to STRONG "
-             "with via=EXACT in the same change)."),
+             "file its harness invokes before every tool call), a different name. RATIFIED STRONG "
+             "under the steward's standing one-gate ruling, align upward (dp): every seat's gate "
+             "entry carries the same bar. Priced LOCATION-QUALIFIED rather than by name: "
+             "`bar_for` derives gate-entry pricing from its member-entry table (each member's "
+             "install dest and gate_probe.entry, pinned to plugins/*/expects.json by a rust "
+             "test), so the entry is two-factor where a member's install declaration puts it -- "
+             "installed, repo source, published ground truth -- and a same-named file anywhere "
+             "else is not promoted. The next member with a differently named entry is covered by "
+             "its declaration, not by a new clause here."),
 
     dict(key="gate_self", label="<exemption-ledger>", intended=AWAITING, via=UNNAMED,
          tracked=True,
@@ -311,6 +315,21 @@ def _bar_names(text):
     if start < 0 or end < 0:
         return None
     return re.findall(r'contains\("([^"]+)"\)', text[start:end]) or None
+
+
+def _bar_entry_names(text):
+    """The gate-entry basenames `bar_for` prices two-factor by LOCATION: the `entry` of every
+    row of the bar's member-entry table, counted only while `bar_for` consults that table.
+    Read from the source, never spelled here (same reason as `_bar_names`)."""
+    start = text.find("pub fn bar_for")
+    end = text.find("\n}", start) if start >= 0 else -1
+    if start < 0 or end < 0 or "member_gate_entry_of(marker)" not in text[start:end]:
+        return set()
+    table = re.search(r"pub const MEMBER_GATE_ENTRIES: &\[MemberGateEntry\] = &\[(.*?)\];",
+                      text, re.S)
+    if not table:
+        return set()
+    return {e.rsplit("/", 1)[-1] for e in re.findall(r'entry:\s*"([^"]+)"', table.group(1))}
 
 
 def _emitted_marker(name, governed):
@@ -432,9 +451,13 @@ def audit(matcher_text=None, bar_text=None, declared=DECLARED):
                 "exists to end. Add a row above, with a written reason.")
 
     # --- B/C/D. derived vs declared, per name.
+    entry_names = _bar_entry_names(btext)
+
     def _from_bar(name):
         """(class, mechanism) for the marker string `name`, per the bar alone."""
         hit = [s for s in strong if s in name]
+        if not hit and name in entry_names:
+            return STRONG, INSTALL_DECLARED
         if not hit:
             return SINGLE, UNNAMED
         return STRONG, (EXACT if hit[0] == name else SUBSTRING)
@@ -662,8 +685,12 @@ def selftest():
     # A bar literal that a row declares STRONG/EXACT -- the one whose removal must
     # surface as a declared-vs-measured mismatch.
     exact_rows = [r for r in DECLARED if r["intended"] is STRONG and r["via"] is EXACT]
+    # Not a gate-entry name: those are also priced by location (the member-entry table), so
+    # dropping their name clause changes the MECHANISM, which is a different check's red.
+    entry_names = _bar_entry_names(bt)
     exact_name = next(g for g in governed
-                      if any(g.startswith(r["key"]) for r in exact_rows) and g in strong)
+                      if any(g.startswith(r["key"]) for r in exact_rows) and g in strong
+                      and g not in entry_names)
     # The row that reaches the strong bar by SUBSTRING, and its declaration mis-stated as
     # EXACT. The error this file once corrected lived in the DECLARATION, not in either
     # source, so a sabotage set that only mutates the sources cannot reach that class.
@@ -707,6 +734,12 @@ def selftest():
 
         ("the DECLARATION mis-states the mechanism (a SUBSTRING row declared EXACT)",
          mt, bt, was_exact, "DIFFERENT mechanism"),
+
+        # The location-derived gate-entry clause is dropped from the bar: a row declared STRONG
+        # by install declaration must go red, not silently fall to one approver.
+        ("the bar stops pricing member gate entries by their install declaration",
+         mt, _drop_line(bt, "member_gate_entry_of(marker).is_some()"), DECLARED,
+         "change the bar"),
 
         # The stage C bar fix, undone: the open path goes back to the first marker alone...
         ("the open path prices by the FIRST marker again (stage C fix reverted)",

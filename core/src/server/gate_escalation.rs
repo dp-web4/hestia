@@ -323,11 +323,87 @@ pub fn bar_for(marker: &str) -> Bar {
         // at once — priced like the gate it replaced (align upward), never single-approver by
         // omission (the governance-class declaration's "DECIDE before the shims land").
         || marker.contains("hestia_single_gate.py")
+        // EVERY member's gate entry, wherever its install declaration puts it (align upward):
+        // a seat's enforcement path is priced like every other seat's, whatever its harness
+        // calls the file. Location-qualified, derived from `MEMBER_GATE_ENTRIES` (pinned to the
+        // members' expects.json), so the next member is covered by its declaration and a
+        // same-named file outside every declared location is not promoted.
+        || member_gate_entry_of(marker).is_some()
     {
         Bar::SovereignPlusPeer
     } else {
         Bar::SingleApprover
     }
+}
+
+/// One member's gate entry as its `plugins/<plugin>/expects.json` `install` block declares it:
+/// `dest` (where the installer puts the hooks) and `gate_probe.entry` (the file the harness
+/// invokes, relative to the plugin dir).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemberGateEntry {
+    pub plugin: &'static str,
+    pub dest: &'static str,
+    pub entry: &'static str,
+}
+
+/// Every member's gate entry — a mirror of the members' install declarations, pinned equal to
+/// them by `member_gate_entries_match_the_install_declarations` (a member added, renamed or
+/// moved without this table is red). The sovereign half of `bar_for` for gate ENTRIES is
+/// derived from it, so a member whose entry is not named like the others' is still priced like
+/// them. `SOVEREIGN_FILES` stays the name-anywhere backstop for the names it already holds.
+pub const MEMBER_GATE_ENTRIES: &[MemberGateEntry] = &[
+    MemberGateEntry { plugin: "claude-code", dest: "~/.claude/hooks/hestia",
+                      entry: "hooks/pre_tool_use.py" },
+    MemberGateEntry { plugin: "codex", dest: "~/.codex/hooks", entry: "hooks/pre_tool_use.py" },
+    MemberGateEntry { plugin: "gemini", dest: "~/.gemini/hestia-plugins/gemini/hooks",
+                      entry: "hooks/before_tool.py" },
+    MemberGateEntry { plugin: "kimi", dest: "~/.kimi-code/hooks", entry: "hooks/pre_tool_use.py" },
+];
+
+/// Path segments with any home anchor dropped (`~/.x/y` -> [.x, y]).
+fn path_segments(p: &str) -> Vec<&str> {
+    let mut s: Vec<&str> = p.split('/').filter(|x| !x.is_empty() && *x != ".").collect();
+    if matches!(s.first(), Some(&"~") | Some(&"$HOME") | Some(&"${HOME}")) {
+        s.remove(0);
+    }
+    s
+}
+
+/// The locations a member's gate entry lives at, as segment runs: installed
+/// (`dest`/<entry basename>), repo source (`plugins/<plugin>/<entry>`) and published ground
+/// truth (`hooks-gt/<plugin>/<entry>`). A `dest` shorter than two segments contributes no
+/// installed location (it would match every same-named dir).
+fn member_entry_locations(e: &MemberGateEntry) -> Vec<Vec<&'static str>> {
+    let entry = path_segments(e.entry);
+    let Some(base) = entry.last().copied() else { return vec![] };
+    let mut out = Vec::new();
+    let dest = path_segments(e.dest);
+    if dest.len() >= 2 {
+        let mut d = dest.clone();
+        d.push(base);
+        out.push(d);
+    }
+    for root in ["plugins", "hooks-gt"] {
+        let mut r = vec![root, e.plugin];
+        r.extend(entry.iter().copied());
+        out.push(r);
+    }
+    out
+}
+
+/// When `path` ends (by whole segments) at a declared member gate entry location, that location
+/// as a marker string (e.g. `.x/hooks/entry.py`); else None. A file merely NAMED like an entry
+/// elsewhere is not one.
+pub fn member_gate_entry_of(path: &str) -> Option<String> {
+    let segs = path_segments(path.trim());
+    for e in MEMBER_GATE_ENTRIES {
+        for loc in member_entry_locations(e) {
+            if loc.len() <= segs.len() && segs[segs.len() - loc.len()..] == loc[..] {
+                return Some(loc.join("/"));
+            }
+        }
+    }
+    None
 }
 
 /// The files whose silent compromise ends the model, by basename — the sovereign half of
@@ -356,6 +432,23 @@ pub fn markers_of(marker: &str, act: Option<&str>) -> Vec<String> {
             let base = tok.rsplit('/').next().unwrap_or("");
             if SOVEREIGN_FILES.contains(&base) && !out.iter().any(|m| m == base) {
                 out.push(base.to_string());
+            }
+        }
+    }
+    // A member's gate entry named in the act text at a declared location, whose basename is
+    // not already a sovereign name (those are found above), joins as its qualified location.
+    // Add-only, like every input here: it can raise the bar, never lower it.
+    if let Some(text) = act {
+        let split = |c: char| c.is_whitespace() || "\"'`=,;:()<>|&{}[]\\".contains(c);
+        for tok in text.split(split) {
+            let base = tok.rsplit('/').next().unwrap_or("");
+            if SOVEREIGN_FILES.contains(&base) {
+                continue;
+            }
+            if let Some(loc) = member_gate_entry_of(tok) {
+                if !out.iter().any(|m| *m == loc) {
+                    out.push(loc);
+                }
             }
         }
     }
@@ -3284,6 +3377,87 @@ mod tests {
         // And a directory marker for hooks prices by the file it names.
         let e = open_act("plugins/*/hooks", "/w/plugins/claude-code/hooks/law_inject.py");
         assert_eq!(e.bar, Bar::SingleApprover);
+    }
+
+    /// Align upward: every member's gate entry is priced like every other's, wherever its install
+    /// declaration puts it and whatever its harness names it. Tested through `open`, with the
+    /// marker the closure actually reports (the installed hooks dir, or the repo hooks pattern).
+    #[test]
+    fn every_member_gate_entry_prices_sovereign_at_its_declared_locations() {
+        for e in MEMBER_GATE_ENTRIES {
+            let base = e.entry.rsplit('/').next().unwrap();
+            let dest = e.dest.trim_start_matches("~/");
+            for (marker, act) in [
+                (dest.to_string(), format!("/home/u/{dest}/{base}")),
+                (dest.to_string(), format!("touch /home/u/{dest}/{base}")),
+                (dest.to_string(), format!("echo x > ~/{dest}/{base}")),
+                ("plugins/*/hooks".to_string(), format!("/w/hestia/plugins/{}/{}", e.plugin, e.entry)),
+                (base.to_string(), format!("/w/hestia/hooks-gt/{}/{}", e.plugin, e.entry)),
+            ] {
+                let opened = open_act(&marker, &act);
+                assert_eq!(opened.bar, Bar::SovereignPlusPeer, "{}: {marker} / {act}", e.plugin);
+            }
+        }
+        // The member whose entry is not in SOVEREIGN_FILES, by its qualified marker.
+        let e = open_act(".gemini/hestia-plugins/gemini/hooks",
+                         "/home/u/.gemini/hestia-plugins/gemini/hooks/before_tool.py");
+        assert_eq!(e.matched_markers, vec![
+            ".gemini/hestia-plugins/gemini/hooks".to_string(),
+            ".gemini/hestia-plugins/gemini/hooks/before_tool.py".to_string()]);
+    }
+
+    /// The derivation is location-qualified: a file merely NAMED like a member's entry, outside
+    /// every declared location, is not promoted — neither as the closure's marker nor in the act
+    /// text (the exact-name act-text rule covers `SOVEREIGN_FILES` only). Pre-existing names
+    /// keep their name-anywhere pricing (the backstop is unchanged).
+    #[test]
+    fn an_entry_named_file_outside_every_declared_location_is_not_promoted() {
+        let base = "before_tool.py";
+        assert_eq!(bar_for(base), Bar::SingleApprover);
+        for act in [
+            "/srv/proj/hooks/before_tool.py",
+            "touch /home/u/.gemini/before_tool.py",
+            "/w/plugins/gemini/before_tool.py",           // not under the declared entry path
+            "/home/u/.gemini/hestia-plugins/gemini/hooks/before_tool.py.bak",
+        ] {
+            let e = open_act(base, act);
+            assert_eq!(e.bar, Bar::SingleApprover, "{act}");
+            assert_eq!(e.matched_markers, vec![base.to_string()], "{act}");
+        }
+        // Backstop unchanged: a SOVEREIGN_FILES name is still priced by name anywhere, and is
+        // not double-listed as a qualified location.
+        let e = open_act("plugins/*/hooks", "/w/plugins/kimi/hooks/pre_tool_use.py");
+        assert_eq!(e.bar, Bar::SovereignPlusPeer);
+        assert_eq!(e.matched_markers.len(), 2, "{:?}", e.matched_markers);
+    }
+
+    /// Covered by construction: the table `bar_for` derives entry pricing from must equal what
+    /// the members' expects.json install blocks declare — a member added, renamed or moved
+    /// without it is red here.
+    #[test]
+    fn member_gate_entries_match_the_install_declarations() {
+        let plugins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("plugins");
+        let Ok(dir) = std::fs::read_dir(&plugins) else {
+            // A source tarball without the plugins tree: nothing to bind against.
+            eprintln!("no plugins dir at {}; declarations not checked", plugins.display());
+            return;
+        };
+        let mut declared: Vec<(String, String, String)> = Vec::new();
+        for ent in dir.flatten() {
+            let p = ent.path().join("expects.json");
+            let Ok(text) = std::fs::read_to_string(&p) else { continue };
+            let v: serde_json::Value = serde_json::from_str(&text).expect("expects.json parses");
+            let inst = &v["install"];
+            let (Some(dest), Some(entry)) = (inst["dest"].as_str(), inst["gate_probe"]["entry"].as_str())
+            else { continue };
+            declared.push((ent.file_name().to_string_lossy().into_owned(), dest.into(), entry.into()));
+        }
+        declared.sort();
+        let mut table: Vec<(String, String, String)> = MEMBER_GATE_ENTRIES.iter()
+            .map(|e| (e.plugin.into(), e.dest.into(), e.entry.into())).collect();
+        table.sort();
+        assert!(declared.len() >= 4, "found {declared:?}");
+        assert_eq!(table, declared, "MEMBER_GATE_ENTRIES drifted from plugins/*/expects.json");
     }
 
     /// #774/#1169: a reclaim is recovery of one lost answer. Every conjunct is exercised on its
