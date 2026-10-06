@@ -367,9 +367,27 @@ pub const MEMBER_GATE_ENTRIES: &[MemberGateEntry] = &[
     MemberGateEntry { plugin: "kimi", dest: "~/.kimi-code/hooks", entry: "hooks/pre_tool_use.py" },
 ];
 
-/// Path segments with any home anchor dropped (`~/.x/y` -> [.x, y]).
+/// Path segments, NORMALISED LEXICALLY: repeated slashes collapse, `.` drops, `..` removes the
+/// segment before it (a leading `..` of a relative path is kept: there is nothing to remove),
+/// and a home anchor (`~`, `$HOME`, `${HOME}`) is dropped. So `.x/hooks/sub/../entry.py` is
+/// `.x/hooks/entry.py`, and `.x/hooks/../hooks-old/entry.py` is NOT under `.x/hooks`. Symlinks
+/// are the gate's to resolve (the closure realpaths before it reports a resolved target);
+/// this only makes the string's own `..` mean what the filesystem would make of it.
 fn path_segments(p: &str) -> Vec<&str> {
-    let mut s: Vec<&str> = p.split('/').filter(|x| !x.is_empty() && *x != ".").collect();
+    let mut s: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if matches!(s.last(), Some(&last) if last != "..") {
+                    s.pop();
+                } else {
+                    s.push("..");
+                }
+            }
+            x => s.push(x),
+        }
+    }
     if matches!(s.first(), Some(&"~") | Some(&"$HOME") | Some(&"${HOME}")) {
         s.remove(0);
     }
@@ -429,7 +447,9 @@ pub const SOVEREIGN_FILES: &[&str] = &[
 /// **An escalation's bar is the HIGHEST `bar_for` over every marker the act reaches.** The
 /// markers, in order, deduplicated (`markers_of`):
 ///   1. the closure's reported `marker` — always present, always first;
-///   2. the basename of the act's RESOLVED TARGET, when the caller sent one;
+///   2. the basename of the act's RESOLVED TARGET, when the caller sent one — and, when the
+///      full target lies at a member's declared gate-entry location (`member_gate_entry_of`,
+///      after lexical normalisation), that location: entries are priced by WHERE they are;
 ///   3. every sovereign file (`SOVEREIGN_FILES`, by exact basename) named in the ACT TEXT.
 ///
 /// (1) and (2) are names the GATE resolved for this write — the closure element that fired,
@@ -482,7 +502,17 @@ pub fn markers_of(marker: &str, act: Option<&str>, resolved_target: Option<&str>
     };
     if let Some(t) = resolved_target {
         let t = t.trim().trim_end_matches('/');
-        add(t.rsplit('/').next().unwrap_or("").trim(), &mut out);
+        let base = t.rsplit('/').next().unwrap_or("").trim();
+        add(base, &mut out);
+        // The FULL resolved target, not only its basename: a member's gate entry is priced by
+        // its declared LOCATION, and the gate resolved this path (cwd-joined, `..`/symlinks
+        // resolved) — so it holds the location even when the act summary is shortened,
+        // withheld, or names the file relatively. A sovereign basename is already priced above.
+        if !SOVEREIGN_FILES.contains(&base) {
+            if let Some(loc) = member_gate_entry_of(t) {
+                add(&loc, &mut out);
+            }
+        }
     }
     if let Some(text) = act {
         let split = |c: char| c.is_whitespace() || "\"'`=,;:()<>|&{}[]\\".contains(c);
@@ -6592,6 +6622,77 @@ mod resolved_target_tests {
         s.open_with_payload("kimi-code", "role:constellation:member", "Bash", marker, Some(act),
                             target, None, None, None, T0, 3600)
             .expect("open")
+    }
+
+    // ── a member's gate entry is priced from the RESOLVED location, never the summary ──────
+    /// The marker the closure reports for a write into a member's installed hooks dir: the dir.
+    const ENTRY_DIR: &str = ".gemini/hestia-plugins/gemini/hooks";
+    const ENTRY: &str = "/home/u/.gemini/hestia-plugins/gemini/hooks/before_tool.py";
+    const ENTRY_LOC: &str = ".gemini/hestia-plugins/gemini/hooks/before_tool.py";
+
+    /// Pricing must not depend on display text. Whatever the summary carries (nothing, a
+    /// withheld credential-shaped command, a shortened command, a relative name), the gate's
+    /// resolved target holds the location and the bar is two-factor. Each arm's control is the
+    /// same act with no target: one approver — the summary alone cannot see it.
+    #[test]
+    fn a_member_entry_prices_from_the_resolved_target_whatever_the_summary_says() {
+        let shortened = format!("Bash: cp /tmp/{}/staged/x.py /home/u/.gemini/hest …", "s".repeat(190));
+        for act in [
+            "Bash: …",                                            // omitted (no path at all)
+            "Bash: [command withheld: credential-shaped]",       // withheld
+            shortened.as_str(),                                   // shortened
+            "Bash: touch before_tool.py",                         // relative (cd'd into the dir)
+            "Write -> ./before_tool.py",                          // relative Write
+        ] {
+            let control = open_t(ENTRY_DIR, act, None);
+            assert_eq!(control.bar, Bar::SingleApprover, "control, no target: {act:?}");
+            let e = open_t(ENTRY_DIR, act, Some(ENTRY));
+            assert_eq!(e.bar, Bar::SovereignPlusPeer, "{act:?}");
+            assert!(e.matched_markers.iter().any(|m| m == ENTRY_LOC), "{act:?}: {:?}", e.matched_markers);
+        }
+        // The repo source and the published copy, by resolved target behind the hooks pattern.
+        for t in ["/w/hestia/plugins/gemini/hooks/before_tool.py",
+                  "/w/hestia/hooks-gt/gemini/hooks/before_tool.py"] {
+            assert_eq!(open_t(HOOKS, "Bash: …", Some(t)).bar, Bar::SovereignPlusPeer, "{t}");
+        }
+    }
+
+    /// The resolved target is matched after LEXICAL normalisation: collapsed slashes, `.`, and a
+    /// `..` that lands inside the entry location all price two-factor. A path that only LOOKS
+    /// like the location by string prefix but resolves outside it does not.
+    #[test]
+    fn a_normalised_target_inside_the_location_is_sovereign_and_a_lookalike_is_not() {
+        for t in [
+            "/home/u/.gemini//hestia-plugins/./gemini/hooks/before_tool.py",
+            "/home/u/.gemini/hestia-plugins/gemini/hooks/sub/../before_tool.py",
+            "/home/u/.gemini/hestia-plugins/gemini/other/../hooks/before_tool.py",
+            "~/.gemini/hestia-plugins/gemini/hooks/before_tool.py",
+        ] {
+            assert_eq!(open_t(ENTRY_DIR, "Bash: …", Some(t)).bar, Bar::SovereignPlusPeer, "{t}");
+        }
+        for t in [
+            "/home/u/.gemini/hestia-plugins/gemini/hooks/../hooks-old/before_tool.py",
+            "/home/u/.gemini/hestia-plugins/gemini/hooks-old/before_tool.py",
+            "/home/u/.gemini/hestia-plugins/gemini/hooks/before_tool.py/../x.py",
+            "/home/u/.gemini/hestia-plugins/gemini/hooks/before_tool.py.bak",
+        ] {
+            assert_eq!(open_t(ENTRY_DIR, "Bash: …", Some(t)).bar, Bar::SingleApprover, "{t}");
+        }
+    }
+
+    /// Outside every declared location, a file named like an entry is not promoted by its
+    /// resolved target either; a sovereign basename keeps its stage C markers (no location
+    /// is double-listed for it).
+    #[test]
+    fn an_entry_named_target_outside_every_location_stays_single() {
+        for t in ["/srv/proj/hooks/before_tool.py", "/home/u/.gemini/before_tool.py",
+                  "/w/plugins/gemini/before_tool.py", "before_tool.py"] {
+            let e = open_t("before_tool.py", "Bash: …", Some(t));
+            assert_eq!(e.bar, Bar::SingleApprover, "{t}");
+            assert_eq!(e.matched_markers, vec!["before_tool.py".to_string()], "{t}");
+        }
+        let e = open_t(HOOKS, "Bash: …", Some(TARGET));
+        assert_eq!(e.matched_markers, vec![HOOKS.to_string(), "pre_tool_use.py".to_string()]);
     }
 
     /// What #812 adds beyond stage C. Stage C reads the file out of the act TEXT; when the

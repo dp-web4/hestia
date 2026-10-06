@@ -202,6 +202,46 @@ def test_a_degenerate_declaration_does_not_widen_the_closure():
         check(f"degenerate-{p}", v.classification == "none", v)
 
 
+def test_the_verdict_carries_the_resolved_location():
+    """The daemon prices a member's gate entry by LOCATION, from the location the gate resolved
+    — never from how the act was spelled. So every spelling of a write to an installed entry
+    (relative to the cwd, inside a `cd`, through `..`, through a symlinked dir, home-relative)
+    carries the same resolved location; a `..` that only looks like the location by prefix
+    resolves outside it."""
+    c = installed_closure()
+    root = tempfile.mkdtemp(prefix="mis-resolved-")
+    for member, man in manifests().items():
+        inst = man["install"]
+        rel_dest = inst["dest"][2:] if inst["dest"].startswith("~/") else inst["dest"].lstrip("/")
+        dest = os.path.join(root, member, rel_dest)
+        os.makedirs(dest, exist_ok=True)
+        base = os.path.basename(inst["gate_probe"]["entry"])
+        want = os.path.realpath(os.path.join(dest, base))
+        alias = os.path.join(root, member + "-alias")
+        os.symlink(dest, alias)
+        for label, tool, ti, cwd in (
+            ("absolute", "Write", {"file_path": os.path.join(dest, base)}, _NEUTRAL_CWD),
+            ("relative-to-cwd", "Write", {"file_path": base}, dest),
+            ("dot-relative", "Write", {"file_path": "./" + base}, dest),
+            ("cd-then-touch", "Bash", {"command": f"cd {dest} && touch {base}"}, _NEUTRAL_CWD),
+            ("dotdot-inside", "Bash", {"command": f"touch {dest}/sub/../{base}"}, _NEUTRAL_CWD),
+            ("symlinked-dir", "Bash", {"command": f"echo x > {alias}/{base}"}, _NEUTRAL_CWD),
+            ("double-slash", "Write", {"file_path": dest + "//" + base}, _NEUTRAL_CWD),
+        ):
+            v = g.classify(tool, ti, cwd=cwd, closure=c)
+            check(f"{member}-{label}-write", v.classification == "write", (ti, v))
+            check(f"{member}-{label}-resolved", v.resolved == want, (ti, v.resolved, want))
+        # A `..` that leaves the dest: the resolved location is OUTSIDE it.
+        v = g.classify("Bash", {"command": f"touch {dest}/../{os.path.basename(dest)}-old/{base}"},
+                       cwd=_NEUTRAL_CWD, closure=c)
+        check(f"{member}-lookalike-resolves-outside",
+              v.resolved is None or not v.resolved.startswith(dest + os.sep), v)
+    # Reads and non-closure acts carry no resolved location.
+    v = g.classify("Read", {"file_path": os.path.join(FAKE_HOME, ".gemini", "settings.json")},
+                   cwd=_NEUTRAL_CWD, closure=c)
+    check("a-read-carries-no-resolved", v.resolved is None, v)
+
+
 ALL = [
     test_every_member_install_surface_is_closure_installed,
     test_every_member_install_surface_is_closure_repo,
@@ -211,6 +251,7 @@ ALL = [
     test_floor_install_snapshot_matches_the_manifests,
     test_a_new_member_is_covered_by_its_manifest_alone,
     test_a_degenerate_declaration_does_not_widen_the_closure,
+    test_the_verdict_carries_the_resolved_location,
 ]
 
 if __name__ == "__main__":

@@ -718,7 +718,10 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
             # and this, highest wins — `inv.attempted` is a bounded summary that can cut the
             # filename out; this cannot. Sent only when it matched a closure element: an
             # opaque/internal verdict's resource ("stdin", "internal:…") names no target.
-            resolved_target=cv.resource if cv.marker else None)
+            # The LOCATION the closure resolved (cwd-joined, symlinks and `..` resolved), not the
+            # argument as written: the daemon prices a member's gate entry by where it is, and a
+            # relative or `cd`-qualified spelling names no location.
+            resolved_target=(cv.resolved or cv.resource) if cv.marker else None)
         if claimed is _LATE:
             # Unknown, not "nothing happened": the daemon may have opened or matched an
             # escalation after the bound (#1166). Re-issuing the identical act is safe.

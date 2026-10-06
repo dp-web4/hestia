@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 6bfb11858f3c35be4b738af5371b5af13aba4299d77704e0d4458c21b0826be5  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: c010f7ed9ad37aa4aabfe7fd94014bb35fb5ecd434d51a9d7911e694fdcf09b5  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -131,6 +131,7 @@ __all__ = [
     "load_closure",
     "default_closure",
     "attest_shims",
+    "resolve_location",
 ]
 
 # ── Rule ids (returned to the shim; the shim's refusal/witness names the RULE and the ACT) ──
@@ -171,9 +172,32 @@ class ClosureVerdict:
     marker: Optional[str] = None   # matched closure element
     resource: Optional[str] = None  # the argument that resolved into the closure
     source: str = "floor"
+    # The LOCATION the write reaches, as this classifier resolved it: home-expanded, joined
+    # onto the caller's cwd when relative, realpath'd (symlinks and `..` resolved). `resource`
+    # is the argument as written (it can be relative, or a name inside a `cd`); this is where it
+    # lands. Set on a resolved write only. It is what the daemon prices a member's gate entry
+    # from, by location, so the price never depends on how the act was spelled or summarised.
+    resolved: Optional[str] = None
 
 
 # ── The closure — segment-pattern matchers, tighten-only union ──────────────────────────────
+def resolve_location(target: str, cwd: Optional[str] = None) -> Optional[str]:
+    """Where `target` lands: home-expanded, cwd-joined when relative, then realpath'd. A
+    relative target with no cwd to pin it is normalised but stays relative (realpath would
+    resolve it against THIS process's cwd, which is not the classified command's)."""
+    if not isinstance(target, str) or not target:
+        return None
+    try:
+        p = os.path.expanduser(target.replace("\\", "/"))
+        if not os.path.isabs(p):
+            if not (isinstance(cwd, str) and cwd):
+                return os.path.normpath(p)
+            p = os.path.join(os.path.expanduser(cwd), p)
+        return os.path.realpath(p)
+    except (OSError, ValueError):
+        return None
+
+
 def _segments(path: str) -> tuple:
     p = path.replace("\\", "/").rstrip("/")
     return tuple(s for s in p.split("/") if s not in ("", "."))
@@ -1237,7 +1261,9 @@ def classify(tool_name: str, tool_input: Any, *, cwd: Optional[str] = None,
                     rule = RULE_WRITE_UNPARSEABLE
                 else:
                     rule = RULE_WRITE
-                return ClosureVerdict("write", rule, marker, t, src)
+                return ClosureVerdict("write", rule, marker, t, src,
+                                      resolved=resolve_location(t, cwd) if rule == RULE_WRITE
+                                      else None)
     except Exception as e:  # noqa: BLE001 — fail-closed: a broken write classifier must not admit
         return ClosureVerdict("write", RULE_INTERNAL, None,
                               f"internal:{type(e).__name__}", src)

@@ -414,6 +414,39 @@ def test_installed_gate_entry_witness_and_registration_refused():
     _each_seat(arm)
 
 
+def test_installed_entry_claim_carries_the_resolved_location():
+    """The daemon prices a member's gate entry from the LOCATION the gate resolved, so the claim
+    must carry it whatever the spelling: relative to the event cwd, inside a `cd`, through `..`.
+    The argument as written (`resource`) can be a bare name; the resolved target cannot."""
+    def arm(seat, fx):
+        stub = Stub()
+        try:
+            home = fx.home(seat, stub.url)
+            target = _install_surfaces(seat, home)["entry"]
+            dest, base = os.path.dirname(target), os.path.basename(target)
+            os.makedirs(dest, exist_ok=True)
+            want = os.path.realpath(target)
+            forms = [
+                ("relative-write", "Write", {"file_path": base, "content": "x"}, dest),
+                ("cd-then-touch", "Bash", {"command": f"cd {dest} && touch {base}"}, None),
+                ("dotdot", "Bash", {"command": f"touch {dest}/sub/../{base}"}, None),
+            ]
+            for n, (label, tool, ti, cwd) in enumerate(forms, start=40):
+                mark = len(stub.calls)
+                ev = native(seat, tool, ti, n=n)
+                if cwd:
+                    ev["cwd"] = cwd
+                v, text, _ = run(seat, home, ev)
+                check(f"{seat}-{label}-denied", v == "deny" and "gate.self_access" in text, text)
+                claims = [a for c, a in stub.calls[mark:] if c == "hestia_gate_escalation_claim"]
+                check(f"{seat}-{label}-claim-carries-resolved-location",
+                      claims and claims[0].get("resolved_target") == want,
+                      (want, claims and claims[0].get("resolved_target")))
+        finally:
+            stub.close()
+    _each_seat(arm)
+
+
 def test_approved_gate_write_proceeds_to_ordinary_law():
     def arm(seat, fx):
         stub = Stub(claim={"claimed": True, "permits_write": True, "decided_by": "test-operator",
@@ -584,6 +617,7 @@ ALL = [
     test_gate_file_shell_write_refused,
     test_every_declared_member_is_exercised_here,
     test_installed_gate_entry_witness_and_registration_refused,
+    test_installed_entry_claim_carries_the_resolved_location,
     test_approved_gate_write_proceeds_to_ordinary_law,
     test_distinctive_names_govern_anywhere_hooks_only_names_do_not,
     test_ordinary_write_is_asked_allowed_and_recorded,
