@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Register every installed member's hestia hooks in that member's OWN harness config.
+"""Reconcile every installed member's hestia hooks in that member's OWN harness config.
 
 dp, 2026-09-27 (#1133): "the auto install process is supposed to take care of all this. isn't
 there a script? editing files by hand is unacceptable friction for product we're trying to
@@ -7,60 +7,86 @@ release generally." There was no script. `deploy/install-members.sh` copies a ho
 where the harness ALREADY registers it (it derives the target from the registration, never
 from `expects.json`'s dest — #315), and the daemon's `install_claude_code` (core/src/
 orchestrators.rs) merges exactly one hook for one member. Every other registration was a hand
-edit, which is how codex ran 14 days with `witness.py` registered nowhere: skipped by the
-installer every cycle ("not registered on this host") and read as governed by the inventory.
+edit, which is how codex ran 14 days with `witness.py` registered nowhere.
 
-This script closes the loop the installer left open. For each `plugins/<member>/expects.json`
-that declares `install.registration` and ships a `hooks/hooks.json` template:
+dp, 2026-10-06 (#1237, #1242): "i need the install from git to update properly and automatically
+... looking towards release, these frictions are unacceptable to ordinary users." Until then this
+script was ADD-ONLY: it never rewrote a command, so a template change (one-gate stage C's
+HESTIA_HOME on the gate line) reached no host that was already registered, and the deploy
+preflight refused every cycle on CBP, Legion and HUB. THE RULING: THE DEPLOYER OWNS HESTIA'S
+REGISTRATION LINES. A line hestia installed is rewritten to the rendered template on every deploy;
+a line it did not install is never touched; per-seat customisation goes through the vault's seat
+projection, never through a hand edit to a hook line.
+
+For each `plugins/<member>/expects.json` that declares `install.registration` and ships a
+`hooks/hooks.json` template:
 
   1. Is the harness on this host?  Its config DIRECTORY exists (`~/.codex`, `~/.claude`, ...).
-     Absent -> skip, said aloud. Never mint a registration for a harness that is not here
-     (#1130: "offer and accept only what is installed here").
-  2. Render the template: `@HESTIA_PLUGIN_ROOT@/<member>/hooks/<file>` -> `<install.dest>/<file>`
-     (the declared dest, which install-members.sh will then find REGISTERED and install to —
-     the two scripts agree by construction). `HESTIA_WORKSPACE=@HESTIA_WORKSPACE@` renders from
+     Absent -> skip, said aloud. Never mint a registration for a harness that is not here (#1130).
+  2. Render the template. `@HESTIA_PLUGIN_ROOT@/<member>/hooks/<file>` -> `<install.dest>/<file>`
+     (the declared dest, which install-members.sh then finds REGISTERED and installs to).
+     `@HESTIA_HOME@` -> the deploying environment's HESTIA_HOME, resolved to an ABSOLUTE path;
+     unset REFUSES the member — the bootstrap locator has no default, by design (#944), and a
+     gate line without it is the #1237 outage. `HESTIA_WORKSPACE=@HESTIA_WORKSPACE@` renders from
      the environment when set and is dropped when not (every hook has a default). Any other
-     placeholder left unrendered REFUSES the member: a template that advertises a path nobody
-     rendered must never reach a config (plugins/codex/README.md).
-  3. Merge, idempotently, by TARGET BASENAME: a hook whose file is already registered on that
-     event — by any command, any spelling — is left exactly as it is. Only the missing ones are
-     added, as a new matcher group (JSON: appended to `hooks.<Event>`; TOML: an appended
-     `[[hooks.<Event>]]` + `[[hooks.<Event>.hooks]]` block under a marker comment). Nothing
-     already in the file is rewritten or reordered; a second run is a byte-identical no-op.
-  4. Validate the result before it stands: JSON must reload; TOML must parse under tomllib
-     when the interpreter has it (3.11+). A failed parse restores the backup and exits 6 —
-     a broken hook table would disable EVERY hook, gate included, which is worse than the gap.
-  5. `install.registration.ensure` (optional): lines a harness needs for hooks to fire at
-     all — codex's `[features] codex_hooks = true`. Added only when the key is absent.
+     placeholder left unrendered REFUSES the member.
+  3. OWNERSHIP. A registered hook is HESTIA'S when its target (the first absolute-path token of
+     its command, the installer's rule) is exactly `<install.dest>/<basename>` for a basename the
+     template registers on that event. Nothing else is owned: a hook whose target lies anywhere
+     else — even one with the same basename — is FOREIGN and is never rewritten.
+  4. RECONCILE, per templated hook (event, basename):
+       - missing        -> added (JSON: a new group appended to `hooks.<Event>`; TOML: a new
+                           `[[hooks.<Event>]]` + `[[hooks.<Event>.hooks]]` block, or a flat
+                           `[[hooks]]` table, under a marker comment). Only once its target file
+                           is on disk (else PENDING; install-members.sh plans, installs, then
+                           registers, so nothing ever points at a missing file).
+       - owned, differs -> rewritten IN PLACE to the rendered value: command, timeout, type,
+                           statusMessage (nested/JSON) and the matcher. A matcher lives on a
+                           group; when the group also holds hooks that are not this one, the hook
+                           is moved to its own group instead, so no foreign hook's matcher moves.
+       - owned, equal   -> nothing. A second run is a byte-identical no-op.
+       - owned, twice   -> reduced to one owned entry (the one already on the template's matcher,
+                           else the first); the others are removed.
+       - foreign only   -> left exactly as it is, and reported: FOREIGN when its matcher covers
+                           the template's, NARROW when it does not (exit 8), SHORT when its
+                           timeout is below the template's (exit 10), INERT when it carries an
+                           env override no gate reads since stage C.
+     Each rewrite is reported old -> new.
+  5. Validate before anything stands. JSON is written structurally and must reload. TOML is
+     text-edited line by line (comments, alignment and every byte the reconcile does not own are
+     kept), and the edit is PROVED before it is written: the edited text is re-parsed (tomllib on
+     3.11+, else this script's strict line grammar) and must equal the reconcile applied to the
+     parsed original — every foreign hook and every non-hooks key unchanged. A config this script
+     cannot verify is REFUSED (exit 7), never guessed at. A file that fails to parse after the
+     write is restored to what this run read (exit 6): a broken hook table disables every hook,
+     gate included, which is worse than the gap.
+  6. `install.registration.ensure` (optional): lines a harness needs for hooks to fire at all —
+     codex's `[features] codex_hooks = true`. Added only when the key is absent.
 
-Reader semantics are the installer's (json-hook-commands / toml-hook-commands: the target is
-the absolute-path token of a `command` value); this script reads registration exactly the way
-install-members.sh does, so what it writes is what the installer will see.
+THE TIMEOUT IS THE GATE'S BOUND (one-gate stage C): every seat's gate reads the timeout its harness
+registered and decides inside it. The reconcile sets an owned hook's timeout to the template's
+value in both directions; `--raise-timeouts` is kept as an accepted no-op alias.
 
-  6. THE TIMEOUT IS THE GATE'S BOUND (one-gate stage C). Every seat's gate READS the timeout
-     its harness registered and decides inside `start + timeout - margin`, so it always fails
-     closed before the harness kills it and fails open. Registration length is therefore the
-     AVAILABILITY knob: a template's value (claude-code 10 s, codex 15 s, kimi 15 s, gemini
-     15000 ms) absorbs one cold member connect (measured 4.6-5.1 s); a shorter one turns that
-     connect into a recorded denial. A templated hook already registered with a SHORTER timeout
-     (or none) is reported SHORT (exit 10) and, with --raise-timeouts, raised to the template's
-     value in place — raised only, never lowered, nothing else on the line touched. A registered
-     gate command carrying an env override no gate reads any more (HESTIA_PRE_TOTAL_BUDGET_MS,
-     HESTIA_PRE_REQUEST_TIMEOUT_S, a per-seat HESTIA_<SEAT>_GATE_MODE) is reported INERT; the
-     script never rewrites a command, so removing it is the operator's edit.
+    DRY_RUN=1        print what would change (each rewrite old -> new), write nothing
+    --plan           machine-readable rows for install-members.sh: member<TAB>basename<TAB>target
+                     for every templated hook whose file must be installed before it registers
+    --plugins DIR    read plugin dirs from DIR; default: this checkout's plugins/
+    --home DIR       treat DIR as the home directory; default: ~
+    --member NAME    only this member (the plugin directory name)
+    --raise-timeouts accepted, does nothing more (the reconcile covers it)
 
-    DRY_RUN=1        print what would change, write nothing (exit 0)
-    --plugins DIR    read plugin dirs from DIR (tests); default: this checkout's plugins/
-    --home DIR       treat DIR as the home directory (tests); default: ~
-    --member NAME    only this member
-    --raise-timeouts raise every SHORT templated hook's timeout to the template's value
+The renderer is shared: `deploy/from-main/gate-preflight.py` loads this file and probes each
+candidate gate under `reconciled_commands()` — the registration this install WILL write — not the
+one currently on disk (which the install is about to rewrite).
 
-Exit: 0 clean (registered or nothing to do); 6 a write failed validation and was restored;
-7 a template carries an unrendered placeholder (that member skipped, others proceed); 8 narrow;
-9 pending; 10 a templated hook is registered with a timeout below its template's.
+Exit: 0 clean; 6 a write failed validation and was restored; 7 refused (an unrendered placeholder,
+HESTIA_HOME unset, or a config that cannot be verified; that member skipped, others proceed);
+8 a FOREIGN registration is narrower than the template; 9 pending; 10 a FOREIGN registration's
+timeout is below the template's.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -72,12 +98,23 @@ REPO_ROOT = os.path.dirname(HERE)
 MARK = "# hestia: registered by deploy/register-members.py"
 _PLACEHOLDER = re.compile(r"@[A-Z_]+@")
 FORCE_LINE_SCAN = False   # tests set this to exercise the fallback reader on a host with tomllib
-_TOML_CMD = re.compile(r"""\s*command\s*=\s*(['"])(.*)\1\s*$""")
 ENV = os.environ
+#: The characters a rendered HESTIA_HOME may hold: it lands unquoted on a shell command line (and
+#: install-members.sh writes the same value into a sourced ~/.profile, with the same allowlist).
+_SAFE_PATH = re.compile(r"^/[A-Za-z0-9/._+@,:-]*$")
+DELETE = object()         # a field the reconcile removes
 
 
 class Unrendered(Exception):
     pass
+
+
+class TomlUnsupported(Exception):
+    """The reader met TOML it cannot verify. The registrar refuses to certify or edit anything."""
+
+
+class Unlocatable(Exception):
+    """A TOML edit could not be placed on, or proved against, the text. Nothing is written."""
 
 
 def log(msg: str) -> None:
@@ -85,9 +122,29 @@ def log(msg: str) -> None:
 
 
 # ---------------------------------------------------------------- rendering --------------
-def render_command(cmd: str, member: str, dest: str) -> str:
+def hestia_home_value(env=None) -> str:
+    """The bootstrap locator as it will be written onto a hook line: the deploying environment's
+    HESTIA_HOME, resolved to an absolute path. Unset refuses -- there is no default, by design
+    (#944); a gate line rendered without it is exactly the #1237/#1242 outage."""
+    env = ENV if env is None else env
+    raw = env.get("HESTIA_HOME")
+    if not raw:
+        raise Unrendered("@HESTIA_HOME@: HESTIA_HOME is not set in the deploying environment; "
+                         "the bootstrap locator has no default, by design (#944)")
+    path = os.path.realpath(os.path.expanduser(raw))
+    if not _SAFE_PATH.match(path):
+        raise Unrendered(f"@HESTIA_HOME@: HESTIA_HOME resolves to {path!r}, which carries characters "
+                         "this registrar will not write onto a shell command line (allowed: letters, "
+                         "digits and / . _ + @ , : -)")
+    return path
+
+
+def render_command(cmd: str, member: str, dest: str, env=None) -> str:
+    env = ENV if env is None else env
     cmd = cmd.replace(f"@HESTIA_PLUGIN_ROOT@/{member}/hooks/", dest.rstrip("/") + "/")
-    ws = ENV.get("HESTIA_WORKSPACE")
+    if "@HESTIA_HOME@" in cmd:
+        cmd = cmd.replace("@HESTIA_HOME@", hestia_home_value(env))
+    ws = env.get("HESTIA_WORKSPACE")
     if "@HESTIA_WORKSPACE@" in cmd:
         if ws:
             cmd = cmd.replace("@HESTIA_WORKSPACE@", ws)
@@ -106,7 +163,15 @@ def target_basename(cmd: str) -> str | None:
     return None
 
 
-def rendered_groups(template: dict, member: str, dest: str) -> dict[str, list[dict]]:
+def target_path(cmd: str) -> str | None:
+    """The installer's rule, the whole path: the first token that is an absolute path."""
+    for tok in cmd.split():
+        if tok.startswith("/"):
+            return tok
+    return None
+
+
+def rendered_groups(template: dict, member: str, dest: str, env=None) -> dict[str, list[dict]]:
     """{event: [{matcher?, hooks:[{type, command, statusMessage?, timeout?}]}]} with commands
     rendered. Raises Unrendered."""
     hooks = template.get("hooks", template)
@@ -123,23 +188,49 @@ def rendered_groups(template: dict, member: str, dest: str) -> dict[str, list[di
                 if not isinstance(h, dict) or not isinstance(h.get("command"), str):
                     continue
                 nh = dict(h)
-                nh["command"] = render_command(h["command"], member, dest)
+                nh["command"] = render_command(h["command"], member, dest, env)
                 ng["hooks"].append(nh)
             if ng["hooks"]:
                 out.setdefault(event, []).append(ng)
     return out
 
 
+class Desired:
+    """One templated hook: `group` is the template group's keys (matcher, ...) without `hooks`;
+    `hook` the rendered template hook."""
+    def __init__(self, event: str, base: str, target, group: dict, hook: dict):
+        self.event, self.base, self.target, self.group, self.hook = event, base, target, group, hook
+
+    @property
+    def matcher(self):
+        return self.group.get("matcher")
+
+
+def desired_hooks(groups: dict) -> list[Desired]:
+    out, seen = [], set()
+    for event, gs in groups.items():
+        for g in gs:
+            for h in g["hooks"]:
+                b = target_basename(h["command"]) or ""
+                if (event, b) in seen:
+                    raise Unrendered(f"the template registers {event}/{b} twice; ownership is keyed by "
+                                     "(event, basename), so this template cannot be reconciled")
+                seen.add((event, b))
+                out.append(Desired(event, b, target_path(h["command"]),
+                                   {k: v for k, v in g.items() if k != "hooks"}, h))
+    return out
+
+
 # ---------------------------------------------------------------- reading ----------------
 ALL_MATCHERS = (None, "", "*", ".*", ".+")
+UNPARSED = object()   # a matcher the reader could not decode: covers NOTHING
 
 
 def covers(have, want) -> bool:
     """Does an existing registration's matcher cover what the template's matcher asks for?
     A template matcher that matches every tool (absent, "", "*", ".*") is covered only by an
     existing matcher that also matches every tool; a specific one is covered by itself or by an
-    all-tools matcher. #1142 review: a gate registered only for `Read` was reported as "every
-    templated hook is registered" because presence was judged by basename and event alone."""
+    all-tools matcher (#1142 review)."""
     if have is UNPARSED:
         return False                      # never certify a gate whose matcher could not be read
     if have in ALL_MATCHERS:
@@ -149,95 +240,21 @@ def covers(have, want) -> bool:
     return have == want
 
 
-def registered_json(path: str) -> dict[str, dict[str, list]]:
-    """{event: {target basename: [matcher of each group that registers it]}} —
-    json-hook-commands semantics. A group with no `matcher` key is recorded as None (all tools)."""
-    with open(path, encoding="utf-8") as fh:
-        data = json.load(fh)
-    out: dict[str, dict[str, list]] = {}
-    for event, groups in (data.get("hooks") or {}).items():
-        if not isinstance(groups, list):
-            continue
-        for g in groups:
-            if not isinstance(g, dict):
-                continue
-            m = g.get("matcher")
-            for h in g.get("hooks") or []:
-                if isinstance(h, dict) and isinstance(h.get("command"), str):
-                    b = target_basename(h["command"])
-                    if b:
-                        out.setdefault(event, {}).setdefault(b, []).append(m)
-    return out
-
-
-UNPARSED = object()   # a matcher line the fallback reader could not decode: covers NOTHING
-
-
-def _toml_structural(path: str, flat: bool = False):
-    """{event: {basename: [matcher]}} from a real TOML parse, or None when no parser is available
-    (or FORCE_LINE_SCAN is set, for the tests of the fallback)."""
-    if FORCE_LINE_SCAN:
-        return None
-    try:
-        import tomllib  # type: ignore
-    except ImportError:
-        return None
-    try:
-        with open(path, "rb") as fh:
-            data = tomllib.load(fh)
-    except tomllib.TOMLDecodeError as e:
-        # not valid TOML: nothing in it can be certified, whichever reader looks
-        raise TomlUnsupported(f"not valid TOML ({e})") from e
-    out: dict[str, dict[str, list]] = {}
-    if flat:
-        for tbl in data.get("hooks") or []:
-            if not isinstance(tbl, dict) or not isinstance(tbl.get("event"), str):
-                continue
-            m = tbl.get("matcher")
-            m = m if (m is None or isinstance(m, str)) else UNPARSED
-            cmd = tbl.get("command")
-            b = target_basename(cmd) if isinstance(cmd, str) else None
-            if b:
-                out.setdefault(tbl["event"], {}).setdefault(b, []).append(m)
-        return out
-    for event, groups in (data.get("hooks") or {}).items():
-        if not isinstance(groups, list):
-            continue
-        for g in groups:
-            if not isinstance(g, dict):
-                continue
-            m = g.get("matcher")
-            m = m if (m is None or isinstance(m, str)) else UNPARSED
-            for h in g.get("hooks") or []:
-                cmd = h.get("command") if isinstance(h, dict) else None
-                b = target_basename(cmd) if isinstance(cmd, str) else None
-                if b:
-                    out.setdefault(event, {}).setdefault(b, []).append(m)
-    return out
-
-
-class TomlUnsupported(Exception):
-    """The fallback reader met TOML it cannot verify. The registrar refuses to certify anything."""
-
-
-# The fallback's whole grammar. Keys: bare or quoted. Headers: [a.b] / [[a.b]] with bare or quoted
-# segments. Values: one basic or literal string, an integer, or a boolean. Each line may end in a comment.
+# The strict line grammar (the fallback reader, and the proof of an edit on a host without tomllib).
+# Keys: bare or quoted. Headers: [a.b] / [[a.b]] with bare or quoted segments. Values: one basic or
+# literal string, an integer, or a boolean. Each line may end in a comment.
 _KEY = r"""(?:[A-Za-z0-9_-]+|"(?:[^"\\]|\\.)*"|'[^']*')"""
 _KEYPATH = rf"{_KEY}(?:\s*\.\s*{_KEY})*"
 _HEADER = re.compile(rf"""^\s*(\[\[|\[)\s*({_KEYPATH})\s*(\]\]|\])\s*(?:#.*)?$""")
 _ASSIGN = re.compile(rf"""^\s*({_KEYPATH})\s*=\s*(.*?)\s*$""")
 _VALUE = re.compile(r"""^(?:"((?:[^"\\]|\\.)*)"|'([^']*)'|([+-]?[0-9_]+)|(true|false))\s*(?:#.*)?$""")
 _KEYSEG = re.compile(_KEY)
-
-
 _TOML_ESCAPES = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", '"': '"', "\\": "\\"}
 
 
 def _toml_basic(s: str) -> str:
     r"""Decode a TOML basic-string body EXACTLY (TOML 1.0: \b \t \n \f \r \" \\ \uXXXX \UXXXXXXXX), or raise
-    TomlUnsupported. Never return the raw spelling: #1142's fourth review showed `"\U0000006datcher"` -- a
-    valid TOML spelling of `matcher` -- decoded by JSON (which has no \U escape), failed, came back raw, and
-    became an unrelated key, so a narrow gate read as all-tools."""
+    TomlUnsupported. Never return the raw spelling (#1142's fourth review: `"\U0000006datcher"`)."""
     out, i, n = [], 0, len(s)
     while i < n:
         ch = s[i]
@@ -280,32 +297,29 @@ def _segments(keypath: str) -> list[str]:
     return out
 
 
-def _toml_scan(path: str, flat: bool = False) -> tuple[dict, set]:
-    """The fallback reader: ({event: {basename: [matcher]}}, {absolute target}). Raises TomlUnsupported
-    on anything outside its grammar that could bear on hooks -- it never guesses.
+def _scan_value(v: re.Match):
+    if v.group(1) is not None:
+        return _toml_basic(v.group(1))
+    if v.group(2) is not None:
+        return v.group(2)
+    if v.group(3) is not None:
+        return int(v.group(3).replace("_", ""))
+    return v.group(4) == "true"
 
-    #1142 third review: `"matcher" = "shell"` (a quoted key, valid TOML) was not recognised, the matcher
-    stayed None, and None is all-tools. Quoted keys and quoted header segments are now read the TOML way,
-    and every other form the scan cannot parse is a refusal, not an absence."""
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        text = fh.read()
+
+def _toml_scan_hooks(text: str, flat: bool = False):
+    """The strict reader: the hooks structure in tomllib's shape -- nested: {event: [{matcher?,
+    hooks: [{key: value}]}]}; flat: [{event, command, ...}] -- or TomlUnsupported on anything outside
+    its grammar that could bear on hooks. It never guesses.
+
+    #1142 third review: `"matcher" = "shell"` (a quoted key) was not recognised and read as all-tools.
+    Quoted keys and header segments are read the TOML way; every other form is a refusal."""
     if '"' * 3 in text or "'" * 3 in text:
         raise TomlUnsupported("a multi-line string (it can hide table headers from a line scan)")
-    have: dict[str, dict[str, list]] = {}
-    targets: set[str] = set()
+    nested: dict[str, list] = {}
+    tables: list[dict] = []
     ctx = None                     # None | ("group", event) | ("entry", event) | ("flat",) | ("other",)
-    matcher = None
-    table: dict = {}               # the current flat [[hooks]] table's keys
-
-    def flush_flat() -> None:
-        ev, cmd = table.get("event"), table.get("command")
-        if isinstance(ev, str) and isinstance(cmd, str):
-            t = target_path(cmd)
-            if t:
-                targets.add(t)
-            b = target_basename(cmd)
-            if b:
-                have.setdefault(ev, {}).setdefault(b, []).append(table.get("matcher"))
+    cur: dict | None = None        # the table the keys land in
     for n, line in enumerate(text.splitlines(), 1):
         st = line.strip()
         if not st or st.startswith("#"):
@@ -314,28 +328,30 @@ def _toml_scan(path: str, flat: bool = False) -> tuple[dict, set]:
         if h:
             segs = _segments(h.group(2))
             arr = h.group(1) == "[["
-            if ctx == ("flat",):
-                flush_flat()
-                table = {}
             if flat:
                 if segs and segs[0] == "hooks":
                     if arr and segs == ["hooks"]:
-                        ctx = ("flat",)
+                        ctx, cur = ("flat",), {}
+                        tables.append(cur)
                         continue
                     raise TomlUnsupported(f"line {n}: hooks table form {st!r} in a flat layout")
-                ctx = ("other",)
+                ctx, cur = ("other",), None
                 continue
             if segs and segs[0] == "hooks" and not arr and len(segs) >= 2 and segs[1] == "state":
-                ctx = ("other",)          # codex's per-hook approval state: defines no hooks
+                ctx, cur = ("other",), None   # codex's per-hook approval state: defines no hooks
             elif segs and segs[0] == "hooks":
                 if arr and len(segs) == 2:
-                    ctx, matcher = ("group", segs[1]), None
-                elif arr and len(segs) == 3 and segs[2] == "hooks" and ctx and ctx[0] in ("group", "entry") and ctx[1] == segs[1]:
+                    ctx, cur = ("group", segs[1]), {}
+                    nested.setdefault(segs[1], []).append(cur)
+                elif (arr and len(segs) == 3 and segs[2] == "hooks" and ctx and ctx[0] in ("group", "entry")
+                      and ctx[1] == segs[1]):
                     ctx = ("entry", segs[1])
+                    cur = {}
+                    nested[segs[1]][-1].setdefault("hooks", []).append(cur)
                 else:
                     raise TomlUnsupported(f"line {n}: hooks table form {st!r}")
             else:
-                ctx = ("other",)
+                ctx, cur = ("other",), None
             continue
         if st.startswith("["):
             raise TomlUnsupported(f"line {n}: unparseable table header {st!r}")
@@ -355,71 +371,393 @@ def _toml_scan(path: str, flat: bool = False) -> tuple[dict, set]:
         v = _VALUE.match(a.group(2))
         if v is None:
             raise TomlUnsupported(f"line {n}: value the scan cannot read {st!r}")
-        sval = _toml_basic(v.group(1)) if v.group(1) is not None else v.group(2)
-        key = segs[0]
-        if ctx[0] == "flat":
-            if key in ("event", "command", "matcher"):
-                if sval is None:
-                    raise TomlUnsupported(f"line {n}: non-string {key} {st!r}")
-                if key in table:
-                    raise TomlUnsupported(f"line {n}: {key} set twice in one [[hooks]] table")
-                table[key] = sval
+        key, val = segs[0], _scan_value(v)
+        if key in ("event", "command", "matcher") and not isinstance(val, str):
+            raise TomlUnsupported(f"line {n}: non-string {key} {st!r}")
+        if key in cur:
+            raise TomlUnsupported(f"line {n}: {key} set twice in one table")
+        cur[key] = val
+    return tables if flat else nested
+
+
+def toml_hooks(text: str, flat: bool = False):
+    """The hooks structure of a TOML config: a structural parse (tomllib) when the host has one,
+    otherwise the strict line grammar. Raises TomlUnsupported."""
+    if not FORCE_LINE_SCAN:
+        try:
+            import tomllib  # type: ignore
+        except ImportError:
+            tomllib = None
+        if tomllib is not None:
+            try:
+                data = tomllib.loads(text)
+            except tomllib.TOMLDecodeError as e:
+                raise TomlUnsupported(f"not valid TOML ({e})") from e
+            hooks = data.get("hooks")
+            if flat:
+                return [t for t in hooks if isinstance(t, dict)] if isinstance(hooks, list) else []
+            return hooks if isinstance(hooks, dict) else {}
+    return _toml_scan_hooks(text, flat)
+
+
+class Reg:
+    """One registered hook. `gi`/`hi` index the nested/JSON layout; `ti` the flat one."""
+    def __init__(self, event: str, matcher, hook: dict, base, target, gi: int = -1, hi: int = -1,
+                 ti: int = -1):
+        self.event, self.matcher, self.hook, self.base, self.target = event, matcher, hook, base, target
+        self.gi, self.hi, self.ti = gi, hi, ti
+
+
+def _matcher_of(holder: dict):
+    m = holder.get("matcher")
+    return m if (m is None or isinstance(m, str)) else UNPARSED
+
+
+def index_hooks(hooks, flat: bool) -> list[Reg]:
+    out: list[Reg] = []
+    if flat:
+        for ti, t in enumerate(hooks if isinstance(hooks, list) else []):
+            if not isinstance(t, dict) or not isinstance(t.get("event"), str):
+                continue
+            cmd = t.get("command")
+            cmd = cmd if isinstance(cmd, str) else ""
+            out.append(Reg(t["event"], _matcher_of(t), t, target_basename(cmd), target_path(cmd), ti=ti))
+        return out
+    for event, gs in (hooks.items() if isinstance(hooks, dict) else []):
+        if not isinstance(gs, list):
             continue
-        if ctx[0] == "group" and key == "matcher":
-            if sval is None:
-                raise TomlUnsupported(f"line {n}: non-string matcher {st!r}")
-            matcher = sval
-        elif ctx[0] == "entry" and key == "command" and sval is not None:
-            t = target_path(sval)
-            if t:
-                targets.add(t)
-            b = target_basename(sval)
-            if b:
-                have.setdefault(ctx[1], {}).setdefault(b, []).append(matcher)
-    if ctx == ("flat",):
-        flush_flat()
-    return have, targets
+        for gi, g in enumerate(gs):
+            if not isinstance(g, dict):
+                continue
+            for hi, h in enumerate(g.get("hooks") or []):
+                cmd = h.get("command") if isinstance(h, dict) else None
+                if not isinstance(cmd, str):
+                    continue
+                out.append(Reg(event, _matcher_of(g), h, target_basename(cmd), target_path(cmd), gi=gi, hi=hi))
+    return out
+
+
+def _have(regs: list[Reg]) -> dict[str, dict[str, list]]:
+    out: dict[str, dict[str, list]] = {}
+    for r in regs:
+        if r.base:
+            out.setdefault(r.event, {}).setdefault(r.base, []).append(r.matcher)
+    return out
+
+
+def registered_json(path: str) -> dict[str, dict[str, list]]:
+    """{event: {target basename: [matcher of each group that registers it]}}."""
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    return _have(index_hooks(data.get("hooks") or {}, False))
 
 
 def registered_toml(path: str, flat: bool = False) -> dict[str, dict[str, list]]:
-    """{event: {target basename: [matcher of each group that registers it]}} -- toml-hook-commands
-    semantics. A structural parse (tomllib) when the host has one; otherwise `_toml_scan`, which
-    refuses (TomlUnsupported) rather than reading an unrecognised matcher as absent -- absent is
-    all-tools, so a misread would certify a narrow gate (#1142 reviews 2 and 3)."""
-    got = _toml_structural(path, flat)
-    if got is not None:
-        return got
-    return _toml_scan(path, flat)[0]
+    """{event: {target basename: [matcher of each group that registers it]}} -- read structurally
+    (tomllib) or by the strict grammar, which refuses rather than reading an unrecognised matcher
+    as absent (absent is all-tools)."""
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return _have(index_hooks(toml_hooks(fh.read(), flat), flat))
 
 
-def target_path(cmd: str) -> str | None:
-    """The installer's rule, the whole path: the first token that is an absolute path."""
-    for tok in cmd.split():
-        if tok.startswith("/"):
-            return tok
-    return None
+# ---------------------------------------------------------------- reconcile --------------
+#: What the reconcile owns on a hook entry. A key outside these on an owned line is left alone.
+NESTED_FIELDS = ("type", "command", "statusMessage", "timeout")
+FLAT_FIELDS = ("command", "timeout", "matcher")
+#: Env overrides on a registered gate command that no gate reads since one-gate stage C.
+INERT_GATE_ENV = re.compile(r"\b(HESTIA_PRE_TOTAL_BUDGET_MS|HESTIA_PRE_REQUEST_TIMEOUT_S|"
+                            r"HESTIA_[A-Z]+_GATE_MODE)=\S*")
 
 
-# ---------------------------------------------------------------- writing ----------------
-def _backup(path: str) -> None:
-    bak = path + ".pre-register.bak"
-    if not os.path.exists(bak):
-        shutil.copy2(path, bak)
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
-def _write_atomic(path: str, text: str) -> None:
-    """Write `text` to `path` so a crash leaves the old file or the new one, never half of one.
-    The temp file takes the original's mode: ~/.codex/config.toml is 0600, and a fresh temp file
-    (0644 under the usual umask) would loosen a harness config every time this ran."""
-    d = os.path.dirname(path) or "."
-    tmp = os.path.join(d, f".{os.path.basename(path)}.register-tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
-        fh.flush()
-        os.fsync(fh.fileno())
-    if os.path.exists(path):
-        shutil.copymode(path, tmp)
-    os.replace(tmp, path)
+def _flat_matcher(m):
+    return None if m in ALL_MATCHERS else m
+
+
+def _toml_hook(hook: dict) -> dict:
+    """The rendered hook as a nested TOML entry holds it (exactly what toml_block writes)."""
+    out = {"type": str(hook.get("type", "command")), "command": hook["command"]}
+    if isinstance(hook.get("statusMessage"), str):
+        out["statusMessage"] = hook["statusMessage"]
+    if _is_num(hook.get("timeout")):
+        out["timeout"] = int(hook["timeout"])
+    return out
+
+
+def _want_fields(d: Desired, layout: str) -> dict:
+    """{field: value or None (absent)} the owned entry must carry."""
+    if layout == "flat":
+        t = d.hook.get("timeout")
+        return {"command": d.hook["command"], "timeout": int(t) if _is_num(t) else None,
+                "matcher": _flat_matcher(d.matcher)}
+    h = _toml_hook(d.hook) if layout == "toml" else d.hook
+    return {f: h.get(f) for f in NESTED_FIELDS}
+
+
+def _show(v) -> str:
+    return "(none)" if v is None else (repr(v) if isinstance(v, str) else str(v))
+
+
+class Plan:
+    def __init__(self):
+        self.ops: list = []       # ("set", Reg, {f: v|DELETE}) | ("gmatch", ev, gi, v|DELETE) | ("drop", Reg) | ("add", Desired)
+        self.changes: list = []   # (verb, text): verb in add/rewrite/remove
+        self.notes: list = []     # "NARROW ..." / "PENDING ..." / ...
+        self.planned: list = []   # (base, target) the installer must put on disk
+        self.narrow = False
+        self.pending = False
+
+
+def plan_reconcile(desired: list[Desired], regs: list[Reg], hooks, layout: str, *,
+                   installed, dry: bool, plan_mode: bool) -> Plan:
+    """Decide every op. `layout` in json/toml/flat. `installed(target)` says whether a target file is
+    on disk (preflight passes `lambda t: True`: it judges the registration after the install)."""
+    P = Plan()
+    flat = layout == "flat"
+    norm = lambda p: os.path.normpath(p) if p else p  # noqa: E731
+    dropped: set[int] = set()
+    moved: set[int] = set()
+    regroup: dict[tuple, list] = {}               # (event, gi) -> [(Reg, Desired)] needing a matcher
+    sets: list[tuple] = []
+    for d in desired:
+        same = [r for r in regs if r.event == d.event and r.base == d.base and r.base]
+        owned = [r for r in same if d.target and norm(r.target) == norm(d.target)]
+        foreign = [r for r in same if r not in owned]
+        key = f"{d.event}/{d.base}"
+        if owned:
+            want = _want_fields(d, layout)
+            if flat:
+                keep = next((r for r in owned if r.hook.get("matcher") == want["matcher"]), owned[0])
+            else:
+                keep = next((r for r in owned if r.matcher == d.matcher), owned[0])
+            for r in owned:
+                if r is not keep:
+                    dropped.add(id(r))
+                    P.ops.append(("drop", r))
+                    P.changes.append(("remove", f"{key}: duplicate owned entry {_show(r.hook.get('command'))}"
+                                                f" (kept one; {len(owned)} were registered)"))
+            diff = {f: v for f, v in want.items() if keep.hook.get(f) != v}
+            if diff:
+                sets.append((keep, d, diff))
+            if not flat and keep.matcher != d.matcher:
+                regroup.setdefault((d.event, keep.gi), []).append((keep, d))
+            if d.target and not installed(d.target):
+                if plan_mode:
+                    P.planned.append((d.base, d.target))
+                elif not dry:
+                    P.pending = True
+                    P.notes.append(f"PENDING {key} is registered but {d.target} is not installed "
+                                   f"(install-members.sh installs it)")
+            continue
+        if foreign:
+            if any(covers(r.matcher if not flat else r.hook.get("matcher"), d.matcher) for r in foreign):
+                for r in foreign:
+                    P.notes.append(f"FOREIGN {key} is registered at {r.target}, not under the declared "
+                                   f"dest ({os.path.dirname(d.target or '')}); not hestia's line, left as it is")
+                    want = d.hook.get("timeout")
+                    t = r.hook.get("timeout")
+                    if _is_num(want) and not (_is_num(t) and t >= want):
+                        P.notes.append(f"SHORT {key} is registered with timeout {t!r}, below the template's "
+                                       f"{want!r}, on a line hestia does not own: the gate decides inside the "
+                                       f"registered value -- raise it, or let the deploy own the line")
+                    stray = sorted({m.group(0) for m in INERT_GATE_ENV.finditer(r.hook.get("command") or "")})
+                    if stray:
+                        P.notes.append(f"INERT {key} command carries {', '.join(stray)}, which no gate reads "
+                                       f"since one-gate stage C; remove it from that (foreign) line")
+                continue
+            P.narrow = True
+            ms = [(r.matcher if not flat else r.hook.get("matcher")) for r in foreign]
+            P.notes.append(f"NARROW {key} is registered only for matcher "
+                           f"{', '.join('<unreadable>' if m is UNPARSED else repr(m) for m in ms)}; "
+                           f"the template wants {d.matcher!r} -- a line hestia does not own (target "
+                           f"{foreign[0].target}): left as it is, not reported as registered")
+            continue
+        P.planned.append((d.base, d.target))
+        if plan_mode:
+            continue
+        if not dry and (d.target is None or not installed(d.target)):
+            P.pending = True
+            P.notes.append(f"PENDING {key} -> {d.target} is not installed yet; not registered "
+                           f"(install-members.sh installs it, then registers)")
+            continue
+        P.ops.append(("add", d))
+        P.changes.append(("add", key))
+
+    # Matchers live on groups (nested/JSON). Rewrite a group's matcher in place only when every
+    # surviving hook in it is an owned hook wanting that same matcher; otherwise move each owned hook
+    # out to its own group, so no foreign hook's matcher ever moves.
+    for (event, gi), pairs in regroup.items():
+        members = [r for r in regs if r.event == event and r.gi == gi and id(r) not in dropped]
+        wants = {repr(d.matcher) for _r, d in pairs}
+        if len(members) == len(pairs) and len(wants) == 1:
+            m = pairs[0][1].matcher
+            P.ops.append(("gmatch", event, gi, DELETE if m is None else m))
+            for r, d in pairs:
+                P.changes.append(("rewrite", f"{d.event}/{d.base}: matcher {_show(r.matcher if r.matcher is not UNPARSED else '<unreadable>')} -> {_show(m)}"))
+        else:
+            for r, d in pairs:
+                moved.add(id(r))
+                P.ops.append(("drop", r))
+                P.ops.append(("add", d))
+                P.changes.append(("rewrite", f"{d.event}/{d.base}: matcher {_show(r.matcher if r.matcher is not UNPARSED else '<unreadable>')} -> "
+                                             f"{_show(d.matcher)} (moved to its own group: its group also holds "
+                                             f"hooks that are not this one)"))
+    for keep, d, diff in sets:
+        if id(keep) in moved:
+            old = {f: keep.hook.get(f) for f in diff}
+            P.changes.append(("rewrite", f"{d.event}/{d.base}: " + "; ".join(
+                f"{f} {_show(old[f])} -> {_show(v)}" for f, v in diff.items())))
+            continue
+        P.ops.append(("set", keep, {f: (DELETE if v is None else v) for f, v in diff.items()}))
+        P.changes.append(("rewrite", f"{d.event}/{d.base}: " + "; ".join(
+            f"{f} {_show(keep.hook.get(f))} -> {_show(v)}" for f, v in diff.items())))
+    return P
+
+
+def _new_group(d: Desired, layout: str) -> dict:
+    if layout == "json":
+        return {**d.group, "hooks": [dict(d.hook)]}
+    g = {"matcher": d.matcher} if isinstance(d.matcher, str) else {}
+    g["hooks"] = [_toml_hook(d.hook)]
+    return g
+
+
+def _new_flat(d: Desired) -> dict:
+    t = {"event": d.event}
+    m = _flat_matcher(d.matcher)
+    if isinstance(m, str):
+        t["matcher"] = m
+    t["command"] = d.hook["command"]
+    if _is_num(d.hook.get("timeout")):
+        t["timeout"] = int(d.hook["timeout"])
+    return t
+
+
+def apply_structural(hooks, ops: list, layout: str):
+    """The reconcile applied to the parsed hooks structure (a deep copy). This is the definition the
+    TOML text edit is proved against, and the whole edit for JSON."""
+    flat = layout == "flat"
+    new = copy.deepcopy(hooks) if hooks is not None else ([] if flat else {})
+    drops: set = set()
+    adds = []
+    for op in ops:
+        if op[0] == "set":
+            _k, r, fields = op
+            tgt = new[r.ti] if flat else new[r.event][r.gi]["hooks"][r.hi]
+            for f, v in fields.items():
+                if v is DELETE:
+                    tgt.pop(f, None)
+                else:
+                    tgt[f] = v
+        elif op[0] == "gmatch":
+            _k, event, gi, v = op
+            if v is DELETE:
+                new[event][gi].pop("matcher", None)
+            else:
+                new[event][gi]["matcher"] = v
+        elif op[0] == "drop":
+            r = op[1]
+            drops.add(r.ti if flat else (r.event, r.gi, r.hi))
+        elif op[0] == "add":
+            adds.append(op[1])
+    if flat:
+        new = [t for i, t in enumerate(new) if i not in drops]
+        new += [_new_flat(d) for d in adds]
+        return new
+    for event in list(new):
+        gs = new[event]
+        if not isinstance(gs, list):
+            continue
+        if not any(k[0] == event for k in drops):
+            continue
+        kept_groups = []
+        for gi, g in enumerate(gs):
+            hs = g.get("hooks")
+            if isinstance(hs, list):
+                nh = [h for hi, h in enumerate(hs) if (event, gi, hi) not in drops]
+                if not nh and len(nh) != len(hs):
+                    continue                      # every hook it held was dropped: the group goes too
+                if len(nh) != len(hs):
+                    g = dict(g, hooks=nh)
+            kept_groups.append(g)
+        if kept_groups:
+            new[event] = kept_groups
+        else:
+            del new[event]
+    for d in adds:
+        new.setdefault(d.event, []).append(_new_group(d, layout))
+    return new
+
+
+# ---------------------------------------------------------------- TOML text edit ---------
+class Block:
+    """`start`: header line index (-1: the top-level block); `end`: one past its last content line
+    (trailing blanks/comments excluded); `keys`: single-segment key -> line index."""
+    def __init__(self, start: int, end: int, segs, arr: bool):
+        self.start, self.end, self.segs, self.arr = start, end, segs, arr
+        self.keys: dict = {}
+
+
+_VALTOK = r"""(?:"(?:[^"\\]|\\.)*"|'[^']*'|[+-]?[0-9_]+|true|false)"""
+_KEYLINE = re.compile(rf"""^(\s*{_KEY}\s*=\s*)({_VALTOK})(\s*(?:#.*)?)$""")
+
+
+def _blocks(lines: list[str]) -> list[Block]:
+    """Every table block of a TOML text, with the line of each single-segment key. Lenient about
+    content outside hooks tables (multi-line strings and arrays are skipped); the edit made on these
+    blocks is PROVED by re-parsing, so a misplaced header can only refuse, never land."""
+    blocks = [Block(-1, 0, None, False)]
+    in_ml: str | None = None
+    depth = 0
+    for i, line in enumerate(lines):
+        if in_ml:
+            if in_ml in line:
+                in_ml = None
+            blocks[-1].end = i + 1
+            continue
+        if depth > 0:
+            depth += line.count("[") - line.count("]")
+            blocks[-1].end = i + 1
+            continue
+        st = line.strip()
+        if not st or st.startswith("#"):
+            continue
+        h = _HEADER.match(line)
+        if h:
+            try:
+                segs = _segments(h.group(2))
+            except TomlUnsupported:
+                segs = ["<undecodable>"]
+            blocks.append(Block(i, i + 1, segs, h.group(1) == "[["))
+            continue
+        blocks[-1].end = i + 1
+        a = _ASSIGN.match(line)
+        if not a:
+            continue
+        val = a.group(2)
+        for q in ('"""', "'''"):
+            if val.startswith(q) and val.count(q) == 1:
+                in_ml = q
+        if val.startswith("[") and not in_ml:
+            depth = val.count("[") - val.count("]")
+        try:
+            ks = _segments(a.group(1))
+        except TomlUnsupported:
+            continue
+        if len(ks) == 1 and ks[0] not in blocks[-1].keys:
+            blocks[-1].keys[ks[0]] = i
+    return blocks
+
+
+def _toml_value(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    return _toml_str(str(v))
 
 
 def _toml_str(s: str) -> str:
@@ -437,7 +775,7 @@ def toml_block(member: str, event: str, group: dict, hook: dict) -> str:
     if isinstance(hook.get("statusMessage"), str):
         lines.append(f"statusMessage = {_toml_str(hook['statusMessage'])}")
     t = hook.get("timeout")
-    if isinstance(t, (int, float)) and not isinstance(t, bool):
+    if _is_num(t):
         lines.append(f"timeout = {int(t)}")
     return "\n".join(lines) + "\n"
 
@@ -453,9 +791,162 @@ def toml_block_flat(member: str, event: str, hook: dict, group: dict | None = No
         lines.append(f"matcher = {_toml_str(m)}")
     lines.append(f"command = {_toml_str(hook['command'])}")
     t = hook.get("timeout")
-    if isinstance(t, (int, float)) and not isinstance(t, bool):
+    if _is_num(t):
         lines.append(f"timeout = {int(t)}")
     return "\n".join(lines) + "\n"
+
+
+def _locate(blocks: list[Block], hooks, flat: bool):
+    """Map the parsed structure onto text blocks: flat -> [Block per table]; nested ->
+    {event: [(group Block, [entry Block])]}. Raises Unlocatable when the text and the parse
+    disagree on the shape (inline tables, headers the lenient scan misread, ...)."""
+    if flat:
+        tbls = [b for b in blocks if b.segs == ["hooks"] and b.arr]
+        n = len(hooks) if isinstance(hooks, list) else 0
+        if len(tbls) != n:
+            raise Unlocatable(f"{len(tbls)} [[hooks]] headers in the text, {n} tables parsed")
+        return tbls
+    out: dict[str, list] = {}
+    for b in blocks:
+        if not (b.arr and b.segs and b.segs[0] == "hooks"):
+            continue
+        if len(b.segs) == 2:
+            out.setdefault(b.segs[1], []).append((b, []))
+        elif len(b.segs) == 3 and b.segs[2] == "hooks" and out.get(b.segs[1]):
+            out[b.segs[1]][-1][1].append(b)
+        else:
+            raise Unlocatable(f"line {b.start + 1}: hooks header the edit cannot place")
+    parsed = {e: gs for e, gs in (hooks.items() if isinstance(hooks, dict) else []) if isinstance(gs, list)}
+    if set(parsed) != set(out):
+        raise Unlocatable(f"events in the text {sorted(out)} differ from the parse {sorted(parsed)}")
+    for e, gs in parsed.items():
+        if len(gs) != len(out[e]) or any(len((g.get("hooks") or [])) != len(out[e][i][1])
+                                         for i, g in enumerate(gs)):
+            raise Unlocatable(f"hooks.{e}: the text's groups/entries do not match the parse")
+    return out
+
+
+def _set_fields(lines: list[str], b: Block, fields: dict, repl: dict, ins: dict) -> None:
+    for f, v in fields.items():
+        at = b.keys.get(f)
+        if v is DELETE:
+            if at is not None:
+                repl[at] = None
+            continue
+        if at is not None:
+            m = _KEYLINE.match(lines[at])
+            if not m:
+                raise Unlocatable(f"line {at + 1}: `{f} = ...` is not a value the edit can rewrite")
+            repl[at] = m.group(1) + _toml_value(v) + m.group(3)
+        else:
+            after = max([b.start] + list(b.keys.values()))
+            ins.setdefault(after, []).append(f"{f} = {_toml_value(v)}")
+
+
+def _drop_range(lines: list[str], a: int, b: int, repl: dict) -> None:
+    """Delete lines [a, b), the marker comment this script wrote directly above them (and the blank
+    line it put before that), and -- when what precedes is already a blank line -- the blank lines
+    that follow, so a removal leaves the file's spacing as it was."""
+    for i in range(a, b):
+        repl[i] = None
+    first = a
+    if a - 1 >= 0 and lines[a - 1].startswith(MARK):
+        repl[a - 1] = None
+        first = a - 1
+        if a - 2 >= 0 and not lines[a - 2].strip():
+            repl[a - 2] = None
+            first = a - 2
+    prev = first - 1
+    while prev >= 0 and repl.get(prev, "") is None:
+        prev -= 1
+    if prev < 0 or not lines[prev].strip():
+        j = b
+        while j < len(lines) and not lines[j].strip() and j < len(lines) - 1:
+            repl[j] = None
+            j += 1
+
+
+def apply_toml_text(text: str, hooks, ops: list, layout: str, member: str) -> str:
+    """The reconcile as a line edit of `text`. Every byte no op names is kept."""
+    flat = layout == "flat"
+    lines = text.split("\n")
+    edits = [op for op in ops if op[0] != "add"]
+    repl: dict[int, str | None] = {}
+    ins: dict[int, list[str]] = {}
+    if edits:
+        loc = _locate(_blocks(lines), hooks, flat)
+        dropped: dict[tuple, set] = {}
+        for op in edits:
+            if op[0] == "set":
+                r = op[1]
+                b = loc[r.ti] if flat else loc[r.event][r.gi][1][r.hi]
+                _set_fields(lines, b, op[2], repl, ins)
+            elif op[0] == "gmatch":
+                _k, event, gi, v = op
+                _set_fields(lines, loc[event][gi][0], {"matcher": v}, repl, ins)
+            elif op[0] == "drop":
+                r = op[1]
+                if flat:
+                    b = loc[r.ti]
+                    _drop_range(lines, b.start, b.end, repl)
+                    continue
+                gb, entries = loc[r.event][r.gi]
+                dropped.setdefault((r.event, r.gi), set()).add(r.hi)
+        for (event, gi), his in dropped.items():
+            gb, entries = loc[event][gi]
+            if len(his) == len(entries):          # the group goes with its last hook
+                _drop_range(lines, gb.start, max(e.end for e in entries), repl)
+            else:
+                for hi in his:
+                    _drop_range(lines, entries[hi].start, entries[hi].end, repl)
+    out: list[str] = []
+    for i, ln in enumerate(lines):
+        if i in repl:
+            if repl[i] is not None:
+                out.append(repl[i])
+        else:
+            out.append(ln)
+        out.extend(ins.get(i, []))
+    new = "\n".join(out)
+    for op in ops:
+        if op[0] == "add":
+            d = op[1]
+            new += toml_block_flat(member, d.event, d.hook, d.group) if flat else \
+                toml_block(member, d.event, d.group, d.hook)
+    return new
+
+
+def _norm_hooks(h, flat: bool):
+    if flat:
+        return h if isinstance(h, list) else []
+    return {e: v for e, v in (h.items() if isinstance(h, dict) else []) if isinstance(v, list)}
+
+
+def verify_toml_edit(old: str, new: str, expected_hooks, flat: bool) -> str | None:
+    """PROVE the text edit: the edited text re-parses to exactly the reconcile's structure, and with
+    a structural parser every non-hooks key (and the non-list part of `hooks`, codex's approval
+    state) is unchanged. -> None when proved, else why not."""
+    try:
+        got = toml_hooks(new, flat)
+    except TomlUnsupported as e:
+        return f"the edited text does not parse ({e})"
+    if _norm_hooks(got, flat) != _norm_hooks(expected_hooks, flat):
+        return "the edited text does not parse to the reconciled hooks"
+    if FORCE_LINE_SCAN:
+        return None
+    try:
+        import tomllib  # type: ignore
+    except ImportError:
+        return None
+    a, b = tomllib.loads(old), tomllib.loads(new)
+    rest = lambda d: {k: v for k, v in d.items() if k != "hooks"}  # noqa: E731
+    if rest(a) != rest(b):
+        return "the edit changed a key outside the hooks tables"
+    if not flat:
+        side = lambda d: {k: v for k, v in (d.get("hooks") or {}).items() if not isinstance(v, list)}  # noqa: E731
+        if side(a) != side(b):
+            return "the edit changed a non-hook key under [hooks]"
+    return None
 
 
 def toml_ensure(text: str, ensure: list[dict]) -> tuple[str, list[str]]:
@@ -482,7 +973,7 @@ def validate_toml(text: str) -> str | None:
     try:
         import tomllib  # type: ignore
     except ImportError:
-        return None                       # no parser here: the line scan is the reader anyway
+        return None                       # no parser here: the strict grammar proved the edit
     try:
         tomllib.loads(text)
         return None
@@ -490,214 +981,36 @@ def validate_toml(text: str) -> str | None:
         return f"{type(e).__name__}: {e}"
 
 
-def registered_targets(cfg: str, reader: str, flat: bool = False) -> set[str]:
-    """Every absolute target a config registers (the installer's rule: the first absolute path in the
-    command), read structurally. Empty when the file is absent or unreadable."""
-    out: set[str] = set()
-    try:
-        if reader == "json-hook-commands":
-            with open(cfg, encoding="utf-8") as fh:
-                data = json.load(fh)
-            groups = (data.get("hooks") or {}).values()
-        else:
-            try:
-                if FORCE_LINE_SCAN:
-                    raise ImportError
-                import tomllib  # type: ignore
-            except ImportError:
-                return _toml_scan(cfg, flat)[1]
-            with open(cfg, "rb") as fh:
-                hooks = tomllib.load(fh).get("hooks") or ({} if not flat else [])
-            if flat:
-                for tbl in hooks if isinstance(hooks, list) else []:
-                    c = tbl.get("command") if isinstance(tbl, dict) else None
-                    t = target_path(c) if isinstance(c, str) else None
-                    if t:
-                        out.add(t)
-                return out
-            groups = hooks.values()
-        for gs in groups:
-            for g in gs if isinstance(gs, list) else []:
-                for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
-                    c = h.get("command") if isinstance(h, dict) else None
-                    t = target_path(c) if isinstance(c, str) else None
-                    if t:
-                        out.add(t)
-    except Exception:                     # noqa: BLE001 -- absent, unparseable, or no tomllib: no repair rows
-        return set()
-    return out
+# ---------------------------------------------------------------- writing ----------------
+def _backup(path: str) -> None:
+    bak = path + ".pre-register.bak"
+    if not os.path.exists(bak):
+        shutil.copy2(path, bak)
 
 
-# ---------------------------------------------------------------- timeouts ---------------
-#: Env overrides on a registered gate command that no gate reads since one-gate stage C (the
-#: deadline is the registration's). Reported INERT, never rewritten.
-INERT_GATE_ENV = re.compile(r"\b(HESTIA_PRE_TOTAL_BUDGET_MS|HESTIA_PRE_REQUEST_TIMEOUT_S|"
-                            r"HESTIA_[A-Z]+_GATE_MODE)=\S*")
+def _write_atomic(path: str, text: str) -> None:
+    """Write `text` to `path` so a crash leaves the old file or the new one, never half of one.
+    The temp file takes the original's mode: ~/.codex/config.toml is 0600."""
+    d = os.path.dirname(path) or "."
+    tmp = os.path.join(d, f".{os.path.basename(path)}.register-tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    if os.path.exists(path):
+        shutil.copymode(path, tmp)
+    os.replace(tmp, path)
 
 
-def registered_timeouts(cfg: str, reader: str, flat: bool = False):
-    """{event: {basename: [(timeout or None, command)]}} read structurally, or None when the
-    file cannot be read that way (absent, unparseable, or TOML without tomllib)."""
-    try:
-        if reader == "json-hook-commands":
-            with open(cfg, encoding="utf-8") as fh:
-                hooks = (json.load(fh).get("hooks") or {})
-        else:
-            if FORCE_LINE_SCAN:
-                return None
-            import tomllib  # type: ignore
-            with open(cfg, "rb") as fh:
-                hooks = tomllib.load(fh).get("hooks") or ({} if not flat else [])
-    except Exception:  # noqa: BLE001
-        return None
-    out: dict[str, dict[str, list]] = {}
-
-    def add(event, h):
-        cmd = h.get("command") if isinstance(h, dict) else None
-        b = target_basename(cmd) if isinstance(cmd, str) else None
-        if b:
-            out.setdefault(event, {}).setdefault(b, []).append((h.get("timeout"), cmd))
-    if flat:
-        for tbl in hooks if isinstance(hooks, list) else []:
-            if isinstance(tbl, dict) and isinstance(tbl.get("event"), str):
-                add(tbl["event"], tbl)
-        return out
-    for event, gs in (hooks.items() if isinstance(hooks, dict) else []):
-        for g in gs if isinstance(gs, list) else []:
-            for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
-                add(event, h)
-    return out
+# ---------------------------------------------------------------- one member -------------
+class Loaded:
+    def __init__(self, cfg, dest, reader, layout, raw, data, hooks, desired, reg):
+        self.cfg, self.dest, self.reader, self.layout = cfg, dest, reader, layout   # layout: json|toml|flat
+        self.raw, self.data, self.hooks, self.desired, self.reg = raw, data, hooks, desired, reg
 
 
-def _is_num(v) -> bool:
-    return isinstance(v, (int, float)) and not isinstance(v, bool)
-
-
-def timeout_findings(groups: dict, registered) -> tuple[list, list]:
-    """(short, inert). short: (event, basename, registered timeout or None, template timeout)
-    for each templated hook registered below its template's timeout (or with none); inert:
-    (event, basename, [stray env assignments]) for registered gate commands carrying one."""
-    short, inert = [], []
-    if not registered:
-        return short, inert
-    for event, gs in groups.items():
-        for g in gs:
-            for h in g["hooks"]:
-                want = h.get("timeout")
-                base = target_basename(h["command"]) or ""
-                for t, cmd in registered.get(event, {}).get(base, []):
-                    if _is_num(want) and not (_is_num(t) and t >= want):
-                        short.append((event, base, t, want))
-                    stray = [m.group(0) for m in INERT_GATE_ENV.finditer(cmd or "")]
-                    if stray:
-                        inert.append((event, base, sorted(set(stray))))
-    return short, inert
-
-
-def raise_json_timeouts(data: dict, short: list) -> list[str]:
-    """Raise each SHORT hook's timeout in a parsed JSON config. Returns what changed."""
-    changed = []
-    want = {(e, b): w for e, b, _t, w in short}
-    for event, gs in (data.get("hooks") or {}).items():
-        for g in gs if isinstance(gs, list) else []:
-            for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
-                b = target_basename(h.get("command") or "") if isinstance(h, dict) else None
-                w = want.get((event, b))
-                if w is not None and not (_is_num(h.get("timeout")) and h["timeout"] >= w):
-                    changed.append(f"timeout {event}/{b} {h.get('timeout')} -> {w}")
-                    h["timeout"] = w
-    return changed
-
-
-def raise_toml_timeouts(text: str, short: list, flat: bool) -> tuple[str, list[str]]:
-    """Raise each SHORT hook's `timeout =` line in TOML text, inside the table that carries its
-    command (inserting one after the command when the table has none). Only lines of tables
-    whose command names a SHORT basename are touched; every other byte is kept."""
-    lines = text.split("\n")
-    changed = []
-    bases = {b: w for _e, b, _t, w in short}
-    i = 0
-    while i < len(lines):
-        m = _TOML_CMD.match(lines[i])
-        b = target_basename(m.group(2)) if m else None
-        if b in bases:
-            w = bases[b]
-            j, found = i + 1, None
-            start = i
-            while start > 0 and not lines[start - 1].lstrip().startswith("["):
-                start -= 1
-            for k in list(range(start, i)) + list(range(i + 1, len(lines))):
-                if k > i and lines[k].lstrip().startswith("["):
-                    break
-                tm = re.match(r"^(\s*timeout\s*=\s*)([0-9]+)(.*)$", lines[k])
-                if tm:
-                    found = k
-                    break
-            if found is None:
-                lines.insert(i + 1, f"timeout = {int(w)}")
-                changed.append(f"timeout {b} (none) -> {int(w)}")
-                j = i + 2
-            else:
-                tm = re.match(r"^(\s*timeout\s*=\s*)([0-9]+)(.*)$", lines[found])
-                if int(tm.group(2)) < w:
-                    lines[found] = f"{tm.group(1)}{int(w)}{tm.group(3)}"
-                    changed.append(f"timeout {b} {tm.group(2)} -> {int(w)}")
-            i = j
-            continue
-        i += 1
-    return "\n".join(lines), changed
-
-
-def _decide(groups: dict, have: dict, dry: bool, plan: bool, own: set | None = None):
-    """For each templated hook: present (a covering registration exists), NARROW (registered only
-    under a matcher that does not cover the template's -- reported, never silently widened, never
-    counted as present), PENDING (its target file is not installed yet -- never registered, so no
-    live registration points at a missing file), or WANT (register it).
-    -> (want [(event, group, hook)], narrow [str], pending [str], planned [(base, target)])"""
-    want, narrow, pending, planned = [], [], [], []
-    own = own or set()
-    for event, gs in groups.items():
-        for g in gs:
-            tm = g.get("matcher")
-            for h in g["hooks"]:
-                b = target_basename(h["command"]) or ""
-                t = target_path(h["command"])
-                existing = have.get(event, {}).get(b)
-                if existing:
-                    if any(covers(m, tm) for m in existing):
-                        # registered -- but a registration is only as good as the file it names. When the
-                        # registration names THIS template's target (one this script wrote) and that file is
-                        # missing -- a host left registered with nothing installed (HUB 2026-09-28, #1153) --
-                        # it is PENDING, not ok, and --plan lists it so the installer puts the file there.
-                        # A registration naming some other path is the installer's to check, as before.
-                        if t is not None and t in own and not os.path.isfile(t):
-                            if plan:
-                                planned.append((b, t))
-                            elif not dry:
-                                pending.append(f"{event}/{b} is registered but {t} is not installed "
-                                               f"(install-members.sh installs it)")
-                        continue
-                    narrow.append(f"{event}/{b} is registered only for matcher "
-                                  f"{', '.join('<unreadable>' if m is UNPARSED else repr(m) for m in existing)}; "
-                                  f"the template wants {tm!r} "
-                                  f"-- left as it is, not reported as registered")
-                    continue
-                planned.append((b, t))
-                if plan:
-                    continue
-                if not dry and (t is None or not os.path.isfile(t)):
-                    pending.append(f"{event}/{b} -> {t} is not installed yet; not registered "
-                                   f"(install-members.sh installs it, then registers)")
-                    continue
-                want.append((event, g, h))
-    return want, narrow, pending, planned
-
-
-def register_member(member: str, spec: dict, template: dict, home: str, dry: bool,
-                    plan: bool = False, raise_timeouts: bool = False) -> tuple[str, list[str]]:
-    """-> (verdict, lines). verdict in {registered, ok, skip, refused, failed, narrow, pending, plan}.
-    `lines` are the changes made (or planned: 'base\ttarget'), then any 'NARROW ...' / 'PENDING ...'
-    / 'SHORT ...' / 'INERT ...' notes."""
+def _load(member: str, spec: dict, template: dict, home: str, env=None):
+    """-> Loaded, or (verdict, lines) when the member stops here."""
     reg = spec.get("registration") or {}
     segs, reader = reg.get("path") or [], reg.get("reader", "")
     dest = spec.get("dest") or ""
@@ -709,123 +1022,156 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
         return "skip", [f"{cfg_dir} absent — harness not on this host"]
     dest = os.path.join(home, dest[2:]) if dest.startswith("~/") else os.path.expanduser(dest)
     try:
-        groups = rendered_groups(template, member, dest)
+        groups = rendered_groups(template, member, dest, env)
+        desired = desired_hooks(groups)
     except Unrendered as e:
-        return "refused", [f"template carries an unrendered placeholder: {e}"]
+        return "refused", [f"template cannot be rendered: {e}"]
     if not groups:
         return "skip", ["template registers no command hooks"]
     if reader not in ("json-hook-commands", "toml-hook-commands"):
         return "skip", [f"unknown registration reader {reader!r} — refusing to guess"]
-
-    flat = reg.get("layout") == "flat"
-    raw, data = "", {}
+    layout = "json" if reader == "json-hook-commands" else ("flat" if reg.get("layout") == "flat" else "toml")
+    raw, data, hooks = "", None, None
     if os.path.exists(cfg):
         with open(cfg, encoding="utf-8", errors="replace") as fh:
             raw = fh.read()
-        if reader == "json-hook-commands":
-            try:
-                data = json.loads(raw) if raw.strip() else {}
-            except ValueError as e:
-                return "failed", [f"{cfg} is not parseable JSON ({e}); refusing to guess"]
-            if not isinstance(data, dict):
-                return "failed", [f"{cfg} is not a JSON object"]
-            have = registered_json(cfg) if raw.strip() else {}
-        else:
-            try:
-                have = registered_toml(cfg, flat=flat)
-            except TomlUnsupported as e:
-                return "refused", [f"{cfg}: this config cannot be verified ({e}); nothing registered, "
-                                   f"nothing certified -- fix the file, or, on a host without tomllib, "
-                                   f"run with Python >= 3.11 or register by hand"]
+    if layout == "json":
+        try:
+            data = json.loads(raw) if raw.strip() else {}
+        except ValueError as e:
+            return "failed", [f"{cfg} is not parseable JSON ({e}); refusing to guess"]
+        if not isinstance(data, dict):
+            return "failed", [f"{cfg} is not a JSON object"]
+        hooks = data.get("hooks") if isinstance(data.get("hooks"), dict) else {}
     else:
-        have = {}
+        try:
+            hooks = toml_hooks(raw, layout == "flat")
+        except TomlUnsupported as e:
+            return "refused", [f"{cfg}: this config cannot be verified ({e}); nothing registered, "
+                               f"nothing certified -- fix the file, or, on a host without tomllib, "
+                               f"run with Python >= 3.11 or register by hand"]
+    return Loaded(cfg, dest, reader, layout, raw, data, hooks, desired, reg)
 
-    own = registered_targets(cfg, reader, flat) if os.path.exists(cfg) else set()
-    want, narrow, pending, planned = _decide(groups, have, dry, plan, own)
-    notes = [f"NARROW {n}" for n in narrow] + [f"PENDING {p}" for p in pending]
+
+def reconciled_commands(member_dir: str, home: str, env=None) -> tuple[str, list[str], str]:
+    """The hook commands this member's registration will carry AFTER the install (every planned file
+    assumed installed, which is what install-members.sh does before it registers).
+    -> (status, commands, reason); status in {ok, absent, refused}. Shared with the deploy
+    preflight, so the probe judges the line that will be written, by the same renderer."""
+    member = os.path.basename(os.path.normpath(member_dir))
+    expects = os.path.join(member_dir, "expects.json")
+    tpl = os.path.join(member_dir, "hooks", "hooks.json")
+    try:
+        with open(expects, encoding="utf-8") as fh:
+            spec = json.load(fh).get("install") or {}
+    except (OSError, ValueError) as e:
+        return "refused", [], f"expects.json unreadable ({type(e).__name__})"
+    if not os.path.isfile(tpl):
+        return "absent", [], "ships no hooks/hooks.json template"
+    try:
+        with open(tpl, encoding="utf-8") as fh:
+            template = json.load(fh)
+    except (OSError, ValueError) as e:
+        return "refused", [], f"hooks/hooks.json unreadable ({type(e).__name__})"
+    got = _load(member, spec, template, home, env)
+    if not isinstance(got, Loaded):
+        verdict, lines = got
+        return ("absent" if verdict == "skip" else "refused"), [], "; ".join(lines)
+    regs = index_hooks(got.hooks, got.layout == "flat")
+    P = plan_reconcile(got.desired, regs, got.hooks, got.layout, installed=lambda t: True,
+                       dry=False, plan_mode=False)
+    new = apply_structural(got.hooks, P.ops, got.layout)
+    return "ok", [r.hook["command"] for r in index_hooks(new, got.layout == "flat")
+                  if isinstance(r.hook.get("command"), str)], ""
+
+
+def register_member(member: str, spec: dict, template: dict, home: str, dry: bool,
+                    plan: bool = False, raise_timeouts: bool = False, env=None) -> tuple[str, list[str]]:
+    """-> (verdict, lines). verdict in {registered, ok, skip, refused, failed, narrow, pending, plan}.
+    `lines`: the changes made (or planned: 'base\\ttarget'), each 'add ...' / 'rewrite ...' /
+    'remove ...' / 'ensure ...', then any NARROW / PENDING / SHORT / INERT / FOREIGN notes.
+    `raise_timeouts` is accepted and ignored: the reconcile sets every owned timeout."""
+    got = _load(member, spec, template, home, env)
+    if not isinstance(got, Loaded):
+        return got
+    L = got
+    exists = os.path.exists(L.cfg)
+    flat = L.layout == "flat"
+    regs = index_hooks(L.hooks, flat)
+    P = plan_reconcile(L.desired, regs, L.hooks, L.layout, installed=os.path.isfile, dry=dry, plan_mode=plan)
     if plan:
-        return "plan", [f"{b}\t{t}" for b, t in planned] + notes
-    # The registered timeout is the bound the gate decides inside (stage C): read it.
-    short, inert = timeout_findings(
-        groups, registered_timeouts(cfg, reader, flat) if os.path.exists(cfg) else None)
+        return "plan", [f"{b}\t{t}" for b, t in P.planned] + \
+            [n for n in P.notes if n.startswith(("NARROW", "PENDING"))]
 
-    def done(verdict: str, changes: list[str]) -> tuple[str, list[str]]:
-        # What this script registers points INTO `dest`, and install-members.sh refuses a
-        # registration whose directory is absent ("registered at … but … does not exist") —
-        # correctly, for a hand edit to a path nobody made. For a registration THIS script
-        # wrote, the directory is ours to make: registering without it turned every deploy on
-        # a host whose harness had never been hand-wired (HUB, 2026-09-28: ~/.codex present,
-        # ~/.codex/hooks never created) into a FATAL that stopped the whole members' install.
-        # Made on the `ok` arm too, so a host already left in that state repairs itself.
-        if not dry and verdict in ("ok", "registered") and not os.path.isdir(dest):
-            os.makedirs(dest, exist_ok=True)
-            log(f"  made  {member}: {dest} — the directory its registration points into")
-        return verdict, changes
+    def done(verdict: str, out: list[str]) -> tuple[str, list[str]]:
+        # What this script registers points INTO `dest`; install-members.sh refuses a registration
+        # whose directory is absent. For a registration THIS script wrote, the directory is ours to
+        # make (HUB 2026-09-28, #1153). Made on the `ok` arm too, so a host left that way repairs.
+        if not dry and verdict in ("ok", "registered") and not os.path.isdir(L.dest):
+            os.makedirs(L.dest, exist_ok=True)
+            log(f"  made  {member}: {L.dest} — the directory its registration points into")
+        return verdict, out
 
-    changes: list[str] = []
-    if reader == "json-hook-commands":
-        hooks = data.setdefault("hooks", {})
-        for event, g, h in want:
-            hooks.setdefault(event, []).append({**{k: v for k, v in g.items() if k != "hooks"}, "hooks": [h]})
-            changes.append(f"{event}/{target_basename(h['command'])}")
-        if raise_timeouts and short:
-            changes += raise_json_timeouts(data, short)
-            short = []
-        if changes and not dry:
+    changes = [f"{verb} {text}" for verb, text in P.changes]
+    if L.layout == "json":
+        if P.ops:
+            data = L.data
+            data["hooks"] = apply_structural(L.hooks, P.ops, "json")
             new = json.dumps(data, indent=2) + "\n"
-            json.loads(new)
-            if raw:
-                _backup(cfg)
-            _write_atomic(cfg, new)
+            back = json.loads(new)
+            if back.get("hooks") != data["hooks"]:
+                return "failed", [f"rendered {L.cfg} does not reload to the reconciled hooks; nothing written"] + P.notes
+            if not dry:
+                if L.raw:
+                    _backup(L.cfg)
+                _write_atomic(L.cfg, new)
     else:
-        new = raw
-        for event, g, h in want:
-            new += toml_block_flat(member, event, h, g) if flat else toml_block(member, event, g, h)
-            changes.append(f"{event}/{target_basename(h['command'])}")
-        new, ensured = toml_ensure(new, reg.get("ensure") or [])
+        new = L.raw
+        if P.ops:
+            expected = apply_structural(L.hooks, P.ops, L.layout)
+            try:
+                new = apply_toml_text(L.raw, L.hooks, P.ops, L.layout, member)
+            except Unlocatable as e:
+                return "refused", [f"{L.cfg}: the reconcile cannot be placed on this file's text ({e}); "
+                                   f"nothing written -- hestia's lines here need a hand repair once"] + P.notes
+            why = verify_toml_edit(L.raw, new, expected, flat)
+            if why:
+                return "refused", [f"{L.cfg}: the edit could not be proved ({why}); nothing written"] + P.notes
+        new, ensured = toml_ensure(new, L.reg.get("ensure") or [])
         changes += [f"ensure {e}" for e in ensured]
-        if raise_timeouts and short:
-            new, raised = raise_toml_timeouts(new, short, flat)
-            changes += raised
-            short = []
         if changes:
             err = validate_toml(new)
             if err:
-                return "failed", [f"rendered {cfg} would not parse ({err}); nothing written"] + notes
+                return "failed", [f"rendered {L.cfg} would not parse ({err}); nothing written"] + P.notes
             if not dry:
-                if raw:
-                    _backup(cfg)
-                _write_atomic(cfg, new)
-                with open(cfg, encoding="utf-8", errors="replace") as fh:
+                if L.raw:
+                    _backup(L.cfg)
+                _write_atomic(L.cfg, new)
+                with open(L.cfg, encoding="utf-8", errors="replace") as fh:
                     back = fh.read()
                 err = validate_toml(back)
                 if err:
-                    # Restore what THIS run read, not `.pre-register.bak`: that backup is written once,
-                    # on the first run ever, so restoring it would roll the harness config back past
-                    # every edit made since. A file that did not exist goes back to not existing.
-                    if raw:
-                        _write_atomic(cfg, raw)
+                    # Restore what THIS run read, not `.pre-register.bak` (written once, on the first
+                    # run ever). A file that did not exist goes back to not existing.
+                    if exists:
+                        _write_atomic(L.cfg, L.raw)
                     else:
-                        os.remove(cfg)
-                    return "failed", [f"{cfg} failed to parse after write ({err}); restored as it was"] + notes
-
-    notes += [f"SHORT {e}/{b} is registered with timeout {t!r}, below the template's {w!r}: the "
-              f"gate decides inside the registered value, so a cold member connect (4.6-5.1 s) "
-              f"becomes a denial -- re-run with --raise-timeouts" for e, b, t, w in short]
-    notes += [f"INERT {e}/{b} command carries {', '.join(s)}, which no gate reads since one-gate "
-              f"stage C (the deadline is the registration's); remove it from the registered "
-              f"command" for e, b, s in inert]
-    lines = ([f"would add {c}" for c in changes] if dry else changes) + notes
-    # #1142 re-review P2: a run that registered some hooks and left others PENDING returned
-    # "registered" and exited 0. Narrow and pending are unfinished work: they outrank a partial
-    # registration (the additions are still in `lines` and still reported).
-    if narrow:
+                        os.remove(L.cfg)
+                    return "failed", [f"{L.cfg} failed to parse after write ({err}); restored as it was"] + P.notes
+    lines = changes + P.notes
+    # #1142 re-review P2: narrow and pending are unfinished work: they outrank a partial registration.
+    if P.narrow:
         return "narrow", lines
-    if pending:
+    if P.pending:
         return "pending", lines
     if changes:
         return done("registered", lines)
     return done("ok", lines)
+
+
+# ---------------------------------------------------------------- main -------------------
+_VERB = {"add": "REGISTERED", "rewrite": "REWROTE", "remove": "REMOVED", "ensure": "REGISTERED"}
+_NOTES = ("NARROW ", "PENDING ", "SHORT ", "INERT ", "FOREIGN ")
 
 
 def main(argv: list[str]) -> int:
@@ -834,7 +1180,8 @@ def main(argv: list[str]) -> int:
     global FORCE_LINE_SCAN
     only = None
     plan = False
-    raise_timeouts = "--raise-timeouts" in argv
+    # --raise-timeouts: an accepted no-op alias since the reconcile (dp 2026-10-06) sets every owned
+    # timeout to the template's value.
     argv = [a for a in argv if a != "--raise-timeouts"]
     if "--toml-line-scan" in argv:
         FORCE_LINE_SCAN = True
@@ -876,26 +1223,27 @@ def main(argv: list[str]) -> int:
             continue
         with open(tpl, encoding="utf-8") as fh:
             template = json.load(fh)
-        verdict, lines = register_member(member, spec, template, home, dry, plan=plan,
-                                         raise_timeouts=raise_timeouts)
+        verdict, lines = register_member(member, spec, template, home, dry, plan=plan)
         if plan:
             # machine-readable, for install-members.sh: member<TAB>basename<TAB>absolute target
             for ln in lines:
                 if "\t" in ln and not ln.startswith(("NARROW", "PENDING")):
                     print(f"{member}\t{ln}", flush=True)
             continue
-        kinds = ("NARROW ", "PENDING ", "SHORT ", "INERT ")
-        adds = [ln for ln in lines if not ln.startswith(kinds)]
-        notes = [ln for ln in lines if ln.startswith(kinds)]
+        changes = [ln for ln in lines if not ln.startswith(_NOTES)]
+        notes = [ln for ln in lines if ln.startswith(_NOTES)]
         if verdict in ("registered", "narrow", "pending", "ok"):
-            for c in adds:
-                log(f"  {'would' if dry else 'REGISTERED'} {member}: {c}")
+            for c in changes:
+                verb, text = c.split(" ", 1)
+                if dry:
+                    log(f"  would {member}: would {verb} {text}")
+                else:
+                    log(f"  {_VERB.get(verb, verb.upper())} {member}: {c if verb == 'ensure' else text}")
             for n in notes:
                 log(f"  {n.split(' ', 1)[0]} {member}: {n.split(' ', 1)[1]}")
             if verdict == "ok":
-                log(f"  ok    {member} — every templated hook is registered")
-            # the exit code comes from the NOTES, not the headline verdict: a member can be narrow AND
-            # pending, and neither may be hidden behind the other or behind a successful addition
+                log(f"  ok    {member} — every templated hook is registered as the template renders it")
+            # the exit code comes from the NOTES, not the headline verdict
             if any(n.startswith("NARROW ") for n in notes):
                 rc = rc or 8
             if any(n.startswith("PENDING ") for n in notes):
