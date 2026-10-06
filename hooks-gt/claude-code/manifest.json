@@ -12,7 +12,7 @@
     },
     {
       "path": "hooks/hooks.json",
-      "sha256": "4b544677a350440fba3797144e94b0146db30d889af111f20ed1ef2d4ab00cdd",
+      "sha256": "13c0732cb18e0292b188f729f12da661579f51d5714f8ba56ab98ca1d5ebbaff",
       "source": "plugins/claude-code/hooks/hooks.json"
     },
     {
@@ -62,5 +62,5 @@
     ]
   },
   "requires": [],
-  "gt_version": "b67cc4c98134dbc92bb306f63d96d01692edb5b95087a18191de8a19c4bad2fa"
+  "gt_version": "4dcbf90883af6ff95fd511cdd2b43b9f07ae48e146b51e578b8b65ac37708c7d"
 }
