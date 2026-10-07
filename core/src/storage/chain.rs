@@ -436,6 +436,9 @@ impl SqliteChainStore {
                         && entry.signer_lct == signer_lct,
                     "witness event_key '{key}' was replayed with a different fact"
                 );
+                // A replay answers with a row that may be committed but not yet fsynced: the
+                // retrying request must wait for it exactly as the first one does.
+                super::durability::note_appended(&self.durability, entry.chain_position + 1);
                 return Ok((entry, false));
             }
         }
@@ -1281,6 +1284,44 @@ mod tests {
         assert_eq!(reopened.verify_integrity().unwrap(), reopened.len().unwrap());
         assert!(!reopened.durability().poisoned(), "the restart starts clean");
         reopened.append("post-restart", json!({}), "lct:x").expect("a restarted chain appends");
+    }
+
+    /// A retried `append_once` answers with the row the first attempt committed. While that row
+    /// is still in the commit-to-fsync window, the retry must not be acknowledged either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replayed_key_is_acknowledged_only_once_its_row_is_durable() {
+        use crate::storage::durability::durable_scope;
+        let dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap());
+        let hold = store.durability().hold_flush_for_test();
+        let st = store.clone();
+        let first = tokio::spawn(async move {
+            durable_scope(async { st.append_once("k1", "t", json!({"a": 1}), "lct:x").unwrap() }).await.1
+        });
+        for _ in 0..200 {
+            if store.len().unwrap() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(store.len().unwrap(), 1, "the first attempt committed");
+        let st = store.clone();
+        let replay = tokio::spawn(async move {
+            let ((_, inserted), res) = durable_scope(async {
+                st.append_once("k1", "t", json!({"a": 1}), "lct:x").unwrap()
+            })
+            .await;
+            assert!(!inserted, "a replay, not a second row");
+            res
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!replay.is_finished(),
+                "a replay was acknowledged while the row it returned was not yet durable");
+        assert!(!first.is_finished());
+        drop(hold);
+        replay.await.unwrap().unwrap();
+        first.await.unwrap().unwrap();
+        assert!(store.durability().frontier().durable >= 1);
     }
 
     /// The checkpoint runs on the flusher, at idle — never inside an append.

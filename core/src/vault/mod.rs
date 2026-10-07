@@ -53,7 +53,12 @@ pub struct Vault {
     /// break-glass writer. Read-only Vault opens do not acquire it. Ordinary short-lived
     /// writers acquire the same lease around each save in `storage::save_if_current`.
     writer_lease: Option<storage::WriterLease>,
+    /// Run before every save (see [`Vault::set_pre_save_barrier`]).
+    pre_save: Option<PreSaveBarrier>,
 }
+
+/// A hook run before every vault save; an error refuses the save.
+pub type PreSaveBarrier = std::sync::Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>;
 
 impl Vault {
     /// Re-read THIS vault from disk with the same path and passphrase.
@@ -76,6 +81,7 @@ impl Vault {
             passphrase,
             data,
             writer_lease: None,
+            pre_save: None,
         })
     }
 
@@ -96,6 +102,7 @@ impl Vault {
             passphrase,
             data,
             writer_lease: None,
+            pre_save: None,
         })
     }
 
@@ -174,7 +181,18 @@ impl Vault {
         Ok(removed)
     }
 
+    /// Install a hook that runs before EVERY save and may refuse it. The daemon installs one that
+    /// makes the witness chain durable first (group commit, storage::durability): a vault write
+    /// often follows an `*_intent` chain row, and since chain commits no longer fsync inline, the
+    /// vault (which does fsync) could otherwise reach disk ahead of the rows that justify it.
+    pub fn set_pre_save_barrier(&mut self, barrier: PreSaveBarrier) {
+        self.pre_save = Some(barrier);
+    }
+
     fn save(&mut self) -> Result<()> {
+        if let Some(barrier) = &self.pre_save {
+            barrier().map_err(CoreError::SaveBarrier)?;
+        }
         // Timed (state-lock instrumentation): a vault save derives a fresh Argon2 key, encrypts
         // the whole vault and fsyncs, and the daemon does it while holding its state lock (#453).
         let next_generation = crate::server::state_lock::time_section("vault.save", || {
