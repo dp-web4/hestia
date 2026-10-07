@@ -73,10 +73,9 @@ impl PolicyEngine {
             // Rate-limit gate
             if let Some(rl) = &rule.r#match.rate_limit {
                 let key = self.rate_limit_key(rule, action);
-                let r = self.rate_limiter.check(&key, rl.max_count, rl.window_ms);
-                if r.allowed {
-                    // Under the limit — record the firing and skip (rule doesn't apply yet)
-                    self.rate_limiter.record(&key);
+                // Check and record as one step: evaluation runs concurrently (#1272).
+                if self.rate_limiter.admit(&key, rl.max_count, rl.window_ms).allowed {
+                    // Under the limit — firing recorded; skip (rule doesn't apply yet)
                     continue;
                 }
                 // Over the limit — rule fires
@@ -214,6 +213,45 @@ mod tests {
         let b = a.clone();
         assert!(std::sync::Arc::ptr_eq(&a.rate_limiter, &b.rate_limiter));
         assert_eq!(a.content_hash(), b.content_hash());
+    }
+
+    /// Codex's #1272 reproduction, as a guard: 16 threads on live and published clones of one
+    /// engine, a deny rule at `max_count=1`. Exactly one call may be under the limit (allow).
+    #[test]
+    fn concurrent_clones_admit_exactly_the_limit() {
+        use std::sync::{Arc, Barrier};
+        let config: PolicyConfig = serde_json::from_value(serde_json::json!({
+            "name": "rl", "version": "1", "enforce": true, "default_policy": "allow",
+            "rules": [{"id": "one", "name": "one", "priority": 1,
+              "match": {"tools": ["Read"], "rate_limit": {"max_count": 1, "window_ms": 60000}},
+              "decision": "deny"}]
+        }))
+        .unwrap();
+        for _ in 0..200 {
+            let live = PolicyEngine::new(config.clone());
+            let published = live.clone();
+            let start = Arc::new(Barrier::new(16));
+            let allowed: usize = std::thread::scope(|scope| {
+                let jobs: Vec<_> = (0..16)
+                    .map(|i| {
+                        let engine = if i % 2 == 0 { live.clone() } else { published.clone() };
+                        let start = start.clone();
+                        scope.spawn(move || {
+                            start.wait();
+                            let v = engine.evaluate(&PolicyAction {
+                                tool_name: "Read",
+                                category: "file_read",
+                                target: Some("/tmp/example"),
+                                full_command: None,
+                            });
+                            usize::from(v.decision == PolicyDecision::Allow)
+                        })
+                    })
+                    .collect();
+                jobs.into_iter().map(|j| j.join().unwrap()).sum()
+            });
+            assert_eq!(allowed, 1);
+        }
     }
     use crate::policy::presets::get_preset;
 
