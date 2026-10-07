@@ -104,8 +104,8 @@ def test_every_seat_records_two_factors_for_its_own_entry_whatever_the_spelling(
                     ev["cwd"] = cwd
                 rec = open_and_read(seat, home, ev, label)
                 check(f"{seat}-{label}-bar", rec.get("bar") == "sovereign_plus_peer", rec)
-                check(f"{seat}-{label}-resolved-target", rec.get("resolved_target") == want,
-                      (want, rec.get("resolved_target")))
+                check(f"{seat}-{label}-resolved-target", want in (rec.get("resolved_targets") or []),
+                      (want, rec.get("resolved_targets")))
         finally:
             fx.close()
 

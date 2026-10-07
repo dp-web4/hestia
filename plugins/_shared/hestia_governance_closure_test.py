@@ -703,7 +703,39 @@ def test_496_pins_do_not_refuse_benign_forms():
               f"{label}: want {want}, got {v.classification!r} for {cmd!r}")
 
 
+def test_write_verdicts_reports_every_governed_target():
+    """#810 / Codex P1-2 on #1239: `classify` stops at the FIRST governed write target; the
+    escalation's price needs them all. `write_verdicts` returns one write verdict per governed
+    write-position argument, in order, and is consistent with `classify` (same first verdict,
+    empty exactly when classify is not a write)."""
+    gate = "hestia_single_" + "gate.py"
+    first = "/w/hestia/plugins/_shared/ordinary.txt"
+    last = f"/w/hestia/plugins/_shared/{gate}"
+    pad = " ".join(f"/w/x/pad{i}.txt" for i in range(25))
+    ti = {"command": f"touch {first} {pad} {last}"}
+    vs = g.write_verdicts("Bash", ti, cwd=_NEUTRAL_CWD, closure=FLOOR)
+    check("every_target", [v.resource for v in vs] == [first, last], [v.resource for v in vs])
+    check("all_writes_with_markers", all(v.classification == "write" and v.marker for v in vs), vs)
+    one = cls("Bash", ti)
+    check("first_equals_classify", vs and vs[0] == one, (vs, one))
+    check("none_is_empty", g.write_verdicts("Bash", {"command": "echo hi > /tmp/x"},
+                                            cwd=_NEUTRAL_CWD, closure=FLOOR) == [])
+    check("read_is_empty", g.write_verdicts("Bash", {"command": f"cat {last}"},
+                                            cwd=_NEUTRAL_CWD, closure=FLOOR) == [])
+
+    def boom(tool, ti):
+        raise RuntimeError("classifier bug")
+    g._write_position_targets = boom
+    try:
+        vs = g.write_verdicts("Write", {"file_path": "/tmp/a.txt"}, cwd=_NEUTRAL_CWD, closure=FLOOR)
+        check("internal_error_is_one_markerless_write",
+              len(vs) == 1 and vs[0].rule == g.RULE_INTERNAL and vs[0].marker is None, vs)
+    finally:
+        g._write_position_targets = _REAL_WRITE_TARGETS
+
+
 ALL = [
+    test_write_verdicts_reports_every_governed_target,
     test_fused_paren_no_longer_hides_write_onto_gate,
     test_fused_paren_no_longer_leaks_stdin_src_past_boundary,
     test_operator_table_covers_the_tokenizer_alphabet_496,

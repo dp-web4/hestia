@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 5a8c077629451b48882fe256dd564681eacb7faa9743a71e547a72322c40c940  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 5a7863127db450c14759261d5fb2c4a1eb445bc2cb19910ae267d2698f0b83a5  (published ground truth; manifest: hooks-gt)
 """Shared in-process daemon-query mechanism — the society-safety verdict path.
 
 PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
@@ -1513,25 +1513,50 @@ def witness_gate_self(event_type, marker, tool_name, rule=None, *,
 
 
 RESOLVED_TARGET_MAX = 400
+MAX_RESOLVED_TARGETS = 16
+# A resolved target the gate could not price, said IN-BAND so it cannot be dropped silently. The
+# daemon prices any such entry at the HIGHEST bar (core `gate_escalation::UNPRICEABLE_PREFIX`):
+# missing pricing evidence must never read as the weaker bar (Codex review of #1239).
+UNPRICEABLE_PREFIX = "hestia:unpriceable:"
 
 
-def resolved_target_for_claim(target):
-    """The resolved target as it may ride a claim, or None. Whitespace-collapsed; tail-capped,
-    because the governed filename sits at the END of a path and a cap must cut the head; and
-    withheld whole when credential-shaped, by the same discipline as `attempted_summary` — the
-    claim lands on the witness chain."""
-    if not isinstance(target, str):
-        return None
-    t = " ".join(target.split())
-    if not t or credential_shaped(t):
-        return None
-    return t[-RESOLVED_TARGET_MAX:]
+def resolved_targets_for_claim(targets, complete=True):
+    """The resolved targets as they ride a claim: a list, possibly empty.
+
+    Each is whitespace-collapsed and tail-capped (the governed filename sits at the END of a
+    path, so a cap cuts the head). A path that is ITSELF credential-shaped is not copied onto the
+    witness chain — but it is not DROPPED either: it becomes the `credential-path` sentinel,
+    which the daemon prices at the highest bar. Redaction of the act summary does not touch
+    these: they are paths the gate itself resolved, carried independently of the summary. More
+    than MAX_RESOLVED_TARGETS, or a write set the gate could not enumerate (`complete=False`),
+    adds an `overflow` / `unenumerated` sentinel — again the highest bar, never a silent cut."""
+    out = []
+    overflow = False
+    for target in targets or ():
+        if not isinstance(target, str):
+            t = UNPRICEABLE_PREFIX + "malformed"
+        else:
+            t = " ".join(target.split())
+            if not t:
+                continue
+            t = UNPRICEABLE_PREFIX + "credential-path" if credential_shaped(t) else t[-RESOLVED_TARGET_MAX:]
+        if t in out:
+            continue
+        if len(out) >= MAX_RESOLVED_TARGETS:
+            overflow = True
+            continue
+        out.append(t)
+    if overflow:
+        out.append(UNPRICEABLE_PREFIX + "overflow")
+    if not complete:
+        out.append(UNPRICEABLE_PREFIX + "unenumerated")
+    return out
 
 
 def claim_self_write(marker, tool_name, attempted, *,
                      plugin_id, role, client_name, host_session_id=None, invocation_key=None,
-                     supersession=None, deadline=None, resolved_target=None,
-                     also_resolved=None):
+                     supersession=None, deadline=None, resolved_targets=None,
+                     resolved_targets_complete=True):
     """Ask ONCE whether a human has already approved this exact (member, marker) write.
     Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
 
@@ -1541,18 +1566,17 @@ def claim_self_write(marker, tool_name, attempted, *,
     is a refusal: a daemon that cannot answer must not be a way to get a governance write
     through.
 
-    `resolved_target` (#810; recut of #812, kimi-code) is the act's concrete target — on the
-    live path the closure verdict's `resource`, the WRITE-POSITION argument that matched, never
-    payload text. The daemon prices the escalation's bar over the marker, the act and this
-    target, highest wins (core `gate_escalation::price`), so it can only strengthen the bar.
-    It matters because `attempted` is a bounded, self-censoring summary that can cut the
-    filename out. Not part of the request key: it is derived from the same act. Old daemons
-    ignore the key; callers that omit it price exactly as before.
-
-    `also_resolved` is every FURTHER closure location the same act writes, after the first. The
-    daemon prices them exactly like `resolved_target` (`price_targets`), so a multi-target act
-    is priced by its strongest target whatever order it names them in. Each item gets the
-    same cap and credential discipline as `resolved_target`."""
+    `resolved_targets` (#810; recut of #812, kimi-code) are the act's concrete targets — on the
+    live path EVERY write-position argument the closure resolved (`write_verdicts`), never
+    payload text, not only the first. The daemon prices the escalation's bar over the marker,
+    the act and every target, highest wins (core `gate_escalation::price`), so they can only
+    strengthen the bar; and it will not spend an approval granted under a lower bar than the
+    act now prices. They matter because `attempted` is a bounded, self-censoring summary that
+    can cut a filename out — and redacting that summary never drops them (see
+    `resolved_targets_for_claim`). `resolved_targets_complete=False` says the gate could not
+    enumerate the write set; the daemon then prices the highest bar. Not part of the request
+    key: they are derived from the same act. Old daemons ignore the key; callers that omit
+    it price exactly as before."""
     claim_args = {
         "plugin_id": plugin_id,
         "role": role,
@@ -1586,12 +1610,9 @@ def claim_self_write(marker, tool_name, attempted, *,
     # this spend, which only costs a lost answer a fresh petition.
     if supersession:
         claim_args["supersession"] = supersession
-    rt = resolved_target_for_claim(resolved_target)
-    if rt:
-        claim_args["resolved_target"] = rt
-    more = [m for m in (resolved_target_for_claim(t) for t in (also_resolved or ())) if m]
-    if more:
-        claim_args["also_resolved"] = more
+    rts = resolved_targets_for_claim(resolved_targets, resolved_targets_complete)
+    if rts:
+        claim_args["resolved_targets"] = rts
     r = gate_self_call("hestia_gate_escalation_claim", claim_args,
                        plugin_id=plugin_id, role=role, client_name=client_name,
                        host_session_id=host_session_id, deadline=deadline)

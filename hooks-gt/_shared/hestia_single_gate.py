@@ -1,4 +1,4 @@
-# hestia-gt-sha256: f8610d34a29e3ecbbcb5536513b93a45d5026abee989dd3a773e101ab10d0b4a  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 86bf3113a70d7ba2f86aa9f4ff61543b1967a8fb2bf1f27fa0765e41172543f1  (published ground truth; manifest: hooks-gt)
 """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
 
 One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
@@ -829,32 +829,34 @@ def _launch_role(inv: _Invocation, permitted: str) -> Optional[GateDecision]:
                         innate=True, anomaly=True)
 
 
-def _closure_view(event: GateEvent, against=None):
-    """The closure classifier's verdict on this act. Tool-shape adaptation only: a lowercase
-    shell tool or an argv list is the Bash form; an apply_patch is one Write per target."""
+def _closure_shape(event: GateEvent):
+    """(tool, tool_input, patch_targets, is_patch): the tool-shape adaptation both closure reads
+    share. A lowercase shell tool or an argv list is the Bash form; an apply_patch is one Write
+    per target."""
     tool, ti = event.tool, event.tool_input if isinstance(event.tool_input, dict) else {}
     targets = _patch_targets(tool, ti)
     if targets or (isinstance(tool, str) and tool.lower() == "apply_patch"):
-        found, write, also = None, None, []
-        for p in targets:
-            cv = closure.classify("Write", {"file_path": p}, cwd=event.cwd, closure=against)
-            if cv.classification == "write":
-                # Every file of a multi-file patch that writes the closure is priced, not only
-                # the first: the first verdict decides the refusal, the rest ride along.
-                if write is None:
-                    write = cv
-                for loc in (cv.resolved, *cv.also_resolved):
-                    if loc and loc != write.resolved and loc not in also:
-                        also.append(loc)
-            elif cv.classification == "read" and found is None:
-                found = cv
-        if write is not None:
-            return replace(write, also_resolved=tuple(also))
-        return found
+        return tool, ti, targets, True
     if _shell_tool(tool) and tool not in ("Bash", "Shell"):
         tool = "Bash"
     if _shell_tool(tool) and not isinstance(ti.get("command"), str):
         ti = dict(ti, command=_command_text(ti) or "")
+    return tool, ti, targets, False
+
+
+def _closure_view(event: GateEvent, against=None):
+    """The closure classifier's verdict on this act (the first governed target decides).
+    `against`: the closure to classify with (default: the declared one)."""
+    tool, ti, targets, is_patch = _closure_shape(event)
+    if is_patch:
+        found = None
+        for p in targets:
+            cv = closure.classify("Write", {"file_path": p}, cwd=event.cwd, closure=against)
+            if cv.classification == "write":
+                return cv
+            if cv.classification == "read" and found is None:
+                found = cv
+        return found
     return closure.classify(tool, ti, cwd=event.cwd, closure=against)
 
 
@@ -871,10 +873,34 @@ def _closure_verdict(inv: _Invocation):
     rv = _closure_view(inv.event, reg.closure())
     if rv is None or rv.classification != "write":
         return cv if cv is not None else rv
-    locs = {rv.resolved, *(getattr(rv, "also_resolved", ()) or ())}
-    if any(loc in reg.entries for loc in locs if loc):
+    if rv.resolved and rv.resolved in reg.entries:
         rv = replace(rv, marker=REGISTERED_ENTRY_MARKER)
     return rv
+
+
+def _closure_write_set(event: GateEvent, against=None):
+    """(targets, complete): EVERY governed write-position path this act resolves into the
+    closure, in order — not only the first, which is all `_closure_view` reports (Codex review
+    of #1239, P1-2: a later sovereign target beyond the bounded summary priced as nothing).
+    Each is the LOCATION the closure resolved (cwd-joined, symlinks and `..` resolved), falling
+    back to the argument as written only where there is none: the daemon prices a member's gate
+    entry by where it is, and a relative or `cd`-qualified spelling names no location (#1247).
+    `against`: the closure to enumerate with — the seat's registered surface when it has one, so
+    a write the executed surface governs is enumerated too.
+    `complete` is False when the write set could not be enumerated (an opaque writer, an
+    internal error, no target named): the daemon then prices the highest bar. Never raises."""
+    try:
+        tool, ti, targets, is_patch = _closure_shape(event)
+        if is_patch:
+            verdicts = [v for p in targets
+                        for v in closure.write_verdicts("Write", {"file_path": p}, cwd=event.cwd,
+                                                        closure=against)]
+        else:
+            verdicts = closure.write_verdicts(tool, ti, cwd=event.cwd, closure=against)
+        resolved = [(v.resolved or v.resource) for v in verdicts if v.marker and v.resource]
+        return resolved, bool(resolved) and all(v.marker for v in verdicts)
+    except Exception:  # noqa: BLE001 — unenumerated is priced highest, never lowest
+        return [], False
 
 
 def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
@@ -894,6 +920,12 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
         except Exception:  # noqa: BLE001
             pass
         return None
+    write_set = _closure_write_set(ev, inv.registered.closure() if inv.registered else None)
+    if inv.registered is not None and any(t in inv.registered.entries for t in write_set[0]):
+        # A target is this seat's REGISTERED gate entry (one no declaration covers): say so
+        # in-band, so the daemon prices it like a declared entry even when it is not the target
+        # the closure reported first (`cv`'s marker covers only that one).
+        write_set = (write_set[0] + [REGISTERED_ENTRY_MARKER], write_set[1])
     try:
         claimed = _bounded(
             inv.phase_deadline, mechanism.claim_self_write,
@@ -904,18 +936,13 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
             # may make the declaration that lets the daemon reclaim a lost answer (#1169).
             supersession=mechanism.SUPERSESSION_HARD_STOP,
             deadline=inv.phase_deadline,
-            # THE ACT'S RESOLVED TARGET (#810; recut of #812, kimi-code): the write-position
-            # argument the closure matched. The daemon prices the bar over the marker, the act
-            # and this, highest wins — `inv.attempted` is a bounded summary that can cut the
-            # filename out; this cannot. Sent only when it matched a closure element: an
-            # opaque/internal verdict's resource ("stdin", "internal:…") names no target.
-            # The LOCATION the closure resolved (cwd-joined, symlinks and `..` resolved), not the
-            # argument as written: the daemon prices a member's gate entry by where it is, and a
-            # relative or `cd`-qualified spelling names no location.
-            resolved_target=(cv.resolved or cv.resource) if cv.marker else None,
-            # Every further closure location the same act writes. The daemon prices the bar over
-            # all of them, so it does not depend on which one the act named first.
-            also_resolved=list(cv.also_resolved) if cv.marker else None)
+            # THE ACT'S RESOLVED TARGETS (#810; recut of #812, kimi-code): EVERY write-position
+            # path the closure resolved, not only the one `cv` reports — each as the LOCATION it
+            # lands at (#1247). The daemon prices the bar over the marker, the act and all of
+            # them, highest wins — `inv.attempted` is a bounded, self-censoring summary that can
+            # cut a filename out (or withhold the whole command); these are carried
+            # independently of it. An unenumerable write set is said as such, and priced highest.
+            resolved_targets=write_set[0], resolved_targets_complete=write_set[1])
         if claimed is _LATE:
             # Unknown, not "nothing happened": the daemon may have opened or matched an
             # escalation after the bound (#1166). Re-issuing the identical act is safe.

@@ -176,10 +176,13 @@ if claim and connect:
     check("the reason is the ATTEMPTED ACT, not a rationale", a.get("reason") == "Edit: x -> y", a)
 check("the verdict path is unchanged by threading", v == "escalated", v)
 
-# --- the resolved target rides the claim (#810; recut of #812) ----------------------------------------
-# The daemon prices the bar over the marker, the act AND this target, highest wins; the act is a
-# bounded summary that can cut the filename out, so the target is sent as its own field.
+# --- the resolved targets ride the claim (#810; recut of #812) ---------------------------------------
+# The daemon prices the bar over the marker, the act AND every target, highest wins; the act is a
+# bounded summary that can cut a filename out, so the targets are sent as their own field.
 _HOOK = "pre_" + "tool_use.py"
+_GATE = "hestia_single_" + "gate.py"
+_UNP = mech.UNPRICEABLE_PREFIX
+_KEYFILE = "id_" + "ed" + "25519"   # spelled in parts: the literal is egress vocabulary
 
 
 def _claim_args(**kw):
@@ -188,25 +191,54 @@ def _claim_args(**kw):
             if (r.get("params") or {}).get("name") == "hestia_gate_escalation_claim"]
 
 
-a = _claim_args(resolved_target=f"/w/plugins/kimi/hooks/{_HOOK}")
-check("the claim carries the resolved target when the gate has one",
-      a and a[0].get("resolved_target") == f"/w/plugins/kimi/hooks/{_HOOK}", a)
+_T = f"/w/plugins/kimi/hooks/{_HOOK}"
+a = _claim_args(resolved_targets=[_T])
+check("the claim carries the resolved targets when the gate has them",
+      a and a[0].get("resolved_targets") == [_T], a)
+a = _claim_args(resolved_targets=["/w/plugins/_shared/ordinary.txt", f"/w/plugins/_shared/{_GATE}"])
+check("EVERY target rides, not only the first (P1-2)",
+      a and a[0].get("resolved_targets") == ["/w/plugins/_shared/ordinary.txt",
+                                             f"/w/plugins/_shared/{_GATE}"], a)
+a = _claim_args(resolved_targets=["/w/hooks-gt/kimi/hooks/*.py"])
+check("a glob target rides as written (the daemon prices it by what it can expand to)",
+      a and a[0].get("resolved_targets") == ["/w/hooks-gt/kimi/hooks/*.py"], a)
 a = _claim_args()
-check("no target, no key on the wire (an old caller changes nothing)",
-      a and "resolved_target" not in a[0], a)
-a = _claim_args(resolved_target="   ")
-check("a blank target is no target", a and "resolved_target" not in a[0], a)
-a = _claim_args(resolved_target="/home/m/" + "." + "ssh/authorized_keys")
-check("a credential-shaped target is withheld whole, like the attempted summary",
-      a and "resolved_target" not in a[0], a)
+check("no targets, no key on the wire (an old caller changes nothing)",
+      a and "resolved_targets" not in a[0], a)
+a = _claim_args(resolved_targets=["   "])
+check("a blank target is no target", a and "resolved_targets" not in a[0], a)
+_cred = "/w/credential-fixture/" + "." + f"ssh/plugins/kimi/hooks/{_HOOK}"
+a = _claim_args(resolved_targets=[_cred])
+check("a credential-shaped target path is NOT dropped: it rides as the credential-path sentinel "
+      "the daemon prices highest (P1-3)",
+      a and a[0].get("resolved_targets") == [_UNP + "credential-path"], a)
+check("and the credential-shaped path itself is not copied onto the wire",
+      a and "ssh" not in json.dumps(a[0].get("resolved_targets")), a)
+# P1-3, producer side end to end: a credential-shaped COMMAND is withheld whole from the summary,
+# and its sovereign target still rides — redaction is the summary's, not the targets'.
+_cmd = "cp /home/m/" + "." + f"ssh/{_KEYFILE} {_T}"
+_summary = mech.attempted_summary("Bash", {"command": _cmd}, command=_cmd)
+check("control: the credential-shaped command's summary is withheld whole",
+      "REDACTED" in _summary and _HOOK not in _summary, _summary)
+a = _claim_args(resolved_targets=[_T])
+check("the sovereign target rides beside a redacted summary (P1-3)",
+      a and a[0].get("resolved_targets") == [_T], a)
 _long = "/" + "d" * 900 + f"/plugins/kimi/hooks/{_HOOK}"
-a = _claim_args(resolved_target=_long)
+a = _claim_args(resolved_targets=[_long])
 check("an over-long target is tail-capped and keeps its filename",
-      a and len(a[0].get("resolved_target", "")) == mech.RESOLVED_TARGET_MAX
-      and a[0]["resolved_target"].endswith(f"/{_HOOK}"), a and len(a[0].get("resolved_target", "")))
-a1 = _claim_args(resolved_target=f"/w/plugins/kimi/hooks/{_HOOK}")
+      a and len(a[0]["resolved_targets"][0]) == mech.RESOLVED_TARGET_MAX
+      and a[0]["resolved_targets"][0].endswith(f"/{_HOOK}"), a)
+_many = [f"/w/plugins/kimi/hooks/f{i}.txt" for i in range(mech.MAX_RESOLVED_TARGETS + 4)]
+a = _claim_args(resolved_targets=_many)
+check("more targets than the bound: the excess is an overflow sentinel, never a silent cut",
+      a and len(a[0]["resolved_targets"]) == mech.MAX_RESOLVED_TARGETS + 1
+      and a[0]["resolved_targets"][-1] == _UNP + "overflow", a and a[0].get("resolved_targets"))
+a = _claim_args(resolved_targets=[], resolved_targets_complete=False)
+check("an unenumerable write set says so (the daemon prices it highest)",
+      a and a[0].get("resolved_targets") == [_UNP + "unenumerated"], a)
+a1 = _claim_args(resolved_targets=[_T])
 a2 = _claim_args()
-check("the target is not part of the request key (it is derived from the same act)",
+check("the targets are not part of the request key (they are derived from the same act)",
       a1 and a2 and a1[0]["request_key"] == a2[0]["request_key"], (a1, a2))
 
 print(f"\n{'FAIL' if FAILS else 'all'} claim checks: {len(RAN) - len(FAILS)}/{len(RAN)} passed")

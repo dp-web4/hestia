@@ -7,7 +7,7 @@
   "files": [
     {
       "path": "hooks/hooks.json",
-      "sha256": "2ba6fe7def97f86e3dfa66bab31a5c10bb739704e8c540ed0dc3afea72f9ffd3",
+      "sha256": "501ba4ed4c864dfddb102db3189c2aa93f92cd30bd71292e133c3e8856428f29",
       "source": "plugins/codex/hooks/hooks.json"
     },
     {
@@ -33,7 +33,7 @@
   ],
   "engine": {
     "unit": "_shared",
-    "gt_version": "56c878a7e7219509e9042fe87d8bfdd9a08057111aaf6ca6c063fbe38af2a0af",
+    "gt_version": "bff38247b911a3021a1f9213954a0909258c4b4aa927e23fde60679d7627e01f",
     "files": [
       {
         "path": "hestia_gate_core.py",
@@ -41,11 +41,11 @@
       },
       {
         "path": "hestia_gate_mechanism.py",
-        "sha256": "5a8c077629451b48882fe256dd564681eacb7faa9743a71e547a72322c40c940"
+        "sha256": "5a7863127db450c14759261d5fb2c4a1eb445bc2cb19910ae267d2698f0b83a5"
       },
       {
         "path": "hestia_governance_closure.py",
-        "sha256": "e92ee2aee5b104e80401776c7e25880ad5cc21d94457fea3aba3759a1bc349e5"
+        "sha256": "80b52126d29cd409caf0ceadcfa40c2f1161b2d2465464bbaba0d1e59f6f19fb"
       },
       {
         "path": "hestia_shell_classifier.py",
@@ -53,7 +53,7 @@
       },
       {
         "path": "hestia_single_gate.py",
-        "sha256": "f8610d34a29e3ecbbcb5536513b93a45d5026abee989dd3a773e101ab10d0b4a"
+        "sha256": "86bf3113a70d7ba2f86aa9f4ff61543b1967a8fb2bf1f27fa0765e41172543f1"
       },
       {
         "path": "hestia_witness_core.py",
@@ -62,5 +62,5 @@
     ]
   },
   "requires": [],
-  "gt_version": "26067d1adcbff4fa34ec4267d508ee77349b50d496149c3e7f4270594ea16be8"
+  "gt_version": "1f666444d011d519200bae2e4c090308069c7cd00cb5e6af2a15dac19b21b428"
 }
