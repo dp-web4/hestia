@@ -1,4 +1,4 @@
-# hestia-gt-sha256: 5cf21cbc55c74ca39e177fe7c518dfca581e972f94ad651cba7fcdce9018315b  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 2d86a3f4a7b8dc21bb8bedcc4f18c0893046d00d04be4f105a6f20a499b840c5  (published ground truth; manifest: hooks-gt)
 """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
 
 One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
@@ -283,50 +283,68 @@ def _command_targets(command: str, env) -> list:
 
 
 def _names_hook(command: str, env, base: str) -> bool:
-    """Boolean relevance ONLY: does this command appear to invoke this hook. The basename as a
-    BOUNDED token of the expanded command (of the RAW text when a `${VAR}`/`{cwd}` cannot be
-    resolved here) — not a token basename equality: shlex without punctuation_chars glues shell
-    operators onto the token (`./hook.py;`, `hook.py|cat`, `(python3 ./hook.py)`), basename
-    equality misses those, and the entry then DROPS beside a longer exact binding, letting the
-    computed deadline outrun the timeout the harness actually enforces on that spelling (#1262
-    re-review P1 — every glued spelling was executed under `sh` and runs the hook). The edge
-    class [A-Za-z0-9._-] keeps a longer name that merely CONTAINS the basename (`hook.py.bak`,
-    `hook.py5`, `xhook.py`) a different file: it drops. Whatever names the hook without an
-    exact realpath binding is MISWIRED evidence; the binding test itself stays exact."""
+    """Boolean relevance ONLY: does this command appear to invoke this hook. Two readings, and
+    either one is evidence. (1) The basename as a BOUNDED token of the expanded RAW text (of the
+    raw command when a `${VAR}`/`{cwd}` cannot be resolved here) — not a token basename equality:
+    shlex without punctuation_chars glues shell operators onto the token (`./hook.py;`,
+    `hook.py|cat`, `(python3 ./hook.py)`), basename equality misses those, and the entry then
+    DROPS beside a longer exact binding, letting the computed deadline outrun the timeout the
+    harness actually enforces on that spelling (#1262 re-review P1 — every glued spelling was
+    executed under `sh` and runs the hook). (2) The same bounded test on each SHELL-NORMALIZED
+    token — shlex quote and backslash removal (`./gate_'hook'.py`, `./gate_\\hook.py`) — because
+    the shell performs that same removal and the normalized spelling RUNS the hook (#1262
+    re-review P1 round 2: the quoted/escaped spellings were executed under `sh` beside an exact
+    15s registration and the bound outran it at 15s). The edge class [A-Za-z0-9._-] keeps a
+    longer name that merely CONTAINS the basename (`hook.py.bak`, `hook.py5`, `xhook.py`) a
+    different file: it drops. Constructs no lexical reading can resolve — glob patterns
+    (`gate_hoo?.py`), command substitution (`$(printf ...)`) — stay outside this guarantee.
+    Whatever names the hook without an exact realpath binding is MISWIRED evidence; the binding
+    test itself stays exact."""
+    pattern = r"(?<![A-Za-z0-9._-])" + re.escape(base) + r"(?![A-Za-z0-9._-])"
     text = _expand(command, env, None)
     if text is None:
         text = command
-    return re.search(r"(?<![A-Za-z0-9._-])" + re.escape(base) + r"(?![A-Za-z0-9._-])",
-                     text) is not None
+    if re.search(pattern, text):
+        return True
+    return any(re.search(pattern, token) for token in _command_tokens(command, env))
 
 
 def _hook_entries(doc: Any, reader: str, layout: str, event: str) -> list:
-    """[(command, timeout-or-None, entry-object)] for every hook registered on `event` in a
-    parsed config. The entry object rides along so a duplicate-key mark recorded at parse time
-    can be attributed to the exact registration that carries it."""
+    """[(command, timeout-or-None, entry-object, ancestors)] for every hook registered on
+    `event` in a parsed config. The entry object rides along so a duplicate-key mark recorded at
+    parse time can be attributed to the exact registration that carries it; `ancestors` is the
+    chain of (object, key) the walk traversed from the document root, so an agreeing duplicate
+    mark on the ENCLOSING wiring can be attributed to the registrations beneath it (#1262
+    re-review P2 round 2)."""
     out = []
     hooks = doc.get("hooks") if isinstance(doc, dict) else None
     if layout == "flat":
         for tbl in hooks if isinstance(hooks, list) else []:
             if isinstance(tbl, dict) and tbl.get("event") == event and isinstance(tbl.get("command"), str):
-                out.append((tbl["command"], tbl.get("timeout"), tbl))
+                out.append((tbl["command"], tbl.get("timeout"), tbl, ((doc, "hooks"),)))
         return out
     groups = hooks.get(event) if isinstance(hooks, dict) else None
     for group in groups if isinstance(groups, list) else []:
         for h in (group.get("hooks") or []) if isinstance(group, dict) else []:
             if isinstance(h, dict) and isinstance(h.get("command"), str):
-                out.append((h["command"], h.get("timeout"), h))
+                out.append((h["command"], h.get("timeout"), h,
+                            ((doc, "hooks"), (hooks, event), (group, "hooks"))))
     return out
 
 
 def _load_config(path: str, reader: str):
-    """(parsed document, None, dupes) or (None, why, {}). `dupes` maps id(entry-object) to its
-    duplicated keys, for the JSON reader only: json.loads is last-wins — as the harness's own
-    parser is — so a duplicated key is no measured deadline overrun, but it IS ambiguous wiring,
-    MISWIRED evidence under the protocol's duplicate rule (#1262 re-review P2). TOML rejects a
-    duplicate key at parse, so the tomllib path never marks anything. A TOML config without
-    tomllib is (None, "scan", {}). The id-keyed map is sound because the returned document tree
-    holds every marked object alive."""
+    """(parsed document, None, dupes) or (None, why, {}). `dupes` maps id(marked object) to
+    (the marked object, {repeated key: [occurrences in order]}), for the JSON reader only:
+    json.loads is last-wins — as the harness's own parser is — so a duplicated key is no
+    measured deadline overrun, but it IS ambiguous wiring, MISWIRED evidence under the
+    protocol's duplicate rule (#1262 re-review P2). TOML rejects a duplicate key at parse, so
+    the tomllib path never marks anything. A TOML config without tomllib is (None, "scan", {}).
+    The mark carries its object: holding it keeps the id from being recycled once an overwritten
+    object is freed, and the lookup re-checks identity — a bare id() can be handed to a later
+    allocation, which would hang a stranger's repeated key on a clean registration (#1262
+    re-review B1). Occurrences are kept so an ENCLOSING key whose copies agree (deep-equal) can
+    be told from one the harness's last-wins parser silently chooses between (#1262 re-review
+    P2 round 2)."""
     with open(path, "rb") as fh:
         raw = fh.read()
     if reader == "json-hook-commands":
@@ -334,13 +352,13 @@ def _load_config(path: str, reader: str):
 
         def _pairs(pairs):
             obj = {}
-            repeated = set()
+            repeated = {}
             for k, v in pairs:
                 if k in obj:
-                    repeated.add(k)
+                    repeated.setdefault(k, [obj[k]]).append(v)
                 obj[k] = v
             if repeated:
-                dupes[id(obj)] = repeated
+                dupes[id(obj)] = (obj, repeated)
             return obj
 
         return json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs), None, dupes
@@ -349,6 +367,16 @@ def _load_config(path: str, reader: str):
     except ImportError:
         return None, "scan", {}
     return tomllib.loads(raw.decode("utf-8")), None, {}
+
+
+def _dupe_marks(dupes: dict, obj: Any) -> Optional[dict]:
+    """The {repeated key: occurrences} recorded for THIS object, or None. The mark is accepted
+    only by identity: a bare id() match proves nothing, because an overwritten duplicate's object
+    is freed and its id can be recycled onto a clean registration (#1262 re-review B1)."""
+    mark = dupes.get(id(obj)) if dupes else None
+    if mark is not None and mark[0] is obj:
+        return mark[1]
+    return None
 
 
 def _text_mentions_hook(path: str, base: str) -> bool:
@@ -375,10 +403,12 @@ def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[
     Anything else that APPEARS to register this hook contributes no deadline, only MISWIRED
     evidence, and closes the bound: a missing or non-numeric timeout, an out-of-envelope
     value, an unparseable or unreadable config naming the hook, no parser available for it, a
-    relative, foreign or shell-punctuated command naming its basename (the timeout cannot be
-    bound to the exact registered hook), a JSON registration object that repeats a key (the
-    harness's own parser is last-wins; an ambiguous entry is not a binding), or
-    duplicate/conflicting bindings. A config whose text never mentions this hook is irrelevant
+    relative, foreign or shell-punctuated command naming its basename — read again after the
+    shell's own quote and backslash removal, because the shell runs that file (the timeout
+    cannot be bound to the exact registered hook), a JSON registration object that repeats a
+    key, or wiring that encloses it repeating a key with an identical value (the harness's own
+    parser is last-wins; ambiguous wiring is not a binding), or duplicate/conflicting bindings.
+    A config whose text never mentions this hook is irrelevant
     and drops. The gate NEVER infers a deadline from a partial lexical scan. A non-harness
     invoker's explicit HESTIA_HOOK_TIMEOUT_S joins the minimum: it can only shorten.
 
@@ -415,7 +445,7 @@ def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[
                     problems.append(f"{path}: MISWIRED: appears to register this hook and no "
                                     f"parser is available for it")
                 continue
-            for command, timeout, hook_obj in _hook_entries(doc, reader, layout, event):
+            for command, timeout, hook_obj, ancestors in _hook_entries(doc, reader, layout, event):
                 targets = _command_targets(command, env)
                 hit_exact = any(os.path.realpath(t) == me for t in targets)
                 if not hit_exact:
@@ -424,11 +454,20 @@ def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[
                                         f"exactly (a relative, foreign or shell-punctuated command "
                                         f"cannot bind a timeout to the registered hook)")
                     continue                   # some other hook's entry: irrelevant
-                repeated = dupes.get(id(hook_obj)) if dupes else None
+                repeated = _dupe_marks(dupes, hook_obj)
                 if repeated:
                     problems.append(f"{path}: MISWIRED: this hook's registration repeats key "
                                     f"{sorted(repeated)} — the harness's JSON parser is last-wins, "
                                     f"so an ambiguous entry is not a binding")
+                    continue
+                enclosing = next((key for container, key in ancestors
+                                  if (marks := _dupe_marks(dupes, container)) and key in marks
+                                  and all(v == marks[key][-1] for v in marks[key])), None)
+                if enclosing is not None:
+                    problems.append(f"{path}: MISWIRED: the wiring enclosing this hook's "
+                                    f"registration repeats key {enclosing!r} with an identical "
+                                    f"value (an agreeing duplicate) — the harness's JSON parser "
+                                    f"is last-wins, so ambiguous wiring is not a binding")
                     continue
                 seconds, why = validate_timeout(timeout, unit)
                 if seconds is None:
