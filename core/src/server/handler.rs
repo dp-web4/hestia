@@ -29115,7 +29115,7 @@ mod concurrency_battery {
             let (st, id) = (state.clone(), esc_id.clone());
             let approve = i % 3 != 0; // some denied, so a deny is in the mix too
             tasks.spawn(async move {
-                let _ = super::super::http::operator_gate_escalation_for_battery(
+                let _ = super::super::http::battery_decide_via_operator_route(
                     st,
                     super::super::http::GateEscalationDecision {
                         id, approve, reason: Some("battery operator".into()),

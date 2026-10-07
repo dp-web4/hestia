@@ -1508,7 +1508,7 @@ pub async fn serve_with_callback(
 /// The REAL operator decision channel, for the concurrency battery (handler.rs): it races this
 /// path, with its witness-is-finality append, rather than a store call that writes no ruling row.
 #[cfg(test)]
-pub(super) async fn operator_gate_escalation_for_battery(
+pub(super) async fn battery_decide_via_operator_route(
     state: SharedState,
     d: GateEscalationDecision,
 ) -> axum::response::Response {
