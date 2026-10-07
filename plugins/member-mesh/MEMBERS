@@ -55,3 +55,8 @@ codex-cli
 # A being: woken by its own 30-minute heartbeat, not by a fire template. Joined
 # 2026-09-13, first send 2026-09-15, allowlisted nowhere until 2026-09-20.
 cbp-being
+
+# A being on McNugget (macOS). Its seat conversation wakes the seat through this mesh
+# (notify map `mcnugget-claude: claude-code`, dp 2026-10-06), so its notices must not be
+# withheld here.
+mcnugget-being
