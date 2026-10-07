@@ -87,8 +87,28 @@ impl ServerHandler for HestiaServer {
         // GROUP COMMIT: the reply waits until every chain entry this call appended is fsynced
         // (storage::durability) — after the state lock is released, so the fsync no longer
         // stalls every other member, and never before it, so "recorded" always means durable.
-        let (dispatch, durable) = crate::storage::durability::durable_scope(
-            super::state_lock::with_label(lock_label, async { match name.as_str() {
+        // DURABLE READS: tools that REPORT shared state (escalation status, inbox, history,
+        // appeals, evidence, a witness answered with an existing row) do not reply before what
+        // they read is durable. The gate's own hot path does not wait on other requests' rows.
+        let reports_shared_state = matches!(
+            name.as_str(),
+            "hestia_gate_escalation_poll"
+                | "hestia_gate_escalation_lookup"
+                | "hestia_gate_escalation_claimable"
+                | "hestia_gate_pending_escalations"
+                | "hestia_escalation_evidence"
+                | "hestia_gate_escalation_claim"
+                | "hestia_member_inbox"
+                | "hestia_member_unanswered"
+                | "hestia_inbox"
+                | "hestia_pair_inbox"
+                | "hestia_egress_pending"
+                | "hestia_query_history"
+                | "hestia_open_appeals"
+                | "hestia_my_appeals"
+                | "hestia_witness_decision"
+        );
+        let scoped = super::state_lock::with_label(lock_label, async { match name.as_str() {
             "hestia_connect" => tool_connect(&self.state, &args).await,
             "hestia_begin_action" => tool_begin_action(&self.state, &args).await,
             "hestia_record_outcome" => tool_record_outcome(&self.state, &args).await,
@@ -133,7 +153,12 @@ impl ServerHandler for HestiaServer {
                 &format!("Unknown tool: {}", name),
                 Some(json!({"tool": name})),
             )),
-        } })).await;
+        } });
+        let (dispatch, durable) = if reports_shared_state {
+            crate::storage::durability::durable_scope_observing(scoped).await
+        } else {
+            crate::storage::durability::durable_scope(scoped).await
+        };
         let dispatch = match durable {
             Ok(()) => dispatch,
             // Durability lost (an fsync failed): whatever this call appended may or may not
@@ -245,7 +270,16 @@ impl ServerHandler for HestiaServer {
             "resource:",
             &uri.splitn(4, '/').take(3).collect::<Vec<_>>().join("/"),
         );
-        let body = match super::state_lock::with_label(lock_label, read_resource_body(&self.state, &uri)).await {
+        // DURABLE READS: a resource answer (a ruling, an appeal, an escalation) must not be served
+        // before the chain rows it reflects are durable.
+        let (body, durable) = crate::storage::durability::durable_scope_observing(
+            super::state_lock::with_label(lock_label, read_resource_body(&self.state, &uri)),
+        )
+        .await;
+        if let Err(e) = durable {
+            return Err(ErrorData::internal_error(format!("hestia.not_durable: {e:#}"), None));
+        }
+        let body = match body {
             Ok(b) => b,
             Err(msg) => {
                 return Err(ErrorData::invalid_params(msg, None));
@@ -1157,6 +1191,7 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
     // The snapshot is swapped atomically at the release of any write that changed a policy
     // input, so this reads the law before or after a change — never half of one.
     let p = state.published();
+    p.observe();
     // ATTRIBUTED CALLERS ONLY — and "attributed" means RESOLVED, not "an id was supplied".
     //
     // The first fix here guarded on a MISSING session_id, which kimi measured as still
@@ -1634,6 +1669,8 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     // then witnesses this same verdict is answered with this row, not a duplicate of it.
     let mut decision_entry_hash: Option<String> = None;
     if evaluation.decision != crate::policy::PolicyDecision::Allow {
+        // DURABLE READS: a refusal may answer with a row another request committed.
+        crate::storage::durability::note_observed(s.chain_store.durability(), s.chain_len());
         // A deny blocks before execution, so this is the ONLY witnessed record of a
         // denied action — carry the full accountability WHO (instance + role +
         // session) and WHY (actor intent) here, or they're lost for everything the
@@ -7066,6 +7103,11 @@ pub(crate) fn ensure_disposition_lane(
         tracing::warn!("disposition lane for {} NOT written: no committed ruling hash to project", esc.id);
         return false;
     }
+    // DURABLE READS: a lane line names a ruling hash; it may never reach disk ahead of it.
+    if let Err(e) = s.chain_store.durability().flush_committed_blocking() {
+        tracing::warn!("disposition lane for {} NOT written: chain not durable ({e:#})", esc.id);
+        return false;
+    }
     let dir = s.home.join(DISPOSITION_LANE_DIR);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("disposition lane dir {dir:?} unavailable ({e}) - the asker will not be told");
@@ -7434,12 +7476,18 @@ pub(crate) fn project_dispositions(
     chain: &crate::storage::chain::SqliteChainStore,
     inbox: &crate::storage::SqliteInboxStore,
 ) -> anyhow::Result<DispositionProjection> {
+    // DURABLE READS: make everything committed durable first (one group fsync per pass, off the
+    // state lock), then read only durable rows — so a pass never acts outward on a row an OS
+    // crash could still take back, and nothing committed waits a whole extra pass.
+    chain.durability().flush_committed_blocking()?;
     // The cursor is the NEXT UNREAD position (chain positions start at 0, so
     // "last processed" has no empty-chain representation). Cold start = the
     // current tail: `len` is the next position an append will take, so nothing
     // already on the chain is ever backfilled.
     let Some(cursor) = inbox.projection_cursor(DISPOSITION_PROJECTION_CURSOR)? else {
-        let tail = chain.len()?;
+        // Cold start at the DURABLE tail: nothing already durable is backfilled, and anything
+        // committed past it is projected once it is durable.
+        let tail = chain.durability().frontier().durable;
         inbox.set_projection_cursor(DISPOSITION_PROJECTION_CURSOR, tail)?;
         return Ok(DispositionProjection {
             projected: 0,
@@ -7447,7 +7495,9 @@ pub(crate) fn project_dispositions(
             caught_up: true,
         });
     };
-    let rows = chain.read_from(cursor, DISPOSITION_PROJECTION_PAGE)?;
+    // DURABLE READS: the projector acts outward (an inbox obligation) on what it reads, so it
+    // reads only rows an OS crash can no longer take back.
+    let rows = chain.read_from_durable(cursor, DISPOSITION_PROJECTION_PAGE)?;
     let mut advanced_to = cursor;
     let mut projected = 0usize;
     for row in &rows {
@@ -23047,6 +23097,7 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
     let now = now_secs();
     // LOCK-FREE (stage 2): the published policy snapshot, never the state lock.
     let s = state.published();
+    s.observe();
 
     // THE HONOR HORIZON IS BOUNDED BY WHAT IT COVERS (GPT review of #431, blocker 3). A
     // flat now+8h told consumers they could honour a cached snapshot for hours while a
@@ -29148,7 +29199,9 @@ mod concurrency_battery {
         let len_poisoned = { state.lock().await.chain_len() };
         let ((_, v_after), res_after) = durable_scope(deny(state.clone(), sid.clone())).await;
         assert!(v_after["decisionEntryHash"].is_null(), "a poisoned chain witnessed: {v_after}");
-        assert!(res_after.is_ok(), "nothing was appended, so there is nothing to wait for");
+        // Durable reads: a request that observed a poisoned chain is not acknowledged either —
+        // whatever it read may not survive the restart that is coming.
+        assert!(res_after.is_err(), "a poisoned daemon acknowledges nothing, reads included");
         assert_eq!(state.lock().await.chain_len(), len_poisoned, "no append after poison");
 
         let acked_ledger: BTreeMap<_, _> = {
@@ -29595,5 +29648,150 @@ mod published_snapshot_tests {
         *s.policy_engine = engine_tagged("escaped");
         s.forget_policy_dirty_for_test();
         drop(s);
+    }
+}
+
+#[cfg(test)]
+mod durable_reads_tests {
+    //! DURABLE READS (#1266 review): no reply — read or write — carries a chain fact an OS crash
+    //! could still take back, and nothing outward (inbox, lanes, status, vault, projector) acts
+    //! on one. The commit-to-fsync window is held open with the test flush hold.
+    use super::inbox_tests::{open_state, seeded_home};
+    use super::*;
+    use crate::storage::durability::durable_scope;
+    use std::time::Duration;
+
+    /// Readers of all three kinds — the published snapshot (`scope_status`), the chain
+    /// (`query_history`) and in-memory state (`hestia://scope/<id>`) — do not return while what
+    /// they would report is still undurable; once it is, they return it, and a restart still
+    /// has every fact they returned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_reader_returns_a_fact_an_os_crash_could_take_back() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = tool_connect(&state, &json!({"plugin_id": "codex", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let durability = { state.lock().await.chain_store.durability().clone() };
+        let hold = durability.hold_flush_for_test();
+
+        // Two writers that touch no other store: a scope request (a published policy input, an
+        // in-memory row and a chain row) and a bare witnessed fact.
+        let req = tool_request_scope(&state, &json!({"plugin_id": "codex", "session_id": sid,
+            "path": "/tmp/durable-read-probe.txt", "reason": "durable reads test"})).await.unwrap();
+        let request_id = req["request_id"].as_str().unwrap_or_else(|| panic!("{req}")).to_string();
+        let fact = { state.lock().await.append_chain("battery_fact", json!({"n": 1})).unwrap() };
+
+        let st = state.clone();
+        let r_snapshot = tokio::spawn(async move {
+            durable_scope(async { tool_scope_status(&st, &json!({"plugin_id": "codex"})).await.unwrap() }).await
+        });
+        let st = state.clone();
+        let r_chain = tokio::spawn(async move {
+            durable_scope(async { tool_query_history(&st, &json!({"filter": {"limit": 20}})).await.unwrap() }).await
+        });
+        let st = state.clone();
+        let uri = format!("hestia://scope/{request_id}");
+        let r_memory = tokio::spawn(async move {
+            crate::storage::durability::durable_scope_observing(async {
+                read_resource_body(&st, &uri).await
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!r_snapshot.is_finished(), "the published snapshot was served before its chain row was durable");
+        assert!(!r_chain.is_finished(), "a chain read was served before its rows were durable");
+        assert!(!r_memory.is_finished(), "an in-memory read was served before its chain row was durable");
+
+        drop(hold);
+        let (snap, d1) = r_snapshot.await.unwrap();
+        let (hist, d2) = r_chain.await.unwrap();
+        let (mem, d3) = r_memory.await.unwrap();
+        d1.unwrap(); d2.unwrap(); d3.unwrap();
+        assert!(snap["requests"].as_array().unwrap().iter().any(|r| r["request_id"] == json!(request_id)), "{snap}");
+        assert!(hist["entries"].as_array().unwrap().iter().any(|e| e["hash"] == json!(fact.hash)), "{hist}");
+        assert!(mem.unwrap().contains(&request_id));
+
+        drop(durability);
+        drop(state);
+        let restarted = open_state(&dir);
+        let s = restarted.lock().await;
+        assert!(s.chain_store.read_by_hash(&fact.hash).unwrap().is_some(), "a returned fact was lost");
+        assert!(s.recent_chain(50).iter().any(|e| e.event_data.to_string().contains(&request_id)),
+                "the scope request a reader returned has no chain row after restart");
+    }
+
+    /// The gate's hot path is NOT held hostage by other requests' unsynced rows: a begin_action
+    /// and an allowed query_policy reply while another request's row is still in the window.
+    /// (Measured before this split: making every lock release an observation pushed gate-path
+    /// replies behind two slow group fsyncs and past the 8.5 s deadline under disk pressure.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_gate_path_does_not_wait_for_other_requests_rows() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = tool_connect(&state, &json!({"plugin_id": "codex", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let durability = { state.lock().await.chain_store.durability().clone() };
+        let hold = durability.hold_flush_for_test();
+        let _other = { state.lock().await.append_chain("battery_fact", json!({"other": true})).unwrap() };
+        let st = state.clone();
+        let gate = tokio::spawn(async move {
+            durable_scope(async {
+                let b = tool_begin_action(&st, &json!({"tool_name": "Read", "target": "/tmp/x",
+                    "parameters": {"file_path": "/tmp/x"}, "session_id": sid})).await.unwrap();
+                tool_query_policy(&st, &json!({"action_id": b["actionId"]})).await.unwrap()
+            })
+            .await
+        });
+        let (verdict, res) = tokio::time::timeout(Duration::from_secs(3), gate)
+            .await
+            .expect("the gate path waited on another request's unsynced row")
+            .unwrap();
+        res.unwrap();
+        assert_eq!(verdict["decision"], json!("allow"), "{verdict}");
+        drop(hold);
+    }
+
+    /// No inbox write (dispositions, invitations, notices, egress) reaches disk ahead of the
+    /// chain row it names.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_inbox_write_waits_for_the_chain_row_it_names() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let (durability, inbox) = {
+            let s = state.lock().await;
+            (s.chain_store.durability().clone(), s.inbox_store.clone())
+        };
+        let hold = durability.hold_flush_for_test();
+        let row = { state.lock().await.append_chain("gate_escalation_decided", json!({"battery": true})).unwrap() };
+        let hash = row.hash.clone();
+        let mut write = tokio::task::spawn_blocking(move || {
+            inbox.ensure_member_disposition("codex", DAEMON_NOTICE_KIND_DISPOSITION,
+                                            "hestia://escalation/battery#decided", &hash)
+        });
+        if tokio::time::timeout(Duration::from_millis(500), &mut write).await.is_ok() {
+            panic!("an inbox row naming an undurable chain row reached the store");
+        }
+        drop(hold);
+        write.await.unwrap().expect("written once the chain is durable");
+        assert!(durability.frontier().durable > row.chain_position);
+    }
+
+    /// The disposition projector acts outward on what it reads, so it reads only durable rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_projector_reads_only_durable_rows() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let chain = { state.lock().await.chain_store.clone() };
+        let base = chain.len().unwrap();
+        let hold = chain.durability().hold_flush_for_test();
+        for n in 0..3 {
+            chain.append("battery_fact", json!({"n": n}), "lct:x").unwrap();
+        }
+        assert!(chain.read_from_durable(base, 10).unwrap().is_empty(),
+                "rows inside the commit-to-fsync window were handed to an outward actor");
+        assert_eq!(chain.read_from(base, 10).unwrap().len(), 3, "control: they are committed");
+        drop(hold);
+        chain.durability().flush_committed_blocking().unwrap();
+        assert_eq!(chain.read_from_durable(base, 10).unwrap().len(), 3);
     }
 }

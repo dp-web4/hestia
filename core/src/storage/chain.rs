@@ -310,6 +310,21 @@ impl SqliteChainStore {
         })
     }
 
+    /// DURABLE READS: a request that reads chain rows may reply with them, so it must not reply
+    /// before everything committed when it read is durable (no-op outside a request scope).
+    fn observe(&self) {
+        super::durability::note_observed(&self.durability, self.len.load(Ordering::Acquire));
+    }
+
+    /// `read_from`, clamped to the DURABLE frontier: for projectors that act outward on what they
+    /// read (the disposition lane) and must never act on a row an OS crash could still take back.
+    pub fn read_from_durable(&self, from_position: u64, limit: u64) -> Result<Vec<ChainEntry>> {
+        let durable = self.durability.frontier().durable;
+        let mut rows = self.read_from(from_position, limit)?;
+        rows.retain(|e| e.chain_position < durable);
+        Ok(rows)
+    }
+
     /// The group-commit durability frontier for this chain (see `storage::durability`).
     pub fn durability(&self) -> &std::sync::Arc<super::durability::Durability> {
         &self.durability
@@ -339,6 +354,7 @@ impl SqliteChainStore {
 
     /// Most recent entry's hash, or the genesis sentinel if empty.
     pub fn tail_hash(&self) -> Result<String> {
+        self.observe();
         let conn = self.read_conn.lock().unwrap();
         let h: Option<String> = conn
             .query_row(
@@ -368,6 +384,7 @@ impl SqliteChainStore {
     /// tombstone. The caller can validate immutable application binding against
     /// the first witness instead of rebuilding it with a new session id.
     pub fn event_by_key(&self, event_key: &str) -> Result<Option<ChainEntry>> {
+        self.observe();
         let conn = self.read_conn.lock().unwrap();
         conn.query_row(
             "SELECT e.chain_position, e.hash, e.prev_hash, e.event_type, e.event_data,
@@ -502,6 +519,7 @@ impl SqliteChainStore {
     }
     /// Most recent `limit` entries in descending chain_position order.
     pub fn read_recent(&self, limit: u64) -> Result<Vec<ChainEntry>> {
+        self.observe();
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
@@ -529,6 +547,7 @@ impl SqliteChainStore {
     /// caller's cursor. Ascending order matters — a projector that walks
     /// newest-first could skip rows forever if appends outpace the page.
     pub fn read_from(&self, from_position: u64, limit: u64) -> Result<Vec<ChainEntry>> {
+        self.observe();
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
@@ -552,6 +571,7 @@ impl SqliteChainStore {
     /// event_data id has no index, so it pages instead). `before_position` is
     /// EXCLUSIVE; pass a value past the tail to start at the newest entry.
     pub fn read_before(&self, before_position: u64, limit: u64) -> Result<Vec<ChainEntry>> {
+        self.observe();
         let conn = self.conn.lock().unwrap();
         // u64::MAX as i64 would wrap negative — clamp into range.
         let before = i64::try_from(before_position).unwrap_or(i64::MAX);
@@ -586,6 +606,7 @@ impl SqliteChainStore {
         cutoff_rfc3339: Option<&str>,
         limit: u64,
     ) -> Result<Vec<ChainEntry>> {
+        self.observe();
         let Some(cutoff) = cutoff_rfc3339 else {
             return self.read_recent(limit);
         };
@@ -654,6 +675,7 @@ impl SqliteChainStore {
         limit: u64,
         mut project: impl FnMut(ChainRowRef<'_>) -> Option<T>,
     ) -> Result<Vec<T>> {
+        self.observe();
         // An empty type list asks for nothing. Same rule as `read_recent_by_types`:
         // widening it to the whole chain would answer a question nobody posed.
         if matches!(event_types, Some(t) if t.is_empty()) {
@@ -716,6 +738,7 @@ impl SqliteChainStore {
         event_types: &[&str],
         limit: u64,
     ) -> Result<Vec<ChainEntry>> {
+        self.observe();
         if event_types.is_empty() {
             return Ok(Vec::new());
         }
@@ -765,6 +788,7 @@ impl SqliteChainStore {
     /// window: fleet chain churn must not make quiet routing evidence disappear
     /// from the report merely because unrelated acts were busy.
     pub fn read_recent_route_shadow(&self, limit: u64) -> Result<Vec<ChainEntry>> {
+        self.observe();
         let conn = self.conn.lock().unwrap();
         // First choose exactly N parity samples. Then pull the legacy transport
         // disposition for successful samples by durable egress row id. Forward
@@ -812,6 +836,7 @@ impl SqliteChainStore {
     /// Fetch one entry by its hash (the chain's stable public identifier —
     /// receipts, claim_refs, and supersedes links all address entries this way).
     pub fn read_by_hash(&self, hash: &str) -> Result<Option<ChainEntry>> {
+        self.observe();
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
@@ -857,6 +882,7 @@ impl SqliteChainStore {
     /// The filing and ruling paths keep their window deliberately: acting on an aged-out
     /// deny is refused. Knowing what happened to one is not.
     pub fn appeal_rows_for_pointer(&self, ptr: &str) -> Result<Vec<ChainEntry>> {
+        self.observe();
         let ptr = validate_hash_pointer(ptr)?;
         // Hex only (validated), so `%` cannot occur in `ptr` and needs no escaping.
         let pattern = if ptr.len() >= 8 { format!("{ptr}%") } else { ptr };
@@ -889,6 +915,7 @@ impl SqliteChainStore {
     /// event types, like `appeal_rows_for_pointer`; on the read connection, so a reader never
     /// waits on the writer.
     pub fn escalation_rows(&self, escalation_id: &str) -> Result<Vec<ChainEntry>> {
+        self.observe();
         let conn = self.read_conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
@@ -913,6 +940,7 @@ impl SqliteChainStore {
     /// `appeal_rows_for_pointer`. `cap` bounds the rows returned (newest kept) so a member with
     /// a long appeal history cannot drag it all into memory in one read.
     pub fn appeal_rows_for_member(&self, plugin_id: &str, cap: u64) -> Result<Vec<ChainEntry>> {
+        self.observe();
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT * FROM (
@@ -933,6 +961,7 @@ impl SqliteChainStore {
     }
 
     pub fn read_by_hash_prefix(&self, prefix: &str, cap: u64) -> Result<Vec<ChainEntry>> {
+        self.observe();
         validate_hash_pointer(prefix)?;
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -964,6 +993,7 @@ impl SqliteChainStore {
     /// still cannot tell 9 from 900, and COUNT over the `hash` index never
     /// materializes a row.
     pub fn count_by_hash_prefix(&self, prefix: &str) -> Result<u64> {
+        self.observe();
         validate_hash_pointer(prefix)?;
         let conn = self.conn.lock().unwrap();
         let n: i64 = conn.query_row(
@@ -992,6 +1022,7 @@ impl SqliteChainStore {
         marker: &str,
         cap: u64,
     ) -> Result<Vec<ChainEntry>> {
+        self.observe();
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT * FROM (
@@ -1020,6 +1051,7 @@ impl SqliteChainStore {
     /// so this is history, never a prediction: the bundle presents it as what the member has
     /// been refused for, and leaves the inference to whoever is deciding.
     pub fn denies_for_member(&self, plugin_id: &str, cap: u64) -> Result<Vec<ChainEntry>> {
+        self.observe();
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
@@ -1039,6 +1071,7 @@ impl SqliteChainStore {
     }
 
     pub fn read_failures(&self, limit: u64) -> Result<Vec<ChainEntry>> {
+        self.observe();
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
@@ -1058,6 +1091,7 @@ impl SqliteChainStore {
 
     /// Entries since (exclusive of) `chain_position`, ascending.
     pub fn read_since(&self, chain_position: u64, limit: u64) -> Result<Vec<ChainEntry>> {
+        self.observe();
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp

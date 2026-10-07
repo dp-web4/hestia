@@ -424,6 +424,9 @@ impl Drop for Durability {
 /// Request-scoped durability: everything a request appends is waited for before it replies.
 struct ScopeState {
     target: Option<(Arc<Durability>, u64)>,
+    /// Whether every state-lock release in this request counts as having read what was committed
+    /// (requests that REPORT shared state: see `durable_scope_observing`).
+    observe_releases: bool,
 }
 
 tokio::task_local! {
@@ -443,11 +446,37 @@ pub(crate) fn note_appended(d: &Arc<Durability>, len: u64) {
     });
 }
 
+/// A request's reply may reflect chain entries up to committed length `len` (it read them, or
+/// state that moved with them): it must not reply before they are durable. Same wait as an
+/// append; named for the read side (durable reads, #1266 review).
+pub fn note_observed(d: &Arc<Durability>, len: u64) {
+    note_appended(d, len)
+}
+
+/// Is the current request one whose replies report shared state (so a lock release = a read)?
+pub fn observing_releases() -> bool {
+    SCOPE.try_with(|s| s.borrow().observe_releases).unwrap_or(false)
+}
+
+/// `durable_scope` for a request that REPORTS shared state (escalation status, inbox contents,
+/// history, operator views): everything committed when it released the state lock counts as
+/// read, so it does not reply before that is durable. Gate-path requests (connect, begin,
+/// query_policy allow, outcome) use the plain scope: their replies carry no other request's
+/// chain facts, and making them wait for every in-flight group fsync put the gate's deadline
+/// within reach of two slow fsyncs (measured on this PR before the split).
+pub async fn durable_scope_observing<F: Future>(f: F) -> (F::Output, Result<()>) {
+    durable_scope_inner(f, true).await
+}
+
 /// Run `f`; then, before returning its output, wait until every chain entry it appended is
 /// durable. `Err` means durability was lost: the caller must NOT report the act as recorded.
 pub async fn durable_scope<F: Future>(f: F) -> (F::Output, Result<()>) {
+    durable_scope_inner(f, false).await
+}
+
+async fn durable_scope_inner<F: Future>(f: F, observe_releases: bool) -> (F::Output, Result<()>) {
     let (out, target) = SCOPE
-        .scope(RefCell::new(ScopeState { target: None }), async {
+        .scope(RefCell::new(ScopeState { target: None, observe_releases }), async {
             let out = f.await;
             let t = SCOPE.with(|s| s.borrow_mut().target.take());
             (out, t)

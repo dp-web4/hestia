@@ -304,9 +304,9 @@ async fn dashboard_read_model_worker(
             }
         }
 
-        let mut snapshot = {
+        let (mut snapshot, observed_len) = {
             let s = state.lock().await;
-            s.dashboard_snapshot_from_projection(projection.clone(), cutoff, label)
+            (s.dashboard_snapshot_from_projection(projection.clone(), cutoff, label), s.chain_len())
         };
         // The fold registers any grain it had no derivation for — at start, all of them.
         // Derive those off the lock and fold once more, so no snapshot is published with a
@@ -317,6 +317,12 @@ async fn dashboard_read_model_worker(
                 let s = state.lock().await;
                 snapshot = s.dashboard_snapshot_from_projection(projection, cutoff, label);
             }
+        }
+        // DURABLE READS: the operator is never shown a chain fact an OS crash could take back.
+        if let Err(e) = chain_store.durability().wait_durable(observed_len).await {
+            tracing::warn!("dashboard snapshot withheld: chain not durable ({e:#})");
+            model.failed(range);
+            continue;
         }
         model.publish(range, snapshot);
     }
@@ -1352,6 +1358,7 @@ pub async fn serve_with_callback(
         loop {
             tick.tick().await;
             let now = super::gate_escalation::now_secs();
+            let (_, durable) = crate::storage::durability::durable_scope(async {
             let mut s = verify_state.lock().await;
             match s.verify_standing_projection(now) {
                 Ok(audit) => {
@@ -1382,6 +1389,11 @@ pub async fn serve_with_callback(
                         });
                 }
             }
+            })
+            .await;
+            if let Err(e) = durable {
+                tracing::error!("standing projection verifier: chain not durable ({e:#})");
+            }
         }
     });
 
@@ -1393,7 +1405,9 @@ pub async fn serve_with_callback(
         loop {
             tick.tick().await;
             let now = super::gate_escalation::now_secs();
-            let lapsed = {
+            // DURABLE READS: the pass runs in a durability scope (its outward writes also flush
+            // the chain first: inbox barrier, lane, status file, vault barrier).
+            let (lapsed, durable) = crate::storage::durability::durable_scope(async {
                 let mut s = lapse_state.lock().await;
                 // One named pass, so what the worker does is testable: record lapses, then
                 // rewrite any lane projection that did not land (PRD #845 R2).
@@ -1420,7 +1434,11 @@ pub async fn serve_with_callback(
                     tracing::warn!(status = %gates["status"], "gate integrity: not verified");
                 }
                 n
-            };
+            })
+            .await;
+            if let Err(e) = durable {
+                tracing::error!("disposition worker pass: chain not durable ({e:#})");
+            }
             match super::handler::project_dispositions(&chain_handle, &inbox_handle) {
                 Ok(p) if p.projected > 0 || lapsed > 0 => {
                     tracing::info!(
@@ -1528,7 +1546,8 @@ async fn label_state_lock_by_route(
         .map(|p| super::state_lock::intern_label("http:", p.as_str()))
         .unwrap_or("http:unmatched");
     // GROUP COMMIT: reply only once this request's chain appends are fsynced.
-    let (resp, durable) = crate::storage::durability::durable_scope(
+    // Operator surfaces report shared state: every lock release counts as a read.
+    let (resp, durable) = crate::storage::durability::durable_scope_observing(
         super::state_lock::with_label(label, next.run(req)),
     )
     .await;

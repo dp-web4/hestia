@@ -98,9 +98,15 @@ pub struct InboxNotice {
 /// Durable inbound mailbox persisted to SQLCipher. Locking is internal so the
 /// store is `Send + Sync` from the caller's perspective (same shape as
 /// [`super::SqliteChainStore`]).
+/// Run before every inbox WRITE; an error refuses the write.
+pub type PreWriteBarrier = std::sync::Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>;
+
 pub struct SqliteInboxStore {
     conn: Mutex<Connection>,
     path: PathBuf,
+    /// Durable reads (#1266 review): inbox rows routinely carry a chain hash (dispositions,
+    /// invitations, notices, egress), so no inbox write may reach disk ahead of the chain.
+    barrier: std::sync::OnceLock<PreWriteBarrier>,
 }
 
 /// The debt-clearing kinds (`reply`, `ack`, `review_done`), matched fractally —
@@ -145,8 +151,22 @@ impl SqliteInboxStore {
         .context("initializing inbox schema (wrong storage key, or not an inbox DB?)")?;
         Ok(Self {
             conn: Mutex::new(conn),
+            barrier: std::sync::OnceLock::new(),
             path,
         })
+    }
+
+    /// Install the pre-write barrier (the daemon: make the witness chain durable first).
+    pub fn set_pre_write_barrier(&self, barrier: PreWriteBarrier) {
+        let _ = self.barrier.set(barrier);
+    }
+
+    /// The write connection, after the barrier. Every method that writes takes this.
+    fn write_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        if let Some(b) = self.barrier.get() {
+            b().map_err(|e| anyhow::anyhow!("inbox write refused: {e}"))?;
+        }
+        Ok(self.conn.lock().unwrap())
     }
 
     pub fn path(&self) -> &Path {
@@ -179,7 +199,7 @@ impl SqliteInboxStore {
     ) -> Result<u64> {
         let now = Utc::now();
         let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         conn.execute(
             "DELETE FROM inbox_notices WHERE queued_at < ?1",
             params![cutoff],
@@ -218,7 +238,7 @@ impl SqliteInboxStore {
     /// the same failure bias as the hub's mailbox).
     pub fn drain(&self) -> Result<Vec<InboxNotice>> {
         let cutoff = (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn()?;
         let tx = conn.transaction().context("starting inbox drain")?;
         let notices = {
             let mut stmt = tx
@@ -417,7 +437,7 @@ impl SqliteInboxStore {
     /// tracks would silently skip obligations, which is the exact hole the
     /// disposition projector exists to close.
     pub fn set_projection_cursor(&self, name: &str, position: u64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         conn.execute(
             "INSERT INTO projection_cursors (name, position) VALUES (?1, ?2)
@@ -457,7 +477,7 @@ impl SqliteInboxStore {
     ) -> Result<Option<u64>> {
         let now = Utc::now();
         let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         // Same retention discipline as every other writer on this plane.
         conn.execute(
@@ -581,7 +601,7 @@ impl SqliteInboxStore {
     /// not invent one.
     #[cfg(test)]
     pub fn backdate_inbox_touch(&self, plugin_id: &str, when: DateTime<Utc>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let n = conn.execute(
             "UPDATE member_inbox_touch SET first_seen = ?2, last_touch = ?2 WHERE plugin_id = ?1",
@@ -730,7 +750,7 @@ impl SqliteInboxStore {
     /// many callers unchanged; the handler makes both calls under the one server lock, so no
     /// drainer can read the row between them.
     pub fn set_egress_transport_stamp(&self, id: u64, stamp: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         conn.execute(
             "UPDATE member_notices SET transport_stamp = ?1 WHERE id = ?2 AND dest_peer IS NOT NULL",
@@ -804,7 +824,7 @@ impl SqliteInboxStore {
     /// fleet mesh ACCEPTED it, not that the far member read it. Conflating those is
     /// the "send succeeded != delivered" defect this whole thread is about.
     pub fn mark_egress_forwarded(&self, id: u64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         conn.execute(
             "UPDATE member_notices SET drained_at = ?1 WHERE id = ?2 AND dest_peer IS NOT NULL",
             params![Utc::now().to_rfc3339(), id as i64],
@@ -914,7 +934,7 @@ impl SqliteInboxStore {
         response_template: &Value,
         shadow_record_template: Option<&Value>,
     ) -> Result<MemberSendOperation> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let tx = conn.transaction().context("starting member-send operation")?;
         if let Some(op) = Self::member_send_operation_on(&tx, sender_plugin, operation_id)? {
@@ -976,7 +996,7 @@ impl SqliteInboxStore {
         response_template: &Value,
         shadow_record_template: Option<&Value>,
     ) -> Result<MemberSendOperation> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let tx = conn.transaction().context("starting routed member-send operation")?;
         if let Some(op) = Self::member_send_operation_on(&tx, sender_plugin, operation_id)? {
@@ -1032,7 +1052,7 @@ impl SqliteInboxStore {
         operation_id: &str,
         witness_hash: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let prior: Option<Option<String>> = conn
             .query_row(
@@ -1078,7 +1098,7 @@ impl SqliteInboxStore {
         report_pointer: Option<&str>,
         chain_hash: &str,
     ) -> Result<Option<u64>> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let tx = conn.transaction().context("starting egress retirement")?;
         let n = tx
@@ -1388,7 +1408,7 @@ impl SqliteInboxStore {
     /// addressed back to this party. `None` when the id is not on record (aged out:
     /// unverifiable, not forged — same posture as `member_notice_recipient`).
     pub fn member_notice_sender(&self, id: u64) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let mut stmt = conn.prepare("SELECT from_plugin FROM member_notices WHERE id = ?1")?;
         let mut rows = stmt.query(params![id as i64])?;
@@ -1415,7 +1435,7 @@ impl SqliteInboxStore {
     pub fn drain_member(&self, to_plugin: &str) -> Result<Vec<MemberNotice>> {
         let now = Utc::now();
         let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let tx = conn.transaction().context("starting member drain")?;
         let notices = {
@@ -1766,7 +1786,7 @@ impl SqliteInboxStore {
     /// true, so a local row can never match a named peer. Same result, one term
     /// fewer.
     pub fn egress_queued_for(&self, dest_peer: &str) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM member_notices
@@ -1792,7 +1812,7 @@ impl SqliteInboxStore {
     /// actually be emitted; a store method cannot witness one.
     pub fn expired_egress(&self, older_than_secs: i64, limit: u32) -> Result<Vec<u64>> {
         let cutoff = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let mut stmt = conn.prepare(
             "SELECT id FROM member_notices
@@ -1825,7 +1845,7 @@ impl SqliteInboxStore {
     /// packet already retired. `None` means *nothing happened*, which is the only
     /// answer that lets the caller stay silent.
     pub fn record_egress_failure(&self, id: u64, reason: &str) -> Result<Option<i64>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let updated = conn
             .execute(
@@ -1862,7 +1882,7 @@ impl SqliteInboxStore {
     /// dead a second time — and `member_notice_unreachable` is a durable claim
     /// about a PEER that a trust tally will count.
     pub fn retire_egress(&self, id: u64) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         let n = conn
             .execute(
                 "UPDATE member_notices SET drained_at = ?1
@@ -2119,7 +2139,7 @@ impl SqliteInboxStore {
             notice_id.len() == 64 && notice_id.bytes().all(|b| b.is_ascii_hexdigit()),
             "Hub receipt notice id must be 64 hex characters"
         );
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_hub_receipt_schema(&conn)?;
         let now_dt = Utc::now();
         let now = now_dt.to_rfc3339();
@@ -2191,7 +2211,7 @@ impl SqliteInboxStore {
         notice_id: &str,
         witness_hash: &str,
     ) -> Result<u64> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn()?;
         Self::ensure_hub_receipt_schema(&conn)?;
         Self::ensure_member_schema(&conn)?;
         let tx = conn.transaction().context("starting Hub receipt local acceptance")?;
@@ -2293,7 +2313,7 @@ impl SqliteInboxStore {
         notice_id: &str,
         delivery_witness_hash: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_hub_receipt_schema(&conn)?;
         let row = conn
             .query_row(
@@ -2357,7 +2377,7 @@ impl SqliteInboxStore {
         receiver_binding_id: Uuid,
         notice_id: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_hub_receipt_schema(&conn)?;
         let changed = conn.execute(
             "UPDATE hub_receipt_custody SET hub_acked_at = ?3
@@ -2575,7 +2595,7 @@ impl SqliteInboxStore {
         packet_json: &str,
         packet_hash: &str,
     ) -> Result<RouterPacketState> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn()?;
         Self::ensure_router_packet_schema(&conn)?;
         Self::prune_router_custody_on(&conn)?;
         let tx = conn.transaction().context("starting router packet stage")?;
@@ -2643,7 +2663,7 @@ impl SqliteInboxStore {
         candidate_packet_json: &str,
         candidate_packet_hash: &str,
     ) -> Result<(RouterPacketState, bool)> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn()?;
         Self::ensure_router_packet_schema(&conn)?;
         Self::prune_router_custody_on(&conn)?;
         let tx = conn.transaction().context("starting router origin admission")?;
@@ -2712,7 +2732,7 @@ impl SqliteInboxStore {
         packet_id: Uuid,
         witness_hash: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_router_packet_schema(&conn)?;
         let existing: Option<(String, Option<String>)> = conn.query_row(
             "SELECT packet_id, stage_witness_hash FROM router_ingress_receipts
@@ -2752,7 +2772,7 @@ impl SqliteInboxStore {
         forward_link_id: Uuid,
         operation_id: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_router_packet_schema(&conn)?;
         let state = Self::router_packet_state_on(&conn, packet_id)?
             .ok_or_else(|| anyhow::anyhow!("route packet {packet_id} was not staged"))?;
@@ -2787,7 +2807,7 @@ impl SqliteInboxStore {
         decision_json: &str,
         local_child_lct: Option<&str>,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_router_packet_schema(&conn)?;
         let state = Self::router_packet_state_on(&conn, packet_id)?
             .ok_or_else(|| anyhow::anyhow!("route packet {packet_id} was not staged"))?;
@@ -2821,7 +2841,7 @@ impl SqliteInboxStore {
         pointer_uri: &str,
         chain_hash: &str,
     ) -> Result<u64> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn()?;
         Self::ensure_router_packet_schema(&conn)?;
         Self::ensure_member_schema(&conn)?;
         let tx = conn.transaction().context("starting routed local acceptance")?;
@@ -2859,7 +2879,7 @@ impl SqliteInboxStore {
         notice_id: &str,
         entry_index: u64,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_router_packet_schema(&conn)?;
         let state = Self::router_packet_state_on(&conn, packet_id)?
             .ok_or_else(|| anyhow::anyhow!("route packet {packet_id} was not staged"))?;
@@ -2886,7 +2906,7 @@ impl SqliteInboxStore {
         completion_kind: &str,
         witness_hash: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_router_packet_schema(&conn)?;
         let state = Self::router_packet_state_on(&conn, packet_id)?
             .ok_or_else(|| anyhow::anyhow!("route packet {packet_id} was not staged"))?;
@@ -2918,7 +2938,7 @@ impl SqliteInboxStore {
         claimed_packet_id: Option<Uuid>,
         witness_hash: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_router_packet_schema(&conn)?;
         Self::prune_router_custody_on(&conn)?;
         let now = Utc::now().to_rfc3339();
@@ -2982,7 +3002,7 @@ impl SqliteInboxStore {
         ingress_binding_id: Uuid,
         hub_notice_id: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_router_packet_schema(&conn)?;
         let eligible: i64 = conn.query_row(
             "SELECT COUNT(*)
@@ -3033,7 +3053,7 @@ impl SqliteInboxStore {
         ingress_binding_id: Uuid,
         hub_notice_id: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_router_packet_schema(&conn)?;
         let eligible: i64 = conn.query_row(
             "SELECT COUNT(*) FROM router_ingress_rejections
