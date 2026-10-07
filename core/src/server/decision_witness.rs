@@ -290,6 +290,11 @@ impl DecisionLedger {
 
 /// Append one settled charge to the durable settle record. Best effort: a failed write is
 /// reported, and costs only the restart case (the key would read as owed after a restart).
+/// The settle record line `persist_settled` writes.
+pub fn settled_line(member: &str, action_id: Uuid, row: &str) -> String {
+    serde_json::json!({"member": member, "action_id": action_id.to_string(), "row": row}).to_string()
+}
+
 pub fn persist_settled(path: &std::path::Path, member: &str, action_id: Uuid, row: &str) {
     use std::io::Write;
     let line = serde_json::json!({"member": member, "action_id": action_id.to_string(), "row": row});

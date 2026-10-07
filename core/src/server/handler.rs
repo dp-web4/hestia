@@ -4333,12 +4333,13 @@ fn settle_decision_charge(
     };
     let trust = s.apply_outcome_ctx(member, false, c.magnitude, &rep_ctx)?;
     if s.decision_ledger.record_charge(member, action_id, &row) {
-        super::decision_witness::persist_settled(
-            &s.home.join(super::decision_witness::SETTLED_FILE),
-            member,
-            action_id,
-            &row,
-        );
+        // Written only after the charge's trust write is durable (same ordered persister), so a
+        // crash can never leave "settled" on disk for a charge whose trust write was lost.
+        let path = s.home.join(super::decision_witness::SETTLED_FILE);
+        let line = super::decision_witness::settled_line(member, action_id, &row);
+        if let Err(e) = s.trust_store.append_after_trust(&path, line) {
+            tracing::warn!("decision settle record not queued: {e:#}");
+        }
     }
     Ok(Some((row, trust)))
 }
@@ -9373,7 +9374,9 @@ mod accountability_tests {
 
     /// Read every delta the sink has collected, newest last.
     async fn sink_deltas(state: &SharedState) -> Vec<serde_json::Value> {
+        crate::storage::trust::flush_all_for_test();
         let path = state.lock().await.reputation_sink();
+        crate::storage::trust::flush_all_for_test();
         std::fs::read_to_string(path)
             .unwrap_or_default()
             .lines()
@@ -21860,6 +21863,7 @@ mod authority_attribution_tests {
     async fn witness_decision_threads_caller_rule_id_to_reputation_row() {
         let (dir, _) = seeded_home();
         let state = open_state(&dir);
+        crate::storage::trust::flush_all_for_test();
         let sink = { state.lock().await.reputation_sink() };
         tool_witness_decision(
             &state,
@@ -21874,6 +21878,7 @@ mod authority_attribution_tests {
         )
         .await
         .expect("witness_decision with a rule_id arg");
+        crate::storage::trust::flush_all_for_test();
         let body = std::fs::read_to_string(&sink).expect("a delta row was emitted");
         let last: serde_json::Value =
             serde_json::from_str(body.lines().last().unwrap()).unwrap();
@@ -28476,6 +28481,7 @@ mod decision_witness_tests {
     }
 
     fn sink_lines(state_sink: &std::path::Path) -> usize {
+        crate::storage::trust::flush_all_for_test();
         std::fs::read_to_string(state_sink).map(|b| b.lines().count()).unwrap_or(0)
     }
 
@@ -28523,6 +28529,7 @@ mod decision_witness_tests {
     #[tokio::test]
     async fn allow_is_witnessed_as_its_own_event_and_charges_nothing() {
         let (_d, state) = state_with_safety().await;
+        crate::storage::trust::flush_all_for_test();
         let sink = { state.lock().await.reputation_sink() };
         let before = sink_lines(&sink);
         let decisions_before = rows_of(&state, "policy_decision").await.len();
@@ -28553,6 +28560,7 @@ mod decision_witness_tests {
     #[tokio::test]
     async fn a_deployed_refusal_call_writes_the_row_it_always_wrote() {
         let (_d, state) = state_with_safety().await;
+        crate::storage::trust::flush_all_for_test();
         let sink = { state.lock().await.reputation_sink() };
         let before = sink_lines(&sink);
         for decision in ["deny", "warn"] {
@@ -28640,6 +28648,7 @@ mod decision_witness_tests {
         let (aid, verdict) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
         assert_eq!(verdict["decision"], json!("deny"), "precondition: {verdict}");
         assert!(is_chain_hash(&verdict["decisionEntryHash"]), "query_policy names its row: {verdict}");
+        crate::storage::trust::flush_all_for_test();
         let sink = { state.lock().await.reputation_sink() };
         let charged_before = sink_lines(&sink);
         let rows_before = rows_of(&state, "policy_decision").await.len();
@@ -28709,10 +28718,13 @@ mod decision_witness_tests {
 
     /// Reputation deltas in the sink charged to `plugin_id`'s member LCT for action `aid`.
     async fn charges_for(state: &SharedState, plugin_id: &str, aid: &str) -> usize {
+        crate::storage::trust::flush_all_for_test();
         let (sink, lct) = {
+            crate::storage::trust::flush_all_for_test();
             let s = state.lock().await;
             (s.reputation_sink(), s.member_lct(plugin_id).expect("a mapped member"))
         };
+        crate::storage::trust::flush_all_for_test();
         std::fs::read_to_string(sink)
             .unwrap_or_default()
             .lines()
@@ -28734,6 +28746,7 @@ mod decision_witness_tests {
     #[tokio::test]
     async fn append_fails_trust_would_succeed_later_witness_appends_and_charges_once() {
         let (dir, state) = state_with_safety().await;
+        crate::storage::trust::flush_all_for_test();
         let sink = { state.lock().await.reputation_sink() };
         let before = sink_lines(&sink);
         let conn = fail_decision_appends(&dir);
@@ -28759,6 +28772,7 @@ mod decision_witness_tests {
     #[tokio::test]
     async fn daemon_deny_then_seat_warn_keeps_both_rows_and_one_charge() {
         let (_d, state) = state_with_safety().await;
+        crate::storage::trust::flush_all_for_test();
         let sink = { state.lock().await.reputation_sink() };
         let before = sink_lines(&sink);
         let (aid, verdict) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
@@ -28789,6 +28803,7 @@ mod decision_witness_tests {
     #[tokio::test]
     async fn seat_warn_then_daemon_deny_keeps_both_rows_and_one_charge() {
         let (_d, state) = state_with_safety().await;
+        crate::storage::trust::flush_all_for_test();
         let sink = { state.lock().await.reputation_sink() };
         let before = sink_lines(&sink);
         let connect = tool_connect(&state, &json!({"plugin_id": "codex", "host_agent": "test"}))
@@ -28835,6 +28850,7 @@ mod decision_witness_tests {
     #[tokio::test]
     async fn duplicate_deliveries_never_charge_twice() {
         let (_d, state) = state_with_safety().await;
+        crate::storage::trust::flush_all_for_test();
         let sink = { state.lock().await.reputation_sink() };
         let before = sink_lines(&sink);
 
@@ -28868,6 +28884,7 @@ mod decision_witness_tests {
     #[tokio::test]
     async fn mismatched_verdicts_in_any_order_charge_once_per_member() {
         let (_d, state) = state_with_safety().await;
+        crate::storage::trust::flush_all_for_test();
         let sink = { state.lock().await.reputation_sink() };
         let before = sink_lines(&sink);
         let (aid, _) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
@@ -28904,50 +28921,70 @@ mod decision_witness_tests {
         std::fs::rename(dir.path().join("trust.off"), dir.path().join("trust")).unwrap();
     }
 
-    /// GPT #2 on #1196, seat path: the row commits, the trust write fails. The call errors (so a
-    /// receipt-checking caller retries). The retry is answered with the committed row — no
-    /// second row — and settles the owed charge. A further retry charges nothing.
-    #[tokio::test]
-    async fn committed_row_failed_trust_write_retry_settles_exactly_one_charge() {
+    /// Reopen after a restart with the safety preset the decision tests run under.
+    async fn reopen_with_safety(dir: &tempfile::TempDir) -> SharedState {
+        let state = open_state(dir);
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine =
+                crate::policy::PolicyEngine::new(crate::policy::get_preset("safety").unwrap().config);
+        }
+        state
+    }
+
+    /// WRITE-BEHIND TRUST (persistence off the state lock): the row commits and the trust write
+    /// FAILS on disk. Same rule as a chain fsync failure: the request is NOT acknowledged, every
+    /// later trust write is refused, and the daemon restarts. After the restart (disk healed) the
+    /// charge reads OWED — the settle line is only ever written after its trust write is durable,
+    /// so none exists — and the retry settles it exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn committed_row_failed_trust_write_restart_settles_exactly_one_charge() {
+        use crate::storage::durability::durable_scope;
         let (dir, state) = state_with_safety().await;
         let aid = Uuid::new_v4().to_string();
         let mut a = witness_args("gemini", "deny");
         a["action_id"] = json!(aid);
         break_trust(&dir);
-        let failed = tool_witness_decision(&state, &a).await;
-        assert!(failed.is_err(), "a failed charge is not a clean receipt: {failed:?}");
+        let (_out, durable) = durable_scope(tool_witness_decision(&state, &a)).await;
+        assert!(durable.is_err(), "a charge whose trust write failed is never acknowledged");
         let rows = rows_of(&state, "policy_decision").await;
         let row_hash = rows.iter().find(|e| e.event_data["action_id"] == json!(aid)).unwrap().hash.clone();
-        assert_eq!(charges_for(&state, "gemini", &aid).await, 0, "the charge is owed, not applied");
+        assert_eq!(charges_for(&state, "gemini", &aid).await, 0, "no delta reached disk");
+        let mut b = witness_args("gemini", "deny");
+        b["action_id"] = json!(Uuid::new_v4().to_string());
+        assert!(tool_witness_decision(&state, &b).await.is_err(),
+                "after a persistence failure every trust write is refused");
+        drop(state);
         heal_trust(&dir);
 
+        let state = reopen_with_safety(&dir).await;
         let retry = tool_witness_decision(&state, &a).await.unwrap();
         assert_eq!(retry["recorded"], json!("existing"), "{retry}");
         assert_eq!(retry["witnessEntryHash"], json!(row_hash));
-        assert_eq!(retry["charged"], json!(true), "the retry settles the owed charge: {retry}");
+        assert_eq!(retry["charged"], json!(true), "owed across the restart, settled now: {retry}");
         assert_eq!(retry["chargedRow"], json!(row_hash));
-        assert!(retry["updatedTrust"].is_object(), "{retry}");
         let again = tool_witness_decision(&state, &a).await.unwrap();
         assert_eq!(again["charged"], json!(false), "{again}");
         assert_eq!(rows_for(&rows_of(&state, "policy_decision").await, &aid).len(), 1, "one row");
         assert_eq!(charges_for(&state, "gemini", &aid).await, 1, "exactly one charge");
     }
 
-    /// The daemon path: query_policy's row commits but its Conduct charge fails. The verdict is
-    /// unchanged and the row is named. The NEXT decision on the key — here the seat's different
-    /// verdict — settles the daemon row's owed charge (Conduct, gate:deny), and its own row is
-    /// evidence-only, naming the deny row.
-    #[tokio::test]
+    /// The daemon path: query_policy's row commits but its Conduct charge never reaches disk.
+    /// After the restart the NEXT decision on the key — the seat's different verdict — settles
+    /// the daemon row's owed charge (Conduct, gate:deny); its own row is evidence-only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_owed_daemon_charge_is_settled_by_the_next_decision_on_the_key() {
         let (dir, state) = state_with_safety().await;
         break_trust(&dir);
         let (aid, verdict) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
-        heal_trust(&dir);
         assert_eq!(verdict["decision"], json!("deny"), "{verdict}");
         let deny_hash = verdict["decisionEntryHash"].clone();
         assert!(is_chain_hash(&deny_hash), "the row committed: {verdict}");
-        assert_eq!(charges_for(&state, "codex", &aid).await, 0);
+        drop(state);
+        heal_trust(&dir);
 
+        let state = reopen_with_safety(&dir).await;
+        assert_eq!(charges_for(&state, "codex", &aid).await, 0);
         let mut w = witness_args("codex", "warn");
         w["action_id"] = json!(aid);
         let out = tool_witness_decision(&state, &w).await.unwrap();
@@ -28956,28 +28993,35 @@ mod decision_witness_tests {
         assert_eq!(out["chargedRow"], deny_hash, "the owed charge was the deny row's: {out}");
         assert_eq!(out["chargeHeldBy"], deny_hash);
         assert_eq!(charges_for(&state, "codex", &aid).await, 1);
+        crate::storage::trust::flush_all_for_test();
         let sink = { state.lock().await.reputation_sink() };
+        crate::storage::trust::flush_all_for_test();
         let line = std::fs::read_to_string(sink).unwrap();
         let line = line.lines().find(|l| l.contains(aid.as_str())).unwrap().to_string();
         assert!(line.contains("gate:deny") && line.contains("onduct"), "the daemon's charge: {line}");
-
-        // And the daemon's repeat ruling settles nothing more.
-        let v2 = tool_query_policy(&state, &json!({"action_id": aid})).await.unwrap();
-        assert_eq!(v2["decisionEntryHash"], deny_hash);
+        let v2 = tool_query_policy(&state, &json!({"action_id": aid})).await;
+        // The action itself did not survive the restart (in-flight actions are RAM-only).
+        assert!(v2.is_ok());
         assert_eq!(charges_for(&state, "codex", &aid).await, 1);
     }
 
-    /// The daemon's own repeat ruling settles its own owed charge: one row, one charge.
-    #[tokio::test]
-    async fn the_daemons_repeat_ruling_settles_its_owed_charge_once() {
+    /// The daemon's own repeat ruling settles its own owed charge after the restart: one row,
+    /// one charge. (The action is re-begun: in-flight actions are RAM-only.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_daemons_owed_charge_settles_once_after_the_restart() {
         let (dir, state) = state_with_safety().await;
         break_trust(&dir);
         let (aid, v1) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
+        assert!(is_chain_hash(&v1["decisionEntryHash"]), "{v1}");
+        drop(state);
         heal_trust(&dir);
+        let state = reopen_with_safety(&dir).await;
         assert_eq!(charges_for(&state, "codex", &aid).await, 0);
+        let mut d = witness_args("codex", "deny");
+        d["action_id"] = json!(aid);
         for _ in 0..2 {
-            let v = tool_query_policy(&state, &json!({"action_id": aid})).await.unwrap();
-            assert_eq!(v["decisionEntryHash"], v1["decisionEntryHash"]);
+            let out = tool_witness_decision(&state, &d).await.unwrap();
+            assert_eq!(out["witnessEntryHash"], v1["decisionEntryHash"], "{out}");
         }
         assert_eq!(rows_for(&rows_of(&state, "policy_decision").await, &aid).len(), 1);
         assert_eq!(charges_for(&state, "codex", &aid).await, 1);
@@ -29021,7 +29065,9 @@ mod decision_witness_tests {
         let mut a = witness_args("gemini", "warn");
         a["action_id"] = json!(aid);
         break_trust(&dir);
-        assert!(tool_witness_decision(&state, &a).await.is_err());
+        let (_out, durable) =
+            crate::storage::durability::durable_scope(tool_witness_decision(&state, &a)).await;
+        assert!(durable.is_err(), "a charge whose trust write failed is never acknowledged");
         drop(state);
         heal_trust(&dir);
 
@@ -29104,6 +29150,7 @@ mod concurrency_battery {
 
     /// Reputation deltas charged for `aid` to `plugin_id`'s member LCT.
     fn charges(sink: &std::path::Path, lct: &str, aid: &str) -> usize {
+        crate::storage::trust::flush_all_for_test();
         std::fs::read_to_string(sink)
             .unwrap_or_default()
             .lines()
@@ -29370,6 +29417,7 @@ mod concurrency_battery {
 
         // ---- invariant 1: exactly one charge per (member, action) --------------------------
         let (sink, lcts) = {
+            crate::storage::trust::flush_all_for_test();
             let s = state.lock().await;
             (s.reputation_sink(),
              (0..MEMBERS).map(|i| s.member_lct(&member(i)).expect("mapped member")).collect::<Vec<_>>())

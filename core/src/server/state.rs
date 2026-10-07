@@ -1667,9 +1667,12 @@ impl ServerState {
                 &after,
                 chrono::Utc::now(),
             ) {
-                super::state_lock::time_section("reputation.log_delta", || {
-                    crate::reputation::log_delta(&self.reputation_sink(), &delta)
-                });
+                // After the trust write it describes is durable (write-behind, ordered).
+                if let Some(line) = crate::reputation::delta_line(&delta) {
+                    if let Err(e) = self.trust_store.append_after_trust(&self.reputation_sink(), line) {
+                        tracing::warn!("reputation delta not queued: {e:#}");
+                    }
+                }
             }
         }
         Ok(after)
@@ -1764,7 +1767,12 @@ impl ServerState {
                 &after,
                 chrono::Utc::now(),
             ) {
-                crate::reputation::log_delta(&self.reputation_sink(), &delta);
+                // After the trust write it describes is durable (write-behind, ordered).
+                if let Some(line) = crate::reputation::delta_line(&delta) {
+                    if let Err(e) = self.trust_store.append_after_trust(&self.reputation_sink(), line) {
+                        tracing::warn!("reputation delta not queued: {e:#}");
+                    }
+                }
             }
         }
         Ok(after)
@@ -1793,7 +1801,12 @@ impl ServerState {
                 &after,
                 chrono::Utc::now(),
             ) {
-                crate::reputation::log_delta(&self.reputation_sink(), &delta);
+                // After the trust write it describes is durable (write-behind, ordered).
+                if let Some(line) = crate::reputation::delta_line(&delta) {
+                    if let Err(e) = self.trust_store.append_after_trust(&self.reputation_sink(), line) {
+                        tracing::warn!("reputation delta not queued: {e:#}");
+                    }
+                }
             }
         }
         Ok(after)
@@ -2335,8 +2348,10 @@ mod tests {
         // A real member: a moving outcome emits a delta whose subject_lct is the
         // mapped member LCT, not the raw plugin_id.
         state.apply_outcome("real-plugin", false, 0.7).unwrap();
+        crate::storage::trust::flush_all_for_test();
         let sink = state.reputation_sink();
         let expected = state.member_lct("real-plugin").unwrap();
+        crate::storage::trust::flush_all_for_test();
         let lines: Vec<String> = std::fs::File::open(&sink)
             .map(|f| {
                 std::io::BufReader::new(f)
@@ -2358,6 +2373,7 @@ mod tests {
         // A synthetic member: trust still updates locally, but NO delta is emitted.
         state.mark_synthetic("synthetic-plugin", 3).unwrap();
         state.apply_outcome("synthetic-plugin", false, 0.7).unwrap();
+        crate::storage::trust::flush_all_for_test();
         let after: Vec<String> = std::fs::File::open(&sink)
             .map(|f| {
                 std::io::BufReader::new(f)
