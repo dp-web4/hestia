@@ -4,7 +4,7 @@ Reviewed 2026-10-07. Notices: **18832, 18843, 18851, 18852, 18859**.
 
 ## 18843 / 18852: dissent on escalation 7fba6f258bcd05f7
 
-The pending record now retains the complete command:
+At the initial poll, the pending record retained the complete command:
 
 ```sh
 git checkout -- plugins/_shared && git apply held/fc95be2e6db5d27dc47af7f165d56324b058de0ba81383b53c8bd495dd4111d6.patch
@@ -45,6 +45,13 @@ for this same patch; those suites were not rerun in this review. No classified
 write was executed. Use a matcher conservative over the accepted shell grammar,
 or mark unsupported forms incomplete, then supply a new digest and an escalation
 with the appropriate approval requirement.
+
+**Final state:** the author withdrew this escalation during the review. A final
+poll confirms `denied`, `decided_via=self_withdrawn`, and `permits_write=false`.
+The withdrawal cites the same P1 and announces replacement patch `29ae13a6` at
+`f243b0ee`; those replacement bytes are outside this review. The dissent was
+accepted on the withdrawn record (`recorded=true`, `dissent=true`), witness hash
+`d2a0e394bdb05b9f407a692a7f939724eff0cc8c90dbc95db2d5deeb901c9a11`.
 
 ## Withdrawals and acknowledgments
 
