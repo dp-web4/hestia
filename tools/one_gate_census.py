@@ -540,8 +540,56 @@ class IsolatedDaemon:
 
 
 # ------------------------------------------------------------------ host facts -------------------
+UNIT_ENV_KEYS = ("HESTIA_HOME", "HESTIA_WORKSPACE")
+
+
+def unit_file_env(unit: Path, home: Optional[Path] = None) -> dict[str, str]:
+    """Environment= as systemd composes it from a unit file and its drop-ins, for UNIT_ENV_KEYS.
+
+    The fallback for when `systemctl --user show` cannot answer: a hub- or cron-fired session has no
+    user bus (measured on HUB: DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR unset), and a drop-in
+    that overrides the base unit was then invisible, so the census rendered against the wrong env
+    and reported a drift that was not there (hestia#1252, HUB census). Order is systemd's: the unit,
+    then `<unit>.d/*.conf` in lexical order; within that, later assignments win and an empty
+    `Environment=` resets everything assigned before it. `%h` and `%%` are expanded (the shipped unit
+    says HESTIA_HOME=%h/.hestia); other specifiers and EnvironmentFile= are not followed.
+    """
+    home_s = str(home or Path.home())
+    files = [unit] if unit.is_file() else []
+    files += sorted((unit.parent / (unit.name + ".d")).glob("*.conf"))
+    env: dict[str, str] = {}
+    for f in files:
+        try:
+            text = f.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        section = ""
+        for line in text.replace("\\\n", " ").splitlines():
+            line = line.strip()
+            if not line or line[0] in "#;":
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line
+                continue
+            key, eq, value = line.partition("=")
+            if section != "[Service]" or not eq or key.strip() != "Environment":
+                continue
+            if not value.strip():
+                env.clear()
+                continue
+            with contextlib.suppress(ValueError):
+                for tok in shlex.split(value):
+                    k, _, v = tok.partition("=")
+                    env[k] = re.sub(r"%[h%]", lambda m: home_s if m.group(0) == "%h" else "%", v)
+    return {k: v for k, v in env.items() if k in UNIT_ENV_KEYS}
+
+
 def deploy_unit_env(hestia_home: Path, workspace: Optional[str]) -> tuple[dict[str, str], str]:
-    """HESTIA_HOME / HESTIA_WORKSPACE as the deploy unit gives them to the reconciler."""
+    """HESTIA_HOME / HESTIA_WORKSPACE as the deploy unit gives them to the reconciler.
+
+    The source string says how this was learned. Anything starting "fallback" means the unit's real
+    env was NOT read, so a registration drift rendered against it is unverified (see registration_row).
+    """
     env: dict[str, str] = {}
     source = "fallback (--hestia-home/--workspace)"
     try:
@@ -550,18 +598,23 @@ def deploy_unit_env(hestia_home: Path, workspace: Optional[str]) -> tuple[dict[s
         if out.returncode == 0 and out.stdout.strip():
             for tok in shlex.split(out.stdout.strip()):
                 k, _, v = tok.partition("=")
-                if k in ("HESTIA_HOME", "HESTIA_WORKSPACE"):
+                if k in UNIT_ENV_KEYS:
                     env[k] = v
             source = "systemctl --user show hestia-deploy.service"
     except (OSError, subprocess.SubprocessError, ValueError):
         pass
+    if not env:
+        unit = Path.home() / ".config" / "systemd" / "user" / "hestia-deploy.service"
+        env = unit_file_env(unit)
+        if env:
+            source = f"unit file {unit} + drop-ins (no user bus)"
     if not env:
         plist = Path.home() / "Library" / "LaunchAgents" / "com.web4.hestia.deploy.plist"
         if plist.is_file():
             import plistlib
             with contextlib.suppress(Exception):
                 d = plistlib.loads(plist.read_bytes()).get("EnvironmentVariables") or {}
-                env = {k: v for k, v in d.items() if k in ("HESTIA_HOME", "HESTIA_WORKSPACE")}
+                env = {k: v for k, v in d.items() if k in UNIT_ENV_KEYS}
                 source = str(plist)
     env.setdefault("HESTIA_HOME", str(hestia_home))
     if workspace:
@@ -795,8 +848,13 @@ class Census:
             return {"status": "absent" if verdict == "skip" else "refused", "changes": [],
                     "notes": list(lines)}
         notes = [n for n in got.P.notes]
-        return {"status": "no-op" if not got.changes else "drift", "changes": list(got.changes),
-                "notes": notes}
+        row = {"status": "no-op" if not got.changes else "drift", "changes": list(got.changes),
+               "notes": notes}
+        if getattr(self, "deploy_env_source", "").startswith("fallback"):
+            # still counted: an unverifiable registration is not a pass. But it must not read as
+            # a measured drift — the deploy unit's own env was never seen.
+            row["unverified"] = f"rendered against {self.deploy_env_source}, not the deploy unit's env"
+        return row
 
     # -- one seat --------------------------------------------------------------------------
     def seat(self, expects: Path, deploy_env: dict, facts: dict, client: Mcp) -> Optional[dict]:
@@ -1102,6 +1160,7 @@ class Census:
         self.registrar = load_module(self.repo / "deploy" / "register-members.py", "census_register_members")
         self.gt = load_module(self.repo / "tools" / "hooks_gt.py", "census_hooks_gt")
         deploy_env, env_source = deploy_unit_env(self.hestia_home, a.workspace)
+        self.deploy_env_source = env_source
         workspace = deploy_env.get("HESTIA_WORKSPACE") or str(self.home / "ai-workspace")
         self.daemon = IsolatedDaemon(Path(a.daemon_bin).expanduser(), self.root, workspace,
                                      Path(facts["build_file"]), self.live_ports)
@@ -1163,7 +1222,8 @@ def cell(row: Optional[dict], key: str) -> str:
     if key == "bytes":
         return f"{st} ({r.get('compared', 0)} files)" + ("" if st == "match" else ": " + "; ".join(r.get("drift", []))[:160])
     if key == "registration":
-        return st + ("" if st in ("no-op", "absent") else ": " + "; ".join(r.get("changes") or r.get("notes") or [])[:160])
+        flag = " (UNVERIFIED: fallback env)" if r.get("unverified") else ""
+        return st + flag + ("" if st in ("no-op", "absent") else ": " + "; ".join(r.get("changes") or r.get("notes") or [])[:160])
     if key == "behaviour":
         v = r.get("verdicts") or {}
         esc = r.get("self_write_escalation") or {}

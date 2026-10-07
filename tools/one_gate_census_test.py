@@ -191,6 +191,34 @@ def test_self_write_ratchet():
     assert census.judge_self_write("no-such-member", infra)[0] == "fail"
 
 
+def test_unit_file_env_follows_drop_ins_like_systemd():
+    # HUB's layout (hestia#1252): the base unit empties HESTIA_WORKSPACE, a drop-in sets it. Read
+    # without the drop-in, the census rendered codex without HESTIA_WORKSPACE and reported a false drift.
+    with tempfile.TemporaryDirectory() as d:
+        unit = Path(d) / "hestia-deploy.service"
+        unit.write_text("[Unit]\nEnvironment=HESTIA_WORKSPACE=/not/service/section\n[Service]\n"
+                        "Environment=HESTIA_HOME=%h/.hestia\nEnvironment=HESTIA_WORKSPACE=\n"
+                        "Environment=\"PATH=/a b\" OTHER=1\n")
+        assert census.unit_file_env(unit, Path("/home/x")) == {"HESTIA_HOME": "/home/x/.hestia",
+                                                              "HESTIA_WORKSPACE": ""}
+        drop = Path(d) / "hestia-deploy.service.d"
+        drop.mkdir()
+        (drop / "20-late.conf").write_text("[Service]\nEnvironment=HESTIA_WORKSPACE=/w/late\n")
+        (drop / "10-workspace.conf").write_text("[Service]\nEnvironment=HESTIA_WORKSPACE=/w/early\n")
+        assert census.unit_file_env(unit, Path("/home/x"))["HESTIA_WORKSPACE"] == "/w/late", "lexical, last wins"
+        (drop / "30-reset.conf").write_text("[Service]\nEnvironment=\nEnvironment=HESTIA_HOME=/h%%\n")
+        assert census.unit_file_env(unit, Path("/home/x")) == {"HESTIA_HOME": "/h%"}, "empty Environment= resets"
+        assert census.unit_file_env(Path(d) / "absent.service") == {}
+
+
+def test_fallback_env_marks_a_drift_unverified():
+    reg = {"status": "drift", "changes": ["codex PreToolUse: drop HESTIA_WORKSPACE"], "notes": [],
+           "unverified": "rendered against fallback (--hestia-home/--workspace), not the deploy unit's env"}
+    assert "UNVERIFIED" in census.cell({"registration": reg}, "registration")
+    reg.pop("unverified")
+    assert "UNVERIFIED" not in census.cell({"registration": reg}, "registration")
+
+
 TESTS = [
     test_guard_refuses_the_guarded_port_and_only_it,
     test_guard_refuses_writes_outside_the_throwaway_and_redirects,
@@ -198,6 +226,8 @@ TESTS = [
     test_an_absent_harness_is_absent_not_a_failure,
     test_session_evidence_decides_use,
     test_self_write_ratchet,
+    test_unit_file_env_follows_drop_ins_like_systemd,
+    test_fallback_env_marks_a_drift_unverified,
 ]
 
 
