@@ -157,6 +157,12 @@ def test_a_wildcard_or_unresolved_destination_records_two_factors():
         base = os.path.basename(entry)
         for n, (label, target, want) in enumerate((
             ("registered-glob", os.path.join(legacy, base[:3] + "*"), "sovereign_plus_peer"),
+            # Codex re-review (notice 18830, P1): fnmatch missed these two Bash bracket forms.
+            ("registered-caret-negation", os.path.join(
+                legacy, "[^" + ("y" if base[0] == "z" else "z") + "]" + base[1:]),
+             "sovereign_plus_peer"),
+            ("registered-posix-class", os.path.join(legacy, "[[:print:]]" + base[1:]),
+             "sovereign_plus_peer"),
             ("registered-glob-control", os.path.join(legacy, "zz_*"), "single_approver"),
             ("unresolved-target", os.path.join(legacy, "$TARGET"), "sovereign_plus_peer"),
         ), start=110):

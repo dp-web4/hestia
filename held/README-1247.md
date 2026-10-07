@@ -13,7 +13,44 @@ wording said "not applied". That was true of the installed gate, not of this tre
 applies only to its base `1d82846` (below). The patch is what landing #1247 changes relative to that
 base.
 
-## Delta for Codex's 18786 P1s: `fc95be2e…`
+## Current delta, superseding `fc95be2e…`: `29ae13a6…` (answers Codex 18830)
+
+| file | sha256 |
+|---|---|
+| `29ae13a63a5d29824ef610a562af05044a6636af81e005528375208c67154655.patch` | `29ae13a63a5d29824ef610a562af05044a6636af81e005528375208c67154655` |
+
+Same base (`18f91db`) and the same 8 files as `fc95be2e…`. It is `fc95be2e…` plus one fix.
+Codex's re-review (notice 18830, P1) showed that `fnmatch` is not a conservative reading of a Bash
+glob. It reads `[^z]` as "`^` or `z`" and `[[:alpha:]]` as a bracket followed by a literal `]`.
+Bash expands both onto `before_tool.py`, so the write was priced `single_approver`.
+
+- `_reaches_registered_entry` now matches through `_glob_over_regex`, which can only over-match.
+  Every bracket expression stands for ANY one character, whatever it says (negation, range, POSIX
+  class, locale). `*` and `?` may cross `/`. A backslash is optional before the character it
+  escapes. An unclosed `[` makes the rest of the pattern match anything. `_bracket_end` reads a
+  bracket the way Bash does: a leading `!`/`^`, a leading literal `]`, `[:…:]`/`[=…=]`/`[.….]`
+  items, and `\` escapes. Without that, `[[:alpha:]]` would close early.
+- Tests: the wildcard loop now also covers `[^z]`, `[!z]`, `[[:alpha:]]` and `[]b]`. A new
+  differential test, `test_the_entry_matcher_covers_every_bash_expansion`, runs 15 patterns through
+  real Bash pathname expansion over 7 candidate names and requires every expanded name to be
+  matched. Both tests are red against the current gate (`[^z]efore_tool.py` → `Before_tool.py` is
+  the first miss) and green with the patch (9/9).
+- `tools/escalation_bar_real_daemon_test.py` (not closure, committed directly) gains
+  `registered-caret-negation` and `registered-posix-class`, both expecting `sovereign_plus_peer`.
+  **Not run yet:** this test needs the gate patched in the tree, which is the governed act itself.
+- The republished engine's canonical digest is
+  `b86956c9ef8664592b6f65ff2a4627eeb78c2c998c6c4d3f0b062ab469139b0d`. The GT copy with its header
+  stripped equals the source.
+
+Verified read-only, because a scratch-index `git apply --cached` is itself refused as a closure
+write (self-retired `c6aaac809ca9dc85`): the patch was applied in memory to `18f91db`'s blobs. The
+two `plugins/_shared` results are byte-identical to the tested copies (`7204b0e8…`, `98a1cae3…`).
+`hooks-gt/` is unchanged between `18f91db` and this branch head.
+
+Landing act, in this worktree: `git checkout -- plugins/_shared && git apply held/29ae13a6….patch`
+(with the full name). It replaces escalation `7fba6f25…`, which is withdrawn.
+
+## Superseded: delta for Codex's 18786 P1s, `fc95be2e…`
 
 | file | sha256 |
 |---|---|
