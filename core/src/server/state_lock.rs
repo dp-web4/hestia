@@ -342,15 +342,38 @@ pub fn time_section<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
     r
 }
 
-/// The shared state's lock: a `tokio::sync::Mutex` that measures itself.
-pub struct StateCell<T> {
-    inner: tokio::sync::Mutex<T>,
-    stats: LockStats,
+/// State that publishes an immutable snapshot for lock-free readers (stage 2,
+/// `server::published`). `on_release` runs at EVERY guard release, while the lock is still held,
+/// and swaps a new snapshot into `slot` when the state's published inputs changed — so a write
+/// is never visible to lock takers before it is visible to snapshot readers.
+pub trait Publish {
+    type Snapshot: Send + Sync + 'static;
+    fn initial_snapshot(&mut self) -> Self::Snapshot;
+    fn on_release(&mut self, slot: &std::sync::RwLock<std::sync::Arc<Self::Snapshot>>);
 }
 
-impl<T> StateCell<T> {
-    pub fn new(value: T) -> Self {
-        Self { inner: tokio::sync::Mutex::new(value), stats: LockStats::new("state lock hold") }
+/// The shared state's lock: a `tokio::sync::Mutex` that measures itself, plus the published
+/// snapshot slot readers use without taking it.
+pub struct StateCell<T: Publish> {
+    inner: tokio::sync::Mutex<T>,
+    stats: LockStats,
+    published: std::sync::RwLock<std::sync::Arc<T::Snapshot>>,
+}
+
+impl<T: Publish> StateCell<T> {
+    pub fn new(mut value: T) -> Self {
+        let snap = std::sync::Arc::new(value.initial_snapshot());
+        Self {
+            inner: tokio::sync::Mutex::new(value),
+            stats: LockStats::new("state lock hold"),
+            published: std::sync::RwLock::new(snap),
+        }
+    }
+
+    /// The current published snapshot — never takes the state lock. The slot's own lock is held
+    /// only for an `Arc` clone (a writer holds it only for the swap).
+    pub fn published(&self) -> std::sync::Arc<T::Snapshot> {
+        self.published.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     pub fn stats(&self) -> &LockStats {
@@ -415,7 +438,7 @@ impl<T> StateCell<T> {
 }
 
 /// A held state lock. Derefs to the state; records its hold time when dropped.
-pub struct StateGuard<'a, T> {
+pub struct StateGuard<'a, T: Publish> {
     guard: Option<tokio::sync::MutexGuard<'a, T>>,
     cell: &'a StateCell<T>,
     site: &'static Location<'static>,
@@ -424,21 +447,25 @@ pub struct StateGuard<'a, T> {
     called: Instant,
 }
 
-impl<T> Deref for StateGuard<'_, T> {
+impl<T: Publish> Deref for StateGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         self.guard.as_deref().expect("guard present until drop")
     }
 }
 
-impl<T> DerefMut for StateGuard<'_, T> {
+impl<T: Publish> DerefMut for StateGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         self.guard.as_deref_mut().expect("guard present until drop")
     }
 }
 
-impl<T> Drop for StateGuard<'_, T> {
+impl<T: Publish> Drop for StateGuard<'_, T> {
     fn drop(&mut self) {
+        // Republish (if anything published changed) BEFORE the lock is released.
+        if let Some(g) = self.guard.as_deref_mut() {
+            g.on_release(&self.cell.published);
+        }
         // Clear the holder BEFORE releasing, so a report never names a holder that has left.
         self.cell.stats.with(|s| s.holder = None);
         let released = Instant::now();
@@ -452,6 +479,34 @@ impl<T> Drop for StateGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl Publish for u32 {
+        type Snapshot = u32;
+        fn initial_snapshot(&mut self) -> u32 {
+            *self
+        }
+        fn on_release(&mut self, slot: &std::sync::RwLock<std::sync::Arc<u32>>) {
+            *slot.write().unwrap() = std::sync::Arc::new(*self);
+        }
+    }
+    impl Publish for () {
+        type Snapshot = ();
+        fn initial_snapshot(&mut self) {}
+        fn on_release(&mut self, _: &std::sync::RwLock<std::sync::Arc<()>>) {}
+    }
+
+    /// The published snapshot moves with the release that changed the state, not later.
+    #[tokio::test]
+    async fn a_release_publishes_before_the_next_reader() {
+        let cell = StateCell::new(1u32);
+        assert_eq!(*cell.published(), 1);
+        {
+            let mut g = cell.lock().await;
+            *g = 7;
+            assert_eq!(*cell.published(), 1, "not visible while the writer still holds the lock");
+        }
+        assert_eq!(*cell.published(), 7);
+    }
     use std::sync::Arc;
     use std::time::Duration;
 

@@ -53,6 +53,15 @@ pub struct Vault {
     /// break-glass writer. Read-only Vault opens do not acquire it. Ordinary short-lived
     /// writers acquire the same lease around each save in `storage::save_if_current`.
     writer_lease: Option<storage::WriterLease>,
+    /// Process-unique generation of the in-memory policy lists: fresh for every Vault instance
+    /// and every `set_policy_lists`, so replacing the vault object (a reopen assigned over the
+    /// daemon's) moves it too. Read by the lock-free law publication.
+    policy_lists_gen: u64,
+}
+
+fn next_policy_lists_gen() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Vault {
@@ -76,6 +85,7 @@ impl Vault {
             passphrase,
             data,
             writer_lease: None,
+            policy_lists_gen: next_policy_lists_gen(),
         })
     }
 
@@ -96,6 +106,7 @@ impl Vault {
             passphrase,
             data,
             writer_lease: None,
+            policy_lists_gen: next_policy_lists_gen(),
         })
     }
 
@@ -201,6 +212,12 @@ impl Vault {
     /// them past the vault lock — the law is read on every session start and every
     /// `hestia_operating_law` call, and holding the vault while composing a reply is how
     /// a read path becomes a contention path.
+    /// Moves whenever the policy lists are replaced in memory — the lock-free law publication
+    /// (`server::published`) republishes when it does.
+    pub fn policy_lists_generation(&self) -> u64 {
+        self.policy_lists_gen
+    }
+
     pub fn policy_lists(&self) -> policy_lists::PolicyLists {
         self.data.policy_lists.clone()
     }
@@ -209,6 +226,7 @@ impl Vault {
     /// responsible for having established operator authority BEFORE reaching here.
     pub fn set_policy_lists(&mut self, lists: policy_lists::PolicyLists) -> Result<()> {
         self.data.policy_lists = lists;
+        self.policy_lists_gen = next_policy_lists_gen();
         self.save()
     }
 

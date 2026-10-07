@@ -299,7 +299,7 @@ pub struct ServerState {
     /// answers a narrower question the daemon's build id cannot — whether a caller ever said
     /// it understood a newly served field. #481 remains the integrity boundary for proving
     /// which installed bytes made that report.
-    pub gate_capabilities: HashMap<String, HashSet<String>>,
+    pub gate_capabilities: Arc<crate::server::published::GateCapabilities>,
     /// Member → wall-clock time its current seat-config finding was FIRST observed.
     ///
     /// The edge, not the level. A stateless check can only ever report "miswired again" on every
@@ -348,7 +348,7 @@ pub struct ServerState {
     /// a tally would make the ATTESTATION rather than the chain the source of truth.
     pub scope_tally: std::collections::HashMap<(String, String), (u64, u64)>,
     pub vault: Vault,
-    pub sessions: HashMap<Uuid, Session>,
+    pub sessions: crate::server::published::Sessions,
     pub actions: HashMap<Uuid, InFlightAction>,
     /// BEHIND AN `Arc` SO A HEAVY READ NEED NOT HOLD THE GLOBAL STATE LOCK.
     ///
@@ -402,17 +402,17 @@ pub struct ServerState {
     /// verifiable legacy alias to its `member_lct` label. See `member_registry`.
     pub member_registry: crate::member_registry::MemberRegistry,
     pub shared_context: serde_json::Map<String, serde_json::Value>,
-    pub policy_engine: crate::policy::PolicyEngine,
+    pub policy_engine: crate::server::published::Watched<crate::policy::PolicyEngine>,
     /// Per-constellation-role policy engines (#403 role-scoped law), built from
     /// the vault's `role_overlays`. A session's declared role selects its engine;
     /// its verdict is folded into `policy_engine` by strictest-wins in
     /// `query_policy`, so a role can only tighten the base, never loosen it.
-    pub role_policy_engines: HashMap<String, crate::policy::PolicyEngine>,
+    pub role_policy_engines: crate::server::published::Watched<HashMap<String, crate::policy::PolicyEngine>>,
     /// Per-`(instance, role)` policy engines (the finest grain), keyed by
     /// `(plugin_id, role)`. Selected AFTER the role engine and folded strictest-
     /// wins in the gate, so a specific orchestrator can only tighten its role's
     /// law, never loosen it. Built from the vault's `instance_overlays`.
-    pub instance_policy_engines: HashMap<(String, String), crate::policy::PolicyEngine>,
+    pub instance_policy_engines: crate::server::published::Watched<HashMap<(String, String), crate::policy::PolicyEngine>>,
     /// OPERATOR GRANTS — per-`(plugin_id, role)`, and the ONLY input in the whole fold that
     /// may LOOSEN (dp, 2026-08-01).
     ///
@@ -436,7 +436,7 @@ pub struct ServerState {
     ///
     /// Society baseline is NOT this. The baseline lives in society law and moves only by
     /// amendment — a grant is a scoped exception to it, never an edit of it.
-    pub instance_grants: HashMap<(String, String), InstanceGrant>,
+    pub instance_grants: crate::server::published::Watched<HashMap<(String, String), InstanceGrant>>,
     /// Scope requests and the operator's answers, keyed by request id. See `ScopeRequest`.
     ///
     /// Memory-only for the same reason `instance_grants` is: this widens reach, so it must
@@ -446,13 +446,13 @@ pub struct ServerState {
     /// Deliberately keyed by id and not by `(plugin, path)`: the record of an ASK that was
     /// refused is as much of the account as the record of one that was granted, and a map
     /// keyed by target would let a re-ask overwrite a refusal.
-    pub scope_requests: HashMap<String, ScopeRequest>,
+    pub scope_requests: crate::server::published::Watched<HashMap<String, ScopeRequest>>,
     /// STANDING scope grants — the third row of `POLICY_SCOPE_ASYMMETRY`: durable,
     /// operator-decided, vault-persisted (`scope`/`standing` document), generation-counted.
     /// Loaded at startup, written back through `persist_standing_scope` on every operator
     /// decision. Mutated ONLY from the operator-gated HTTP surface; no MCP tool reaches it
     /// (`no_mcp_tool_can_mutate_standing_scope`). See `server::standing_scope`.
-    pub standing_scope: crate::server::standing_scope::StandingScopeStore,
+    pub standing_scope: crate::server::published::Watched<crate::server::standing_scope::StandingScopeStore>,
     /// Ids the operator has retired on THIS seat: no longer parties, their standing grants
     /// revoked in the same commit, hidden from the default agent view. Rebuilt from the vault
     /// at load like `member_registry`. Never deletion -- see `server::retirement`.
@@ -460,11 +460,11 @@ pub struct ServerState {
     /// What was found where the standing authority should be, at launch. Set once during
     /// construction and served beside the envelope so an unmigrated society is legible
     /// rather than silently empty.
-    pub authority_status: crate::server::standing_scope::AuthorityStatus,
+    pub authority_status: crate::server::published::Watched<crate::server::standing_scope::AuthorityStatus>,
     /// The most recent proof that the runtime projection still equals the vault. `None`
     /// until the first verification runs, which is itself information: it means no
     /// verification has happened yet, not that everything is fine.
-    pub standing_projection_audit: Option<crate::server::standing_scope::ProjectionAudit>,
+    pub standing_projection_audit: crate::server::published::Watched<Option<crate::server::standing_scope::ProjectionAudit>>,
     /// TRUE while the in-memory standing store is TIGHTER than the persisted vault copy —
     /// set when a revoke's vault write fails after the row was already removed from memory
     /// (memory keeps the tighter state on purpose). While set, the revoke surface accepts a
@@ -473,6 +473,10 @@ pub struct ServerState {
     /// Never persisted: a restart reloads the vault copy, at which point memory and vault
     /// agree again (the grant resurrects, visibly, and a fresh revoke takes the normal path).
     pub standing_scope_dirty: bool,
+    /// Moves on every policy republish (`server::published`).
+    pub publication_version: u64,
+    /// The vault policy-list generation the current publication was built from.
+    published_lists_gen: u64,
     /// Transport bindings (#1030): which hub identity carries each member's routed acts,
     /// and where the answer belongs. Operator-written through `commit_transport_bindings`,
     /// vault-persisted, read by `member_notify` at enqueue and by the egress plane.
@@ -729,7 +733,7 @@ impl ServerState {
         };
 
         let mut st = Self {
-            gate_capabilities: HashMap::new(),
+            gate_capabilities: Arc::new(crate::server::published::GateCapabilities::default()),
             // REBUILT FROM THE CHAIN, not started empty. Starting empty loses the ability to
             // close any finding opened before this restart, because the pass that opened it
             // also repaired the artifact — so the next pass sees clean, has nothing to close,
@@ -739,7 +743,7 @@ impl ServerState {
             seat_live: HashMap::new(),
             scope_tally: std::collections::HashMap::new(),
             vault,
-            sessions: HashMap::new(),
+            sessions: crate::server::published::Sessions::default(),
             actions: HashMap::new(),
             // Rebuilt from the chain + settle record, so a late witness for an action from before
             // this restart finds its row and its charge state (one-gate stage A). Evaluated
@@ -757,25 +761,27 @@ impl ServerState {
             member_registry,
             retired_members,
             shared_context: serde_json::Map::new(),
-            policy_engine,
-            role_policy_engines,
-            instance_policy_engines,
+            policy_engine: crate::server::published::Watched::new(policy_engine),
+            role_policy_engines: crate::server::published::Watched::new(role_policy_engines),
+            instance_policy_engines: crate::server::published::Watched::new(instance_policy_engines),
             // Empty at every startup, by design: grants do not survive a restart. Escalations
             // DO — see the rehydrate call after construction. The two are opposite on purpose:
             // a human's ruling must survive a deploy, a standing permission must not.
-            instance_grants: HashMap::new(),
+            instance_grants: crate::server::published::Watched::new(HashMap::new()),
             // Same reasoning, same lifetime: a widening dies with the daemon.
-            scope_requests: HashMap::new(),
+            scope_requests: crate::server::published::Watched::new(HashMap::new()),
             // The deliberate exception (row 3): standing grants are durable and were just
             // loaded from the vault, so an operator's standing ruling survives the deploy.
-            standing_scope,
-            authority_status,
+            standing_scope: crate::server::published::Watched::new(standing_scope),
+            authority_status: crate::server::published::Watched::new(authority_status),
             // No verification has run yet. Deliberately not a synthetic "matches: true":
             // construction agreeing with itself is not a proof, and claiming one here would
             // make the freshness timestamp lie from the first second.
-            standing_projection_audit: None,
+            standing_projection_audit: crate::server::published::Watched::new(None),
             // Memory was just loaded FROM the vault, so the two agree by construction.
             standing_scope_dirty: false,
+            publication_version: 0,
+            published_lists_gen: u64::MAX,
             transport_bindings,
             law_gate,
             synthetic_plugins,
@@ -939,15 +945,15 @@ impl ServerState {
             .policy()
             .resolve()
             .unwrap_or_else(|| crate::policy::get_preset("safety").unwrap().config);
-        self.policy_engine = crate::policy::PolicyEngine::new(config);
-        self.role_policy_engines = self
+        *self.policy_engine = crate::policy::PolicyEngine::new(config);
+        *self.role_policy_engines = self
             .vault
             .policy()
             .role_configs()
             .into_iter()
             .map(|(role, cfg)| (role, crate::policy::PolicyEngine::new(cfg)))
             .collect();
-        self.instance_policy_engines = self
+        *self.instance_policy_engines = self
             .vault
             .policy()
             .instance_configs()
@@ -1055,13 +1061,7 @@ impl ServerState {
     /// wildcard — narrow before broad, which is the same precedence every other layer uses.
     pub fn instance_grant(&self, plugin_id: &str, role: &str) -> Option<&InstanceGrant> {
         let now = crate::server::gate_escalation::now_secs();
-        self.instance_grants
-            .get(&(plugin_id.to_string(), role.to_string()))
-            .or_else(|| {
-                self.instance_grants
-                    .get(&(plugin_id.to_string(), "*".to_string()))
-            })
-            .filter(|g| g.is_live(now))
+        crate::server::published::instance_grant_in(&self.instance_grants, plugin_id, role, now)
     }
 
     /// Every live scope grant a member currently holds — what the gate consults, and what
@@ -1073,13 +1073,7 @@ impl ServerState {
     /// stop applying midway through the work it was granted for.
     pub fn live_scope_grants(&self, plugin_id: &str) -> Vec<&ScopeRequest> {
         let now = crate::server::gate_escalation::now_secs();
-        let mut live: Vec<&ScopeRequest> = self
-            .scope_requests
-            .values()
-            .filter(|r| r.plugin_id == plugin_id && r.is_live(now))
-            .collect();
-        live.sort_by_key(|r| r.requested_at);
-        live
+        crate::server::published::live_scope_grants_in(&self.scope_requests, plugin_id, now)
     }
 
     /// Does this member hold a live grant for exactly this path?
@@ -1125,7 +1119,7 @@ impl ServerState {
             "scope",
             "standing",
             "standing-scope.json",
-            &self.standing_scope,
+            &*self.standing_scope,
         )
     }
 
@@ -1143,7 +1137,7 @@ impl ServerState {
         let mut candidate = self.standing_scope.clone();
         mutate(&mut candidate);
         crate::vault::save_doc(&mut self.vault, "scope", "standing", "standing-scope.json", &candidate)?;
-        self.standing_scope = candidate;
+        *self.standing_scope = candidate;
         // The vault now holds exactly what memory holds, so any earlier revoke-persist
         // failure has been overtaken: the synced state is the tighter one plus this
         // committed mutation.
@@ -1408,7 +1402,7 @@ impl ServerState {
             if !standing.is_empty() {
                 crate::vault::save_doc(&mut self.vault, "scope", "standing", "standing-scope.json", &scope)
                     .context("NOTHING changed: the standing-scope document did not persist")?;
-                self.standing_scope = scope;
+                *self.standing_scope = scope;
                 self.standing_scope_dirty = false;
             }
         }
@@ -1809,6 +1803,101 @@ impl ServerState {
     pub fn resolve_plugin_id(&self, session_id: Option<&str>) -> Option<String> {
         let uuid = Uuid::parse_str(session_id?).ok()?;
         self.sessions.get(&uuid).map(|s| s.plugin_id.clone())
+    }
+}
+
+impl ServerState {
+    fn build_publication(&self) -> crate::server::published::PolicyPublication {
+        use crate::server::published::{EngineView, PolicyPublication};
+        PolicyPublication {
+            version: self.publication_version,
+            society: EngineView::of(&self.policy_engine),
+            roles: self.role_policy_engines.iter().map(|(k, e)| (k.clone(), EngineView::of(e))).collect(),
+            instances: self
+                .instance_policy_engines
+                .iter()
+                .map(|(k, e)| (k.clone(), EngineView::of(e)))
+                .collect(),
+            instance_grants: (*self.instance_grants).clone(),
+            policy_lists: self.vault.policy_lists(),
+            scope_requests: (*self.scope_requests).clone(),
+            standing_scope: (*self.standing_scope).clone(),
+            authority_status: *self.authority_status,
+            standing_projection_audit: (*self.standing_projection_audit).clone(),
+            sessions: self.sessions.directory(),
+            gate_capabilities: self.gate_capabilities.clone(),
+        }
+    }
+
+    /// Did any policy input change since the last publication? Clears every dirty bit (all of
+    /// them, not short-circuiting, so none stays set into the next release).
+    fn take_policy_dirty(&mut self) -> bool {
+        let mut d = false;
+        d |= self.policy_engine.take_dirty();
+        d |= self.role_policy_engines.take_dirty();
+        d |= self.instance_policy_engines.take_dirty();
+        d |= self.instance_grants.take_dirty();
+        d |= self.scope_requests.take_dirty();
+        d |= self.standing_scope.take_dirty();
+        d |= self.authority_status.take_dirty();
+        d |= self.standing_projection_audit.take_dirty();
+        let lists_gen = self.vault.policy_lists_generation();
+        if lists_gen != self.published_lists_gen {
+            self.published_lists_gen = lists_gen;
+            d = true;
+        }
+        d
+    }
+}
+
+#[cfg(test)]
+impl ServerState {
+    /// Lose every pending dirty bit — the failure the debug staleness check exists to catch.
+    pub(crate) fn forget_policy_dirty_for_test(&mut self) {
+        let _ = self.take_policy_dirty();
+    }
+}
+
+impl super::state_lock::Publish for ServerState {
+    type Snapshot = crate::server::published::PolicyPublication;
+
+    fn initial_snapshot(&mut self) -> Self::Snapshot {
+        let _ = self.take_policy_dirty();
+        self.sessions.apply_pending();
+        self.build_publication()
+    }
+
+    fn on_release(&mut self, slot: &std::sync::RwLock<Arc<Self::Snapshot>>) {
+        let dirty = self.take_policy_dirty();
+        if dirty {
+            self.publication_version += 1;
+        }
+        if dirty || self.sessions.has_pending() {
+            // Build outside the slot's write lock; swap (and apply staged session changes)
+            // inside it, so a reader sees one consistent (directory, publication) pair.
+            let fresh = if dirty { Some(Arc::new(self.build_publication())) } else { None };
+            let mut w = slot.write().unwrap_or_else(|p| p.into_inner());
+            self.sessions.apply_pending();
+            if let Some(f) = fresh {
+                *w = f;
+            }
+            return;
+        }
+        // THE STALENESS CHECK (debug builds, so every test): nothing was marked dirty, so the
+        // published snapshot must equal one built from the live state right now. A mutation that
+        // escaped `Watched` fails here, at the release that made it, naming nothing stale.
+        #[cfg(debug_assertions)]
+        {
+            if std::env::var_os("HESTIA_SKIP_PUBLICATION_CHECK").is_none() {
+                let current = slot.read().unwrap_or_else(|p| p.into_inner()).clone();
+                let fresh = self.build_publication();
+                let (a, b) = (fresh.canonical(), current.canonical());
+                assert!(
+                    a == b,
+                    "STALE POLICY PUBLICATION: a policy input changed without passing through                      `Watched` (or the vault list generation). live={a} published={b}"
+                );
+            }
+        }
     }
 }
 

@@ -1363,14 +1363,14 @@ pub async fn serve_with_callback(
                             "standing-scope projection DIVERGED from the vault authority"
                         );
                     }
-                    s.standing_projection_audit = Some(audit);
+                    *s.standing_projection_audit = Some(audit);
                 }
                 // A vault that cannot be read is itself a finding, and leaving the previous
                 // audit in place would let a stale "matches: true" outlive the evidence for
                 // it. Record the failure as a non-match with the reason.
                 Err(e) => {
                     tracing::error!("standing-scope projection unverifiable: {e}");
-                    s.standing_projection_audit =
+                    *s.standing_projection_audit =
                         Some(super::standing_scope::ProjectionAudit {
                             verified_at: now,
                             matches: false,
@@ -1402,7 +1402,7 @@ pub async fn serve_with_callback(
                 // edited at noon is a miswire from noon, not from the next restart.
                 // Not `gate_capabilities.keys()` alone: that is who CONNECTED, which is a
                 // different question from who has config (#898 review, finding 4).
-                let connected: Vec<String> = s.gate_capabilities.keys().cloned().collect();
+                let connected: Vec<String> = s.gate_capabilities.keys().into_iter().collect();
                 let home = s.home.clone();
                 let members = super::seat_config::members_to_check(&s.vault, &home, &connected);
                 let drifted = super::handler::render_and_verify_seat_configs(&mut s, &members)
@@ -3535,7 +3535,7 @@ async fn config_put_seat(
     // and that difference is the operator's act, not drift. A write to the shared set
     // re-renders every seat in the same act, because every seat inherits it.
     let members = if writing_shared {
-        let connected: Vec<String> = s.gate_capabilities.keys().cloned().collect();
+        let connected: Vec<String> = s.gate_capabilities.keys().into_iter().collect();
         sc::members_to_check(&s.vault, &home, &connected)
     } else {
         vec![member.clone()]
@@ -3665,7 +3665,7 @@ fn seat_config_summary(
 /// this is the view a page polls, and a polled surface is the one an operator leaves open.
 async fn config_list_seats(State(state): State<SharedState>) -> impl IntoResponse {
     let s = state.lock().await;
-    let connected: Vec<String> = s.gate_capabilities.keys().cloned().collect();
+    let connected: Vec<String> = s.gate_capabilities.keys().into_iter().collect();
     let home = s.home.clone();
     let members = super::seat_config::members_to_check(&s.vault, &home, &connected);
     let seats: Vec<serde_json::Value> = members.iter().map(|m| seat_config_summary(&s, m)).collect();
