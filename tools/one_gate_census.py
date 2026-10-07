@@ -646,6 +646,15 @@ def session_evidence(home: Path, plugin_dir: str, days: float) -> dict[str, Any]
     }
 
 
+def registered_targets(regs: list, own_dirs: set[str]) -> dict[str, str]:
+    """base -> registered target, for hestia's own lines only. A seat may register its files in more
+    than one dir (Legion: gate + witness in the legacy plugin dir, law_inject at the declared dest),
+    so each file is compared where ITS line points, not under the gate's dir. Restricted to hestia's
+    dirs: another plugin may register a same-named file (hardbound's pre_tool_use.py) — hestia#1252."""
+    return {r.base: r.target for r in regs
+            if r.base and r.target and os.path.dirname(r.target) in own_dirs}
+
+
 def git_show(repo: Path, rev: str, path: str) -> Optional[bytes]:
     out = subprocess.run(["git", "-C", str(repo), "show", f"{rev}:{path}"], capture_output=True,
                          timeout=30)
@@ -830,7 +839,8 @@ class Census:
                 if rel.endswith(".json"):
                     continue
                 base = os.path.basename(rel)
-                compare(plugin_dir, rel, row.get("sha256", ""), files_dir / base,
+                target = self.registered_targets.get(base)
+                compare(plugin_dir, rel, row.get("sha256", ""), Path(target) if target else files_dir / base,
                         required=base in registered_bases)
         if shared_dir is None:
             drift.append("no shared engine resolved from the seat projection")
@@ -889,6 +899,8 @@ class Census:
                             and r.target), None)
         self.registered_bases = [r.base for r in regs if r.base and r.target and loaded.dest
                                  and os.path.dirname(r.target) == loaded.dest]
+        self.registered_targets = registered_targets(
+            regs, {d for d in (loaded.dest, os.path.dirname(gate_reg.target) if gate_reg else None) if d})
         evidence = session_evidence(self.home, plugin_dir, self.args.in_use_days)
         row["use_evidence"] = evidence
         row["state"] = "in use" if evidence["files_in_window"] else "installed, not in use"

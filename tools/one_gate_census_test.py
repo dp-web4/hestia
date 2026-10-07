@@ -233,6 +233,23 @@ def test_a_missing_daemon_binary_is_a_setup_error():
         assert not d.fake_home.exists(), "start() did work before checking the binary"
 
 
+def test_registered_targets_follow_each_line_within_hestias_dirs():
+    # Legion (hestia#1252): gate + witness in the legacy plugin dir, law_inject at the declared dest.
+    # Looked up under the gate's dir, a correctly installed law_inject read as "not installed".
+    from types import SimpleNamespace as R
+    legacy, dest = "/h/.claude/plugins/hestia/hooks", "/h/.claude/hooks/hestia"
+    regs = [R(base="pre_tool_use.py", target=f"{legacy}/pre_tool_use.py"),
+            R(base="witness.py", target=f"{legacy}/witness.py"),
+            R(base="law_inject.py", target=f"{dest}/law_inject.py"),
+            R(base="pre_tool_use.py", target="/h/.claude/plugins/hardbound/hooks/pre_tool_use.py"),
+            R(base="hydrate.sh", target=None)]
+    got = census.registered_targets(regs, {dest, legacy})
+    assert got == {"pre_tool_use.py": f"{legacy}/pre_tool_use.py", "witness.py": f"{legacy}/witness.py",
+                   "law_inject.py": f"{dest}/law_inject.py"}, got
+    # the single-dir layout is unchanged: everything maps under the one dir
+    assert set(census.registered_targets(regs[2:3], {dest}).values()) == {f"{dest}/law_inject.py"}
+
+
 TESTS = [
     test_guard_refuses_the_guarded_port_and_only_it,
     test_guard_refuses_writes_outside_the_throwaway_and_redirects,
@@ -243,6 +260,7 @@ TESTS = [
     test_unit_file_env_follows_drop_ins_like_systemd,
     test_fallback_env_marks_a_drift_unverified,
     test_a_missing_daemon_binary_is_a_setup_error,
+    test_registered_targets_follow_each_line_within_hestias_dirs,
 ]
 
 
