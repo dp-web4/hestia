@@ -28407,6 +28407,96 @@ mod decision_witness_tests {
     use super::inbox_tests::{open_state, seeded_home};
     use super::*;
 
+    // Review reproduction: the assertions describe the broken restart behavior.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_settle_append_failure_double_charges_after_restart() {
+        use crate::storage::durability::durable_scope;
+        let (dir, state) = state_with_safety().await;
+        let count_before = {
+            let s = state.lock().await;
+            let n = s.trust("gemini").action_count;
+            s.trust_store.persister().flush_blocking().unwrap();
+            n
+        };
+        let settled = dir.path().join(super::super::decision_witness::SETTLED_FILE);
+        std::fs::create_dir(&settled).unwrap(); // trust succeeds; only the settle append fails
+        let mut args = witness_args("gemini", "deny");
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        let (_out, durable) = durable_scope(tool_witness_decision(&state, &args)).await;
+        assert!(durable.is_err());
+        drop(state);
+        std::fs::remove_dir(&settled).unwrap();
+        let state = reopen_with_safety(&dir).await;
+        let persisted = state.lock().await.trust("gemini").action_count;
+        assert_eq!(persisted, count_before + 1, "the first charge reached disk");
+        let (retry, durable) = durable_scope(tool_witness_decision(&state, &args)).await;
+        durable.unwrap();
+        let retry = retry.unwrap();
+        assert_eq!(retry["recorded"], "existing");
+        assert_eq!(retry["charged"], true, "BUG: persisted charge is applied again");
+        let after = state.lock().await.trust("gemini").action_count;
+        assert_eq!(after, count_before + 2);
+        println!("one decision: before={count_before}, persisted={persisted}, after retry={after}");
+    }
+
+    #[tokio::test]
+    async fn review_trust_resource_acknowledges_held_write() {
+        let (_dir, state) = state_with_safety().await;
+        let (hold, old) = {
+            let s = state.lock().await;
+            let old = s.trust("gemini");
+            s.trust_store.persister().flush_blocking().unwrap();
+            let hold = s.trust_store.persister().hold_for_test();
+            s.apply_outcome("gemini", false, 0.5).unwrap();
+            (hold, old)
+        };
+        let (body, durable) = tokio::time::timeout(std::time::Duration::from_secs(1),
+            crate::storage::durability::durable_scope_observing(
+                read_resource_body(&state, "hestia://society/trust/gemini")))
+            .await.expect("BUG: resource replies while its trust write is held");
+        durable.unwrap();
+        let body: Value = serde_json::from_str(&body.unwrap()).unwrap();
+        assert_eq!(body["actionCount"], old.action_count + 1);
+        println!("resource acknowledged actionCount={} while trust persistence held", body["actionCount"]);
+        drop(hold);
+    }
+
+    #[tokio::test]
+    async fn review_held_by_row_survives_a_lost_trust_charge() {
+        let (dir, state) = state_with_safety().await;
+        let (hold, before) = {
+            let s = state.lock().await;
+            let before = s.trust("gemini").action_count;
+            s.trust_store.persister().flush_blocking().unwrap();
+            (s.trust_store.persister().hold_for_test(), before)
+        };
+        let mut args = witness_args("gemini", "deny");
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        let first = tool_witness_decision(&state, &args).await.unwrap();
+        let mut second_args = args.clone();
+        second_args["decision"] = json!("warn");
+        let second = tool_witness_decision(&state, &second_args).await.unwrap();
+        assert_eq!(second["chargeHeldBy"], first["witnessEntryHash"]);
+        {
+            let s = state.lock().await;
+            s.trust_store.persister().inject_failure();
+        }
+        drop(hold);
+        {
+            let s = state.lock().await;
+            assert!(s.trust_store.persister().flush_blocking().is_err());
+        }
+        drop(state);
+        let state = reopen_with_safety(&dir).await;
+        assert_eq!(state.lock().await.trust("gemini").action_count, before);
+        let (out, durable) = crate::storage::durability::durable_scope(
+            tool_witness_decision(&state, &args)).await;
+        durable.unwrap();
+        assert_eq!(out.unwrap()["charged"], false, "BUG: replay trusts held_by despite lost charge");
+        assert_eq!(state.lock().await.trust("gemini").action_count, before);
+        println!("two verdict rows, lost trust write: retry charged=false, count remains {before}");
+    }
+
     async fn state_with_safety() -> (tempfile::TempDir, SharedState) {
         let (dir, _) = seeded_home();
         let state = open_state(&dir);
