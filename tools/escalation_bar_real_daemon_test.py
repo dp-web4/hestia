@@ -144,8 +144,32 @@ def test_a_gate_registered_outside_every_declaration_records_two_factors():
             fx.close()
 
 
+def test_a_wildcard_or_unresolved_destination_records_two_factors():
+    """Codex review of #1247 at 18f91db (notice 18786), both P1s, through the real shim:
+    a wildcard that can expand onto the REGISTERED entry, and a destination the gate cannot
+    resolve (`$TARGET`), each record sovereign_plus_peer. A wildcard that cannot reach the entry
+    is the control: one approver."""
+    seat = "gemini"
+    fx = sb.Fixture()
+    try:
+        home = fx.home(seat, ENDPOINT)
+        legacy, entry, _wit = sb._legacy_install(seat, home)
+        base = os.path.basename(entry)
+        for n, (label, target, want) in enumerate((
+            ("registered-glob", os.path.join(legacy, base[:3] + "*"), "sovereign_plus_peer"),
+            ("registered-glob-control", os.path.join(legacy, "zz_*"), "single_approver"),
+            ("unresolved-target", os.path.join(legacy, "$TARGET"), "sovereign_plus_peer"),
+        ), start=110):
+            rec = open_and_read(seat, home, sb.native(seat, "Bash", {"command": "touch " + target},
+                                                      n=n), label, shim_path=entry)
+            check(f"{label}-bar", rec.get("bar") == want, (want, rec))
+    finally:
+        fx.close()
+
+
 ALL = [
     test_a_gate_registered_outside_every_declaration_records_two_factors,
+    test_a_wildcard_or_unresolved_destination_records_two_factors,
     test_every_seat_records_two_factors_for_its_own_entry_whatever_the_spelling,
     test_a_same_named_file_outside_every_location_records_one_approver,
 ]

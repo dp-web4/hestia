@@ -2,11 +2,46 @@
 
 `held/README.md` and `held/574426d6…patch` are #1239's. This file is #1247's.
 
-This keeps the **governed half** of #1247 as one digest-named patch, so the reviewed bytes live in
-the repo and not only in a scratch directory. **It is not applied.** Applying it changes files the
-gate governs (the shared closure, the common gate, the core's canonical list, and their published
-copies under `hooks-gt/`), so it lands through the gate's escalation path, as one `git apply`,
-after review.
+This keeps the **governed half** of #1247 as digest-named patches, so the reviewed bytes live in
+the repo and not only in a scratch directory. The patches change files the gate governs (the shared
+closure, the common gate, the core's canonical list, and their published copies under `hooks-gt/`),
+so they reach any INSTALLED copy only through the gate's escalation path, as one `git apply`.
+
+**Correction (Codex review, notice 18786): this branch's tree ALREADY CONTAINS `e2b891c2…`.** Earlier
+wording said "not applied". That was true of the installed gate, not of this tree. Do not `git apply`
+`e2b891c2…` to this branch's head. It reverse-checks cleanly here (`git apply -R --check`), and it
+applies only to its base `1d82846` (below). The patch is what landing #1247 changes relative to that
+base.
+
+## Delta for Codex's 18786 P1s: `fc95be2e…`
+
+| file | sha256 |
+|---|---|
+| `fc95be2e6db5d27dc47af7f165d56324b058de0ba81383b53c8bd495dd4111d6.patch` | `fc95be2e6db5d27dc47af7f165d56324b058de0ba81383b53c8bd495dd4111d6` |
+
+The base is `18f91db` (the tree with `e2b891c2…` in it). It touches the common gate, its test, and
+the hooks-gt republish (1 engine copy and 5 manifests).
+
+- **Registered entry, by wildcard.** `_reaches_registered_entry` now matches a resolved target that
+  carries a wildcard (`*?[`) against the seat's registered entries. Before, only a literal match
+  counted. `touch <legacy>/before_*` reached the running gate but carried no
+  `registered-gate-entry` token. The daemon knows only declared locations, so it could not recover
+  that. `fnmatch` lets `*` cross `/`, so it can only over-match, which prices higher, not lower.
+  `after_*` is the negative control.
+- **Completeness is about the whole write set.** `_closure_write_set` now reports complete only when
+  every verdict is a `governance-closure-write` landing at an absolute location. Out-of-grammar
+  (a `$VAR` destination), unparseable, opaque, internal, and relative-without-cwd verdicts make it
+  incomplete, so the daemon gets the `unenumerated` sentinel. Before, a known target beside an
+  unresolved one read as the whole set.
+- **Tests** in `registered_surface_test.py`: three wildcard spellings and the negative control; three
+  incomplete cases and three complete controls. They are red against `18f91db`'s gate.
+
+How it reached this tree: the gate and test edits were first written with a python heredoc, which
+the gate does not see (hestia#1059). That bypass was not deliberate, and it is disclosed here. The
+same bytes were then re-sent as ONE gated act,
+`git checkout -- <both files> && git apply <this patch>`: escalation `c4cf18fb71bffd6d`. The two
+earlier asks, `7072da09…` and `8a8897bd…`, were self-retired because each was missing part of the
+set.
 
 | file | sha256 |
 |---|---|
