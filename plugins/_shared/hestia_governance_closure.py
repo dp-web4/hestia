@@ -107,6 +107,7 @@ __all__ = [
     "RULE_INTERNAL",
     "RULE_READ_INTERNAL",
     "classify",
+    "write_verdicts",
     "load_closure",
     "default_closure",
     "attest_shims",
@@ -1070,20 +1071,21 @@ def _read_position_mentions(tool_name: str, tool_input: Any) -> list:
     return out
 
 
-def classify(tool_name: str, tool_input: Any, *, cwd: Optional[str] = None,
-             closure: Optional[Closure] = None) -> ClosureVerdict:
-    """Classify one tool call against the governance closure. NEVER raises.
-
-    Returns classification "write" (refuse + escalate), "read" (allow + witness), or "none".
-    See the module docstring for the fail-direction asymmetry between the two phases."""
+def _resolve_closure(closure: Optional[Closure]):
     try:
         if closure is None:
             closure = default_closure()
-        src = closure.source
+        return closure, closure.source
     except Exception:
-        closure, src = LITERAL_FLOOR, LITERAL_FLOOR.source
+        return LITERAL_FLOOR, LITERAL_FLOOR.source
 
-    # Phase 1 — WRITE positions. Internal errors here fail CLOSED.
+
+def _phase1_writes(tool_name: str, tool_input: Any, cwd: Optional[str], closure: Closure, src: str):
+    """Phase 1 — WRITE positions, as a generator: one "write" verdict per write-position
+    argument that resolves into the closure, in argument order, yielded lazily (so `classify`,
+    which takes the first, stops matching exactly where it always did). An opaque writer or an
+    internal error yields its single fail-closed verdict and stops. `write_verdicts` takes them
+    all. Internal errors fail CLOSED."""
     try:
         targets, note = _write_position_targets(tool_name, tool_input)
         # OUT OF GRAMMAR (REPAIR 2): `targets` is the command's full vocabulary token list,
@@ -1093,22 +1095,58 @@ def classify(tool_name: str, tool_input: Any, *, cwd: Optional[str] = None,
         if note == "opaque-writer":
             # GPT second pass: the literal "any closure write" invariant. An opaque patch
             # whose content cannot be read is refused regardless of argv vocabulary.
-            return ClosureVerdict("write", RULE_OPAQUE_WRITER, None,
-                                  targets[0] if targets else "stdin", src)
+            yield ClosureVerdict("write", RULE_OPAQUE_WRITER, None,
+                                 targets[0] if targets else "stdin", src)
+            return
         position = "read" if note == "out-of-grammar" else "write"
+        if note == "out-of-grammar":
+            rule = RULE_OUT_OF_GRAMMAR
+        elif note == "unparseable":
+            rule = RULE_WRITE_UNPARSEABLE
+        else:
+            rule = RULE_WRITE
         for t in targets:
             marker = closure.match(t, cwd=cwd, position=position)
             if marker:
-                if note == "out-of-grammar":
-                    rule = RULE_OUT_OF_GRAMMAR
-                elif note == "unparseable":
-                    rule = RULE_WRITE_UNPARSEABLE
-                else:
-                    rule = RULE_WRITE
-                return ClosureVerdict("write", rule, marker, t, src)
+                yield ClosureVerdict("write", rule, marker, t, src)
     except Exception as e:  # noqa: BLE001 — fail-closed: a broken write classifier must not admit
-        return ClosureVerdict("write", RULE_INTERNAL, None,
-                              f"internal:{type(e).__name__}", src)
+        yield ClosureVerdict("write", RULE_INTERNAL, None, f"internal:{type(e).__name__}", src)
+
+
+def write_verdicts(tool_name: str, tool_input: Any, *, cwd: Optional[str] = None,
+                   closure: Optional[Closure] = None) -> list:
+    """EVERY write-position argument of one tool call that resolves into the closure, as one
+    "write" verdict each, in argument order (#810, recut of #812). NEVER raises.
+
+    `classify` answers WHETHER the act writes the closure and stops at the first target; the
+    escalation's price needs WHAT it writes — all of it — because a later target can be the
+    sovereign one, and the act summary the daemon also reads is bounded and can cut it out.
+    Every rule carries its targets (out-of-grammar and unparseable included). Empty means no
+    closure write. An opaque writer or an internal error is one fail-closed verdict with no
+    marker: it names no target, and the caller must treat the write set as unenumerated rather
+    than as complete."""
+    closure, src = _resolve_closure(closure)
+    try:
+        return list(_phase1_writes(tool_name, tool_input, cwd, closure, src))
+    except Exception as e:  # noqa: BLE001
+        return [ClosureVerdict("write", RULE_INTERNAL, None, f"internal:{type(e).__name__}", src)]
+
+
+def classify(tool_name: str, tool_input: Any, *, cwd: Optional[str] = None,
+             closure: Optional[Closure] = None) -> ClosureVerdict:
+    """Classify one tool call against the governance closure. NEVER raises.
+
+    Returns classification "write" (refuse + escalate), "read" (allow + witness), or "none".
+    See the module docstring for the fail-direction asymmetry between the two phases."""
+    closure, src = _resolve_closure(closure)
+
+    # Phase 1 — WRITE positions (the first one decides). Internal errors here fail CLOSED.
+    try:
+        first = next(_phase1_writes(tool_name, tool_input, cwd, closure, src), None)
+    except Exception as e:  # noqa: BLE001
+        first = ClosureVerdict("write", RULE_INTERNAL, None, f"internal:{type(e).__name__}", src)
+    if first is not None:
+        return first
 
     # Phase 2 — READ mentions. Internal errors here must NOT block (reads cannot mutate the
     # closure; failing closed here is the FP loop). Nothing write-shaped can reach this phase.
