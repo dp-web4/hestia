@@ -1505,6 +1505,16 @@ pub async fn serve_with_callback(
     Ok(())
 }
 
+/// The REAL operator decision channel, for the concurrency battery (handler.rs): it races this
+/// path, with its witness-is-finality append, rather than a store call that writes no ruling row.
+#[cfg(test)]
+pub(super) async fn operator_gate_escalation_for_battery(
+    state: SharedState,
+    d: GateEscalationDecision,
+) -> axum::response::Response {
+    operator_gate_escalation(State(state), Json(d)).await.into_response()
+}
+
 /// Label the state-lock acquisitions a request makes with its MATCHED route template
 /// (`http:/api/agents/:id/retire`), never the raw path: the template set is finite, the raw path
 /// is caller-chosen.
@@ -7557,9 +7567,7 @@ pub(super) struct GateEscalationDecision {
     pub(super) reason: Option<String>,
 }
 
-// `pub(super)` so the concurrency battery (handler.rs) races the REAL operator channel, with its
-// witness-is-finality append, rather than a store call that writes no ruling row.
-pub(super) async fn operator_gate_escalation(
+async fn operator_gate_escalation(
     State(state): State<SharedState>,
     Json(d): Json<GateEscalationDecision>,
 ) -> impl IntoResponse {

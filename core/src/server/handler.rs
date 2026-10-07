@@ -29115,12 +29115,11 @@ mod concurrency_battery {
             let (st, id) = (state.clone(), esc_id.clone());
             let approve = i % 3 != 0; // some denied, so a deny is in the mix too
             tasks.spawn(async move {
-                use axum::extract::{Json, State};
-                let _ = super::super::http::operator_gate_escalation(
-                    State(st),
-                    Json(super::super::http::GateEscalationDecision {
+                let _ = super::super::http::operator_gate_escalation_for_battery(
+                    st,
+                    super::super::http::GateEscalationDecision {
                         id, approve, reason: Some("battery operator".into()),
-                    }),
+                    },
                 )
                 .await;
             });
