@@ -1195,16 +1195,78 @@ def test_canonical_or_miswired(m, g, wc, home):
                             str(shim), t0, env=env)
         check("duplicate-registrations-are-miswired", miswired(b) and "duplicate" in b.why, b)
 
+        # #1262 re-review P1: a shell operator glued to a relative (or exact) spelling still RUNS
+        # this hook — each spelling is EXECUTED below — so it must not drop out of the bound
+        # beside a longer exact registration; it is MISWIRED evidence.
+        real_hook = h / "hooks" / "gate_hook.py"
+        real_hook.parent.mkdir(parents=True, exist_ok=True)
+        real_hook.write_text("print('gate-hook-ran')\n")
+        for label, spelling in (("semicolon", "python3 ./gate_hook.py;"),
+                                ("andand", "python3 ./gate_hook.py&&true"),
+                                ("subshell", "(python3 ./gate_hook.py)"),
+                                ("pipe", "python3 gate_hook.py|cat"),
+                                ("exact-semicolon", f"python3 {real_hook};")):
+            ran = subprocess.run(["sh", "-c", spelling], cwd=str(real_hook.parent),
+                                 capture_output=True, text=True, timeout=30)
+            check(f"p1-shell-actually-runs-{label}",
+                  ran.returncode == 0 and "gate-hook-ran" in ran.stdout, ran)
+            glued = entry(h / f"glued-{label}.toml", 5, command=spelling)
+            b = g.harness_bound(harness(abs15, glued), str(shim), t0, env=env)
+            check(f"p1-glued-{label}-is-miswired", miswired(b), b)
+
         # No parser for a config that names the hook: MISWIRED. One that does not: drops.
         orig_loader = g._load_config
         try:
-            g._load_config = lambda *a: (None, "scan")
+            g._load_config = lambda *a: (None, "scan", {})
             b = g.harness_bound(harness(abs15), str(shim), t0, env=env)
             check("no-parser-is-miswired", miswired(b), b)
             b = g.harness_bound(harness(other), str(shim), t0, env=env)
             check("no-parser-unrelated-drops", b.deadline is None and "MISWIRED" not in b.why, b)
         finally:
             g._load_config = orig_loader
+
+
+def test_json_duplicate_keys_are_miswired(m, g, wc, home):
+    """#1262 re-review P2: the JSON reader is last-wins — as the harness's own parser is — so a
+    hook object carrying a duplicated key is no measured deadline overrun; it is ambiguous
+    wiring, and the protocol counts it MISWIRED rather than binding the surviving value,
+    AGREEING duplicates included. A duplicate inside ANOTHER hook's object is that hook's
+    ambiguity and does not touch this hook's bound."""
+    seat = "claude-code"
+    shim_mod = _shim_module(seat)
+    with tempfile.TemporaryDirectory() as td:
+        h = pathlib.Path(td)
+        env = {"HOME": str(h)}
+        cfg = h / "settings.json"
+        harness = _neutral_harness(shim_mod.HARNESS, cfg)
+        shim = h / "hooks" / "gate_hook.py"     # never created: realpath needs no file
+        t0 = time.monotonic()
+
+        def obj(command, timeout_fragment):
+            return '{"type": "command", "command": "' + command + '", ' + timeout_fragment + '}'
+
+        def write(*entries):
+            cfg.write_text('{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": ['
+                           + ", ".join(entries) + ']}]}}')
+
+        for label, fragment in (("conflicting-5-15", '"timeout": 5, "timeout": 15'),
+                                ("conflicting-15-5", '"timeout": 15, "timeout": 5'),
+                                ("agreeing-10-10", '"timeout": 10, "timeout": 10')):
+            write(obj(f"python3 {shim}", fragment))
+            b = g.harness_bound(harness, str(shim), t0, env=env)
+            check(f"json-duplicate-timeout-{label}-is-miswired",
+                  b.deadline is None and "MISWIRED" in b.why and "repeats key" in b.why, b)
+
+        # A duplicated key in a DIFFERENT hook's object leaves this hook's clean binding alone.
+        write(obj(f"python3 {shim}", '"timeout": 10'),
+              obj("python3 /x/other.py", '"timeout": 5, "timeout": 20'))
+        b = g.harness_bound(harness, str(shim), t0, env=env)
+        check("json-duplicate-in-another-hooks-object-drops", b.timeout_seconds == 10.0, b)
+
+        # Regression guard: a clean single-key registration still binds.
+        write(obj(f"python3 {shim}", '"timeout": 10'))
+        b = g.harness_bound(harness, str(shim), t0, env=env)
+        check("json-single-key-still-binds", b.timeout_seconds == 10.0, b)
 
 
 def test_an_unknown_or_spent_bound_refuses_without_asking(m, g, wc, home):
@@ -1321,6 +1383,7 @@ CONTRACT_TESTS = [
     test_stage_c_wires_every_seat,
     test_the_bound_is_the_real_registration,
     test_canonical_or_miswired,
+    test_json_duplicate_keys_are_miswired,
     test_an_unknown_or_spent_bound_refuses_without_asking,
     test_the_launch_role_bound_is_the_gates,
     test_the_mcp_transport_is_command_scoped,
