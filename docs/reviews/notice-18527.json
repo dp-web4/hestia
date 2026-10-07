@@ -1,0 +1,45 @@
+{
+  "reviewer": "codex",
+  "in_reply_to": 18527,
+  "pull_request": "https://github.com/dp-web4/hestia/pull/1262",
+  "reviewed_commit": "f7f8aa9ea48b20f4d73323e96cf11e84b1ecbbc1",
+  "verdict": "changes_requested",
+  "resolved": [
+    "The reported literal shell-punctuation cases now contribute MISWIRED.",
+    "Conflicting and agreeing timeout keys on an exact hook-entry object now contribute MISWIRED; the regression test is registered.",
+    "Both loader call sites unpack the new triple.",
+    "The PR description reflects the final design and records row-10 integration dependencies under the posted scope ruling.",
+    "Published hook bytes and manifests pass the ground-truth checks."
+  ],
+  "findings": [
+    {
+      "priority": "P1",
+      "title": "Preserve shell quote removal when deciding hook relevance",
+      "path": "plugins/_shared/hestia_single_gate.py",
+      "lines": [295, 299],
+      "explanation": "The new regex searches expanded command text before shell quote/backslash removal. A relative command such as python3 ./gate_'hook'.py or python3 ./gate_\\hook.py executes gate_hook.py, but contains no literal gate_hook.py for this regex. _command_targets only retains absolute paths, so these entries disappear. Beside an exact 15-second binding, a real 5-second registration yields timeout_seconds=15 and deadline=113.5 at start=100. The combined quoted-fragment/semicolon spelling also disappears. This restores the deadline-overrun condition P1 was meant to close.",
+      "evidence": "All three command spellings were executed under sh in the temporary hook directory and printed the marker from the same temporary script. The unchanged exact-head harness_bound returned 15 for each. Plain relative and literal-semicolon controls correctly returned MISWIRED.",
+      "requested_change": "Combine conservative punctuation-aware relevance with shell-normalized token relevance; do not replace the latter with a raw-text-only name test. Keep numeric timeout binding structural. Add quote-fragment and backslash regressions beside a longer exact binding, including shell execution proof.",
+      "limit": "Executed shell invocation plus bound-function reproduction, not a live vendor timeout/kill experiment."
+    },
+    {
+      "priority": "P2",
+      "title": "Propagate duplicate-key evidence along the registration path",
+      "path": "plugins/_shared/hestia_single_gate.py",
+      "lines": [426, 431],
+      "explanation": "Only dupes[id(hook_obj)] is consumed. Duplicate top-level hooks, duplicate PreToolUse keys, and duplicate group-level hooks keys are collected by object_pairs_hook but ignored when binding a surviving child. Repeating the same canonical registration in either occurrence at any of these three levels returns a clean 15-second bound, contrary to the rule that even agreeing duplicate critical declarations are MISWIRED. The PR description's no-registration fallback covers complete erasure only; it does not cover a surviving target registration.",
+      "evidence": "Three agreeing structural-duplicate fixtures independently returned timeout_seconds=15 and deadline=113.5. An entry-local duplicate timeout control correctly returned MISWIRED.",
+      "requested_change": "Carry relevant ancestor duplicate evidence to the binding decision, retaining enough occurrence/provenance information when duplicate keys overwrite values. Add regressions at each registration-bearing level, while keeping duplicates confined to unrelated hook objects irrelevant.",
+      "limit": "Protocol-conformance finding, not a measured disagreement with a vendor's last-wins JSON parser."
+    }
+  ],
+  "verification": {
+    "focused_probe": "10 cases measured by docs/reviews/notice-18527-probe.py; results in notice-18527-results.json",
+    "contract_and_parity": "PASS: 21 decide() contract tests + shim-parity 29x4; isolated real-daemon arm skipped because no endpoint was configured",
+    "hooks_gt_check": "PASS",
+    "hooks_gt_test": "ALL CHECKS PASSED",
+    "shim_certification": "PASS, 11 tests",
+    "remote_ci_at_review": "7 success; cargo test in progress"
+  },
+  "scope": "Review and reproducible evidence only; no implementation or installed configuration changes."
+}

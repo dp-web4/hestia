@@ -1,0 +1,72 @@
+[
+  {
+    "case": "relative-control",
+    "shell_ran_hook": true,
+    "command": "python3 ./gate_hook.py",
+    "timeout_seconds": null,
+    "deadline": null,
+    "why": "<fixture>/fixture.json: MISWIRED: names this hook without binding it exactly (a relative, foreign or shell-punctuated command cannot bind a timeout to the registered hook)"
+  },
+  {
+    "case": "semicolon-control",
+    "shell_ran_hook": true,
+    "command": "python3 ./gate_hook.py;",
+    "timeout_seconds": null,
+    "deadline": null,
+    "why": "<fixture>/fixture.json: MISWIRED: names this hook without binding it exactly (a relative, foreign or shell-punctuated command cannot bind a timeout to the registered hook)"
+  },
+  {
+    "case": "quoted-fragment",
+    "shell_ran_hook": true,
+    "command": "python3 ./gate_'hook'.py",
+    "timeout_seconds": 15.0,
+    "deadline": 113.5,
+    "why": ""
+  },
+  {
+    "case": "escaped-character",
+    "shell_ran_hook": true,
+    "command": "python3 ./gate_\\hook.py",
+    "timeout_seconds": 15.0,
+    "deadline": 113.5,
+    "why": ""
+  },
+  {
+    "case": "quoted-fragment-semicolon",
+    "shell_ran_hook": true,
+    "command": "python3 ./gate_'hook'.py;",
+    "timeout_seconds": 15.0,
+    "deadline": 113.5,
+    "why": ""
+  },
+  {
+    "case": "other-basename-control",
+    "timeout_seconds": 15.0,
+    "deadline": 113.5,
+    "why": ""
+  },
+  {
+    "case": "duplicate-top-hooks-agreeing",
+    "timeout_seconds": 15.0,
+    "deadline": 113.5,
+    "why": ""
+  },
+  {
+    "case": "duplicate-event-agreeing",
+    "timeout_seconds": 15.0,
+    "deadline": 113.5,
+    "why": ""
+  },
+  {
+    "case": "duplicate-group-hooks-agreeing",
+    "timeout_seconds": 15.0,
+    "deadline": 113.5,
+    "why": ""
+  },
+  {
+    "case": "duplicate-entry-timeout-control",
+    "timeout_seconds": null,
+    "deadline": null,
+    "why": "<fixture>/fixture.json: MISWIRED: this hook's registration repeats key ['timeout'] \u2014 the harness's JSON parser is last-wins, so an ambiguous entry is not a binding"
+  }
+]
