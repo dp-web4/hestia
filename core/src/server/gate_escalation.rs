@@ -363,6 +363,11 @@ pub const SOVEREIGN_FILES: &[&str] = &[
 /// `bar_for` as it stands. (3) is free text: it also names sources, flags and look-alikes, so
 /// only an exact sovereign basename counts there (`not_witness.py.bak` is not the witness).
 ///
+/// A GLOB prices by what it can EXPAND to: a basename with `*`, `?` or `[...]` — in a resolved
+/// target or in the act text — adds every `SOVEREIGN_FILES` name it matches
+/// (`sovereign_expansions`), so `rm …/hooks/*.py` prices as the gate it removes; a brace
+/// pattern in a target cannot be bounded on the name and is unpriceable (kimi, #1231 Q4).
+///
 /// UNPRICEABLE IS THE HIGHEST BAR, never the lowest. A resolved target that arrives as an
 /// `UNPRICEABLE_PREFIX` sentinel — the gate could not enumerate the whole write set (an
 /// opaque writer, an internal error, more targets than `MAX_RESOLVED_TARGETS`), or a target
@@ -425,7 +430,17 @@ pub fn markers_of(marker: &str, act: Option<&str>, resolved_targets: &[String]) 
             add(t, &mut out);
         } else {
             let t = t.trim_end_matches('/');
-            add(t.rsplit('/').next().unwrap_or("").trim(), &mut out);
+            let base = t.rsplit('/').next().unwrap_or("").trim();
+            add(base, &mut out);
+            // A GLOB prices by what it can expand to (kimi, #1231 review Q4): `*.py` in a
+            // hooks dir reaches the gate. Brace expansion cannot be bounded here, so it is
+            // unpriceable — the highest bar, never the literal's.
+            if base.contains('{') {
+                add(&format!("{UNPRICEABLE_PREFIX}brace-glob"), &mut out);
+            }
+            for s in sovereign_expansions(base) {
+                add(s, &mut out);
+            }
         }
     }
     if let Some(text) = act {
@@ -435,9 +450,105 @@ pub fn markers_of(marker: &str, act: Option<&str>, resolved_targets: &[String]) 
             if SOVEREIGN_FILES.contains(&base) {
                 add(base, &mut out);
             }
+            // The same glob rule over the act text: `rm hooks-gt/kimi/hooks/*.py` names no
+            // sovereign file literally, and expands to several. Free text is noisier than a
+            // resolved target, so a token counts as a path glob only if it is one: it has a
+            // directory part, or a literal character beside its metacharacters. A bare `***`
+            // (the apply_patch envelope) is punctuation, not a pattern; a bare `*` relative to
+            // a hooks cwd is still priced, from the resolved target the closure reports.
+            let pathlike = tok.contains('/') || base.chars().any(|c| !"*?[]!^-".contains(c));
+            if pathlike {
+                for s in sovereign_expansions(base) {
+                    add(s, &mut out);
+                }
+            }
         }
     }
     out
+}
+
+/// The sovereign files (`SOVEREIGN_FILES`) a glob basename can expand to — empty for a name
+/// with no glob metacharacter (`*`, `?`, `[`). This is what the pattern CAN reach, decided on
+/// the name alone (no filesystem, so the price never depends on the daemon's cwd or on what
+/// exists at the moment of asking).
+pub fn sovereign_expansions(base: &str) -> Vec<&'static str> {
+    if !base.contains(['*', '?', '[']) {
+        return Vec::new();
+    }
+    SOVEREIGN_FILES.iter().copied().filter(|s| glob_match(base, s)).collect()
+}
+
+/// Shell-style glob match of a whole name: `*` (any run), `?` (one char), `[...]` (a class,
+/// with `!`/`^` negation and `a-z` ranges). An unterminated `[` is a literal, as in the shell.
+pub fn glob_match(pat: &str, name: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    // Iterative wildcard match with single-star backtracking.
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    // One class at p[i] ('['): Some((matched, len)) or None when it is not a class.
+    let class = |i: usize, c: char| -> Option<(bool, usize)> {
+        let mut j = i + 1;
+        let neg = j < p.len() && (p[j] == '!' || p[j] == '^');
+        if neg {
+            j += 1;
+        }
+        let start = j;
+        let mut hit = false;
+        while j < p.len() && (p[j] != ']' || j == start) {
+            if j + 2 < p.len() && p[j + 1] == '-' && p[j + 2] != ']' {
+                if p[j] <= c && c <= p[j + 2] {
+                    hit = true;
+                }
+                j += 3;
+            } else {
+                if p[j] == c {
+                    hit = true;
+                }
+                j += 1;
+            }
+        }
+        if j >= p.len() {
+            return None; // unterminated: a literal '['
+        }
+        Some((hit != neg, j + 1 - i))
+    };
+    while ni < n.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ni;
+            pi += 1;
+            continue;
+        }
+        let step = if pi < p.len() {
+            match p[pi] {
+                '?' => Some(1),
+                '[' => match class(pi, n[ni]) {
+                    Some((true, len)) => Some(len),
+                    Some((false, _)) => None,
+                    None => (n[ni] == '[').then_some(1),
+                },
+                c => (c == n[ni]).then_some(1),
+            }
+        } else {
+            None
+        };
+        match step {
+            Some(len) => {
+                pi += len;
+                ni += 1;
+            }
+            None => match star {
+                Some(s) => {
+                    pi = s + 1;
+                    mark += 1;
+                    ni = mark;
+                }
+                None => return false,
+            },
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
 }
 
 /// One marker's bar: `bar_for`, except that an unpriceable-target sentinel is the HIGHEST bar.
@@ -6875,5 +6986,56 @@ mod resolved_target_tests {
                                                        &[], None, None, None, T0 + 12, 3600)
             .unwrap();
         assert!(old_hook.coalesced());
+    }
+
+    /// The glob row (kimi, #1231 review Q4; carried on #1239 2026-10-07): a glob prices by
+    /// what it can EXPAND to, in the act text and in a resolved target alike — whichever form
+    /// the producer sends (the glob text, as the closure resolves it today, or an expansion).
+    #[test]
+    fn a_glob_prices_by_what_it_can_expand_to() {
+        let hooks_glob = "/w/hooks-gt/kimi/hooks/*.py";
+        // Act text alone (no targets): `rm hooks-gt/kimi/hooks/*.py`.
+        let e = open_t(HOOKS, "Bash: rm hooks-gt/kimi/hooks/*.py", &[]);
+        assert_eq!(e.bar, Bar::SovereignPlusPeer, "act-text glob: {:?}", e.matched_markers);
+        assert!(e.matched_markers.contains(&"pre_tool_use.py".to_string()));
+        // A resolved target that IS the glob.
+        let e = open_t(HOOKS, "Edit -> act", &[hooks_glob]);
+        assert_eq!(e.bar, Bar::SovereignPlusPeer);
+        // The expansion form, for a producer that expands: same price.
+        assert_eq!(open_t(HOOKS, "Edit -> act", &["/w/hooks-gt/kimi/hooks/pre_tool_use.py"]).bar,
+                   Bar::SovereignPlusPeer);
+        // Narrower globs, both ways.
+        for (pat, strong) in [("pre_*.py", true), ("*gate.py", true), ("p?e_tool_use.py", true),
+                              ("[pq]re_tool_use.py", true), ("[!p]re_tool_use.py", false),
+                              ("*.txt", false), ("law_*.py", false), ("*.md", false),
+                              ("witness.p[a-z]", true), ("README*", false)] {
+            let e = open_t(HOOKS, "Edit -> act", &[&format!("/w/plugins/kimi/hooks/{pat}")]);
+            let want = if strong { Bar::SovereignPlusPeer } else { Bar::SingleApprover };
+            assert_eq!(e.bar, want, "{pat}: {:?}", e.matched_markers);
+        }
+        // Free-text noise is not a pattern: the apply_patch envelope's `***` prices nothing,
+        // while a pathlike glob in the act text still does.
+        assert_eq!(open_t("plugins/_shared", "*** Begin Patch\n*** Update File: /w/x.txt", &[]).bar,
+                   Bar::SingleApprover);
+        assert_eq!(open_t("plugins/_shared", "Bash: rm /w/plugins/kimi/hooks/*", &[]).bar,
+                   Bar::SovereignPlusPeer);
+        // Brace expansion cannot be bounded on the name: unpriceable, the highest bar.
+        let e = open_t(HOOKS, "Edit -> act", &["/w/plugins/kimi/hooks/{a,b}.py"]);
+        assert_eq!(e.bar, Bar::SovereignPlusPeer);
+        // A literal name with no metacharacter is unchanged by the rule.
+        assert!(sovereign_expansions("notes.txt").is_empty());
+        assert_eq!(open_t(HOOKS, "Edit -> act", &["/w/plugins/kimi/hooks/notes.txt"]).bar,
+                   Bar::SingleApprover);
+    }
+
+    #[test]
+    fn glob_match_is_the_shell_rule() {
+        for (p, n, want) in [("*", "x", true), ("*", "", true), ("a*b", "ab", true),
+                             ("a*b", "axxb", true), ("a*b", "axxc", false), ("?", "", false),
+                             ("[abc]", "b", true), ("[a-c]x", "bx", true), ("[!a]", "a", false),
+                             ("[^a]", "b", true), ("[", "[", true), ("*.py", "x.py", true),
+                             ("*.py", "x.pyc", false), ("**y", "xy", true)] {
+            assert_eq!(glob_match(p, n), want, "{p} vs {n}");
+        }
     }
 }
