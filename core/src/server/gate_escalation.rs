@@ -336,12 +336,21 @@ pub fn bar_for(marker: &str) -> Bar {
         // members' expects.json), so the next member is covered by its declaration and a
         // same-named file outside every declared location is not promoted.
         || member_gate_entry_of(marker).is_some()
+        // A seat's REGISTERED gate entry that no declared location covers (a legacy or
+        // hand-placed install the harness registration actually runs): the gate escalates it
+        // under this marker, and it is priced like a declared entry. Caller-asserted like every
+        // marker, so it can only raise the asker's own bar.
+        || marker.trim() == REGISTERED_GATE_ENTRY_MARKER
     {
         Bar::SovereignPlusPeer
     } else {
         Bar::SingleApprover
     }
 }
+
+/// The closure marker the common gate uses for a write to a seat's registered gate entry that
+/// no declared location covers (`hestia_single_gate.REGISTERED_ENTRY_MARKER`).
+pub const REGISTERED_GATE_ENTRY_MARKER: &str = "registered-gate-entry";
 
 /// One member's gate entry as its `plugins/<plugin>/expects.json` `install` block declares it:
 /// `dest` (where the installer puts the hooks) and `gate_probe.entry` (the file the harness
@@ -3672,6 +3681,21 @@ mod tests {
         assert_eq!(e.matched_markers, vec![
             ".gemini/hestia-plugins/gemini/hooks".to_string(),
             ".gemini/hestia-plugins/gemini/hooks/before_tool.py".to_string()]);
+    }
+
+    /// A registered gate entry no declaration covers (a legacy install the harness actually runs)
+    /// escalates under the registered-entry marker and is priced two-factor, whatever its
+    /// directory marker or act text say. Control: the same act under the directory marker alone.
+    #[test]
+    fn a_registered_gate_entry_prices_sovereign_like_a_declared_one() {
+        assert_eq!(bar_for(REGISTERED_GATE_ENTRY_MARKER), Bar::SovereignPlusPeer);
+        assert_eq!(bar_for(&format!(" {REGISTERED_GATE_ENTRY_MARKER} ")), Bar::SovereignPlusPeer);
+        let act = "/home/u/.hestia/members/gemini/entry_gate.py";
+        assert_eq!(open_act(REGISTERED_GATE_ENTRY_MARKER, act).bar, Bar::SovereignPlusPeer);
+        assert_eq!(open_act("home/u/.hestia/members/gemini", act).bar, Bar::SingleApprover);
+        // Not a prefix or substring rule: a look-alike marker is not promoted.
+        assert_eq!(bar_for("registered-gate-entry-not"), Bar::SingleApprover);
+        assert_eq!(bar_for("x/registered-gate-entry"), Bar::SingleApprover);
     }
 
     /// The derivation is location-qualified: a file merely NAMED like a member's entry, outside

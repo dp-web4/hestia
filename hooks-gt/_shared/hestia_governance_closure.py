@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: c010f7ed9ad37aa4aabfe7fd94014bb35fb5ecd434d51a9d7911e694fdcf09b5  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: e92ee2aee5b104e80401776c7e25880ad5cc21d94457fea3aba3759a1bc349e5  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -112,7 +112,7 @@ import json
 import os
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 from typing import Any, Callable, Iterable, Optional
 
 __all__ = [
@@ -132,6 +132,8 @@ __all__ = [
     "default_closure",
     "attest_shims",
     "resolve_location",
+    "declared_dest",
+    "registered_closure",
 ]
 
 # ── Rule ids (returned to the shim; the shim's refusal/witness names the RULE and the ACT) ──
@@ -178,6 +180,11 @@ class ClosureVerdict:
     # lands. Set on a resolved write only. It is what the daemon prices a member's gate entry
     # from, by location, so the price never depends on how the act was spelled or summarised.
     resolved: Optional[str] = None
+    # EVERY FURTHER location the same act writes into the closure, after `resolved`, in the
+    # order the act names them. One command or patch can reach several closure files; the
+    # verdict reports the first match, and the daemon prices the bar over ALL of these, so the
+    # price never depends on which closure file the act happened to name first.
+    also_resolved: tuple = ()
 
 
 # ── The closure — segment-pattern matchers, tighten-only union ──────────────────────────────
@@ -366,15 +373,18 @@ def _home_relative(path: str) -> tuple:
 
 def _install_declaration(install: Any) -> Optional[dict]:
     """The governance-relevant part of one expects.json `install` block, normalised:
-    {"dest": str, "entry": str, "registration": [segments]}. None when unusable."""
+    {"member": str, "dest": str, "entry": str, "registration": [segments]}. None when unusable."""
     if not isinstance(install, dict):
         return None
+    member = install.get("member")
     dest = install.get("dest")
     probe = install.get("gate_probe")
     entry = probe.get("entry") if isinstance(probe, dict) else None
     reg = install.get("registration")
     reg_path = reg.get("path") if isinstance(reg, dict) else None
     out: dict = {}
+    if isinstance(member, str) and member:
+        out["member"] = member
     if isinstance(dest, str) and dest:
         out["dest"] = dest
     if isinstance(entry, str) and entry:
@@ -425,15 +435,43 @@ def _closure_from_declaration(decl: Optional[dict]) -> Optional[Closure]:
 # manifests beside it). Generated from plugins/*/expects.json by _install_declaration and
 # pinned equal to them by member_install_surface_test.py — edit the manifest, then this.
 MEMBER_INSTALL_DECLARATIONS = {
-    "claude-code": {"dest": "~/.claude/hooks/hestia", "entry": "hooks/pre_tool_use.py",
-                    "registration": [".claude", "settings.json"]},
-    "codex": {"dest": "~/.codex/hooks", "entry": "hooks/pre_tool_use.py",
+    "claude-code": {"member": "claude-code", "dest": "~/.claude/hooks/hestia",
+                    "entry": "hooks/pre_tool_use.py", "registration": [".claude", "settings.json"]},
+    "codex": {"member": "codex", "dest": "~/.codex/hooks", "entry": "hooks/pre_tool_use.py",
               "registration": [".codex", "config.toml"]},
-    "gemini": {"dest": "~/.gemini/hestia-plugins/gemini/hooks", "entry": "hooks/before_tool.py",
-               "registration": [".gemini", "settings.json"]},
-    "kimi": {"dest": "~/.kimi-code/hooks", "entry": "hooks/pre_tool_use.py",
+    "gemini": {"member": "gemini", "dest": "~/.gemini/hestia-plugins/gemini/hooks",
+               "entry": "hooks/before_tool.py", "registration": [".gemini", "settings.json"]},
+    "kimi": {"member": "kimi-code", "dest": "~/.kimi-code/hooks", "entry": "hooks/pre_tool_use.py",
              "registration": [".kimi-code", "config.toml"]},
 }
+
+
+def declared_dest(member_id: str, home: Optional[str]) -> Optional[str]:
+    """Where this member's install declaration puts its hooks, home-expanded against `home` —
+    the caller's seat home, passed explicitly (no default: a home-relative dest with no home
+    names nowhere). None for a member with no declaration, or a home-relative dest without one."""
+    for decl in MEMBER_INSTALL_DECLARATIONS.values():
+        if decl.get("member") == member_id and isinstance(decl.get("dest"), str):
+            dest = decl["dest"]
+            if dest.startswith("~/"):
+                return os.path.join(home, dest[2:]) if home else None
+            return dest
+    return None
+
+
+def registered_closure(own_dirs: Iterable[str] = (), targets: Iterable[str] = ()) -> Closure:
+    """The EXECUTED governance surface of one seat, as absolute locations: the directories its
+    hestia-owned hooks run from (dir markers) and every hestia-owned hook its harness
+    registration actually points at (exact paths). Built at gate runtime from what the
+    harness REGISTERS (the caller reads the registration), unioned onto the declared closure
+    — a seat whose registration points somewhere no declaration names is governed there too.
+    Paths are realpath'd by the caller; a path of fewer than three segments is ignored rather
+    than widened (`/home/x` would govern a whole home)."""
+    dirs = tuple(seg for seg in (_segments(d) for d in own_dirs if isinstance(d, str))
+                 if len(seg) >= 3)
+    files = tuple(seg for seg in (_segments(t) for t in targets if isinstance(t, str))
+                  if len(seg) >= 3)
+    return Closure(dir_markers=dirs, exact_paths=files, source="registered")
 
 
 def _failsafe_closure() -> Closure:
@@ -1252,18 +1290,32 @@ def classify(tool_name: str, tool_input: Any, *, cwd: Optional[str] = None,
             return ClosureVerdict("write", RULE_OPAQUE_WRITER, None,
                                   targets[0] if targets else "stdin", src)
         position = "read" if note == "out-of-grammar" else "write"
+        first = None
+        also: list = []
         for t in targets:
             marker = closure.match(t, cwd=cwd, position=position)
-            if marker:
+            if not marker:
+                continue
+            if first is None:
                 if note == "out-of-grammar":
                     rule = RULE_OUT_OF_GRAMMAR
                 elif note == "unparseable":
                     rule = RULE_WRITE_UNPARSEABLE
                 else:
                     rule = RULE_WRITE
-                return ClosureVerdict("write", rule, marker, t, src,
-                                      resolved=resolve_location(t, cwd) if rule == RULE_WRITE
-                                      else None)
+                first = ClosureVerdict("write", rule, marker, t, src,
+                                       resolved=resolve_location(t, cwd) if rule == RULE_WRITE
+                                       else None)
+                if rule != RULE_WRITE:
+                    return first  # no resolved write positions to carry
+                continue
+            # Keep classifying past the first match: the refusal is decided, but the PRICE is
+            # the highest over every closure target, so each one must reach the daemon.
+            loc = resolve_location(t, cwd)
+            if loc and loc != first.resolved and loc not in also:
+                also.append(loc)
+        if first is not None:
+            return _dc_replace(first, also_resolved=tuple(also)) if also else first
     except Exception as e:  # noqa: BLE001 — fail-closed: a broken write classifier must not admit
         return ClosureVerdict("write", RULE_INTERNAL, None,
                               f"internal:{type(e).__name__}", src)

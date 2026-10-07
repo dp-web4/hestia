@@ -196,6 +196,13 @@ class HarnessBound:
     on_timeout: str                       # what the harness does when the timeout expires
     sources: tuple = ()                   # where each timeout came from, for the record
     why: str = ""                         # why the bound is unknown, when it is
+    # What the harness's registration ACTUALLY points its hooks at (every event, every source
+    # that exists), read in the same pass as the timeout. The closure is built from install
+    # declarations; execution is built from this. `decide()` governs both (see
+    # `registered_surface`). `unreadable` names a source that exists but could not be parsed.
+    self_path: str = ""                   # realpath of the running gate
+    registered: tuple = ()                # ((source, absolute target), ...)
+    unreadable: tuple = ()                # (source, ...)
 
 
 _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
@@ -264,8 +271,24 @@ def _hook_entries(doc: Any, reader: str, layout: str, event: str) -> list:
     return out
 
 
+_CONFIG_CACHE: dict = {}
+
+
 def _load_config(path: str, reader: str):
-    """(parsed document, None) or (None, why). A TOML config without tomllib is (None, "scan")."""
+    """(parsed document, None) or (None, why). A TOML config without tomllib is (None, "scan").
+    Cached on (path, reader, mtime, size): the timeout bound and the registered-surface read
+    parse each registration once per process, and a changed file is re-read."""
+    st = os.stat(path)
+    key = (path, reader, st.st_mtime_ns, st.st_size)
+    hit = _CONFIG_CACHE.get(key)
+    if hit is not None:
+        return hit
+    out = _load_config_uncached(path, reader)
+    _CONFIG_CACHE[key] = out
+    return out
+
+
+def _load_config_uncached(path: str, reader: str):
     with open(path, "rb") as fh:
         raw = fh.read()
     if reader == "json-hook-commands":
@@ -287,7 +310,68 @@ def _scan_timeouts(path: str, base: str) -> Optional[list]:
     return [float(m.group(1)) for m in re.finditer(r"(?m)^\s*timeout\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*(?:#.*)?$", text)]
 
 
+def _all_hook_commands(doc: Any, layout: str) -> list:
+    """Every hook command a parsed registration carries, on EVERY event (a witness is registered
+    on a different event from the gate)."""
+    out = []
+    hooks = doc.get("hooks") if isinstance(doc, dict) else None
+    if layout == "flat":
+        for tbl in hooks if isinstance(hooks, list) else []:
+            if isinstance(tbl, dict) and isinstance(tbl.get("command"), str):
+                out.append(tbl["command"])
+        return out
+    for groups in (hooks.values() if isinstance(hooks, dict) else ()):
+        for group in groups if isinstance(groups, list) else []:
+            for h in (group.get("hooks") or []) if isinstance(group, dict) else []:
+                if isinstance(h, dict) and isinstance(h.get("command"), str):
+                    out.append(h["command"])
+    return out
+
+
+_SCAN_COMMAND = re.compile(r"""(?m)^\s*command\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)')""")
+
+
+def registered_hooks(harness: dict, *, cwd: Optional[str] = None, env=None) -> tuple:
+    """(registered, unreadable): every absolute hook target the harness's registration sources
+    name, as ((source, target), ...), and the sources that exist but could not be read or
+    parsed. NEVER raises: a failure is reported as unreadable, which the caller treats as
+    "this source may register more than we saw" (fail closed)."""
+    env = os.environ if env is None else env
+    registered, unreadable = [], []
+    for reg in (harness or {}).get("registrations") or ():
+        try:
+            path = _expand(str(reg.get("path") or ""), env, cwd)
+            if not path or not os.path.isfile(path):
+                continue
+            reader, layout = reg.get("reader") or "", reg.get("layout") or "nested"
+            doc, how = _load_config(path, reader)
+            if how == "scan":
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    commands = [m.group(1) or m.group(2) or "" for m in _SCAN_COMMAND.finditer(fh.read())]
+            else:
+                commands = _all_hook_commands(doc, layout)
+            for command in commands:
+                for t in _command_targets(command, env):
+                    registered.append((path, t))
+        except Exception:  # noqa: BLE001 — an unreadable source: the caller fails closed
+            unreadable.append(str(reg.get("path") or "?"))
+    return tuple(registered), tuple(unreadable)
+
+
 def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[str] = None,
+                  env=None) -> HarnessBound:
+    """The harness bound (`_harness_bound`), carrying what the registration actually registers
+    (`registered_hooks`) and the running gate's own realpath. NEVER raises."""
+    b = _harness_bound(harness, self_path, start, cwd=cwd, env=env)
+    try:
+        registered, unreadable = registered_hooks(harness, cwd=cwd, env=env)
+        me = os.path.realpath(self_path) if self_path else ""
+        return replace(b, self_path=me, registered=registered, unreadable=unreadable)
+    except Exception:  # noqa: BLE001 — the bound itself stands; the surface fails closed later
+        return b
+
+
+def _harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[str] = None,
                   env=None) -> HarnessBound:
     """The deadline the harness's REAL registered timeout allows this hook process. NEVER raises.
 
@@ -374,6 +458,84 @@ def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[
                             f"the registration reader failed ({type(exc).__name__}: {exc})")
 
 
+# ── the EXECUTED surface: what this seat's harness registration actually runs ─────────────────
+
+#: The closure marker for a write to a seat's REGISTERED gate entry that no declared location
+#: covers (a legacy or hand-placed install). The daemon prices it sovereign_plus_peer, like a
+#: declared entry (core `bar_for`). Caller-asserted, so it can only raise the asker's own bar.
+REGISTERED_ENTRY_MARKER = "registered-gate-entry"
+
+
+@dataclass(frozen=True)
+class RegisteredSurface:
+    """One seat's executed governance surface. `own_dirs`: where hestia's hooks run from on this
+    seat (the running gate's realpath dir, always; the member's declared dest). `targets`: every
+    registered hook whose realpath lies in an own dir (the reconciler's and the census's
+    ownership rule: a same-named hook registered from another plugin's dir is FOREIGN and not
+    governed by being registered). `entries`: the gate entries among them (the running gate,
+    and any owned target named like it). `unreadable`: registration sources that could not be
+    read. Fail closed: whatever the registration says, the gate's own realpath and dir are
+    governed."""
+
+    self_path: str
+    own_dirs: tuple = ()
+    targets: tuple = ()
+    entries: tuple = ()
+    unreadable: tuple = ()
+
+    def closure(self):
+        return closure.default_closure().union(
+            closure.registered_closure(self.own_dirs, self.targets + self.entries),
+            source="registered+registry+floor")
+
+
+def _degenerate_dir(d: str, home: str) -> bool:
+    """A dir too broad to govern wholesale: the filesystem root, a home, or shallower."""
+    real = d.rstrip("/") or "/"
+    return (real == "/" or (bool(home) and real == home.rstrip("/"))
+            or len([x for x in real.split("/") if x]) < 3)
+
+
+def registered_surface(bound: Optional[HarnessBound], profile: GateProfile,
+                       env=None) -> Optional[RegisteredSurface]:
+    """The executed surface for this invocation, or None when there is no gate path to anchor
+    it (a non-seat caller). NEVER raises; a failure yields the minimum (self file and dir)."""
+    env = os.environ if env is None else env
+    self_path = (getattr(bound, "self_path", "") or
+                 (os.path.realpath(profile.gate_path) if profile.gate_path else ""))
+    if not self_path:
+        return None
+    # The seat's home from its environment only (no default): without one, nothing can be judged
+    # a home-level anchor, so only the file itself and its non-degenerate dir are governed.
+    home = os.path.realpath(env["HOME"]) if env.get("HOME") else ""
+    own = []
+    try:
+        d = os.path.dirname(self_path)
+        if not _degenerate_dir(d, home):
+            own.append(d)
+        dest = closure.declared_dest(profile.member_id, env.get("HOME"))
+        if dest:
+            rd = os.path.realpath(dest)
+            if rd not in own and not _degenerate_dir(rd, home):
+                own.append(rd)
+        base = os.path.basename(self_path)
+        targets, entries = [], [self_path]
+        for _source, t in getattr(bound, "registered", ()) or ():
+            rp = os.path.realpath(t)
+            if os.path.dirname(rp) not in own:
+                continue                      # foreign: another plugin's hook, not hestia's
+            if rp not in targets:
+                targets.append(rp)
+            if os.path.basename(rp) == base and rp not in entries:
+                entries.append(rp)
+        return RegisteredSurface(self_path, tuple(own), tuple(targets), tuple(entries),
+                                 tuple(getattr(bound, "unreadable", ()) or ()))
+    except Exception:  # noqa: BLE001 — the minimum, never fewer
+        d = os.path.dirname(self_path)
+        return RegisteredSurface(self_path, (d,) if not _degenerate_dir(d, home) else (),
+                                 (), (self_path,), ("registered surface failed",))
+
+
 # ── invocation context ───────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -389,6 +551,7 @@ class _Invocation:
     warnings: list = field(default_factory=list)   # [(rule, reason, verdict_available)]
 
     budget: float = DEFAULT_DEADLINE_SECONDS
+    registered: Optional[RegisteredSurface] = None
 
     @property
     def phase_deadline(self) -> float:
@@ -665,7 +828,7 @@ def _launch_role(inv: _Invocation, permitted: str) -> Optional[GateDecision]:
                         innate=True, anomaly=True)
 
 
-def _closure_view(event: GateEvent):
+def _closure_view(event: GateEvent, against=None):
     """The closure classifier's verdict on this act. Tool-shape adaptation only: a lowercase
     shell tool or an argv list is the Bash form; an apply_patch is one Write per target."""
     tool, ti = event.tool, event.tool_input if isinstance(event.tool_input, dict) else {}
@@ -673,7 +836,7 @@ def _closure_view(event: GateEvent):
     if targets or (isinstance(tool, str) and tool.lower() == "apply_patch"):
         found, write, also = None, None, []
         for p in targets:
-            cv = closure.classify("Write", {"file_path": p}, cwd=event.cwd)
+            cv = closure.classify("Write", {"file_path": p}, cwd=event.cwd, closure=against)
             if cv.classification == "write":
                 # Every file of a multi-file patch that writes the closure is priced, not only
                 # the first: the first verdict decides the refusal, the rest ride along.
@@ -691,12 +854,31 @@ def _closure_view(event: GateEvent):
         tool = "Bash"
     if _shell_tool(tool) and not isinstance(ti.get("command"), str):
         ti = dict(ti, command=_command_text(ti) or "")
-    return closure.classify(tool, ti, cwd=event.cwd)
+    return closure.classify(tool, ti, cwd=event.cwd, closure=against)
+
+
+def _closure_verdict(inv: _Invocation):
+    """The declared closure's verdict, then — when it does not already refuse — the seat's
+    EXECUTED surface (`registered_surface`): a write to where this seat's registration actually
+    runs hestia's hooks is a closure write even where no declaration names the place. A write
+    reaching a registered gate entry escalates under REGISTERED_ENTRY_MARKER, priced like a
+    declared entry."""
+    cv = _closure_view(inv.event)
+    reg = inv.registered
+    if reg is None or (cv is not None and cv.classification == "write"):
+        return cv
+    rv = _closure_view(inv.event, reg.closure())
+    if rv is None or rv.classification != "write":
+        return cv if cv is not None else rv
+    locs = {rv.resolved, *(getattr(rv, "also_resolved", ()) or ())}
+    if any(loc in reg.entries for loc in locs if loc):
+        rv = replace(rv, marker=REGISTERED_ENTRY_MARKER)
+    return rv
 
 
 def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
     ev, prof = inv.event, inv.profile
-    cv = _closure_view(ev)
+    cv = _closure_verdict(inv)
     if cv is None or cv.classification not in ("read", "write"):
         return None
     marker = cv.marker or cv.rule or "governance"
@@ -962,6 +1144,7 @@ def decide(event: GateEvent, profile: GateProfile, *, rollout: Optional[str] = N
         if not isinstance(profile, GateProfile):
             raise TypeError("decide requires a GateProfile")
         inv = _Invocation(event=event, profile=profile, rollout=mode, deadline=deadline,
+                          registered=registered_surface(bound, profile),
                           key=mechanism.correlation_key(event.raw), budget=budget)
         inv.attempted = attempted_of(event)
         return _sequence(inv, permitted_roles)

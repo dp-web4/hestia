@@ -603,17 +603,24 @@ def audit(matcher_text=None, bar_text=None, declared=DECLARED):
     # sovereign file the act text names, highest `bar_for` wins. F binds exactly that: the rule
     # takes the target, it is the one computation site at open AND at the replay fallback, and
     # replay RESTORES a recorded bar instead of repricing it (#812 review hold 2).
+    #
+    # EVERY RESOLVED TARGET (#1247 review): the rule's body moved to `price_targets(marker, act,
+    # resolved_target, also_resolved)`, which takes the max over `markers_of_targets` — the first
+    # target and every further one the gate resolved. `price` delegates to it, and the two
+    # computation sites call it with the row's / the ask's whole target set.
     del markers   # the adapter marker tuple no longer exists
     sov = re.search(r"pub const SOVEREIGN_FILES: &\[&str\] = &\[(.*?)\];", btext, re.S)
     sov_names = re.findall(r'"([^"]+)"', sov.group(1)) if sov else []
     prod = btext.split("\n#[cfg(test)]\nmod ", 1)[0]
     rule = re.search(r"pub fn price\(.*?\n\}", prod, re.S)
-    rule_body = rule.group(0) if rule else ""
+    rule_targets = re.search(r"pub fn price_targets\(.*?\n\}", prod, re.S)
+    rule_body = (rule.group(0) if rule else "") + (rule_targets.group(0) if rule_targets else "")
     # The two sites that must use it: `open` (the live price) and `rehydrate` (the fallback for a
     # row that recorded no bar). Each is matched by its own shape, so neither can stand in for
     # the other and the rule's own definition counts for neither.
-    sites = (bool(re.search(r"=\s*price\(\s*marker,\s*act,\s*resolved_target", prod))
-             + bool(re.search(r"=\s*price\(\s*&marker,", prod)))
+    sites = (bool(re.search(r"=\s*price_targets\(\s*marker,\s*act,\s*resolved_target\.as_deref\(\),"
+                            r"\s*&also_resolved\)", prod))
+             + bool(re.search(r"=\s*price_targets\(\s*&marker,", prod)))
     out.append("")
     out.append(f"sovereign list: {len(sov_names)} names; one pricing rule "
                f"({'present' if rule else 'MISSING'}), {sites} of 2 computation sites use it")
@@ -621,7 +628,8 @@ def audit(matcher_text=None, bar_text=None, declared=DECLARED):
         bad(f"the sovereign file list and `bar_for` disagree (list {sorted(sov_names)}, bar "
             f"{sorted(strong)}): a name priced two-factor by one is invisible to the other, so "
             f"a directory marker can shadow it again")
-    if ("markers_of(marker, act, resolved_target)" not in rule_body
+    if ("price_targets(marker, act, resolved_target" not in rule_body
+            or "markers_of_targets(marker, act, resolved_target, also_resolved)" not in rule_body
             or "bar_for_markers(&markers)" not in rule_body):
         bad("the pricing rule (`price`) no longer takes the max over EVERY marker the act "
             "reaches -- the closure marker, the resolved target AND the act text: a directory "
@@ -720,7 +728,8 @@ def selftest():
     was_exact = tuple(dict(r, via=EXACT) if r is sub_row else r for r in DECLARED)
     # The stage C / #812-recut bar fix, undone four ways (derived from the bar text, never spelled).
     open_site = re.search(
-        r"let \(bar, matched_markers\) = price\(marker, act, resolved_target\.as_deref\(\)\);", bt)
+        r"let \(bar, matched_markers\) =\s*price_targets\(marker, act, resolved_target\.as_deref\(\), "
+        r"&also_resolved\);", bt)
     sov_line = next(ln for ln in bt.splitlines(keepends=True)
                     if ln.strip() == f'"{exact_name}",')
     # A row to collide a key against, and a victim name to rename onto its key.
@@ -773,7 +782,8 @@ def selftest():
 
         # ...the rule stops taking the resolved target (#810 reverted)...
         ("the pricing rule drops the resolved target (#810 reverted)",
-         mt, bt.replace("markers_of(marker, act, resolved_target)", "markers_of(marker, act, None)", 1),
+         mt, bt.replace("markers_of_targets(marker, act, resolved_target, also_resolved)",
+                        "markers_of_targets(marker, act, None, also_resolved)", 1),
          DECLARED, "no longer takes the max over EVERY marker"),
 
         # ...replay reprices history instead of restoring the recorded bar (hold 2 reverted)...

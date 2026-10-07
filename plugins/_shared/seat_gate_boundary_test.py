@@ -252,7 +252,7 @@ def native(seat, tool, ti, n=1):
             "tool_input": ti, "tool_use_id": f"toolu_sb{n}"}
 
 
-def run(seat, home, event, *, declare=True, stdin=None, cwd=None):
+def run(seat, home, event, *, declare=True, stdin=None, cwd=None, shim_path=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith("HESTIA_")}
     env.update({"HOME": home, "HESTIA_HOME": home, "PYTHONDONTWRITEBYTECODE": "1"})
     env.pop("PYTHONPATH", None)
@@ -261,7 +261,7 @@ def run(seat, home, event, *, declare=True, stdin=None, cwd=None):
     # Launched in the fixture's repo, as a harness launched in a task repo is: the launch-cwd
     # grant (the core's launch_cwd_repo) is what puts that repo in scope.
     cwd = cwd or os.path.join(os.path.dirname(home), "ws", "hestia")
-    p = subprocess.run([sys.executable, shim(seat)], input=stdin if stdin is not None else json.dumps(event),
+    p = subprocess.run([sys.executable, shim_path or shim(seat)], input=stdin if stdin is not None else json.dumps(event),
                        capture_output=True, text=True, timeout=60, env=env, cwd=cwd)
     try:
         payload = json.loads(p.stdout.strip() or "null")
@@ -447,6 +447,116 @@ def test_installed_entry_claim_carries_the_resolved_location():
     _each_seat(arm)
 
 
+# ── the EXECUTED surface: a gate registered where no declaration names it ───────────────────
+#: (registration file under the fixture HOME, the gate's event, the witness's event)
+LEGACY_REG = {"claude-code": ((".claude", "settings.json"), "PreToolUse", "PostToolUse", 20),
+              "gemini": ((".gemini", "settings.json"), "BeforeTool", "AfterTool", 20000)}  # ms
+REGISTERED_ENTRY_MARKER = "registered-gate-entry"
+
+
+def _legacy_install(seat, home, foreign=(), extra_sources=()):
+    """The seat's real shim installed in a LEGACY members dir no declaration names, and the
+    harness registration pointing its gate and witness there (plus any foreign hooks)."""
+    member = SEATS[seat]["member"]
+    legacy = os.path.join(home, ".hestia", "members", member)
+    os.makedirs(legacy, exist_ok=True)
+    entry = os.path.join(legacy, SEATS[seat]["hook"][1])
+    shutil.copyfile(shim(seat), entry)
+    wit = os.path.join(legacy, "wit" + "ness.py")
+    with open(wit, "w", encoding="utf-8") as fh:
+        fh.write("# witness\n")
+    rel, pre, post, timeout = LEGACY_REG[seat]
+    doc = {"hooks": {
+        pre: [{"matcher": "*", "hooks": [{"type": "command", "command": f"python3 {c}", "timeout": timeout}
+                                         for c in (entry, *foreign)]}],
+        post: [{"matcher": "*", "hooks": [{"type": "command", "command": f"python3 {wit}", "timeout": timeout}]}]}}
+    reg = os.path.join(home, *rel)
+    os.makedirs(os.path.dirname(reg), exist_ok=True)
+    with open(reg, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+    for src, text in extra_sources:
+        with open(os.path.join(home, *src), "w", encoding="utf-8") as fh:
+            fh.write(text)
+    return os.path.realpath(legacy), os.path.realpath(entry), os.path.realpath(wit)
+
+
+def test_a_gate_registered_outside_every_declaration_is_refused():
+    """A seat whose registration runs hestia's gate and witness from a legacy dir: a write to
+    the gate, the witness, or a new file beside them is refused as gate.self_access before the
+    daemon is asked, and a write to the gate entry escalates under the registered-entry marker
+    (priced like a declared entry). RED on the declared closure alone."""
+    def arm(seat, fx):
+        if seat not in LEGACY_REG:
+            return
+        stub = Stub()
+        try:
+            home = fx.home(seat, stub.url)
+            legacy, entry, wit = _legacy_install(seat, home)
+            n = 70
+            for label, target in (("entry", entry), ("witness", wit),
+                                  ("beside", os.path.join(legacy, "dropped.py"))):
+                for tool, ti in (("Write", {"file_path": target, "content": "x"}),
+                                 ("Bash", {"command": f"echo x > {target}"})):
+                    n += 1
+                    mark = len(stub.calls)
+                    v, text, _ = run(seat, home, native(seat, tool, ti, n=n), shim_path=entry)
+                    check(f"{seat}-{label}-{tool}-refused", v == "deny" and "gate.self_access" in text, text)
+                    calls = stub.calls[mark:]
+                    check(f"{seat}-{label}-{tool}-pre-daemon",
+                          "hestia_begin_action" not in [c for c, _ in calls], calls)
+                    claims = [a for c, a in calls if c == "hestia_gate_escalation_claim"]
+                    if label == "entry":
+                        check(f"{seat}-entry-{tool}-marker",
+                              claims and claims[0].get("marker") == REGISTERED_ENTRY_MARKER, claims)
+        finally:
+            stub.close()
+    _each_seat(arm)
+
+
+def test_a_foreign_hook_in_the_same_registration_stays_ordinary():
+    """Another plugin's hook registered in the same file — even under the gate's basename — is
+    not hestia's: writing it is ordinary work, asked of the daemon, never a closure claim."""
+    def arm(seat, fx):
+        if seat not in LEGACY_REG:
+            return
+        stub = Stub()
+        try:
+            home = fx.home(seat, stub.url)
+            foreign = os.path.join(fx.repo, "vendor", "hardbound", "bin", SEATS[seat]["hook"][1])
+            os.makedirs(os.path.dirname(foreign), exist_ok=True)
+            with open(foreign, "w", encoding="utf-8") as fh:
+                fh.write("# another plugin's hook\n")
+            _legacy, entry, _wit = _legacy_install(seat, home, foreign=(foreign,))
+            v, text, _ = run(seat, home, native(seat, "Write", {"file_path": foreign, "content": "x"}, n=80),
+                             shim_path=entry)
+            check(f"{seat}-foreign-allowed", v == "allow", text)
+            check(f"{seat}-foreign-no-claim", "hestia_gate_escalation_claim" not in stub.names(), stub.names())
+        finally:
+            stub.close()
+    _each_seat(arm)
+
+
+def test_an_unreadable_registration_source_fails_closed():
+    """A second registration source that exists but cannot be parsed: the gate still governs its
+    own realpath and directory (the minimum, never fewer)."""
+    def arm(seat, fx):
+        if seat != "claude-code":
+            return
+        stub = Stub()
+        try:
+            home = fx.home(seat, stub.url)
+            legacy, entry, _wit = _legacy_install(
+                seat, home, extra_sources=(((".claude", "settings.local.json"), "{ not json"),))
+            for n, target in enumerate((entry, os.path.join(legacy, "dropped.py")), start=85):
+                v, text, _ = run(seat, home, native(seat, "Write", {"file_path": target, "content": "x"}, n=n),
+                                 shim_path=entry)
+                check(f"{seat}-unreadable-{os.path.basename(target)}-refused",
+                      v == "deny" and "gate.self_access" in text, text)
+        finally:
+            stub.close()
+    _each_seat(arm)
+
+
 def test_approved_gate_write_proceeds_to_ordinary_law():
     def arm(seat, fx):
         stub = Stub(claim={"claimed": True, "permits_write": True, "decided_by": "test-operator",
@@ -618,6 +728,9 @@ ALL = [
     test_every_declared_member_is_exercised_here,
     test_installed_gate_entry_witness_and_registration_refused,
     test_installed_entry_claim_carries_the_resolved_location,
+    test_a_gate_registered_outside_every_declaration_is_refused,
+    test_a_foreign_hook_in_the_same_registration_stays_ordinary,
+    test_an_unreadable_registration_source_fails_closed,
     test_approved_gate_write_proceeds_to_ordinary_law,
     test_distinctive_names_govern_anywhere_hooks_only_names_do_not,
     test_ordinary_write_is_asked_allowed_and_recorded,

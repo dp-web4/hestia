@@ -131,6 +131,8 @@ __all__ = [
     "default_closure",
     "attest_shims",
     "resolve_location",
+    "declared_dest",
+    "registered_closure",
 ]
 
 # ── Rule ids (returned to the shim; the shim's refusal/witness names the RULE and the ACT) ──
@@ -370,15 +372,18 @@ def _home_relative(path: str) -> tuple:
 
 def _install_declaration(install: Any) -> Optional[dict]:
     """The governance-relevant part of one expects.json `install` block, normalised:
-    {"dest": str, "entry": str, "registration": [segments]}. None when unusable."""
+    {"member": str, "dest": str, "entry": str, "registration": [segments]}. None when unusable."""
     if not isinstance(install, dict):
         return None
+    member = install.get("member")
     dest = install.get("dest")
     probe = install.get("gate_probe")
     entry = probe.get("entry") if isinstance(probe, dict) else None
     reg = install.get("registration")
     reg_path = reg.get("path") if isinstance(reg, dict) else None
     out: dict = {}
+    if isinstance(member, str) and member:
+        out["member"] = member
     if isinstance(dest, str) and dest:
         out["dest"] = dest
     if isinstance(entry, str) and entry:
@@ -429,15 +434,43 @@ def _closure_from_declaration(decl: Optional[dict]) -> Optional[Closure]:
 # manifests beside it). Generated from plugins/*/expects.json by _install_declaration and
 # pinned equal to them by member_install_surface_test.py — edit the manifest, then this.
 MEMBER_INSTALL_DECLARATIONS = {
-    "claude-code": {"dest": "~/.claude/hooks/hestia", "entry": "hooks/pre_tool_use.py",
-                    "registration": [".claude", "settings.json"]},
-    "codex": {"dest": "~/.codex/hooks", "entry": "hooks/pre_tool_use.py",
+    "claude-code": {"member": "claude-code", "dest": "~/.claude/hooks/hestia",
+                    "entry": "hooks/pre_tool_use.py", "registration": [".claude", "settings.json"]},
+    "codex": {"member": "codex", "dest": "~/.codex/hooks", "entry": "hooks/pre_tool_use.py",
               "registration": [".codex", "config.toml"]},
-    "gemini": {"dest": "~/.gemini/hestia-plugins/gemini/hooks", "entry": "hooks/before_tool.py",
-               "registration": [".gemini", "settings.json"]},
-    "kimi": {"dest": "~/.kimi-code/hooks", "entry": "hooks/pre_tool_use.py",
+    "gemini": {"member": "gemini", "dest": "~/.gemini/hestia-plugins/gemini/hooks",
+               "entry": "hooks/before_tool.py", "registration": [".gemini", "settings.json"]},
+    "kimi": {"member": "kimi-code", "dest": "~/.kimi-code/hooks", "entry": "hooks/pre_tool_use.py",
              "registration": [".kimi-code", "config.toml"]},
 }
+
+
+def declared_dest(member_id: str, home: Optional[str]) -> Optional[str]:
+    """Where this member's install declaration puts its hooks, home-expanded against `home` —
+    the caller's seat home, passed explicitly (no default: a home-relative dest with no home
+    names nowhere). None for a member with no declaration, or a home-relative dest without one."""
+    for decl in MEMBER_INSTALL_DECLARATIONS.values():
+        if decl.get("member") == member_id and isinstance(decl.get("dest"), str):
+            dest = decl["dest"]
+            if dest.startswith("~/"):
+                return os.path.join(home, dest[2:]) if home else None
+            return dest
+    return None
+
+
+def registered_closure(own_dirs: Iterable[str] = (), targets: Iterable[str] = ()) -> Closure:
+    """The EXECUTED governance surface of one seat, as absolute locations: the directories its
+    hestia-owned hooks run from (dir markers) and every hestia-owned hook its harness
+    registration actually points at (exact paths). Built at gate runtime from what the
+    harness REGISTERS (the caller reads the registration), unioned onto the declared closure
+    — a seat whose registration points somewhere no declaration names is governed there too.
+    Paths are realpath'd by the caller; a path of fewer than three segments is ignored rather
+    than widened (`/home/x` would govern a whole home)."""
+    dirs = tuple(seg for seg in (_segments(d) for d in own_dirs if isinstance(d, str))
+                 if len(seg) >= 3)
+    files = tuple(seg for seg in (_segments(t) for t in targets if isinstance(t, str))
+                  if len(seg) >= 3)
+    return Closure(dir_markers=dirs, exact_paths=files, source="registered")
 
 
 def _failsafe_closure() -> Closure:

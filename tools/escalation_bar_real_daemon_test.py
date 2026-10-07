@@ -69,12 +69,12 @@ def read_escalation(url, esc_id):
 ESC_ID = re.compile(r"Escalation ([0-9a-f]{8,}) is open")
 
 
-def open_and_read(seat, home, event, label):
+def open_and_read(seat, home, event, label, shim_path=None):
     # A cold daemon (a debug build's first claims) can miss the gate's claim deadline: the gate
     # then says OUTCOME UNKNOWN and that re-issuing the identical act is safe (it returns the
     # same escalation). Re-issue, bounded; the refusal itself never depends on it.
     for _attempt in range(3):
-        v, text, _ = sb.run(seat, home, event)
+        v, text, _ = sb.run(seat, home, event, shim_path=shim_path)
         if "OUTCOME UNKNOWN" not in text:
             break
     check(f"{seat}-{label}-refused", v == "deny" and "gate.self_access" in text, text)
@@ -127,7 +127,25 @@ def test_a_same_named_file_outside_every_location_records_one_approver():
         fx.close()
 
 
+def test_a_gate_registered_outside_every_declaration_records_two_factors():
+    """A seat whose harness registration runs hestia's gate from a legacy dir no declaration
+    names: a write to that gate is refused and the daemon RECORDS sovereign_plus_peer, under the
+    registered-entry marker — priced like a declared entry, from what the seat actually runs."""
+    for seat in ("claude-code", "gemini"):
+        fx = sb.Fixture()
+        try:
+            home = fx.home(seat, ENDPOINT)
+            _legacy, entry, _wit = sb._legacy_install(seat, home)
+            rec = open_and_read(seat, home, sb.native(seat, "Write", {"file_path": entry, "content": "x"},
+                                                      n=95), "registered-entry", shim_path=entry)
+            check(f"{seat}-registered-entry-bar", rec.get("bar") == "sovereign_plus_peer", rec)
+            check(f"{seat}-registered-entry-marker", rec.get("marker") == sb.REGISTERED_ENTRY_MARKER, rec)
+        finally:
+            fx.close()
+
+
 ALL = [
+    test_a_gate_registered_outside_every_declaration_records_two_factors,
     test_every_seat_records_two_factors_for_its_own_entry_whatever_the_spelling,
     test_a_same_named_file_outside_every_location_records_one_approver,
 ]
