@@ -13,7 +13,46 @@ wording said "not applied". That was true of the installed gate, not of this tre
 applies only to its base `1d82846` (below). The patch is what landing #1247 changes relative to that
 base.
 
-## Current delta, superseding `fc95be2e…`: `29ae13a6…` (answers Codex 18830)
+## Current delta, superseding `29ae13a6…`: `01cf91e4…` (answers Codex 18931)
+
+| file | sha256 |
+|---|---|
+| `01cf91e4a6d68f30c545133557ffc436b78e0d7731f02fd0a21c35f1f98f5bc8.patch` | `01cf91e4a6d68f30c545133557ffc436b78e0d7731f02fd0a21c35f1f98f5bc8` |
+
+Same base (`18f91db`), same 8 files. It is `29ae13a6…` plus two widenings of `_glob_over_regex`:
+
+- **Escaped wildcard (Codex 18931, P2).** The backslash branch did not consume the character it
+  escaped. So the `[` in `x\[ab]y*` opened a bracket, and `[ab]` shrank to one character, which
+  missed the `x[ab]yes` that Bash expands it onto. Now a backslash before an ordinary character
+  consumes it, as `\\?` plus that literal. A backslash before `*`, `?` or `[` makes the rest of the
+  pattern `.*`. I chose the fallback over a literal reading on purpose. Whether the backslash still
+  escapes depends on quoting the producer may already have stripped, and the safe answer to an
+  uncertain reading is the wider one.
+- **Bracket holding a `[` (found by the widened corpus, not in the review).** Bash 5.2.21 reads
+  `[[=b=]]*` both ways. It expands onto `bx`, and also onto `[b]x` and `[=]x`, where the first `[`
+  is a literal and `[=b=]` is the bracket. `[[:alpha:]]` and `[[.a.]]` did not fork in my probe,
+  but the rule is general: any bracket whose body contains `[` falls back to `.*`. Over-match only.
+- **Tests.** The differential corpus gains literal-bracket and literal-wildcard names (`x[ab]yes`,
+  `x[ab]efore_tool.py`, `[b]efore_tool.py`, `*efore_tool.py`, `?efore_tool.py`, `[=]efore_tool.py`,
+  `[:]efore_tool.py`). It also gains 16 patterns: Codex's two, other escapes (`\[b]*`, `\**`,
+  `\?efore*`, `b\efore_*`, `x\[a*`, `*\]*` …) and nested brackets (`[[=b=]]*`, `[![:alpha:]]*`, `[[]*` …).
+  The producer loop gains `b\efore_*`, `\before_tool.py` and `before\_tool.py`. All three mark, so
+  the shell parse plus target normalization does not lose an escaped entry. The new tests run
+  **red against `29ae13a6`'s gate** (first miss: `[[=b=]]efore_tool.py` → `[=]efore_tool.py`) and
+  **green with the fix (9/9)**. Codex's two counterexamples now match.
+- Built and verified in memory by `docs/reviews/notice-18931-build.py`, which writes no governed path.
+  The patch reconstructs over `18f91db` to the tested bytes: gate `e34f7aea…`, test `3d3333b6…`.
+  The GT copy with its header stripped equals the source. The engine's canonical digest is
+  `ac14f90d81761433559ea83aefc6f9f5a31ca9410dddac60b17586dfde5e61e3`.
+- Still **not run**: `tools/escalation_bar_real_daemon_test.py`, for the same reason as below.
+  It needs the patched gate in the tree.
+
+Landing act, in this worktree: `git checkout -- plugins/_shared && git apply held/01cf91e4….patch`
+(with the full name). **Note:** this worktree's uncommitted `plugins/_shared` diff is the older
+`fc95be2e` content (the heredoc bypass recorded below), not any held patch. Codex 18931 excluded it
+for that reason, and the `checkout` in the landing act discards it.
+
+## Superseded: `29ae13a6…` (answered Codex 18830)
 
 | file | sha256 |
 |---|---|
