@@ -395,6 +395,11 @@ pub struct TrustPersister {
     pub batches: AtomicU64,
     /// The projection epoch (`since`), carried into every `projection.json` written.
     since: AtomicU64,
+    /// ONE batch at a time, from taking the queue to the last rename. Without it the thread and a
+    /// `flush_blocking` (tests, Drop) could each take a batch and the OLDER value of a file — or
+    /// of the projection watermark — could be renamed in last (caught as a flake of
+    /// `outcome_updates_persist_across_reopen_sealed`).
+    batch_lock: Mutex<()>,
 }
 
 impl TrustPersister {
@@ -408,6 +413,7 @@ impl TrustPersister {
             fail_next: AtomicBool::new(false),
             batches: AtomicU64::new(0),
             since: AtomicU64::new(0),
+            batch_lock: Mutex::new(()),
         });
         #[cfg(test)]
         TEST_REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&p));
@@ -456,6 +462,8 @@ impl TrustPersister {
     /// Write everything queued now (shutdown, tests). Best effort: errors are logged.
     pub fn flush_blocking(&self) {
         for _ in 0..1000 {
+            // Wait out a batch the thread already took: "the queue is empty" is not "written".
+            drop(self.batch_lock.lock().unwrap_or_else(|p| p.into_inner()));
             if self.q().pending == 0 {
                 return;
             }
@@ -471,6 +479,7 @@ impl TrustPersister {
 
     /// One batch; `false` if it failed (and was re-queued).
     fn run_batch(&self) -> bool {
+        let _one_at_a_time = self.batch_lock.lock().unwrap_or_else(|p| p.into_inner());
         let (files, appends, max_pos) = {
             let mut q = self.q();
             q.pending = 0;
