@@ -24,7 +24,10 @@ neutralized. Consequences, stated so the table is read honestly:
     `cd X && rm -rf out`) measure `allow` on every seat here and flag as
     expected-mismatches. That is a stub limitation, not four gate bugs.
   * `degraded` marks a fail-closed-NO-VERDICT cell (config.unbacked, no-shared-authority,
-    [fail-closed], [degraded], a crash, a timeout). The stub is built so these are rare;
+    [fail-closed], [degraded], a crash, a timeout, one of the gate's no-verdict rules —
+    gate.harness_timeout_unknown "was not judged", gate.internal_error,
+    gate.evidence_uncommitted, invocation.superseded, society.unreachable — or a seat that
+    never contacted the stub daemon at all). The stub is built so these are rare;
     a whole degraded seat means the harness is broken, not the seat.
 
 Scope layout: HESTIA_WORKSPACE is the repo's PARENT (the fleet layout the launch-cwd grant
@@ -48,6 +51,12 @@ not runner noise.
 
 Run:  python3 tools/gate_parity_runner.py            # full 25x4 matrix, writes the report
       python3 tools/gate_parity_runner.py --seat kimi --act secret-cat-id_rsa
+
+Verdicts depend on WHERE this checkout sits: WORKSPACE is the repo's PARENT, so a checkout
+placed straight in /tmp puts {SCRATCH} inside the workspace and the digest rows measure
+deny:scope instead of the baseline's allow. And a PIN row's `pin-ok` asserts cross-seat
+AGREEMENT only — never that the agreed value equals the 10-01 baseline; naming the baseline
+value is the reporter's claim to make from the table, not something the runner checks.
 """
 from __future__ import annotations
 
@@ -74,6 +83,11 @@ from gate_parity_corpus import CORPUS  # noqa: E402
 # ($HESTIA_HOME/seats/<plugin>.env) so projection-consuming shims get the real shape.
 sys.path.insert(0, str(REPO / "plugins" / "claude-code" / "tests"))
 import projection_fixture  # noqa: E402
+
+# The stub's witness-receipt event types come from the mechanism's own map (imported, not
+# copied), so the stub tracks the map the recorder validates against instead of drifting.
+sys.path.insert(0, str(REPO / "plugins" / "_shared"))
+from hestia_gate_mechanism import DECISION_EVENT_TYPES  # noqa: E402
 
 WORKSPACE = str(REPO.parent)          # the fleet workspace: the launch-cwd grant names REPO's dir
 SHARED_DIR = str(REPO / "plugins" / "_shared")
@@ -168,13 +182,11 @@ class StubDaemon:
             # C11: the recorder accepts only a receipt that NAMES the decision it was sent,
             # the event type that decision maps to, and the action/correlation join keys.
             # The real daemon's row carries all four; the stub derives them the way the
-            # daemon does (event map: hestia_gate_mechanism.DECISION_EVENT_TYPES).
-            event_type = {"allow": "policy_allow"}.get(arguments.get("decision"),
-                                                       "policy_decision")
+            # daemon does — from the mechanism's own DECISION_EVENT_TYPES (imported above),
+            # whose get() yields None for a non-verdict decision, as the old inline map did.
             return {"ok": True, "witnessEntryHash": digest, "id": f"stub-wit-{digest[:12]}",
                     "decision": arguments.get("decision"),
-                    "eventType": event_type if arguments.get("decision") in
-                    ("allow", "warn", "deny") else None,
+                    "eventType": DECISION_EVENT_TYPES.get(arguments.get("decision")),
                     "actionId": arguments.get("action_id"),
                     "correlationKey": arguments.get("correlation_key")}
         return {"ok": True, "stub": True, "hash": digest}
@@ -315,7 +327,11 @@ _FAMILY_RULES = [
 _DEGRADED_RE = re.compile(
     r"\[fail-closed\]|no verdict|\[degraded\]|config\.unbacked|config\.miswired|"
     r"no-shared-authority|gate-internal-error|gate\.core_unavailable|gate\.degraded|"
-    r"could not parse the tool event|the gate crashed|gate-core-unavailable")
+    r"could not parse the tool event|the gate crashed|gate-core-unavailable|"
+    # The one gate's no-verdict rules (hestia_single_gate.py, verdict_available=False):
+    # a cell the gate never judged is infra, whatever the wording around it.
+    r"gate\.harness_timeout_unknown|was not judged|gate\.internal_error|"
+    r"gate\.evidence_uncommitted|invocation\.superseded|society\.unreachable")
 _WARN_RE = re.compile(r"hestia: warn|would-deny \(audit-only\)")
 _RULE_ID_RE = re.compile(
     r"governance-closure-[a-z-]+|gate-self-access|gate\.self_access|egress\.secret|"
@@ -528,10 +544,12 @@ def run_matrix(seats: list[str], acts: list, timeout: float) -> dict:
         scratch = build_scratch(root)
         with StubDaemon() as stub:
             endpoint = stub.url
+            no_contact: list[str] = []
             for seat in seats:
                 home = build_seat_home(root / "homes", seat, endpoint)
                 env = seat_env(seat, home, endpoint, timeout)
                 shim = REPO / SEAT_SHIM[seat]
+                served_before = len(stub.requests)
                 for act in acts:
                     act_id, act_class, tool, tool_input, expected, note = act
                     mapping = {"{REPO}": str(REPO), "{SCRATCH}": str(scratch),
@@ -547,7 +565,21 @@ def run_matrix(seats: list[str], acts: list, timeout: float) -> dict:
                         "note": cell.note, "rc": result.rc, "timed_out": result.timed_out,
                         "event": event, "stdout": result.stdout, "stderr": result.stderr,
                     }
+                if len(stub.requests) == served_before:
+                    # A post-cutover seat that NEVER contacts the daemon is a broken harness,
+                    # not a measurement: its shims failed closed before the wire. Mark every
+                    # cell degraded so wording drift past _DEGRADED_RE can never read a dead
+                    # harness as a verdict (or a PIN row as pin-ok).
+                    no_contact.append(seat)
+                    for act in acts:
+                        entry = report["cells"][f"{act[0]}|{seat}"]
+                        entry["degraded"] = True
+                        entry["note"] = ((entry["note"] + "; ") if entry["note"] else "") + \
+                            "seat never contacted the stub daemon"
+                        if entry["verdict"] == "deny" and entry["family"] in ("unknown", "none"):
+                            entry["family"] = "degraded"
             report["stub_requests"] = stub.summary()
+            report["seats_without_daemon_contact"] = no_contact
     for act in acts:
         act_id, act_class, tool, _ti, expected, note = act
         row = {"id": act_id, "class": act_class, "tool": tool, "expected": expected,
@@ -588,6 +620,10 @@ def print_report(report: dict) -> None:
     print(f"gate parity — {len(report['rows'])} acts x {len(seats)} seats "
           f"(stub daemon: {sum(report['stub_requests'].values())} requests served)")
     print(f"repo: {report['repo']}   workspace: {report['workspace']}")
+    no_contact = report.get("seats_without_daemon_contact") or []
+    if no_contact:
+        print(f"!! BROKEN HARNESS: {', '.join(no_contact)} never contacted the stub daemon "
+              f"— those cells are fail-closed infra, not verdicts")
     print()
     header = "act".ljust(30) + "".join(s.ljust(width) for s in seats) + "flags"
     print(header)
