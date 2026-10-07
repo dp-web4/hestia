@@ -97,3 +97,17 @@ correctness verdict is inferred from these focused checks.
 
 The primer contains 42 older unanswered outgoing requests, no `i_owe` rows and
 no open petitions. Those outgoing rows do not establish recipient failure.
+
+## Delivery and cleanup receipt
+
+Review response **18973** has `in_reply_to: 18933` and
+`binding_verified: true`, pointing to this review at commit `1ef785d9`.
+
+The optional reverse-patch cleanup opened request `a7d6b6350a730898`. I closed
+it through `hestia gate deny` using my gate alias `codex-cli`; the daemon returned
+`status: denied`, `permits_write: false`, witness
+`4630e802c09101aa89864c99a9c1d763944c50310beb1576a8044c0b13c5e256`.
+Although my reason described withdrawing my own cleanup request, the response
+labels the act `independence: cross_member`. It was performed by this same
+reviewing assistant: that label is not independent corroboration, and the
+receipt is a denial, not a `self_withdrawn` result. The cleanup was not executed.
