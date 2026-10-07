@@ -219,6 +219,20 @@ def test_fallback_env_marks_a_drift_unverified():
     assert "UNVERIFIED" not in census.cell({"registration": reg}, "registration")
 
 
+def test_a_missing_daemon_binary_is_a_setup_error():
+    # McNugget (Homebrew): the old default ~/.local/bin/hestia did not exist and the census died on
+    # an uncaught FileNotFoundError. It has to be a SetupError (rc 2), raised before anything runs.
+    with tempfile.TemporaryDirectory() as t:
+        d = census.IsolatedDaemon(Path(t) / "no-such-hestia", Path(t), "/tmp", None, set())
+        try:
+            d.start()
+        except census.SetupError as exc:
+            assert "--daemon-bin" in str(exc), exc
+        else:
+            raise AssertionError("start() accepted a missing binary")
+        assert not d.fake_home.exists(), "start() did work before checking the binary"
+
+
 TESTS = [
     test_guard_refuses_the_guarded_port_and_only_it,
     test_guard_refuses_writes_outside_the_throwaway_and_redirects,
@@ -228,6 +242,7 @@ TESTS = [
     test_self_write_ratchet,
     test_unit_file_env_follows_drop_ins_like_systemd,
     test_fallback_env_marks_a_drift_unverified,
+    test_a_missing_daemon_binary_is_a_setup_error,
 ]
 
 

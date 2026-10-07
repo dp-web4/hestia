@@ -497,6 +497,8 @@ class IsolatedDaemon:
     def start(self) -> None:
         if self.port in self.live_ports:
             raise SetupError("refusing to bind a live daemon port")
+        if not (self.binary.is_file() and os.access(self.binary, os.X_OK)):
+            raise SetupError(f"daemon binary not found or not executable: {self.binary} (pass --daemon-bin)")
         self.fake_home.mkdir(parents=True, exist_ok=True)
         env = self.env()
         self.version = subprocess.run([str(self.binary), "--version"], capture_output=True, text=True,
@@ -1291,12 +1293,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--hestia-home", default=os.environ.get("HESTIA_HOME") or "~/.hestia")
     p.add_argument("--home", default="~")
     p.add_argument("--workspace", default=None, help="override the deploy unit's HESTIA_WORKSPACE")
-    p.add_argument("--daemon-bin", default="~/.local/bin/hestia", help="the host's installed daemon binary")
+    p.add_argument("--daemon-bin", default=None,
+                   help="the host's installed daemon binary (default: ~/.local/bin/hestia, else `hestia` on "
+                        "PATH — Homebrew installs to /opt/homebrew/bin)")
     p.add_argument("--member", action="append", help="only this plugin directory (repeatable)")
     p.add_argument("--in-use-days", type=float, default=30.0)
     p.add_argument("--json", dest="json_path", default=None)
     p.add_argument("--keep", action="store_true", help="keep the throwaway dir")
     args = p.parse_args(argv)
+    if args.daemon_bin is None:
+        local = Path("~/.local/bin/hestia").expanduser()
+        args.daemon_bin = str(local) if local.is_file() else (shutil.which("hestia") or str(local))
     census = Census(args)
     try:
         rc = census.run()
