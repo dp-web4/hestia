@@ -1214,6 +1214,23 @@ def test_canonical_or_miswired(m, g, wc, home):
             b = g.harness_bound(harness(abs15, glued), str(shim), t0, env=env)
             check(f"p1-glued-{label}-is-miswired", miswired(b), b)
 
+        # #1262 re-review P1 round 2 (codex, notice 18529): the shell's OWN quote and backslash
+        # removal makes these spellings this same file — each is EXECUTED below — so relevance
+        # must read the shell-normalized token as well as the raw text; beside the exact 15s
+        # registration each of these real 5s registrations is MISWIRED evidence, never a drop.
+        for label, spelling in (("quoted-fragment", "python3 ./gate_'hook'.py"),
+                                ("double-quoted-fragment", 'python3 ./gate_"hook".py'),
+                                ("escaped-character", "python3 ./gate_\\hook.py"),
+                                ("quoted-fragment-semicolon", "python3 ./gate_'hook'.py;")):
+            ran = subprocess.run(["sh", "-c", spelling], cwd=str(real_hook.parent),
+                                 capture_output=True, text=True, timeout=30)
+            check(f"p1-shell-actually-runs-{label}",
+                  ran.returncode == 0 and "gate-hook-ran" in ran.stdout, ran)
+            quoted = entry(h / f"quoted-{label}.toml", 5,
+                           command=spelling.replace("\\", "\\\\").replace('"', '\\"'))
+            b = g.harness_bound(harness(abs15, quoted), str(shim), t0, env=env)
+            check(f"p1-quoted-{label}-is-miswired", miswired(b), b)
+
         # No parser for a config that names the hook: MISWIRED. One that does not: drops.
         orig_loader = g._load_config
         try:
@@ -1262,6 +1279,45 @@ def test_json_duplicate_keys_are_miswired(m, g, wc, home):
               obj("python3 /x/other.py", '"timeout": 5, "timeout": 20'))
         b = g.harness_bound(harness, str(shim), t0, env=env)
         check("json-duplicate-in-another-hooks-object-drops", b.timeout_seconds == 10.0, b)
+
+        # #1262 re-review P2 round 2 (codex, notice 18529): AGREEING duplicates on the keys that
+        # ENCLOSE the registration are ambiguous wiring too — the entry-local mark alone misses
+        # them, and a clean 15s bound beside identical copies breaches the duplicate rule.
+        clean15 = obj(f"python3 {shim}", '"timeout": 15')
+        group15 = '{"matcher": "Bash", "hooks": [' + clean15 + ']}'
+        event15 = '"PreToolUse": [' + group15 + ']'
+        cfg.write_text('{"hooks": {' + event15 + '}, "hooks": {' + event15 + '}}')
+        b = g.harness_bound(harness, str(shim), t0, env=env)
+        check("json-agreeing-duplicate-top-hooks-is-miswired",
+              b.deadline is None and "MISWIRED" in b.why and "repeats key" in b.why, b)
+        cfg.write_text('{"hooks": {' + event15 + ', ' + event15 + '}}')
+        b = g.harness_bound(harness, str(shim), t0, env=env)
+        check("json-agreeing-duplicate-event-is-miswired",
+              b.deadline is None and "MISWIRED" in b.why and "repeats key" in b.why, b)
+        cfg.write_text('{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [' + clean15
+                       + '], "hooks": [' + clean15 + ']}]}}')
+        b = g.harness_bound(harness, str(shim), t0, env=env)
+        check("json-agreeing-duplicate-group-hooks-is-miswired",
+              b.deadline is None and "MISWIRED" in b.why and "repeats key" in b.why, b)
+
+        # R2 (claude-code, notice 18530): DISAGREEING duplicates at an enclosing level resolve
+        # last-wins, exactly as the harness's own parser resolves them — the surviving
+        # registration is the one the harness enforces, so it binds.
+        group5 = '{"matcher": "Bash", "hooks": [' + obj(f"python3 {shim}", '"timeout": 5') + ']}'
+        cfg.write_text('{"hooks": {"PreToolUse": [' + group5 + '], "PreToolUse": [' + group15
+                       + ']}}')
+        b = g.harness_bound(harness, str(shim), t0, env=env)
+        check("json-disagreeing-ancestor-binds-last-wins", b.timeout_seconds == 15.0, b)
+
+        # #1262 re-review B1 (claude-code, notice 18530): a duplicate mark is attributed by
+        # object IDENTITY, never by a bare id() — the first group's overwritten note object is
+        # freed, and its recycled id must not hang a stranger's repeated 'k' on the second
+        # group's clean registration.
+        cfg.write_text('{"hooks": {"PreToolUse": ['
+                       '{"matcher": "Bash", "hooks": [], "note": {"k": 1, "k": 2}, "note": 0}, '
+                       '{"matcher": "Bash", "hooks": [' + clean15 + ']}]}}')
+        b = g.harness_bound(harness, str(shim), t0, env=env)
+        check("json-overwritten-objects-id-reuse-still-binds", b.timeout_seconds == 15.0, b)
 
         # Regression guard: a clean single-key registration still binds.
         write(obj(f"python3 {shim}", '"timeout": 10'))
