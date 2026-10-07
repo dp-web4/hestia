@@ -83,24 +83,43 @@ impl<T: std::fmt::Debug> std::fmt::Debug for Watched<T> {
 
 // ----------------------------------------------------------------------- engine view
 
-/// What the published law needs of a policy engine: its config and content hash. (The engine
-/// itself carries rate-limit state and is not `Clone`.)
-#[derive(Clone)]
-pub struct EngineView {
-    config: crate::policy::PolicyConfig,
-    content_hash: String,
-}
+/// The published engines are clones of the daemon's own: `PolicyEngine` clones share their
+/// rate-limit state, so evaluating against the publication counts against the same limits.
+pub type EngineView = crate::policy::PolicyEngine;
 
-impl EngineView {
-    pub fn of(e: &crate::policy::PolicyEngine) -> Self {
-        Self { config: e.config().clone(), content_hash: e.content_hash().to_string() }
+/// THE LAW FOLD, in one place for both the lock holders and the publication: the society base,
+/// then the session role's overlay and the (instance, role) overlay folded strictest-wins; then a
+/// live operator grant, which SUBSTITUTES its preset for the local layers (the one input allowed
+/// to loosen, applied outside the fold); then ratified hub law, folded strictest-wins over all of
+/// it so no local grant can reach past an amendment-only baseline.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_folded(
+    society: &EngineView,
+    roles: &HashMap<String, EngineView>,
+    instances: &HashMap<(String, String), EngineView>,
+    grants: &HashMap<(String, String), InstanceGrant>,
+    law_gate: Option<&crate::policy::LawGate>,
+    plugin_id: &str,
+    role: &str,
+    pa: &crate::policy::PolicyAction,
+) -> crate::policy::PolicyEvaluation {
+    let mut evaluation = society.evaluate(pa);
+    if let Some(e) = roles.get(role) {
+        evaluation = crate::policy::fold_strictest(evaluation, e.evaluate(pa));
     }
-    pub fn config(&self) -> &crate::policy::PolicyConfig {
-        &self.config
+    if let Some(e) = instances.get(&(plugin_id.to_string(), role.to_string())) {
+        evaluation = crate::policy::fold_strictest(evaluation, e.evaluate(pa));
     }
-    pub fn content_hash(&self) -> &str {
-        &self.content_hash
+    let now = crate::server::gate_escalation::now_secs();
+    if let Some(p) = instance_grant_in(grants, plugin_id, role, now)
+        .and_then(|g| crate::policy::get_preset(&g.preset))
+    {
+        evaluation = crate::policy::PolicyEngine::new(p.config).evaluate(pa);
     }
+    if let Some(gate) = law_gate {
+        evaluation = crate::policy::fold_strictest(evaluation, gate.evaluate(pa, role));
+    }
+    evaluation
 }
 
 // ------------------------------------------------------------------ shared grant readers
@@ -150,6 +169,8 @@ pub struct PolicyPublication {
     pub roles: HashMap<String, EngineView>,
     pub instances: HashMap<(String, String), EngineView>,
     pub instance_grants: HashMap<(String, String), InstanceGrant>,
+    /// Ratified hub law (shared, not copied).
+    pub law_gate: Option<Arc<crate::policy::LawGate>>,
     pub policy_lists: crate::vault::policy_lists::PolicyLists,
     pub scope_requests: HashMap<String, ScopeRequest>,
     pub standing_scope: StandingScopeStore,
@@ -182,6 +203,18 @@ impl PolicyPublication {
         crate::storage::durability::note_observed(&self.chain_durability, self.observed_len);
     }
 
+    /// Evaluate an action against this publication's law — outside the state lock. Same fold
+    /// as the lock holders' (`evaluate_folded`).
+    pub fn evaluate(
+        &self,
+        plugin_id: &str,
+        role: &str,
+        pa: &crate::policy::PolicyAction,
+    ) -> crate::policy::PolicyEvaluation {
+        evaluate_folded(&self.society, &self.roles, &self.instances, &self.instance_grants,
+                        self.law_gate.as_deref(), plugin_id, role, pa)
+    }
+
     /// Resolve a caller-supplied session id. FAIL-CLOSED like `resolve_attributed_caller`.
     pub fn resolve(&self, session_id: Option<&str>) -> Option<CallerIdent> {
         let uuid = Uuid::parse_str(session_id?).ok()?;
@@ -197,8 +230,8 @@ impl PolicyPublication {
     /// staleness check and the equivalence tests. HashMap order is normalised.
     pub fn canonical(&self) -> Value {
         fn eng(e: &EngineView) -> Value {
-            json!({"hash": e.content_hash,
-                   "config": serde_json::to_value(&e.config).unwrap_or(Value::Null)})
+            json!({"hash": e.content_hash(),
+                   "config": serde_json::to_value(e.config()).unwrap_or(Value::Null)})
         }
         let roles: BTreeMap<_, _> = self.roles.iter().map(|(k, v)| (k.clone(), eng(v))).collect();
         let instances: BTreeMap<_, _> = self
@@ -223,6 +256,7 @@ impl PolicyPublication {
             .collect();
         json!({
             "society": eng(&self.society),
+            "law_gate": format!("{:?}", self.law_gate.as_deref()),
             "roles": roles,
             "instances": instances,
             "instance_grants": grants,

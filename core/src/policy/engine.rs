@@ -13,9 +13,13 @@ use super::types::{
     PolicyAction, PolicyConfig, PolicyDecision, PolicyEvaluation, PolicyMatch, PolicyRule,
 };
 
-/// Hold a policy config + rate-limit state. Cloning the engine gives
-/// you the same rule set with independent rate-limit counters; usually
-/// you want a single engine per daemon, not per request.
+/// Hold a policy config + rate-limit state.
+///
+/// CLONES SHARE the rate-limit state (it lives behind an `Arc`). The daemon publishes a copy of
+/// its engines for evaluation outside the state lock (`server::published`); a rate-limited rule
+/// must count the same calls whichever copy evaluated them, or publishing an engine would
+/// silently reset or split its limits.
+#[derive(Clone)]
 pub struct PolicyEngine {
     config: PolicyConfig,
     /// Sorted ascending by priority for evaluation. Cached at construction.
@@ -23,7 +27,7 @@ pub struct PolicyEngine {
     /// SHA-256 of the canonical config serialization; used as the policy's
     /// entity_id suffix in audit trails.
     content_hash: String,
-    rate_limiter: RateLimiter,
+    rate_limiter: std::sync::Arc<RateLimiter>,
 }
 
 impl PolicyEngine {
@@ -35,7 +39,7 @@ impl PolicyEngine {
             config,
             sorted_rules,
             content_hash,
-            rate_limiter: RateLimiter::new(),
+            rate_limiter: std::sync::Arc::new(RateLimiter::new()),
         }
     }
 
@@ -201,6 +205,16 @@ fn canonical_hash(config: &PolicyConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The publication evaluates on a CLONE of the daemon's engine; a rate-limited rule must
+    /// count both copies' calls against one limit.
+    #[test]
+    fn clones_share_their_rate_limit_state() {
+        let a = PolicyEngine::new(crate::policy::get_preset("safety").unwrap().config);
+        let b = a.clone();
+        assert!(std::sync::Arc::ptr_eq(&a.rate_limiter, &b.rate_limiter));
+        assert_eq!(a.content_hash(), b.content_hash());
+    }
     use crate::policy::presets::get_preset;
 
     fn act<'a>(tool: &'a str, category: &'a str, target: Option<&'a str>) -> PolicyAction<'a> {

@@ -1230,7 +1230,7 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         .instance_grant(&who.plugin_id, &who.role_lct)
         .and_then(|g| crate::policy::get_preset(&g.preset).map(|p| (g, p)));
     let grant_engine = granted.as_ref().map(|(_, preset)| {
-        super::published::EngineView::of(&crate::policy::PolicyEngine::new(preset.config.clone()))
+        crate::policy::PolicyEngine::new(preset.config.clone())
     });
 
     let mut layers: Vec<(String, &super::published::EngineView)> = Vec::new();
@@ -1451,16 +1451,24 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     let action_id_str = require_string(args, "action_id")?;
     let action_id =
         Uuid::parse_str(&action_id_str).map_err(|_| anyhow::anyhow!("invalid action_id"))?;
-    let mut s = state.lock().await;
-    let action = match s.actions.get(&action_id) {
-        Some(a) => a.clone(),
-        None => {
-            return Ok(hestia_error_envelope(
-                "hestia.action_not_found",
-                &format!("Action {} not found", action_id),
-                Some(json!({"action_id": action_id_str})),
-            ));
-        }
+    // PHASE 1 (state lock, brief): the in-flight action and who it belongs to.
+    let (action, session_identity) = {
+        let s = state.lock().await;
+        let action = match s.actions.get(&action_id) {
+            Some(a) => a.clone(),
+            None => {
+                return Ok(hestia_error_envelope(
+                    "hestia.action_not_found",
+                    &format!("Action {} not found", action_id),
+                    Some(json!({"action_id": action_id_str})),
+                ));
+            }
+        };
+        let who = s
+            .sessions
+            .get(&action.session_id)
+            .map(|sess| (sess.plugin_id.clone(), sess.constellation_role.clone()));
+        (action, who)
     };
 
     // Build a PolicyAction from the in-flight action + classify the tool.
@@ -1530,75 +1538,25 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     // constellation-role overlay by STRICTEST verdict. A self-declared role can
     // only ever tighten the base (Deny > Warn > Allow), never loosen it — so
     // declaring a permissive role can't be used to escape the base floor.
-    let mut evaluation = s.policy_engine.evaluate(&pa);
-    let (session_plugin_id, session_role) = s
-        .sessions
-        .get(&action.session_id)
-        .map(|sess| (sess.plugin_id.clone(), sess.constellation_role.clone()))
-        .unwrap_or_else(|| {
-            (
-                "unknown".to_string(),
-                crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string(),
-            )
-        });
-    if let Some(role_engine) = s.role_policy_engines.get(&session_role) {
-        evaluation = crate::policy::fold_strictest(evaluation, role_engine.evaluate(&pa));
-    }
-    // Finest grain: the per-(instance, role) overlay for THIS orchestrator, folded
-    // AFTER the role overlay so a specific instance can only tighten its role's law.
-    if let Some(inst_engine) = s
-        .instance_policy_engines
-        .get(&(session_plugin_id.clone(), session_role.clone()))
-    {
-        evaluation = crate::policy::fold_strictest(evaluation, inst_engine.evaluate(&pa));
-    }
-    // OPERATOR GRANT — applied OUTSIDE the fold, because it is the one input allowed to
-    // loosen and `fold_strictest` would discard it by definition (dp, 2026-08-01: "if i want
-    // to grant permissive it should be my choice without setting all the rest to permissive").
-    //
-    // Deliberately NOT folded: folding is how every other input composes, and adding a
-    // "loosest-wins" branch to the fold would make the fold itself unsafe for the inputs that
-    // must only tighten. Keeping the grant a separate, explicit substitution means the
-    // invariant "law tightens as it gets more specific" still holds for all of role overlay,
-    // instance overlay and hub law, and the one exception is legible at the call site rather
-    // than hidden inside a comparator.
-    //
-    // Society baseline is untouched: a grant is an exception FOR one member, never an edit of
-    // the law. The baseline moves only by amendment.
-    //
-    // ORDERING, and it is a decision rather than an accident: the grant lands BEFORE the hub-law
-    // fold, so ratified society law still folds strictest-wins OVER it and a local operator
-    // cannot grant past it. dp's own framing forces this — "society baseline is encoded in
-    // society law, and can only be changed through law amendment process" — and a grant that
-    // could override hub law WOULD be a law change without an amendment, made by one machine's
-    // operator. So a grant loosens the local baseline (preset + role + instance overlays) and
-    // nothing above it. If that turns out to be too narrow in practice, the fix is an
-    // amendment, which is the correct place for that argument to happen.
-    evaluation = s.apply_instance_grant(&session_plugin_id, &session_role, &pa, evaluation);
-    // Third fold input (consolidation 2026-07-10): hub law via the
-    // canonical web4-policy engine. Strictest-wins like the role overlay —
-    // law can only tighten, never loosen.
-    if let Some(gate) = &s.law_gate {
-        evaluation = crate::policy::fold_strictest(evaluation, gate.evaluate(&pa, &session_role));
-    }
+    let (session_plugin_id, session_role) = session_identity.unwrap_or_else(|| {
+        (
+            "unknown".to_string(),
+            crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string(),
+        )
+    });
+    // PHASE 2 (NO state lock): evaluate against the published law. Role-scoped law (#403)
+    // folds strictest-wins, so a self-declared role only tightens; an operator grant substitutes
+    // its preset before ratified hub law folds over it — the same fold, one implementation
+    // (`published::evaluate_folded`), now outside the lock: this evaluation was the global
+    // lock's second-largest holder (~3-4 ms a call, measured on #1267).
+    let published = state.published();
+    let policy_version = published.version;
+    let evaluation = published.evaluate(&session_plugin_id, &session_role, &pa);
+    let (plugin_id_for_chain, role_lct) = (session_plugin_id.clone(), session_role.clone());
 
-    // Witness the policy decision when the verdict is anything other
-    // than `allow`. Deny + warn + would-deny (audit-only) are all
-    // operationally interesting events — denies in particular block
-    // a tool call before it runs, so PostToolUse never fires and the
-    // outcome would otherwise never reach the chain. This is the
-    // structural place to capture them: any policy gate flow that
-    // calls query_policy gets witnessed automatically.
-    let (plugin_id_for_chain, role_lct) = s
-        .sessions
-        .get(&action.session_id)
-        .map(|sess| (sess.plugin_id.clone(), sess.constellation_role.clone()))
-        .unwrap_or_else(|| {
-            (
-                "unknown".to_string(),
-                crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string(),
-            )
-        });
+    // PHASE 3 (state lock): only the writes this verdict needs — the scope tally, the decision
+    // row and its charge.
+    let mut s = state.lock().await;
     // SCOPE ATTESTATION — count what the gate judged, allows included.
     //
     // The window, not the action, is the unit of evidence. 1,000 in-scope calls attest
@@ -1700,7 +1658,7 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                 // WHICH published law this verdict was evaluated under (stage 2): the same
                 // `publication_version` `hestia_operating_law` returns beside its law_hash, so a
                 // decision row can be joined to the exact law a gate fetched.
-                "policy_version": s.publication_version,
+                "policy_version": policy_version,
                 "action_id": action_id_str,
                 "tool_name": action.tool_name,
                 "target": target,
@@ -1821,7 +1779,7 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         // already handle both branches per spec §3.4.1.
         "status": "decided",
         "nextPollMs": serde_json::Value::Null,
-        "policyVersion": s.publication_version,
+        "policyVersion": policy_version,
     }))
 }
 
@@ -1988,28 +1946,9 @@ fn gate_direct_tool(
         target: Some(target),
         full_command: None,
     };
-    let mut evaluation = s.policy_engine.evaluate(&pa);
-    if let Some(role_engine) = s.role_policy_engines.get(&who.role_lct) {
-        evaluation = crate::policy::fold_strictest(evaluation, role_engine.evaluate(&pa));
-    }
-    // Finest grain: the per-(instance, role) overlay for this caller, folded after
-    // the role overlay — the direct-call gate must honor the same instance law.
-    if let Some(inst_engine) = s
-        .instance_policy_engines
-        .get(&(who.plugin_id.clone(), who.role_lct.clone()))
-    {
-        evaluation = crate::policy::fold_strictest(evaluation, inst_engine.evaluate(&pa));
-    }
-    // Operator grant — the ENFORCEMENT path. Applied here and not only on the advisory
-    // surfaces, because a grant that shows up in `operating_law` and not in the gate tells a
-    // member it may act and then refuses it. Before the hub-law fold, so ratified society law
-    // still binds and a local operator cannot grant past an amendment-only baseline.
-    evaluation = s.apply_instance_grant(&who.plugin_id, &who.role_lct, &pa, evaluation);
-    // Hub-law third input applies to the vault gate too — a norm that
-    // denies secret reads must bind here, not only on tool calls.
-    if let Some(gate) = &s.law_gate {
-        evaluation = crate::policy::fold_strictest(evaluation, gate.evaluate(&pa, &who.role_lct));
-    }
+    // The full fold (base, role, instance, operator grant, hub law) — one implementation,
+    // shared with the lock-free publication (`published::evaluate_folded`).
+    let evaluation = s.evaluate_folded(&who.plugin_id, &who.role_lct, &pa);
     if evaluation.decision == crate::policy::PolicyDecision::Deny && evaluation.enforced {
         let instance_lct = s.member_lct(&who.plugin_id);
         let _ = s.append_chain(
@@ -29841,5 +29780,74 @@ mod durable_reads_tests {
         drop(hold);
         chain.durability().flush_committed_blocking().unwrap();
         assert_eq!(chain.read_from_durable(base, 10).unwrap().len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod query_policy_off_lock_tests {
+    //! `hestia_query_policy` evaluates against the published law OUTSIDE the state lock; its
+    //! verdicts must be exactly those of the locked fold on live state.
+    use super::inbox_tests::{open_state, seeded_home};
+    use super::*;
+
+    const DENY_CMD: &str = "rm -rf /home/user/data";
+
+    async fn verdict(state: &SharedState, sid: &str, tool: &str, cmd: &str) -> (Value, String) {
+        let b = tool_begin_action(state, &json!({"tool_name": tool, "target": cmd,
+            "parameters": {"command": cmd}, "session_id": sid})).await.unwrap();
+        let aid = b["actionId"].as_str().unwrap().to_string();
+        (tool_query_policy(state, &json!({"action_id": aid})).await.unwrap(), aid)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn off_lock_verdicts_equal_the_locked_fold_on_live_state() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine =
+                crate::policy::PolicyEngine::new(crate::policy::get_preset("safety").unwrap().config);
+        }
+        let sid = tool_connect(&state, &json!({"plugin_id": "codex", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let role = { state.lock().await.sessions.values().next().unwrap().constellation_role.clone() };
+        let cases = [("Bash", DENY_CMD), ("Bash", "ls -la"), ("Read", "/etc/shadow"), ("Read", "/tmp/x")];
+        let check = |label: &'static str| {
+            let state = state.clone();
+            let sid = sid.clone();
+            let role = role.clone();
+            async move {
+                for (tool, cmd) in cases {
+                    let (v, _) = verdict(&state, &sid, tool, cmd).await;
+                    let s = state.lock().await;
+                    let target = Some(cmd);
+                    let pa = crate::policy::PolicyAction {
+                        tool_name: tool,
+                        category: crate::policy::classify(tool),
+                        target,
+                        full_command: if tool == "Bash" { Some(cmd) } else { None },
+                    };
+                    let live = s.evaluate_folded("codex", &role, &pa);
+                    assert_eq!(v["decision"], json!(live.decision.as_str()), "{label} {tool} {cmd}: {v}");
+                    assert_eq!(v["ruleId"], json!(live.rule_id), "{label} {tool} {cmd}");
+                    assert_eq!(v["policyVersion"], json!(s.publication_version), "{label}");
+                }
+            }
+        };
+        check("society").await;
+        // A role overlay that tightens, then an operator grant that substitutes a preset.
+        {
+            let mut s = state.lock().await;
+            s.role_policy_engines.insert(role.clone(), crate::policy::PolicyEngine::new(
+                crate::policy::get_preset("strict").unwrap().config));
+        }
+        check("role overlay").await;
+        {
+            let mut s = state.lock().await;
+            s.instance_grants.insert(("codex".into(), "*".into()), crate::server::state::InstanceGrant {
+                preset: "permissive".into(), granted_by: "operator".into(), granted_at: 0,
+                reason: "test".into(), expires_at: None });
+        }
+        check("operator grant").await;
     }
 }
