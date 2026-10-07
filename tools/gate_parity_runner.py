@@ -46,7 +46,7 @@ deny on every seat; gemini denies it at Gate-1b scope first (it has no closure l
 own and its governor only sees in-scope acts) — that family divergence is a real finding,
 not runner noise.
 
-Run:  python3 tools/gate_parity_runner.py            # full 24x4 matrix, writes the report
+Run:  python3 tools/gate_parity_runner.py            # full 25x4 matrix, writes the report
       python3 tools/gate_parity_runner.py --seat kimi --act secret-cat-id_rsa
 """
 from __future__ import annotations
@@ -165,7 +165,18 @@ class StubDaemon:
                     "how_to_decide": "stub: no human decides during a parity measurement",
                     "retry_within_secs": 300}
         if name in ("hestia_request_witness", "hestia_witness_decision"):
-            return {"ok": True, "witnessEntryHash": digest, "id": f"stub-wit-{digest[:12]}"}
+            # C11: the recorder accepts only a receipt that NAMES the decision it was sent,
+            # the event type that decision maps to, and the action/correlation join keys.
+            # The real daemon's row carries all four; the stub derives them the way the
+            # daemon does (event map: hestia_gate_mechanism.DECISION_EVENT_TYPES).
+            event_type = {"allow": "policy_allow"}.get(arguments.get("decision"),
+                                                       "policy_decision")
+            return {"ok": True, "witnessEntryHash": digest, "id": f"stub-wit-{digest[:12]}",
+                    "decision": arguments.get("decision"),
+                    "eventType": event_type if arguments.get("decision") in
+                    ("allow", "warn", "deny") else None,
+                    "actionId": arguments.get("action_id"),
+                    "correlationKey": arguments.get("correlation_key")}
         return {"ok": True, "stub": True, "hash": digest}
 
     def handle(self, req: dict) -> tuple[dict | None, str | None]:
@@ -437,11 +448,17 @@ def build_seat_home(homes: Path, seat: str, endpoint: str) -> Path:
     return home
 
 
-def seat_env(seat: str, home: Path, endpoint: str) -> dict:
+def seat_env(seat: str, home: Path, endpoint: str, hook_timeout_s: float = 30.0) -> dict:
     """The subprocess environment: every ambient HESTIA_* stripped (a leak could re-point a
     shim at the LIVE daemon), then the seat's pins. HOME is the throwaway seat home so every
     ~-default (observe dirs, telemetry, identity) lands in the fixture, never in a live dir.
-    Gate modes stay at their defaults (enforce) — the corpus measures the enforcing posture."""
+    Gate modes stay at their defaults (enforce) — the corpus measures the enforcing posture.
+
+    HESTIA_HOOK_TIMEOUT_S declares the timeout THIS RUNNER enforces (run_shim kills the shim
+    at the same bound): post-#1245 a shim refuses closed when it cannot read how long its
+    caller waits, and the fixture homes carry no harness registration files. The runner is
+    the caller, so the runner says so — the same door the shim docs offer a non-harness
+    caller."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("HESTIA_")}
     env.update({
         "HOME": str(home),
@@ -449,6 +466,7 @@ def seat_env(seat: str, home: Path, endpoint: str) -> dict:
         "HESTIA_SHARED_DIR": SHARED_DIR,
         "HESTIA_WORKSPACE": WORKSPACE,
         "HESTIA_ENDPOINT": endpoint,
+        "HESTIA_HOOK_TIMEOUT_S": str(hook_timeout_s),
         "HESTIA_STATE_DIR": str(home / "state"),
         "HESTIA_OBSERVE_DIR": str(home / "observe"),
         "HESTIA_KIMI_IDENTITY": str(home / "identity.json"),
@@ -512,7 +530,7 @@ def run_matrix(seats: list[str], acts: list, timeout: float) -> dict:
             endpoint = stub.url
             for seat in seats:
                 home = build_seat_home(root / "homes", seat, endpoint)
-                env = seat_env(seat, home, endpoint)
+                env = seat_env(seat, home, endpoint, timeout)
                 shim = REPO / SEAT_SHIM[seat]
                 for act in acts:
                     act_id, act_class, tool, tool_input, expected, note = act
