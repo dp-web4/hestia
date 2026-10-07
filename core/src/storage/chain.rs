@@ -1220,6 +1220,76 @@ mod tests {
 
     const TEST_KEY: [u8; 32] = [7u8; 32];
 
+    #[test]
+    fn review_18933_read_can_outgrow_its_observed_frontier() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap());
+        let hold = store.durability().hold_flush_for_test();
+        let read_guard = store.read_conn.lock().unwrap();
+        let baseline = Arc::strong_count(store.durability());
+        let reader_store = store.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let result = rt.block_on(crate::storage::durability::durable_scope(async {
+                reader_store.tail_hash().unwrap()
+            }));
+            tx.send(result).unwrap();
+        });
+        // The scope's Arc proves observe() ran before the blocked SQL read.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(store.durability()) == baseline {
+            assert!(Instant::now() < deadline, "reader did not register observation");
+            std::thread::yield_now();
+        }
+        let row = store.append("review_fact", json!({"n": 1}), "lct:test").unwrap();
+        drop(read_guard);
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        let frontier = store.durability().frontier();
+        drop(hold);
+        reader.join().unwrap();
+        let (hash, status) = result.expect("counterexample: reader returned during flush hold");
+        status.unwrap();
+        assert_eq!(hash, row.hash);
+        assert_eq!(frontier.durable, 0);
+        assert_eq!(row.chain_position, 0);
+        println!("COUNTEREXAMPLE: successful read returned position 0 while durable length was 0");
+    }
+
+    #[test]
+    fn review_18933_enqueue_paths_skip_the_prewrite_barrier() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let dir = TempDir::new().unwrap();
+        let chain = SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap();
+        let inbox = Arc::new(crate::storage::SqliteInboxStore::open(dir.path().join("i.db"), TEST_KEY).unwrap());
+        let durability = chain.durability().clone();
+        inbox.set_pre_write_barrier(Arc::new(move || {
+            durability.flush_committed_blocking().map_err(|e| format!("{e:#}"))
+        }));
+        let hold = chain.durability().hold_flush_for_test();
+        let row = chain.append("member_notice", json!({}), "lct:test").unwrap();
+        let hash = row.hash.clone();
+        let writer_inbox = inbox.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let local = writer_inbox.enqueue_member("reader", "writer", "role:test", "reply", Some("hestia://test"), &hash, None).unwrap();
+            let remote = writer_inbox.enqueue_egress("peer", "reader", "writer", "role:test", "reply", Some("hestia://test"), &hash).unwrap();
+            tx.send((local, remote)).unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        let frontier = chain.durability().frontier();
+        drop(hold);
+        writer.join().unwrap();
+        result.expect("counterexample: both queue writes completed during flush hold");
+        assert_eq!(frontier.durable, 0);
+        assert_eq!(inbox.peek_member("reader").unwrap()[0].chain_hash, row.hash);
+        assert_eq!(inbox.pending_egress(10).unwrap().len(), 1);
+        println!("COUNTEREXAMPLE: local and egress notices persisted while their chain row was not durable");
+    }
+
     // ------------------------------------------------------------- group commit (durability)
 
     /// The commit path is fsync-free and checkpoint-free: both moved to the flusher.
