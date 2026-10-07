@@ -1,13 +1,14 @@
 {
-  "_comment": "NON-RUNNABLE INSTALLATION TEMPLATE for Kimi Code hooks. deploy/register-members.py renders it into ~/.kimi-code/config.toml as flat `[[hooks]] event = ...` tables (install.registration.layout = flat), adding only what is missing by target basename. Unrendered placeholders must never be deployed.",
+  "_comment": "NON-RUNNABLE INSTALLATION TEMPLATE for Kimi Code hooks. deploy/register-members.py renders it into ~/.kimi-code/config.toml as flat `[[hooks]] event = ...` tables (install.registration.layout = flat), reconciling by target: a line whose target is under the declared dest is hestia's and is rewritten to this template on every deploy (dp 2026-10-06); any other line is never touched. @HESTIA_HOME@ renders to the deploying environment's HESTIA_HOME as an absolute path, refused when unset (#1237); HESTIA_ROLE passes a launcher's value through and otherwise defaults to install.default_role. Unrendered placeholders must never be deployed.",
   "_witness_note": "witness.py is the hook that reaches the daemon; kimi fires PostToolUseFailure INSTEAD of PostToolUse for a failed call, so the witness is registered on both. Before 2026-09-28 kimi shipped no witness: its seat ran a private 07-26 copy of claude-code's that never saw a failure and never closed a gated action (findings/per-harness-witness-drift-2026-09-28.md).",
+  "_timeout_contract": "One-gate stage C. The PreToolUse gate READS its timeout from the flat [[hooks]] table this template becomes (seconds; an entry without one is refused, since Kimi's default is not documented here) and decides inside start + timeout - 1.5 s, so it always fails closed before Kimi kills it (Kimi's engine allows the tool on a timeout, i.e. fail-open). 15 s absorbs a cold member connect (measured 4.6-5.1 s). Nothing in this template sets HESTIA_PRE_TOTAL_BUDGET_MS: since stage C no gate reads it (the deadline is the registration's), so a hand-added one on a registered command is inert and should be removed.",
   "hooks": {
     "PreToolUse": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "HESTIA_WORKSPACE=@HESTIA_WORKSPACE@ python3 @HESTIA_PLUGIN_ROOT@/kimi/hooks/pre_tool_use.py",
+            "command": "HESTIA_HOME=@HESTIA_HOME@ HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" HESTIA_WORKSPACE=@HESTIA_WORKSPACE@ python3 @HESTIA_PLUGIN_ROOT@/kimi/hooks/pre_tool_use.py",
             "timeout": 15
           }
         ]
@@ -34,7 +35,7 @@
           },
           {
             "type": "command",
-            "command": "python3 @HESTIA_PLUGIN_ROOT@/kimi/hooks/witness.py",
+            "command": "HESTIA_HOME=@HESTIA_HOME@ HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" python3 @HESTIA_PLUGIN_ROOT@/kimi/hooks/witness.py",
             "timeout": 10
           }
         ]
@@ -50,7 +51,7 @@
           },
           {
             "type": "command",
-            "command": "python3 @HESTIA_PLUGIN_ROOT@/kimi/hooks/witness.py",
+            "command": "HESTIA_HOME=@HESTIA_HOME@ HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" python3 @HESTIA_PLUGIN_ROOT@/kimi/hooks/witness.py",
             "timeout": 10
           }
         ]

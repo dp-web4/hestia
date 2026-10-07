@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 2f759e13985a8e14cf2c41b2402c902eb57e4fa6e69d2cb36fb933209d51134b  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 40ac543f269f4f6667d2220769dc650e0963bee3c3e80899387ad6fbb0ae7ee1  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -272,6 +272,10 @@ LITERAL_FLOOR = Closure(
         "hestia_gate_mechanism.py",
         "hestia_governance_closure.py",   # this module is itself closure
         "gate_self_protection_test.py",
+        # THE common gate (one-gate stage C): every seat's shim delegates its whole decision
+        # to it. Governed wherever it lives, so the INSTALLED copy ($HESTIA_HOME/shared) is
+        # closure too, not only the repo copy under plugins/_shared.
+        "hestia_single_gate.py",
         # web4-hub DEPLOY closure (#415 / web4 #709, R7c limb): these decide WHICH hub
         # binary executes — a write redirecting which binary runs is equivalent to a
         # write to it, and that binary enforces its society's law. Distinctive names,

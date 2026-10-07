@@ -5,6 +5,8 @@
   "install": {
     "member": "kimi-code",
     "dest": "~/.kimi-code/hooks",
+    "default_role": "role:constellation:interactive-dev",
+    "_default_role_note": "HESTIA_ROLE is launch context, never config: the seat loader refuses it from the vault projection, so the hook line is the only place a default can live. deploy/register-members.py renders it as a pass-through, HESTIA_ROLE=\"${HESTIA_ROLE:-<this>}\", on the gate and witness lines, so a launcher that knows better (a mesh fire, a watcher unit) still overrides it. The value is what this seat registered by hand before the reconciler (dp 2026-10-06).",
     "registration": {
       "reader": "toml-hook-commands",
       "path": [
@@ -21,9 +23,7 @@
     ],
     "gate_probe": {
       "entry": "hooks/pre_tool_use.py",
-      "environment": {
-        "HESTIA_KIMI_GATE_MODE": "enforce"
-      },
+      "environment": {},
       "events": [
         {
           "label": "read recovery scratch",

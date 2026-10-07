@@ -271,6 +271,10 @@ LITERAL_FLOOR = Closure(
         "hestia_gate_mechanism.py",
         "hestia_governance_closure.py",   # this module is itself closure
         "gate_self_protection_test.py",
+        # THE common gate (one-gate stage C): every seat's shim delegates its whole decision
+        # to it. Governed wherever it lives, so the INSTALLED copy ($HESTIA_HOME/shared) is
+        # closure too, not only the repo copy under plugins/_shared.
+        "hestia_single_gate.py",
         # web4-hub DEPLOY closure (#415 / web4 #709, R7c limb): these decide WHICH hub
         # binary executes — a write redirecting which binary runs is equivalent to a
         # write to it, and that binary enforces its society's law. Distinctive names,

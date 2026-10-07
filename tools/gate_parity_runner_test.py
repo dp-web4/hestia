@@ -98,6 +98,48 @@ def test_timeout_is_degraded_no_verdict():
     assert cell.degraded and "timeout" in cell.note, cell
 
 
+def test_harness_timeout_unknown_is_degraded_not_a_verdict():
+    # The exact wording main measured red-on-green with post-#1231: the shim failed closed
+    # before reaching the gate, which must never classify as the seat's ruling (F1).
+    cell = runner.classify_cell(
+        "claude-code",
+        canned(2, stderr="hestia: deny [gate.harness_timeout_unknown] — 'Bash' was not "
+                         "judged: no registration found. Without the timeout its harness "
+                         "enforces, the gate cannot finish before the harness kills it\n"))
+    assert cell.verdict == "deny" and cell.degraded and cell.family == "degraded", cell
+
+
+def test_one_gate_internal_error_dot_spelling_is_degraded():
+    cell = runner.classify_cell(
+        "kimi", canned(2, stderr="hestia: deny [gate.internal_error] — the common gate could "
+                                 "not complete the decision: boom\n"))
+    assert cell.degraded and cell.family == "degraded", cell
+
+
+def test_seat_that_never_contacts_the_daemon_is_flagged_not_measured():
+    # F1 close 2: a post-cutover seat whose shim fails closed before the wire leaves ZERO
+    # requests in the stub log. Even if its wording drifts past _DEGRADED_RE, a seat that
+    # never reached the daemon is a broken harness, and every one of its cells is degraded.
+    orig_run_shim = runner.run_shim
+
+    def silent_deny(*_a, **_k):
+        return canned(2, stderr="hestia: deny [scope] — wording drift, looks like a verdict\n")
+
+    runner.run_shim = silent_deny
+    try:
+        report = runner.run_matrix(["kimi"], list(runner.CORPUS)[:3], 5.0)
+    finally:
+        runner.run_shim = orig_run_shim
+    assert report["seats_without_daemon_contact"] == ["kimi"], report.get(
+        "seats_without_daemon_contact")
+    for row in report["rows"]:
+        seat = row["seats"]["kimi"]
+        assert seat["degraded"] and seat["matches_expected"] is None, row
+        assert not row["agreement"], row
+    for key, cell in report["cells"].items():
+        assert cell["degraded"] and "never contacted the stub daemon" in cell["note"], key
+
+
 # ── classify_cell: gemini's two-channel contract ────────────────────────────────────────────
 def test_gemini_policy_deny_is_stdout_json_at_exit_zero():
     payload = json.dumps({"decision": "deny",
@@ -274,7 +316,7 @@ def test_seat_env_strips_ambient_and_pins_the_stub():
 
 
 def test_corpus_is_loaded_and_unmodified_shape():
-    assert len(runner.CORPUS) == 32, len(runner.CORPUS)
+    assert len(runner.CORPUS) == 25, len(runner.CORPUS)
     for act in runner.CORPUS:
         act_id, act_class, tool, tool_input, expected, note = act
         assert isinstance(act_id, str) and tool_input is not None
@@ -292,6 +334,9 @@ if __name__ == "__main__":
     test_config_refusal_is_degraded()
     test_crash_exit_is_degraded()
     test_timeout_is_degraded_no_verdict()
+    test_harness_timeout_unknown_is_degraded_not_a_verdict()
+    test_one_gate_internal_error_dot_spelling_is_degraded()
+    test_seat_that_never_contacts_the_daemon_is_flagged_not_measured()
     test_gemini_policy_deny_is_stdout_json_at_exit_zero()
     test_gemini_anomaly_channel_is_degraded()
     test_gemini_warn_is_exit_zero_stderr()
@@ -306,4 +351,4 @@ if __name__ == "__main__":
     test_smoke_act_against_a_fake_shim()
     test_seat_env_strips_ambient_and_pins_the_stub()
     test_corpus_is_loaded_and_unmodified_shape()
-    print("ok: 23 gate-parity-runner checks")
+    print("ok: 26 gate-parity-runner checks")

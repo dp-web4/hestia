@@ -166,11 +166,42 @@ def asserting(fn):
 
 
 def _load_gate():
+    """The classifier surface this seat's gate decides with — since one-gate stage C, the SHARED
+    modules every seat's common gate calls, not a private copy inside the claude-code hook.
+
+    The pre-C hook re-exported `_is_read_only` (from hestia_shell_classifier) and
+    `_closure_classify` (hestia_governance_closure.classify) and carried a Tier-2 fallback
+    matcher, `_touches_self`. The certified shim carries none of them: the common gate classifies
+    every act through the shared closure. So the corpus below now runs against exactly that:
+    `_touches_self(tool, input)` is the shared closure's verdict in the old return shape (a
+    `(marker, resource, key)` triple for a governance read or write, None otherwise)."""
     import importlib.util
-    spec = importlib.util.spec_from_file_location("_gate_under_test", HOOK)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    import types
+    shared = os.environ["HESTIA_SHARED_DIR"]
+    if shared not in sys.path:
+        sys.path.insert(0, shared)
+    mods = {}
+    for name in ("hestia_shell_classifier", "hestia_governance_closure"):
+        spec = importlib.util.spec_from_file_location(name, os.path.join(shared, name + ".py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        mods[name] = mod
+    classify = mods["hestia_governance_closure"].classify
+
+    def _touches_self(tool, tool_input):
+        v = classify(tool, tool_input if isinstance(tool_input, dict) else {})
+        if v.classification not in ("read", "write"):
+            return None
+        return (v.marker or v.rule, v.resource or v.marker or v.rule,
+                "command" if tool == "Bash" else "file_path")
+
+    return types.SimpleNamespace(
+        _is_read_only=mods["hestia_shell_classifier"]._is_read_only,
+        _closure_classify=classify,
+        _touches_self=_touches_self,
+        _SELF_MARKERS=tuple("/".join(p) for p in mods["hestia_governance_closure"].LITERAL_FLOOR.dir_markers),
+    )
 
 
 def _installed_gate_path():
@@ -734,10 +765,13 @@ def test_fp8_write_content_is_fixed():
           mod._touches_self("Bash", {"command": f"sed -i s/a/b/ {HOOK}"}) is not None,
           "`command` stays in the haystack. It is the only signal Bash offers, and "
           "removing it would unprotect the shell surface entirely")
-    check("fp8_targetless_write_falls_back_to_content",
-          mod._touches_self("Write", {"content": prose}) is not None,
-          "no target key at all: the destination cannot decide, so `content` must. An "
-          "unknown tool shape reads as risk, not as absence of it")
+    # One-gate stage C: the content fallback was the retired Tier-2 matcher's. The shared
+    # closure judges DESTINATIONS only, and a Write with no destination writes nothing — the
+    # live behaviour since Sprint B (the closure was the live path; Tier-2 ran only when it
+    # failed to import, which the certified shim makes a fail-closed load error instead).
+    check("fp8_targetless_write_is_judged_by_destination_only",
+          mod._touches_self("Write", {"content": prose}) is None,
+          "the shared closure judges the destination; a targetless Write has none")
 
 
 @asserting
@@ -753,11 +787,19 @@ def test_fp8_edit_new_string_is_pinned_open_not_fixed():
     """
     mod = _load_gate()
     prose = f"see {HOOK} for the mechanism"
-    check("fp8_edit_still_open__edit_a_doc_to_mention_the_gate",
+    # MOVED in one-gate stage C, and the move was earned before it: the shared closure (the live
+    # path since Sprint B) is write-POSITION keyed — an Edit's destination is its `file_path`,
+    # and `new_string` is content steering a file that is not the gate. What makes it safe is
+    # the same as for Write: the destination always decides, and a gate-file destination is
+    # refused whatever its new_string says (fp8_write_to_the_gate_still_refused's twin below).
+    # This row pinned the retired Tier-2 matcher, which only ran if the closure failed to load.
+    check("fp8_edit_to_a_doc_mentioning_the_gate_is_not_a_gate_write",
           mod._touches_self("Edit", {"file_path": "/tmp/notes.md", "old_string": "x",
-                                     "new_string": prose}) is not None,
-          "this now returns None — Edit's new_string left the haystack and nobody moved "
-          "the row. If that was earned, say what makes the hard case safe.")
+                                     "new_string": prose}) is None,
+          "an Edit whose destination is outside the governance surface is not a gate write")
+    check("fp8_edit_to_the_gate_is_still_refused",
+          mod._touches_self("Edit", {"file_path": HOOK, "old_string": "x",
+                                     "new_string": "harmless"}) is not None)
 
 
 @asserting
@@ -795,19 +837,13 @@ def test_the_record_names_the_act_not_the_rule():
         check("key_names_the_field_it_matched_in", key == "file_path", repr(key))
         check("marker_is_still_the_reason", marker in mod._SELF_MARKERS, repr(marker))
 
-    # The FP8-shape case: the destination is ordinary, the payload QUOTES the gate.
-    # The match must be reported as text matched in `new_string`, not as a file.
+    # The FP8-shape case (an ordinary destination whose payload QUOTES the gate) is no longer a
+    # match at all under the shared closure (see test_fp8_edit_new_string_is_pinned_open_not_fixed),
+    # so there is no payload match whose report could misname the place. One-gate stage C.
     prose = f"see {HOOK} for the mechanism"
     hit = mod._touches_self("Edit", {"file_path": "/tmp/notes.md", "old_string": "x",
                                      "new_string": prose})
-    ok = isinstance(hit, tuple) and len(hit) == 3
-    check("payload_match_still_returns_the_triple", ok, repr(hit))
-    if ok:
-        marker, resource, key = hit
-        check("payload_match_names_the_text_as_the_match",
-              key == "new_string" and resource == prose,
-              f"key={key!r} resource={resource!r} — the honest report is that the "
-              f"match is payload content, not a destination (1474 §2, the FP8 case)")
+    check("payload_quoting_the_gate_is_not_reported_as_a_place", hit is None, repr(hit))
 
 
 @asserting
@@ -1009,7 +1045,19 @@ def test_marker_evasion_by_path_assembly_is_pinned_open():
         # heredoc half, which fails differently and needs a different fix.
         ("script_file_names_it_literally", "python3 /tmp/patch.py"),
     ]
+    # INVERTED in one-gate stage C for three rows, as their message asked. What closed them is
+    # the shared closure's grammar (the live path since Sprint B; these rows pinned the retired
+    # Tier-2 substring matcher): a command whose write target it cannot resolve — a variable,
+    # a concatenation, a glob reaching a hooks-only name — is classified as a governance WRITE
+    # (out of grammar), not passed. The interpreter-payload rows stay pinned open: the path
+    # lives in a payload or a file no text matcher can read.
+    closed_by_the_closure_grammar = {"shell_concatenation", "glob", "variable_holding_the_dir"}
     for name, cmd in evasions:
+        if name in closed_by_the_closure_grammar:
+            check(f"evasion_now_seen__{name}",
+                  mod._touches_self("Bash", {"command": cmd}) is not None,
+                  "the shared closure no longer refuses this unresolvable write target")
+            continue
         check(f"evasion_still_unseen__{name}",
               mod._touches_self("Bash", {"command": cmd}) is None,
               "the marker now FIRES on this spelling — the hole closed and nobody moved "
@@ -1042,16 +1090,27 @@ def test_this_file_certifies_the_enforcing_copy():
     them would be the null-state twin of a real pass — the exact shape `asserting` exists
     to stop for pytest.
     """
-    installed = _installed_gate_path()
-    if installed is None:
+    # One-gate stage C: the classifiers this corpus exercises are the SHARED ones every seat's
+    # common gate loads from the installed engine, $HESTIA_HOME/shared — so that is the
+    # enforcing copy, not the claude-code hook (which classifies nothing any more).
+    if _installed_gate_path() is None:
         skip("in_tree_matches_the_enforcing_copy",
              "no claude PreToolUse registration on this host — nothing enforcing to compare")
         return
-    here, there = _sha256(HOOK), _sha256(installed)
-    check("in_tree_matches_the_enforcing_copy", here == there,
-          f"the registered gate is NOT this file: in-tree sha256 {here[:12]}… vs installed "
-          f"{there[:12]}…. Every other check in this file is then a statement about an "
-          f"unenforced copy. Redeploy, or say so where the result is cited.")
+    home = os.environ.get("HESTIA_HOME")
+    installed_dir = os.path.join(home, "shared") if home else ""
+    if not installed_dir or not os.path.isdir(installed_dir):
+        skip("in_tree_matches_the_enforcing_copy",
+             "no installed engine at $HESTIA_HOME/shared — nothing enforcing to compare")
+        return
+    for name in ("hestia_governance_closure.py", "hestia_shell_classifier.py"):
+        here = _sha256(os.path.join(REPO, "plugins", "_shared", name))
+        there_path = os.path.join(installed_dir, name)
+        there = _sha256(there_path) if os.path.isfile(there_path) else "absent"
+        check(f"in_tree_matches_the_enforcing_copy__{name}", here == there,
+              f"the installed {name} is NOT this tree's: in-tree sha256 {here[:12]}… vs "
+              f"installed {there[:12]}…. Every other check in this file is then a statement "
+              f"about an unenforced copy. Redeploy, or say so where the result is cited.")
 
 
 # --------------------------------------------------------------------------------------

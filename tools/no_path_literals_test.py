@@ -80,6 +80,7 @@ Run:  python3 tools/no_path_literals_test.py
 """
 from __future__ import annotations
 
+import ast
 import io
 import os
 import re
@@ -118,17 +119,23 @@ PATTERNS = [
      "hestia state at a literal location under /tmp"),
 ]
 
-# Declared exceptions: (class, substring that identifies the accepted spelling, justification).
-# A hit whose line contains the substring is reported as "allowed" with its reason, never
-# silently dropped. Add a row here only with a justification a reviewer can reject.
+# Declared exceptions: (class, substring, structural scope, justification).
+# Scope None means any scanned runtime line. "harness-registration" means the matching string
+# literal must live structurally inside HARNESS["registrations"]; the same spelling elsewhere
+# is a defect. Add a row only with a justification a reviewer can reject.
 ALLOWED = [
-    ("cwd-root-fallback", "os.fspath(entry) or os.getcwd()",
+    ("cwd-root-fallback", "os.fspath(entry) or os.getcwd()", None,
      "canonicalizing the EMPTY sys.path entry, which Python defines as cwd; not selecting authority"),
-    ("cwd-root-fallback", "(cwd or os.getcwd())",
+    ("cwd-root-fallback", "(cwd or os.getcwd())", None,
      "resolving the ACT's relative target against the event cwd; data about the act, not a root"),
-    ("cwd-root-fallback", 'event.get("cwd") or',
-     "the act's cwd taken from the event first; same shape as the scope resolvers, on the gemini seat"),
-    ("getenv-path-default", 'os.environ.get("HESTIA_PLUGIN_ID", DEFAULT_PLUGIN_ID)',
+    # One-gate stage C: these defaults are data about where the HARNESS itself records this hook,
+    # used only to read the timeout the harness enforces. They are allowed ONLY as string literals
+    # under HARNESS["registrations"]; an identical fallback anywhere else remains a hardcoded path.
+    ("shell-home-default", "${CLAUDE_CONFIG_DIR:-~/.claude}/", "harness-registration",
+     "Claude Code HARNESS registration location; data about the harness, not Hestia authority"),
+    ("shell-home-default", "${CODEX_HOME:-~/.codex}/", "harness-registration",
+     "Codex HARNESS registration location; data about the harness, not Hestia authority"),
+    ("getenv-path-default", 'os.environ.get("HESTIA_PLUGIN_ID", DEFAULT_PLUGIN_ID)', None,
      "the witness shim's member-id default, not a path: the one identity line per shim (the rest is "
      "byte-identical across harnesses); matched only because the class flags any DEFAULT_ constant"),
 ]
@@ -146,18 +153,23 @@ ALLOWED = [
 PINNED_BASELINE: dict | None = {
     # RUNTIME set
     "plugins/_shared/hestia_gate_core.py":          {"cwd-root-fallback": 3, "expanduser-tilde": 1, "tilde-hestia": 1},
-    "plugins/_shared/hestia_gate_mechanism.py":     {"getenv-path-default": 2},
+    # 2026-10-04 (one-gate stage C): the four shims FELL to zero counted hits (every seat-local
+    # default left with the seat-local law; the HARNESS registration locations are a declared
+    # exception above), the mechanism 2 -> 1, and the common gate and template are pinned at 0.
+    "plugins/_shared/hestia_gate_mechanism.py":     {"getenv-path-default": 1},
     "plugins/_shared/hestia_governance_closure.py": {},
     "plugins/_shared/hestia_shell_classifier.py":   {},
-    "plugins/claude-code/hooks/" + _HOOK:      {"expanduser-tilde": 1},
+    "plugins/_shared/hestia_single_gate.py":        {},
+    "plugins/_template/shim_template.py":           {},
+    "plugins/claude-code/hooks/" + _HOOK:      {},
     # 2026-09-28: the #977 pair below (gate cache writer + witness reader, each carrying
     # /tmp/hestia-actions) became ONE literal in the shared witness core, which owns both halves
     # of the seam for every harness (findings/per-harness-witness-drift-2026-09-28.md). Net: 3 -> 1
     # (the codex witness's getenv default went with its private copy). It still retires under #944.
     "plugins/_shared/hestia_witness_core.py":       {"abs-tmp-state": 1},
-    "plugins/codex/hooks/" + _HOOK:                 {"cwd-root-fallback": 2, "expanduser-tilde": 1, "getenv-path-default": 3, "tilde-hestia": 1},
-    "plugins/kimi/hooks/" + _HOOK:                  {"cwd-root-fallback": 2, "expanduser-tilde": 1, "getenv-path-default": 2},
-    "plugins/gemini/hooks/" + _GEM:                 {"cwd-root-fallback": 1, "expanduser-tilde": 1, "getenv-path-default": 2, "tilde-hestia": 1},
+    "plugins/codex/hooks/" + _HOOK:                 {},
+    "plugins/kimi/hooks/" + _HOOK:                  {},
+    "plugins/gemini/hooks/" + _GEM:                 {},
     # 2026-09-06: RISES 0 -> 1, and the direction is the point. `ACTIONS_DIR` is now declared
     # on BOTH sides of the Pre→Post contract, because the outcome hook must read the action id
     # the gate cached rather than begin a second action (#977: measured 4,121 outcomes and 450
@@ -243,6 +255,27 @@ def _prose_lines(src: str):
     return comments, docstrings
 
 
+def _harness_registration_string_lines(src: str) -> set[int]:
+    """Line numbers of string literals structurally inside HARNESS["registrations"]."""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return set()
+    lines = set()
+    for node in tree.body:
+        if not (isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "HARNESS" for t in node.targets)
+                and isinstance(node.value, ast.Dict)):
+            continue
+        for key, value in zip(node.value.keys, node.value.values):
+            if not (isinstance(key, ast.Constant) and key.value == "registrations"):
+                continue
+            for sub in ast.walk(value):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    lines.add(sub.lineno)
+    return lines
+
+
 def scan(rel: str) -> int:
     path = os.path.join(ROOT, rel)
     try:
@@ -253,8 +286,10 @@ def scan(rel: str) -> int:
         return -1
     if rel.endswith(".py"):
         comments, docstrings = _prose_lines(src)
+        harness_registration_lines = _harness_registration_string_lines(src)
     else:
         comments, docstrings = set(), set()
+        harness_registration_lines = set()
     per: dict[str, int] = {}
     n = 0
     for ln, line in enumerate(src.split("\n"), 1):
@@ -267,9 +302,14 @@ def scan(rel: str) -> int:
                 continue
             if not re.search(pat, code_part):
                 continue
-            allowed = next((a for a in ALLOWED if a[0] == cls and a[1] in line), None)
+            allowed = next((
+                a for a in ALLOWED
+                if a[0] == cls and a[1] in line
+                and (a[2] is None
+                     or (a[2] == "harness-registration" and ln in harness_registration_lines))
+            ), None)
             if allowed:
-                _ALLOWED_HITS.append(f"{rel}:{ln}  [{cls}]  allowed: {allowed[2]}")
+                _ALLOWED_HITS.append(f"{rel}:{ln}  [{cls}]  allowed: {allowed[3]}")
                 continue
             _FAILS.append(f"{rel}:{ln}  [{cls}]  {line.strip()[:88]}")
             per[cls] = per.get(cls, 0) + 1
@@ -307,9 +347,10 @@ def test_every_declared_exception_is_live():
     _scan_all()
     if os.getenv("HESTIA_RUNTIME_ROOT"):
         return
-    for cls, needle, why in ALLOWED:
+    for cls, needle, scope, why in ALLOWED:
         assert any(f"[{cls}]" in h and why in h for h in _ALLOWED_HITS), (
-            f"declared exception [{cls}] {needle!r} absorbed no hit — retire it or fix it: {why}")
+            f"declared exception [{cls}] {needle!r} scope={scope!r} absorbed no hit — "
+            f"retire it or fix it: {why}")
 
 
 def test_prose_is_reported_not_counted():

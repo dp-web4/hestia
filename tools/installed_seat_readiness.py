@@ -47,7 +47,8 @@ sys.path.insert(0, str(HERE))
 import gate_collapse_meter as meter  # noqa: E402
 from path_key_vocabulary_probe import (  # noqa: E402
     NOT_REACH, REACH_TABLE_NAMES, active_reach_keys, engine_reach_table_from_core,
-    keys_from_get_literals, keys_from_path_targets, live_site_delegates)
+    delegates_to_common_gate, keys_from_get_literals, keys_from_path_targets,
+    live_site_delegates)
 
 GATE_BASENAMES = set(meter.GATE_BASENAMES)
 
@@ -87,6 +88,13 @@ try:
     g = importlib.util.module_from_spec(s); s.loader.exec_module(g)
 except BaseException as e:  # a hook that cannot even initialise is a finding, not a crash
     out["error"] = f"{type(e).__name__}: {e}"[:200]
+# A stage-C shim loads nothing at import: its certified `_load_gate` selects the authority and
+# the common gate binds its siblings. Drive it, as `main` would, before reading sys.modules.
+if out["error"] is None and callable(getattr(g, "_load_gate", None)):
+    try:
+        g._load_gate()
+    except BaseException as e:
+        out["error"] = f"_load_gate: {type(e).__name__}: {e}"[:200]
 for n in names:
     m = sys.modules.get(n)
     if m is None:
@@ -239,7 +247,10 @@ def measure(ledger_path: Path, hestia_home: Path, max_local: dict, max_forks: di
         p = row.get("resident_path")
         if not p or row.get("resident_sha") is None:
             continue
-        if live_site_delegates(Path(p)):
+        # A stage-C shim binds no paths at all: it hands the act to the INSTALLED common gate,
+        # whose one extraction site is the engine table (same conclusion, proven on both files).
+        if live_site_delegates(Path(p)) or delegates_to_common_gate(
+                Path(p), gate_path=installed_shared / "hestia_single_gate.py"):
             sources[row["seat"]] = "engine"
             if engine_keys is not None:
                 declared[row["seat"]] = set(engine_keys)

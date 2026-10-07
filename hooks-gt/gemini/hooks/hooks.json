@@ -1,7 +1,8 @@
 {
   "_comment": "NON-RUNNABLE INSTALLATION TEMPLATE for Gemini CLI user-level hooks. Prefer plugins/gemini/install.sh, which renders verified absolute runtime paths. Project-source hooks may be gated by the harness trust setting and are not a substitute for user-level installation.",
-  "_paths_note": "Replace @HESTIA_WORKSPACE@ and @HESTIA_PLUGIN_ROOT@ before installation, then verify every command target exists. Unrendered placeholders must never be installed: a missing hook process may fail open in the harness.",
+  "_paths_note": "Replace @HESTIA_HOME@ (the deploying environment's HESTIA_HOME, absolute; deploy/register-members.py refuses when it is unset), @HESTIA_DEFAULT_ROLE@ (install.default_role, inside a HESTIA_ROLE pass-through; dropped when undeclared), @HESTIA_WORKSPACE@ and @HESTIA_PLUGIN_ROOT@ before installation, then verify every command target exists. Unrendered placeholders must never be installed: a missing hook process may fail open in the harness.",
   "_hooksConfig_note": "Pin \"hooksConfig\": {\"enabled\": true} in settings.json alongside this block. It defaults true, but \"enabled\": false disarms every hook and hooksConfig.disabled can disable this gate by command string. Operator's prerogative, but it must be visible to anything auditing the member.",
+  "_timeout_contract": "One-gate stage C. The BeforeTool gate READS its timeout from the registration this template becomes (MILLISECONDS; gemini-cli's default for an entry without one is 60000) and decides inside start + timeout - 1.5 s, so it always fails closed before gemini-cli kills it (a timed-out hook produces no output and the tool proceeds, i.e. fail-open). 15000 ms absorbs a cold member connect (measured 4.6-5.1 s). A shorter registration costs availability, never safety; deploy/register-members.py reports one below this floor.",
   "hooks": {
     "BeforeTool": [
       {
@@ -9,7 +10,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "HESTIA_WORKSPACE=@HESTIA_WORKSPACE@ python3 @HESTIA_PLUGIN_ROOT@/gemini/hooks/before_tool.py",
+            "command": "HESTIA_HOME=@HESTIA_HOME@ HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" HESTIA_WORKSPACE=@HESTIA_WORKSPACE@ python3 @HESTIA_PLUGIN_ROOT@/gemini/hooks/before_tool.py",
             "timeout": 15000
           }
         ]
@@ -27,7 +28,7 @@
         "matcher": ".*",
         "hooks": [
           { "type": "command", "command": "@HESTIA_PLUGIN_ROOT@/gemini/hooks/observe.sh", "timeout": 10000 },
-          { "type": "command", "command": "python3 @HESTIA_PLUGIN_ROOT@/gemini/hooks/witness.py", "timeout": 10000 }
+          { "type": "command", "command": "HESTIA_HOME=@HESTIA_HOME@ HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" python3 @HESTIA_PLUGIN_ROOT@/gemini/hooks/witness.py", "timeout": 10000 }
         ]
       }
     ],

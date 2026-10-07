@@ -76,15 +76,45 @@ approved = true
 """
 
 
-def _plugins(tmp: Path) -> Path:
-    """A plugins dir holding the REAL codex and claude-code manifests and templates."""
+#: The hooks that load the seat projection, so carry the bootstrap locator on their line.
+_LOCATOR_HOOKS = ("pre_tool_use.py", "before_tool.py", "witness.py")
+#: What the governed template patch puts in front of each of them: the locator, and the launch role
+#: as a pass-through whose default is the member's install.default_role.
+_LOCATOR = 'HESTIA_HOME=@HESTIA_HOME@ HESTIA_ROLE="${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}" '
+_ROLE_DEFAULT = "role:constellation:interactive-dev"
+
+
+def _with_locator(text: str) -> str:
+    """The template as the governed half of this change ships it: `HESTIA_HOME=@HESTIA_HOME@` on
+    every gate and witness line. A no-op on a template that already carries it, so these tests
+    measure the shipped shape whether or not the template edit has landed in this tree
+    (test_shipped_templates_render_the_locator_onto_gate_and_witness pins the real files)."""
+    doc = json.loads(text)
+    for gs in (doc.get("hooks") or {}).values():
+        for g in gs:
+            for h in g.get("hooks") or []:
+                c = h.get("command") or ""
+                if c.split("/")[-1] in _LOCATOR_HOOKS and "@HESTIA_HOME@" not in c:
+                    h["command"] = _LOCATOR + c
+                if c.endswith("@HESTIA_PLUGIN_ROOT@/codex/hooks/hydrate.sh") and "CODEX_PLUGIN_ROOT" not in c:
+                    h["command"] = c.replace("@HESTIA_PLUGIN_ROOT@/codex/hooks/hydrate.sh",
+                                             "CODEX_PLUGIN_ROOT=@HESTIA_PLUGIN_SOURCE@ @HESTIA_PLUGIN_ROOT@/codex/hooks/hydrate.sh")
+    return json.dumps(doc, indent=2) + "\n"
+
+
+def _copy_member(p: Path, m: str) -> None:
+    (p / m / "hooks").mkdir(parents=True, exist_ok=True)
+    (p / m / "expects.json").write_text((REPO / "plugins" / m / "expects.json").read_text())
+    src = REPO / "plugins" / m / "hooks" / "hooks.json"
+    if src.exists():
+        (p / m / "hooks" / "hooks.json").write_text(_with_locator(src.read_text()))
+
+
+def _plugins(tmp: Path, members=("codex", "claude-code")) -> Path:
+    """A plugins dir holding the REAL manifests and templates of `members`."""
     p = tmp / "plugins"
-    for m in ("codex", "claude-code"):
-        (p / m / "hooks").mkdir(parents=True)
-        (p / m / "expects.json").write_text((REPO / "plugins" / m / "expects.json").read_text())
-        src = REPO / "plugins" / m / "hooks" / "hooks.json"
-        if src.exists():
-            (p / m / "hooks" / "hooks.json").write_text(src.read_text())
+    for m in members:
+        _copy_member(p, m)
     return p
 
 
@@ -114,9 +144,16 @@ def _installer_reader(path: Path) -> set[str]:
     return seen
 
 
+def _hh(tmp: Path) -> str:
+    """The HESTIA_HOME every run renders (a value of None in `env` unsets it)."""
+    return str(tmp / "hestia-home")
+
+
 def _run(tmp: Path, plugins: Path, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
     e = {k: v for k, v in os.environ.items() if k not in ("DRY_RUN", "HESTIA_WORKSPACE")}
+    e["HESTIA_HOME"] = _hh(tmp)
     e.update(env or {})
+    e = {k: v for k, v in e.items() if v is not None}
     return subprocess.run([sys.executable, str(SCRIPT), "--plugins", str(plugins), "--home", str(tmp), *args],
                           capture_output=True, text=True, env=e)
 
@@ -201,18 +238,16 @@ timeout = 15
 """
 
 
-def test_kimi_flat_layout_registers_the_failure_witness_only():
+def test_kimi_flat_layout_registers_the_failure_witness_and_reconciles_owned_lines():
     """kimi's config is flat `[[hooks]] event = ...` tables. The seat already ran a witness on
-    PostToolUse (its private fork, at the installed path) but none on PostToolUseFailure — the
-    event kimi fires INSTEAD of PostToolUse for a failed call — so no failed kimi act was ever
-    witnessed. Registration must see what is there (keys in either order) and add only that."""
+    PostToolUse but none on PostToolUseFailure — the event kimi fires INSTEAD of PostToolUse for a
+    failed call — so no failed kimi act was ever witnessed. Registration must see what is there (keys
+    in either order) and add that. Since the reconcile (dp 2026-10-06) the owned gate and witness
+    lines are also rewritten to the template (the locator added, the hand-added HESTIA_PLUGIN_ID
+    gone), IN PLACE: every other line of the file stays where and as it was."""
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
-        plugins = _plugins(tmp)
-        (plugins / "kimi" / "hooks").mkdir(parents=True)
-        (plugins / "kimi" / "expects.json").write_text((REPO / "plugins" / "kimi" / "expects.json").read_text())
-        (plugins / "kimi" / "hooks" / "hooks.json").write_text(
-            (REPO / "plugins" / "kimi" / "hooks" / "hooks.json").read_text())
+        plugins = _plugins(tmp, ("codex", "claude-code", "kimi"))
         cfg = tmp / ".kimi-code" / "config.toml"
         cfg.parent.mkdir()
         before = KIMI_TOML.replace("/HOME", str(tmp))
@@ -224,10 +259,18 @@ def test_kimi_flat_layout_registers_the_failure_witness_only():
         added = sorted(ln.split(": ", 1)[1] for ln in r.stdout.splitlines()
                        if ln.strip().startswith("REGISTERED kimi"))
         assert "PostToolUseFailure/witness.py" in r.stdout, r.stdout
-        assert "PostToolUse/witness.py" not in r.stdout.replace("PostToolUseFailure/witness.py", ""), r.stdout
-        assert "PreToolUse/pre_tool_use.py" not in r.stdout, "a key-order-swapped table was not read"
+        assert "REGISTERED kimi: PreToolUse/pre_tool_use.py" not in r.stdout, "a key-order-swapped table was not read"
+        hh = os.path.realpath(_hh(tmp))
+        assert f"REWROTE kimi: PreToolUse/pre_tool_use.py: command 'python3 {tmp}/.kimi-code/hooks/pre_tool_use.py' " \
+               f"-> 'HESTIA_HOME={hh} HESTIA_ROLE=\"${{HESTIA_ROLE:-{_ROLE_DEFAULT}}}\" python3 {tmp}/.kimi-code/hooks/pre_tool_use.py'" in r.stdout, r.stdout
+        assert "REWROTE kimi: PostToolUse/witness.py: command 'HESTIA_PLUGIN_ID=kimi-code python3" in r.stdout, r.stdout
         after = cfg.read_text()
-        assert after.startswith(before), "existing content was rewritten or reordered"
+        # in place: the same lines, in the same order, but the two owned commands
+        old_lines, new_lines = before.split("\n"), after.split("\n")[:len(before.split("\n"))]
+        diffs = [(a, b) for a, b in zip(old_lines, new_lines) if a != b]
+        assert [a for a, _b in diffs] == [
+            f'command = "HESTIA_PLUGIN_ID=kimi-code python3 {tmp}/.kimi-code/hooks/witness.py"',
+            f'command = "python3 {tmp}/.kimi-code/hooks/pre_tool_use.py"'], diffs
         assert "[[hooks.PostToolUseFailure" not in after, "wrote codex's nested layout into kimi's flat file"
         try:
             import tomllib
@@ -285,13 +328,17 @@ def test_json_member_merges_without_disturbing_other_keys():
         cfg.write_text(json.dumps(existing, indent=2))
         _install(tmp, "claude-code", "witness.py")
         r = _run(tmp, plugins, "--member", "claude-code")
-        assert r.returncode == 0, r.stdout + r.stderr
+        # One-gate stage C: the gate's existing registration declares NO timeout, which the
+        # registrar now reports SHORT (exit 10) — the gate's bound should be explicit. It is a
+        # report: nothing about the registration is rewritten without --raise-timeouts.
+        assert r.returncode == 10, r.stdout + r.stderr
+        assert "SHORT claude-code: PreToolUse/pre_tool_use.py is registered with timeout None" in r.stdout
         data = json.loads(cfg.read_text())
         assert data["permissions"] == existing["permissions"]
         assert data["hooks"]["PreCompact"] == existing["hooks"]["PreCompact"]
         # the gate was already registered (by basename, at a different path): left alone
         assert data["hooks"]["PreToolUse"] == existing["hooks"]["PreToolUse"]
-        assert "PreToolUse/pre_tool_use.py" not in r.stdout
+        assert "REGISTERED claude-code: PreToolUse/pre_tool_use.py" not in r.stdout
         posts = [h["command"] for g in data["hooks"]["PostToolUse"] for h in g["hooks"]]
         assert posts == ["python3 " + str(tmp / ".claude" / "hooks" / "hestia" / "witness.py")], posts
         r2 = _run(tmp, plugins, "--member", "claude-code")
@@ -378,7 +425,8 @@ def test_a_failed_write_restores_what_this_run_read_not_the_first_backup():
         orig = RM.validate_toml
         RM.validate_toml = lambda text: calls.append(1) or (None if len(calls) == 1 else "forced: after-write parse failure")
         try:
-            verdict, changes = RM.register_member("codex", spec, template, str(tmp), False)
+            verdict, changes = RM.register_member("codex", spec, template, str(tmp), False,
+                                                  env={"HESTIA_HOME": _hh(tmp)}, source=str(plugins / "codex"))
         finally:
             RM.validate_toml = orig
         assert verdict == "failed" and "restored as it was" in changes[0], (verdict, changes)
@@ -421,12 +469,15 @@ def test_claude_code_template_registers_the_gate_and_law_inject_beside_an_existi
         assert r.returncode == 0, r.stdout + r.stderr
         assert "REGISTERED claude-code: PreToolUse/pre_tool_use.py" in r.stdout, r.stdout
         assert "REGISTERED claude-code: SessionStart/law_inject.py" in r.stdout, r.stdout
-        assert "PostToolUse/witness.py" not in r.stdout, "the witness was already registered (at another path) and must not be duplicated"
+        assert "REGISTERED claude-code: PostToolUse/witness.py" not in r.stdout, \
+            "the witness was already registered (at another path) and must not be duplicated"
+        assert "FOREIGN claude-code: PostToolUse/witness.py is registered at /elsewhere/hestia/witness.py" in r.stdout, r.stdout
         data = json.loads(cfg.read_text())
         assert data["permissions"] == existing["permissions"]
         dest = tmp / ".claude" / "hooks" / "hestia"
         pre = [h["command"] for g in data["hooks"]["PreToolUse"] for h in g["hooks"]]
-        assert pre == [f"python3 {dest}/pre_tool_use.py"], pre
+        assert pre == [f'HESTIA_HOME={os.path.realpath(_hh(tmp))} HESTIA_ROLE="${{HESTIA_ROLE:-{_ROLE_DEFAULT}}}" '
+                       f'python3 {dest}/pre_tool_use.py'], pre
         assert data["hooks"]["PreToolUse"][0]["matcher"] == "*"
         posts = [h["command"] for g in data["hooks"]["PostToolUse"] for h in g["hooks"]]
         assert posts == ["python3 /elsewhere/hestia/witness.py"], posts
@@ -480,26 +531,98 @@ def test_plan_names_every_hook_to_add_with_its_target():
         assert not (tmp / ".claude" / "settings.json").exists() and not (tmp / ".claude" / "hooks").exists(), "--plan wrote something"
 
 
-def test_a_read_only_gate_is_reported_narrow_not_registered():
+def test_a_read_only_gate_is_narrow_when_foreign_and_widened_when_owned():
     """#1142 review, case 2: an existing PreToolUse gate with matcher 'Read' was reported as 'every
-    templated hook is registered' and left as it was. The all-tools gate is NOT wired; say so."""
+    templated hook is registered' and left as it was. The all-tools gate is NOT wired; say so.
+    Since the reconcile (dp 2026-10-06) that holds for a line hestia does NOT own (a target outside
+    the declared dest): NARROW, exit 8, untouched. A narrow line hestia DID install is rewritten
+    to the template's matcher -- the deployer owns it -- and nothing else in its group moves."""
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         plugins = _plugins(tmp)
         dest = _install(tmp, "claude-code", "pre_tool_use.py", "witness.py", "law_inject.py")
         cfg = tmp / ".claude" / "settings.json"
         narrow = {"hooks": {"PreToolUse": [{"matcher": "Read", "hooks": [
-            {"type": "command", "command": f"python3 {dest}/pre_tool_use.py", "timeout": 10}]}]}}
+            {"type": "command", "command": "python3 /opt/elsewhere/pre_tool_use.py", "timeout": 10}]}]}}
         cfg.write_text(json.dumps(narrow, indent=2))
         r = _run(tmp, plugins, "--member", "claude-code")
         assert r.returncode == 8, (r.returncode, r.stdout)
         assert "NARROW claude-code: PreToolUse/pre_tool_use.py is registered only for matcher 'Read'" in r.stdout, r.stdout
         assert "every templated hook is registered" not in r.stdout, r.stdout
         data = json.loads(cfg.read_text())
-        assert data["hooks"]["PreToolUse"] == narrow["hooks"]["PreToolUse"], "the narrow gate was silently rewritten"
+        assert data["hooks"]["PreToolUse"] == narrow["hooks"]["PreToolUse"], "a foreign narrow gate was rewritten"
         # the other two hooks, which are not narrow, still register
         assert "REGISTERED claude-code: PostToolUse/witness.py" in r.stdout, r.stdout
         assert "REGISTERED claude-code: SessionStart/law_inject.py" in r.stdout, r.stdout
+
+        # owned: the same narrow gate, at the declared dest
+        owned = {"hooks": {"PreToolUse": [{"matcher": "Read", "hooks": [
+            {"type": "command", "command": f"python3 {dest}/pre_tool_use.py", "timeout": 10}]}]}}
+        cfg.write_text(json.dumps(owned, indent=2))
+        r = _run(tmp, plugins, "--member", "claude-code")
+        assert r.returncode == 0, (r.returncode, r.stdout)
+        assert "REWROTE claude-code: PreToolUse/pre_tool_use.py: matcher 'Read' -> '*'" in r.stdout, r.stdout
+        pre = json.loads(cfg.read_text())["hooks"]["PreToolUse"]
+        assert len(pre) == 1 and pre[0]["matcher"] == "*", pre
+        assert pre[0]["hooks"][0]["command"].startswith("HESTIA_HOME="), pre
+
+
+def test_an_owned_hook_sharing_a_group_is_moved_never_the_foreign_hooks_matcher():
+    """A matcher lives on the GROUP. When an owned narrow hook shares its group with a hook hestia
+    does not own, rewriting the group's matcher would widen the foreign hook too: the owned hook is
+    moved to a group of its own instead, and the foreign one stays exactly where and as it was."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        dest = _install(tmp, "claude-code", "pre_tool_use.py", "witness.py", "law_inject.py")
+        cfg = tmp / ".claude" / "settings.json"
+        foreign = {"type": "command", "command": "node /w/snarc/pre-tool-use.js", "timeout": 15}
+        cfg.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "Read", "hooks": [
+            {"type": "command", "command": f"python3 {dest}/pre_tool_use.py", "timeout": 10}, foreign]}]}}, indent=2))
+        r = _run(tmp, plugins, "--member", "claude-code")
+        assert r.returncode == 0, (r.returncode, r.stdout)
+        assert "moved to its own group" in r.stdout, r.stdout
+        pre = json.loads(cfg.read_text())["hooks"]["PreToolUse"]
+        assert pre[0] == {"matcher": "Read", "hooks": [foreign]}, pre
+        assert pre[1]["matcher"] == "*" and [h["command"].split("/")[-1] for h in pre[1]["hooks"]] == ["pre_tool_use.py"], pre
+        again = _run(tmp, plugins, "--member", "claude-code")
+        assert again.returncode == 0 and "REWROTE" not in again.stdout and "ok    claude-code" in again.stdout, again.stdout
+
+
+def test_a_foreign_hook_without_a_command_keeps_its_group_and_matcher():
+    """Codex review 17401 P2: group ownership was counted from the hooks the reader INDEXES, and the
+    index skips entries with no `command` -- a `type: prompt` (or agent) hook. A group holding an
+    owned narrow gate and a foreign prompt read as wholly owned, so the matcher was rewritten on the
+    GROUP and the unrelated prompt started running for every tool. Every entry counts: the owned
+    hook moves to its own group, and the foreign one stays byte-identical under its own matcher."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        dest = _install(tmp, "claude-code", "pre_tool_use.py", "witness.py", "law_inject.py")
+        cfg = tmp / ".claude" / "settings.json"
+        prompt = {"type": "prompt", "prompt": "Review this read request."}
+        cfg.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "Read", "hooks": [
+            {"type": "command", "command": f"python3 {dest}/pre_tool_use.py", "timeout": 10}, prompt]}]}}, indent=2))
+        r = _run(tmp, plugins, "--member", "claude-code")
+        assert r.returncode == 0, (r.returncode, r.stdout)
+        pre = json.loads(cfg.read_text())["hooks"]["PreToolUse"]
+        assert pre[0] == {"matcher": "Read", "hooks": [prompt]}, pre
+        assert pre[1]["matcher"] == "*" and [h["command"].split("/")[-1] for h in pre[1]["hooks"]] == ["pre_tool_use.py"], pre
+        assert "moved to its own group" in r.stdout, r.stdout
+        # nested TOML: the same shape, a foreign entry with no command
+        _plugins(tmp, ("codex",))
+        _install(tmp, "codex", "pre_tool_use.py", "witness.py", "observe.sh", "hydrate.sh")
+        toml = tmp / ".codex" / "config.toml"
+        foreign = '[[hooks.PreToolUse.hooks]]\ntype = "prompt"\nprompt = "Review this shell call."\n'
+        toml.write_text('[[hooks.PreToolUse]]\nmatcher = "shell"\n\n[[hooks.PreToolUse.hooks]]\ntype = "command"\n'
+                        f'command = "python3 {tmp}/.codex/hooks/pre_tool_use.py"\ntimeout = 15\n\n' + foreign)
+        r = _run(tmp, plugins, "--member", "codex")
+        assert r.returncode == 0, (r.returncode, r.stdout)
+        import tomllib
+        g = tomllib.loads(toml.read_text())["hooks"]["PreToolUse"]
+        assert g[0] == {"matcher": "shell", "hooks": [{"type": "prompt", "prompt": "Review this shell call."}]}, g
+        assert any(gg.get("matcher") == ".*" and gg["hooks"][0]["command"].endswith("/pre_tool_use.py") for gg in g[1:]), g
+        assert foreign in toml.read_text(), toml.read_text()
 
 
 def test_a_narrow_toml_matcher_is_read_from_its_group():
@@ -647,25 +770,32 @@ def test_the_left_behind_repair_also_works_through_the_fallback():
 def test_a_narrow_kimi_flat_matcher_is_narrow_in_both_readers():
     """#1149's flat reader kept no matchers, so a kimi `[[hooks]]` gate with `matcher = "Shell"` read as
     all-tools -- the same false completeness as #1142's reviews. Flat tables carry their matcher now,
-    in the structural reader and in the fallback, quoted key or not."""
+    in the structural reader and in the fallback, quoted key or not. (A FOREIGN line, here: since the
+    reconcile an owned narrow line is rewritten -- the second half of this test.)"""
     for spelling in ('matcher = "Shell"', '"matcher" = "Shell" # narrow'):
         for scan in (["--toml-line-scan"], []):
             with tempfile.TemporaryDirectory() as d:
                 tmp = Path(d)
-                plugins = _plugins(tmp)
-                (plugins / "kimi" / "hooks").mkdir(parents=True)
-                (plugins / "kimi" / "expects.json").write_text((REPO / "plugins" / "kimi" / "expects.json").read_text())
-                (plugins / "kimi" / "hooks" / "hooks.json").write_text(
-                    (REPO / "plugins" / "kimi" / "hooks" / "hooks.json").read_text())
+                plugins = _plugins(tmp, ("kimi",))
                 cfg = tmp / ".kimi-code" / "config.toml"
                 cfg.parent.mkdir()
-                text = KIMI_TOML.replace("/HOME", str(tmp)).replace(
+                base = KIMI_TOML.replace("/HOME", str(tmp))
+                foreign = base.replace(f"python3 {tmp}/.kimi-code/hooks/pre_tool_use.py",
+                                       "python3 /opt/elsewhere/pre_tool_use.py").replace(
                     'event = "PreToolUse"', 'event = "PreToolUse"\n' + spelling)
-                cfg.write_text(text)
+                cfg.write_text(foreign)
                 _install(tmp, "kimi", "observe.sh", "hydrate.sh", "witness.py", "pre_tool_use.py")
                 r = _run(tmp, plugins, "--member", "kimi", *scan)
                 assert r.returncode == 8, (spelling, scan, r.returncode, r.stdout)
                 assert "PreToolUse/pre_tool_use.py is registered only for matcher 'Shell'" in r.stdout, (spelling, scan, r.stdout)
+                assert spelling in cfg.read_text(), "a foreign narrow line was rewritten"
+                # owned: the narrow matcher on hestia's own line is removed (kimi's all-tools spelling)
+                owned = base.replace('event = "PreToolUse"', 'event = "PreToolUse"\n' + spelling)
+                cfg.write_text(owned)
+                r = _run(tmp, plugins, "--member", "kimi", *scan)
+                assert r.returncode == 0, (spelling, scan, r.returncode, r.stdout)
+                assert "REWROTE kimi: PreToolUse/pre_tool_use.py:" in r.stdout and "matcher 'Shell' -> (none)" in r.stdout, r.stdout
+                assert "Shell" not in cfg.read_text(), cfg.read_text()
 
 
 def test_escaped_toml_spellings_are_decoded_or_refused():
@@ -984,14 +1114,16 @@ def test_install_members_end_to_end_in_an_isolated_home():
         assert json.loads((home / ".claude" / "settings.json").read_text()) == data
 
 
-def test_install_members_reports_a_narrow_gate_and_leaves_it():
+def test_install_members_reports_a_foreign_narrow_gate_and_widens_an_owned_one():
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         root, home, env = _e2e_root(tmp)
         dest = home / ".claude" / "hooks" / "hestia"
         dest.mkdir(parents=True)
+        elsewhere = tmp / "elsewhere"
+        elsewhere.mkdir()
         narrow = {"hooks": {"PreToolUse": [{"matcher": "Read", "hooks": [
-            {"type": "command", "command": f"python3 {dest}/pre_tool_use.py", "timeout": 10}]}]}}
+            {"type": "command", "command": f"python3 {elsewhere}/pre_tool_use.py", "timeout": 10}]}]}}
         (home / ".claude" / "settings.json").write_text(json.dumps(narrow, indent=2))
         p = subprocess.run(["bash", str(root / "deploy" / "install-members.sh")], capture_output=True, text=True, env=env)
         out = p.stdout + p.stderr
@@ -999,6 +1131,15 @@ def test_install_members_reports_a_narrow_gate_and_leaves_it():
         assert "every templated hook is registered" not in out
         got = json.loads((home / ".claude" / "settings.json").read_text())["hooks"]["PreToolUse"]
         assert got == narrow["hooks"]["PreToolUse"], got
+        # hestia's own narrow line is the deployer's to rewrite
+        owned = {"hooks": {"PreToolUse": [{"matcher": "Read", "hooks": [
+            {"type": "command", "command": f"python3 {dest}/pre_tool_use.py", "timeout": 10}]}]}}
+        (home / ".claude" / "settings.json").write_text(json.dumps(owned, indent=2))
+        p = subprocess.run(["bash", str(root / "deploy" / "install-members.sh")], capture_output=True, text=True, env=env)
+        out = p.stdout + p.stderr
+        assert p.returncode == 0 and "REWROTE claude-code: PreToolUse/pre_tool_use.py: matcher 'Read' -> '*'" in out, out[-3000:]
+        got = json.loads((home / ".claude" / "settings.json").read_text())["hooks"]["PreToolUse"]
+        assert got[0]["matcher"] == "*", got
 
 
 def test_install_names_the_seat_document_step_and_never_fails_on_it():
@@ -1019,9 +1160,602 @@ def test_install_names_the_seat_document_step_and_never_fails_on_it():
         assert out.index("REGISTERED claude-code") < out.index("SEATS ("), "seat step must follow the hooks"
 
 
+# ---- one-gate stage C: the registered timeout is the gate's bound -----------------------------
+# Fixture members with NEUTRAL hook names (`gate_hook.py`): the registrar locates hooks by the
+# basename its template renders, so nothing here needs a governed filename.
+
+def _neutral_plugins(tmp: Path) -> Path:
+    """Three fixture members, one per registration reader/layout, each templating gate_hook.py
+    on PreToolUse at a 10 s floor."""
+    p = tmp / "plugins"
+    shapes = {"jseat": ([".jseat", "settings.json"], "json-hook-commands", None),
+              "nseat": ([".nseat", "config.toml"], "toml-hook-commands", None),
+              "fseat": ([".fseat", "config.toml"], "toml-hook-commands", "flat")}
+    for m, (segs, reader, layout) in shapes.items():
+        (p / m / "hooks").mkdir(parents=True)
+        reg = {"reader": reader, "path": segs}
+        if layout:
+            reg["layout"] = layout
+        (p / m / "expects.json").write_text(json.dumps({"install": {
+            "member": m, "dest": f"~/{segs[0]}/hooks", "registration": reg,
+            "files": ["hooks/gate_hook.py"]}}))
+        (p / m / "hooks" / "hooks.json").write_text(json.dumps({"hooks": {"PreToolUse": [
+            {"matcher": "*", "hooks": [{"type": "command", "timeout": 10,
+                                        "command": f"python3 @HESTIA_PLUGIN_ROOT@/{m}/hooks/gate_hook.py"}]}]}}))
+        (tmp / segs[0] / "hooks").mkdir(parents=True)
+        (tmp / segs[0] / "hooks" / "gate_hook.py").write_text("# fixture\n")
+    return p
+
+
+def _neutral_configs(tmp: Path, timeout: int, stray: str = "") -> None:
+    h = lambda seat: f"{tmp}/.{seat}/hooks/gate_hook.py"  # noqa: E731
+    (tmp / ".jseat" / "settings.json").write_text(json.dumps({"hooks": {"PreToolUse": [
+        {"matcher": "*", "hooks": [{"type": "command", "command": f"{stray}python3 {h('jseat')}",
+                                    "timeout": timeout}]}]}}))
+    (tmp / ".nseat" / "config.toml").write_text(
+        f'model = "x"\n\n[[hooks.PreToolUse]]\nmatcher = "*"\n\n[[hooks.PreToolUse.hooks]]\n'
+        f'type = "command"\ncommand = "{stray}python3 {h("nseat")}"\ntimeout = {timeout}\n')
+    (tmp / ".fseat" / "config.toml").write_text(
+        f'[[hooks]]\nevent = "PreToolUse"\ncommand = "{stray}python3 {h("fseat")}"\ntimeout = {timeout}\n'
+        f'\n[[hooks]]\nevent = "SessionStart"\ncommand = "/x/other.sh"\ntimeout = 3\n')
+
+
+def test_a_short_registered_timeout_is_reconciled_in_every_reader():
+    """One-gate stage C: the registered timeout is the gate's bound. Since the reconcile an OWNED
+    hook registered below its template's timeout is rewritten to it -- in JSON, nested TOML and flat
+    TOML -- and only that hook's value moves: the flat file's other table keeps its 3."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _neutral_plugins(tmp)
+        _neutral_configs(tmp, 5)
+        r = _run(tmp, plugins)
+        assert r.returncode == 0, (r.returncode, r.stdout)
+        for seat in ("jseat", "nseat", "fseat"):
+            assert f"REWROTE {seat}: PreToolUse/gate_hook.py: timeout 5 -> 10" in r.stdout, r.stdout
+        assert "SHORT" not in r.stdout, r.stdout
+        j = json.loads((tmp / ".jseat" / "settings.json").read_text())
+        assert j["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] == 10, j
+        n = (tmp / ".nseat" / "config.toml").read_text()
+        assert "timeout = 10" in n and "timeout = 5" not in n and 'model = "x"' in n, n
+        f = (tmp / ".fseat" / "config.toml").read_text()
+        assert "timeout = 10" in f and "timeout = 3" in f, f"only the gate's table moves: {f}"
+        snap = {s: (tmp / f".{s}" / n_).read_bytes() for s, n_ in
+                (("jseat", "settings.json"), ("nseat", "config.toml"), ("fseat", "config.toml"))}
+        again = _run(tmp, plugins)
+        assert again.returncode == 0 and "REWROTE" not in again.stdout, again.stdout
+        for s, n_ in (("jseat", "settings.json"), ("nseat", "config.toml"), ("fseat", "config.toml")):
+            assert (tmp / f".{s}" / n_).read_bytes() == snap[s], f"{s}: the second run was not byte-identical"
+
+
+def test_raise_timeouts_is_an_accepted_no_op_and_the_reconcile_lowers_too():
+    """--raise-timeouts is redundant (the reconcile covers it) and stays accepted, so an old caller
+    does not break. The template's value is the bound in BOTH directions: a hand-raised 30 is set
+    back to 10 -- per-seat tuning belongs in the vault, never on a hook line (dp 2026-10-06)."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _neutral_plugins(tmp)
+        _neutral_configs(tmp, 30)
+        r = _run(tmp, plugins, "--raise-timeouts")
+        assert r.returncode == 0, (r.returncode, r.stdout)
+        for seat in ("jseat", "nseat", "fseat"):
+            assert f"REWROTE {seat}: PreToolUse/gate_hook.py: timeout 30 -> 10" in r.stdout, r.stdout
+        assert "timeout = 10" in (tmp / ".nseat" / "config.toml").read_text()
+        _neutral_configs(tmp, 30)
+        plain = _run(tmp, plugins)
+        assert plain.stdout == r.stdout, "--raise-timeouts changed the outcome"
+
+
+def test_an_untimed_registration_gains_one_and_an_inert_override_is_removed():
+    """An owned line with no timeout gets the template's; an owned line carrying an env override no
+    gate reads since stage C (kimi's HESTIA_PRE_TOTAL_BUDGET_MS=14000) is rewritten without it. The
+    same override on a FOREIGN line is only named (INERT), never edited."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _neutral_plugins(tmp)
+        _neutral_configs(tmp, 10, stray="HESTIA_PRE_TOTAL_BUDGET_MS=14000 ")
+        (tmp / ".fseat" / "config.toml").write_text(
+            f'[[hooks]]\nevent = "PreToolUse"\ncommand = "python3 {tmp}/.fseat/hooks/gate_hook.py"\n')
+        r = _run(tmp, plugins)
+        assert r.returncode == 0, (r.returncode, r.stdout)
+        assert "REWROTE fseat: PreToolUse/gate_hook.py: timeout (none) -> 10" in r.stdout, r.stdout
+        assert "REWROTE jseat: PreToolUse/gate_hook.py: command 'HESTIA_PRE_TOTAL_BUDGET_MS=14000 python3" in r.stdout, r.stdout
+        assert "HESTIA_PRE_TOTAL_BUDGET_MS" not in (tmp / ".nseat" / "config.toml").read_text()
+        assert 'timeout = 10' in (tmp / ".fseat" / "config.toml").read_text()
+        # foreign: the same override, on a line outside the declared dest
+        (tmp / ".nseat" / "config.toml").write_text(
+            'model = "x"\n\n[[hooks.PreToolUse]]\nmatcher = "*"\n\n[[hooks.PreToolUse.hooks]]\n'
+            'type = "command"\ncommand = "HESTIA_PRE_TOTAL_BUDGET_MS=14000 python3 /opt/x/gate_hook.py"\ntimeout = 4\n')
+        before = (tmp / ".nseat" / "config.toml").read_text()
+        r = _run(tmp, plugins, "--member", "nseat")
+        assert "INERT nseat" in r.stdout and "SHORT nseat" in r.stdout and "FOREIGN nseat" in r.stdout, r.stdout
+        assert r.returncode == 10, (r.returncode, r.stdout)
+        assert (tmp / ".nseat" / "config.toml").read_text() == before
+
+
+# ---- the reconcile on real-shaped configs, all four harnesses (dp 2026-10-06, #1237 #1242) ----
+# Shapes follow the live files measured on CBP / Legion / HUB on 2026-10-05: claude's hand line with
+# the `${HESTIA_HOME:-$HOME/.hestia}` form, a codex/kimi/gemini gate line WITHOUT HESTIA_HOME (the
+# exact #1237/#1242 failure), kimi's inert 14000 override, short timeouts, a duplicate, and foreign
+# hooks of other tools sharing the same events (and, for claude, the same groups).
+
+CLAUDE_REAL = {
+    "hooks": {
+        "SessionStart": [
+            {"hooks": [{"type": "command", "command": "node /w/snarc/dist/hooks/handlers/session-start.js", "timeout": 15}]},
+            {"hooks": [{"type": "command", "command": "/HOME/.claude/hooks/hestia/law_inject.py", "timeout": 10}]},
+        ],
+        "PreToolUse": [{"matcher": "*", "hooks": [
+            {"type": "command", "command": 'HESTIA_HOME="${HESTIA_HOME:-$HOME/.hestia}" HESTIA_ROLE="${HESTIA_ROLE:-role:constellation:interactive-dev}" python3 /HOME/.claude/hooks/hestia/pre_tool_use.py', "timeout": 10},
+            {"type": "command", "command": "node /w/snarc/dist/hooks/handlers/pre-tool-use.js", "timeout": 15},
+        ]}],
+        "PostToolUse": [{"matcher": "*", "hooks": [
+            {"type": "command", "command": "/w/claude-code/plugins/web4-governance/hooks/post_tool_use.py"},
+            {"type": "command", "command": 'HESTIA_HOME="${HESTIA_HOME:-$HOME/.hestia}" python3 /HOME/.claude/hooks/hestia/witness.py', "timeout": 3},
+            {"type": "command", "command": "python3 /HOME/.claude/hooks/hestia/witness.py", "timeout": 3},
+        ]}],
+    },
+    "theme": "dark",
+}
+
+CODEX_REAL = """model = "gpt-5"
+approval_policy = "on-request"
+
+[features]
+codex_hooks = true
+
+[projects."/w"]
+trust_level = "trusted"
+
+# ---- hestia: the fail-closed scope + egress + society-safety gate ----
+[[hooks.PreToolUse]]
+matcher = ".*"
+
+[[hooks.PreToolUse.hooks]]
+type          = "command"
+command       = "HESTIA_WORKSPACE=/w python3 /HOME/.codex/hooks/pre_tool_use.py"
+statusMessage = "hestia: scope + safety gate"
+timeout       = 5   # hand-tuned
+
+[[hooks.SessionStart]]
+
+[[hooks.SessionStart.hooks]]
+type    = "command"
+command = "/HOME/.codex/hooks/observe.sh"
+timeout = 15
+
+[[hooks.PostToolUse]]
+matcher = ".*"
+
+[[hooks.PostToolUse.hooks]]
+type    = "command"
+command = "/HOME/.codex/hooks/observe.sh"
+timeout = 10
+
+# someone else's hook: never hestia's to touch
+[[hooks.PostToolUse]]
+matcher = "apply_patch"
+
+[[hooks.PostToolUse.hooks]]
+type    = "command"
+command = "/usr/local/bin/notify-patch.sh --quiet"
+timeout = 2
+
+[[hooks.SessionEnd]]
+
+[[hooks.SessionEnd.hooks]]
+type    = "command"
+command = "/HOME/.codex/hooks/hydrate.sh"
+timeout = 20
+
+[[hooks.SessionEnd]]
+
+[[hooks.SessionEnd.hooks]]
+type    = "command"
+command = "/HOME/.codex/hooks/hydrate.sh"
+timeout = 20
+
+[hooks.state]
+
+[hooks.state."/HOME/.codex/config.toml:pre_tool_use:0:0"]
+approved = true
+"""
+
+CODEX_FOREIGN = """# someone else's hook: never hestia's to touch
+[[hooks.PostToolUse]]
+matcher = "apply_patch"
+
+[[hooks.PostToolUse.hooks]]
+type    = "command"
+command = "/usr/local/bin/notify-patch.sh --quiet"
+timeout = 2
+"""
+
+KIMI_REAL = """default_model = "kimi-k2"
+
+# kimi hooks are flat tables
+[[hooks]]
+event = "SessionStart"
+command = "/HOME/.kimi-code/hooks/observe.sh"
+timeout = 15
+
+[[hooks]]
+event = "PreToolUse"
+command = "HESTIA_PRE_TOTAL_BUDGET_MS=14000 HESTIA_WORKSPACE=/w python3 /HOME/.kimi-code/hooks/pre_tool_use.py"
+timeout = 15
+
+[[hooks]]
+event = "PostToolUse"
+command = "/HOME/.kimi-code/hooks/observe.sh"
+timeout = 10
+
+[[hooks]]
+event = "PostToolUse"
+command = "python3 /HOME/.kimi-code/hooks/witness.py"
+timeout = 10
+
+[[hooks]]
+event = "Stop"
+command = "/opt/tools/notify.sh"
+timeout = 3
+
+[[hooks]]
+event = "PostToolUseFailure"
+command = "/HOME/.kimi-code/hooks/observe.sh"
+timeout = 10
+
+[[hooks]]
+event = "SessionEnd"
+command = "/HOME/.kimi-code/hooks/observe.sh"
+timeout = 10
+
+[[hooks]]
+event = "SessionEnd"
+command = "/HOME/.kimi-code/hooks/hydrate.sh"
+timeout = 20
+"""
+
+KIMI_FOREIGN = """[[hooks]]
+event = "Stop"
+command = "/opt/tools/notify.sh"
+timeout = 3
+"""
+
+GEMINI_REAL = {
+    "hooksConfig": {"enabled": True},
+    "hooks": {
+        "BeforeTool": [
+            {"matcher": ".*", "hooks": [{"type": "command", "command": "HESTIA_WORKSPACE=/w python3 /HOME/.gemini/hestia-plugins/gemini/hooks/before_tool.py", "timeout": 5000}]},
+            {"matcher": "run_shell_command", "hooks": [{"type": "command", "command": "/opt/gem/shell-audit.sh", "timeout": 1000}]},
+        ],
+        "SessionStart": [{"hooks": [{"type": "command", "command": "/HOME/.gemini/hestia-plugins/gemini/hooks/observe.sh", "timeout": 15000}]}],
+        "AfterTool": [{"matcher": ".*", "hooks": [{"type": "command", "command": "/HOME/.gemini/hestia-plugins/gemini/hooks/observe.sh", "timeout": 10000}]}],
+        "SessionEnd": [{"hooks": [{"type": "command", "command": "/HOME/.gemini/hestia-plugins/gemini/hooks/hydrate.sh", "timeout": 20000}]}],
+    },
+    "security": {"auth": {"selectedType": "oauth-personal"}},
+}
+
+_REAL_FILES = {
+    "claude-code": ((".claude", "settings.json"), ("pre_tool_use.py", "witness.py", "law_inject.py")),
+    "codex": ((".codex", "config.toml"), ("pre_tool_use.py", "witness.py", "observe.sh", "hydrate.sh")),
+    "kimi": ((".kimi-code", "config.toml"), ("pre_tool_use.py", "witness.py", "observe.sh", "hydrate.sh")),
+    "gemini": ((".gemini", "settings.json"), ("before_tool.py", "witness.py", "observe.sh", "hydrate.sh")),
+}
+_REAL_DEST = {"claude-code": (".claude", "hooks", "hestia"), "codex": (".codex", "hooks"),
+              "kimi": (".kimi-code", "hooks"), "gemini": (".gemini", "hestia-plugins", "gemini", "hooks")}
+
+
+def _real_host(tmp: Path) -> tuple[Path, dict[str, Path]]:
+    """All four harnesses on one simulated host, their hook files installed, real-shaped configs."""
+    plugins = _plugins(tmp, tuple(_REAL_FILES))
+    cfgs = {}
+    for m, (segs, files) in _REAL_FILES.items():
+        dest = tmp.joinpath(*_REAL_DEST[m])
+        dest.mkdir(parents=True, exist_ok=True)
+        for f in files:
+            (dest / f).write_text(f"# installed {f}\n")
+        cfgs[m] = tmp.joinpath(*segs)
+    H = str(tmp)
+    cfgs["claude-code"].write_text(json.dumps(CLAUDE_REAL, indent=2).replace("/HOME", H) + "\n")
+    cfgs["codex"].write_text(CODEX_REAL.replace("/HOME", H))
+    cfgs["kimi"].write_text(KIMI_REAL.replace("/HOME", H))
+    cfgs["gemini"].write_text(json.dumps(GEMINI_REAL, indent=2).replace("/HOME", H) + "\n")
+    return plugins, cfgs
+
+
+def _template_cmds(plugins: Path, member: str, tmp: Path) -> dict[tuple, str]:
+    """{(event, basename): the command the template renders} -- the expectation, by the shared renderer."""
+    spec = json.loads((plugins / member / "expects.json").read_text())["install"]
+    dest = str(tmp.joinpath(*_REAL_DEST[member]))
+    groups = RM.rendered_groups(json.loads((plugins / member / "hooks" / "hooks.json").read_text()), member, dest,
+                                {"HESTIA_HOME": _hh(tmp)}, default_role=spec.get("default_role"),
+                                source=str(plugins / member))
+    assert spec["dest"]
+    return {(e, RM.target_basename(h["command"])): h["command"] for e, gs in groups.items() for g in gs for h in g["hooks"]}
+
+
+def _reg_cmds(cfg: Path, member: str) -> dict[tuple, list]:
+    layout = "flat" if member == "kimi" else ("json" if cfg.suffix == ".json" else "toml")
+    text = cfg.read_text()
+    hooks = (json.loads(text).get("hooks") or {}) if layout == "json" else RM.toml_hooks(text, layout == "flat")
+    out: dict[tuple, list] = {}
+    for r in RM.index_hooks(hooks, layout == "flat"):
+        out.setdefault((r.event, r.base), []).append(r.hook)
+    return out
+
+
+def test_the_reconcile_on_real_shaped_configs_of_all_four_harnesses():
+    """The fleet's state after #1231, one host, all four harnesses. One deploy run must leave every
+    owned line equal to the rendered template (locator added, inert override gone, short timeout
+    raised, duplicate reduced, missing witness added), every foreign hook exactly as it was, every
+    rewrite reported old -> new, and a second run byte-identical -- through tomllib and through the
+    strict line grammar alike."""
+    for scan in ([], ["--toml-line-scan"]):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            plugins, cfgs = _real_host(tmp)
+            H = str(tmp)
+            r = _run(tmp, plugins, *scan)
+            assert r.returncode == 0, (scan, r.returncode, r.stdout + r.stderr)
+            out = r.stdout
+            hh = os.path.realpath(_hh(tmp))
+            # every reported rewrite names old -> new
+            for ln in out.splitlines():
+                if "REWROTE" in ln:
+                    assert " -> " in ln, ln
+            # today's exact failure, per harness: the gate line lacking HESTIA_HOME is rewritten
+            assert (f"REWROTE codex: PreToolUse/pre_tool_use.py: command 'HESTIA_WORKSPACE=/w python3 {H}/.codex/hooks/pre_tool_use.py' "
+                    f"-> 'HESTIA_HOME={hh} python3 {H}/.codex/hooks/pre_tool_use.py'; timeout 5 -> 15") in out, out
+            assert "REWROTE kimi: PreToolUse/pre_tool_use.py: command 'HESTIA_PRE_TOTAL_BUDGET_MS=14000 HESTIA_WORKSPACE=/w python3" in out, out
+            assert "REWROTE gemini: BeforeTool/before_tool.py: command" in out and "timeout 5000 -> 15000" in out, out
+            assert "REWROTE claude-code: PreToolUse/pre_tool_use.py: command 'HESTIA_HOME=\"${HESTIA_HOME:-$HOME/.hestia}\"" in out, out
+            # duplicates reduced, missing added
+            assert "REMOVED claude-code: PostToolUse/witness.py: duplicate owned entry" in out, out
+            assert "REMOVED codex: SessionEnd/hydrate.sh: duplicate owned entry" in out, out
+            for m, ev in (("codex", "PostToolUse"), ("kimi", "PostToolUseFailure"), ("gemini", "AfterTool")):
+                assert f"REGISTERED {m}: {ev}/witness.py" in out, (m, out)
+
+            for m, cfg in cfgs.items():
+                want = _template_cmds(plugins, m, tmp)
+                got = _reg_cmds(cfg, m)
+                for key, cmd in want.items():
+                    assert key in got and len(got[key]) == 1, (m, key, got.get(key))
+                    assert got[key][0]["command"] == cmd, (m, key, got[key][0]["command"], cmd)
+                assert "${HESTIA_HOME" not in cfg.read_text() and "14000" not in cfg.read_text(), (m, cfg.read_text())
+            # foreign hooks: byte-identical in TOML, identical and in place in JSON
+            assert CODEX_FOREIGN in cfgs["codex"].read_text(), cfgs["codex"].read_text()
+            assert KIMI_FOREIGN in cfgs["kimi"].read_text(), cfgs["kimi"].read_text()
+            c = json.loads(cfgs["claude-code"].read_text())
+            assert c["hooks"]["SessionStart"][0] == CLAUDE_REAL["hooks"]["SessionStart"][0]
+            assert c["hooks"]["PreToolUse"][0]["hooks"][1] == CLAUDE_REAL["hooks"]["PreToolUse"][0]["hooks"][1]
+            assert c["hooks"]["PostToolUse"][0]["hooks"][0] == CLAUDE_REAL["hooks"]["PostToolUse"][0]["hooks"][0]
+            assert c["theme"] == "dark"
+            g = json.loads(cfgs["gemini"].read_text())
+            assert g["hooks"]["BeforeTool"][1] == GEMINI_REAL["hooks"]["BeforeTool"][1]
+            assert g["hooksConfig"] == {"enabled": True} and g["security"] == GEMINI_REAL["security"]
+            # codex: the approval state and every non-hook table survive the text edit
+            import tomllib
+            cx = tomllib.loads(cfgs["codex"].read_text())
+            assert cx["hooks"]["state"] == {f"{H}/.codex/config.toml:pre_tool_use:0:0": {"approved": True}}, cx["hooks"]["state"]
+            assert cx["projects"] == {"/w": {"trust_level": "trusted"}} and cx["model"] == "gpt-5"
+            assert "timeout       = 15   # hand-tuned" in cfgs["codex"].read_text(), "the line's alignment/comment were not kept"
+
+            snap = {m: p.read_bytes() for m, p in cfgs.items()}
+            again = _run(tmp, plugins, *scan)
+            assert again.returncode == 0, again.stdout
+            assert "REWROTE" not in again.stdout and "REMOVED" not in again.stdout and "REGISTERED" not in again.stdout, again.stdout
+            for m, p in cfgs.items():
+                assert p.read_bytes() == snap[m], f"{m}: the second run was not byte-identical"
+
+
+def test_the_two_toml_readers_write_the_same_bytes():
+    """The text edit is the same edit whichever reader proved it."""
+    outs = []
+    for scan in ([], ["--toml-line-scan"]):
+        with tempfile.TemporaryDirectory(prefix="rmsame") as d:
+            tmp = Path(d)
+            plugins, cfgs = _real_host(tmp)
+            _run(tmp, plugins, *scan)
+            outs.append({m: cfgs[m].read_text().replace(str(tmp), "/T") for m in ("codex", "kimi")})
+    assert outs[0] == outs[1], outs
+
+
+def test_dry_run_reports_every_rewrite_and_writes_nothing():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins, cfgs = _real_host(tmp)
+        snap = {m: p.read_bytes() for m, p in cfgs.items()}
+        r = _run(tmp, plugins, env={"DRY_RUN": "1"})
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "DRY RUN" in r.stdout
+        assert "would kimi: would rewrite PreToolUse/pre_tool_use.py: command 'HESTIA_PRE_TOTAL_BUDGET_MS=14000" in r.stdout, r.stdout
+        assert "would claude-code: would remove PostToolUse/witness.py" in r.stdout, r.stdout
+        assert "would codex: would add PostToolUse/witness.py" in r.stdout, r.stdout
+        for m, p in cfgs.items():
+            assert p.read_bytes() == snap[m], f"DRY_RUN wrote {m}"
+        assert not list(tmp.rglob("*.pre-register.bak")), "DRY_RUN made a backup"
+
+
+def test_hestia_home_unset_refuses_every_templated_member_and_writes_nothing():
+    """The bootstrap locator has no default, by design (#944). A render without it would write the
+    #1237 outage onto every gate line, so the member is REFUSED (exit 7) and its config untouched."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins, cfgs = _real_host(tmp)
+        snap = {m: p.read_bytes() for m, p in cfgs.items()}
+        r = _run(tmp, plugins, env={"HESTIA_HOME": None})
+        assert r.returncode == 7, (r.returncode, r.stdout)
+        for m in cfgs:
+            assert f"REFUSED {m}" in r.stdout and "HESTIA_HOME is not set" in r.stdout, (m, r.stdout)
+            assert cfgs[m].read_bytes() == snap[m], m
+        # a path that cannot sit unquoted on a shell line is refused the same way
+        odd = tmp / "hestia home"
+        odd.mkdir()
+        r = _run(tmp, plugins, "--member", "codex", env={"HESTIA_HOME": str(odd)})
+        assert r.returncode == 7 and "will not write onto a shell command line" in r.stdout, r.stdout
+        assert cfgs["codex"].read_bytes() == snap["codex"]
+
+
+def test_hestia_home_renders_as_an_absolute_resolved_path():
+    dest = "/home/u/.codex/hooks"
+    c = "HESTIA_HOME=@HESTIA_HOME@ HESTIA_WORKSPACE=@HESTIA_WORKSPACE@ python3 @HESTIA_PLUGIN_ROOT@/codex/hooks/pre_tool_use.py"
+    with tempfile.TemporaryDirectory() as d:
+        real = Path(d).resolve() / "real-home"
+        real.mkdir()
+        link = Path(d).resolve() / "link-home"
+        link.symlink_to(real)
+        got = RM.render_command(c, "codex", dest, {"HESTIA_HOME": str(link)})
+        assert got == f"HESTIA_HOME={real} python3 {dest}/pre_tool_use.py", got
+        got = RM.render_command(c, "codex", dest, {"HESTIA_HOME": str(real), "HESTIA_WORKSPACE": "/w"})
+        assert got == f"HESTIA_HOME={real} HESTIA_WORKSPACE=/w python3 {dest}/pre_tool_use.py", got
+    try:
+        RM.render_command(c, "codex", dest, {})
+        raise AssertionError("an unset HESTIA_HOME rendered")
+    except RM.Unrendered as e:
+        assert "no default" in str(e), e
+
+
+def test_a_failed_write_of_a_rewrite_restores_what_this_run_read():
+    """Parse failure after the write -> restore, on the REWRITE path (kimi flat, owned lines edited
+    in place), not only on an append."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins, cfgs = _real_host(tmp)
+        before = cfgs["kimi"].read_text()
+        spec = json.loads((plugins / "kimi" / "expects.json").read_text())["install"]
+        template = json.loads((plugins / "kimi" / "hooks" / "hooks.json").read_text())
+        calls = []
+        orig = RM.validate_toml
+        RM.validate_toml = lambda text: calls.append(1) or (None if len(calls) == 1 else "forced: after-write parse failure")
+        try:
+            verdict, lines = RM.register_member("kimi", spec, template, str(tmp), False, env={"HESTIA_HOME": _hh(tmp)},
+                                                source=str(plugins / "kimi"))
+        finally:
+            RM.validate_toml = orig
+        assert verdict == "failed" and "restored as it was" in lines[0], (verdict, lines)
+        assert cfgs["kimi"].read_text() == before
+
+
+def test_a_rewrite_the_text_cannot_place_is_refused_not_guessed():
+    """An owned gate written as an INLINE array (`hooks = [{...}]`) is valid TOML the line edit
+    cannot place. The reconcile must refuse (exit 7) and write nothing -- never a half edit."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp, ("codex",))
+        _install(tmp, "codex", "pre_tool_use.py", "witness.py", "observe.sh", "hydrate.sh")
+        cfg = tmp / ".codex" / "config.toml"
+        text = ('[features]\ncodex_hooks = true\n\n[[hooks.PreToolUse]]\nmatcher = ".*"\n'
+                f'hooks = [ {{ type = "command", command = "python3 {tmp}/.codex/hooks/pre_tool_use.py", timeout = 5 }} ]\n')
+        cfg.write_text(text)
+        r = _run(tmp, plugins, "--member", "codex")
+        assert r.returncode == 7 and "REFUSED codex" in r.stdout and "cannot be placed" in r.stdout, (r.returncode, r.stdout)
+        assert cfg.read_text() == text
+
+
+def test_reconciled_commands_is_the_line_the_install_will_write():
+    """The preflight's view (shared renderer): a stale registered gate comes back as the rendered
+    line, a missing hook comes back added (its file assumed installed), a harness that is not here
+    is `absent`, and an unset HESTIA_HOME is `refused`."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins, cfgs = _real_host(tmp)
+        env = {"HESTIA_HOME": _hh(tmp)}
+        status, cmds, why = RM.reconciled_commands(str(plugins / "codex"), str(tmp), env)
+        assert status == "ok", why
+        gate = [c for c in cmds if c.endswith("/pre_tool_use.py")]
+        assert gate == [f"HESTIA_HOME={os.path.realpath(_hh(tmp))} python3 {tmp}/.codex/hooks/pre_tool_use.py"], cmds
+        assert any(c.endswith("/witness.py") for c in cmds), "the missing witness is part of what will be written"
+        assert "/usr/local/bin/notify-patch.sh --quiet" in cmds, "foreign hooks stay in the registration"
+        assert RM.reconciled_commands(str(plugins / "codex"), str(tmp), {})[0] == "refused"
+        shutil.rmtree(tmp / ".codex")
+        assert RM.reconciled_commands(str(plugins / "codex"), str(tmp), env)[0] == "absent"
+
+
+def test_the_launch_role_is_a_pass_through_with_the_members_declared_default():
+    """HESTIA_ROLE is launch context, never config: the seat loader refuses it from the vault
+    projection (plugins/kimi/hooks/pre_tool_use.py), so the hook line is the ONLY place it can come
+    from. Dropping it would silently move claude and kimi to the daemon default (member) and split
+    their trust record. It renders as `HESTIA_ROLE="${HESTIA_ROLE:-<install.default_role>}"` -- a
+    launcher's own value still wins -- and a member that declares no default gets no token (the
+    daemon default, as today). The rendered `${...}` is shell text, never an unrendered placeholder.
+    claude's CBP hand line already carries exactly this token: the reconcile keeps it byte for byte."""
+    c = _LOCATOR + "python3 @HESTIA_PLUGIN_ROOT@/kimi/hooks/witness.py"
+    env = {"HESTIA_HOME": "/srv/hh"}
+    got = RM.render_command(c, "kimi", "/d", env, default_role=_ROLE_DEFAULT)
+    assert got == f'HESTIA_HOME=/srv/hh HESTIA_ROLE="${{HESTIA_ROLE:-{_ROLE_DEFAULT}}}" python3 /d/witness.py', got
+    assert RM.render_command(c, "kimi", "/d", env) == "HESTIA_HOME=/srv/hh python3 /d/witness.py"
+    for bad in ("interactive-dev", 'role:x" ; touch /tmp/injected ; "', "role:a b", "role:$(id)"):
+        try:
+            RM.render_command(c, "kimi", "/d", env, default_role=bad)
+            raise AssertionError(f"accepted default_role {bad!r}")
+        except RM.Unrendered:
+            pass
+    # the declarations: claude-code and kimi registered interactive-dev by hand; codex and gemini
+    # declared none (their lines carried no role; their seeds say role:constellation:member, the
+    # daemon default), so they get no token
+    decl = {m: json.loads((REPO / "plugins" / m / "expects.json").read_text())["install"].get("default_role")
+            for m in ("claude-code", "kimi", "codex", "gemini")}
+    assert decl == {"claude-code": _ROLE_DEFAULT, "kimi": _ROLE_DEFAULT, "codex": None, "gemini": None}, decl
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins, cfgs = _real_host(tmp)
+        r = _run(tmp, plugins)
+        assert r.returncode == 0, r.stdout + r.stderr
+        role = f'HESTIA_ROLE="${{HESTIA_ROLE:-{_ROLE_DEFAULT}}}"'
+        c = json.loads(cfgs["claude-code"].read_text())
+        gate = c["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        assert role in gate and role in CLAUDE_REAL["hooks"]["PreToolUse"][0]["hooks"][0]["command"], gate
+        kimi = {RM.target_basename(t["command"]) + t["event"]: t["command"]
+                for t in RM.toml_hooks(cfgs["kimi"].read_text(), True)}
+        assert role in kimi["pre_tool_use.pyPreToolUse"] and role in kimi["witness.pyPostToolUse"], kimi
+        assert "HESTIA_ROLE" not in cfgs["codex"].read_text() and "HESTIA_ROLE" not in cfgs["gemini"].read_text()
+
+
+def test_codex_hydrate_is_pointed_at_the_plugin_source_where_its_seed_lives():
+    """hydrate.sh seeds a fresh identity from ${CODEX_PLUGIN_ROOT:-$(dirname "$0")/..}/instance/
+    identity.seed.json. The installer copies hooks into the dest and never the seed, so the fallback
+    (<dest>/..) holds no seed (measured on CBP 2026-10-06: absent at ~/.codex/instance/); rendering
+    the root from install.dest would name that same empty place. The line names the deployed plugin
+    directory instead, which carries the seed."""
+    assert (REPO / "plugins" / "codex" / "instance" / "identity.seed.json").is_file()
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins, cfgs = _real_host(tmp)
+        r = _run(tmp, plugins, "--member", "codex")
+        assert r.returncode == 0, r.stdout + r.stderr
+        src = os.path.realpath(plugins / "codex")
+        hyd = [h["command"] for h in _reg_cmds(cfgs["codex"], "codex")[("SessionEnd", "hydrate.sh")]]
+        assert hyd == [f"CODEX_PLUGIN_ROOT={src} {tmp}/.codex/hooks/hydrate.sh"], hyd
+        try:
+            RM.render_command("CODEX_PLUGIN_ROOT=@HESTIA_PLUGIN_SOURCE@ /x/hydrate.sh", "codex", "/d", {"HESTIA_HOME": "/h"})
+            raise AssertionError("rendered a plugin source nobody supplied")
+        except RM.Unrendered:
+            pass
+
+
+def test_shipped_templates_render_the_locator_onto_gate_and_witness():
+    """The governed half of this change: every member's gate and witness line carries
+    `HESTIA_HOME=@HESTIA_HOME@` (the post-#1231 shims refuse without it, #1237 #1242), and no other
+    hook carries it. RED until the template patch is applied: a reconciler that rewrites owned lines
+    to a template WITHOUT the locator would strip the one claude's hand line carries today."""
+    for m, gate in (("claude-code", "pre_tool_use.py"), ("codex", "pre_tool_use.py"),
+                    ("kimi", "pre_tool_use.py"), ("gemini", "before_tool.py")):
+        doc = json.loads((REPO / "plugins" / m / "hooks" / "hooks.json").read_text())
+        seen = set()
+        for gs in doc["hooks"].values():
+            for g in gs:
+                for h in g["hooks"]:
+                    base = h["command"].split("/")[-1]
+                    if base in (gate, "witness.py"):
+                        assert h["command"].startswith(_LOCATOR), (m, h["command"])
+                        seen.add(base)
+                    else:
+                        assert "@HESTIA_HOME@" not in h["command"], (m, h["command"])
+        assert seen == {gate, "witness.py"}, (m, seen)
+
+
 TESTS = [
     test_thor_case_registers_only_the_missing_witness,
-    test_kimi_flat_layout_registers_the_failure_witness_only,
+    test_kimi_flat_layout_registers_the_failure_witness_and_reconciles_owned_lines,
     test_ensure_adds_the_feature_flag_when_absent,
     test_json_member_merges_without_disturbing_other_keys,
     test_a_harness_not_on_this_host_is_not_minted,
@@ -1035,7 +1769,9 @@ TESTS = [
     test_claude_code_template_on_an_empty_settings_registers_all_three_once_installed,
     test_a_target_not_on_disk_is_pending_never_registered,
     test_plan_names_every_hook_to_add_with_its_target,
-    test_a_read_only_gate_is_reported_narrow_not_registered,
+    test_a_read_only_gate_is_narrow_when_foreign_and_widened_when_owned,
+    test_an_owned_hook_sharing_a_group_is_moved_never_the_foreign_hooks_matcher,
+    test_a_foreign_hook_without_a_command_keeps_its_group_and_matcher,
     test_a_narrow_toml_matcher_is_read_from_its_group,
     test_an_inline_comment_on_a_narrow_toml_matcher_is_still_narrow,
     test_the_fallback_line_scan_cannot_widen_a_matcher,
@@ -1055,8 +1791,22 @@ TESTS = [
     test_install_refuses_a_home_path_with_shell_special_characters,
     test_covers,
     test_install_members_end_to_end_in_an_isolated_home,
-    test_install_members_reports_a_narrow_gate_and_leaves_it,
+    test_install_members_reports_a_foreign_narrow_gate_and_widens_an_owned_one,
     test_install_names_the_seat_document_step_and_never_fails_on_it,
+    test_a_short_registered_timeout_is_reconciled_in_every_reader,
+    test_raise_timeouts_is_an_accepted_no_op_and_the_reconcile_lowers_too,
+    test_an_untimed_registration_gains_one_and_an_inert_override_is_removed,
+    test_the_reconcile_on_real_shaped_configs_of_all_four_harnesses,
+    test_the_two_toml_readers_write_the_same_bytes,
+    test_dry_run_reports_every_rewrite_and_writes_nothing,
+    test_hestia_home_unset_refuses_every_templated_member_and_writes_nothing,
+    test_hestia_home_renders_as_an_absolute_resolved_path,
+    test_a_failed_write_of_a_rewrite_restores_what_this_run_read,
+    test_a_rewrite_the_text_cannot_place_is_refused_not_guessed,
+    test_reconciled_commands_is_the_line_the_install_will_write,
+    test_the_launch_role_is_a_pass_through_with_the_members_declared_default,
+    test_codex_hydrate_is_pointed_at_the_plugin_source_where_its_seed_lives,
+    test_shipped_templates_render_the_locator_onto_gate_and_witness,
 ]
 
 if __name__ == "__main__":
