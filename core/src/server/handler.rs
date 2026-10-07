@@ -81,7 +81,10 @@ impl ServerHandler for HestiaServer {
             .map(Value::Object)
             .unwrap_or(Value::Object(serde_json::Map::new()));
 
-        let dispatch = match name.as_str() {
+        // Every state-lock acquisition under this dispatch is attributed to the tool (#lock
+        // instrumentation): `GET /api/debug/locks` reports wait and hold per `mcp:<tool>`.
+        let lock_label = super::state_lock::intern_label("mcp:", &name);
+        let dispatch = super::state_lock::with_label(lock_label, async { match name.as_str() {
             "hestia_connect" => tool_connect(&self.state, &args).await,
             "hestia_begin_action" => tool_begin_action(&self.state, &args).await,
             "hestia_record_outcome" => tool_record_outcome(&self.state, &args).await,
@@ -126,7 +129,7 @@ impl ServerHandler for HestiaServer {
                 &format!("Unknown tool: {}", name),
                 Some(json!({"tool": name})),
             )),
-        };
+        } }).await;
 
         let payload = dispatch.unwrap_or_else(|e| {
             hestia_error_envelope(
@@ -222,7 +225,13 @@ impl ServerHandler for HestiaServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, ErrorData> {
         let uri = request.uri.clone();
-        let body = match read_resource_body(&self.state, &uri).await {
+        // Label by scheme + first segment (`hestia://adjudication`), never the whole uri: the
+        // tail is caller-chosen, and the interner is bounded but labels should stay meaningful.
+        let lock_label = super::state_lock::intern_label(
+            "resource:",
+            &uri.splitn(4, '/').take(3).collect::<Vec<_>>().join("/"),
+        );
+        let body = match super::state_lock::with_label(lock_label, read_resource_body(&self.state, &uri)).await {
             Ok(b) => b,
             Err(msg) => {
                 return Err(ErrorData::invalid_params(msg, None));
@@ -14086,7 +14095,7 @@ mod tests {
             ))
             .unwrap();
         let state = super::super::state::ServerState::open(vault, dir.path(), "p").unwrap();
-        (dir, std::sync::Arc::new(tokio::sync::Mutex::new(state)))
+        (dir, std::sync::Arc::new(crate::server::state_lock::StateCell::new(state)))
     }
 
     pub(super) fn deny_credential_access_engine() -> PolicyEngine {
@@ -18821,7 +18830,7 @@ mod open_appeals_tests {
             );
             ids.push(sid);
         }
-        (dir, std::sync::Arc::new(tokio::sync::Mutex::new(st)), ids)
+        (dir, std::sync::Arc::new(crate::server::state_lock::StateCell::new(st)), ids)
     }
 
     /// A deny on the chain, landed on `plugin_id`, in the shape `tool_appeal` requires.
@@ -28937,5 +28946,329 @@ mod decision_witness_tests {
         .await
         .unwrap();
         assert_eq!(out["_hestia_error"]["code"], json!("hestia.witness_reserved_event"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod concurrency_battery {
+    //! THE CONCURRENCY BATTERY — the invariants every stage of the per-member serialisation plan
+    //! must keep (one-lock → per-member locks, lock-free snapshots, separate escalation store,
+    //! short chain append, society barrier). Written FIRST, green against today's single global
+    //! lock, so each later stage is measured against a battery that already held rather than one
+    //! written to fit the new design.
+    //!
+    //! One burst, many simulated members and sessions at once, through the REAL tool handlers:
+    //! - deny verdicts for one action raced from the daemon (query_policy) and the seat
+    //!   (witness_decision deny + warn): exactly ONE charge per (member, action_id);
+    //! - notices sent while their recipients drain: none lost, none delivered twice;
+    //! - escalations decided by racing peers and an operator: decided at most once, one ruling
+    //!   row; claims raced by the asker: at most one spend, and never a spend of an approval
+    //!   whose bar is not met (the weaker approval);
+    //! and then a RESTART: state rebuilt from the chain (decision ledger, escalation store,
+    //! inbox) must equal the running state the burst left. Sessions are RAM-only by design and
+    //! are not compared.
+    use super::inbox_tests::{open_state, seeded_home};
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const MEMBERS: usize = 10;
+    const NOTICES_PER_SENDER: usize = 4;
+    const DENY_CMD: &str = "rm -rf /home/user/data";
+
+    fn member(i: usize) -> String {
+        format!("battery-m{i}")
+    }
+
+    async fn connect(state: &SharedState, plugin_id: &str, hsid: &str) -> String {
+        tool_connect(state, &json!({"plugin_id": plugin_id, "host_agent": "battery",
+                                    "host_session_id": hsid}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn witness(plugin_id: &str, decision: &str, aid: &str) -> Value {
+        json!({
+            "plugin_id": plugin_id, "decision": decision, "action_id": aid,
+            "adjudicator": format!("plugin-gate:{plugin_id}"), "reason": "battery",
+            "rule_id": "battery", "tool_name": "Bash", "target": DENY_CMD,
+            "verdict_available": true, "attempted": DENY_CMD,
+        })
+    }
+
+    /// Reputation deltas charged for `aid` to `plugin_id`'s member LCT.
+    fn charges(sink: &std::path::Path, lct: &str, aid: &str) -> usize {
+        std::fs::read_to_string(sink)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(aid) && l.contains(lct))
+            .count()
+    }
+
+    type EscView = BTreeMap<String, (String, Option<String>, bool, bool)>;
+
+    fn escalation_view(s: &super::super::state::ServerState) -> EscView {
+        s.gate_escalations
+            .rows()
+            .map(|e| {
+                (
+                    e.id.clone(),
+                    (format!("{:?}", e.stored_status()), e.decided_by.clone(),
+                     e.consumed_at.is_some(), e.bar_met()),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn a_concurrent_burst_keeps_every_invariant_and_replays_to_the_running_state() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        {
+            let mut s = state.lock().await;
+            s.policy_engine =
+                crate::policy::PolicyEngine::new(crate::policy::get_preset("safety").unwrap().config);
+        }
+        let mut sids = Vec::new();
+        for i in 0..MEMBERS {
+            sids.push(connect(&state, &member(i), &format!("hs-{i}")).await);
+        }
+
+        // ---- the burst: every member's three workloads at once -----------------------------
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut aids = Vec::new();
+        let mut esc_ids = Vec::new();
+        for i in 0..MEMBERS {
+            // (1) one denied action, its verdict raced five ways
+            let begin = tool_begin_action(&state, &json!({
+                "tool_name": "Bash", "target": DENY_CMD, "parameters": {"command": DENY_CMD},
+                "session_id": sids[i]})).await.unwrap();
+            let aid = begin["actionId"].as_str().unwrap().to_string();
+            aids.push(aid.clone());
+            for k in 0..5 {
+                let (st, m, aid) = (state.clone(), member(i), aid.clone());
+                tasks.spawn(async move {
+                    match k {
+                        0 | 1 => { tool_query_policy(&st, &json!({"action_id": aid})).await.unwrap(); }
+                        2 | 3 => { tool_witness_decision(&st, &witness(&m, "deny", &aid)).await.unwrap(); }
+                        _ => { tool_witness_decision(&st, &witness(&m, "warn", &aid)).await.unwrap(); }
+                    }
+                });
+            }
+            // (2) notices out to the next members, while those members drain
+            for n in 0..NOTICES_PER_SENDER {
+                let (st, sid) = (state.clone(), sids[i].clone());
+                let to = member((i + 1 + n) % MEMBERS);
+                tasks.spawn(async move {
+                    let r = tool_member_notify(&st, &json!({
+                        "to_plugin_id": to, "kind": "coordination", "session_id": sid,
+                        "pointer_uri": format!("hestia://battery/{i}/{n}")})).await.unwrap();
+                    assert!(r.get("_hestia_error").is_none(), "notify refused: {r}");
+                });
+            }
+            // (3) one escalation per member, through the one-gate claim door (opens on first ask)
+            let key = format!("{:064x}", i + 1);
+            let (m, sid) = (member(i), sids[i].clone());
+            let claim_args = move |inv: String| json!({
+                "plugin_id": m, "session_id": sid, "tool_name": "Bash",
+                "marker": "pre_tool_use.py", "reason": format!("Bash: git apply /tmp/p/{i}.patch"),
+                "request_key": key, "invocation_key": inv, "supersession": "hard_stop"});
+            let opened = tool_gate_escalation_claim(&state, &claim_args(format!("open-{i}"))).await.unwrap();
+            let esc_id = opened["escalation_id"].as_str().unwrap_or_else(|| panic!("{opened}")).to_string();
+            esc_ids.push((i, esc_id.clone(), claim_args));
+        }
+        // drains run concurrently with the sends
+        let received: std::sync::Arc<std::sync::Mutex<Vec<(usize, String)>>> = Default::default();
+        for i in 0..MEMBERS {
+            for _ in 0..3 {
+                let (st, sid, rec) = (state.clone(), sids[i].clone(), received.clone());
+                tasks.spawn(async move {
+                    let r = tool_member_inbox(&st, &json!({"session_id": sid})).await.unwrap();
+                    for n in r["notices"].as_array().cloned().unwrap_or_default() {
+                        if let Some(p) = n["pointer_uri"].as_str() {
+                            rec.lock().unwrap().push((i, p.to_string()));
+                        }
+                    }
+                });
+            }
+        }
+        // decisions raced on every escalation: two peers (recognised harnesses, so eligible)
+        // and the operator
+        let arbiters = [connect(&state, "codex", "hs-arb-codex").await,
+                        connect(&state, "kimi-code", "hs-arb-kimi").await];
+        for (i, esc_id, _) in &esc_ids {
+            for arb in &arbiters {
+                let (st, id, sid) = (state.clone(), esc_id.clone(), arb.clone());
+                tasks.spawn(async move {
+                    if let Err(e) = tool_gate_arbitrate_escalation(&st, &json!({
+                        "escalation_id": id, "approve": true, "session_id": sid,
+                        "reason": "battery peer"})).await {
+                        eprintln!("battery peer refused: {}", e.to_string().chars().take(200).collect::<String>());
+                    }
+                });
+            }
+            if i % 5 == 4 {
+                continue; // peers only: a peer approval may be the WEAKER approval
+            }
+            let (st, id) = (state.clone(), esc_id.clone());
+            let approve = i % 3 != 0; // some denied, so a deny is in the mix too
+            tasks.spawn(async move {
+                use axum::extract::{Json, State};
+                let _ = super::super::http::operator_gate_escalation(
+                    State(st),
+                    Json(super::super::http::GateEscalationDecision {
+                        id, approve, reason: Some("battery operator".into()),
+                    }),
+                )
+                .await;
+            });
+        }
+        while let Some(r) = tasks.join_next().await {
+            r.expect("a burst task panicked");
+        }
+        // claims raced after the decisions: four invocations per escalation
+        // Per escalation: (fresh spends, reclaims, invocation keys handed a write permit). A
+        // reclaim (#1169) legitimately re-delivers an UNDELIVERED permit to a new invocation and
+        // fences the first, so "two replies said claimed" is not the invariant; "at most one
+        // invocation can execute" is, and it is checked below by trying to begin each one.
+        type Spend = (usize, usize, Vec<String>);
+        let spends: std::sync::Arc<std::sync::Mutex<BTreeMap<String, Spend>>> = Default::default();
+        for (i, esc_id, claim_args) in &esc_ids {
+            for k in 0..4 {
+                let inv = format!("claim-{i}-{k}");
+                let (st, id, args, sp) = (state.clone(), esc_id.clone(),
+                                          claim_args(inv.clone()), spends.clone());
+                tasks.spawn(async move {
+                    let r = tool_gate_escalation_claim(&st, &args).await.unwrap();
+                    let mut g = sp.lock().unwrap();
+                    let e = g.entry(id).or_default();
+                    if r["claimed"] == json!(true) {
+                        if r["reclaimed"] == json!(true) { e.1 += 1 } else { e.0 += 1 }
+                    }
+                    if r["permits_write"] == json!(true) {
+                        e.2.push(inv);
+                    }
+                });
+            }
+        }
+        while let Some(r) = tasks.join_next().await {
+            r.expect("a claim task panicked");
+        }
+        // final drain picks up anything sent after the racing drains ran
+        for i in 0..MEMBERS {
+            let r = tool_member_inbox(&state, &json!({"session_id": sids[i]})).await.unwrap();
+            for n in r["notices"].as_array().cloned().unwrap_or_default() {
+                if let Some(p) = n["pointer_uri"].as_str() {
+                    received.lock().unwrap().push((i, p.to_string()));
+                }
+            }
+        }
+
+        // ---- invariant 1: exactly one charge per (member, action) --------------------------
+        let (sink, lcts) = {
+            let s = state.lock().await;
+            (s.reputation_sink(),
+             (0..MEMBERS).map(|i| s.member_lct(&member(i)).expect("mapped member")).collect::<Vec<_>>())
+        };
+        for i in 0..MEMBERS {
+            assert_eq!(charges(&sink, lcts[i].as_str(), &aids[i]), 1,
+                       "member {i}: a raced deny must charge exactly once");
+        }
+
+        // ---- invariant 2: no lost notice, none delivered twice -----------------------------
+        // Only the battery's own notices: the escalations above also (correctly) wake members
+        // with invitations and dispositions, which land in the same inboxes.
+        let got: Vec<(usize, String)> = received.lock().unwrap().iter()
+            .filter(|(_, p)| p.starts_with("hestia://battery/"))
+            .cloned()
+            .collect();
+        let got_set: BTreeSet<(usize, String)> = got.iter().cloned().collect();
+        assert_eq!(got.len(), got_set.len(), "a notice was delivered twice: {got:?}");
+        let mut want = BTreeSet::new();
+        for i in 0..MEMBERS {
+            for n in 0..NOTICES_PER_SENDER {
+                want.insert(((i + 1 + n) % MEMBERS, format!("hestia://battery/{i}/{n}")));
+            }
+        }
+        assert_eq!(got_set, want, "every notice sent is received exactly once");
+
+        // ---- invariant 3: decided at most once; spent at most once; never a weaker approval -
+        let (esc_view, decided_rows) = {
+            let s = state.lock().await;
+            let rows: Vec<_> = s.recent_chain(100_000).into_iter()
+                .filter(|e| e.event_type == "gate_escalation_decided")
+                .collect();
+            (escalation_view(&s), rows)
+        };
+        let spends = spends.lock().unwrap().clone();
+        let mut decided = 0;
+        let mut spent_total = 0;
+        for (_, esc_id, _) in &esc_ids {
+            let (status, by, consumed, bar_met) = esc_view.get(esc_id).cloned().expect("row present");
+            let ruling_rows = decided_rows.iter()
+                .filter(|e| e.event_data["escalation_id"] == json!(esc_id)
+                         || e.event_data["id"] == json!(esc_id))
+                .count();
+            assert!(ruling_rows <= 1, "{esc_id}: decided {ruling_rows} times on the chain");
+            if status != "Pending" {
+                decided += 1;
+                assert!(by.is_some(), "{esc_id}: decided with no decider");
+            }
+            let (fresh, reclaims, permitted) = spends.get(esc_id).cloned().unwrap_or_default();
+            assert!(fresh <= 1, "{esc_id}: one approval spent {fresh} times");
+            assert!(reclaims <= 1, "{esc_id}: reclaimed {reclaims} times (once is the limit)");
+            assert!(reclaims == 0 || fresh == 1, "{esc_id}: a reclaim with no spend to recover");
+            if fresh + reclaims > 0 || !permitted.is_empty() {
+                assert_eq!(status, "Approved", "{esc_id}: a permit from a non-approval");
+                assert!(bar_met, "{esc_id}: a WEAKER approval (bar not met) was spent");
+                assert!(consumed, "{esc_id}: spent but not marked consumed");
+            }
+            // At most ONE permitted invocation may execute: the others were fenced.
+            let mut began = 0;
+            for inv in &permitted {
+                let sid = sids[esc_ids.iter().position(|(_, e, _)| e == esc_id).unwrap()].clone();
+                let b = tool_begin_action(&state, &json!({"tool_name": "Bash", "session_id": sid,
+                                                          "correlation_key": inv})).await.unwrap();
+                if b.get("_hestia_error").is_none() {
+                    began += 1;
+                }
+            }
+            assert!(began <= 1, "{esc_id}: {began} invocations could execute on one approval");
+            if !permitted.is_empty() {
+                assert_eq!(began, 1, "{esc_id}: a permit was handed out and nothing may use it");
+            }
+            spent_total += fresh;
+        }
+        assert!(decided > 0, "precondition: the burst decided something");
+
+        // ---- invariant 4: a restart rebuilt from the chain equals the running state -------
+        let (ledger_before, esc_before, chain_len_before) = {
+            let s = state.lock().await;
+            (s.decision_ledger.canonical(), escalation_view(&s), s.chain_len())
+        };
+        drop(state); // release the vault writer lease, as a real restart does
+        let restarted = open_state(&dir);
+        let s = restarted.lock().await;
+        assert_eq!(s.chain_len(), chain_len_before);
+        assert_eq!(s.decision_ledger.canonical(), ledger_before,
+                   "the decision ledger rebuilt from the chain differs from the running one");
+        assert_eq!(escalation_view(&s), esc_before,
+                   "the escalation store rebuilt from the chain differs from the running one");
+        // Nothing left undelivered was invented or lost by the restart either.
+        drop(s);
+        for i in 0..MEMBERS {
+            let sid = connect(&restarted, &member(i), &format!("hs-r-{i}")).await;
+            let r = tool_member_inbox(&restarted, &json!({"session_id": sid})).await.unwrap();
+            assert_eq!(r["total"], json!(0), "member {i}: a drained notice came back after restart: {r}");
+        }
+        let mut deciders: BTreeMap<String, usize> = BTreeMap::new();
+        for (st, by, _, bar) in esc_before.values() {
+            *deciders.entry(format!("{st}/{}/bar_met={bar}", by.clone().unwrap_or_default()))
+                .or_default() += 1;
+        }
+        eprintln!("battery: {decided} escalations decided, {spent_total} spent, {} notices \
+                   delivered; outcomes {deciders:?}", got.len());
     }
 }

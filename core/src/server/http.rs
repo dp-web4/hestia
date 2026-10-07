@@ -1301,6 +1301,11 @@ pub async fn serve_with_callback(
         // The admin ledger — governance history with status facets. Operator-gated for the same
         // reason /api/chain is: it is the society's whole record of who ruled on what.
         .route("/api/governance/ledger", get(governance_ledger))
+        // Global state-lock wait/hold by label and call site (lock instrumentation, stage 1 of
+        // the per-member serialisation plan). Read-only, and it never takes the state lock: the
+        // statistics live beside the mutex, not inside it, so it answers even while a holder
+        // is starving everyone else — which is exactly when it is needed.
+        .route("/api/debug/locks", get(debug_locks))
         // OID4VCI issuance MINTS a presentation SIGNED WITH THE OWNER'S IDENTITY KEY — a consequential
         // act that must be owner-authorized. Fail-closed stopgap (PRD §5.6/§7.1; Nomad's finding, dp's
         // §12 disposition): gate it behind the operator session like every other consequential surface,
@@ -1466,7 +1471,9 @@ pub async fn serve_with_callback(
         .route("/.well-known/openid-credential-issuer", get(vci_metadata))
         .route("/nonce", post(vci_nonce))
         .with_state(state)
-        .nest_service("/mcp", service);
+        .nest_service("/mcp", service)
+        // Attribute every state-lock acquisition a request makes to its matched route.
+        .layer(axum::middleware::from_fn(label_state_lock_by_route));
 
     if let Some(kp) = callback_keypair {
         let cb_state = Arc::new(tokio::sync::Mutex::new(CallbackState::new(kp)));
@@ -1496,6 +1503,28 @@ pub async fn serve_with_callback(
         .context("axum::serve failed")?;
 
     Ok(())
+}
+
+/// Label the state-lock acquisitions a request makes with its MATCHED route template
+/// (`http:/api/agents/:id/retire`), never the raw path: the template set is finite, the raw path
+/// is caller-chosen.
+async fn label_state_lock_by_route(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let label = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|p| super::state_lock::intern_label("http:", p.as_str()))
+        .unwrap_or("http:unmatched");
+    super::state_lock::with_label(label, next.run(req)).await
+}
+
+/// `GET /api/debug/locks` — the state lock's own report (see `state_lock::LockStats::report`).
+async fn debug_locks(State(state): State<SharedState>) -> impl IntoResponse {
+    let mut report = state.stats().report();
+    report["sections"] = super::state_lock::sections().report();
+    Json(report)
 }
 
 async fn dashboard_html() -> impl IntoResponse {
@@ -7521,14 +7550,16 @@ struct LedgerQuery {
 /// box already has. Both are recorded; `via` keeps them apart, because a reader must be able to
 /// tell a proof from a convenience.
 #[derive(serde::Deserialize)]
-struct GateEscalationDecision {
-    id: String,
-    approve: bool,
+pub(super) struct GateEscalationDecision {
+    pub(super) id: String,
+    pub(super) approve: bool,
     #[serde(default)]
-    reason: Option<String>,
+    pub(super) reason: Option<String>,
 }
 
-async fn operator_gate_escalation(
+// `pub(super)` so the concurrency battery (handler.rs) races the REAL operator channel, with its
+// witness-is-finality append, rather than a store call that writes no ruling row.
+pub(super) async fn operator_gate_escalation(
     State(state): State<SharedState>,
     Json(d): Json<GateEscalationDecision>,
 ) -> impl IntoResponse {
@@ -10955,7 +10986,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
         let state = ServerState::open(vault, dir.path(), "p").unwrap();
-        (dir, Arc::new(tokio::sync::Mutex::new(state)))
+        (dir, Arc::new(crate::server::state_lock::StateCell::new(state)))
     }
 
     /// Issue #423: a GET must consume only the immutable read model. Holding

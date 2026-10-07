@@ -16,7 +16,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 use web4_trust_core::EntityTrust;
 
@@ -1475,8 +1474,10 @@ impl ServerState {
         event_type: &str,
         event_data: serde_json::Value,
     ) -> Result<ChainEntry> {
-        self.chain_store
-            .append(event_type, event_data, &self.sovereign_lct)
+        super::state_lock::time_section("chain.append", || {
+            self.chain_store
+                .append(event_type, event_data, &self.sovereign_lct)
+        })
     }
 
     /// Confer citizenship on `subject_lct_id` — birth into THIS society's MRH —
@@ -1638,9 +1639,10 @@ impl ServerState {
         // reputation is its own, and can't be diluted or poisoned by another
         // capacity of the same instance.
         let trust_key = self.trust_entity_key(plugin_id, ctx.role_lct);
-        let (before, after) = self
-            .trust_store
-            .update_returning_prior(&trust_key, success, magnitude)?;
+        let (before, after) = super::state_lock::time_section("trust_store.update", || {
+            self.trust_store
+                .update_returning_prior(&trust_key, success, magnitude)
+        })?;
         // LCT-mapping (sequence head, `repemit-1`): resolve the durable member
         // LCT for `plugin_id` before building the delta, so `subject_lct` is a
         // ground-truth member identity minted under hestia's sovereign — never
@@ -1656,7 +1658,9 @@ impl ServerState {
                 &after,
                 chrono::Utc::now(),
             ) {
-                crate::reputation::log_delta(&self.reputation_sink(), &delta);
+                super::state_lock::time_section("reputation.log_delta", || {
+                    crate::reputation::log_delta(&self.reputation_sink(), &delta)
+                });
             }
         }
         Ok(after)
@@ -1808,7 +1812,8 @@ impl ServerState {
     }
 }
 
-pub type SharedState = Arc<Mutex<ServerState>>;
+/// The daemon's shared state behind its one global lock, instrumented (see `state_lock`).
+pub type SharedState = Arc<super::state_lock::StateCell<ServerState>>;
 
 #[cfg(test)]
 mod tests {

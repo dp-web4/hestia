@@ -175,11 +175,15 @@ impl Vault {
     }
 
     fn save(&mut self) -> Result<()> {
-        let next_generation = if self.writer_lease.is_some() {
-            storage::save_if_current_locked(&self.path, &self.passphrase, &self.data)?
-        } else {
-            storage::save_if_current(&self.path, &self.passphrase, &self.data)?
-        };
+        // Timed (state-lock instrumentation): a vault save derives a fresh Argon2 key, encrypts
+        // the whole vault and fsyncs, and the daemon does it while holding its state lock (#453).
+        let next_generation = crate::server::state_lock::time_section("vault.save", || {
+            if self.writer_lease.is_some() {
+                storage::save_if_current_locked(&self.path, &self.passphrase, &self.data)
+            } else {
+                storage::save_if_current(&self.path, &self.passphrase, &self.data)
+            }
+        })?;
         self.data.generation = next_generation;
         Ok(())
     }
