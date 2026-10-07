@@ -29075,6 +29075,40 @@ mod concurrency_battery {
             .collect()
     }
 
+    /// GROUP COMMIT, ordering arm: a vault save that follows an intent row must not reach disk
+    /// while that row is still unsynced. A crash at any instant then leaves neither, the intent
+    /// alone (the case `*_intent` rows exist to record), or both, but never the vault write
+    /// without the chain row that justifies it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_vault_save_never_reaches_disk_ahead_of_the_chain_row_before_it() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let durability = { state.lock().await.chain_store.durability().clone() };
+        let vault_path = dir.path().join("v.enc");
+        let before = std::fs::read(&vault_path).unwrap();
+        let hold = durability.hold_flush_for_test();
+        let st = state.clone();
+        let mut writer = tokio::spawn(async move {
+            let mut s = st.lock().await;
+            let intent = s
+                .append_chain("scope_standing_promote_intent", json!({"battery": "vault-order"}))
+                .unwrap();
+            s.standing_scope_dirty = true;
+            s.persist_standing_scope().expect("the save completes once the chain is durable");
+            intent.chain_position
+        });
+        // A vault save (Argon2 + encrypt + fsync) is slow in a test build; give it ample time.
+        if tokio::time::timeout(std::time::Duration::from_secs(8), &mut writer).await.is_ok() {
+            panic!("the vault save completed while the intent row before it was not durable");
+        }
+        assert_eq!(std::fs::read(&vault_path).unwrap(), before,
+                   "the vault reached disk while the intent row before it was not durable");
+        drop(hold);
+        let pos = writer.await.unwrap();
+        assert!(durability.frontier().durable > pos, "the intent row is durable");
+        assert_ne!(std::fs::read(&vault_path).unwrap(), before, "and then the vault was written");
+    }
+
     /// GROUP COMMIT, failure arm: an fsync that fails after commit. Decisions acknowledged
     /// before it survive a restart exactly; the request whose fsync failed is told
     /// `not durable` (never "recorded"); the running daemon refuses every later append; and the

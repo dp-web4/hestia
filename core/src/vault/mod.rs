@@ -57,12 +57,17 @@ pub struct Vault {
     /// and every `set_policy_lists`, so replacing the vault object (a reopen assigned over the
     /// daemon's) moves it too. Read by the lock-free law publication.
     policy_lists_gen: u64,
+    /// Run before every save (see [`Vault::set_pre_save_barrier`]).
+    pre_save: Option<PreSaveBarrier>,
 }
 
 fn next_policy_lists_gen() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
+
+/// A hook run before every vault save; an error refuses the save.
+pub type PreSaveBarrier = std::sync::Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>;
 
 impl Vault {
     /// Re-read THIS vault from disk with the same path and passphrase.
@@ -86,6 +91,7 @@ impl Vault {
             data,
             writer_lease: None,
             policy_lists_gen: next_policy_lists_gen(),
+            pre_save: None,
         })
     }
 
@@ -107,6 +113,7 @@ impl Vault {
             data,
             writer_lease: None,
             policy_lists_gen: next_policy_lists_gen(),
+            pre_save: None,
         })
     }
 
@@ -185,7 +192,18 @@ impl Vault {
         Ok(removed)
     }
 
+    /// Install a hook that runs before EVERY save and may refuse it. The daemon installs one that
+    /// makes the witness chain durable first (group commit, storage::durability): a vault write
+    /// often follows an `*_intent` chain row, and since chain commits no longer fsync inline, the
+    /// vault (which does fsync) could otherwise reach disk ahead of the rows that justify it.
+    pub fn set_pre_save_barrier(&mut self, barrier: PreSaveBarrier) {
+        self.pre_save = Some(barrier);
+    }
+
     fn save(&mut self) -> Result<()> {
+        if let Some(barrier) = &self.pre_save {
+            barrier().map_err(CoreError::SaveBarrier)?;
+        }
         // Timed (state-lock instrumentation): a vault save derives a fresh Argon2 key, encrypts
         // the whole vault and fsyncs, and the daemon does it while holding its state lock (#453).
         let next_generation = crate::server::state_lock::time_section("vault.save", || {

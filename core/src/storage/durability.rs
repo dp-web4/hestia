@@ -88,6 +88,9 @@ pub struct Durability {
     pub checkpoints: AtomicU64,
     /// Test-only fault injection: the next fsync reports failure.
     fail_next_sync: AtomicBool,
+    /// Test-only: while set, nothing becomes durable (holds the window between commit and fsync
+    /// open, deterministically).
+    hold: AtomicBool,
     last_wal_ino: AtomicU64,
 }
 
@@ -122,6 +125,7 @@ impl Durability {
             fsyncs: AtomicU64::new(0),
             checkpoints: AtomicU64::new(0),
             fail_next_sync: AtomicBool::new(false),
+            hold: AtomicBool::new(false),
             last_wal_ino: AtomicU64::new(0),
         })
     }
@@ -145,6 +149,26 @@ impl Durability {
     #[doc(hidden)]
     pub fn inject_sync_failure(&self) {
         self.fail_next_sync.store(true, Ordering::Release);
+    }
+
+    /// Test hook: hold every fsync until the returned guard drops (the commit-to-fsync window,
+    /// held open). A guard, so a failing assertion releases it while unwinding instead of leaving
+    /// the store's drop-time flush waiting forever.
+    #[doc(hidden)]
+    pub fn hold_flush_for_test(self: &Arc<Self>) -> FlushHold {
+        self.hold.store(true, Ordering::Release);
+        FlushHold(self.clone())
+    }
+
+    /// Committed entry count (what a flush now would make durable).
+    pub fn committed(&self) -> u64 {
+        self.committed.load(Ordering::Acquire)
+    }
+
+    /// Make everything committed so far durable, synchronously. For writes to ANOTHER durable
+    /// store (vault, inbox, lanes, status files) that must never reach disk ahead of the chain.
+    pub fn flush_committed_blocking(self: &Arc<Self>) -> Result<()> {
+        self.wait_durable_blocking(self.committed())
     }
 
     fn ensure_flusher(self: &Arc<Self>) {
@@ -208,6 +232,9 @@ impl Durability {
     }
 
     fn flush_inline(&self, len: u64) -> Result<()> {
+        while self.hold.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let _g = self.sync_lock.lock().unwrap_or_else(|p| p.into_inner());
         let f = self.frontier();
         if f.poisoned {
@@ -318,6 +345,17 @@ impl Durability {
     }
 }
 
+/// Releases a test flush hold when dropped.
+#[doc(hidden)]
+pub struct FlushHold(Arc<Durability>);
+
+impl Drop for FlushHold {
+    fn drop(&mut self) {
+        self.0.hold.store(false, Ordering::Release);
+        self.0.cv.notify_all();
+    }
+}
+
 fn poisoned_error() -> anyhow::Error {
     anyhow!(
         "the witness chain's fsync failed: durability of this entry is UNKNOWN (it may or may \
@@ -351,6 +389,10 @@ fn flusher_loop(weak: std::sync::Weak<Durability>) {
         if d.poisoned() {
             // Nothing more to make durable; just wake anyone still waiting (they see poisoned).
             std::thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        if d.hold.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(5));
             continue;
         }
         if wanted > d.frontier().durable {
