@@ -93,8 +93,11 @@ with open(os.path.join(HOME, "seats", "gemini.env"), "w") as f:
 ENV = {k: v for k, v in os.environ.items()
        if k not in ("HESTIA_SHARED_DIR", "HESTIA_ENDPOINT", "HESTIA_WORKSPACE", "HESTIA_GATE_MODE")}
 # The test is the hook's invoker, so it declares the timeout it enforces (subprocess default
-# below is none; 20 s is ample) and the gate decides inside it.
-ENV.update(HESTIA_HOME=HOME, HESTIA_HOOK_TIMEOUT_S="20")
+# below is none; 20 s is ample) and the gate decides inside it. HOME is the fixture: inheriting
+# the operator's real home would leak the LIVE seat's registration (~/.gemini/settings.json),
+# which names this hook's basename without binding this fixture shim exactly — MISWIRED
+# (ambiguous hook ownership) under the critical-timeout protocol (#1262).
+ENV.update(HESTIA_HOME=HOME, HESTIA_HOOK_TIMEOUT_S="20", HOME=HOME)
 CWD = os.path.join(V, "ws", "web4")
 FORBIDDEN = "sec" + "rets"   # assembled: this file's text must not carry the token the gate matches
 

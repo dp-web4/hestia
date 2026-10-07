@@ -12,7 +12,7 @@
     },
     {
       "path": "hooks/hooks.json",
-      "sha256": "efd3e850e35bcefe116626b04cdc0f2b6770f2e3fed41a0870acfb9963639791",
+      "sha256": "9a067b277bf91ca6a045ba0dede82d599c091bc929c16f648dead12e57e96ae1",
       "source": "plugins/gemini/hooks/hooks.json"
     },
     {
@@ -33,7 +33,7 @@
   ],
   "engine": {
     "unit": "_shared",
-    "gt_version": "91efdd292059b6b03a98ff2490f10ce498eb9b16d3930c2381ead9384add0b3d",
+    "gt_version": "a4b3e2f593e2e32244ee9f099a7227bba253a4ff57d85fa75f644e8176d30a2c",
     "files": [
       {
         "path": "hestia_gate_core.py",
@@ -53,7 +53,7 @@
       },
       {
         "path": "hestia_single_gate.py",
-        "sha256": "dcc00b423e7952209fb5400da0984223dbc8413f7490c7d22295d2a541818dd5"
+        "sha256": "18cd82c058fa5e54757f7452fbe696751a014c03149bdc8ff82f0a5d6c139381"
       },
       {
         "path": "hestia_witness_core.py",
@@ -62,5 +62,5 @@
     ]
   },
   "requires": [],
-  "gt_version": "f07f3b0f90a2ecb7e3e7007b60c7e2f0e6a33bbdea88a2f994e7458538220780"
+  "gt_version": "6c8fc4a9b248672adbc52d8514ee9fcf4b9cc4be250fab2550d3105cd45c829f"
 }

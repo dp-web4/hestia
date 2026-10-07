@@ -1045,8 +1045,9 @@ TEMPLATE_TIMEOUT = {"claude-code": 10, "codex": 15, "kimi": 15, "gemini": 15000}
 def test_the_bound_is_the_real_registration(m, g, wc, home):
     """THE SAFETY INVARIANT (dp 2026-10-02): the deadline is the hook process's start plus the
     timeout the harness REALLY enforces, read from its live registration, minus the margin — for
-    every seat, in each harness's own config shape and unit. Never the default, never a template;
-    the smallest of several registrations wins; an unreadable or absent one is refused."""
+    every seat, in each harness's own config shape and unit. Never the default, never a template.
+    The critical-timeout protocol (#1262): ONE exact, canonical registration or MISWIRED — a
+    missing, out-of-envelope or duplicate timeout closes the bound; an absent one is refused."""
     real_config = {"claude-code": ("json-hook-commands", "nested", "settings.json", 1, 60),
                    "codex": ("toml-hook-commands", "nested", "config.toml", 1, None),
                    "kimi": ("toml-hook-commands", "flat", "config.toml", 1, 30),
@@ -1059,8 +1060,8 @@ def test_the_bound_is_the_real_registration(m, g, wc, home):
               and primary.get("layout", "nested") == layout and primary["path"].endswith(cfg_name)
               and shim_mod.HARNESS["timeout_unit_seconds"] == unit
               and shim_mod.HARNESS["default_timeout_seconds"] == default, shim_mod.HARNESS)
-        # The margin floor, directly (#1259 A6): with no margin declared the bound would equal
-        # the enforced deadline and the shim would race the harness's kill.
+        # The margin cap, directly (#1259 A6): with no cap declared the bound could equal the
+        # enforced deadline and the shim would race the harness's kill.
         check(f"{seat}-declares-a-positive-margin",
               float(shim_mod.HARNESS.get("margin_seconds") or 0) > 0, shim_mod.HARNESS)
         with tempfile.TemporaryDirectory() as td:
@@ -1078,112 +1079,132 @@ def test_the_bound_is_the_real_registration(m, g, wc, home):
             b = g.harness_bound(harness, str(shim), t0, env=env)
             check(f"{seat}-bound-is-the-registered-7s", b.timeout_seconds is not None
                   and abs(b.timeout_seconds - 7.0) < 1e-9, b)
+            # The margin is proportional and bounded (#1262): max(0.5, min(cap, timeout*0.15)).
+            want_margin = max(0.5, min(harness["margin_seconds"], 7.0 * 0.15))
             check(f"{seat}-deadline-strictly-below-the-harness", b.deadline is not None
-                  and b.deadline < t0 + 7.0 and abs(b.deadline - (t0 + 7.0 - harness["margin_seconds"])) < 1e-6, b)
+                  and b.deadline < t0 + 7.0 and abs(b.deadline - (t0 + 7.0 - want_margin)) < 1e-6
+                  and abs(b.margin_seconds - want_margin) < 1e-9, b)
             check(f"{seat}-declares-what-the-harness-does", "fail-open" in b.on_timeout, b)
             b2 = g.harness_bound(harness, str(shim), t0, env=dict(env, HESTIA_HOOK_TIMEOUT_S="4"))
             check(f"{seat}-a-declaration-can-only-shorten", b2.timeout_seconds == 4.0, b2)
             b3 = g.harness_bound(harness, str(shim), t0, env=dict(env, HESTIA_HOOK_TIMEOUT_S="60"))
             check(f"{seat}-a-declaration-cannot-lengthen", abs(b3.timeout_seconds - 7.0) < 1e-9, b3)
-            # Two registrations of the same hook: the SMALLER one bounds this invocation.
-            _write_registration(cfg, seat, shim, seven, extra_timeout=4000 if seat == "gemini" else 4)
+            # The canonical envelope (3-30 s, in the harness's own unit): edges accepted.
+            for raw, seconds in (((3000, 3.0), (30000, 30.0)) if seat == "gemini"
+                                 else ((3, 3.0), (30, 30.0))):
+                _write_registration(cfg, seat, shim, raw)
+                b = g.harness_bound(harness, str(shim), t0, env=env)
+                check(f"{seat}-envelope-edge-{seconds:g}s-accepted", b.timeout_seconds == seconds, b)
+            for raw, seconds in (((2000, 2), (31000, 31)) if seat == "gemini"
+                                 else ((2, 2), (31, 31))):
+                _write_registration(cfg, seat, shim, raw)
+                b = g.harness_bound(harness, str(shim), t0, env=env)
+                check(f"{seat}-outside-envelope-{seconds}s-miswired",
+                      b.deadline is None and "MISWIRED" in b.why and "envelope" in b.why, b)
+            # Two registrations of the same hook, even AGREEING ones: duplicate is MISWIRED.
+            _write_registration(cfg, seat, shim, seven,
+                                extra_timeout=7000 if seat == "gemini" else 7)
             b = g.harness_bound(harness, str(shim), t0, env=env)
-            check(f"{seat}-the-smallest-registration-wins", b.timeout_seconds == 4.0, b)
-            # No timeout field: the harness's documented default, or a refusal when unknown.
+            check(f"{seat}-duplicate-registrations-are-miswired",
+                  b.deadline is None and "duplicate" in b.why, b)
+            # No timeout field: MISWIRED, whatever the vendor default (a data fact, not a semantic).
             _write_registration(cfg, seat, shim, None)
             b = g.harness_bound(harness, str(shim), t0, env=env)
-            if default is None:
-                check(f"{seat}-untimed-with-unknown-default-refused", b.deadline is None, b)
-            else:
-                check(f"{seat}-untimed-uses-the-harness-default", b.timeout_seconds == float(default), b)
-            # An unreadable config that names the hook establishes nothing.
+            check(f"{seat}-untimed-is-miswired", b.deadline is None and "MISWIRED" in b.why, b)
+            # A broken config that does not name the hook is irrelevant: it drops.
             cfg.write_text("{not json or toml")
             b = g.harness_bound(harness, str(shim), t0, env=env)
             check(f"{seat}-unreadable-config-no-bound", b.deadline is None, b)
 
 
-def test_a_registration_cannot_vanish(m, g, wc, home):
-    """#1259: the bound must never exceed the deadline the harness REALLY enforces. A RELATIVE
-    registration (the harness resolves it against its own launch directory) is invisible to the
-    absolute-path reader yet enforced all the same — it joins the minimum. A config that fails
-    to parse but names this hook falls back to the line scan. An untimed registration of this
-    hook whose default is unknown closes the bound even when another file yields an exact
-    match. One seat's config format suffices: the reader under test is the shared gate."""
+def test_canonical_or_miswired(m, g, wc, home):
+    """The critical-timeout protocol (dp ruling on #1262, superseding the #1259 scan recovery):
+    the bound resolves to ONE exact, canonical registration — structurally parsed, explicit,
+    in-envelope — and anything else that appears to register the hook is MISWIRED evidence,
+    never a guessed deadline. One seat's config format suffices: the reader under test is the
+    shared gate."""
     seat = "kimi"
     shim_mod = _shim_module(seat)
     with tempfile.TemporaryDirectory() as td:
         h = pathlib.Path(td)
         env = {"HOME": str(h)}
         shim = h / "hooks" / "gate_hook.py"     # never created: realpath needs no file
-        abs_cfg = h / "abs.toml"
-        _write_registration(abs_cfg, seat, shim, 15)
         t0 = time.monotonic()
 
-        def harness(*paths, default=30):
+        def harness(*paths):
             regs = tuple(dict(shim_mod.HARNESS["registrations"][0], path=str(p)) for p in paths)
-            return dict(shim_mod.HARNESS, registrations=regs, default_timeout_seconds=default)
+            return dict(shim_mod.HARNESS, registrations=regs)
 
-        def write_relative(path, timeout):
+        def write(path, body):
+            path.write_text(body)
+            return path
+
+        def entry(path, timeout, command=None):
             t = "" if timeout is None else f"\ntimeout = {timeout}"
-            path.write_text(f'[[hooks]]\nevent = "PreToolUse"\n'
-                            f'command = "python3 hooks/gate_hook.py"{t}\n')
+            cmd = command or f"python3 {shim}"
+            return write(path, f'[[hooks]]\nevent = "PreToolUse"\ncommand = "{cmd}"{t}\n')
 
-        # A1b: an exact absolute 15 s entry plus a RELATIVE 5 s entry the harness enforces.
-        rel_cfg = h / "rel.toml"
-        write_relative(rel_cfg, 5)
-        b = g.harness_bound(harness(abs_cfg, rel_cfg), str(shim), t0, env=env)
-        check("relative-registration-joins-the-min", b.timeout_seconds == 5.0, b)
+        def miswired(b):
+            return b.deadline is None and "MISWIRED" in b.why
 
-        # A relative entry is the ONLY registration: it alone bounds the invocation.
-        b = g.harness_bound(harness(rel_cfg), str(shim), t0, env=env)
-        check("relative-registration-alone-bounds", b.timeout_seconds == 5.0, b)
+        abs15 = entry(h / "abs15.toml", 15)
 
-        # A3: a second config that fails to parse but names the hook falls back to the line scan.
-        mal = h / "mal.toml"
-        mal.write_text('[[hooks]\nevent = "PreToolUse"\n'
-                       'command = "python3 gate_hook.py"\ntimeout = 5\n')
-        b = g.harness_bound(harness(abs_cfg, mal), str(shim), t0, env=env)
-        check("malformed-registration-does-not-vanish", b.timeout_seconds == 5.0, b)
+        # A relative (or foreign same-basename) command names the hook but cannot bind it exactly.
+        rel = entry(h / "rel.toml", 5, command="python3 hooks/gate_hook.py")
+        b = g.harness_bound(harness(abs15, rel), str(shim), t0, env=env)
+        check("relative-command-is-miswired", miswired(b), b)
+        foreign = entry(h / "foreign.toml", 5, command="python3 /other/seat/gate_hook.py")
+        b = g.harness_bound(harness(foreign), str(shim), t0, env=env)
+        check("foreign-same-basename-is-miswired", miswired(b), b)
 
-        # A malformed config whose text never names this hook cannot register it: it drops.
-        other = h / "other.toml"
-        other.write_text('[[hooks]\nevent = "PreToolUse"\n'
-                         'command = "python3 other_hook.py"\ntimeout = 5\n')
-        b = g.harness_bound(harness(abs_cfg, other), str(shim), t0, env=env)
-        check("unrelated-malformed-config-drops", b.timeout_seconds == 15.0, b)
+        # A config that fails to parse while naming the hook is MISWIRED; one that does not drops.
+        mal = write(h / "mal.toml", '[[hooks]\nevent = "PreToolUse"\n'
+                                    f'command = "python3 {shim}"\ntimeout = 5\n')
+        b = g.harness_bound(harness(abs15, mal), str(shim), t0, env=env)
+        check("malformed-naming-hook-is-miswired", miswired(b), b)
+        other = write(h / "other.toml", '[[hooks]\nevent = "PreToolUse"\n'
+                                        'command = "python3 other_hook.py"\ntimeout = 5\n')
+        b = g.harness_bound(harness(abs15, other), str(shim), t0, env=env)
+        check("broken-unrelated-config-drops", b.timeout_seconds == 15.0, b)
 
-        # #1262 review (codex's factor, claude-code's reproduction): the scan may shorten,
-        # NEVER fill. A timeout spelling the regex cannot read closes the bound rather than
-        # falling back to the harness default — on 813ff01 a `5e0` beside default 30 measured
-        # a 28.5 s bound against a 5 s kill, the fail-open this test exists to prevent.
-        for label, body in (
-                ("scientific", "timeout = 5e0"),
-                ("signed", "timeout = +5"),
-                ("inline-table",
-                 'hooks = [{event="PreToolUse", command="python3 gate_hook.py", timeout=5}]')):
-            odd = h / f"odd_{label}.toml"
-            odd.write_text(f'[[hooks]\nevent = "PreToolUse"\ncommand = "python3 gate_hook.py"\n'
-                           f'{body}\n')
-            b = g.harness_bound(harness(odd), str(shim), t0, env=env)
-            check(f"scan-{label}-closes-not-fills", b.deadline is None and b.why, b)
+        # Spellings the STRUCTURAL parser binds and normalizes are accepted; the same text in an
+        # unparseable file is MISWIRED — the gate never infers a deadline from a lexical scan.
+        for label, body in (("scientific", "timeout = 5e0"), ("signed", "timeout = +5")):
+            ok_cfg = write(h / f"ok_{label}.toml",
+                           f'[[hooks]]\nevent = "PreToolUse"\ncommand = "python3 {shim}"\n{body}\n')
+            b = g.harness_bound(harness(ok_cfg), str(shim), t0, env=env)
+            check(f"parseable-{label}-normalizes", b.timeout_seconds == 5.0, b)
+            bad = write(h / f"bad_{label}.toml",
+                        f'[[hooks]\nevent = "PreToolUse"\ncommand = "python3 {shim}"\n{body}\n')
+            b = g.harness_bound(harness(bad), str(shim), t0, env=env)
+            check(f"unparseable-{label}-is-miswired", miswired(b), b)
+        inline = write(h / "inline.toml",
+                       f'hooks = [{{event = "PreToolUse", command = "python3 {shim}", timeout = 5}}]\n')
+        b = g.harness_bound(harness(inline), str(shim), t0, env=env)
+        check("parseable-inline-table-binds", b.timeout_seconds == 5.0, b)
 
-        # ...while a plain decimal the regex CAN read still shortens, default known or not.
-        dec = h / "odd_decimal.toml"
-        dec.write_text('[[hooks]\nevent = "PreToolUse"\ncommand = "python3 gate_hook.py"\n'
-                       'timeout = 5.0\n')
-        b = g.harness_bound(harness(dec), str(shim), t0, env=env)
-        check("scan-readable-decimal-still-shortens", b.timeout_seconds == 5.0, b)
+        # Omitted is MISWIRED — and a sibling hook's readable timeout is never borrowed.
+        sibling = write(h / "sibling.toml",
+                        f'[[hooks]]\nevent = "PreToolUse"\ncommand = "python3 {shim}"\n\n'
+                        f'[[hooks]]\nevent = "SessionStart"\ncommand = "/x/other.sh"\ntimeout = 8\n')
+        b = g.harness_bound(harness(sibling), str(shim), t0, env=env)
+        check("omitted-never-borrows-a-sibling", miswired(b) and "no timeout" in b.why, b)
 
-        # An untimed relative entry with a known harness default: the default is its bound.
-        rel_untimed = h / "rel_untimed.toml"
-        write_relative(rel_untimed, None)
-        b = g.harness_bound(harness(rel_untimed), str(shim), t0, env=env)
-        check("relative-untimed-uses-the-default", b.timeout_seconds == 30.0, b)
+        # Duplicates, even agreeing ones, in one file or two: MISWIRED.
+        b = g.harness_bound(harness(entry(h / "dup1.toml", 10), entry(h / "dup2.toml", 10)),
+                            str(shim), t0, env=env)
+        check("duplicate-registrations-are-miswired", miswired(b) and "duplicate" in b.why, b)
 
-        # ...and with the default unknown it closes the bound, exact match or no (#1259: the
-        # problem entry never vanishes behind an exact match).
-        b = g.harness_bound(harness(abs_cfg, rel_untimed, default=None), str(shim), t0, env=env)
-        check("relative-untimed-unknown-default-closes", b.deadline is None and b.why, b)
+        # No parser for a config that names the hook: MISWIRED. One that does not: drops.
+        orig_loader = g._load_config
+        try:
+            g._load_config = lambda *a: (None, "scan")
+            b = g.harness_bound(harness(abs15), str(shim), t0, env=env)
+            check("no-parser-is-miswired", miswired(b), b)
+            b = g.harness_bound(harness(other), str(shim), t0, env=env)
+            check("no-parser-unrelated-drops", b.deadline is None and "MISWIRED" not in b.why, b)
+        finally:
+            g._load_config = orig_loader
 
 
 def test_an_unknown_or_spent_bound_refuses_without_asking(m, g, wc, home):
@@ -1299,7 +1320,7 @@ CONTRACT_TESTS = [
     test_an_internal_error_fails_closed_through_the_one_recorder,
     test_stage_c_wires_every_seat,
     test_the_bound_is_the_real_registration,
-    test_a_registration_cannot_vanish,
+    test_canonical_or_miswired,
     test_an_unknown_or_spent_bound_refuses_without_asking,
     test_the_launch_role_bound_is_the_gates,
     test_the_mcp_transport_is_command_scoped,

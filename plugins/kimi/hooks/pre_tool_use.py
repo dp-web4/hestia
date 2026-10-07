@@ -8,8 +8,13 @@ registration allows, and renders the verdict. Every law-bearing step is the comm
 
 HARNESS FACTS (data below, not code):
   - registration: flat `[[hooks]]` tables (`event = "PreToolUse"`) in `~/.kimi-code/config.toml`;
-    `timeout` in seconds. Kimi's default for an entry that declares none is not documented
-    here, so such an entry is refused, never guessed.
+    `timeout` in seconds. Kimi's vendor default for an entry that declares none is 30 s,
+    verified from the binary: `hook.timeout ?? DEFAULT_HOOK_TIMEOUT_SECONDS` (agent-core-v2
+    `matchHooks`, 2.1.1). A vendor default is a harness FACT, never a security semantic:
+    under the critical-timeout protocol (#1262) the bound comes only from ONE explicit,
+    structurally parsed, in-envelope (3-30 s) timeout on the exact registration — a missing,
+    duplicate, unreadable or unparseable one is MISWIRED and closes the bound
+    (`gate.harness_timeout_unknown`).
   - Kimi's hook engine FAILS OPEN on every failure mode (verified from the binary: timeout,
     spawn failure, a non-2 exit, an exception all allow the tool).
   - the correlation key is Kimi's `tool_call_id`, read from the raw event by the common gate.

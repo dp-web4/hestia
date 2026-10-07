@@ -7,7 +7,7 @@
   "files": [
     {
       "path": "hooks/hooks.json",
-      "sha256": "d647f2fbfd8f3843f81142fa01625b496d2149b5ee1f42cffee7e2b605d0d4a1",
+      "sha256": "ce144f8803943fd8f72c8f4af0a65608bf02c8d22a28370060e6c7ac03476246",
       "source": "plugins/kimi/hooks/hooks.json"
     },
     {
@@ -22,7 +22,7 @@
     },
     {
       "path": "hooks/pre_tool_use.py",
-      "sha256": "753cbb46059d9f5e1ed693a0e34305b29b5016e5ae796ccbd12166ef11177b6d",
+      "sha256": "9f7333fc0a57b8041d01862b71cf2745d55e2b7b272c4fddfc0c789d48aff3ae",
       "source": "plugins/kimi/hooks/pre_tool_use.py"
     },
     {
@@ -33,7 +33,7 @@
   ],
   "engine": {
     "unit": "_shared",
-    "gt_version": "91efdd292059b6b03a98ff2490f10ce498eb9b16d3930c2381ead9384add0b3d",
+    "gt_version": "a4b3e2f593e2e32244ee9f099a7227bba253a4ff57d85fa75f644e8176d30a2c",
     "files": [
       {
         "path": "hestia_gate_core.py",
@@ -53,7 +53,7 @@
       },
       {
         "path": "hestia_single_gate.py",
-        "sha256": "dcc00b423e7952209fb5400da0984223dbc8413f7490c7d22295d2a541818dd5"
+        "sha256": "18cd82c058fa5e54757f7452fbe696751a014c03149bdc8ff82f0a5d6c139381"
       },
       {
         "path": "hestia_witness_core.py",
@@ -62,5 +62,5 @@
     ]
   },
   "requires": [],
-  "gt_version": "a4727db754cf47017ff4fca2fc697bc5cade7350cd670eb20dbc73e648535d02"
+  "gt_version": "900e22df0b907c4e950fe9b220ecb939f59cce6f8efb3a9a7843a05ed48e57e5"
 }

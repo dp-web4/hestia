@@ -200,6 +200,36 @@ class HarnessBound:
 
 _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
+# ── the critical-timeout protocol (dp ruling on #1262, 2026-10-07): canonical or MISWIRED ──
+#: Canonical envelope for a critical hook registration's timeout, seconds. A value outside is
+#: REJECTED (MISWIRED), never clamped. The reconciler WRITES DEFAULT when it canonicalizes a
+#: registration; the gate never substitutes it — a missing timeout is MISWIRED, whatever the
+#: vendor documents.
+MIN_TIMEOUT_SECONDS = 3.0
+DEFAULT_TIMEOUT_SECONDS = 10.0
+MAX_TIMEOUT_SECONDS = 30.0
+#: The margin is proportional and bounded: max(floor, min(cap, timeout * rate)) — the shim's
+#: declared cap from 10 s up, the floor at the 3 s envelope edge.
+MARGIN_FLOOR_SECONDS = 0.5
+MARGIN_RATE = 0.15
+
+
+def validate_timeout(value, unit: float):
+    """The protocol's one validator — the gate is its first consumer; deploy/preflight, the
+    reconciler and the census wire in under #1262 row 10. A STRUCTURALLY parsed timeout field,
+    in the harness's unit, -> (canonical seconds, None), or (None, reason) MISWIRED. No vendor
+    default is ever substituted; an out-of-envelope value is rejected, not clamped."""
+    if value is None:
+        return None, ("no timeout declared (a missing timeout is MISWIRED: a vendor default "
+                      "is not a security semantic)")
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None, f"timeout {value!r} is not a number the protocol can bind"
+    seconds = float(value) * unit
+    if not MIN_TIMEOUT_SECONDS <= seconds <= MAX_TIMEOUT_SECONDS:
+        return None, (f"timeout {seconds:g}s is outside the canonical envelope "
+                      f"{MIN_TIMEOUT_SECONDS:g}-{MAX_TIMEOUT_SECONDS:g}s (rejected, never clamped)")
+    return seconds, None
+
 
 def _expand(text: str, env, cwd: Optional[str]) -> Optional[str]:
     """`${VAR:-default}`, `${VAR}`, `$VAR`, `~` and `{cwd}`. None when a variable with no default
@@ -289,30 +319,12 @@ def _load_config(path: str, reader: str):
     return tomllib.loads(raw.decode("utf-8")), None
 
 
-def _scan_timeouts(path: str, base: str) -> Optional[list]:
-    """No TOML parser: every `timeout = N` in a file that names this hook at all. Conservative —
-    the smallest of them can only shorten the bound. None when the file does not name the hook."""
+def _text_mentions_hook(path: str, base: str) -> bool:
+    """Boolean relevance ONLY: does this file's text mention the hook at all. Reads no value —
+    the protocol forbids inferring a deadline from a lexical scan (#1262); it exists to split a
+    broken file that appears to register this hook (MISWIRED) from one that does not (drops)."""
     with open(path, encoding="utf-8", errors="replace") as fh:
-        text = fh.read()
-    if base not in text:
-        return None
-    return [float(m.group(1)) for m in re.finditer(r"(?m)^\s*timeout\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*(?:#.*)?$", text)]
-
-
-def _scan_bound(path: str, base: str, unit: float, note: str, problems: list):
-    """The line scan as a bound source: (seconds, where), or None when the file does not name
-    this hook. The scan runs only where the file could not be PARSED, so it may shorten the
-    bound but never fill one in: a file that names the hook with a timeout spelling the regex
-    cannot read (`5e0`, `+5`, an inline table) must CLOSE the bound — falling back to the
-    harness default there can outrun the enforced deadline, the fail-open this function exists
-    to prevent (#1262 review)."""
-    values = _scan_timeouts(path, base)
-    if values is None:
-        return None
-    if not values:
-        problems.append(f"{path}: names this hook but no timeout could be read ({note})")
-        return None
-    return min(v * unit for v in values), f"{path} ({note}, smallest timeout in the file)"
+        return base in fh.read()
 
 
 def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[str] = None,
@@ -321,98 +333,101 @@ def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[
 
     `harness` is the shim's HARNESS data: where this harness records its hooks (`registrations`:
     reader, layout, path with `~`/`${VAR:-default}`/`{cwd}`), the hook `event`, the timeout's
-    unit, the harness's own default when an entry omits it (None when unknown), `on_timeout`
-    and `margin_seconds`. Every registration of THIS file on the event counts — matched by
-    realpath, by basename, or by a RELATIVE command naming its basename (the harness resolves
-    it against its own launch directory and enforces it all the same) — from every source that
-    exists, and the SMALLEST timeout wins: a smaller bound costs availability, never safety. A
-    non-harness invoker's HESTIA_HOOK_TIMEOUT_S joins the same minimum. A registration that
-    names this hook but cannot be read, or carries no readable timeout with the harness's
-    default unknown, closes the bound: it may be the one carrying the smaller timeout, and a
-    bound longer than the enforced deadline is the fail-open this function exists to prevent
-    (#1259). A config that fails to parse falls back to the line scan; one whose text never
-    names this hook cannot register it and drops out. The scan only ever SHORTENS the bound:
-    a file it cannot parse may carry a timeout spelling the regex cannot read (`5e0`, `+5`,
-    an inline table), so a scan hit with no readable timeout closes the bound rather than
-    filling it from the harness default (#1262 review).
+    unit, `on_timeout` and `margin_seconds` (the proportional margin's cap). A vendor default
+    timeout the data may carry is a harness FACT, not a security semantic: never substituted.
 
-    Returns `HarnessBound(deadline=start + timeout - margin, ...)`, or `deadline=None` with the
-    reason when no enforced timeout could be established."""
+    The critical-timeout protocol (dp ruling on #1262, 2026-10-07): canonical or MISWIRED.
+    The bound resolves to ONE registration binding THIS file exactly (its realpath) on the
+    event, carrying ONE explicit timeout that `validate_timeout` accepts — present, numeric,
+    inside the envelope after the unit, rejected outside and never clamped or defaulted.
+    Anything else that APPEARS to register this hook contributes no deadline, only MISWIRED
+    evidence, and closes the bound: a missing or non-numeric timeout, an out-of-envelope
+    value, an unparseable or unreadable config naming the hook, no parser available for it, a
+    relative or foreign command naming its basename (the timeout cannot be bound to the exact
+    registered hook), or duplicate/conflicting bindings. A config whose text never mentions
+    this hook is irrelevant and drops. The gate NEVER infers a deadline from a partial lexical
+    scan. A non-harness invoker's explicit HESTIA_HOOK_TIMEOUT_S joins the minimum: it can
+    only shorten.
+
+    Returns `HarnessBound(deadline=start + timeout - margin, ...)` with the proportional
+    margin max(0.5, min(cap, timeout * 0.15)), or `deadline=None` with the MISWIRED reason (or
+    the plain no-registration reason) when no enforced timeout could be established."""
     env = os.environ if env is None else env
-    margin = float(harness.get("margin_seconds") or 0.0)
+    margin_cap = float(harness.get("margin_seconds") or 1.5)
     on_timeout = str(harness.get("on_timeout") or "unknown")
     try:
         unit = float(harness.get("timeout_unit_seconds") or 1.0)
-        default = harness.get("default_timeout_seconds")
         event = harness.get("event") or ""
         me = os.path.realpath(self_path)
         base = os.path.basename(me)
-        exact, by_name, sources, problems = [], [], [], []
+        bindings, problems = [], []
         for reg in harness.get("registrations") or ():
             path = _expand(str(reg.get("path") or ""), env, cwd)
             if not path or not os.path.isfile(path):
-                continue
+                continue                       # not configured there: nothing registers
             reader, layout = reg.get("reader") or "", reg.get("layout") or "nested"
             try:
                 doc, how = _load_config(path, reader)
             except Exception as exc:  # noqa: BLE001 — a parse failure must not swallow this hook
                 try:
-                    hit = _scan_bound(path, base, unit,
-                                      f"unparseable ({type(exc).__name__}); line scan", problems)
-                except Exception:  # noqa: BLE001 — unreadable: it may carry the smaller timeout
-                    problems.append(f"{path}: unreadable ({type(exc).__name__})")
-                    continue
-                if hit:
-                    by_name.append(hit)
-                continue
+                    relevant = _text_mentions_hook(path, base)
+                except Exception:  # noqa: BLE001 — unreadable: it may be the registration
+                    relevant = True
+                if relevant:
+                    problems.append(f"{path}: MISWIRED: appears to register this hook but "
+                                    f"cannot be parsed or read ({type(exc).__name__})")
+                continue                       # its text never names this hook: irrelevant
             if how == "scan":
-                hit = _scan_bound(path, base, unit, "line scan", problems)
-                if hit:
-                    by_name.append(hit)
+                if _text_mentions_hook(path, base):
+                    problems.append(f"{path}: MISWIRED: appears to register this hook and no "
+                                    f"parser is available for it")
                 continue
             for command, timeout in _hook_entries(doc, reader, layout, event):
                 targets = _command_targets(command, env)
                 hit_exact = any(os.path.realpath(t) == me for t in targets)
-                hit_name = hit_exact or any(os.path.basename(t) == base for t in targets) \
-                    or _names_hook(command, env, base)
-                if not hit_name:
+                if not hit_exact:
+                    if _names_hook(command, env, base):
+                        problems.append(f"{path}: MISWIRED: names this hook without binding it "
+                                        f"exactly (a relative or foreign command cannot bind a "
+                                        f"timeout to the registered hook)")
+                    continue                   # some other hook's entry: irrelevant
+                seconds, why = validate_timeout(timeout, unit)
+                if seconds is None:
+                    problems.append(f"{path}: MISWIRED: {why}")
                     continue
-                if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
-                    seconds = float(timeout) * unit
-                    where = f"{path}: timeout {timeout}"
-                elif default is not None:
-                    seconds = float(default)
-                    where = f"{path}: no timeout declared, harness default {default}s"
-                else:
-                    problems.append(f"{path}: registers this hook with no timeout, and this "
-                                    f"harness's default is not known")
-                    continue
-                (exact if hit_exact else by_name).append((seconds, where))
-        found = exact + by_name
+                bindings.append((seconds, f"{path}: timeout {timeout}"))
+        if len(bindings) > 1:
+            problems.append("MISWIRED: duplicate/conflicting registrations of this hook ("
+                            + "; ".join(w for _, w in bindings) + ")")
+            bindings = []
+        found = list(bindings)
         declared = env.get(HOOK_TIMEOUT_ENV)
         if declared:
             try:
                 d = float(declared)
                 if d > 0:
                     found = found + [(d, f"{HOOK_TIMEOUT_ENV}={declared} (the invoker's declaration)")]
+                else:
+                    problems.append(f"{HOOK_TIMEOUT_ENV}={declared!r} is not positive")
             except ValueError:
                 problems.append(f"{HOOK_TIMEOUT_ENV}={declared!r} is not a number")
         if problems:
-            # A registration of this hook we could not read — or a declaration we could not
-            # parse — may be the one carrying the smaller timeout. It never vanishes: the only
-            # bound that cannot exceed the enforced deadline is no bound.
-            return HarnessBound(None, None, margin, on_timeout, tuple(w for _, w in found),
+            # Whatever appears to register this hook but is not one exact, canonical
+            # registration contributes no deadline — MISWIRED is wiring evidence, never a
+            # guessed timeout.
+            return HarnessBound(None, None, margin_cap, on_timeout, tuple(w for _, w in found),
                                 "; ".join(problems))
         if not found:
-            return HarnessBound(None, None, margin, on_timeout, (),
+            return HarnessBound(None, None, margin_cap, on_timeout, (),
                                 f"no registration of {base} on {event or 'its event'} was found "
                                 f"in this harness's configuration, and no {HOOK_TIMEOUT_ENV} was "
                                 f"declared")
         timeout = min(s for s, _ in found)
-        sources.extend(w for _, w in found)
-        return HarnessBound(start + timeout - margin, timeout, margin, on_timeout, tuple(sources))
+        margin = max(MARGIN_FLOOR_SECONDS, min(margin_cap, timeout * MARGIN_RATE))
+        return HarnessBound(start + timeout - margin, timeout, margin, on_timeout,
+                            tuple(w for _, w in found))
     except Exception as exc:  # noqa: BLE001 — a reader that breaks establishes nothing
-        return HarnessBound(None, None, margin, on_timeout, (),
+        return HarnessBound(None, None, margin_cap, on_timeout, (),
                             f"the registration reader failed ({type(exc).__name__}: {exc})")
 
 
