@@ -1049,7 +1049,7 @@ def test_the_bound_is_the_real_registration(m, g, wc, home):
     the smallest of several registrations wins; an unreadable or absent one is refused."""
     real_config = {"claude-code": ("json-hook-commands", "nested", "settings.json", 1, 60),
                    "codex": ("toml-hook-commands", "nested", "config.toml", 1, None),
-                   "kimi": ("toml-hook-commands", "flat", "config.toml", 1, None),
+                   "kimi": ("toml-hook-commands", "flat", "config.toml", 1, 30),
                    "gemini": ("json-hook-commands", "nested", "settings.json", 0.001, 60)}
     for seat in SEATS:
         shim_mod = _shim_module(seat)
@@ -1059,6 +1059,10 @@ def test_the_bound_is_the_real_registration(m, g, wc, home):
               and primary.get("layout", "nested") == layout and primary["path"].endswith(cfg_name)
               and shim_mod.HARNESS["timeout_unit_seconds"] == unit
               and shim_mod.HARNESS["default_timeout_seconds"] == default, shim_mod.HARNESS)
+        # The margin floor, directly (#1259 A6): with no margin declared the bound would equal
+        # the enforced deadline and the shim would race the harness's kill.
+        check(f"{seat}-declares-a-positive-margin",
+              float(shim_mod.HARNESS.get("margin_seconds") or 0) > 0, shim_mod.HARNESS)
         with tempfile.TemporaryDirectory() as td:
             h = pathlib.Path(td)
             env = {"HOME": str(h)}
@@ -1096,6 +1100,68 @@ def test_the_bound_is_the_real_registration(m, g, wc, home):
             cfg.write_text("{not json or toml")
             b = g.harness_bound(harness, str(shim), t0, env=env)
             check(f"{seat}-unreadable-config-no-bound", b.deadline is None, b)
+
+
+def test_a_registration_cannot_vanish(m, g, wc, home):
+    """#1259: the bound must never exceed the deadline the harness REALLY enforces. A RELATIVE
+    registration (the harness resolves it against its own launch directory) is invisible to the
+    absolute-path reader yet enforced all the same — it joins the minimum. A config that fails
+    to parse but names this hook falls back to the line scan. An untimed registration of this
+    hook whose default is unknown closes the bound even when another file yields an exact
+    match. One seat's config format suffices: the reader under test is the shared gate."""
+    seat = "kimi"
+    shim_mod = _shim_module(seat)
+    with tempfile.TemporaryDirectory() as td:
+        h = pathlib.Path(td)
+        env = {"HOME": str(h)}
+        shim = h / "hooks" / "gate_hook.py"     # never created: realpath needs no file
+        abs_cfg = h / "abs.toml"
+        _write_registration(abs_cfg, seat, shim, 15)
+        t0 = time.monotonic()
+
+        def harness(*paths, default=30):
+            regs = tuple(dict(shim_mod.HARNESS["registrations"][0], path=str(p)) for p in paths)
+            return dict(shim_mod.HARNESS, registrations=regs, default_timeout_seconds=default)
+
+        def write_relative(path, timeout):
+            t = "" if timeout is None else f"\ntimeout = {timeout}"
+            path.write_text(f'[[hooks]]\nevent = "PreToolUse"\n'
+                            f'command = "python3 hooks/gate_hook.py"{t}\n')
+
+        # A1b: an exact absolute 15 s entry plus a RELATIVE 5 s entry the harness enforces.
+        rel_cfg = h / "rel.toml"
+        write_relative(rel_cfg, 5)
+        b = g.harness_bound(harness(abs_cfg, rel_cfg), str(shim), t0, env=env)
+        check("relative-registration-joins-the-min", b.timeout_seconds == 5.0, b)
+
+        # A relative entry is the ONLY registration: it alone bounds the invocation.
+        b = g.harness_bound(harness(rel_cfg), str(shim), t0, env=env)
+        check("relative-registration-alone-bounds", b.timeout_seconds == 5.0, b)
+
+        # A3: a second config that fails to parse but names the hook falls back to the line scan.
+        mal = h / "mal.toml"
+        mal.write_text('[[hooks]\nevent = "PreToolUse"\n'
+                       'command = "python3 gate_hook.py"\ntimeout = 5\n')
+        b = g.harness_bound(harness(abs_cfg, mal), str(shim), t0, env=env)
+        check("malformed-registration-does-not-vanish", b.timeout_seconds == 5.0, b)
+
+        # A malformed config whose text never names this hook cannot register it: it drops.
+        other = h / "other.toml"
+        other.write_text('[[hooks]\nevent = "PreToolUse"\n'
+                         'command = "python3 other_hook.py"\ntimeout = 5\n')
+        b = g.harness_bound(harness(abs_cfg, other), str(shim), t0, env=env)
+        check("unrelated-malformed-config-drops", b.timeout_seconds == 15.0, b)
+
+        # An untimed relative entry with a known harness default: the default is its bound.
+        rel_untimed = h / "rel_untimed.toml"
+        write_relative(rel_untimed, None)
+        b = g.harness_bound(harness(rel_untimed), str(shim), t0, env=env)
+        check("relative-untimed-uses-the-default", b.timeout_seconds == 30.0, b)
+
+        # ...and with the default unknown it closes the bound, exact match or no (#1259: the
+        # problem entry never vanishes behind an exact match).
+        b = g.harness_bound(harness(abs_cfg, rel_untimed, default=None), str(shim), t0, env=env)
+        check("relative-untimed-unknown-default-closes", b.deadline is None and b.why, b)
 
 
 def test_an_unknown_or_spent_bound_refuses_without_asking(m, g, wc, home):

@@ -226,7 +226,7 @@ HARNESS = {
         {"reader": "toml-hook-commands", "layout": "flat", "path": "~/.kimi-code/config.toml"},
     ),
     "timeout_unit_seconds": 1,
-    "default_timeout_seconds": None,
+    "default_timeout_seconds": 30,
     "on_timeout": ("fail-open: Kimi's hook engine allows the tool on a timeout, a spawn "
                    "failure, a non-2 exit or an exception"),
     "margin_seconds": 1.5,

@@ -1,4 +1,4 @@
-# hestia-gt-sha256: c7cfe50bd717ecb1470f1bce6d00d1ebb030d8f4daf05330dee1b3229a0a38da  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: cd72bb7ded6fa7b724199df356c177dc3082383f402947f276f861cfd8b5eddf  (published ground truth; manifest: hooks-gt)
 """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
 
 One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
@@ -232,20 +232,32 @@ def _expand(text: str, env, cwd: Optional[str]) -> Optional[str]:
     return out
 
 
-def _command_targets(command: str, env) -> list:
-    """Every absolute path a hook command names, expanded the way the harness's shell would."""
+def _command_tokens(command: str, env):
+    """Every token of a hook command, expanded the way the harness's shell would (environment
+    assignments skipped; a token naming an unset variable with no default drops out)."""
     try:
         tokens = shlex.split(command)
     except ValueError:
         tokens = command.split()
-    out = []
     for tok in tokens:
         if "=" in tok and not tok.startswith(("/", "~", "$")):
             continue                       # an environment assignment, not the program
         t = _expand(tok, env, None)
-        if t and os.path.isabs(t):
-            out.append(t)
-    return out
+        if t:
+            yield t
+
+
+def _command_targets(command: str, env) -> list:
+    """Every absolute path a hook command names, expanded the way the harness's shell would."""
+    return [t for t in _command_tokens(command, env) if os.path.isabs(t)]
+
+
+def _names_hook(command: str, env, base: str) -> bool:
+    """Any token of the command names this hook by basename — including a RELATIVE path, which
+    `_command_targets` never returns but the harness still resolves (against its own launch
+    directory) and enforces a real timeout on. Such a registration must join the bound: dropping
+    it lets the computed deadline exceed the enforced one (#1259)."""
+    return any(os.path.basename(t) == base for t in _command_tokens(command, env))
 
 
 def _hook_entries(doc: Any, reader: str, layout: str, event: str) -> list:
@@ -295,10 +307,16 @@ def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[
     `harness` is the shim's HARNESS data: where this harness records its hooks (`registrations`:
     reader, layout, path with `~`/`${VAR:-default}`/`{cwd}`), the hook `event`, the timeout's
     unit, the harness's own default when an entry omits it (None when unknown), `on_timeout`
-    and `margin_seconds`. Every registration of THIS file on the event counts (its realpath, or
-    failing any such match its basename), from every source that exists, and the SMALLEST
-    timeout wins: a smaller bound costs availability, never safety. A non-harness invoker's
-    HESTIA_HOOK_TIMEOUT_S joins the same minimum.
+    and `margin_seconds`. Every registration of THIS file on the event counts — matched by
+    realpath, by basename, or by a RELATIVE command naming its basename (the harness resolves
+    it against its own launch directory and enforces it all the same) — from every source that
+    exists, and the SMALLEST timeout wins: a smaller bound costs availability, never safety. A
+    non-harness invoker's HESTIA_HOOK_TIMEOUT_S joins the same minimum. A registration that
+    names this hook but cannot be read, or carries no readable timeout with the harness's
+    default unknown, closes the bound: it may be the one carrying the smaller timeout, and a
+    bound longer than the enforced deadline is the fail-open this function exists to prevent
+    (#1259). A config that fails to parse falls back to the line scan; one whose text never
+    names this hook cannot register it and drops out.
 
     Returns `HarnessBound(deadline=start + timeout - margin, ...)`, or `deadline=None` with the
     reason when no enforced timeout could be established."""
@@ -319,8 +337,20 @@ def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[
             reader, layout = reg.get("reader") or "", reg.get("layout") or "nested"
             try:
                 doc, how = _load_config(path, reader)
-            except Exception as exc:  # noqa: BLE001 — an unreadable registration is no bound
-                problems.append(f"{path}: unreadable ({type(exc).__name__})")
+            except Exception as exc:  # noqa: BLE001 — a parse failure must not swallow this hook
+                try:
+                    values = _scan_timeouts(path, base)
+                except Exception:  # noqa: BLE001 — unreadable: it may carry the smaller timeout
+                    problems.append(f"{path}: unreadable ({type(exc).__name__})")
+                    continue
+                if values is None:
+                    continue            # its text never names this hook: it cannot register it
+                note = f"unparseable ({type(exc).__name__}); line scan"
+                if not values and default is None:
+                    problems.append(f"{path}: names this hook but no timeout could be read ({note})")
+                    continue
+                vals = [v * unit for v in values] + ([float(default)] if default is not None else [])
+                by_name.append((min(vals), f"{path} ({note}, smallest timeout in the file)"))
                 continue
             if how == "scan":
                 values = _scan_timeouts(path, base)
@@ -335,7 +365,8 @@ def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[
             for command, timeout in _hook_entries(doc, reader, layout, event):
                 targets = _command_targets(command, env)
                 hit_exact = any(os.path.realpath(t) == me for t in targets)
-                hit_name = hit_exact or any(os.path.basename(t) == base for t in targets)
+                hit_name = hit_exact or any(os.path.basename(t) == base for t in targets) \
+                    or _names_hook(command, env, base)
                 if not hit_name:
                     continue
                 if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
@@ -349,7 +380,7 @@ def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[
                                     f"harness's default is not known")
                     continue
                 (exact if hit_exact else by_name).append((seconds, where))
-        found = exact or by_name
+        found = exact + by_name
         declared = env.get(HOOK_TIMEOUT_ENV)
         if declared:
             try:
@@ -358,8 +389,10 @@ def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[
                     found = found + [(d, f"{HOOK_TIMEOUT_ENV}={declared} (the invoker's declaration)")]
             except ValueError:
                 problems.append(f"{HOOK_TIMEOUT_ENV}={declared!r} is not a number")
-        if problems and not exact:
-            # A registration of this hook we could not read may carry the smaller timeout.
+        if problems:
+            # A registration of this hook we could not read — or a declaration we could not
+            # parse — may be the one carrying the smaller timeout. It never vanishes: the only
+            # bound that cannot exceed the enforced deadline is no bound.
             return HarnessBound(None, None, margin, on_timeout, tuple(w for _, w in found),
                                 "; ".join(problems))
         if not found:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: eb8969c817fb4fb6d60db00a2ecc26e38bd8debfd02bf54be29e05636f3268b1  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 753cbb46059d9f5e1ed693a0e34305b29b5016e5ae796ccbd12166ef11177b6d  (published ground truth; manifest: hooks-gt)
 """Hestia PreToolUse gate for Kimi Code: the certified shim (one-gate stage C).
 
 This file is `plugins/_template/shim_template.py` with this harness's data and adapters. It
@@ -227,7 +227,7 @@ HARNESS = {
         {"reader": "toml-hook-commands", "layout": "flat", "path": "~/.kimi-code/config.toml"},
     ),
     "timeout_unit_seconds": 1,
-    "default_timeout_seconds": None,
+    "default_timeout_seconds": 30,
     "on_timeout": ("fail-open: Kimi's hook engine allows the tool on a timeout, a spawn "
                    "failure, a non-2 exit or an exception"),
     "margin_seconds": 1.5,
