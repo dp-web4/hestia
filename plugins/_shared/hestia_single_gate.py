@@ -299,6 +299,22 @@ def _scan_timeouts(path: str, base: str) -> Optional[list]:
     return [float(m.group(1)) for m in re.finditer(r"(?m)^\s*timeout\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*(?:#.*)?$", text)]
 
 
+def _scan_bound(path: str, base: str, unit: float, note: str, problems: list):
+    """The line scan as a bound source: (seconds, where), or None when the file does not name
+    this hook. The scan runs only where the file could not be PARSED, so it may shorten the
+    bound but never fill one in: a file that names the hook with a timeout spelling the regex
+    cannot read (`5e0`, `+5`, an inline table) must CLOSE the bound — falling back to the
+    harness default there can outrun the enforced deadline, the fail-open this function exists
+    to prevent (#1262 review)."""
+    values = _scan_timeouts(path, base)
+    if values is None:
+        return None
+    if not values:
+        problems.append(f"{path}: names this hook but no timeout could be read ({note})")
+        return None
+    return min(v * unit for v in values), f"{path} ({note}, smallest timeout in the file)"
+
+
 def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[str] = None,
                   env=None) -> HarnessBound:
     """The deadline the harness's REAL registered timeout allows this hook process. NEVER raises.
@@ -315,7 +331,10 @@ def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[
     default unknown, closes the bound: it may be the one carrying the smaller timeout, and a
     bound longer than the enforced deadline is the fail-open this function exists to prevent
     (#1259). A config that fails to parse falls back to the line scan; one whose text never
-    names this hook cannot register it and drops out.
+    names this hook cannot register it and drops out. The scan only ever SHORTENS the bound:
+    a file it cannot parse may carry a timeout spelling the regex cannot read (`5e0`, `+5`,
+    an inline table), so a scan hit with no readable timeout closes the bound rather than
+    filling it from the harness default (#1262 review).
 
     Returns `HarnessBound(deadline=start + timeout - margin, ...)`, or `deadline=None` with the
     reason when no enforced timeout could be established."""
@@ -338,28 +357,18 @@ def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[
                 doc, how = _load_config(path, reader)
             except Exception as exc:  # noqa: BLE001 — a parse failure must not swallow this hook
                 try:
-                    values = _scan_timeouts(path, base)
+                    hit = _scan_bound(path, base, unit,
+                                      f"unparseable ({type(exc).__name__}); line scan", problems)
                 except Exception:  # noqa: BLE001 — unreadable: it may carry the smaller timeout
                     problems.append(f"{path}: unreadable ({type(exc).__name__})")
                     continue
-                if values is None:
-                    continue            # its text never names this hook: it cannot register it
-                note = f"unparseable ({type(exc).__name__}); line scan"
-                if not values and default is None:
-                    problems.append(f"{path}: names this hook but no timeout could be read ({note})")
-                    continue
-                vals = [v * unit for v in values] + ([float(default)] if default is not None else [])
-                by_name.append((min(vals), f"{path} ({note}, smallest timeout in the file)"))
+                if hit:
+                    by_name.append(hit)
                 continue
             if how == "scan":
-                values = _scan_timeouts(path, base)
-                if values is None:
-                    continue
-                if not values and default is None:
-                    problems.append(f"{path}: names this hook but no timeout could be read")
-                    continue
-                vals = [v * unit for v in values] + ([float(default)] if default is not None else [])
-                by_name.append((min(vals), f"{path} (line scan, smallest timeout in the file)"))
+                hit = _scan_bound(path, base, unit, "line scan", problems)
+                if hit:
+                    by_name.append(hit)
                 continue
             for command, timeout in _hook_entries(doc, reader, layout, event):
                 targets = _command_targets(command, env)

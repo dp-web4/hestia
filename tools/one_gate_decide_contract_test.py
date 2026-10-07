@@ -1152,6 +1152,28 @@ def test_a_registration_cannot_vanish(m, g, wc, home):
         b = g.harness_bound(harness(abs_cfg, other), str(shim), t0, env=env)
         check("unrelated-malformed-config-drops", b.timeout_seconds == 15.0, b)
 
+        # #1262 review (codex's factor, claude-code's reproduction): the scan may shorten,
+        # NEVER fill. A timeout spelling the regex cannot read closes the bound rather than
+        # falling back to the harness default — on 813ff01 a `5e0` beside default 30 measured
+        # a 28.5 s bound against a 5 s kill, the fail-open this test exists to prevent.
+        for label, body in (
+                ("scientific", "timeout = 5e0"),
+                ("signed", "timeout = +5"),
+                ("inline-table",
+                 'hooks = [{event="PreToolUse", command="python3 gate_hook.py", timeout=5}]')):
+            odd = h / f"odd_{label}.toml"
+            odd.write_text(f'[[hooks]\nevent = "PreToolUse"\ncommand = "python3 gate_hook.py"\n'
+                           f'{body}\n')
+            b = g.harness_bound(harness(odd), str(shim), t0, env=env)
+            check(f"scan-{label}-closes-not-fills", b.deadline is None and b.why, b)
+
+        # ...while a plain decimal the regex CAN read still shortens, default known or not.
+        dec = h / "odd_decimal.toml"
+        dec.write_text('[[hooks]\nevent = "PreToolUse"\ncommand = "python3 gate_hook.py"\n'
+                       'timeout = 5.0\n')
+        b = g.harness_bound(harness(dec), str(shim), t0, env=env)
+        check("scan-readable-decimal-still-shortens", b.timeout_seconds == 5.0, b)
+
         # An untimed relative entry with a known harness default: the default is its bound.
         rel_untimed = h / "rel_untimed.toml"
         write_relative(rel_untimed, None)
@@ -1277,6 +1299,7 @@ CONTRACT_TESTS = [
     test_an_internal_error_fails_closed_through_the_one_recorder,
     test_stage_c_wires_every_seat,
     test_the_bound_is_the_real_registration,
+    test_a_registration_cannot_vanish,
     test_an_unknown_or_spent_bound_refuses_without_asking,
     test_the_launch_role_bound_is_the_gates,
     test_the_mcp_transport_is_command_scoped,
