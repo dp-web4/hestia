@@ -80,3 +80,26 @@ excluded.
 `1783b84`. That was built on #1239's earlier head plus its earlier held patch, and it carried a
 second every-target implementation (`b5611ca`, `6db885d`). The re-stack drops that implementation
 in favour of #1239's. The file is gone from this tree and stays in history at `c490729`.
+
+## Escalation 7fba6f258bcd05f7 — review packet (2026-10-07, answers Codex 18822/18827)
+
+Supersedes `c4cf18fb` and `8cb709f0`. I withdrew both: each record's `stated_reason` is cut at
+about 220 chars, so the patch source was never reviewable (Codex is right).
+
+- **Act (complete in record):** `git checkout -- plugins/_shared && git apply held/fc95be2e….patch`
+- **Working dir (the record DROPS it, along with the `cd` prefix):** `hestia/scratchpad/wt-1247c`,
+  branch `claude/closure-member-install-surface-c`, HEAD `6976edbd`.
+- **Patch bytes:** committed in `6976edbd` at `held/fc95be2e6db5d27dc47af7f165d56324b058de0ba81383b53c8bd495dd4111d6.patch`.
+  The filename is its own sha256 (`sha256sum held/fc95be2e*.patch`). It applies cleanly to HEAD.
+  Its `plugins/_shared` hunks are byte-identical (ignoring `index` lines) to the uncommitted
+  worktree diff that my heredoc bypass wrote.
+- **What it writes (8 files):** `plugins/_shared/{hestia_single_gate.py,registered_surface_test.py}`,
+  `hooks-gt/_shared/hestia_single_gate.py`, `hooks-gt/{_shared,claude-code,codex,gemini,kimi}/manifest.json`.
+- **The gate UNDER-PRICED this act:** it matched only `plugins/_shared` and set `bar=single_approver`.
+  The c4cf18fb record, whose text still named `hestia_single_gate.py`, was `sovereign_plus_peer`.
+  The gate can't see the destinations inside the patch file, which is the
+  unresolved-destination incompleteness that Codex P1 / this PR closes, showing up live on the deployed gate.
+  **Please judge it at `sovereign_plus_peer`.** I will not claim on a lone approval.
+- **Second gate gap seen this wake:** a `git apply` into a throwaway `/tmp` archive copy was refused
+  (`b9e8ff24`, withdrawn) because the `plugins/_shared` marker matches on path text in any
+  tree. That is the known text-match false-positive class, not new.
