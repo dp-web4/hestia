@@ -304,20 +304,8 @@ async fn dashboard_read_model_worker(
             }
         }
 
-        let (mut snapshot, observed_len) = {
-            let s = state.lock().await;
-            (s.dashboard_snapshot_from_projection(projection.clone(), cutoff, label), s.chain_len())
-        };
-        // The fold registers any grain it had no derivation for — at start, all of them.
-        // Derive those off the lock and fold once more, so no snapshot is published with a
-        // member's trust missing.
-        if chain_store.derivations().has_due() {
-            let store = chain_store.clone();
-            if tokio::task::spawn_blocking(move || refresh_derivations(&store)).await.is_ok() {
-                let s = state.lock().await;
-                snapshot = s.dashboard_snapshot_from_projection(projection, cutoff, label);
-            }
-        }
+        let (snapshot, observed_len) =
+            fold_dashboard_snapshot(&state, &chain_store, projection, cutoff, label, &|| {}).await;
         // DURABLE READS: the operator is never shown a chain fact an OS crash could take back.
         if let Err(e) = chain_store.durability().wait_durable(observed_len).await {
             tracing::warn!("dashboard snapshot withheld: chain not durable ({e:#})");
@@ -326,6 +314,43 @@ async fn dashboard_read_model_worker(
         }
         model.publish(range, snapshot);
     }
+}
+
+/// Fold the in-memory state over a chain projection into a dashboard snapshot, and return the
+/// chain length the snapshot reflects (what the worker must wait to be durable).
+///
+/// The fold registers any grain it had no derivation for — at start, all of them. Those are
+/// derived off the lock and the state is folded once more, so no snapshot is published with a
+/// member's trust missing. `between_folds` runs just before that second fold (a test seam).
+///
+/// The length is taken WITH the fold that is published (Codex review 18933, P2: the second
+/// fold used to keep the first fold's length, so a scope request or escalation committed
+/// during the derivation await was shown while the worker waited only for the older length).
+/// It is also raised to the store's read high-water: the projection and the derivations were
+/// read on the blocking pool, outside any request scope, and every row they returned lies
+/// within the frontier those reads registered there.
+async fn fold_dashboard_snapshot(
+    state: &SharedState,
+    chain_store: &Arc<crate::storage::SqliteChainStore>,
+    projection: crate::server::dashboard::DashboardChainProjection,
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
+    label: &'static str,
+    between_folds: &(dyn Fn() + Sync),
+) -> (DashboardSnapshot, u64) {
+    let (mut snapshot, mut observed_len) = {
+        let s = state.lock().await;
+        (s.dashboard_snapshot_from_projection(projection.clone(), cutoff, label), s.chain_len())
+    };
+    if chain_store.derivations().has_due() {
+        let store = chain_store.clone();
+        if tokio::task::spawn_blocking(move || refresh_derivations(&store)).await.is_ok() {
+            between_folds();
+            let s = state.lock().await;
+            snapshot = s.dashboard_snapshot_from_projection(projection, cutoff, label);
+            observed_len = s.chain_len();
+        }
+    }
+    (snapshot, observed_len.max(chain_store.read_high_water()))
 }
 
 // ---- Operator-surface authentication (RWOA clauses W + O) -------------------
@@ -1307,11 +1332,6 @@ pub async fn serve_with_callback(
         // The admin ledger — governance history with status facets. Operator-gated for the same
         // reason /api/chain is: it is the society's whole record of who ruled on what.
         .route("/api/governance/ledger", get(governance_ledger))
-        // Global state-lock wait/hold by label and call site (lock instrumentation, stage 1 of
-        // the per-member serialisation plan). Read-only, and it never takes the state lock: the
-        // statistics live beside the mutex, not inside it, so it answers even while a holder
-        // is starving everyone else — which is exactly when it is needed.
-        .route("/api/debug/locks", get(debug_locks))
         // OID4VCI issuance MINTS a presentation SIGNED WITH THE OWNER'S IDENTITY KEY — a consequential
         // act that must be owner-authorized. Fail-closed stopgap (PRD §5.6/§7.1; Nomad's finding, dp's
         // §12 disposition): gate it behind the operator session like every other consequential surface,
@@ -1472,8 +1492,23 @@ pub async fn serve_with_callback(
         }
     });
 
+    // Global state-lock wait/hold by label and call site (lock instrumentation, stage 1 of the
+    // per-member serialisation plan). Read-only, and NOTHING on its path takes the state lock:
+    // the statistics live beside the mutex, and its authorization (`debug_gate`) reads operator
+    // sessions from their own lock — so it answers while a holder is starving everyone else,
+    // which is exactly when it is needed. Behind `operator_gate` it could not (Codex review of
+    // #1265: that middleware resolves the session under the state lock).
+    let operator_sessions = state.lock().await.operator_sessions.lockfree_view();
+    let debug_surface = axum::Router::new()
+        .route("/api/debug/locks", get(debug_locks))
+        .route_layer(axum::middleware::from_fn_with_state(
+            (state.clone(), operator_sessions),
+            debug_gate,
+        ));
+
     let mut app = axum::Router::new()
         .merge(operator_surface)
+        .merge(debug_surface)
         // The dashboard HTML shell — unauthenticated (app skeleton + sign-in JS,
         // no data). The operator signs in from here; all /api/* data is gated.
         .route("/", get(dashboard_html))
@@ -1561,6 +1596,63 @@ async fn label_state_lock_by_route(
             })),
         )
             .into_response(),
+    }
+}
+
+/// The operator check for the lock report, without the state lock (see the route).
+///
+/// The same admission `operator_gate` gives a low-stakes read: a live, unexpired operator
+/// session (401 otherwise), or — outside the production profile — the named dev override, still
+/// witnessed, but by a background task so the reply does not wait for the lock. One difference,
+/// stated rather than hidden: `operator_gate` also re-checks that operator access is
+/// bootstrapped, which lives in the law, under the lock. Sessions can only be opened by an
+/// operator the law authorizes, so this differs only for a session opened before the law lost
+/// every operator, and only for this read-only report.
+async fn debug_gate(
+    State((state, sessions)): State<(SharedState, super::operator_auth::OperatorSessionView)>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path().to_string();
+    let bearer = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string);
+    let production = std::env::var("HESTIA_PROFILE")
+        .map(|p| p == "production")
+        .unwrap_or(false);
+    if let Some(dev) = std::env::var("HESTIA_OPERATOR_DEV_TOKEN").ok().filter(|t| !t.is_empty()) {
+        if !production && bearer.as_deref() == Some(dev.as_str()) {
+            eprintln!("[hestia] WARNING: operator dev-override used on GET {path} (dev-only, unsafe)");
+            let now = super::state::unix_now();
+            tokio::spawn(async move {
+                let mut s = state.lock().await;
+                let _ = s.append_chain(
+                    "operator_gate",
+                    serde_json::json!({ "act": format!("GET {path}"), "verdict": "dev-override",
+                        "stakes": "low-reversible", "unsafe": true, "at": now }),
+                );
+            });
+            return next.run(req).await;
+        }
+    }
+    let now = super::state::unix_now();
+    let admitted = bearer
+        .as_deref()
+        .and_then(|t| sessions.operator(t, now, super::operator_auth::SESSION_TTL_SECS))
+        .is_some();
+    if admitted {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "no operator session (present an LCT-signed challenge first)"
+            })),
+        )
+            .into_response()
     }
 }
 
@@ -8917,6 +9009,102 @@ mod disposition_tests {
         }
     }
 
+    /// Codex review of #1265 (P2): `/api/debug/locks` exists to show who holds the state lock
+    /// DURING a stall, so its authorization must not queue on that lock. Through the real
+    /// served router and middleware: with another task holding the state lock, an operator
+    /// session gets the report, and a request without one is still refused — both promptly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_lock_report_answers_while_the_state_lock_is_held() {
+        std::env::remove_var("HESTIA_OPERATOR_DEV_TOKEN");
+        let (_dir, state) = test_state().await;
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let bind = format!("127.0.0.1:{port}");
+        let served = state.clone();
+        let _server = tokio::spawn(async move {
+            let _ = super::serve_with_callback(served, &bind, None).await;
+        });
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+        let mut up = false;
+        for _ in 0..50 {
+            if client.get(format!("{base}/api/debug/locks")).send().await.is_ok() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(up, "the test server never came up on {base}");
+
+        let kp = web4_core::crypto::KeyPair::generate();
+        let lct_id = web4_core::lct::derive_lct_id(&kp.verifying_key());
+        {
+            let mut s = state.lock().await;
+            let mut policy = s.vault.policy().clone();
+            policy.operator_access.push(crate::vault::OperatorIdentity {
+                lct_id: lct_id.clone(),
+                public_key_hex: hex::encode(kp.public_key_bytes()),
+                label: "test operator".into(),
+            });
+            s.vault.set_policy(policy).unwrap();
+            s.reload_policy();
+        }
+        let ch: serde_json::Value = client
+            .post(format!("{base}/api/operator/challenge"))
+            .send().await.unwrap().json().await.unwrap();
+        let challenge = ch["challenge"].as_str().expect("a challenge").to_string();
+        let sess: serde_json::Value = client
+            .post(format!("{base}/api/operator/session"))
+            .json(&serde_json::json!({
+                "lct_id": lct_id,
+                "challenge": challenge,
+                "signature": kp.sign(challenge.as_bytes()).to_hex(),
+            }))
+            .send().await.unwrap().json().await.unwrap();
+        let token = sess["token"].as_str().expect(&format!("a session token: {sess}")).to_string();
+
+        // The stall: some other request holds the state lock and does not let go.
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let holder_state = state.clone();
+        let holder = tokio::spawn(async move {
+            let _g = holder_state.lock().await;
+            let _ = held_tx.send(());
+            let _ = release_rx.await;
+        });
+        held_rx.await.unwrap();
+
+        let budget = std::time::Duration::from_secs(3);
+        let authed = tokio::time::timeout(
+            budget,
+            client.get(format!("{base}/api/debug/locks")).bearer_auth(&token).send(),
+        )
+        .await;
+        let anonymous = tokio::time::timeout(
+            budget,
+            client.get(format!("{base}/api/debug/locks")).send(),
+        )
+        .await;
+        let wrong = tokio::time::timeout(
+            budget,
+            client.get(format!("{base}/api/debug/locks")).bearer_auth("not-a-session").send(),
+        )
+        .await;
+        let _ = release_tx.send(());
+        holder.await.unwrap();
+
+        let authed = authed.expect("the lock report queued behind the state lock it reports on").unwrap();
+        assert_eq!(authed.status(), reqwest::StatusCode::OK);
+        let report: serde_json::Value = authed.json().await.unwrap();
+        assert!(report.get("sections").is_some(), "{report}");
+        let anonymous = anonymous.expect("a refusal queued behind the state lock").unwrap();
+        assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED, "no session, no report");
+        let wrong = wrong.expect("a refusal queued behind the state lock").unwrap();
+        assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED, "a wrong bearer is the same as none");
+    }
+
     /// THE NEGATIVE ARM #944 REQUIRES: an unauthenticated HTTP client obtains no value from
     /// either GET. Run against the real served router — the middleware is the thing under
     /// test, and a handler-level test cannot see it. No dev-override token in this process.
@@ -11069,6 +11257,41 @@ mod tests {
         assert!(!live_read_is_current(100, t0, 101, two), "the chain moved: re-read");
         assert!(!live_read_is_current(100, t0, 100, t0 + DASHBOARD_PROJECTION_MAX_AGE),
                 "rolling windows still roll: a 30 s old live read is re-read on a quiet chain");
+    }
+
+    /// Codex review 18933, P2: when derivations are due the worker folds TWICE, and the second
+    /// snapshot can reflect rows committed after the first. The length the worker waits for
+    /// must cover the snapshot it publishes, not the first fold's. An append lands between the
+    /// folds (via the seam) and stays in the commit-to-fsync window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_second_dashboard_fold_waits_for_what_it_reflects() {
+        let (_dir, state) = make_shared_state();
+        let sid = crate::server::handler::tool_connect(&state, &serde_json::json!({
+            "plugin_id": "codex", "host_agent": "h"})).await.unwrap()["sessionId"]
+            .as_str().unwrap().to_string();
+        let b = crate::server::handler::tool_begin_action(&state, &serde_json::json!({
+            "tool_name": "Read", "target": "/tmp/x", "parameters": {"file_path": "/tmp/x"},
+            "session_id": sid})).await.unwrap();
+        crate::server::handler::tool_record_outcome(&state, &serde_json::json!({
+            "action_id": b["actionId"], "success": true, "session_id": sid})).await.unwrap();
+        let chain_store = { state.lock().await.chain_store.clone() };
+        chain_store.durability().flush_committed_blocking().unwrap();
+        // A fresh derivation cache has derived nobody: the first fold registers the member's
+        // grain, so the second fold runs.
+        let hold = chain_store.durability().hold_flush_for_test();
+        let projection = DashboardChainProjection::read(&chain_store, 100, None);
+        let appended = StdMutex::new(None);
+        let seam = || {
+            let row = chain_store.append("battery_fact", serde_json::json!({"between": "folds"}), "lct:x").unwrap();
+            *appended.lock().unwrap() = Some(row.chain_position);
+        };
+        let (snapshot, observed_len) =
+            fold_dashboard_snapshot(&state, &chain_store, projection, None, "all", &seam).await;
+        drop(hold);
+        let pos = appended.lock().unwrap().expect("setup: derivations were due, so the worker folded twice");
+        assert_eq!(snapshot.society.chain_length, pos + 1, "the second fold reflects the append");
+        assert!(observed_len > pos,
+                "the snapshot reflects chain position {pos}, but the worker would wait only for length {observed_len}");
     }
 
     #[test]

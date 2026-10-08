@@ -28428,6 +28428,135 @@ mod decision_witness_tests {
     use super::inbox_tests::{open_state, seeded_home};
     use super::*;
 
+    // Codex review 19153 on f4c6629: reproduced as failures there; assert the recovery now.
+    fn review_entity_file(state: &super::super::state::ServerState, member: &str) -> std::path::PathBuf {
+        use sha2::{Digest, Sha256};
+        let key = state.trust_entity_key(member, crate::reputation::DEFAULT_CONSTELLATION_ROLE);
+        let hash = format!("{:x}", Sha256::digest(key.as_bytes()));
+        state.home.join("trust").join(format!("{}.json", &hash[..16]))
+    }
+
+    #[tokio::test]
+    async fn review_19153_a_lost_entity_under_a_surviving_checkpoint_is_replayed() {
+        use crate::storage::durability::durable_scope;
+        let (dir, state) = state_with_safety().await;
+        let mut args = witness_args("gemini", "deny");
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        let (out, durable) = durable_scope(tool_witness_decision(&state, &args)).await;
+        durable.unwrap();
+        assert_eq!(out.unwrap()["charged"], true);
+        let path = {
+            let s = state.lock().await;
+            s.trust_store.persister().flush_blocking();
+            review_entity_file(&s, "gemini")
+        };
+        assert_eq!(grain_actions(&state, "gemini").await, 1);
+        drop(state);
+        // Model an independently lost unsynced cache file with projection.json surviving.
+        // No chain rows are changed; the acknowledged decision remains durable.
+        assert!(dir.path().join("trust/projection.json").exists());
+        std::fs::remove_file(path).unwrap();
+        let reopened = reopen_with_safety(&dir).await;
+        assert_eq!(grain_actions(&reopened, "gemini").await, 1, "the checkpoint's manifest no longer verifies: replay from the epoch");
+        let retry = tool_witness_decision(&reopened, &args).await.unwrap();
+        assert_eq!(retry["charged"], false, "the charge is on the chain once");
+        assert_eq!(grain_actions(&reopened, "gemini").await, 1);
+    }
+
+    #[tokio::test]
+    async fn review_19153_a_partial_first_batch_is_not_mistaken_for_legacy() {
+        use crate::storage::durability::durable_scope;
+        let (dir, state) = state_with_safety().await;
+        let persister = { state.lock().await.trust_store.persister().clone() };
+        let hold = persister.hold_for_test();
+        for member in ["gemini", "codex"] {
+            let mut args = witness_args(member, "deny");
+            args["action_id"] = json!(Uuid::new_v4().to_string());
+            let (out, durable) = durable_scope(tool_witness_decision(&state, &args)).await;
+            durable.unwrap();
+            assert_eq!(out.unwrap()["charged"], true);
+        }
+        let (keep, lose) = {
+            let s = state.lock().await;
+            (review_entity_file(&s, "gemini"), review_entity_file(&s, "codex"))
+        };
+        drop(hold);
+        persister.flush_blocking();
+        drop(persister);
+        drop(state);
+        // Exact cache shape of a process crash part-way through the FIRST batch: one v2
+        // entity rename completed; the other entity and last-written manifest did not.
+        assert!(keep.exists());
+        std::fs::remove_file(lose).unwrap();
+        std::fs::remove_file(dir.path().join("trust/projection.json")).unwrap();
+        let reopened = reopen_with_safety(&dir).await;
+        assert_eq!(grain_actions(&reopened, "gemini").await, 1);
+        assert_eq!(grain_actions(&reopened, "codex").await, 1, "a v2 cache is replayed, not adopted at the head");
+        let s = reopened.lock().await;
+        assert_eq!(s.trust_store.projection_since(), Some(0), "the fresh epoch stays 0");
+    }
+
+    /// Codex, #1271 review 19161: the cache must never hold a charge the chain does not. Two
+    /// layers. (1) The barrier: while the chain's fsync is held, no trust file reaches disk, so a
+    /// crash cannot leave the cache ahead of the chain. (2) Recovery: a cache that IS ahead (here,
+    /// the chain restored from an older copy) is set aside and rebuilt, so the retry of the lost
+    /// row counts once. Before the fix the cache advanced under the hold and recovery kept the
+    /// unwitnessed charge (2 against the chain's 1). A retry did NOT count it twice, even with a
+    /// later row landing first (measured: 3 rows, 3 charges) — but with no retry, the cache stays
+    /// one charge above the chain for good.
+    #[tokio::test]
+    async fn review_19161_the_cache_never_holds_a_charge_the_chain_does_not() {
+        use crate::storage::durability::durable_scope;
+        let (dir, state) = state_with_safety().await;
+        let mut first = witness_args("gemini", "deny");
+        first["action_id"] = json!(Uuid::new_v4().to_string());
+        let (out, durable) = durable_scope(tool_witness_decision(&state, &first)).await;
+        durable.unwrap();
+        assert_eq!(out.unwrap()["charged"], true);
+        assert_eq!(grain_actions(&state, "gemini").await, 1);
+        drop(state);
+        let chain_path = dir.path().join("witness.db");
+        let durable_prefix = std::fs::read(&chain_path).unwrap();
+        assert!(!dir.path().join("witness.db-wal").exists(), "closed prefix has no WAL");
+
+        let state = reopen_with_safety(&dir).await;
+        let durability = { state.lock().await.chain_store.durability().clone() };
+        let held = durability.hold_flush_for_test();
+        let durable_before = durability.frontier().durable;
+        let mut pending = witness_args("gemini", "deny");
+        pending["action_id"] = json!(Uuid::new_v4().to_string());
+        assert_eq!(tool_witness_decision(&state, &pending).await.unwrap()["charged"], true);
+        assert!(durability.committed() > durable_before);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        {
+            let s = state.lock().await;
+            assert!(s.trust_store.projected_through().is_none_or(|t| t < durable_before),
+                    "(1) no trust file reaches disk while its chain row is not durable");
+        }
+        drop(held);
+        { state.lock().await.trust_store.persister().flush_blocking(); }
+        drop(durability);
+        drop(state);
+        assert!(!dir.path().join("witness.db-wal").exists());
+        // The cache now holds the second charge; restore the chain to the copy without it.
+        std::fs::write(&chain_path, durable_prefix).unwrap();
+        let reopened = reopen_with_safety(&dir).await;
+        let rows = rows_of(&reopened, "policy_decision").await;
+        assert!(!rows.iter().any(|r| r.event_data["action_id"] == pending["action_id"]));
+        assert_eq!(grain_actions(&reopened, "gemini").await, 1,
+                   "(2) a cache ahead of the chain is rebuilt from the chain");
+        let mut later = witness_args("gemini", "deny");
+        later["action_id"] = json!(Uuid::new_v4().to_string());
+        let (out, durable) = durable_scope(tool_witness_decision(&reopened, &later)).await;
+        durable.unwrap();
+        assert_eq!(out.unwrap()["charged"], true);
+        let (retry, durable) = durable_scope(tool_witness_decision(&reopened, &pending)).await;
+        durable.unwrap();
+        assert_eq!(retry.unwrap()["charged"], true, "the lost row is witnessed on retry");
+        assert_eq!(grain_actions(&reopened, "gemini").await, 3,
+                   "three rows on the chain, three charges: the retry counts once");
+    }
+
     async fn state_with_safety() -> (tempfile::TempDir, SharedState) {
         let (dir, _) = seeded_home();
         let state = open_state(&dir);
@@ -28869,16 +28998,20 @@ mod decision_witness_tests {
 
     // ------------------------------- exactly once: an owed charge is settled, across restarts too
 
-    /// Make the trust store unwritable: its directory becomes a plain file, so every trust write
-    /// fails while the chain keeps committing (row commits, trust write fails).
+    /// Make the trust store unwritable: its directory goes read-only, so every trust write fails
+    /// while the chain keeps committing (row commits, trust write fails). Reads still work — a
+    /// store that cannot be READ is an error, not an absent entity (#1271 review 19166), so
+    /// swapping the directory for a file no longer models a lost write.
     fn break_trust(dir: &tempfile::TempDir) {
-        std::fs::rename(dir.path().join("trust"), dir.path().join("trust.off")).unwrap();
-        std::fs::write(dir.path().join("trust"), b"not a directory").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path().join("trust"), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
     }
 
     fn heal_trust(dir: &tempfile::TempDir) {
-        std::fs::remove_file(dir.path().join("trust")).unwrap();
-        std::fs::rename(dir.path().join("trust.off"), dir.path().join("trust")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path().join("trust"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
     }
 
     /// Reopen after a restart with the safety preset the decision tests run under.
@@ -29882,6 +30015,75 @@ mod durable_reads_tests {
         drop(hold);
         write.await.unwrap().expect("written once the chain is durable");
         assert!(durability.frontier().durable > row.chain_position);
+    }
+
+    /// Codex review 18933, P1 (admission): the ORDINARY admissions — `enqueue_member` (local
+    /// notices, escalation invitations, appeal dispatch) and `enqueue_egress` (legacy routed
+    /// sends) — take the same barrier as the operation-keyed ones. Store level, with the
+    /// daemon's real barrier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_ordinary_notice_or_egress_admission_waits_for_the_chain_row_it_names() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let (durability, inbox) = {
+            let s = state.lock().await;
+            (s.chain_store.durability().clone(), s.inbox_store.clone())
+        };
+        let hold = durability.hold_flush_for_test();
+        let row = { state.lock().await.append_chain("member_notice", json!({"battery": true})).unwrap() };
+        let (h1, h2) = (row.hash.clone(), row.hash.clone());
+        let (i1, i2) = (inbox.clone(), inbox.clone());
+        let mut local = tokio::task::spawn_blocking(move || {
+            i1.enqueue_member("reader", "writer", "role:test", "coordination", Some("hestia://t"), &h1, None)
+        });
+        let mut egress = tokio::task::spawn_blocking(move || {
+            i2.enqueue_egress("peer", "reader", "writer", "role:test", "coordination", Some("hestia://t"), &h2)
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(500), &mut local).await.is_err(),
+                "a local notice naming an undurable chain row reached the inbox");
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut egress).await.is_err(),
+                "an egress row naming an undurable chain row reached the queue");
+        drop(hold);
+        local.await.unwrap().expect("queued once the chain is durable");
+        egress.await.unwrap().expect("queued once the chain is durable");
+        assert!(durability.frontier().durable > row.chain_position);
+        assert_eq!(inbox.peek_member("reader").unwrap()[0].chain_hash, row.hash);
+        assert_eq!(inbox.pending_egress(10).unwrap().len(), 1);
+    }
+
+    /// The same, end to end: `hestia_member_notify` WITHOUT an operation_id, to a local member
+    /// and to a routed address, queues nothing while its own witness row is undurable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn member_notify_without_an_operation_id_queues_nothing_before_its_witness_is_durable() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = tool_connect(&state, &json!({"plugin_id": "claude-code", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let _ = tool_connect(&state, &json!({"plugin_id": "kimi-code", "host_agent": "h"})).await.unwrap();
+        let (durability, inbox) = {
+            let s = state.lock().await;
+            (s.chain_store.durability().clone(), s.inbox_store.clone())
+        };
+        let hold = durability.hold_flush_for_test();
+        let mut sends = Vec::new();
+        for to in ["kimi-code", "thor/kimi-code"] {
+            let st = state.clone();
+            let args = json!({"to_plugin_id": to, "kind": "coordination",
+                              "pointer_uri": "shared-context/forum/x.md", "session_id": sid});
+            sends.push(tokio::spawn(async move { tool_member_notify(&st, &args).await }));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(inbox.peek_member("kimi-code").unwrap().is_empty(),
+                "a local notice was queued while its witness row was undurable");
+        assert!(inbox.pending_egress(10).unwrap().is_empty(),
+                "an egress row was queued while its witness row was undurable");
+        drop(hold);
+        for s in sends {
+            let out = s.await.unwrap().unwrap();
+            assert!(out["queued_id"].as_u64().is_some(), "{out}");
+        }
+        assert_eq!(inbox.peek_member("kimi-code").unwrap().len(), 1);
+        assert_eq!(inbox.pending_egress(10).unwrap().len(), 1);
     }
 
     /// The disposition projector acts outward on what it reads, so it reads only durable rows.
