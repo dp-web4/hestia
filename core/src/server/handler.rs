@@ -28557,6 +28557,53 @@ mod decision_witness_tests {
         assert_eq!(s.trust_store.projection_since(), Some(0), "the fresh epoch stays 0");
     }
 
+    /// Bug reproduction: a cache can survive a power loss ahead of its chain row.
+    /// Construct that recovery image with a saved, cleanly closed chain prefix;
+    /// this is not a physical power-failure experiment. Passing asserts the bug.
+    #[tokio::test]
+    async fn review_19161_cache_ahead_of_recovered_chain_keeps_an_unwitnessed_charge() {
+        use crate::storage::durability::durable_scope;
+        let (dir, state) = state_with_safety().await;
+        let mut first = witness_args("gemini", "deny");
+        first["action_id"] = json!(Uuid::new_v4().to_string());
+        let (out, durable) = durable_scope(tool_witness_decision(&state, &first)).await;
+        durable.unwrap();
+        assert_eq!(out.unwrap()["charged"], true);
+        assert_eq!(grain_actions(&state, "gemini").await, 1);
+        drop(state);
+        let chain_path = dir.path().join("witness.db");
+        let durable_prefix = std::fs::read(&chain_path).unwrap();
+        assert!(!dir.path().join("witness.db-wal").exists(), "closed prefix has no WAL");
+
+        let state = reopen_with_safety(&dir).await;
+        let durability = { state.lock().await.chain_store.durability().clone() };
+        let held = durability.hold_flush_for_test();
+        let durable_before = durability.frontier().durable;
+        let mut pending = witness_args("gemini", "deny");
+        pending["action_id"] = json!(Uuid::new_v4().to_string());
+        // Direct tool call only: no durable_scope reply is claimed for this row.
+        assert_eq!(tool_witness_decision(&state, &pending).await.unwrap()["charged"], true);
+        {
+            let s = state.lock().await;
+            s.trust_store.persister().flush_blocking();
+            assert!(s.trust_store.projected_through().unwrap() >= durable_before);
+        }
+        assert_eq!(durability.frontier().durable, durable_before, "cache advances while chain fsync is held");
+        assert!(durability.committed() > durable_before);
+        assert_eq!(grain_actions(&state, "gemini").await, 2);
+        drop(held);
+        drop(durability);
+        drop(state);
+        assert!(!dir.path().join("witness.db-wal").exists());
+        // Preserve all cache files; recover the chain prefix preceding the unacked row.
+        std::fs::write(&chain_path, durable_prefix).unwrap();
+        let reopened = reopen_with_safety(&dir).await;
+        let rows = rows_of(&reopened, "policy_decision").await;
+        assert!(!rows.iter().any(|r| r.event_data["action_id"] == pending["action_id"]));
+        assert_eq!(grain_actions(&reopened, "gemini").await, 2,
+                   "BUG: chain has one charge, but surviving cache retains two");
+    }
+
     async fn state_with_safety() -> (tempfile::TempDir, SharedState) {
         let (dir, _) = seeded_home();
         let state = open_state(&dir);
