@@ -784,6 +784,82 @@ mod tests {
         RowAt { pos, ts: chrono::DateTime::from_timestamp(1_800_000_000 + pos as i64, 0).unwrap() }
     }
 
+    /// Review 19164 reproduction: v1 history is not a disposable projection. These tests
+    /// assert the observed loss, not the desired contract. The chain positions are modeled;
+    /// only rows at or after the migration epoch may be replayed by startup.
+    fn review_19164_legacy_fixture() -> (TempDir, TrustStore, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let store = TrustStore::open(dir.path(), KEY).unwrap();
+        let mut legacy = EntityTrust::new("plugin:old");
+        for _ in 0..7 {
+            legacy.update_from_outcome(true, 0.8);
+        }
+        let path = store.entity_file("plugin:old");
+        write_durable(&path, &crypto::seal(&store.dk(), &serde_json::to_vec(&legacy).unwrap()).unwrap()).unwrap();
+        assert_eq!(store.recover(10).unwrap(), (10, 10));
+        assert_eq!(store.get("old").unwrap().action_count, 7);
+        store.update_at("old", false, 0.5, at(10)).unwrap();
+        store.persister().flush_blocking();
+        assert_eq!(store.get("old").unwrap().action_count, 8);
+        (dir, store, path)
+    }
+
+    #[test]
+    fn review_19164_missing_migrated_cache_loses_legacy_baseline() {
+        let (dir, store, path) = review_19164_legacy_fixture();
+        drop(store);
+        // Model a lost unsynced cache file. The modeled chain still contains row 10;
+        // neither a chain rollback nor a cache-ahead condition is needed.
+        std::fs::remove_file(path).unwrap();
+        let reopened = TrustStore::open(dir.path(), KEY).unwrap();
+        assert_eq!(reopened.recover(11).unwrap(), (10, 10));
+        reopened.update_at("old", false, 0.5, at(10)).unwrap();
+        assert_eq!(reopened.get("old").unwrap().action_count, 1,
+                   "BUG reproduced: expected the 7-action baseline plus row 10 (8)");
+    }
+
+    #[test]
+    fn review_19164_ahead_migrated_cache_loses_legacy_baseline() {
+        let (dir, store, path) = review_19164_legacy_fixture();
+        store.update_at("old", false, 0.5, at(11)).unwrap();
+        store.persister().flush_blocking();
+        drop(store);
+        // Model a restored chain prefix retaining row 10, but not row 11.
+        let reopened = TrustStore::open(dir.path(), KEY).unwrap();
+        assert_eq!(reopened.recover(11).unwrap(), (10, 10));
+        assert!(path.with_extension("corrupt").exists());
+        reopened.update_at("old", false, 0.5, at(10)).unwrap();
+        assert_eq!(reopened.get("old").unwrap().action_count, 1,
+                   "BUG reproduced: rejecting row 11 also loses the 7-action baseline");
+    }
+
+    #[test]
+    fn review_19164_failed_barrier_publishes_nothing_and_retries() {
+        let dir = TempDir::new().unwrap();
+        let store = TrustStore::open(dir.path(), KEY).unwrap();
+        store.recover(0).unwrap();
+        let held = store.persister().hold_for_test();
+        let fail = Arc::new(AtomicBool::new(true));
+        let barrier_fail = fail.clone();
+        store.persister().set_pre_write_barrier(Arc::new(move || {
+            if barrier_fail.load(Ordering::Acquire) { Err("test barrier failure".into()) }
+            else { Ok(()) }
+        }));
+        let append = dir.path().join("deltas.jsonl");
+        store.update_at("a", true, 0.8, at(0)).unwrap();
+        store.append_after_trust(&append, "test delta".into()).unwrap();
+        assert!(!store.persister().run_batch());
+        assert!(!store.entity_file("plugin:a").exists());
+        assert!(!append.exists());
+        assert_eq!(store.projected_through(), None);
+        fail.store(false, Ordering::Release);
+        assert!(store.persister().run_batch());
+        assert!(store.entity_file("plugin:a").exists());
+        assert_eq!(std::fs::read_to_string(append).unwrap(), "test delta\n");
+        assert_eq!(store.projected_through(), Some(0));
+        drop(held);
+    }
+
     /// A chain-projected update is idempotent by position, and takes its clock from the row.
     #[test]
     fn a_projected_update_is_idempotent_by_position() {
