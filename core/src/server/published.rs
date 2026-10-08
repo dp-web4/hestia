@@ -21,9 +21,24 @@
 //!
 //! Session identity (for "who is asking") is served from a [`SessionDirectory`] beside the
 //! publication. Its changes are STAGED by [`Sessions`] and applied at the same release, under the
-//! same write lock as the publication swap, so resolving a caller and reading its law are one
-//! consistent view. The connect REUSE arm (a timestamp bump on a known host session) is served
-//! from the directory too, and takes no state lock.
+//! same write lock as the publication swap. The connect REUSE arm (a timestamp bump on a known
+//! host session) is served from the directory too, and takes no state lock.
+//!
+//! WHAT THAT DOES AND DOES NOT MAKE ATOMIC (Codex reviews of #1267, 1f460fd4 and notice 19473). The
+//! directory is SHARED by every publication, not versioned with it: `StateCell::published()`
+//! clones the publication `Arc` and drops the slot lock, and a later [`PolicyPublication::resolve`]
+//! takes the directory's own lock. So "capture the publication, then resolve the caller" is two
+//! reads, and a release can land between them: a reader holding publication N may resolve against
+//! the directory as of N+1. What bounds that, and the only guarantee claimed here:
+//!   - a session's identity (plugin, role, LCT, basis) is immutable after mint (Guard A), so a
+//!     session present in both versions resolves identically in both;
+//!   - a session REMOVED in between resolves to `None`, and every caller fails closed on that;
+//!   - a session ADDED in between resolves, and is judged by publication N's law — the law that
+//!     was current when the caller's request began, which a lock-taking reader could equally have
+//!     read just before that release.
+//! A paired session-and-policy change is therefore NOT observed as one atomic view by a reader
+//! that straddles it. Nothing in the gate path depends on that today; anything that would must
+//! capture the identity under the slot lock, or version the directory with the publication.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
