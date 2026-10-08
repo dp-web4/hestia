@@ -954,6 +954,53 @@ mod tests {
         drop(held);
     }
 
+    /// Positive control: a corrupt disposable cache falls back to the sealed baseline.
+    #[test]
+    fn review_19166_corrupt_cache_recovers_all_legacy_actions() {
+        let (dir, store, path) = review_19164_legacy_fixture();
+        drop(store);
+        std::fs::write(&path, b"corrupt cache").unwrap();
+        let reopened = TrustStore::open(dir.path(), KEY).unwrap();
+        assert_eq!(reopened.recover(11).unwrap(), (10, 10));
+        assert!(path.with_extension("corrupt").exists());
+        reopened.update_at("old", false, 0.5, at(10)).unwrap();
+        assert_eq!(reopened.get("old").unwrap().action_count, 8);
+    }
+
+    /// BUG REPRODUCTION: passing pins the observed loss, not the desired contract.
+    /// An inaccessible baseline is not an absent pre-fix baseline. A temporary directory
+    /// permission error must fail recovery, rather than publishing a fresh projection over it.
+    #[cfg(unix)]
+    #[test]
+    fn review_19166_unreadable_baseline_directory_silently_rebuilds_fresh_trust() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, store, path) = review_19164_legacy_fixture();
+        drop(store);
+        std::fs::remove_file(&path).unwrap();
+        let baseline = dir.path().join(BASELINE_DIR);
+        let permissions = std::fs::metadata(&baseline).unwrap().permissions();
+        std::fs::set_permissions(&baseline, std::fs::Permissions::from_mode(0)).unwrap();
+        let directory_error = std::fs::read_dir(&baseline).err().map(|e| e.kind());
+        let reopened = TrustStore::open(dir.path(), KEY).unwrap();
+        let recovery = reopened.recover(11);
+        let replay = reopened.update_at("old", false, 0.5, at(10));
+        let count = reopened.get("old").map(|t| t.action_count);
+        drop(reopened); // Flush the incorrectly reconstructed cache and checkpoint.
+        // Restore permissions before any assertion, including the non-root fixture check.
+        std::fs::set_permissions(&baseline, permissions).unwrap();
+        assert_eq!(directory_error, Some(std::io::ErrorKind::PermissionDenied),
+                   "this reproduction requires an unprivileged test process");
+        assert_eq!(recovery.unwrap(), (10, 10), "BUG: recovery should return the I/O error");
+        assert!(replay.unwrap().is_some());
+        assert_eq!(count.unwrap(), 1, "BUG: silently lost the 7-action baseline");
+        let after_repair = TrustStore::open(dir.path(), KEY).unwrap();
+        assert_eq!(after_repair.recover(11).unwrap(), (10, 11));
+        assert_eq!(after_repair.get("old").unwrap().action_count, 1,
+                   "repairing permissions does not undo the incorrectly checkpointed state");
+        let preserved = after_repair.parse(std::fs::read(baseline.join(file_name(&path))).unwrap()).unwrap();
+        assert_eq!(preserved.trust.action_count, 7, "the durable baseline itself was never lost");
+    }
+
     /// A chain-projected update is idempotent by position, and takes its clock from the row.
     #[test]
     fn a_projected_update_is_idempotent_by_position() {
