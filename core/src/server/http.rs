@@ -304,20 +304,8 @@ async fn dashboard_read_model_worker(
             }
         }
 
-        let (mut snapshot, observed_len) = {
-            let s = state.lock().await;
-            (s.dashboard_snapshot_from_projection(projection.clone(), cutoff, label), s.chain_len())
-        };
-        // The fold registers any grain it had no derivation for — at start, all of them.
-        // Derive those off the lock and fold once more, so no snapshot is published with a
-        // member's trust missing.
-        if chain_store.derivations().has_due() {
-            let store = chain_store.clone();
-            if tokio::task::spawn_blocking(move || refresh_derivations(&store)).await.is_ok() {
-                let s = state.lock().await;
-                snapshot = s.dashboard_snapshot_from_projection(projection, cutoff, label);
-            }
-        }
+        let (snapshot, observed_len) =
+            fold_dashboard_snapshot(&state, &chain_store, projection, cutoff, label, &|| {}).await;
         // DURABLE READS: the operator is never shown a chain fact an OS crash could take back.
         if let Err(e) = chain_store.durability().wait_durable(observed_len).await {
             tracing::warn!("dashboard snapshot withheld: chain not durable ({e:#})");
@@ -326,6 +314,43 @@ async fn dashboard_read_model_worker(
         }
         model.publish(range, snapshot);
     }
+}
+
+/// Fold the in-memory state over a chain projection into a dashboard snapshot, and return the
+/// chain length the snapshot reflects (what the worker must wait to be durable).
+///
+/// The fold registers any grain it had no derivation for — at start, all of them. Those are
+/// derived off the lock and the state is folded once more, so no snapshot is published with a
+/// member's trust missing. `between_folds` runs just before that second fold (a test seam).
+///
+/// The length is taken WITH the fold that is published (Codex review 18933, P2: the second
+/// fold used to keep the first fold's length, so a scope request or escalation committed
+/// during the derivation await was shown while the worker waited only for the older length).
+/// It is also raised to the store's read high-water: the projection and the derivations were
+/// read on the blocking pool, outside any request scope, and every row they returned lies
+/// within the frontier those reads registered there.
+async fn fold_dashboard_snapshot(
+    state: &SharedState,
+    chain_store: &Arc<crate::storage::SqliteChainStore>,
+    projection: crate::server::dashboard::DashboardChainProjection,
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
+    label: &'static str,
+    between_folds: &(dyn Fn() + Sync),
+) -> (DashboardSnapshot, u64) {
+    let (mut snapshot, mut observed_len) = {
+        let s = state.lock().await;
+        (s.dashboard_snapshot_from_projection(projection.clone(), cutoff, label), s.chain_len())
+    };
+    if chain_store.derivations().has_due() {
+        let store = chain_store.clone();
+        if tokio::task::spawn_blocking(move || refresh_derivations(&store)).await.is_ok() {
+            between_folds();
+            let s = state.lock().await;
+            snapshot = s.dashboard_snapshot_from_projection(projection, cutoff, label);
+            observed_len = s.chain_len();
+        }
+    }
+    (snapshot, observed_len.max(chain_store.read_high_water()))
 }
 
 // ---- Operator-surface authentication (RWOA clauses W + O) -------------------
@@ -11069,6 +11094,41 @@ mod tests {
         assert!(!live_read_is_current(100, t0, 101, two), "the chain moved: re-read");
         assert!(!live_read_is_current(100, t0, 100, t0 + DASHBOARD_PROJECTION_MAX_AGE),
                 "rolling windows still roll: a 30 s old live read is re-read on a quiet chain");
+    }
+
+    /// Codex review 18933, P2: when derivations are due the worker folds TWICE, and the second
+    /// snapshot can reflect rows committed after the first. The length the worker waits for
+    /// must cover the snapshot it publishes, not the first fold's. An append lands between the
+    /// folds (via the seam) and stays in the commit-to-fsync window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_second_dashboard_fold_waits_for_what_it_reflects() {
+        let (_dir, state) = make_shared_state();
+        let sid = crate::server::handler::tool_connect(&state, &serde_json::json!({
+            "plugin_id": "codex", "host_agent": "h"})).await.unwrap()["sessionId"]
+            .as_str().unwrap().to_string();
+        let b = crate::server::handler::tool_begin_action(&state, &serde_json::json!({
+            "tool_name": "Read", "target": "/tmp/x", "parameters": {"file_path": "/tmp/x"},
+            "session_id": sid})).await.unwrap();
+        crate::server::handler::tool_record_outcome(&state, &serde_json::json!({
+            "action_id": b["actionId"], "success": true, "session_id": sid})).await.unwrap();
+        let chain_store = { state.lock().await.chain_store.clone() };
+        chain_store.durability().flush_committed_blocking().unwrap();
+        // A fresh derivation cache has derived nobody: the first fold registers the member's
+        // grain, so the second fold runs.
+        let hold = chain_store.durability().hold_flush_for_test();
+        let projection = DashboardChainProjection::read(&chain_store, 100, None);
+        let appended = StdMutex::new(None);
+        let seam = || {
+            let row = chain_store.append("battery_fact", serde_json::json!({"between": "folds"}), "lct:x").unwrap();
+            *appended.lock().unwrap() = Some(row.chain_position);
+        };
+        let (snapshot, observed_len) =
+            fold_dashboard_snapshot(&state, &chain_store, projection, None, "all", &seam).await;
+        drop(hold);
+        let pos = appended.lock().unwrap().expect("setup: derivations were due, so the worker folded twice");
+        assert_eq!(snapshot.society.chain_length, pos + 1, "the second fold reflects the append");
+        assert!(observed_len > pos,
+                "the snapshot reflects chain position {pos}, but the worker would wait only for length {observed_len}");
     }
 
     #[test]

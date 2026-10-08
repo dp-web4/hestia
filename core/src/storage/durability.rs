@@ -243,14 +243,20 @@ impl Durability {
         if f.durable >= len {
             return Ok(());
         }
-        self.sync_once();
+        self.sync_once(len);
         let f = self.frontier();
         if f.poisoned { Err(poisoned_error()) } else { Ok(()) }
     }
 
     /// One group fsync covering everything committed when it starts. Updates the frontier.
-    fn sync_once(&self) {
-        let target = self.committed.load(Ordering::Acquire);
+    ///
+    /// `at_least`: a length some waiter asked for BEFORE this fsync started. A reader's
+    /// frontier is its SQL snapshot (`MAX(chain_position) + 1`), which can run a moment ahead
+    /// of `committed` (that counter trails COMMIT), or past it for good if anything else
+    /// appended to the file. Every row such a reader saw was already in the WAL when it asked,
+    /// so this fsync covers it; counting it here means that wait can never outlive the fsync.
+    fn sync_once(&self, at_least: u64) {
+        let target = self.committed.load(Ordering::Acquire).max(at_least);
         let res = crate::server::state_lock::time_section("chain.fsync", || self.fsync_files());
         self.fsyncs.fetch_add(1, Ordering::Relaxed);
         match res {
@@ -397,13 +403,13 @@ fn flusher_loop(weak: std::sync::Weak<Durability>) {
         }
         if wanted > d.frontier().durable {
             let _g = d.sync_lock.lock().unwrap_or_else(|p| p.into_inner());
-            d.sync_once();
+            d.sync_once(wanted);
             continue;
         }
         // Idle: make durable whatever background tasks committed, then maybe checkpoint.
         if d.committed.load(Ordering::Acquire) > d.frontier().durable {
             let _g = d.sync_lock.lock().unwrap_or_else(|p| p.into_inner());
-            d.sync_once();
+            d.sync_once(0);
         }
         let wal = d.wal_bytes();
         if wal >= CHECKPOINT_FORCE_BYTES || (wal >= CHECKPOINT_MIN_BYTES && d.idle_for() >= CHECKPOINT_IDLE) {

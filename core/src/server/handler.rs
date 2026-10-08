@@ -29776,6 +29776,75 @@ mod durable_reads_tests {
         assert!(durability.frontier().durable > row.chain_position);
     }
 
+    /// Codex review 18933, P1 (admission): the ORDINARY admissions — `enqueue_member` (local
+    /// notices, escalation invitations, appeal dispatch) and `enqueue_egress` (legacy routed
+    /// sends) — take the same barrier as the operation-keyed ones. Store level, with the
+    /// daemon's real barrier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_ordinary_notice_or_egress_admission_waits_for_the_chain_row_it_names() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let (durability, inbox) = {
+            let s = state.lock().await;
+            (s.chain_store.durability().clone(), s.inbox_store.clone())
+        };
+        let hold = durability.hold_flush_for_test();
+        let row = { state.lock().await.append_chain("member_notice", json!({"battery": true})).unwrap() };
+        let (h1, h2) = (row.hash.clone(), row.hash.clone());
+        let (i1, i2) = (inbox.clone(), inbox.clone());
+        let mut local = tokio::task::spawn_blocking(move || {
+            i1.enqueue_member("reader", "writer", "role:test", "coordination", Some("hestia://t"), &h1, None)
+        });
+        let mut egress = tokio::task::spawn_blocking(move || {
+            i2.enqueue_egress("peer", "reader", "writer", "role:test", "coordination", Some("hestia://t"), &h2)
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(500), &mut local).await.is_err(),
+                "a local notice naming an undurable chain row reached the inbox");
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut egress).await.is_err(),
+                "an egress row naming an undurable chain row reached the queue");
+        drop(hold);
+        local.await.unwrap().expect("queued once the chain is durable");
+        egress.await.unwrap().expect("queued once the chain is durable");
+        assert!(durability.frontier().durable > row.chain_position);
+        assert_eq!(inbox.peek_member("reader").unwrap()[0].chain_hash, row.hash);
+        assert_eq!(inbox.pending_egress(10).unwrap().len(), 1);
+    }
+
+    /// The same, end to end: `hestia_member_notify` WITHOUT an operation_id, to a local member
+    /// and to a routed address, queues nothing while its own witness row is undurable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn member_notify_without_an_operation_id_queues_nothing_before_its_witness_is_durable() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = tool_connect(&state, &json!({"plugin_id": "claude-code", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let _ = tool_connect(&state, &json!({"plugin_id": "kimi-code", "host_agent": "h"})).await.unwrap();
+        let (durability, inbox) = {
+            let s = state.lock().await;
+            (s.chain_store.durability().clone(), s.inbox_store.clone())
+        };
+        let hold = durability.hold_flush_for_test();
+        let mut sends = Vec::new();
+        for to in ["kimi-code", "thor/kimi-code"] {
+            let st = state.clone();
+            let args = json!({"to_plugin_id": to, "kind": "coordination",
+                              "pointer_uri": "shared-context/forum/x.md", "session_id": sid});
+            sends.push(tokio::spawn(async move { tool_member_notify(&st, &args).await }));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(inbox.peek_member("kimi-code").unwrap().is_empty(),
+                "a local notice was queued while its witness row was undurable");
+        assert!(inbox.pending_egress(10).unwrap().is_empty(),
+                "an egress row was queued while its witness row was undurable");
+        drop(hold);
+        for s in sends {
+            let out = s.await.unwrap().unwrap();
+            assert!(out["queued_id"].as_u64().is_some(), "{out}");
+        }
+        assert_eq!(inbox.peek_member("kimi-code").unwrap().len(), 1);
+        assert_eq!(inbox.pending_egress(10).unwrap().len(), 1);
+    }
+
     /// The disposition projector acts outward on what it reads, so it reads only durable rows.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_projector_reads_only_durable_rows() {
