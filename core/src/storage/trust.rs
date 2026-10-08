@@ -1006,6 +1006,42 @@ mod tests {
         assert_eq!(after_repair.get("old").unwrap().action_count, 8, "the baseline survived");
     }
 
+    /// A malformed baseline path is also an I/O error, not a missing pre-fix baseline.
+    /// Failed recovery and a rejected update must leave the checkpoint untouched.
+    #[test]
+    fn review_19169_baseline_file_blocks_replay_without_publishing() {
+        let (dir, store, path) = review_19164_legacy_fixture();
+        drop(store);
+        std::fs::remove_file(&path).unwrap();
+        let baseline = dir.path().join(BASELINE_DIR);
+        let saved = dir.path().join("baseline.saved");
+        let checkpoint = dir.path().join(PROJECTION_FILE);
+        let before = std::fs::read(&checkpoint).unwrap();
+        std::fs::rename(&baseline, &saved).unwrap();
+        std::fs::write(&baseline, b"not a directory").unwrap();
+
+        let reopened = TrustStore::open(dir.path(), KEY).unwrap();
+        let recovery = reopened.recover(11);
+        let read = reopened.get("old");
+        let replay = reopened.update_at("old", false, 0.5, at(10));
+        drop(reopened);
+        assert!(recovery.is_err(), "a baseline file must not pass as absent");
+        assert!(read.is_err(), "an uncheckable baseline entity must not read fresh");
+        assert!(replay.is_err(), "an uncheckable baseline entity must not replay fresh");
+        assert!(!path.exists(), "failed replay must not publish a cache");
+        assert_eq!(std::fs::read(&checkpoint).unwrap(), before);
+
+        std::fs::remove_file(&baseline).unwrap();
+        std::fs::rename(saved, baseline).unwrap();
+        let repaired = TrustStore::open(dir.path(), KEY).unwrap();
+        assert_eq!(repaired.recover(11).unwrap(), (10, 10));
+        repaired.update_at("old", false, 0.5, at(10)).unwrap();
+        drop(repaired);
+        let final_store = TrustStore::open(dir.path(), KEY).unwrap();
+        assert_eq!(final_store.recover(11).unwrap(), (10, 11));
+        assert_eq!(final_store.get("old").unwrap().action_count, 8);
+    }
+
     /// A chain-projected update is idempotent by position, and takes its clock from the row.
     #[test]
     fn a_projected_update_is_idempotent_by_position() {
