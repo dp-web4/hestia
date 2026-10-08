@@ -28489,6 +28489,74 @@ mod decision_witness_tests {
     use super::inbox_tests::{open_state, seeded_home};
     use super::*;
 
+    // Review reproductions on f4c6629. These assert the observed failures, not correctness.
+    fn review_entity_file(state: &super::super::state::ServerState, member: &str) -> std::path::PathBuf {
+        use sha2::{Digest, Sha256};
+        let key = state.trust_entity_key(member, crate::reputation::DEFAULT_CONSTELLATION_ROLE);
+        let hash = format!("{:x}", Sha256::digest(key.as_bytes()));
+        state.home.join("trust").join(format!("{}.json", &hash[..16]))
+    }
+
+    #[tokio::test]
+    async fn review_19153_surviving_checkpoint_skips_a_lost_entity() {
+        use crate::storage::durability::durable_scope;
+        let (dir, state) = state_with_safety().await;
+        let mut args = witness_args("gemini", "deny");
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        let (out, durable) = durable_scope(tool_witness_decision(&state, &args)).await;
+        durable.unwrap();
+        assert_eq!(out.unwrap()["charged"], true);
+        let path = {
+            let s = state.lock().await;
+            s.trust_store.persister().flush_blocking();
+            review_entity_file(&s, "gemini")
+        };
+        assert_eq!(grain_actions(&state, "gemini").await, 1);
+        drop(state);
+        // Model an independently lost unsynced cache file with projection.json surviving.
+        // No chain rows are changed; the acknowledged decision remains durable.
+        assert!(dir.path().join("trust/projection.json").exists());
+        std::fs::remove_file(path).unwrap();
+        let reopened = reopen_with_safety(&dir).await;
+        assert_eq!(grain_actions(&reopened, "gemini").await, 0, "BUG: checkpoint skipped the lost entity");
+        let retry = tool_witness_decision(&reopened, &args).await.unwrap();
+        assert_eq!(retry["charged"], false, "ledger considers the lost charge settled");
+        assert_eq!(grain_actions(&reopened, "gemini").await, 0);
+    }
+
+    #[tokio::test]
+    async fn review_19153_partial_first_batch_is_mistaken_for_legacy() {
+        use crate::storage::durability::durable_scope;
+        let (dir, state) = state_with_safety().await;
+        let persister = { state.lock().await.trust_store.persister().clone() };
+        let hold = persister.hold_for_test();
+        for member in ["gemini", "codex"] {
+            let mut args = witness_args(member, "deny");
+            args["action_id"] = json!(Uuid::new_v4().to_string());
+            let (out, durable) = durable_scope(tool_witness_decision(&state, &args)).await;
+            durable.unwrap();
+            assert_eq!(out.unwrap()["charged"], true);
+        }
+        let (keep, lose) = {
+            let s = state.lock().await;
+            (review_entity_file(&s, "gemini"), review_entity_file(&s, "codex"))
+        };
+        drop(hold);
+        persister.flush_blocking();
+        drop(persister);
+        drop(state);
+        // Exact cache shape of a process crash part-way through the FIRST batch: one v2
+        // entity rename completed; the other entity and last-written manifest did not.
+        assert!(keep.exists());
+        std::fs::remove_file(lose).unwrap();
+        std::fs::remove_file(dir.path().join("trust/projection.json")).unwrap();
+        let reopened = reopen_with_safety(&dir).await;
+        assert_eq!(grain_actions(&reopened, "gemini").await, 1);
+        assert_eq!(grain_actions(&reopened, "codex").await, 0, "BUG: v2 cache adopted as legacy at chain head");
+        let s = reopened.lock().await;
+        assert!(s.trust_store.projection_since().unwrap() > 0, "BUG: fresh projection epoch was advanced");
+    }
+
     async fn state_with_safety() -> (tempfile::TempDir, SharedState) {
         let (dir, _) = seeded_home();
         let state = open_state(&dir);
