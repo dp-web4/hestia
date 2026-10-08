@@ -28425,6 +28425,7 @@ mod transport_binding_tests {
 // pinned against these replies by tools/decision_witness_contract_test.py.
 #[cfg(test)]
 mod decision_witness_tests {
+    include!("review_19474_tests.rs");
     use super::inbox_tests::{open_state, seeded_home};
     use super::*;
 
