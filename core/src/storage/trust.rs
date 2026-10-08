@@ -17,8 +17,16 @@
 //! - each file records the chain position it is projected through (`through`), so applying a row
 //!   is idempotent — a row at or below an entity's `through` is skipped;
 //! - `projection.json` records the position every file is current through (written after each
-//!   batch); at startup the daemon replays the chain from it through the same update functions,
-//!   restoring whatever the cache lost.
+//!   batch) AND a MANIFEST: every entity file and the `through` it held at that checkpoint. A
+//!   checkpoint is a claim about files that were never fsynced, so startup VERIFIES it (every
+//!   listed file present, readable, and at least as far as listed) before replaying from it; a
+//!   checkpoint that does not verify is ignored and the daemon replays from the EPOCH, which
+//!   per-entity `through` makes safe (Codex P1, #1271 review 19153);
+//! - the EPOCH (`projection-epoch.json`: the first chain position trust is a projection from) is
+//!   written ONCE, fsynced, before any v2 cache file can exist. So "v2 files, no epoch" cannot
+//!   arise from a crash, and a legacy cache is told apart from an interrupted v2 projection by
+//!   the files' own form (v1 = bare `EntityTrust`), not by the absence of a checkpoint (Codex
+//!   P1, #1271 review 19153).
 //! Requests no longer wait on trust I/O at all: the fact they report is the chain row, which is
 //! durable before the reply (group commit).
 //!
@@ -50,6 +58,17 @@ struct EntityFile {
 }
 
 const PROJECTION_FILE: &str = "projection.json";
+const EPOCH_FILE: &str = "projection-epoch.json";
+
+/// An entity cache file (not the checkpoint, the epoch, or a temp file).
+fn is_entity_file(p: &Path) -> bool {
+    p.extension().and_then(|s| s.to_str()) == Some("json")
+        && !matches!(p.file_name().and_then(|s| s.to_str()), Some(PROJECTION_FILE | EPOCH_FILE))
+}
+
+fn file_name(p: &Path) -> String {
+    p.file_name().and_then(|s| s.to_str()).unwrap_or_default().to_string()
+}
 
 #[derive(Clone)]
 struct Cached {
@@ -105,6 +124,11 @@ impl TrustStore {
 
     /// Decrypt (or read legacy plaintext) and parse either file version.
     fn parse(&self, raw: Vec<u8>) -> Option<Cached> {
+        self.parse_versioned(raw).map(|(c, _)| c)
+    }
+
+    /// As [`parse`](Self::parse), and whether the file is the v2 projection form.
+    fn parse_versioned(&self, raw: Vec<u8>) -> Option<(Cached, bool)> {
         // Sealed blobs are nonce-prefixed ChaCha20-Poly1305 with no magic header, so their first
         // byte is random: decrypt first, fall back to legacy plaintext only when AEAD
         // authentication fails (which it always does for genuine plaintext).
@@ -113,11 +137,11 @@ impl TrustStore {
             Err(_) => raw,
         };
         if let Ok(f) = serde_json::from_slice::<EntityFile>(&json) {
-            return Some(Cached { trust: f.trust, through: f.through });
+            return Some((Cached { trust: f.trust, through: f.through }, true));
         }
         serde_json::from_slice::<EntityTrust>(&json)
             .ok()
-            .map(|trust| Cached { trust, through: None })
+            .map(|trust| (Cached { trust, through: None }, false))
     }
 
     /// The cached entity, loading its file on first touch. `None` if it has never existed.
@@ -140,12 +164,13 @@ impl TrustStore {
 
     /// Record a new value in the cache and hand its sealed bytes to the write-behind persister.
     fn store(&self, c: Cached, at: Option<RowAt>) -> Result<()> {
-        let file = EntityFile { v: 2, through: c.through, trust: c.trust.clone() };
+        let through = c.through;
+        let file = EntityFile { v: 2, through, trust: c.trust.clone() };
         let json = serde_json::to_vec_pretty(&file).context("serializing trust")?;
         let sealed = crypto::seal(&self.dk(), &json).context("sealing trust")?;
         let path = self.entity_file(&c.trust.entity_id);
         self.cache().insert(c.trust.entity_id.clone(), c);
-        self.persister.enqueue(path, sealed, at.map(|a| a.pos));
+        self.persister.enqueue(path, sealed, through, at.map(|a| a.pos));
         Ok(())
     }
 
@@ -171,10 +196,14 @@ impl TrustStore {
     /// The PROJECTION EPOCH: the first chain position from which trust has been a projection of
     /// the chain (0 for a home that never had a legacy cache). Fixed once; unlike `through`, it
     /// never moves. Rows from here on charge exactly when they commit, so the decision ledger
-    /// derives their charge from the chain alone.
+    /// derives their charge from the chain alone. Read from the durable epoch file; a home from
+    /// before that file carried it in `projection.json`.
     pub fn projection_since(&self) -> Option<u64> {
-        let raw = std::fs::read(self.base_dir.join(PROJECTION_FILE)).ok()?;
-        serde_json::from_slice::<serde_json::Value>(&raw).ok()?.get("since")?.as_u64()
+        let read = |name: &str| -> Option<u64> {
+            let raw = std::fs::read(self.base_dir.join(name)).ok()?;
+            serde_json::from_slice::<serde_json::Value>(&raw).ok()?.get("since")?.as_u64()
+        };
+        read(EPOCH_FILE).or_else(|| read(PROJECTION_FILE))
     }
 
     /// Set the epoch every later `projection.json` carries.
@@ -182,25 +211,89 @@ impl TrustStore {
         self.persister.since.store(since, Ordering::Release);
     }
 
-    /// Adopt a legacy cache: the files as they stand ARE the state through `pos`, and the
-    /// projection starts at `since`.
-    pub fn adopt_legacy(&self, through: Option<u64>, since: u64) -> Result<()> {
-        self.set_projection_since(since);
-        write_atomic(&self.base_dir.join(PROJECTION_FILE),
-                     serde_json::json!({"through": through, "since": since}).to_string().as_bytes())
-    }
-
     /// Does this store hold ANY cached entity file?
     pub fn has_entity_files(&self) -> bool {
         std::fs::read_dir(&self.base_dir)
-            .map(|rd| {
-                rd.flatten().any(|e| {
-                    let p = e.path();
-                    p.extension().and_then(|s| s.to_str()) == Some("json")
-                        && p.file_name().and_then(|s| s.to_str()) != Some(PROJECTION_FILE)
-                })
-            })
+            .map(|rd| rd.flatten().any(|e| is_entity_file(&e.path())))
             .unwrap_or(false)
+    }
+
+    /// Every entity file on disk: its name, and — if it reads — whether it is v2 and its `through`.
+    fn scan(&self) -> HashMap<String, Option<(bool, Option<u64>)>> {
+        let mut out = HashMap::new();
+        if let Ok(rd) = std::fs::read_dir(&self.base_dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if !is_entity_file(&p) {
+                    continue;
+                }
+                let parsed = std::fs::read(&p).ok().and_then(|raw| self.parse_versioned(raw));
+                out.insert(file_name(&p), parsed.map(|(c, v2)| (v2, c.through)));
+            }
+        }
+        out
+    }
+
+    /// STARTUP RECOVERY: fix the epoch (durably, once) and decide where replay starts. Returns
+    /// `(since, from)`: `since` is the projection epoch, `from` the first chain position replay
+    /// must visit. `chain_len` is the chain's length now.
+    ///
+    /// - The epoch: the recorded one; else a cache of ONLY v1 files is a LEGACY cache — it IS the
+    ///   state as of now, so the epoch is the chain head; else (fresh, deleted, or a v2 cache whose
+    ///   first checkpoint never landed) 0. Recorded with fsync before any v2 file can be written,
+    ///   so a later crash cannot make a v2 cache look legacy.
+    /// - The start: the checkpoint's `through + 1` ONLY if its manifest verifies against the
+    ///   files; otherwise the epoch. A file that does not read is set aside (`.corrupt`) so the
+    ///   replay rebuilds it from the chain.
+    pub fn recover(&self, chain_len: u64) -> Result<(u64, u64)> {
+        let mut files = self.scan();
+        let any_v2 = files.values().any(|f| matches!(f, Some((true, _))));
+        let any_v1 = files.values().any(|f| matches!(f, Some((false, _))));
+        let recorded = self.projection_since();
+        let legacy = recorded.is_none() && any_v1 && !any_v2;
+        let since = match recorded {
+            Some(s) => s,
+            None if legacy => chain_len,
+            None => 0,
+        };
+        if std::fs::metadata(self.base_dir.join(EPOCH_FILE)).is_err() {
+            write_durable(&self.base_dir.join(EPOCH_FILE),
+                          serde_json::json!({ "since": since }).to_string().as_bytes())?;
+        }
+        self.set_projection_since(since);
+
+        let checkpoint: Option<serde_json::Value> = std::fs::read(self.base_dir.join(PROJECTION_FILE))
+            .ok()
+            .and_then(|raw| serde_json::from_slice(&raw).ok());
+        let through = checkpoint.as_ref().and_then(|c| c.get("through")?.as_u64());
+        let verified = !legacy && through.is_some() && checkpoint
+            .as_ref()
+            .and_then(|c| c.get("entities")?.as_object().cloned())
+            .is_some_and(|manifest| {
+                manifest.iter().all(|(name, listed)| {
+                    let listed = listed.as_u64();
+                    matches!(files.get(name), Some(Some((_, t))) if *t >= listed)
+                })
+            });
+        let from = match through {
+            Some(p) if verified => p + 1,
+            _ => since,
+        };
+        if through.is_some() && !verified {
+            tracing::warn!("trust cache checkpoint does not match its files; replaying from the epoch {since}");
+        }
+        // A file that does not read cannot be a replay base: set it aside so the chain rebuilds it.
+        // (Only a pre-epoch — legacy — part of its state is beyond the chain's reach.)
+        for name in files.iter().filter(|(_, p)| p.is_none()).map(|(n, _)| n) {
+            let p = self.base_dir.join(name);
+            tracing::warn!("trust cache file {} does not read; set aside, rebuilt from the chain", p.display());
+            std::fs::rename(&p, p.with_extension("corrupt"))
+                .with_context(|| format!("setting aside {}", p.display()))?;
+        }
+        files.retain(|_, p| p.is_some());
+        *self.persister.manifest() =
+            files.into_iter().map(|(n, p)| (n, p.and_then(|(_, t)| t))).collect();
+        Ok((since, from))
     }
 
     /// Fetch the entity trust for a plugin; an entity that does not exist yet is returned fresh
@@ -318,9 +411,7 @@ impl TrustStore {
         if let Ok(rd) = std::fs::read_dir(&self.base_dir) {
             for e in rd.flatten() {
                 let p = e.path();
-                if p.extension().and_then(|s| s.to_str()) != Some("json")
-                    || p.file_name().and_then(|s| s.to_str()) == Some(PROJECTION_FILE)
-                {
+                if !is_entity_file(&p) {
                     continue;
                 }
                 if let Some(c) = std::fs::read(&p).ok().and_then(|raw| self.parse(raw)) {
@@ -366,6 +457,24 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// [`write_atomic`] made durable: the data, then the rename (the directory), are fsynced. For the
+/// write-once epoch only — the cache files stay unsynced by design.
+fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    f.write_all(bytes)?;
+    f.sync_all().with_context(|| format!("syncing {}", tmp.display()))?;
+    drop(f);
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("syncing {}", dir.display()))?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // WRITE-BEHIND CACHE WRITER. No fsync anywhere: the chain row is the durable fact, these files are
 // its projection. Atomic rename keeps a file whole; a lost write is restored by replay.
@@ -373,8 +482,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 
 #[derive(Default)]
 struct PersistQueue {
-    /// Latest sealed bytes per file (coalesced).
-    files: HashMap<PathBuf, Vec<u8>>,
+    /// Latest sealed bytes per file (coalesced), with the `through` they carry.
+    files: HashMap<PathBuf, (Vec<u8>, Option<u64>)>,
     /// Ordered line appends (after the batch's files).
     appends: Vec<(PathBuf, String)>,
     /// Highest chain position whose trust change is in memory (and so in this queue or already
@@ -400,6 +509,9 @@ pub struct TrustPersister {
     /// of the projection watermark — could be renamed in last (caught as a flake of
     /// `outcome_updates_persist_across_reopen_sealed`).
     batch_lock: Mutex<()>,
+    /// Every entity file written (or found at startup) and the `through` it holds: the manifest
+    /// each checkpoint carries, so startup can verify the checkpoint against the files.
+    manifest: Mutex<HashMap<String, Option<u64>>>,
 }
 
 impl TrustPersister {
@@ -414,6 +526,7 @@ impl TrustPersister {
             batches: AtomicU64::new(0),
             since: AtomicU64::new(0),
             batch_lock: Mutex::new(()),
+            manifest: Mutex::new(HashMap::new()),
         });
         #[cfg(test)]
         TEST_REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&p));
@@ -424,10 +537,14 @@ impl TrustPersister {
         self.queue.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn enqueue(self: &Arc<Self>, path: PathBuf, sealed: Vec<u8>, pos: Option<u64>) {
+    fn manifest(&self) -> std::sync::MutexGuard<'_, HashMap<String, Option<u64>>> {
+        self.manifest.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn enqueue(self: &Arc<Self>, path: PathBuf, sealed: Vec<u8>, through: Option<u64>, pos: Option<u64>) {
         {
             let mut q = self.q();
-            q.files.insert(path, sealed);
+            q.files.insert(path, (sealed, through));
             if let Some(p) = pos {
                 q.max_pos = Some(q.max_pos.map_or(p, |m| m.max(p)));
             }
@@ -511,7 +628,7 @@ impl TrustPersister {
 
     fn write_batch(
         &self,
-        files: &HashMap<PathBuf, Vec<u8>>,
+        files: &HashMap<PathBuf, (Vec<u8>, Option<u64>)>,
         appends: &[(PathBuf, String)],
         max_pos: Option<u64>,
     ) -> Result<()> {
@@ -519,8 +636,9 @@ impl TrustPersister {
         if self.fail_next.swap(false, Ordering::AcqRel) {
             anyhow::bail!("injected trust cache write failure");
         }
-        for (path, bytes) in files {
+        for (path, (bytes, through)) in files {
             write_atomic(path, bytes)?;
+            self.manifest().insert(file_name(path), *through);
         }
         for (path, line) in appends {
             let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)
@@ -528,12 +646,16 @@ impl TrustPersister {
             writeln!(f, "{line}")?;
         }
         // Every file is now current through max_pos (each dirty file was just written with its
-        // latest value; a clean one has had no change since). Written LAST: a crash before this
-        // only means replay starts earlier, and per-entity `through` keeps it idempotent.
+        // latest value; a clean one has had no change since). Nothing here is fsynced, so the
+        // write order is NOT a durability order: the checkpoint carries the manifest it claims,
+        // and startup trusts it only where the files bear it out (`TrustStore::recover`).
         if let Some(p) = max_pos {
             let since = self.since.load(Ordering::Acquire);
+            let entities: serde_json::Map<String, serde_json::Value> =
+                self.manifest().iter().map(|(n, t)| (n.clone(), serde_json::json!(t))).collect();
             write_atomic(&self.dir.join(PROJECTION_FILE),
-                         serde_json::json!({"through": p, "since": since}).to_string().as_bytes())?;
+                         serde_json::json!({"through": p, "since": since, "entities": entities})
+                             .to_string().as_bytes())?;
         }
         Ok(())
     }
@@ -665,6 +787,75 @@ mod tests {
         let reopened = TrustStore::open(dir.path(), KEY).unwrap();
         assert!(reopened.update_at("claude-code", true, 0.8, at(7)).unwrap().is_none());
         assert_eq!(reopened.get("claude-code").unwrap().action_count, 1);
+    }
+
+    /// A checkpoint is trusted only where its manifest verifies against the files (Codex 19153).
+    #[test]
+    fn recovery_trusts_a_checkpoint_only_where_its_files_bear_it_out() {
+        let dir = TempDir::new().unwrap();
+        let store = TrustStore::open(dir.path(), KEY).unwrap();
+        assert_eq!(store.recover(0).unwrap(), (0, 0), "fresh home: epoch 0");
+        store.update_at("a", true, 0.8, at(3)).unwrap();
+        store.update_at("b", true, 0.8, at(5)).unwrap();
+        store.persister().flush_blocking();
+        let lose = store.entity_file("plugin:b");
+        drop(store);
+        let reopened = TrustStore::open(dir.path(), KEY).unwrap();
+        assert_eq!(reopened.recover(9).unwrap(), (0, 6), "every listed file present: from through+1");
+        drop(reopened);
+        std::fs::remove_file(&lose).unwrap();
+        let reopened = TrustStore::open(dir.path(), KEY).unwrap();
+        assert_eq!(reopened.recover(9).unwrap(), (0, 0), "a listed file lost: from the epoch");
+    }
+
+    /// A stale file (older than its checkpoint lists) and an unreadable one both fail verification;
+    /// the unreadable one is set aside so the replay rebuilds it.
+    #[test]
+    fn recovery_replays_over_a_stale_or_unreadable_file() {
+        let dir = TempDir::new().unwrap();
+        let store = TrustStore::open(dir.path(), KEY).unwrap();
+        store.recover(0).unwrap();
+        store.update_at("a", true, 0.8, at(2)).unwrap();
+        store.persister().flush_blocking();
+        let path = store.entity_file("plugin:a");
+        let old = std::fs::read(&path).unwrap();
+        store.update_at("a", true, 0.8, at(4)).unwrap();
+        store.persister().flush_blocking();
+        drop(store);
+        std::fs::write(&path, &old).unwrap();
+        let reopened = TrustStore::open(dir.path(), KEY).unwrap();
+        assert_eq!(reopened.recover(9).unwrap(), (0, 0), "stale file: from the epoch");
+        drop(reopened);
+        std::fs::write(&path, b"").unwrap();
+        let reopened = TrustStore::open(dir.path(), KEY).unwrap();
+        assert_eq!(reopened.recover(9).unwrap(), (0, 0));
+        assert!(!path.exists() && path.with_extension("corrupt").exists(), "set aside");
+        assert!(reopened.update_at("a", true, 0.8, at(2)).unwrap().is_some(), "rebuilt from the chain");
+    }
+
+    /// Only a cache of v1 files is legacy; v2 files without an epoch are a projection from 0.
+    #[test]
+    fn recovery_tells_legacy_from_an_interrupted_v2_projection() {
+        let dir = TempDir::new().unwrap();
+        let store = TrustStore::open(dir.path(), KEY).unwrap();
+        store.update_at("a", true, 0.8, at(1)).unwrap();
+        store.persister().flush_blocking();
+        drop(store);
+        // The first batch's entity rename landed; its checkpoint did not.
+        std::fs::remove_file(dir.path().join(PROJECTION_FILE)).unwrap();
+        let reopened = TrustStore::open(dir.path(), KEY).unwrap();
+        assert_eq!(reopened.recover(7).unwrap(), (0, 0), "v2 files, no epoch, no checkpoint");
+        assert_eq!(reopened.projection_since(), Some(0), "the epoch is now recorded");
+        drop(reopened);
+
+        let dir = TempDir::new().unwrap();
+        let legacy = EntityTrust::new("plugin:old");
+        std::fs::write(dir.path().join("0000000000000000.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let store = TrustStore::open(dir.path(), KEY).unwrap();
+        assert_eq!(store.recover(7).unwrap(), (7, 7), "v1 only: legacy, adopted at the head");
+        drop(store);
+        let reopened = TrustStore::open(dir.path(), KEY).unwrap();
+        assert_eq!(reopened.recover(9).unwrap(), (7, 7), "the epoch is durable and fixed");
     }
 
     /// A read creates nothing: an entity exists only once a chain row changed it.

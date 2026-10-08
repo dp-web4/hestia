@@ -617,23 +617,11 @@ impl ServerState {
             }));
         }
         let trust_store = TrustStore::open(home.join("trust"), store_key)?;
-        // TRUST IS A PROJECTION OF THE CHAIN (#1271). Where the cache is current through; a
-        // legacy cache (files, no projection record) IS the state as of now and is adopted as
-        // such; no cache at all (fresh, or deleted) replays from the start.
-        // `since` is the projection EPOCH (fixed; the decision ledger derives charges from the
-        // chain from there); `from` is where the cache is current (replay starts there).
-        let (trust_projection_since, trust_projection_from): (u64, u64) =
-            match (trust_store.projected_through(), trust_store.projection_since()) {
-                (Some(p), since) => (since.unwrap_or(0), p + 1),
-                (None, Some(since)) => (since, since),
-                (None, None) if trust_store.has_entity_files() => {
-                    let len = chain_store.len()?;
-                    trust_store.adopt_legacy(len.checked_sub(1), len)?;
-                    (len, len)
-                }
-                (None, None) => (0, 0),
-            };
-        trust_store.set_projection_since(trust_projection_since);
+        // TRUST IS A PROJECTION OF THE CHAIN (#1271). `since` is the projection EPOCH (fixed;
+        // the decision ledger derives charges from the chain from there); `from` is where replay
+        // starts — the cache's checkpoint only where its manifest verifies against the files,
+        // else the epoch (see `TrustStore::recover`).
+        let (trust_projection_since, trust_projection_from) = trust_store.recover(chain_store.len()?)?;
         let inbox_store = crate::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
         // Durable reads: inbox rows carry chain hashes; no inbox write reaches disk ahead of them.
         {

@@ -28489,7 +28489,7 @@ mod decision_witness_tests {
     use super::inbox_tests::{open_state, seeded_home};
     use super::*;
 
-    // Review reproductions on f4c6629. These assert the observed failures, not correctness.
+    // Codex review 19153 on f4c6629: reproduced as failures there; assert the recovery now.
     fn review_entity_file(state: &super::super::state::ServerState, member: &str) -> std::path::PathBuf {
         use sha2::{Digest, Sha256};
         let key = state.trust_entity_key(member, crate::reputation::DEFAULT_CONSTELLATION_ROLE);
@@ -28498,7 +28498,7 @@ mod decision_witness_tests {
     }
 
     #[tokio::test]
-    async fn review_19153_surviving_checkpoint_skips_a_lost_entity() {
+    async fn review_19153_a_lost_entity_under_a_surviving_checkpoint_is_replayed() {
         use crate::storage::durability::durable_scope;
         let (dir, state) = state_with_safety().await;
         let mut args = witness_args("gemini", "deny");
@@ -28518,14 +28518,14 @@ mod decision_witness_tests {
         assert!(dir.path().join("trust/projection.json").exists());
         std::fs::remove_file(path).unwrap();
         let reopened = reopen_with_safety(&dir).await;
-        assert_eq!(grain_actions(&reopened, "gemini").await, 0, "BUG: checkpoint skipped the lost entity");
+        assert_eq!(grain_actions(&reopened, "gemini").await, 1, "the checkpoint's manifest no longer verifies: replay from the epoch");
         let retry = tool_witness_decision(&reopened, &args).await.unwrap();
-        assert_eq!(retry["charged"], false, "ledger considers the lost charge settled");
-        assert_eq!(grain_actions(&reopened, "gemini").await, 0);
+        assert_eq!(retry["charged"], false, "the charge is on the chain once");
+        assert_eq!(grain_actions(&reopened, "gemini").await, 1);
     }
 
     #[tokio::test]
-    async fn review_19153_partial_first_batch_is_mistaken_for_legacy() {
+    async fn review_19153_a_partial_first_batch_is_not_mistaken_for_legacy() {
         use crate::storage::durability::durable_scope;
         let (dir, state) = state_with_safety().await;
         let persister = { state.lock().await.trust_store.persister().clone() };
@@ -28552,9 +28552,9 @@ mod decision_witness_tests {
         std::fs::remove_file(dir.path().join("trust/projection.json")).unwrap();
         let reopened = reopen_with_safety(&dir).await;
         assert_eq!(grain_actions(&reopened, "gemini").await, 1);
-        assert_eq!(grain_actions(&reopened, "codex").await, 0, "BUG: v2 cache adopted as legacy at chain head");
+        assert_eq!(grain_actions(&reopened, "codex").await, 1, "a v2 cache is replayed, not adopted at the head");
         let s = reopened.lock().await;
-        assert!(s.trust_store.projection_since().unwrap() > 0, "BUG: fresh projection epoch was advanced");
+        assert_eq!(s.trust_store.projection_since(), Some(0), "the fresh epoch stays 0");
     }
 
     async fn state_with_safety() -> (tempfile::TempDir, SharedState) {
