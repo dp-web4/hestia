@@ -27,7 +27,7 @@
     },
     {
       "path": "hestia_single_gate.py",
-      "sha256": "c7cfe50bd717ecb1470f1bce6d00d1ebb030d8f4daf05330dee1b3229a0a38da",
+      "sha256": "2d86a3f4a7b8dc21bb8bedcc4f18c0893046d00d04be4f105a6f20a499b840c5",
       "source": "plugins/_shared/hestia_single_gate.py"
     },
     {
@@ -38,5 +38,5 @@
   ],
   "engine": null,
   "requires": [],
-  "gt_version": "43c25182d697f72ccde867962752f5718563f9ef674dec659851f8959e77e632"
+  "gt_version": "06d28ec1c18d5c6a7352eb26e6196a7776bc972016ab5db54f7e62456639fb52"
 }

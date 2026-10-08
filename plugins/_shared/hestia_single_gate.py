@@ -200,6 +200,36 @@ class HarnessBound:
 
 _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
+# ── the critical-timeout protocol (dp ruling on #1262, 2026-10-07): canonical or MISWIRED ──
+#: Canonical envelope for a critical hook registration's timeout, seconds. A value outside is
+#: REJECTED (MISWIRED), never clamped. The reconciler WRITES DEFAULT when it canonicalizes a
+#: registration; the gate never substitutes it — a missing timeout is MISWIRED, whatever the
+#: vendor documents.
+MIN_TIMEOUT_SECONDS = 3.0
+DEFAULT_TIMEOUT_SECONDS = 10.0
+MAX_TIMEOUT_SECONDS = 30.0
+#: The margin is proportional and bounded: max(floor, min(cap, timeout * rate)) — the shim's
+#: declared cap from 10 s up, the floor at the 3 s envelope edge.
+MARGIN_FLOOR_SECONDS = 0.5
+MARGIN_RATE = 0.15
+
+
+def validate_timeout(value, unit: float):
+    """The protocol's one validator — the gate is its first consumer; deploy/preflight, the
+    reconciler and the census wire in under #1262 row 10. A STRUCTURALLY parsed timeout field,
+    in the harness's unit, -> (canonical seconds, None), or (None, reason) MISWIRED. No vendor
+    default is ever substituted; an out-of-envelope value is rejected, not clamped."""
+    if value is None:
+        return None, ("no timeout declared (a missing timeout is MISWIRED: a vendor default "
+                      "is not a security semantic)")
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None, f"timeout {value!r} is not a number the protocol can bind"
+    seconds = float(value) * unit
+    if not MIN_TIMEOUT_SECONDS <= seconds <= MAX_TIMEOUT_SECONDS:
+        return None, (f"timeout {seconds:g}s is outside the canonical envelope "
+                      f"{MIN_TIMEOUT_SECONDS:g}-{MAX_TIMEOUT_SECONDS:g}s (rejected, never clamped)")
+    return seconds, None
+
 
 def _expand(text: str, env, cwd: Optional[str]) -> Optional[str]:
     """`${VAR:-default}`, `${VAR}`, `$VAR`, `~` and `{cwd}`. None when a variable with no default
@@ -231,60 +261,129 @@ def _expand(text: str, env, cwd: Optional[str]) -> Optional[str]:
     return out
 
 
-def _command_targets(command: str, env) -> list:
-    """Every absolute path a hook command names, expanded the way the harness's shell would."""
+def _command_tokens(command: str, env):
+    """Every token of a hook command, expanded the way the harness's shell would (environment
+    assignments skipped; a token naming an unset variable with no default drops out)."""
     try:
         tokens = shlex.split(command)
     except ValueError:
         tokens = command.split()
-    out = []
     for tok in tokens:
         if "=" in tok and not tok.startswith(("/", "~", "$")):
             continue                       # an environment assignment, not the program
         t = _expand(tok, env, None)
-        if t and os.path.isabs(t):
-            out.append(t)
-    return out
+        if t:
+            yield t
+
+
+def _command_targets(command: str, env) -> list:
+    """Every absolute path a hook command names, expanded the way the harness's shell would."""
+    return [t for t in _command_tokens(command, env) if os.path.isabs(t)]
+
+
+def _names_hook(command: str, env, base: str) -> bool:
+    """Boolean relevance ONLY: does this command appear to invoke this hook. Two readings, and
+    either one is evidence. (1) The basename as a BOUNDED token of the expanded RAW text (of the
+    raw command when a `${VAR}`/`{cwd}` cannot be resolved here) — not a token basename equality:
+    shlex without punctuation_chars glues shell operators onto the token (`./hook.py;`,
+    `hook.py|cat`, `(python3 ./hook.py)`), basename equality misses those, and the entry then
+    DROPS beside a longer exact binding, letting the computed deadline outrun the timeout the
+    harness actually enforces on that spelling (#1262 re-review P1 — every glued spelling was
+    executed under `sh` and runs the hook). (2) The same bounded test on each SHELL-NORMALIZED
+    token — shlex quote and backslash removal (`./gate_'hook'.py`, `./gate_\\hook.py`) — because
+    the shell performs that same removal and the normalized spelling RUNS the hook (#1262
+    re-review P1 round 2: the quoted/escaped spellings were executed under `sh` beside an exact
+    15s registration and the bound outran it at 15s). The edge class [A-Za-z0-9._-] keeps a
+    longer name that merely CONTAINS the basename (`hook.py.bak`, `hook.py5`, `xhook.py`) a
+    different file: it drops. Constructs no lexical reading can resolve — glob patterns
+    (`gate_hoo?.py`), command substitution (`$(printf ...)`) — stay outside this guarantee.
+    Whatever names the hook without an exact realpath binding is MISWIRED evidence; the binding
+    test itself stays exact."""
+    pattern = r"(?<![A-Za-z0-9._-])" + re.escape(base) + r"(?![A-Za-z0-9._-])"
+    text = _expand(command, env, None)
+    if text is None:
+        text = command
+    if re.search(pattern, text):
+        return True
+    return any(re.search(pattern, token) for token in _command_tokens(command, env))
 
 
 def _hook_entries(doc: Any, reader: str, layout: str, event: str) -> list:
-    """[(command, timeout-or-None)] for every hook registered on `event` in a parsed config."""
+    """[(command, timeout-or-None, entry-object, ancestors)] for every hook registered on
+    `event` in a parsed config. The entry object rides along so a duplicate-key mark recorded at
+    parse time can be attributed to the exact registration that carries it; `ancestors` is the
+    chain of (object, key) the walk traversed from the document root, so an agreeing duplicate
+    mark on the ENCLOSING wiring can be attributed to the registrations beneath it (#1262
+    re-review P2 round 2)."""
     out = []
     hooks = doc.get("hooks") if isinstance(doc, dict) else None
     if layout == "flat":
         for tbl in hooks if isinstance(hooks, list) else []:
             if isinstance(tbl, dict) and tbl.get("event") == event and isinstance(tbl.get("command"), str):
-                out.append((tbl["command"], tbl.get("timeout")))
+                out.append((tbl["command"], tbl.get("timeout"), tbl, ((doc, "hooks"),)))
         return out
     groups = hooks.get(event) if isinstance(hooks, dict) else None
     for group in groups if isinstance(groups, list) else []:
         for h in (group.get("hooks") or []) if isinstance(group, dict) else []:
             if isinstance(h, dict) and isinstance(h.get("command"), str):
-                out.append((h["command"], h.get("timeout")))
+                out.append((h["command"], h.get("timeout"), h,
+                            ((doc, "hooks"), (hooks, event), (group, "hooks"))))
     return out
 
 
 def _load_config(path: str, reader: str):
-    """(parsed document, None) or (None, why). A TOML config without tomllib is (None, "scan")."""
+    """(parsed document, None, dupes) or (None, why, {}). `dupes` maps id(marked object) to
+    (the marked object, {repeated key: [occurrences in order]}), for the JSON reader only:
+    json.loads is last-wins — as the harness's own parser is — so a duplicated key is no
+    measured deadline overrun, but it IS ambiguous wiring, MISWIRED evidence under the
+    protocol's duplicate rule (#1262 re-review P2). TOML rejects a duplicate key at parse, so
+    the tomllib path never marks anything. A TOML config without tomllib is (None, "scan", {}).
+    The mark carries its object: holding it keeps the id from being recycled once an overwritten
+    object is freed, and the lookup re-checks identity — a bare id() can be handed to a later
+    allocation, which would hang a stranger's repeated key on a clean registration (#1262
+    re-review B1). Occurrences are kept so an ENCLOSING key whose copies agree (deep-equal) can
+    be told from one the harness's last-wins parser silently chooses between (#1262 re-review
+    P2 round 2)."""
     with open(path, "rb") as fh:
         raw = fh.read()
     if reader == "json-hook-commands":
-        return json.loads(raw.decode("utf-8")), None
+        dupes: dict = {}
+
+        def _pairs(pairs):
+            obj = {}
+            repeated = {}
+            for k, v in pairs:
+                if k in obj:
+                    repeated.setdefault(k, [obj[k]]).append(v)
+                obj[k] = v
+            if repeated:
+                dupes[id(obj)] = (obj, repeated)
+            return obj
+
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs), None, dupes
     try:
         import tomllib  # type: ignore
     except ImportError:
-        return None, "scan"
-    return tomllib.loads(raw.decode("utf-8")), None
+        return None, "scan", {}
+    return tomllib.loads(raw.decode("utf-8")), None, {}
 
 
-def _scan_timeouts(path: str, base: str) -> Optional[list]:
-    """No TOML parser: every `timeout = N` in a file that names this hook at all. Conservative —
-    the smallest of them can only shorten the bound. None when the file does not name the hook."""
+def _dupe_marks(dupes: dict, obj: Any) -> Optional[dict]:
+    """The {repeated key: occurrences} recorded for THIS object, or None. The mark is accepted
+    only by identity: a bare id() match proves nothing, because an overwritten duplicate's object
+    is freed and its id can be recycled onto a clean registration (#1262 re-review B1)."""
+    mark = dupes.get(id(obj)) if dupes else None
+    if mark is not None and mark[0] is obj:
+        return mark[1]
+    return None
+
+
+def _text_mentions_hook(path: str, base: str) -> bool:
+    """Boolean relevance ONLY: does this file's text mention the hook at all. Reads no value —
+    the protocol forbids inferring a deadline from a lexical scan (#1262); it exists to split a
+    broken file that appears to register this hook (MISWIRED) from one that does not (drops)."""
     with open(path, encoding="utf-8", errors="replace") as fh:
-        text = fh.read()
-    if base not in text:
-        return None
-    return [float(m.group(1)) for m in re.finditer(r"(?m)^\s*timeout\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*(?:#.*)?$", text)]
+        return base in fh.read()
 
 
 def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[str] = None,
@@ -293,84 +392,119 @@ def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[
 
     `harness` is the shim's HARNESS data: where this harness records its hooks (`registrations`:
     reader, layout, path with `~`/`${VAR:-default}`/`{cwd}`), the hook `event`, the timeout's
-    unit, the harness's own default when an entry omits it (None when unknown), `on_timeout`
-    and `margin_seconds`. Every registration of THIS file on the event counts (its realpath, or
-    failing any such match its basename), from every source that exists, and the SMALLEST
-    timeout wins: a smaller bound costs availability, never safety. A non-harness invoker's
-    HESTIA_HOOK_TIMEOUT_S joins the same minimum.
+    unit, `on_timeout` and `margin_seconds` (the proportional margin's cap). A vendor default
+    timeout the data may carry is a harness FACT, not a security semantic: never substituted.
 
-    Returns `HarnessBound(deadline=start + timeout - margin, ...)`, or `deadline=None` with the
-    reason when no enforced timeout could be established."""
+    The critical-timeout protocol (dp ruling on #1262, 2026-10-07): canonical or MISWIRED.
+    The bound resolves to ONE registration binding THIS file exactly (its realpath) on the
+    event, carrying ONE explicit timeout that `validate_timeout` accepts — present, numeric,
+    inside the envelope after the unit, rejected outside and never clamped or defaulted.
+    Anything else that APPEARS to register this hook contributes no deadline, only MISWIRED
+    evidence, and closes the bound: a missing or non-numeric timeout, an out-of-envelope
+    value, an unparseable or unreadable config naming the hook, no parser available for it, a
+    relative, foreign or shell-punctuated command naming its basename — read again after the
+    shell's own quote and backslash removal, because the shell runs that file (the timeout
+    cannot be bound to the exact registered hook), a JSON registration object that repeats a
+    key, or wiring that encloses it repeating a key with an identical value (the harness's own
+    parser is last-wins; ambiguous wiring is not a binding), or duplicate/conflicting bindings.
+    A config whose text never mentions this hook is irrelevant
+    and drops. The gate NEVER infers a deadline from a partial lexical scan. A non-harness
+    invoker's explicit HESTIA_HOOK_TIMEOUT_S joins the minimum: it can only shorten.
+
+    Returns `HarnessBound(deadline=start + timeout - margin, ...)` with the proportional
+    margin max(0.5, min(cap, timeout * 0.15)), or `deadline=None` with the MISWIRED reason (or
+    the plain no-registration reason) when no enforced timeout could be established."""
     env = os.environ if env is None else env
-    margin = float(harness.get("margin_seconds") or 0.0)
+    margin_cap = float(harness.get("margin_seconds") or 1.5)
     on_timeout = str(harness.get("on_timeout") or "unknown")
     try:
         unit = float(harness.get("timeout_unit_seconds") or 1.0)
-        default = harness.get("default_timeout_seconds")
         event = harness.get("event") or ""
         me = os.path.realpath(self_path)
         base = os.path.basename(me)
-        exact, by_name, sources, problems = [], [], [], []
+        bindings, problems = [], []
         for reg in harness.get("registrations") or ():
             path = _expand(str(reg.get("path") or ""), env, cwd)
             if not path or not os.path.isfile(path):
-                continue
+                continue                       # not configured there: nothing registers
             reader, layout = reg.get("reader") or "", reg.get("layout") or "nested"
             try:
-                doc, how = _load_config(path, reader)
-            except Exception as exc:  # noqa: BLE001 — an unreadable registration is no bound
-                problems.append(f"{path}: unreadable ({type(exc).__name__})")
-                continue
+                doc, how, dupes = _load_config(path, reader)
+            except Exception as exc:  # noqa: BLE001 — a parse failure must not swallow this hook
+                try:
+                    relevant = _text_mentions_hook(path, base)
+                except Exception:  # noqa: BLE001 — unreadable: it may be the registration
+                    relevant = True
+                if relevant:
+                    problems.append(f"{path}: MISWIRED: appears to register this hook but "
+                                    f"cannot be parsed or read ({type(exc).__name__})")
+                continue                       # its text never names this hook: irrelevant
             if how == "scan":
-                values = _scan_timeouts(path, base)
-                if values is None:
-                    continue
-                if not values and default is None:
-                    problems.append(f"{path}: names this hook but no timeout could be read")
-                    continue
-                vals = [v * unit for v in values] + ([float(default)] if default is not None else [])
-                by_name.append((min(vals), f"{path} (line scan, smallest timeout in the file)"))
+                if _text_mentions_hook(path, base):
+                    problems.append(f"{path}: MISWIRED: appears to register this hook and no "
+                                    f"parser is available for it")
                 continue
-            for command, timeout in _hook_entries(doc, reader, layout, event):
+            for command, timeout, hook_obj, ancestors in _hook_entries(doc, reader, layout, event):
                 targets = _command_targets(command, env)
                 hit_exact = any(os.path.realpath(t) == me for t in targets)
-                hit_name = hit_exact or any(os.path.basename(t) == base for t in targets)
-                if not hit_name:
+                if not hit_exact:
+                    if _names_hook(command, env, base):
+                        problems.append(f"{path}: MISWIRED: names this hook without binding it "
+                                        f"exactly (a relative, foreign or shell-punctuated command "
+                                        f"cannot bind a timeout to the registered hook)")
+                    continue                   # some other hook's entry: irrelevant
+                repeated = _dupe_marks(dupes, hook_obj)
+                if repeated:
+                    problems.append(f"{path}: MISWIRED: this hook's registration repeats key "
+                                    f"{sorted(repeated)} — the harness's JSON parser is last-wins, "
+                                    f"so an ambiguous entry is not a binding")
                     continue
-                if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
-                    seconds = float(timeout) * unit
-                    where = f"{path}: timeout {timeout}"
-                elif default is not None:
-                    seconds = float(default)
-                    where = f"{path}: no timeout declared, harness default {default}s"
-                else:
-                    problems.append(f"{path}: registers this hook with no timeout, and this "
-                                    f"harness's default is not known")
+                enclosing = next((key for container, key in ancestors
+                                  if (marks := _dupe_marks(dupes, container)) and key in marks
+                                  and all(v == marks[key][-1] for v in marks[key])), None)
+                if enclosing is not None:
+                    problems.append(f"{path}: MISWIRED: the wiring enclosing this hook's "
+                                    f"registration repeats key {enclosing!r} with an identical "
+                                    f"value (an agreeing duplicate) — the harness's JSON parser "
+                                    f"is last-wins, so ambiguous wiring is not a binding")
                     continue
-                (exact if hit_exact else by_name).append((seconds, where))
-        found = exact or by_name
+                seconds, why = validate_timeout(timeout, unit)
+                if seconds is None:
+                    problems.append(f"{path}: MISWIRED: {why}")
+                    continue
+                bindings.append((seconds, f"{path}: timeout {timeout}"))
+        if len(bindings) > 1:
+            problems.append("MISWIRED: duplicate/conflicting registrations of this hook ("
+                            + "; ".join(w for _, w in bindings) + ")")
+            bindings = []
+        found = list(bindings)
         declared = env.get(HOOK_TIMEOUT_ENV)
         if declared:
             try:
                 d = float(declared)
                 if d > 0:
                     found = found + [(d, f"{HOOK_TIMEOUT_ENV}={declared} (the invoker's declaration)")]
+                else:
+                    problems.append(f"{HOOK_TIMEOUT_ENV}={declared!r} is not positive")
             except ValueError:
                 problems.append(f"{HOOK_TIMEOUT_ENV}={declared!r} is not a number")
-        if problems and not exact:
-            # A registration of this hook we could not read may carry the smaller timeout.
-            return HarnessBound(None, None, margin, on_timeout, tuple(w for _, w in found),
+        if problems:
+            # Whatever appears to register this hook but is not one exact, canonical
+            # registration contributes no deadline — MISWIRED is wiring evidence, never a
+            # guessed timeout.
+            return HarnessBound(None, None, margin_cap, on_timeout, tuple(w for _, w in found),
                                 "; ".join(problems))
         if not found:
-            return HarnessBound(None, None, margin, on_timeout, (),
+            return HarnessBound(None, None, margin_cap, on_timeout, (),
                                 f"no registration of {base} on {event or 'its event'} was found "
                                 f"in this harness's configuration, and no {HOOK_TIMEOUT_ENV} was "
                                 f"declared")
         timeout = min(s for s, _ in found)
-        sources.extend(w for _, w in found)
-        return HarnessBound(start + timeout - margin, timeout, margin, on_timeout, tuple(sources))
+        margin = max(MARGIN_FLOOR_SECONDS, min(margin_cap, timeout * MARGIN_RATE))
+        return HarnessBound(start + timeout - margin, timeout, margin, on_timeout,
+                            tuple(w for _, w in found))
     except Exception as exc:  # noqa: BLE001 — a reader that breaks establishes nothing
-        return HarnessBound(None, None, margin, on_timeout, (),
+        return HarnessBound(None, None, margin_cap, on_timeout, (),
                             f"the registration reader failed ({type(exc).__name__}: {exc})")
 
 
