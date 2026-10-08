@@ -339,9 +339,33 @@ impl Durability {
             })
         });
         self.checkpoints.fetch_add(1, Ordering::Relaxed);
-        if let Err(e) = r {
-            tracing::warn!("chain checkpoint failed (will retry): {e}");
+        match r {
+            // An I/O failure inside the checkpoint is a failed fsync by another name: same
+            // fatal rule as the group flush (see `checkpoint_error_is_fatal`).
+            Err(e) if checkpoint_error_is_fatal(&e) => self.poison(&format!("checkpoint: {e}")),
+            Err(e) => tracing::warn!("chain checkpoint failed (will retry): {e}"),
+            Ok(_) => {}
         }
+    }
+}
+
+/// Whether a checkpoint error means durability is uncertain (poison, as a failed group fsync
+/// does) rather than ordinary contention (retry later).
+///
+/// A checkpoint copies WAL frames into the database file and SQLite fsyncs both itself, outside
+/// [`Durability::fsync_files`]. An I/O error there (`SQLITE_IOERR_FSYNC`, `_WRITE`, `_DIR_FSYNC`,
+/// … — the whole IOERR family) is the fsyncgate case: the kernel may have dropped the dirty
+/// pages, and a retry that succeeds proves nothing. Corruption is the same verdict. BUSY and
+/// LOCKED are a reader or writer in the way; FULL leaves the WAL authoritative and is retried.
+fn checkpoint_error_is_fatal(e: &rusqlite::Error) -> bool {
+    match e {
+        rusqlite::Error::SqliteFailure(err, _) => matches!(
+            err.code,
+            rusqlite::ErrorCode::SystemIoFailure
+                | rusqlite::ErrorCode::DatabaseCorrupt
+                | rusqlite::ErrorCode::NotADatabase
+        ),
+        _ => false,
     }
 }
 
@@ -458,4 +482,84 @@ pub async fn durable_scope<F: Future>(f: F) -> (F::Output, Result<()>) {
         None => Ok(()),
     };
     (out, res)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::ffi;
+    use std::os::raw::{c_int, c_void};
+    use std::sync::atomic::AtomicUsize;
+
+    static FAILED_SYNCS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn failing_sync(_f: *mut ffi::sqlite3_file, _flags: c_int) -> c_int {
+        FAILED_SYNCS.fetch_add(1, Ordering::SeqCst);
+        ffi::SQLITE_IOERR_FSYNC
+    }
+
+    /// Codex re-review of #1266 (19472): SQLite fsyncs the database file INSIDE a checkpoint,
+    /// outside `fsync_files`, so an `SQLITE_IOERR_FSYNC` there must reach the same fatal state
+    /// as a failed group fsync — not be logged and retried. Codex's reproduction: the checkpoint
+    /// connection's main-file `xSync` is swapped (via `SQLITE_FCNTL_FILE_POINTER`) for one that
+    /// fails, and the real `Durability::checkpoint` runs.
+    #[test]
+    fn a_failed_fsync_inside_a_checkpoint_poisons_durability() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::storage::SqliteChainStore::open(dir.path().join("w.db"), [7u8; 32]).unwrap();
+        for n in 0..20 {
+            store.append("t", serde_json::json!({"n": n}), "lct:x").unwrap();
+        }
+        let d = store.durability().clone();
+        d.flush_committed_blocking().unwrap();
+
+        let conn = rusqlite::Connection::open(&d.db_path).unwrap();
+        conn.pragma_update(None, "key", &d.key_hex).unwrap();
+        let _: i64 = conn.query_row("SELECT COUNT(*) FROM chain_entries", [], |r| r.get(0)).unwrap();
+        let before = FAILED_SYNCS.load(Ordering::SeqCst);
+        let mut slot = Some(conn);
+        unsafe {
+            let handle = slot.as_ref().unwrap().handle();
+            let mut fp: *mut ffi::sqlite3_file = std::ptr::null_mut();
+            let rc = ffi::sqlite3_file_control(
+                handle,
+                c"main".as_ptr(),
+                ffi::SQLITE_FCNTL_FILE_POINTER,
+                &mut fp as *mut *mut ffi::sqlite3_file as *mut c_void,
+            );
+            assert_eq!(rc, ffi::SQLITE_OK);
+            assert!(!fp.is_null() && !(*fp).pMethods.is_null(), "main file not open");
+            let original = (*fp).pMethods;
+            let mut patched: ffi::sqlite3_io_methods = std::ptr::read(original);
+            patched.xSync = Some(failing_sync);
+            let patched = Box::new(patched);
+            (*fp).pMethods = &*patched;
+            d.checkpoint(&mut slot);
+            (*fp).pMethods = original;
+            drop(patched);
+        }
+        assert!(FAILED_SYNCS.load(Ordering::SeqCst) > before, "setup: the checkpoint never synced the database file");
+        assert!(d.poisoned(), "SQLITE_IOERR_FSYNC during checkpoint was ignored");
+        assert!(store.append("t", serde_json::json!({"after": true}), "lct:x").is_err(),
+                "a poisoned chain still accepted an append");
+    }
+
+    /// Contention is not a durability failure: a checkpoint that cannot proceed because a
+    /// reader holds the WAL is retried later, and the store stays healthy.
+    #[test]
+    fn a_busy_checkpoint_does_not_poison() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::storage::SqliteChainStore::open(dir.path().join("w.db"), [7u8; 32]).unwrap();
+        store.append("t", serde_json::json!({"n": 1}), "lct:x").unwrap();
+        let d = store.durability().clone();
+        let busy = rusqlite::Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_BUSY), None);
+        let locked = rusqlite::Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_LOCKED), None);
+        let ioerr = rusqlite::Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_IOERR_FSYNC), None);
+        assert!(!checkpoint_error_is_fatal(&busy));
+        assert!(!checkpoint_error_is_fatal(&locked));
+        assert!(checkpoint_error_is_fatal(&ioerr));
+        let mut slot = None;
+        d.checkpoint(&mut slot);
+        assert!(!d.poisoned());
+    }
 }
