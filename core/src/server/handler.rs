@@ -29059,16 +29059,20 @@ mod decision_witness_tests {
 
     // ------------------------------- exactly once: an owed charge is settled, across restarts too
 
-    /// Make the trust store unwritable: its directory becomes a plain file, so every trust write
-    /// fails while the chain keeps committing (row commits, trust write fails).
+    /// Make the trust store unwritable: its directory goes read-only, so every trust write fails
+    /// while the chain keeps committing (row commits, trust write fails). Reads still work — a
+    /// store that cannot be READ is an error, not an absent entity (#1271 review 19166), so
+    /// swapping the directory for a file no longer models a lost write.
     fn break_trust(dir: &tempfile::TempDir) {
-        std::fs::rename(dir.path().join("trust"), dir.path().join("trust.off")).unwrap();
-        std::fs::write(dir.path().join("trust"), b"not a directory").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path().join("trust"), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
     }
 
     fn heal_trust(dir: &tempfile::TempDir) {
-        std::fs::remove_file(dir.path().join("trust")).unwrap();
-        std::fs::rename(dir.path().join("trust.off"), dir.path().join("trust")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path().join("trust"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
     }
 
     /// Reopen after a restart with the safety preset the decision tests run under.

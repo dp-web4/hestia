@@ -156,11 +156,14 @@ impl TrustStore {
         if let Some(c) = self.cache().get(entity_id) {
             return Ok(Some(c.clone()));
         }
+        // `try_exists`: a path that cannot be checked is an error, never an absent file — an
+        // unreadable baseline must not read as "no baseline" (Codex P2, #1271 review 19166).
+        let exists = |p: &Path| p.try_exists().with_context(|| format!("checking trust {}", p.display()));
         let mut path = self.entity_file(entity_id);
-        if !path.exists() {
+        if !exists(&path)? {
             // No cache file: the entity's pre-epoch baseline, if it had one (replay supplies the rest).
             path = self.base_dir.join(BASELINE_DIR).join(file_name(&path));
-            if !path.exists() {
+            if !exists(&path)? {
                 return Ok(None);
             }
         }
@@ -344,15 +347,21 @@ impl TrustStore {
     /// be rebuilt over FRESH trust and served as if reconstructed (Codex P1, #1271 review 19164).
     fn check_baseline(&self, since: u64) -> Result<()> {
         let dir = self.base_dir.join(BASELINE_DIR);
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            if since > 0 {
-                tracing::warn!("trust epoch {since} has no baseline (migrated before #1271 review 19164): \
-                                an entity whose cache file is lost loses its pre-epoch state");
+        // Only a baseline that is ABSENT is the pre-fix case; one that does not open is an error
+        // (Codex P2, #1271 review 19166), as is an entry that does not list.
+        let rd = match std::fs::read_dir(&dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if since > 0 {
+                    tracing::warn!("trust epoch {since} has no baseline (migrated before #1271 review 19164): \
+                                    an entity whose cache file is lost loses its pre-epoch state");
+                }
+                return Ok(());
             }
-            return Ok(());
+            r => r.with_context(|| format!("trust baseline {} does not open: pre-epoch trust cannot \
+                                            be reconstructed (fix its permissions or restore it)", dir.display()))?,
         };
-        for e in rd.flatten() {
-            let p = e.path();
+        for e in rd {
+            let p = e.with_context(|| format!("listing trust baseline {}", dir.display()))?.path();
             if !is_entity_file(&p) {
                 continue;
             }
@@ -967,12 +976,12 @@ mod tests {
         assert_eq!(reopened.get("old").unwrap().action_count, 8);
     }
 
-    /// BUG REPRODUCTION: passing pins the observed loss, not the desired contract.
-    /// An inaccessible baseline is not an absent pre-fix baseline. A temporary directory
-    /// permission error must fail recovery, rather than publishing a fresh projection over it.
+    /// An inaccessible baseline is not an absent pre-fix baseline: recovery fails on it rather
+    /// than publishing a fresh projection over it, and once it reads again nothing was lost
+    /// (Codex P2, #1271 review 19166 — this test pinned the loss before the fix).
     #[cfg(unix)]
     #[test]
-    fn review_19166_unreadable_baseline_directory_silently_rebuilds_fresh_trust() {
+    fn review_19166_unreadable_baseline_directory_fails_recovery() {
         use std::os::unix::fs::PermissionsExt;
         let (dir, store, path) = review_19164_legacy_fixture();
         drop(store);
@@ -983,22 +992,18 @@ mod tests {
         let directory_error = std::fs::read_dir(&baseline).err().map(|e| e.kind());
         let reopened = TrustStore::open(dir.path(), KEY).unwrap();
         let recovery = reopened.recover(11);
-        let replay = reopened.update_at("old", false, 0.5, at(10));
-        let count = reopened.get("old").map(|t| t.action_count);
-        drop(reopened); // Flush the incorrectly reconstructed cache and checkpoint.
+        let read = reopened.get("old").map(|t| t.action_count);
+        drop(reopened);
         // Restore permissions before any assertion, including the non-root fixture check.
         std::fs::set_permissions(&baseline, permissions).unwrap();
         assert_eq!(directory_error, Some(std::io::ErrorKind::PermissionDenied),
                    "this reproduction requires an unprivileged test process");
-        assert_eq!(recovery.unwrap(), (10, 10), "BUG: recovery should return the I/O error");
-        assert!(replay.unwrap().is_some());
-        assert_eq!(count.unwrap(), 1, "BUG: silently lost the 7-action baseline");
+        assert!(recovery.is_err(), "recovery must stop on an unreadable baseline");
+        assert!(read.is_err(), "a read must not take an unreadable baseline for an absent one");
         let after_repair = TrustStore::open(dir.path(), KEY).unwrap();
-        assert_eq!(after_repair.recover(11).unwrap(), (10, 11));
-        assert_eq!(after_repair.get("old").unwrap().action_count, 1,
-                   "repairing permissions does not undo the incorrectly checkpointed state");
-        let preserved = after_repair.parse(std::fs::read(baseline.join(file_name(&path))).unwrap()).unwrap();
-        assert_eq!(preserved.trust.action_count, 7, "the durable baseline itself was never lost");
+        assert_eq!(after_repair.recover(11).unwrap(), (10, 10));
+        after_repair.update_at("old", false, 0.5, at(10)).unwrap();
+        assert_eq!(after_repair.get("old").unwrap().action_count, 8, "the baseline survived");
     }
 
     /// A chain-projected update is idempotent by position, and takes its clock from the row.
