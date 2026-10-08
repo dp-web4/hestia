@@ -28557,6 +28557,67 @@ mod decision_witness_tests {
         assert_eq!(s.trust_store.projection_since(), Some(0), "the fresh epoch stays 0");
     }
 
+    /// Codex, #1271 review 19161: the cache must never hold a charge the chain does not. Two
+    /// layers. (1) The barrier: while the chain's fsync is held, no trust file reaches disk, so a
+    /// crash cannot leave the cache ahead of the chain. (2) Recovery: a cache that IS ahead (here,
+    /// the chain restored from an older copy) is set aside and rebuilt, so the retry of the lost
+    /// row counts once. Before the fix the cache advanced under the hold and recovery kept the
+    /// unwitnessed charge (2 against the chain's 1). A retry did NOT count it twice, even with a
+    /// later row landing first (measured: 3 rows, 3 charges) — but with no retry, the cache stays
+    /// one charge above the chain for good.
+    #[tokio::test]
+    async fn review_19161_the_cache_never_holds_a_charge_the_chain_does_not() {
+        use crate::storage::durability::durable_scope;
+        let (dir, state) = state_with_safety().await;
+        let mut first = witness_args("gemini", "deny");
+        first["action_id"] = json!(Uuid::new_v4().to_string());
+        let (out, durable) = durable_scope(tool_witness_decision(&state, &first)).await;
+        durable.unwrap();
+        assert_eq!(out.unwrap()["charged"], true);
+        assert_eq!(grain_actions(&state, "gemini").await, 1);
+        drop(state);
+        let chain_path = dir.path().join("witness.db");
+        let durable_prefix = std::fs::read(&chain_path).unwrap();
+        assert!(!dir.path().join("witness.db-wal").exists(), "closed prefix has no WAL");
+
+        let state = reopen_with_safety(&dir).await;
+        let durability = { state.lock().await.chain_store.durability().clone() };
+        let held = durability.hold_flush_for_test();
+        let durable_before = durability.frontier().durable;
+        let mut pending = witness_args("gemini", "deny");
+        pending["action_id"] = json!(Uuid::new_v4().to_string());
+        assert_eq!(tool_witness_decision(&state, &pending).await.unwrap()["charged"], true);
+        assert!(durability.committed() > durable_before);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        {
+            let s = state.lock().await;
+            assert!(s.trust_store.projected_through().is_none_or(|t| t < durable_before),
+                    "(1) no trust file reaches disk while its chain row is not durable");
+        }
+        drop(held);
+        { state.lock().await.trust_store.persister().flush_blocking(); }
+        drop(durability);
+        drop(state);
+        assert!(!dir.path().join("witness.db-wal").exists());
+        // The cache now holds the second charge; restore the chain to the copy without it.
+        std::fs::write(&chain_path, durable_prefix).unwrap();
+        let reopened = reopen_with_safety(&dir).await;
+        let rows = rows_of(&reopened, "policy_decision").await;
+        assert!(!rows.iter().any(|r| r.event_data["action_id"] == pending["action_id"]));
+        assert_eq!(grain_actions(&reopened, "gemini").await, 1,
+                   "(2) a cache ahead of the chain is rebuilt from the chain");
+        let mut later = witness_args("gemini", "deny");
+        later["action_id"] = json!(Uuid::new_v4().to_string());
+        let (out, durable) = durable_scope(tool_witness_decision(&reopened, &later)).await;
+        durable.unwrap();
+        assert_eq!(out.unwrap()["charged"], true);
+        let (retry, durable) = durable_scope(tool_witness_decision(&reopened, &pending)).await;
+        durable.unwrap();
+        assert_eq!(retry.unwrap()["charged"], true, "the lost row is witnessed on retry");
+        assert_eq!(grain_actions(&reopened, "gemini").await, 3,
+                   "three rows on the chain, three charges: the retry counts once");
+    }
+
     async fn state_with_safety() -> (tempfile::TempDir, SharedState) {
         let (dir, _) = seeded_home();
         let state = open_state(&dir);

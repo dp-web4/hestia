@@ -617,6 +617,13 @@ impl ServerState {
             }));
         }
         let trust_store = TrustStore::open(home.join("trust"), store_key)?;
+        // Durable cache: no trust file reaches disk ahead of the chain row it projects.
+        {
+            let durability = chain_store.durability().clone();
+            trust_store.persister().set_pre_write_barrier(Arc::new(move || {
+                durability.flush_committed_blocking().map_err(|e| format!("{e:#}"))
+            }));
+        }
         // TRUST IS A PROJECTION OF THE CHAIN (#1271). `since` is the projection EPOCH (fixed;
         // the decision ledger derives charges from the chain from there); `from` is where replay
         // starts — the cache's checkpoint only where its manifest verifies against the files,

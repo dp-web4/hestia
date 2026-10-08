@@ -247,6 +247,15 @@ impl TrustStore {
     ///   replay rebuilds it from the chain.
     pub fn recover(&self, chain_len: u64) -> Result<(u64, u64)> {
         let mut files = self.scan();
+        // A file projected through a position the chain does not hold is AHEAD of the chain (a
+        // cache written before the barrier existed, or a chain restored from an older copy). It
+        // holds changes no row witnesses, so it cannot be a replay base: treat it like a file
+        // that does not read — set aside, rebuilt from the chain (Codex, #1271 review 19161).
+        for f in files.values_mut() {
+            if matches!(f, Some((_, Some(t))) if *t >= chain_len) {
+                *f = None;
+            }
+        }
         let any_v2 = files.values().any(|f| matches!(f, Some((true, _))));
         let any_v1 = files.values().any(|f| matches!(f, Some((false, _))));
         let recorded = self.projection_since();
@@ -266,7 +275,7 @@ impl TrustStore {
             .ok()
             .and_then(|raw| serde_json::from_slice(&raw).ok());
         let through = checkpoint.as_ref().and_then(|c| c.get("through")?.as_u64());
-        let verified = !legacy && through.is_some() && checkpoint
+        let verified = !legacy && through.is_some_and(|t| t < chain_len) && checkpoint
             .as_ref()
             .and_then(|c| c.get("entities")?.as_object().cloned())
             .is_some_and(|manifest| {
@@ -286,7 +295,7 @@ impl TrustStore {
         // (Only a pre-epoch — legacy — part of its state is beyond the chain's reach.)
         for name in files.iter().filter(|(_, p)| p.is_none()).map(|(n, _)| n) {
             let p = self.base_dir.join(name);
-            tracing::warn!("trust cache file {} does not read; set aside, rebuilt from the chain", p.display());
+            tracing::warn!("trust cache file {} does not read or is ahead of the chain; set aside, rebuilt from the chain", p.display());
             std::fs::rename(&p, p.with_extension("corrupt"))
                 .with_context(|| format!("setting aside {}", p.display()))?;
         }
@@ -512,6 +521,9 @@ pub struct TrustPersister {
     /// Every entity file written (or found at startup) and the `through` it holds: the manifest
     /// each checkpoint carries, so startup can verify the checkpoint against the files.
     manifest: Mutex<HashMap<String, Option<u64>>>,
+    /// Runs before any cache file is written (the daemon: make the witness chain durable first),
+    /// so a file can never reach disk ahead of the row it projects (Codex, #1271 review 19161).
+    barrier: std::sync::OnceLock<crate::storage::inbox::PreWriteBarrier>,
 }
 
 impl TrustPersister {
@@ -527,6 +539,7 @@ impl TrustPersister {
             since: AtomicU64::new(0),
             batch_lock: Mutex::new(()),
             manifest: Mutex::new(HashMap::new()),
+            barrier: std::sync::OnceLock::new(),
         });
         #[cfg(test)]
         TEST_REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&p));
@@ -535,6 +548,11 @@ impl TrustPersister {
 
     fn q(&self) -> std::sync::MutexGuard<'_, PersistQueue> {
         self.queue.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Install the pre-write barrier (the daemon: make the witness chain durable first).
+    pub fn set_pre_write_barrier(&self, barrier: crate::storage::inbox::PreWriteBarrier) {
+        let _ = self.barrier.set(barrier);
     }
 
     fn manifest(&self) -> std::sync::MutexGuard<'_, HashMap<String, Option<u64>>> {
@@ -635,6 +653,12 @@ impl TrustPersister {
         use std::io::Write;
         if self.fail_next.swap(false, Ordering::AcqRel) {
             anyhow::bail!("injected trust cache write failure");
+        }
+        // The rows this batch projects are committed but maybe not yet durable: a file written
+        // ahead of its row survives a crash that loses the row, and holds a charge the chain does
+        // not (Codex, #1271 review 19161). A failed barrier fails the batch; it is retried.
+        if let Some(b) = self.barrier.get() {
+            b().map_err(|e| anyhow::anyhow!("chain durability barrier: {e}"))?;
         }
         for (path, (bytes, through)) in files {
             write_atomic(path, bytes)?;
@@ -810,6 +834,23 @@ mod tests {
 
     /// A stale file (older than its checkpoint lists) and an unreadable one both fail verification;
     /// the unreadable one is set aside so the replay rebuilds it.
+    #[test]
+    fn recovery_sets_aside_a_file_ahead_of_the_chain() {
+        let dir = TempDir::new().unwrap();
+        let store = TrustStore::open(dir.path(), KEY).unwrap();
+        store.recover(0).unwrap();
+        store.update_at("a", true, 0.8, at(2)).unwrap();
+        store.update_at("b", true, 0.8, at(5)).unwrap();
+        store.persister().flush_blocking();
+        let (a, b) = (store.entity_file("plugin:a"), store.entity_file("plugin:b"));
+        drop(store);
+        let reopened = TrustStore::open(dir.path(), KEY).unwrap();
+        assert_eq!(reopened.recover(4).unwrap(), (0, 0), "checkpoint at 5 is past a 4-row chain");
+        assert!(!b.exists() && b.with_extension("corrupt").exists(), "b (through 5) set aside");
+        assert!(a.exists(), "a (through 2) kept");
+        assert!(reopened.update_at("b", true, 0.8, at(3)).unwrap().is_some(), "rebuilt from the chain");
+    }
+
     #[test]
     fn recovery_replays_over_a_stale_or_unreadable_file() {
         let dir = TempDir::new().unwrap();
