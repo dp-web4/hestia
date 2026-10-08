@@ -161,7 +161,9 @@ impl SqliteInboxStore {
         let _ = self.barrier.set(barrier);
     }
 
-    /// The write connection, after the barrier. Every method that writes takes this.
+    /// The write connection, after the barrier. Every method that writes a row takes this. The
+    /// direct `self.conn.lock()` sites are reads (their `ensure_*_schema` calls are idempotent
+    /// DDL, not data) plus `peek_member`'s liveness touch, which names no chain fact.
     fn write_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
         if let Some(b) = self.barrier.get() {
             b().map_err(|e| anyhow::anyhow!("inbox write refused: {e}"))?;
@@ -671,7 +673,9 @@ impl SqliteInboxStore {
         pointer_uri: Option<&str>,
         chain_hash: &str,
     ) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
+        // The row names `chain_hash`: barrier first (Codex review 18933 — this ordinary
+        // admission was missed when the operation-keyed one was converted).
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         Self::enqueue_egress_on(
             &conn,
@@ -843,7 +847,9 @@ impl SqliteInboxStore {
         chain_hash: &str,
         in_reply_to: Option<u64>,
     ) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
+        // Local notices, escalation invitations, appeal dispatch: the row names `chain_hash`,
+        // so barrier first (Codex review 18933).
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         Self::enqueue_member_on(&conn, to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, in_reply_to)
     }
@@ -1533,6 +1539,10 @@ impl SqliteInboxStore {
     pub fn peek_member(&self, to_plugin: &str) -> Result<Vec<MemberNotice>> {
         let now = Utc::now();
         let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
+        // The one direct-lock write left in this store (audited for Codex review 18933): the
+        // liveness touch records WHEN the member read, and carries no chain fact, so a peek
+        // does not pay a chain flush for it. Every row that names a chain hash takes
+        // `write_conn`.
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
         Self::touch_inbox(&conn, to_plugin, &now)?;

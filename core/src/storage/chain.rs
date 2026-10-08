@@ -106,6 +106,8 @@ pub struct SqliteChainStore {
     /// passing, and a cache that silently misses an invalidation shows a member a trust level
     /// its own record has already contradicted. See `derivation_cache`.
     derivations: crate::derivation_cache::DerivationCache,
+    /// The highest chain length any read has observed (see `read_high_water`).
+    read_high_water: AtomicU64,
 }
 
 impl Drop for SqliteChainStore {
@@ -113,6 +115,27 @@ impl Drop for SqliteChainStore {
     fn drop(&mut self) {
         let n = self.len.load(Ordering::Acquire);
         let _ = self.durability.wait_durable_blocking(n);
+    }
+}
+
+/// A store connection inside one read transaction whose snapshot frontier has been registered
+/// (see `SqliteChainStore::observed`). Ends the transaction on drop.
+struct ObservedConn<'a> {
+    guard: std::sync::MutexGuard<'a, Connection>,
+}
+
+impl std::ops::Deref for ObservedConn<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.guard
+    }
+}
+
+impl Drop for ObservedConn<'_> {
+    fn drop(&mut self) {
+        if !self.guard.is_autocommit() && self.guard.execute_batch("COMMIT").is_err() {
+            let _ = self.guard.execute_batch("ROLLBACK");
+        }
     }
 }
 
@@ -307,13 +330,49 @@ impl SqliteChainStore {
             len,
             durability,
             derivations: crate::derivation_cache::DerivationCache::new(),
+            read_high_water: AtomicU64::new(0),
         })
     }
 
     /// DURABLE READS: a request that reads chain rows may reply with them, so it must not reply
-    /// before everything committed when it read is durable (no-op outside a request scope).
-    fn observe(&self) {
-        super::durability::note_observed(&self.durability, self.len.load(Ordering::Acquire));
+    /// before every row its read could see is durable.
+    ///
+    /// The frontier is the read's OWN snapshot, not a length sampled beside it (Codex review
+    /// 18933). Sampling `len` before taking the connection let a writer commit in between, and
+    /// the SELECT then returned a row the scope never waited for; sampling just after taking
+    /// it is not enough on `read_conn`, whose snapshot is fixed only by its first SELECT, and
+    /// `len` itself trails COMMIT by an instruction. So every read runs in one read
+    /// transaction whose FIRST statement fixes the snapshot and reads its frontier
+    /// (`MAX(chain_position) + 1`, an O(log n) primary-key lookup); every later statement of
+    /// the read sees exactly that snapshot, so nothing it returns lies beyond the frontier it
+    /// registered. The transaction ends when the guard drops (after every statement borrowed
+    /// from it). Registration is a no-op outside a request scope; the store-wide
+    /// [`Self::read_high_water`] records it regardless, for readers with no scope.
+    fn observed<'a>(&'a self, conn: &'a Mutex<Connection>) -> Result<ObservedConn<'a>> {
+        let guard = conn.lock().unwrap();
+        guard.execute_batch("BEGIN DEFERRED")?;
+        let frontier = guard.query_row(
+            "SELECT COALESCE(MAX(chain_position) + 1, 0) FROM chain_entries",
+            [],
+            |r| r.get::<_, i64>(0),
+        );
+        let frontier = match frontier {
+            Ok(f) => f.max(0) as u64,
+            Err(e) => {
+                let _ = guard.execute_batch("ROLLBACK");
+                return Err(e.into());
+            }
+        };
+        self.read_high_water.fetch_max(frontier, Ordering::AcqRel);
+        super::durability::note_observed(&self.durability, frontier);
+        Ok(ObservedConn { guard })
+    }
+
+    /// The highest snapshot frontier any read of this store has observed: a reader outside a
+    /// request scope (the dashboard worker, on the blocking pool) waits for this to be durable
+    /// before publishing what it read.
+    pub fn read_high_water(&self) -> u64 {
+        self.read_high_water.load(Ordering::Acquire)
     }
 
     /// `read_from`, clamped to the DURABLE frontier: for projectors that act outward on what they
@@ -354,8 +413,7 @@ impl SqliteChainStore {
 
     /// Most recent entry's hash, or the genesis sentinel if empty.
     pub fn tail_hash(&self) -> Result<String> {
-        self.observe();
-        let conn = self.read_conn.lock().unwrap();
+        let conn = self.observed(&self.read_conn)?;
         let h: Option<String> = conn
             .query_row(
                 "SELECT hash FROM chain_entries ORDER BY chain_position DESC LIMIT 1",
@@ -384,8 +442,7 @@ impl SqliteChainStore {
     /// tombstone. The caller can validate immutable application binding against
     /// the first witness instead of rebuilding it with a new session id.
     pub fn event_by_key(&self, event_key: &str) -> Result<Option<ChainEntry>> {
-        self.observe();
-        let conn = self.read_conn.lock().unwrap();
+        let conn = self.observed(&self.read_conn)?;
         conn.query_row(
             "SELECT e.chain_position, e.hash, e.prev_hash, e.event_type, e.event_data,
                     e.signer_lct, e.timestamp
@@ -519,8 +576,7 @@ impl SqliteChainStore {
     }
     /// Most recent `limit` entries in descending chain_position order.
     pub fn read_recent(&self, limit: u64) -> Result<Vec<ChainEntry>> {
-        self.observe();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.observed(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
              FROM chain_entries
@@ -547,8 +603,7 @@ impl SqliteChainStore {
     /// caller's cursor. Ascending order matters — a projector that walks
     /// newest-first could skip rows forever if appends outpace the page.
     pub fn read_from(&self, from_position: u64, limit: u64) -> Result<Vec<ChainEntry>> {
-        self.observe();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.observed(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
              FROM chain_entries
@@ -571,8 +626,7 @@ impl SqliteChainStore {
     /// event_data id has no index, so it pages instead). `before_position` is
     /// EXCLUSIVE; pass a value past the tail to start at the newest entry.
     pub fn read_before(&self, before_position: u64, limit: u64) -> Result<Vec<ChainEntry>> {
-        self.observe();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.observed(&self.conn)?;
         // u64::MAX as i64 would wrap negative — clamp into range.
         let before = i64::try_from(before_position).unwrap_or(i64::MAX);
         let mut stmt = conn.prepare(
@@ -606,11 +660,10 @@ impl SqliteChainStore {
         cutoff_rfc3339: Option<&str>,
         limit: u64,
     ) -> Result<Vec<ChainEntry>> {
-        self.observe();
         let Some(cutoff) = cutoff_rfc3339 else {
             return self.read_recent(limit);
         };
-        let conn = self.conn.lock().unwrap();
+        let conn = self.observed(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
              FROM chain_entries
@@ -675,13 +728,12 @@ impl SqliteChainStore {
         limit: u64,
         mut project: impl FnMut(ChainRowRef<'_>) -> Option<T>,
     ) -> Result<Vec<T>> {
-        self.observe();
         // An empty type list asks for nothing. Same rule as `read_recent_by_types`:
         // widening it to the whole chain would answer a question nobody posed.
         if matches!(event_types, Some(t) if t.is_empty()) {
             return Ok(Vec::new());
         }
-        let conn = self.read_conn.lock().unwrap();
+        let conn = self.observed(&self.read_conn)?;
         let mut where_parts: Vec<String> = Vec::new();
         if let Some(types) = event_types {
             where_parts.push(format!("event_type IN ({})", vec!["?"; types.len()].join(",")));
@@ -738,11 +790,10 @@ impl SqliteChainStore {
         event_types: &[&str],
         limit: u64,
     ) -> Result<Vec<ChainEntry>> {
-        self.observe();
         if event_types.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.observed(&self.conn)?;
         let placeholders = vec!["?"; event_types.len()].join(",");
         let (sql, has_cutoff) = match cutoff_rfc3339 {
             Some(_) => (
@@ -788,8 +839,7 @@ impl SqliteChainStore {
     /// window: fleet chain churn must not make quiet routing evidence disappear
     /// from the report merely because unrelated acts were busy.
     pub fn read_recent_route_shadow(&self, limit: u64) -> Result<Vec<ChainEntry>> {
-        self.observe();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.observed(&self.conn)?;
         // First choose exactly N parity samples. Then pull the legacy transport
         // disposition for successful samples by durable egress row id. Forward
         // events do not consume the sample limit.
@@ -836,8 +886,7 @@ impl SqliteChainStore {
     /// Fetch one entry by its hash (the chain's stable public identifier —
     /// receipts, claim_refs, and supersedes links all address entries this way).
     pub fn read_by_hash(&self, hash: &str) -> Result<Option<ChainEntry>> {
-        self.observe();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.observed(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
              FROM chain_entries WHERE hash = ?1 LIMIT 1",
@@ -882,11 +931,10 @@ impl SqliteChainStore {
     /// The filing and ruling paths keep their window deliberately: acting on an aged-out
     /// deny is refused. Knowing what happened to one is not.
     pub fn appeal_rows_for_pointer(&self, ptr: &str) -> Result<Vec<ChainEntry>> {
-        self.observe();
         let ptr = validate_hash_pointer(ptr)?;
         // Hex only (validated), so `%` cannot occur in `ptr` and needs no escaping.
         let pattern = if ptr.len() >= 8 { format!("{ptr}%") } else { ptr };
-        let conn = self.conn.lock().unwrap();
+        let conn = self.observed(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
              FROM chain_entries
@@ -915,8 +963,7 @@ impl SqliteChainStore {
     /// event types, like `appeal_rows_for_pointer`; on the read connection, so a reader never
     /// waits on the writer.
     pub fn escalation_rows(&self, escalation_id: &str) -> Result<Vec<ChainEntry>> {
-        self.observe();
-        let conn = self.read_conn.lock().unwrap();
+        let conn = self.observed(&self.read_conn)?;
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
              FROM chain_entries
@@ -940,8 +987,7 @@ impl SqliteChainStore {
     /// `appeal_rows_for_pointer`. `cap` bounds the rows returned (newest kept) so a member with
     /// a long appeal history cannot drag it all into memory in one read.
     pub fn appeal_rows_for_member(&self, plugin_id: &str, cap: u64) -> Result<Vec<ChainEntry>> {
-        self.observe();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.observed(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT * FROM (
                 SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
@@ -961,9 +1007,8 @@ impl SqliteChainStore {
     }
 
     pub fn read_by_hash_prefix(&self, prefix: &str, cap: u64) -> Result<Vec<ChainEntry>> {
-        self.observe();
         validate_hash_pointer(prefix)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.observed(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
              FROM chain_entries WHERE hash LIKE ?1 || '%'
@@ -993,9 +1038,8 @@ impl SqliteChainStore {
     /// still cannot tell 9 from 900, and COUNT over the `hash` index never
     /// materializes a row.
     pub fn count_by_hash_prefix(&self, prefix: &str) -> Result<u64> {
-        self.observe();
         validate_hash_pointer(prefix)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.observed(&self.conn)?;
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM chain_entries WHERE hash LIKE ?1 || '%'",
             params![prefix],
@@ -1022,8 +1066,7 @@ impl SqliteChainStore {
         marker: &str,
         cap: u64,
     ) -> Result<Vec<ChainEntry>> {
-        self.observe();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.observed(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT * FROM (
                SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
@@ -1051,8 +1094,7 @@ impl SqliteChainStore {
     /// so this is history, never a prediction: the bundle presents it as what the member has
     /// been refused for, and leaves the inference to whoever is deciding.
     pub fn denies_for_member(&self, plugin_id: &str, cap: u64) -> Result<Vec<ChainEntry>> {
-        self.observe();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.observed(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
              FROM chain_entries
@@ -1071,8 +1113,7 @@ impl SqliteChainStore {
     }
 
     pub fn read_failures(&self, limit: u64) -> Result<Vec<ChainEntry>> {
-        self.observe();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.observed(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
              FROM chain_entries
@@ -1091,8 +1132,7 @@ impl SqliteChainStore {
 
     /// Entries since (exclusive of) `chain_position`, ascending.
     pub fn read_since(&self, chain_position: u64, limit: u64) -> Result<Vec<ChainEntry>> {
-        self.observe();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.observed(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
              FROM chain_entries
@@ -1111,7 +1151,7 @@ impl SqliteChainStore {
     /// Verify hash linkage walks correctly from genesis to tail.
     /// Returns the chain length on success, or an error describing the break.
     pub fn verify_integrity(&self) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.observed(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
              FROM chain_entries ORDER BY chain_position ASC",
@@ -1219,6 +1259,102 @@ mod tests {
     use tempfile::TempDir;
 
     const TEST_KEY: [u8; 32] = [7u8; 32];
+
+    /// Codex review 18933, P1 (read frontier): a read must wait for every row it RETURNS, not
+    /// for a length sampled before its SQL ran. The probe is Codex's, inverted into the
+    /// contract: the reader is parked on its connection, a row is appended and left in the
+    /// commit-to-fsync window, then the connection is released. Whatever the reader returns
+    /// while the window is held must already be durable; once released, it returns the row.
+    ///
+    /// The bounded wait for the scope's Arc is what made the old shape fail deterministically
+    /// (it registered its frontier BEFORE blocking on the connection); the fixed shape registers
+    /// after its snapshot is taken, so the wait simply times out.
+    #[test]
+    fn a_read_waits_for_every_row_it_returns() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap());
+        let hold = store.durability().hold_flush_for_test();
+        let read_guard = store.read_conn.lock().unwrap();
+        let baseline = Arc::strong_count(store.durability());
+        let reader_store = store.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let (hash, status) = rt.block_on(crate::storage::durability::durable_scope(async {
+                reader_store.tail_hash().unwrap()
+            }));
+            let durable_at_return = reader_store.durability().frontier().durable;
+            tx.send((hash, status, durable_at_return)).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Arc::strong_count(store.durability()) == baseline && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let row = store.append("review_fact", json!({"n": 1}), "lct:test").unwrap();
+        drop(read_guard);
+        let early = rx.recv_timeout(Duration::from_millis(1500));
+        drop(hold);
+        let (hash, status, durable_at_return) = match early {
+            Ok(r) => r,
+            Err(_) => rx.recv_timeout(Duration::from_secs(10)).expect("reader returns once durable"),
+        };
+        reader.join().unwrap();
+        status.unwrap();
+        assert!(
+            hash != row.hash || durable_at_return > row.chain_position,
+            "a read returned position {} while the durable length was {durable_at_return}",
+            row.chain_position
+        );
+        assert_eq!(hash, row.hash, "the reader's snapshot was taken after the append");
+    }
+
+    /// The same contract for an aggregate (a count is a chain fact too) and for a read on the
+    /// WRITE connection: every read reports the snapshot frontier it actually read, and the
+    /// store's read high-water covers it (the dashboard worker waits on that).
+    #[test]
+    fn every_read_registers_the_frontier_of_its_own_snapshot() {
+        use std::sync::Arc;
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap());
+        let _hold = store.durability().hold_flush_for_test();
+        let row = store.append("review_fact", json!({"n": 1}), "lct:test").unwrap();
+        assert_eq!(store.read_high_water(), 0, "nothing has been read yet");
+        let prefix = &row.hash[..8];
+        assert_eq!(store.count_by_hash_prefix(prefix).unwrap(), 1);
+        assert_eq!(store.read_high_water(), row.chain_position + 1, "count_by_hash_prefix");
+        let row2 = store.append("review_fact", json!({"n": 2}), "lct:test").unwrap();
+        assert_eq!(store.read_recent(10).unwrap().len(), 2);
+        assert_eq!(store.read_high_water(), row2.chain_position + 1, "read_recent (write connection)");
+    }
+
+    /// A read's frontier is its snapshot, so it can be past this store's own `committed` count
+    /// (a row another handle appended to the same file). The wait must still end: the fsync
+    /// that follows the request covers every row the reader saw.
+    #[test]
+    fn a_read_past_this_handles_committed_count_still_completes() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("w.db");
+        let reader = Arc::new(SqliteChainStore::open(&path, TEST_KEY).unwrap());
+        let other = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        let row = other.append("review_fact", json!({"n": 1}), "lct:other").unwrap();
+        assert_eq!(reader.durability().committed(), 0, "setup: the reader's handle did not append");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = reader.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let out = rt.block_on(crate::storage::durability::durable_scope(async { r.tail_hash().unwrap() }));
+            let _ = tx.send(out);
+        });
+        let (hash, status) = rx.recv_timeout(Duration::from_secs(10))
+            .expect("a read whose snapshot ran past `committed` never completed");
+        status.unwrap();
+        assert_eq!(hash, row.hash);
+        assert!(reader.durability().frontier().durable >= 1);
+    }
 
     // ------------------------------------------------------------- group commit (durability)
 
