@@ -4,6 +4,7 @@
 //!
 //! - `check(key, max, window_ms)` — would a new firing be under the limit?
 //! - `record(key)` — record a firing
+//! - `admit(key, max, window_ms)` — check and, if under the limit, record, as ONE step
 //! - `prune(window_ms)` — drop expired entries globally
 //!
 //! Time uses Unix-epoch milliseconds (`SystemTime::UNIX_EPOCH`). The
@@ -48,6 +49,28 @@ impl RateLimiter {
         let current = entry.len() as u32;
         RateLimitResult {
             allowed: current < max_count,
+            current,
+            limit: max_count,
+        }
+    }
+
+    /// Check and, when under the limit, record the firing, under ONE lock acquisition.
+    ///
+    /// Policy evaluation runs concurrently outside the state lock (#1272), so `check` then
+    /// `record` would let two callers both see the last free slot and both be admitted.
+    pub fn admit(&self, key: &str, max_count: u32, window_ms: u64) -> RateLimitResult {
+        let now = now_ms();
+        let cutoff = now.saturating_sub(window_ms);
+        let mut guard = self.windows.lock().unwrap();
+        let entry = guard.entry(key.to_string()).or_default();
+        entry.retain(|t| *t > cutoff);
+        let current = entry.len() as u32;
+        let allowed = current < max_count;
+        if allowed {
+            entry.push(now);
+        }
+        RateLimitResult {
+            allowed,
             current,
             limit: max_count,
         }
@@ -147,6 +170,30 @@ mod tests {
         let pruned = l.prune(5);
         assert_eq!(pruned, 1);
         assert_eq!(l.key_count(), 0);
+    }
+
+    /// Many threads racing for the last slots: exactly `max` are admitted.
+    #[test]
+    fn concurrent_admissions_never_exceed_the_limit() {
+        use std::sync::{Arc, Barrier};
+        for _ in 0..200 {
+            let l = Arc::new(RateLimiter::new());
+            let start = Arc::new(Barrier::new(16));
+            let admitted: u32 = (0..16)
+                .map(|_| {
+                    let (l, start) = (l.clone(), start.clone());
+                    std::thread::spawn(move || {
+                        start.wait();
+                        u32::from(l.admit("k", 3, 60_000).allowed)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|j| j.join().unwrap())
+                .sum();
+            assert_eq!(admitted, 3);
+            assert_eq!(l.count("k"), 3);
+        }
     }
 
     #[test]

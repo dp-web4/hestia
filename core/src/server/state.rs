@@ -484,7 +484,7 @@ pub struct ServerState {
     /// Hub-law gate (consolidation, 2026-07-10): the third fold input.
     /// `None` = no law file at `$HESTIA_HOME/law/hub-law.yaml` (no-op);
     /// `Some(Invalid)` fails closed. See `policy::law_gate`.
-    pub law_gate: Option<crate::policy::LawGate>,
+    pub law_gate: crate::server::published::Watched<Option<Arc<crate::policy::LawGate>>>,
     /// Plugin IDs that self-declared as synthetic (test harnesses,
     /// fuzzers, etc.). Excluded from operator-facing aggregations by
     /// default. Enclosed in the vault (document `presence`/`synthetic`).
@@ -811,7 +811,7 @@ impl ServerState {
             publication_version: 0,
             published_lists_gen: u64::MAX,
             transport_bindings,
-            law_gate,
+            law_gate: crate::server::published::Watched::new(law_gate.map(Arc::new)),
             synthetic_plugins,
             home: home.to_path_buf(),
             member_notify_limiter: crate::policy::RateLimiter::new(),
@@ -996,7 +996,7 @@ impl ServerState {
             .collect();
         // Re-read the machine-local hub law alongside vault policy so an
         // operator law update lands without a daemon restart.
-        self.law_gate = crate::policy::LawGate::load(&self.home);
+        *self.law_gate = crate::policy::LawGate::load(&self.home).map(Arc::new);
     }
 
     /// Issue a Soft LCT for a new session.
@@ -1040,6 +1040,26 @@ impl ServerState {
     ///
     /// Callers must apply this BEFORE folding hub law, so ratified society law still binds. See
     /// the ordering note at the `gate_direct_tool` call site.
+    /// The full law fold for an action, on LIVE state (lock holders). One implementation with
+    /// the publication's: `published::evaluate_folded`.
+    pub fn evaluate_folded(
+        &self,
+        plugin_id: &str,
+        role: &str,
+        pa: &crate::policy::PolicyAction,
+    ) -> crate::policy::PolicyEvaluation {
+        crate::server::published::evaluate_folded(
+            &self.policy_engine,
+            &self.role_policy_engines,
+            &self.instance_policy_engines,
+            &self.instance_grants,
+            self.law_gate.as_deref(),
+            plugin_id,
+            role,
+            pa,
+        )
+    }
+
     pub fn apply_instance_grant(
         &self,
         plugin_id: &str,
@@ -1993,17 +2013,14 @@ impl ServerState {
 
 impl ServerState {
     fn build_publication(&self) -> crate::server::published::PolicyPublication {
-        use crate::server::published::{EngineView, PolicyPublication};
+        use crate::server::published::PolicyPublication;
         PolicyPublication {
             version: self.publication_version,
-            society: EngineView::of(&self.policy_engine),
-            roles: self.role_policy_engines.iter().map(|(k, e)| (k.clone(), EngineView::of(e))).collect(),
-            instances: self
-                .instance_policy_engines
-                .iter()
-                .map(|(k, e)| (k.clone(), EngineView::of(e)))
-                .collect(),
+            society: (*self.policy_engine).clone(),
+            roles: (*self.role_policy_engines).clone(),
+            instances: (*self.instance_policy_engines).clone(),
             instance_grants: (*self.instance_grants).clone(),
+            law_gate: (*self.law_gate).clone(),
             policy_lists: self.vault.policy_lists(),
             scope_requests: (*self.scope_requests).clone(),
             standing_scope: (*self.standing_scope).clone(),
@@ -2024,6 +2041,7 @@ impl ServerState {
         d |= self.role_policy_engines.take_dirty();
         d |= self.instance_policy_engines.take_dirty();
         d |= self.instance_grants.take_dirty();
+        d |= self.law_gate.take_dirty();
         d |= self.scope_requests.take_dirty();
         d |= self.standing_scope.take_dirty();
         d |= self.authority_status.take_dirty();
