@@ -744,6 +744,34 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // THE REUSE ARM, LOCK-FREE (stage 2). The gate connects on every tool call, and for a known
+    // (member, host session) a connect is a liveness bump and nothing else (Guard A below). That
+    // answer is served from the session directory published beside the policy snapshot, without
+    // the state lock: before this every gate call's first step queued behind every write in the
+    // society. Same reply, same Guard A/C semantics (the key is (plugin_id, host_session_id),
+    // never the host id alone); a miss falls through to the locked path, which re-checks.
+    if let Some(hsid) = host_session_id.as_deref() {
+        let published = state.published();
+        if let Some(existing) = published.sessions.find_reuse(&plugin_id, hsid) {
+            existing.touch();
+            if let Some(capabilities) = gate_capabilities.as_ref() {
+                published.gate_capabilities.insert(plugin_id.clone(), capabilities.clone());
+            }
+            let honored = !declared_role.is_empty() && declared_role == existing.constellation_role;
+            return Ok(json!({
+                "sessionId": existing.session_id,
+                "softLct": existing.soft_lct,
+                "assignedRole": existing.assigned_role,
+                "constellationRole": existing.constellation_role,
+                "roleDeclarationHonored": honored,
+                "roleBasis": existing.role_basis,
+                "gateCapabilityReportAccepted": gate_capability_report_accepted,
+                "protocolVersion": 1,
+                "reused": true,
+            }));
+        }
+    }
+
     let mut s = state.lock().await;
 
     // Connect idempotency (HUB ruling 2026-07-24): the claude-code hook connects on EVERY tool call
@@ -765,11 +793,9 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
     //     `plugin_id` is still asserted, proof-of-possession is #824's boundary, and #981's close
     //     predicate remains exact action/session identity, not this pair.
     if let Some(hsid) = host_session_id.as_deref() {
-        if let Some(existing) = s
-            .sessions
-            .values_mut()
-            .find(|sess| sess.plugin_id == plugin_id && sess.host_session_id.as_deref() == Some(hsid))
-        {
+        let reuse_id = s.sessions.find_reuse_id(&plugin_id, hsid);
+        let caps_table = s.gate_capabilities.clone();
+        if let Some(mut existing) = reuse_id.and_then(|id| s.sessions.get_mut(&id)) {
             existing.connected_at = Utc::now(); // Guard A: liveness only — no other field mutates
             // Guard A means a reused session keeps the role it was MINTED with — this
             // call's `role` argument is ignored outright. Report against the role the
@@ -787,11 +813,11 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
                 "protocolVersion": 1,
                 "reused": true,
             });
+            drop(existing);
             // Store the report only after this call has been accepted as a real reuse. A
             // refused connect must never leave a green deployment-health residue.
             if let Some(capabilities) = gate_capabilities.as_ref() {
-                s.gate_capabilities
-                    .insert(plugin_id.clone(), capabilities.clone());
+                caps_table.insert(plugin_id.clone(), capabilities.clone());
             }
             return Ok(response);
         }
@@ -1127,7 +1153,10 @@ pub(crate) async fn tool_record_outcome(state: &SharedState, args: &Value) -> To
 /// Composed in the order the gate itself folds, and every statement names the LAYER it
 /// came from, so a member can tell a society-wide norm from something bound to it alone.
 async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
-    let s = state.lock().await;
+    // LOCK-FREE (stage 2): composed from the published policy snapshot, never the state lock.
+    // The snapshot is swapped atomically at the release of any write that changed a policy
+    // input, so this reads the law before or after a change — never half of one.
+    let p = state.published();
     // ATTRIBUTED CALLERS ONLY — and "attributed" means RESOLVED, not "an id was supplied".
     //
     // The first fix here guarded on a MISSING session_id, which kimi measured as still
@@ -1143,7 +1172,7 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
     // `resolve_attributed_caller` parses, looks up, and returns None on any failure — the
     // correct primitive, already in this file, thirty lines from the surface that needed
     // it. The error contract is now "a caller was attributed", not "an id was supplied".
-    let Some(who) = resolve_attributed_caller(&s, optional_session_id(args).as_deref())
+    let Some(who) = p.resolve(optional_session_id(args).as_deref())
     else {
         return Ok(hestia_error_envelope(
             "hestia.operating_law_unattributed",
@@ -1162,23 +1191,23 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
     // which means this surface has to reflect the substitution, not merely mention it. A member
     // told "society: deny" while the gate runs it under a permissive grant has been told the
     // wrong law, and would waste a session obeying a rule nobody is applying to it.
-    let granted = s
+    let granted = p
         .instance_grant(&who.plugin_id, &who.role_lct)
         .and_then(|g| crate::policy::get_preset(&g.preset).map(|p| (g, p)));
-    let grant_engine = granted
-        .as_ref()
-        .map(|(_, p)| crate::policy::PolicyEngine::new(p.config.clone()));
+    let grant_engine = granted.as_ref().map(|(_, preset)| {
+        super::published::EngineView::of(&crate::policy::PolicyEngine::new(preset.config.clone()))
+    });
 
-    let mut layers: Vec<(String, &crate::policy::PolicyEngine)> = Vec::new();
+    let mut layers: Vec<(String, &super::published::EngineView)> = Vec::new();
     if let Some(e) = grant_engine.as_ref() {
         layers.push(("operator-grant".to_string(), e));
     } else {
-        layers.push(("society".to_string(), &s.policy_engine));
-        if let Some(e) = s.role_policy_engines.get(&who.role_lct) {
+        layers.push(("society".to_string(), &p.society));
+        if let Some(e) = p.roles.get(&who.role_lct) {
             layers.push((format!("role:{}", who.role_lct), e));
         }
-        if let Some(e) = s
-            .instance_policy_engines
+        if let Some(e) = p
+            .instances
             .get(&(who.plugin_id.clone(), who.role_lct.clone()))
         {
             layers.push((format!("instance:{}", who.plugin_id), e));
@@ -1201,8 +1230,7 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
     }
 
     // Operator-authored lists bound to this member (vault-stored; see vault::policy_lists).
-    let lists = s.vault.policy_lists();
-    let bound = crate::vault::policy_lists::for_member(&lists, &who.plugin_id, &who.role_lct);
+    let bound = crate::vault::policy_lists::for_member(&p.policy_lists, &who.plugin_id, &who.role_lct);
     for l in &bound {
         use crate::vault::policy_lists::ListPerm;
         // METADATA VISIBILITY IS DECIDED, NOT INHERITED (kimi, finding 2). The first cut
@@ -1291,7 +1319,7 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         // widening the subject cannot see is a trapdoor whether it widens a PRESET or a PATH.
         // Being in `body` means a grant appearing or lapsing moves `law_hash`, so a member that
         // pins the hash learns its reach changed instead of discovering it by trying.
-        "scope_grants": s.live_scope_grants(&who.plugin_id)
+        "scope_grants": p.live_scope_grants(&who.plugin_id)
             .iter()
             .map(|r| json!({
                 "path": r.path,
@@ -1305,7 +1333,7 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         // (Sprint F R1): the durable widening is the one a member most needs to see, because
         // it is the one no restart will quietly retire. A standing grant appearing, expiring
         // or being revoked MOVES law_hash.
-        "standing_grants": s.live_standing_grants(&who.plugin_id)
+        "standing_grants": p.live_standing_grants(&who.plugin_id)
             .iter()
             .map(|g| json!({
                 "path": g.path,
@@ -1335,7 +1363,7 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
     let mut out = body;
     if let Some(o) = out.as_object_mut() {
         o.insert("law_hash".into(), json!(law_hash));
-        o.insert("society_policy_hash".into(), json!(s.policy_engine.content_hash()));
+        o.insert("society_policy_hash".into(), json!(p.society.content_hash()));
     }
     Ok(json!({
         // FOURTH instance of the shape the comment below names, caught while adding this
@@ -1372,6 +1400,9 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         // existing audit entries reference it.
         "law_hash": out.get("law_hash").cloned().unwrap_or(Value::Null),
         "society_policy_hash": out.get("society_policy_hash").cloned().unwrap_or(Value::Null),
+        // Outside the hashed body on purpose: it moves on ANY republish, the hash only when this
+        // member's law changed. A decision row records the same number (`policy_version`).
+        "publication_version": p.version,
         "note": "This is the law you operate under. If a rule blocks legitimate work, \
                  appeal it with `hestia_appeal` (the deny's chain hash + your reason) \
                  rather than rephrasing around it. An appeal is recorded conduct that can \
@@ -1629,6 +1660,10 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         let charge_held_by =
             s.decision_ledger.charge_holder(&plugin_id_for_chain, action_id).map(str::to_string);
         let mut own_data = json!({
+                // WHICH published law this verdict was evaluated under (stage 2): the same
+                // `publication_version` `hestia_operating_law` returns beside its law_hash, so a
+                // decision row can be joined to the exact law a gate fetched.
+                "policy_version": s.publication_version,
                 "action_id": action_id_str,
                 "tool_name": action.tool_name,
                 "target": target,
@@ -1749,6 +1784,7 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         // already handle both branches per spec §3.4.1.
         "status": "decided",
         "nextPollMs": serde_json::Value::Null,
+        "policyVersion": s.publication_version,
     }))
 }
 
@@ -8383,7 +8419,8 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
         // coordination-safe metadata and REDACTS the bearer fields. `session/own` still returns the full
         // session: you may hold your OWN capability, never a peer's.
         let mut sessions: Vec<&Session> = s.sessions.values().collect();
-        sessions.sort_by_key(|sess| sess.connected_at);
+        // Liveness includes lock-free reuse bumps (stage 2), which land in the directory.
+        sessions.sort_by_key(|sess| s.sessions.last_seen(sess));
         let safe: Vec<Value> = sessions
             .iter()
             .map(|sess| {
@@ -8391,7 +8428,7 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
                     "host_agent": sess.host_agent,
                     "host_agent_version": sess.host_agent_version,
                     "role": sess.constellation_role,
-                    "connected_at": sess.connected_at,
+                    "connected_at": s.sessions.last_seen(sess),
                     // The coordination-safe NAME: host_session_id NAMES a session (so a sibling/launcher
                     // can say "session X holds this") without conferring capability (Guard B — never an
                     // authz key). session_id + soft_lct remain OMITTED (bearer tokens in the vault path).
@@ -9227,7 +9264,7 @@ fn resolve_session_uuid(
     state
         .sessions
         .values()
-        .max_by_key(|sess| sess.connected_at)
+        .max_by_key(|sess| state.sessions.last_seen(sess))
         .map(|sess| sess.session_id)
 }
 
@@ -10671,7 +10708,7 @@ mod accountability_tests {
         // deterministically, independent of the fresh vault's default policy.
         {
             let mut s = state.lock().await;
-            s.policy_engine = crate::policy::PolicyEngine::new(
+            *s.policy_engine = crate::policy::PolicyEngine::new(
                 crate::policy::get_preset("safety").unwrap().config,
             );
         }
@@ -10743,7 +10780,7 @@ mod accountability_tests {
         let (_dir, state) = test_state().await;
         {
             let mut s = state.lock().await;
-            s.policy_engine = crate::policy::PolicyEngine::new(
+            *s.policy_engine = crate::policy::PolicyEngine::new(
                 crate::policy::get_preset("safety").unwrap().config,
             );
         }
@@ -10816,7 +10853,7 @@ mod accountability_tests {
         let (_dir, state) = test_state().await;
         {
             let mut s = state.lock().await;
-            s.policy_engine = crate::policy::PolicyEngine::new(
+            *s.policy_engine = crate::policy::PolicyEngine::new(
                 crate::policy::get_preset("safety").unwrap().config,
             );
         }
@@ -19874,7 +19911,7 @@ mod appeal_tests {
     pub(super) async fn seat_in_wake(state: &SharedState, plugin_id: &str, wake: &str) -> Uuid {
         let sid = seat(state, plugin_id).await;
         let mut s = state.lock().await;
-        if let Some(sess) = s.sessions.get_mut(&sid) {
+        if let Some(mut sess) = s.sessions.get_mut(&sid) {
             sess.host_session_id = Some(wake.to_string());
         }
         sid
@@ -23008,7 +23045,8 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
 
     let plugin_id = require_string(args, "plugin_id")?;
     let now = now_secs();
-    let s = state.lock().await;
+    // LOCK-FREE (stage 2): the published policy snapshot, never the state lock.
+    let s = state.published();
 
     // THE HONOR HORIZON IS BOUNDED BY WHAT IT COVERS (GPT review of #431, blocker 3). A
     // flat now+8h told consumers they could honour a cached snapshot for hours while a
@@ -23134,6 +23172,7 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
             .map(|a| a.divergence.clone())
             .unwrap_or_default(),
         "snapshot_expires_at": snapshot_expires_at,
+        "publication_version": s.version,
         "lifetime": "live_grants are memory-only — they die with the daemon, and the operator \
                      can also withdraw one early: its request then reads status `revoked`, with \
                      `revoked_by` and `revoke_reason`. standing_grants \
@@ -25101,7 +25140,7 @@ mod standing_scope_surface_tests {
         assert_eq!(s.standing_scope.grants.len(), 2);
         assert!(s.standing_scope.floor_allows("/w/shared"));
         assert_eq!(
-            s.authority_status,
+            *s.authority_status,
             crate::server::standing_scope::AuthorityStatus::Loaded,
             "a document was present, so this is neither a fresh install nor a migration"
         );
@@ -25318,7 +25357,7 @@ mod standing_scope_surface_tests {
 
         let (_dir, fresh) = test_state().await;
         assert_eq!(
-            fresh.lock().await.authority_status,
+            *fresh.lock().await.authority_status,
             AuthorityStatus::Fresh,
             "no document and no history is a fresh install, and empty is correct"
         );
@@ -25339,7 +25378,7 @@ mod standing_scope_surface_tests {
         let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
         let s = state.lock().await;
         assert_eq!(
-            s.authority_status,
+            *s.authority_status,
             AuthorityStatus::MigrationRequired,
             "history plus no standing document is a migration, not an empty society"
         );
@@ -25621,7 +25660,7 @@ mod standing_scope_surface_tests {
         .await
         .unwrap();
         assert_eq!(first["gateCapabilityReportAccepted"], true);
-        assert!(state.lock().await.gate_capabilities["codex"].contains("society-floor:v1"));
+        assert!(state.lock().await.gate_capabilities.get("codex").unwrap().contains("society-floor:v1"));
 
         // A normal non-gate connect says nothing about the installed gate and must not turn
         // a prior positive report into a false negative merely by omitting the field.
@@ -25632,7 +25671,7 @@ mod standing_scope_surface_tests {
         .await
         .unwrap();
         assert_eq!(second["gateCapabilityReportAccepted"], false);
-        assert!(state.lock().await.gate_capabilities["codex"].contains("society-floor:v1"));
+        assert!(state.lock().await.gate_capabilities.get("codex").unwrap().contains("society-floor:v1"));
 
         let refused = tool_connect(
             &state,
@@ -28378,7 +28417,7 @@ mod decision_witness_tests {
         let state = open_state(&dir);
         {
             let mut s = state.lock().await;
-            s.policy_engine = crate::policy::PolicyEngine::new(
+            *s.policy_engine = crate::policy::PolicyEngine::new(
                 crate::policy::get_preset("safety").unwrap().config,
             );
         }
@@ -29081,7 +29120,7 @@ mod concurrency_battery {
         let state = open_state(&dir);
         {
             let mut s = state.lock().await;
-            s.policy_engine =
+            *s.policy_engine =
                 crate::policy::PolicyEngine::new(crate::policy::get_preset("safety").unwrap().config);
         }
         let sid = connect(&state, "battery-fsync", "hs-f").await;
@@ -29139,7 +29178,7 @@ mod concurrency_battery {
         let state = open_state(&dir);
         {
             let mut s = state.lock().await;
-            s.policy_engine =
+            *s.policy_engine =
                 crate::policy::PolicyEngine::new(crate::policy::get_preset("safety").unwrap().config);
         }
         let mut sids = Vec::new();
@@ -29380,5 +29419,181 @@ mod concurrency_battery {
         }
         eprintln!("battery: {decided} escalations decided, {spent_total} spent, {} notices \
                    delivered; outcomes {deciders:?}", got.len());
+    }
+}
+
+#[cfg(test)]
+mod published_snapshot_tests {
+    //! Stage 2: the gate's policy snapshot is served from an atomically swapped publication and
+    //! never takes the state lock.
+    use super::inbox_tests::{open_state, seeded_home};
+    use super::*;
+    use std::time::Duration;
+
+    const DENY_CMD: &str = "rm -rf /home/user/data";
+
+    fn engine_tagged(tag: &str) -> crate::policy::PolicyEngine {
+        let mut cfg = crate::policy::get_preset("safety").unwrap().config;
+        for r in cfg.rules.iter_mut() {
+            r.name = format!("{tag}:{}", r.name);
+        }
+        crate::policy::PolicyEngine::new(cfg)
+    }
+
+    async fn connected(state: &SharedState, member: &str, hs: &str) -> String {
+        tool_connect(state, &json!({"plugin_id": member, "host_agent": "h", "host_session_id": hs}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// The property the stage exists for: a writer holding the state lock (as a slow append
+    /// did for seconds) no longer stalls the gate's three snapshot calls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_gate_snapshot_is_served_while_the_state_lock_is_held() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = connected(&state, "codex", "hs-1").await;
+        let held = state.lock().await;
+        let calls = async {
+            let c = tool_connect(&state, &json!({"plugin_id": "codex", "host_agent": "h",
+                                                 "host_session_id": "hs-1",
+                                                 "gate_capabilities": ["society-floor:v1"]}))
+                .await
+                .unwrap();
+            assert_eq!(c["reused"], json!(true), "{c}");
+            assert_eq!(c["sessionId"], json!(sid));
+            let law = tool_operating_law(&state, &json!({"session_id": sid})).await.unwrap();
+            assert!(law["law_hash"].is_string(), "{law}");
+            let sc = tool_scope_status(&state, &json!({"plugin_id": "codex"})).await.unwrap();
+            assert!(sc["generation"].is_u64(), "{sc}");
+        };
+        tokio::time::timeout(Duration::from_secs(5), calls)
+            .await
+            .expect("a gate snapshot call waited on the state lock");
+        drop(held);
+        // The lock-free reuse arm's write is visible to lock holders too.
+        let s = state.lock().await;
+        assert!(s.gate_capabilities.get("codex").is_some_and(|c| c.contains("society-floor:v1")));
+    }
+
+    /// A policy change made in ONE critical section (society engine AND the member's role
+    /// overlay, tagged together) is seen whole or not at all by concurrent law readers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reader_sees_a_policy_change_whole_or_not_at_all() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = connected(&state, "codex", "hs-1").await;
+        let role = tool_operating_law(&state, &json!({"session_id": sid})).await.unwrap()
+            ["identity"]["role"].as_str().unwrap().to_string();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut readers = tokio::task::JoinSet::new();
+        for _ in 0..3 {
+            let (st, sid, done) = (state.clone(), sid.clone(), done.clone());
+            readers.spawn(async move {
+                let mut reads = 0u32;
+                while !done.load(std::sync::atomic::Ordering::Acquire) || reads == 0 {
+                    let law = tool_operating_law(&st, &json!({"session_id": sid})).await.unwrap();
+                    let mut society = std::collections::BTreeSet::new();
+                    let mut role_tags = std::collections::BTreeSet::new();
+                    let mut role_present = false;
+                    for stmt in law["law"].as_array().unwrap() {
+                        let layer = stmt["layer"].as_str().unwrap_or("");
+                        // "g<k>:<rule>" after a change; any untagged name is the base law.
+                        let name = stmt["rule"].as_str().unwrap_or("");
+                        let tag = match name.split_once(':') {
+                            Some((t, _)) if t.starts_with('g')
+                                && t[1..].parse::<u32>().is_ok() => t.to_string(),
+                            _ => "base".to_string(),
+                        };
+                        if layer == "society" {
+                            society.insert(tag);
+                        } else if layer.starts_with("role:") {
+                            role_present = true;
+                            role_tags.insert(tag);
+                        }
+                    }
+                    assert_eq!(society.len(), 1, "one society law per read: {society:?}");
+                    if role_present {
+                        assert_eq!(society, role_tags,
+                                   "HALF A CHANGE: society {society:?} vs role {role_tags:?}");
+                    } else {
+                        assert_eq!(society.iter().next().unwrap(), "base",
+                                "society changed but its paired role overlay is missing: {society:?}");
+                    }
+                    reads += 1;
+                    tokio::task::yield_now().await;
+                }
+                reads
+            });
+        }
+        for k in 0..150 {
+            let mut s = state.lock().await;
+            *s.policy_engine = engine_tagged(&format!("g{k}"));
+            tokio::task::yield_now().await; // widen the window between the two halves
+            s.role_policy_engines.insert(role.clone(), engine_tagged(&format!("g{k}")));
+        }
+        done.store(true, std::sync::atomic::Ordering::Release);
+        let mut total = 0;
+        while let Some(r) = readers.join_next().await {
+            total += r.expect("a reader saw half a change");
+        }
+        assert!(total > 0);
+    }
+
+    /// The law names the publication it was composed from, a decision records the version it was
+    /// evaluated under, and they agree; a policy change moves both (and the hash).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_law_and_the_decision_name_the_same_publication_version() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine = crate::policy::PolicyEngine::new(
+                crate::policy::get_preset("safety").unwrap().config);
+        }
+        let sid = connected(&state, "codex", "hs-1").await;
+        let decide = |st: SharedState, sid: String| async move {
+            let b = tool_begin_action(&st, &json!({"tool_name": "Bash", "target": DENY_CMD,
+                "parameters": {"command": DENY_CMD}, "session_id": sid})).await.unwrap();
+            tool_query_policy(&st, &json!({"action_id": b["actionId"]})).await.unwrap()
+        };
+        let law1 = tool_operating_law(&state, &json!({"session_id": sid})).await.unwrap();
+        let v1 = law1["publication_version"].as_u64().expect("version");
+        let d1 = decide(state.clone(), sid.clone()).await;
+        assert_eq!(d1["policyVersion"], json!(v1), "{d1}");
+        let row = {
+            let s = state.lock().await;
+            s.recent_chain(20).into_iter().find(|e| e.event_type == "policy_decision").unwrap()
+        };
+        assert_eq!(row.event_data["policy_version"], json!(v1));
+
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine = engine_tagged("changed");
+        }
+        let law2 = tool_operating_law(&state, &json!({"session_id": sid})).await.unwrap();
+        let v2 = law2["publication_version"].as_u64().unwrap();
+        assert!(v2 > v1);
+        assert_ne!(law2["law_hash"], law1["law_hash"], "the law changed, so must its hash");
+        let d2 = decide(state.clone(), sid.clone()).await;
+        assert_eq!(d2["policyVersion"], json!(v2), "{d2}");
+        let law3 = tool_operating_law(&state, &json!({"session_id": sid})).await.unwrap();
+        assert_eq!(law3["law_hash"], law2["law_hash"], "an unchanged law reads back unchanged");
+    }
+
+    /// Negative control for the debug staleness check: a policy change whose dirty bit is lost
+    /// (the one way a stale publication could arise) panics at the release that made it.
+    #[tokio::test]
+    #[should_panic(expected = "STALE POLICY PUBLICATION")]
+    async fn the_debug_check_catches_a_change_that_escaped_watched() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let mut s = state.lock().await;
+        *s.policy_engine = engine_tagged("escaped");
+        s.forget_policy_dirty_for_test();
+        drop(s);
     }
 }

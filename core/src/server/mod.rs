@@ -24,6 +24,7 @@ pub mod standing_scope;
 pub mod transport_binding;
 mod state;
 pub mod state_lock;
+pub mod published;
 
 pub use dashboard::{
     ActivityStats, DashboardSnapshot, DeploymentHealth, RecentEntry, SocietyView, TrustView,
