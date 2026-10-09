@@ -95,7 +95,10 @@ pub struct SqliteChainStore {
     /// would fail its own verification. `chain_len_cache_matches_count` pins that
     /// invariant against the real `COUNT(*)`, so the cache cannot drift silently if a
     /// deletion path is ever added.
-    len: AtomicU64,
+    len: std::sync::Arc<AtomicU64>,
+    /// Group commit: the fsync that used to run inside every COMMIT (under the daemon's state
+    /// lock) runs here, once per group, outside it. See `storage::durability`.
+    durability: std::sync::Arc<super::durability::Durability>,
     /// Cached trust derivations, invalidated HERE, on append.
     ///
     /// The store is the one path every chain write takes. An invalidation hook anywhere else
@@ -103,6 +106,14 @@ pub struct SqliteChainStore {
     /// passing, and a cache that silently misses an invalidation shows a member a trust level
     /// its own record has already contradicted. See `derivation_cache`.
     derivations: crate::derivation_cache::DerivationCache,
+}
+
+impl Drop for SqliteChainStore {
+    /// A clean shutdown leaves nothing committed-but-unsynced behind.
+    fn drop(&mut self) {
+        let n = self.len.load(Ordering::Acquire);
+        let _ = self.durability.wait_durable_blocking(n);
+    }
 }
 
 const GENESIS_PREV_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -235,6 +246,17 @@ impl SqliteChainStore {
         // is encrypted by SQLCipher under the same database key.
         conn.pragma_update(None, "journal_mode", "WAL")
             .with_context(|| "enabling WAL mode for concurrent chain reads")?;
+        // GROUP COMMIT (storage::durability). NORMAL keeps COMMIT synchronous and ordered —
+        // errors still surface to the appending handler — but drops the fsync from it; the
+        // flusher fsyncs the WAL once per group and a request replies only once covered.
+        // Auto-checkpoint is OFF here because SQLite runs it INSIDE the commit that crosses
+        // 1000 pages, i.e. under the daemon's state lock; the flusher checkpoints at idle.
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .with_context(|| "setting synchronous=NORMAL (group commit)")?;
+        conn.pragma_update(None, "wal_autocheckpoint", 0)
+            .with_context(|| "disabling inline WAL auto-checkpoint")?;
+        conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)
+            .with_context(|| "bounding the WAL file after checkpoints")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chain_entries (
                 chain_position INTEGER PRIMARY KEY,
@@ -273,13 +295,24 @@ impl SqliteChainStore {
             .with_context(|| "making witness-chain read connection query-only")?;
         // Pay the O(n) count exactly once, at open, then track it incrementally.
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM chain_entries", [], |row| row.get(0))?;
+        let len = std::sync::Arc::new(AtomicU64::new(n as u64));
+        let durability = super::durability::Durability::new(&path, &key_hex, len.clone());
+        // What a previous run committed is made durable before anything is served from it.
+        durability.wait_durable_blocking(n as u64)
+            .with_context(|| "syncing the witness chain at open")?;
         Ok(Self {
             conn: Mutex::new(conn),
             read_conn: Mutex::new(read_conn),
             path,
-            len: AtomicU64::new(n as u64),
+            len,
+            durability,
             derivations: crate::derivation_cache::DerivationCache::new(),
         })
+    }
+
+    /// The group-commit durability frontier for this chain (see `storage::durability`).
+    pub fn durability(&self) -> &std::sync::Arc<super::durability::Durability> {
+        &self.durability
     }
 
     /// The event-triggered trust derivation cache over this chain.
@@ -373,6 +406,12 @@ impl SqliteChainStore {
         event_data: serde_json::Value,
         signer_lct: &str,
     ) -> Result<(ChainEntry, bool)> {
+        // Durability lost: nothing more may be acknowledged as witnessed until a restart
+        // rebuilds memory from what the chain actually holds.
+        anyhow::ensure!(
+            !self.durability.poisoned(),
+            "witness chain refuses appends: an fsync failed and the daemon must restart"
+        );
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
@@ -397,6 +436,9 @@ impl SqliteChainStore {
                         && entry.signer_lct == signer_lct,
                     "witness event_key '{key}' was replayed with a different fact"
                 );
+                // A replay answers with a row that may be committed but not yet fsynced: the
+                // retrying request must wait for it exactly as the first one does.
+                super::durability::note_appended(&self.durability, entry.chain_position + 1);
                 return Ok((entry, false));
             }
         }
@@ -443,6 +485,8 @@ impl SqliteChainStore {
         }
         tx.commit()?;
         self.len.fetch_add(1, Ordering::Release);
+        self.durability.note_commit();
+        super::durability::note_appended(&self.durability, chain_position + 1);
 
         let entry = ChainEntry {
             hash,
@@ -1141,6 +1185,168 @@ mod tests {
     use tempfile::TempDir;
 
     const TEST_KEY: [u8; 32] = [7u8; 32];
+
+    // ------------------------------------------------------------- group commit (durability)
+
+    /// The commit path is fsync-free and checkpoint-free: both moved to the flusher.
+    #[test]
+    fn the_write_connection_commits_without_fsync_or_inline_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let sync: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+        let auto: i64 = conn.query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0)).unwrap();
+        assert_eq!(sync, 1, "NORMAL: COMMIT does not fsync; the flusher does");
+        assert_eq!(auto, 0, "no auto-checkpoint inside a commit (it ran under the state lock)");
+    }
+
+    /// A request scope returns only once its own entry is durable, and an append made outside
+    /// any scope is not waited for (background tasks reply to no one).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scope_returns_only_after_its_entry_is_durable() {
+        let dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap());
+        let s2 = store.clone();
+        let (entry, res) = crate::storage::durability::durable_scope(async move {
+            s2.append("t", json!({"n": 1}), "lct:x").unwrap()
+        })
+        .await;
+        res.unwrap();
+        assert!(store.durability().frontier().durable >= entry.chain_position + 1);
+    }
+
+    /// GROUP commit: many concurrent requests, far fewer fsyncs, and every one of them
+    /// acknowledged only once covered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_fsync_covers_many_concurrent_appends() {
+        let dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap());
+        let before = store.durability().fsyncs.load(Ordering::Relaxed);
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..64u64 {
+            let st = store.clone();
+            set.spawn(async move {
+                let (e, res) = crate::storage::durability::durable_scope(async {
+                    st.append("t", json!({"i": i}), "lct:x").unwrap()
+                })
+                .await;
+                res.unwrap();
+                assert!(st.durability().frontier().durable > e.chain_position);
+            });
+        }
+        while let Some(r) = set.join_next().await {
+            r.unwrap();
+        }
+        let fsyncs = store.durability().fsyncs.load(Ordering::Relaxed) - before;
+        assert!(fsyncs < 64, "64 appends took {fsyncs} fsyncs: not grouped");
+        assert_eq!(store.durability().frontier().durable, store.len().unwrap());
+        assert_eq!(store.verify_integrity().unwrap(), 64);
+    }
+
+    /// An fsync FAILURE: the unacknowledged request gets an error (never "recorded"), every
+    /// later append is refused, and a reopen — the restart — serves exactly a chain that holds
+    /// everything acknowledged before the failure and verifies end to end. (The unacknowledged
+    /// entry's fate is UNKNOWN by definition — after EIO it may or may not have reached disk —
+    /// so it is neither required nor forbidden.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_fsync_failure_poisons_refuses_and_reopens_to_the_acknowledged_chain() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("w.db");
+        let store = std::sync::Arc::new(SqliteChainStore::open(&path, TEST_KEY).unwrap());
+        let mut acked = Vec::new();
+        for i in 0..3 {
+            let st = store.clone();
+            let (e, res) = crate::storage::durability::durable_scope(async move {
+                st.append("acked", json!({"i": i}), "lct:x").unwrap()
+            })
+            .await;
+            res.expect("acknowledged");
+            acked.push(e.hash);
+        }
+        store.durability().inject_sync_failure();
+        let st = store.clone();
+        let (_e, res) = crate::storage::durability::durable_scope(async move {
+            st.append("unacked", json!({}), "lct:x").unwrap()
+        })
+        .await;
+        assert!(res.is_err(), "an entry whose fsync failed must not be acknowledged");
+        assert!(store.durability().poisoned());
+        let refused = store.append("after", json!({}), "lct:x");
+        assert!(refused.is_err(), "a poisoned chain accepts nothing more");
+        drop(store);
+
+        let reopened = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        for h in &acked {
+            assert!(reopened.read_by_hash(h).unwrap().is_some(), "acknowledged entry {h} lost");
+        }
+        assert!(reopened.read_recent(10).unwrap().iter().all(|e| e.event_type != "after"),
+                "a refused append must not exist");
+        assert_eq!(reopened.verify_integrity().unwrap(), reopened.len().unwrap());
+        assert!(!reopened.durability().poisoned(), "the restart starts clean");
+        reopened.append("post-restart", json!({}), "lct:x").expect("a restarted chain appends");
+    }
+
+    /// A retried `append_once` answers with the row the first attempt committed. While that row
+    /// is still in the commit-to-fsync window, the retry must not be acknowledged either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replayed_key_is_acknowledged_only_once_its_row_is_durable() {
+        use crate::storage::durability::durable_scope;
+        let dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap());
+        let hold = store.durability().hold_flush_for_test();
+        let st = store.clone();
+        let first = tokio::spawn(async move {
+            durable_scope(async { st.append_once("k1", "t", json!({"a": 1}), "lct:x").unwrap() }).await.1
+        });
+        for _ in 0..200 {
+            if store.len().unwrap() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(store.len().unwrap(), 1, "the first attempt committed");
+        let st = store.clone();
+        let replay = tokio::spawn(async move {
+            let ((_, inserted), res) = durable_scope(async {
+                st.append_once("k1", "t", json!({"a": 1}), "lct:x").unwrap()
+            })
+            .await;
+            assert!(!inserted, "a replay, not a second row");
+            res
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!replay.is_finished(),
+                "a replay was acknowledged while the row it returned was not yet durable");
+        assert!(!first.is_finished());
+        drop(hold);
+        replay.await.unwrap().unwrap();
+        first.await.unwrap().unwrap();
+        assert!(store.durability().frontier().durable >= 1);
+    }
+
+    /// The checkpoint runs on the flusher, at idle — never inside an append.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_wal_is_checkpointed_at_idle_off_the_commit_path() {
+        let dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap());
+        let blob = "x".repeat(8 * 1024);
+        let st = store.clone();
+        let (_, res) = crate::storage::durability::durable_scope(async move {
+            for i in 0..300 {
+                st.append("bulk", json!({"i": i, "pad": blob}), "lct:x").unwrap();
+            }
+        })
+        .await;
+        res.unwrap();
+        let ck = || store.durability().checkpoints.load(Ordering::Relaxed);
+        for _ in 0..60 {
+            if ck() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(ck() > 0, "no idle checkpoint ran within 6 s of a >1 MiB WAL going quiet");
+    }
 
     #[test]
     fn empty_store_reports_zero_and_genesis_tail() {

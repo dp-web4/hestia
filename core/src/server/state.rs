@@ -604,6 +604,14 @@ impl ServerState {
         let store_key = crate::storage::storage_key(home, passphrase)
             .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
         let chain_store = Arc::new(SqliteChainStore::open(home.join("witness.db"), store_key)?);
+        // The vault never reaches disk ahead of the chain rows that justify its writes (group
+        // commit): every save first makes everything committed to the chain durable.
+        {
+            let durability = chain_store.durability().clone();
+            vault.set_pre_save_barrier(Arc::new(move || {
+                durability.flush_committed_blocking().map_err(|e| format!("{e:#}"))
+            }));
+        }
         let trust_store = TrustStore::open(home.join("trust"), store_key)?;
         let inbox_store = crate::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
         // The disposition projection cursor is initialized HERE — synchronously,

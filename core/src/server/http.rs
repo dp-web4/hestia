@@ -1539,7 +1539,22 @@ async fn label_state_lock_by_route(
         .get::<axum::extract::MatchedPath>()
         .map(|p| super::state_lock::intern_label("http:", p.as_str()))
         .unwrap_or("http:unmatched");
-    super::state_lock::with_label(label, next.run(req)).await
+    // GROUP COMMIT: reply only once this request's chain appends are fsynced.
+    let (resp, durable) = crate::storage::durability::durable_scope(
+        super::state_lock::with_label(label, next.run(req)),
+    )
+    .await;
+    match durable {
+        Ok(()) => resp,
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": format!("{e:#}"),
+                "code": "hestia.not_durable",
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// The operator check for the lock report, without the state lock (see the route).

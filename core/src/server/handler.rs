@@ -84,7 +84,11 @@ impl ServerHandler for HestiaServer {
         // Every state-lock acquisition under this dispatch is attributed to the tool (#lock
         // instrumentation): `GET /api/debug/locks` reports wait and hold per `mcp:<tool>`.
         let lock_label = super::state_lock::intern_label("mcp:", &name);
-        let dispatch = super::state_lock::with_label(lock_label, async { match name.as_str() {
+        // GROUP COMMIT: the reply waits until every chain entry this call appended is fsynced
+        // (storage::durability) — after the state lock is released, so the fsync no longer
+        // stalls every other member, and never before it, so "recorded" always means durable.
+        let (dispatch, durable) = crate::storage::durability::durable_scope(
+            super::state_lock::with_label(lock_label, async { match name.as_str() {
             "hestia_connect" => tool_connect(&self.state, &args).await,
             "hestia_begin_action" => tool_begin_action(&self.state, &args).await,
             "hestia_record_outcome" => tool_record_outcome(&self.state, &args).await,
@@ -129,7 +133,17 @@ impl ServerHandler for HestiaServer {
                 &format!("Unknown tool: {}", name),
                 Some(json!({"tool": name})),
             )),
-        } }).await;
+        } })).await;
+        let dispatch = match durable {
+            Ok(()) => dispatch,
+            // Durability lost (an fsync failed): whatever this call appended may or may not
+            // survive, so it must not be reported as recorded. The daemon is restarting.
+            Err(e) => Ok(hestia_error_envelope(
+                "hestia.not_durable",
+                &format!("{e:#}"),
+                Some(json!({"tool": name})),
+            )),
+        };
 
         let payload = dispatch.unwrap_or_else(|e| {
             hestia_error_envelope(
@@ -29020,6 +29034,103 @@ mod concurrency_battery {
                 )
             })
             .collect()
+    }
+
+    /// GROUP COMMIT, ordering arm: a vault save that follows an intent row must not reach disk
+    /// while that row is still unsynced. A crash at any instant then leaves neither, the intent
+    /// alone (the case `*_intent` rows exist to record), or both, but never the vault write
+    /// without the chain row that justifies it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_vault_save_never_reaches_disk_ahead_of_the_chain_row_before_it() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let durability = { state.lock().await.chain_store.durability().clone() };
+        let vault_path = dir.path().join("v.enc");
+        let before = std::fs::read(&vault_path).unwrap();
+        let hold = durability.hold_flush_for_test();
+        let st = state.clone();
+        let mut writer = tokio::spawn(async move {
+            let mut s = st.lock().await;
+            let intent = s
+                .append_chain("scope_standing_promote_intent", json!({"battery": "vault-order"}))
+                .unwrap();
+            s.standing_scope_dirty = true;
+            s.persist_standing_scope().expect("the save completes once the chain is durable");
+            intent.chain_position
+        });
+        // A vault save (Argon2 + encrypt + fsync) is slow in a test build; give it ample time.
+        if tokio::time::timeout(std::time::Duration::from_secs(8), &mut writer).await.is_ok() {
+            panic!("the vault save completed while the intent row before it was not durable");
+        }
+        assert_eq!(std::fs::read(&vault_path).unwrap(), before,
+                   "the vault reached disk while the intent row before it was not durable");
+        drop(hold);
+        let pos = writer.await.unwrap();
+        assert!(durability.frontier().durable > pos, "the intent row is durable");
+        assert_ne!(std::fs::read(&vault_path).unwrap(), before, "and then the vault was written");
+    }
+
+    /// GROUP COMMIT, failure arm: an fsync that fails after commit. Decisions acknowledged
+    /// before it survive a restart exactly; the request whose fsync failed is told
+    /// `not durable` (never "recorded"); the running daemon refuses every later append; and the
+    /// restart's ledger, rebuilt from the chain, equals the acknowledged ledger.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_fsync_is_never_acknowledged_and_a_restart_rebuilds_the_acknowledged_state() {
+        use crate::storage::durability::durable_scope;
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        {
+            let mut s = state.lock().await;
+            s.policy_engine =
+                crate::policy::PolicyEngine::new(crate::policy::get_preset("safety").unwrap().config);
+        }
+        let sid = connect(&state, "battery-fsync", "hs-f").await;
+        let deny = |st: SharedState, sid: String| async move {
+            let b = tool_begin_action(&st, &json!({"tool_name": "Bash", "target": DENY_CMD,
+                "parameters": {"command": DENY_CMD}, "session_id": sid})).await.unwrap();
+            let aid = b["actionId"].as_str().unwrap().to_string();
+            let v = tool_query_policy(&st, &json!({"action_id": aid})).await.unwrap();
+            (aid, v)
+        };
+        let mut acked = Vec::new();
+        for _ in 0..3 {
+            let ((aid, v), res) = durable_scope(deny(state.clone(), sid.clone())).await;
+            res.expect("acknowledged");
+            assert!(v["decisionEntryHash"].is_string(), "{v}");
+            acked.push((aid, v["decisionEntryHash"].as_str().unwrap().to_string()));
+        }
+        let durability = { state.lock().await.chain_store.durability().clone() };
+        durability.inject_sync_failure();
+        let ((_aid, _v), res) = durable_scope(deny(state.clone(), sid.clone())).await;
+        assert!(res.is_err(), "a decision whose fsync failed must not be acknowledged");
+
+        // The running daemon now refuses to witness anything: no reply after the failure can
+        // rest on memory that is ahead of the chain.
+        let len_poisoned = { state.lock().await.chain_len() };
+        let ((_, v_after), res_after) = durable_scope(deny(state.clone(), sid.clone())).await;
+        assert!(v_after["decisionEntryHash"].is_null(), "a poisoned chain witnessed: {v_after}");
+        assert!(res_after.is_ok(), "nothing was appended, so there is nothing to wait for");
+        assert_eq!(state.lock().await.chain_len(), len_poisoned, "no append after poison");
+
+        let acked_ledger: BTreeMap<_, _> = {
+            let s = state.lock().await;
+            s.decision_ledger.canonical().into_iter()
+                .filter(|((_, a), _)| acked.iter().any(|(aid, _)| aid == &a.to_string()))
+                .collect()
+        };
+        assert_eq!(acked_ledger.len(), acked.len());
+        drop(durability);
+        drop(state);
+        let restarted = open_state(&dir);
+        let s = restarted.lock().await;
+        for (_, h) in &acked {
+            assert!(s.chain_store.read_by_hash(h).unwrap().is_some(), "acknowledged row {h} lost");
+        }
+        let rebuilt: BTreeMap<_, _> = s.decision_ledger.canonical().into_iter()
+            .filter(|(k, _)| acked_ledger.contains_key(k))
+            .collect();
+        assert_eq!(rebuilt, acked_ledger, "restart-from-chain != the acknowledged state");
+        assert!(!s.chain_store.durability().poisoned());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
