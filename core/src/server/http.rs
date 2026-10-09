@@ -1451,8 +1451,23 @@ pub async fn serve_with_callback(
         }
     });
 
+    // Global state-lock wait/hold by label and call site (lock instrumentation, stage 1 of the
+    // per-member serialisation plan). Read-only, and NOTHING on its path takes the state lock:
+    // the statistics live beside the mutex, and its authorization (`debug_gate`) reads operator
+    // sessions from their own lock — so it answers while a holder is starving everyone else,
+    // which is exactly when it is needed. Behind `operator_gate` it could not (Codex review of
+    // #1265: that middleware resolves the session under the state lock).
+    let operator_sessions = state.lock().await.operator_sessions.lockfree_view();
+    let debug_surface = axum::Router::new()
+        .route("/api/debug/locks", get(debug_locks))
+        .route_layer(axum::middleware::from_fn_with_state(
+            (state.clone(), operator_sessions),
+            debug_gate,
+        ));
+
     let mut app = axum::Router::new()
         .merge(operator_surface)
+        .merge(debug_surface)
         // The dashboard HTML shell — unauthenticated (app skeleton + sign-in JS,
         // no data). The operator signs in from here; all /api/* data is gated.
         .route("/", get(dashboard_html))
@@ -1468,7 +1483,9 @@ pub async fn serve_with_callback(
         .route("/.well-known/openid-credential-issuer", get(vci_metadata))
         .route("/nonce", post(vci_nonce))
         .with_state(state)
-        .nest_service("/mcp", service);
+        .nest_service("/mcp", service)
+        // Attribute every state-lock acquisition a request makes to its matched route.
+        .layer(axum::middleware::from_fn(label_state_lock_by_route));
 
     if let Some(kp) = callback_keypair {
         let cb_state = Arc::new(tokio::sync::Mutex::new(CallbackState::new(kp)));
@@ -1498,6 +1515,95 @@ pub async fn serve_with_callback(
         .context("axum::serve failed")?;
 
     Ok(())
+}
+
+/// The REAL operator decision channel, for the concurrency battery (handler.rs): it races this
+/// path, with its witness-is-finality append, rather than a store call that writes no ruling row.
+#[cfg(test)]
+pub(super) async fn battery_decide_via_operator_route(
+    state: SharedState,
+    d: GateEscalationDecision,
+) -> axum::response::Response {
+    operator_gate_escalation(State(state), Json(d)).await.into_response()
+}
+
+/// Label the state-lock acquisitions a request makes with its MATCHED route template
+/// (`http:/api/agents/:id/retire`), never the raw path: the template set is finite, the raw path
+/// is caller-chosen.
+async fn label_state_lock_by_route(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let label = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|p| super::state_lock::intern_label("http:", p.as_str()))
+        .unwrap_or("http:unmatched");
+    super::state_lock::with_label(label, next.run(req)).await
+}
+
+/// The operator check for the lock report, without the state lock (see the route).
+///
+/// The same admission `operator_gate` gives a low-stakes read: a live, unexpired operator
+/// session (401 otherwise), or — outside the production profile — the named dev override, still
+/// witnessed, but by a background task so the reply does not wait for the lock. One difference,
+/// stated rather than hidden: `operator_gate` also re-checks that operator access is
+/// bootstrapped, which lives in the law, under the lock. Sessions can only be opened by an
+/// operator the law authorizes, so this differs only for a session opened before the law lost
+/// every operator, and only for this read-only report.
+async fn debug_gate(
+    State((state, sessions)): State<(SharedState, super::operator_auth::OperatorSessionView)>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path().to_string();
+    let bearer = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string);
+    let production = std::env::var("HESTIA_PROFILE")
+        .map(|p| p == "production")
+        .unwrap_or(false);
+    if let Some(dev) = std::env::var("HESTIA_OPERATOR_DEV_TOKEN").ok().filter(|t| !t.is_empty()) {
+        if !production && bearer.as_deref() == Some(dev.as_str()) {
+            eprintln!("[hestia] WARNING: operator dev-override used on GET {path} (dev-only, unsafe)");
+            let now = super::state::unix_now();
+            tokio::spawn(async move {
+                let mut s = state.lock().await;
+                let _ = s.append_chain(
+                    "operator_gate",
+                    serde_json::json!({ "act": format!("GET {path}"), "verdict": "dev-override",
+                        "stakes": "low-reversible", "unsafe": true, "at": now }),
+                );
+            });
+            return next.run(req).await;
+        }
+    }
+    let now = super::state::unix_now();
+    let admitted = bearer
+        .as_deref()
+        .and_then(|t| sessions.operator(t, now, super::operator_auth::SESSION_TTL_SECS))
+        .is_some();
+    if admitted {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "no operator session (present an LCT-signed challenge first)"
+            })),
+        )
+            .into_response()
+    }
+}
+
+/// `GET /api/debug/locks` — the state lock's own report (see `state_lock::LockStats::report`).
+async fn debug_locks(State(state): State<SharedState>) -> impl IntoResponse {
+    let mut report = state.stats().report();
+    report["sections"] = super::state_lock::sections().report();
+    Json(report)
 }
 
 async fn dashboard_html() -> impl IntoResponse {
@@ -7523,11 +7629,11 @@ struct LedgerQuery {
 /// box already has. Both are recorded; `via` keeps them apart, because a reader must be able to
 /// tell a proof from a convenience.
 #[derive(serde::Deserialize)]
-struct GateEscalationDecision {
-    id: String,
-    approve: bool,
+pub(super) struct GateEscalationDecision {
+    pub(super) id: String,
+    pub(super) approve: bool,
     #[serde(default)]
-    reason: Option<String>,
+    pub(super) reason: Option<String>,
 }
 
 async fn operator_gate_escalation(
@@ -8846,6 +8952,106 @@ mod disposition_tests {
         }
     }
 
+    /// Codex review of #1265 (P2): `/api/debug/locks` exists to show who holds the state lock
+    /// DURING a stall, so its authorization must not queue on that lock. Through the real
+    /// served router and middleware: with another task holding the state lock, an operator
+    /// session gets the report, and a request without one is still refused — both promptly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_lock_report_answers_while_the_state_lock_is_held() {
+        std::env::remove_var("HESTIA_OPERATOR_DEV_TOKEN");
+        let (_dir, state) = test_state().await;
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let bind = format!("127.0.0.1:{port}");
+        let served = state.clone();
+        let _server = tokio::spawn(async move {
+            let _ = super::serve_with_callback(served, &bind, None).await;
+        });
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+        // The server binds only after `bootstrap_operator_if_genesis` mints the first operator
+        // on this fresh vault, and that vault write measured 4.5 s in a debug build on CBP
+        // (unoptimized argon2). A 5 s budget passed locally with tries to spare (45-48 of 50)
+        // and failed on every CI run of #1265-#1268; the budget is an upper bound, not a delay.
+        let mut up = false;
+        for _ in 0..600 {
+            if client.get(format!("{base}/api/debug/locks")).send().await.is_ok() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(up, "the test server never came up on {base}");
+
+        let kp = web4_core::crypto::KeyPair::generate();
+        let lct_id = web4_core::lct::derive_lct_id(&kp.verifying_key());
+        {
+            let mut s = state.lock().await;
+            let mut policy = s.vault.policy().clone();
+            policy.operator_access.push(crate::vault::OperatorIdentity {
+                lct_id: lct_id.clone(),
+                public_key_hex: hex::encode(kp.public_key_bytes()),
+                label: "test operator".into(),
+            });
+            s.vault.set_policy(policy).unwrap();
+            s.reload_policy();
+        }
+        let ch: serde_json::Value = client
+            .post(format!("{base}/api/operator/challenge"))
+            .send().await.unwrap().json().await.unwrap();
+        let challenge = ch["challenge"].as_str().expect("a challenge").to_string();
+        let sess: serde_json::Value = client
+            .post(format!("{base}/api/operator/session"))
+            .json(&serde_json::json!({
+                "lct_id": lct_id,
+                "challenge": challenge,
+                "signature": kp.sign(challenge.as_bytes()).to_hex(),
+            }))
+            .send().await.unwrap().json().await.unwrap();
+        let token = sess["token"].as_str().expect(&format!("a session token: {sess}")).to_string();
+
+        // The stall: some other request holds the state lock and does not let go.
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let holder_state = state.clone();
+        let holder = tokio::spawn(async move {
+            let _g = holder_state.lock().await;
+            let _ = held_tx.send(());
+            let _ = release_rx.await;
+        });
+        held_rx.await.unwrap();
+
+        let budget = std::time::Duration::from_secs(3);
+        let authed = tokio::time::timeout(
+            budget,
+            client.get(format!("{base}/api/debug/locks")).bearer_auth(&token).send(),
+        )
+        .await;
+        let anonymous = tokio::time::timeout(
+            budget,
+            client.get(format!("{base}/api/debug/locks")).send(),
+        )
+        .await;
+        let wrong = tokio::time::timeout(
+            budget,
+            client.get(format!("{base}/api/debug/locks")).bearer_auth("not-a-session").send(),
+        )
+        .await;
+        let _ = release_tx.send(());
+        holder.await.unwrap();
+
+        let authed = authed.expect("the lock report queued behind the state lock it reports on").unwrap();
+        assert_eq!(authed.status(), reqwest::StatusCode::OK);
+        let report: serde_json::Value = authed.json().await.unwrap();
+        assert!(report.get("sections").is_some(), "{report}");
+        let anonymous = anonymous.expect("a refusal queued behind the state lock").unwrap();
+        assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED, "no session, no report");
+        let wrong = wrong.expect("a refusal queued behind the state lock").unwrap();
+        assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED, "a wrong bearer is the same as none");
+    }
+
     /// THE NEGATIVE ARM #944 REQUIRES: an unauthenticated HTTP client obtains no value from
     /// either GET. Run against the real served router — the middleware is the thing under
     /// test, and a handler-level test cannot see it. No dev-override token in this process.
@@ -8874,8 +9080,12 @@ mod disposition_tests {
         });
         let base = format!("http://127.0.0.1:{port}");
         let client = reqwest::Client::new();
+        // The server binds only after `bootstrap_operator_if_genesis` mints the first operator
+        // on this fresh vault, and that vault write measured 4.5 s in a debug build on CBP
+        // (unoptimized argon2). A 5 s budget passed locally with tries to spare (45-48 of 50)
+        // and failed on every CI run of #1265-#1268; the budget is an upper bound, not a delay.
         let mut up = false;
-        for _ in 0..50 {
+        for _ in 0..600 {
             if client.get(format!("{base}/api/config/seat")).send().await.is_ok() {
                 up = true;
                 break;
@@ -10957,7 +11167,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
         let state = ServerState::open(vault, dir.path(), "p").unwrap();
-        (dir, Arc::new(tokio::sync::Mutex::new(state)))
+        (dir, Arc::new(crate::server::state_lock::StateCell::new(state)))
     }
 
     /// Issue #423: a GET must consume only the immutable read model. Holding

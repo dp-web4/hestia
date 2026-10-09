@@ -230,6 +230,20 @@ impl DecisionLedger {
         self.entry(member, action_id)?.charged_by.as_deref()
     }
 
+    /// Every key, its committed row hashes (sorted) and its charge holder — a canonical view for
+    /// audits and for the chain-replay equivalence test (a rehydrated ledger must equal the
+    /// running one).
+    pub fn canonical(&self) -> std::collections::BTreeMap<(String, Uuid), (Vec<String>, Option<String>)> {
+        self.keys
+            .iter()
+            .map(|(k, e)| {
+                let mut rows: Vec<String> = e.rows.iter().map(|r| r.hash.clone()).collect();
+                rows.sort();
+                (k.clone(), (rows, e.charged_by.clone()))
+            })
+            .collect()
+    }
+
     /// The key's owed charge (row hash + what to charge), cloned for the settle.
     pub fn owed(&self, member: &str, action_id: Uuid) -> Option<(String, ChargeSpec)> {
         self.entry(member, action_id)?
