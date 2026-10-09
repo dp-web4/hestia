@@ -917,6 +917,10 @@
       "why": "no consumer yet"
     },
     {
+      "route": "GET /api/debug/locks",
+      "why": "diagnostic, not an operator act: the daemon state lock's wait/hold statistics, read by tools/daemon_concurrency_load.py (#1265); read-only and never takes the lock"
+    },
+    {
       "route": "GET /api/scope/requests",
       "why": "both surfaces read requests from the snapshot (GET /api/dashboard) instead"
     },
