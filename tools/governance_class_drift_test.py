@@ -559,24 +559,46 @@ def audit(matcher_text=None, bar_text=None, declared=DECLARED):
     # file cannot match a bar testing for filenames" was a live defect, not only a pin: the
     # shared closure matches DIRECTORIES first, so a write to the mechanism under
     # plugins/_shared arrived as marker `plugins/_shared` and priced single-approver (stage A's
-    # escalation 9c433571). The bar is now the HIGHEST over every marker the act reaches
-    # (`bar_for_markers(&markers_of(marker, act))`), and the sovereign file list is ONE list
-    # (`SOVEREIGN_FILES`) that `bar_for` and `markers_of` share. F now binds exactly that:
-    # every escalation's bar is computed over its markers, and the sovereign list IS the bar's.
+    # escalation 9c433571). The bar is now the HIGHEST over every marker the act reaches, and
+    # the sovereign file list is ONE list (`SOVEREIGN_FILES`) that `bar_for` and the act-text
+    # scan share.
+    #
+    # THE RECUT OF #812 (#810, kimi-code) MADE THAT ONE RULE, STATED ONCE: `price(marker, act,
+    # resolved_targets)` -- the closure marker, every resolved target's basename, and every
+    # sovereign file the act text names, highest `bar_for` wins. F binds exactly that: the rule
+    # takes the targets, it is the one computation site at open AND at the replay fallback, and
+    # replay RESTORES a recorded bar instead of repricing it (#812 review hold 2).
     del markers   # the adapter marker tuple no longer exists
     sov = re.search(r"pub const SOVEREIGN_FILES: &\[&str\] = &\[(.*?)\];", btext, re.S)
     sov_names = re.findall(r'"([^"]+)"', sov.group(1)) if sov else []
+    prod = btext.split("\n#[cfg(test)]\nmod ", 1)[0]
+    rule = re.search(r"pub fn price\(.*?\n\}", prod, re.S)
+    rule_body = rule.group(0) if rule else ""
+    # The two sites that must use it: `open` (the live price) and `rehydrate` (the fallback for a
+    # row that recorded no bar). Each is matched by its own shape, so neither can stand in for
+    # the other and the rule's own definition counts for neither.
+    sites = (bool(re.search(r"=\s*price\(\s*marker,\s*act,\s*&resolved_targets\)", prod))
+             + bool(re.search(r"=\s*price\(\s*&marker,", prod)))
     out.append("")
-    out.append(f"sovereign list: {len(sov_names)} names; bar over every marker: "
-               f"{btext.count('bar_for_markers(&markers_of(')} computation site(s)")
+    out.append(f"sovereign list: {len(sov_names)} names; one pricing rule "
+               f"({'present' if rule else 'MISSING'}), {sites} of 2 computation sites use it")
     if sorted(sov_names) != sorted(strong):
         bad(f"the sovereign file list and `bar_for` disagree (list {sorted(sov_names)}, bar "
             f"{sorted(strong)}): a name priced two-factor by one is invisible to the other, so "
             f"a directory marker can shadow it again")
-    if btext.count("bar_for_markers(&markers_of(") < 2:
+    if ("markers_of(marker, act, resolved_targets)" not in rule_body
+            or "bar_for_markers(&markers)" not in rule_body):
+        bad("the pricing rule (`price`) no longer takes the max over EVERY marker the act "
+            "reaches -- the closure marker, the resolved target AND the act text: a directory "
+            "marker matched first prices the sovereign file inside it single-approver again")
+    if sites < 2:
         bad("an escalation's bar is not computed over EVERY marker its act reaches (expected "
-            "`bar_for_markers(&markers_of(...))` at open and at restore): a directory marker "
+            "`price(marker, ...)` at open and at the replay fallback): a directory marker "
             "matched first prices the sovereign file inside it single-approver again")
+    if "from_value::<Bar>" not in prod:
+        bad("replay no longer RESTORES the recorded bar: a restart reprices every open "
+            "escalation under today's rule, and the record's criterion-frozen-at-open claim is "
+            "false on the path that makes it durable")
 
     if awaiting:
         out.append("")
@@ -657,8 +679,9 @@ def selftest():
     # source, so a sabotage set that only mutates the sources cannot reach that class.
     sub_row = next(r for r in DECLARED if r["via"] is SUBSTRING)
     was_exact = tuple(dict(r, via=EXACT) if r is sub_row else r for r in DECLARED)
-    # The stage C bar fix, undone two ways (derived from the bar text, never spelled).
-    open_site = re.search(r"bar: bar_for_markers\(&markers_of\(marker, act\)\)", bt)
+    # The stage C / #812-recut bar fix, undone four ways (derived from the bar text, never spelled).
+    open_site = re.search(
+        r"let \(bar, matched_markers\) = price\(marker, act, &resolved_targets\);", bt)
     sov_line = next(ln for ln in bt.splitlines(keepends=True)
                     if ln.strip() == f'"{exact_name}",')
     # A row to collide a key against, and a victim name to rename onto its key.
@@ -698,8 +721,20 @@ def selftest():
 
         # The stage C bar fix, undone: the open path goes back to the first marker alone...
         ("the open path prices by the FIRST marker again (stage C fix reverted)",
-         mt, bt.replace(open_site.group(0), "bar: bar_for(marker)", 1) if open_site else bt + "\n",
+         mt, bt.replace(open_site.group(0),
+                        "let (bar, matched_markers) = (bar_for(marker), vec![marker.to_string()]);",
+                        1) if open_site else bt + "\n",
          DECLARED, "not computed over EVERY marker"),
+
+        # ...the rule stops taking the resolved target (#810 reverted)...
+        ("the pricing rule drops the resolved target (#810 reverted)",
+         mt, bt.replace("markers_of(marker, act, resolved_targets)", "markers_of(marker, act, &[])", 1),
+         DECLARED, "no longer takes the max over EVERY marker"),
+
+        # ...replay reprices history instead of restoring the recorded bar (hold 2 reverted)...
+        ("replay reprices the recorded bar (#812 hold 2 reverted)",
+         mt, bt.replace("from_value::<Bar>", "from_value::<NotABar>"),
+         DECLARED, "no longer RESTORES the recorded bar"),
 
         # ...and the sovereign list loses a name `bar_for` still prices two-factor.
         ("the sovereign list drops a name the bar still prices",
