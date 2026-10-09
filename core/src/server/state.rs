@@ -16,7 +16,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 use web4_trust_core::EntityTrust;
 
@@ -300,7 +299,7 @@ pub struct ServerState {
     /// answers a narrower question the daemon's build id cannot — whether a caller ever said
     /// it understood a newly served field. #481 remains the integrity boundary for proving
     /// which installed bytes made that report.
-    pub gate_capabilities: HashMap<String, HashSet<String>>,
+    pub gate_capabilities: Arc<crate::server::published::GateCapabilities>,
     /// Member → wall-clock time its current seat-config finding was FIRST observed.
     ///
     /// The edge, not the level. A stateless check can only ever report "miswired again" on every
@@ -349,7 +348,7 @@ pub struct ServerState {
     /// a tally would make the ATTESTATION rather than the chain the source of truth.
     pub scope_tally: std::collections::HashMap<(String, String), (u64, u64)>,
     pub vault: Vault,
-    pub sessions: HashMap<Uuid, Session>,
+    pub sessions: crate::server::published::Sessions,
     pub actions: HashMap<Uuid, InFlightAction>,
     /// BEHIND AN `Arc` SO A HEAVY READ NEED NOT HOLD THE GLOBAL STATE LOCK.
     ///
@@ -403,17 +402,17 @@ pub struct ServerState {
     /// verifiable legacy alias to its `member_lct` label. See `member_registry`.
     pub member_registry: crate::member_registry::MemberRegistry,
     pub shared_context: serde_json::Map<String, serde_json::Value>,
-    pub policy_engine: crate::policy::PolicyEngine,
+    pub policy_engine: crate::server::published::Watched<crate::policy::PolicyEngine>,
     /// Per-constellation-role policy engines (#403 role-scoped law), built from
     /// the vault's `role_overlays`. A session's declared role selects its engine;
     /// its verdict is folded into `policy_engine` by strictest-wins in
     /// `query_policy`, so a role can only tighten the base, never loosen it.
-    pub role_policy_engines: HashMap<String, crate::policy::PolicyEngine>,
+    pub role_policy_engines: crate::server::published::Watched<HashMap<String, crate::policy::PolicyEngine>>,
     /// Per-`(instance, role)` policy engines (the finest grain), keyed by
     /// `(plugin_id, role)`. Selected AFTER the role engine and folded strictest-
     /// wins in the gate, so a specific orchestrator can only tighten its role's
     /// law, never loosen it. Built from the vault's `instance_overlays`.
-    pub instance_policy_engines: HashMap<(String, String), crate::policy::PolicyEngine>,
+    pub instance_policy_engines: crate::server::published::Watched<HashMap<(String, String), crate::policy::PolicyEngine>>,
     /// OPERATOR GRANTS — per-`(plugin_id, role)`, and the ONLY input in the whole fold that
     /// may LOOSEN (dp, 2026-08-01).
     ///
@@ -437,7 +436,7 @@ pub struct ServerState {
     ///
     /// Society baseline is NOT this. The baseline lives in society law and moves only by
     /// amendment — a grant is a scoped exception to it, never an edit of it.
-    pub instance_grants: HashMap<(String, String), InstanceGrant>,
+    pub instance_grants: crate::server::published::Watched<HashMap<(String, String), InstanceGrant>>,
     /// Scope requests and the operator's answers, keyed by request id. See `ScopeRequest`.
     ///
     /// Memory-only for the same reason `instance_grants` is: this widens reach, so it must
@@ -447,13 +446,13 @@ pub struct ServerState {
     /// Deliberately keyed by id and not by `(plugin, path)`: the record of an ASK that was
     /// refused is as much of the account as the record of one that was granted, and a map
     /// keyed by target would let a re-ask overwrite a refusal.
-    pub scope_requests: HashMap<String, ScopeRequest>,
+    pub scope_requests: crate::server::published::Watched<HashMap<String, ScopeRequest>>,
     /// STANDING scope grants — the third row of `POLICY_SCOPE_ASYMMETRY`: durable,
     /// operator-decided, vault-persisted (`scope`/`standing` document), generation-counted.
     /// Loaded at startup, written back through `persist_standing_scope` on every operator
     /// decision. Mutated ONLY from the operator-gated HTTP surface; no MCP tool reaches it
     /// (`no_mcp_tool_can_mutate_standing_scope`). See `server::standing_scope`.
-    pub standing_scope: crate::server::standing_scope::StandingScopeStore,
+    pub standing_scope: crate::server::published::Watched<crate::server::standing_scope::StandingScopeStore>,
     /// Ids the operator has retired on THIS seat: no longer parties, their standing grants
     /// revoked in the same commit, hidden from the default agent view. Rebuilt from the vault
     /// at load like `member_registry`. Never deletion -- see `server::retirement`.
@@ -461,11 +460,11 @@ pub struct ServerState {
     /// What was found where the standing authority should be, at launch. Set once during
     /// construction and served beside the envelope so an unmigrated society is legible
     /// rather than silently empty.
-    pub authority_status: crate::server::standing_scope::AuthorityStatus,
+    pub authority_status: crate::server::published::Watched<crate::server::standing_scope::AuthorityStatus>,
     /// The most recent proof that the runtime projection still equals the vault. `None`
     /// until the first verification runs, which is itself information: it means no
     /// verification has happened yet, not that everything is fine.
-    pub standing_projection_audit: Option<crate::server::standing_scope::ProjectionAudit>,
+    pub standing_projection_audit: crate::server::published::Watched<Option<crate::server::standing_scope::ProjectionAudit>>,
     /// TRUE while the in-memory standing store is TIGHTER than the persisted vault copy —
     /// set when a revoke's vault write fails after the row was already removed from memory
     /// (memory keeps the tighter state on purpose). While set, the revoke surface accepts a
@@ -474,6 +473,10 @@ pub struct ServerState {
     /// Never persisted: a restart reloads the vault copy, at which point memory and vault
     /// agree again (the grant resurrects, visibly, and a fresh revoke takes the normal path).
     pub standing_scope_dirty: bool,
+    /// Moves on every policy republish (`server::published`).
+    pub publication_version: u64,
+    /// The vault policy-list generation the current publication was built from.
+    published_lists_gen: u64,
     /// Transport bindings (#1030): which hub identity carries each member's routed acts,
     /// and where the answer belongs. Operator-written through `commit_transport_bindings`,
     /// vault-persisted, read by `member_notify` at enqueue and by the egress plane.
@@ -481,7 +484,7 @@ pub struct ServerState {
     /// Hub-law gate (consolidation, 2026-07-10): the third fold input.
     /// `None` = no law file at `$HESTIA_HOME/law/hub-law.yaml` (no-op);
     /// `Some(Invalid)` fails closed. See `policy::law_gate`.
-    pub law_gate: Option<crate::policy::LawGate>,
+    pub law_gate: crate::server::published::Watched<Option<Arc<crate::policy::LawGate>>>,
     /// Plugin IDs that self-declared as synthetic (test harnesses,
     /// fuzzers, etc.). Excluded from operator-facing aggregations by
     /// default. Enclosed in the vault (document `presence`/`synthetic`).
@@ -605,8 +608,35 @@ impl ServerState {
         let store_key = crate::storage::storage_key(home, passphrase)
             .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
         let chain_store = Arc::new(SqliteChainStore::open(home.join("witness.db"), store_key)?);
+        // The vault never reaches disk ahead of the chain rows that justify its writes (group
+        // commit): every save first makes everything committed to the chain durable.
+        {
+            let durability = chain_store.durability().clone();
+            vault.set_pre_save_barrier(Arc::new(move || {
+                durability.flush_committed_blocking().map_err(|e| format!("{e:#}"))
+            }));
+        }
         let trust_store = TrustStore::open(home.join("trust"), store_key)?;
+        // Durable cache: no trust file reaches disk ahead of the chain row it projects.
+        {
+            let durability = chain_store.durability().clone();
+            trust_store.persister().set_pre_write_barrier(Arc::new(move || {
+                durability.flush_committed_blocking().map_err(|e| format!("{e:#}"))
+            }));
+        }
+        // TRUST IS A PROJECTION OF THE CHAIN (#1271). `since` is the projection EPOCH (fixed;
+        // the decision ledger derives charges from the chain from there); `from` is where replay
+        // starts — the cache's checkpoint only where its manifest verifies against the files,
+        // else the epoch (see `TrustStore::recover`).
+        let (trust_projection_since, trust_projection_from) = trust_store.recover(chain_store.len()?)?;
         let inbox_store = crate::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
+        // Durable reads: inbox rows carry chain hashes; no inbox write reaches disk ahead of them.
+        {
+            let durability = chain_store.durability().clone();
+            inbox_store.set_pre_write_barrier(Arc::new(move || {
+                durability.flush_committed_blocking().map_err(|e| format!("{e:#}"))
+            }));
+        }
         // The disposition projection cursor is initialized HERE — synchronously,
         // at state open, before any ruling surface is reachable (revised #480
         // review, blocker 2). The r3 shape initialized it lazily on the worker's
@@ -730,7 +760,7 @@ impl ServerState {
         };
 
         let mut st = Self {
-            gate_capabilities: HashMap::new(),
+            gate_capabilities: Arc::new(crate::server::published::GateCapabilities::default()),
             // REBUILT FROM THE CHAIN, not started empty. Starting empty loses the ability to
             // close any finding opened before this restart, because the pass that opened it
             // also repaired the artifact — so the next pass sees clean, has nothing to close,
@@ -740,14 +770,15 @@ impl ServerState {
             seat_live: HashMap::new(),
             scope_tally: std::collections::HashMap::new(),
             vault,
-            sessions: HashMap::new(),
+            sessions: crate::server::published::Sessions::default(),
             actions: HashMap::new(),
             // Rebuilt from the chain + settle record, so a late witness for an action from before
             // this restart finds its row and its charge state (one-gate stage A). Evaluated
             // before `chain_store` moves into the struct below.
-            decision_ledger: super::decision_witness::rehydrate(
+            decision_ledger: super::decision_witness::rehydrate_from(
                 &chain_store,
                 &home.join(super::decision_witness::SETTLED_FILE),
+                trust_projection_since,
             ),
             chain_store,
             trust_store,
@@ -758,27 +789,29 @@ impl ServerState {
             member_registry,
             retired_members,
             shared_context: serde_json::Map::new(),
-            policy_engine,
-            role_policy_engines,
-            instance_policy_engines,
+            policy_engine: crate::server::published::Watched::new(policy_engine),
+            role_policy_engines: crate::server::published::Watched::new(role_policy_engines),
+            instance_policy_engines: crate::server::published::Watched::new(instance_policy_engines),
             // Empty at every startup, by design: grants do not survive a restart. Escalations
             // DO — see the rehydrate call after construction. The two are opposite on purpose:
             // a human's ruling must survive a deploy, a standing permission must not.
-            instance_grants: HashMap::new(),
+            instance_grants: crate::server::published::Watched::new(HashMap::new()),
             // Same reasoning, same lifetime: a widening dies with the daemon.
-            scope_requests: HashMap::new(),
+            scope_requests: crate::server::published::Watched::new(HashMap::new()),
             // The deliberate exception (row 3): standing grants are durable and were just
             // loaded from the vault, so an operator's standing ruling survives the deploy.
-            standing_scope,
-            authority_status,
+            standing_scope: crate::server::published::Watched::new(standing_scope),
+            authority_status: crate::server::published::Watched::new(authority_status),
             // No verification has run yet. Deliberately not a synthetic "matches: true":
             // construction agreeing with itself is not a proof, and claiming one here would
             // make the freshness timestamp lie from the first second.
-            standing_projection_audit: None,
+            standing_projection_audit: crate::server::published::Watched::new(None),
             // Memory was just loaded FROM the vault, so the two agree by construction.
             standing_scope_dirty: false,
+            publication_version: 0,
+            published_lists_gen: u64::MAX,
             transport_bindings,
-            law_gate,
+            law_gate: crate::server::published::Watched::new(law_gate.map(Arc::new)),
             synthetic_plugins,
             home: home.to_path_buf(),
             member_notify_limiter: crate::policy::RateLimiter::new(),
@@ -821,6 +854,12 @@ impl ServerState {
         // Log the zero too. "restored 0" and "did not look" are different facts, and only one of
         // them used to be visible.
         eprintln!("[hestia] restored {restored} live escalation(s) from the chain");
+        // Restore whatever the trust cache lost: replay from where it is current.
+        match st.replay_trust_projection(trust_projection_from) {
+            Ok(n) if n > 0 => eprintln!("[hestia] trust projection: replayed {n} row(s) from {trust_projection_from}"),
+            Ok(_) => {}
+            Err(e) => tracing::error!("trust projection replay failed: {e:#}"),
+        }
         Ok(st)
     }
 
@@ -940,15 +979,15 @@ impl ServerState {
             .policy()
             .resolve()
             .unwrap_or_else(|| crate::policy::get_preset("safety").unwrap().config);
-        self.policy_engine = crate::policy::PolicyEngine::new(config);
-        self.role_policy_engines = self
+        *self.policy_engine = crate::policy::PolicyEngine::new(config);
+        *self.role_policy_engines = self
             .vault
             .policy()
             .role_configs()
             .into_iter()
             .map(|(role, cfg)| (role, crate::policy::PolicyEngine::new(cfg)))
             .collect();
-        self.instance_policy_engines = self
+        *self.instance_policy_engines = self
             .vault
             .policy()
             .instance_configs()
@@ -957,7 +996,7 @@ impl ServerState {
             .collect();
         // Re-read the machine-local hub law alongside vault policy so an
         // operator law update lands without a daemon restart.
-        self.law_gate = crate::policy::LawGate::load(&self.home);
+        *self.law_gate = crate::policy::LawGate::load(&self.home).map(Arc::new);
     }
 
     /// Issue a Soft LCT for a new session.
@@ -1001,6 +1040,26 @@ impl ServerState {
     ///
     /// Callers must apply this BEFORE folding hub law, so ratified society law still binds. See
     /// the ordering note at the `gate_direct_tool` call site.
+    /// The full law fold for an action, on LIVE state (lock holders). One implementation with
+    /// the publication's: `published::evaluate_folded`.
+    pub fn evaluate_folded(
+        &self,
+        plugin_id: &str,
+        role: &str,
+        pa: &crate::policy::PolicyAction,
+    ) -> crate::policy::PolicyEvaluation {
+        crate::server::published::evaluate_folded(
+            &self.policy_engine,
+            &self.role_policy_engines,
+            &self.instance_policy_engines,
+            &self.instance_grants,
+            self.law_gate.as_deref(),
+            plugin_id,
+            role,
+            pa,
+        )
+    }
+
     pub fn apply_instance_grant(
         &self,
         plugin_id: &str,
@@ -1056,13 +1115,7 @@ impl ServerState {
     /// wildcard — narrow before broad, which is the same precedence every other layer uses.
     pub fn instance_grant(&self, plugin_id: &str, role: &str) -> Option<&InstanceGrant> {
         let now = crate::server::gate_escalation::now_secs();
-        self.instance_grants
-            .get(&(plugin_id.to_string(), role.to_string()))
-            .or_else(|| {
-                self.instance_grants
-                    .get(&(plugin_id.to_string(), "*".to_string()))
-            })
-            .filter(|g| g.is_live(now))
+        crate::server::published::instance_grant_in(&self.instance_grants, plugin_id, role, now)
     }
 
     /// Every live scope grant a member currently holds — what the gate consults, and what
@@ -1074,13 +1127,7 @@ impl ServerState {
     /// stop applying midway through the work it was granted for.
     pub fn live_scope_grants(&self, plugin_id: &str) -> Vec<&ScopeRequest> {
         let now = crate::server::gate_escalation::now_secs();
-        let mut live: Vec<&ScopeRequest> = self
-            .scope_requests
-            .values()
-            .filter(|r| r.plugin_id == plugin_id && r.is_live(now))
-            .collect();
-        live.sort_by_key(|r| r.requested_at);
-        live
+        crate::server::published::live_scope_grants_in(&self.scope_requests, plugin_id, now)
     }
 
     /// Does this member hold a live grant for exactly this path?
@@ -1126,7 +1173,7 @@ impl ServerState {
             "scope",
             "standing",
             "standing-scope.json",
-            &self.standing_scope,
+            &*self.standing_scope,
         )
     }
 
@@ -1144,7 +1191,7 @@ impl ServerState {
         let mut candidate = self.standing_scope.clone();
         mutate(&mut candidate);
         crate::vault::save_doc(&mut self.vault, "scope", "standing", "standing-scope.json", &candidate)?;
-        self.standing_scope = candidate;
+        *self.standing_scope = candidate;
         // The vault now holds exactly what memory holds, so any earlier revoke-persist
         // failure has been overtaken: the synced state is the tighter one plus this
         // committed mutation.
@@ -1409,7 +1456,7 @@ impl ServerState {
             if !standing.is_empty() {
                 crate::vault::save_doc(&mut self.vault, "scope", "standing", "standing-scope.json", &scope)
                     .context("NOTHING changed: the standing-scope document did not persist")?;
-                self.standing_scope = scope;
+                *self.standing_scope = scope;
                 self.standing_scope_dirty = false;
             }
         }
@@ -1475,8 +1522,10 @@ impl ServerState {
         event_type: &str,
         event_data: serde_json::Value,
     ) -> Result<ChainEntry> {
-        self.chain_store
-            .append(event_type, event_data, &self.sovereign_lct)
+        super::state_lock::time_section("chain.append", || {
+            self.chain_store
+                .append(event_type, event_data, &self.sovereign_lct)
+        })
     }
 
     /// Confer citizenship on `subject_lct_id` — birth into THIS society's MRH —
@@ -1615,7 +1664,7 @@ impl ServerState {
                 "outcome:failure"
             },
         };
-        self.apply_outcome_ctx(plugin_id, success, magnitude, &ctx)
+        self.apply_outcome_ctx(plugin_id, success, magnitude, &ctx, None)
     }
 
     /// Apply an outcome AND emit the trust movement as a role-scoped
@@ -1629,34 +1678,81 @@ impl ServerState {
         success: bool,
         magnitude: f64,
         ctx: &crate::reputation::RepContext,
+        row: Option<&ChainEntry>,
     ) -> Result<EntityTrust> {
-        // Trust accrues to the #403 (instance, role) grain, NOT the plugin type.
-        // Before this, a mesh-worker's failures and an interactive session's
-        // successes both landed on one `plugin:claude-code` entity — the deltas
-        // were role-scoped but the trust generating them was not. Keying the
-        // store on the (instance_lct, role_lct) pair closes that seam: a role's
-        // reputation is its own, and can't be diluted or poisoned by another
-        // capacity of the same instance.
-        let trust_key = self.trust_entity_key(plugin_id, ctx.role_lct);
-        let (before, after) = self
-            .trust_store
-            .update_returning_prior(&trust_key, success, magnitude)?;
-        // LCT-mapping (sequence head, `repemit-1`): resolve the durable member
-        // LCT for `plugin_id` before building the delta, so `subject_lct` is a
-        // ground-truth member identity minted under hestia's sovereign — never
-        // the raw `plugin:` string. Fail-closed: an unmapped plugin (synthetic
-        // or malformed) yields `None` and emits NO delta, so test harnesses
-        // never pollute the hub's reputation view and no un-mappable id reaches
-        // the emit path. Local trust bookkeeping above still runs for everyone.
-        if let Some(subject_lct) = self.member_lct(plugin_id) {
+        // Trust accrues to the #403 (instance, role) grain, NOT the plugin type: keyed on the
+        // (instance_lct, role_lct) pair so a role's reputation can't be diluted or poisoned by
+        // another capacity of the same instance.
+        let (base, lct) = self.trust_grain(plugin_id, ctx.role_lct, row);
+        self.apply_change(&base, lct.as_deref(), TrustChange::Outcome { success, magnitude }, ctx, row)
+    }
+
+    /// The trust grain for `(plugin_id, role)`: `<instance_lct>#<role>` for a mapped member,
+    /// `plugin:<id>#<role>` otherwise. Projected from a chain ROW, the LCT is the one the row
+    /// recorded at the time — so a replay keys exactly as the live write did, even if the member
+    /// was minted after the row.
+    fn trust_grain(
+        &self,
+        plugin_id: &str,
+        role_lct: &str,
+        row: Option<&ChainEntry>,
+    ) -> (String, Option<String>) {
+        let lct = match row {
+            Some(r) => row_instance_lct(r),
+            None => self.member_lct(plugin_id),
+        };
+        let base = match &lct {
+            Some(l) => format!("{l}#{role_lct}"),
+            None => format!("plugin:{plugin_id}#{role_lct}"),
+        };
+        (base, lct)
+    }
+
+    /// Apply one trust change. With a `row`, it is a PROJECTION of that chain row: idempotent by
+    /// position (an entity already projected through it skips it), clocked by the row, and the
+    /// delta is stamped with the row's time — so replaying the chain reproduces it exactly.
+    fn apply_change(
+        &self,
+        key: &str,
+        lct: Option<&str>,
+        change: TrustChange,
+        ctx: &crate::reputation::RepContext,
+        row: Option<&ChainEntry>,
+    ) -> Result<EntityTrust> {
+        let changed = super::state_lock::time_section("trust_store.update", || match (row, change) {
+            (Some(r), TrustChange::Outcome { success, magnitude }) => self.trust_store.update_at(
+                key, success, magnitude,
+                crate::storage::trust::RowAt { pos: r.chain_position, ts: r.timestamp },
+            ),
+            (Some(r), TrustChange::V3 { dimension, score }) => self.trust_store.update_v3_at(
+                key, dimension, score,
+                crate::storage::trust::RowAt { pos: r.chain_position, ts: r.timestamp },
+            ),
+            (None, TrustChange::Outcome { success, magnitude }) => {
+                self.trust_store.update_returning_prior(key, success, magnitude).map(Some)
+            }
+            (None, TrustChange::V3 { dimension, score }) => {
+                self.trust_store.update_v3_returning_prior(key, dimension, score).map(Some)
+            }
+        })?;
+        let Some((before, after)) = changed else {
+            return self.trust_store.get(key); // already projected through this row
+        };
+        // LCT-mapping (`repemit-1`): only a member with a durable LCT emits a delta; an unmapped
+        // plugin (synthetic or malformed) emits none. Local bookkeeping above runs for everyone.
+        if let Some(subject_lct) = lct {
             if let Some(delta) = crate::reputation::delta_from_change(
-                &subject_lct,
+                subject_lct,
                 ctx,
                 &before,
                 &after,
-                chrono::Utc::now(),
+                row.map(|r| r.timestamp).unwrap_or_else(chrono::Utc::now),
             ) {
-                crate::reputation::log_delta(&self.reputation_sink(), &delta);
+                if let Some(line) = crate::reputation::delta_line(&delta) {
+                    if let Err(e) = self.trust_store.append_after_trust(&self.reputation_sink(), line) {
+                        tracing::warn!("reputation delta not queued: {e:#}");
+                    }
+                }
             }
         }
         Ok(after)
@@ -1738,52 +1834,159 @@ impl ServerState {
         dimension: web4_core::v3::ValueDimension,
         score: f64,
         ctx: &crate::reputation::RepContext,
+        row: Option<&ChainEntry>,
     ) -> Result<EntityTrust> {
-        let key = self.adjudicated_entity_key(subject_plugin_id, ctx.role_lct);
-        let (before, after) = self
-            .trust_store
-            .update_v3_returning_prior(&key, dimension, score)?;
-        if let Some(subject_lct) = self.member_lct(subject_plugin_id) {
-            if let Some(delta) = crate::reputation::delta_from_change(
-                &subject_lct,
-                ctx,
-                &before,
-                &after,
-                chrono::Utc::now(),
-            ) {
-                crate::reputation::log_delta(&self.reputation_sink(), &delta);
-            }
-        }
-        Ok(after)
+        let (base, lct) = self.trust_grain(subject_plugin_id, ctx.role_lct, row);
+        let key = format!("{base}#adjudicated");
+        self.apply_change(&key, lct.as_deref(), TrustChange::V3 { dimension, score }, ctx, row)
     }
 
-    /// Apply a judgment outcome to the judgment-axis entity and emit the delta
-    /// (same bridge as [`apply_outcome_ctx`]). The delta's `action_type`
-    /// (`"reversal"`) is what separates this stream from execution deltas in the
-    /// sink — the role_lct stays canonical so the hub fold doesn't fragment.
+    /// Apply a judgment outcome to the judgment-axis entity and emit the delta (same bridge as
+    /// [`apply_outcome_ctx`]; `action_type` `"reversal"` separates the stream in the sink).
     pub fn apply_judgment_ctx(
         &self,
         plugin_id: &str,
         success: bool,
         magnitude: f64,
         ctx: &crate::reputation::RepContext,
+        row: Option<&ChainEntry>,
     ) -> Result<EntityTrust> {
-        let key = self.judgment_entity_key(plugin_id, ctx.role_lct);
-        let (before, after) = self
-            .trust_store
-            .update_returning_prior(&key, success, magnitude)?;
-        if let Some(subject_lct) = self.member_lct(plugin_id) {
-            if let Some(delta) = crate::reputation::delta_from_change(
-                &subject_lct,
-                ctx,
-                &before,
-                &after,
-                chrono::Utc::now(),
-            ) {
-                crate::reputation::log_delta(&self.reputation_sink(), &delta);
+        let (base, lct) = self.trust_grain(plugin_id, ctx.role_lct, row);
+        let key = format!("{base}#judgment");
+        self.apply_change(&key, lct.as_deref(), TrustChange::Outcome { success, magnitude }, ctx, row)
+    }
+
+    /// TRUST IS A PROJECTION OF THE CHAIN (#1271): re-apply every trust-affecting row from
+    /// position `from`, through the same functions the live writes use. Idempotent per entity
+    /// (`through`), so it is safe over rows the cache already holds. Returns rows applied.
+    pub fn replay_trust_projection(&self, from: u64) -> Result<u64> {
+        let mut pos = from;
+        let mut applied = 0u64;
+        loop {
+            let rows = self.chain_store.read_from(pos, 2000)?;
+            if rows.is_empty() {
+                break;
+            }
+            for r in &rows {
+                if self.project_trust_row(r)? {
+                    applied += 1;
+                }
+                pos = r.chain_position + 1;
             }
         }
-        Ok(after)
+        Ok(applied)
+    }
+
+    /// The trust change one chain row carries, derived from the row's content alone — the same
+    /// rule every live write path follows. `true` if the row carries one.
+    fn project_trust_row(&self, r: &ChainEntry) -> Result<bool> {
+        use crate::reputation::{DeltaClass, RepContext};
+        let d = &r.event_data;
+        let st = |k: &str| d.get(k).and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+        match r.event_type.as_str() {
+            "outcome" => {
+                let success = d.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                let magnitude = d.get("magnitude").and_then(serde_json::Value::as_f64).unwrap_or(0.5);
+                let (plugin, role, tool, aid) = (st("plugin_id"), st("role_lct"), st("tool_name"), st("action_id"));
+                let ctx = RepContext {
+                    class: DeltaClass::Unclassified,
+                    role_lct: &role,
+                    action_type: "tool_execution",
+                    action_target: &tool,
+                    action_id: &aid,
+                    rule_triggered: "",
+                    reason: if success { "outcome:success" } else { "outcome:failure" },
+                };
+                self.apply_outcome_ctx(&plugin, success, magnitude, &ctx, Some(r))?;
+                Ok(true)
+            }
+            t if t == super::decision_witness::DECISION_EVENT || t == "decision_charge_settled" => {
+                let settled = t == "decision_charge_settled";
+                let has_action = d.get("action_id").and_then(serde_json::Value::as_str).is_some();
+                // Which rows charged, live: a keyed row with a charge and no `charge_held_by`
+                // (the first charge on its key); a seat row with no action id (adjudicator
+                // present); a settle row for an owed legacy charge. A daemon direct-tool deny
+                // (no action id, no adjudicator) never charged.
+                let spec = if settled {
+                    d.get("charge").and_then(super::decision_witness::ChargeSpec::from_settle)
+                } else if has_action {
+                    if d.get("charge_held_by").is_some() {
+                        None
+                    } else {
+                        super::decision_witness::ChargeSpec::from_row(d)
+                    }
+                } else if d.get("adjudicator").and_then(serde_json::Value::as_str).is_some() {
+                    super::decision_witness::ChargeSpec::from_row(d).map(|mut c| {
+                        c.conduct = false;
+                        c
+                    })
+                } else {
+                    None
+                };
+                let Some(c) = spec else { return Ok(false) };
+                let (plugin, aid) = (st(if settled { "member" } else { "plugin_id" }), st("action_id"));
+                let ctx = RepContext {
+                    class: if c.conduct { DeltaClass::Conduct } else { DeltaClass::Unclassified },
+                    role_lct: &c.role_lct,
+                    action_type: "policy_gate",
+                    action_target: &c.tool_name,
+                    action_id: &aid,
+                    rule_triggered: &c.rule_id,
+                    reason: &c.reason,
+                };
+                self.apply_outcome_ctx(&plugin, false, c.magnitude, &ctx, Some(r))?;
+                Ok(true)
+            }
+            "adjudication" => {
+                let Some(score) = d.get("score").and_then(serde_json::Value::as_f64) else {
+                    return Ok(false); // deferred: no trust change
+                };
+                let axis = st("axis");
+                let operator = d.pointer("/adjudicated_by/operator").and_then(serde_json::Value::as_bool) == Some(true);
+                // The two adjudication doors map axes differently; the row says which door.
+                let dimension = if operator {
+                    if axis == "validity" { web4_core::v3::ValueDimension::Validity } else { web4_core::v3::ValueDimension::Valuation }
+                } else {
+                    match crate::server::handler::axis_dimension(&axis) {
+                        Some(dim) => dim,
+                        None => return Ok(false),
+                    }
+                };
+                let (plugin, role, target) = (st("subject_plugin_id"), st("subject_role"), st("ref"));
+                let reason = format!("adjudication:{axis}:{}:{}", st("verdict"), st("method"));
+                let ctx = RepContext {
+                    class: DeltaClass::Conduct,
+                    role_lct: &role,
+                    action_type: "adjudication",
+                    action_target: &target,
+                    action_id: "",
+                    rule_triggered: "",
+                    reason: &reason,
+                };
+                self.apply_adjudication_ctx(&plugin, dimension, score, &ctx, Some(r))?;
+                Ok(true)
+            }
+            "reversal" => {
+                if d.get("validity_effect").and_then(serde_json::Value::as_str) != Some("refuted") {
+                    return Ok(false);
+                }
+                let magnitude = d.get("magnitude").and_then(serde_json::Value::as_f64).unwrap_or(0.5);
+                let (plugin, role, target) = (st("subject_plugin_id"), st("subject_role"), st("ref"));
+                let reason = format!("reversal:{}:{}", st("kind"), st("cause"));
+                let ctx = RepContext {
+                    class: DeltaClass::Conduct,
+                    role_lct: &role,
+                    action_type: "reversal",
+                    action_target: &target,
+                    action_id: "",
+                    rule_triggered: "",
+                    reason: &reason,
+                };
+                self.apply_judgment_ctx(&plugin, false, magnitude, &ctx, Some(r))?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     /// Read trust for a plugin in the default (member) capacity. Retained for the
@@ -1808,7 +2011,128 @@ impl ServerState {
     }
 }
 
-pub type SharedState = Arc<Mutex<ServerState>>;
+impl ServerState {
+    fn build_publication(&self) -> crate::server::published::PolicyPublication {
+        use crate::server::published::PolicyPublication;
+        PolicyPublication {
+            version: self.publication_version,
+            society: (*self.policy_engine).clone(),
+            roles: (*self.role_policy_engines).clone(),
+            instances: (*self.instance_policy_engines).clone(),
+            instance_grants: (*self.instance_grants).clone(),
+            law_gate: (*self.law_gate).clone(),
+            policy_lists: self.vault.policy_lists(),
+            scope_requests: (*self.scope_requests).clone(),
+            standing_scope: (*self.standing_scope).clone(),
+            authority_status: *self.authority_status,
+            standing_projection_audit: (*self.standing_projection_audit).clone(),
+            sessions: self.sessions.directory(),
+            gate_capabilities: self.gate_capabilities.clone(),
+            chain_durability: self.chain_store.durability().clone(),
+            observed_len: self.chain_store.len().unwrap_or(0),
+        }
+    }
+
+    /// Did any policy input change since the last publication? Clears every dirty bit (all of
+    /// them, not short-circuiting, so none stays set into the next release).
+    fn take_policy_dirty(&mut self) -> bool {
+        let mut d = false;
+        d |= self.policy_engine.take_dirty();
+        d |= self.role_policy_engines.take_dirty();
+        d |= self.instance_policy_engines.take_dirty();
+        d |= self.instance_grants.take_dirty();
+        d |= self.law_gate.take_dirty();
+        d |= self.scope_requests.take_dirty();
+        d |= self.standing_scope.take_dirty();
+        d |= self.authority_status.take_dirty();
+        d |= self.standing_projection_audit.take_dirty();
+        let lists_gen = self.vault.policy_lists_generation();
+        if lists_gen != self.published_lists_gen {
+            self.published_lists_gen = lists_gen;
+            d = true;
+        }
+        d
+    }
+}
+
+#[cfg(test)]
+impl ServerState {
+    /// Lose every pending dirty bit — the failure the debug staleness check exists to catch.
+    pub(crate) fn forget_policy_dirty_for_test(&mut self) {
+        let _ = self.take_policy_dirty();
+    }
+}
+
+impl super::state_lock::Publish for ServerState {
+    type Snapshot = crate::server::published::PolicyPublication;
+
+    fn initial_snapshot(&mut self) -> Self::Snapshot {
+        let _ = self.take_policy_dirty();
+        self.sessions.apply_pending();
+        self.build_publication()
+    }
+
+    fn on_release(&mut self, slot: &std::sync::RwLock<Arc<Self::Snapshot>>) {
+        // DURABLE READS: whatever this holder read or will reply with reflects every chain entry
+        // committed so far; its request (if any) must not reply before they are durable.
+        if crate::storage::durability::observing_releases() {
+            crate::storage::durability::note_observed(
+                self.chain_store.durability(),
+                self.chain_store.len().unwrap_or(0),
+            );
+        }
+        let dirty = self.take_policy_dirty();
+        if dirty {
+            self.publication_version += 1;
+        }
+        if dirty || self.sessions.has_pending() {
+            // Build outside the slot's write lock; swap (and apply staged session changes)
+            // inside it, so a reader sees one consistent (directory, publication) pair.
+            let fresh = if dirty { Some(Arc::new(self.build_publication())) } else { None };
+            let mut w = slot.write().unwrap_or_else(|p| p.into_inner());
+            self.sessions.apply_pending();
+            if let Some(f) = fresh {
+                *w = f;
+            }
+            return;
+        }
+        // THE STALENESS CHECK (debug builds, so every test): nothing was marked dirty, so the
+        // published snapshot must equal one built from the live state right now. A mutation that
+        // escaped `Watched` fails here, at the release that made it, naming nothing stale.
+        #[cfg(debug_assertions)]
+        {
+            if std::env::var_os("HESTIA_SKIP_PUBLICATION_CHECK").is_none() {
+                let current = slot.read().unwrap_or_else(|p| p.into_inner()).clone();
+                let fresh = self.build_publication();
+                let (a, b) = (fresh.canonical(), current.canonical());
+                assert!(
+                    a == b,
+                    "STALE POLICY PUBLICATION: a policy input changed without passing through                      `Watched` (or the vault list generation). live={a} published={b}"
+                );
+            }
+        }
+    }
+}
+
+/// One trust change, as a chain row carries it.
+#[derive(Clone, Copy)]
+enum TrustChange {
+    Outcome { success: bool, magnitude: f64 },
+    V3 { dimension: web4_core::v3::ValueDimension, score: f64 },
+}
+
+/// The member LCT a row recorded for its subject at the time (`instance_lct` on outcome and
+/// decision rows, `subject_instance_lct` on adjudications and reversals).
+fn row_instance_lct(r: &ChainEntry) -> Option<String> {
+    r.event_data
+        .get("instance_lct")
+        .or_else(|| r.event_data.get("subject_instance_lct"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// The daemon's shared state behind its one global lock, instrumented (see `state_lock`).
+pub type SharedState = Arc<super::state_lock::StateCell<ServerState>>;
 
 #[cfg(test)]
 mod tests {
@@ -1844,10 +2168,10 @@ mod tests {
         let dev = "role:constellation:interactive-dev";
         // Same plugin, mesh-worker role: two failures.
         state
-            .apply_outcome_ctx("claude-code", false, 0.8, &ctx_for(mw))
+            .apply_outcome_ctx("claude-code", false, 0.8, &ctx_for(mw), None)
             .unwrap();
         let mw_trust = state
-            .apply_outcome_ctx("claude-code", false, 0.8, &ctx_for(mw))
+            .apply_outcome_ctx("claude-code", false, 0.8, &ctx_for(mw), None)
             .unwrap();
         // Same plugin, interactive-dev role: one success.
         let dev_trust = state
@@ -1859,6 +2183,7 @@ mod tests {
                     reason: "outcome:success",
                     ..ctx_for(dev)
                 },
+                None,
             )
             .unwrap();
         // Distinct entities: the two roles carry different entity_ids + scores.
@@ -2216,8 +2541,10 @@ mod tests {
         // A real member: a moving outcome emits a delta whose subject_lct is the
         // mapped member LCT, not the raw plugin_id.
         state.apply_outcome("real-plugin", false, 0.7).unwrap();
+        crate::storage::trust::flush_all_for_test();
         let sink = state.reputation_sink();
         let expected = state.member_lct("real-plugin").unwrap();
+        crate::storage::trust::flush_all_for_test();
         let lines: Vec<String> = std::fs::File::open(&sink)
             .map(|f| {
                 std::io::BufReader::new(f)
@@ -2239,6 +2566,7 @@ mod tests {
         // A synthetic member: trust still updates locally, but NO delta is emitted.
         state.mark_synthetic("synthetic-plugin", 3).unwrap();
         state.apply_outcome("synthetic-plugin", false, 0.7).unwrap();
+        crate::storage::trust::flush_all_for_test();
         let after: Vec<String> = std::fs::File::open(&sink)
             .map(|f| {
                 std::io::BufReader::new(f)

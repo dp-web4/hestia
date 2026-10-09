@@ -23,6 +23,8 @@ pub mod retirement;
 pub mod standing_scope;
 pub mod transport_binding;
 mod state;
+pub mod state_lock;
+pub mod published;
 
 pub use dashboard::{
     ActivityStats, DashboardSnapshot, DeploymentHealth, RecentEntry, SocietyView, TrustView,
@@ -34,7 +36,6 @@ pub use state::{ServerState, SharedState};
 use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use crate::vault::Vault;
 
@@ -58,5 +59,5 @@ pub fn build_state(mut vault: Vault, home: &Path, passphrase: &str) -> Result<Sh
         tracing::warn!("failed to project public identity from authoritative vault state: {e:#}");
     }
 
-    Ok(Arc::new(Mutex::new(state)))
+    Ok(Arc::new(state_lock::StateCell::new(state)))
 }
