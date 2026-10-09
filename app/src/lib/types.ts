@@ -17,6 +17,8 @@ export interface ActivityStats {
 
 export interface TrustView {
   plugin_id: string;
+  /** Set when this id was merged into another: its acts count toward that one. */
+  aliased_to?: string | null;
   entity_id: string;
   level: string;
   // Canonical unmeasured-handling: a dimension with zero observations is null
@@ -480,6 +482,18 @@ export interface AgentInventory {
   /** Active gate bypasses, BESIDE the inventory's verdicts (the daemon does not tell the inventory). */
   bypassed?: Record<string, GateBypass>;
 }
+
+/** What a retire/reinstate came back as. Conflicts are outcomes, not errors (PRD §1a). */
+export type MemberActOutcome =
+  | { outcome: "retired" | "reinstated"; result: Record<string, unknown> }
+  | { outcome: "already_retired" | "already_reinstated"; detail: string }
+  | {
+      outcome: "needs_confirmation";
+      detail: string;
+      acts_recently: number | null;
+      unmeasurable: boolean;
+      window_hours: number | null;
+    };
 
 /**
  * One grant in force, from the snapshot. `live` dies at the next daemon restart; `standing`

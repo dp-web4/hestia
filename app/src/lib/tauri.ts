@@ -3,6 +3,7 @@ import type {
   AgentInventory,
   DashboardSnapshot,
   DecideOutcome,
+  MemberActOutcome,
   ReachOutcome,
   ScopeGrantRow,
   GateReport,
@@ -82,6 +83,25 @@ export async function gatesForget(reason: string, paths: string[]): Promise<unkn
 /** Who is on this box and whether it is governed. Read-only. */
 export async function agentsInventory(): Promise<AgentInventory> {
   return invoke("agents_inventory");
+}
+
+/**
+ * Retire a member id on this seat: revokes its standing, live and delegated authority. A reason
+ * and a reference are required. The daemon refuses an id that acted in the last 24h unless
+ * `confirmActive` is sent; that comes back as `needs_confirmation` with the evidence.
+ */
+export async function retireAgent(
+  id: string,
+  reason: string,
+  evidenceRef: string,
+  confirmActive = false,
+): Promise<MemberActOutcome> {
+  return invoke("retire_agent", { id, reason, evidenceRef, confirmActive });
+}
+
+/** Undo a retirement. The authority revoked then is NOT restored; the result names it. */
+export async function reinstateAgent(id: string, reason: string): Promise<MemberActOutcome> {
+  return invoke("reinstate_agent", { id, reason });
 }
 
 /**
