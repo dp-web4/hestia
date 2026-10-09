@@ -618,6 +618,13 @@ impl ServerState {
         }
         let trust_store = TrustStore::open(home.join("trust"), store_key)?;
         let inbox_store = crate::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
+        // Durable reads: inbox rows carry chain hashes; no inbox write reaches disk ahead of them.
+        {
+            let durability = chain_store.durability().clone();
+            inbox_store.set_pre_write_barrier(Arc::new(move || {
+                durability.flush_committed_blocking().map_err(|e| format!("{e:#}"))
+            }));
+        }
         // The disposition projection cursor is initialized HERE — synchronously,
         // at state open, before any ruling surface is reachable (revised #480
         // review, blocker 2). The r3 shape initialized it lazily on the worker's
@@ -1834,6 +1841,8 @@ impl ServerState {
             standing_projection_audit: (*self.standing_projection_audit).clone(),
             sessions: self.sessions.directory(),
             gate_capabilities: self.gate_capabilities.clone(),
+            chain_durability: self.chain_store.durability().clone(),
+            observed_len: self.chain_store.len().unwrap_or(0),
         }
     }
 
@@ -1876,6 +1885,14 @@ impl super::state_lock::Publish for ServerState {
     }
 
     fn on_release(&mut self, slot: &std::sync::RwLock<Arc<Self::Snapshot>>) {
+        // DURABLE READS: whatever this holder read or will reply with reflects every chain entry
+        // committed so far; its request (if any) must not reply before they are durable.
+        if crate::storage::durability::observing_releases() {
+            crate::storage::durability::note_observed(
+                self.chain_store.durability(),
+                self.chain_store.len().unwrap_or(0),
+            );
+        }
         let dirty = self.take_policy_dirty();
         if dirty {
             self.publication_version += 1;

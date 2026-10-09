@@ -173,6 +173,10 @@ pub struct PolicyPublication {
     /// Shared handles (not copies): session identity and gate-capability reports.
     pub sessions: Arc<SessionDirectory>,
     pub gate_capabilities: Arc<GateCapabilities>,
+    /// DURABLE READS: the chain length this publication's inputs reflect. A reader replying from
+    /// it waits until that much of the chain is durable (`observe`).
+    pub chain_durability: Arc<crate::storage::durability::Durability>,
+    pub observed_len: u64,
 }
 
 impl PolicyPublication {
@@ -187,6 +191,12 @@ impl PolicyPublication {
     pub fn live_standing_grants(&self, plugin_id: &str) -> Vec<&StandingGrant> {
         self.standing_scope.live_for(plugin_id, crate::server::gate_escalation::now_secs())
     }
+    /// Register this publication with the current request's durability scope: its reply must not
+    /// precede the durability of the chain entries the publication reflects.
+    pub fn observe(&self) {
+        crate::storage::durability::note_observed(&self.chain_durability, self.observed_len);
+    }
+
     /// Resolve a caller-supplied session id. FAIL-CLOSED like `resolve_attributed_caller`.
     pub fn resolve(&self, session_id: Option<&str>) -> Option<CallerIdent> {
         let uuid = Uuid::parse_str(session_id?).ok()?;
