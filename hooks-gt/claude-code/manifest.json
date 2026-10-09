@@ -7,12 +7,12 @@
   "files": [
     {
       "path": "hooks/disposition_deliver.py",
-      "sha256": "c54e5ebceea5c92a0bff63276dd79e462f6bc7156fe2d98e5189b736ee7aadd5",
+      "sha256": "d86f39b2399ccedab559f38e3410ecf26dc0e2e69fc9d40501691cb988a77b61",
       "source": "plugins/claude-code/hooks/disposition_deliver.py"
     },
     {
       "path": "hooks/hooks.json",
-      "sha256": "4b544677a350440fba3797144e94b0146db30d889af111f20ed1ef2d4ab00cdd",
+      "sha256": "99abbd954c119823bd411ddb4be4fe5d727819dd899700163da1b679a17a0ff7",
       "source": "plugins/claude-code/hooks/hooks.json"
     },
     {
@@ -62,5 +62,5 @@
     ]
   },
   "requires": [],
-  "gt_version": "8a9083d5f88d96195d263724396d1c130f7fb9520eb3f0ffe814bc64a18bf71b"
+  "gt_version": "56d6a72b7602509678325aa08cdcbfee12e1cea8169a3fd1e89411373e7f8719"
 }

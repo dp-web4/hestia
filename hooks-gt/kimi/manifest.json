@@ -7,7 +7,7 @@
   "files": [
     {
       "path": "hooks/hooks.json",
-      "sha256": "ff6a6b61e99bbac86dbf0d38e6113b627c8214d0cf8e797295854e5ff4400671",
+      "sha256": "d647f2fbfd8f3843f81142fa01625b496d2149b5ee1f42cffee7e2b605d0d4a1",
       "source": "plugins/kimi/hooks/hooks.json"
     },
     {
@@ -62,5 +62,5 @@
     ]
   },
   "requires": [],
-  "gt_version": "8be2b5404fbac6b47ad9dc94bc91583065d06f13dd38727964055de54ebbfeb2"
+  "gt_version": "6fa534cf548c8f191d1c2c95c2812de67c56c5f533bbda32b4cadead745a5686"
 }

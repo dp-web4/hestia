@@ -1,7 +1,8 @@
 {
-  "_comment": "NON-RUNNABLE INSTALLATION TEMPLATE for Claude Code hooks (~/.claude/settings.json). deploy/register-members.py renders @HESTIA_PLUGIN_ROOT@/claude-code/hooks/<file> to the member's declared install dest (expects.json install.dest) and merges, by target basename, only the hooks the settings do not already carry. Unrendered placeholders must never be deployed. Shapes and timeouts mirror the registration measured on thor 2026-09-28.",
+  "_comment": "NON-RUNNABLE INSTALLATION TEMPLATE for Claude Code hooks (~/.claude/settings.json). deploy/register-members.py renders @HESTIA_PLUGIN_ROOT@/claude-code/hooks/<file> to the member's declared install dest (expects.json install.dest) and merges, by target basename, only the hooks the settings do not already carry. It renders @HESTIA_HOME@ to the deploying environment's HESTIA_HOME as an absolute path (unset refuses: the bootstrap locator has no default) on the gate and the witness, the two hooks that load the seat projection, together with HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\": the role is launch context, never config (the projection cannot carry it), so the line passes a launcher's HESTIA_ROLE through and otherwise defaults to this member's install.default_role (no declaration drops the token). Since dp's 2026-10-06 ruling the deployer OWNS these lines: every line it installed is rewritten to this template on each deploy; per-seat customisation goes through the vault's seat projection, never a hand edit to a hook line. Unrendered placeholders must never be deployed. Shapes and timeouts mirror the registration measured on thor 2026-09-28.",
   "_why": "Before this file, claude-code's registration was a hand edit on every host (#1133, #1135): the plugin shipped pre_tool_use.py, witness.py and law_inject.py and nothing wrote them into settings.json. The daemon's install_claude_code merges only the witness. This template is what the installer renders.",
   "_timeout_contract": "One-gate stage C. The PreToolUse gate READS its timeout from the registration this template becomes (seconds; Claude Code's default for an entry without one is 60) and decides inside start + timeout - 1.5 s, so it always fails closed before Claude Code kills it (a hook timeout is a non-blocking error there: the tool runs, i.e. fail-open). 10 s absorbs one cold member connect (measured 4.6-5.1 s). A shorter registration costs availability, never safety; deploy/register-members.py reports one below this floor.",
+  "_disposition_reader": "disposition_deliver.py (PRD_DISPOSITION_DELIVERY R4/R4a, #845, #849) renders the daemon's ruling on the asker's own hook stream, so an asker learns 'approved, re-issue the same act' without the operator relaying it in chat. PreToolUse and PostToolUse are the ports that reach a SUBAGENT (every tool call it makes fires them, carrying the parent's session_id plus its own agent_id, measured on Claude Code 2.1.290, 2026-10-06); UserPromptSubmit reaches only the interactive parent idle at its prompt. PreToolUse renders on the asker's very next call; PostToolUse catches a ruling that lands during a long call. It is a stat on one file and fails silent, so 3 s, the witness's budget. It carries HESTIA_HOME because the lane lives in the daemon's home, and no HESTIA_ROLE because it loads no seat projection. Before this entry the reader shipped in expects.json and no host registered it (CBP's deploy log: 'skip disposition_deliver.py - not registered on this host'), so every ruling still went by hand.",
   "hooks": {
     "PreToolUse": [
       {
@@ -9,8 +10,18 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 @HESTIA_PLUGIN_ROOT@/claude-code/hooks/pre_tool_use.py",
+            "command": "HESTIA_HOME=@HESTIA_HOME@ HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" python3 @HESTIA_PLUGIN_ROOT@/claude-code/hooks/pre_tool_use.py",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HESTIA_HOME=@HESTIA_HOME@ python3 @HESTIA_PLUGIN_ROOT@/claude-code/hooks/disposition_deliver.py",
+            "timeout": 3
           }
         ]
       }
@@ -21,7 +32,28 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 @HESTIA_PLUGIN_ROOT@/claude-code/hooks/witness.py",
+            "command": "HESTIA_HOME=@HESTIA_HOME@ HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" python3 @HESTIA_PLUGIN_ROOT@/claude-code/hooks/witness.py",
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HESTIA_HOME=@HESTIA_HOME@ python3 @HESTIA_PLUGIN_ROOT@/claude-code/hooks/disposition_deliver.py",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HESTIA_HOME=@HESTIA_HOME@ python3 @HESTIA_PLUGIN_ROOT@/claude-code/hooks/disposition_deliver.py",
             "timeout": 3
           }
         ]

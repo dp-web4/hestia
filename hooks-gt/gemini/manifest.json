@@ -12,7 +12,7 @@
     },
     {
       "path": "hooks/hooks.json",
-      "sha256": "0ee723265e4b46b761a45029cacd96f82839a9f151fe0be343edc5783d442489",
+      "sha256": "efd3e850e35bcefe116626b04cdc0f2b6770f2e3fed41a0870acfb9963639791",
       "source": "plugins/gemini/hooks/hooks.json"
     },
     {
@@ -62,5 +62,5 @@
     ]
   },
   "requires": [],
-  "gt_version": "5b803c44195c1f17f1e1b97bb4a3e2255f0cb250b0b0b27087feb7ed6e27f4d3"
+  "gt_version": "d3bf109375ce2143fe67271af96a0147bedef227e35a45017cde6f9ca7f05ff6"
 }
