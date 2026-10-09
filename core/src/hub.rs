@@ -57,6 +57,17 @@ pub enum JoinOutcome {
     Escalated { reason: String },
 }
 
+/// What a hub said to a member-initiated withdrawal (web4#804).
+#[derive(Debug)]
+pub enum WithdrawOutcome {
+    /// The hub witnessed `MemberWithdrew`; the body names the entry and any roles vacated.
+    Withdrawn(serde_json::Value),
+    /// The hub answered that this LCT is not a member (404 from a verified envelope). Kept
+    /// apart from an error: "you were already gone" -- perhaps an operator removed you -- is
+    /// a fact about membership, not a failure to ask.
+    NotAMember(String),
+}
+
 /// A challenge nonce from the hub.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChallengeResponse {
@@ -461,6 +472,56 @@ impl HubClient {
             anyhow::bail!("hub /members/join returned HTTP {status}: {text}");
         }
         Ok(JoinOutcome::Admitted(body))
+    }
+
+    /// End this member's own membership of a hub: `POST /v1/hubs/{hub_id}/members/withdraw`
+    /// (web4#804, PRD_HUB_V2_FEDERATED R8.2 exit without penalty).
+    ///
+    /// The hub verifies the envelope against the key IT pinned at admission and has no way to
+    /// decline: there is no law gate on exit. The payload's `member_lct_id` must equal the
+    /// signer, so this can only ever withdraw the member whose keypair signs it.
+    pub async fn withdraw(
+        &self,
+        rest_endpoint: &str,
+        hub_id: Uuid,
+        member_lct_id: Uuid,
+        member_keypair: &KeyPair,
+        reason: Option<String>,
+    ) -> Result<WithdrawOutcome> {
+        let rest = rest_endpoint.trim_end_matches('/');
+        let challenge = self.challenge(rest, member_lct_id).await?;
+        let mut payload = serde_json::json!({
+            "action": "member_withdraw",
+            "member_lct_id": member_lct_id,
+        });
+        if let Some(r) = reason {
+            payload["reason"] = serde_json::Value::String(r);
+        }
+        let envelope =
+            SignedEnvelope::create(challenge.nonce, payload, member_lct_id, member_keypair);
+
+        let url = format!("{rest}/hubs/{hub_id}/members/withdraw");
+        let resp = self
+            .http
+            .post(&url)
+            .json(&envelope)
+            .send()
+            .await
+            .with_context(|| format!("posting withdraw to {url}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let body: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        // The route's own 404 for "not a member" carries that phrase; its 404 for a mismatched
+        // hub id says "does not match this hub" and is NOT a statement about membership.
+        if status.as_u16() == 404 && text.contains("is not a member of") {
+            let msg = body.get("error").and_then(|v| v.as_str()).unwrap_or(&text).to_string();
+            return Ok(WithdrawOutcome::NotAMember(msg));
+        }
+        if !status.is_success() {
+            anyhow::bail!("hub /members/withdraw returned HTTP {status}: {text}");
+        }
+        Ok(WithdrawOutcome::Withdrawn(body))
     }
 
     /// Push the member-tier profile to a hub as a `MemberProfileUpdated` act.

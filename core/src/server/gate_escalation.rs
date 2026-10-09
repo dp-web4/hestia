@@ -586,8 +586,14 @@ pub fn markers_of(marker: &str, act: Option<&str>, resolved_targets: &[String]) 
         }
     }
     if let Some(text) = act {
+        // Two tokenizations, unioned (markers only add, so the union can only raise the bar):
+        // one splits on `[`/`]` so a bracketed literal (`[/w/hooks/pre_tool_use.py]`) still
+        // names its file; one keeps them so a bracket CLASS (`[pq]re_tool_use.py`) survives
+        // whole to `sovereign_expansions`, pricing like the same pattern as a resolved target
+        // (Codex notice 18784, P2).
         let split = |c: char| c.is_whitespace() || "\"'`=,;:()<>|&{}[]\\".contains(c);
-        for tok in text.split(split) {
+        let keep = |c: char| c.is_whitespace() || "\"'`=,;:()<>|&{}\\".contains(c);
+        for tok in text.split(split).chain(text.split(keep)) {
             let base = tok.rsplit('/').next().unwrap_or("");
             if SOVEREIGN_FILES.contains(&base) {
                 add(base, &mut out);
@@ -7379,6 +7385,17 @@ mod resolved_target_tests {
                    Bar::SingleApprover);
         assert_eq!(open_t("plugins/_shared", "Bash: rm /w/plugins/kimi/hooks/*", &[]).bar,
                    Bar::SovereignPlusPeer);
+        // Codex notice 18784, P2: a bracket CLASS in the act text prices like the same pattern
+        // as a resolved target; a bracketed literal still names its file; a class that cannot
+        // reach a sovereign name adds nothing.
+        assert_eq!(open_t("plugins/_shared", "Bash: rm /w/plugins/kimi/hooks/[pq]re_tool_use.py", &[]).bar,
+                   Bar::SovereignPlusPeer);
+        assert_eq!(open_t("plugins/_shared", "Edit -> act", &["/w/plugins/kimi/hooks/[pq]re_tool_use.py"]).bar,
+                   Bar::SovereignPlusPeer);
+        assert_eq!(open_t("plugins/_shared", "Bash: ls [/w/plugins/kimi/hooks/pre_tool_use.py]", &[]).bar,
+                   Bar::SovereignPlusPeer);
+        assert_eq!(open_t("plugins/_shared", "Bash: rm /w/plugins/kimi/hooks/[xy]re_tool_use.py", &[]).bar,
+                   Bar::SingleApprover);
         // Brace expansion cannot be bounded on the name: unpriceable, the highest bar.
         let e = open_t(HOOKS, "Edit -> act", &["/w/plugins/kimi/hooks/{a,b}.py"]);
         assert_eq!(e.bar, Bar::SovereignPlusPeer);

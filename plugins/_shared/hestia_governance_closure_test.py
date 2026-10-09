@@ -723,6 +723,29 @@ def test_write_verdicts_reports_every_governed_target():
     check("read_is_empty", g.write_verdicts("Bash", {"command": f"cat {last}"},
                                             cwd=_NEUTRAL_CWD, closure=FLOOR) == [])
 
+    # Codex notice 17632, P1-2: a verdict carries the spellings its match consulted, so an
+    # alias that matched by its realpath carries that destination (realpath modeled, no link).
+    alias = "/w/x/alias.txt"
+    real_rp = g.os.path.realpath
+    g.os.path.realpath = lambda p: last if p == alias else real_rp(p)
+    try:
+        vs = g.write_verdicts("Bash", {"command": f"touch {alias}"}, cwd=_NEUTRAL_CWD, closure=FLOOR)
+    finally:
+        g.os.path.realpath = real_rp
+    check("alias_carries_its_destination",
+          len(vs) == 1 and vs[0].resource == alias and last in vs[0].resolved, vs)
+    vs = g.write_verdicts("Bash", {"command": "touch plugins/_shared/x.txt"}, cwd="/w/hestia",
+                          closure=FLOOR)
+    check("relative_carries_its_cwd_join",
+          len(vs) == 1 and "/w/hestia/plugins/_shared/x.txt" in vs[0].resolved, vs)
+    vs = g.write_verdicts("Bash", {"command": f"touch {last}"}, cwd=_NEUTRAL_CWD, closure=FLOOR)
+    check("a_plain_absolute_target_adds_nothing", len(vs) == 1 and vs[0].resolved == (), vs)
+    # P1-1: out of grammar, the verdict's rule says the target is vocabulary, not a position.
+    vs = g.write_verdicts("Bash", {"command": "touch /w/hestia/plugins/_shared/$TARGET"},
+                          cwd=_NEUTRAL_CWD, closure=FLOOR)
+    check("out_of_grammar_rule_marks_vocabulary",
+          vs and all(v.rule == g.RULE_OUT_OF_GRAMMAR for v in vs), vs)
+
     def boom(tool, ti):
         raise RuntimeError("classifier bug")
     g._write_position_targets = boom

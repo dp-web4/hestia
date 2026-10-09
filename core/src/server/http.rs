@@ -1165,6 +1165,8 @@ pub async fn serve_with_callback(
             axum::routing::put(super::hub_tab::hub_urls_set_active),
         )
         .route("/api/hub/join", post(super::hub_tab::hub_join))
+        .route("/api/hub/memberships", get(super::hub_tab::hub_memberships))
+        .route("/api/hub/withdraw", post(super::hub_tab::hub_withdraw))
         .route("/api/hub/topics", get(super::hub_tab::hub_topics))
         .route("/api/hub/topic", post(super::hub_tab::hub_topic_create))
         .route("/api/hub/post", post(super::hub_tab::hub_post))

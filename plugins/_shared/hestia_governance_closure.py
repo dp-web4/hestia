@@ -54,24 +54,6 @@ loosen it. An unreadable vault yields the floor, never an empty (open) closure. 
 same reasoning as the core's "mirrored, not imported" note: a load failure must not disarm
 the check.
 
-EACH MEMBER'S INSTALLED SURFACE IS DERIVED FROM ITS INSTALL DECLARATION
------------------------------------------------------------------------
-A member's gate runs from where the installer put it, under the entry name its harness
-invokes, wired in by a harness config file — expects.json `install.dest`,
-`install.gate_probe.entry` and `install.registration.path`. Those three declarations ARE the
-member's governance surface on a running seat, so the closure derives it from them
-(_closure_from_install) instead of hoping each member's names match a basename list written
-before it existed: the dest dir becomes a dir marker, the entry basename a hooks-dir name,
-the registration path an exact path. A list keyed on names is a list of the members its
-author knew; a member with a different entry name or harness home falls outside it silently.
-
-The installed module has no manifests beside it ($HESTIA_HOME/shared holds the engine only),
-so its registry is empty and only the floor holds there. The floor therefore carries a
-SNAPSHOT of every member's install declaration (MEMBER_INSTALL_DECLARATIONS), derived by the
-same function, and a drift test pins that snapshot equal to the manifests — a member whose
-gate moves or is renamed without the snapshot following is red in CI, not open on a seat.
-Literal names stay in LITERAL_FLOOR too, as the backstop under both.
-
 FAIL-CLOSED CONTRACT — WITH A DELIBERATE, LOAD-BEARING ASYMMETRY
 ----------------------------------------------------------------
 classify() NEVER raises to the caller and this module never calls sys.exit (it returns a
@@ -118,8 +100,6 @@ __all__ = [
     "ClosureVerdict",
     "Closure",
     "LITERAL_FLOOR",
-    "FAILSAFE_CLOSURE",
-    "MEMBER_INSTALL_DECLARATIONS",
     "RULE_WRITE",
     "RULE_WRITE_UNPARSEABLE",
     "RULE_OUT_OF_GRAMMAR",
@@ -131,9 +111,6 @@ __all__ = [
     "load_closure",
     "default_closure",
     "attest_shims",
-    "resolve_location",
-    "declared_dest",
-    "registered_closure",
 ]
 
 # ── Rule ids (returned to the shim; the shim's refusal/witness names the RULE and the ACT) ──
@@ -168,38 +145,19 @@ class ClosureVerdict:
     `marker` is the matched closure element (the REASON); `resource` is the concrete
     argument that matched (the ACT — a human's basis for approving an escalation).
     `source` says which closure decided: "registry+floor" or "floor".
+    `resolved` are the other spellings of `resource` the match consulted — cwd-joined and
+    realpath'd, only where they differ — so an alias that matched by its destination carries
+    that destination to the escalation's price, not only the alias (Codex review of #1239).
     """
     classification: str            # "none" | "read" | "write"
     rule: Optional[str] = None     # rule id on "write" (and diagnostics on read-internal)
     marker: Optional[str] = None   # matched closure element
     resource: Optional[str] = None  # the argument that resolved into the closure
     source: str = "floor"
-    # The LOCATION the write reaches, as this classifier resolved it: home-expanded, joined
-    # onto the caller's cwd when relative, realpath'd (symlinks and `..` resolved). `resource`
-    # is the argument as written (it can be relative, or a name inside a `cd`); this is where it
-    # lands. Set on a resolved write only. It is what the daemon prices a member's gate entry
-    # from, by location, so the price never depends on how the act was spelled or summarised.
-    resolved: Optional[str] = None
+    resolved: tuple = ()
 
 
 # ── The closure — segment-pattern matchers, tighten-only union ──────────────────────────────
-def resolve_location(target: str, cwd: Optional[str] = None) -> Optional[str]:
-    """Where `target` lands: home-expanded, cwd-joined when relative, then realpath'd. A
-    relative target with no cwd to pin it is normalised but stays relative (realpath would
-    resolve it against THIS process's cwd, which is not the classified command's)."""
-    if not isinstance(target, str) or not target:
-        return None
-    try:
-        p = os.path.expanduser(target.replace("\\", "/"))
-        if not os.path.isabs(p):
-            if not (isinstance(cwd, str) and cwd):
-                return os.path.normpath(p)
-            p = os.path.join(os.path.expanduser(cwd), p)
-        return os.path.realpath(p)
-    except (OSError, ValueError):
-        return None
-
-
 def _segments(path: str) -> tuple:
     p = path.replace("\\", "/").rstrip("/")
     return tuple(s for s in p.split("/") if s not in ("", "."))
@@ -267,12 +225,11 @@ class Closure:
                 return base
         return None
 
-    def match(self, target: str, *, cwd: Optional[str] = None,
-              position: str = "write") -> Optional[str]:
-        """The matched closure element, or None. Candidates: raw, cwd-joined (when relative),
-        and realpath'd forms — resolve BEFORE segment comparison (symlink/.. aliasing)."""
+    def forms(self, target: str, *, cwd: Optional[str] = None) -> list:
+        """Every spelling `match` consults, raw first: raw, cwd-joined (when relative), and
+        realpath'd forms — resolved BEFORE segment comparison (symlink/.. aliasing)."""
         if not isinstance(target, str) or not target:
-            return None
+            return []
         cands = [target]
         norm = target.replace("\\", "/")
         rel = not os.path.isabs(norm) and not norm.startswith("~")
@@ -292,7 +249,12 @@ class Closure:
                     cands.append(rp)
             except (OSError, ValueError):
                 pass
-        for c in cands:
+        return cands
+
+    def match(self, target: str, *, cwd: Optional[str] = None,
+              position: str = "write") -> Optional[str]:
+        """The matched closure element, or None, over every form in `forms`."""
+        for c in self.forms(target, cwd=cwd):
             hit = self._match_segments(_segments(c), position)
             if hit:
                 return hit
@@ -336,9 +298,6 @@ LITERAL_FLOOR = Closure(
         "post_tool_use.py",
         "witness.py",
         "law_inject.py",
-        # A harness whose gate entry is not named like the others. Also derived from that
-        # member's install declaration (below); listed here as the literal backstop.
-        "before_tool.py",
     ),
     exact_paths=(
         # The hub's STAGED EXECUTABLE (#415): deliberately a segment path, not a
@@ -350,139 +309,9 @@ LITERAL_FLOOR = Closure(
         (".codex", "config.toml"),
         (".kimi-code", "config.toml"),
         (".kimi", "config.toml"),
-        (".gemini", "settings.json"),
     ),
     source="floor",
 )
-
-
-# ── Install-declared surfaces — derived, so a member cannot fall outside by naming ──────────
-def _home_relative(path: str) -> tuple:
-    """Segments of an install path with its home anchor removed: `~/.x/hooks` -> (.x, hooks).
-    The closure matches by segment run / suffix, so the home it lands in does not matter."""
-    segs = _segments(path)
-    if segs and segs[0] in ("~", "$HOME", "${HOME}"):
-        segs = segs[1:]
-    return segs
-
-
-def _install_declaration(install: Any) -> Optional[dict]:
-    """The governance-relevant part of one expects.json `install` block, normalised:
-    {"member": str, "dest": str, "entry": str, "registration": [segments]}. None when unusable."""
-    if not isinstance(install, dict):
-        return None
-    member = install.get("member")
-    dest = install.get("dest")
-    probe = install.get("gate_probe")
-    entry = probe.get("entry") if isinstance(probe, dict) else None
-    reg = install.get("registration")
-    reg_path = reg.get("path") if isinstance(reg, dict) else None
-    out: dict = {}
-    if isinstance(member, str) and member:
-        out["member"] = member
-    if isinstance(dest, str) and dest:
-        out["dest"] = dest
-    if isinstance(entry, str) and entry:
-        out["entry"] = entry
-    if isinstance(reg_path, list) and reg_path and all(isinstance(s, str) for s in reg_path):
-        out["registration"] = list(reg_path)
-    return out or None
-
-
-def _closure_from_install(install: Any) -> Optional[Closure]:
-    """One member's installed governance surface, from its expects.json `install` block."""
-    return _closure_from_declaration(_install_declaration(install))
-
-
-def _closure_from_declaration(decl: Optional[dict]) -> Optional[Closure]:
-    """Derive one member's installed governance surface from its normalised declaration.
-
-    * dest  -> dir marker: every file the installer puts there (gate entry, witness, helpers,
-               and a NEW file dropped beside them) is a closure write.
-    * entry -> hooks-dir name: the entry basename governs under any hooks/ segment, as the
-               conventionally named entries already do (repo copies, published copies).
-    * registration -> exact path: the harness config that selects which gate runs.
-    A dest or registration of fewer than two segments is IGNORED, not widened: `hooks` or
-    `settings.json` alone would govern every same-named dir or file anywhere."""
-    if not isinstance(decl, dict):
-        return None
-    dirs, hooks_only, paths = [], [], []
-    dest = decl.get("dest")
-    if isinstance(dest, str):
-        segs = _home_relative(dest)
-        if len(segs) >= 2:
-            dirs.append(segs)
-    entry = decl.get("entry")
-    if isinstance(entry, str) and _segments(entry):
-        hooks_only.append(_segments(entry)[-1])
-    reg = decl.get("registration")
-    if isinstance(reg, (list, tuple)):
-        segs = tuple(s for s in reg if isinstance(s, str) and s not in ("", ".", "~"))
-        if len(segs) >= 2:
-            paths.append(segs)
-    if not (dirs or hooks_only or paths):
-        return None
-    return Closure(dir_markers=tuple(dirs), files_hooks_only=tuple(hooks_only),
-                   exact_paths=tuple(paths), source="install")
-
-
-# Snapshot of every member's install declaration, for the INSTALLED module (which has no
-# manifests beside it). Generated from plugins/*/expects.json by _install_declaration and
-# pinned equal to them by member_install_surface_test.py — edit the manifest, then this.
-MEMBER_INSTALL_DECLARATIONS = {
-    "claude-code": {"member": "claude-code", "dest": "~/.claude/hooks/hestia",
-                    "entry": "hooks/pre_tool_use.py", "registration": [".claude", "settings.json"]},
-    "codex": {"member": "codex", "dest": "~/.codex/hooks", "entry": "hooks/pre_tool_use.py",
-              "registration": [".codex", "config.toml"]},
-    "gemini": {"member": "gemini", "dest": "~/.gemini/hestia-plugins/gemini/hooks",
-               "entry": "hooks/before_tool.py", "registration": [".gemini", "settings.json"]},
-    "kimi": {"member": "kimi-code", "dest": "~/.kimi-code/hooks", "entry": "hooks/pre_tool_use.py",
-             "registration": [".kimi-code", "config.toml"]},
-}
-
-
-def declared_dest(member_id: str, home: Optional[str]) -> Optional[str]:
-    """Where this member's install declaration puts its hooks, home-expanded against `home` —
-    the caller's seat home, passed explicitly (no default: a home-relative dest with no home
-    names nowhere). None for a member with no declaration, or a home-relative dest without one."""
-    for decl in MEMBER_INSTALL_DECLARATIONS.values():
-        if decl.get("member") == member_id and isinstance(decl.get("dest"), str):
-            dest = decl["dest"]
-            if dest.startswith("~/"):
-                return os.path.join(home, dest[2:]) if home else None
-            return dest
-    return None
-
-
-def registered_closure(own_dirs: Iterable[str] = (), targets: Iterable[str] = ()) -> Closure:
-    """The EXECUTED governance surface of one seat, as absolute locations: the directories its
-    hestia-owned hooks run from (dir markers) and every hestia-owned hook its harness
-    registration actually points at (exact paths). Built at gate runtime from what the
-    harness REGISTERS (the caller reads the registration), unioned onto the declared closure
-    — a seat whose registration points somewhere no declaration names is governed there too.
-    Paths are realpath'd by the caller; a path of fewer than three segments is ignored rather
-    than widened (`/home/x` would govern a whole home)."""
-    dirs = tuple(seg for seg in (_segments(d) for d in own_dirs if isinstance(d, str))
-                 if len(seg) >= 3)
-    files = tuple(seg for seg in (_segments(t) for t in targets if isinstance(t, str))
-                  if len(seg) >= 3)
-    return Closure(dir_markers=dirs, exact_paths=files, source="registered")
-
-
-def _failsafe_closure() -> Closure:
-    out = LITERAL_FLOOR
-    for _name, decl in sorted(MEMBER_INSTALL_DECLARATIONS.items()):
-        extra = _closure_from_declaration(decl)
-        if extra is not None:
-            out = out.union(extra)
-    return Closure(out.dir_markers, out.files_anywhere, out.files_hooks_only, out.exact_paths,
-                   source="floor")
-
-
-try:
-    FAILSAFE_CLOSURE = _failsafe_closure()
-except Exception:  # noqa: BLE001 — never let the derivation disarm the literal floor
-    FAILSAFE_CLOSURE = LITERAL_FLOOR
 
 
 def _closure_from_manifest(manifest: dict) -> Optional[Closure]:
@@ -519,8 +348,7 @@ def _read_manifests_fs(plugins_root: str) -> dict:
 
 def load_closure(plugins_root: Optional[str] = None,
                  manifest_reader: Optional[Callable[[], dict]] = None) -> Closure:
-    """Assemble the closure: the fail-safe floor (LITERAL_FLOOR ∪ the install snapshot) ∪
-    every plugin manifest's declared closure ∪ every manifest's install-derived surface.
+    """Assemble the closure: LITERAL_FLOOR ∪ every plugin manifest's declared closure.
 
     `manifest_reader` (tests, vault-backed readers) returns {plugin_name: manifest_dict}.
     Default reads plugins/*/expects.json beside this module. NEVER raises; total failure
@@ -532,24 +360,16 @@ def load_closure(plugins_root: Optional[str] = None,
             root = plugins_root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             manifests = _read_manifests_fs(root)
         if not isinstance(manifests, dict):
-            return FAILSAFE_CLOSURE
-        result = FAILSAFE_CLOSURE
+            return LITERAL_FLOOR
+        result = LITERAL_FLOOR
         for _name, manifest in sorted(manifests.items()):
-            for derive in (_closure_from_manifest, _closure_from_install_of):
-                try:
-                    extra = derive(manifest)
-                except Exception:  # noqa: BLE001 — a bad manifest adds nothing, removes nothing
-                    extra = None
-                if extra is not None:
-                    result = result.union(extra)
+            extra = _closure_from_manifest(manifest)
+            if extra is not None:
+                result = result.union(extra)
         return Closure(result.dir_markers, result.files_anywhere, result.files_hooks_only,
                        result.exact_paths, source="registry+floor")
     except Exception:
-        return FAILSAFE_CLOSURE
-
-
-def _closure_from_install_of(manifest: Any) -> Optional[Closure]:
-    return _closure_from_install(manifest.get("install")) if isinstance(manifest, dict) else None
+        return LITERAL_FLOOR
 
 
 _DEFAULT_CLOSURE: Optional[Closure] = None
@@ -1265,15 +1085,14 @@ def _resolve_closure(closure: Optional[Closure]):
             closure = default_closure()
         return closure, closure.source
     except Exception:
-        return FAILSAFE_CLOSURE, FAILSAFE_CLOSURE.source
+        return LITERAL_FLOOR, LITERAL_FLOOR.source
 
 
 def _phase1_writes(tool_name: str, tool_input: Any, cwd: Optional[str], closure: Closure, src: str):
     """Phase 1 — WRITE positions, as a generator: one "write" verdict per write-position
-    argument that resolves into the closure, in argument order, yielded lazily (so `classify`,
-    which takes the first, stops matching exactly where it always did). An opaque writer or an
-    internal error yields its single fail-closed verdict and stops. `write_verdicts` takes them
-    all. Internal errors fail CLOSED."""
+    argument that resolves into the closure, in argument order. An opaque writer or an
+    internal error yields its single fail-closed verdict and stops. `classify` takes the
+    first; `write_verdicts` takes them all. Internal errors fail CLOSED."""
     try:
         targets, note = _write_position_targets(tool_name, tool_input)
         # OUT OF GRAMMAR (REPAIR 2): `targets` is the command's full vocabulary token list,
@@ -1296,12 +1115,9 @@ def _phase1_writes(tool_name: str, tool_input: Any, cwd: Optional[str], closure:
         for t in targets:
             marker = closure.match(t, cwd=cwd, position=position)
             if marker:
-                # `resolved`: where this write lands (cwd-joined, symlinks and `..` resolved), so
-                # every write verdict carries the LOCATION the daemon prices member gate entries
-                # by, not only the argument as written (#1247).
+                # Lazily, so `classify` stops matching at the first target exactly as before.
                 yield ClosureVerdict("write", rule, marker, t, src,
-                                     resolved=resolve_location(t, cwd) if rule == RULE_WRITE
-                                     else None)
+                                     tuple(closure.forms(t, cwd=cwd)[1:]))
     except Exception as e:  # noqa: BLE001 — fail-closed: a broken write classifier must not admit
         yield ClosureVerdict("write", RULE_INTERNAL, None, f"internal:{type(e).__name__}", src)
 
@@ -1314,10 +1130,9 @@ def write_verdicts(tool_name: str, tool_input: Any, *, cwd: Optional[str] = None
     `classify` answers WHETHER the act writes the closure and stops at the first target; the
     escalation's price needs WHAT it writes — all of it — because a later target can be the
     sovereign one, and the act summary the daemon also reads is bounded and can cut it out.
-    Every rule carries its targets (out-of-grammar and unparseable included). Empty means no
-    closure write. An opaque writer or an internal error is one fail-closed verdict with no
-    marker: it names no target, and the caller must treat the write set as unenumerated rather
-    than as complete."""
+    Empty means no closure write. An opaque writer or an internal error is one fail-closed
+    verdict with no marker: it names no target, and the caller must treat the write set as
+    unenumerated rather than as complete."""
     closure, src = _resolve_closure(closure)
     try:
         return list(_phase1_writes(tool_name, tool_input, cwd, closure, src))
