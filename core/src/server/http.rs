@@ -9028,8 +9028,12 @@ mod disposition_tests {
         });
         let base = format!("http://127.0.0.1:{port}");
         let client = reqwest::Client::new();
+        // The server binds only after `bootstrap_operator_if_genesis` mints the first operator
+        // on this fresh vault, and that vault write measured 4.5 s in a debug build on CBP
+        // (unoptimized argon2). A 5 s budget passed locally with tries to spare (45-48 of 50)
+        // and failed on every CI run of #1265-#1268; the budget is an upper bound, not a delay.
         let mut up = false;
-        for _ in 0..50 {
+        for _ in 0..600 {
             if client.get(format!("{base}/api/debug/locks")).send().await.is_ok() {
                 up = true;
                 break;
@@ -9133,8 +9137,12 @@ mod disposition_tests {
         });
         let base = format!("http://127.0.0.1:{port}");
         let client = reqwest::Client::new();
+        // The server binds only after `bootstrap_operator_if_genesis` mints the first operator
+        // on this fresh vault, and that vault write measured 4.5 s in a debug build on CBP
+        // (unoptimized argon2). A 5 s budget passed locally with tries to spare (45-48 of 50)
+        // and failed on every CI run of #1265-#1268; the budget is an upper bound, not a delay.
         let mut up = false;
-        for _ in 0..50 {
+        for _ in 0..600 {
             if client.get(format!("{base}/api/config/seat")).send().await.is_ok() {
                 up = true;
                 break;
