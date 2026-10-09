@@ -241,5 +241,56 @@ a2 = _claim_args()
 check("the targets are not part of the request key (they are derived from the same act)",
       a1 and a2 and a1[0]["request_key"] == a2[0]["request_key"], (a1, a2))
 
+# --- the PRODUCER: what the common gate collects is what rides (Codex notice 18784) -------------------
+# The rows above feed `claim_self_write` a target list by hand. These run the common gate's own
+# collector, `_closure_write_set`, over Codex's 18784 counterexamples and send what it returns over
+# the claim wire, so a producer that marks an unknown destination complete, or drops an alias's
+# canonical destination, fails HERE (both regressed in the 574426d6 rebuild of the 2e0547b5 fix).
+_CL, _SG = "hestia_governance_" + "closure", "hestia_single_" + "gate"
+for _name in (_CL, _SG):
+    _sp = importlib.util.spec_from_file_location(
+        _name, _overlay.get(_name) or os.path.join(HERE, _name + ".py"))
+    _m = importlib.util.module_from_spec(_sp)
+    sys.modules[_name] = _m
+    _sp.loader.exec_module(_m)
+_closure, _gate = sys.modules[_CL], sys.modules[_SG]
+_closure.default_closure = lambda: _closure.LITERAL_FLOOR   # the literal floor, no registry read
+
+
+def _produced(command, cwd="/w"):
+    targets, complete = _gate._closure_write_set(_gate.GateEvent("Bash", {"command": command}, cwd=cwd))
+    a = _claim_args(resolved_targets=targets, resolved_targets_complete=complete)
+    return complete, (a[0].get("resolved_targets") if a else None)
+
+
+_SG_FILE = f"/w/plugins/_shared/{_GATE}"
+_ORD = "/w/plugins/_shared/ordinary.txt"
+_UNENUM = _UNP + "unenumerated"
+c, w = _produced("touch /w/plugins/_shared/$TARGET")
+check("18784 P1-1: an out-of-grammar variable destination is NOT complete; the known vocabulary "
+      "rides and the unenumerated sentinel follows",
+      c is False and w == ["/w/plugins/_shared/$TARGET", _UNENUM], (c, w))
+c, w = _produced('touch /w/plugins/_shared/ordinary.txt; touch "$TARGET"')
+check("18784 P1-1: a known ordinary target beside an unknown destination is NOT complete",
+      c is False and w == [_ORD, _UNENUM], (c, w))
+c, w = _produced("touch plugins/_shared/ordinary.txt", cwd=None)
+check("18784 P1-1: a relative target with no cwd to resolve it is NOT complete",
+      c is False and w and w[-1] == _UNENUM, (c, w))
+c, w = _produced("touch plugins/_shared/ordinary.txt", cwd="/w")
+check("control: a relative target WITH a cwd is complete and carries its cwd-joined form",
+      c is True and w == ["plugins/_shared/ordinary.txt", _ORD], (c, w))
+c, w = _produced(f"touch {_ORD}")
+check("control: a plain absolute target is complete and adds nothing", c is True and w == [_ORD], (c, w))
+_alias = "/w/alias.txt"
+_rp = _closure.os.path.realpath
+_closure.os.path.realpath = lambda p: _SG_FILE if p == _alias else _rp(p)   # modeled, no link
+try:
+    c, w = _produced(f"touch {_alias}")
+finally:
+    _closure.os.path.realpath = _rp
+check("18784 P1-2: an alias the closure matched by its destination carries that canonical "
+      "destination onto the wire, not only the alias spelling",
+      w == [_alias, _SG_FILE], (c, w))
+
 print(f"\n{'FAIL' if FAILS else 'all'} claim checks: {len(RAN) - len(FAILS)}/{len(RAN)} passed")
 sys.exit(1 if FAILS else 0)

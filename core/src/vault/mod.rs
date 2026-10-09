@@ -53,7 +53,21 @@ pub struct Vault {
     /// break-glass writer. Read-only Vault opens do not acquire it. Ordinary short-lived
     /// writers acquire the same lease around each save in `storage::save_if_current`.
     writer_lease: Option<storage::WriterLease>,
+    /// Process-unique generation of the in-memory policy lists: fresh for every Vault instance
+    /// and every `set_policy_lists`, so replacing the vault object (a reopen assigned over the
+    /// daemon's) moves it too. Read by the lock-free law publication.
+    policy_lists_gen: u64,
+    /// Run before every save (see [`Vault::set_pre_save_barrier`]).
+    pre_save: Option<PreSaveBarrier>,
 }
+
+fn next_policy_lists_gen() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A hook run before every vault save; an error refuses the save.
+pub type PreSaveBarrier = std::sync::Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>;
 
 impl Vault {
     /// Re-read THIS vault from disk with the same path and passphrase.
@@ -76,6 +90,8 @@ impl Vault {
             passphrase,
             data,
             writer_lease: None,
+            policy_lists_gen: next_policy_lists_gen(),
+            pre_save: None,
         })
     }
 
@@ -96,6 +112,8 @@ impl Vault {
             passphrase,
             data,
             writer_lease: None,
+            policy_lists_gen: next_policy_lists_gen(),
+            pre_save: None,
         })
     }
 
@@ -174,12 +192,27 @@ impl Vault {
         Ok(removed)
     }
 
+    /// Install a hook that runs before EVERY save and may refuse it. The daemon installs one that
+    /// makes the witness chain durable first (group commit, storage::durability): a vault write
+    /// often follows an `*_intent` chain row, and since chain commits no longer fsync inline, the
+    /// vault (which does fsync) could otherwise reach disk ahead of the rows that justify it.
+    pub fn set_pre_save_barrier(&mut self, barrier: PreSaveBarrier) {
+        self.pre_save = Some(barrier);
+    }
+
     fn save(&mut self) -> Result<()> {
-        let next_generation = if self.writer_lease.is_some() {
-            storage::save_if_current_locked(&self.path, &self.passphrase, &self.data)?
-        } else {
-            storage::save_if_current(&self.path, &self.passphrase, &self.data)?
-        };
+        if let Some(barrier) = &self.pre_save {
+            barrier().map_err(CoreError::SaveBarrier)?;
+        }
+        // Timed (state-lock instrumentation): a vault save derives a fresh Argon2 key, encrypts
+        // the whole vault and fsyncs, and the daemon does it while holding its state lock (#453).
+        let next_generation = crate::server::state_lock::time_section("vault.save", || {
+            if self.writer_lease.is_some() {
+                storage::save_if_current_locked(&self.path, &self.passphrase, &self.data)
+            } else {
+                storage::save_if_current(&self.path, &self.passphrase, &self.data)
+            }
+        })?;
         self.data.generation = next_generation;
         Ok(())
     }
@@ -197,6 +230,12 @@ impl Vault {
     /// them past the vault lock — the law is read on every session start and every
     /// `hestia_operating_law` call, and holding the vault while composing a reply is how
     /// a read path becomes a contention path.
+    /// Moves whenever the policy lists are replaced in memory — the lock-free law publication
+    /// (`server::published`) republishes when it does.
+    pub fn policy_lists_generation(&self) -> u64 {
+        self.policy_lists_gen
+    }
+
     pub fn policy_lists(&self) -> policy_lists::PolicyLists {
         self.data.policy_lists.clone()
     }
@@ -205,6 +244,7 @@ impl Vault {
     /// responsible for having established operator authority BEFORE reaching here.
     pub fn set_policy_lists(&mut self, lists: policy_lists::PolicyLists) -> Result<()> {
         self.data.policy_lists = lists;
+        self.policy_lists_gen = next_policy_lists_gen();
         self.save()
     }
 

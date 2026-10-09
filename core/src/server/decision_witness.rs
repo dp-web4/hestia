@@ -101,6 +101,26 @@ pub struct ChargeSpec {
 impl ChargeSpec {
     /// The charge a committed decision row carries, or `None` for one that charges nothing
     /// (an allow, or a row with no recognisable verdict).
+    /// The spec a `decision_charge_settled` row carries under `charge`.
+    pub fn from_settle(v: &Value) -> Option<Self> {
+        Some(Self {
+            magnitude: v.get("magnitude")?.as_f64()?,
+            conduct: v.get("conduct")?.as_bool()?,
+            role_lct: v.get("role_lct")?.as_str()?.to_string(),
+            tool_name: v.get("tool_name")?.as_str()?.to_string(),
+            rule_id: v.get("rule_id")?.as_str()?.to_string(),
+            reason: v.get("reason")?.as_str()?.to_string(),
+        })
+    }
+
+    /// The `charge` object a settle row carries.
+    pub fn to_settle(&self) -> Value {
+        serde_json::json!({
+            "magnitude": self.magnitude, "conduct": self.conduct, "role_lct": self.role_lct,
+            "tool_name": self.tool_name, "rule_id": self.rule_id, "reason": self.reason,
+        })
+    }
+
     pub fn from_row(data: &Value) -> Option<Self> {
         let verdict = Verdict::parse(data.get("decision")?.as_str()?)?;
         let magnitude = verdict.risk_magnitude()?;
@@ -230,6 +250,20 @@ impl DecisionLedger {
         self.entry(member, action_id)?.charged_by.as_deref()
     }
 
+    /// Every key, its committed row hashes (sorted) and its charge holder — a canonical view for
+    /// audits and for the chain-replay equivalence test (a rehydrated ledger must equal the
+    /// running one).
+    pub fn canonical(&self) -> std::collections::BTreeMap<(String, Uuid), (Vec<String>, Option<String>)> {
+        self.keys
+            .iter()
+            .map(|(k, e)| {
+                let mut rows: Vec<String> = e.rows.iter().map(|r| r.hash.clone()).collect();
+                rows.sort();
+                (k.clone(), (rows, e.charged_by.clone()))
+            })
+            .collect()
+    }
+
     /// The key's owed charge (row hash + what to charge), cloned for the settle.
     pub fn owed(&self, member: &str, action_id: Uuid) -> Option<(String, ChargeSpec)> {
         self.entry(member, action_id)?
@@ -276,6 +310,11 @@ impl DecisionLedger {
 
 /// Append one settled charge to the durable settle record. Best effort: a failed write is
 /// reported, and costs only the restart case (the key would read as owed after a restart).
+/// The settle record line `persist_settled` writes.
+pub fn settled_line(member: &str, action_id: Uuid, row: &str) -> String {
+    serde_json::json!({"member": member, "action_id": action_id.to_string(), "row": row}).to_string()
+}
+
 pub fn persist_settled(path: &std::path::Path, member: &str, action_id: Uuid, row: &str) {
     use std::io::Write;
     let line = serde_json::json!({"member": member, "action_id": action_id.to_string(), "row": row});
@@ -297,9 +336,22 @@ pub fn rehydrate(
     chain: &crate::storage::chain::SqliteChainStore,
     settled: &std::path::Path,
 ) -> DecisionLedger {
+    rehydrate_from(chain, settled, u64::MAX)
+}
+
+/// `rehydrate`, with trust projected from the chain from position `projected_from` on (#1271):
+/// a charge can no longer fail apart from its row there, so the first committed charging row of
+/// a key IS its charge holder, and a `decision_charge_settled` row settles an owed legacy charge.
+pub fn rehydrate_from(
+    chain: &crate::storage::chain::SqliteChainStore,
+    settled: &std::path::Path,
+    projected_from: u64,
+) -> DecisionLedger {
     let cutoff = (chrono::Utc::now() - chrono::Duration::hours(DECISION_LEDGER_REPLAY_HOURS))
         .to_rfc3339();
     struct Replayed {
+        pos: u64,
+        settle_of: Option<String>,
         member: String,
         action_id: Uuid,
         verdict: Verdict,
@@ -309,12 +361,26 @@ pub fn rehydrate(
     }
     let rows = chain.scan_recent(
         Some(&cutoff),
-        Some(&[DECISION_EVENT, ALLOW_EVENT]),
+        Some(&[DECISION_EVENT, ALLOW_EVENT, "decision_charge_settled"]),
         DECISION_LEDGER_CAP as u64,
         |r| {
             let data: Value = serde_json::from_str(r.event_data).ok()?;
             let action_id = Uuid::parse_str(data.get("action_id")?.as_str()?).ok()?;
+            if r.event_type == "decision_charge_settled" {
+                return Some(Replayed {
+                    pos: r.chain_position,
+                    settle_of: data.get("row").and_then(Value::as_str).map(str::to_string),
+                    member: data.get("member")?.as_str()?.to_string(),
+                    action_id,
+                    verdict: Verdict::Deny,
+                    hash: r.hash.to_string(),
+                    charge: None,
+                    held_by: None,
+                });
+            }
             Some(Replayed {
+                pos: r.chain_position,
+                settle_of: None,
                 member: data.get("plugin_id")?.as_str()?.to_string(),
                 action_id,
                 verdict: Verdict::parse(data.get("decision")?.as_str()?)?,
@@ -334,7 +400,21 @@ pub fn rehydrate(
     };
     // Newest-first from the store; replay in arrival order so "first committed row" holds.
     for r in rows.iter().rev() {
-        ledger.record_row(&r.member, r.action_id, r.verdict, &r.hash, r.charge.clone());
+        if r.settle_of.is_none() {
+            ledger.record_row(&r.member, r.action_id, r.verdict, &r.hash, r.charge.clone());
+        }
+    }
+    // Projected window: the first charging row of a key charged when it committed, and a settle
+    // row names the owed row it settled. Oldest first, so `record_charge` keeps the first.
+    for r in rows.iter().rev() {
+        if r.pos < projected_from {
+            continue;
+        }
+        if let Some(of) = &r.settle_of {
+            ledger.record_charge(&r.member, r.action_id, of);
+        } else if r.charge.is_some() && r.held_by.is_none() {
+            ledger.record_charge(&r.member, r.action_id, &r.hash);
+        }
     }
     // A committed row that names the row holding its key's charge is chain-witnessed proof that
     // the charge was applied.

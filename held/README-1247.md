@@ -1,11 +1,166 @@
 # Held governed patch for #1247
 
-`held/README.md` and `held/574426d6…patch` are #1239's. This file is #1247's.
+`held/README.md`, `held/ca833c34…patch` and `held/lineage/{2e0547b5…,574426d6…,2e0547b5-to-ca833c34.diff}`
+are #1239's. This file is #1247's.
 
-This keeps the **governed half** of #1247 as digest-named patches, so the reviewed bytes live in
-the repo and not only in a scratch directory. The patches change files the gate governs (the shared
-closure, the common gate, the core's canonical list, and their published copies under `hooks-gt/`),
-so they reach any INSTALLED copy only through the gate's escalation path, as one `git apply`.
+This keeps the **governed half** of #1247 as ONE digest-named patch, so the reviewed bytes live in
+the repo and not only in a scratch directory. The patch changes files the gate governs (the shared
+closure, the common gate, the core's canonical list, their tests, and their published copies under
+`hooks-gt/`), so it reaches any tree or INSTALLED copy only through the gate's escalation path, as
+one `git apply`.
+
+## Current: `88c5095c…`, re-stacked on #1274 (`716ae2d1`, #1239's clean replacement)
+
+| file | sha256 |
+|---|---|
+| `88c5095c90a5b555d313bd52f319a6f20d9cc2c0d970eb9547a1182b39d618bb.patch` | `88c5095c90a5b555d313bd52f319a6f20d9cc2c0d970eb9547a1182b39d618bb` |
+
+**Base: `716ae2d155e2e8625fb5b8e7c208871e659609c9`**, the head of #1274. #1274 replaces #1239,
+which is closed. It is `c535619d` merged with main `ecd888f1`. `c535619d` is #1239 with its
+Codex-cleared held patch `ca833c34…` applied (escalation `1617aee101fc9d1d`). #1247 was stacked
+on #1239's older, regressed base (`574426d6…`, via `1d82846e`). This branch now merges
+`716ae2d1` in (no force). Its governed tree is `c535619d`'s plus main's claude-code hooks change
+(`disposition_deliver.py`, `hooks.json` and the claude-code manifest). This patch touches none of
+the source files that change.
+
+**This branch's governed tree is `716ae2d1`'s, byte for byte** (`plugins/` and `hooks-gt/` are
+716ae2d1's tree objects). That changes the earlier arrangement, where the branch tree already
+contained `e2b891c2…` (see the correction in History). Now **none** of #1247's governed delta is
+in the tree, and `88c5095c…` applies to the branch head directly:
+
+    git apply held/88c5095c90a5b555d313bd52f319a6f20d9cc2c0d970eb9547a1182b39d618bb.patch
+
+That is the landing act, one gated write. Verify first: `sha256sum held/88c5095c*.patch` must
+print the name.
+
+**What it writes (14 files).** Sources: `plugins/_shared/{hestia_gate_core.py,
+hestia_governance_closure.py, hestia_single_gate.py, seat_gate_boundary_test.py}`, plus two new
+tests, `member_install_surface_test.py` and `registered_surface_test.py` (mode 100755). Published
+copies: `hooks-gt/_shared/{hestia_gate_core.py, hestia_governance_closure.py,
+hestia_single_gate.py}` and the five `manifest.json` (`_shared`, `claude-code`, `codex`,
+`gemini`, `kimi`). It does not touch `hestia_gate_mechanism.py`, `claim_self_write_test.py` or
+`hestia_governance_closure_test.py`. #1247's delta there was only `574426d6`'s, which
+`ca833c34` supersedes.
+
+Sha256 of each source after the patch:
+
+| file | sha256 (prefix) |
+|---|---|
+| `hestia_gate_core.py` | `c3c15a04a5d1` |
+| `hestia_governance_closure.py` | `93e894818aba` |
+| `hestia_single_gate.py` | `84d5585a0ca1` |
+| `member_install_surface_test.py` | `276604560f6e` |
+| `registered_surface_test.py` | `3d3333b64fcd` (identical to the one Codex cleared in `01cf91e4`) |
+| `seat_gate_boundary_test.py` | `d07ddbc4261f` |
+
+The republished engine's canonical digest is
+`10cd8ec2bca7db3e42269c1e74544ae4a526cb9c9aac07bd82049dd7b966502a`, and the shared `gt_version`
+becomes `aa1def96f9a0cd00974663018357ab4658d41ce34d2da3db3ec3f26465d3a71e`. Each GT copy with its
+header stripped equals its source.
+
+### What the re-stack resolved
+
+It was a three-way merge of the governed sources. Base `1d82846e` (old #1239). Ours is #1247 as
+Codex cleared it: `18f91db` plus `01cf91e4`. Theirs is `c535619d` (#1274 changes none of these sources). Two files conflicted textually,
+the closure and the common gate, and both conflicts were the same clash.
+
+- **`ClosureVerdict.resolved` stays #1239's cleared TUPLE** of every other spelling the match
+  consulted (`Closure.forms()[1:]`). #1247's single location, which #1247 had also called
+  `resolved` (`Optional[str]`), is renamed **`landing`**. The two fields answer different
+  questions: `resolved` lists the spellings, and `landing` names where the bytes go.
+  `resolve_location` is unchanged (home-expanded, cwd-joined, realpath'd), and `landing` is still
+  set on a `RULE_WRITE` verdict only. I renamed instead of deriving the location from the tuple
+  because the tuple is empty for an absolute path, and it does not expand `~` in the cwd the way
+  `resolve_location` does. Deriving it would have changed #1247's cleared semantics in edge cases.
+- **A silent clash, not a textual one:** `_closure_verdict` passed `rv.resolved` to
+  `_reaches_registered_entry`. Against the tuple, `isinstance(target, str)` is False, so the
+  registered-entry marker would never have fired. It now reads `landing`.
+- **`_closure_write_set` keeps `against` AND #1239's rules.** It still has the `against` closure
+  argument, threaded through `write_verdicts(..., closure=against)`. Its targets follow #1239's
+  order: resource, then each spelling in `resolved`, then `landing` only if that location is not
+  already in the list. That keeps #1239's exact lists (`[alias, realpath]`,
+  `[ordinary, gate]`, `[glob]`). Completeness is #1239's rule (in-grammar `RULE_WRITE`, target
+  absolute or pinned by a spelling) AND #1247's (the `landing` is absolute). A set either rule
+  calls incomplete rides the `unenumerated` sentinel. In practice the two rules agree. The
+  conjunction just means neither cleared rule can be the weaker reading.
+- `member_install_surface_test.py` reads `v.landing` where it read `v.resolved`. Nothing else in
+  #1247's tests changed.
+- The daemon side (`core/src/server/gate_escalation.rs`, not governed) merged with no conflict.
+  #1239's two-tokenization change to the act-text loop in `markers_of`, which lets a bracket
+  class survive whole, sits beside #1247's loop for location-qualified entries in act text. That
+  loop still splits on `[`/`]`. `member_gate_entry_of` matches exact segments, so a bracket-class
+  token could not match there in either tokenization. Glob entries are priced from the resolved
+  targets (`member_gate_entries_matching`), which carry them.
+
+### How it was built and checked
+
+The patch was built read-only. It wrote no governed path (`docs/reviews/restack-1247-build/`
+holds the scripts):
+
+- `extract3.py` extracted base, ours (with `01cf91e4` applied in memory over `18f91db`'s blobs)
+  and theirs under neutral names. `git merge-file` merged them, and `resolve.py` resolved the two
+  conflicts with anchors asserted once each.
+- `build_held.py` emitted the patch against a checkout of `716ae2d1` (verified), recomputed the
+  hooks-gt half with `tools/hooks_gt.py`'s own functions, and checked it the way
+  `hooks_gt.py check` does. It then re-applied the patch IN MEMORY over `716ae2d1`'s blobs and
+  required byte-identical results for all 14 files.
+- The merge commit was composed with plumbing in a scratch index (`make_merge.py`). Its tree is
+  `git merge-tree`'s, except for two things. The governed subtrees are `716ae2d1`'s, which an
+  assertion checks. And `held/` gains this patch and moves #1247's superseded patches to
+  `held/lineage/`, as #1239 did with its own.
+
+### Tests (2026-10-09, on my own worktree of this merge, `716ae2d1` + #1247)
+
+The patched governed modules (core, closure, common gate) and patched tests were swapped in by
+`run_one.py`. It sets `HESTIA_CONTRACT_OVERLAY` for subprocess fixtures and preloads the modules
+for in-process importers, so no governed path was written. HOME and HESTIA_HOME were isolated,
+and nothing touched the live daemon.
+
+- **Python, 17 of 18 suites green:**
+  - registered_surface: 9
+  - member_install_surface: 9
+  - seat_gate_boundary: 17 tests × 4 seats
+  - claim_self_write: 45/45
+  - governance_closure: 39
+  - gate_core, gate_mechanism (30), cross_harness_closure (4/4), shim_structure (86/86), shell_grammar
+  - sprintD (82), sprintE (9), sprintF (10)
+  - one_gate_decide_contract: 19, plus shim parity 29×4
+  - supersession_hard_stop, attempted_summary, hooks_gt_test
+
+  Control: registered_surface and member_install_surface go red against the unpatched modules,
+  with 8 and 7 failures.
+- **`tools/governance_class_drift_test.py`: red on the branch as committed, by construction.** It
+  parses the matcher from disk, and on this branch that is the unpatched core, so `<gate-alt-entry>`
+  matches no governed name. With only the matcher read swapped for the patched core
+  (`drift_probe.py`), it is green: "the matcher, the bar and the declaration agree", with all 13
+  mutations RED as designed. It turns green on the branch when this patch lands.
+- **Codex's earlier counterexamples (`probe_codex.py`), 20 of 20 pass:**
+  - escaped brackets (`x\[ab]y*`, `x\[ab]efore_*`), `[^z]`, `[[:alpha:]]`, `[[=b=]]`;
+  - relative, `cd`, dotdot, alias and summary-cut targets;
+  - `$TARGET` and a relative target with no cwd are both incomplete;
+  - `resolved` is the tuple, `landing` is the location, and the write set keeps #1239's order.
+- **Rust, full suite (`cargo test -j2 --no-fail-fast -- --test-threads=2`, debug=0, private
+  target dir, under the 3 s watchdog): 25 test binaries, 1302 passed, 0 failed, 2 ignored.** The
+  lib suite alone is 1215 passed.
+- **Real daemon (`tools/escalation_bar_real_daemon_test.py`), 4 of 4 PASS.** The daemon is built
+  from this tree and runs isolated on 127.0.0.1:7797 with a throwaway home. The tests:
+  - registered legacy entry: two factors, under the registered-entry marker;
+  - wildcard and unresolved destinations, including caret negation and a POSIX class, with
+    `zz_*` as the one-approver control;
+  - every seat's own entry, relative, `cd` and summary-cut: two factors, with the location among
+    the resolved targets;
+  - a same-named file outside every location: one approver.
+
+  The unpatched control arm fails all 4. That is a weak control: it fails on the missing
+  seat-boundary helpers before any bar is read.
+
+## History (before the re-stack on `716ae2d1`)
+
+Everything below describes earlier states. The patches it names, `01cf91e4…`, `29ae13a6…`,
+`fc95be2e…` and `e2b891c2…`, are now under `held/lineage/`, kept for reference. Do not apply
+them. Their base (`18f91db` / `1d82846e`) carries `574426d6`, which `ca833c34` supersedes. The
+"tree ALREADY CONTAINS `e2b891c2…`" correction that follows was true up to `0cac5783`. It is not
+true after the re-stack, because the governed tree is now `716ae2d1`'s.
 
 **Correction (Codex review, notice 18786): this branch's tree ALREADY CONTAINS `e2b891c2…`.** Earlier
 wording said "not applied". That was true of the installed gate, not of this tree. Do not `git apply`
