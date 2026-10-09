@@ -1942,7 +1942,7 @@ async fn operator_adjudicate(
             rule_triggered: "",
             reason: &adj_reason,
         };
-        match s.apply_adjudication_ctx(&a.subject_plugin_id, dimension, score, &rep_ctx) {
+        match s.apply_adjudication_ctx(&a.subject_plugin_id, dimension, score, &rep_ctx, Some(&entry)) {
             Ok(t) => updated = Some(t.entity_id),
             Err(e) => {
                 return (

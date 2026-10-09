@@ -617,6 +617,18 @@ impl ServerState {
             }));
         }
         let trust_store = TrustStore::open(home.join("trust"), store_key)?;
+        // Durable cache: no trust file reaches disk ahead of the chain row it projects.
+        {
+            let durability = chain_store.durability().clone();
+            trust_store.persister().set_pre_write_barrier(Arc::new(move || {
+                durability.flush_committed_blocking().map_err(|e| format!("{e:#}"))
+            }));
+        }
+        // TRUST IS A PROJECTION OF THE CHAIN (#1271). `since` is the projection EPOCH (fixed;
+        // the decision ledger derives charges from the chain from there); `from` is where replay
+        // starts — the cache's checkpoint only where its manifest verifies against the files,
+        // else the epoch (see `TrustStore::recover`).
+        let (trust_projection_since, trust_projection_from) = trust_store.recover(chain_store.len()?)?;
         let inbox_store = crate::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
         // Durable reads: inbox rows carry chain hashes; no inbox write reaches disk ahead of them.
         {
@@ -763,9 +775,10 @@ impl ServerState {
             // Rebuilt from the chain + settle record, so a late witness for an action from before
             // this restart finds its row and its charge state (one-gate stage A). Evaluated
             // before `chain_store` moves into the struct below.
-            decision_ledger: super::decision_witness::rehydrate(
+            decision_ledger: super::decision_witness::rehydrate_from(
                 &chain_store,
                 &home.join(super::decision_witness::SETTLED_FILE),
+                trust_projection_since,
             ),
             chain_store,
             trust_store,
@@ -841,6 +854,12 @@ impl ServerState {
         // Log the zero too. "restored 0" and "did not look" are different facts, and only one of
         // them used to be visible.
         eprintln!("[hestia] restored {restored} live escalation(s) from the chain");
+        // Restore whatever the trust cache lost: replay from where it is current.
+        match st.replay_trust_projection(trust_projection_from) {
+            Ok(n) if n > 0 => eprintln!("[hestia] trust projection: replayed {n} row(s) from {trust_projection_from}"),
+            Ok(_) => {}
+            Err(e) => tracing::error!("trust projection replay failed: {e:#}"),
+        }
         Ok(st)
     }
 
@@ -1625,7 +1644,7 @@ impl ServerState {
                 "outcome:failure"
             },
         };
-        self.apply_outcome_ctx(plugin_id, success, magnitude, &ctx)
+        self.apply_outcome_ctx(plugin_id, success, magnitude, &ctx, None)
     }
 
     /// Apply an outcome AND emit the trust movement as a role-scoped
@@ -1639,37 +1658,81 @@ impl ServerState {
         success: bool,
         magnitude: f64,
         ctx: &crate::reputation::RepContext,
+        row: Option<&ChainEntry>,
     ) -> Result<EntityTrust> {
-        // Trust accrues to the #403 (instance, role) grain, NOT the plugin type.
-        // Before this, a mesh-worker's failures and an interactive session's
-        // successes both landed on one `plugin:claude-code` entity — the deltas
-        // were role-scoped but the trust generating them was not. Keying the
-        // store on the (instance_lct, role_lct) pair closes that seam: a role's
-        // reputation is its own, and can't be diluted or poisoned by another
-        // capacity of the same instance.
-        let trust_key = self.trust_entity_key(plugin_id, ctx.role_lct);
-        let (before, after) = super::state_lock::time_section("trust_store.update", || {
-            self.trust_store
-                .update_returning_prior(&trust_key, success, magnitude)
+        // Trust accrues to the #403 (instance, role) grain, NOT the plugin type: keyed on the
+        // (instance_lct, role_lct) pair so a role's reputation can't be diluted or poisoned by
+        // another capacity of the same instance.
+        let (base, lct) = self.trust_grain(plugin_id, ctx.role_lct, row);
+        self.apply_change(&base, lct.as_deref(), TrustChange::Outcome { success, magnitude }, ctx, row)
+    }
+
+    /// The trust grain for `(plugin_id, role)`: `<instance_lct>#<role>` for a mapped member,
+    /// `plugin:<id>#<role>` otherwise. Projected from a chain ROW, the LCT is the one the row
+    /// recorded at the time — so a replay keys exactly as the live write did, even if the member
+    /// was minted after the row.
+    fn trust_grain(
+        &self,
+        plugin_id: &str,
+        role_lct: &str,
+        row: Option<&ChainEntry>,
+    ) -> (String, Option<String>) {
+        let lct = match row {
+            Some(r) => row_instance_lct(r),
+            None => self.member_lct(plugin_id),
+        };
+        let base = match &lct {
+            Some(l) => format!("{l}#{role_lct}"),
+            None => format!("plugin:{plugin_id}#{role_lct}"),
+        };
+        (base, lct)
+    }
+
+    /// Apply one trust change. With a `row`, it is a PROJECTION of that chain row: idempotent by
+    /// position (an entity already projected through it skips it), clocked by the row, and the
+    /// delta is stamped with the row's time — so replaying the chain reproduces it exactly.
+    fn apply_change(
+        &self,
+        key: &str,
+        lct: Option<&str>,
+        change: TrustChange,
+        ctx: &crate::reputation::RepContext,
+        row: Option<&ChainEntry>,
+    ) -> Result<EntityTrust> {
+        let changed = super::state_lock::time_section("trust_store.update", || match (row, change) {
+            (Some(r), TrustChange::Outcome { success, magnitude }) => self.trust_store.update_at(
+                key, success, magnitude,
+                crate::storage::trust::RowAt { pos: r.chain_position, ts: r.timestamp },
+            ),
+            (Some(r), TrustChange::V3 { dimension, score }) => self.trust_store.update_v3_at(
+                key, dimension, score,
+                crate::storage::trust::RowAt { pos: r.chain_position, ts: r.timestamp },
+            ),
+            (None, TrustChange::Outcome { success, magnitude }) => {
+                self.trust_store.update_returning_prior(key, success, magnitude).map(Some)
+            }
+            (None, TrustChange::V3 { dimension, score }) => {
+                self.trust_store.update_v3_returning_prior(key, dimension, score).map(Some)
+            }
         })?;
-        // LCT-mapping (sequence head, `repemit-1`): resolve the durable member
-        // LCT for `plugin_id` before building the delta, so `subject_lct` is a
-        // ground-truth member identity minted under hestia's sovereign — never
-        // the raw `plugin:` string. Fail-closed: an unmapped plugin (synthetic
-        // or malformed) yields `None` and emits NO delta, so test harnesses
-        // never pollute the hub's reputation view and no un-mappable id reaches
-        // the emit path. Local trust bookkeeping above still runs for everyone.
-        if let Some(subject_lct) = self.member_lct(plugin_id) {
+        let Some((before, after)) = changed else {
+            return self.trust_store.get(key); // already projected through this row
+        };
+        // LCT-mapping (`repemit-1`): only a member with a durable LCT emits a delta; an unmapped
+        // plugin (synthetic or malformed) emits none. Local bookkeeping above runs for everyone.
+        if let Some(subject_lct) = lct {
             if let Some(delta) = crate::reputation::delta_from_change(
-                &subject_lct,
+                subject_lct,
                 ctx,
                 &before,
                 &after,
-                chrono::Utc::now(),
+                row.map(|r| r.timestamp).unwrap_or_else(chrono::Utc::now),
             ) {
-                super::state_lock::time_section("reputation.log_delta", || {
-                    crate::reputation::log_delta(&self.reputation_sink(), &delta)
-                });
+                if let Some(line) = crate::reputation::delta_line(&delta) {
+                    if let Err(e) = self.trust_store.append_after_trust(&self.reputation_sink(), line) {
+                        tracing::warn!("reputation delta not queued: {e:#}");
+                    }
+                }
             }
         }
         Ok(after)
@@ -1751,52 +1814,159 @@ impl ServerState {
         dimension: web4_core::v3::ValueDimension,
         score: f64,
         ctx: &crate::reputation::RepContext,
+        row: Option<&ChainEntry>,
     ) -> Result<EntityTrust> {
-        let key = self.adjudicated_entity_key(subject_plugin_id, ctx.role_lct);
-        let (before, after) = self
-            .trust_store
-            .update_v3_returning_prior(&key, dimension, score)?;
-        if let Some(subject_lct) = self.member_lct(subject_plugin_id) {
-            if let Some(delta) = crate::reputation::delta_from_change(
-                &subject_lct,
-                ctx,
-                &before,
-                &after,
-                chrono::Utc::now(),
-            ) {
-                crate::reputation::log_delta(&self.reputation_sink(), &delta);
-            }
-        }
-        Ok(after)
+        let (base, lct) = self.trust_grain(subject_plugin_id, ctx.role_lct, row);
+        let key = format!("{base}#adjudicated");
+        self.apply_change(&key, lct.as_deref(), TrustChange::V3 { dimension, score }, ctx, row)
     }
 
-    /// Apply a judgment outcome to the judgment-axis entity and emit the delta
-    /// (same bridge as [`apply_outcome_ctx`]). The delta's `action_type`
-    /// (`"reversal"`) is what separates this stream from execution deltas in the
-    /// sink — the role_lct stays canonical so the hub fold doesn't fragment.
+    /// Apply a judgment outcome to the judgment-axis entity and emit the delta (same bridge as
+    /// [`apply_outcome_ctx`]; `action_type` `"reversal"` separates the stream in the sink).
     pub fn apply_judgment_ctx(
         &self,
         plugin_id: &str,
         success: bool,
         magnitude: f64,
         ctx: &crate::reputation::RepContext,
+        row: Option<&ChainEntry>,
     ) -> Result<EntityTrust> {
-        let key = self.judgment_entity_key(plugin_id, ctx.role_lct);
-        let (before, after) = self
-            .trust_store
-            .update_returning_prior(&key, success, magnitude)?;
-        if let Some(subject_lct) = self.member_lct(plugin_id) {
-            if let Some(delta) = crate::reputation::delta_from_change(
-                &subject_lct,
-                ctx,
-                &before,
-                &after,
-                chrono::Utc::now(),
-            ) {
-                crate::reputation::log_delta(&self.reputation_sink(), &delta);
+        let (base, lct) = self.trust_grain(plugin_id, ctx.role_lct, row);
+        let key = format!("{base}#judgment");
+        self.apply_change(&key, lct.as_deref(), TrustChange::Outcome { success, magnitude }, ctx, row)
+    }
+
+    /// TRUST IS A PROJECTION OF THE CHAIN (#1271): re-apply every trust-affecting row from
+    /// position `from`, through the same functions the live writes use. Idempotent per entity
+    /// (`through`), so it is safe over rows the cache already holds. Returns rows applied.
+    pub fn replay_trust_projection(&self, from: u64) -> Result<u64> {
+        let mut pos = from;
+        let mut applied = 0u64;
+        loop {
+            let rows = self.chain_store.read_from(pos, 2000)?;
+            if rows.is_empty() {
+                break;
+            }
+            for r in &rows {
+                if self.project_trust_row(r)? {
+                    applied += 1;
+                }
+                pos = r.chain_position + 1;
             }
         }
-        Ok(after)
+        Ok(applied)
+    }
+
+    /// The trust change one chain row carries, derived from the row's content alone — the same
+    /// rule every live write path follows. `true` if the row carries one.
+    fn project_trust_row(&self, r: &ChainEntry) -> Result<bool> {
+        use crate::reputation::{DeltaClass, RepContext};
+        let d = &r.event_data;
+        let st = |k: &str| d.get(k).and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+        match r.event_type.as_str() {
+            "outcome" => {
+                let success = d.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                let magnitude = d.get("magnitude").and_then(serde_json::Value::as_f64).unwrap_or(0.5);
+                let (plugin, role, tool, aid) = (st("plugin_id"), st("role_lct"), st("tool_name"), st("action_id"));
+                let ctx = RepContext {
+                    class: DeltaClass::Unclassified,
+                    role_lct: &role,
+                    action_type: "tool_execution",
+                    action_target: &tool,
+                    action_id: &aid,
+                    rule_triggered: "",
+                    reason: if success { "outcome:success" } else { "outcome:failure" },
+                };
+                self.apply_outcome_ctx(&plugin, success, magnitude, &ctx, Some(r))?;
+                Ok(true)
+            }
+            t if t == super::decision_witness::DECISION_EVENT || t == "decision_charge_settled" => {
+                let settled = t == "decision_charge_settled";
+                let has_action = d.get("action_id").and_then(serde_json::Value::as_str).is_some();
+                // Which rows charged, live: a keyed row with a charge and no `charge_held_by`
+                // (the first charge on its key); a seat row with no action id (adjudicator
+                // present); a settle row for an owed legacy charge. A daemon direct-tool deny
+                // (no action id, no adjudicator) never charged.
+                let spec = if settled {
+                    d.get("charge").and_then(super::decision_witness::ChargeSpec::from_settle)
+                } else if has_action {
+                    if d.get("charge_held_by").is_some() {
+                        None
+                    } else {
+                        super::decision_witness::ChargeSpec::from_row(d)
+                    }
+                } else if d.get("adjudicator").and_then(serde_json::Value::as_str).is_some() {
+                    super::decision_witness::ChargeSpec::from_row(d).map(|mut c| {
+                        c.conduct = false;
+                        c
+                    })
+                } else {
+                    None
+                };
+                let Some(c) = spec else { return Ok(false) };
+                let (plugin, aid) = (st(if settled { "member" } else { "plugin_id" }), st("action_id"));
+                let ctx = RepContext {
+                    class: if c.conduct { DeltaClass::Conduct } else { DeltaClass::Unclassified },
+                    role_lct: &c.role_lct,
+                    action_type: "policy_gate",
+                    action_target: &c.tool_name,
+                    action_id: &aid,
+                    rule_triggered: &c.rule_id,
+                    reason: &c.reason,
+                };
+                self.apply_outcome_ctx(&plugin, false, c.magnitude, &ctx, Some(r))?;
+                Ok(true)
+            }
+            "adjudication" => {
+                let Some(score) = d.get("score").and_then(serde_json::Value::as_f64) else {
+                    return Ok(false); // deferred: no trust change
+                };
+                let axis = st("axis");
+                let operator = d.pointer("/adjudicated_by/operator").and_then(serde_json::Value::as_bool) == Some(true);
+                // The two adjudication doors map axes differently; the row says which door.
+                let dimension = if operator {
+                    if axis == "validity" { web4_core::v3::ValueDimension::Validity } else { web4_core::v3::ValueDimension::Valuation }
+                } else {
+                    match crate::server::handler::axis_dimension(&axis) {
+                        Some(dim) => dim,
+                        None => return Ok(false),
+                    }
+                };
+                let (plugin, role, target) = (st("subject_plugin_id"), st("subject_role"), st("ref"));
+                let reason = format!("adjudication:{axis}:{}:{}", st("verdict"), st("method"));
+                let ctx = RepContext {
+                    class: DeltaClass::Conduct,
+                    role_lct: &role,
+                    action_type: "adjudication",
+                    action_target: &target,
+                    action_id: "",
+                    rule_triggered: "",
+                    reason: &reason,
+                };
+                self.apply_adjudication_ctx(&plugin, dimension, score, &ctx, Some(r))?;
+                Ok(true)
+            }
+            "reversal" => {
+                if d.get("validity_effect").and_then(serde_json::Value::as_str) != Some("refuted") {
+                    return Ok(false);
+                }
+                let magnitude = d.get("magnitude").and_then(serde_json::Value::as_f64).unwrap_or(0.5);
+                let (plugin, role, target) = (st("subject_plugin_id"), st("subject_role"), st("ref"));
+                let reason = format!("reversal:{}:{}", st("kind"), st("cause"));
+                let ctx = RepContext {
+                    class: DeltaClass::Conduct,
+                    role_lct: &role,
+                    action_type: "reversal",
+                    action_target: &target,
+                    action_id: "",
+                    rule_triggered: "",
+                    reason: &reason,
+                };
+                self.apply_judgment_ctx(&plugin, false, magnitude, &ctx, Some(r))?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     /// Read trust for a plugin in the default (member) capacity. Retained for the
@@ -1926,6 +2096,23 @@ impl super::state_lock::Publish for ServerState {
     }
 }
 
+/// One trust change, as a chain row carries it.
+#[derive(Clone, Copy)]
+enum TrustChange {
+    Outcome { success: bool, magnitude: f64 },
+    V3 { dimension: web4_core::v3::ValueDimension, score: f64 },
+}
+
+/// The member LCT a row recorded for its subject at the time (`instance_lct` on outcome and
+/// decision rows, `subject_instance_lct` on adjudications and reversals).
+fn row_instance_lct(r: &ChainEntry) -> Option<String> {
+    r.event_data
+        .get("instance_lct")
+        .or_else(|| r.event_data.get("subject_instance_lct"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
 /// The daemon's shared state behind its one global lock, instrumented (see `state_lock`).
 pub type SharedState = Arc<super::state_lock::StateCell<ServerState>>;
 
@@ -1963,10 +2150,10 @@ mod tests {
         let dev = "role:constellation:interactive-dev";
         // Same plugin, mesh-worker role: two failures.
         state
-            .apply_outcome_ctx("claude-code", false, 0.8, &ctx_for(mw))
+            .apply_outcome_ctx("claude-code", false, 0.8, &ctx_for(mw), None)
             .unwrap();
         let mw_trust = state
-            .apply_outcome_ctx("claude-code", false, 0.8, &ctx_for(mw))
+            .apply_outcome_ctx("claude-code", false, 0.8, &ctx_for(mw), None)
             .unwrap();
         // Same plugin, interactive-dev role: one success.
         let dev_trust = state
@@ -1978,6 +2165,7 @@ mod tests {
                     reason: "outcome:success",
                     ..ctx_for(dev)
                 },
+                None,
             )
             .unwrap();
         // Distinct entities: the two roles carry different entity_ids + scores.
@@ -2335,8 +2523,10 @@ mod tests {
         // A real member: a moving outcome emits a delta whose subject_lct is the
         // mapped member LCT, not the raw plugin_id.
         state.apply_outcome("real-plugin", false, 0.7).unwrap();
+        crate::storage::trust::flush_all_for_test();
         let sink = state.reputation_sink();
         let expected = state.member_lct("real-plugin").unwrap();
+        crate::storage::trust::flush_all_for_test();
         let lines: Vec<String> = std::fs::File::open(&sink)
             .map(|f| {
                 std::io::BufReader::new(f)
@@ -2358,6 +2548,7 @@ mod tests {
         // A synthetic member: trust still updates locally, but NO delta is emitted.
         state.mark_synthetic("synthetic-plugin", 3).unwrap();
         state.apply_outcome("synthetic-plugin", false, 0.7).unwrap();
+        crate::storage::trust::flush_all_for_test();
         let after: Vec<String> = std::fs::File::open(&sink)
             .map(|f| {
                 std::io::BufReader::new(f)

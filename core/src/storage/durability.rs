@@ -50,6 +50,17 @@ const CHECKPOINT_FORCE_BYTES: u64 = 64 * 1024 * 1024;
 /// Below this the WAL is not worth a checkpoint.
 const CHECKPOINT_MIN_BYTES: u64 = 1024 * 1024;
 
+/// A frontier cell another durable store publishes (the trust persister), so a request scope can
+/// wait on it beside the chain.
+pub type FrontierCell = Arc<tokio::sync::watch::Sender<Frontier>>;
+
+/// Run the daemon's fatal hook (another store lost durability; same rule as the chain).
+pub fn trigger_fatal(why: &str) {
+    if let Some(h) = FATAL_HOOK.get() {
+        h(why);
+    }
+}
+
 /// The durability frontier, published to async waiters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Frontier {
@@ -454,6 +465,8 @@ impl Drop for Durability {
 /// Request-scoped durability: everything a request appends is waited for before it replies.
 struct ScopeState {
     target: Option<(Arc<Durability>, u64)>,
+    /// Other durable stores this request wrote to (trust), with the seq it must wait for.
+    others: Vec<(FrontierCell, u64)>,
     /// Whether every state-lock release in this request counts as having read what was committed
     /// (requests that REPORT shared state: see `durable_scope_observing`).
     observe_releases: bool,
@@ -472,6 +485,18 @@ pub(crate) fn note_appended(d: &Arc<Durability>, len: u64) {
             Some((_, t)) if *t >= len => {}
             Some((existing, t)) if Arc::ptr_eq(existing, d) => *t = len,
             _ => s.target = Some((d.clone(), len)),
+        }
+    });
+}
+
+/// The current request enqueued work up to `seq` on another durable store: wait for it too.
+pub fn note_frontier(cell: &FrontierCell, seq: u64) {
+    let _ = SCOPE.try_with(|s| {
+        let mut s = s.borrow_mut();
+        if let Some(e) = s.others.iter_mut().find(|(c, _)| Arc::ptr_eq(c, cell)) {
+            e.1 = e.1.max(seq);
+        } else {
+            s.others.push((cell.clone(), seq));
         }
     });
 }
@@ -505,17 +530,34 @@ pub async fn durable_scope<F: Future>(f: F) -> (F::Output, Result<()>) {
 }
 
 async fn durable_scope_inner<F: Future>(f: F, observe_releases: bool) -> (F::Output, Result<()>) {
-    let (out, target) = SCOPE
-        .scope(RefCell::new(ScopeState { target: None, observe_releases }), async {
+    let (out, target, others) = SCOPE
+        .scope(RefCell::new(ScopeState { target: None, others: Vec::new(), observe_releases }), async {
             let out = f.await;
-            let t = SCOPE.with(|s| s.borrow_mut().target.take());
-            (out, t)
+            let (t, o) = SCOPE.with(|s| {
+                let mut s = s.borrow_mut();
+                (s.target.take(), std::mem::take(&mut s.others))
+            });
+            (out, t, o)
         })
         .await;
-    let res = match target {
+    let mut res = match target {
         Some((d, len)) => d.wait_durable(len).await,
         None => Ok(()),
     };
+    for (cell, seq) in others {
+        if res.is_err() {
+            break;
+        }
+        let mut rx = cell.subscribe();
+        res = match rx.wait_for(|f| f.poisoned || f.durable >= seq).await {
+            Ok(f) if f.poisoned => Err(anyhow!(
+                "a store this request wrote to lost durability (the daemon restarts to rebuild); \
+                 this act is NOT acknowledged as recorded"
+            )),
+            Ok(_) => Ok(()),
+            Err(_) => Err(anyhow!("durability channel closed")),
+        };
+    }
     (out, res)
 }
 
