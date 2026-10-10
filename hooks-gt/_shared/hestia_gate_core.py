@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: cd797980c479cb858359757273c575f6ba2e9ad0268a99773d10a3c9deea9855  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 8510c4d5d6080e7601cbc239cd63687b19a0acf2e0985c0d6d7c98d83dc2fad5  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -184,6 +184,9 @@ GOVERNANCE_FILES = (
     # THE common gate (one-gate stage C): every seat's shim delegates its whole decision to
     # it, so after the cutover it is the single file whose edit changes all four seats.
     "hestia_single_gate.py",
+    # A harness whose gate entry is not named pre_tool_use.py. The closure also derives each
+    # member's entry name from its install declaration; this is the canonical literal.
+    "before_tool.py",
 )
 
 
