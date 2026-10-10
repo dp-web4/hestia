@@ -566,7 +566,7 @@ fn deployment_health(state: &ServerState) -> DeploymentHealth {
             .into_iter()
             .map(|(member, _)| member.clone()),
     );
-    members.extend(state.gate_capabilities.keys().cloned());
+    members.extend(state.gate_capabilities.keys().into_iter());
     for member in members {
         match state.gate_capabilities.get(&member) {
             Some(caps) if caps.contains(CAPABILITY) => capable_members.push(member),

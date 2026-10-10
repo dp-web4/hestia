@@ -665,12 +665,25 @@ def _launch_role(inv: _Invocation, permitted: str) -> Optional[GateDecision]:
                         innate=True, anomaly=True)
 
 
-def _closure_view(event: GateEvent):
-    """The closure classifier's verdict on this act. Tool-shape adaptation only: a lowercase
-    shell tool or an argv list is the Bash form; an apply_patch is one Write per target."""
+def _closure_shape(event: GateEvent):
+    """(tool, tool_input, patch_targets, is_patch): the tool-shape adaptation both closure reads
+    share. A lowercase shell tool or an argv list is the Bash form; an apply_patch is one Write
+    per target."""
     tool, ti = event.tool, event.tool_input if isinstance(event.tool_input, dict) else {}
     targets = _patch_targets(tool, ti)
     if targets or (isinstance(tool, str) and tool.lower() == "apply_patch"):
+        return tool, ti, targets, True
+    if _shell_tool(tool) and tool not in ("Bash", "Shell"):
+        tool = "Bash"
+    if _shell_tool(tool) and not isinstance(ti.get("command"), str):
+        ti = dict(ti, command=_command_text(ti) or "")
+    return tool, ti, targets, False
+
+
+def _closure_view(event: GateEvent):
+    """The closure classifier's verdict on this act (the first governed target decides)."""
+    tool, ti, targets, is_patch = _closure_shape(event)
+    if is_patch:
         found = None
         for p in targets:
             cv = closure.classify("Write", {"file_path": p}, cwd=event.cwd)
@@ -679,11 +692,39 @@ def _closure_view(event: GateEvent):
             if cv.classification == "read" and found is None:
                 found = cv
         return found
-    if _shell_tool(tool) and tool not in ("Bash", "Shell"):
-        tool = "Bash"
-    if _shell_tool(tool) and not isinstance(ti.get("command"), str):
-        ti = dict(ti, command=_command_text(ti) or "")
     return closure.classify(tool, ti, cwd=event.cwd)
+
+
+def _closure_write_set(event: GateEvent):
+    """(targets, complete): EVERY governed write-position path this act resolves into the
+    closure, in order — not only the first, which is all `_closure_view` reports (Codex review
+    of #1239, P1-2: a later sovereign target beyond the bounded summary priced as nothing).
+    Each target rides with the other spellings the closure matched it by (cwd-joined,
+    realpath'd), so an alias carries its destination (Codex review of #1239, P1-2).
+    `complete` is False when the write set could not be enumerated: an opaque writer, an
+    internal error, no target named, a command outside the grammar or unparseable (its
+    targets are vocabulary that matched, not resolved write positions: `$TARGET` names no
+    file), or a relative target with no cwd to resolve it against (P1-1). The daemon then
+    prices the highest bar; the targets that are known still ride. Never raises."""
+    try:
+        tool, ti, targets, is_patch = _closure_shape(event)
+        if is_patch:
+            verdicts = [v for p in targets
+                        for v in closure.write_verdicts("Write", {"file_path": p}, cwd=event.cwd)]
+        else:
+            verdicts = closure.write_verdicts(tool, ti, cwd=event.cwd)
+        resolved = []
+        for v in verdicts:
+            if v.marker and v.resource:
+                resolved.append(v.resource)
+                resolved.extend(getattr(v, "resolved", ()))
+        complete = bool(resolved) and all(
+            v.marker and v.rule == closure.RULE_WRITE
+            and (os.path.isabs(v.resource) or getattr(v, "resolved", ()))
+            for v in verdicts)
+        return resolved, complete
+    except Exception:  # noqa: BLE001 — unenumerated is priced highest, never lowest
+        return [], False
 
 
 def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
@@ -703,6 +744,7 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
         except Exception:  # noqa: BLE001
             pass
         return None
+    write_set = _closure_write_set(ev)
     try:
         claimed = _bounded(
             inv.phase_deadline, mechanism.claim_self_write,
@@ -712,7 +754,14 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
             # THIS module stops a superseded invocation in every rollout mode (step 5), so it
             # may make the declaration that lets the daemon reclaim a lost answer (#1169).
             supersession=mechanism.SUPERSESSION_HARD_STOP,
-            deadline=inv.phase_deadline)
+            deadline=inv.phase_deadline,
+            # THE ACT'S RESOLVED TARGETS (#810; recut of #812, kimi-code): EVERY write-position
+            # path the closure resolved, not only the one `cv` reports. The daemon prices the bar
+            # over the marker, the act and all of them, highest wins — `inv.attempted` is a
+            # bounded, self-censoring summary that can cut a filename out (or withhold the whole
+            # command); these are carried independently of it. An unenumerable write set is
+            # said as such, and priced highest.
+            resolved_targets=write_set[0], resolved_targets_complete=write_set[1])
         if claimed is _LATE:
             # Unknown, not "nothing happened": the daemon may have opened or matched an
             # escalation after the bound (#1166). Re-issuing the identical act is safe.

@@ -307,6 +307,10 @@ def test_gate_file_write_refused_before_the_daemon():
             check(f"{seat}-claim-carries-host-session",
                   claims and claims[0].get("host_session_id") == "seat-boundary-session", claims)
             check(f"{seat}-claim-declares-hard-stop", claims and claims[0].get("supersession") == "hard_stop", claims)
+            # #810 (recut of #812): the claim carries the closure's resolved targets — the
+            # write-position paths, which name the file even when the marker is a directory.
+            check(f"{seat}-claim-carries-resolved-target",
+                  claims and claims[0].get("resolved_targets") == [gate_file(fx, seat)], claims)
             check(f"{seat}-witnessed", any(a.get("event_type") == "gate_self_access"
                                            for a in stub.args("hestia_request_witness")), stub.calls)
             check(f"{seat}-pre-daemon", "hestia_begin_action" not in stub.names(), stub.names())
@@ -323,6 +327,58 @@ def test_gate_file_shell_write_refused():
             v, text, _ = run(seat, home, native(seat, "Bash", {"command": f"echo pwned > {gate_file(fx, seat)}"}))
             check(f"{seat}-denied", v == "deny" and "gate.self_access" in text, text)
             check(f"{seat}-claim-made", "hestia_gate_escalation_claim" in stub.names(), stub.names())
+            claims = stub.args("hestia_gate_escalation_claim")
+            check(f"{seat}-shell-claim-carries-resolved-target",
+                  claims and [str(x) for x in claims[0].get("resolved_targets", [])][-1:]
+                  and str(claims[0]["resolved_targets"][-1]).endswith(
+                      os.path.basename(gate_file(fx, seat))), claims)
+            # Codex P1-2 on #1239: an ORDINARY governed target first, padding past the summary's
+            # bound, the seat's gate LAST. The closure reports the first; the claim must carry
+            # every governed target, so the daemon can price the gate.
+            mark = len(stub.calls)
+            ordinary = os.path.join(fx.repo, "plugins", "_shared", "ordinary.txt")
+            pad = " ".join(os.path.join(fx.repo, "docs", f"pad{i}.txt") for i in range(25))
+            v2, text2, _ = run(seat, home, native(seat, "Bash", {
+                "command": f"touch {ordinary} {pad} {gate_file(fx, seat)}"}, n=2))
+            check(f"{seat}-multi-denied", v2 == "deny" and "gate.self_access" in text2, text2)
+            multi = [a for n, a in stub.calls[mark:] if n == "hestia_gate_escalation_claim"]
+            check(f"{seat}-multi-claim-carries-every-governed-target",
+                  multi and multi[0].get("resolved_targets") == [ordinary, gate_file(fx, seat)],
+                  multi)
+            check(f"{seat}-multi-summary-lost-the-gate (the case the targets exist for)",
+                  multi and os.path.basename(gate_file(fx, seat)) not in multi[0].get("reason", ""),
+                  multi)
+            # The glob row (kimi, #1231 Q4): `rm <hooks dir>/*.py` is refused, and the claim
+            # carries the glob as written — the daemon prices it by what it can expand to.
+            mark = len(stub.calls)
+            glob = os.path.join(os.path.dirname(gate_file(fx, seat)), "*.py")
+            v3, text3, _ = run(seat, home, native(seat, "Bash", {"command": f"rm {glob}"}, n=3))
+            check(f"{seat}-glob-denied", v3 == "deny" and "gate.self_access" in text3, text3)
+            g = [a for n, a in stub.calls[mark:] if n == "hestia_gate_escalation_claim"]
+            check(f"{seat}-glob-claim-carries-the-glob",
+                  g and g[0].get("resolved_targets") == [glob], g)
+            # Codex notice 17632, P1-2: an ALIAS the closure recognized by its destination. The
+            # claim carries the destination too, not only the alias spelling.
+            alias = os.path.join(fx.repo, "docs", "alias.txt")
+            os.makedirs(os.path.dirname(alias), exist_ok=True)
+            os.symlink(gate_file(fx, seat), alias)
+            mark = len(stub.calls)
+            v3, text3, _ = run(seat, home, native(seat, "Bash", {"command": f"touch {alias}"}, n=3))
+            check(f"{seat}-alias-denied", v3 == "deny" and "gate.self_access" in text3, text3)
+            al = [a for n, a in stub.calls[mark:] if n == "hestia_gate_escalation_claim"]
+            check(f"{seat}-alias-claim-carries-the-destination",
+                  al and al[0].get("resolved_targets") == [alias, os.path.realpath(gate_file(fx, seat))],
+                  al)
+            # P1-1: out of grammar, the matched token is vocabulary, not a resolved path: the
+            # write set is unenumerated and says so, beside the target that is known.
+            mark = len(stub.calls)
+            var = os.path.join(fx.repo, "plugins", "_shared", "$TARGET")
+            v4, text4, _ = run(seat, home, native(seat, "Bash", {"command": f"touch {var}"}, n=4))
+            check(f"{seat}-out-of-grammar-denied", v4 == "deny" and "gate.self_access" in text4, text4)
+            og = [a for n, a in stub.calls[mark:] if n == "hestia_gate_escalation_claim"]
+            check(f"{seat}-out-of-grammar-claim-is-unenumerated",
+                  og and og[0].get("resolved_targets", [])[-1:] == ["hestia:unpriceable:unenumerated"],
+                  og)
             if seat == "codex":
                 patch = (f"*** Begin Patch\n*** Update File: {gate_file(fx, seat)}\n@@\n-a\n+b\n"
                          "*** End Patch\n")
