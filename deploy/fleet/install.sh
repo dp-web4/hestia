@@ -23,8 +23,12 @@
 set -euo pipefail
 
 REPO="dp-web4/hestia"
-DEFAULT_VERSION="v0.0.3"
-VERSION="${HESTIA_VERSION:-$DEFAULT_VERSION}"
+# The release a pin-less install gets. #520: this was a literal (v0.0.3) for two months after
+# v0.0.4 shipped -- every curl|sh install got a binary that cannot read v0.0.4's databases, and
+# the header above said "default: latest". It now resolves GitHub's marked-latest release, and
+# falls back to this floor only when the API cannot be reached (offline, rate-limited).
+FALLBACK_VERSION="v0.0.4"
+VERSION="${HESTIA_VERSION:-}"
 HESTIA_HOME="${HESTIA_HOME:-$HOME/.hestia}"
 HESTIA_BIND="${HESTIA_BIND:-127.0.0.1:7711}"
 # DERIVE, do not enumerate. The first draft of this block listed the workspace roots of
@@ -835,10 +839,44 @@ step_smoketest() {
   exit 1
 }
 
+resolve_version() {
+  [ -n "$VERSION" ] && return 0
+  local tag
+  tag="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+    | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)" || true
+  case "$tag" in
+    v[0-9]*) VERSION="$tag" ;;
+    *) VERSION="$FALLBACK_VERSION"
+       c_warn "could not resolve the latest release from GitHub; installing ${VERSION} (set HESTIA_VERSION to choose)" ;;
+  esac
+}
+
+# Never replace a newer daemon with an older release (#520: the v0.0.3 default downgraded a
+# v0.0.4 host and took its daemon down -- v0.0.3 cannot open v0.0.4's databases). Compares the
+# installed binary's package version with the target tag; a deliberate downgrade must say so.
+guard_downgrade() {
+  [ -x "$BIN_PATH" ] || return 0
+  local have want
+  have="$("$BIN_PATH" --version 2>/dev/null | sed -n 's/^[^0-9]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n1)"
+  want="${VERSION#v}"; want="${want%%-*}"
+  [ -n "$have" ] && [ -n "$want" ] || return 0
+  [ "$have" = "$want" ] && return 0
+  if [ "$(printf '%s\n%s\n' "$have" "$want" | sort -V | tail -n1)" = "$have" ]; then
+    if [ -n "${HESTIA_ALLOW_DOWNGRADE:-}" ]; then
+      c_warn "downgrading hestia ${have} -> ${want} (HESTIA_ALLOW_DOWNGRADE set)"
+    else
+      c_err "installed hestia ${have} is newer than ${VERSION}; refusing to downgrade (a newer daemon's databases may not open). Set HESTIA_ALLOW_DOWNGRADE=1 to force."
+      exit 1
+    fi
+  fi
+}
+
 main() {
   local target os
   target="$(detect_target)"
   os="$(uname -s)"
+  resolve_version
+  guard_downgrade
   c_hdr "hestia fleet installer — ${VERSION} → ${target}"
   step_download "$target"
   step_vault
