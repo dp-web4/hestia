@@ -393,14 +393,19 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/http.rs::policy_revoke_instance_grant", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
-    ("server/state.rs::apply_adjudication_ctx", &[
-        "if let Some(subject_lct) = self.member_lct(subject_plugin_id) {",
+    // RE-READ 2026-10-07 (claude-code, #1271 trust as a projection of the chain). The three
+    // `apply_*_ctx` sites folded into ONE: `trust_grain`, which names the trust grain and the
+    // delta subject. Who gets named is unchanged (the same member LCT); when projecting from a
+    // chain row it is the LCT the ROW recorded, so a replay names exactly what the live write
+    // named even if the member was minted later. No derived name is compared: Naming.
+    ("server/state.rs::trust_grain", &[
+        "None => self.member_lct(plugin_id),",
     ], SiteClass::Naming),
-    ("server/state.rs::apply_judgment_ctx", &[
-        "if let Some(subject_lct) = self.member_lct(plugin_id) {",
-    ], SiteClass::Naming),
-    ("server/state.rs::apply_outcome_ctx", &[
-        "if let Some(subject_lct) = self.member_lct(plugin_id) {",
+    // ADDED 2026-10-07 (#1271): the `decision_charge_settled` row records the member's LCT so a
+    // replay keys the settled charge on the grain the live settle used. Recorded, never
+    // compared: Naming.
+    ("server/handler.rs::settle_decision_charge", &[
+        "let instance_lct = s.member_lct(member);",
     ], SiteClass::Naming),
     // ── ADDED 2026-08-02 (claude-code). FOUR OF THESE FIVE ARE NOT NEW CODE. ──
     //

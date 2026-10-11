@@ -1479,6 +1479,17 @@ fn cmd_serve(home: &std::path::Path, bind: &str, allow_remote: bool, callback: b
         None
     };
 
+    // Group commit (storage::durability): if a witness-chain fsync ever fails, the outcome of
+    // every unacknowledged entry is unknown and memory may be ahead of the chain. Exit non-zero
+    // so systemd (Restart=on-failure) restarts the daemon and state is rebuilt from the chain.
+    // The short grace lets in-flight waiters receive their `hestia.not_durable` replies.
+    hestia::storage::durability::set_fatal_hook(Box::new(|why: &str| {
+        eprintln!("[hestia] exiting for restart: witness chain durability lost ({why})");
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            std::process::exit(75);
+        });
+    }));
     let state = hestia::server::build_state(vault, home, &passphrase)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -1,0 +1,14 @@
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -62,9 +62,5 @@
+     ]
+   },
+   "requires": [],
+-<<<<<<< HEAD
+-  "gt_version": "8c1281577bbea68dd24de463b6e06c57e15a5b6a095b03f1778d7a2eda9b967d"
+-=======
+-  "gt_version": "297dd7164c7830fffae9d033edf77b96da872692551d8670ff332184c70e9b3e"
+->>>>>>> origin/main
++  "gt_version": "f5c16bc97f3af24023b92bffaa14b84a48e18bd19f006dbd06551160411c7fa0"
+ }

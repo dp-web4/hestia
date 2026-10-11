@@ -197,6 +197,11 @@ pub fn delta_from_change(
 /// Append a delta as one JSON line to the local sink. Best-effort: a logging
 /// failure must NEVER break a trust update, so errors are swallowed (the sink is
 /// a projection, not the source of truth — the witness chain is).
+/// The line `log_delta` writes, for callers that route it through an ordered persister.
+pub fn delta_line(delta: &ReputationDelta) -> Option<String> {
+    serde_json::to_string(delta).ok()
+}
+
 pub fn log_delta(sink: &Path, delta: &ReputationDelta) {
     use std::io::Write;
     if let Ok(line) = serde_json::to_string(delta) {

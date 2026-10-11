@@ -847,6 +847,32 @@
           "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
         }
       }
+    },
+    {
+      "id": "hub-memberships",
+      "title": "Hub memberships: which hubs this node is in (asked of each hub), apply, withdraw, remove from list",
+      "place": "communities",
+      "kind": "write",
+      "risk": "medium",
+      "routes": [
+        "GET /api/hub/memberships",
+        "POST /api/hub/withdraw"
+      ],
+      "rules": [
+        "signed-in-only",
+        "unknown-not-fine",
+        "confirm-irreversible"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      },
+      "notes": "Enrollment is probed per hub (GET /v1/hubs/{hub}/members/{me}/pubkey): only 200/404 set it; unreachable or any other answer is UNKNOWN, rendered amber, never 'not a member'. Withdraw is the member's own exit (web4#804); 'remove from list' only forgets a URL locally. Apply reuses POST /api/hub/join + PUT /api/hub/urls/active (hub-act, hub-urls)."
     }
   ],
   "unsurfaced": [
@@ -889,6 +915,10 @@
     {
       "route": "GET /api/trust/graph",
       "why": "no consumer yet"
+    },
+    {
+      "route": "GET /api/debug/locks",
+      "why": "diagnostic, not an operator act: the daemon state lock's wait/hold statistics, read by tools/daemon_concurrency_load.py (#1265); read-only and never takes the lock"
     },
     {
       "route": "GET /api/scope/requests",

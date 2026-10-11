@@ -267,6 +267,27 @@ impl OperatorSessionIdentity {
 #[derive(Debug, Default)]
 pub struct SessionStore {
     sessions: HashMap<String, (OperatorSessionIdentity, u64)>,
+    /// The same sessions as (principal, issued_at), behind their OWN lock, for the one surface
+    /// that must authorize without the daemon's state lock: `GET /api/debug/locks`, which
+    /// reports who holds that lock during a stall (Codex review of #1265). Kept in step by
+    /// `open`/`close`/`gc`, the only mutators of `sessions`.
+    view: OperatorSessionView,
+}
+
+/// A lock-free (of the state lock) read of the live operator sessions. See
+/// [`SessionStore::lockfree_view`].
+#[derive(Debug, Default, Clone)]
+pub struct OperatorSessionView(std::sync::Arc<std::sync::RwLock<HashMap<String, (String, u64)>>>);
+
+impl OperatorSessionView {
+    /// The operator a token belongs to iff present and unexpired — the same rule as
+    /// [`SessionStore::operator`].
+    pub fn operator(&self, token: &str, now: u64, ttl_secs: u64) -> Option<String> {
+        let g = self.0.read().unwrap_or_else(|p| p.into_inner());
+        g.get(token).and_then(|(principal, issued)| {
+            (now.saturating_sub(*issued) <= ttl_secs).then(|| principal.clone())
+        })
+    }
 }
 
 impl SessionStore {
@@ -277,8 +298,19 @@ impl SessionStore {
         let mut buf = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut buf);
         let token = hex::encode(buf);
-        self.sessions.insert(token.clone(), (identity.into(), now));
+        let identity = identity.into();
+        self.view
+            .0
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(token.clone(), (identity.principal().to_string(), now));
+        self.sessions.insert(token.clone(), (identity, now));
         token
+    }
+
+    /// A handle that resolves sessions without the state lock (see the `view` field).
+    pub fn lockfree_view(&self) -> OperatorSessionView {
+        self.view.clone()
     }
 
     /// Resolve a session token to its operator lct_id iff present and unexpired.
@@ -301,10 +333,16 @@ impl SessionStore {
     /// Close a session (operator logout / revocation).
     pub fn close(&mut self, token: &str) {
         self.sessions.remove(token);
+        self.view.0.write().unwrap_or_else(|p| p.into_inner()).remove(token);
     }
 
     pub fn gc(&mut self, now: u64, ttl_secs: u64) {
         self.sessions
+            .retain(|_, (_, issued)| now.saturating_sub(*issued) <= ttl_secs);
+        self.view
+            .0
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
             .retain(|_, (_, issued)| now.saturating_sub(*issued) <= ttl_secs);
     }
 }

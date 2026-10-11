@@ -102,12 +102,43 @@ def _with_locator(text: str) -> str:
     return json.dumps(doc, indent=2) + "\n"
 
 
+#: The disposition reader's line, as the governed template patch ships it (#845 R4/R4a, #849): on
+#: PreToolUse and PostToolUse, the ports that reach a subagent, and on UserPromptSubmit, the port
+#: that reaches an idle interactive parent. HESTIA_HOME (the lane is in the daemon's home), no role.
+_READER = "HESTIA_HOME=@HESTIA_HOME@ python3 @HESTIA_PLUGIN_ROOT@/claude-code/hooks/disposition_deliver.py"
+_READER_EVENTS = ("PreToolUse", "PostToolUse", "UserPromptSubmit")
+#: Every file the claude-code template registers once the reader is in it.
+_CC_FILES = ("pre_tool_use.py", "witness.py", "law_inject.py", "disposition_deliver.py")
+
+
+def _with_reader(text: str) -> str:
+    """The claude-code template as the governed half of THIS change ships it: the disposition reader
+    registered on _READER_EVENTS. A no-op once the template carries it, so the fixture tests measure
+    the shipped shape whether or not the patch has landed in this tree
+    (test_shipped_claude_template_registers_the_disposition_reader pins the real file)."""
+    doc = json.loads(text)
+    hooks = doc.setdefault("hooks", {})
+    for ev in _READER_EVENTS:
+        gs = hooks.setdefault(ev, [])
+        if any((h.get("command") or "").endswith("/disposition_deliver.py") for g in gs for h in g.get("hooks") or []):
+            continue
+        g = {"matcher": "*"} if ev != "UserPromptSubmit" else {}
+        g["hooks"] = [{"type": "command", "command": _READER, "timeout": 3}]
+        gs.append(g)
+    return json.dumps(doc, indent=2) + "\n"
+
+
+def _shipped_template(m: str, text: str) -> str:
+    text = _with_locator(text)
+    return _with_reader(text) if m == "claude-code" else text
+
+
 def _copy_member(p: Path, m: str) -> None:
     (p / m / "hooks").mkdir(parents=True, exist_ok=True)
     (p / m / "expects.json").write_text((REPO / "plugins" / m / "expects.json").read_text())
     src = REPO / "plugins" / m / "hooks" / "hooks.json"
     if src.exists():
-        (p / m / "hooks" / "hooks.json").write_text(_with_locator(src.read_text()))
+        (p / m / "hooks" / "hooks.json").write_text(_shipped_template(m, src.read_text()))
 
 
 def _plugins(tmp: Path, members=("codex", "claude-code")) -> Path:
@@ -464,23 +495,26 @@ def test_claude_code_template_registers_the_gate_and_law_inject_beside_an_existi
                               "SessionStart": [{"hooks": [
                                   {"type": "command", "command": "/home/u/.local/bin/hestia-agent-inventory --workspace /w --brief", "timeout": 20}]}]}}
         cfg.write_text(json.dumps(existing, indent=2))
-        _install(tmp, "claude-code", "pre_tool_use.py", "law_inject.py")
+        _install(tmp, "claude-code", "pre_tool_use.py", "law_inject.py", "disposition_deliver.py")
         r = _run(tmp, plugins, "--member", "claude-code")
         assert r.returncode == 0, r.stdout + r.stderr
         assert "REGISTERED claude-code: PreToolUse/pre_tool_use.py" in r.stdout, r.stdout
         assert "REGISTERED claude-code: SessionStart/law_inject.py" in r.stdout, r.stdout
+        for ev in _READER_EVENTS:
+            assert f"REGISTERED claude-code: {ev}/disposition_deliver.py" in r.stdout, r.stdout
         assert "REGISTERED claude-code: PostToolUse/witness.py" not in r.stdout, \
             "the witness was already registered (at another path) and must not be duplicated"
         assert "FOREIGN claude-code: PostToolUse/witness.py is registered at /elsewhere/hestia/witness.py" in r.stdout, r.stdout
         data = json.loads(cfg.read_text())
         assert data["permissions"] == existing["permissions"]
         dest = tmp / ".claude" / "hooks" / "hestia"
+        reader = f"HESTIA_HOME={os.path.realpath(_hh(tmp))} python3 {dest}/disposition_deliver.py"
         pre = [h["command"] for g in data["hooks"]["PreToolUse"] for h in g["hooks"]]
         assert pre == [f'HESTIA_HOME={os.path.realpath(_hh(tmp))} HESTIA_ROLE="${{HESTIA_ROLE:-{_ROLE_DEFAULT}}}" '
-                       f'python3 {dest}/pre_tool_use.py'], pre
+                       f'python3 {dest}/pre_tool_use.py', reader], pre
         assert data["hooks"]["PreToolUse"][0]["matcher"] == "*"
         posts = [h["command"] for g in data["hooks"]["PostToolUse"] for h in g["hooks"]]
-        assert posts == ["python3 /elsewhere/hestia/witness.py"], posts
+        assert posts == ["python3 /elsewhere/hestia/witness.py", reader], posts
         starts = [h["command"] for g in data["hooks"]["SessionStart"] for h in g["hooks"]]
         assert starts[0].startswith("/home/u/.local/bin/hestia-agent-inventory") and starts[1] == f"python3 {dest}/law_inject.py", starts
         assert "@HESTIA" not in cfg.read_text()
@@ -488,17 +522,20 @@ def test_claude_code_template_registers_the_gate_and_law_inject_beside_an_existi
         assert "ok    claude-code" in r2.stdout and json.loads(cfg.read_text()) == data
 
 
-def test_claude_code_template_on_an_empty_settings_registers_all_three_once_installed():
+def test_claude_code_template_on_an_empty_settings_registers_every_hook_once_installed():
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         plugins = _plugins(tmp)
         (tmp / ".claude").mkdir()
-        _install(tmp, "claude-code", "pre_tool_use.py", "witness.py", "law_inject.py")
+        _install(tmp, "claude-code", *_CC_FILES)
         r = _run(tmp, plugins, "--member", "claude-code")
         assert r.returncode == 0, r.stdout + r.stderr
         data = json.loads((tmp / ".claude" / "settings.json").read_text())
         got = {ev: [h["command"].split("/")[-1] for g in gs for h in g["hooks"]] for ev, gs in data["hooks"].items()}
-        assert got == {"PreToolUse": ["pre_tool_use.py"], "PostToolUse": ["witness.py"], "SessionStart": ["law_inject.py"]}, got
+        assert got == {"PreToolUse": ["pre_tool_use.py", "disposition_deliver.py"],
+                       "PostToolUse": ["witness.py", "disposition_deliver.py"],
+                       "UserPromptSubmit": ["disposition_deliver.py"],
+                       "SessionStart": ["law_inject.py"]}, got
 
 
 def test_a_target_not_on_disk_is_pending_never_registered():
@@ -511,7 +548,8 @@ def test_a_target_not_on_disk_is_pending_never_registered():
         (tmp / ".claude").mkdir()
         r = _run(tmp, plugins, "--member", "claude-code")
         assert r.returncode == 9, (r.returncode, r.stdout)
-        assert r.stdout.count("PENDING claude-code") == 3 and "REGISTERED" not in r.stdout, r.stdout
+        # one PENDING per (event, file): gate, witness, law_inject, and the reader on three events
+        assert r.stdout.count("PENDING claude-code") == 6 and "REGISTERED" not in r.stdout, r.stdout
         assert "every templated hook is registered" not in r.stdout
         assert not (tmp / ".claude" / "settings.json").exists(), "a registration was written for files that do not exist"
 
@@ -526,7 +564,9 @@ def test_plan_names_every_hook_to_add_with_its_target():
         assert r.returncode == 0, r.stdout + r.stderr
         rows = [ln.split("\t") for ln in r.stdout.splitlines() if ln.strip()]
         dest = str(tmp / ".claude" / "hooks" / "hestia")
-        want = [["claude-code", b, f"{dest}/{b}"] for b in ("pre_tool_use.py", "witness.py", "law_inject.py")]
+        # one row per (event, file), as codex's observe.sh already has: the reader rides three
+        # events, and install-members.sh keys its plan by member/basename, so it installs it once
+        want = [["claude-code", b, f"{dest}/{b}"] for b in _CC_FILES + ("disposition_deliver.py",) * 2]
         assert sorted(rows) == sorted(want), rows
         assert not (tmp / ".claude" / "settings.json").exists() and not (tmp / ".claude" / "hooks").exists(), "--plan wrote something"
 
@@ -540,7 +580,7 @@ def test_a_read_only_gate_is_narrow_when_foreign_and_widened_when_owned():
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         plugins = _plugins(tmp)
-        dest = _install(tmp, "claude-code", "pre_tool_use.py", "witness.py", "law_inject.py")
+        dest = _install(tmp, "claude-code", *_CC_FILES)
         cfg = tmp / ".claude" / "settings.json"
         narrow = {"hooks": {"PreToolUse": [{"matcher": "Read", "hooks": [
             {"type": "command", "command": "python3 /opt/elsewhere/pre_tool_use.py", "timeout": 10}]}]}}
@@ -550,7 +590,7 @@ def test_a_read_only_gate_is_narrow_when_foreign_and_widened_when_owned():
         assert "NARROW claude-code: PreToolUse/pre_tool_use.py is registered only for matcher 'Read'" in r.stdout, r.stdout
         assert "every templated hook is registered" not in r.stdout, r.stdout
         data = json.loads(cfg.read_text())
-        assert data["hooks"]["PreToolUse"] == narrow["hooks"]["PreToolUse"], "a foreign narrow gate was rewritten"
+        assert data["hooks"]["PreToolUse"][0] == narrow["hooks"]["PreToolUse"][0], "a foreign narrow gate was rewritten"
         # the other two hooks, which are not narrow, still register
         assert "REGISTERED claude-code: PostToolUse/witness.py" in r.stdout, r.stdout
         assert "REGISTERED claude-code: SessionStart/law_inject.py" in r.stdout, r.stdout
@@ -563,8 +603,9 @@ def test_a_read_only_gate_is_narrow_when_foreign_and_widened_when_owned():
         assert r.returncode == 0, (r.returncode, r.stdout)
         assert "REWROTE claude-code: PreToolUse/pre_tool_use.py: matcher 'Read' -> '*'" in r.stdout, r.stdout
         pre = json.loads(cfg.read_text())["hooks"]["PreToolUse"]
-        assert len(pre) == 1 and pre[0]["matcher"] == "*", pre
-        assert pre[0]["hooks"][0]["command"].startswith("HESTIA_HOME="), pre
+        gates = [g for g in pre if any(h["command"].endswith("/pre_tool_use.py") for h in g["hooks"])]
+        assert len(gates) == 1 and gates[0]["matcher"] == "*", pre
+        assert gates[0]["hooks"][0]["command"].startswith("HESTIA_HOME="), pre
 
 
 def test_an_owned_hook_sharing_a_group_is_moved_never_the_foreign_hooks_matcher():
@@ -574,7 +615,7 @@ def test_an_owned_hook_sharing_a_group_is_moved_never_the_foreign_hooks_matcher(
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         plugins = _plugins(tmp)
-        dest = _install(tmp, "claude-code", "pre_tool_use.py", "witness.py", "law_inject.py")
+        dest = _install(tmp, "claude-code", *_CC_FILES)
         cfg = tmp / ".claude" / "settings.json"
         foreign = {"type": "command", "command": "node /w/snarc/pre-tool-use.js", "timeout": 15}
         cfg.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "Read", "hooks": [
@@ -584,7 +625,9 @@ def test_an_owned_hook_sharing_a_group_is_moved_never_the_foreign_hooks_matcher(
         assert "moved to its own group" in r.stdout, r.stdout
         pre = json.loads(cfg.read_text())["hooks"]["PreToolUse"]
         assert pre[0] == {"matcher": "Read", "hooks": [foreign]}, pre
-        assert pre[1]["matcher"] == "*" and [h["command"].split("/")[-1] for h in pre[1]["hooks"]] == ["pre_tool_use.py"], pre
+        gate = [g for g in pre[1:] if any(h["command"].endswith("/pre_tool_use.py") for h in g["hooks"])]
+        assert len(gate) == 1 and gate[0]["matcher"] == "*" and \
+            [h["command"].split("/")[-1] for h in gate[0]["hooks"]] == ["pre_tool_use.py"], pre
         again = _run(tmp, plugins, "--member", "claude-code")
         assert again.returncode == 0 and "REWROTE" not in again.stdout and "ok    claude-code" in again.stdout, again.stdout
 
@@ -598,7 +641,7 @@ def test_a_foreign_hook_without_a_command_keeps_its_group_and_matcher():
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         plugins = _plugins(tmp)
-        dest = _install(tmp, "claude-code", "pre_tool_use.py", "witness.py", "law_inject.py")
+        dest = _install(tmp, "claude-code", *_CC_FILES)
         cfg = tmp / ".claude" / "settings.json"
         prompt = {"type": "prompt", "prompt": "Review this read request."}
         cfg.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "Read", "hooks": [
@@ -607,7 +650,9 @@ def test_a_foreign_hook_without_a_command_keeps_its_group_and_matcher():
         assert r.returncode == 0, (r.returncode, r.stdout)
         pre = json.loads(cfg.read_text())["hooks"]["PreToolUse"]
         assert pre[0] == {"matcher": "Read", "hooks": [prompt]}, pre
-        assert pre[1]["matcher"] == "*" and [h["command"].split("/")[-1] for h in pre[1]["hooks"]] == ["pre_tool_use.py"], pre
+        gate = [g for g in pre[1:] if any(h["command"].endswith("/pre_tool_use.py") for h in g["hooks"])]
+        assert len(gate) == 1 and gate[0]["matcher"] == "*" and \
+            [h["command"].split("/")[-1] for h in gate[0]["hooks"]] == ["pre_tool_use.py"], pre
         assert "moved to its own group" in r.stdout, r.stdout
         # nested TOML: the same shape, a foreign entry with no command
         _plugins(tmp, ("codex",))
@@ -874,7 +919,7 @@ def test_mixed_installed_and_missing_targets_exit_pending():
         r = _run(tmp, plugins, "--member", "claude-code")
         assert r.returncode == 9, (r.returncode, r.stdout)
         assert "REGISTERED claude-code: PostToolUse/witness.py" in r.stdout, r.stdout
-        assert r.stdout.count("PENDING claude-code") == 2, r.stdout
+        assert r.stdout.count("PENDING claude-code") == 5, r.stdout   # gate, law_inject, reader x3
         assert "every templated hook is registered" not in r.stdout
         data = json.loads((tmp / ".claude" / "settings.json").read_text())
         assert list(data["hooks"]) == ["PostToolUse"], data
@@ -1080,6 +1125,8 @@ def _e2e_root(tmp: Path):
     shutil.copytree(REPO / "plugins" / "_shared", root / "plugins" / "_shared")
     shutil.copytree(REPO / "plugins" / "claude-code", root / "plugins" / "claude-code",
                     ignore=shutil.ignore_patterns("__pycache__", "test_*.py"))
+    tpl = root / "plugins" / "claude-code" / "hooks" / "hooks.json"
+    tpl.write_text(_shipped_template("claude-code", tpl.read_text()))
     home = tmp / "home"
     (home / ".claude").mkdir(parents=True)
     env = {k: v for k, v in os.environ.items() if k not in _SESSION_KEYS}
@@ -1100,11 +1147,12 @@ def test_install_members_end_to_end_in_an_isolated_home():
         assert p.returncode == 0, out[-3000:]
         assert "FATAL" not in out, out[-3000:]
         dest = home / ".claude" / "hooks" / "hestia"
-        for b in ("pre_tool_use.py", "witness.py", "law_inject.py"):
+        for b in _CC_FILES:
             assert (dest / b).read_bytes() == (REPO / "plugins" / "claude-code" / "hooks" / b).read_bytes(), b
         data = json.loads((home / ".claude" / "settings.json").read_text())
         targets = [RM.target_path(h["command"]) for gs in data["hooks"].values() for g in gs for h in g["hooks"]]
-        assert sorted(os.path.basename(x) for x in targets) == ["law_inject.py", "pre_tool_use.py", "witness.py"], targets
+        assert sorted(os.path.basename(x) for x in targets) == sorted(
+            ["law_inject.py", "pre_tool_use.py", "witness.py"] + ["disposition_deliver.py"] * 3), targets
         assert all(os.path.isfile(x) for x in targets), "a registration points at a file that is not on disk"
         assert data["hooks"]["PreToolUse"][0]["matcher"] == "*"
         assert out.index("PLAN") < out.index("wrote pre_tool_use.py") < out.index("REGISTERED claude-code"), "not plan -> install -> register"
@@ -1130,7 +1178,8 @@ def test_install_members_reports_a_foreign_narrow_gate_and_widens_an_owned_one()
         assert "NARROW claude-code: PreToolUse/pre_tool_use.py" in out and "narrower than its template" in out, out[-3000:]
         assert "every templated hook is registered" not in out
         got = json.loads((home / ".claude" / "settings.json").read_text())["hooks"]["PreToolUse"]
-        assert got == narrow["hooks"]["PreToolUse"], got
+        assert got[0] == narrow["hooks"]["PreToolUse"][0], got
+        assert [h["command"].split("/")[-1] for g in got[1:] for h in g["hooks"]] == ["disposition_deliver.py"], got
         # hestia's own narrow line is the deployer's to rewrite
         owned = {"hooks": {"PreToolUse": [{"matcher": "Read", "hooks": [
             {"type": "command", "command": f"python3 {dest}/pre_tool_use.py", "timeout": 10}]}]}}
@@ -1435,7 +1484,7 @@ GEMINI_REAL = {
 }
 
 _REAL_FILES = {
-    "claude-code": ((".claude", "settings.json"), ("pre_tool_use.py", "witness.py", "law_inject.py")),
+    "claude-code": ((".claude", "settings.json"), _CC_FILES),
     "codex": ((".codex", "config.toml"), ("pre_tool_use.py", "witness.py", "observe.sh", "hydrate.sh")),
     "kimi": ((".kimi-code", "config.toml"), ("pre_tool_use.py", "witness.py", "observe.sh", "hydrate.sh")),
     "gemini": ((".gemini", "settings.json"), ("before_tool.py", "witness.py", "observe.sh", "hydrate.sh")),
@@ -1748,9 +1797,81 @@ def test_shipped_templates_render_the_locator_onto_gate_and_witness():
                     if base in (gate, "witness.py"):
                         assert h["command"].startswith(_LOCATOR), (m, h["command"])
                         seen.add(base)
+                    elif m == "claude-code" and base == "disposition_deliver.py":
+                        # the reader finds the lane in the daemon's home; it loads no projection,
+                        # so it carries the locator and no launch role
+                        assert h["command"] == _READER, (m, h["command"])
                     else:
                         assert "@HESTIA_HOME@" not in h["command"], (m, h["command"])
         assert seen == {gate, "witness.py"}, (m, seen)
+
+
+def test_shipped_claude_template_registers_the_disposition_reader():
+    """The governed half of THIS change. dp, 2026-10-06: "we're supposed to have a mechanism that
+    notifies the requestor of disposition, without me doing it manually." #849 built the reader and
+    no template registered it, so no host ran it (CBP's deploy: "skip disposition_deliver.py - not
+    registered on this host"). RED until the template patch is applied: the shipped claude-code
+    template must register the reader on PreToolUse and PostToolUse (they reach a subagent: every
+    tool call it makes) and UserPromptSubmit (an idle interactive parent), at the witness's 3 s."""
+    doc = json.loads((REPO / "plugins" / "claude-code" / "hooks" / "hooks.json").read_text())
+    for ev in _READER_EVENTS:
+        hs = [h for g in doc["hooks"].get(ev, []) for h in g["hooks"]
+              if h["command"].endswith("/disposition_deliver.py")]
+        assert len(hs) == 1, (ev, hs)
+        assert hs[0] == {"type": "command", "command": _READER, "timeout": 3}, (ev, hs[0])
+        if ev != "UserPromptSubmit":
+            g = next(g for g in doc["hooks"][ev] if hs[0] in g["hooks"])
+            assert g.get("matcher") == "*", (ev, g)
+    spec = json.loads((REPO / "plugins" / "claude-code" / "expects.json").read_text())["install"]
+    assert "hooks/disposition_deliver.py" in spec["files"], "the installer ships only declared files"
+
+
+def test_the_reconcile_adds_the_disposition_reader_to_a_host_that_lacks_it():
+    """CBP on 2026-10-06, exactly: the gate, witness and law_inject registered as the reconciler
+    renders them, the reader shipped on disk and registered NOWHERE, plus the member-mesh prompt
+    watch (a foreign UserPromptSubmit hook) and a foreign PreToolUse hook. One deploy run adds the
+    reader on all three events, rewrites nothing it already owned, leaves every foreign hook in
+    place; a second run is byte-identical and reports nothing."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp)
+        dest = _install(tmp, "claude-code", *_CC_FILES)
+        hh = os.path.realpath(_hh(tmp))
+        role = f'HESTIA_ROLE="${{HESTIA_ROLE:-{_ROLE_DEFAULT}}}"'
+        watch = {"type": "command", "command": "/w/hestia/plugins/member-mesh/prompt-disposition-watch.sh", "timeout": 5}
+        snarc = {"type": "command", "command": "node /w/snarc/dist/hooks/handlers/pre-tool-use.js", "timeout": 15}
+        before = {"theme": "dark", "hooks": {
+            "PreToolUse": [{"matcher": "*", "hooks": [
+                {"type": "command", "command": f"HESTIA_HOME={hh} {role} python3 {dest}/pre_tool_use.py", "timeout": 10},
+                snarc]}],
+            "PostToolUse": [{"matcher": "*", "hooks": [
+                {"type": "command", "command": f"HESTIA_HOME={hh} {role} python3 {dest}/witness.py", "timeout": 3}]}],
+            "UserPromptSubmit": [{"hooks": [watch]}],
+            "SessionStart": [{"hooks": [{"type": "command", "command": f"python3 {dest}/law_inject.py", "timeout": 10}]}],
+        }}
+        cfg = tmp / ".claude" / "settings.json"
+        cfg.write_text(json.dumps(before, indent=2))
+        r = _run(tmp, plugins, "--member", "claude-code")
+        assert r.returncode == 0, r.stdout + r.stderr
+        for ev in _READER_EVENTS:
+            assert f"REGISTERED claude-code: {ev}/disposition_deliver.py" in r.stdout, r.stdout
+        assert "REWROTE" not in r.stdout and "REMOVED" not in r.stdout, \
+            "the lines this host already carried were the template's; only the reader is new: " + r.stdout
+        data = json.loads(cfg.read_text())
+        reader = f"HESTIA_HOME={hh} python3 {dest}/disposition_deliver.py"
+        for ev in _READER_EVENTS:
+            hs = [h for g in data["hooks"][ev] for h in g["hooks"] if h["command"] == reader]
+            assert len(hs) == 1 and hs[0]["timeout"] == 3, (ev, data["hooks"][ev])
+        assert data["hooks"]["PreToolUse"][0] == before["hooks"]["PreToolUse"][0], "the gate's group moved"
+        assert data["hooks"]["UserPromptSubmit"][0] == {"hooks": [watch]}, "the foreign prompt watch moved"
+        assert data["hooks"]["PostToolUse"][0] == before["hooks"]["PostToolUse"][0]
+        assert data["hooks"]["SessionStart"] == before["hooks"]["SessionStart"] and data["theme"] == "dark"
+        assert "@HESTIA" not in cfg.read_text()
+        snap = cfg.read_bytes()
+        again = _run(tmp, plugins, "--member", "claude-code")
+        assert again.returncode == 0 and "ok    claude-code" in again.stdout, again.stdout
+        assert "REGISTERED" not in again.stdout and "REWROTE" not in again.stdout, again.stdout
+        assert cfg.read_bytes() == snap, "the second run was not byte-identical"
 
 
 TESTS = [
@@ -1766,7 +1887,7 @@ TESTS = [
     test_a_failed_write_restores_what_this_run_read_not_the_first_backup,
     test_a_write_keeps_the_config_file_mode,
     test_claude_code_template_registers_the_gate_and_law_inject_beside_an_existing_witness,
-    test_claude_code_template_on_an_empty_settings_registers_all_three_once_installed,
+    test_claude_code_template_on_an_empty_settings_registers_every_hook_once_installed,
     test_a_target_not_on_disk_is_pending_never_registered,
     test_plan_names_every_hook_to_add_with_its_target,
     test_a_read_only_gate_is_narrow_when_foreign_and_widened_when_owned,
@@ -1807,6 +1928,8 @@ TESTS = [
     test_the_launch_role_is_a_pass_through_with_the_members_declared_default,
     test_codex_hydrate_is_pointed_at_the_plugin_source_where_its_seed_lives,
     test_shipped_templates_render_the_locator_onto_gate_and_witness,
+    test_shipped_claude_template_registers_the_disposition_reader,
+    test_the_reconcile_adds_the_disposition_reader_to_a_host_that_lacks_it,
 ]
 
 if __name__ == "__main__":

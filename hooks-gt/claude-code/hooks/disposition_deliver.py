@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: c54e5ebceea5c92a0bff63276dd79e462f6bc7156fe2d98e5189b736ee7aadd5  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: d86f39b2399ccedab559f38e3410ecf26dc0e2e69fc9d40501691cb988a77b61  (published ground truth; manifest: hooks-gt)
 """Deliver a governance disposition to the asker's LIVE session, on the seat's own hook stream.
 
 dp, 2026-09-02: "regardless of window, the mechanism is supposed to notify the asker of the
@@ -40,6 +40,24 @@ fires afterwards: every arm read `delivered=False`.  So first sight scans from t
 renders only lines whose `for_session` IS this session; unaddressed lines are delivered from
 the second sight on, when "I was here already" is true.
 
+A SUBAGENT SHARES ITS PARENT'S SESSION ID, SO THE CURSOR IS PER (SESSION, AGENT).  Measured on
+Claude Code 2.1.290, 2026-10-06, with a hook that dumped its raw input: a subagent's PreToolUse
+and PostToolUse carry the PARENT's `session_id` and `transcript_path`, plus `agent_id` and
+`agent_type`, which the parent's own events do not carry; additionalContext returned on the
+subagent's PreToolUse reached the subagent and not the parent; UserPromptSubmit fired only for
+the parent's prompt. The gate sends `session_id` as `host_session_id`, so the daemon addresses a
+subagent's escalation to the PARENT's session. With one cursor per session_id, a background
+subagent's ruling was consumed by whichever of the two fired first -- usually the parent, which
+keeps making calls while the subagent runs -- and the asker never saw it: #851's defect between
+two agents of one session (escalation c96eb3d5, 2026-10-06, relayed by hand through the parent).
+So an event that carries `agent_id` keeps its OWN cursor (the parent's cursor key is unchanged),
+and no agent's read is destructive to another's. Addressing then has two strengths:
+  - a row with a `for_agent` key (the daemon recording the asker's agent id at open; the proposed
+    daemon slice) is rendered only to the agent it names, `null` naming the parent;
+  - a row WITHOUT the key (today's daemon) names the session and not the agent, so every agent of
+    that session is shown it once, on its own cursor, with one line of channel framing that says
+    exactly that, so a parent does not take a subagent's grant for its own.
+
 FAILURE POSTURE.  Silence.  Any error -- no lane, unreadable cursor, malformed line, missing
 field -- exits 0 with no output.  A delivery mechanism that could break a session would be
 worse than the manual relay it replaces, and this hook holds no verdict to fail closed over.
@@ -62,7 +80,7 @@ MAX_LINES = 20               # a backlog is delivered; a runaway lane is not a c
 CURSOR_TTL_SECS = 7 * 86400  # a cursor outlives its session by a week, then it is litter
 
 
-def cursor_path(session_id: str) -> str:
+def cursor_path(session_id: str, agent_id: str = "") -> str:
     """One cursor per (seat, session), named by a HASH of the full session identity.
 
     The first cut sanitised the id into a filename (`[^A-Za-z0-9_.-]` -> `_`, cut at 120), which
@@ -72,6 +90,11 @@ def cursor_path(session_id: str) -> str:
     cannot collide two sessions; #1148's prompt watch keys its state the same way."""
     if not session_id:
         return os.path.join(CURSOR_DIR, "no-session.json")
+    if agent_id:
+        # A subagent: same session_id as its parent, so its own key. NUL-separated, so no
+        # (session, agent) pair can spell another pair or a bare parent session.
+        key = (session_id + "\0agent\0" + agent_id).encode("utf-8")
+        return os.path.join(CURSOR_DIR, "a-" + hashlib.sha256(key).hexdigest() + ".json")
     return os.path.join(CURSOR_DIR, "s-" + hashlib.sha256(session_id.encode("utf-8")).hexdigest() + ".json")
 
 
@@ -155,7 +178,7 @@ def unread_records(lane: str, cursor: dict):
     return out, st.st_ino, boundary, offset, first_sight
 
 
-def select(records, session_id: str, boundary: float = 0):
+def select(records, session_id: str, boundary: float = 0, agent_id: str = "", framed=None):
     """(texts to render, offset to advance to) -- addressing FIRST, then the bound.
 
     The first cut sliced `lines[-MAX_LINES:]` BEFORE filtering on `for_session`, while the cursor
@@ -169,7 +192,13 @@ def select(records, session_id: str, boundary: float = 0):
 
     `records` are (line, start, end). A row naming this session is always ours; a row naming
     another never is; an UNADDRESSED row is ours only if it starts at or after `boundary`, the
-    lane's size when this session first saw it."""
+    lane's size when this session first saw it.
+
+    Agent addressing (a subagent shares its parent's session_id): a row carrying a `for_agent` KEY
+    names one agent of the session, `null`/"" being the parent, and is ours only when it equals
+    this event's `agent_id`. A row naming the session without that key cannot say which agent
+    asked; it is shown to each agent of the session once, and its index is added to `framed`
+    (when a list is passed) so the caller can say so."""
     out, advance = [], None
     for raw, start, end in records:
         try:
@@ -182,13 +211,19 @@ def select(records, session_id: str, boundary: float = 0):
             continue
         want = row.get("for_session")
         text = row.get("render")
-        named = bool(want and session_id and want == session_id)
-        other = bool(want and session_id and want != session_id)
+        agent_known = "for_agent" in row
+        agent_ok = (not agent_known) or ((row.get("for_agent") or "") == (agent_id or ""))
+        # The agent test stands on its own: a `for_agent` row whose session address is absent
+        # (or whose reader has no session_id) is still one agent's, not everyone's (codex, 1248).
+        named = bool(want and session_id and want == session_id and agent_ok)
+        other = bool(want and session_id and want != session_id) or not agent_ok
         ours = named or (not other and start >= boundary)
         # (an unaddressed row before the boundary predates this session: not ours to render)
         if ours and isinstance(text, str) and text.strip():
             if len(out) >= MAX_LINES:
                 break         # the bound: this record waits for the next event, unpassed
+            if named and not agent_known and framed is not None:
+                framed.append(len(out))
             out.append(text.strip()[:MAX_RENDER])
         advance = end
     return out, advance
@@ -213,12 +248,14 @@ def main() -> int:
         return 0
     hook_event = event.get("hook_event_name") or "PreToolUse"
     session_id = event.get("session_id") or ""
-    path = cursor_path(session_id)
+    agent_id = event.get("agent_id") or ""
+    path = cursor_path(session_id, agent_id)
     reap_cursors(time.time())
     records, inode, boundary, offset, first_sight = unread_records(LANE, read_cursor(path))
     if inode is None:
         return 0
-    texts, advance = select(records, session_id, boundary)
+    framed: list = []
+    texts, advance = select(records, session_id, boundary, agent_id, framed)
     if advance is not None or first_sight:
         # This session's own position only, and only as far as it PROCESSED: an addressed
         # ruling held back by the bound is not passed (GPT, f5baa33). No other session's
@@ -228,6 +265,11 @@ def main() -> int:
         write_cursor(path, advance if advance is not None else offset, inode, boundary)
     if not texts:
         return 0
+    for i in framed:
+        # Channel framing, not law: the address on this row is a session, and a session can hold
+        # a parent and its subagents. Say that, so whoever did NOT open it does not spend it.
+        texts[i] = ("[addressed to this session, not to one agent of it: if you did not open this "
+                    "escalation, it is not yours to re-issue] " + texts[i])
     body = ("hestia: governance disposition (the daemon ruled; this is the ruling, not a gate)\n\n"
             + "\n\n".join(texts))
     print(json.dumps({"hookSpecificOutput": {

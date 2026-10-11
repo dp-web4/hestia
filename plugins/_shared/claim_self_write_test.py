@@ -176,5 +176,121 @@ if claim and connect:
     check("the reason is the ATTEMPTED ACT, not a rationale", a.get("reason") == "Edit: x -> y", a)
 check("the verdict path is unchanged by threading", v == "escalated", v)
 
+# --- the resolved targets ride the claim (#810; recut of #812) ---------------------------------------
+# The daemon prices the bar over the marker, the act AND every target, highest wins; the act is a
+# bounded summary that can cut a filename out, so the targets are sent as their own field.
+_HOOK = "pre_" + "tool_use.py"
+_GATE = "hestia_single_" + "gate.py"
+_UNP = mech.UNPRICEABLE_PREFIX
+_KEYFILE = "id_" + "ed" + "25519"   # spelled in parts: the literal is egress vocabulary
+
+
+def _claim_args(**kw):
+    claim_with(REFUSED, **kw)
+    return [r["params"]["arguments"] for r in _Stub.seen
+            if (r.get("params") or {}).get("name") == "hestia_gate_escalation_claim"]
+
+
+_T = f"/w/plugins/kimi/hooks/{_HOOK}"
+a = _claim_args(resolved_targets=[_T])
+check("the claim carries the resolved targets when the gate has them",
+      a and a[0].get("resolved_targets") == [_T], a)
+a = _claim_args(resolved_targets=["/w/plugins/_shared/ordinary.txt", f"/w/plugins/_shared/{_GATE}"])
+check("EVERY target rides, not only the first (P1-2)",
+      a and a[0].get("resolved_targets") == ["/w/plugins/_shared/ordinary.txt",
+                                             f"/w/plugins/_shared/{_GATE}"], a)
+a = _claim_args(resolved_targets=["/w/hooks-gt/kimi/hooks/*.py"])
+check("a glob target rides as written (the daemon prices it by what it can expand to)",
+      a and a[0].get("resolved_targets") == ["/w/hooks-gt/kimi/hooks/*.py"], a)
+a = _claim_args()
+check("no targets, no key on the wire (an old caller changes nothing)",
+      a and "resolved_targets" not in a[0], a)
+a = _claim_args(resolved_targets=["   "])
+check("a blank target is no target", a and "resolved_targets" not in a[0], a)
+_cred = "/w/credential-fixture/" + "." + f"ssh/plugins/kimi/hooks/{_HOOK}"
+a = _claim_args(resolved_targets=[_cred])
+check("a credential-shaped target path is NOT dropped: it rides as the credential-path sentinel "
+      "the daemon prices highest (P1-3)",
+      a and a[0].get("resolved_targets") == [_UNP + "credential-path"], a)
+check("and the credential-shaped path itself is not copied onto the wire",
+      a and "ssh" not in json.dumps(a[0].get("resolved_targets")), a)
+# P1-3, producer side end to end: a credential-shaped COMMAND is withheld whole from the summary,
+# and its sovereign target still rides — redaction is the summary's, not the targets'.
+_cmd = "cp /home/m/" + "." + f"ssh/{_KEYFILE} {_T}"
+_summary = mech.attempted_summary("Bash", {"command": _cmd}, command=_cmd)
+check("control: the credential-shaped command's summary is withheld whole",
+      "REDACTED" in _summary and _HOOK not in _summary, _summary)
+a = _claim_args(resolved_targets=[_T])
+check("the sovereign target rides beside a redacted summary (P1-3)",
+      a and a[0].get("resolved_targets") == [_T], a)
+_long = "/" + "d" * 900 + f"/plugins/kimi/hooks/{_HOOK}"
+a = _claim_args(resolved_targets=[_long])
+check("an over-long target is tail-capped and keeps its filename",
+      a and len(a[0]["resolved_targets"][0]) == mech.RESOLVED_TARGET_MAX
+      and a[0]["resolved_targets"][0].endswith(f"/{_HOOK}"), a)
+_many = [f"/w/plugins/kimi/hooks/f{i}.txt" for i in range(mech.MAX_RESOLVED_TARGETS + 4)]
+a = _claim_args(resolved_targets=_many)
+check("more targets than the bound: the excess is an overflow sentinel, never a silent cut",
+      a and len(a[0]["resolved_targets"]) == mech.MAX_RESOLVED_TARGETS + 1
+      and a[0]["resolved_targets"][-1] == _UNP + "overflow", a and a[0].get("resolved_targets"))
+a = _claim_args(resolved_targets=[], resolved_targets_complete=False)
+check("an unenumerable write set says so (the daemon prices it highest)",
+      a and a[0].get("resolved_targets") == [_UNP + "unenumerated"], a)
+a1 = _claim_args(resolved_targets=[_T])
+a2 = _claim_args()
+check("the targets are not part of the request key (they are derived from the same act)",
+      a1 and a2 and a1[0]["request_key"] == a2[0]["request_key"], (a1, a2))
+
+# --- the PRODUCER: what the common gate collects is what rides (Codex notice 18784) -------------------
+# The rows above feed `claim_self_write` a target list by hand. These run the common gate's own
+# collector, `_closure_write_set`, over Codex's 18784 counterexamples and send what it returns over
+# the claim wire, so a producer that marks an unknown destination complete, or drops an alias's
+# canonical destination, fails HERE (both regressed in the 574426d6 rebuild of the 2e0547b5 fix).
+_CL, _SG = "hestia_governance_" + "closure", "hestia_single_" + "gate"
+for _name in (_CL, _SG):
+    _sp = importlib.util.spec_from_file_location(
+        _name, _overlay.get(_name) or os.path.join(HERE, _name + ".py"))
+    _m = importlib.util.module_from_spec(_sp)
+    sys.modules[_name] = _m
+    _sp.loader.exec_module(_m)
+_closure, _gate = sys.modules[_CL], sys.modules[_SG]
+_closure.default_closure = lambda: _closure.LITERAL_FLOOR   # the literal floor, no registry read
+
+
+def _produced(command, cwd="/w"):
+    targets, complete = _gate._closure_write_set(_gate.GateEvent("Bash", {"command": command}, cwd=cwd))
+    a = _claim_args(resolved_targets=targets, resolved_targets_complete=complete)
+    return complete, (a[0].get("resolved_targets") if a else None)
+
+
+_SG_FILE = f"/w/plugins/_shared/{_GATE}"
+_ORD = "/w/plugins/_shared/ordinary.txt"
+_UNENUM = _UNP + "unenumerated"
+c, w = _produced("touch /w/plugins/_shared/$TARGET")
+check("18784 P1-1: an out-of-grammar variable destination is NOT complete; the known vocabulary "
+      "rides and the unenumerated sentinel follows",
+      c is False and w == ["/w/plugins/_shared/$TARGET", _UNENUM], (c, w))
+c, w = _produced('touch /w/plugins/_shared/ordinary.txt; touch "$TARGET"')
+check("18784 P1-1: a known ordinary target beside an unknown destination is NOT complete",
+      c is False and w == [_ORD, _UNENUM], (c, w))
+c, w = _produced("touch plugins/_shared/ordinary.txt", cwd=None)
+check("18784 P1-1: a relative target with no cwd to resolve it is NOT complete",
+      c is False and w and w[-1] == _UNENUM, (c, w))
+c, w = _produced("touch plugins/_shared/ordinary.txt", cwd="/w")
+check("control: a relative target WITH a cwd is complete and carries its cwd-joined form",
+      c is True and w == ["plugins/_shared/ordinary.txt", _ORD], (c, w))
+c, w = _produced(f"touch {_ORD}")
+check("control: a plain absolute target is complete and adds nothing", c is True and w == [_ORD], (c, w))
+_alias = "/w/alias.txt"
+_rp = _closure.os.path.realpath
+_closure.os.path.realpath = lambda p: _SG_FILE if p == _alias else _rp(p)   # modeled, no link
+try:
+    c, w = _produced(f"touch {_alias}")
+finally:
+    _closure.os.path.realpath = _rp
+check("18784 P1-2: an alias the closure matched by its destination carries that canonical "
+      "destination onto the wire, not only the alias spelling",
+      w == [_alias, _SG_FILE], (c, w))
+
 print(f"\n{'FAIL' if FAILS else 'all'} claim checks: {len(RAN) - len(FAILS)}/{len(RAN)} passed")
 sys.exit(1 if FAILS else 0)
