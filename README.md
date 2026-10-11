@@ -299,4 +299,4 @@ today) and the one-variable mitigation that closes them.
 
 ## License
 
-[AGPL-3.0-or-later](LICENSE). Commercial license available for closed-source use.
+[AGPL-3.0-or-later](LICENSE). Commercial license available for closed-source use. For interoperability with Web4/Hub, see Web4's [legal and patent scope guide](https://github.com/dp-web4/web4/blob/main/docs/LEGAL_AND_PATENT_SCOPE.md). That explanatory guide does not replace Hestia's own license or grant additional rights.
