@@ -164,7 +164,10 @@ function ScopeRequestCard({
   const [reason, setReason] = useState("");
   // DURATION and BREADTH, chosen at decide time (spec decide-scope-request, 2026-10-05).
   const durations = scopeDurations(req);
-  const [duration, setDuration] = useState<ScopeDuration>("session");
+  // An act the gate could not enumerate (once_only) offers only "this act once".
+  const [duration, setDuration] = useState<ScopeDuration>(
+    durations.includes("session") ? "session" : (durations[0] ?? "once"),
+  );
   const breadths = scopeBreadthOptions(req.path, !!req.subtree);
   const [breadthIdx, setBreadthIdx] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -211,8 +214,16 @@ function ScopeRequestCard({
           {req.role ? ` · ${req.role}` : ""}
         </dd>
         <dt>path</dt>
-        {/* Exactly one path. The asker cannot request recursion; only the ruler can grant it. */}
-        <dd className="pre">{req.path}</dd>
+        {/* Exactly one path. The asker cannot request recursion; only the ruler can grant it.
+            An act the gate could not enumerate names no path (dp, 2026-10-10). */}
+        {req.once_only ? (
+          <dd data-scope-once-only>
+            no path: the gate cannot enumerate what this act reaches — approve it once, as
+            written, or refuse
+          </dd>
+        ) : (
+          <dd className="pre">{req.path}</dd>
+        )}
         {fromGate ? (
           <>
             {/* A GATE-OPENED request is a refused act, not an ask: the act is what is being

@@ -3650,7 +3650,9 @@
           <span class="esc-ttl" id="scope-ttl-${escapeHtml(String(r.request_id))}">${
             escapeHtml(`expires in ${escFmtAge(r.secs_remaining ?? 0)}`)}</span>
         </div>
-        <div class="esc-marker">${escapeHtml(path)}</div>
+        <div class="esc-marker">${r.once_only === true
+          ? 'no path: the gate cannot enumerate what this act reaches — approve it once, as written, or refuse'
+          : escapeHtml(path)}</div>
         ${basis}
         <div class="esc-meta">id ${escapeHtml(String(r.request_id))}</div>`;
 
@@ -3777,6 +3779,9 @@
     if (r && r.once_available === true) {
       out.push(['once', 'this act once (spent by the identical act, inside the claim window)']);
     }
+    // dp, 2026-10-10 (#1232 narrowed): the gate could not enumerate what this act reaches, so
+    // the request names the act, not a path — "this act once" is the only grant there is.
+    if (r && r.once_only === true) return out;
     out.push(['session', 'for the session (memory-only, expires)']);
     out.push(['standing', 'standing (vault; survives restart until revoked)']);
     return out;

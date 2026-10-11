@@ -181,6 +181,12 @@ export interface PendingScopeRequest {
   /** "This act once" is a choice only when the gate recorded an act to bind. */
   once_available?: boolean;
   /**
+   * dp, 2026-10-10 (#1232 narrowed): the gate could not enumerate what the refused act reaches
+   * (an expansion decides it), so the request names the ACT — `path` is the act-keyed
+   * `hestia:unpriceable:…` sentinel — and "this act once" is the only grant there is.
+   */
+  once_only?: boolean;
+  /**
    * dp, 2026-10-05: NOT-SAME peers invited to decide a gate-opened request. Non-empty = the
    * request awaits a PEER and the operator's controls are an override; empty = no peer can
    * clear it (an unproven asker, or no admissible peer) and it is the operator's.

@@ -259,6 +259,23 @@ describe("Decide — scope requests (Sprint 2)", () => {
     expect(ruleScopeRequest.mock.calls[0][3]).toEqual({ once: true, askedPath: gateScopeRequest().path });
   });
 
+  it("offers ONLY 'this act once' for an act the gate could not enumerate (dp, 2026-10-10)", async () => {
+    const path = "hestia:unpriceable:unenumerated#0123456789abcdef";
+    const req = gateScopeRequest({ request_id: "scope-unenum-1", path, once_only: true,
+                                   act: 'for f in a b; do cat "$f"; done' });
+    getDashboard.mockResolvedValue({ pending_escalations: [], pending_scope_requests: [req] });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+    ruleScopeRequest.mockResolvedValue({ outcome: "decided", result: {} });
+    render(<Decide />);
+    const dur = (await screen.findByRole("combobox", { name: /duration/i })) as HTMLSelectElement;
+    expect([...dur.options].map((o) => o.value)).toEqual(["once"]);
+    // the sentinel is not presented as a filesystem path
+    expect(screen.getByText(/no path: the gate cannot enumerate/)).toBeTruthy();
+    screen.getByRole("button", { name: /grant/i }).click();
+    await waitFor(() => expect(ruleScopeRequest).toHaveBeenCalled());
+    expect(ruleScopeRequest.mock.calls[0][3]).toEqual({ once: true, askedPath: path });
+  });
+
   it("grants standing at a directory above the asked path, recursively", async () => {
     getDashboard.mockResolvedValue({ pending_escalations: [], pending_scope_requests: [gateScopeRequest()] });
     operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });

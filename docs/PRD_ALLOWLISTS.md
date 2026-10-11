@@ -736,14 +736,37 @@ directory, hestia's own state, cross-seat reads of peer homes, tools invoked by 
    `awk` (unless an option supplied the pattern), and the values of delimiter / pattern / string
    options of the command that defines them (`cut -d`, `awk -F`, `find -name`, `git -m`, …).
    Quoting is tracked per character (`"/"*` expands) and never exempts by itself.
-3b'. Anything the parser does not model — an unbalanced quote or substitution, an unknown heredoc
-   form, an expansion it cannot resolve inside a path (an unknown variable, `$1`, the output of an
-   arbitrary command) — is INCOMPLETE classification and refused, never skipped. Modelled:
-   assignments and `for` loop variables in the same command, the environment, `$PWD`/`$(pwd)`,
-   `${V:-default}`, special parameters and arithmetic, value commands (`$(date …)`), echo, and
-   listers (`$(find R …)`, `$(ls R)`, `$(grep -l … R)` → R's subtree).
+3b'. NOTHING AN EXPANSION PRODUCES IS MODELLED (dp's ruling, 2026-10-10: "narrow and land").
+   The earlier revision modelled substitution OUTPUT and variable values with tables keyed on the
+   command NAME ("date prints a number", "head selects lines", "find prints paths under its
+   roots"); four Codex rounds found false-allows in each new member, because soundness depends on
+   argv SHAPE — `date +/x`, `seq -f`, `shuf -e`, `expr`, `wc`/`sha256sum` operand echo, `grep`/
+   `sort`/`head FILE`, `find -printf` all print paths. So a command substitution, a process
+   substitution, a variable (quoted or not; a linear scan is not the shell's scoping), brace
+   expansion, argv built from stdin (`xargs`, `parallel`), an expansion used as the program, or an
+   expansion handed to a command in its environment — wherever its value would be judged as a
+   path — is UNENUMERATED, as is shell the lexer cannot read (an unbalanced quote, an unknown
+   heredoc form). What stays: the literal path words (absolute, `~`/`$HOME`, relative against the
+   cwd, redirect targets), globs judged as their directory's subtree (a `..` after a glob is
+   unenumerated), and the expansions whose value cannot contain `/` or be `..` — arithmetic and
+   `$?` `$#` `$$` `$!` `$-` — replaced by a placeholder. Substitution BODIES are still judged as
+   commands. Found writing the narrowed battery and closed in the same change: a relative path is
+   also judged under every literal `cd` / `pushd` / `git|make|tar -C` target in the command (an
+   unknown target makes it unenumerated); `eval`, `watch`, `su|runuser|script|flock -c` and
+   `sh -c` anywhere in argv run their string as shell; an interpreter anywhere on a heredoc's
+   consumer line makes the body code; a command that reassigns HOME makes its home spellings
+   unenumerated; the workspace path is normalised before anything is compared against it.
+3b''. An UNENUMERATED reach is refused with #1274's sentinel as its target
+   (`hestia:unpriceable:unenumerated`), and the escalation below opens a scope request for THE
+   ACT: its "path" is the sentinel keyed on the first 16 hex of the complete-act digest
+   (`hestia:unpriceable:unenumerated#…`), so two different acts are two requests. Such a request
+   can be granted ONCE (that act, exactly) or refused — never for a session or standing, since
+   there is no path a grant could name; the daemon refuses anything broader, and the surfaces
+   offer only "this act once" (`once_only`). A blanket refusal is load-bearing; its price is
+   measured in the PR (refusal rate before and after, and what the proposed grants absorb).
 3b. Past the judging budget (128 distinct spellings per pass) the classification is INCOMPLETE,
-   and incomplete is a refusal, never an allow of the unjudged rest (P1-3).
+   and incomplete is a refusal, never an allow of the unjudged rest (P1-3) — escalated the same
+   way with the `hestia:unpriceable:overflow` sentinel.
 4. Nothing else is hardcoded. Every default the fleet needs is a grant the operator issues
    through the existing standing store — BEFORE the change deploys (the PR names the set).
 

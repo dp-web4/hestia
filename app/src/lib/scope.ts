@@ -17,8 +17,15 @@ export function scopeAwaitsOperator(
   return !(req.origin === "gate_deny" && (req.invited_peers?.length ?? 0) > 0);
 }
 
-/** "This act once" is a choice only when the gate recorded an act to bind. */
-export function scopeDurations(req: Pick<PendingScopeRequest, "once_available">): ScopeDuration[] {
+/**
+ * "This act once" is a choice only when the gate recorded an act to bind; for an act the gate
+ * could not enumerate (`once_only`, dp 2026-10-10) it is the ONLY choice — there is no path a
+ * session or standing grant could name.
+ */
+export function scopeDurations(
+  req: Pick<PendingScopeRequest, "once_available" | "once_only">,
+): ScopeDuration[] {
+  if (req.once_only === true) return req.once_available === true ? ["once"] : [];
   return req.once_available === true ? ["once", "session", "standing"] : ["session", "standing"];
 }
 

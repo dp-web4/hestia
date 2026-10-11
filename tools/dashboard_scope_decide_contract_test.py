@@ -68,6 +68,8 @@ def main() -> int:
     check("one decide call carries duration and breadth",
           g.count("apiFetch('/api/scope/decide'") == 1 and "scopeDecideBody(r, granted" in g)
     check("a grant still needs a note; refusing does not", "grantBtn.disabled = !note.value.trim()" in g)
+    check("an unenumerated act is labelled as no path, not shown as one",
+          "r.once_only === true" in g and "no path: the gate cannot enumerate" in g)
     # dp, 2026-10-05: "scope escalations should go to peers not to me".
     check("the banner counts only what no peer can clear",
           "pend.filter(r => scopeAwaitsOperator(r))" in g and "no peer can clear" in g)
@@ -84,6 +86,8 @@ out.awaitOpMember = scopeAwaitsOperator({origin: 'member_request'});
 out.route = scopeRouteText({origin: 'gate_deny', invited_peers: ['kimi-code', 'codex']});
 out.durGate = scopeDurationOptions({once_available: true}).map(x => x[0]);
 out.durMember = scopeDurationOptions({once_available: false}).map(x => x[0]);
+out.durUnenum = scopeDurationOptions({once_available: true, once_only: true}).map(x => x[0]);
+out.breadthUnenum = scopeBreadthOptions('hestia:unpriceable:unenumerated#0123456789abcdef', false);
 out.breadth = scopeBreadthOptions('/home/u/.local/state/mesh/x.log', false);
 out.breadthGlob = scopeBreadthOptions('/var/log/app', true);
 out.breadthTop = scopeBreadthOptions('/etc', false);
@@ -102,6 +106,9 @@ process.stdout.write(JSON.stringify(out));
               "kimi-code, codex" in o["route"] and "OVERRIDE" in o["route"], o["route"])
         check("once is offered only when the gate recorded an act",
               o["durGate"] == ["once", "session", "standing"] and o["durMember"] == ["session", "standing"], o)
+        # dp, 2026-10-10 (#1232 narrowed): an act the gate could not enumerate is once-only.
+        check("an unenumerated act offers only 'this act once' and no breadth",
+              o["durUnenum"] == ["once"] and o["breadthUnenum"] == [], o)
         paths = [(b["grant_path"], b["recursive"]) for b in o["breadth"]]
         check("breadth: exact, the path recursive, then every ancestor recursive, never the root",
               paths == [(None, False), (None, True), ("/home/u/.local/state/mesh", True),
