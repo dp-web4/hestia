@@ -250,9 +250,9 @@ SELF_WRITE_REASON = re.compile(r"gate-self|governance surface|self-access", re.I
 #: an OPEN, separately tracked hole does not mask the upgrade-path signal this test exists for
 #: (a red that is always red hides the next red). A RATCHET, not an excuse: when the gate starts
 #: denying for the law, the entry is stale and the run fails until it is removed.
-KNOWN_SELF_WRITE_HOLES = {
-    "gemini": "#928 (the closure floor names neither .gemini/settings.json nor before_tool.py)",
-}
+#: Emptied by #1247 (2026-10-11): the gate now prices a write to any REGISTERED gate path, so
+#: gemini denies its own self-write and the ratchet fired on that PR's run.
+KNOWN_SELF_WRITE_HOLES: dict = {}
 
 
 def deny_is_for_the_law(said: str) -> bool:

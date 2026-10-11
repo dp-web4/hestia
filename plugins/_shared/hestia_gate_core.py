@@ -183,6 +183,9 @@ GOVERNANCE_FILES = (
     # THE common gate (one-gate stage C): every seat's shim delegates its whole decision to
     # it, so after the cutover it is the single file whose edit changes all four seats.
     "hestia_single_gate.py",
+    # A harness whose gate entry is not named pre_tool_use.py. The closure also derives each
+    # member's entry name from its install declaration; this is the canonical literal.
+    "before_tool.py",
 )
 
 
