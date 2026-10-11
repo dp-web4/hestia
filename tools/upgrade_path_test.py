@@ -148,6 +148,17 @@ if _PORT:
 """
 
 
+#: The harness homes a simulated box carries (dir -> its config file and an empty-ish body): every
+#: harness installed, hestia not yet. `--without-harness DIR` leaves one out, to ask what a host
+#: that runs only some of them sees.
+HARNESSES = {
+    ".claude": ("settings.json", "{}\n"),
+    ".codex": ("config.toml", 'model = "sim"\n'),
+    ".kimi-code": ("config.toml", 'default_model = "sim"\n'),
+    ".gemini": ("settings.json", "{}\n"),
+}
+
+
 class SetupError(Exception):
     """The simulation could not be built. Not a verdict on the candidate."""
 
@@ -368,7 +379,9 @@ def load_module(path: Path, name: str):
 
 # ------------------------------------------------------------------ the simulated machine -----
 class Machine:
-    def __init__(self, root: Path, source: Path, daemon_bin: Path, verbose: bool = False):
+    def __init__(self, root: Path, source: Path, daemon_bin: Path, verbose: bool = False,
+                 without: Iterable[str] = ()):
+        self.without = set(without)
         self.root = root
         self.source = source
         self.daemon_bin = daemon_bin
@@ -476,14 +489,11 @@ class Machine:
         self.install_guard()
         for d in (self.home, self.workspace, self.scratch_dir, self.origin, self.home / ".local" / "bin"):
             d.mkdir(parents=True, exist_ok=True)
-        (self.home / ".claude").mkdir()
-        (self.home / ".claude" / "settings.json").write_text("{}\n")
-        (self.home / ".codex").mkdir()
-        (self.home / ".codex" / "config.toml").write_text('model = "sim"\n')
-        (self.home / ".kimi-code").mkdir()
-        (self.home / ".kimi-code" / "config.toml").write_text('default_model = "sim"\n')
-        (self.home / ".gemini").mkdir()
-        (self.home / ".gemini" / "settings.json").write_text("{}\n")
+        for harness, (config, body) in HARNESSES.items():
+            if harness in self.without:
+                continue
+            (self.home / harness).mkdir()
+            (self.home / harness / config).write_text(body)
         # A git identity for the throwaway repos, in the fake HOME (never the operator's).
         (self.home / ".gitconfig").write_text(
             "[user]\n\tname = upgrade-path-sim\n\temail = sim@invalid\n[init]\n\tdefaultBranch = main\n")
@@ -658,6 +668,10 @@ class Machine:
             row: dict[str, Any] = {"member": member}
             rows.append(row)
             reg_path = self.home.joinpath(*reg["path"])
+            if not (self.home / reg["path"][0]).is_dir():
+                # The harness is not on this box (--without-harness): nothing to install or probe.
+                row.update(status="absent", reason="harness not on this box")
+                continue
             if not reg_path.exists():
                 row.update(status="FAIL", reason=f"no registration file {reg_path.name}")
                 continue
@@ -750,6 +764,11 @@ def seed_findings(m: Machine, tree: Path) -> tuple[list[dict], list[str]]:
     installed = {row.get("member"): row for row in manifest.get("members") or [] if isinstance(row, dict)}
     for seed in sorted((tree / "plugins").glob("*/instance/identity.seed.json")):
         member = seed.parent.parent.name
+        reg = ((json.loads((seed.parent.parent / "expects.json").read_text()).get("install") or {})
+               .get("registration") or {}).get("path") or []
+        if reg and not (m.home / reg[0]).is_dir():
+            rows.append({"member": member, "status": "absent"})
+            continue
         row = installed.get(member)
         files = (row or {}).get("files") or []
         if not files:
@@ -774,7 +793,7 @@ def log_gates(m: Machine, rows: list[dict], failures: list[str], label: str) -> 
               f"read={said('allow')} self-write={said('deny')} "
               f"candidate-bytes={row.get('installed_is_candidate')}"
               + (f"  -- {row['reason']}" if row.get("reason") else ""))
-        if row["status"] not in ("ok", "known-open"):
+        if row["status"] not in ("ok", "known-open", "absent"):
             failures.append(f"{label} {row['member']}: {row.get('reason')}")
 
 
@@ -818,7 +837,7 @@ def make_machine(args: argparse.Namespace, source: Path, daemon_bin: Path, prefi
     if not args.workdir and not str(parent.resolve()).startswith(("/tmp", "/var/tmp")):
         parent = Path("/tmp")
     root = Path(tempfile.mkdtemp(prefix=prefix, dir=str(parent)))
-    m = Machine(root, source, daemon_bin, verbose=args.verbose)
+    m = Machine(root, source, daemon_bin, verbose=args.verbose, without=args.without_harness or ())
     if m.home.resolve() == Path.home().resolve():
         raise SetupError("the fake HOME resolved to the real one")
     return m
@@ -1078,6 +1097,9 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--previous-back", type=int, metavar="N", help="previous = origin/main~N")
     p.add_argument("--arms", choices=("all", "upgrade", "fresh"), default="all",
                    help="which arm(s) to run: the previous-release upgrade, the fresh host, or both")
+    p.add_argument("--without-harness", action="append", choices=sorted(HARNESSES), metavar="DIR",
+                   help="leave this harness home off the simulated box (repeatable): a host that "
+                        "runs only some harnesses")
     p.add_argument("--repo", default=str(ROOT), help="the git repo holding both commits")
     p.add_argument("--workdir", help="where the throwaway machines are built (default /tmp)")
     p.add_argument("--keep", action="store_true", help="keep the throwaway machines for inspection")
