@@ -456,6 +456,38 @@ fn deployment_update_status(
     }
 }
 
+/// The abbreviated sha a `git describe` string ends in (`v0.0.4-968-ga7e33bc4` -> `a7e33bc4`),
+/// or the whole string when it is a bare sha (a clone without tags). None for an exact tag,
+/// `unknown`, or anything shorter than git's minimum abbreviation.
+fn describe_hex(build: &str) -> Option<&str> {
+    let s = build.strip_suffix("-dirty").unwrap_or(build);
+    let hex = s.rsplit_once("-g").map(|(_, h)| h).unwrap_or(s);
+    (hex.len() >= 7 && hex.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))).then_some(hex)
+}
+
+/// Whether the deployment authority names the build this daemon is running (#1250).
+///
+/// `git describe` sizes its abbreviated sha by the object count of the clone it runs in, so one
+/// commit is `-g588684d` in one clone and `-g588684d6` in another (measured by the upgrade-path
+/// harness, twice in one night). A string compare called the same build stale. So: equal strings;
+/// else the same `-dirty` state and the SAME COMMIT -- the running abbreviation a prefix of the
+/// manifest's full `head_sha` when it carries one (install-members.sh writes it), else the two
+/// abbreviations agreeing on the shorter one's length.
+pub(crate) fn same_deployed_build(manifest_build: &str, manifest_head_sha: Option<&str>, running: &str) -> bool {
+    if manifest_build == running {
+        return true;
+    }
+    if manifest_build.ends_with("-dirty") != running.ends_with("-dirty") {
+        return false;
+    }
+    let Some(run) = describe_hex(running) else { return false };
+    if let Some(full) = manifest_head_sha.filter(|h| h.len() == 40 && h.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))) {
+        return full.starts_with(run);
+    }
+    let Some(man) = describe_hex(manifest_build) else { return false };
+    man.starts_with(run) || run.starts_with(man)
+}
+
 fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
     let running_build = env!("HESTIA_GIT_VERSION").to_string();
     let Some(path) = path else {
@@ -522,7 +554,8 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
             gate_engine: GateEngineHealth::default(),
         };
     };
-    let current = current_build == running_build;
+    let head_sha = manifest.get("head_sha").and_then(serde_json::Value::as_str);
+    let current = same_deployed_build(&current_build, head_sha, &running_build);
     let (update_capable, update_state, update_request_id, update_note) =
         deployment_update_status(path, current);
     DeploymentHealth {
@@ -1772,6 +1805,28 @@ mod tests {
         let current = deployment_health_from_path(Some(&manifest));
         assert_eq!(current.state, "current");
         assert_eq!(current.current_build.as_deref(), Some(running));
+    }
+
+    #[test]
+    fn deployment_build_is_compared_by_commit_not_by_abbreviation() {
+        // #1250: the same commit spelled at two abbreviation lengths is one build.
+        assert!(same_deployed_build("v0.0.4-965-g588684d6", None, "v0.0.4-965-g588684d"));
+        assert!(same_deployed_build("v0.0.4-965-g588684d", None, "v0.0.4-965-g588684d6"));
+        // A moved tag renames the count, not the commit.
+        assert!(same_deployed_build("v0.0.4-492-g588684d6", None, "v0.0.4-485-g588684d"));
+        let full = "588684d6aaaabbbbccccddddeeeeffff00001111";
+        assert!(same_deployed_build("v0.0.4-965-g588684d6", Some(full), "v0.0.4-965-g588684d"));
+        // The full sha decides when the manifest carries one.
+        assert!(!same_deployed_build("v0.0.4-965-g588684d6", Some("9c880def0000000000000000000000000000000a"), "v0.0.4-965-g588684d"));
+        // Different commits, dirty vs clean, exact tags and unknowns are not the same build.
+        assert!(!same_deployed_build("v0.0.4-966-g9c880de", None, "v0.0.4-965-g588684d"));
+        assert!(!same_deployed_build("v0.0.4-965-g588684d6-dirty", None, "v0.0.4-965-g588684d"));
+        assert!(!same_deployed_build("v0.0.5", None, "v0.0.4-965-g588684d"));
+        assert!(!same_deployed_build("unknown", None, "v0.0.4-965-g588684d"));
+        assert!(!same_deployed_build("v0.0.4-965-g5886", None, "v0.0.4-965-g588684d"));
+        assert!(same_deployed_build("v0.0.5", None, "v0.0.5"));
+        // A clone without tags names the commit by a bare sha.
+        assert!(same_deployed_build("588684d6", None, "v0.0.4-965-g588684d"));
     }
 
     #[test]

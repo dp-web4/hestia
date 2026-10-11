@@ -725,7 +725,7 @@ fn deployment_update_trigger_for(os: &str, uid: Option<&str>) -> Option<Deployme
     }
 }
 
-fn deployment_update_authority() -> std::result::Result<(std::path::PathBuf, String), String> {
+fn deployment_update_authority() -> std::result::Result<(std::path::PathBuf, String, Option<String>), String> {
     let manifest_path = std::env::var_os("HESTIA_CURRENT_BUILD_FILE")
         .map(std::path::PathBuf::from)
         .ok_or_else(|| "deployment update unavailable: HESTIA_CURRENT_BUILD_FILE is not configured".to_string())?;
@@ -746,7 +746,10 @@ fn deployment_update_authority() -> std::result::Result<(std::path::PathBuf, Str
     let home = manifest_path
         .parent()
         .ok_or_else(|| "deployment update unavailable: deployment authority has no parent directory".to_string())?;
-    Ok((home.to_path_buf(), target.to_string()))
+    // The full commit the installer recorded (#1250): builds are compared by commit, not by the
+    // clone-dependent abbreviation in the describe string.
+    let head_sha = manifest.get("head_sha").and_then(serde_json::Value::as_str).map(str::to_string);
+    Ok((home.to_path_buf(), target.to_string(), head_sha))
 }
 
 fn create_deployment_update_request(
@@ -853,7 +856,7 @@ async fn operator_deployment_update(
         current_operator_context(&s, &headers, now)
     };
 
-    let (home, authority_build) = match deployment_update_authority() {
+    let (home, authority_build, authority_head_sha) = match deployment_update_authority() {
         Ok(value) => value,
         Err(error) => {
             return (
@@ -866,7 +869,7 @@ async fn operator_deployment_update(
         }
     };
 
-    if authority_build == env!("HESTIA_GIT_VERSION") {
+    if super::dashboard::same_deployed_build(&authority_build, authority_head_sha.as_deref(), env!("HESTIA_GIT_VERSION")) {
         return (
             StatusCode::OK,
             Json(serde_json::json!({

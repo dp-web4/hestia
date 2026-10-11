@@ -84,6 +84,7 @@ HOLD="$HESTIA_HOME/deploy.hold"
 HOLD_MAX_SECS="${HESTIA_DEPLOY_HOLD_MAX_SECS:-21600}"
 KEEP_BACKUPS="${HESTIA_DEPLOY_KEEP_BACKUPS:-5}"
 READY_SECS="${HESTIA_DEPLOY_READY_SECS:-120}"
+PROBE_TIMEOUT_S=12   # one preflight gate probe's bound; gate-preflight.py's PROBE_TIMEOUT_S
 MODE="${1:-full}"
 case "$MODE" in
   full|--check|--build-only|--hooks-only|--preflight) ;;
@@ -158,6 +159,53 @@ cleanup_deploy() {
 # The parenthesised `git describe` string from a version line, e.g.
 #   hestia 0.0.4 (v0.0.4-444-gdd4300c)  ->  v0.0.4-444-gdd4300c
 describe_of() { grep -oE '\([^)]+\)' | head -1 | tr -d '()'; }
+
+# ONE BUILD, MANY SPELLINGS (#1250). `git describe` sizes the abbreviated sha by the object count
+# of the clone it runs in, so ONE commit reads `-g588684d` in one clone and `-g588684d6` in another
+# -- and in the same clone after enough objects arrive. Every identity this script compares
+# (target, running, ondisk, the manifest's build_id) is such a string, and a string compare called
+# the same build stale: the upgrade-path harness measured it twice in one night (`-g9c880de` vs
+# `-g9c880def`). So builds are compared by the COMMIT they name, resolved to a full sha in the
+# deploy checkout, never by spelling. The producers keep git's default abbreviation on purpose: a
+# fixed --abbrev in build.rs would make the binary of the transition cycle describe itself
+# differently from what the PREVIOUS (still-installed, strict-comparing) copy of this script
+# computes, and that copy dies at "built binary describes itself as ..." once on every host.
+#   build_hex  the abbreviated sha in a describe string: the `-g<hex>` suffix, or the whole string
+#              when it is a bare sha (a clone without tags); nothing for an exact tag or "unknown".
+#   same_build equal strings, or the same -dirty state and both abbreviations resolving, in this
+#              checkout, to ONE full sha. A sha the checkout cannot resolve (unknown, or ambiguous
+#              at that length) is NOT the same build: the conservative direction is a rebuild.
+build_hex() {
+  local s="${1%-dirty}"
+  case "$s" in *-g*) s="${s##*-g}" ;; esac
+  case "$s" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#s}" -ge 7 ] || return 1
+  printf '%s\n' "$s"
+}
+same_build() {
+  local a b fa fb
+  [ -n "$1" ] && [ -n "$2" ] || return 1
+  [ "$1" = "$2" ] && return 0
+  case "$1" in *-dirty) a=dirty ;; *) a=clean ;; esac
+  case "$2" in *-dirty) b=dirty ;; *) b=clean ;; esac
+  [ "$a" = "$b" ] || return 1
+  fa="$(build_commit "$1")" || return 1
+  fb="$(build_commit "$2")" || return 1
+  [ -n "$fa" ] && [ "$fa" = "$fb" ]
+}
+# The full sha a describe string names in the deploy checkout: its abbreviation resolved, or, for
+# an EXACT-TAG describe (`v0.0.5`, what describe prints at a tagged commit), the tag peeled to
+# its commit -- so a release tag landing on the deployed commit renames it without making it a
+# different build (Codex notice 20534 found the harness's twin of this gap).
+build_commit() {
+  local s="${1%-dirty}" h
+  if h="$(build_hex "$1")"; then
+    git -C "$DEPLOY_ROOT/hestia" rev-parse -q --verify "$h^{commit}" 2>/dev/null
+    return
+  fi
+  case "$s" in ''|-*|*[!A-Za-z0-9._/+-]*) return 1 ;; esac
+  git -C "$DEPLOY_ROOT/hestia" rev-parse -q --verify "refs/tags/$s^{commit}" 2>/dev/null
+}
 
 running_version() {
   curl -s -m 10 -X POST "$EP" \
@@ -336,7 +384,7 @@ bash4() {
 # disarms healthy seats and still misses the mechanism that actually locks one.
 #
 # So this tests the artifact by RUNNING it — the same post-condition discipline the binary
-# (`[ "$newv" = "$target" ]`) and the manifest already get here. Execute the gate this cycle
+# (`same_build "$newv" "$target"`) and the manifest already get here. Execute the gate this cycle
 # would install, in the fail-closed posture, on acts that must survive, and refuse to install one
 # that does not answer. It is a REVERSIBILITY test, not a policy-content test: the question is
 # never "what does the envelope say", it is "after this install, can this seat still undo this
@@ -415,6 +463,17 @@ preflight_gate() {
   # The point is to catch a gate that cannot answer BEFORE it becomes the one deciding.
   gate="$DEPLOY_ROOT/hestia/plugins/claude-code/hooks/pre_tool_use.py"
   [ -f "$gate" ] || { preflight="skipped(no claude-code gate in checkout)"; return 0; }
+  # NOT INSTALLED, NOT PROBED (dp 2026-10-11: "anything that isn't installed shouldn't be
+  # attempted"). The same rule the installer uses (register-members.py: the registration's
+  # directory absent = "harness not on this host", skip) — so this probe and the install can never
+  # disagree about whether claude-code is here. Measured by #1277's harness `--without-harness
+  # .claude`: without this, a host with no Claude Code HALF-DEPLOYED on config.unbacked forever.
+  # The other members are probed by gate-preflight.py, which already skips an absent harness.
+  local claude_probe=""
+  if [ ! -d "$HOME/.claude" ]; then
+    log "preflight: claude-code harness not on this host ($HOME/.claude absent) — not probed"
+    claude_probe="skipped(harness not installed)"
+  fi
   # SCRATCH IN A ROOT THE GATE'S OWN DOMAIN RECOGNISES — deliberately NOT $TMPDIR (mcnugget,
   # 2026-08-29, finding 1). This line was `mktemp -d "${TMPDIR:-/tmp}/…"`, and on darwin $TMPDIR
   # is the per-uid /var/folders/<hash>/T, which is under neither entry of the gate's
@@ -479,6 +538,9 @@ preflight_gate() {
       "$DEPLOY_ROOT/hestia/plugins/_shared")" || probe_home="$HESTIA_HOME"
   fi
   _probe() {  # $1 = label, $2 = event json
+    # Every _probe below speaks claude-code's event schema to claude-code's gate: with that
+    # harness absent there is nothing to ask (logged once above). gate-preflight.py still runs.
+    [ -n "$claude_probe" ] && return 0
     # HESTIA_HOME is the bootstrap locator and has no default by design (#944): since the
     # config-from-vault consumer landed, a gate that cannot find the vault refuses every tool
     # with `config.unbacked`. This script sets HESTIA_HOME at the top but never EXPORTS it, so
@@ -486,10 +548,23 @@ preflight_gate() {
     # preflight refuse a benign read on every box whose seats are correctly configured, with a
     # message about the seat's config rather than about the probe's own environment (Sprout,
     # 2026-09-08: four rendered projections, all four probes still denied).
+    #
+    # THE PROBE DECLARES THE TIMEOUT IT ENFORCES (#1250; gate-preflight.py has done this since
+    # one-gate stage C). A stage-C gate bounds its decision by the timeout its harness enforces,
+    # read from its own registration -- and refuses `gate.harness_timeout_unknown` when it finds
+    # none. On an upgraded host the registration exists, so this probe passed; on a FRESH host
+    # nothing has registered the gate yet (the install it guards is what registers it), and the
+    # probe refused the benign read forever -- the next fresh-host refusal behind config.unbacked,
+    # measured by the upgrade-path harness's fresh-host arm. This probe is a non-harness invoker,
+    # so it declares its own bound; when the gate also finds a registration the smaller wins, so
+    # the declaration can only shorten the gate's budget. Enforced with timeout(1) where present.
+    local _bound=()
+    command -v timeout >/dev/null 2>&1 && _bound=(timeout "$PROBE_TIMEOUT_S")
     printf '%s' "$2" | (cd "$DEPLOY_ROOT/hestia" && env HESTIA_PRE_FAIL_CLOSED=1 CLAUDECODE=1 \
       HESTIA_HOME="$probe_home" \
       HESTIA_SHARED_DIR="$DEPLOY_ROOT/hestia/plugins/_shared" \
-      HESTIA_ENDPOINT="$EP" python3 "$gate") >"$tmp/out" 2>"$tmp/err"
+      HESTIA_HOOK_TIMEOUT_S="$PROBE_TIMEOUT_S" \
+      HESTIA_ENDPOINT="$EP" ${_bound[@]+"${_bound[@]}"} python3 "$gate") >"$tmp/out" 2>"$tmp/err"
     rc=$?
     [ "$rc" = 0 ] && return 0
     log "WARN preflight probe '$1' -> rc=$rc: $(head -c 300 "$tmp/err" | tr '\n' ' ')"
@@ -583,6 +658,55 @@ preflight_gate() {
   return 0
 }
 
+# ---- seat documents BEFORE the preflight (#1250) ---------------------------------------------
+# A FRESH HOST COULD NOT INSTALL FROM THE TIMER. Since #959 a seat's gate refuses every act without
+# its rendered projection ($HESTIA_HOME/seats/<seat>.env, `config.unbacked`), and the preflight
+# probes the candidate gates under the seat's projection -- re-pointed into a throwaway home, #1171
+# -- or, when there is none, under no projection at all, which is that seat's truth: refused. The
+# only thing that WROTE the projections was tools/seed_seat_config.py, run at the END of
+# install-members.sh (#1186) -- after this preflight had already refused the install that would have
+# run it. So the first-ever cycle on a new machine refused, every later cycle refused identically,
+# and "no timer cycle repairs a preflight verdict" (measured: tools/upgrade_path_test.py's
+# fresh-host arm, `FAILED(gate refuses a benign read)` on main 7e901d3c).
+#
+# The seeder runs here, from the candidate checkout, BEFORE the preflight, in the same mode the
+# installer runs it (--add-missing): idempotent, it writes only the installed seats the vault does
+# not declare, never modifies an operator's document, and grants nothing (no role, no scope -- it
+# writes layout and the society facts, and the daemon re-checks absence under its own lock). The
+# preflight is NOT weakened: it still probes every gate under the projection the seat will load
+# after this install, which is now the real one, rendered by the daemon from the vault, re-pointed
+# at the candidate engine exactly as on any configured host. A seeder that cannot run (no operator
+# key, no Ed25519 backend, no workspace) leaves the seat unbacked and the preflight refuses as
+# before; `seats=` names which.
+#
+# It is an OPERATOR act (it signs with $HESTIA_HOME/operator.key), so like the installer it does
+# not run inside a governed session. HESTIA_DEPLOY_SEED_SEATS=0 switches it off. Never fatal.
+seats="not-run"
+seed_seats() {
+  local seeder="$DEPLOY_ROOT/hestia/tools/seed_seat_config.py" out rc=0 last
+  [ "${HESTIA_DEPLOY_SEED_SEATS:-1}" = "1" ] || { seats="skipped(HESTIA_DEPLOY_SEED_SEATS=0)"; return 0; }
+  if [ -n "${CLAUDECODE:-}" ] || [ -n "${HESTIA_ROLE:-}" ]; then
+    seats="refused(governed session)"; return 0
+  fi
+  [ -f "$seeder" ] || { seats="skipped(no seeder in the checkout)"; return 0; }
+  [ -f "$HESTIA_HOME/operator.key" ] || { seats="skipped(no operator key in HESTIA_HOME)"; return 0; }
+  # `|| rc=$?`: under set -e an assignment whose substitution fails would end the cycle here.
+  out="$(HESTIA_HOME="$HESTIA_HOME" python3 "$seeder" --add-missing --apply 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/  seed-seats: /' >>"$LOG"
+  last="$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-160 || true)"
+  if [ "$rc" != 0 ]; then
+    seats="FAILED(rc=$rc: $last)"
+  elif printf '%s\n' "$out" | grep -q '^Seeded '; then
+    seats="ok(added)"
+  elif printf '%s\n' "$out" | grep -q 'EVERY INSTALLED SEAT HAS A DOCUMENT'; then
+    seats="ok(complete)"
+  else
+    seats="ok($last)"
+  fi
+  case "$seats" in ok\(complete\)) ;; *) log "seats: $seats" ;; esac
+  return 0
+}
+
 # Sets $hooks. A function because --hooks-only needs the same path: a cycle that deployed the
 # binary and then failed the manifest leaves the box reading STALE, and nothing retries it —
 # the next cycle sees a current binary, logs CURRENT and exits before reaching here.
@@ -594,6 +718,8 @@ install_hooks() {
   # gate that cannot answer or one registered where a pull can swap it; installing more gate onto
   # that box is the one act that makes it worse, and the daemon is not the thing that locks a
   # seat out. So the binary still deploys, this step does not, and the cycle exits loud.
+  # The seat documents first: the preflight probes each gate under its seat's projection (#1250).
+  seed_seats
   preflight_gate
   case "$preflight" in
     FAILED*) hooks="refused($preflight)"
@@ -622,11 +748,11 @@ install_hooks() {
     # that rc=0 as "manifest now current" broke the promise one layer up: mcnugget, 2026-08-28,
     # under a REAL launchd timer with no member registered in HOME — `manifest-repair hooks=ok`,
     # rc=0, twice, and no current-build.json. Every 4h, forever, green. So the manifest gets the
-    # same post-condition the binary already has (`[ "$newv" = "$target" ] || die`): check the
+    # same post-condition the binary already has (`same_build "$newv" "$target" || die`): check the
     # file this value is named for, not the exit code of the thing that was supposed to write it.
     local after
     after="$(manifest_build_id)"
-    if [ "$after" != "$target" ]; then
+    if ! same_build "$after" "$target"; then
       hooks="FAILED(installer rc=0, manifest '${after:-none}')"
     fi
   else
@@ -821,6 +947,16 @@ if [ "$MODE" = "--preflight" ]; then
   mkdir -p "$HESTIA_HOME"
   preflight_gate
   log "PREFLIGHT $preflight"
+  # This mode writes nothing, so it does not seed seat documents the way a timer cycle does
+  # (seed_seats, #1250). On a box that has never been seeded the probes therefore run unbacked and
+  # refuse `config.unbacked`; say so, so a fresh host's "before you arm" check is not read as the
+  # verdict its first timer cycle will reach.
+  case "$preflight" in
+    FAILED*)
+      if ! ls "$HESTIA_HOME"/seats/*.env >/dev/null 2>&1; then
+        log "NOTE no seat projection exists under $HESTIA_HOME/seats yet. A timer cycle seeds the seat documents (tools/seed_seat_config.py --add-missing) BEFORE it runs this preflight; --preflight writes nothing and so probes the seats unbacked. If the probe lines above say config.unbacked, that is this box's state before its first cycle, not a gate defect."
+      fi ;;
+  esac
   case "$preflight" in FAILED*) exit 4 ;; *) exit 0 ;; esac
 fi
 
@@ -935,17 +1071,17 @@ fi
 # divergence the policy exists to remove. So it refuses unless the synced checkout is still
 # exactly what is deployed, and says to run a full cycle instead.
 if [ "$MODE" = "--hooks-only" ]; then
-  if [ "$running" != "$target" ] || [ "$ondisk" != "$target" ]; then
+  if ! same_build "$running" "$target" || ! same_build "$ondisk" "$target"; then
     die "--hooks-only refuses: checkout is now '$target' but running='${running:-none}' ondisk='${ondisk:-none}'; a manifest written here would not match the binary. Run a full cycle."
   fi
   install_hooks
   install_inventory
-  log "HOOKS-ONLY $target hooks=$hooks inventory=$inventory"
+  log "HOOKS-ONLY $target hooks=$hooks inventory=$inventory seats=$seats"
   [ "$hooks" = "ok" ] || { log "manifest not written; $(hooks_repair_hint)"; exit 1; }
   exit 0
 fi
 
-if [ "$running" = "$target" ] && [ "$ondisk" = "$target" ]; then
+if same_build "$running" "$target" && same_build "$ondisk" "$target"; then
   # A current binary with a manifest that does not say so is a half deploy left behind by an
   # earlier cycle (hooks != ok), and until 2026-08-27 nothing retried it: this branch logged
   # CURRENT and exited before the installer, and the only repair was --hooks-only — which the
@@ -953,11 +1089,11 @@ if [ "$running" = "$target" ] && [ "$ondisk" = "$target" ]; then
   # installer refuses it (rc=3). The timer is the one caller that is not a session, so the
   # timer's own CURRENT cycle is where the repair belongs. Full mode only: --check reports.
   manifest="$(manifest_build_id)"
-  if [ "$MODE" = "full" ] && [ "${HESTIA_DEPLOY_HOOKS:-1}" = "1" ] && [ "$manifest" != "$target" ]; then
+  if [ "$MODE" = "full" ] && [ "${HESTIA_DEPLOY_HOOKS:-1}" = "1" ] && ! same_build "$manifest" "$target"; then
     log "CURRENT $target but manifest says '${manifest:-none}'; re-running the members' install"
     install_hooks
     install_inventory
-    log "CURRENT $target manifest-repair hooks=$hooks inventory=$inventory"
+    log "CURRENT $target manifest-repair hooks=$hooks inventory=$inventory seats=$seats"
     case "$hooks" in
       ok) exit 0 ;;
       *)  log "HALF-DEPLOYED $target: binary current, manifest still '${manifest:-none}' (hooks=$hooks); $(hooks_repair_hint)"; exit 1 ;;
@@ -983,7 +1119,7 @@ fi
 new="$CARGO_TARGET_DIR/release/hestia"
 [ -x "$new" ] || die "no binary at $new"
 newv="$("$new" --version | describe_of)"
-[ "$newv" = "$target" ] || die "built binary describes itself as '$newv', checkout is '$target'"
+same_build "$newv" "$target" || die "built binary describes itself as '$newv', checkout is '$target'"
 log "built $newv in $(( $(date +%s) - T0 ))s"
 [ "$MODE" = "--build-only" ] && { log "BUILD-ONLY done"; exit 0; }
 
@@ -1013,10 +1149,10 @@ deadline=$(( $(date +%s) + READY_SECS ))
 got=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
   got="$(running_version)"
-  [ "$got" = "$newv" ] && break
+  same_build "$got" "$newv" && break
   sleep 3
 done
-[ "$got" = "$newv" ] || rollback "daemon did not answer as $newv within ${READY_SECS}s (got '${got:-none}')"
+same_build "$got" "$newv" || rollback "daemon did not answer as $newv within ${READY_SECS}s (got '${got:-none}')"
 log "daemon up on $newv after $(( $(date +%s) - T0 ))s"
 
 # ---- members' governance surface, from the SAME checkout -----------------------------------------
@@ -1029,7 +1165,7 @@ ls -1t "$HESTIA_HOME"/hestia.prev-* 2>/dev/null | tail -n +"$(( KEEP_BACKUPS + 1
 done
 
 secret_hygiene
-log "DEPLOYED ${running:-none} -> $newv (hestia $target_sha, web4 $web4_sha, atlas $atlas) hooks=$hooks inventory=$inventory in $(( $(date +%s) - T0 ))s"
+log "DEPLOYED ${running:-none} -> $newv (hestia $target_sha, web4 $web4_sha, atlas $atlas) hooks=$hooks inventory=$inventory seats=$seats in $(( $(date +%s) - T0 ))s"
 
 # A DEPLOYED line with hooks != ok is HALF a deploy: the binary is current, the manifest is not,
 # and the dashboard reads stale (or unknown) until someone runs --hooks-only. Until 2026-08-27
