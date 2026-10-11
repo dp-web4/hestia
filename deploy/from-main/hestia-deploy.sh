@@ -452,6 +452,17 @@ preflight_gate() {
   # The point is to catch a gate that cannot answer BEFORE it becomes the one deciding.
   gate="$DEPLOY_ROOT/hestia/plugins/claude-code/hooks/pre_tool_use.py"
   [ -f "$gate" ] || { preflight="skipped(no claude-code gate in checkout)"; return 0; }
+  # NOT INSTALLED, NOT PROBED (dp 2026-10-11: "anything that isn't installed shouldn't be
+  # attempted"). The same rule the installer uses (register-members.py: the registration's
+  # directory absent = "harness not on this host", skip) — so this probe and the install can never
+  # disagree about whether claude-code is here. Measured by #1277's harness `--without-harness
+  # .claude`: without this, a host with no Claude Code HALF-DEPLOYED on config.unbacked forever.
+  # The other members are probed by gate-preflight.py, which already skips an absent harness.
+  local claude_probe=""
+  if [ ! -d "$HOME/.claude" ]; then
+    log "preflight: claude-code harness not on this host ($HOME/.claude absent) — not probed"
+    claude_probe="skipped(harness not installed)"
+  fi
   # SCRATCH IN A ROOT THE GATE'S OWN DOMAIN RECOGNISES — deliberately NOT $TMPDIR (mcnugget,
   # 2026-08-29, finding 1). This line was `mktemp -d "${TMPDIR:-/tmp}/…"`, and on darwin $TMPDIR
   # is the per-uid /var/folders/<hash>/T, which is under neither entry of the gate's
@@ -516,6 +527,9 @@ preflight_gate() {
       "$DEPLOY_ROOT/hestia/plugins/_shared")" || probe_home="$HESTIA_HOME"
   fi
   _probe() {  # $1 = label, $2 = event json
+    # Every _probe below speaks claude-code's event schema to claude-code's gate: with that
+    # harness absent there is nothing to ask (logged once above). gate-preflight.py still runs.
+    [ -n "$claude_probe" ] && return 0
     # HESTIA_HOME is the bootstrap locator and has no default by design (#944): since the
     # config-from-vault consumer landed, a gate that cannot find the vault refuses every tool
     # with `config.unbacked`. This script sets HESTIA_HOME at the top but never EXPORTS it, so
