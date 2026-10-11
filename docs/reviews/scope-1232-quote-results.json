@@ -1,0 +1,86 @@
+{
+  "reviewed_head": "8fe48feaaa9f3af82500e3367342fa4ac53a2eb7",
+  "held": "d10129c2c49be63e5aa941855a1c0e1026d47ed635c1667be93c3de78e7c9fe7",
+  "validation": {
+    "original_shell_runner": {
+      "checks": 96,
+      "failures": 0
+    },
+    "original_literal_runner": {
+      "checks": 156,
+      "failures": 0
+    },
+    "supplied_battery": {
+      "checks": 944,
+      "failures": 0
+    },
+    "new_runner": {
+      "checks": 114,
+      "failures": 54,
+      "held": "d10129c2c49be63e5aa941855a1c0e1026d47ed635c1667be93c3de78e7c9fe7",
+      "full_gate": true,
+      "failed_cases": [
+        "helper/quoted-assignment-word",
+        "core/quoted-assignment-word",
+        "helper/quoted-assignment-name",
+        "core/quoted-assignment-name",
+        "helper/escaped-assignment-name",
+        "core/escaped-assignment-name",
+        "helper/quoted-assignment-equals",
+        "core/quoted-assignment-equals",
+        "helper/shell-stdin-option",
+        "core/shell-stdin-option",
+        "helper/shell-stdin-input-option",
+        "core/shell-stdin-input-option",
+        "helper/shell-stdin-script-option",
+        "core/shell-stdin-script-option",
+        "helper/shell-heredoc-override",
+        "core/shell-heredoc-override",
+        "helper/find-clustered-shell",
+        "core/find-clustered-shell",
+        "claude-code/quoted-assignment-word",
+        "claude-code/quoted-assignment-name",
+        "claude-code/escaped-assignment-name",
+        "claude-code/quoted-assignment-equals",
+        "claude-code/shell-stdin-option",
+        "claude-code/shell-stdin-input-option",
+        "claude-code/shell-stdin-script-option",
+        "claude-code/shell-heredoc-override",
+        "claude-code/find-clustered-shell",
+        "codex/quoted-assignment-word",
+        "codex/quoted-assignment-name",
+        "codex/escaped-assignment-name",
+        "codex/quoted-assignment-equals",
+        "codex/shell-stdin-option",
+        "codex/shell-stdin-input-option",
+        "codex/shell-stdin-script-option",
+        "codex/shell-heredoc-override",
+        "codex/find-clustered-shell",
+        "kimi/quoted-assignment-word",
+        "kimi/quoted-assignment-name",
+        "kimi/escaped-assignment-name",
+        "kimi/quoted-assignment-equals",
+        "kimi/shell-stdin-option",
+        "kimi/shell-stdin-input-option",
+        "kimi/shell-stdin-script-option",
+        "kimi/shell-heredoc-override",
+        "kimi/find-clustered-shell",
+        "gemini/quoted-assignment-word",
+        "gemini/quoted-assignment-name",
+        "gemini/escaped-assignment-name",
+        "gemini/quoted-assignment-equals",
+        "gemini/shell-stdin-option",
+        "gemini/shell-stdin-input-option",
+        "gemini/shell-stdin-script-option",
+        "gemini/shell-heredoc-override",
+        "gemini/find-clustered-shell"
+      ]
+    },
+    "harmless_shell_semantics": {
+      "cases": 9,
+      "passed": 9,
+      "target_files_opened": false
+    }
+  },
+  "limits": "Gate calls use a disposable policy stub. No real-daemon or Rust rerun; no governed patch applied."
+}
