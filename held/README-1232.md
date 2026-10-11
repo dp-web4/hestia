@@ -6,12 +6,14 @@ touches are the governance surface, so they land only through the gate's escalat
 
 | file | sha256 |
 |---|---|
-| `f4644ef4f71a48cda62a546d5552f5e34063c43109e73aa71e3934d7ada699a0.patch` | `f4644ef4f71a48cda62a546d5552f5e34063c43109e73aa71e3934d7ada699a0` (the proposal; main `7e901d3c`, merge `3efae5d2`) |
+| `d10129c2c49be63e5aa941855a1c0e1026d47ed635c1667be93c3de78e7c9fe7.patch` | `d10129c2c49be63e5aa941855a1c0e1026d47ed635c1667be93c3de78e7c9fe7` (the proposal; main `7e901d3c`, merge `3efae5d2`) |
+| `lineage/f4644ef4f71a48cda62a546d5552f5e34063c43109e73aa71e3934d7ada699a0.patch` | `f4644ef4f71a48cda62a546d5552f5e34063c43109e73aa71e3934d7ada699a0`: the literal rule as first built; Codex HOLD 20536 (four P1s); reference only, superseded |
 | `lineage/c36101e4fbe0e459c9de2584db08c4c7b841d29b6482b8b1293fe23855c868e3.patch` | `c36101e4fbe0e459c9de2584db08c4c7b841d29b6482b8b1293fe23855c868e3`: the previous proposal (narrowing without the literal rule, on main `d3c731fc`); reference only, superseded |
 | `lineage/01e68a1cd2d3f980021fd73c5d882697b8887b8ddab10380d5ab3b0dca3bae20.patch` | `01e68a1cd2d3f980021fd73c5d882697b8887b8ddab10380d5ab3b0dca3bae20`: the patch Codex reviewed in 17054 and kimi verified on 2026-10-07 (reference only, do not apply; its base is `d3c05006`) |
 | `lineage/1232-01e68a1c-onto-main.diff` | 01e68a1c's sources against the same sources merged onto main (conflict resolutions plus main's drift) |
 | `lineage/1232-narrowing.diff` | **exactly what dp's 2026-10-10 ruling changed** on top of that |
 | `lineage/1232-literal-rule.diff` | **exactly what dp's 2026-10-11 ruling added** (the single-literal-assignment rule), on the sources carried onto `7e901d3c` |
+| `lineage/1232-codex-20536.diff` | **exactly what the repair of Codex's HOLD 20536 changed** on top of `f4644ef4` |
 
 Each patch filename is its own sha256, so `sha256sum held/*.patch held/lineage/*.patch` verifies them.
 
@@ -110,6 +112,30 @@ Everything else stays unenumerated (a scope request), each pinned by a battery r
 The bound value lives on the scan's own state (never module state), and only the outer command's
 statements can bind: substitution bodies are subshells.
 
+### Hardened after Codex's HOLD (notice 20536)
+
+Codex found four P1s in `f4644ef4`; each is repaired conservatively (unenumerated → scope request),
+with no new shell modelling:
+
+1. **Substitution order.** `echo "$(cat $S/hostname)"; S=/tmp/x` allowed: bodies were scanned after
+   the outer tokens, so a LATER literal reached an EARLIER body. Each lifted body now carries the
+   position of the outer word that holds it, and resolves only bindings committed before that
+   position (`S=/tmp/x; echo "$(cat $S/x)"` still allows; the reverse is a request).
+2. **Field splitting.** `S="/tmp/x /etc"; cat $S/hostname` allowed (two arguments, one judged). A
+   value containing IFS whitespace now binds only at a use written inside double quotes (the lexer
+   marks quoted references); an unquoted use is unenumerated. Glob characters never bind.
+3. **Rebinding through binders.** `printf -vS`, `read -aS`, `: $((S=0))` allowed. Now ANY binder
+   anywhere disqualifies EVERY name: `read`, `printf` with any `-v…` option, `mapfile`/`readarray`,
+   `declare`/`typeset`/`local`/`export`/`readonly`/`let`/`getopts`/`unset`/`eval`/`source`, any
+   `$((` / `((`, and assigning expansions (`${S:=x}`, `${S=x}`).
+4. **Interpreters and hidden code.** Any shell or interpreter word anywhere, with any option
+   spelling, disqualifies every name. The nine forms Codex's earlier runner pinned are now judged
+   in their own right: clustered code options (`bash -lc`, `sh -ec`, wrappers `exec` / `sudo`,
+   `perl -ne`) take the next word as code; `builtin eval` is unwrapped like `command eval`; `$'…'`
+   and `$"…"` quoting is unenumerated where judged as a path; an interpreter reading its program
+   from a pipe, a here-string, `-` or a descriptor path (`bash <<<`, `… | sh`, `sh /dev/fd/3`) is
+   unenumerated. A heredoc program (`python3 - <<'EOF'`) stays visible and judged.
+
 ## Battery (written first)
 
 Every Codex false-allow from the review rounds is a row: 16955/a589ed9, 17015, 17029a–f, 17054
@@ -122,12 +148,21 @@ through `command_scope_reach` and through `core.evaluate`.
 | 01e68a1c as reviewed | 14 | 25 | 121 (incl. 21 plain incomplete) | 57/57 |
 | 01e68a1c merged onto main | 14 | 25 | 121 | 57/57 |
 | narrowed, without the literal rule (c36101e4) | 0 | 0 | 99 path / 36 request | 57/57 |
-| **narrowed + literal rule (this patch)** | **0** | **0** | **102 path / 36 request** | **62/62** |
+| narrowed + literal rule as first built (f4644ef4) | 17 (Codex's forms, imported) | 1 | — | 70/70 |
+| **narrowed + literal rule, Codex-20536 repairs (this patch)** | **0** | **0** | **113 path / 59 request** | **70/70** |
 
-The battery now has 821 checks (79 request rows, 62 allow rows): 821/821 on this patch. Against the
-literal-rule battery, the only verdicts that changed between the pre-rule and rule cores: the former
-request row `D=/tmp/x; cat $D/y` and four new admitted shapes now ALLOW, and `S=; cat $S/etc/hostname`
-moved from a request to a concrete `/etc/hostname` refusal. Every exclusion row stays a request. A `request` row must be refused as the sentinel (a scope request),
+The battery has 944 checks (80 request rows, 70 allow rows): 944/944 on this patch. Both of Codex's
+runners are imported as invariants (`codex-shell-*`, `codex-lit-*`: every refusal case refused, every
+positive control allowed). Against the full battery, the rows whose verdict changed from `f4644ef4`'s
+core: the 17 Codex forms (ALLOW → refused or request) and `lit-after-a-python-c-literal` (an
+interpreter now disqualifies the rule; ALLOW → request). No allow row changed.
+
+**Codex's runners, `--full-gate`, from a nested export of this branch:** `scope-1232-shell-regressions.py`
+0 failures / 96 checks and `scope-1232-literal-regressions.py` 0 / 156 on this patch; the same runs
+against `f4644ef4` reproduce Codex's 54 / 96 and 48 / 156.
+
+(Earlier, the literal rule's own rows: `D=/tmp/x; cat $D/y` and four admitted shapes moved request →
+ALLOW, and `S=; cat $S/etc/hostname` request → a concrete `/etc/hostname` refusal.) A `request` row must be refused as the sentinel (a scope request),
 and it must also be liftable by exactly a one-time approval of the act.
 
 ## What it costs (re-measured over the real corpus)
@@ -145,10 +180,11 @@ claude-code 2,726 refused, and 1,607 against 1,609 with grants.
 | 01e68a1c as reviewed | 3,415 (10.3%) | 1,607 (4.9%) | 783 | 0 | 820 |
 | 01e68a1c merged onto main | 3,415 (10.3%) | 1,607 (4.9%) | 783 | 0 | 820 |
 | narrowed, without the literal rule (c36101e4) | 7,051 (21.3%) | 5,660 (17.1%) | 1,079 | 4,581 | 0 |
-| **narrowed + literal rule (this patch)** | **5,539 (16.8%)** | **4,048 (12.2%)** | 1,080 | **2,968** | 0 |
+| narrowed + literal rule as first built (f4644ef4) | 5,539 (16.8%) | 4,048 (12.2%) | 1,080 | 2,968 | 0 |
+| **+ Codex-20536 repairs (this patch)** | **6,288 (19.0%)** | **4,822 (14.6%)** | 1,079 | **3,743** | 0 |
 
-Per seat, this patch with the proposed grants: claude-code 15.1% (21.1% without the rule; 5.8% on
-01e68a1c), codex 1.1% (0.8%), kimi-code 6.1% (8.6%; 2.9%). Path refusals are unchanged by the rule
+Per seat, this patch with the proposed grants: claude-code 18.0% (15.1% for f4644ef4, 21.1% without
+the rule; 5.8% on 01e68a1c), codex 1.1% (0.8%), kimi-code 7.2% (6.1%, 8.6%; 2.9%). Path refusals are unchanged by the rule
 (2,773 without grants in both): it only converts once-only requests into judged literals.
 
 **Full window, 2026-09-20 to now.** 53,502 commands for the 01e68a1c rows (2026-10-10), 53,844 for
@@ -158,7 +194,8 @@ the literal-rule replay (2026-10-11; the corpus grows with every session).
 |---|---|---|---|
 | 01e68a1c as reviewed / merged onto main | 6,629 (12.4%) | 4,025 (7.5%) | 0 (2,865 plain incomplete) |
 | narrowed, without the literal rule | 13,401 (24.9%) | 11,499 (21.4%) | 9,804 |
-| **narrowed + literal rule (this patch)** | **10,722 (19.9%)** | **8,661 (16.1%)** | **6,965** |
+| narrowed + literal rule as first built (f4644ef4) | 10,764 (19.9%) | 8,702 (16.1%) | 7,000 |
+| **+ Codex-20536 repairs (this patch; 54,099 commands)** | **12,099 (22.4%)** | **10,075 (18.6%)** | **8,374** |
 
 **What the standing grants absorb.**
 
@@ -199,7 +236,7 @@ and value checks all excluded), and lands at 12.2% / 16.1% with grants. Scripts 
   hooks-gt half was computed with `tools/hooks_gt.py`'s own functions.
 - `git apply --check` is clean on HEAD. Applied to a throwaway export of HEAD, every staged file
   comes out byte-identical and `tools/hooks_gt.py check` reports ok.
-- Python tests ran with the patched modules supplied through `HESTIA_CONTRACT_OVERLAY` and a process-wide import overlay; the patch's own test files ran from their staged copies. Results (2026-10-11, literal rule): battery 821/821; contract 21 + shim parity 29×4; real-daemon arm against an isolated daemon built from this branch passes; `test_gate_core` all checks pass. Full CI Python set: 152 pass / 5 fail, all accounted for — `last_words_test` (A7) and `shared_target_split_test` (cannot locate the real cargo behind the shim) fail on main in this environment too; `loader_binds_installed_engine_test` poisons the installed core on purpose and cannot run under a process-wide import overlay (it passes under the per-test seam); `public_boundary_test` and `shebang_exec_bit_test` failed on this branch's earlier measurement scripts (baked local paths, a shebang without the exec bit) and are fixed by replacing them with the path-free `held/measure-1232/` scripts. Rust: `cargo test -j2 --lib` under the watchdog, 1230 passed, 0 failed.
+- Python tests ran with the patched modules supplied through `HESTIA_CONTRACT_OVERLAY` and a process-wide import overlay; the patch's own test files ran from their staged copies. Results (2026-10-11, after Codex 20536): battery 944/944; Codex's two runners 0/96 and 0/156 with `--full-gate`; contract 21 + shim parity 29×4; real-daemon arm passes; `test_gate_core` all checks pass. Full CI Python set: 154 pass / 3 fail, all accounted for — `last_words_test` (A7) and `shared_target_split_test` (cannot locate the real cargo behind the shim) fail on main in this environment too; `loader_binds_installed_engine_test` poisons the installed core on purpose and cannot run under a process-wide import overlay (it passes under the per-test seam). Rust: `cargo test -j2 --no-fail-fast`, every target, under the watchdog: 1317 passed, 0 failed (CI's red `cargo test` on this branch was `member_presence_census`, fixed in `6a9d7cf3`).
 - The contract suite's real-daemon arm ran against an isolated daemon built from this branch, on
   :7799. The sentinel request opens through the real handler, and a re-issue finds it.
 

@@ -88,3 +88,23 @@ once-only requests after the proposed grants: 6984
        1    0.0%  <incomplete: more distinct paths than the gate judges in one
        1    0.0%  a heredoc form the parser does not model
 ```
+
+## 2026-10-11: main 7e901d3c vs f4644ef4 (lit) vs the Codex-20536 repairs (fix) — 54,099 commands
+
+### Window of the 2026-10-05 run (2026-09-20 .. 2026-10-05T20:05Z): 33054 commands (claude-code 24536, codex 3359, kimi-code 5159)
+| core | grants | refused (delta over main) | of which: path | once-only request | plain incomplete | claude-code | codex | kimi-code |
+|---|---|---|---|---|---|---|---|---|
+| lit | none | 5539 (16.8%) | 2773 | 2766 | 0 | 4690 (19.1%) | 76 (2.3%) | 773 (15.0%) |
+| lit | proposed | 4048 (12.2%) | 1080 | 2968 | 0 | 3699 (15.1%) | 36 (1.1%) | 313 (6.1%) |
+| fix | none | 6288 (19.0%) | 2773 | 3515 | 0 | 5378 (21.9%) | 76 (2.3%) | 834 (16.2%) |
+| fix | proposed | 4822 (14.6%) | 1079 | 3743 | 0 | 4412 (18.0%) | 36 (1.1%) | 374 (7.2%) |
+
+### Full window (2026-09-20 .. now): 54099 commands (claude-code 41509, codex 5881, kimi-code 6709)
+| core | grants | refused (delta over main) | of which: path | once-only request | plain incomplete | claude-code | codex | kimi-code |
+|---|---|---|---|---|---|---|---|---|
+| lit | none | 10764 (19.9%) | 4149 | 6615 | 0 | 9560 (23.0%) | 138 (2.3%) | 1066 (15.9%) |
+| lit | proposed | 8702 (16.1%) | 1702 | 7000 | 0 | 8210 (19.8%) | 74 (1.3%) | 418 (6.2%) |
+| fix | none | 12099 (22.4%) | 4149 | 7950 | 0 | 10830 (26.1%) | 139 (2.4%) | 1130 (16.8%) |
+| fix | proposed | 10075 (18.6%) | 1701 | 8374 | 0 | 9518 (22.9%) | 75 (1.3%) | 482 (7.2%) |
+
+main itself refuses 1431 of 54099 (pass 1/2, unchanged by this PR)
