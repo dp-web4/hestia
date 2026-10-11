@@ -5,6 +5,8 @@
   "install": {
     "member": "claude-code",
     "dest": "~/.claude/hooks/hestia",
+    "default_role": "role:constellation:interactive-dev",
+    "_default_role_note": "HESTIA_ROLE is launch context, never config: the seat loader refuses it from the vault projection, so the hook line is the only place a default can live. deploy/register-members.py renders it as a pass-through, HESTIA_ROLE=\"${HESTIA_ROLE:-<this>}\", on the gate and witness lines, so a launcher that knows better (a mesh fire, a watcher unit) still overrides it. The value is what this seat registered by hand before the reconciler (dp 2026-10-06).",
     "registration": {
       "reader": "json-hook-commands",
       "path": [

@@ -291,6 +291,54 @@ Router→router hops use Web4's receipt-only `route_forward` channel operation. 
 has not opted into non-destructive fetch/ACK is not routable: using a consume-on-response
 mailbox would reintroduce the packet-loss boundary F3 exists to remove.
 
+**Receipt-mode router memberships are dedicated transport identities.** Enrollment is one-way:
+once a Hub member opts into receipt fetch/ACK, the historical destructive `notifications`
+consumer is refused. Therefore a machine/seat member still drained by legacy `hub-watch`
+MUST NOT be reused as an F3 router interface for an incremental edge cutover. Doing so would
+silently turn a one-edge pilot into a whole-mailbox migration.
+
+For migration, each machine provisions a distinct Hub membership/key for its router plane:
+
+- canonical machine/router LCT remains the routed identity;
+- dedicated Hub member UUID is only that router's transport membership;
+- its raw channel key is an unattended credential handle, distinct from seat/member keys;
+- join/admission follows ordinary Hub law;
+- receipt mode is enabled by a separate explicit Hub-operator act after admission;
+- the old seat/machine Hub membership remains untouched until its own measured retirement.
+
+Router membership bootstrap is retry-stable: the UUID/key are persisted **before** the network
+join request. Lost response, pending Sovereign admission, and retry all reuse the same identity;
+the primary Hestia Hub connection is never re-keyed or repointed. After admission, Hestia
+re-resolves the Hub pin and only then binds the dedicated member as a router interface.
+
+**Router interfaces and neighbors require portable certificate evidence before D3 cutover.**
+A router-interface certificate binds, in one versioned payload:
+
+- the canonical key-derived router LCT + router public key;
+- Hub LCT;
+- dedicated Hub member UUID + the Hub-pinned member public key;
+- exact Hestia router-interface binding UUID;
+- successful non-destructive receipt-mode capability proof;
+- issuance time.
+
+The payload is signed independently by **both** the canonical router/Society binding key and
+the dedicated Hub membership key. A verifier re-derives the router LCT from the router public
+key, verifies both signatures over deterministic domain-separated bytes, and then rechecks the
+Hub-member key against the **current live Hub pin**. Possession at issuance is therefore
+necessary but not sufficient after a re-key.
+
+A neighbor binding is not authorized by separately typed `next_hop_lct` and Hub-member UUID.
+The peer certificate is the evidence that those values belong together; the neighbor stores
+that certificate. Old/manual neighbor rows may remain readable for recovery, but they are
+**uncertified** and MUST NOT authorize a D3 legacy→F3 authority flip.
+
+The cutover preflight requires certificate evidence on **both sides of the active hop**:
+the local sending router interface must have its own persisted certificate, and the selected
+peer neighbor must carry the peer certificate. Both certificate member keys are rechecked
+against the live Hub immediately before READY. Missing, invalid, stale, wrong-Hub, or
+wrong-interface evidence is HOLD even when route parity is otherwise perfect.
+
+
 #### 4.5.3 Unreachable is a packet, not an exception
 
 When a data packet reaches a terminal routing failure, the router creates one structured

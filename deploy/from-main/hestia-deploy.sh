@@ -552,13 +552,26 @@ preflight_gate() {
   # registered candidate through its declared read + hold probes before installation. The
   # declaration belongs beside the harness's install metadata; the common runner discovers
   # actual registration and never makes an absent member a deployment requirement.
+  #
+  # THE ORDER IS RENDER -> PREFLIGHT ON THE RENDERED -> RECONCILE -> INSTALL (dp 2026-10-06,
+  # #1237 #1242). The deployer owns hestia's hook lines: install-members.sh's register step
+  # (deploy/register-members.py) rewrites each of them to the rendered template. So the runner
+  # renders the CANDIDATE's templates with the candidate's own registrar and probes each gate
+  # under the line that will be written -- not the one on disk, which a template change (stage C's
+  # HESTIA_HOME) left stale and which this preflight used to judge forever, refusing the very
+  # install that would have fixed it. The render needs the deploying environment's HESTIA_HOME
+  # (the bootstrap locator, no default by design), which this script resolves at the top but does
+  # not export: pass it. The probe still strips it from the candidate's environment; it reaches
+  # the candidate only by being rendered onto the line, exactly as it reaches the seat.
+  # (Within install-members.sh the reconcile runs after the files land -- plan, install, register,
+  # #1142 -- so no NEW registration ever names a missing file; rewrites keep their target.)
   member_probe="$DEPLOY_ROOT/hestia/deploy/from-main/gate-preflight.py"
   if [ ! -f "$member_probe" ]; then
     preflight="FAILED(per-member gate probe is missing)"
     return 0
   fi
   member_probe_rc=0
-  python3 "$member_probe" --repo "$DEPLOY_ROOT/hestia" --workspace "$DEPLOY_ROOT" --endpoint "$EP" \
+  HESTIA_HOME="$HESTIA_HOME" python3 "$member_probe" --repo "$DEPLOY_ROOT/hestia" --workspace "$DEPLOY_ROOT" --endpoint "$EP" \
     --scratch "$tmp/probe" --hold "$HOLD" --exclude-member claude-code >>"$LOG" 2>&1 \
     || member_probe_rc=$?
   if [ "$member_probe_rc" != 0 ]; then

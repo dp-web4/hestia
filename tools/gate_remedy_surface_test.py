@@ -296,9 +296,12 @@ def main() -> int:
               "; ".join(f"'{t}' at {p}:{ln} — not dispatched" for t, p, ln in bad_t)
               or f"{len(tool_ads)} checked")
 
-    # E — this file names no governance file, per the list the GATE defines.
+    # E — this file names no governance file, per the list the GATE defines. Since one-gate
+    # stage C the list is the shared core's `GOVERNANCE_FILES` (the claude-code shim's private
+    # `_GOVERNANCE_FILES` went with the rest of its law); both spellings are read.
     governance = set()
-    for path in sources:
+    core_src = "plugins/_shared/" + "hestia_gate_" + "core.py"   # assembled: E checks this file
+    for path in list(sources) + ([core_src] if core_src not in sources else []):
         try:
             tree = ast.parse((REPO / path).read_text(encoding="utf-8", errors="replace"))
         except SyntaxError:
@@ -306,7 +309,7 @@ def main() -> int:
         for node in ast.walk(tree):
             if (isinstance(node, ast.Assign) and len(node.targets) == 1
                     and isinstance(node.targets[0], ast.Name)
-                    and node.targets[0].id == "_GOVERNANCE_FILES"):
+                    and node.targets[0].id in ("_GOVERNANCE_FILES", "GOVERNANCE_FILES")):
                 for elt in ast.walk(node.value):
                     if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
                         governance.add(elt.value)

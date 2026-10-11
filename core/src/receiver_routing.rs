@@ -80,6 +80,13 @@ pub struct RouterNeighbor {
     /// this hop. One interface may have many neighbors.
     pub interface_binding_id: Uuid,
     pub next_hop_hub_member_lct: Uuid,
+    /// Remote proof that next_hop_lct, its dedicated Hub membership/key, and
+    /// that router's receipt-mode interface are one dual-signed fact.
+    ///
+    /// Old/manual rows deserialize as None for recovery visibility, but they
+    /// cannot be created by bind_neighbor and cannot authorize D3 cutover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_certificate: Option<crate::router_certificate::RouterInterfaceCertificate>,
     pub reason: String,
     #[serde(default)]
     pub set_by: String,
@@ -444,13 +451,79 @@ impl ReceiverRoutingTable {
     }
 
     pub fn bind_neighbor(&mut self, neighbor: RouterNeighbor) -> Result<()> {
-        anyhow::ensure!(!neighbor.next_hop_lct.trim().is_empty(),
-            "neighbor next_hop_lct must not be empty");
         anyhow::ensure!(
-            !self.neighbors.iter().any(|n| n.next_hop_lct == neighbor.next_hop_lct),
-            "neighbor {} already exists; remove it only after transit custody is clear",
-            neighbor.next_hop_lct
+            !neighbor.next_hop_lct.trim().is_empty(),
+            "neighbor next_hop_lct must not be empty"
         );
+        let iface_hub = self
+            .router_ingress_by_id(neighbor.interface_binding_id)
+            .map(|iface| (iface.binding_id, iface.hub_lct_id))
+            .ok_or_else(|| anyhow::anyhow!(
+                "neighbor interface {} does not exist",
+                neighbor.interface_binding_id
+            ))?;
+        let cert = neighbor.peer_certificate.as_ref().ok_or_else(|| anyhow::anyhow!(
+            "neighbor {} requires a verified router-interface certificate",
+            neighbor.next_hop_lct
+        ))?;
+        cert.verify()?;
+        anyhow::ensure!(
+            cert.payload.router_lct == neighbor.next_hop_lct,
+            "neighbor LCT {} differs from certificate router {}",
+            neighbor.next_hop_lct,
+            cert.payload.router_lct
+        );
+        anyhow::ensure!(
+            cert.payload.hub_member_lct == neighbor.next_hop_hub_member_lct,
+            "neighbor Hub member {} differs from certificate member {}",
+            neighbor.next_hop_hub_member_lct,
+            cert.payload.hub_member_lct
+        );
+        anyhow::ensure!(
+            cert.payload.hub_lct_id == iface_hub.1,
+            "neighbor certificate is for Hub {}, but interface {} belongs to Hub {}",
+            cert.payload.hub_lct_id,
+            iface_hub.0,
+            iface_hub.1
+        );
+
+        // Migration-only ratchet: a shadow-era/manual row with the SAME
+        // topology may be certified in place. Preserve its link_id so any
+        // persisted transit decision pinned to that link remains valid.
+        if let Some(existing) = self
+            .neighbors
+            .iter_mut()
+            .find(|n| n.next_hop_lct == neighbor.next_hop_lct)
+        {
+            anyhow::ensure!(
+                existing.interface_binding_id == neighbor.interface_binding_id
+                    && existing.next_hop_hub_member_lct == neighbor.next_hop_hub_member_lct,
+                "neighbor {} already exists with a different topology tuple; \
+                 refuse in-place replacement",
+                neighbor.next_hop_lct
+            );
+            if let (Some(old_cert), Some(new_cert)) = (
+                existing.peer_certificate.as_ref(),
+                neighbor.peer_certificate.as_ref(),
+            ) {
+                anyhow::ensure!(
+                    new_cert.payload.issued_at >= old_cert.payload.issued_at,
+                    "neighbor {} certificate renewal would move issued_at backwards ({} -> {})",
+                    neighbor.next_hop_lct,
+                    old_cert.payload.issued_at,
+                    new_cert.payload.issued_at
+                );
+            }
+            // Same-topology certificate attachment/renewal is custody-safe:
+            // persisted packet decisions pin link_id + Hub member UUID, neither
+            // of which changes. Keep link_id stable and ratchet only the proof.
+            existing.peer_certificate = neighbor.peer_certificate;
+            existing.reason = neighbor.reason;
+            existing.set_by = neighbor.set_by;
+            existing.set_at = neighbor.set_at;
+            return Ok(());
+        }
+
         anyhow::ensure!(
             !self.neighbors.iter().any(|n| n.link_id == neighbor.link_id),
             "router neighbor link id {} is already in use",
@@ -964,6 +1037,194 @@ mod tests {
                 destination_lct: "lct:web4:mb32:unknown".into(),
                 next_hop_lct: "upstream".into(), via: "default",
             }
+        );
+    }
+
+    #[test]
+    fn neighbor_binding_requires_and_checks_peer_certificate() {
+        let local_router = web4_core::derive_lct_id(
+            &web4_core::crypto::KeyPair::generate().verifying_key(),
+        );
+        let peer_router_key = web4_core::crypto::KeyPair::generate();
+        let peer_member_key = web4_core::crypto::KeyPair::generate();
+        let peer_router = web4_core::derive_lct_id(&peer_router_key.verifying_key());
+        let hub = Uuid::new_v4();
+        let peer_member = Uuid::new_v4();
+        let local_if = Uuid::new_v4();
+
+        let mut t = ReceiverRoutingTable::default();
+        t.bind_router_ingress(RouterIngressBinding {
+            binding_id: local_if,
+            router_lct: local_router,
+            hub_url: "https://hub.test".into(),
+            hub_lct_id: hub,
+            rest_endpoint: "https://hub.test/v1".into(),
+            hub_member_lct: Uuid::new_v4(),
+            member_key_source: MemberKeySource::VaultIdentity,
+            reason: "test".into(),
+            set_by: "test".into(),
+            set_at: 1,
+        }).unwrap();
+
+        let unsigned = RouterNeighbor {
+            link_id: Uuid::new_v4(),
+            next_hop_lct: peer_router.clone(),
+            interface_binding_id: local_if,
+            next_hop_hub_member_lct: peer_member,
+            peer_certificate: None,
+            reason: "manual".into(),
+            set_by: "test".into(),
+            set_at: 1,
+        };
+        let err = t.bind_neighbor(unsigned).unwrap_err();
+        assert!(err.to_string().contains("requires a verified"), "{err}");
+
+        let cert = crate::router_certificate::RouterInterfaceCertificate::issue(
+            crate::router_certificate::RouterInterfaceCertificatePayload {
+                protocol: crate::router_certificate::ROUTER_CERT_PROTOCOL.into(),
+                router_lct: peer_router.clone(),
+                router_pubkey_hex: peer_router_key.verifying_key().to_hex(),
+                hub_lct_id: hub,
+                hub_member_lct: peer_member,
+                hub_member_pubkey_hex: peer_member_key.verifying_key().to_hex(),
+                interface_binding_id: Uuid::new_v4(),
+                receipt_protocol: crate::router_certificate::RECEIPT_PROTOCOL.into(),
+                issued_at: 7,
+            },
+            &peer_router_key,
+            &peer_member_key,
+        ).unwrap();
+        t.bind_neighbor(RouterNeighbor {
+            link_id: Uuid::new_v4(),
+            next_hop_lct: peer_router.clone(),
+            interface_binding_id: local_if,
+            next_hop_hub_member_lct: peer_member,
+            peer_certificate: Some(cert),
+            reason: "certified".into(),
+            set_by: "test".into(),
+            set_at: 2,
+        }).unwrap();
+
+        assert_eq!(t.neighbor(&peer_router).unwrap().next_hop_hub_member_lct, peer_member);
+    }
+
+    #[test]
+    fn same_topology_manual_neighbor_upgrades_to_certificate_without_changing_link() {
+        let local_router = web4_core::derive_lct_id(
+            &web4_core::crypto::KeyPair::generate().verifying_key(),
+        );
+        let peer_router_key = web4_core::crypto::KeyPair::generate();
+        let peer_member_key = web4_core::crypto::KeyPair::generate();
+        let peer_router = web4_core::derive_lct_id(&peer_router_key.verifying_key());
+        let hub = Uuid::new_v4();
+        let peer_member = Uuid::new_v4();
+        let local_if = Uuid::new_v4();
+        let old_link = Uuid::new_v4();
+
+        let mut t = ReceiverRoutingTable::default();
+        t.bind_router_ingress(RouterIngressBinding {
+            binding_id: local_if,
+            router_lct: local_router,
+            hub_url: "https://hub.test".into(),
+            hub_lct_id: hub,
+            rest_endpoint: "https://hub.test/v1".into(),
+            hub_member_lct: Uuid::new_v4(),
+            member_key_source: MemberKeySource::VaultIdentity,
+            reason: "test".into(),
+            set_by: "test".into(),
+            set_at: 1,
+        }).unwrap();
+
+        // Simulate a pre-#1230 shadow/manual row already persisted in the vault.
+        t.neighbors.push(RouterNeighbor {
+            link_id: old_link,
+            next_hop_lct: peer_router.clone(),
+            interface_binding_id: local_if,
+            next_hop_hub_member_lct: peer_member,
+            peer_certificate: None,
+            reason: "old manual shadow".into(),
+            set_by: "old".into(),
+            set_at: 1,
+        });
+
+        let cert = crate::router_certificate::RouterInterfaceCertificate::issue(
+            crate::router_certificate::RouterInterfaceCertificatePayload {
+                protocol: crate::router_certificate::ROUTER_CERT_PROTOCOL.into(),
+                router_lct: peer_router.clone(),
+                router_pubkey_hex: peer_router_key.verifying_key().to_hex(),
+                hub_lct_id: hub,
+                hub_member_lct: peer_member,
+                hub_member_pubkey_hex: peer_member_key.verifying_key().to_hex(),
+                interface_binding_id: Uuid::new_v4(),
+                receipt_protocol: crate::router_certificate::RECEIPT_PROTOCOL.into(),
+                issued_at: 11,
+            },
+            &peer_router_key,
+            &peer_member_key,
+        ).unwrap();
+
+        t.bind_neighbor(RouterNeighbor {
+            link_id: Uuid::new_v4(), // must be ignored for same-topology upgrade
+            next_hop_lct: peer_router.clone(),
+            interface_binding_id: local_if,
+            next_hop_hub_member_lct: peer_member,
+            peer_certificate: Some(cert),
+            reason: "certificate upgrade".into(),
+            set_by: "new".into(),
+            set_at: 2,
+        }).unwrap();
+
+        let upgraded = t.neighbor(&peer_router).unwrap();
+        assert_eq!(upgraded.link_id, old_link);
+        assert!(upgraded.peer_certificate.is_some());
+        assert_eq!(upgraded.reason, "certificate upgrade");
+        assert_eq!(upgraded.set_at, 2);
+
+        let cert_at = |issued_at| {
+            crate::router_certificate::RouterInterfaceCertificate::issue(
+                crate::router_certificate::RouterInterfaceCertificatePayload {
+                    protocol: crate::router_certificate::ROUTER_CERT_PROTOCOL.into(),
+                    router_lct: peer_router.clone(),
+                    router_pubkey_hex: peer_router_key.verifying_key().to_hex(),
+                    hub_lct_id: hub,
+                    hub_member_lct: peer_member,
+                    hub_member_pubkey_hex: peer_member_key.verifying_key().to_hex(),
+                    interface_binding_id: Uuid::new_v4(),
+                    receipt_protocol: crate::router_certificate::RECEIPT_PROTOCOL.into(),
+                    issued_at,
+                },
+                &peer_router_key,
+                &peer_member_key,
+            ).unwrap()
+        };
+
+        let err = t.bind_neighbor(RouterNeighbor {
+            link_id: Uuid::new_v4(),
+            next_hop_lct: peer_router.clone(),
+            interface_binding_id: local_if,
+            next_hop_hub_member_lct: peer_member,
+            peer_certificate: Some(cert_at(10)),
+            reason: "stale cert".into(),
+            set_by: "test".into(),
+            set_at: 3,
+        }).unwrap_err();
+        assert!(err.to_string().contains("issued_at backwards"), "{err}");
+
+        t.bind_neighbor(RouterNeighbor {
+            link_id: Uuid::new_v4(),
+            next_hop_lct: peer_router.clone(),
+            interface_binding_id: local_if,
+            next_hop_hub_member_lct: peer_member,
+            peer_certificate: Some(cert_at(12)),
+            reason: "renewed cert".into(),
+            set_by: "test".into(),
+            set_at: 4,
+        }).unwrap();
+        let renewed = t.neighbor(&peer_router).unwrap();
+        assert_eq!(renewed.link_id, old_link);
+        assert_eq!(
+            renewed.peer_certificate.as_ref().unwrap().payload.issued_at,
+            12
         );
     }
 

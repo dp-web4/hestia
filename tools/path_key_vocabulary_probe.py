@@ -43,6 +43,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gate_collapse_meter import discover_gates, repo_root  # noqa: E402
@@ -279,6 +280,42 @@ def live_site_delegates(path: Path) -> bool:
     return True
 
 
+def delegates_to_common_gate(path: Path, root: Optional[Path] = None,
+                             gate_path: Optional[Path] = None) -> bool:
+    """One-gate stage C: does this seat's gate hand the WHOLE act to the common gate, whose one
+    extraction site is the engine table?
+
+    Proven structurally on both sides, never by a substring: the shim calls `gate.decide(...)`
+    and binds no paths and defines no extractor of its own; and the common gate's
+    `normalized_event` builds the core's `paths` from `core.path_targets(...)`. Then the seat's
+    vocabulary IS the engine table by construction, exactly as `live_site_delegates` concludes
+    for a seat whose live site is the engine call. The common gate is `gate_path` (an installed
+    engine's copy) or the tree's own under `root`."""
+    if gate_path is None:
+        if root is None:
+            return False
+        gate_path = root / "plugins" / "_shared" / "hestia_single_gate.py"
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        gate = ast.parse(Path(gate_path).read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError):
+        return False
+    calls = {ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    if "gate.decide" not in calls:
+        return False
+    local_fns = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+    if local_fns & {"path_targets", "_path_targets"}:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in ("paths", "_paths")
+                                                for t in node.targets):
+            return False
+    norm = next((n for n in gate.body if isinstance(n, ast.FunctionDef) and n.name == "normalized_event"), None)
+    if norm is None:
+        return False
+    return any(isinstance(n, ast.Call) and ast.unparse(n.func) == "core.path_targets" for n in ast.walk(norm))
+
+
 def gate_key_vocabularies(root: Path):
     gates, unclassified = discover_gates(root)
     if unclassified:
@@ -292,6 +329,12 @@ def gate_key_vocabularies(root: Path):
         # substring (see live_site_delegates). The flat key census below is a trend, not the
         # contract: the typed (tool, key) behaviour is pinned by
         # tools/reach_domain_contract_test.py, which can turn red where this cannot.
+        if engine_keys is not None and delegates_to_common_gate(path, root):
+            declared[seat] = engine_keys
+            vocab[seat] = {"keys": {k for k in engine_keys if k not in NOT_REACH},
+                           "source": "engine reach table (via the common gate)", "path": path,
+                           "mixed": []}
+            continue
         if engine_keys is not None and live_site_delegates(path):
             declared[seat] = engine_keys
             vocab[seat] = {"keys": {k for k in engine_keys if k not in NOT_REACH},

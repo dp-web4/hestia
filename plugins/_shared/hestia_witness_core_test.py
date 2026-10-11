@@ -254,14 +254,18 @@ def main() -> int:
               "witness.py" in ((spec.get("targets") or {}).get("observe") or []),
               json.dumps(spec.get("targets")))
 
+    # Since one-gate stage C no seat asks the daemon itself: every seat's shim delegates to the
+    # common gate, and the gate's ONE society ask carries the key computed from the RAW event
+    # (tools/one_gate_decide_contract_test.py proves it reaches begin_action on every seat).
+    gate_src = (HERE / "hestia_single_gate.py").read_text()
+    asks = re.findall(r"mechanism\.query_society_safety,\n(.*?)\)\n", gate_src, flags=re.S)
+    check("E the common gate's daemon ask passes the correlation key",
+          len(asks) == 1 and "correlation_key=inv.key" in asks[0], f"{len(asks)} ask(s)")
     for rel in ("claude-code/hooks/pre_tool_use.py", "codex/hooks/pre_tool_use.py",
-                "kimi/hooks/pre_tool_use.py"):
+                "kimi/hooks/pre_tool_use.py", "gemini/hooks/before_tool.py"):
         src = (REPO / "plugins" / rel).read_text()
-        # A call site opens its argument list on the next line; a comment mentioning
-        # `query_society_safety()` is not a call and must not be scored as one.
-        calls = re.findall(r"query_society_safety\(\n(.*?)\)\n", src, flags=re.S)
-        check(f"E {rel}: every daemon ask passes the correlation key",
-              bool(calls) and all("correlation_key=" in c for c in calls), f"{len(calls)} call(s)")
+        check(f"E {rel}: asks the daemon only through the common gate",
+              "query_society_safety" not in src and "gate.decide(" in src)
     manifest = (HERE / "RUNTIME_MANIFEST.txt").read_text().split()
     check("E the core is in the installed engine set", "hestia_witness_core.py" in manifest)
 

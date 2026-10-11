@@ -1,0 +1,97 @@
+name: upgrade path
+
+# A host on the previous release must deploy this commit cleanly (#1237, #1242, #716).
+#
+# Stage C (#1231) passed every job in ci.yml and then half-deployed every machine: the deploy's
+# preflight refused the members' install because the hook registrations those hosts already had
+# carried no HESTIA_HOME. No job exercised "a box on the previous release runs the timer and lands
+# on this commit". tools/upgrade_path_test.py is that path, driven through the REAL scripts
+# (hestia-deploy.sh as installed by the previous release, the candidate's gate-preflight.py and
+# install-members.sh, register-members.py, the seat seeder) with redirected roots, against an
+# isolated daemon built from this commit.
+#
+# NON-BLOCKING ON PURPOSE, FOR NOW. This is its own workflow, and "upgrade path" is not among the
+# required status checks (cargo test / hook tests / plugin tests), so a red here does not block a
+# merge. It is red on main the day it lands: main's gates refuse `config.unbacked` under the
+# registration lines a previous-release host has, which is exactly #1237. The deployer-owned
+# registration reconciler is the fix; once it is on main and this job is green there, add
+# "upgrade path" to the required checks. NOTE for that day: a required check that a path filter
+# skips never reports, and GitHub then blocks the PR forever. Drop the `paths:` filter (or move
+# the filter into a step that exits 0) in the same change that makes it required.
+#
+# Previous release: on a PR, the base branch tip (every host deploys from main, so "the release
+# a host is on" is main); on a push to main, main~1. The harness's own default (the latest v* tag)
+# is for hand runs: v0.0.4 is ~970 commits behind main and predates the deploy surface.
+
+on:
+  pull_request:
+    paths:
+      - "deploy/**"
+      - "plugins/**"
+      - "core/**"
+      - "tools/hooks_gt*"
+      - "tools/seed_seat_config.py"
+      - "tools/upgrade_path*"
+      - ".github/workflows/upgrade-path.yml"
+  push:
+    branches: [main]
+    paths:
+      - "deploy/**"
+      - "plugins/**"
+      - "core/**"
+      - "tools/hooks_gt*"
+      - "tools/seed_seat_config.py"
+      - "tools/upgrade_path*"
+      - ".github/workflows/upgrade-path.yml"
+
+jobs:
+  upgrade-path:
+    name: upgrade path
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      # Full history and tags: every identity the deploy compares is a `git describe` string,
+      # and the previous release must be checkout-able.
+      - uses: actions/checkout@v4
+        with:
+          path: hestia
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: dp-web4/web4
+          path: web4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hestia/core
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The seat seeder signs the operator challenge with Ed25519 (PyNaCl or cryptography).
+      - name: Python dependency for the seeder
+        run: python -m pip install -q cryptography
+
+      # Built from THIS commit: one deploy cycle swaps the binary first and installs the members'
+      # surface second, and the harness simulates the cycle after the swap.
+      - name: Build the daemon
+        working-directory: hestia/core
+        run: cargo build --locked --bin hestia
+
+      - name: Upgrade a previous-release host to this commit
+        working-directory: hestia
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            previous=(--previous "origin/${{ github.base_ref }}")
+          else
+            previous=(--previous-back 1)
+          fi
+          python3 tools/upgrade_path_test.py \
+            --daemon-bin "$GITHUB_WORKSPACE/hestia/core/target/debug/hestia" \
+            --candidate HEAD "${previous[@]}" --json "$RUNNER_TEMP/upgrade-path.json"
+
+      - name: Report
+        if: always()
+        run: cat "$RUNNER_TEMP/upgrade-path.json" || true

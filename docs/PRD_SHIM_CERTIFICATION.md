@@ -83,7 +83,39 @@ test rather than a promise: `tools/shim_certification_test.py` parses this table
 `PERMITTED_FUNCTIONS`, `BYTE_IDENTICAL_FUNCTIONS` and `ADAPTER_FUNCTIONS`, and fails when
 the names, the kinds, or C4's counts disagree.
 
-Plus one profile, as data. Anything else is a finding.
+Plus two data blocks, `PROFILE` and `HARNESS`. Anything else is a finding.
+
+### 1.1 Amendment 2026-10-04 — one-gate stage C (criteria label `@2026-10-04`)
+
+Stage C wired all four seats to `hestia_single_gate.decide` (`REQUIRED_GATE_API = "decide/2"`)
+and moved every remaining per-seat difference into data. What changed, and what each change
+is checked by:
+
+- **`HARNESS` is data, beside `PROFILE`** (keys pinned by `PERMITTED_HARNESS_KEYS`): the harness
+  name and event, every place the harness registers its hook timeout (`registrations`: reader,
+  layout, path), the timeout unit, the harness default when a registration names none, what the
+  harness does on a timeout, and the margin. `shim_structure_test.py` refuses any other key.
+- **The deadline comes from the real registration.** `main` hands `HARNESS` to
+  `gate.harness_bound(...)`, which reads every registration that names this shim (realpath,
+  else basename), takes the SMALLEST timeout (plus any `HESTIA_HOOK_TIMEOUT_S` the invoker
+  declares), and sets `deadline = shim start + timeout − margin`. SAFETY INVARIANT (dp): the
+  deadline is strictly below the timeout the harness will enforce, so a slow daemon becomes a
+  recorded deny, never a harness kill that fails open. No readable timeout is
+  `gate.harness_timeout_unknown`, denied without a daemon call. Each seat's reader is covered for
+  its real config format (JSON settings, nested TOML, flat TOML) by
+  `tools/one_gate_decide_contract_test.py`.
+- **The rollout is the vault's.** `_load_projection` drops a launcher-supplied
+  `HESTIA_GATE_MODE`; only the seat's projection line `<TOKEN>__HESTIA_GATE_MODE` sets it (C5).
+- **The launch-role verdict moved into `decide`** (`config.miswired`); the loader keeps the
+  projected `HESTIA_ROLE_PERMITTED` aside, unjudged. `HESTIA_ROLE_VERIFIED` (read by nothing) is
+  retired.
+- **`_load_gate` evicts stale siblings** (C1, below): a `hestia_*` module an earlier import left
+  in `sys.modules` from outside the selected authority is removed before the gate loads, so the
+  gate's bare sibling imports bind installed bytes (#747; `tools/loader_binds_installed_engine_test.py`
+  arm 1, every seat).
+- **`attempted` is the mechanism's one summary** (`attempted_summary`): bounded, credential-shaped
+  commands and paths withheld whole with their length stated — the claude-code seat's #185 rule,
+  now every seat's (`tools/attempted_summary_test.py`).
 
 ## 2. Criteria
 
@@ -107,8 +139,11 @@ criterion.
 The shim MUST resolve every governing module through the authority-loader contract:
 installed directory only (no checkout fallback), `sys.path` canonicalized by
 `realpath`+`normcase` so a symlink and its target cannot both hold precedence, the loaded
-module's `__file__` verified to equal the required path, and `BaseException` during module
-initialization converted to `ImportError` so callers reach the fail-closed posture.
+module's `__file__` verified to equal the required path, any `hestia_*` module already in
+`sys.modules` from outside the selected authority evicted before the gate loads (a cached
+module beats `sys.path`, so without this the gate's sibling imports bind a decoy — #747), and
+`BaseException` during module initialization converted to `ImportError` so callers reach the
+fail-closed posture.
 
 > **Fails today: kimi.** It has no `_load_shared_module`. It uses five bare
 > `__import__('hestia_gate_mechanism')` calls guarded by

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -100,17 +101,36 @@ def test_typed_contract_holds_and_can_fail() -> None:
 
 
 # ── B: the live site, not a substring ─────────────────────────────────────────────────
+# Staging seams (unset in the repo and in CI): HESTIA_CONTRACT_SHIMS ({seat: path}),
+# HESTIA_CONTRACT_OVERLAY ({module: path}; "sprintF_test" for arm C's harness).
+_SHIMS = json.loads(os.environ.get("HESTIA_CONTRACT_SHIMS") or "{}")
+_OVERLAY = json.loads(os.environ.get("HESTIA_CONTRACT_OVERLAY") or "{}")
 SEATS = {
     "claude-code": REPO / "plugins" / "claude-code" / "hooks" / "pre_tool_use.py",
     "codex": REPO / "plugins" / "codex" / "hooks" / "pre_tool_use.py",
     "kimi": REPO / "plugins" / "kimi" / "hooks" / "pre_tool_use.py",
     "gemini": REPO / "plugins" / "gemini" / "hooks" / "before_tool.py",
 }
+SEATS = {s: Path(_SHIMS.get(s) or p) for s, p in SEATS.items()}
+COMMON_GATE = Path(_OVERLAY.get("hestia_single_gate")
+                   or REPO / "plugins" / "_shared" / "hestia_single_gate.py")
 
 
 def test_live_site_delegation_proven_per_seat() -> None:
+    # Since one-gate stage C a seat binds no paths: it hands the act to the common gate, whose
+    # one extraction site is the engine call (proven on both files by delegates_to_common_gate).
     for seat, path in SEATS.items():
-        check(probe.live_site_delegates(path), f"[B] {seat}: the live scope-extraction site IS the engine call")
+        check(probe.live_site_delegates(path)
+              or probe.delegates_to_common_gate(path, gate_path=COMMON_GATE),
+              f"[B] {seat}: the live scope-extraction site IS the engine call")
+    # A shim that ALSO binds its own paths is not delegated, whatever it hands the gate.
+    with tempfile.TemporaryDirectory() as raw:
+        p = Path(raw) / "fork_beside_decide.py"
+        p.write_text("def main(gate, event, profile):\n"
+                     "    paths = [event.tool_input.get('file_path')]\n"
+                     "    return gate.decide(event, profile)\n", encoding="utf-8")
+        check(not probe.delegates_to_common_gate(p, gate_path=COMMON_GATE),
+              "[B] a shim that binds its own paths beside gate.decide reads NOT delegated")
     # GPT's counterexample: a dead engine call somewhere, and a local 3-key extractor on the
     # live path. The old substring check blessed this; the site rule must not.
     fake = '''
@@ -176,7 +196,7 @@ def main():
 # ── C: behaviour through the seats, stub daemon ───────────────────────────────────────
 def test_behaviour_across_seats() -> None:
     spec = importlib.util.spec_from_file_location(
-        "sprintF", REPO / "plugins" / "_shared" / "sprintF_test.py")
+        "sprintF", _OVERLAY.get("sprintF_test") or REPO / "plugins" / "_shared" / "sprintF_test.py")
     sf = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(sf)
     tmp, ws = sf.make_workspace()

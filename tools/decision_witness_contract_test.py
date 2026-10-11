@@ -21,7 +21,6 @@ CI's isolated-daemon job sets it. An endpoint on :7711 (the live daemon's port) 
 Run: python3 tools/decision_witness_contract_test.py
 """
 import http.server
-import inspect
 import json
 import os
 import pathlib
@@ -234,29 +233,11 @@ def test_a_failed_append_is_not_committed():
     try:
         r = record(stub.url, "warn")
         check("append-failed-not-committed", not r.committed and r.status == "refused", r)
-        # The deployed recorder, same reply: it says True. That is the bug this contract closes,
-        # pinned so the difference stays visible while both exist.
-        legacy = Stub(_ruled("hestia.internal_error"))
-        saved = m._discover_endpoint
-        m._discover_endpoint = lambda: legacy.url
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                # witness_decision_unified's fallback guesses ~/.hestia when HESTIA_HOME is unset;
-                # point its log at a temp home so this measurement writes nothing real.
-                prev = m._deny_fallback_path
-                m._deny_fallback_path = lambda pid: pathlib.Path(tmp) / f"gate-denies-{pid}.jsonl"
-                try:
-                    said = m.witness_decision_unified(
-                        None, plugin_id="codex", decision="warn", rule="r", tool_name="Write",
-                        target="/tmp/x", session_id=None, verdict_available=True,
-                        attempted_summary="Write -> /tmp/x")
-                finally:
-                    m._deny_fallback_path = prev
-            check("legacy-recorder-still-reads-a-refusal-as-delivered", said is True,
-                  "if this flips, the deployed recorder changed: stage A must not touch it")
-        finally:
-            m._discover_endpoint = saved
-            legacy.close()
+        # Until one-gate stage C the deployed `witness_decision_unified` read this same reply as
+        # delivered, and this arm pinned that difference. Stage C retired it: the recorder that
+        # said True on a refusal must not come back beside the one that cannot.
+        check("legacy-recorder-retired", not hasattr(m, "witness_decision_unified"),
+              "the recorder that reads a refused append as delivered is back")
     finally:
         stub.close()
 
@@ -486,9 +467,12 @@ def test_the_correlation_key_is_the_cores_rule_from_the_raw_event():
         stub.close()
 
 
-# ---- stage A changes no seat ---------------------------------------------------------------
+# ---- one recorder, one caller (one-gate stage C) ---------------------------------------------
 
-def test_stage_a_is_unwired():
+def test_only_the_common_gate_records():
+    """Since stage C every seat reaches `record_decision` through the common gate's `decide`,
+    never directly: a shim that recorded on its own would be a second witness path, the
+    per-seat drift the cutover removed. (Stage A pinned the opposite: nothing wired yet.)"""
     callers = []
     for root in ("plugins", "integrations", "hooks-gt"):
         for p in (REPO / root).rglob("*.py"):
@@ -496,11 +480,11 @@ def test_stage_a_is_unwired():
                 continue
             if "record_decision(" in p.read_text(encoding="utf-8", errors="replace"):
                 callers.append(str(p.relative_to(REPO)))
-    check("no-seat-calls-record_decision-yet", callers == [], callers)
-    params = list(inspect.signature(m.witness_decision_unified).parameters)
-    check("deployed-recorder-signature-unchanged", params == [
-        "client_or_none", "plugin_id", "decision", "rule", "tool_name", "target",
-        "session_id", "verdict_available", "attempted_summary"], params)
+    check("no-seat-calls-record_decision-directly", callers == [], callers)
+    gate = (SHARED / "hestia_single_gate.py").read_text(encoding="utf-8")
+    check("the-common-gate-is-the-caller", "record_decision(" in gate,
+          "decide() no longer records its verdicts")
+    check("no-legacy-recorder", not hasattr(m, "witness_decision_unified"))
 
 
 # ---- the real daemon (isolated only) ---------------------------------------------------------
@@ -715,7 +699,7 @@ TESTS = [
     test_a_non_verdict_is_refused_without_a_wire_call,
     test_the_fallback_needs_an_explicit_home_and_is_never_evidence,
     test_the_correlation_key_is_the_cores_rule_from_the_raw_event,
-    test_stage_a_is_unwired,
+    test_only_the_common_gate_records,
     test_against_an_isolated_real_daemon,
     test_real_daemon_warm_latency_within_hook_budget,
 ]

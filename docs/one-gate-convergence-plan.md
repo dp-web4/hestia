@@ -247,6 +247,31 @@ Alternative on record: GPT's proposal folds B and C into one reviewed train. Thi
 them separate so B's contract suite is green and reviewed before any seat depends on it.
 dp/GPT can merge the two PRs back to back if they prefer the single train.
 
+### Stage C as built (2026-10-04): where it departs from the design above
+
+- **The bound is read, not declared.** Each shim's `HARNESS` block names every place its harness
+  registers the hook timeout; `harness_bound()` reads them all and takes the smallest (realpath
+  match, else basename), joined by any `HESTIA_HOOK_TIMEOUT_S` an invoker declares. An unreadable
+  bound is `gate.harness_timeout_unknown`, denied without a daemon call. Margin 1.5 s per seat.
+- **Rollout is vault-only** (decision for dp). A launcher's `HESTIA_GATE_MODE` is dropped; only
+  the projection's `<TOKEN>__HESTIA_GATE_MODE` sets it. Reversal: delete
+  `os.environ.pop("HESTIA_GATE_MODE", None)` in each shim's `_load_projection`.
+- **Escalation bar priced over every marker the act matches** (core `bar_for_markers`, recorded as
+  `matched_markers`): a mechanism write through `plugins/_shared` prices sovereign. Stage A
+  evidence: escalation 9c433571 recorded `plugins/_shared` (single approver) for a mechanism write.
+- **Aligned upward, not averaged:** claude-code's #185 credential masking of `attempted` and
+  #747 `sys.modules` eviction are now every seat's (mechanism `attempted_summary`; template
+  `_load_gate`).
+- **Live divergences from the pre-C seats, all declared in the contract suite:** codex's shell
+  read is judged by the shared law (C8 row); claude-code's claim no longer separates
+  `unreachable` from `unknown` (the mechanism says `unknown` for both); codex/kimi/gemini
+  escalation reasons change format (`Tool: cmd` / `Tool -> path`, 220 chars), so a request key
+  minted before deploy is not matched after it (one extra escalation per act in flight).
+- **Open, filed:** #1229 — the masked reason is the request key's preimage (same class as
+  #627's act digest).
+- **Collapse meter** after C: claude-code 4.6 %, codex 4.6 %, gemini 5.3 %, kimi 4.6 % (CI pins
+  were 29.9 / 20.6 / 10.3 / 16.8); pins moved down to the measured values.
+
 ## 5. Stage D: acceptance census (after deploy)
 
 Deploy the exact merged build, then:

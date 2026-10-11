@@ -7,10 +7,13 @@ refusals — the false ones reported in #983 and #639 among them — never reach
 Measured on Legion 2026-09-14 (20 refusals, 0 decision rows) and on CBP 2026-09-17.
 
 Every arm runs the REAL hook as a subprocess against a fixture HESTIA_HOME whose endpoint is
-unreachable, so `witness_decision_unified` cannot deliver and writes its documented fallback
-row to `$HESTIA_HOME/telemetry/gate-denies-claude-code.jsonl`. That row is the observable: it
-is written by the same call that, with a daemon up, records to the chain. No live daemon is
-touched.
+unreachable, so the recorder cannot deliver and writes its documented fallback row. Since
+one-gate stage C the hook is the certified shim, the recorder is the common gate's ONE
+`record_decision`, and the row lands in `$HESTIA_HOME/telemetry/gate-decisions-claude-code.jsonl`
+(the Sprint E `witness_decision_unified` and its gate-denies log are retired). That row is the
+observable: it is written by the same call that, with a daemon up, records to the chain. No
+live daemon is touched. Arm 2's degraded refusal is `gate.degraded` (every act without a
+snapshot, dp 2026-10-01).
 
   1. INNATE, DEGRADED — no snapshot, a command naming a forbidden token: refused
      `[egress.secret]`, and recorded as a real verdict (`verdict_available: true`).
@@ -82,7 +85,8 @@ def run(home: Path, event: dict) -> subprocess.CompletedProcess:
 
 
 def rows(home: Path) -> list[dict]:
-    path = home / "telemetry" / "gate-denies-claude-code.jsonl"
+    # Since one-gate stage C: record_decision's uncommitted fallback (explicit HESTIA_HOME only).
+    path = home / "telemetry" / "gate-decisions-claude-code.jsonl"
     if not path.exists():
         return []
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]

@@ -153,14 +153,12 @@ def main():
     # ── (b) every refusal names a tool that exists ─────────────────────────────────────
     for shim, src in shim_srcs.items():
         rules = _rules_used(src)
-        # Sprint F cutover: a shim no longer AUTHORS rule ids — the decision (and its rule)
-        # comes from core.evaluate()/degraded_verdict, rendered via deny(verdict.rule).
-        # Pre-F shims must still carry >=3 literal rule ids; post-F shims must instead show
-        # the cutover shape. Any literal that remains must still be registered (below).
-        if "_core.evaluate(" in src and "degraded_verdict" in src:
-            check(f"{shim}_decides_via_core_evaluate", True)
-        else:
-            check(f"{shim}_uses_rule_ids", len(rules) >= 3, f"found {sorted(rules)}")
+        # One-gate stage C: a shim neither AUTHORS nor RENDERS a rule id any more — the whole
+        # decision, its rule and its remedy come from the common gate (`gate.decide`), and the
+        # words from its one renderer (`gate.render`). So the shim must delegate and author no
+        # deny of its own; any literal rule id that remained would still have to be registered.
+        check(f"{shim}_delegates_to_the_common_gate", "gate.decide(" in src and "gate.render(" in src)
+        check(f"{shim}_authors_no_refusal", not rules and "_deny(" not in src, f"found {sorted(rules)}")
         unregistered = sorted(rules - set(core.REMEDIES))
         check(f"{shim}_rules_all_registered", not unregistered, str(unregistered))
         named = set()
@@ -186,9 +184,10 @@ def main():
         for fn in ("load_in_scope", "launch_cwd_repo", "_identity_role"):
             check(f"{shim}_{fn}_gone",
                   f"def {fn}" not in src and not re.search(rf"\b{re.escape(fn)}\s*\(", src))
-        check(f"{shim}_carries_sprint_f_markers",
-              src.count("# SPRINT-F: replace with certified snapshot") >= 3,
-              "each TEMPORARY bridge must carry the marker")
+        # The SPRINT-F bridges these markers labelled (scope computed shim-side) left the shims
+        # with the stage C cutover: no shim computes scope, so none carries a bridge to mark.
+        check(f"{shim}_carries_no_scope_bridge",
+              "# SPRINT-F: replace with certified snapshot" not in src and "evaluate(" not in src)
     check("core_identity_role_gone",
           "def identity_role" not in core_src
           and not re.search(r"(?<!_)\bidentity_role\s*\(", core_src))

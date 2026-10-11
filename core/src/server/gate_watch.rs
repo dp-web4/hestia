@@ -374,6 +374,11 @@ pub fn check(s: &mut super::state::ServerState) -> Value {
         }
     }
     let doc = status_document(&seen, &s.gate_findings_open, now, failures);
+    // DURABLE READS: the status file names finding chain hashes; it may not precede them.
+    if let Err(e) = s.chain_store.durability().flush_committed_blocking() {
+        tracing::warn!(error = %e, "gate integrity status NOT written: chain not durable");
+        return doc;
+    }
     if let Err(e) = write_status(&s.home, &doc) {
         tracing::warn!(error = %e, "gate integrity status file could not be written");
     }

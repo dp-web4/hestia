@@ -7,7 +7,7 @@
   "files": [
     {
       "path": "hooks/hooks.json",
-      "sha256": "a40fc68686096fc0088094b0270d634f43d9714d269575c2de7e9fe09b5c8029",
+      "sha256": "d647f2fbfd8f3843f81142fa01625b496d2149b5ee1f42cffee7e2b605d0d4a1",
       "source": "plugins/kimi/hooks/hooks.json"
     },
     {
@@ -22,7 +22,7 @@
     },
     {
       "path": "hooks/pre_tool_use.py",
-      "sha256": "47b47c0b34c3cbc5a0b4fd9b1111894d614c8b9daadad3d56e68a0141233d7d6",
+      "sha256": "eb8969c817fb4fb6d60db00a2ecc26e38bd8debfd02bf54be29e05636f3268b1",
       "source": "plugins/kimi/hooks/pre_tool_use.py"
     },
     {
@@ -33,23 +33,27 @@
   ],
   "engine": {
     "unit": "_shared",
-    "gt_version": "708e6d14e922130dbc44e84d28371fab01ca84a216430fb2d8e4e423bd2294a6",
+    "gt_version": "a95cbcb1292180956634798c6705cf2664dc1d0d3907b5afa2a31e1d8801e2eb",
     "files": [
       {
         "path": "hestia_gate_core.py",
-        "sha256": "dd48f4c4ff9eb5a0271968dd5c22802dc69214406af53bd56c8c77c92942306b"
+        "sha256": "cd797980c479cb858359757273c575f6ba2e9ad0268a99773d10a3c9deea9855"
       },
       {
         "path": "hestia_gate_mechanism.py",
-        "sha256": "0ce99a681728bdff97c6d2eaf093ced839f4edd255692bf00319d331f24ded08"
+        "sha256": "5a7863127db450c14759261d5fb2c4a1eb445bc2cb19910ae267d2698f0b83a5"
       },
       {
         "path": "hestia_governance_closure.py",
-        "sha256": "2f759e13985a8e14cf2c41b2402c902eb57e4fa6e69d2cb36fb933209d51134b"
+        "sha256": "c2b29069707506d97ad5af7727df7cf68b2fa92df46562174d2e2d6c5fe64f6f"
       },
       {
         "path": "hestia_shell_classifier.py",
         "sha256": "b3f508899069c0b894c792838d9d43925121ec4605cc7e30df22c7d7b425bce2"
+      },
+      {
+        "path": "hestia_single_gate.py",
+        "sha256": "d369028728faf2aebd24f8c979d29da4a29f876a39aa63619490a1dc1f8ed9f5"
       },
       {
         "path": "hestia_witness_core.py",
@@ -58,5 +62,5 @@
     ]
   },
   "requires": [],
-  "gt_version": "3923ba07b2e513ebf17cd3d1866a5438381185932d2c3db13deb637cd60a0e13"
+  "gt_version": "a5806ae27a3d9b0123e29b13b6f8e10053f3017115d56b7d61a403a21bbf8338"
 }

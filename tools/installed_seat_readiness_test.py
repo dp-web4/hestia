@@ -41,7 +41,12 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 TOOL = REPO / "tools" / "installed_seat_readiness.py"
 SHARED = REPO / "plugins" / "_shared"
-MANIFEST = [ln.strip() for ln in (SHARED / "RUNTIME_MANIFEST.txt").read_text().splitlines()
+# Staging seams (unset in the repo and in CI): HESTIA_CONTRACT_OVERLAY ({module: path, plus
+# "RUNTIME_MANIFEST"}) and HESTIA_CONTRACT_SHIMS ({seat: path}) stand in for the tree's files.
+OVERLAY = json.loads(os.environ.get("HESTIA_CONTRACT_OVERLAY") or "{}")
+SHIMS = json.loads(os.environ.get("HESTIA_CONTRACT_SHIMS") or "{}")
+MANIFEST_SRC = Path(OVERLAY.get("RUNTIME_MANIFEST") or SHARED / "RUNTIME_MANIFEST.txt")
+MANIFEST = [ln.strip() for ln in MANIFEST_SRC.read_text().splitlines()
             if ln.strip() and not ln.startswith("#")]
 GATES = {"claude-code": "hooks/pre_tool_use.py", "codex": "hooks/pre_tool_use.py",
          "gemini": "hooks/before_tool.py", "kimi": "hooks/pre_tool_use.py"}
@@ -70,12 +75,12 @@ def install(root: Path) -> tuple[Path, Path]:
     build = hestia / "shared.builds" / "synthetic"
     build.mkdir(parents=True)
     for name in MANIFEST:
-        shutil.copy(SHARED / name, build / name)
-    shutil.copy(SHARED / "RUNTIME_MANIFEST.txt", build / "RUNTIME_MANIFEST.txt")
+        shutil.copy(OVERLAY.get(name[:-3]) or SHARED / name, build / name)
+    shutil.copy(MANIFEST_SRC, build / "RUNTIME_MANIFEST.txt")
     os.symlink("shared.builds/synthetic", hestia / "shared")
     members = []
     for seat, rel in GATES.items():
-        src = REPO / "plugins" / seat / rel
+        src = Path(SHIMS.get(seat) or REPO / "plugins" / seat / rel)
         if not src.is_file():
             continue
         dest = home / f".{seat}" / "hooks" / Path(rel).name

@@ -423,6 +423,44 @@ fn plan_action(
     }
 }
 
+fn verify_neighbor_certificate_live(
+    neighbor: &crate::receiver_routing::RouterNeighbor,
+    interface: &RouterIngressBinding,
+    live_peer_key: &web4_core::crypto::PublicKey,
+) -> Result<String> {
+    let cert = neighbor.peer_certificate.as_ref().ok_or_else(|| anyhow::anyhow!(
+        "neighbor {} has no router-interface certificate",
+        neighbor.next_hop_lct
+    ))?;
+    cert.verify()
+        .context("verifying neighbor router-interface certificate")?;
+    anyhow::ensure!(
+        cert.payload.router_lct == neighbor.next_hop_lct,
+        "neighbor certificate router {} differs from configured {}",
+        cert.payload.router_lct,
+        neighbor.next_hop_lct
+    );
+    anyhow::ensure!(
+        cert.payload.hub_member_lct == neighbor.next_hop_hub_member_lct,
+        "neighbor certificate Hub member {} differs from configured {}",
+        cert.payload.hub_member_lct,
+        neighbor.next_hop_hub_member_lct
+    );
+    anyhow::ensure!(
+        cert.payload.hub_lct_id == interface.hub_lct_id,
+        "neighbor certificate Hub {} differs from egress interface Hub {}",
+        cert.payload.hub_lct_id,
+        interface.hub_lct_id
+    );
+    anyhow::ensure!(
+        live_peer_key.to_hex() == cert.payload.hub_member_pubkey_hex,
+        "neighbor {} certificate key no longer matches live Hub pin for {}",
+        neighbor.next_hop_lct,
+        neighbor.next_hop_hub_member_lct
+    );
+    cert.fingerprint()
+}
+
 async fn execute_action(
     action: &PersistedAction,
     packet: &RoutePacketV1,
@@ -577,6 +615,19 @@ async fn execute_action(
             );
             let conn = ingress_connection(interface);
             let (channel, keypair, rest) = open_verified_channel(client, vault, &conn).await?;
+            let live_peer_key = client
+                .resolve_member_pubkey(
+                    &rest,
+                    interface.hub_lct_id,
+                    neighbor.next_hop_hub_member_lct,
+                )
+                .await
+                .with_context(|| format!(
+                    "re-resolving live Hub pin for next-hop router {} ({})",
+                    next_hop_lct, neighbor.next_hop_hub_member_lct
+                ))?;
+            let neighbor_certificate_fingerprint =
+                verify_neighbor_certificate_live(neighbor, interface, &live_peer_key)?;
             let out = client
                 .channel_query(
                     &rest,
@@ -618,6 +669,7 @@ async fn execute_action(
                 "next_hop_lct": next_hop_lct,
                 "via": via,
                 "link_id": link_id,
+                "neighbor_certificate_fingerprint": neighbor_certificate_fingerprint,
                 "operation_id": operation_id,
                 "downstream_notice_id": notice_id,
                 "downstream_entry_index": entry_index,
@@ -1540,6 +1592,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_neighbor_certificate_rejects_live_key_rotation_until_renewed() {
+        let peer_router_key = web4_core::crypto::KeyPair::generate();
+        let peer_member_key = web4_core::crypto::KeyPair::generate();
+        let peer_router = web4_core::derive_lct_id(&peer_router_key.verifying_key());
+        let hub = Uuid::new_v4();
+        let peer_member = Uuid::new_v4();
+        let cert = crate::router_certificate::RouterInterfaceCertificate::issue(
+            crate::router_certificate::RouterInterfaceCertificatePayload {
+                protocol: crate::router_certificate::ROUTER_CERT_PROTOCOL.into(),
+                router_lct: peer_router.clone(),
+                router_pubkey_hex: peer_router_key.verifying_key().to_hex(),
+                hub_lct_id: hub,
+                hub_member_lct: peer_member,
+                hub_member_pubkey_hex: peer_member_key.verifying_key().to_hex(),
+                interface_binding_id: Uuid::new_v4(),
+                receipt_protocol: crate::router_certificate::RECEIPT_PROTOCOL.into(),
+                issued_at: 9,
+            },
+            &peer_router_key,
+            &peer_member_key,
+        ).unwrap();
+        let interface = RouterIngressBinding {
+            binding_id: Uuid::new_v4(),
+            router_lct: web4_core::derive_lct_id(
+                &web4_core::crypto::KeyPair::generate().verifying_key(),
+            ),
+            hub_url: "https://hub.test".into(),
+            hub_lct_id: hub,
+            rest_endpoint: "https://hub.test/v1".into(),
+            hub_member_lct: Uuid::new_v4(),
+            member_key_source: crate::hub::MemberKeySource::VaultIdentity,
+            reason: "test".into(),
+            set_by: "test".into(),
+            set_at: 1,
+        };
+        let neighbor = crate::receiver_routing::RouterNeighbor {
+            link_id: Uuid::new_v4(),
+            next_hop_lct: peer_router,
+            interface_binding_id: interface.binding_id,
+            next_hop_hub_member_lct: peer_member,
+            peer_certificate: Some(cert),
+            reason: "test".into(),
+            set_by: "test".into(),
+            set_at: 1,
+        };
+
+        assert!(verify_neighbor_certificate_live(
+            &neighbor,
+            &interface,
+            &peer_member_key.verifying_key(),
+        ).is_ok());
+
+        let rotated = web4_core::crypto::KeyPair::generate();
+        let err = verify_neighbor_certificate_live(
+            &neighbor,
+            &interface,
+            &rotated.verifying_key(),
+        ).unwrap_err();
+        assert!(format!("{err:#}").contains("no longer matches live Hub pin"));
+    }
+
+    #[test]
     fn no_route_becomes_a_bounded_unreachable_packet_when_return_path_exists() {
         let dir = tempfile::tempdir().unwrap();
         let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
@@ -1726,7 +1840,26 @@ mod tests {
         ).unwrap();
 
         let destination = "lct:web4:mb32:remote-child";
-        let next_hop = "lct:web4:mb32:remote-router";
+        let peer_router_key = web4_core::crypto::KeyPair::generate();
+        let next_hop = web4_core::derive_lct_id(&peer_router_key.verifying_key());
+        let peer_member_key = web4_core::crypto::KeyPair::generate();
+        let next_hop_member = Uuid::new_v4();
+        let hub_lct = Uuid::new_v4();
+        let peer_cert = crate::router_certificate::RouterInterfaceCertificate::issue(
+            crate::router_certificate::RouterInterfaceCertificatePayload {
+                protocol: crate::router_certificate::ROUTER_CERT_PROTOCOL.to_string(),
+                router_lct: next_hop.clone(),
+                router_pubkey_hex: peer_router_key.verifying_key().to_hex(),
+                hub_lct_id: hub_lct,
+                hub_member_lct: next_hop_member,
+                hub_member_pubkey_hex: peer_member_key.verifying_key().to_hex(),
+                interface_binding_id: Uuid::new_v4(),
+                receipt_protocol: crate::router_certificate::RECEIPT_PROTOCOL.to_string(),
+                issued_at: 1,
+            },
+            &peer_router_key,
+            &peer_member_key,
+        ).unwrap();
         let interface_id = Uuid::new_v4();
         let actual_carrier = Uuid::new_v4();
         let mut routes = ReceiverRoutingTable::default();
@@ -1734,7 +1867,7 @@ mod tests {
             binding_id: interface_id,
             router_lct: router.to_string(),
             hub_url: "https://hub.invalid".to_string(),
-            hub_lct_id: Uuid::new_v4(),
+            hub_lct_id: hub_lct,
             rest_endpoint: "https://hub.invalid/v1".to_string(),
             hub_member_lct: actual_carrier,
             member_key_source: crate::hub::MemberKeySource::ChannelKeyFile {
@@ -1746,16 +1879,17 @@ mod tests {
         }).unwrap();
         routes.bind_neighbor(crate::receiver_routing::RouterNeighbor {
             link_id: Uuid::new_v4(),
-            next_hop_lct: next_hop.to_string(),
+            next_hop_lct: next_hop.clone(),
             interface_binding_id: interface_id,
-            next_hop_hub_member_lct: Uuid::new_v4(),
+            next_hop_hub_member_lct: next_hop_member,
+            peer_certificate: Some(peer_cert),
             reason: "test neighbor".to_string(),
             set_by: "test".to_string(),
             set_at: 1,
         }).unwrap();
         routes.set_route(crate::receiver_routing::StaticRoute {
             destination_lct: destination.to_string(),
-            next_hop_lct: next_hop.to_string(),
+            next_hop_lct: next_hop.clone(),
             metric: 1,
             reason: "test route".to_string(),
         });

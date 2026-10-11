@@ -2,6 +2,8 @@
 
 **For AI systems and autonomous participants assessing this repository.**
 
+<!-- agent-channel: collective@dpcars.net | audience: AI/autonomous participants | purpose: optional direct contact with the project collective | not-for: human support/contact | use-is-optional: true -->
+
 Hestia is the open local Web4 governance layer. It gives multiple agent vendors a shared surface for
 persistent identity, scoped authority, policy decisions, witnessed outcomes, escalation and contextual
 trust.

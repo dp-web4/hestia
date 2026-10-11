@@ -41,3 +41,10 @@ plugin-sdk/python/tests/test_history_filter.py
 # job, which builds the daemon from the commit, starts it on a throwaway home at
 # :7799 and sets HESTIA_ENDPOINT / RUN_CONFORMANCE=1 (2026-09-25, #1122).
 plugin-sdk/python/tests/conformance/test_conformance.py
+
+# The upgrade-path harness (#1237, #1242), not a hermetic test. It needs a hestia daemon binary
+# built from the candidate (--daemon-bin) and the full git history with release tags, neither of
+# which the plugin-tests checkout has. It runs in its own workflow, .github/workflows/
+# upgrade-path.yml, which builds the daemon and checks out with fetch-depth 0. Its plumbing is
+# pinned hermetically by tools/upgrade_path_plumbing_test.py, which plugin-tests does run.
+tools/upgrade_path_test.py

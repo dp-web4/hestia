@@ -548,10 +548,17 @@ jobs:
           # lexical way. Worth saying plainly: this number barely moved (30.0 in-shim -> 29.9),
           # because the meter measures vocabulary in the seat, not where decisions live. What
           # moved is in SHIM_LEDGER: the predicate, exemption and refusal words are the core's.
+          # One-gate stage C (2026-10-04): every seat is the certified template plus data plus
+          # three adapters, and every law-bearing step is the common gate's `decide`. Measured on
+          # the cutover bytes: claude-code 4.6, codex 4.6, gemini 5.3, kimi 4.6 (from 29.9 / 20.6
+          # / 10.3 / 16.8). What remains per seat is the byte-identical bootstrap (projection
+          # loader, authority loader with #747 sys.modules eviction, emergency block, main) and the
+          # adapters, which the meter counts lexically; gemini's extra 0.7 is its lineage
+          # translation and two-channel emit. Pinned at the measured values: the ratchet only falls.
           python3 tools/gate_collapse_meter.py \
             --max-divergent-forked 0 --max-verbatim-forked 0 \
-            --max-seat-pct claude-code=29.9 --max-seat-pct codex=20.6 \
-            --max-seat-pct gemini=10.3 --max-seat-pct kimi=16.8
+            --max-seat-pct claude-code=4.6 --max-seat-pct codex=4.6 \
+            --max-seat-pct gemini=5.3 --max-seat-pct kimi=4.6
 
       - name: Do the forked predicates actually disagree with the engine?
         run: |
