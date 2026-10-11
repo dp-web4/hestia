@@ -104,11 +104,9 @@ LIVE_DEFAULT_PORT = 7711
 #: Probes KNOWN to fail, with the open item that tracks each. A ratchet, not an excuse: when the
 #: probe starts passing the entry is stale and the census fails until it is removed.
 KNOWN_OPEN: dict[tuple[str, str], str] = {
-    # Measured by #1244's harness and by this census on CBP: the stage-C gemini gate allows a write
-    # to its own installed before_tool.py (the closure floor names neither that file nor
-    # ~/.gemini/settings.json). #1247 derives each member's governance surface from its install
-    # declaration.
-    ("gemini", "self_write"): "#1247 (closure does not cover gemini's install surface)",
+    # Emptied 2026-10-11: #1247 (merged 7e901d3c) closed gemini's self-write hole, and this census
+    # on CBP then reported the entry stale. Add a (member, probe) row here, with its issue, only
+    # for a hole that is open and tracked elsewhere.
 }
 
 #: Where each harness keeps its own session history: the USE evidence (plugin directory -> globs
