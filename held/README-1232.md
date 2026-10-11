@@ -6,10 +6,12 @@ touches are the governance surface, so they land only through the gate's escalat
 
 | file | sha256 |
 |---|---|
-| `c36101e4fbe0e459c9de2584db08c4c7b841d29b6482b8b1293fe23855c868e3.patch` | `c36101e4fbe0e459c9de2584db08c4c7b841d29b6482b8b1293fe23855c868e3` (the proposal) |
+| `f4644ef4f71a48cda62a546d5552f5e34063c43109e73aa71e3934d7ada699a0.patch` | `f4644ef4f71a48cda62a546d5552f5e34063c43109e73aa71e3934d7ada699a0` (the proposal; main `7e901d3c`, merge `3efae5d2`) |
+| `lineage/c36101e4fbe0e459c9de2584db08c4c7b841d29b6482b8b1293fe23855c868e3.patch` | `c36101e4fbe0e459c9de2584db08c4c7b841d29b6482b8b1293fe23855c868e3`: the previous proposal (narrowing without the literal rule, on main `d3c731fc`); reference only, superseded |
 | `lineage/01e68a1cd2d3f980021fd73c5d882697b8887b8ddab10380d5ab3b0dca3bae20.patch` | `01e68a1cd2d3f980021fd73c5d882697b8887b8ddab10380d5ab3b0dca3bae20`: the patch Codex reviewed in 17054 and kimi verified on 2026-10-07 (reference only, do not apply; its base is `d3c05006`) |
 | `lineage/1232-01e68a1c-onto-main.diff` | 01e68a1c's sources against the same sources merged onto main (conflict resolutions plus main's drift) |
 | `lineage/1232-narrowing.diff` | **exactly what dp's 2026-10-10 ruling changed** on top of that |
+| `lineage/1232-literal-rule.diff` | **exactly what dp's 2026-10-11 ruling added** (the single-literal-assignment rule), on the sources carried onto `7e901d3c` |
 
 Each patch filename is its own sha256, so `sha256sum held/*.patch held/lineage/*.patch` verifies them.
 
@@ -80,6 +82,34 @@ values cannot contain `/` or be `..`. Substitution bodies are still judged as co
   path look like a traversal out of it, and under a temp-root workspace it admitted the workspace's
   own ungranted repo. This was a 01e68a1c regression; main refused it. The staged contract run found it.
 
+## The single-literal-assignment rule (dp's ruling, 2026-10-11)
+
+Measured first on the narrowed core: 45% of the once-only requests were `S=/tmp/x; cat $S/y`. The rule
+is scoped exactly that tightly. A variable assigned **exactly one literal** earlier in the **same
+command**, and never otherwise bound, resolves to that literal where it is used as a path; it is then
+judged like the literal (so `S=/etc; cat $S/hostname` is a concrete `/etc` refusal).
+
+Everything else stays unenumerated (a scope request), each pinned by a battery row:
+
+- **binding forms:** a `for` or `read` variable; any second assignment, including the conditional
+  `S=a || S=b`; `unset`, `export` (of the name, anywhere), `declare` / `local` / `typeset` / `readonly`,
+  `declare -n` namerefs (target included), arrays (`S[i]=`, `S=(…)`), appends (`S+=`), `printf -v`,
+  `mapfile`, `let`, `getopts`;
+- **placement:** an assignment that is not a top-level statement of its own — inside `( )`, `{ }`, a
+  loop, a branch, a function or a substitution body; entered after `&&`, `||` or `|`; ended by anything
+  but `;`, a newline or `&&` (so not a pipeline stage, not `&`); a prefix assignment (`S=/x cat $S/y`
+  does not bind for that command's own expansions); and any use BEFORE the assignment;
+- **the value:** a substitution (`S=$(…)`), or any `$` (live or quoted), backtick, glob character,
+  brace, or `..` component;
+- **the name:** HOME, PWD, OLDPWD, IFS, PATH and the other shell-owned names, and any name present in
+  the gate's environment;
+- **the command:** anything that runs a string or file as shell (`eval`, `source` / `.`, `sh -c`,
+  `watch`, `su|runuser|script|flock -c`) or defines a function disqualifies every name in it;
+- **expansion operators:** only a bare `$S` / `${S}` resolves; `${S:-x}` and friends stay unenumerated.
+
+The bound value lives on the scan's own state (never module state), and only the outer command's
+statements can bind: substitution bodies are subshells.
+
 ## Battery (written first)
 
 Every Codex false-allow from the review rounds is a row: 16955/a589ed9, 17015, 17029a–f, 17054
@@ -91,9 +121,13 @@ through `command_scope_reach` and through `core.evaluate`.
 |---|---|---|---|---|
 | 01e68a1c as reviewed | 14 | 25 | 121 (incl. 21 plain incomplete) | 57/57 |
 | 01e68a1c merged onto main | 14 | 25 | 121 | 57/57 |
-| **narrowed (this patch)** | **0** | **0** | **99 path / 36 request** | **57/57** |
+| narrowed, without the literal rule (c36101e4) | 0 | 0 | 99 path / 36 request | 57/57 |
+| **narrowed + literal rule (this patch)** | **0** | **0** | **102 path / 36 request** | **62/62** |
 
-The narrowed battery passes 671/671. A `request` row must be refused as the sentinel (a scope request),
+The battery now has 821 checks (79 request rows, 62 allow rows): 821/821 on this patch. Against the
+literal-rule battery, the only verdicts that changed between the pre-rule and rule cores: the former
+request row `D=/tmp/x; cat $D/y` and four new admitted shapes now ALLOW, and `S=; cat $S/etc/hostname`
+moved from a request to a concrete `/etc/hostname` refusal. Every exclusion row stays a request. A `request` row must be refused as the sentinel (a scope request),
 and it must also be liftable by exactly a one-time approval of the act.
 
 ## What it costs (re-measured over the real corpus)
@@ -110,18 +144,21 @@ claude-code 2,726 refused, and 1,607 against 1,609 with grants.
 |---|---|---|---|---|---|
 | 01e68a1c as reviewed | 3,415 (10.3%) | 1,607 (4.9%) | 783 | 0 | 820 |
 | 01e68a1c merged onto main | 3,415 (10.3%) | 1,607 (4.9%) | 783 | 0 | 820 |
-| **narrowed (this patch)** | **7,051 (21.3%)** | **5,660 (17.1%)** | 1,079 | **4,581** | 0 |
+| narrowed, without the literal rule (c36101e4) | 7,051 (21.3%) | 5,660 (17.1%) | 1,079 | 4,581 | 0 |
+| **narrowed + literal rule (this patch)** | **5,539 (16.8%)** | **4,048 (12.2%)** | 1,080 | **2,968** | 0 |
 
-Per seat, narrowed with the proposed grants: claude-code 21.1% (was 5.8%), codex 1.1% (was 0.8%),
-kimi-code 8.6% (was 2.9%).
+Per seat, this patch with the proposed grants: claude-code 15.1% (21.1% without the rule; 5.8% on
+01e68a1c), codex 1.1% (0.8%), kimi-code 6.1% (8.6%; 2.9%). Path refusals are unchanged by the rule
+(2,773 without grants in both): it only converts once-only requests into judged literals.
 
-**Full window, 2026-09-20 to 2026-10-10.** That is 53,502 commands; the narrowed run saw 53,590,
-the difference being this session's own commands.
+**Full window, 2026-09-20 to now.** 53,502 commands for the 01e68a1c rows (2026-10-10), 53,844 for
+the literal-rule replay (2026-10-11; the corpus grows with every session).
 
 | core | refused, no grants | refused, proposed grants | once-only requests (with grants) |
 |---|---|---|---|
 | 01e68a1c as reviewed / merged onto main | 6,629 (12.4%) | 4,025 (7.5%) | 0 (2,865 plain incomplete) |
-| **narrowed** | **13,316 (24.8%)** | **11,415 (21.3%)** | **9,727** |
+| narrowed, without the literal rule | 13,401 (24.9%) | 11,499 (21.4%) | 9,804 |
+| **narrowed + literal rule (this patch)** | **10,722 (19.9%)** | **8,661 (16.1%)** | **6,965** |
 
 **What the standing grants absorb.**
 
@@ -132,7 +169,7 @@ the difference being this session's own commands.
 - With grants the once-only count rises slightly (4,278 to 4,581): a lifted path refusal unmasks the
   unenumerated part of the same command.
 
-**What the once-only requests are made of.** Full window, with grants, 9,677 requests:
+**What the once-only requests were made of** before the literal rule (full window, with grants, 9,677 requests; the rule removes most of the first row):
 
 | share | cause |
 |---|---|
@@ -148,27 +185,21 @@ the difference being this session's own commands.
 | 0.8% | a home spelling after HOME is reassigned |
 | 2.0% | other (positional parameters, `${…}`, brace expansion, unbalanced quotes) |
 
-**An option for dp to rule on (MEASURED, NOT in this patch).** A literal-assignment rule would say:
-`$N` resolves to its literal only when N is assigned exactly once in the command, as a top-level
-statement entered from `;` / newline / start, ended by `;` / newline / `&&`, and N is never a
-`for` / `read` / `export` / `unset` operand, with no `eval` / `source` / function definition in the
-command. On the same corpus this takes the narrowed rate with grants from 17.1% to **11.8%** on the
-2026-10-05 window, and from 21.3% to **15.6%** on the full window. Once-only requests fall from
-4,581 to 2,831, and from 9,727 to 6,652. The narrowed battery stays green with it, except for the one
-row it is meant to flip (`D=/tmp/x; cat $D/y`). dp's ruling excludes variable modelling, so this is
-reported for a decision and not shipped. The scripts are in `held/measure-1232/`.
+**The literal rule, shipped (dp, 2026-10-11).** The broader experiment measured on 2026-10-10
+(11.8% / 15.6%) is tighter now (environment names, `declare`, appends, arrays, code-running commands
+and value checks all excluded), and lands at 12.2% / 16.1% with grants. Scripts and tables are in
+`held/measure-1232/`.
 
 ## How it was built and checked
 
 - The governed sources were extracted read-only into neutral-named scratch copies and three-way merged
-  there (`git merge-file`, base `23ea9324`). The two conflicts (mechanism: `tally_scope(deadline=)`;
+  there (`git merge-file`, base `23ea9324`; then old main → `7e901d3c`, clean). The two conflicts (mechanism: `tally_scope(deadline=)`;
   orchestrator: main's MCP-transport views) were resolved there, and the narrowing was edited there.
 - The patch was emitted against this branch's HEAD by the recovered `build_patch.py` recipe. The
   hooks-gt half was computed with `tools/hooks_gt.py`'s own functions.
 - `git apply --check` is clean on HEAD. Applied to a throwaway export of HEAD, every staged file
   comes out byte-identical and `tools/hooks_gt.py check` reports ok.
-- Python tests ran with the patched modules supplied through `HESTIA_CONTRACT_OVERLAY` and a
-  process-wide import overlay. The patch's own test files ran from their staged copies. Results: the CI Python set (153 files) plus the battery came out 150 pass / 4 fail in one run, and every failure is accounted for. The staged contract suite failed only on a repo path spelled with `..`. Main's own suite fails under that spelling too, and the narrowed suite passes 21 + shim parity 29×4 with the normalized path. That same spelling exposed the workspace-normalisation defect fixed above. `loader_binds_installed_engine_test` cannot run under a process-wide import overlay, because it poisons the installed core on purpose; under the per-test seam it passes. `last_words_test` (A7) and `shared_target_split_test` (it cannot locate the real cargo behind the shim) fail on main in this environment too. Also run: battery 671/671; `test_gate_core` all checks pass; `gate_holes_test` (gemini) passes on patched and on main modules (HOLE 3's command changed, see the PR); dashboard decide contract and operator-surfaces spec pass.
+- Python tests ran with the patched modules supplied through `HESTIA_CONTRACT_OVERLAY` and a process-wide import overlay; the patch's own test files ran from their staged copies. Results (2026-10-11, literal rule): battery 821/821; contract 21 + shim parity 29×4; real-daemon arm against an isolated daemon built from this branch passes; `test_gate_core` all checks pass. Full CI Python set: 152 pass / 5 fail, all accounted for — `last_words_test` (A7) and `shared_target_split_test` (cannot locate the real cargo behind the shim) fail on main in this environment too; `loader_binds_installed_engine_test` poisons the installed core on purpose and cannot run under a process-wide import overlay (it passes under the per-test seam); `public_boundary_test` and `shebang_exec_bit_test` failed on this branch's earlier measurement scripts (baked local paths, a shebang without the exec bit) and are fixed by replacing them with the path-free `held/measure-1232/` scripts. Rust: `cargo test -j2 --lib` under the watchdog, 1230 passed, 0 failed.
 - The contract suite's real-daemon arm ran against an isolated daemon built from this branch, on
   :7799. The sentinel request opens through the real handler, and a re-issue finds it.
 

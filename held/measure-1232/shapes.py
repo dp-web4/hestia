@@ -1,4 +1,5 @@
-"""What the narrowed core's once-only requests are made of (re-judges only those commands)."""
+"""What a core's once-only requests are made of. usage: shapes.py <core.py> results.jsonl [<core name>]
+(re-judges only the rows whose `<core>+g` verdict was `request`; core name = argv[3], default after)."""
 import collections
 import importlib.util
 import json
@@ -9,20 +10,21 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 SP = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
-import mine  # noqa: E402
+import corpus as mine  # noqa: E402
 
-spec = importlib.util.spec_from_file_location("core_after", os.path.join(SP, "stage1232", "narrow", "gcore.py"))
+spec = importlib.util.spec_from_file_location("core_after", sys.argv[1])
 G = importlib.util.module_from_spec(spec)
 sys.modules["core_after"] = G
 spec.loader.exec_module(G)
-WS = "/home/dp/ai-workspace"
+WS = os.environ["HESTIA_WORKSPACE"]
 MARKER = {"claude-code": "~/.claude", "codex": "~/.codex", "kimi-code": "~/.kimi-code"}
 repos = [d for d in os.listdir(WS) if os.path.isdir(os.path.join(WS, d)) and not d.startswith(".")]
 with open(os.path.join(HERE, "grants-proposed.txt")) as fh:
     grants = [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
 
-results = [json.loads(ln) for ln in open(os.path.join(HERE, "results.jsonl"))]
-want = {(r["seat"], r["ts"]) for r in results if r.get("main+g") == "allow" and r.get("after+g") == "request"}
+results = [json.loads(ln) for ln in open(sys.argv[2])]
+KEY = sys.argv[3] if len(sys.argv) > 3 else "after"
+want = {(r["seat"], r["ts"]) for r in results if r.get("main+g") == "allow" and r.get(KEY + "+g") == "request"}
 
 classes = collections.Counter()
 loopy = collections.Counter()

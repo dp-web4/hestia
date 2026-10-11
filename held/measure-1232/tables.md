@@ -1,8 +1,44 @@
-# #1232 refusal-rate measurement output (2026-10-10)
+# #1232 refusal-rate measurement output
 
-Reference scripts, run from a scratch layout: `replay3.py` judges the corpus (`mine.py`, every seat's shell commands since 2026-09-20) under main's core, the reviewed 01e68a1c core, 01e68a1c merged onto main, and the narrowed core; `replay_exp.py` adds the literal-assignment experiment (`make_exp.py`). Core paths are the staging copies named in each script. `results*.jsonl` (seat, timestamp, verdict class per core; no command text) are not committed.
+Scripts: `corpus.py` (the corpus reader), `replay.py` (judge every command under each core in `MEASURE_CORES`, with and without `grants-proposed.txt`), `aggregate.py`, `shapes.py`. Rows (`results.jsonl`: seat, timestamp, verdict class per core; no command text) are not committed.
 
-## replay3.py → aggregate.py
+## 2026-10-11: main 7e901d3c vs c36101e4 (v1) vs the literal rule (lit) — replay of 53,844 commands
+
+### Window of the 2026-10-05 run (2026-09-20 .. 2026-10-05T20:05Z): 33054 commands (claude-code 24536, codex 3359, kimi-code 5159)
+| core | grants | refused (delta over main) | of which: path | once-only request | plain incomplete | claude-code | codex | kimi-code |
+|---|---|---|---|---|---|---|---|---|
+| v1 | none | 7051 (21.3%) | 2773 | 4278 | 0 | 6080 (24.8%) | 76 (2.3%) | 895 (17.3%) |
+| v1 | proposed | 5660 (17.1%) | 1079 | 4581 | 0 | 5182 (21.1%) | 36 (1.1%) | 442 (8.6%) |
+| lit | none | 5539 (16.8%) | 2773 | 2766 | 0 | 4690 (19.1%) | 76 (2.3%) | 773 (15.0%) |
+| lit | proposed | 4048 (12.2%) | 1080 | 2968 | 0 | 3699 (15.1%) | 36 (1.1%) | 313 (6.1%) |
+
+### Full window (2026-09-20 .. now): 53844 commands (claude-code 41355, codex 5780, kimi-code 6709)
+| core | grants | refused (delta over main) | of which: path | once-only request | plain incomplete | claude-code | codex | kimi-code |
+|---|---|---|---|---|---|---|---|---|
+| v1 | none | 13401 (24.9%) | 4137 | 9264 | 0 | 12069 (29.2%) | 133 (2.3%) | 1199 (17.9%) |
+| v1 | proposed | 11499 (21.4%) | 1695 | 9804 | 0 | 10871 (26.3%) | 70 (1.2%) | 558 (8.3%) |
+| lit | none | 10722 (19.9%) | 4137 | 6585 | 0 | 9523 (23.0%) | 133 (2.3%) | 1066 (15.9%) |
+| lit | proposed | 8661 (16.1%) | 1696 | 6965 | 0 | 8173 (19.8%) | 70 (1.2%) | 418 (6.2%) |
+
+main itself refuses 1427 of 53844 (pass 1/2, unchanged by this PR)
+
+## 2026-10-11: reproduced with the committed scripts (53,995 commands)
+
+### Window of the 2026-10-05 run (2026-09-20 .. 2026-10-05T20:05Z): 33054 commands (claude-code 24536, codex 3359, kimi-code 5159)
+| core | grants | refused (delta over main) | of which: path | once-only request | plain incomplete | claude-code | codex | kimi-code |
+|---|---|---|---|---|---|---|---|---|
+| lit | none | 5539 (16.8%) | 2773 | 2766 | 0 | 4690 (19.1%) | 76 (2.3%) | 773 (15.0%) |
+| lit | proposed | 4048 (12.2%) | 1080 | 2968 | 0 | 3699 (15.1%) | 36 (1.1%) | 313 (6.1%) |
+
+### Full window (2026-09-20 .. now): 53995 commands (claude-code 41452, codex 5834, kimi-code 6709)
+| core | grants | refused (delta over main) | of which: path | once-only request | plain incomplete | claude-code | codex | kimi-code |
+|---|---|---|---|---|---|---|---|---|
+| lit | none | 10743 (19.9%) | 4140 | 6603 | 0 | 9543 (23.0%) | 134 (2.3%) | 1066 (15.9%) |
+| lit | proposed | 8682 (16.1%) | 1698 | 6984 | 0 | 8193 (19.8%) | 71 (1.2%) | 418 (6.2%) |
+
+main itself refuses 1429 of 53995 (pass 1/2, unchanged by this PR)
+
+## 2026-10-10: main d3c731fc vs 01e68a1c as reviewed (orig), merged onto main (before), narrowed (after)
 
 ### Window of the 2026-10-05 run (2026-09-20 .. 2026-10-05T20:05Z): 33054 commands (claude-code 24536, codex 3359, kimi-code 5159)
 | core | grants | refused (delta over main) | of which: path | once-only request | plain incomplete | claude-code | codex | kimi-code |
@@ -26,48 +62,28 @@ Reference scripts, run from a scratch layout: `replay3.py` judges the corpus (`m
 
 main itself refuses 1426 of 53502 (pass 1/2, unchanged by this PR)
 
-## replay_exp.py → aggregate_exp.py
-
-### Window of the 2026-10-05 run (2026-09-20 .. 2026-10-05T20:05Z): 33054 commands (claude-code 24536, codex 3359, kimi-code 5159)
-| core | grants | refused (delta over main) | of which: path | once-only request | plain incomplete | claude-code | codex | kimi-code |
-|---|---|---|---|---|---|---|---|---|
-| after | none | 7051 (21.3%) | 2773 | 4278 | 0 | 6080 (24.8%) | 76 (2.3%) | 895 (17.3%) |
-| after | proposed | 5660 (17.1%) | 1079 | 4581 | 0 | 5182 (21.1%) | 36 (1.1%) | 442 (8.6%) |
-| exp | none | 5409 (16.4%) | 2773 | 2636 | 0 | 4556 (18.6%) | 76 (2.3%) | 777 (15.1%) |
-| exp | proposed | 3911 (11.8%) | 1080 | 2831 | 0 | 3558 (14.5%) | 36 (1.1%) | 317 (6.1%) |
-
-### Full window (2026-09-20 .. now): 53590 commands (claude-code 41230, codex 5651, kimi-code 6709)
-| core | grants | refused (delta over main) | of which: path | once-only request | plain incomplete | claude-code | codex | kimi-code |
-|---|---|---|---|---|---|---|---|---|
-| after | none | 13316 (24.8%) | 4126 | 9190 | 0 | 11992 (29.1%) | 125 (2.2%) | 1199 (17.9%) |
-| after | proposed | 11415 (21.3%) | 1688 | 9727 | 0 | 10795 (26.2%) | 62 (1.1%) | 558 (8.3%) |
-| exp | none | 10409 (19.4%) | 4127 | 6282 | 0 | 9212 (22.3%) | 125 (2.2%) | 1072 (16.0%) |
-| exp | proposed | 8342 (15.6%) | 1690 | 6652 | 0 | 7856 (19.1%) | 62 (1.1%) | 424 (6.3%) |
-
-main itself refuses 1426 of 53590 (pass 1/2, unchanged by this PR)
-
-## shapes.py (once-only requests, narrowed core, proposed grants, full window)
+## once-only requests left by the literal rule (proposed grants, full window)
 ```
-once-only requests after the proposed grants: 9677
-    4239   43.8%  variable: assigned a LITERAL in the same command (one assignment)
-    2480   25.6%  variable: assigned an EXPANSION in the same command
-    1242   12.8%  variable: a for-loop variable
-     472    4.9%  command substitution used as a path
-     272    2.8%  an expansion exported in …
-     152    1.6%  an expansion handed to … in …
-     139    1.4%  an expansion used as the program
-     115    1.2%  variable: a `read` variable (stdin)
-     112    1.2%  variable: assigned a LITERAL in the same command (several)
-     110    1.1%  a process substitution used as a path
-      79    0.8%  argv built from stdin (…)
-      77    0.8%  a home spelling after HOME is reassigned
-      71    0.7%  variable: from the environment / unknown
-      50    0.5%  parameter expansion ${…}
-      27    0.3%  positional parameter
-      17    0.2%  brace expansion
-      13    0.1%  an unbalanced double quote
+once-only requests after the proposed grants: 6984
+    2739   39.2%  variable: assigned an EXPANSION in the same command
+    1373   19.7%  variable: a for-loop variable
+    1020   14.6%  variable: assigned a LITERAL in the same command (one assignment)
+     520    7.4%  command substitution used as a path
+     275    3.9%  an expansion exported in …
+     253    3.6%  an expansion handed to … in …
+     195    2.8%  an expansion used as the program
+     128    1.8%  a process substitution used as a path
+      92    1.3%  variable: a `read` variable (stdin)
+      84    1.2%  argv built from stdin (…)
+      78    1.1%  a home spelling after HOME is reassigned
+      76    1.1%  variable: from the environment / unknown
+      57    0.8%  parameter expansion ${…}
+      29    0.4%  positional parameter
+      22    0.3%  variable: assigned a LITERAL in the same command (several)
+      19    0.3%  brace expansion
+      13    0.2%  an unbalanced double quote
        6    0.1%  an unbalanced single quote
-       1    0.0%  a relative path after a directory change to …
+       2    0.0%  a relative path after a directory change to …
        1    0.0%  more than 16 directory changes
        1    0.0%  <incomplete: more distinct paths than the gate judges in one
        1    0.0%  a heredoc form the parser does not model

@@ -1,4 +1,4 @@
-"""Aggregate replay3's results.jsonl into the cost table for #1232's narrowing."""
+"""Cost table from replay.py's rows. usage: aggregate.py results.jsonl <core> [<core> ...]"""
 import collections
 import datetime
 import json
@@ -7,9 +7,9 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OLD_END = datetime.datetime(2026, 10, 5, 20, 5, tzinfo=datetime.timezone.utc).timestamp()
-rows = [json.loads(ln) for ln in open(os.path.join(HERE, "results.jsonl"))]
+rows = [json.loads(ln) for ln in open(sys.argv[1])]
 SEATS = ("claude-code", "codex", "kimi-code")
-CORES = ("orig", "before", "after")
+CORES = tuple(sys.argv[2:])
 
 
 def table(rs, title):
