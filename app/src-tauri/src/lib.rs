@@ -1,5 +1,6 @@
 mod commands;
 mod daemon;
+pub mod handshake;
 pub mod identity;
 pub mod identity_vault;
 pub mod operator;
@@ -7,6 +8,7 @@ pub mod operator;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
@@ -34,7 +36,14 @@ pub struct AppState {
     /// The live operator session. Deliberately shell-side: neither the token
     /// nor the signing key ever crosses the IPC boundary into the webview.
     operator: Mutex<Option<operator::OperatorSession>>,
+    /// The last `/api/version` handshake: (daemon url, when, result). Keyed by URL, so
+    /// pointing the app at another daemon re-probes; see `daemon::ensure_compatible`.
+    handshake: Mutex<Option<(String, Instant, handshake::Handshake)>>,
 }
+
+/// How long a handshake result stands before the next route re-probes. Short, because the
+/// daemon on the other end can be swapped by a deploy while the app stays open.
+pub const HANDSHAKE_TTL: Duration = Duration::from_secs(15);
 
 impl AppState {
     pub fn new() -> Self {
@@ -43,6 +52,7 @@ impl AppState {
             mode: Mutex::new("sovereign".to_string()),
             remotes: Mutex::new(Vec::new()),
             operator: Mutex::new(None),
+            handshake: Mutex::new(None),
         }
     }
 
@@ -107,6 +117,27 @@ impl AppState {
                 migration_available: false,
             },
         }
+    }
+
+    // ---- daemon handshake (web4#904) ----
+
+    /// The cached handshake for `url`, if it is younger than [`HANDSHAKE_TTL`].
+    pub fn cached_handshake(&self, url: &str) -> Option<handshake::Handshake> {
+        let guard = self.handshake.lock().unwrap();
+        guard
+            .as_ref()
+            .filter(|(u, at, _)| u == url && at.elapsed() < HANDSHAKE_TTL)
+            .map(|(_, _, h)| h.clone())
+    }
+
+    /// Remember a handshake. An unreachable result is not cached: the next call re-probes.
+    pub fn store_handshake(&self, url: &str, h: &handshake::Handshake) {
+        let mut guard = self.handshake.lock().unwrap();
+        *guard = if h.state.answered() {
+            Some((url.to_string(), Instant::now(), h.clone()))
+        } else {
+            None
+        };
     }
 
     pub fn remotes(&self) -> Vec<RemoteEntry> {

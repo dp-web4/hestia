@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import type { DashboardSnapshot } from "../lib/types";
+import type { DashboardSnapshot, Handshake } from "../lib/types";
 import { getDashboard, getDaemonStatus } from "../lib/tauri";
 
 export function useDashboard(pollMs = 2000) {
@@ -9,6 +9,9 @@ export function useDashboard(pollMs = 2000) {
   // made v0.1.2 read as simply broken once the operator gate landed.
   const [signedIn, setSignedIn] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // What the daemon at the configured URL is (web4#904). Read on every failure, because a
+  // refusal from the shell may mean "incompatible daemon", which is neither down nor signed out.
+  const [handshake, setHandshake] = useState<Handshake | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -22,14 +25,15 @@ export function useDashboard(pollMs = 2000) {
       setError(msg);
       if (msg.includes("not signed in") || msg.includes("session expired")) {
         setSignedIn(false);
-        // The daemon may be perfectly healthy — ask it directly.
-        try {
-          setOnline((await getDaemonStatus()).online);
-        } catch {
-          setOnline(false);
-        }
-      } else {
+      }
+      // The daemon may be perfectly healthy, or a release this app cannot talk to: ask it.
+      try {
+        const status = await getDaemonStatus();
+        setOnline(status.online);
+        setHandshake(status.handshake ?? null);
+      } catch {
         setOnline(false);
+        setHandshake(null);
       }
     }
   }, []);
@@ -52,10 +56,11 @@ export function useDashboard(pollMs = 2000) {
       const status = await getDaemonStatus();
       setOnline(status.online);
       setSignedIn(status.signed_in ?? false);
+      setHandshake(status.handshake ?? null);
     } catch {
       setOnline(false);
     }
   }, []);
 
-  return { data, online, signedIn, error, refresh, checkStatus };
+  return { data, online, signedIn, error, handshake, refresh, checkStatus };
 }

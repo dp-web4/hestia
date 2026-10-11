@@ -72,6 +72,9 @@ pub async fn operator_sign_in(
     } else {
         None
     };
+    // The sign-in handshake is itself an operator route whose shape can change: learn
+    // whether this daemon speaks our API before sending it a credential.
+    crate::daemon::ensure_compatible(&state).await?;
     let vault = identity_vault::open_or_import(&path, legacy.as_deref(), passphrase.as_str())?;
     let session = operator::authenticate(&state.daemon_url(), Arc::new(vault)).await?;
     state.set_operator(session);

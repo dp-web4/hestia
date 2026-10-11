@@ -83,6 +83,34 @@
       "notes": "Custody differs by design today: the app keeps the key in a passphrase vault in Rust; the dashboard keeps the seed in browser storage. Revisit."
     },
     {
+      "id": "version-handshake",
+      "title": "Daemon version handshake (lockstep version, build id, operator API compat)",
+      "place": "me",
+      "kind": "read",
+      "risk": "low",
+      "routes": [
+        "GET /api/version"
+      ],
+      "rules": [
+        "unknown-not-fine"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "planned",
+          "why": "the dashboard is served by the daemon it talks to, so it cannot be paired with a different release; showing the version in its header is wanted, not needed for compatibility"
+        },
+        "app": {
+          "status": "required"
+        }
+      },
+      "obligations": [
+        "the app reads GET /api/version before any other daemon route and compares api_compat with hestia_wire::OPERATOR_API_COMPAT: a different api_compat is shown as an incompatible-daemon state naming both versions, not as route errors",
+        "a daemon that answers but has no /api/version (404/405) is shown as an incompatible daemon (no version endpoint), never as offline and never as compatible",
+        "an equal api_compat with a different version is compatible and is shown as version skew"
+      ],
+      "notes": "Unauthenticated by design, like the challenge: the app must know whether it speaks the daemon's API before it signs in. web4#904 phase 1."
+    },
+    {
       "id": "snapshot",
       "title": "Live snapshot: members, trust, chain tail, pending decisions",
       "place": "activity",

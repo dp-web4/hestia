@@ -22,7 +22,33 @@
 
 use serde_json::Value;
 
+use crate::handshake::{self, Handshake};
 use crate::AppState;
+
+/// The handshake for the current daemon URL, from cache or a fresh `GET /api/version`.
+pub async fn current_handshake(state: &AppState) -> Handshake {
+    let url = state.daemon_url();
+    if let Some(h) = state.cached_handshake(&url) {
+        return h;
+    }
+    let h = handshake::handshake(&url).await;
+    state.store_handshake(&url, &h);
+    h
+}
+
+/// Refuse before the first operator route if the daemon does not speak this app's API.
+///
+/// Every route goes through here, so an incompatible pairing reads as ONE clear sentence
+/// ("incompatible daemon: ...") on every page, instead of each page's first route failing
+/// in its own way (a 404 on a renamed route, "bad response" on a reshaped body).
+pub async fn ensure_compatible(state: &AppState) -> Result<Handshake, String> {
+    let h = current_handshake(state).await;
+    if h.state.usable() {
+        Ok(h)
+    } else {
+        Err(h.message)
+    }
+}
 
 fn needs_signin() -> String {
     "not signed in — open Settings and unlock your identity vault".to_string()
@@ -105,6 +131,7 @@ pub(crate) async fn request_status(
     path: &str,
     body: Option<Value>,
 ) -> Result<(reqwest::StatusCode, Value), String> {
+    ensure_compatible(state).await?;
     let Some(token) = state.operator_token() else {
         return Err(needs_signin());
     };

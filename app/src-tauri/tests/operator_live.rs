@@ -3,6 +3,12 @@
 //! Ignored by default (needs a daemon + an operator key on this machine):
 //!     cargo test --test operator_live -- --ignored --nocapture
 //!
+//! Which daemon and which key (CI: the `app-daemon contract` job in ci.yml runs these
+//! against an isolated daemon built from the same commit, never the host's :7711):
+//!     HESTIA_APP_LIVE_DAEMON        daemon base URL (default http://127.0.0.1:7711)
+//!     HESTIA_APP_LIVE_OPERATOR_KEY  the genesis operator credential file the daemon minted
+//!                                   (default: the legacy per-user location, if it exists)
+//!
 //! This exercises the SHIPPING code path (`operator::authenticate`), not a
 //! reimplementation of it — the distinction that makes it worth having.
 //!
@@ -15,9 +21,22 @@
 
 use std::sync::Arc;
 
-use hestia_app_lib::{identity_vault, operator};
+use hestia_app_lib::{handshake, identity_vault, operator};
 
-const DAEMON: &str = "http://127.0.0.1:7711";
+fn daemon() -> String {
+    std::env::var("HESTIA_APP_LIVE_DAEMON")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .unwrap_or_else(|| "http://127.0.0.1:7711".to_string())
+}
+
+fn operator_key_path() -> Option<std::path::PathBuf> {
+    match std::env::var_os("HESTIA_APP_LIVE_OPERATOR_KEY") {
+        Some(p) if !p.is_empty() => Some(std::path::PathBuf::from(p)),
+        _ => operator::default_legacy_key_path(),
+    }
+}
 
 fn test_vault_from_legacy(
     source: &std::path::Path,
@@ -38,14 +57,16 @@ fn test_vault_from_legacy(
 #[tokio::test]
 #[ignore]
 async fn authenticate_opens_a_session_and_the_token_reads_the_gated_api() {
-    let path = operator::default_legacy_key_path().expect(
-        "no ~/.hestia/operator.key on this machine — this test was invoked explicitly \
-         (--ignored), so an absent key is a failure to run the check, not a reason to \
-         pass. Mint an operator key, or don't invoke it.",
+    let path = operator_key_path().expect(
+        "no operator key (HESTIA_APP_LIVE_OPERATOR_KEY unset and no ~/.hestia/operator.key) — \
+         this test was invoked explicitly (--ignored), so an absent key is a failure to run \
+         the check, not a reason to pass. Mint an operator key, or don't invoke it.",
     );
+    let daemon = daemon();
+    let daemon = daemon.as_str();
 
     let (_dir, vault) = test_vault_from_legacy(&path);
-    let session = operator::authenticate(DAEMON, vault)
+    let session = operator::authenticate(daemon, vault)
         .await
         .expect("operator handshake should succeed against the live daemon");
     assert!(!session.token.is_empty(), "session carried no token");
@@ -57,7 +78,7 @@ async fn authenticate_opens_a_session_and_the_token_reads_the_gated_api() {
     // The token must actually open the gate: an unauthed GET is 401.
     let client = reqwest::Client::new();
     let unauthed = client
-        .get(format!("{DAEMON}/api/dashboard"))
+        .get(format!("{daemon}/api/dashboard"))
         .send()
         .await
         .expect("daemon unreachable");
@@ -72,7 +93,7 @@ async fn authenticate_opens_a_session_and_the_token_reads_the_gated_api() {
     // and 401 (not 400/422) also proves the gate preflights BEFORE body parsing (RWOA O). An empty body
     // is deliberate: if it were 422, the gate would not be dominating the side effect.
     let cred_unauthed = client
-        .post(format!("{DAEMON}/credential"))
+        .post(format!("{daemon}/credential"))
         .json(&serde_json::json!({}))
         .send()
         .await
@@ -84,7 +105,7 @@ async fn authenticate_opens_a_session_and_the_token_reads_the_gated_api() {
     );
     // ...but /nonce grants nothing and must stay open, or the stopgap over-gated (fail-fragile, §4.1).
     let nonce_open = client
-        .post(format!("{DAEMON}/nonce"))
+        .post(format!("{daemon}/nonce"))
         .send()
         .await
         .expect("daemon unreachable");
@@ -95,7 +116,7 @@ async fn authenticate_opens_a_session_and_the_token_reads_the_gated_api() {
     );
 
     let authed = client
-        .get(format!("{DAEMON}/api/dashboard"))
+        .get(format!("{daemon}/api/dashboard"))
         .bearer_auth(&session.token)
         .send()
         .await
@@ -150,7 +171,7 @@ async fn a_bad_key_is_refused() {
         "operator-live-test-only",
     )
     .unwrap();
-    let result = operator::authenticate(DAEMON, Arc::new(vault)).await;
+    let result = operator::authenticate(&daemon(), Arc::new(vault)).await;
     let why = result.expect_err("an unauthorized key must NOT open an operator session");
 
     // `is_err()` alone is green when the daemon is simply down — the refusal we
@@ -159,5 +180,42 @@ async fn a_bad_key_is_refused() {
     assert!(
         !why.contains("request failed"),
         "daemon unreachable, so nothing was actually refused: {why}"
+    );
+}
+
+/// The handshake (web4#904) against a daemon built from the same commit: it must answer
+/// `GET /api/version` without a session, and the app's own classification must read it as
+/// the SAME release — same lockstep version, same operator-API generation. In CI this is the
+/// contract that a daemon and an app built from one commit agree about what they are.
+#[tokio::test]
+#[ignore]
+async fn the_daemon_handshake_matches_this_app() {
+    let daemon = daemon();
+    let raw = reqwest::get(format!("{daemon}/api/version"))
+        .await
+        .expect("daemon unreachable");
+    assert_eq!(
+        raw.status(),
+        reqwest::StatusCode::OK,
+        "/api/version must answer without a session"
+    );
+    let body: serde_json::Value = raw.json().await.expect("/api/version not JSON");
+    for field in ["version", "build_id", "api_compat"] {
+        assert!(body.get(field).is_some(), "/api/version is missing `{field}`: {body}");
+    }
+
+    let h = handshake::handshake(&daemon).await;
+    assert_eq!(
+        h.state,
+        handshake::CompatState::Compatible,
+        "a daemon from this commit must be compatible with this app: {}",
+        h.message
+    );
+    assert_eq!(h.daemon_version.as_deref(), Some(handshake::APP_VERSION));
+    assert_eq!(h.daemon_api_compat, Some(handshake::APP_API_COMPAT));
+    let build = h.daemon_build_id.unwrap_or_default();
+    assert!(
+        !build.is_empty() && !build.starts_with("app-v"),
+        "build id must be a daemon describe string, never an app-v* tag: {build:?}"
     );
 }

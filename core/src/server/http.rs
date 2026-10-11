@@ -1518,6 +1518,11 @@ pub async fn serve_with_callback(
         // an operator establishes a session; issuing a challenge grants nothing).
         .route("/api/operator/challenge", post(operator_challenge))
         .route("/api/operator/session", post(operator_session))
+        // The app/daemon handshake (web4#904): {version, build_id, api_compat}. Open for the
+        // same reason as the challenge — the app must learn whether it speaks this daemon's
+        // API before it can sign in — and it reveals only what `hestia --version` prints.
+        // Lock-free; see server/api_version.rs.
+        .route("/api/version", get(super::api_version::api_version))
         // OID4VCI issuance (EUDI Phase 2) — hestia as person-scale issuer.
         // /metadata + /nonce are legitimately unauthenticated (discovery + a freshness
         // nonce grant nothing). /credential — which mints an OWNER-SIGNED presentation —

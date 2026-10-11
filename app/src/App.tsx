@@ -12,6 +12,8 @@ import { Hubs } from "./pages/Hubs";
 import { Fleet } from "./pages/Fleet";
 import { Settings } from "./pages/Settings";
 import { OperatorBar } from "./components/OperatorBar";
+import { CompatBanner } from "./components/CompatBanner";
+import { APP_VERSION } from "./lib/compat";
 import "./styles/global.css";
 
 export default function App() {
@@ -39,10 +41,11 @@ export default function App() {
           </div>
           <div className="sidebar-footer">
             <OperatorBar onChange={() => window.dispatchEvent(new Event("hestia:auth"))} />
-            <span className="version">v0.2.0</span>
+            <span className="version">v{APP_VERSION}</span>
           </div>
         </nav>
         <main className="main-content">
+          <CompatBanner />
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/decide" element={<Decide />} />
