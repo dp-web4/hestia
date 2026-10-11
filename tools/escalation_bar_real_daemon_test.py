@@ -42,6 +42,28 @@ def check(name, ok, detail=""):
         FAILS.append(f"{name}: {str(detail)[:600]}")
 
 
+def reported(test):
+    """Raise at the end of a test for every failure it recorded, so pytest sees them too.
+
+    `check` collects instead of stopping at the first miss (every seat and spelling is
+    reported); without this, a failure recorded under pytest never reached the runner,
+    because FAILS was only read in `__main__` (the CI hygiene check caught it on #1247).
+    """
+    import functools
+
+    @functools.wraps(test)
+    def run(*a, **kw):
+        if not ENDPOINT:  # same rule as __main__: no isolated daemon, nothing is checked
+            import unittest
+            raise unittest.SkipTest("set HESTIA_ESCALATION_BAR_ENDPOINT to an isolated daemon")
+        before = len(FAILS)
+        test(*a, **kw)
+        new = FAILS[before:]
+        if new:
+            raise AssertionError(f"{len(new)} check(s) failed:\n" + "\n".join(new))
+    return run
+
+
 def _post(url, body, session=None):
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, method="POST", headers={
@@ -83,6 +105,7 @@ def open_and_read(seat, home, event, label, shim_path=None):
     return read_escalation(ENDPOINT, m.group(1)) if m else {}
 
 
+@reported
 def test_every_seat_records_two_factors_for_its_own_entry_whatever_the_spelling():
     for seat in sb.SEATS:
         fx = sb.Fixture()
@@ -110,6 +133,7 @@ def test_every_seat_records_two_factors_for_its_own_entry_whatever_the_spelling(
             fx.close()
 
 
+@reported
 def test_a_same_named_file_outside_every_location_records_one_approver():
     # Only meaningful for an entry whose NAME is not sovereign everywhere: the member whose
     # entry is priced by location alone.
@@ -127,6 +151,7 @@ def test_a_same_named_file_outside_every_location_records_one_approver():
         fx.close()
 
 
+@reported
 def test_a_gate_registered_outside_every_declaration_records_two_factors():
     """A seat whose harness registration runs hestia's gate from a legacy dir no declaration
     names: a write to that gate is refused and the daemon RECORDS sovereign_plus_peer, under the
@@ -144,6 +169,7 @@ def test_a_gate_registered_outside_every_declaration_records_two_factors():
             fx.close()
 
 
+@reported
 def test_a_wildcard_or_unresolved_destination_records_two_factors():
     """Codex review of #1247 at 18f91db (notice 18786), both P1s, through the real shim:
     a wildcard that can expand onto the REGISTERED entry, and a destination the gate cannot
