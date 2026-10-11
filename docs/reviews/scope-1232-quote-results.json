@@ -1,0 +1,498 @@
+{
+  "previous_shell": {
+    "checks": 96,
+    "failures": 0,
+    "held": "d10129c2c49be63e5aa941855a1c0e1026d47ed635c1667be93c3de78e7c9fe7",
+    "full_gate": true,
+    "failed_cases": []
+  },
+  "previous_literal": {
+    "checks": 156,
+    "failures": 0,
+    "held": "d10129c2c49be63e5aa941855a1c0e1026d47ed635c1667be93c3de78e7c9fe7",
+    "full_gate": true,
+    "failed_cases": []
+  },
+  "new_cases": [
+    {
+      "case": "helper/custom-ifs-splits-literal",
+      "expected_allow": false,
+      "actual_allow": true,
+      "rule": "",
+      "passed": false
+    },
+    {
+      "case": "core/custom-ifs-splits-literal",
+      "expected_allow": false,
+      "actual_allow": true,
+      "rule": "",
+      "passed": false
+    },
+    {
+      "case": "helper/raw-quote-marker",
+      "expected_allow": false,
+      "actual_allow": true,
+      "rule": "",
+      "passed": false
+    },
+    {
+      "case": "core/raw-quote-marker",
+      "expected_allow": false,
+      "actual_allow": true,
+      "rule": "",
+      "passed": false
+    },
+    {
+      "case": "helper/single-quoted-marker",
+      "expected_allow": false,
+      "actual_allow": true,
+      "rule": "",
+      "passed": false
+    },
+    {
+      "case": "core/single-quoted-marker",
+      "expected_allow": false,
+      "actual_allow": true,
+      "rule": "",
+      "passed": false
+    },
+    {
+      "case": "helper/custom-ifs-quoted-control",
+      "expected_allow": true,
+      "actual_allow": true,
+      "rule": "",
+      "passed": true
+    },
+    {
+      "case": "core/custom-ifs-quoted-control",
+      "expected_allow": true,
+      "actual_allow": true,
+      "rule": "",
+      "passed": true
+    },
+    {
+      "case": "helper/whitespace-quoted-control",
+      "expected_allow": true,
+      "actual_allow": true,
+      "rule": "",
+      "passed": true
+    },
+    {
+      "case": "core/whitespace-quoted-control",
+      "expected_allow": true,
+      "actual_allow": true,
+      "rule": "",
+      "passed": true
+    },
+    {
+      "case": "helper/whitespace-unquoted-control",
+      "expected_allow": false,
+      "actual_allow": false,
+      "rule": "",
+      "passed": true
+    },
+    {
+      "case": "core/whitespace-unquoted-control",
+      "expected_allow": false,
+      "actual_allow": false,
+      "rule": "mrh.command",
+      "passed": true
+    },
+    {
+      "case": "helper/mixed-quoted-unquoted-control",
+      "expected_allow": false,
+      "actual_allow": false,
+      "rule": "",
+      "passed": true
+    },
+    {
+      "case": "core/mixed-quoted-unquoted-control",
+      "expected_allow": false,
+      "actual_allow": false,
+      "rule": "mrh.command",
+      "passed": true
+    },
+    {
+      "case": "helper/newline-unquoted-control",
+      "expected_allow": false,
+      "actual_allow": false,
+      "rule": "",
+      "passed": true
+    },
+    {
+      "case": "core/newline-unquoted-control",
+      "expected_allow": false,
+      "actual_allow": false,
+      "rule": "mrh.command",
+      "passed": true
+    },
+    {
+      "case": "helper/simple-literal-control",
+      "expected_allow": true,
+      "actual_allow": true,
+      "rule": "",
+      "passed": true
+    },
+    {
+      "case": "core/simple-literal-control",
+      "expected_allow": true,
+      "actual_allow": true,
+      "rule": "",
+      "passed": true
+    },
+    {
+      "case": "claude-code/custom-ifs-splits-literal",
+      "expected_allow": false,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": false,
+      "evidence_committed": true
+    },
+    {
+      "case": "claude-code/raw-quote-marker",
+      "expected_allow": false,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": false,
+      "evidence_committed": true
+    },
+    {
+      "case": "claude-code/single-quoted-marker",
+      "expected_allow": false,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": false,
+      "evidence_committed": true
+    },
+    {
+      "case": "claude-code/custom-ifs-quoted-control",
+      "expected_allow": true,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "claude-code/whitespace-quoted-control",
+      "expected_allow": true,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "claude-code/whitespace-unquoted-control",
+      "expected_allow": false,
+      "actual_allow": false,
+      "rule": "mrh.command",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "claude-code/mixed-quoted-unquoted-control",
+      "expected_allow": false,
+      "actual_allow": false,
+      "rule": "mrh.command",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "claude-code/newline-unquoted-control",
+      "expected_allow": false,
+      "actual_allow": false,
+      "rule": "mrh.command",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "claude-code/simple-literal-control",
+      "expected_allow": true,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "codex/custom-ifs-splits-literal",
+      "expected_allow": false,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": false,
+      "evidence_committed": true
+    },
+    {
+      "case": "codex/raw-quote-marker",
+      "expected_allow": false,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": false,
+      "evidence_committed": true
+    },
+    {
+      "case": "codex/single-quoted-marker",
+      "expected_allow": false,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": false,
+      "evidence_committed": true
+    },
+    {
+      "case": "codex/custom-ifs-quoted-control",
+      "expected_allow": true,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "codex/whitespace-quoted-control",
+      "expected_allow": true,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "codex/whitespace-unquoted-control",
+      "expected_allow": false,
+      "actual_allow": false,
+      "rule": "mrh.command",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "codex/mixed-quoted-unquoted-control",
+      "expected_allow": false,
+      "actual_allow": false,
+      "rule": "mrh.command",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "codex/newline-unquoted-control",
+      "expected_allow": false,
+      "actual_allow": false,
+      "rule": "mrh.command",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "codex/simple-literal-control",
+      "expected_allow": true,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "kimi/custom-ifs-splits-literal",
+      "expected_allow": false,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": false,
+      "evidence_committed": true
+    },
+    {
+      "case": "kimi/raw-quote-marker",
+      "expected_allow": false,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": false,
+      "evidence_committed": true
+    },
+    {
+      "case": "kimi/single-quoted-marker",
+      "expected_allow": false,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": false,
+      "evidence_committed": true
+    },
+    {
+      "case": "kimi/custom-ifs-quoted-control",
+      "expected_allow": true,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "kimi/whitespace-quoted-control",
+      "expected_allow": true,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "kimi/whitespace-unquoted-control",
+      "expected_allow": false,
+      "actual_allow": false,
+      "rule": "mrh.command",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "kimi/mixed-quoted-unquoted-control",
+      "expected_allow": false,
+      "actual_allow": false,
+      "rule": "mrh.command",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "kimi/newline-unquoted-control",
+      "expected_allow": false,
+      "actual_allow": false,
+      "rule": "mrh.command",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "kimi/simple-literal-control",
+      "expected_allow": true,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "gemini/custom-ifs-splits-literal",
+      "expected_allow": false,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": false,
+      "evidence_committed": true
+    },
+    {
+      "case": "gemini/raw-quote-marker",
+      "expected_allow": false,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": false,
+      "evidence_committed": true
+    },
+    {
+      "case": "gemini/single-quoted-marker",
+      "expected_allow": false,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": false,
+      "evidence_committed": true
+    },
+    {
+      "case": "gemini/custom-ifs-quoted-control",
+      "expected_allow": true,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "gemini/whitespace-quoted-control",
+      "expected_allow": true,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "gemini/whitespace-unquoted-control",
+      "expected_allow": false,
+      "actual_allow": false,
+      "rule": "mrh.command",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "gemini/mixed-quoted-unquoted-control",
+      "expected_allow": false,
+      "actual_allow": false,
+      "rule": "mrh.command",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "gemini/newline-unquoted-control",
+      "expected_allow": false,
+      "actual_allow": false,
+      "rule": "mrh.command",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "case": "gemini/simple-literal-control",
+      "expected_allow": true,
+      "actual_allow": true,
+      "rule": "gate.allow",
+      "passed": true,
+      "evidence_committed": true
+    },
+    {
+      "checks": 54,
+      "failures": 18,
+      "held": "d10129c2c49be63e5aa941855a1c0e1026d47ed635c1667be93c3de78e7c9fe7",
+      "full_gate": true,
+      "failed_cases": [
+        "helper/custom-ifs-splits-literal",
+        "core/custom-ifs-splits-literal",
+        "helper/raw-quote-marker",
+        "core/raw-quote-marker",
+        "helper/single-quoted-marker",
+        "core/single-quoted-marker",
+        "claude-code/custom-ifs-splits-literal",
+        "claude-code/raw-quote-marker",
+        "claude-code/single-quoted-marker",
+        "codex/custom-ifs-splits-literal",
+        "codex/raw-quote-marker",
+        "codex/single-quoted-marker",
+        "kimi/custom-ifs-splits-literal",
+        "kimi/raw-quote-marker",
+        "kimi/single-quoted-marker",
+        "gemini/custom-ifs-splits-literal",
+        "gemini/raw-quote-marker",
+        "gemini/single-quoted-marker"
+      ]
+    }
+  ],
+  "bash_argv": {
+    "scaffold": "cat() { printf \"<%s>\\n\" \"$@\"; }; ",
+    "results": [
+      {
+        "name": "custom-ifs",
+        "command": "IFS=:; S=/tmp:/etc; cat $S/hostname",
+        "returncode": 0,
+        "stdout": "</tmp>\n</etc/hostname>\n",
+        "stderr": ""
+      },
+      {
+        "name": "raw-marker",
+        "command": "S=\"/tmp/x /etc\"; cat \u0004$S/hostname",
+        "returncode": 0,
+        "stdout": "<\u0004/tmp/x>\n</etc/hostname>\n",
+        "stderr": ""
+      },
+      {
+        "name": "single-quoted-marker",
+        "command": "S=\"/tmp/x /etc\"; cat '\u0004'$S/hostname",
+        "returncode": 0,
+        "stdout": "<\u0004/tmp/x>\n</etc/hostname>\n",
+        "stderr": ""
+      },
+      {
+        "name": "quoted-ifs",
+        "command": "IFS=:; S=/tmp:/etc; cat \"$S/hostname\"",
+        "returncode": 0,
+        "stdout": "</tmp:/etc/hostname>\n",
+        "stderr": ""
+      },
+      {
+        "name": "quoted-whitespace",
+        "command": "S=\"/tmp/x /etc\"; cat \"$S/hostname\"",
+        "returncode": 0,
+        "stdout": "</tmp/x /etc/hostname>\n",
+        "stderr": ""
+      }
+    ]
+  }
+}
