@@ -10,7 +10,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 M = HERE / "merged"
-W = "/home/dp/ai-workspace/hestia/scratchpad/wt-1247-restack-af33"
+W = os.environ["RESTACK_WT"]  # the re-stack worktree
 H = os.path.expanduser("~/.cache/rs1247-home")
 SH = "plugins/_shared/"
 SUITES = [

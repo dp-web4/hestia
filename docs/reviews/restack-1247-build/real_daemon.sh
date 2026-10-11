@@ -3,9 +3,9 @@
 # (port 7797, throwaway home), the patched governed modules swapped in via run_one.py.
 # Never :7711. Usage: real_daemon.sh [unpatched]
 set -u
-SP=/tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad
+SP="${SCRATCH:?set SCRATCH to a scratch dir}"
 RS=$SP/rs1247
-W=/home/dp/ai-workspace/hestia/scratchpad/wt-1247-restack-af33
+W="${RESTACK_WT:?set RESTACK_WT to the re-stack worktree}"
 BIN=$SP/target-hestia-conc-nodbg/debug/hestia
 PORT=7797
 [ -x "$BIN" ] || { echo "no binary at $BIN"; exit 2; }

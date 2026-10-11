@@ -7,12 +7,13 @@ by resolve.py); the hooks-gt republish is computed with tools/hooks_gt.py's own 
 the edited sources, as `hooks_gt.py publish` would after the source edit landed. The patch is
 re-applied IN MEMORY to 716ae2d1's blobs and must reproduce the intended bytes exactly.
 Writes only <here>/<sha256>.patch."""
+import os
 import difflib, hashlib, importlib.util, json, re, subprocess, sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 M = HERE / "merged"
-W = Path("/home/dp/ai-workspace/hestia/scratchpad/wt-1247-restack-af33")
+W = Path(os.environ["RESTACK_WT"])  # the re-stack worktree
 BASE = "716ae2d155e2e8625fb5b8e7c208871e659609c9"
 SH = "plugins/_shared/"
 EDITS = {SH + "hestia_gate_" + "core.py": "core.py", SH + "hestia_governance_" + "closure.py": "closure.py",

@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO = "/home/dp/ai-workspace/hestia"
+REPO = os.environ["HESTIA_REPO"]  # the hestia checkout
 OURS, THEIRS = "0cac578316ff999420324f3f3daa2fa16205c75d", "716ae2d155e2e8625fb5b8e7c208871e659609c9"
 patch, readme, msg = (Path(a).resolve() for a in sys.argv[1:4])
 idx = Path(__file__).resolve().parent / "restack.index"

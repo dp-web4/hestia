@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Extract base (1d82846e), ours (18f91db + held 01cf91e4 in memory), theirs (c535619d) copies of
 #1247's governed SOURCE files, under neutral names, into base/ ours/ theirs/. Writes no governed path."""
+import os
 import hashlib, re, subprocess, sys
 from pathlib import Path
-REPO = "/home/dp/ai-workspace/hestia"
+REPO = os.environ["HESTIA_REPO"]  # the hestia checkout
 OUT = Path(__file__).resolve().parent
 SH = "plugins/_shared/"
 N = {SH + "hestia_gate_" + "core.py": "core.py", SH + "hestia_gate_" + "mechanism.py": "mech.py",
