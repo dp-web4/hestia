@@ -357,6 +357,12 @@ jobs:
           done
           echo "daemon never answered /api/version"; cat "$home/serve.log"; exit 1
 
+      # A fresh daemon has no trust grains, and the contract asserts the TrustView fields the
+      # app renders: give it one real witnessed member action so that check has something to read.
+      - name: Seed one witnessed member action
+        working-directory: hestia
+        run: python3 tools/app_contract_seed.py --endpoint http://127.0.0.1:7797/mcp
+
       - name: Live contract tests (operator_live, incl. the handshake)
         working-directory: hestia/app/src-tauri
         env:

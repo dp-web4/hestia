@@ -115,15 +115,35 @@ async fn authenticate_opens_a_session_and_the_token_reads_the_gated_api() {
         "/nonce grants nothing and must stay open — the stopgap must not over-gate"
     );
 
-    let authed = client
-        .get(format!("{daemon}/api/dashboard"))
-        .bearer_auth(&session.token)
-        .send()
-        .await
-        .expect("daemon unreachable");
-    assert!(authed.status().is_success(), "bearer token was rejected");
-
-    let snapshot: serde_json::Value = authed.json().await.expect("dashboard not JSON");
+    // `/api/dashboard` is a read model: each GET returns the LAST projection and queues a
+    // refresh (stale-while-revalidate), and answers 503 while the first projection warms. So a
+    // single GET right after activity reads the snapshot from before it. Poll, bounded, until
+    // the projection carries trust; never until it carries anything at all.
+    let mut snapshot = serde_json::Value::Null;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let authed = client
+            .get(format!("{daemon}/api/dashboard"))
+            .bearer_auth(&session.token)
+            .send()
+            .await
+            .expect("daemon unreachable");
+        let status = authed.status();
+        assert!(
+            status.is_success() || status == reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "bearer token was rejected: {status}"
+        );
+        if status.is_success() {
+            snapshot = authed.json().await.expect("dashboard not JSON");
+            if snapshot["trust"].as_array().is_some_and(|a| !a.is_empty()) {
+                break;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
     assert!(
         snapshot["society"]["chain_length"].as_u64().unwrap_or(0) > 0,
         "dashboard carried no chain"
@@ -135,7 +155,8 @@ async fn authenticate_opens_a_session_and_the_token_reads_the_gated_api() {
     let trust = snapshot["trust"]
         .as_array()
         .and_then(|a| a.first())
-        .expect("no trust grains");
+        .expect("no trust grains after 20 s of polling (CI seeds one witnessed member action \
+                 with tools/app_contract_seed.py; a hand run needs a daemon with member activity)");
     for field in [
         "legacy_level",
         "derived_temperament",

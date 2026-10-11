@@ -36,4 +36,4 @@ web4-core = { path = "../../../web4/web4-core" }
 hestia-wire = { path = "../../wire" }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
