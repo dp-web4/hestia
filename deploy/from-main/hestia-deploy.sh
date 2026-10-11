@@ -84,6 +84,7 @@ HOLD="$HESTIA_HOME/deploy.hold"
 HOLD_MAX_SECS="${HESTIA_DEPLOY_HOLD_MAX_SECS:-21600}"
 KEEP_BACKUPS="${HESTIA_DEPLOY_KEEP_BACKUPS:-5}"
 READY_SECS="${HESTIA_DEPLOY_READY_SECS:-120}"
+PROBE_TIMEOUT_S=12   # one preflight gate probe's bound; gate-preflight.py's PROBE_TIMEOUT_S
 MODE="${1:-full}"
 case "$MODE" in
   full|--check|--build-only|--hooks-only|--preflight) ;;
@@ -522,10 +523,23 @@ preflight_gate() {
     # preflight refuse a benign read on every box whose seats are correctly configured, with a
     # message about the seat's config rather than about the probe's own environment (Sprout,
     # 2026-09-08: four rendered projections, all four probes still denied).
+    #
+    # THE PROBE DECLARES THE TIMEOUT IT ENFORCES (#1250; gate-preflight.py has done this since
+    # one-gate stage C). A stage-C gate bounds its decision by the timeout its harness enforces,
+    # read from its own registration -- and refuses `gate.harness_timeout_unknown` when it finds
+    # none. On an upgraded host the registration exists, so this probe passed; on a FRESH host
+    # nothing has registered the gate yet (the install it guards is what registers it), and the
+    # probe refused the benign read forever -- the next fresh-host refusal behind config.unbacked,
+    # measured by the upgrade-path harness's fresh-host arm. This probe is a non-harness invoker,
+    # so it declares its own bound; when the gate also finds a registration the smaller wins, so
+    # the declaration can only shorten the gate's budget. Enforced with timeout(1) where present.
+    local _bound=()
+    command -v timeout >/dev/null 2>&1 && _bound=(timeout "$PROBE_TIMEOUT_S")
     printf '%s' "$2" | (cd "$DEPLOY_ROOT/hestia" && env HESTIA_PRE_FAIL_CLOSED=1 CLAUDECODE=1 \
       HESTIA_HOME="$probe_home" \
       HESTIA_SHARED_DIR="$DEPLOY_ROOT/hestia/plugins/_shared" \
-      HESTIA_ENDPOINT="$EP" python3 "$gate") >"$tmp/out" 2>"$tmp/err"
+      HESTIA_HOOK_TIMEOUT_S="$PROBE_TIMEOUT_S" \
+      HESTIA_ENDPOINT="$EP" ${_bound[@]+"${_bound[@]}"} python3 "$gate") >"$tmp/out" 2>"$tmp/err"
     rc=$?
     [ "$rc" = 0 ] && return 0
     log "WARN preflight probe '$1' -> rc=$rc: $(head -c 300 "$tmp/err" | tr '\n' ' ')"

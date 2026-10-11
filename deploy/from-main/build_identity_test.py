@@ -154,6 +154,16 @@ check("governed session (HESTIA_ROLE)", (rc, seats), (0, "refused(governed sessi
 rc, seats, _ = seed(ADDS, env={"HESTIA_DEPLOY_SEED_SEATS": "0"})
 check("explicit opt-out", (rc, seats), (0, "skipped(HESTIA_DEPLOY_SEED_SEATS=0)"))
 
+# The inline claude-code probe declares the timeout it enforces: a fresh host has no registration
+# for a stage-C gate to read one from, and the gate refuses gate.harness_timeout_unknown without it.
+pg = extract_function("preflight_gate")
+check("the inline probe declares HESTIA_HOOK_TIMEOUT_S", 'HESTIA_HOOK_TIMEOUT_S="$PROBE_TIMEOUT_S"' in pg, True)
+gp = (HERE / "gate-preflight.py").read_text()
+m = re.search(r"^PROBE_TIMEOUT_S = (\d+)", gp, re.M)
+m2 = re.search(r"^PROBE_TIMEOUT_S=(\d+)", TEXT, re.M)
+check("both preflight arms use one probe bound", (m and m.group(1), m2 and m2.group(1)),
+      (m and m.group(1), m and m.group(1)))
+
 # The ORDER is the fix: seed_seats runs inside install_hooks, before preflight_gate.
 ih = extract_function("install_hooks")
 check("install_hooks seeds before it preflights",
