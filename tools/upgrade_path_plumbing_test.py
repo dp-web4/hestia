@@ -40,6 +40,16 @@ check("describe_hash_len reads a 7-char abbreviation", h.describe_hash_len("v0.0
 check("describe_hash_len survives -dirty", h.describe_hash_len("v0.0.4-965-g588684d-dirty") == 7)
 check("describe_hash_len reads a bare --always sha", h.describe_hash_len("a7e33bc4") == 8)
 check("describe_hash_len refuses a tag-only describe", h.describe_hash_len("v0.0.4") is None)
+# #1250: a build is a COMMIT; the abbreviation length is a property of the clone.
+FULL_SHA = "588684d6aaaabbbbccccddddeeeeffff00001111"
+check("names_commit: 7-hex spelling names the commit", h.names_commit("v0.0.4-965-g588684d", FULL_SHA))
+check("names_commit: 9-hex spelling names the same commit", h.names_commit("v0.0.4-965-g588684d6a", FULL_SHA))
+check("names_commit: a bare sha names it", h.names_commit("588684d6", FULL_SHA))
+check("names_commit: another commit does not", not h.names_commit("v0.0.4-966-g9c880de", FULL_SHA))
+check("names_commit: a dirty build is never the candidate", not h.names_commit("v0.0.4-965-g588684d-dirty", FULL_SHA))
+check("names_commit: an exact tag carries no commit", not h.names_commit("v0.0.4", FULL_SHA))
+check("names_commit: fewer than 7 hex is not evidence", not h.names_commit("v0.0.4-965-g58868", FULL_SHA))
+check("describe_hex reads the abbreviation", h.describe_hex("v0.0.4-968-ga7e33bc4") == "a7e33bc4")
 check("describe_of_version is hestia-deploy's describe_of",
       h.describe_of_version("hestia 0.0.4 (v0.0.4-968-ga7e33bc4)") == "v0.0.4-968-ga7e33bc4")
 
