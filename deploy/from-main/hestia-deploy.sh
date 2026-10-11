@@ -189,11 +189,22 @@ same_build() {
   case "$1" in *-dirty) a=dirty ;; *) a=clean ;; esac
   case "$2" in *-dirty) b=dirty ;; *) b=clean ;; esac
   [ "$a" = "$b" ] || return 1
-  a="$(build_hex "$1")" || return 1
-  b="$(build_hex "$2")" || return 1
-  fa="$(git -C "$DEPLOY_ROOT/hestia" rev-parse -q --verify "$a^{commit}" 2>/dev/null)" || return 1
-  fb="$(git -C "$DEPLOY_ROOT/hestia" rev-parse -q --verify "$b^{commit}" 2>/dev/null)" || return 1
+  fa="$(build_commit "$1")" || return 1
+  fb="$(build_commit "$2")" || return 1
   [ -n "$fa" ] && [ "$fa" = "$fb" ]
+}
+# The full sha a describe string names in the deploy checkout: its abbreviation resolved, or, for
+# an EXACT-TAG describe (`v0.0.5`, what describe prints at a tagged commit), the tag peeled to
+# its commit -- so a release tag landing on the deployed commit renames it without making it a
+# different build (Codex notice 20534 found the harness's twin of this gap).
+build_commit() {
+  local s="${1%-dirty}" h
+  if h="$(build_hex "$1")"; then
+    git -C "$DEPLOY_ROOT/hestia" rev-parse -q --verify "$h^{commit}" 2>/dev/null
+    return
+  fi
+  case "$s" in ''|-*|*[!A-Za-z0-9._/+-]*) return 1 ;; esac
+  git -C "$DEPLOY_ROOT/hestia" rev-parse -q --verify "refs/tags/$s^{commit}" 2>/dev/null
 }
 
 running_version() {

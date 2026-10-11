@@ -47,7 +47,32 @@ check("names_commit: 9-hex spelling names the same commit", h.names_commit("v0.0
 check("names_commit: a bare sha names it", h.names_commit("588684d6", FULL_SHA))
 check("names_commit: another commit does not", not h.names_commit("v0.0.4-966-g9c880de", FULL_SHA))
 check("names_commit: a dirty build is never the candidate", not h.names_commit("v0.0.4-965-g588684d-dirty", FULL_SHA))
-check("names_commit: an exact tag carries no commit", not h.names_commit("v0.0.4", FULL_SHA))
+check("names_commit: an exact tag with no repo to resolve it names nothing", not h.names_commit("v0.0.4", FULL_SHA))
+
+# Codex notice 20534: an exact-tag describe (a tagged candidate) is resolved and verified, not refused.
+import subprocess  # noqa: E402
+with tempfile.TemporaryDirectory() as raw:
+    repo = Path(raw)
+    genv = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@invalid",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@invalid"}
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True,  # noqa: E731
+                                  text=True, env=genv).stdout.strip()
+    g("init", "-q")
+    g("commit", "-q", "--allow-empty", "-m", "one")
+    first = g("rev-parse", "HEAD")
+    g("tag", "v0.0.4")
+    g("commit", "-q", "--allow-empty", "-m", "two")
+    tagged = g("rev-parse", "HEAD")
+    g("tag", "-a", "v0.0.5", "-m", "release")
+    produced = g("describe", "--tags", "--always", "--dirty")   # core/build.rs's producer
+    check("fixture: the producer prints a bare tag at a tagged commit", produced == "v0.0.5", produced)
+    check("names_commit: an exact (annotated) tag at the candidate names it",
+          h.names_commit(produced, tagged, repo))
+    check("names_commit: a tag on ANOTHER commit does not name the candidate",
+          not h.names_commit("v0.0.4", tagged, repo))
+    check("names_commit: a tag the repo does not have names nothing", not h.names_commit("v9.9.9", tagged, repo))
+    check("names_commit: a lightweight tag at the candidate names it", h.names_commit("v0.0.4", first, repo))
+    check("names_commit: a dirty exact tag is never the candidate", not h.names_commit("v0.0.5-dirty", tagged, repo))
 check("names_commit: fewer than 7 hex is not evidence", not h.names_commit("v0.0.4-965-g58868", FULL_SHA))
 check("describe_hex reads the abbreviation", h.describe_hex("v0.0.4-968-ga7e33bc4") == "a7e33bc4")
 check("describe_of_version is hestia-deploy's describe_of",
@@ -141,6 +166,41 @@ with tempfile.TemporaryDirectory() as raw:
     check("snapshot_diff reports a changed file", any(d.startswith("changed:") and d.endswith("/d/a") for d in diff), str(diff))
     check("snapshot_diff reports an added file", any(d.startswith("added:") and d.endswith("/d/b") for d in diff), str(diff))
     check("snapshot_diff reports a re-pointed symlink", any(d.endswith("/link") for d in diff), str(diff))
+
+# ---- where the seed is looked for: beside hydrate, as the installer anchors it ------------------
+# Codex notice 20534: registrations are derived per file, so a member's gate and its hydrate.sh can
+# sit in different directories. The installer anchors the seed on hydrate.sh; so must the check.
+with tempfile.TemporaryDirectory() as raw:
+    root = Path(raw)
+    m = h.Machine.__new__(h.Machine)
+    m.home = root / "home"
+    m.hestia_home = m.home / ".hestia"
+    m.hestia_home.mkdir(parents=True)
+    (m.home / ".x").mkdir()
+    tree = root / "tree"
+    (tree / "plugins" / "x" / "instance").mkdir(parents=True)
+    (tree / "plugins" / "x" / "instance" / "identity.seed.json").write_text("{}")
+    (tree / "plugins" / "x" / "expects.json").write_text(json.dumps(
+        {"install": {"member": "x", "registration": {"path": [".x", "cfg.toml"]}}}))
+    gate = m.home / "gate" / "hooks" / "gate.py"
+    hyd = m.home / "hyd" / "hooks" / "hydrate.sh"
+    (m.hestia_home / "current-build.json").write_text(json.dumps({"members": [{"member": "x", "files": [
+        {"file": "gate.py", "path": str(gate)}, {"file": "hydrate.sh", "path": str(hyd)}]}]}))
+    at_hyd = m.home / "hyd" / "instance" / "identity.seed.json"
+    at_gate = m.home / "gate" / "instance" / "identity.seed.json"
+    at_hyd.parent.mkdir(parents=True)
+    at_hyd.write_text("{}")
+    rows, problems = h.seed_findings(m, tree)
+    check("split registration: a seed only beside hydrate reads ok", rows[0]["status"] == "ok" and not problems,
+          str(rows))
+    at_hyd.unlink()
+    at_gate.parent.mkdir(parents=True)
+    at_gate.write_text("{}")
+    rows, problems = h.seed_findings(m, tree)
+    check("split registration: a seed only beside the gate (hydrate's fallback empty) FAILS",
+          rows[0]["status"] == "FAIL" and problems, str(rows))
+    check("seed_location falls back to the first file when no hydrate.sh is installed",
+          h.seed_location([{"path": str(gate)}]) == at_gate)
 
 # ---- the simulated machine's environment ------------------------------------------------------
 with tempfile.TemporaryDirectory() as raw:

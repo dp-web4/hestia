@@ -182,11 +182,25 @@ def describe_hex(describe: str) -> str | None:
     return m.group(1) if m else None
 
 
-def names_commit(describe: str, full_sha: str) -> bool:
+def names_commit(describe: str, full_sha: str, repo: Path | None = None) -> bool:
     """Whether a describe string names this commit, at whatever abbreviation length (#1250: the
-    length is a property of the clone, not of the commit). Never true for a -dirty build."""
-    hexed = describe_hex(describe or "")
-    return bool(hexed) and len(hexed) >= 7 and not describe.endswith("-dirty") and full_sha.startswith(hexed)
+    length is a property of the clone, not of the commit). Never true for a -dirty build.
+
+    An EXACT-TAG describe (`v0.0.5`: what `git describe --tags --always` prints at a tagged
+    commit) carries no sha, so it is resolved in `repo` and must peel to this commit (Codex
+    notice 20534: without this a correctly built tagged candidate was refused). Without a repo
+    to resolve it in, a tag names nothing."""
+    describe = (describe or "").strip()
+    if not describe or describe.endswith("-dirty"):
+        return False
+    hexed = describe_hex(describe)
+    if hexed and len(hexed) >= 7 and full_sha.startswith(hexed):
+        return True
+    if repo is None or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/+-]*", describe):
+        return False
+    out = subprocess.run(["git", "-C", str(repo), "rev-parse", "-q", "--verify",
+                          f"refs/tags/{describe}^{{commit}}"], capture_output=True, text=True)
+    return out.returncode == 0 and out.stdout.strip() == full_sha
 
 
 def describe_of_version(line: str) -> str:
@@ -749,6 +763,15 @@ def expected_seats(m: Machine, tree: Path) -> list[str]:
     return seats
 
 
+def seed_location(files: list[dict]) -> Path:
+    """Where hydrate's fallback (`$(dirname "$0")/..`) finds the seed: beside the INSTALLED
+    hydrate.sh when the member has one, else beside its first installed file -- the installer's
+    own anchor rule (Codex notice 20534: registrations are derived per file, so a gate and hydrate
+    can live in different directories, and checking beside the gate judged the wrong place)."""
+    chosen = next((f for f in files if Path(f.get("path", "")).name == "hydrate.sh"), files[0])
+    return Path(chosen["path"]).parent.parent / "instance" / "identity.seed.json"
+
+
 def seed_findings(m: Machine, tree: Path) -> tuple[list[dict], list[str]]:
     """Per member that SHIPS an identity seed: is it on the host where its hooks look for it?
 
@@ -775,7 +798,7 @@ def seed_findings(m: Machine, tree: Path) -> tuple[list[dict], list[str]]:
             rows.append({"member": member, "status": "FAIL", "reason": "member not installed"})
             problems.append(f"{member}: not installed, so no seed location")
             continue
-        where = Path(files[0]["path"]).parent.parent / "instance" / "identity.seed.json"
+        where = seed_location(files)
         present = where.is_file()
         rows.append({"member": member, "status": "ok" if present else "FAIL",
                      "path": str(where).replace(str(m.home), "~")})
@@ -898,7 +921,7 @@ def upgrade_arm(args: argparse.Namespace, source: Path, daemon_bin: Path, candid
 
         # ---- 2. the candidate, via the timer's path -------------------------------------------
         m.move_main(candidate)
-        if not names_commit(daemon_describe, candidate):
+        if not names_commit(daemon_describe, candidate, source):
             raise SetupError(f"--daemon-bin describes itself as {daemon_describe!r}, which is not the "
                              f"candidate {candidate[:12]}; build the daemon from the candidate")
         target = m.origin_describe(length)
@@ -917,7 +940,7 @@ def upgrade_arm(args: argparse.Namespace, source: Path, daemon_bin: Path, candid
             failures.append(f"a. upgrade cycle was {cycle['outcome']}, not a full deploy")
         manifest = json.loads((m.hestia_home / "current-build.json").read_text())
         report["manifest_build_id"] = manifest.get("build_id")
-        if not names_commit(manifest.get("build_id") or "", candidate) or manifest.get("head_sha") != candidate:
+        if not names_commit(manifest.get("build_id") or "", candidate, source) or manifest.get("head_sha") != candidate:
             failures.append(f"a. manifest names {manifest.get('build_id')!r} / {str(manifest.get('head_sha'))[:12]}, "
                             f"not the candidate {target!r}")
 
@@ -965,7 +988,7 @@ def fresh_host_arm(args: argparse.Namespace, source: Path, daemon_bin: Path, can
         m.build_box()
         daemon_describe = m.start_daemon()
         length = describe_hash_len(daemon_describe) or 7
-        if not names_commit(daemon_describe, candidate):
+        if not names_commit(daemon_describe, candidate, source):
             raise SetupError(f"--daemon-bin describes itself as {daemon_describe!r}, which is not the "
                              f"candidate {candidate[:12]}; build the daemon from the candidate")
         m.build_origins(candidate)
@@ -1000,7 +1023,7 @@ def fresh_host_arm(args: argparse.Namespace, source: Path, daemon_bin: Path, can
         except (OSError, ValueError):
             manifest = {}
         report["manifest_build_id"] = manifest.get("build_id")
-        if manifest.get("head_sha") != candidate or not names_commit(manifest.get("build_id") or "", candidate):
+        if manifest.get("head_sha") != candidate or not names_commit(manifest.get("build_id") or "", candidate, source):
             failures.append(f"f1. manifest is {manifest.get('build_id')!r}, not the candidate")
 
         # ---- f2. seat projections ----------------------------------------------------------------

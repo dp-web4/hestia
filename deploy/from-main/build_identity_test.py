@@ -58,7 +58,8 @@ def git(repo: Path, *args: str) -> str:
 
 
 # ---- 1. same_build ------------------------------------------------------------------------
-FUNCS = extract_function("build_hex") + "\n" + extract_function("same_build") + "\n"
+FUNCS = (extract_function("build_hex") + "\n" + extract_function("build_commit") + "\n"
+         + extract_function("same_build") + "\n")
 
 with tempfile.TemporaryDirectory() as d:
     root = Path(d)
@@ -95,6 +96,10 @@ with tempfile.TemporaryDirectory() as d:
           same("v0.0.4-9-gdeadbee", "v0.0.4-9-gdeadbeef"), False)
     check("an exact tag equals only itself", same("v0.0.4", "v0.0.4"), True)
     check("an exact tag is not a describe of another commit", same("v0.0.4", b7), False)
+    git(repo, "tag", "v0.0.5", b_full)
+    check("a release tag landing on the deployed commit renames it, not rebuilds it", same("v0.0.5", b9), True)
+    check("an exact tag the checkout lacks is not the same build", same("v9.9.9", b9), False)
+    check("a dirty exact tag is not the clean build", same("v0.0.5-dirty", b9), False)
 
 # Every comparison site uses it: no build id is compared as a string any more.
 for pattern in (r'"\$running" [!=]= "\$target"', r'"\$ondisk" [!=]= "\$target"',
