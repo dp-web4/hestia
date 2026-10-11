@@ -2937,6 +2937,19 @@ pub(crate) async fn scope_decide_as(
     }
     let (plugin_id, path, ask) = (req.plugin_id.clone(), req.path.clone(), req.reason.clone());
     let gate_origin = req.ext.gate.clone();
+    // An UNENUMERATED act (dp, 2026-10-10, #1232 narrowed): the gate could not enumerate what it
+    // reaches, so the request names the act, not a path. ONCE (that act, exactly) or refuse —
+    // a session or standing grant would have to name a path nobody knows.
+    if granted && !once && crate::server::state::is_unpriceable_scope_path(&path) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "the gate could not enumerate what this act reaches (an expansion \
+                          decides it), so there is no path a session or standing grant could \
+                          name: approve it ONCE (this act, exactly) or refuse it"
+            })),
+        );
+    }
     if once && gate_origin.is_none() {
         return (
             StatusCode::BAD_REQUEST,
@@ -11379,6 +11392,73 @@ mod disposition_tests {
         assert_eq!(s.scope_requests[&id].status(crate::server::gate_escalation::now_secs()), "spent");
         assert!(s.recent_chain(20).iter().any(|e| e.event_type == "scope_once_spent"
             && e.event_data["request_id"] == id.as_str()));
+    }
+
+    /// dp, 2026-10-10 (#1232 narrowed): an act whose reach the gate cannot ENUMERATE is asked for
+    /// as the act — #1274's sentinel keyed on its digest — and the only grant it can take is
+    /// "this act once". Session, standing, breadth: refused. In force: never. A malformed
+    /// sentinel opens nothing. Two acts are two requests.
+    #[tokio::test]
+    async fn scope_claim_an_unenumerated_act_is_once_only() {
+        let (_dir, state) = test_state().await;
+        let act = "cat \"$(date +/etc/hostname)\"";
+        let path = format!("hestia:unpriceable:unenumerated#{}", &digest_of(act)[..16]);
+        let opened = claim(&state, "codex", &path, act, false).await;
+        assert_eq!(opened["verdict"], "opened", "{opened}");
+        assert_eq!(opened["path"], path.as_str(), "kept verbatim, never normalised");
+        assert_eq!(opened["subtree"], false);
+        assert!(opened["how_to_decide"].as_str().unwrap().contains("ONCE"), "{opened}");
+        let id = opened["request_id"].as_str().unwrap().to_string();
+        assert!(state.lock().await.scope_requests[&id].reason.contains("cannot enumerate"));
+        for bad in [
+            serde_json::json!({"request_id": &id, "granted": true, "reason": "r"}),
+            serde_json::json!({"request_id": &id, "granted": true, "reason": "r", "standing": true}),
+            serde_json::json!({"request_id": &id, "granted": true, "reason": "r", "recursive": true}),
+            serde_json::json!({"request_id": &id, "granted": true, "reason": "r", "grant_path": "/etc"}),
+        ] {
+            let (code, body) = decide(&state, bad.clone()).await;
+            assert_eq!(code, StatusCode::BAD_REQUEST, "{bad} -> {body}");
+        }
+        // a second, different unenumerated act is its own request, not "pending" on the first
+        let act2 = "cat \"$(date +/etc/os-release)\"";
+        let path2 = format!("hestia:unpriceable:unenumerated#{}", &digest_of(act2)[..16]);
+        let second = claim(&state, "codex", &path2, act2, false).await;
+        assert_eq!(second["verdict"], "opened", "{second}");
+        assert_ne!(second["request_id"], id.as_str());
+        // once: spendable exactly by the act it was shown, once, through reserve/commit
+        let ok = decide(&state, serde_json::json!({
+            "request_id": &id, "granted": true, "reason": "read the one file", "once": true})).await;
+        assert_eq!(ok.0, StatusCode::OK, "{}", ok.1);
+        assert!(!state.lock().await.has_scope_grant("codex", &path), "never policy");
+        let r = batch(&state, "codex", "reserve", "op-unenumerated-0001", &[path.as_str()], act).await;
+        assert_eq!(r["verdict"], "reserved", "{r}");
+        let c = batch(&state, "codex", "commit", "op-unenumerated-0001", &[], act).await;
+        assert_eq!(c["verdict"], "committed", "{c}");
+        let again = claim(&state, "codex", &path, act, false).await;
+        assert_ne!(again["verdict"], "approved", "single use: {again}");
+        // a sentinel without the act key, a foreign class, or an uppercase key opens nothing
+        for bad in ["hestia:unpriceable:unenumerated", "hestia:unpriceable:malformed#0123456789abcdef",
+                    "hestia:unpriceable:unenumerated#0123456789ABCDEF",
+                    "hestia:unpriceable:unenumerated#0123"] {
+            let r = claim(&state, "codex", bad, act, false).await;
+            assert_eq!(r["verdict"], "not_opened", "{bad} -> {r}");
+        }
+    }
+
+    /// The dashboard says an unenumerated request is once-only, so the surfaces offer nothing
+    /// broader (spec decide-scope-request).
+    #[tokio::test]
+    async fn scope_snapshot_marks_an_unenumerated_request_once_only() {
+        let (_dir, state) = test_state().await;
+        let act = "for f in a b; do cat $f; done";
+        let path = format!("hestia:unpriceable:unenumerated#{}", &digest_of(act)[..16]);
+        claim(&state, "codex", &path, act, false).await;
+        claim(&state, "codex", "/srv/plain.txt", "cat /srv/plain.txt", false).await;
+        let rows = state.lock().await.dashboard_snapshot(10).pending_scope_requests;
+        let unenum = rows.iter().find(|r| r["path"] == path.as_str()).expect("listed");
+        let plain = rows.iter().find(|r| r["path"] == "/srv/plain.txt").expect("listed");
+        assert_eq!(unenum["once_only"], true, "{unenum}");
+        assert_eq!(plain["once_only"], false, "{plain}");
     }
 
     /// A refusal is not reopened by re-issuing inside its window, and a member-filed ask has no

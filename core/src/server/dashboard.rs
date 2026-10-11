@@ -1526,6 +1526,9 @@ impl ServerState {
                             "reissues": r.ext.gate.as_ref().map(|g| g.reissues).unwrap_or(0),
                             "subtree": r.ext.gate.as_ref().is_some_and(|g| g.subtree),
                             "once_available": r.ext.gate.is_some(),
+                            // dp, 2026-10-10 (#1232 narrowed): an act the gate could not
+                            // enumerate names no path — "this act once" is the ONLY grant.
+                            "once_only": crate::server::state::is_unpriceable_scope_path(&r.path),
                             // dp, 2026-10-05: NOT-SAME peers decide gate-opened requests; the
                             // operator surfaces show who was invited and offer the OVERRIDE.
                             "invited_peers": r.ext.invited_peers,

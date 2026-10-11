@@ -669,6 +669,32 @@ pub fn normalize_scope_path(path: &str) -> String {
     }
 }
 
+/// The "path" of a scope request for an act whose reach the gate could NOT ENUMERATE (dp,
+/// 2026-10-10, #1232 narrowed): #1274's sentinel (`gate_escalation::UNPRICEABLE_PREFIX` +
+/// `unenumerated` | `overflow`), keyed on the act by `#` and the first 16 hex of its complete-act
+/// digest — `hestia:unpriceable:unenumerated#0123456789abcdef`. Nothing an expansion produces is
+/// modelled any more, so a command whose reach depends on one names no path at all; the gate asks
+/// for THE ACT instead. Such a request can be granted ONCE (that act, exactly) or refused —
+/// never for a session or standing, because there is no path a grant could name. Returns the
+/// canonical spelling, or `None` for anything else (a real path is `normalize_scope_path`'s).
+pub fn unpriceable_scope_path(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    let rest = t.strip_prefix(crate::server::gate_escalation::UNPRICEABLE_PREFIX)?;
+    let (class, key) = rest.split_once('#')?;
+    if !matches!(class, "unenumerated" | "overflow") {
+        return None;
+    }
+    if key.len() != 16 || !key.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return None;
+    }
+    Some(t.to_string())
+}
+
+/// Whether a scope request's path is an UNENUMERATED act (see `unpriceable_scope_path`).
+pub fn is_unpriceable_scope_path(path: &str) -> bool {
+    unpriceable_scope_path(path).is_some()
+}
+
 /// A `path:` scope grant MUST be stored absolute (#722). A relative grant renders in the seat's
 /// grant set — e.g. `path:home/dp/ai-workspace` with no leading slash — but can never match a
 /// resolved absolute candidate under #597 prefix containment (`_within_path_grant`/`_scope_parts`),

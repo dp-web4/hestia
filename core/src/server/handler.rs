@@ -90,24 +90,7 @@ impl ServerHandler for HestiaServer {
         // DURABLE READS: tools that REPORT shared state (escalation status, inbox, history,
         // appeals, evidence, a witness answered with an existing row) do not reply before what
         // they read is durable. The gate's own hot path does not wait on other requests' rows.
-        let reports_shared_state = matches!(
-            name.as_str(),
-            "hestia_gate_escalation_poll"
-                | "hestia_gate_escalation_lookup"
-                | "hestia_gate_escalation_claimable"
-                | "hestia_gate_pending_escalations"
-                | "hestia_escalation_evidence"
-                | "hestia_gate_escalation_claim"
-                | "hestia_member_inbox"
-                | "hestia_member_unanswered"
-                | "hestia_inbox"
-                | "hestia_pair_inbox"
-                | "hestia_egress_pending"
-                | "hestia_query_history"
-                | "hestia_open_appeals"
-                | "hestia_my_appeals"
-                | "hestia_witness_decision"
-        );
+        let reports_shared_state = reports_shared_state(name.as_str());
         let scoped = super::state_lock::with_label(lock_label, async { match name.as_str() {
             "hestia_connect" => tool_connect(&self.state, &args).await,
             "hestia_begin_action" => tool_begin_action(&self.state, &args).await,
@@ -303,6 +286,38 @@ impl ServerHandler for HestiaServer {
 // =========================================================================
 // Tool surface metadata
 // =========================================================================
+
+/// DURABLE READS (#1268): the tools whose reply REPORTS shared state — rows other requests
+/// committed — and so waits until what it read is durable (`durable_scope_observing`). Every
+/// other tool waits only for its own appends (group commit). A fn, not an inline list, so the
+/// wiring is testable without an MCP request context.
+pub(crate) fn reports_shared_state(name: &str) -> bool {
+    matches!(
+        name,
+        "hestia_gate_escalation_poll"
+            | "hestia_gate_escalation_lookup"
+            | "hestia_gate_escalation_claimable"
+            | "hestia_gate_pending_escalations"
+            | "hestia_escalation_evidence"
+            | "hestia_gate_escalation_claim"
+            | "hestia_member_inbox"
+            | "hestia_member_unanswered"
+            | "hestia_inbox"
+            | "hestia_pair_inbox"
+            | "hestia_egress_pending"
+            | "hestia_query_history"
+            | "hestia_open_appeals"
+            | "hestia_my_appeals"
+            | "hestia_witness_decision"
+            // #1232 on #1268's rules: a scope claim answers `approved` / `in_force` /
+            // `pending` / `refused` / a reservation's state from rows OTHER requests
+            // committed (a peer's or the operator's ruling, the request itself), and the
+            // gate lets an act run on `approved`. So the reply waits for those rows to be
+            // durable. A peer decide may report a request it did not write the same way.
+            | "hestia_scope_claim"
+            | "hestia_scope_peer_decide"
+    )
+}
 
 fn hestia_tools() -> Vec<Tool> {
     fn schema_of(schema: Value) -> Arc<serde_json::Map<String, Value>> {
@@ -23473,8 +23488,14 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
     let session_id_arg = optional_session_id(args);
 
     let trimmed = raw_path.trim();
-    let subtree = trimmed.ends_with("/*");
-    let path = normalize_scope_path(if subtree { &trimmed[..trimmed.len() - 2] } else { trimmed });
+    // An UNENUMERATED act (dp, 2026-10-10): its "path" is the act-keyed sentinel, kept verbatim —
+    // no filesystem normalisation, never a glob, never in force (no grant can name it).
+    let unpriceable = crate::server::state::unpriceable_scope_path(trimmed);
+    let subtree = unpriceable.is_none() && trimmed.ends_with("/*");
+    let path = match unpriceable.clone() {
+        Some(p) => p,
+        None => normalize_scope_path(if subtree { &trimmed[..trimmed.len() - 2] } else { trimmed }),
+    };
     let now = now_secs();
     let mut s = state.lock().await;
 
@@ -23495,20 +23516,22 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
         Some(who) => (who.plugin_id, crate::arbiter::AskerBasis::Session),
         None => (asserted, crate::arbiter::AskerBasis::Asserted),
     };
-    if !path.starts_with('/') || path == "/" {
+    if unpriceable.is_none() && (!path.starts_with('/') || path == "/") {
         return Ok(json!({
             "verdict": "not_opened",
             "permits": false,
             "path": path,
-            "detail": "a scope request names one absolute path below the root; the root itself \
-                       is not grantable, so no request was opened",
+            "detail": "a scope request names one absolute path below the root (or the gate's \
+                       act-keyed unenumerated sentinel); the root itself is not grantable, so no \
+                       request was opened",
         }));
     }
     let key = scope_request_key(&plugin_id, &path);
     let probe = if subtree { format!("{path}/*") } else { path.clone() };
 
-    // (1) IN FORCE — live or standing (or the society floor) already covers it.
-    if s.has_scope_grant(&plugin_id, &probe) {
+    // (1) IN FORCE — live or standing (or the society floor) already covers it. Never for an
+    // unenumerated act: no grant names it, so only a one-time approval can answer it.
+    if unpriceable.is_none() && s.has_scope_grant(&plugin_id, &probe) {
         return Ok(json!({
             "verdict": "in_force",
             "permits": true,
@@ -23630,7 +23653,14 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
     let reason = format!(
         "opened by the gate on a refused {} ({rule}){}; act: {act}",
         if tool.is_empty() { "act" } else { tool.as_str() },
-        if subtree { " — a glob over this directory: only a recursive grant covers it" } else { "" }
+        if subtree {
+            " — a glob over this directory: only a recursive grant covers it"
+        } else if unpriceable.is_some() {
+            " — the gate cannot enumerate what this act reaches (an expansion decides it), so \
+             only a one-time approval of this exact act can lift it"
+        } else {
+            ""
+        }
     );
     let expires_at = now + SCOPE_REQUEST_TTL_SECS;
     let origin = GateDenyOrigin {
@@ -23727,7 +23757,7 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
         "invited_peers": invited,
         "invitations": invitations,
         "on_timeout": "REFUSED — no answer within the window is a refusal, not a retry",
-        "how_to_decide": scope_how_to_decide(&id, invited.is_empty()),
+        "how_to_decide": scope_how_to_decide(&id, invited.is_empty(), unpriceable.is_some()),
         "detail": if invited.is_empty() {
             "refused; a scope request was opened — no NOT-SAME peer can clear it (the asker is \
              unproven or no admissible peer exists), so the operator decides"
@@ -23739,7 +23769,21 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
 
 /// The recipe a gate-opened scope request names. Peers first (dp, 2026-10-05); the operator is
 /// the override, not the default route.
-fn scope_how_to_decide(id: &str, no_peer: bool) -> String {
+fn scope_how_to_decide(id: &str, no_peer: bool, once_only: bool) -> String {
+    if once_only {
+        // An unenumerated act (dp, 2026-10-10): once or refuse, nothing broader exists.
+        return format!(
+            "the gate could not enumerate what this act reaches, so it can be approved ONCE \
+             (this act, exactly) or refused — no session or standing grant can name it: {}",
+            if no_peer {
+                format!("the operator decides {id} (dashboard or the app's Decide page)")
+            } else {
+                format!("a NOT-SAME peer decides: hestia scope decide {id} --as <peer-seat> \
+                         --once|--refuse --reason '...' (or hestia_scope_peer_decide); the \
+                         operator may override")
+            }
+        );
+    }
     if no_peer {
         return format!("the operator decides (dashboard Activity → Reach requested, or the app's \
                         Decide page) — no NOT-SAME peer can clear {id}");
@@ -23966,8 +24010,12 @@ async fn scope_claim_spend_all(state: &SharedState, args: &Value, asserted: &str
             return Err(anyhow::anyhow!("paths must be strings"));
         };
         let t = raw.trim();
-        let subtree = t.ends_with("/*");
-        let path = normalize_scope_path(if subtree { &t[..t.len() - 2] } else { t });
+        let unpriceable = crate::server::state::unpriceable_scope_path(t);
+        let subtree = unpriceable.is_none() && t.ends_with("/*");
+        let path = match unpriceable {
+            Some(p) => p,
+            None => normalize_scope_path(if subtree { &t[..t.len() - 2] } else { t }),
+        };
         let probe = if subtree { format!("{path}/*") } else { path.clone() };
         if path.starts_with('/') && path != "/" && s.has_scope_grant(&plugin_id, &probe) {
             in_force.push(path);
@@ -30938,6 +30986,47 @@ mod durable_reads_tests {
         assert!(s.chain_store.read_by_hash(&fact.hash).unwrap().is_some(), "a returned fact was lost");
         assert!(s.recent_chain(50).iter().any(|e| e.event_data.to_string().contains(&request_id)),
                 "the scope request a reader returned has no chain row after restart");
+    }
+
+    /// #1232 on #1268's rules: the scope verbs answer from rows other requests committed (the
+    /// request, a peer's or the operator's ruling) and the gate lets an act run on `approved`,
+    /// so their replies are durable reads; the gate's begin/query path is not.
+    #[test]
+    fn the_scope_verbs_are_durable_reads() {
+        assert!(reports_shared_state("hestia_scope_claim"));
+        assert!(reports_shared_state("hestia_scope_peer_decide"));
+        assert!(!reports_shared_state("hestia_begin_action"));
+        assert!(!reports_shared_state("hestia_query_policy"));
+    }
+
+    /// A re-issued scope claim answered `pending` from a request ANOTHER call opened does not
+    /// reply while that request's chain row is still inside the commit-to-fsync window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scope_claim_does_not_report_an_undurable_request() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let durability = { state.lock().await.chain_store.durability().clone() };
+        let args = json!({"plugin_id": "codex", "path": "/srv/durable-claim.txt", "rule": "mrh.command",
+                          "tool_name": "Bash", "act": "cat /srv/durable-claim.txt",
+                          "act_digest": "a".repeat(64), "spend": false});
+        let hold = durability.hold_flush_for_test();
+        let first = tool_scope_claim(&state, &args).await.unwrap();
+        assert_eq!(first["verdict"], json!("opened"), "{first}");
+        let st = state.clone();
+        let a2 = args.clone();
+        let reissue = tokio::spawn(async move {
+            crate::storage::durability::durable_scope_observing(async {
+                tool_scope_claim(&st, &a2).await.unwrap()
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!reissue.is_finished(), "a claim reported a request whose row was not yet durable");
+        drop(hold);
+        let (again, durable) = reissue.await.unwrap();
+        durable.unwrap();
+        assert_eq!(again["verdict"], json!("pending"), "{again}");
+        assert_eq!(again["request_id"], first["request_id"]);
     }
 
     /// The gate's hot path is NOT held hostage by other requests' unsynced rows: a begin_action
