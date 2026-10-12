@@ -854,15 +854,44 @@ resolve_version() {
 # Never replace a newer daemon with an older release (#520: the v0.0.3 default downgraded a
 # v0.0.4 host and took its daemon down -- v0.0.3 cannot open v0.0.4's databases). Compares the
 # installed binary's package version with the target tag; a deliberate downgrade must say so.
+#
+# Portable on purpose (#1279 review): no GNU version-sort (stock macOS has none). Fail CLOSED: an
+# installed binary whose version cannot be read, or a target that is not X.Y.Z, refuses unless
+# the operator opts in. Only an affirmative HESTIA_ALLOW_DOWNGRADE (1/true/yes) is an opt-in;
+# `0`, `false` or any other value is not.
+
+# version_newer A B -> exit 0 iff X.Y.Z A is strictly newer than X.Y.Z B (numeric per field).
+version_newer() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    na = split(a, x, "."); nb = split(b, y, ".")
+    for (i = 1; i <= 3; i++) { xi = (i <= na) ? x[i] + 0 : 0; yi = (i <= nb) ? y[i] + 0 : 0
+      if (xi > yi) exit 0; if (xi < yi) exit 1 }
+    exit 1 }'
+}
+
+downgrade_opted_in() {
+  case "$(printf '%s' "${HESTIA_ALLOW_DOWNGRADE:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 guard_downgrade() {
   [ -x "$BIN_PATH" ] || return 0
-  local have want
+  local have want semver='^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$'
   have="$("$BIN_PATH" --version 2>/dev/null | sed -n 's/^[^0-9]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n1)"
   want="${VERSION#v}"; want="${want%%-*}"
-  [ -n "$have" ] && [ -n "$want" ] || return 0
+  if ! printf '%s' "$have" | grep -Eq "$semver" || ! printf '%s' "$want" | grep -Eq "$semver"; then
+    if downgrade_opted_in; then
+      c_warn "cannot compare installed hestia (${have:-unreadable}) with ${VERSION}; proceeding (HESTIA_ALLOW_DOWNGRADE set)"
+      return 0
+    fi
+    c_err "cannot compare installed hestia (${have:-version unreadable}) with ${VERSION}; refusing in case this is a downgrade. Set HESTIA_ALLOW_DOWNGRADE=1 to install anyway."
+    exit 1
+  fi
   [ "$have" = "$want" ] && return 0
-  if [ "$(printf '%s\n%s\n' "$have" "$want" | sort -V | tail -n1)" = "$have" ]; then
-    if [ -n "${HESTIA_ALLOW_DOWNGRADE:-}" ]; then
+  if version_newer "$have" "$want"; then
+    if downgrade_opted_in; then
       c_warn "downgrading hestia ${have} -> ${want} (HESTIA_ALLOW_DOWNGRADE set)"
     else
       c_err "installed hestia ${have} is newer than ${VERSION}; refusing to downgrade (a newer daemon's databases may not open). Set HESTIA_ALLOW_DOWNGRADE=1 to force."

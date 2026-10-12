@@ -30,10 +30,11 @@ def func(name):
 
 PRELUDE = "\n".join(line for line in SCRIPT.splitlines()
                     if line.startswith(("REPO=", "FALLBACK_VERSION=")))
-PRELUDE += "\n" + "\n".join(func(n) for n in ("c_warn", "c_err", "resolve_version", "guard_downgrade"))
+PRELUDE += "\n" + "\n".join(func(n) for n in ("c_warn", "c_err", "resolve_version", "version_newer",
+                                       "downgrade_opted_in", "guard_downgrade"))
 
 
-def run(*, api_json=None, installed=None, pin="", allow=""):
+def run(*, api_json=None, installed=None, pin="", allow="", raw_version=None):
     with tempfile.TemporaryDirectory() as d:
         d = pathlib.Path(d)
         stub = d / "curl"
@@ -43,8 +44,13 @@ def run(*, api_json=None, installed=None, pin="", allow=""):
             (d / "api.json").write_text(api_json)
             stub.write_text(f"#!/bin/sh\ncat '{d / 'api.json'}'\n")
         stub.chmod(0o755)
+        (d / "sort").write_text("#!/bin/sh\necho 'sort must not be called (no GNU sort -V on macOS)' >&2\nexit 99\n")
+        (d / "sort").chmod(0o755)
         binp = d / "hestia"
-        if installed:
+        if raw_version is not None:
+            binp.write_text(f"#!/bin/sh\necho '{raw_version}'\n")
+            binp.chmod(0o755)
+        elif installed:
             binp.write_text(f"#!/bin/sh\necho 'hestia {installed} (v{installed}-12-gabc1234)'\n")
             binp.chmod(0o755)
         body = (f"set -euo pipefail\nc_ok() {{ :; }}\n{PRELUDE}\nVERSION='{pin}'\nBIN_PATH='{binp}'\n"
@@ -80,6 +86,24 @@ check("newer installed + HESTIA_ALLOW_DOWNGRADE: proceeds, loudly",
       rc == 0 and "downgrading hestia 0.0.4 -> 0.0.3" in out, out)
 rc, out = run(pin="v0.0.10", installed="0.0.9")
 check("versions compare numerically, not as text (0.0.10 > 0.0.9)", rc == 0, out)
+rc, out = run(pin="v0.0.3", installed="0.0.4", allow="0")
+check("HESTIA_ALLOW_DOWNGRADE=0 is NOT an opt-in (refuses)", rc == 1 and "refusing to downgrade" in out, out)
+rc, out = run(pin="v0.0.3", installed="0.0.4", allow="false")
+check("HESTIA_ALLOW_DOWNGRADE=false is NOT an opt-in", rc == 1, out)
+for v in ("1", "true", "yes", "TRUE"):
+    rc, out = run(pin="v0.0.3", installed="0.0.4", allow=v)
+    check(f"HESTIA_ALLOW_DOWNGRADE={v} is an opt-in", rc == 0 and "downgrading" in out, out)
+rc, out = run(pin="v0.0.3", raw_version="hestia (unknown build)")
+check("installed version unreadable: FAILS CLOSED", rc == 1 and "cannot compare" in out, out)
+rc, out = run(pin="v0.0.3", raw_version="hestia (unknown build)", allow="1")
+check("installed version unreadable + opt-in: proceeds, loudly", rc == 0 and "cannot compare" in out, out)
+rc, out = run(pin="main", installed="0.0.4")
+check("target not X.Y.Z: FAILS CLOSED", rc == 1 and "cannot compare" in out, out)
+rc, out = run(pin="v0.10.0", installed="0.9.12")
+check("numeric per field (0.10.0 > 0.9.12)", rc == 0, out)
+rc, out = run(pin="v1.0.0", installed="0.99.99")
+check("major field dominates (1.0.0 > 0.99.99)", rc == 0, out)
+check("no GNU sort -V in the script", "sort -V" not in SCRIPT)
 check("no literal v0.0.3 default remains", 'DEFAULT_VERSION="v0.0.3"' not in SCRIPT)
 
 raise SystemExit(1 if FAILS else 0)
