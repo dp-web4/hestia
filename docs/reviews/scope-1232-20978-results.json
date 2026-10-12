@@ -1,0 +1,3690 @@
+{
+  "shell": {
+    "exit_code": 0,
+    "rows": [
+      {
+        "case": "helper/direct",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/direct",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/standalone-c",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/standalone-c",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/long-option-c",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/long-option-c",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/combined-lc",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/combined-lc",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/combined-ec",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/combined-ec",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/exec-combined",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/exec-combined",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/sudo-combined",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/sudo-combined",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/builtin-eval",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/builtin-eval",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/command-eval",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/command-eval",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/ansi-c-quote",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ansi-c-quote",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/shell-here-string",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/shell-here-string",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/shell-pipe",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/shell-pipe",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/shell-descriptor",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/shell-descriptor",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/allowed-temp-path",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/allowed-temp-path",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "helper/inert-here-string",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/inert-here-string",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "helper/inert-pipe",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/inert-pipe",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "claude-code/direct",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/standalone-c",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/long-option-c",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/combined-lc",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/combined-ec",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/exec-combined",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/sudo-combined",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/builtin-eval",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/command-eval",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ansi-c-quote",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/shell-here-string",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/shell-pipe",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/shell-descriptor",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/allowed-temp-path",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/inert-here-string",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/inert-pipe",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/direct",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/standalone-c",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/long-option-c",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/combined-lc",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/combined-ec",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/exec-combined",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/sudo-combined",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/builtin-eval",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/command-eval",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ansi-c-quote",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/shell-here-string",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/shell-pipe",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/shell-descriptor",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/allowed-temp-path",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/inert-here-string",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/inert-pipe",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/direct",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/standalone-c",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/long-option-c",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/combined-lc",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/combined-ec",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/exec-combined",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/sudo-combined",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/builtin-eval",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/command-eval",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ansi-c-quote",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/shell-here-string",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/shell-pipe",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/shell-descriptor",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/allowed-temp-path",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/inert-here-string",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/inert-pipe",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/direct",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/standalone-c",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/long-option-c",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/combined-lc",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/combined-ec",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/exec-combined",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/sudo-combined",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/builtin-eval",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/command-eval",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ansi-c-quote",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/shell-here-string",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/shell-pipe",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/shell-descriptor",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/allowed-temp-path",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/inert-here-string",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/inert-pipe",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "checks": 96,
+        "failures": 0,
+        "held": "28b79cccf49c9f37a27a6c95fb006a026d50251d583cd314c83a3aa849f5e241",
+        "full_gate": true,
+        "failed_cases": []
+      }
+    ],
+    "stderr": ""
+  },
+  "literal": {
+    "exit_code": 0,
+    "rows": [
+      {
+        "case": "helper/substitution-use-before-assignment",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/substitution-use-before-assignment",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/literal-field-splitting",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/literal-field-splitting",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/attached-printf-variable",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/attached-printf-variable",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/attached-read-array",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/attached-read-array",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/arithmetic-rebinding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/arithmetic-rebinding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/combined-shell-code",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/combined-shell-code",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/shell-options-disqualify",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/shell-options-disqualify",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/combined-shell-options-disqualify",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/combined-shell-options-disqualify",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/prefix-assignment",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/prefix-assignment",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/pipeline-left",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/pipeline-left",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/pipeline-right",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/pipeline-right",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/subshell-binding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/subshell-binding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/eval-rebinding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/eval-rebinding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/plain-shell-disqualify",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/plain-shell-disqualify",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/nameref-target",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/nameref-target",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/array-element",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/array-element",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/array-compound",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/array-compound",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/plain-use-before",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/plain-use-before",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/spaced-printf-variable",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/spaced-printf-variable",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/spaced-read-array",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/spaced-read-array",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/direct-forbidden",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/direct-forbidden",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/simple-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/simple-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "helper/and-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/and-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "helper/newline-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/newline-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "helper/later-substitution-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/later-substitution-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "helper/quoted-whitespace-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/quoted-whitespace-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "claude-code/substitution-use-before-assignment",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/literal-field-splitting",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/attached-printf-variable",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/attached-read-array",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/arithmetic-rebinding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/combined-shell-code",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/shell-options-disqualify",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/combined-shell-options-disqualify",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/prefix-assignment",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/pipeline-left",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/pipeline-right",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/subshell-binding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/eval-rebinding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/plain-shell-disqualify",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/nameref-target",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/array-element",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/array-compound",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/plain-use-before",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/spaced-printf-variable",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/spaced-read-array",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/direct-forbidden",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/simple-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/and-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/newline-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/later-substitution-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/quoted-whitespace-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/substitution-use-before-assignment",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/literal-field-splitting",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/attached-printf-variable",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/attached-read-array",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/arithmetic-rebinding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/combined-shell-code",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/shell-options-disqualify",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/combined-shell-options-disqualify",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/prefix-assignment",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/pipeline-left",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/pipeline-right",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/subshell-binding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/eval-rebinding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/plain-shell-disqualify",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/nameref-target",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/array-element",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/array-compound",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/plain-use-before",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/spaced-printf-variable",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/spaced-read-array",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/direct-forbidden",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/simple-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/and-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/newline-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/later-substitution-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/quoted-whitespace-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/substitution-use-before-assignment",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/literal-field-splitting",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/attached-printf-variable",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/attached-read-array",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/arithmetic-rebinding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/combined-shell-code",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/shell-options-disqualify",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/combined-shell-options-disqualify",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/prefix-assignment",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/pipeline-left",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/pipeline-right",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/subshell-binding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/eval-rebinding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/plain-shell-disqualify",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/nameref-target",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/array-element",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/array-compound",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/plain-use-before",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/spaced-printf-variable",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/spaced-read-array",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/direct-forbidden",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/simple-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/and-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/newline-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/later-substitution-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/quoted-whitespace-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/substitution-use-before-assignment",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/literal-field-splitting",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/attached-printf-variable",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/attached-read-array",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/arithmetic-rebinding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/combined-shell-code",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/shell-options-disqualify",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/combined-shell-options-disqualify",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/prefix-assignment",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/pipeline-left",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/pipeline-right",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/subshell-binding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/eval-rebinding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/plain-shell-disqualify",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/nameref-target",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/array-element",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/array-compound",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/plain-use-before",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/spaced-printf-variable",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/spaced-read-array",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/direct-forbidden",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/simple-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/and-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/newline-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/later-substitution-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/quoted-whitespace-allow",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "checks": 156,
+        "failures": 0,
+        "held": "28b79cccf49c9f37a27a6c95fb006a026d50251d583cd314c83a3aa849f5e241",
+        "full_gate": true,
+        "failed_cases": []
+      }
+    ],
+    "stderr": ""
+  },
+  "quote": {
+    "exit_code": 0,
+    "rows": [
+      {
+        "case": "helper/custom-ifs-splits-literal",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/custom-ifs-splits-literal",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/raw-quote-marker",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/raw-quote-marker",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/single-quoted-marker",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/single-quoted-marker",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/custom-ifs-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/custom-ifs-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "helper/whitespace-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/whitespace-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "helper/whitespace-unquoted-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/whitespace-unquoted-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/mixed-quoted-unquoted-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/mixed-quoted-unquoted-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/newline-unquoted-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/newline-unquoted-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/simple-literal-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/simple-literal-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "claude-code/custom-ifs-splits-literal",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/raw-quote-marker",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/single-quoted-marker",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/custom-ifs-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/whitespace-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/whitespace-unquoted-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/mixed-quoted-unquoted-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/newline-unquoted-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/simple-literal-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/custom-ifs-splits-literal",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/raw-quote-marker",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/single-quoted-marker",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/custom-ifs-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/whitespace-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/whitespace-unquoted-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/mixed-quoted-unquoted-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/newline-unquoted-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/simple-literal-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/custom-ifs-splits-literal",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/raw-quote-marker",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/single-quoted-marker",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/custom-ifs-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/whitespace-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/whitespace-unquoted-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/mixed-quoted-unquoted-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/newline-unquoted-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/simple-literal-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/custom-ifs-splits-literal",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/raw-quote-marker",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/single-quoted-marker",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/custom-ifs-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/whitespace-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/whitespace-unquoted-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/mixed-quoted-unquoted-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/newline-unquoted-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/simple-literal-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "checks": 54,
+        "failures": 0,
+        "held": "28b79cccf49c9f37a27a6c95fb006a026d50251d583cd314c83a3aa849f5e241",
+        "full_gate": true,
+        "failed_cases": []
+      }
+    ],
+    "stderr": ""
+  },
+  "ifs_original": {
+    "exit_code": 1,
+    "rows": [
+      {
+        "case": "helper/ifs-array-no-splitting-control",
+        "expected_allow": true,
+        "actual_allow": false,
+        "rule": "",
+        "passed": false
+      },
+      {
+        "case": "core/ifs-array-no-splitting-control",
+        "expected_allow": true,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": false
+      },
+      {
+        "case": "helper/ifs-loop-binding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-loop-binding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-array-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-array-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-loop-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-loop-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "helper/ordinary-ifs-assignment-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ordinary-ifs-assignment-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/default-ifs-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/default-ifs-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "claude-code/ifs-array-no-splitting-control",
+        "expected_allow": true,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": false,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-loop-binding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-array-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-loop-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ordinary-ifs-assignment-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/default-ifs-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-array-no-splitting-control",
+        "expected_allow": true,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": false,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-loop-binding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-array-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-loop-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ordinary-ifs-assignment-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/default-ifs-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-array-no-splitting-control",
+        "expected_allow": true,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": false,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-loop-binding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-array-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-loop-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ordinary-ifs-assignment-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/default-ifs-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-array-no-splitting-control",
+        "expected_allow": true,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": false,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-loop-binding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-array-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-loop-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ordinary-ifs-assignment-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/default-ifs-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "checks": 36,
+        "failures": 6,
+        "held": "28b79cccf49c9f37a27a6c95fb006a026d50251d583cd314c83a3aa849f5e241",
+        "full_gate": true,
+        "failed_cases": [
+          "helper/ifs-array-no-splitting-control",
+          "core/ifs-array-no-splitting-control",
+          "claude-code/ifs-array-no-splitting-control",
+          "codex/ifs-array-no-splitting-control",
+          "kimi/ifs-array-no-splitting-control",
+          "gemini/ifs-array-no-splitting-control"
+        ]
+      }
+    ],
+    "stderr": ""
+  },
+  "ifs_expanded": {
+    "exit_code": 0,
+    "rows": [
+      {
+        "case": "helper/ifs-array-conservative-request",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-array-conservative-request",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-loop-binding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-loop-binding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-array-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-array-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-loop-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-loop-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "helper/ordinary-ifs-assignment-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ordinary-ifs-assignment-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/default-ifs-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/default-ifs-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-for-positional",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-for-positional",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-select",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-select",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-exec-fd",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-exec-fd",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-coproc",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-coproc",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-wait-p",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-wait-p",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-case",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-case",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-continuation-assignment",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-continuation-assignment",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-continuation-loop",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-continuation-loop",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-continuation-fd",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-continuation-fd",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-two-continuations",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-two-continuations",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-comment-conservative-request",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-comment-conservative-request",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-comment-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-comment-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-substring-conservative-request",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-substring-conservative-request",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true
+      },
+      {
+        "case": "helper/ifs-substring-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "core/ifs-substring-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "",
+        "passed": true
+      },
+      {
+        "case": "claude-code/ifs-array-conservative-request",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-loop-binding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-array-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-loop-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ordinary-ifs-assignment-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/default-ifs-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-for-positional",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-select",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-exec-fd",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-coproc",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-wait-p",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-case",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-continuation-assignment",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-continuation-loop",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-continuation-fd",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-two-continuations",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-comment-conservative-request",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-comment-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-substring-conservative-request",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "claude-code/ifs-substring-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-array-conservative-request",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-loop-binding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-array-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-loop-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ordinary-ifs-assignment-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/default-ifs-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-for-positional",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-select",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-exec-fd",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-coproc",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-wait-p",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-case",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-continuation-assignment",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-continuation-loop",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-continuation-fd",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-two-continuations",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-comment-conservative-request",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-comment-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-substring-conservative-request",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "codex/ifs-substring-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-array-conservative-request",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-loop-binding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-array-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-loop-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ordinary-ifs-assignment-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/default-ifs-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-for-positional",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-select",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-exec-fd",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-coproc",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-wait-p",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-case",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-continuation-assignment",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-continuation-loop",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-continuation-fd",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-two-continuations",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-comment-conservative-request",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-comment-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-substring-conservative-request",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "kimi/ifs-substring-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-array-conservative-request",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-loop-binding",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-array-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-loop-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ordinary-ifs-assignment-control",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/default-ifs-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-for-positional",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-select",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-exec-fd",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-coproc",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-wait-p",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-case",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-continuation-assignment",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-continuation-loop",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-continuation-fd",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-two-continuations",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-comment-conservative-request",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-comment-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-substring-conservative-request",
+        "expected_allow": false,
+        "actual_allow": false,
+        "rule": "mrh.command",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "case": "gemini/ifs-substring-quoted-control",
+        "expected_allow": true,
+        "actual_allow": true,
+        "rule": "gate.allow",
+        "passed": true,
+        "evidence_committed": true
+      },
+      {
+        "checks": 120,
+        "failures": 0,
+        "held": "28b79cccf49c9f37a27a6c95fb006a026d50251d583cd314c83a3aa849f5e241",
+        "full_gate": true,
+        "failed_cases": []
+      }
+    ],
+    "stderr": ""
+  },
+  "argv_proof": {
+    "exit_code": 0,
+    "rows": [
+      {
+        "case": "ifs-array-conservative-request",
+        "command": "IFS[0]=:; S=/tmp:/etc; cat $S/hostname",
+        "argv": [
+          "/tmp:/etc/hostname"
+        ]
+      },
+      {
+        "case": "ifs-loop-binding",
+        "command": "S=/tmp:/etc; for IFS in :; do cat $S/hostname; done",
+        "argv": [
+          "/tmp",
+          "/etc/hostname"
+        ]
+      },
+      {
+        "case": "ifs-array-quoted-control",
+        "command": "IFS[0]=:; S=/tmp:/etc; cat \"$S/hostname\"",
+        "argv": [
+          "/tmp:/etc/hostname"
+        ]
+      },
+      {
+        "case": "ifs-loop-quoted-control",
+        "command": "S=/tmp:/etc; for IFS in :; do cat \"$S/hostname\"; done",
+        "argv": [
+          "/tmp:/etc/hostname"
+        ]
+      },
+      {
+        "case": "ordinary-ifs-assignment-control",
+        "command": "IFS=:; S=/tmp:/etc; cat $S/hostname",
+        "argv": [
+          "/tmp",
+          "/etc/hostname"
+        ]
+      },
+      {
+        "case": "default-ifs-control",
+        "command": "S=/tmp:/etc; cat $S/hostname",
+        "argv": [
+          "/tmp:/etc/hostname"
+        ]
+      },
+      {
+        "case": "ifs-continuation-assignment",
+        "command": "S=/tmp:/etc; I\\\nFS=:; cat $S/hostname",
+        "argv": [
+          "/tmp",
+          "/etc/hostname"
+        ]
+      },
+      {
+        "case": "ifs-continuation-loop",
+        "command": "S=/tmp:/etc; for I\\\nFS in :; do cat $S/hostname; done",
+        "argv": [
+          "/tmp",
+          "/etc/hostname"
+        ]
+      },
+      {
+        "case": "ifs-two-continuations",
+        "command": "S=/tmp:/etc; for I\\\nF\\\nS in :; do cat $S/hostname; done",
+        "argv": [
+          "/tmp",
+          "/etc/hostname"
+        ]
+      }
+    ],
+    "stderr": ""
+  }
+}
