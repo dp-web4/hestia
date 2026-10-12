@@ -108,3 +108,23 @@ once-only requests after the proposed grants: 6984
 | fix | proposed | 10075 (18.6%) | 1701 | 8374 | 0 | 9518 (22.9%) | 75 (1.3%) | 482 (7.2%) |
 
 main itself refuses 1431 of 54099 (pass 1/2, unchanged by this PR)
+
+## 2026-10-12: main 7e901d3c vs d10129c2 (d101) vs the Codex-20554 repairs (quote) — 57,597 commands
+
+### Window of the 2026-10-05 run (2026-09-20 .. 2026-10-05T20:05Z): 33054 commands (claude-code 24536, codex 3359, kimi-code 5159)
+| core | grants | refused (delta over main) | of which: path | once-only request | plain incomplete | claude-code | codex | kimi-code |
+|---|---|---|---|---|---|---|---|---|
+| d101 | none | 6288 (19.0%) | 2773 | 3515 | 0 | 5378 (21.9%) | 76 (2.3%) | 834 (16.2%) |
+| d101 | proposed | 4822 (14.6%) | 1079 | 3743 | 0 | 4412 (18.0%) | 36 (1.1%) | 374 (7.2%) |
+| quote | none | 6288 (19.0%) | 2773 | 3515 | 0 | 5378 (21.9%) | 76 (2.3%) | 834 (16.2%) |
+| quote | proposed | 4822 (14.6%) | 1079 | 3743 | 0 | 4412 (18.0%) | 36 (1.1%) | 374 (7.2%) |
+
+### Full window (2026-09-20 .. now): 57597 commands (claude-code 44452, codex 6436, kimi-code 6709)
+| core | grants | refused (delta over main) | of which: path | once-only request | plain incomplete | claude-code | codex | kimi-code |
+|---|---|---|---|---|---|---|---|---|
+| d101 | none | 13016 (22.6%) | 4304 | 8712 | 0 | 11734 (26.4%) | 152 (2.4%) | 1130 (16.8%) |
+| d101 | proposed | 10943 (19.0%) | 1783 | 9160 | 0 | 10380 (23.4%) | 81 (1.3%) | 482 (7.2%) |
+| quote | none | 13016 (22.6%) | 4304 | 8712 | 0 | 11734 (26.4%) | 152 (2.4%) | 1130 (16.8%) |
+| quote | proposed | 10943 (19.0%) | 1783 | 9160 | 0 | 10380 (23.4%) | 81 (1.3%) | 482 (7.2%) |
+
+main itself refuses 1488 of 57597 (pass 1/2, unchanged by this PR)

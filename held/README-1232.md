@@ -6,7 +6,8 @@ touches are the governance surface, so they land only through the gate's escalat
 
 | file | sha256 |
 |---|---|
-| `d10129c2c49be63e5aa941855a1c0e1026d47ed635c1667be93c3de78e7c9fe7.patch` | `d10129c2c49be63e5aa941855a1c0e1026d47ed635c1667be93c3de78e7c9fe7` (the proposal; main `7e901d3c`, merge `3efae5d2`) |
+| `f4a517554536adfeb64b76220a4af929ee50a2473d3b692f7f6312f867e2d4f2.patch` | `f4a517554536adfeb64b76220a4af929ee50a2473d3b692f7f6312f867e2d4f2` (the proposal; main `7e901d3c`, merge `3efae5d2`) |
+| `lineage/d10129c2c49be63e5aa941855a1c0e1026d47ed635c1667be93c3de78e7c9fe7.patch` | `d10129c2c49be63e5aa941855a1c0e1026d47ed635c1667be93c3de78e7c9fe7`: after Codex 20536; Codex HOLD 20554 (IFS, marker forgery); reference only, superseded |
 | `lineage/f4644ef4f71a48cda62a546d5552f5e34063c43109e73aa71e3934d7ada699a0.patch` | `f4644ef4f71a48cda62a546d5552f5e34063c43109e73aa71e3934d7ada699a0`: the literal rule as first built; Codex HOLD 20536 (four P1s); reference only, superseded |
 | `lineage/c36101e4fbe0e459c9de2584db08c4c7b841d29b6482b8b1293fe23855c868e3.patch` | `c36101e4fbe0e459c9de2584db08c4c7b841d29b6482b8b1293fe23855c868e3`: the previous proposal (narrowing without the literal rule, on main `d3c731fc`); reference only, superseded |
 | `lineage/01e68a1cd2d3f980021fd73c5d882697b8887b8ddab10380d5ab3b0dca3bae20.patch` | `01e68a1cd2d3f980021fd73c5d882697b8887b8ddab10380d5ab3b0dca3bae20`: the patch Codex reviewed in 17054 and kimi verified on 2026-10-07 (reference only, do not apply; its base is `d3c05006`) |
@@ -14,6 +15,7 @@ touches are the governance surface, so they land only through the gate's escalat
 | `lineage/1232-narrowing.diff` | **exactly what dp's 2026-10-10 ruling changed** on top of that |
 | `lineage/1232-literal-rule.diff` | **exactly what dp's 2026-10-11 ruling added** (the single-literal-assignment rule), on the sources carried onto `7e901d3c` |
 | `lineage/1232-codex-20536.diff` | **exactly what the repair of Codex's HOLD 20536 changed** on top of `f4644ef4` |
+| `lineage/1232-codex-20554.diff` | **exactly what the repair of Codex's HOLD 20554 changed** on top of `d10129c2` |
 
 Each patch filename is its own sha256, so `sha256sum held/*.patch held/lineage/*.patch` verifies them.
 
@@ -136,6 +138,26 @@ with no new shell modelling:
    from a pipe, a here-string, `-` or a descriptor path (`bash <<<`, `… | sh`, `sh /dev/fd/3`) is
    unenumerated. A heredoc program (`python3 - <<'EOF'`) stays visible and judged.
 
+### Hardened after Codex's second HOLD (notice 20554)
+
+1. **IFS is the splitting condition, not whitespace.** `IFS=:; S=/tmp:/etc; cat $S/hostname`
+   allowed. Now any IFS assignment anywhere in the command — a statement, a prefix to a command,
+   `IFS+=` — makes EVERY binding resolve only at a double-quoted use; an unquoted use is a request.
+   (`read` and the `declare` family already disqualify the rule wholesale.) The quoted control
+   `IFS=:; S=/tmp:/etc; cat "$S/hostname"` stays allowed: quoting suppresses splitting whatever IFS is.
+2. **No in-band marker can be forged.** The lexer marks a double-quoted reference with an in-band
+   byte (`\x04`), and uses `\x00`–`\x03` for other markers; a command already containing one forged
+   quote evidence (`cat \x04$S/…`, also inside single quotes). Any command containing a byte in
+   `\x00`–`\x05` is now unenumerated BEFORE any marker is inserted, so every marker in a token is
+   one the lexer wrote. Text the gate re-lexes (an `eval` / `sh -c` string) has its markers
+   stripped first.
+
+**Stated execution contract (residual).** The rule assumes the shell's DEFAULT IFS unless the command
+itself assigns it. An IFS inherited from earlier shell state is not visible to the gate. That is an
+ASSUMPTION about the harness (that each Bash call starts from a shell with the default IFS), not
+something this patch verifies; a harness that keeps one shell alive across calls would need the
+quoted-use-only mode for every binding.
+
 ## Battery (written first)
 
 Every Codex false-allow from the review rounds is a row: 16955/a589ed9, 17015, 17029a–f, 17054
@@ -149,17 +171,25 @@ through `command_scope_reach` and through `core.evaluate`.
 | 01e68a1c merged onto main | 14 | 25 | 121 | 57/57 |
 | narrowed, without the literal rule (c36101e4) | 0 | 0 | 99 path / 36 request | 57/57 |
 | narrowed + literal rule as first built (f4644ef4) | 17 (Codex's forms, imported) | 1 | — | 70/70 |
-| **narrowed + literal rule, Codex-20536 repairs (this patch)** | **0** | **0** | **113 path / 59 request** | **70/70** |
+| narrowed + literal rule, Codex-20536 repairs (d10129c2) | 12 (Codex 20554's 3 + 9 generalising rows) | 0 | — | 73/73 |
+| **+ Codex-20554 repairs (this patch)** | **0** | **0** | **113 path / 75 request** | **73/73** |
 
-The battery has 944 checks (80 request rows, 70 allow rows): 944/944 on this patch. Both of Codex's
+The battery has 995 checks: 995/995 on this patch. Codex's quote runner (`codex-quote-*`) is imported
+as invariants, plus rows that generalise it: every marker byte `\x00`–`\x05` forged in front of a
+reference (`quote-marker-byte-*`, also inside single quotes) and three more IFS spellings (prefix
+`IFS=:`, `IFS+=`, IFS assigned after the binding). Against the full battery, only those 12 deny rows
+changed verdict from `d10129c2`'s core (ALLOW → request); no allow row changed.
+
+**Codex's three runners, `--full-gate`, from a nested export of this branch:** shell 0/96, literal
+0/156, quote **0/54** on this patch; against `d10129c2` the quote runner reproduces Codex's 18/54.
+
+(Previously, against `f4644ef4`: Both of Codex's
 runners are imported as invariants (`codex-shell-*`, `codex-lit-*`: every refusal case refused, every
 positive control allowed). Against the full battery, the rows whose verdict changed from `f4644ef4`'s
 core: the 17 Codex forms (ALLOW → refused or request) and `lit-after-a-python-c-literal` (an
 interpreter now disqualifies the rule; ALLOW → request). No allow row changed.
 
-**Codex's runners, `--full-gate`, from a nested export of this branch:** `scope-1232-shell-regressions.py`
-0 failures / 96 checks and `scope-1232-literal-regressions.py` 0 / 156 on this patch; the same runs
-against `f4644ef4` reproduce Codex's 54 / 96 and 48 / 156.
+the shell and literal runners went 54/96 and 48/156 → 0, and 944 checks passed.)
 
 (Earlier, the literal rule's own rows: `D=/tmp/x; cat $D/y` and four admitted shapes moved request →
 ALLOW, and `S=; cat $S/etc/hostname` request → a concrete `/etc/hostname` refusal.) A `request` row must be refused as the sentinel (a scope request),
@@ -181,7 +211,8 @@ claude-code 2,726 refused, and 1,607 against 1,609 with grants.
 | 01e68a1c merged onto main | 3,415 (10.3%) | 1,607 (4.9%) | 783 | 0 | 820 |
 | narrowed, without the literal rule (c36101e4) | 7,051 (21.3%) | 5,660 (17.1%) | 1,079 | 4,581 | 0 |
 | narrowed + literal rule as first built (f4644ef4) | 5,539 (16.8%) | 4,048 (12.2%) | 1,080 | 2,968 | 0 |
-| **+ Codex-20536 repairs (this patch)** | **6,288 (19.0%)** | **4,822 (14.6%)** | 1,079 | **3,743** | 0 |
+| + Codex-20536 repairs (d10129c2) | 6,288 (19.0%) | 4,822 (14.6%) | 1,079 | 3,743 | 0 |
+| **+ Codex-20554 repairs (this patch)** | **6,288 (19.0%)** | **4,822 (14.6%)** | 1,079 | **3,743** | 0 |
 
 Per seat, this patch with the proposed grants: claude-code 18.0% (15.1% for f4644ef4, 21.1% without
 the rule; 5.8% on 01e68a1c), codex 1.1% (0.8%), kimi-code 7.2% (6.1%, 8.6%; 2.9%). Path refusals are unchanged by the rule
@@ -195,7 +226,12 @@ the literal-rule replay (2026-10-11; the corpus grows with every session).
 | 01e68a1c as reviewed / merged onto main | 6,629 (12.4%) | 4,025 (7.5%) | 0 (2,865 plain incomplete) |
 | narrowed, without the literal rule | 13,401 (24.9%) | 11,499 (21.4%) | 9,804 |
 | narrowed + literal rule as first built (f4644ef4) | 10,764 (19.9%) | 8,702 (16.1%) | 7,000 |
-| **+ Codex-20536 repairs (this patch; 54,099 commands)** | **12,099 (22.4%)** | **10,075 (18.6%)** | **8,374** |
+| + Codex-20536 repairs (d10129c2; 54,099 commands) | 12,099 (22.4%) | 10,075 (18.6%) | 8,374 |
+| **+ Codex-20554 repairs (this patch; 57,597 commands, re-run)** | **13,016 (22.6%)** | **10,943 (19.0%)** | **9,160** |
+
+The 20554 repairs cost nothing on the corpus: on the same 57,597 commands `d10129c2`'s core and this
+patch give identical figures (no corpus command assigns IFS or carries a marker byte where it binds).
+The full window's rise from 18.6% to 19.0% is the corpus growing, not the repair.
 
 **What the standing grants absorb.**
 
@@ -236,7 +272,7 @@ and value checks all excluded), and lands at 12.2% / 16.1% with grants. Scripts 
   hooks-gt half was computed with `tools/hooks_gt.py`'s own functions.
 - `git apply --check` is clean on HEAD. Applied to a throwaway export of HEAD, every staged file
   comes out byte-identical and `tools/hooks_gt.py check` reports ok.
-- Python tests ran with the patched modules supplied through `HESTIA_CONTRACT_OVERLAY` and a process-wide import overlay; the patch's own test files ran from their staged copies. Results (2026-10-11, after Codex 20536): battery 944/944; Codex's two runners 0/96 and 0/156 with `--full-gate`; contract 21 + shim parity 29×4; real-daemon arm passes; `test_gate_core` all checks pass. Full CI Python set: 154 pass / 3 fail, all accounted for — `last_words_test` (A7) and `shared_target_split_test` (cannot locate the real cargo behind the shim) fail on main in this environment too; `loader_binds_installed_engine_test` poisons the installed core on purpose and cannot run under a process-wide import overlay (it passes under the per-test seam). Rust: `cargo test -j2 --no-fail-fast`, every target, under the watchdog: 1317 passed, 0 failed (CI's red `cargo test` on this branch was `member_presence_census`, fixed in `6a9d7cf3`).
+- Python tests ran with the patched modules supplied through `HESTIA_CONTRACT_OVERLAY` and a process-wide import overlay; the patch's own test files ran from their staged copies. Results (2026-10-12, after Codex 20554): battery 995/995; Codex's three runners 0/96, 0/156, 0/54 with `--full-gate`; contract 21 + shim parity 29×4 with the real-daemon arm against an isolated daemon built from this branch; `test_gate_core` all checks pass. Full CI Python set: 154 pass / 3 fail, all accounted for — `last_words_test` (A7) and `shared_target_split_test` (cannot locate the real cargo behind the shim) fail on main in this environment too; `loader_binds_installed_engine_test` poisons the installed core on purpose and cannot run under a process-wide import overlay (it passes under the per-test seam). Rust: `cargo test -j2 --no-fail-fast`, every target, under the watchdog: 1317 passed, 0 failed.
 - The contract suite's real-daemon arm ran against an isolated daemon built from this branch, on
   :7799. The sentinel request opens through the real handler, and a re-issue finds it.
 
