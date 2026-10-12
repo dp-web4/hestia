@@ -237,11 +237,11 @@ drift_direction() {
   # (CI's depth-1 clone), so accept both shapes. A commit this checkout does not
   # have — an unfetched branch, a stub's invented sha — resolves to no direction,
   # which is a real fourth state and not a licence to pick one.
-  local RUN="${1%-dirty}" SRC="${2%-dirty}" A B
-  A="${RUN##*-g}"; B="${SRC##*-g}"
-  case "$A$B" in *[!0-9a-f]*) return 0 ;; esac
-  git -C "$WATCH_REPO_ROOT" cat-file -e "${A}^{commit}" 2>/dev/null || return 0
-  git -C "$WATCH_REPO_ROOT" cat-file -e "${B}^{commit}" 2>/dev/null || return 0
+  # An exact release tag (`v0.3.0`, what describe prints AT a tagged commit) carries no sha and
+  # is resolved through refs/tags, like hestia-deploy's build_commit.
+  local A B
+  A="$(describe_commit "$1")" || return 0
+  B="$(describe_commit "$2")" || return 0
   if git -C "$WATCH_REPO_ROOT" merge-base --is-ancestor "$A" "$B" 2>/dev/null; then
     printf 'daemon-behind-source'
   elif git -C "$WATCH_REPO_ROOT" merge-base --is-ancestor "$B" "$A" 2>/dev/null; then
@@ -255,14 +255,37 @@ drift_direction() {
   # assumed in either direction.
 }
 
+# ONLY RELEASE TAGS NAME A BUILD (web4#904). core/build.rs bakes
+# `git describe --tags --match 'v[0-9]*' --always --dirty`, so the source side is described with the
+# same glob: otherwise an `app-v*` tag (the Android APKs, ancestors of main) at or nearer than the
+# last release renames this checkout and nothing else, and a current daemon reads as drift.
+WATCH_BUILD_TAG_MATCH='v[0-9]*'
+
+describe_commit() {
+  # $1 = a describe string. Echoes the full sha it names in this checkout: the `-g<hex>` suffix
+  # (or a bare sha, a clone without tags) resolved, or an EXACT release tag peeled to its commit.
+  # Nothing (rc 1) for unknown, a commit this checkout lacks, or a non-release tag -- no producer
+  # emits one, so it names no build of ours.
+  local S="${1%-dirty}" H
+  H="${S##*-g}"
+  case "$H" in
+    ''|*[!0-9a-f]*) ;;
+    *) [ "${#H}" -ge 7 ] || return 1
+       git -C "$WATCH_REPO_ROOT" rev-parse -q --verify "${H}^{commit}" 2>/dev/null
+       return ;;
+  esac
+  case "$S" in ''|-*|*[!A-Za-z0-9._/+-]*) return 1 ;; esac
+  # shellcheck disable=SC2254  # the glob is the point
+  case "$S" in $WATCH_BUILD_TAG_MATCH) ;; *) return 1 ;; esac
+  git -C "$WATCH_REPO_ROOT" rev-parse -q --verify "refs/tags/${S}^{commit}" 2>/dev/null
+}
+
 same_commit() {
   # $1, $2 = describe strings. True when both name ONE commit this checkout can resolve, whatever
-  # the abbreviation length. Same hex shapes drift_direction accepts.
-  local A="${1%-dirty}" B="${2%-dirty}" FA FB
-  A="${A##*-g}"; B="${B##*-g}"
-  case "$A$B" in ''|*[!0-9a-f]*) return 1 ;; esac
-  FA="$(git -C "$WATCH_REPO_ROOT" rev-parse -q --verify "${A}^{commit}" 2>/dev/null)" || return 1
-  FB="$(git -C "$WATCH_REPO_ROOT" rev-parse -q --verify "${B}^{commit}" 2>/dev/null)" || return 1
+  # the abbreviation length. -dirty is ignored, as the string arm above it ignores it.
+  local FA FB
+  FA="$(describe_commit "$1")" || return 1
+  FB="$(describe_commit "$2")" || return 1
   [ -n "$FA" ] && [ "$FA" = "$FB" ]
 }
 
@@ -275,7 +298,7 @@ check_daemon_drift() {
   local VER PROV SOURCE STATE REASON
   VER="$(daemon_version_string 2>/dev/null || true)"
   if [ "${1:-}" = "refresh" ] || [ -z "${WATCH_DAEMON_SOURCE_RAW:-}" ]; then
-    WATCH_DAEMON_SOURCE_RAW="$(git -C "$WATCH_REPO_ROOT" describe --tags --always --dirty 2>/dev/null || true)"
+    WATCH_DAEMON_SOURCE_RAW="$(git -C "$WATCH_REPO_ROOT" describe --tags --match "$WATCH_BUILD_TAG_MATCH" --always --dirty 2>/dev/null || true)"
   fi
   SOURCE="$WATCH_DAEMON_SOURCE_RAW"
   case "$VER" in
