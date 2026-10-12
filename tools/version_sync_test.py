@@ -9,6 +9,7 @@
 3. `--write` repairs the copy to a state the checker passes, without reformatting: the only
    changed lines are version lines.
 4. The release check: a tag equal to v$VERSION passes, anything else fails.
+5. Release candidates: v$VERSION-rc.N passes as a prerelease; every near-miss shape fails.
 
 Run: python3 tools/version_sync_test.py   (bare; exit 1 on failure)
 """
@@ -87,6 +88,23 @@ def main() -> int:
         check(f"tag {bad!r} fails", VS.tag_problem(bad) is not None)
     check("the CLI exits 1 on a wrong tag", VS.main(["--tag", "v0.0.0"]) == 1)
     check("the CLI exits 0 on the right tag", VS.main(["--tag", f"v{version}"]) == 0)
+
+    # 5. release candidates (dp, 2026-10-12): exactly v$VERSION-rc.N, N a SemVer numeric id.
+    v = f"v{version}"
+    check("plain tag is a release", VS.tag_kind(v) == "release")
+    for good in (f"{v}-rc.0", f"{v}-rc.1", f"{v}-rc.12", f"refs/tags/{v}-rc.3"):
+        check(f"rc tag {good!r} passes", VS.tag_problem(good) is None)
+        check(f"rc tag {good!r} is a prerelease", VS.tag_kind(good) == "prerelease")
+    for bad in (f"{v}-rc", f"{v}-rc.", f"{v}-rc.01", f"{v}-rc.1a", f"{v}-rc.1.2", f"{v}-rc-1",
+                f"{v}-RC.1", f"{v}-beta.1", f"{v}-alpha.1", f"{v}-rc.1+build", f"{v}rc.1",
+                f"{v}-rc.-1", f"{v}.1-rc.1", "v0.0.4-rc.1", f"app-{v}-rc.1", f"{v} -rc.1",
+                f"{version}-rc.1", f"{v}-rc.1\n"):
+        check(f"tag {bad!r} fails", VS.tag_problem(bad) is not None)
+        check(f"tag {bad!r} has no kind", VS.tag_kind(bad) is None)
+    check("the CLI accepts an rc tag", VS.main(["--tag", f"{v}-rc.1"]) == 0)
+    check("the CLI refuses a beta tag", VS.main(["--tag", f"{v}-beta.1"]) == 1)
+    check("--tag-kind exits 0 on an rc", VS.main(["--tag-kind", f"{v}-rc.2"]) == 0)
+    check("--tag-kind exits 1 on a bare -rc", VS.main(["--tag-kind", f"{v}-rc"]) == 1)
 
     for f in FAILS:
         print("FAIL", f)

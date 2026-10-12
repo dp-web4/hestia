@@ -22,7 +22,14 @@ plugins/openclaw (consumers, not shipped artifacts).
 Usage:
     python3 tools/version_sync.py                  # check; exit 1 on any drift
     python3 tools/version_sync.py --write          # rewrite every site to VERSION
-    python3 tools/version_sync.py --tag v0.3.0     # check, AND the tag equals VERSION
+    python3 tools/version_sync.py --tag v0.3.0     # check, AND the tag is v$VERSION
+    python3 tools/version_sync.py --tag v0.3.0-rc.1  # ... or a release candidate of it
+    python3 tools/version_sync.py --tag-kind v0.3.0-rc.1   # print `release` or `prerelease`
+
+Release tags (dp, 2026-10-12): exactly `vX.Y.Z` (a release, published as latest) or
+`vX.Y.Z-rc.N` (a release candidate, published as a GitHub pre-release and never latest),
+with X.Y.Z equal to VERSION and N a SemVer numeric identifier (digits, no leading zero).
+Nothing else is a release tag: not `-rc`, `-rc.`, `-rc.01`, `-beta.1`, `-RC.1`, `.1`.
     python3 tools/version_sync.py --print          # print VERSION
 
 Writes are textual (one targeted substitution per site) so no file is reformatted;
@@ -249,18 +256,34 @@ def write(root: pathlib.Path = REPO, version: str | None = None) -> list[str]:
     return changed
 
 
-def tag_problem(tag: str, root: pathlib.Path = REPO) -> str | None:
+RC_SUFFIX = re.compile(r"-rc\.(0|[1-9][0-9]*)")
+
+
+def tag_kind(tag: str, root: pathlib.Path = REPO) -> str | None:
+    """`release` for v$VERSION, `prerelease` for v$VERSION-rc.N, None for anything else."""
     tag = tag.removeprefix("refs/tags/")
     want = "v" + read_version(root)
-    if tag != want:
-        return f"tag {tag!r} does not match VERSION (expected {want!r})"
+    if tag == want:
+        return "release"
+    if tag.startswith(want) and RC_SUFFIX.fullmatch(tag[len(want):]):
+        return "prerelease"
+    return None
+
+
+def tag_problem(tag: str, root: pathlib.Path = REPO) -> str | None:
+    if tag_kind(tag, root) is None:
+        want = "v" + read_version(root)
+        return (f"tag {tag.removeprefix('refs/tags/')!r} is not a release tag for VERSION "
+                f"(expected {want!r} or {want + '-rc.N'!r})")
     return None
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--write", action="store_true", help="rewrite every site to VERSION")
-    ap.add_argument("--tag", help="also require this tag (vX.Y.Z) to equal VERSION")
+    ap.add_argument("--tag", help="also require this tag to be v$VERSION or v$VERSION-rc.N")
+    ap.add_argument("--tag-kind", metavar="TAG",
+                    help="print `release` or `prerelease` for TAG and exit (1 if not a release tag)")
     ap.add_argument("--print", action="store_true", help="print VERSION and exit")
     ap.add_argument("--root", type=pathlib.Path, default=REPO, help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -268,6 +291,13 @@ def main(argv=None) -> int:
     version = read_version(a.root)
     if a.print:
         print(version)
+        return 0
+    if a.tag_kind is not None:
+        kind = tag_kind(a.tag_kind, a.root)
+        if kind is None:
+            print(tag_problem(a.tag_kind, a.root), file=sys.stderr)
+            return 1
+        print(kind)
         return 0
     if a.write:
         for rel in write(a.root, version):
