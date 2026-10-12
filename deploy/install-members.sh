@@ -106,7 +106,10 @@ EOF
   echo "!! OVERRIDE: installing from inside an agent session on an explicit operator ack."
 fi
 
-build_id="$(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo unknown)"
+# ONLY RELEASE TAGS NAME A BUILD (web4#904): the same glob core/build.rs bakes in, so the
+# authority's build_id is spelled like the binary's --version even when an app-v* tag (the
+# Android APKs, ancestors of main) sits nearer than the last release.
+build_id="$(git -C "$REPO_ROOT" describe --tags --match 'v[0-9]*' --always --dirty 2>/dev/null || echo unknown)"
 head_sha="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 case "$build_id" in
   *-dirty)
