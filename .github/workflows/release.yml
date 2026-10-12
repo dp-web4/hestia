@@ -16,14 +16,17 @@ name: release
 #             ├── android ────────────────┘              ├── publish
 #             └── draft ─────────────────────────────────┘
 #
-#   version   tag == v$VERSION and every manifest agrees (tools/version_sync.py), before any build.
+#   version   tag is v$VERSION or v$VERSION-rc.N and every manifest agrees (tools/version_sync.py),
+#             before any build. Emits the asset label and the kind (release / prerelease).
 #   draft     (release runs only) creates the release as a DRAFT, with no assets.
-#   assemble  downloads every build's artifacts, re-verifies each .sha256, requires the full asset
-#             set, writes SHA256SUMS, and uploads the set as one artifact. Fails if anything is
-#             missing or a checksum disagrees.
-#   publish   (release runs only) attaches whatever assemble collected to the draft, then flips it
-#             to published ONLY if assemble succeeded. A failed asset job therefore leaves a draft
-#             (possibly partly populated, never published); `gh run rerun --failed` finishes it.
+#   assemble  downloads every build's artifacts, re-verifies each .sha256, writes SHA256SUMS,
+#             requires EXACTLY the manifest (tools/release_publish.py check-dir: 17 names, missing
+#             or extra both fail), and uploads the set as one artifact.
+#   publish   (release runs only) tools/release_publish.py attaches what assemble collected to the
+#             draft, then publishes ONLY if assemble succeeded AND the local set AND the draft's
+#             attached set are each exactly the manifest. A plain vX.Y.Z becomes the latest
+#             release; vX.Y.Z-rc.N a pre-release that is never latest. Otherwise the release stays a
+#             draft (possibly partly populated, never published); `gh run rerun --failed` finishes it.
 #
 # This file is the only workflow that writes a release. The Android APK used to come from
 # app-android.yml on its own tag trigger, racing this one for the same release (and with no
@@ -31,8 +34,8 @@ name: release
 # trigger, called here as the `android` job behind `version`.
 #
 # THREE WAYS TO RUN IT:
-#   push tag vX.Y.Z               release: build, draft, publish.
-#   dispatch with tag=vX.Y.Z      release an EXISTING tag (same as the push).
+#   push tag vX.Y.Z[-rc.N]        release: build, draft, publish.
+#   dispatch with tag=vX.Y.Z      release an EXISTING tag (same as the push; bare tag only).
 #   dispatch with tag empty       DRY RUN: build every job from the dispatched ref and upload the
 #                                 artifacts (one `hestia-release-*` artifact holds the full set).
 #                                 No release, not even a draft, is created. Assets are labelled
@@ -64,17 +67,27 @@ on:
 permissions:
   contents: read
 
-# Two runs for the same tag must not interleave their draft/publish steps.
+# Two runs for the same tag must not interleave their draft/publish steps (one could publish while
+# the other deletes and re-uploads assets). The key is the BARE tag for both triggers: a tag push has
+# github.ref_name == v0.3.0 and a dispatch has inputs.tag == v0.3.0, so both lock `release-v0.3.0`.
+# (It once used github.ref, which is `refs/tags/v0.3.0` on push: two different locks; Codex,
+# hestia#1283.) `version` refuses a dispatched tag that is not bare, so the key cannot be dodged by
+# typing `refs/tags/v0.3.0`. A dry run locks on its branch name. tools/release_workflow_test.py
+# evaluates this expression for both triggers and requires equal keys.
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref }}
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   # ONE VERSION, ONE TAG. The daemon, the app, the wire crate and the plugin SDKs release in
   # lockstep: the root VERSION file is the number, and tools/version_sync.py checks every manifest
-  # against it. A release is refused before any build when the tag is not exactly v$VERSION, or
-  # any manifest disagrees, so a tag can never publish artifacts whose version says something else.
-  # This now covers the APK too (app-android.yml built one for any `v[0-9]*` tag, e.g. `v1`).
+  # against it. A release is refused before any build when the tag is not v$VERSION or
+  # v$VERSION-rc.N, or any manifest disagrees, so a tag can never publish artifacts whose version
+  # says something else. This now covers the APK too (app-android.yml built one for any `v[0-9]*`
+  # tag, e.g. `v1`). RELEASE CANDIDATES (dp, 2026-10-12): `vX.Y.Z-rc.N` publishes as a GitHub
+  # pre-release that is never `latest`, so the installer (releases/latest, #1279) never serves one;
+  # plain `vX.Y.Z` publishes as the latest release. `kind` comes from version_sync.py --tag-kind,
+  # the same parser that accepted the tag.
   version:
     name: tag equals VERSION
     runs-on: ubuntu-latest
@@ -83,6 +96,7 @@ jobs:
       tag: ${{ steps.mode.outputs.tag }}
       ref: ${{ steps.mode.outputs.ref }}
       label: ${{ steps.label.outputs.label }}
+      kind: ${{ steps.label.outputs.kind }}
     steps:
       - name: Resolve mode (release or dry run)
         id: mode
@@ -99,6 +113,8 @@ jobs:
             test "$REF_TYPE" = tag || { echo "push trigger is tags-only; got $REF_TYPE"; exit 1; }
             tag="$REF_NAME"; publish=true; ref="refs/tags/$REF_NAME"
           elif [ -n "$INPUT_TAG" ]; then
+            # Bare tag only: the concurrency key and the checkout ref both assume it.
+            [[ "$INPUT_TAG" =~ ^v[0-9] ]] || { echo "::error::tag input must be a bare tag like v0.3.0, got '$INPUT_TAG'"; exit 1; }
             tag="$INPUT_TAG"; publish=true; ref="refs/tags/$INPUT_TAG"
           else
             tag=""; publish=false; ref="$SHA"
@@ -126,12 +142,15 @@ jobs:
           if [ -n "$TAG" ]; then
             python3 hestia/tools/version_sync.py --tag "$TAG"
             label="$TAG"
+            kind="$(python3 hestia/tools/version_sync.py --tag-kind "$TAG")"
           else
             python3 hestia/tools/version_sync.py
             label="v$(python3 hestia/tools/version_sync.py --print)-dryrun.${SHA:0:7}"
+            kind=none
           fi
-          echo "asset label: $label"
+          echo "asset label: $label (kind: $kind)"
           echo "label=$label" >> "$GITHUB_OUTPUT"
+          echo "kind=$kind" >> "$GITHUB_OUTPUT"
 
   # ── daemon ────────────────────────────────────────────────────────────────────────────────────
   build:
@@ -194,6 +213,21 @@ jobs:
       - name: Build hestia
         working-directory: hestia/core
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # The build id is `git describe --tags --match 'v[0-9]*'` (core/build.rs). Checked out at the
+      # tag, that is the full tag (v0.3.0 or v0.3.0-rc.1), so `--version` names the release it
+      # shipped in; a dry run names its commit. Every target is native on its runner, so run it.
+      - name: --version carries the full tag
+        shell: bash
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          v="$(hestia/core/target/${{ matrix.target }}/release/hestia --version)"
+          echo "$v"
+          if [ -n "$TAG" ]; then want="($TAG)"; else want="(${SHA:0:7}"; fi
+          case "$v" in *"$want"*) ;; *) echo "::error::--version '$v' does not carry '$want'"; exit 1 ;; esac
 
       - name: Stage artifacts
         shell: bash
@@ -422,6 +456,12 @@ jobs:
     env:
       LABEL: ${{ needs.version.outputs.label }}
     steps:
+      # Only for tools/release_publish.py: the one manifest assemble and publish both enforce.
+      - uses: actions/checkout@v4
+        with:
+          path: hestia
+          ref: ${{ needs.version.outputs.ref }}
+
       - name: Download every build artifact
         uses: actions/download-artifact@v4
         with:
@@ -429,38 +469,28 @@ jobs:
           pattern: asset-*
           merge-multiple: true
 
-      - name: Verify checksums and require the full asset set
+      - name: Verify checksums and require exactly the manifest
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p dist
           cd dist
           ls -la
-          missing=0
-          for f in \
-            "hestia-${LABEL}-x86_64-unknown-linux-gnu.tar.gz" \
-            "hestia-${LABEL}-aarch64-unknown-linux-gnu.tar.gz" \
-            "hestia-${LABEL}-aarch64-apple-darwin.tar.gz" \
-            "hestia-app-${LABEL}-x86_64-linux.AppImage" \
-            "hestia-app-${LABEL}-x86_64-linux.deb" \
-            "hestia-app-${LABEL}-aarch64-macos.dmg" \
-            "hestia-app-${LABEL}-aarch64-macos.app.tar.gz" \
-            "hestia-app-${LABEL}-android-universal.apk"
-          do
-            for g in "$f" "$f.sha256"; do
-              test -f "$g" || { echo "::error::missing asset $g"; missing=1; }
-            done
-          done
           # Re-verify every per-asset checksum here, on a third machine, after the artifact
           # round-trip, rather than trusting the build host's line.
           bad=0
           for s in *.sha256; do
+            [ -e "$s" ] || continue
             sha256sum -c "$s" || { echo "::error::checksum mismatch: $s"; bad=1; }
           done
           assets="$(ls | grep -v '\.sha256$' | grep -vx 'SHA256SUMS' || true)"
           if [ -n "$assets" ]; then sha256sum $assets > SHA256SUMS; else : > SHA256SUMS; fi
           cat SHA256SUMS
           { echo "### Assets ($LABEL)"; echo '```'; cat SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          test "$missing" -eq 0 && test "$bad" -eq 0
+          # Exactly the 17 names (8 assets, 8 .sha256, SHA256SUMS): missing AND extra both fail.
+          ok=0
+          python3 ../hestia/tools/release_publish.py check-dir . "$LABEL" || ok=1
+          test "$bad" -eq 0 && test "$ok" -eq 0
 
       # Uploaded even when verification failed, so `publish` can attach what exists to the draft
       # (it will not publish) and a human can see exactly what was built.
@@ -500,9 +530,12 @@ jobs:
           test -n "$rev"
           echo "rev=$rev" >> "$GITHUB_OUTPUT"
 
+      # FATAL when assemble succeeded (Codex, hestia#1283: continue-on-error here let a failed
+      # download publish an EMPTY release). Tolerated only when assemble already failed, so the
+      # draft can still receive whatever was built; release_publish.py will not publish then.
       - name: Download the assembled set
         uses: actions/download-artifact@v4
-        continue-on-error: true
+        continue-on-error: ${{ needs.assemble.result != 'success' }}
         with:
           name: hestia-release-${{ needs.version.outputs.label }}
           path: dist
@@ -521,6 +554,7 @@ jobs:
         shell: bash
         env:
           WEB4: ${{ steps.web4pin.outputs.rev }}
+          KIND: ${{ needs.version.outputs.kind }}
         run: |
           set -euo pipefail
           U="https://github.com/$GH_REPO/releases/download/$TAG"
@@ -551,36 +585,25 @@ jobs:
 
           Build provenance: hestia \`$TAG\`, Web4 \`$WEB4\` (web4.pin).
           EOF
+          if [ "$KIND" = prerelease ]; then
+            printf '\n**Release candidate.** Published as a pre-release, never as latest: the installer does not serve it.\n' >> notes.md
+          fi
           cat notes.md
 
-      - name: Attach assets to the draft
-        shell: bash
-        run: |
-          set -euo pipefail
-          gh api -X PATCH "repos/$GH_REPO/releases/${{ steps.rel.outputs.id }}" \
-            -F body=@notes.md -f name="$TAG" >/dev/null
-          if ls dist/* >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --clobber
-          else
-            echo "::warning::nothing assembled to attach"
-          fi
-          gh api "repos/$GH_REPO/releases/${{ steps.rel.outputs.id }}" --jq '.assets[].name' | sort > attached.txt
-          (cd dist 2>/dev/null && ls | sort) > local.txt || : > local.txt
-          diff local.txt attached.txt || { echo "::error::attached assets differ from the assembled set"; exit 1; }
-
-      # The ONLY step that makes the release visible. It runs only when assemble (which requires
-      # every build job's full asset set and checksums) succeeded; otherwise the release stays a
-      # draft holding whatever was built.
-      - name: Publish (only if every asset job succeeded)
+      # Attach, re-check, publish: tools/release_publish.py (tested with a mocked gh in
+      # tools/release_publish_test.py). It publishes ONLY if assemble succeeded AND the local set
+      # AND the draft's attached set are each exactly the manifest AND the release is still a
+      # draft. A plain vX.Y.Z becomes the latest release; vX.Y.Z-rc.N a pre-release, never latest.
+      # Anything else leaves a draft holding whatever was built; `gh run rerun --failed` finishes it.
+      - name: Attach assets and publish (only on the full manifest)
         shell: bash
         env:
           ASSEMBLE: ${{ needs.assemble.result }}
+          KIND: ${{ needs.version.outputs.kind }}
         run: |
           set -euo pipefail
-          if [ "$ASSEMBLE" != success ]; then
-            echo "::error::assemble=$ASSEMBLE: $TAG is left as a DRAFT. Fix and \`gh run rerun ${{ github.run_id }} --failed\`."
-            exit 1
-          fi
-          gh api -X PATCH "repos/$GH_REPO/releases/${{ steps.rel.outputs.id }}" \
-            -F draft=false -F prerelease=false >/dev/null
-          gh release view "$TAG" --json url,isDraft,assets --jq '{url, isDraft, assets: (.assets | length)}'
+          python3 hestia/tools/release_publish.py publish --tag "$TAG" \
+            --release-id "${{ steps.rel.outputs.id }}" --dist dist \
+            --assemble "$ASSEMBLE" --kind "$KIND" --notes notes.md
+          gh api "repos/$GH_REPO/releases/${{ steps.rel.outputs.id }}" \
+            --jq '{html_url, draft, prerelease, assets: (.assets | length)}'

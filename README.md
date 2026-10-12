@@ -263,6 +263,15 @@ SDKs release in lockstep (dp, 2026-10-11; web4#904). The number lives in the roo
   one manifest without the others is red.
 - A release is the tag `vX.Y.Z` with `X.Y.Z` equal to `VERSION`. `release.yml` refuses any
   other tag before it builds. `hardbound-pak/` is a separate product line and is not covered.
+- **Release candidates** (dp, 2026-10-12) are tagged `vX.Y.Z-rc.N`, again with `X.Y.Z` equal to
+  `VERSION`, and `N` a number with no leading zero (`rc.0`, `rc.1`, `rc.12`). Nothing else is
+  accepted: not `-rc`, `-rc.`, `-rc.01`, `-RC.1` or `-beta.1`. An rc is published as a GitHub
+  **pre-release** and is never marked latest, so the installer, which resolves
+  `releases/latest` (#1279), never serves one. A plain `vX.Y.Z` is published as a normal release
+  and marked latest. The daemon's `--version` and every asset name carry the full tag
+  (`hestia 0.3.0 (v0.3.0-rc.1)`, `hestia-v0.3.0-rc.1-x86_64-unknown-linux-gnu.tar.gz`), while
+  `VERSION` and every manifest stay `0.3.0`. `python3 tools/version_sync.py --tag-kind <tag>`
+  prints `release` or `prerelease`.
 - Build ids are `git describe --tags --match 'v[0-9]*' --always --dirty`, so only release tags
   name a build. The older `app-v*` tags (Android APKs) are never a daemon's build id. Every
   producer and consumer (build.rs, hestia-deploy, install-members, the member-mesh watcher, the
@@ -277,7 +286,9 @@ SDKs release in lockstep (dp, 2026-10-11; web4#904). The number lives in the roo
   the daemon (Linux x86_64/aarch64, macOS arm64), the desktop app (Linux x86_64 AppImage + deb,
   macOS arm64 dmg + `.app.tar.gz`) and the Android APK from that tag, with web4 at `web4.pin`,
   and publishes them under one GitHub Release with a `.sha256` per asset and a `SHA256SUMS`. The
-  release is created as a draft and is published only when every asset job succeeded. Dispatching
+  release is created as a draft. `tools/release_publish.py` publishes it only when every asset
+  job succeeded and the draft holds exactly the expected 17 files; otherwise it stays a draft.
+  Dispatching
   `release.yml` with no tag is a dry run: every build runs and uploads artifacts, and no release
   is created. No Windows build yet: the app follows the daemon (#342).
 
