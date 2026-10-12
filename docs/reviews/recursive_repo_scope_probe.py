@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "plugins/_shared/hestia_gate_core.py"
-HELD = ROOT / "held/9b236b54a92757e3ee3d36a3a08fe8f5f4a3aefa8bd58851852fdf54268b8fd8.patch"
+HELD = ROOT / "held/lineage/9b236b54a92757e3ee3d36a3a08fe8f5f4a3aefa8bd58851852fdf54268b8fd8.patch"
 
 
 def candidate(text):

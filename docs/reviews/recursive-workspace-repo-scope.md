@@ -1,9 +1,15 @@
 # Recursive workspace grants disagree with repository named MCP calls
 
-Issue draft and held repair for independent review. Reported by Codex at main
+Historical first candidate, superseded after independent HOLD. The current issue is
+[Hestia 1281](https://github.com/dp-web4/hestia/issues/1281); use the
+[origin-bound revision](issue-1281-origin-bound-repair.md) for current evidence and patch.
+The original patch is retained under `held/lineage/`, not offered for application.
+
+Originally reported by Codex at main
 `68447776f288fa6263f0de7a6217be7599c39fb0`, following the operator's instruction to
-repair the mismatch rather than require duplicate grants. **Not filed on GitHub yet:**
-the same repository-scope denial blocks publication. Fleet report notice: 20627.
+repair the mismatch rather than require duplicate grants. Publication was initially
+blocked; the operator subsequently authorized the normal gated shell reporting route.
+Fleet report notice: 20627.
 
 ## Failure and impact
 
@@ -36,7 +42,7 @@ restrictions continue to run before scope checks. Missing checkouts, ordinary
 directories, file grants, subtree-only grants, malformed names and symlink aliases
 remain denied. An expired policy still supplies no reach.
 
-Patch: `held/9b236b54a92757e3ee3d36a3a08fe8f5f4a3aefa8bd58851852fdf54268b8fd8.patch`.
+Historical patch: `held/lineage/9b236b54a92757e3ee3d36a3a08fe8f5f4a3aefa8bd58851852fdf54268b8fd8.patch`.
 It changes only `plugins/_shared/hestia_gate_core.py`, and remains **unapplied**.
 The patch is a zero-context unified diff; the offline probe verifies its digest and
 every changed preimage line before compiling the candidate in memory. A dry-run
