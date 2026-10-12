@@ -100,6 +100,7 @@ jobs:
           APK=$(find hestia/app/src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | head -1)
           test -n "$APK" || { echo "no APK produced"; exit 1; }
           REF="${GITHUB_REF_NAME:-dev}"
+          REF="${REF//\//-}"   # a dispatched branch (release/x) must not become a directory
           mkdir -p dist
           cp "$APK" "dist/hestia-${REF}-android-universal.apk"
           ls -la dist/
