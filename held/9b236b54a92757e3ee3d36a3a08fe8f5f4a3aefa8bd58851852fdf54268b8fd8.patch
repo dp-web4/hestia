@@ -1,0 +1,34 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -1163 +1163,27 @@
++def repo_in_scope(repo: str, scopes, workspace: str) -> bool:
++    """Honor a recursive path grant for an existing workspace checkout.
++
++    Repository events name whole repositories: an exact directory or file grant
++    cannot authorize them. Do not inherit the home, temporary-directory or cwd
++    exceptions of path_in_scope. Explicit repository grants retain their meaning.
++    This uses the existing basename identity model, not remote-owner verification.
++    """
++    if not isinstance(repo, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", repo):
++        return False
++    if repo in (".", ".."):
++        return False
++    if repo in scopes:
++        return True
++    ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
++    candidate = ws + "/" + repo
++    # A local alias must not stand for another repository, inside OR outside ws.
++    if os.path.realpath(candidate).replace("\\", "/") != candidate:
++        return False
++    marker = os.path.join(candidate, ".git")
++    if not os.path.isdir(candidate) or not (os.path.isdir(marker) or os.path.isfile(marker)):
++        return False
++    return any(recursive and (candidate == root or candidate.startswith(root + "/"))
++               for root, recursive in _scope_roots_with_reach(scopes, workspace))
++
++
+ # ── The decision ─────────────────────────────────────────────────────────────────────────
+@@ -1239 +1265 @@
+-            if rname not in scopes:
++            if not repo_in_scope(rname, scopes, ws):
