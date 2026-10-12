@@ -29,13 +29,25 @@ pub struct PersistedConfig {
     pub mode: Option<String>,
 }
 
+/// The daemon the app is pointed at, and which selection that is. `generation` moves every
+/// time Settings points the app at a different URL, so an operation can capture the endpoint
+/// once and prove, after any await, that it is still the one selected. Without it, a version
+/// probe answered by daemon A could authorize a request to daemon B (Codex, hestia#1280).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    pub url: String,
+    pub generation: u64,
+}
+
 pub struct AppState {
-    daemon_url: Mutex<String>,
+    endpoint: Mutex<Endpoint>,
     mode: Mutex<String>,
     remotes: Mutex<Vec<RemoteEntry>>,
-    /// The live operator session. Deliberately shell-side: neither the token
-    /// nor the signing key ever crosses the IPC boundary into the webview.
-    operator: Mutex<Option<operator::OperatorSession>>,
+    /// The live operator session, and the endpoint generation its token was minted by.
+    /// Deliberately shell-side: neither the token nor the signing key ever crosses the IPC
+    /// boundary into the webview. The token is only ever sent to that generation's daemon;
+    /// the unlocked vault outlives a URL change and re-authenticates against the new one.
+    operator: Mutex<Option<(u64, operator::OperatorSession)>>,
     /// The last `/api/version` handshake: (daemon url, when, result). Keyed by URL, so
     /// pointing the app at another daemon re-probes; see `daemon::ensure_compatible`.
     handshake: Mutex<Option<(String, Instant, handshake::Handshake)>>,
@@ -48,7 +60,10 @@ pub const HANDSHAKE_TTL: Duration = Duration::from_secs(15);
 impl AppState {
     pub fn new() -> Self {
         Self {
-            daemon_url: Mutex::new("http://127.0.0.1:7711".to_string()),
+            endpoint: Mutex::new(Endpoint {
+                url: "http://127.0.0.1:7711".to_string(),
+                generation: 0,
+            }),
             mode: Mutex::new("sovereign".to_string()),
             remotes: Mutex::new(Vec::new()),
             operator: Mutex::new(None),
@@ -57,11 +72,26 @@ impl AppState {
     }
 
     pub fn daemon_url(&self) -> String {
-        self.daemon_url.lock().unwrap().clone()
+        self.endpoint.lock().unwrap().url.clone()
     }
 
+    /// The selected endpoint, captured. Bind every step of one operation to this value.
+    pub fn endpoint(&self) -> Endpoint {
+        self.endpoint.lock().unwrap().clone()
+    }
+
+    /// Is `ep` still the selected endpoint?
+    pub fn is_current(&self, ep: &Endpoint) -> bool {
+        *self.endpoint.lock().unwrap() == *ep
+    }
+
+    /// Point the app at `url`. A different URL is a new generation; re-saving the same URL is not.
     pub fn set_daemon_url(&self, url: &str) {
-        *self.daemon_url.lock().unwrap() = url.to_string();
+        let mut ep = self.endpoint.lock().unwrap();
+        if ep.url != url {
+            ep.url = url.to_string();
+            ep.generation += 1;
+        }
     }
 
     pub fn mode(&self) -> String {
@@ -74,12 +104,14 @@ impl AppState {
 
     // ---- operator session (shell-side only) ----
 
-    pub fn operator_token(&self) -> Option<String> {
+    /// The bearer for `ep`, only if the session was minted by that same selection.
+    pub fn operator_token_for(&self, ep: &Endpoint) -> Option<String> {
         self.operator
             .lock()
             .unwrap()
             .as_ref()
-            .map(|o| o.token.clone())
+            .filter(|(generation, _)| *generation == ep.generation)
+            .map(|(_, o)| o.token.clone())
     }
 
     pub fn operator_vault(&self) -> Option<Arc<identity_vault::IdentityVault>> {
@@ -87,11 +119,19 @@ impl AppState {
             .lock()
             .unwrap()
             .as_ref()
-            .map(|o| Arc::clone(&o.vault))
+            .map(|(_, o)| Arc::clone(&o.vault))
     }
 
-    pub fn set_operator(&self, session: operator::OperatorSession) {
-        *self.operator.lock().unwrap() = Some(session);
+    /// Publish a session minted against `ep` — unless the selection moved while it was being
+    /// minted, in which case it is dropped and `false` comes back. Checked under the endpoint
+    /// lock, so a concurrent `set_daemon_url` cannot slip between the check and the write.
+    pub fn set_operator_for(&self, ep: &Endpoint, session: operator::OperatorSession) -> bool {
+        let selected = self.endpoint.lock().unwrap();
+        if *selected != *ep {
+            return false;
+        }
+        *self.operator.lock().unwrap() = Some((ep.generation, session));
+        true
     }
 
     pub fn clear_operator(&self) {
@@ -102,7 +142,7 @@ impl AppState {
     pub fn operator_status(&self) -> operator::OperatorStatus {
         let guard = self.operator.lock().unwrap();
         match guard.as_ref() {
-            Some(o) => operator::OperatorStatus {
+            Some((_, o)) => operator::OperatorStatus {
                 signed_in: true,
                 lct_id: Some(o.lct_id.clone()),
                 vault_path: Some(o.vault.path().to_string_lossy().to_string()),
@@ -128,6 +168,12 @@ impl AppState {
             .as_ref()
             .filter(|(u, at, _)| u == url && at.elapsed() < HANDSHAKE_TTL)
             .map(|(_, _, h)| h.clone())
+    }
+
+    /// Drop the cached handshake, so the next route re-probes. A 401 is the cue: sessions live in
+    /// daemon memory, so a session that stopped working is often a daemon that was replaced.
+    pub fn forget_handshake(&self) {
+        *self.handshake.lock().unwrap() = None;
     }
 
     /// Remember a handshake. An unreachable result is not cached: the next call re-probes.

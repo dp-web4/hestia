@@ -104,7 +104,41 @@ describe("Dashboard against an incompatible daemon", () => {
     expect(screen.queryByText("Cannot reach Hestia daemon")).toBeNull();
     expect(screen.getByText(/daemon: hestia 0.4.0 · API v2/)).toBeTruthy();
   });
+
+  // hestia#1280 P2: a successful poll used to leave the old blocking verdict in place, so a
+  // fixed pairing stayed behind the panel until the page remounted. No navigation here.
+  const RECOVERED = {
+    society: { sovereign_lct: "lct:web4:test", chain_length: 4242, active_sessions: 1, vault_entries: 0, known_plugins: 1 },
+    stats: { total_actions: 0, successful_actions: 0, failed_actions: 0, success_rate: 1, by_tool: [], actions_last_hour: 0 },
+    trust: [],
+    recent: [],
+    pending_escalations: [],
+    pending_scope_requests: [],
+    retired: [],
+    generated_at: "2026-10-12T00:00:00Z",
+  };
+  const MALFORMED = hs({ state: "malformed", daemon_version: null, daemon_build_id: null, daemon_api_compat: null, message: "daemon compatibility unknown: GET /api/version answered 500" });
+  for (const blocked of [INCOMPATIBLE, NO_ENDPOINT, MALFORMED]) {
+    it(`recovers from ${blocked.state} in place once the daemon answers`, async () => {
+      getConfig.mockResolvedValue({ mode: "sovereign", daemon_url: "http://127.0.0.1:7799", remotes: [] });
+      getDashboard.mockRejectedValue(blocked.message);
+      getDaemonStatus.mockResolvedValue(status(blocked));
+      const { container } = render(<Dashboard />);
+      await vi.waitFor(() => expect(container.querySelector(`[data-compat="${blocked.state}"]`)).not.toBeNull());
+
+      getDashboard.mockResolvedValue(RECOVERED);
+      getDaemonStatus.mockResolvedValue(status(hs({})));
+      window.dispatchEvent(new Event("hestia:daemon-url"));
+      await vi.waitFor(() => expect(container.querySelector("[data-compat]")).toBeNull());
+      expect(screen.queryByText(compatTitleOf(blocked))).toBeNull();
+      expect(await screen.findByText("4242")).toBeTruthy();
+    });
+  }
 });
+
+function compatTitleOf(h: Handshake): string {
+  return h.state === "malformed" ? "Daemon compatibility unknown" : h.state === "no_version_endpoint" ? "Incompatible daemon (no version endpoint)" : "Incompatible daemon";
+}
 
 describe("compat helpers", () => {
   it("bakes the package version, not a hardcoded string", () => {

@@ -25,8 +25,34 @@ permissions:
   contents: write
 
 jobs:
+  # The same gate as release.yml's `version` job, because this workflow publishes to the same
+  # release independently of it: without this, a `v9.9.9` tag on a 0.3.0 tree was refused for
+  # the daemon and still got a 0.3.0 APK attached (Codex, hestia#1280). Every run checks that
+  # the manifests agree with VERSION; a tag run also requires the tag to be exactly v$VERSION.
+  # A branch dispatch builds an artifact only and publishes nothing, so it needs no tag.
+  version:
+    name: tag equals VERSION
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hestia
+      - name: Every manifest agrees with VERSION (and a tag equals it)
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" = tag ]; then
+            python3 hestia/tools/version_sync.py --tag "$REF_NAME"
+          else
+            python3 hestia/tools/version_sync.py
+          fi
+
   android:
     name: build android apk
+    needs: version
     runs-on: ubuntu-latest
     steps:
       # app/src-tauri path-depends on ../../../web4/web4-core, so materialize the same sibling
@@ -113,7 +139,7 @@ jobs:
           retention-days: 30
 
       - name: Attach to release (tag builds only)
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.apk
