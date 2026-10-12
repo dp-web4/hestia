@@ -64,7 +64,7 @@ with tempfile.TemporaryDirectory() as raw:
     g("commit", "-q", "--allow-empty", "-m", "two")
     tagged = g("rev-parse", "HEAD")
     g("tag", "-a", "v0.0.5", "-m", "release")
-    produced = g("describe", "--tags", "--always", "--dirty")   # core/build.rs's producer
+    produced = g("describe", "--tags", "--match", h.BUILD_TAG_MATCH, "--always", "--dirty")   # core/build.rs's producer
     check("fixture: the producer prints a bare tag at a tagged commit", produced == "v0.0.5", produced)
     check("names_commit: an exact (annotated) tag at the candidate names it",
           h.names_commit(produced, tagged, repo))
@@ -73,6 +73,17 @@ with tempfile.TemporaryDirectory() as raw:
     check("names_commit: a tag the repo does not have names nothing", not h.names_commit("v9.9.9", tagged, repo))
     check("names_commit: a lightweight tag at the candidate names it", h.names_commit("v0.0.4", first, repo))
     check("names_commit: a dirty exact tag is never the candidate", not h.names_commit("v0.0.5-dirty", tagged, repo))
+    # ONLY RELEASE TAGS NAME A BUILD (web4#904). An app-v* tag ON the candidate: the unmatched
+    # describe prints it bare, the producer's glob never does, and names_commit refuses it.
+    g("tag", "app-v0.4.0", tagged)
+    g("tag", "-d", "v0.0.5")
+    check("fixture: an unmatched describe picks up the app tag",
+          g("describe", "--tags", "--always") == "app-v0.4.0")
+    matched = g("describe", "--tags", "--match", h.BUILD_TAG_MATCH, "--always")
+    check("the producer's glob skips the app tag", matched.startswith("v0.0.4-1-g"), matched)
+    check("names_commit: the matched describe names the candidate", h.names_commit(matched, tagged, repo))
+    check("names_commit: an app-v* tag at the candidate names no build",
+          not h.names_commit("app-v0.4.0", tagged, repo))
 check("names_commit: fewer than 7 hex is not evidence", not h.names_commit("v0.0.4-965-g58868", FULL_SHA))
 check("describe_hex reads the abbreviation", h.describe_hex("v0.0.4-968-ga7e33bc4") == "a7e33bc4")
 check("describe_of_version is hestia-deploy's describe_of",

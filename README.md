@@ -263,8 +263,10 @@ SDKs release in lockstep (dp, 2026-10-11; web4#904). The number lives in the roo
   one manifest without the others is red.
 - A release is the tag `vX.Y.Z` with `X.Y.Z` equal to `VERSION`. `release.yml` refuses any
   other tag before it builds. `hardbound-pak/` is a separate product line and is not covered.
-- Build ids are `git describe --tags --match 'v*'`, so only release tags name a build. The
-  older `app-v*` tags (Android APKs) are never a daemon's build id.
+- Build ids are `git describe --tags --match 'v[0-9]*' --always --dirty`, so only release tags
+  name a build. The older `app-v*` tags (Android APKs) are never a daemon's build id. Every
+  producer and consumer (build.rs, hestia-deploy, install-members, the member-mesh watcher, the
+  upgrade-path harness) uses that one glob; `tools/build_tag_match_test.py` holds them to it.
 - **Handshake.** The daemon serves `GET /api/version` (no session) as
   `{version, build_id, api_compat}`. The app reads it before any other route. An equal
   `api_compat` is compatible (a different `version` shows as skew). A different `api_compat`,

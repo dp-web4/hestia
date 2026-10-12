@@ -314,8 +314,8 @@ impl Default for ReadBasis {
 /// Deployment identity as observed by the daemon.
 ///
 /// `HESTIA_CURRENT_BUILD_FILE` points at a small supervisor-owned JSON manifest,
-/// for example `{ "build_id": "app-v0.1.2-607-ge720d0a" }` — the exact
-/// `git describe` provenance string the deployed binary reports in
+/// for example `{ "build_id": "v0.3.0-12-ge720d0a" }` — the exact
+/// `git describe --tags --match 'v[0-9]*'` provenance string the deployed binary reports in
 /// `hestia --version` (see docs/DASHBOARD.md; a short hash never matches).
 /// Missing or unreadable authority is
 /// deliberately `unknown`, not green: a daemon cannot claim freshness from its

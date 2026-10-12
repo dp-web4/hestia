@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 pub struct VersionInfo {
     /// The lockstep release (root `VERSION`, mirrored into core/Cargo.toml).
     pub version: String,
-    /// `git describe --tags --match 'v*'` of the build, as `hestia --version` reports it.
+    /// `git describe --tags --match 'v[0-9]*'` of the build, as `hestia --version` reports it.
     pub build_id: String,
     /// See [`hestia_wire::OPERATOR_API_COMPAT`].
     pub api_compat: u32,

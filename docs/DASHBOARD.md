@@ -18,8 +18,12 @@ exact `git describe` provenance string in parentheses in the deployed binary's `
 output; do not substitute a short commit prefix or normalize a `-dirty` suffix:
 
 ```json
-{"build_id":"app-v0.1.2-607-ge720d0a","updated_at":"2026-08-06T20:00:00Z"}
+{"build_id":"v0.3.0-12-ge720d0a","updated_at":"2026-08-06T20:00:00Z"}
 ```
+
+Build ids name only release tags: every producer describes with `--match 'v[0-9]*'` (web4#904), so
+an `app-v*` tag can no longer become a build id. Builds made before that change, including the
+2026-08-08 audit baseline below, still carry `app-v0.1.2-...` names.
 
 The daemon's own build identity is baked in at compile time. The dashboard shows **current** in
 green when the identities match, **stale** in amber when they differ, and **unknown** when the
