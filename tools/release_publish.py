@@ -76,6 +76,14 @@ def get_release(repo: str, rid: str) -> dict:
     return json.loads(gh("api", f"repos/{repo}/releases/{rid}"))
 
 
+def bound_to_tag(repo: str, tag: str, rid: str) -> bool:
+    """True when GitHub's by-tag lookup returns THIS release (drafts are invisible to it)."""
+    try:
+        return str(json.loads(gh("api", f"repos/{repo}/releases/tags/{tag}")).get("id")) == str(rid)
+    except Exception:  # noqa: BLE001 -- a 404 or a gh failure both mean "not bound"
+        return False
+
+
 def cmd_check_dir(dist: pathlib.Path, label: str) -> int:
     problems = diff(manifest(label), local_names(dist))
     for p in problems:
@@ -136,10 +144,24 @@ def cmd_publish(a) -> int:
         return 1
 
     pre = a.kind == "prerelease"
+    # tag_name GOES IN THE PUBLISH PATCH. v0.3.0-rc.1 (run 38289872894) published with every
+    # asset but as `untagged-<hex>`: GitHub keeps a draft under a placeholder name until it is
+    # published, and a PATCH that flips draft=false without naming the tag left the placeholder.
+    # The pre-publish check above read the draft's tag_name and passed; only the by-tag lookup
+    # after publishing tells the truth, so that is what is verified below.
     gh("api", "-X", "PATCH", f"repos/{repo}/releases/{a.release_id}",
+       "-f", f"tag_name={a.tag}",
        "-F", "draft=false",
        "-F", f"prerelease={'true' if pre else 'false'}",
        "-f", f"make_latest={'false' if pre else 'true'}")
+    if not bound_to_tag(repo, a.tag, a.release_id):
+        print(f"::warning::{a.tag}: published release {a.release_id} is not reachable by its tag; "
+              "re-binding tag_name once")
+        gh("api", "-X", "PATCH", f"repos/{repo}/releases/{a.release_id}", "-f", f"tag_name={a.tag}")
+        if not bound_to_tag(repo, a.tag, a.release_id):
+            print(f"::error::{a.tag}: release {a.release_id} is published but NOT bound to its tag; "
+                  f"fix by hand: gh api -X PATCH repos/{repo}/releases/{a.release_id} -f tag_name={a.tag}")
+            return 1
     print(f"published {a.tag} as {'a PRE-RELEASE (not latest)' if pre else 'the LATEST release'}"
           f" with {len(remote)} assets")
     return 0
