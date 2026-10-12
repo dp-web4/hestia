@@ -1,15 +1,53 @@
 name: release
 
-# Builds prebuilt hestia binaries and attaches them to a GitHub Release.
-# Trigger by pushing a tag matching v*.*.* (e.g. v0.0.4) or dispatching an
-# existing tag. The dashboard HTML is baked into the binary, so the single
-# executable is the runtime artifact.
+# ONE TAG, ONE RELEASE (web4#904 phase 1; dp, 2026-10-11). Pushing the tag `vX.Y.Z` builds every
+# hestia artifact from that tag and publishes them together under ONE GitHub Release:
 #
-# RELEASE INPUTS ARE PART OF THE ARTIFACT. Hestia currently consumes Web4
-# crates through sibling path dependencies, which Cargo.lock cannot pin.
-# Integration CI intentionally tracks Web4 main; releases MUST NOT. Bump
-# web4.pin deliberately before creating each release tag. That file is the
-# single source of truth for the exact cross-repo source that produced bytes.
+#   daemon   hestia-vX.Y.Z-<target>.tar.gz          x86_64/aarch64 linux, aarch64 macOS
+#   desktop  hestia-app-vX.Y.Z-x86_64-linux.{AppImage,deb}
+#            hestia-app-vX.Y.Z-aarch64-macos.{dmg,app.tar.gz}
+#   android  hestia-app-vX.Y.Z-android-universal.apk
+#   each with a `.sha256`, plus one SHA256SUMS over all of them.
+#
+# Jobs and their order:
+#
+#   version ──┬── build (daemon matrix) ──┐
+#             ├── desktop (tauri matrix) ─┼── assemble ──┐
+#             ├── android ────────────────┘              ├── publish
+#             └── draft ─────────────────────────────────┘
+#
+#   version   tag == v$VERSION and every manifest agrees (tools/version_sync.py), before any build.
+#   draft     (release runs only) creates the release as a DRAFT, with no assets.
+#   assemble  downloads every build's artifacts, re-verifies each .sha256, requires the full asset
+#             set, writes SHA256SUMS, and uploads the set as one artifact. Fails if anything is
+#             missing or a checksum disagrees.
+#   publish   (release runs only) attaches whatever assemble collected to the draft, then flips it
+#             to published ONLY if assemble succeeded. A failed asset job therefore leaves a draft
+#             (possibly partly populated, never published); `gh run rerun --failed` finishes it.
+#
+# This file is the only workflow that writes a release. The Android APK used to come from
+# app-android.yml on its own tag trigger, racing this one for the same release (and with no
+# tag==VERSION check until hestia#1280). app-android.yml is now a reusable workflow with no tag
+# trigger, called here as the `android` job behind `version`.
+#
+# THREE WAYS TO RUN IT:
+#   push tag vX.Y.Z               release: build, draft, publish.
+#   dispatch with tag=vX.Y.Z      release an EXISTING tag (same as the push).
+#   dispatch with tag empty       DRY RUN: build every job from the dispatched ref and upload the
+#                                 artifacts (one `hestia-release-*` artifact holds the full set).
+#                                 No release, not even a draft, is created. Assets are labelled
+#                                 v$VERSION-dryrun.<sha7> so they cannot pass for a release.
+#
+# RELEASE INPUTS ARE PART OF THE ARTIFACT. Hestia consumes Web4 crates through sibling path
+# dependencies, which Cargo.lock cannot pin. Integration CI tracks Web4 main; releases MUST NOT.
+# Every build job here checks out web4 at the hestia source's `web4.pin`, the single source of
+# truth for the cross-repo source that produced the bytes. Bump it deliberately before tagging.
+#
+# NOT BUILT: Windows (daemon and desktop) — the daemon has no Windows target until #342 makes its
+# Unix file-mode calls portable, and the app follows the daemon. Signing: no signing secrets exist,
+# so the desktop bundles are UNSIGNED (macOS is ad-hoc signed so Apple Silicon will run it at all)
+# and the APK is debug-keystore signed. README "Installing the desktop app" covers what that means
+# for Gatekeeper and AppImage. No updater plugin: that is a separate decision.
 
 on:
   push:
@@ -18,35 +56,86 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release (e.g. v0.0.4). Must already exist.'
-        required: true
+        description: 'Existing tag to release (e.g. v0.3.0). Leave EMPTY for a dry run: build everything, upload artifacts, create no release.'
+        required: false
+        default: ''
         type: string
 
 permissions:
-  contents: write
+  contents: read
+
+# Two runs for the same tag must not interleave their draft/publish steps.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  # ONE VERSION, ONE TAG (web4#904; dp, 2026-10-11). The daemon, the app, the wire crate and
-  # the plugin SDKs release in lockstep: the root VERSION file is the number, and
-  # tools/version_sync.py checks every manifest against it. A release is refused before any
-  # build when the pushed tag is not exactly v$VERSION, or any manifest disagrees, so a tag can
-  # never publish binaries whose `--version` says something else.
+  # ONE VERSION, ONE TAG. The daemon, the app, the wire crate and the plugin SDKs release in
+  # lockstep: the root VERSION file is the number, and tools/version_sync.py checks every manifest
+  # against it. A release is refused before any build when the tag is not exactly v$VERSION, or
+  # any manifest disagrees, so a tag can never publish artifacts whose version says something else.
+  # This now covers the APK too (app-android.yml built one for any `v[0-9]*` tag, e.g. `v1`).
   version:
     name: tag equals VERSION
     runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.mode.outputs.publish }}
+      tag: ${{ steps.mode.outputs.tag }}
+      ref: ${{ steps.mode.outputs.ref }}
+      label: ${{ steps.label.outputs.label }}
     steps:
+      - name: Resolve mode (release or dry run)
+        id: mode
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = push ]; then
+            test "$REF_TYPE" = tag || { echo "push trigger is tags-only; got $REF_TYPE"; exit 1; }
+            tag="$REF_NAME"; publish=true; ref="refs/tags/$REF_NAME"
+          elif [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"; publish=true; ref="refs/tags/$INPUT_TAG"
+          else
+            tag=""; publish=false; ref="$SHA"
+          fi
+          echo "mode: publish=$publish tag=${tag:-<none>} ref=$ref"
+          {
+            echo "publish=$publish"
+            echo "tag=$tag"
+            echo "ref=$ref"
+          } >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
           path: hestia
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ steps.mode.outputs.ref }}
+
       - name: Tag and every manifest agree with VERSION
+        id: label
         shell: bash
+        env:
+          TAG: ${{ steps.mode.outputs.tag }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          python3 hestia/tools/version_sync.py --tag "${{ github.event.inputs.tag || github.ref_name }}"
+          if [ -n "$TAG" ]; then
+            python3 hestia/tools/version_sync.py --tag "$TAG"
+            label="$TAG"
+          else
+            python3 hestia/tools/version_sync.py
+            label="v$(python3 hestia/tools/version_sync.py --print)-dryrun.${SHA:0:7}"
+          fi
+          echo "asset label: $label"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
 
+  # ── daemon ────────────────────────────────────────────────────────────────────────────────────
   build:
-    name: build ${{ matrix.target }}
+    name: daemon ${{ matrix.target }}
     needs: version
     runs-on: ${{ matrix.os }}
     strategy:
@@ -55,30 +144,24 @@ jobs:
         include:
           # Fleet targets in order: CBP/Thor/Legion/Nomad (x86_64 linux),
           # Sprout (aarch64 linux/Jetson), McNugget (aarch64 darwin/M-series).
-          # Windows is a bonus — no fleet machine runs Windows but the
-          # plugin reaches Windows users via Claude Code.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            archive: tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-            archive: tar.gz
           # x86_64-pc-windows-msvc is OUT pending source portability: the daemon
           # uses std::os::unix + Permissions::set_mode (Unix-only). SQLCipher now
           # builds on windows (vendored OpenSSL), so the remaining work is cfg-gating
           # the Unix file-mode calls — filed as #342. Linux + macOS cover the fleet.
           - target: aarch64-apple-darwin
             os: macos-14
-            archive: tar.gz
     steps:
       # Two repos as SIBLING subdirs of the workspace — the pattern ci.yml proved
       # green. hestia/core has path deps into ../../web4/..., so the release must
-      # materialize the same layout. Unlike integration CI, Web4 is pinned by the
-      # hestia source being released.
+      # materialize the same layout, with Web4 pinned by the hestia source being released.
       - uses: actions/checkout@v4
         with:
           path: hestia
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.version.outputs.ref }}
 
       - name: Read pinned web4 rev
         id: web4pin
@@ -99,7 +182,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "hestia_ref=${{ github.event.inputs.tag || github.ref_name }}"
+          echo "hestia_ref=${{ needs.version.outputs.ref }}"
           echo "web4_ref=${{ steps.web4pin.outputs.rev }}"
           test "$(git -C web4 rev-parse HEAD)" = "${{ steps.web4pin.outputs.rev }}"
 
@@ -112,13 +195,13 @@ jobs:
         working-directory: hestia/core
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Stage artifacts (unix)
-        if: matrix.archive == 'tar.gz'
+      - name: Stage artifacts
         shell: bash
+        env:
+          LABEL: ${{ needs.version.outputs.label }}
         run: |
           set -euo pipefail
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          STAGE="hestia-${TAG}-${{ matrix.target }}"
+          STAGE="hestia-${LABEL}-${{ matrix.target }}"
           mkdir -p "dist/${STAGE}"
           cp "hestia/core/target/${{ matrix.target }}/release/hestia" "dist/${STAGE}/"
           cp hestia/README.md hestia/LICENSE "dist/${STAGE}/" 2>/dev/null || true
@@ -126,44 +209,42 @@ jobs:
           (cd dist && { command -v sha256sum >/dev/null 2>&1 && sha256sum "${STAGE}.tar.gz" || shasum -a 256 "${STAGE}.tar.gz"; } > "${STAGE}.tar.gz.sha256")
           ls -la dist/
 
-      - name: Stage artifacts (windows)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          $tag = "${{ github.event.inputs.tag || github.ref_name }}"
-          $stage = "hestia-$tag-${{ matrix.target }}"
-          New-Item -ItemType Directory -Path "dist/$stage" | Out-Null
-          Copy-Item "hestia/core/target/${{ matrix.target }}/release/hestia.exe" "dist/$stage/"
-          if (Test-Path "hestia/README.md") { Copy-Item "hestia/README.md" "dist/$stage/" }
-          if (Test-Path "hestia/LICENSE") { Copy-Item "hestia/LICENSE" "dist/$stage/" }
-          Compress-Archive -Path "dist/$stage" -DestinationPath "dist/$stage.zip"
-          $hash = (Get-FileHash "dist/$stage.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $stage.zip" | Set-Content "dist/$stage.zip.sha256"
-          Get-ChildItem dist
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hestia-${{ matrix.target }}
+          name: asset-daemon-${{ matrix.target }}
           path: |
             dist/hestia-*.tar.gz
             dist/hestia-*.tar.gz.sha256
-            dist/hestia-*.zip
-            dist/hestia-*.zip.sha256
           if-no-files-found: error
           retention-days: 7
 
-  release:
-    name: publish release
-    needs: build
-    runs-on: ubuntu-latest
+  # ── desktop app (Tauri 2) ─────────────────────────────────────────────────────────────────────
+  # Windows is skipped with the daemon (#342): the app is the daemon's operator console, and a
+  # Windows bundle with no Windows daemon to pair with is not a release.
+  desktop:
+    name: desktop ${{ matrix.platform }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04, not latest: an AppImage runs only on glibc >= the build host's, so the
+          # older base reaches more distros. It also still ships libfuse2, which linuxdeploy needs.
+          - platform: x86_64-linux
+            os: ubuntu-22.04
+            bundles: appimage,deb
+          - platform: aarch64-macos
+            os: macos-14
+            bundles: app,dmg
     steps:
-      # Read provenance from the SAME hestia source/tag the build consumed. Do not
-      # duplicate the pin in workflow env or prose; one release input gets one owner.
+      # app/src-tauri path-depends on ../../../web4/web4-core: the same sibling layout and the
+      # same web4.pin as the daemon build.
       - uses: actions/checkout@v4
         with:
           path: hestia
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.version.outputs.ref }}
 
       - name: Read pinned web4 rev
         id: web4pin
@@ -174,38 +255,325 @@ jobs:
           test -n "$rev"
           echo "rev=$rev" >> "$GITHUB_OUTPUT"
 
-      - name: Download all artifacts
+      - uses: actions/checkout@v4
+        with:
+          repository: dp-web4/web4
+          ref: ${{ steps.web4pin.outputs.rev }}
+          path: web4
+
+      - name: Record release inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "hestia_ref=${{ needs.version.outputs.ref }}"
+          echo "web4_ref=${{ steps.web4pin.outputs.rev }}"
+          test "$(git -C web4 rev-parse HEAD)" = "${{ steps.web4pin.outputs.rev }}"
+
+      # react-router 8.3 needs Node >= 22.22; same pin as ci.yml.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+          cache: npm
+          cache-dependency-path: hestia/app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hestia/app/src-tauri -> target
+          key: desktop-${{ matrix.platform }}
+
+      - name: Install Tauri Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            patchelf \
+            file
+
+      - name: npm ci
+        working-directory: hestia/app
+        run: npm ci
+
+      # Unsigned: no signing secrets exist. On macOS the bundle is ad-hoc signed
+      # (signingIdentity "-"): Apple Silicon refuses to run arm64 code with no signature at all,
+      # and an ad-hoc signature is what an unsigned local build gets anyway. It is NOT a Developer
+      # ID signature and is not notarized, so Gatekeeper still blocks the first launch.
+      - name: tauri build (linux)
+        if: runner.os == 'Linux'
+        working-directory: hestia/app
+        run: npx tauri build --ci --bundles ${{ matrix.bundles }}
+
+      - name: tauri build (macOS, ad-hoc signed)
+        if: runner.os == 'macOS'
+        working-directory: hestia/app
+        run: npx tauri build --ci --bundles ${{ matrix.bundles }} --config '{"bundle":{"macOS":{"signingIdentity":"-"}}}'
+
+      - name: Stage bundles with versioned names
+        shell: bash
+        env:
+          LABEL: ${{ needs.version.outputs.label }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          B=hestia/app/src-tauri/target/release/bundle
+          find "$B" -maxdepth 2
+          one() { # the single match of a glob, or fail loudly
+            local m=( $1 )
+            if [ "${#m[@]}" -ne 1 ] || [ ! -e "${m[0]}" ]; then
+              echo "::error::expected exactly one $1, found: ${m[*]}" >&2; return 1
+            fi
+            printf '%s\n' "${m[0]}"
+          }
+          mkdir -p dist
+          base="hestia-app-${LABEL}-${PLATFORM}"
+          if [ "$RUNNER_OS" = Linux ]; then
+            cp "$(one "$B/appimage/*.AppImage")" "dist/${base}.AppImage"
+            chmod +x "dist/${base}.AppImage"
+            cp "$(one "$B/deb/*.deb")" "dist/${base}.deb"
+            dpkg-deb --info "dist/${base}.deb" | grep -E 'Package|Version|Architecture'
+          else
+            app="$(one "$B/macos/*.app")"
+            codesign --verify --deep --strict --verbose=2 "$app"
+            codesign -dv "$app" 2>&1 | grep -E 'Identifier|Signature|Format'
+            tar -C "$(dirname "$app")" -czf "dist/${base}.app.tar.gz" "$(basename "$app")"
+            cp "$(one "$B/dmg/*.dmg")" "dist/${base}.dmg"
+          fi
+          cd dist
+          for f in hestia-app-*; do
+            { command -v sha256sum >/dev/null 2>&1 && sha256sum "$f" || shasum -a 256 "$f"; } > "$f.sha256"
+          done
+          ls -la
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: asset-desktop-${{ matrix.platform }}
+          path: dist/hestia-app-*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── android (Tauri 2) ─────────────────────────────────────────────────────────────────────────
+  # The recipe lives in app-android.yml (reusable; fixed in hestia#1280, branch run 38196486372
+  # produced a working APK) so a manual APK build and the release build share it. It has no tag
+  # trigger of its own any more: it builds only behind this file's `version` gate, and only
+  # `publish` below attaches the APK. Debug-keystore signed.
+  android:
+    name: android
+    needs: version
+    uses: ./.github/workflows/app-android.yml
+    with:
+      ref: ${{ needs.version.outputs.ref }}
+      label: ${{ needs.version.outputs.label }}
+
+  # ── one release ───────────────────────────────────────────────────────────────────────────────
+  # Created as a DRAFT before any asset exists, so there is never a published release that is
+  # still filling. Release runs only: a dry run never reaches this job.
+  draft:
+    name: create draft release
+    needs: version
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - name: Create the draft (or reuse this tag's existing draft)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$TAG"
+          # `gh release view <tag>` cannot see drafts (the by-tag endpoint omits them), so list.
+          existing="$(gh api "repos/$GH_REPO/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$TAG\") | \"\(.id) \(.draft)\"")"
+          n=$(printf '%s' "$existing" | grep -c . || true)
+          if [ "$n" -gt 1 ]; then
+            echo "::error::$n releases already exist for $TAG; resolve by hand"; echo "$existing"; exit 1
+          elif [ "$n" -eq 1 ]; then
+            case "$existing" in
+              *" true") echo "reusing existing draft for $TAG: $existing" ;;
+              *) echo "::error::$TAG is already PUBLISHED; refusing to modify a published release"; exit 1 ;;
+            esac
+          else
+            gh release create "$TAG" --draft --verify-tag --title "$TAG" \
+              --notes "Draft: assets are being attached by release.yml run ${{ github.run_id }}."
+          fi
+
+  assemble:
+    name: assemble and verify assets
+    needs: [version, build, desktop, android]
+    if: ${{ !cancelled() && needs.version.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      LABEL: ${{ needs.version.outputs.label }}
+    steps:
+      - name: Download every build artifact
         uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: asset-*
           merge-multiple: true
 
-      - name: List artifacts
-        run: ls -la dist/
+      - name: Verify checksums and require the full asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -la
+          missing=0
+          for f in \
+            "hestia-${LABEL}-x86_64-unknown-linux-gnu.tar.gz" \
+            "hestia-${LABEL}-aarch64-unknown-linux-gnu.tar.gz" \
+            "hestia-${LABEL}-aarch64-apple-darwin.tar.gz" \
+            "hestia-app-${LABEL}-x86_64-linux.AppImage" \
+            "hestia-app-${LABEL}-x86_64-linux.deb" \
+            "hestia-app-${LABEL}-aarch64-macos.dmg" \
+            "hestia-app-${LABEL}-aarch64-macos.app.tar.gz" \
+            "hestia-app-${LABEL}-android-universal.apk"
+          do
+            for g in "$f" "$f.sha256"; do
+              test -f "$g" || { echo "::error::missing asset $g"; missing=1; }
+            done
+          done
+          # Re-verify every per-asset checksum here, on a third machine, after the artifact
+          # round-trip, rather than trusting the build host's line.
+          bad=0
+          for s in *.sha256; do
+            sha256sum -c "$s" || { echo "::error::checksum mismatch: $s"; bad=1; }
+          done
+          assets="$(ls | grep -v '\.sha256$' | grep -vx 'SHA256SUMS' || true)"
+          if [ -n "$assets" ]; then sha256sum $assets > SHA256SUMS; else : > SHA256SUMS; fi
+          cat SHA256SUMS
+          { echo "### Assets ($LABEL)"; echo '```'; cat SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          test "$missing" -eq 0 && test "$bad" -eq 0
 
-      - name: Create / update GitHub Release
-        uses: softprops/action-gh-release@v2
+      # Uploaded even when verification failed, so `publish` can attach what exists to the draft
+      # (it will not publish) and a human can see exactly what was built.
+      - name: Upload the assembled set
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          name: ${{ github.event.inputs.tag || github.ref_name }}
-          body: |
-            Prebuilt `hestia` daemon binaries for the targets attached to this release.
+          name: hestia-release-${{ needs.version.outputs.label }}
+          path: dist/*
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
 
-            Build provenance: Web4 `${{ steps.web4pin.outputs.rev }}`.
+  publish:
+    name: attach assets and publish
+    needs: [version, draft, assemble]
+    if: ${{ !cancelled() && needs.draft.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hestia
+          ref: ${{ needs.version.outputs.ref }}
 
-            Linux example:
-            ```sh
-            curl -L https://github.com/dp-web4/hestia/releases/download/${{ github.event.inputs.tag || github.ref_name }}/hestia-${{ github.event.inputs.tag || github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz | tar -xz
-            ./hestia-${{ github.event.inputs.tag || github.ref_name }}-x86_64-unknown-linux-gnu/hestia --version
-            ```
+      - name: Read pinned web4 rev
+        id: web4pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          rev="$(grep -oiE '[0-9a-f]{40}' hestia/web4.pin | head -1)"
+          test -n "$rev"
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
 
-            The dashboard HTML is baked into the binary; nothing else is required to run.
-          draft: false
-          prerelease: false
-          # Windows ZIPs are intentionally absent until #342 is resolved.
-          fail_on_unmatched_files: false
-          files: |
-            dist/hestia-*.tar.gz
-            dist/hestia-*.tar.gz.sha256
-            dist/hestia-*.zip
-            dist/hestia-*.zip.sha256
+      - name: Download the assembled set
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: hestia-release-${{ needs.version.outputs.label }}
+          path: dist
+
+      - name: Find the draft
+        id: rel
+        shell: bash
+        run: |
+          set -euo pipefail
+          row="$(gh api "repos/$GH_REPO/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$TAG\" and .draft == true) | .id")"
+          test "$(printf '%s\n' "$row" | grep -c .)" -eq 1 || { echo "::error::no unique draft for $TAG"; exit 1; }
+          echo "id=$row" >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes
+        shell: bash
+        env:
+          WEB4: ${{ steps.web4pin.outputs.rev }}
+        run: |
+          set -euo pipefail
+          U="https://github.com/$GH_REPO/releases/download/$TAG"
+          cat > notes.md <<EOF
+          hestia $TAG: the daemon, the desktop app and the Android app, one version, one tag.
+
+          | | asset |
+          |---|---|
+          | daemon, Linux x86_64 | \`hestia-$TAG-x86_64-unknown-linux-gnu.tar.gz\` |
+          | daemon, Linux aarch64 (Jetson) | \`hestia-$TAG-aarch64-unknown-linux-gnu.tar.gz\` |
+          | daemon, macOS Apple Silicon | \`hestia-$TAG-aarch64-apple-darwin.tar.gz\` |
+          | desktop app, Linux x86_64 | \`hestia-app-$TAG-x86_64-linux.AppImage\` or \`.deb\` |
+          | desktop app, macOS Apple Silicon | \`hestia-app-$TAG-aarch64-macos.dmg\` or \`.app.tar.gz\` |
+          | Android app | \`hestia-app-$TAG-android-universal.apk\` |
+
+          Every asset has a \`.sha256\`; \`SHA256SUMS\` covers them all.
+
+          Daemon (Linux example):
+          \`\`\`sh
+          curl -L $U/hestia-$TAG-x86_64-unknown-linux-gnu.tar.gz | tar -xz
+          ./hestia-$TAG-x86_64-unknown-linux-gnu/hestia --version
+          \`\`\`
+          The dashboard HTML is baked into the daemon binary; nothing else is required to run.
+
+          **The desktop and Android apps are unsigned** (macOS: ad-hoc signed, not notarized;
+          Android: debug keystore). See "Installing the desktop app" in the README for the
+          Gatekeeper and AppImage steps. No Windows build: the daemon has no Windows target yet (#342).
+
+          Build provenance: hestia \`$TAG\`, Web4 \`$WEB4\` (web4.pin).
+          EOF
+          cat notes.md
+
+      - name: Attach assets to the draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api -X PATCH "repos/$GH_REPO/releases/${{ steps.rel.outputs.id }}" \
+            -F body=@notes.md -f name="$TAG" >/dev/null
+          if ls dist/* >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            echo "::warning::nothing assembled to attach"
+          fi
+          gh api "repos/$GH_REPO/releases/${{ steps.rel.outputs.id }}" --jq '.assets[].name' | sort > attached.txt
+          (cd dist 2>/dev/null && ls | sort) > local.txt || : > local.txt
+          diff local.txt attached.txt || { echo "::error::attached assets differ from the assembled set"; exit 1; }
+
+      # The ONLY step that makes the release visible. It runs only when assemble (which requires
+      # every build job's full asset set and checksums) succeeded; otherwise the release stays a
+      # draft holding whatever was built.
+      - name: Publish (only if every asset job succeeded)
+        shell: bash
+        env:
+          ASSEMBLE: ${{ needs.assemble.result }}
+        run: |
+          set -euo pipefail
+          if [ "$ASSEMBLE" != success ]; then
+            echo "::error::assemble=$ASSEMBLE: $TAG is left as a DRAFT. Fix and \`gh run rerun ${{ github.run_id }} --failed\`."
+            exit 1
+          fi
+          gh api -X PATCH "repos/$GH_REPO/releases/${{ steps.rel.outputs.id }}" \
+            -F draft=false -F prerelease=false >/dev/null
+          gh release view "$TAG" --json url,isDraft,assets --jq '{url, isDraft, assets: (.assets | length)}'

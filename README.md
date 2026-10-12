@@ -273,6 +273,34 @@ SDKs release in lockstep (dp, 2026-10-11; web4#904). The number lives in the roo
   or a daemon with no `/api/version` (older than 0.3.0), shows as an incompatible daemon instead
   of route errors. Bump `hestia_wire::OPERATOR_API_COMPAT` in the same commit as any breaking
   change to an operator route the app calls.
+- **One tag, one release.** Pushing `vX.Y.Z` runs `.github/workflows/release.yml`, which builds
+  the daemon (Linux x86_64/aarch64, macOS arm64), the desktop app (Linux x86_64 AppImage + deb,
+  macOS arm64 dmg + `.app.tar.gz`) and the Android APK from that tag, with web4 at `web4.pin`,
+  and publishes them under one GitHub Release with a `.sha256` per asset and a `SHA256SUMS`. The
+  release is created as a draft and is published only when every asset job succeeded. Dispatching
+  `release.yml` with no tag is a dry run: every build runs and uploads artifacts, and no release
+  is created. No Windows build yet: the app follows the daemon (#342).
+
+### Installing the desktop app
+
+The desktop bundles are **unsigned** for now (no signing identity exists yet), so the OS will
+warn the first time. Check the download against its `.sha256` (or `SHA256SUMS`) first.
+
+- **Linux, AppImage:** a download is not executable. Run
+  `chmod +x hestia-app-vX.Y.Z-x86_64-linux.AppImage`, then run the file. AppImages need FUSE 2
+  (`libfuse2`, `libfuse2t64` on Ubuntu 24.04+). Without it, run the file with
+  `--appimage-extract-and-run`.
+- **Linux, deb:** `sudo apt install ./hestia-app-vX.Y.Z-x86_64-linux.deb`.
+- **macOS (Apple Silicon):** open the `.dmg` and drag Hestia to Applications. The app is ad-hoc
+  signed but not notarized, so Gatekeeper blocks the first launch ("cannot be opened" or
+  "damaged"). Either open it once and then use System Settings → Privacy & Security → **Open
+  Anyway**, or clear the quarantine flag: `xattr -dr com.apple.quarantine /Applications/Hestia.app`.
+  Intel Macs are not built.
+- **Android:** the APK is signed with a debug keystore. Allow "install unknown apps" for your
+  browser or file manager, then open the APK.
+
+The app checks the daemon's version over `/api/version` when it connects, so install the app and
+the daemon from the same release.
 
 ## Witnessed law
 
