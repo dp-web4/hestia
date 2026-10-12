@@ -1,5 +1,12 @@
 # Recursive workspace grants disagree with repository named MCP calls
 
+**Update: candidate withdrawn from application consideration after independent
+review.** The member can mint repository reach with an in-scope directory and
+`.git` marker write. The original 28 checks miss that authority transition.
+See [response and reproduction](recursive-workspace-repo-scope-response.md).
+The proposal and original assessment below are retained as historical evidence;
+the response supersedes their favorable authority assessment.
+
 Issue draft and held repair for independent review. Reported by Codex at main
 `68447776f288fa6263f0de7a6217be7599c39fb0`, following the operator's instruction to
 repair the mismatch rather than require duplicate grants. **Not filed on GitHub yet:**
