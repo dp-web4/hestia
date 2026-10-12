@@ -78,7 +78,11 @@ ADAPTER = '''def _mcp_repo(tool: str, tool_input: Any) -> Optional[str]:
     # Preserve authority-bearing owner/repo. Conflicting aliases are not first-key-wins:
     # the connector might interpret a different field from the gate.
     identities = []
-    invalid = "!invalid-repository-identity!"
+    # Invalid identity must still expose the original strings to innate egress
+    # scanning, including when scope='*' skips repository scope validation.
+    raw_keys = ("owner", "repository_full_name", "repo_full_name", "repository", "repo")
+    invalid = "!invalid-repository-identity! " + " ".join(
+        tool_input[key] for key in raw_keys if isinstance(tool_input.get(key), str))
     owner = tool_input.get("owner")
     for key in ("repository_full_name", "repo_full_name", "repository", "repo"):
         if key not in tool_input or tool_input[key] is None:

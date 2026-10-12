@@ -16,7 +16,7 @@ from unittest.mock import patch
 from recursive_repo_scope_candidate import artifact, proposed_sources
 
 ROOT = Path(__file__).resolve().parents[2]
-HELD = ROOT / "held/7d51dfd969c42c37cd4dd329d981e5654d2c71d0e5551ad755767aa819a43854.patch"
+HELD = ROOT / "held/c7ed5f759edad539f1aed9fcce58ae25b13a92f6b41db193668354d1b5bb7a4e.patch"
 
 
 def load_module(name, path, source):
@@ -94,13 +94,14 @@ def main():
         profile = g.HarnessProfile(member_id="codex", identity_path="unused",
                                    launch_cwd_env="TEST_SCOPE_LAUNCH")
 
-        def verdict(scopes, identity="example/sample", paths=None, fields=None):
+        def verdict(scopes, identity="example/sample", paths=None, fields=None, with_rule=False):
             pol = g.AgentPolicy(member_id="codex", scope=tuple(scopes), source="synthetic-vault")
             event = adapter.normalized_event(adapter.GateEvent(
                 tool="mcp__fixture__github", tool_input=fields if fields is not None else
                 {"repository_full_name": identity}))
             event.paths.extend(paths or [])
-            decision = g.evaluate(event, profile, str(ws), pol).decision
+            result = g.evaluate(event, profile, str(ws), pol)
+            decision = result.decision
             if args.held:
                 baseline_event = baseline_adapter.normalized_event(baseline_adapter.GateEvent(
                     tool="mcp__fixture__github", tool_input=fields if fields is not None else
@@ -109,7 +110,7 @@ def main():
                 baseline = baseline_core.evaluate(baseline_event, profile, str(ws), pol).decision
                 compared.append((baseline, decision))
                 assert decision != "allow" or baseline == "allow", (scopes, identity, baseline, decision)
-            return decision
+            return (decision, result.rule) if with_rule else decision
 
         with patch.dict(os.environ, {"TEST_SCOPE_LAUNCH": str(Path(tmp) / "elsewhere"),
                                      "HESTIA_FORBIDDEN_EXTRA": "blocked-private"}):
@@ -147,6 +148,35 @@ def main():
             check("internal alias", verdict(broad, "example/alias"), "deny")
             check("forbidden name dominates", verdict(broad, "example/blocked-private"), "deny")
             check("relative secret remains forbidden", verdict(broad, paths=[".env"]), "deny")
+            # Notice 20670: invalid identity previously erased egress evidence.
+            # Vary alias, malformed/conflicting shape, policy, and degraded mode.
+            token = g.FORBIDDEN_DEFAULT[-1]
+            egress_fields = []
+            for key in ("repository_full_name", "repo_full_name", "repository", "repo"):
+                for shape, value in (("bare", token),
+                                     ("URL", "https://github.com/o/" + token),
+                                     ("qualified", "o/" + token)):
+                    egress_fields.append((key + " " + shape, {key: value}))
+            egress_fields.extend([
+                ("owner plus bare", {"owner": "o", "repo": token}),
+                ("conflicting aliases", {"repo": "o/" + token, "repository": "o/sample"}),
+                ("conflicting owner", {"owner": token, "repo": "o/sample"}),
+                ("nonstring preceding raw alias", {"repository_full_name": 42, "repo": token}),
+                ("empty preceding raw alias", {"repository_full_name": "", "repo": token}),
+            ])
+            for label, fields in egress_fields:
+                for scope in (["*"], ["sample"], broad, []):
+                    check("innate egress " + label + " scope=" + str(scope),
+                          verdict(scope, fields=fields, with_rule=True), ("deny", "egress.secret"))
+                event = adapter.normalized_event(adapter.GateEvent(
+                    tool="mcp__fixture__github", tool_input=fields))
+                degraded = g.degraded_verdict(event, profile)
+                check("degraded egress " + label,
+                      (degraded.decision, degraded.rule), ("deny", "egress.secret"))
+            check("unscoped benign bare remains allowed",
+                  verdict(["*"], fields={"repo": "sample"}), "allow")
+            check("scoped benign bare remains denied",
+                  verdict(["sample"], fields={"repo": "sample"}, with_rule=True), ("deny", "mrh.repo"))
             for identity in ["example/..", "example/.", "../sample", "example/sample/child", "example/sample\\child", "example/sample%2fchild", "/sample", ""]:
                 check(f"malformed identity {identity!r}", verdict(["sample"], identity), "deny")
             for remote in ["https://github.com/example/sample", "git@github.com:example/sample.git",
