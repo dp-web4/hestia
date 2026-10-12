@@ -337,6 +337,13 @@ jobs:
             chmod +x "dist/${base}.AppImage"
             cp "$(one "$B/deb/*.deb")" "dist/${base}.deb"
             dpkg-deb --info "dist/${base}.deb" | grep -E 'Package|Version|Architecture'
+            # The deb is `hestia-app`, never `hestia`: that name is reserved for a future daemon
+            # deb. Tauri derives Package from productName (kebab-cased) and has no separate
+            # field, so app/src-tauri/tauri.linux.conf.json sets productName "hestia-app" for
+            # Linux only (identifier and window title unchanged; linux/hestia-app.desktop keeps
+            # the menu entry "Hestia").
+            test "$(dpkg-deb -f "dist/${base}.deb" Package)" = hestia-app
+            dpkg-deb -c "dist/${base}.deb" | grep -E ' (\./)?usr/bin/hestia-app$'   # no -q: an early exit would SIGPIPE dpkg-deb under pipefail
           else
             app="$(one "$B/macos/*.app")"
             codesign --verify --deep --strict --verbose=2 "$app"

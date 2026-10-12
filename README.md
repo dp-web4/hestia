@@ -290,7 +290,8 @@ warn the first time. Check the download against its `.sha256` (or `SHA256SUMS`) 
   `chmod +x hestia-app-vX.Y.Z-x86_64-linux.AppImage`, then run the file. AppImages need FUSE 2
   (`libfuse2`, `libfuse2t64` on Ubuntu 24.04+). Without it, run the file with
   `--appimage-extract-and-run`.
-- **Linux, deb:** `sudo apt install ./hestia-app-vX.Y.Z-x86_64-linux.deb`.
+- **Linux, deb:** `sudo apt install ./hestia-app-vX.Y.Z-x86_64-linux.deb`. The package and its
+  binary are both `hestia-app` (`/usr/bin/hestia-app`); the name `hestia` is kept for the daemon.
 - **macOS (Apple Silicon):** open the `.dmg` and drag Hestia to Applications. The app is ad-hoc
   signed but not notarized, so Gatekeeper blocks the first launch ("cannot be opened" or
   "damaged"). Either open it once and then use System Settings → Privacy & Security → **Open
