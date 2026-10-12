@@ -63,6 +63,10 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        # The action's default package list includes the long-removed `tools` package, and
+        # sdkmanager now fails on it ("Failed to find package 'tools'", run 38195474570).
+        with:
+          packages: platform-tools
         # NDK: the runner image's preinstalled NDK is auto-detected by the
         # tauri CLI (verified in run 27447314547 — compiled clean with it).
 
