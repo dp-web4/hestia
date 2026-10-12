@@ -191,7 +191,7 @@ def divergent_checkout(root: Path) -> str:
 def source_describe() -> str:
     out = subprocess.run(
         ["git", "-C", str(HERE.parent.parent.parent),
-         "describe", "--tags", "--always", "--dirty"],
+         "describe", "--tags", "--match", "v[0-9]*", "--always", "--dirty"],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert out, "git describe produced nothing — the watcher will read the same"
@@ -352,6 +352,12 @@ def check_direction_cases(only: str | None = None) -> None:
     if not only or "I".startswith(only):
         check_same_commit_other_spelling()
 
+    if not only or "J".startswith(only):
+        check_exact_release_tag_has_a_direction()
+
+    if not only or "K".startswith(only):
+        check_app_tag_does_not_rename_the_source()
+
     if only and not "G".startswith(only):
         return
     # G. DIVERGENT IS UNRESOLVABLE FOR A SECOND REASON. B's pair is unorderable
@@ -405,6 +411,62 @@ def check_same_commit_other_spelling() -> None:
                 stop(proc)
         finally:
             stub.stop()
+
+
+def _run_once(root: Path, td: str, running: str, needle: str) -> str:
+    stub = StubDaemon(version=f"0.3.0 ({running})")
+    try:
+        proc = start(Path(td) / "home", stub.endpoint,
+                     watcher=root / "plugins" / "member-mesh" / WATCHER.name)
+        try:
+            # Only the matching line: read_until returns everything before it too, and an ARTIFACT
+            # line's own `state=ok` must not satisfy an assertion about the DAEMON.
+            return read_until(proc, needle).splitlines()[-1]
+        finally:
+            stop(proc)
+    finally:
+        stub.stop()
+
+
+def check_exact_release_tag_has_a_direction() -> None:
+    # J. A DAEMON BUILT AT A RELEASE TAG (web4#904). At a tagged commit describe prints the bare tag
+    # (`v0.3.0`), which has no `-g<hex>`. drift_direction used to give up on it ("direction
+    # unresolved"); it now peels the release tag like hestia-deploy's build_commit, so a daemon at
+    # the release while the checkout has moved on reads daemon-behind-source.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "checkout"
+        synthetic_checkout(root)
+        git(root, "tag", "v0.3.0", "HEAD~1")
+        line = _run_once(root, td, "v0.3.0", "DAEMON DRIFT")
+        assert "reason=daemon-behind-source" in line, ("J exact release tag", line)
+        # ... and the same release tag at HEAD is current, whatever the source spells.
+        git(root, "tag", "-d", "v0.3.0")
+        git(root, "tag", "v0.3.0", "HEAD")
+        source = git(root, "describe", "--tags", "--match", "v[0-9]*", "--always")
+        assert source == "v0.3.0", source
+        line = _run_once(root, td, "v0.3.0-dirty", "DAEMON state=")
+        assert "state=ok reason=matches-source" in line, ("J exact release tag at HEAD", line)
+
+
+def check_app_tag_does_not_rename_the_source() -> None:
+    # K. ONLY RELEASE TAGS NAME A BUILD (web4#904). The Android app-v* tags are ancestors of main;
+    # on 2026-08-08 the reference daemon reported `app-v0.1.2-761-g9a6a5c2`. A daemon built by
+    # build.rs (--match 'v[0-9]*') while an app-v* tag sits ON the checkout's HEAD: an unmatched
+    # source describe prints the bare `app-v0.4.0`, which names no sha, and reads as drift.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "checkout"
+        synthetic_checkout(root)
+        git(root, "tag", "v0.3.0", "HEAD~1")
+        git(root, "tag", "app-v0.4.0", "HEAD")
+        built = git(root, "describe", "--tags", "--match", "v[0-9]*", "--always")
+        assert built.startswith("v0.3.0-1-g"), built
+        assert git(root, "describe", "--tags", "--always") == "app-v0.4.0"
+        line = _run_once(root, td, built, "DAEMON state=")
+        assert "state=ok reason=matches-source" in line, ("K app-v tag at HEAD", line)
+        assert "app-v" not in line, ("K the source must not be named by an app tag", line)
+        # A daemon that somehow reports the app tag names no build of ours: not current.
+        line = _run_once(root, td, "app-v0.4.0", "DAEMON DRIFT")
+        assert "reason=differs-from-source" in line, ("K app-v running string", line)
 
 
 def check_direction_flip() -> None:

@@ -5,9 +5,10 @@ import { StatusBadge } from "../components/StatusBadge";
 import { TrustCard } from "../components/TrustCard";
 import { ChainFeed } from "../components/ChainFeed";
 import { ToolHistogram } from "../components/ToolHistogram";
+import { blocksRoutes, compatTitle, sideLabel } from "../lib/compat";
 
 export function Dashboard() {
-  const { data, online, signedIn, error } = useDashboard(2000);
+  const { data, online, signedIn, error, handshake } = useDashboard(2000);
   const [urlDraft, setUrlDraft] = useState<string>("");
   const [saveMsg, setSaveMsg] = useState<string | null>(null);
 
@@ -20,11 +21,31 @@ export function Dashboard() {
   const handleConnect = async () => {
     try {
       await setDaemonUrl(urlDraft);
+      window.dispatchEvent(new Event("hestia:daemon-url"));
       setSaveMsg("Saved — connecting…");
     } catch (e) {
       setSaveMsg(String(e));
     }
   };
+
+  // The daemon answered, but it is a release this app cannot talk to (web4#904). Not offline,
+  // not signed out: a third problem whose fix is an upgrade, so name it and both versions.
+  if (blocksRoutes(handshake) && handshake) {
+    return (
+      <div className="page">
+        <div className="error-panel" data-compat={handshake.state}>
+          <StatusBadge online={true} label="Online · incompatible" />
+          <p>{compatTitle(handshake)}</p>
+          <p className="connect-hint">{handshake.message}</p>
+          <code>
+            daemon: {sideLabel(handshake.daemon_version, handshake.daemon_api_compat)}
+            {handshake.daemon_build_id ? ` (build ${handshake.daemon_build_id})` : ""}
+          </code>
+          <code>app: {sideLabel(handshake.app_version, handshake.app_api_compat)}</code>
+        </div>
+      </div>
+    );
+  }
 
   // Signed out but the daemon is up: a different problem with a different fix
   // (sign in from the sidebar), so say so instead of showing "cannot reach".

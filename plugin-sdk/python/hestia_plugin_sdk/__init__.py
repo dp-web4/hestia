@@ -23,7 +23,7 @@ Quickstart::
 
 from __future__ import annotations
 
-__version__ = "0.0.2"
+__version__ = "0.3.0"
 
 from .client import HestiaClient, create_hestia_client
 from .errors import (

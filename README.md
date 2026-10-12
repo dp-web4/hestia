@@ -251,6 +251,29 @@ hestia/
 └── demo/                 # Worked examples (consumer + enterprise)
 ```
 
+## Versions and releases
+
+**One version, one tag.** The daemon (`core`), the desktop app (`app`: `package.json`,
+`src-tauri/Cargo.toml`, `tauri.conf.json`), the shared wire crate (`wire`) and the three plugin
+SDKs release in lockstep (dp, 2026-10-11; web4#904). The number lives in the root
+[`VERSION`](VERSION) file and nowhere else by hand:
+
+- `python3 tools/version_sync.py` checks every manifest and lockfile entry against `VERSION`;
+  `--write` sets them all. CI runs it through `tools/version_sync_test.py`, so a PR that bumps
+  one manifest without the others is red.
+- A release is the tag `vX.Y.Z` with `X.Y.Z` equal to `VERSION`. `release.yml` refuses any
+  other tag before it builds. `hardbound-pak/` is a separate product line and is not covered.
+- Build ids are `git describe --tags --match 'v[0-9]*' --always --dirty`, so only release tags
+  name a build. The older `app-v*` tags (Android APKs) are never a daemon's build id. Every
+  producer and consumer (build.rs, hestia-deploy, install-members, the member-mesh watcher, the
+  upgrade-path harness) uses that one glob; `tools/build_tag_match_test.py` holds them to it.
+- **Handshake.** The daemon serves `GET /api/version` (no session) as
+  `{version, build_id, api_compat}`. The app reads it before any other route. An equal
+  `api_compat` is compatible (a different `version` shows as skew). A different `api_compat`,
+  or a daemon with no `/api/version` (older than 0.3.0), shows as an incompatible daemon instead
+  of route errors. Bump `hestia_wire::OPERATOR_API_COMPAT` in the same commit as any breaking
+  change to an operator route the app calls.
+
 ## Witnessed law
 
 Hestia is **policy-neutral**: it doesn't dictate how you run your own identity or

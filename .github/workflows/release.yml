@@ -26,8 +26,28 @@ permissions:
   contents: write
 
 jobs:
+  # ONE VERSION, ONE TAG (web4#904; dp, 2026-10-11). The daemon, the app, the wire crate and
+  # the plugin SDKs release in lockstep: the root VERSION file is the number, and
+  # tools/version_sync.py checks every manifest against it. A release is refused before any
+  # build when the pushed tag is not exactly v$VERSION, or any manifest disagrees, so a tag can
+  # never publish binaries whose `--version` says something else.
+  version:
+    name: tag equals VERSION
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hestia
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Tag and every manifest agree with VERSION
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 hestia/tools/version_sync.py --tag "${{ github.event.inputs.tag || github.ref_name }}"
+
   build:
     name: build ${{ matrix.target }}
+    needs: version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

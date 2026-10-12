@@ -58,7 +58,9 @@ def git(repo: Path, *args: str) -> str:
 
 
 # ---- 1. same_build ------------------------------------------------------------------------
-FUNCS = (extract_function("build_hex") + "\n" + extract_function("build_commit") + "\n"
+_MATCH = re.search(r"^BUILD_TAG_MATCH='[^']*'$", TEXT, re.M)
+assert _MATCH, "BUILD_TAG_MATCH not assigned at top level in hestia-deploy.sh"
+FUNCS = (_MATCH.group(0) + "\n" + extract_function("build_hex") + "\n" + extract_function("build_commit") + "\n"
          + extract_function("same_build") + "\n")
 
 with tempfile.TemporaryDirectory() as d:
@@ -100,6 +102,18 @@ with tempfile.TemporaryDirectory() as d:
     check("a release tag landing on the deployed commit renames it, not rebuilds it", same("v0.0.5", b9), True)
     check("an exact tag the checkout lacks is not the same build", same("v9.9.9", b9), False)
     check("a dirty exact tag is not the clean build", same("v0.0.5-dirty", b9), False)
+    # ONLY RELEASE TAGS NAME A BUILD (web4#904): the producers describe with --match 'v[0-9]*', so a
+    # bare app-v* tag is never one of our build ids, even when it really sits on the commit.
+    git(repo, "tag", "app-v0.4.0", b_full)
+    check("an app-v* tag on the deployed commit names no build", same("app-v0.4.0", b9), False)
+    check("an app-v* tag is still equal to itself (string arm)", same("app-v0.4.0", "app-v0.4.0"), True)
+
+# The checkout's target is described with the same glob build.rs bakes in.
+check("BUILD_TAG_MATCH is the release glob", _MATCH.group(0), "BUILD_TAG_MATCH='v[0-9]*'")
+check("target is described with BUILD_TAG_MATCH",
+      bool(re.search(r'^target="\$\(git -C "\$DEPLOY_ROOT/hestia" describe --tags --match "\$BUILD_TAG_MATCH" --always\)"$',
+                     TEXT, re.M)), True)
+check("no unmatched describe left", re.search(r"describe --tags --always", TEXT) is None, True)
 
 # Every comparison site uses it: no build id is compared as a string any more.
 for pattern in (r'"\$running" [!=]= "\$target"', r'"\$ondisk" [!=]= "\$target"',

@@ -1,6 +1,6 @@
 [package]
 name = "hestia-app"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
 # The app is a Tauri application (built by ci.yml / app-android.yml), not a library for
@@ -36,4 +36,4 @@ web4-core = { path = "../../../web4/web4-core" }
 hestia-wire = { path = "../../wire" }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }

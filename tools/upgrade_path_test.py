@@ -82,6 +82,7 @@ tools/upgrade_path_plumbing_test.py.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import importlib.util
 import json
@@ -164,6 +165,11 @@ class SetupError(Exception):
 
 
 # ------------------------------------------------------------------ pure helpers --------------
+# ONLY RELEASE TAGS NAME A BUILD (web4#904): the glob core/build.rs, hestia-deploy.sh
+# (BUILD_TAG_MATCH) and the member-mesh watcher describe with. app-v* tags are the app's.
+BUILD_TAG_MATCH = "v[0-9]*"
+
+
 def describe_hash_len(describe: str) -> int | None:
     """The abbreviated-sha length in a `git describe` string (`v0.0.4-968-ga7e33bc4` -> 8)."""
     m = re.search(r"-g([0-9a-f]{4,40})(?:-dirty)?$", describe.strip())
@@ -186,7 +192,7 @@ def names_commit(describe: str, full_sha: str, repo: Path | None = None) -> bool
     """Whether a describe string names this commit, at whatever abbreviation length (#1250: the
     length is a property of the clone, not of the commit). Never true for a -dirty build.
 
-    An EXACT-TAG describe (`v0.0.5`: what `git describe --tags --always` prints at a tagged
+    An EXACT-TAG describe (`v0.0.5`: what `git describe --tags --match 'v[0-9]*' --always` prints at a tagged
     commit) carries no sha, so it is resolved in `repo` and must peel to this commit (Codex
     notice 20534: without this a correctly built tagged candidate was refused). Without a repo
     to resolve it in, a tag names nothing."""
@@ -198,6 +204,8 @@ def names_commit(describe: str, full_sha: str, repo: Path | None = None) -> bool
         return True
     if repo is None or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/+-]*", describe):
         return False
+    if not fnmatch.fnmatchcase(describe, BUILD_TAG_MATCH):
+        return False   # no producer emits a bare non-release tag (app-v*): it names no build
     out = subprocess.run(["git", "-C", str(repo), "rev-parse", "-q", "--verify",
                           f"refs/tags/{describe}^{{commit}}"], capture_output=True, text=True)
     return out.returncode == 0 and out.stdout.strip() == full_sha
@@ -366,7 +374,7 @@ def resolve_ref(repo: Path, ref: str) -> str:
 def latest_release_tag(repo: Path, of: str) -> str:
     """The newest `v*` release tag reachable from `of` (app-v* tags are the app's, not hestia's)."""
     out = subprocess.run(["git", "-C", str(repo), "describe", "--tags", "--abbrev=0",
-                          "--match", "v[0-9]*", of], capture_output=True, text=True)
+                          "--match", BUILD_TAG_MATCH, of], capture_output=True, text=True)
     if out.returncode != 0:
         raise SetupError(f"no v* release tag reachable from {of}: {last_line(out.stderr)}")
     return out.stdout.strip()
@@ -606,8 +614,8 @@ class Machine:
         self.git("-C", str(self.deploy_root / "hestia"), "config", "core.abbrev", str(length))
 
     def origin_describe(self, length: int) -> str:
-        return self.git("-C", str(self.origin / "hestia.git"), "describe", "--tags", "--always",
-                        f"--abbrev={length}", "main")
+        return self.git("-C", str(self.origin / "hestia.git"), "describe", "--tags",
+                        "--match", BUILD_TAG_MATCH, "--always", f"--abbrev={length}", "main")
 
     # -- the scripts under test ---------------------------------------------------------------
     def deploy_log_offset(self) -> int:

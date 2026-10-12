@@ -1,12 +1,19 @@
 //! Bake the actual build provenance (`git describe`) into the binary so
 //! `hestia --version` reports the commit it was built from, not a hand-bumped
 //! Cargo.toml constant that goes stale the moment nobody remembers to edit it.
+//!
+//! ONLY RELEASE TAGS NAME A BUILD (web4#904). `--match 'v[0-9]*'` keeps every other tag out of
+//! the build id: the Android `app-v*` tags are ancestors of main, and on 2026-08-08 the reference
+//! daemon really did call itself `app-v0.1.2-761-g9a6a5c2`. Every producer and consumer of these
+//! strings uses the same glob: deploy/from-main/hestia-deploy.sh (`BUILD_TAG_MATCH`),
+//! deploy/install-members.sh, plugins/member-mesh/hestia-watch-member.sh and
+//! tools/upgrade_path_test.py (`BUILD_TAG_MATCH`); tools/build_tag_match_test.py holds them to it.
 
 use std::process::Command;
 
 fn main() {
     let git = Command::new("git")
-        .args(["describe", "--tags", "--always", "--dirty"])
+        .args(["describe", "--tags", "--match", "v[0-9]*", "--always", "--dirty"])
         .output()
         .ok()
         .filter(|o| o.status.success())

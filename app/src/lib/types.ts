@@ -266,12 +266,37 @@ export interface WriteEffect {
   note?: string;
 }
 
+/**
+ * The app/daemon handshake (web4#904), classified in the Rust shell
+ * (app/src-tauri/src/handshake.rs). `compatible` and `skew` may use operator routes;
+ * every other state means the shell refuses them with `message`.
+ */
+export type CompatState =
+  | "compatible"
+  | "skew"
+  | "incompatible"
+  | "no_version_endpoint"
+  | "malformed"
+  | "unreachable";
+
+export interface Handshake {
+  state: CompatState;
+  app_version: string;
+  app_api_compat: number;
+  daemon_version: string | null;
+  daemon_build_id: string | null;
+  daemon_api_compat: number | null;
+  message: string;
+}
+
 export interface DaemonStatus {
   online: boolean;
   /** Present since v0.2.0: distinguishes "daemon down" from "signed out". */
   signed_in?: boolean;
   operator_lct?: string | null;
   url: string;
+  /** Present since v0.3.0: what is on the other end, and whether this app can talk to it. */
+  handshake?: Handshake;
 }
 
 export interface RemoteEntry {
