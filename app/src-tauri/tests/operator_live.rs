@@ -4,10 +4,16 @@
 //!     cargo test --test operator_live -- --ignored --nocapture
 //!
 //! Which daemon and which key (CI: the `app-daemon contract` job in ci.yml runs these
-//! against an isolated daemon built from the same commit, never the host's :7711):
-//!     HESTIA_APP_LIVE_DAEMON        daemon base URL (default http://127.0.0.1:7711)
-//!     HESTIA_APP_LIVE_OPERATOR_KEY  the genesis operator credential file the daemon minted
-//!                                   (default: the legacy per-user location, if it exists)
+//! against an isolated daemon built from the same commit):
+//!     HESTIA_APP_LIVE_DAEMON        daemon base URL — REQUIRED, never on port 7711
+//!     HESTIA_APP_LIVE_OPERATOR_KEY  the genesis operator credential file that daemon minted —
+//!                                   REQUIRED for the sign-in test, never under ~/.hestia
+//!
+//! NEVER THE LIVE DAEMON. These tests open operator sessions and write to the daemon they reach.
+//! There is no default endpoint and no default key: an unset endpoint, any endpoint on :7711
+//! (the host's live daemon), or a key under ~/.hestia (the live operator credential) is a
+//! REFUSAL that fails the test with a one-line reason. It is not a skip. `live_target` decides
+//! this; the non-ignored `refusal_*` tests below pin it.
 //!
 //! This exercises the SHIPPING code path (`operator::authenticate`), not a
 //! reimplementation of it — the distinction that makes it worth having.
@@ -23,19 +29,94 @@ use std::sync::Arc;
 
 use hestia_app_lib::{handshake, identity_vault, operator};
 
-fn daemon() -> String {
-    std::env::var("HESTIA_APP_LIVE_DAEMON")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim().trim_end_matches('/').to_string())
-        .unwrap_or_else(|| "http://127.0.0.1:7711".to_string())
+/// The port the live host daemon listens on. Nothing here may reach it.
+const LIVE_PORT: u16 = 7711;
+
+/// The explicit port of a base URL, or the scheme's default. None when it cannot be read, which
+/// the caller refuses (an endpoint it cannot check is not one it may use).
+fn endpoint_port(url: &str) -> Option<u16> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let hostport = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let port = if let Some(v6) = hostport.strip_prefix('[') {
+        v6.split_once(']')?.1.strip_prefix(':')
+    } else {
+        hostport.rsplit_once(':').map(|(_, p)| p)
+    };
+    match port {
+        Some(p) => p.parse().ok(),
+        None => match scheme.to_ascii_lowercase().as_str() {
+            "http" => Some(80),
+            "https" => Some(443),
+            _ => None,
+        },
+    }
 }
 
-fn operator_key_path() -> Option<std::path::PathBuf> {
-    match std::env::var_os("HESTIA_APP_LIVE_OPERATOR_KEY") {
-        Some(p) if !p.is_empty() => Some(std::path::PathBuf::from(p)),
-        _ => operator::default_legacy_key_path(),
+/// Decide which daemon, and (when `need_key`) which key, a live test may use. Pure: the
+/// environment is passed in so the refusals are testable without touching it.
+fn live_target(
+    daemon_env: Option<String>,
+    key_env: Option<std::ffi::OsString>,
+    home: Option<std::path::PathBuf>,
+    need_key: bool,
+) -> Result<(String, Option<std::path::PathBuf>), String> {
+    let daemon = daemon_env
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or("refused: HESTIA_APP_LIVE_DAEMON is not set; operator_live never defaults to the live daemon (point it at an isolated one)")?;
+    match endpoint_port(&daemon) {
+        None => return Err(format!("refused: cannot read a port from HESTIA_APP_LIVE_DAEMON={daemon:?}")),
+        Some(LIVE_PORT) => {
+            return Err(format!(
+                "refused: HESTIA_APP_LIVE_DAEMON={daemon} is on port {LIVE_PORT}, the live daemon's; use an isolated daemon on another port"
+            ))
+        }
+        Some(_) => {}
     }
+    if !need_key {
+        return Ok((daemon, None));
+    }
+    let key = key_env
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+        .ok_or("refused: HESTIA_APP_LIVE_OPERATOR_KEY is not set; operator_live never defaults to the live operator key")?;
+    if let Some(home) = home {
+        let live = home.join(".hestia");
+        // Lexically AND resolved: a relative path, a `..` or a symlink must not reach it either.
+        let resolved = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let lexical = std::path::absolute(&key).unwrap_or_else(|_| key.clone());
+        if lexical.starts_with(&live) || resolved(&key).starts_with(resolved(&live)) {
+            return Err(format!(
+                "refused: HESTIA_APP_LIVE_OPERATOR_KEY={} is under {}, the live operator credential; use the key the isolated daemon minted",
+                key.display(),
+                live.display()
+            ));
+        }
+    }
+    Ok((daemon, Some(key)))
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|h| !h.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The configured target, or a loud failure with the one-line reason.
+fn target(need_key: bool) -> (String, Option<std::path::PathBuf>) {
+    live_target(
+        std::env::var("HESTIA_APP_LIVE_DAEMON").ok(),
+        std::env::var_os("HESTIA_APP_LIVE_OPERATOR_KEY"),
+        home_dir(),
+        need_key,
+    )
+    .unwrap_or_else(|why| panic!("{why}"))
+}
+
+fn daemon() -> String {
+    target(false).0
 }
 
 fn test_vault_from_legacy(
@@ -57,12 +138,9 @@ fn test_vault_from_legacy(
 #[tokio::test]
 #[ignore]
 async fn authenticate_opens_a_session_and_the_token_reads_the_gated_api() {
-    let path = operator_key_path().expect(
-        "no operator key (HESTIA_APP_LIVE_OPERATOR_KEY unset and no ~/.hestia/operator.key) — \
-         this test was invoked explicitly (--ignored), so an absent key is a failure to run \
-         the check, not a reason to pass. Mint an operator key, or don't invoke it.",
-    );
-    let daemon = daemon();
+    // Invoked explicitly (--ignored): an unconfigured or live target is a refusal that FAILS.
+    let (daemon, path) = target(true);
+    let path = path.expect("target(true) returns a key");
     let daemon = daemon.as_str();
 
     let (_dir, vault) = test_vault_from_legacy(&path);
@@ -239,4 +317,70 @@ async fn the_daemon_handshake_matches_this_app() {
         !build.is_empty() && !build.starts_with("app-v"),
         "build id must be a daemon describe string, never an app-v* tag: {build:?}"
     );
+}
+
+// ---- the refusals (NOT ignored: they run in every `cargo test`) ---------------------------------
+
+fn s(v: &str) -> Option<String> {
+    Some(v.to_string())
+}
+
+#[test]
+fn refusal_no_endpoint_is_a_loud_refusal_not_a_default() {
+    let why = live_target(None, None, None, false).unwrap_err();
+    assert!(why.starts_with("refused:") && why.contains("HESTIA_APP_LIVE_DAEMON") && !why.contains('\n'), "{why}");
+    assert!(live_target(s("   "), None, None, false).is_err(), "blank is unset");
+}
+
+#[test]
+fn refusal_port_7711_is_refused_however_it_is_spelled() {
+    for url in [
+        "http://127.0.0.1:7711",
+        "http://127.0.0.1:7711/",
+        "http://localhost:7711/mcp",
+        "http://[::1]:7711",
+        "http://user@10.0.0.5:7711",
+        "HTTP://host:7711?x=1",
+    ] {
+        let why = live_target(s(url), None, None, false).unwrap_err();
+        assert!(why.contains("7711"), "{url}: {why}");
+    }
+    assert!(live_target(s("not a url"), None, None, false).is_err(), "an unreadable endpoint is refused");
+    let (d, k) = live_target(s("http://127.0.0.1:7797/"), None, None, false).unwrap();
+    assert_eq!((d.as_str(), k), ("http://127.0.0.1:7797", None));
+    assert_eq!(endpoint_port("http://127.0.0.1"), Some(80));
+    assert_eq!(endpoint_port("https://h"), Some(443));
+}
+
+#[test]
+fn refusal_the_key_must_be_explicit_and_not_the_live_one() {
+    let home = tempfile::tempdir().unwrap();
+    let live = home.path().join(".hestia");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::write(live.join("operator.key"), "{}").unwrap();
+    let ok = s("http://127.0.0.1:7797");
+    let h = Some(home.path().to_path_buf());
+
+    let why = live_target(ok.clone(), None, h.clone(), true).unwrap_err();
+    assert!(why.contains("HESTIA_APP_LIVE_OPERATOR_KEY is not set"), "{why}");
+
+    let why = live_target(ok.clone(), Some(live.join("operator.key").into()), h.clone(), true).unwrap_err();
+    assert!(why.contains("under") && why.contains(".hestia"), "{why}");
+
+    // A `..` detour and a symlink into ~/.hestia are the same key.
+    let other = home.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let detour = other.join("..").join(".hestia").join("operator.key");
+    assert!(live_target(ok.clone(), Some(detour.into()), h.clone(), true).is_err(), "`..` detour");
+    #[cfg(unix)]
+    {
+        let link = other.join("k");
+        std::os::unix::fs::symlink(live.join("operator.key"), &link).unwrap();
+        assert!(live_target(ok.clone(), Some(link.into()), h.clone(), true).is_err(), "symlink");
+    }
+
+    let isolated = other.join("operator.key");
+    std::fs::write(&isolated, "{}").unwrap();
+    let (_, k) = live_target(ok, Some(isolated.clone().into()), h, true).unwrap();
+    assert_eq!(k.as_deref(), Some(isolated.as_path()));
 }
