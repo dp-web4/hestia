@@ -255,6 +255,17 @@ drift_direction() {
   # assumed in either direction.
 }
 
+same_commit() {
+  # $1, $2 = describe strings. True when both name ONE commit this checkout can resolve, whatever
+  # the abbreviation length. Same hex shapes drift_direction accepts.
+  local A="${1%-dirty}" B="${2%-dirty}" FA FB
+  A="${A##*-g}"; B="${B##*-g}"
+  case "$A$B" in ''|*[!0-9a-f]*) return 1 ;; esac
+  FA="$(git -C "$WATCH_REPO_ROOT" rev-parse -q --verify "${A}^{commit}" 2>/dev/null)" || return 1
+  FB="$(git -C "$WATCH_REPO_ROOT" rev-parse -q --verify "${B}^{commit}" 2>/dev/null)" || return 1
+  [ -n "$FA" ] && [ "$FA" = "$FB" ]
+}
+
 check_daemon_drift() {
   # $1=refresh re-reads the source describe (startup + hourly announce). The
   # per-pass call skips it: `git describe` on a slow mount (WSL drvfs) costs
@@ -290,6 +301,13 @@ check_daemon_drift() {
     STATE="unverifiable"
     REASON="source-not-a-checkout"
   elif [ "${PROV%-dirty}" = "${SOURCE%-dirty}" ]; then
+    STATE="ok"
+    REASON="matches-source"
+  elif same_commit "$PROV" "$SOURCE"; then
+    # One commit, two spellings (#1250): `git describe` sizes the abbreviated sha by the object
+    # count of the clone it runs in, so the daemon (built in the deploy clone) and this checkout
+    # can name the same commit `-g588684d` and `-g588684d6`. Before this arm that read as drift,
+    # and drift_direction then called it daemon-behind-source (a commit is its own ancestor).
     STATE="ok"
     REASON="matches-source"
   else

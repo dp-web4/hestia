@@ -349,6 +349,9 @@ def check_direction_cases(only: str | None = None) -> None:
     if not only or "H".startswith(only):
         check_direction_flip()
 
+    if not only or "I".startswith(only):
+        check_same_commit_other_spelling()
+
     if only and not "G".startswith(only):
         return
     # G. DIVERGENT IS UNRESOLVABLE FOR A SECOND REASON. B's pair is unorderable
@@ -372,6 +375,32 @@ def check_direction_cases(only: str | None = None) -> None:
                 # reporting.
                 read_until(proc, "DAEMON state=drift")
                 assert proc.poll() is None, "watcher stopped on a divergent pair"
+            finally:
+                stop(proc)
+        finally:
+            stub.stop()
+
+
+def check_same_commit_other_spelling() -> None:
+    # I. ONE COMMIT, TWO SPELLINGS (#1250). `git describe` sizes its abbreviation by the object
+    # count of the clone, so the daemon (built in the deploy clone) and this checkout can name the
+    # SAME commit `-g588684d` and `-g588684d6`. Before the same_commit arm that read as drift, and
+    # drift_direction then called it daemon-behind-source (a commit is its own ancestor) -- an
+    # instruction to rebuild a daemon that was exactly current.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "checkout"
+        synthetic_checkout(root)
+        default = git(root, "describe", "--tags", "--always")
+        longer = git(root, "describe", "--tags", "--always", f"--abbrev={len(default) + 4}")
+        assert longer != default, (longer, default)
+        stub = StubDaemon(version=f"0.0.3 ({longer})")
+        try:
+            proc = start(Path(td) / "home", stub.endpoint,
+                         watcher=root / "plugins" / "member-mesh" / WATCHER.name)
+            try:
+                line = read_until(proc, "DAEMON state=")
+                assert "state=ok" in line, ("I same commit, other spelling", line)
+                assert "reason=matches-source" in line, line
             finally:
                 stop(proc)
         finally:
