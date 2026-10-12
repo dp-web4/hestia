@@ -1,8 +1,13 @@
 name: app-android
 
 # Builds the Hestia cross-platform app for Android (Tauri 2) and uploads
-# the APK as a workflow artifact — and, when triggered by an app-v* tag,
-# attaches it to a GitHub Release for direct download + sideload.
+# the APK as a workflow artifact — and, when triggered by a release tag,
+# attaches it to that GitHub Release for direct download + sideload.
+#
+# ONE VERSION, ONE TAG (web4#904; dp, 2026-10-11). The app and the daemon release in lockstep,
+# so this triggers on the same `v[0-9]*` release tags as release.yml, never on `app-v*`: an
+# `app-v*` tag is an ancestor of main and once became every daemon's build id
+# (app-v0.1.2-761-g9a6a5c2, 2026-08-08). One tag publishes the binaries and the APK.
 #
 # The APK is debug-signed (Gradle debug keystore): installable on any
 # device with "install unknown apps" enabled. A Play-Store-grade signing
@@ -14,7 +19,7 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - 'app-v*'
+      - 'v[0-9]*'
 
 permissions:
   contents: write
@@ -24,11 +29,32 @@ jobs:
     name: build android apk
     runs-on: ubuntu-latest
     steps:
+      # app/src-tauri path-depends on ../../../web4/web4-core, so materialize the same sibling
+      # layout release.yml does, with web4 at the hestia source's web4.pin (a release must not
+      # build against a moving web4 main).
       - uses: actions/checkout@v4
+        with:
+          path: hestia
 
+      - name: Read pinned web4 rev
+        id: web4pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          rev="$(grep -oiE '[0-9a-f]{40}' hestia/web4.pin | head -1)"
+          test -n "$rev"
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: dp-web4/web4
+          ref: ${{ steps.web4pin.outputs.rev }}
+          path: web4
+
+      # react-router 8.3 needs Node >= 22; same pin as ci.yml.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22.22.0
 
       - uses: actions/setup-java@v4
         with:
@@ -46,7 +72,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: app/src-tauri -> target
+          workspaces: hestia/app/src-tauri -> target
 
       # The generated Gradle project (gen/android/buildSrc BuildTask.kt)
       # hard-invokes `cargo tauri android android-studio-script`, so the
@@ -58,16 +84,16 @@ jobs:
           tool: tauri-cli@2.11.2
 
       - name: npm ci
-        working-directory: app
+        working-directory: hestia/app
         run: npm ci
 
       - name: Build Android APK (release profile, debug-keystore signed)
-        working-directory: app
+        working-directory: hestia/app
         run: cargo tauri android build --apk
 
       - name: Stage APK with versioned name
         run: |
-          APK=$(find app/src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | head -1)
+          APK=$(find hestia/app/src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | head -1)
           test -n "$APK" || { echo "no APK produced"; exit 1; }
           REF="${GITHUB_REF_NAME:-dev}"
           mkdir -p dist
@@ -82,7 +108,7 @@ jobs:
           retention-days: 30
 
       - name: Attach to release (tag builds only)
-        if: startsWith(github.ref, 'refs/tags/app-v')
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.apk
