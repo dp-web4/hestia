@@ -16,7 +16,7 @@ from unittest.mock import patch
 from recursive_repo_scope_candidate import artifact, proposed_sources
 
 ROOT = Path(__file__).resolve().parents[2]
-HELD = ROOT / "held/c02198170e13611cbe91706d1fcdab60b0156de1c699f1cd3440856f74774480.patch"
+HELD = ROOT / "held/7d51dfd969c42c37cd4dd329d981e5654d2c71d0e5551ad755767aa819a43854.patch"
 
 
 def load_module(name, path, source):
@@ -46,11 +46,16 @@ def main():
         assert HELD.read_text() == a["patch"], "held artifact differs from tested candidate"
         assert hashlib.sha256(HELD.read_bytes()).hexdigest() == HELD.stem
     sys.path.insert(0, str(ROOT / "plugins/_shared"))
+    baseline_core = load_module("hestia_gate_core", ROOT / "plugins/_shared/hestia_gate_core.py",
+                               changes["plugins/_shared/hestia_gate_core.py"][0])
+    baseline_adapter = load_module("hestia_single_gate", ROOT / "plugins/_shared/hestia_single_gate.py",
+                                  changes["plugins/_shared/hestia_single_gate.py"][0])
     g = load_module("hestia_gate_core", ROOT / "plugins/_shared/hestia_gate_core.py",
                     changes["plugins/_shared/hestia_gate_core.py"][int(args.held)])
     adapter = load_module("hestia_single_gate", ROOT / "plugins/_shared/hestia_single_gate.py",
                           changes["plugins/_shared/hestia_single_gate.py"][int(args.held)])
     failed, total = [], 0
+    compared = []
 
     def check(label, observed, expected):
         nonlocal total
@@ -95,23 +100,33 @@ def main():
                 tool="mcp__fixture__github", tool_input=fields if fields is not None else
                 {"repository_full_name": identity}))
             event.paths.extend(paths or [])
-            return g.evaluate(event, profile, str(ws), pol).decision
+            decision = g.evaluate(event, profile, str(ws), pol).decision
+            if args.held:
+                baseline_event = baseline_adapter.normalized_event(baseline_adapter.GateEvent(
+                    tool="mcp__fixture__github", tool_input=fields if fields is not None else
+                    {"repository_full_name": identity}))
+                baseline_event.paths.extend(paths or [])
+                baseline = baseline_core.evaluate(baseline_event, profile, str(ws), pol).decision
+                compared.append((baseline, decision))
+                assert decision != "allow" or baseline == "allow", (scopes, identity, baseline, decision)
+            return decision
 
         with patch.dict(os.environ, {"TEST_SCOPE_LAUNCH": str(Path(tmp) / "elsewhere"),
                                      "HESTIA_FORBIDDEN_EXTRA": "blocked-private"}):
             broad = [f"path:{ws}/**"]
             check("local file already covered", g._within_path_grant(str(repo / "README.md"), broad, str(ws)), True)
             check("adapter preserves owner", adapter._mcp_repo("mcp__fixture", {"repository_full_name": "example/sample"}), "example/sample")
-            check("recursive workspace permits matching origin", verdict(broad), "allow")
-            check("recursive repository path permits matching origin", verdict([f"path:{repo}/**"]), "allow")
+            check("recursive workspace adds no remote authority", verdict(broad), "deny")
+            check("recursive repository path adds no remote authority", verdict([f"path:{repo}/**"]), "deny")
             check("explicit basename grant permits matching origin", verdict(["sample"]), "allow")
             check("foreign owner denied with recursive grant", verdict(broad, "foreign/sample"), "deny")
             check("foreign owner denied with explicit grant", verdict(["sample"], "foreign/sample"), "deny")
             check("basename alone denied", verdict(["sample"], "sample"), "deny")
-            check("owner and repo fields combine", verdict(broad, fields={"owner": "example", "repo": "sample"}), "allow")
+            check("owner and repo fields combine", verdict(["sample"], fields={"owner": "example", "repo": "sample"}), "allow")
             check("conflicting aliases denied", verdict(["sample"], fields={"repository_full_name": "example/sample", "repo": "foreign/sample"}), "deny")
             check("conflicting owner denied", verdict(["sample"], fields={"repository_full_name": "example/sample", "owner": "foreign"}), "deny")
             check("no grants", verdict([]), "deny")
+            check("qualified grant spelling adds no new authority", verdict(["example/sample"]), "deny")
             check("exact workspace stays exact", verdict([f"path:{ws}"]), "deny")
             check("exact repo stays exact", verdict([f"path:{repo}"]), "deny")
             check("file grant cannot front for repo", verdict([f"path:{repo}/README.md"]), "deny")
@@ -122,7 +137,7 @@ def main():
             check("ordinary directory", verdict(broad, "example/plain-directory"), "deny")
             check("missing origin under recursive grant", verdict(broad, "example/missing-origin"), "deny")
             check("missing origin under explicit grant", verdict(["missing-origin"], "example/missing-origin"), "deny")
-            check("real linked worktree", verdict(broad, "example/worktree"), "allow")
+            check("real linked worktree with explicit grant", verdict(["worktree"], "example/worktree"), "allow")
             check("worktree foreign owner", verdict(["worktree"], "foreign/worktree"), "deny")
             git(common, "config", "extensions.worktreeConfig", "true")
             git(ws / "worktree", "config", "--worktree", "remote.origin.url", "https://github.com/foreign/worktree.git")
@@ -138,7 +153,7 @@ def main():
                            "ssh://git@github.com/example/sample.git", "ssh://git@github.com:22/example/sample.git",
                            "https://github.com/EXAMPLE/SAMPLE.git/"]:
                 git(repo, "config", "remote.origin.url", remote)
-                check(f"origin spelling {remote}", verdict(broad), "allow")
+                check(f"origin spelling {remote}", verdict(["sample"]), "allow")
             for remote in ["https://github.com/foreign/sample.git", "https://elsewhere.invalid/example/sample.git",
                            "git@alias:example/sample.git", "https://github.com/example/sample.git?x=1",
                            "https://github.com@example.invalid/example/sample.git", "file:///example/sample.git"]:
@@ -152,16 +167,45 @@ def main():
                                          "GIT_CONFIG_VALUE_0": "https://github.com/foreign/sample.git",
                                          "GIT_DIR": str(outside / ".git")}):
                 check("environment cannot rebind origin", verdict(["sample"], "foreign/sample"), "deny")
-                check("environment does not hide actual origin", verdict(broad), "allow")
+                check("environment does not hide actual origin", verdict(["sample"]), "allow")
             git(repo, "config", "--unset-all", "remote.origin.url")
             includes = Path(tmp) / "extra-config"
             includes.write_text('[remote "origin"]\n url = https://github.com/example/sample.git\n')
             git(repo, "config", "include.path", str(includes))
             check("included origin cannot supply identity", verdict(["sample"]), "deny")
+            # Notice 20654: hold policy fixed while exercising member-writable
+            # evidence. A new checkout, a new origin, and an origin rewrite must
+            # each leave the recursive path grant's remote authority unchanged.
+            minted = ws / "minted"
+            check("before checkout mint", verdict(broad, "victim/minted"), "deny")
+            metadata = minted / ".git"
+            (metadata / "objects").mkdir(parents=True)
+            (metadata / "refs").mkdir()
+            (metadata / "HEAD").write_text("ref: refs/heads/main\n")
+            config = metadata / "config"
+            config.write_text('[core]\n repositoryformatversion = 0\n bare = false\n')
+            check("mint writes covered by existing path grant",
+                  g._within_path_grant(str(config), broad, str(ws)), True)
+            check("after checkout mint without origin", verdict(broad, "victim/minted"), "deny")
+            config.write_text(config.read_text() +
+                              '[remote "origin"]\n url = https://github.com/victim/minted.git\n')
+            check("after matching origin mint", verdict(broad, "victim/minted"), "deny")
+            config.write_text(config.read_text().replace("victim/minted", "other/minted"))
+            check("after origin retarget", verdict(broad, "other/minted"), "deny")
+            # Explicit basename authority already admitted all owners on main.
+            # Record the remaining A1 limit without claiming grant-time binding.
+            git(repo, "config", "remote.origin.url", "https://github.com/example/sample.git")
+            check("explicit grant before origin retarget", verdict(["sample"], "victim/sample"), "deny")
+            config = repo / ".git/config"
+            config.write_text(config.read_text().replace("example/sample", "victim/sample"))
+            check("explicit grant after origin retarget (existing baseline reach)",
+                  verdict(["sample"], "victim/sample"), "allow")
             expired = g.resolve_agent_policy(profile, vault_reader=lambda _: {
                 "in_scope": broad, "generation": 1, "snapshot_expires_at": 1, "expires_at": 1})
             check("expired snapshot has no reach", expired.scope, ())
     print(f"{total - len(failed)}/{total} passed; mode={'held in memory' if args.held else 'main'}")
+    if args.held:
+        print(f"No baseline-deny to candidate-allow transitions in {len(compared)} repository evaluations")
     if args.core_suite:
         scratch = ROOT / "scratchpad"
         scratch.mkdir(exist_ok=True)

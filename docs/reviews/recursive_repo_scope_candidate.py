@@ -51,22 +51,21 @@ def checkout_origin_identity(candidate: str):
 
 
 def repo_in_scope(repository: str, scopes, workspace: str) -> bool:
-    """Bind every scoped repo call to the granted checkout AND its origin identity."""
+    """Narrow existing basename authority by the checkout's full origin identity."""
     parts = github_repository_parts(repository)
     if parts is None:
         return False  # a basename-only adapter cannot establish the remote identity
     owner, repo = parts
+    # Preserve the existing authority prerequisite. Neither recursive path grants
+    # nor a new qualified-grant spelling gain remote reach through local writes.
+    if repo not in scopes:
+        return False
     ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
     candidate = ws + "/" + repo
     if os.path.realpath(candidate).replace("\\", "/") != candidate:
         return False  # neither escaping symlinks nor internal aliases identify this repo
     marker = os.path.join(candidate, ".git")
     if not os.path.isdir(candidate) or not (os.path.isdir(marker) or os.path.isfile(marker)):
-        return False
-    authorized = repo in scopes or repository in scopes or any(
-        recursive and (candidate == root or candidate.startswith(root + "/"))
-        for root, recursive in _scope_roots_with_reach(scopes, workspace))
-    if not authorized:
         return False
     return checkout_origin_identity(candidate) == (owner + "/" + repo).casefold()
 
