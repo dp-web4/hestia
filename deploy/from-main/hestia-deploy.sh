@@ -160,6 +160,13 @@ cleanup_deploy() {
 #   hestia 0.0.4 (v0.0.4-444-gdd4300c)  ->  v0.0.4-444-gdd4300c
 describe_of() { grep -oE '\([^)]+\)' | head -1 | tr -d '()'; }
 
+# ONLY RELEASE TAGS NAME A BUILD (web4#904). core/build.rs bakes
+# `git describe --tags --match 'v[0-9]*' --always --dirty`; the checkout's target must be described
+# with the same glob, or an `app-v*` tag (the Android APKs, ancestors of main) nearer than the last
+# release would rename every build here and nowhere else. The same glob gates build_commit's
+# exact-tag arm: no producer emits a bare non-release tag, so one names no build of ours.
+BUILD_TAG_MATCH='v[0-9]*'
+
 # ONE BUILD, MANY SPELLINGS (#1250). `git describe` sizes the abbreviated sha by the object count
 # of the clone it runs in, so ONE commit reads `-g588684d` in one clone and `-g588684d6` in another
 # -- and in the same clone after enough objects arrive. Every identity this script compares
@@ -204,6 +211,8 @@ build_commit() {
     return
   fi
   case "$s" in ''|-*|*[!A-Za-z0-9._/+-]*) return 1 ;; esac
+  # shellcheck disable=SC2254  # BUILD_TAG_MATCH is a glob on purpose
+  case "$s" in $BUILD_TAG_MATCH) ;; *) return 1 ;; esac
   git -C "$DEPLOY_ROOT/hestia" rev-parse -q --verify "refs/tags/$s^{commit}" 2>/dev/null
 }
 
@@ -1018,7 +1027,7 @@ git -C "$DEPLOY_ROOT/web4" reset -q --hard origin/main || die "reset web4"
 git -C "$DEPLOY_ROOT/web4" clean -qfd
 sync_atlas
 
-target="$(git -C "$DEPLOY_ROOT/hestia" describe --tags --always)"
+target="$(git -C "$DEPLOY_ROOT/hestia" describe --tags --match "$BUILD_TAG_MATCH" --always)"
 target_sha="$(git -C "$DEPLOY_ROOT/hestia" rev-parse --short HEAD)"
 web4_sha="$(git -C "$DEPLOY_ROOT/web4" rev-parse --short HEAD)"
 running="$(running_version)"
