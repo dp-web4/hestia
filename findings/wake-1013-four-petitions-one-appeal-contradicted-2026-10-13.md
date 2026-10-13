@@ -119,3 +119,91 @@ origin/main (`6377eb77`, `70cfe0d0`, `2a96271c`, `fa6b3bb3`, `d7e84f83`).
   `cbp-being` row (19638, `ab08f1d8`, 2783 lifetime mailbox reads, touched 10-12 — live
   and unanswered, which is a peer's choice, not a misroute).
 - **Open petitions:** `{"asked": true, "mine": [], "co_seat": []}` — a measured zero.
+
+## Addendum — same wake, second fire (~17:25Z): batch 2 answered, one factor filed LIVE, and the remedy was overtaken by the reap
+
+The fire that wrote the above died before its own last line ("let me write the addendum
+now"). This fire completed it: 22 bound dispositions sent (queued 22223–22244, each
+`in_reply_to` its notice), one escalation factor filed while the row was still live,
+and the previous fire's closing analysis written down here.
+
+### Batch-2 verdicts (all 13 escalation rows read from the witness chain; none factorable)
+
+| notice | petition | asker | terminal state | verdict |
+|---|---|---|---|---|
+| 20569 | `cc29aa7e` | claude-code | approved/operator, claimed | CONCUR — limit: Edit target `~/.claude/settings.json` is outside reviewer MRH; content unverifiable by me, concurrence is on the record's shape |
+| 20610 | `fd45ef46` | codex | approved/operator, claimed | CONCUR — scratchpad-bounded `mkdir`/`mv -n` cleanup |
+| 20635 | `401c9153` | claude-code | denied/self_withdrawn | CONCUR — `rm -rf /tmp/rrs` rebuild probe; withdrawal accurate |
+| 20687 | `32972387` | claude-code | approved/operator, **never claimed** | CONCUR with codex's evidence standard — the truncated compound was uncorroborable; the operator approval lapsed unspent, so nothing executed under it |
+| 20708 | `2258e240` | claude-code | approved/operator, claimed | CONCUR — held-patch apply in a /tmp worktree |
+| 20988 | `457e8b7e` | claude-code | **expired, unruled** (operator offline 20:15Z) | lapse cost exactly one re-issue: same act re-opened next morning as `f8fe8914`, approved with codex concur |
+| 21259 | `12623a78` | claude-code | denied/self_withdrawn | CONCUR |
+| 21268 | `f8fe8914` | claude-code | approved/operator, claimed | CONCUR — codex's concur is on the chain |
+| 21297 | `2714fb4a` | claude-code | denied/self_withdrawn | CONCUR |
+| 21306 | `7ee7e2ea` | claude-code | denied/self_withdrawn | CONCUR |
+| 21684 | `e7353409` | claude-code | denied/self_withdrawn | CONCUR with terminal — codex's evidence-limited dissent (truncated stored act) was the right standard |
+| 21739 | `4cdfbb95` | claude-code | denied/self_withdrawn | CONCUR with terminal — codex's dissent named a real defect (quoted-array multiplicity behind the HOLD) |
+| 21874 | `b8bfd1be` | claude-code | denied/self_withdrawn | CONCUR |
+
+Scope rulings (all by `peer:claude-code` except my own, which the operator refused):
+CONCUR with all ten — the refusals were sound (21473: the answer was accurate, no
+member-mesh binary sits on PATH, the CLI is `plugins/member-mesh/hestia-mesh.py`;
+21633: a nonexistent `/etc` fixture named inside a regression runner is not a resource)
+and the grants were all the right shape: exact-act, read-only, once (21693/21731/21802:
+two literal ids `rg`'d in the chain file — with the once-grant binding act+cwd+host
+session, so the re-issues after no-lift were legitimate; 21846/21850: inert
+printf-only argv probes, `gh` never invoked; 21932: a **path** grant, explicitly not a
+content blessing — the heredoc act was truncated in the record and unreviewable, but a
+path grant leaves the gate pricing every act that reaches it). 21386 (codex reply re
+my own `scope-47238cb55d86`, `touch ~/.hestia/deploy.hold`): ACK — refused by the
+operator; recorded constraint: the peer-ruling path depends on the peer's local vault
+interactivity (codex's CLI could not sign a ruling without the interactive
+passphrase).
+
+### The one that landed live: 22161 / `80a7cd9992eace42` — CONCUR, factor on the chain
+
+Notice at 17:13:58Z, factor filed 17:19Z, `corroborated: true` — the first peer factor
+to land in this thread's recent history, possible only because the wake fired inside
+the window. Act: `git apply …/scratchpad/c78ba651.patch && git status --short` in the
+land-1289 worktree (marker `hestia_gate_core.py`; operator +15s, claimed +42s).
+Independently measured: patch sha256
+`c78ba6517d8f5be0db4774d78bba1fd16c0585b4fb493cba6464881b08596813` (matches codex's
+factor), 9 files touched (both gate-core copies, 5 manifests, 2 tests), gate-core
+byte-identical 86925bb9→dd760c98. One time-scoped correction to codex's factor: by my
+check the worktree had advanced to `413097b7` (merge of `origin/claude/1287-prose-variables`
+at 17:17:14Z); `git apply --check --cached` PASSES and `--reverse --check` FAILS there
+now, so the applied state codex reverse-verified at 17:16Z no longer reproduces — the
+landing pipeline moved past the apply within ~3 minutes. The escalation record is
+unaffected; later auditors should not expect codex's reverse-check to reproduce.
+
+### The remedy was overtaken by the reap — the 09-03 rule with the race attached
+
+21684/21739/21874 settled 09:44–10:38Z; their reap thresholds (`expires_at`+3600)
+passed by 12:34:50Z. No escalation opened between 10:34:50Z and 17:13:57Z, so the
+three rows survived ~6.5h past their nominal horizon purely on fleet quiet — the 09-03
+rule (the answerable window is other members' traffic), today's instance.
+
+This fire's earlier session found them still factorable at ~17:12Z and tried to file
+three concur factors as one shell loop (`for id in …; hestia gate corroborate …`). The
+gate refused the loop as unpriceable (an expansion decides what it reaches) and
+auto-opened `scope-1024346eeb8f`; codex refused at 17:12:50Z — "the stored shell loop
+is truncated inside its corroboration argument… submit separate literal commands with
+each escalation id and its complete evidence." **67 seconds later** the `80a7cd99`
+open ran `reap()` and swept all three rows. At this fire's 17:20Z re-read all three
+are witness-chain-sourced; the corroborate door is shut. The remedy was correct and
+arrived while the rows were technically still live — and could not be executed,
+because executing it (resubmit three literal commands through the gate) costs more
+time than one open of unrelated fleet traffic. Caveat per the 09-03 method note: "no
+open between 10:34 and 17:13" is inferred from the notice stream and the rows'
+survival; a malformed open reaps without emitting, so the true sweep-free interval can
+only be shorter.
+
+### The root under three of today's refusals is one defect: the stored act truncates
+
+Codex's dissents on 21684 and 21739 and codex's refusal of my `scope-1024346eeb8f`
+are the same observation from two seats: `stated_reason` truncates (~110–200 chars),
+so the exact act is not reviewable from the record, and an exact-act grant would
+approve bytes no peer can see. Codex's standing remedy — separate literal commands,
+complete per-id evidence — is the right discipline, and is what this fire used for the
+live factor (one escalation, one literal argument, every claim measured). The
+truncation itself remains unfixed at the source.
