@@ -1,4 +1,4 @@
-# held/: the governed half of PR #1232, NOT applied
+# held/: the governed half of PR #1232 — APPLIED 2026-10-13 (escalation f8fe8914, operator-approved, Codex concurred)
 
 This is the **whole gate half** of #1232, relative to `main`, kept as a plain patch file so that reviewers
 see the exact bytes and a scratchpad wipe cannot lose them. **Nothing here is applied.** The files it

@@ -108,9 +108,11 @@ over to evaluate() — decided from a policy snapshot fetched LIVE from the daem
 """
 from __future__ import annotations
 
+import glob as _glob
 import json
 import os
 import re
+import shlex
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -206,18 +208,27 @@ class Remedy:
 REMEDIES: dict[str, Remedy] = {
     # ── scope ────────────────────────────────────────────────────────────────────────────
     "mrh.path": Remedy(
-        "Adjust to work within scope. If the path is genuinely needed, ask for it with "
-        "hestia_request_scope (one path, with a reason) — a human decides, the grant is "
-        "memory-only and expires. Do NOT appeal this: hestia_appeal asks whether the deny was "
-        "WRONG and returns a verdict on conduct; it cannot and must not hand you a file. If "
-        "you believe the deny itself was wrong, that is the appeal, and it is a separate act.",
-        ("hestia_request_scope", "hestia_appeal"),
+        "Adjust to work within scope. If the path is genuinely needed: when this refusal names "
+        "a scope request id, the gate already opened it for you — a NOT-SAME peer decides it "
+        "(this act once, for the session, or standing; the operator may override; you cannot "
+        "decide your own), you can watch it with hestia_scope_status, and "
+        "you re-issue this identical act afterwards. When no id is named, ask with "
+        "hestia_request_scope (one path, with a reason). Do NOT appeal this: hestia_appeal asks "
+        "whether the deny was WRONG and returns a verdict on conduct; it cannot and must not "
+        "hand you a file. If you believe the deny itself was wrong, that is the appeal, and it "
+        "is a separate act.",
+        ("hestia_request_scope", "hestia_scope_status", "hestia_appeal"),
     ),
     "mrh.command": Remedy(
-        "Scope the command to a granted repo. If the path is genuinely needed, ask for it with "
-        "hestia_request_scope (one path, with a reason). An appeal cannot deliver a path — "
+        "Scope the command to a granted path. If the path is genuinely needed: when this "
+        "refusal names a scope request id, the gate already opened it for you — a NOT-SAME "
+        "peer decides it (this act once, for the session, or standing; the operator may "
+        "override; you cannot decide your own), you can watch it with "
+        "hestia_scope_status, and you re-issue this identical command afterwards. When no id "
+        "is named, ask with hestia_request_scope (one path, with a reason). Do not rephrase the "
+        "command to reach the same path another way. An appeal cannot deliver a path — "
         "hestia_appeal disputes whether the deny was right, which is a different question.",
-        ("hestia_request_scope", "hestia_appeal"),
+        ("hestia_request_scope", "hestia_scope_status", "hestia_appeal"),
     ),
     # An MCP connector call names a REPOSITORY, not a path — the codex gate scopes on that
     # name (see mcp_repo_target there). Same door as mrh.path, worded for a repo so the
@@ -471,6 +482,11 @@ class Verdict:
     reason: str = ""       # what tripped, naming the offending token
     remedy: str = ""       # from REMEDIES — never authored at a call site
     innate: bool = False   # true = not relaxable by warn-mode or by any grant
+    #: The resolved absolute path a SCOPE refusal judged (mrh.path / mrh.command), carried as
+    #: data so the escalation path can open a scope request for exactly what was refused
+    #: (2026-10-05, dp: "escalation should allow standing grants"). Rebuilding it from the
+    #: reason text is the #1003 defect (right repo, wrong depth); the checker knows the path.
+    target: str = ""
 
     @property
     def blocks(self) -> bool:
@@ -487,7 +503,7 @@ UNREGISTERED_RULE_REMEDY = (
 )
 
 
-def _deny(rule: str, reason: str, innate: bool = False) -> Verdict:
+def _deny(rule: str, reason: str, innate: bool = False, target: str = "") -> Verdict:
     """The ONLY constructor of a refusal. Takes a rule id, not a sentence — which is what
     makes 'a remedy naming a door nobody built' unwriteable rather than merely discouraged.
 
@@ -505,8 +521,8 @@ def _deny(rule: str, reason: str, innate: bool = False) -> Verdict:
     if r is None:
         return Verdict("deny", rule or "gate.internal",
                        f"{reason} [gate defect: no remedy registered for rule '{rule}']",
-                       UNREGISTERED_RULE_REMEDY, innate)
-    return Verdict("deny", rule, reason, r.text, innate)
+                       UNREGISTERED_RULE_REMEDY, innate, target)
+    return Verdict("deny", rule, reason, r.text, innate, target)
 
 
 ALLOW = Verdict("allow")
@@ -659,6 +675,8 @@ def _scope_roots_with_reach(scopes, workspace: str) -> tuple:
     for scope in scopes:
         if not isinstance(scope, str) or not scope.startswith("path:"):
             continue
+        if scope.startswith("path:" + UNPRICEABLE_PREFIX):
+            continue                              # a once-only trial lift, never a root
         raw = os.path.expanduser(scope[len("path:"):]).replace("\\", "/")
         recursive = raw.endswith(RECURSIVE_SUFFIX)
         if recursive:
@@ -686,6 +704,8 @@ def _scope_parts(scopes, workspace: str) -> tuple:
     for scope in scopes:
         if not isinstance(scope, str):
             continue
+        if scope.startswith("path:" + UNPRICEABLE_PREFIX):
+            continue                              # a once-only trial lift, never a root
         if scope.startswith("path:"):
             raw = os.path.expanduser(scope[len("path:"):]).replace("\\", "/")
             if raw.endswith(RECURSIVE_SUFFIX):     # reach is `_scope_roots_with_reach`'s job
@@ -945,14 +965,18 @@ def _default_forbidden() -> tuple:
     return FORBIDDEN_DEFAULT + tuple(t.strip() for t in extra.split(",") if t.strip())
 
 
-def command_in_scope(cmd: str, scopes, workspace: str, cwd: Optional[str] = None, forbidden=None):
+def command_in_scope(cmd: str, scopes, workspace: str, cwd: Optional[str] = None, forbidden=None,
+                     home_markers=None):
     """Returns (ok, offending_token) — the two-field contract every seat's shim reads.
 
     `command_scope_reach` is the same check carrying the third fact the deny text needs:
     the resolved path that was refused. This wrapper exists so the shims (kimi, gemini,
     the parity test) keep their contract while `evaluate` reads the richer one. `forbidden`
-    passes through; None means `_default_forbidden()` (built-ins + the operator's extras)."""
-    ok, offending, _resolved = command_scope_reach(cmd, scopes, workspace, cwd, forbidden=forbidden)
+    passes through; None means `_default_forbidden()` (built-ins + the operator's extras).
+    `home_markers` passes through too; a caller that passes none gets no home allowance for
+    shell paths OUTSIDE the workspace (the narrow direction)."""
+    ok, offending, _resolved = command_scope_reach(cmd, scopes, workspace, cwd, forbidden=forbidden,
+                                                   home_markers=home_markers)
     return ok, offending
 
 
@@ -988,7 +1012,14 @@ def _symlinked_reach_verdict(resolved: str, seg: str, repo_scopes, scopes, works
       - no symlink on the way (realpath == the lexical path): the lexical refusal stands, unchanged;
       - target inside the workspace: judged by the TARGET's repo, and a refusal names that repo
         (the misattribution half of #953);
-      - target outside the workspace: allowed, because a command naming it directly is not MRH-scoped.
+      - target outside the workspace: allowed — the venv interpreter case this function exists for.
+        AMENDED 2026-10-05: the old reason ("a command naming it directly is not MRH-scoped") is
+        no longer true; pass 3 now judges a direct naming. The allowance is KEPT anyway, for the
+        reach a pre-existing link carries out of a granted tree (venvs, toolchains): refusing it
+        would re-open #953 on every seat holding a `path:<ws>/**` grant. What keeps it from being
+        the way around pass 3 is that MAKING such a link names its target (`ln -s /outside …`),
+        and that naming is judged. Residual, stated: a link made by code pass 3 cannot read
+        (an interpreter one-liner) carries reach out. Read shares the lexical half of this.
     Read keeps its own rule (`path_in_scope` refuses outside the workspace either way)."""
     lexical = os.path.normpath(resolved).replace("\\", "/")
     target = os.path.realpath(lexical).replace("\\", "/")
@@ -1003,9 +1034,1234 @@ def _symlinked_reach_verdict(resolved: str, seg: str, repo_scopes, scopes, works
     return None
 
 
+#: POSIX stream and device sinks: always reachable, never a scope question. EXACT paths plus the
+#: `/dev/fd/<n>` family — deliberately not `/dev/**`: a raw disk (`/dev/sda`) or bash's
+#: `/dev/tcp/<host>/<port>` network pseudo-device is reach, and stays judged. Measured
+#: 2026-10-05 over 31,397 shell commands: `/dev/null` alone appears in 5,408 of them, so a
+#: shell scope check without this allowance would refuse a quarter of every seat's work for
+#: plumbing that touches no file. Law, like TEMP_ROOTS, not operator config: these names are
+#: fixed by POSIX and carry no data a grant could be about.
+DEVICE_SINKS = frozenset((
+    "/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/tty",
+    "/dev/zero", "/dev/random", "/dev/urandom", "/dev/full",
+))
+DEVICE_FD_ROOT = "/dev/fd"
+
+
+def _device_sink(path: str) -> bool:
+    """Lexical, on purpose: `/dev/stderr` realpaths to `/proc/self/fd/2` -> `/dev/pts/N`, and
+    judging the target would refuse the sink this allowance exists for."""
+    p = os.path.normpath(path.replace("\\", "/")).replace("\\", "/")
+    return p in DEVICE_SINKS or p == DEVICE_FD_ROOT or p.startswith(DEVICE_FD_ROOT + "/")
+
+
+#: Heredoc bodies fed to these heads are CODE and are judged; a body fed to anything else
+#: (`cat > f <<EOF`, a commit message, a JSON payload) is DATA and is not a reach. Measured
+#: 2026-10-05: ~10% of would-be denials sat only inside heredoc bodies — prose and fixtures.
+#: A SHELL body is judged as shell; any other interpreter's body is judged by its quoted
+#: absolute-path string literals only (`open('/etc/x')`) — shell-tokenising Python or JS
+#: manufactures "paths" out of regexes and comment openers (measured on the same replay).
+_HEREDOC_SHELL = re.compile(r"^(?:ba|z|da|k|fi)?sh$")
+_HEREDOC_INTERPRETER = re.compile(
+    r"^(?:(?:ba|z|da|k|fi)?sh|python[0-9.]*|pypy[0-9.]*|node|deno|bun|ruby|perl|php|lua|Rscript"
+    r"|osascript|tclsh|awk|gawk)$")
+_CODE_PATH_LITERAL = re.compile(r"""(?<![\w])(['"])((?:/|~/|\$HOME/|\$\{HOME\}/)[^'"\s]*)\1""")
+
+
+def _code_path_literals(text: str) -> list:
+    """Quoted absolute-path literals in interpreter code, minus root-only separators (`'/'`,
+    `'//'`). A directory literal with a trailing slash (`'/x/'`) is kept (Codex review 17029f)."""
+    return [lit for _q, lit in _CODE_PATH_LITERAL.findall(text) if lit.strip("/")]
+#: (A code literal must name something below the root: `'/'` / `'//'` in code are separators —
+#: `p.split('/')`. Interpreter CODE is outside the shell grammar this parser models; its quoted
+#: path literals are judged, and code that computes a path is a declared residual.)
+#: Words that run the NEXT word as the command (`sudo bash <<EOF` feeds bash).
+_HEREDOC_WRAPPERS = frozenset(("sudo", "env", "nice", "nohup", "timeout", "exec", "command",
+                               "time", "doas", "stdbuf", "ionice", "xargs", "builtin"))
+#: groups: 1 `-` (tab-strip), 2 a backslash (`<<\EOF`), 3 a quote, 4 the delimiter word. A quoted
+#: or backslashed delimiter makes the body LITERAL; an unquoted one makes it undergo expansion.
+_HEREDOC_OP = re.compile(r"""(?<!<)<<(?!<)(-?)\s*(\\?)(['"]?)([A-Za-z_][A-Za-z0-9_.-]*)\3""")
+
+
+class _Unmodelled(Exception):
+    """The parser met shell it does not model (an unbalanced quote or substitution, an unknown
+    heredoc form). The caller treats this as UNENUMERATED — a scope request for the act, never a
+    skip (Codex re-review of #1232; dp, 2026-10-10)."""
+
+
+class _Unenumerated(_Unmodelled):
+    """An expansion whose VALUE would be judged as a path (dp, 2026-10-10: nothing an expansion
+    produces is modelled). Collected, not raised past the scan: the literal candidates of the same
+    command are still judged first, so a concrete refusal names its path."""
+
+
+def _balanced_end(text: str, open_idx: int) -> int:
+    """Index of the `)` closing the `(` at `open_idx`; quotes and nested substitutions are
+    skipped over. Raises `_Unmodelled` when it never closes."""
+    depth, i, n = 0, open_idx, len(text)
+    pending_docs = []                      # heredoc delimiters opened on the current line
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "\n" and pending_docs:
+            # A heredoc body inside the substitution is text up to its delimiter line — its
+            # quotes and parentheses are not shell syntax (`$(cat <<'EOF' … it's … EOF)`).
+            i += 1
+            for dash, word in pending_docs:
+                while i < n:
+                    j = text.find("\n", i)
+                    line = text[i:n if j < 0 else j]
+                    i = n if j < 0 else j + 1
+                    if (line.lstrip("\t") if dash else line) == word:
+                        break
+            pending_docs = []
+            continue
+        if text.startswith("<<", i) and not text.startswith("<<<", i):
+            m = _HEREDOC_OP.match(text, i)
+            if m:
+                pending_docs.append((m.group(1), m.group(4)))
+                i = m.end()
+                continue
+        if c == "'":
+            j = text.find("'", i + 1)
+            if j < 0:
+                raise _Unmodelled("unbalanced quote inside a substitution")
+            i = j + 1
+            continue
+        if c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            if j >= n:
+                raise _Unmodelled("unbalanced quote inside a substitution")
+            i = j + 1
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    raise _Unmodelled("an unclosed $( substitution")
+
+
+def _substitution_bodies(text: str, quotes: bool = True) -> list:
+    """Every `$( … )` and backtick body in `text`, outermost first, with line boundaries intact
+    (a body may span lines); nested ones are found when the body is itself tokenised. With
+    `quotes`, text inside single quotes is literal and skipped; in a heredoc body (`quotes=False`)
+    a quote is an ordinary character and expansions inside it still run. Raises `_Unmodelled` on
+    an unclosed one."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'" and quotes:
+            j = text.find("'", i + 1)
+            i = n if j < 0 else j + 1
+            continue
+        if text.startswith("$((", i):
+            # Arithmetic is not a command — but a substitution INSIDE it runs (Codex review
+            # 17029d: `$(( $(cat /x) ))`). Its own bodies are collected, never dropped.
+            k = _balanced_end(text, i + 1)
+            out.extend(_substitution_bodies(text[i + 3:k - 1], quotes))
+            i = k + 1
+            continue
+        if text.startswith("$(", i):
+            k = _balanced_end(text, i + 1)
+            out.append(text[i + 2:k])
+            i = k + 1
+            continue
+        if c == "`":
+            j = text.find("`", i + 1)
+            if j < 0:
+                raise _Unmodelled("an unclosed backtick substitution")
+            out.append(text[i + 1:j])
+            i = j + 1
+            continue
+        i += 1
+    return [b for b in out if b.strip()]
+
+
+def _quoted_at(line: str, k: int) -> bool:
+    """Whether position `k` of `line` sits inside single or double quotes (backslash-aware)."""
+    q, i = None, 0
+    while i < k:
+        c = line[i]
+        if c == "\\" and q != "'":
+            i += 2
+            continue
+        if q is None and c in "'\"":
+            q = c
+        elif q == c:
+            q = None
+        i += 1
+    return q is not None
+
+
+def _heredoc_head(before: str) -> str:
+    """The command word that consumes a heredoc opened at the end of `before`.
+
+    FAIL CLOSED toward code (kimi's review of #1232, F2 A04/A06): `sudo -u root bash <<EOF` used to
+    name `root` and `chroot /x bash <<EOF` named `chroot`, so a shell body was stripped as data.
+    An interpreter ANYWHERE among the consumer's words now decides it: the body is that
+    interpreter's (over-judging a remote or container shell is the narrow direction)."""
+    seg = re.split(r"\|\||&&|[|;&(]|\$\(|`", before)[-1]
+    try:
+        words = shlex.split(seg, posix=True)
+    except ValueError:
+        words = seg.split()
+    for w in words:
+        if _HEREDOC_INTERPRETER.match(os.path.basename(w)):
+            return os.path.basename(w)
+    for w in words:
+        if "=" in w and not w.startswith(("-", "/", ".")) and w.split("=", 1)[0].isidentifier():
+            continue                       # an env assignment prefix
+        base = os.path.basename(w)
+        if base in _HEREDOC_WRAPPERS or w.startswith("-") or w.isdigit():
+            continue
+        return base
+    return ""
+
+
+def _strip_data_heredocs(cmd: str) -> str:
+    """The command with every heredoc body handled by what consumes it: a SHELL body stays in
+    place and is judged as shell; another interpreter's body is replaced by its quoted
+    absolute-path literals (one per line, quoted again so they stay one word); a DATA body is
+    removed. See `_HEREDOC_INTERPRETER`.
+
+    EXPANSION IS NOT DATA (Codex review of #1232, P1-2). With an UNQUOTED delimiter the shell
+    expands the body before the consumer sees it: `cat <<EOF\\n$(cat /x)\\nEOF` runs `cat /x`.
+    So for an unquoted delimiter every `$( … )` and backtick body (including those nested in
+    `${ … }`) is kept as an executed command, whatever the consumer. Only a QUOTED delimiter
+    (`<<'EOF'`, `<<"EOF"`, `<<\\EOF`) makes the body literal data."""
+    if "<<" not in cmd:
+        return cmd
+    lines = cmd.split("\n")
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        # A `<<` inside quotes is text, not an operator — and must not be mistaken for one, or the
+        # following lines would be swallowed as a "body" and never judged.
+        ops = [m for m in _HEREDOC_OP.finditer(line) if not _quoted_at(line, m.start())]
+        # Every other unquoted `<<` that is not a here-string (`<<<`) and not arithmetic
+        # (`$(( 1<<2 ))`, `(( … ))`) is a heredoc form we do not parse: UNMODELLED (Codex re-review
+        # of #1232: never skip what the parser cannot read).
+        for k in [m.start() for m in re.finditer(r"(?<!<)<<(?!<)", line)]:
+            if any(m.start() == k for m in ops) or _quoted_at(line, k):
+                continue
+            before = line[:k]
+            if before.count("((") > before.count("))"):
+                continue
+            raise _Unmodelled("a heredoc form the parser does not model")
+        for m in ops:
+            dash, word = m.group(1), m.group(4)
+            literal = bool(m.group(2) or m.group(3))
+            head = _heredoc_head(line[:m.start()])
+            shell = bool(_HEREDOC_SHELL.match(head))
+            code = not shell and bool(_HEREDOC_INTERPRETER.match(head))
+            body_lines = []
+            while i < len(lines):
+                body = lines[i]
+                i += 1
+                if (body.lstrip("\t") if dash else body) == word:
+                    break
+                body_lines.append(body)
+            if shell:
+                out.extend(body_lines)
+                out.append(word)
+                continue
+            literals = []
+            if code:
+                for body in body_lines:
+                    literals.extend(_code_path_literals(body))
+            executed = []
+            if not literal:
+                # The WHOLE body, line boundaries intact, `\`-newline continuations joined: the
+                # shell expands it as one text, so a `$(` opened on one line and closed on a
+                # later one is one substitution (Codex re-review of #1232, P1-2).
+                whole = re.sub(r"\\\n", "", "\n".join(body_lines))
+                executed = _substitution_bodies(whole, quotes=False)
+            out.extend(shlex.quote(lit) for lit in literals)
+            for e in executed:
+                out.append(";")
+                out.append(e)
+            out.append(word)
+    return "\n".join(out)
+
+
+#: A command that gives HOME a value of its own (assignment, export, read, a loop variable).
+_HOME_REASSIGNED = re.compile(
+    r"""(?:^|[\s;&|(`])(?:(?:export|declare|local|typeset|readonly)\s+(?:-\w+\s+)*)?HOME\+?="""
+    r"""|\b(?:read|unset|export)\b[^\n;&|]*\bHOME\b|\bfor\s+HOME\b""")
+#: The shell's own home spellings at a word start: `~`, `~/x`, `$HOME/x`, `${HOME}/x`.
+_HOME_WORD = re.compile(r"""(?:^|(?<=[\s=;|&(<>'"`:]))(?:~|\$HOME|\$\{HOME\})(?=/|$|[\s;|&)<>'"`:])""",
+                        re.MULTILINE)
+
+
+def _expand_home_words(cmd: str) -> str:
+    """Expand the home spellings the shell would expand, so `~/<ws>/x` meets the workspace
+    rule and `~/.x` meets the outside rule. Expanded inside single quotes too, where the shell
+    would not: over-judging a quoted mention is the narrow direction."""
+    if "~" not in cmd and "HOME" not in cmd:
+        return cmd
+    # Exactly the shell's own source for `~` and `$HOME`: the HOME variable, else the account's
+    # passwd entry (what bash falls back to). No path literal (tools/no_path_literals_test.py).
+    home = os.getenv("HOME")
+    # Only an UNSET HOME falls back to the passwd entry; a set-but-EMPTY HOME is what the shell
+    # expands `~` to (Codex re-review of #1232: `if not home` conflated the two).
+    if home is None:
+        try:
+            import pwd
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except Exception:
+            return cmd
+    home = home.replace("\\", "/").rstrip("/")
+    return _HOME_WORD.sub(lambda _m: home, cmd)
+
+
+_SHELL_PUNCT = frozenset(";|&()<>")
+#: Sentinels in a tokenised word: a `$` / backtick the shell will NOT expand (quoted or escaped),
+#: and an UNQUOTED brace expansion (`{a,b}`, `{1..3}`) about to open.
+_LIT_DOLLAR, _LIT_TICK, _BRACE = "\x00", "\x02", "\x03"
+#: Marks a `$NAME` / `${…}` reference written INSIDE double quotes (no field splitting, no
+#: globbing at that use) — evidence the literal rule needs before a whitespace value may bind.
+_DQ_REF = "\x04"
+#: `$'…'` (ANSI-C) and `$"…"` (locale) quoting rewrite their content; never modelled. The word
+#: carries this unbound parameter reference, so wherever it is judged as a path it is
+#: unenumerated (`ANSI-C` is not an identifier: no assignment can ever bind it).
+_ANSI_C_MARK = "${ANSI-C}"
+#: Every byte the lexer uses as an IN-BAND marker (`_LIT_DOLLAR`, `\x01` in `_path_shaped`,
+#: `_LIT_TICK`, `_BRACE`, `_DQ_REF`) plus one spare. A command that already contains one could
+#: forge quote / literal evidence (Codex 20554: `cat \x04$S` read as a quoted use), so such a
+#: command is UNENUMERATED before any marker is inserted. (`_ANSI_C_MARK` is spelled in shell
+#: syntax; forging it only makes a word unenumerated, the strict direction.)
+_MARKER_BYTES = re.compile("[\x00-\x05]")
+_BRACE_EXPANSION = re.compile(r"""\{[^\s{}'"]*(?:,|\.\.)[^\s{}'"]*\}""")
+
+
+def _tokenize(text: str) -> list:
+    """`(kind, value, unquoted_glob)` per token, kind "word" | "op" | "sep".
+
+    A real (if small) shell lexer, because the scope check is now DEFAULT-JUDGE (Codex re-review
+    of #1232): quoting is tracked PER CHARACTER, so `"/"*` keeps an expanding star
+    (`unquoted_glob`); a `$`/backtick inside single quotes or escaped is marked literal; `$( … )`
+    and backticks stay inside their word (bodies are judged separately); `#` at a word start begins
+    a comment (not executed); a newline or `;` / `&&` / `||` / `|` / `&` / `(` / `)` separates
+    commands; `\\`-newline continues. Anything unbalanced raises `_Unmodelled`."""
+    if _MARKER_BYTES.search(text):
+        raise _Unmodelled("a control character the gate's lexer reserves as an internal marker")
+    out, buf, in_word, uglob = [], [], False, False
+    i, n = 0, len(text)
+
+    def flush():
+        nonlocal buf, in_word, uglob
+        if in_word:
+            out.append(("word", "".join(buf), uglob))
+        buf, in_word, uglob = [], False, False
+
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            if i + 1 < n and text[i + 1] == "\n":
+                i += 2
+                continue
+            if i + 1 < n:
+                ch = text[i + 1]
+                buf.append(_LIT_DOLLAR if ch == "$" else _LIT_TICK if ch == "`" else ch)
+            in_word = True
+            i += 2
+            continue
+        if c == "#" and not in_word:
+            j = text.find("\n", i)
+            i = n if j < 0 else j               # a comment runs to the end of the line
+            continue
+        if c == "'":
+            j = text.find("'", i + 1)
+            if j < 0:
+                raise _Unmodelled("an unbalanced single quote")
+            buf.append(text[i + 1:j].replace("$", _LIT_DOLLAR).replace("`", _LIT_TICK))
+            in_word = True
+            i = j + 1
+            continue
+        if c == '"':
+            j, seg = i + 1, []
+            while j < n and text[j] != '"':
+                if text[j] == "\\" and j + 1 < n and text[j + 1] in '"\\$`\n':
+                    nx = text[j + 1]
+                    if nx != "\n":
+                        seg.append(_LIT_DOLLAR if nx == "$" else _LIT_TICK if nx == "`" else nx)
+                    j += 2
+                    continue
+                if text.startswith("$(", j):
+                    k = _balanced_end(text, j + 1)
+                    seg.append(text[j:k + 1])
+                    j = k + 1
+                    continue
+                if text[j] == "`":
+                    k = text.find("`", j + 1)
+                    if k < 0:
+                        raise _Unmodelled("an unclosed backtick")
+                    seg.append(text[j:k + 1])
+                    j = k + 1
+                    continue
+                if text[j] == "$" and j + 1 < n and (text[j + 1] == "{" or text[j + 1] == "_"
+                                                     or text[j + 1].isalpha()):
+                    seg.append(_DQ_REF)               # a quoted variable reference
+                seg.append(text[j])
+                j += 1
+            if j >= n:
+                raise _Unmodelled("an unbalanced double quote")
+            buf.append("".join(seg))
+            in_word = True
+            i = j + 1
+            continue
+        if text.startswith("$'", i) or text.startswith('$"', i):
+            # ANSI-C / locale quoting (Codex 20536): its content is rewritten by the shell, so the
+            # word is unenumerated wherever it is judged as a path (`_ANSI_C_MARK`).
+            q = text[i + 1]
+            j = i + 2
+            while j < n and text[j] != q:
+                j += 2 if text[j] == "\\" else 1
+            if j >= n:
+                raise _Unmodelled("an unbalanced $-quote")
+            buf.append(_ANSI_C_MARK + text[i + 2:j].replace("$", _LIT_DOLLAR).replace("`", _LIT_TICK))
+            in_word = True
+            i = j + 1
+            continue
+        if text.startswith("$(", i):
+            k = _balanced_end(text, i + 1)
+            buf.append(text[i:k + 1])
+            in_word = True
+            i = k + 1
+            continue
+        if text.startswith("${", i):
+            k = text.find("}", i + 2)
+            if k < 0:
+                raise _Unmodelled("an unclosed ${")
+            buf.append(text[i:k + 1])
+            in_word = True
+            i = k + 1
+            continue
+        if c == "`":
+            j = text.find("`", i + 1)
+            if j < 0:
+                raise _Unmodelled("an unclosed backtick")
+            buf.append(text[i:j + 1])
+            in_word = True
+            i = j + 1
+            continue
+        if c.isspace():
+            flush()
+            if c == "\n":
+                out.append(("sep", ";", False))
+            i += 1
+            continue
+        if c in _SHELL_PUNCT:
+            if c in "<>" and in_word and buf and "".join(buf).isdigit():
+                buf, in_word = [], False         # `2>`: an fd number, not a word
+            flush()
+            j = i
+            while j < n and text[j] in _SHELL_PUNCT and j - i < 3:
+                if text[j] in "()" and j > i:
+                    break
+                j += 1
+            op = text[i:j]
+            out.append(("op" if ("<" in op or ">" in op) else "sep", op, False))
+            i = j
+            continue
+        if c in "*?[":
+            uglob = True
+        if c == "{" and _BRACE_EXPANSION.match(text, i):
+            buf.append(_BRACE)                   # brace expansion: never modelled (dp, 2026-10-10)
+        buf.append(c)
+        in_word = True
+        i += 1
+    flush()
+    return out
+
+
+def _shell_words(cmd: str, depth: int = 0, origin=None) -> list:
+    """Every token of a command, with each `$( … )` / backtick body lifted out (balanced, so
+    nesting and multiline bodies hold) and tokenised as a command of its own after a separator —
+    quoting a substitution cannot hide its reach."""
+    if depth > 6:
+        raise _Unmodelled("substitutions nested deeper than the parser follows")
+    toks = _tokenize(cmd)
+    extra = []
+    for i, (kind, w, _g) in enumerate(toks):
+        if kind == "word" and ("$(" in w or "`" in w):
+            # `quotes=False`: `_tokenize` already resolved quoting (a `$` or backtick that single
+            # quotes made literal is a sentinel now), so an apostrophe left in a dequoted word is an
+            # ordinary character. Re-reading it as a quote hid `"'$(cat /x)'"` (Codex review 17054,
+            # P1-quote-context).
+            for body in _substitution_bodies(w.replace(_LIT_TICK, "").replace(_DQ_REF, ""),
+                                             quotes=False):
+                extra.append(("sep", ";", False))
+                # The body runs when the OUTER word holding it is expanded: its position in the
+                # outer command (`origin`, the outermost word's token index, carried through
+                # nesting) is what a binding must precede (Codex 20536, P1-1).
+                extra.append(("mark", i if origin is None else origin, False))
+                # A heredoc INSIDE a substitution (`-m "$(cat <<'EOF' … EOF)"`) is handled like
+                # any other: the outer pass saw its `<<` inside quotes and left it as text.
+                extra.extend(_shell_words(_strip_data_heredocs(body), depth + 1,
+                                          i if origin is None else origin))
+    return toks + extra
+
+
+#: DEFAULT-JUDGE (Codex re-review of #1232; dp: "the shell is a grammar, and skip-lists keep
+#: leaking"). Every word that could be a path — it contains `/`, starts with `~` or `.`, or
+#: carries an UNQUOTED glob character — is judged. A word is skipped ONLY under a precise
+#: exception keyed on (command, argument position or the option that consumes it). Quoting is
+#: never an exemption by itself (`grep -r x "/"` is judged).
+#:
+#: Per-command specs: `strings` = every positional is a string (`tr` sets); `strings_noglob` =
+#: positionals are strings unless they carry an unquoted glob (`echo /*` expands, `echo /` does
+#: not); `pattern_first` = the first positional is a pattern/program unless an option supplied
+#: one; option sets name the options whose VALUE is a delimiter / pattern / plain string (skipped)
+#: or a value we only need to step over (judged as an ordinary word, but it is not positional).
+_GREP_SPEC = {"pattern_first": True, "pattern_opts": {"-e", "--regexp"}, "file_opts": {"-f", "--file"},
+              "value_opts": {"-A", "-B", "-C", "-m", "--max-count", "--include", "--exclude",
+                             "--exclude-dir", "--context", "--after-context", "--before-context",
+                             "-d", "--directories", "-D", "--devices", "--label"}}
+_CMD_SPECS = {
+    "tr": {"positional": "strings"},
+    "echo": {"positional": "strings_noglob"},
+    "printf": {"positional": "strings_noglob"},
+    "grep": _GREP_SPEC, "egrep": _GREP_SPEC, "fgrep": _GREP_SPEC, "zgrep": _GREP_SPEC,
+    "rg": {"pattern_first": True, "pattern_opts": {"-e", "--regexp"}, "file_opts": {"-f", "--file"},
+           "value_opts": {"-g", "--glob", "-t", "--type", "-T", "--type-not", "-m", "--max-count",
+                          "-A", "-B", "-C", "-j", "--threads", "-M", "--max-columns",
+                          "--max-depth", "-E", "--encoding", "--sort", "--sortr"}},
+    "sed": {"pattern_first": True, "pattern_opts": {"-e", "--expression"}, "file_opts": {"-f", "--file"},
+            "value_opts": {"-l", "--line-length"}},
+    "awk": {"pattern_first": True, "file_opts": {"-f", "--file"}, "delim_opts": {"-F", "--field-separator"},
+            "string_opts": {"-v", "--assign"}},
+    "cut": {"delim_opts": {"-d", "--delimiter", "--output-delimiter"},
+            "value_opts": {"-f", "-c", "-b", "--fields", "--characters", "--bytes"}},
+    "sort": {"delim_opts": {"-t", "--field-separator"}, "value_opts": {"-k", "--key", "-S", "--buffer-size"}},
+    "join": {"delim_opts": {"-t"}, "value_opts": {"-1", "-2", "-j", "-o"}},
+    "paste": {"delim_opts": {"-d", "--delimiters"}},
+    "column": {"delim_opts": {"-s", "--separator", "-o", "--output-separator"}},
+    "read": {"delim_opts": {"-d"}, "string_opts": {"-p"}},
+    "find": {"pattern_opts": {"-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename",
+                              "-regex", "-iregex", "-lname", "-ilname"},
+             "string_opts": {"-printf"}},
+    "git": {"string_opts": {"-m", "--message", "--grep", "--author", "--format", "--pretty", "-S", "-G"}},
+}
+_CMD_SPECS["gawk"] = _CMD_SPECS["mawk"] = _CMD_SPECS["awk"]
+#: Heads whose `-c` value is shell code (they also disqualify the literal rule).
+_CODE_OPT_HEADS = frozenset(("su", "runuser", "script", "flock"))
+#: Arguments that are SHELL CODE (judged as a command of their own, found writing the narrowed
+#: battery): `eval` and `watch` take code as positionals; `su`/`runuser`/`script`/`flock` take it
+#: as `-c`. (`sh -c` anywhere in argv — `find -exec sh -c`, `docker exec c bash -c` — is caught by
+#: position in `_outside_candidates`.)
+_CMD_SPECS["eval"] = {"positional": "code"}
+_CMD_SPECS["watch"] = {"positional": "code", "value_opts": {"-n", "--interval", "-d"}}
+for _h in ("su", "runuser"):
+    _CMD_SPECS[_h] = {"code_opts": {"-c", "--command"},
+                      "value_opts": {"-s", "--shell", "-g", "--group", "-G", "--supp-group"}}
+_CMD_SPECS["script"] = {"code_opts": {"-c", "--command"}}
+_CMD_SPECS["flock"] = {"code_opts": {"-c", "--command"}, "value_opts": {"-w", "--timeout"}}
+#: Commands whose argv is built from STDIN: what they reach is another command's output.
+_STDIN_ARGV = frozenset(("xargs", "parallel"))
+#: Commands that resolve their relative arguments against a directory option (`-C D`).
+_DIR_OPT_HEADS = frozenset(("git", "make", "gmake", "tar"))
+#: How many composed directory bases relative paths are judged against before the gate stops
+#: following directory changes (and the reach is unenumerated).
+_MAX_DIR_BASES = 16
+#: Assignments whose value is not a path being reached: a field separator, or a search path list
+#: that only influences later lookups.
+_NONPATH_ASSIGNMENTS = frozenset(("IFS", "PS1", "PS2", "PS4", "PATH", "MANPATH", "INFOPATH",
+                                  "PYTHONPATH", "LD_LIBRARY_PATH", "CLASSPATH", "NODE_PATH",
+                                  "PKG_CONFIG_PATH", "GOPATH", "CDPATH"))
+#: Interpreters whose `-c` / `-e` value is CODE: judged by its quoted absolute-path literals.
+_CODE_ARG_HEADS = re.compile(r"^(?:python[0-9.]*|pypy[0-9.]*|node|deno|bun|ruby|perl|php)$")
+_SHELL_KEYWORDS = frozenset(("if", "then", "else", "elif", "fi", "do", "done", "while", "until",
+                             "for", "case", "esac", "in", "function", "!", "{", "}", "time"))
+_SHELL_SEPARATORS = frozenset(("|", "||", "&&", ";", "&", "(", ")", "|&", ";;", ";&", "{", "}"))
+
+
+#: An attached short option carrying a path: `-I/usr/include`, `-C/elsewhere`, `-o/out`.
+_ATTACHED_OPT = re.compile(r"^-[A-Za-z](/.*)$")
+_GLOB_CHARS = re.compile(r"[*?\[]")
+
+
+#: How many DISTINCT path spellings one command may carry into the filesystem-probing passes
+#: (each pass separately). Past it the classification is incomplete and the command is REFUSED
+#: (`_INCOMPLETE`), not allowed: split the command. Bounds probing inside the engine's hook clamp.
+SCOPE_JUDGE_BUDGET = 128
+_INCOMPLETE = "<incomplete: more distinct paths than the gate judges in one command — split it>"
+_UNMODELLED_PREFIX = "<incomplete: the scope parser does not model "
+
+#: #1274's sentinels (daemon `gate_escalation::UNPRICEABLE_PREFIX`, mechanism
+#: `UNPRICEABLE_PREFIX`). A scope refusal whose reach the gate cannot ENUMERATE carries one of these
+#: as its `target` instead of a path. The gate then opens a scope request for the ACT, and only a
+#: one-time approval of that exact act (its complete-act digest) lifts it: there is no path a
+#: session or standing grant could name, and the daemon refuses to make one. In a trial scope (the
+#: orchestrator re-judging an act it holds an approval for) `path:<sentinel>` lifts exactly that
+#: class for that one evaluation; no snapshot ever carries it.
+UNPRICEABLE_PREFIX = "hestia:unpriceable:"
+UNENUMERATED_TARGET = UNPRICEABLE_PREFIX + "unenumerated"
+OVERFLOW_TARGET = UNPRICEABLE_PREFIX + "overflow"
+
+
+#: NOTHING AN EXPANSION PRODUCES IS MODELLED (dp's ruling, 2026-10-10: "narrow and land").
+#: Patch 01e68a1c modelled substitution OUTPUT with tables keyed on the command NAME ("date
+#: prints a number", "head selects lines", "find prints paths under its roots"), and four Codex
+#: rounds kept finding the same defect in new members: soundness depends on argv SHAPE, and
+#: `date +/x`, `seq -f`, `shuf -e`, `expr`, `wc` / `sha256sum` (operand echo), `grep` / `sort` /
+#: `head FILE` and `find -printf` all print a path the model said they could not. Variables were
+#: modelled the same way, and a linear scan is not the shell's scoping (`D=/tmp cat $D`,
+#: `(D=/x); cat $D`), so they are not modelled either. What remains are expansions whose VALUE
+#: cannot contain `/` or be `..`: arithmetic (a number) and the special parameters `$?` `$#` `$$`
+#: `$!` (digits) and `$-` (flag letters), replaced by a placeholder of the same class.
+_PLACEHOLDER_PARAMS = {"$?": "0", "$#": "0", "$$": "0", "$!": "0", "$-": "x"}
+
+
+def _expansion_spans(value: str) -> list:
+    """`(start, end)` of every live expansion in a tokenised word: `$(…)`, `$((…))`, backticks,
+    `${…}`, `$NAME`, and the special parameters `$?` `$#` `$$` `$!` `$-` `$@` `$*` `$0`…`$9`."""
+    spans, i, n = [], 0, len(value)
+    while i < n:
+        if value.startswith("$((", i):
+            k = value.find("))", i + 3)
+            if k < 0:
+                raise _Unmodelled("an unclosed $(( arithmetic")
+            spans.append((i, k + 2))
+            i = k + 2
+        elif value.startswith("$(", i):
+            k = _balanced_end(value, i + 1)
+            spans.append((i, k + 1))
+            i = k + 1
+        elif value.startswith("${", i):
+            k = value.find("}", i + 2)
+            if k < 0:
+                raise _Unmodelled("an unclosed ${")
+            spans.append((i, k + 1))
+            i = k + 1
+        elif value[i] == "`":
+            k = value.find("`", i + 1)
+            if k < 0:
+                raise _Unmodelled("an unclosed backtick")
+            spans.append((i, k + 1))
+            i = k + 1
+        elif value[i] == "$" and i + 1 < n:
+            m = re.match(r"[A-Za-z_][A-Za-z0-9_]*|[?#$!@*0-9-]", value[i + 1:])
+            if m:
+                spans.append((i, i + 1 + m.end()))
+                i += 1 + m.end()
+            else:
+                i += 1
+        else:
+            i += 1
+    return spans
+
+
+def _expansion_kind(ref: str) -> str:
+    """What the refusal says an unenumerated expansion was."""
+    if ref.startswith("$("):
+        return "a command substitution"
+    if ref.startswith("`"):
+        return "a backtick substitution"
+    if ref.startswith("${"):
+        return f"the parameter expansion {ref[:24]}"
+    name = ref[1:]
+    if name.isdigit() or name in ("@", "*"):
+        return f"the positional parameter {ref}"
+    return f"the variable {ref}"
+
+
+def _word_value(value: str, known=None) -> str:
+    """The text a tokenised word is judged as. Raises `_Unenumerated` when an expansion's value
+    would decide it (see `_PLACEHOLDER_PARAMS`): never a model, never a guess. `known` holds the
+    names `_literal_names` proved to carry ONE literal at this point of the command (dp,
+    2026-10-11); only a bare `$N` / `${N}` resolves — any operator (`${N:-x}`) stays unenumerated."""
+    if _BRACE in value:
+        raise _Unenumerated("brace expansion")
+    out, last = [], 0
+    for a, b in _expansion_spans(value):
+        ref = value[a:b]
+        out.append(value[last:a])
+        if ref.startswith("$(("):
+            out.append("0")                      # arithmetic: a number (its bodies are judged)
+        elif ref in _PLACEHOLDER_PARAMS:
+            out.append(_PLACEHOLDER_PARAMS[ref])
+        elif known and (ref[2:-1] if ref.startswith("${") else ref[1:]) in known \
+                and (not known[ref[2:-1] if ref.startswith("${") else ref[1:]][1]
+                     or (a > 0 and value[a - 1] == _DQ_REF)):
+            # A value that field splitting could break apart binds only at a QUOTED use (Codex
+            # 20536, P1-2); `known` maps name -> (value, needs_quote).
+            out.append(known[ref[2:-1] if ref.startswith("${") else ref[1:]][0])
+        else:
+            raise _Unenumerated(_expansion_kind(ref))
+        last = b
+    out.append(value[last:])
+    return ("".join(out).replace(_DQ_REF, "").replace(_LIT_DOLLAR, "$").replace(_LIT_TICK, "`"))
+
+
+def _path_shaped(value: str, uglob: bool) -> bool:
+    """The DEFAULT: could this word be a path? (`/`, a leading `~` or `.`, an unquoted glob.)
+    Substitution spans are removed first — their bodies are judged as commands; their OUTPUT is
+    only path-shaped if the word around it is."""
+    rest = re.sub(r"\$\((?:[^()]|\([^()]*\))*\)|`[^`]*`", "\x01", value)
+    # A word whose value is (partly) an expansion — a substitution's output, `$VAR` — COULD be a
+    # path: it is judged, which now means UNENUMERATED (`_word_value`). Never skipped. A brace
+    # expansion is path-shaped when it can produce a separator or a `..`.
+    return ("/" in rest or rest.startswith(("~", ".")) or uglob or "\x01" in rest
+            or "$" in rest or (_BRACE in rest and ".." in rest))
+
+
+class _Found:
+    """What one scan found besides its literal candidates (shared by nested scans)."""
+
+    def __init__(self):
+        self.unenum = []            # why a value the gate would judge is unenumerated
+        self.dirs = []              # literal directories relative paths may resolve under
+        self.dirs_unknown = None    # why a directory change cannot be followed
+        self.known = {}             # names bound to ONE literal so far (`_literal_names`)
+
+
+#: THE SINGLE-LITERAL-ASSIGNMENT RULE (dp's ruling, 2026-10-11, measured on #1232 first: ~45% of
+#: the once-only requests were `S=/tmp/x; cat $S/y`). A variable assigned exactly ONE literal
+#: earlier in the SAME command, and never otherwise bound, resolves to that literal where it is
+#: used as a path — and is then judged like the literal. Everything else stays unenumerated:
+#: names the shell or the environment owns; a second assignment, `unset`, `export`, `read`,
+#: `for`, `declare`/`local`/`typeset`/`readonly` (incl. `-n` namerefs), arrays (`N[i]=`,
+#: `N=(…)`), appends (`N+=`), `printf -v`, `mapfile`, `let`, `getopts`; any command that runs a
+#: string or a file as shell in this command (`eval`, `source`/`.`, `sh -c`, `watch`, `su -c`, …)
+#: or defines a function; a value with `$`, a backtick, a glob character, a brace or a `..`
+#: component; an assignment that is not a top-level statement of its own (inside `( )`, `{ }`,
+#: a loop, a branch, a function, a substitution body; entered after `&&` / `||` / `|`; ended by
+#: anything but `;`, a newline or `&&`; or a prefix to a command, which does not bind for that
+#: command's own expansions); and a use BEFORE the assignment.
+_SHELL_OWNED_NAMES = frozenset(("HOME", "PWD", "OLDPWD", "IFS", "PATH", "CDPATH", "ENV",
+                                "BASH_ENV", "SHELLOPTS", "BASHOPTS", "PS4", "UID", "EUID", "PPID",
+                                "RANDOM", "SECONDS", "LINENO", "BASH_ARGV0", "GLOBIGNORE"))
+_BINDING_COMMANDS = frozenset(("for", "select"))
+#: Any of these ANYWHERE in the command disqualifies EVERY name (Codex 20536, P1-3): their operand
+#: spellings (`printf -vS`, `read -aS`, `declare -n R=S`, …) are not worth modelling.
+_ANY_BINDER = frozenset(("unset", "export", "read", "declare", "local", "typeset", "readonly",
+                         "mapfile", "readarray", "getopts", "let", "eval", "source", ".",
+                         "watch", "function", "builtin", "enable", "trap", "alias"))
+_CODE_COMMANDS = frozenset(("eval", "source", ".", "watch", "function"))
+
+
+def _literal_names(toks) -> set:
+    """Names that may bind (see the rule above): assigned exactly once anywhere in the token
+    stream (substitution bodies included), never bound any other way, not shell- or
+    environment-owned, and the command runs no string or file as shell and defines no function."""
+    words = [w for k, w, _g in toks if k == "word"]
+    # Wholesale disqualifications (Codex 20536, P1-3 and P1-4): any binder; `printf` with ANY
+    # option starting `-v`; any arithmetic (`$((`, `((`); an assigning expansion (`${N:=x}`,
+    # `${N=x}`); any shell or interpreter invocation, with any option spelling, anywhere.
+    for i, w in enumerate(words):
+        b = os.path.basename(w)
+        if b in _ANY_BINDER or _HEREDOC_INTERPRETER.match(b) or b in _CODE_OPT_HEADS \
+                or "$((" in w or "((" in w or re.search(r"\$\{[A-Za-z_]\w*:?=", w):
+            return set()
+        if b == "printf" and any(x.startswith("-v") for x in words[i + 1:]):
+            return set()
+    for i, (k, w, _g) in enumerate(toks):
+        if k == "sep" and w == "(" and i > 0 and toks[i - 1] == ("sep", "(", False):
+            return set()                                   # `(( … ))`
+    for i, (k, w, _g) in enumerate(toks):
+        if k == "word" and (os.path.basename(w) in _CODE_COMMANDS
+                            or (w in ("-c", "--command") and i > 0 and toks[i - 1][0] == "word"
+                                and (_HEREDOC_SHELL.match(os.path.basename(toks[i - 1][1]))
+                                     or os.path.basename(toks[i - 1][1]) in _CODE_OPT_HEADS))):
+            return set()
+        if (k == "sep" and w == "(" and i > 0 and toks[i - 1][0] == "word"
+                and i + 1 < len(toks) and toks[i + 1] == ("sep", ")", False)):
+            return set()                                   # `f() …`: a function definition
+    if "printf" in words and "-v" in words:
+        return set()
+    count, banned = {}, set()
+    after_binder = False
+    for k, w, _g in toks:
+        if k != "word":
+            after_binder = False
+            continue
+        if os.path.basename(w) in _BINDING_COMMANDS:
+            after_binder = True
+            continue
+        m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]*\])?(\+)?=", w)
+        if m:
+            name = m.group(1)
+            if m.group(2) or m.group(3) or after_binder:
+                banned.add(name)                           # arrays, appends, declared/exported
+            if after_binder:
+                banned.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", w))   # `-n R=N`: N too
+            count[name] = count.get(name, 0) + 1
+            continue
+        if after_binder:
+            name = w.split("=", 1)[0]
+            if name.isidentifier():
+                banned.add(name)                           # `unset N`, `read N`, `for N`, `-n R=N`
+            for ref in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", w):
+                banned.add(ref)                            # a nameref's TARGET too (`R=N`)
+    return {n for n, c in count.items()
+            if c == 1 and n not in banned and n not in _SHELL_OWNED_NAMES and n not in os.environ}
+
+
+def _is_bindable_literal(val: str, uglob: bool) -> bool:
+    """A value that is a literal and nothing else: no `$` (live or quoted), backtick, glob
+    character, brace or `..` component. (Whitespace is allowed here; such a value binds only at
+    a quoted use — see `_word_value`.)"""
+    if uglob or _BRACE in val or any(c in val for c in "$`*?[{}") or _LIT_DOLLAR in val \
+            or _LIT_TICK in val or _DQ_REF in val or _ANSI_C_MARK in val:
+        return False
+    return ".." not in val.split("/")
+
+
+def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> list:
+    """`(spelling, kind, globbed)` for every literal path-shaped word of `cmd`, kind "abs" | "rel".
+
+    DEFAULT-JUDGE: every path-shaped word is a candidate unless a precise (command, position /
+    option) exception in `_CMD_SPECS` says that argument is a pattern, delimiter or string.
+    Redirection targets are always candidates. NOTHING AN EXPANSION PRODUCES IS MODELLED: a word
+    whose value an expansion decides is recorded on `found.unenum` (the act is then a scope request,
+    `UNENUMERATED_TARGET`), as are argv built from stdin, a process substitution, an expansion used
+    as the program, and an expansion handed to a command in its environment. Directory changes
+    (`cd D`, `pushd D`, `git|make|tar -C D`) are recorded on `found.dirs` so relative paths are
+    also judged under them. Raises `_Unmodelled` only for shell the lexer cannot read."""
+    out = []
+    found = found if found is not None else _Found()
+    pwd = cwd or os.getcwd()
+
+    def emit(value, uglob):
+        if not _path_shaped(value, uglob):
+            return
+        try:
+            v = _word_value(value, in_force())
+        except _Unenumerated as why:
+            found.unenum.append(str(why))
+            return
+        if v.startswith("~"):
+            found.unenum.append("a ~user home the gate does not resolve")
+            return
+        if v.startswith("//"):
+            v = "/" + v.lstrip("/")
+        if uglob:
+            comps = v.split("/")
+            g = next((k for k, c in enumerate(comps) if _GLOB_CHARS.search(c)), None)
+            if g is not None and ".." in comps[g + 1:]:
+                # `/tmp/*/../../x` is wherever the glob's match leads: not the glob's directory.
+                found.unenum.append("a glob followed by `..`")
+                return
+        if v.startswith("/"):
+            out.append((v, "abs", uglob))
+        elif v:
+            out.append((v, "rel", uglob))
+
+    def code(text):
+        # A string the command runs as shell (`eval`, `su -c`, `sh -c` in argv): a command of
+        # its own. A `$` single quotes kept literal here is live when the string runs.
+        out.extend(_outside_candidates(_strip_data_heredocs(
+            text.replace(_DQ_REF, "").replace(_BRACE, "").replace(_LIT_DOLLAR, "$")
+            .replace(_LIT_TICK, "`")), pwd, depth + 1, found))
+
+    def in_force():
+        cut = body_origin
+        return {n: (v_, q_) for n, (v_, q_, ci) in found.known.items() if cut is None or ci < cut}
+
+    def chdir(value, uglob):
+        try:
+            v = _word_value(value, in_force())
+        except _Unenumerated as why:
+            found.dirs_unknown = f"a directory change to {why}"
+            return
+        if uglob or v.startswith("~") or v == "-" or not v:
+            found.dirs_unknown = f"a directory change to '{v[:40]}'"
+            return
+        found.dirs.append(v)
+
+    toks = _shell_words(cmd)
+    state = {}
+    # The literal rule binds only in the OUTER command's own statements: substitution bodies are
+    # appended after them by `_shell_words`, and a body is a subshell.
+    main_len = len(_tokenize(cmd)) if depth == 0 else 0
+    bindable = _literal_names(toks) if depth == 0 else set()
+    # IFS decides field splitting. The default-IFS assumption holds only while the command never
+    # NAMES IFS: then every binding resolves at an unquoted use too. Any occurrence of the name, in
+    # any position (`IFS=`, `IFS+=`, a prefix, `for IFS in`/`for IFS;`, `select IFS`, `exec {IFS}>`,
+    # `coproc IFS`, `wait -p IFS`, a data body, a comment), makes every binding resolve only at a
+    # double-quoted use. Not an enumeration of binders: Codex 20554 found `=`, 20972 found `for`,
+    # and bash has more. Backslash-newlines are removed first (`I\<newline>FS=:` binds IFS). Code
+    # the gate cannot see (`eval`, `source`, `sh -c`, namerefs, `printf -v`) already disqualifies
+    # the rule wholesale; an IFS inherited from earlier shell state stays the stated residual.
+    # The token test is kept beside the text test so this never allows what 20554's repair refused.
+    ifs_touched = ("IFS" in cmd.replace("\\\n", "")
+                   or any(k == "word" and re.match(r"IFS\+?=", w) for k, w, _g in toks))
+    bind = {"pending": None, "prev_sep": ";", "paren": 0, "kw": 0}
+
+    def new_segment(sep=None):
+        # An INTERPRETER whose program is not on its command line — piped in, a here-string, `-`,
+        # or a descriptor path — runs code the gate cannot see: unenumerated (Codex 20536).
+        h = state.get("head")
+        if h and _HEREDOC_INTERPRETER.match(h) and not state.get("code_opt") \
+                and not state.get("heredoc") and (
+                state.get("stdin_prog") or ((state.get("piped_in") or state.get("herestring"))
+                                            and not state.get("script_arg"))):
+            found.unenum.append(f"`{h}` reading its program from stdin or a descriptor")
+        # `cd` with no argument goes HOME; `pushd` with none swaps the stack (not followed).
+        if state.get("head") in ("cd", "pushd") and not state.get("chdir_seen"):
+            home = os.getenv("HOME")
+            if state["head"] == "cd" and home:
+                found.dirs.append(home)
+            else:
+                found.dirs_unknown = f"`{state['head']}` with no directory"
+        state.update(head=None, spec={}, pending=None, redirect=False, positional=0,
+                     pattern_given=False, opts_done=False, dirpending=False, chdir_seen=False,
+                     env_expansion=None, code_opt=False, stdin_prog=False, herestring=False,
+                     script_arg=False, heredoc=False, piped_in=sep in ("|", "|&"))
+
+    new_segment()
+    loop_state = None
+    seg_words, prev = [], None
+    body_origin = None
+    for idx, (kind, w, uglob) in enumerate(toks):
+        p, prev = prev, (kind, w)
+        if kind == "mark":
+            # Entering a substitution body: from here on only bindings committed BEFORE the
+            # outer word that holds it are in force (Codex 20536, P1-1).
+            body_origin = w
+            continue
+        if bind["pending"] is not None:
+            name_, val_ = bind["pending"]
+            bind["pending"] = None
+            if kind == "sep" and w in (";", "&&"):
+                # The statement ended: N is bound from token `idx` on. (value, needs_quote,
+                # commit index): IFS whitespace in the value binds only at a quoted use.
+                found.known[name_] = (val_, ifs_touched or any(c in val_ for c in " \t\n"), idx)
+        if kind == "sep" and w == "(":
+            bind["paren"] += 1
+        elif kind == "sep" and w == ")":
+            bind["paren"] = max(0, bind["paren"] - 1)
+        elif kind == "word" and state["head"] is None and w in ("if", "while", "until", "for",
+                                                                "case", "select", "{"):
+            bind["kw"] += 1
+        elif kind == "word" and state["head"] is None and w in ("fi", "done", "esac", "}"):
+            bind["kw"] = max(0, bind["kw"] - 1)
+        # `for V in W…; do` — V is a variable (unenumerated wherever it is used as a path); a
+        # globbed W is itself a reach.
+        if loop_state == "var" and kind == "word":
+            loop_state = "in"
+            continue
+        if loop_state == "in" and kind == "word":
+            loop_state = "items" if w == "in" else None
+            continue
+        if loop_state == "items":
+            if kind == "word":
+                if uglob:
+                    emit(w, uglob)
+                continue
+            loop_state = None
+        if kind == "word" and state["head"] is None and w == "for":
+            loop_state = "var"
+            continue
+        if kind == "sep" and w == "(" and p is not None and p[0] == "op" and p[1] in ("<", ">"):
+            found.unenum.append("a process substitution used as a path")
+        if kind == "sep" or (kind == "word" and state["head"] is None and w in _SHELL_KEYWORDS):
+            seg_words = []
+            new_segment(w if kind == "sep" else None)
+            bind["prev_sep"] = w if kind == "sep" else "keyword"
+            continue
+        if kind == "word":
+            seg_words.append(w)
+        if kind == "op":
+            # `<` `>` `>>` `2>` `&>` `<>`: the next word is a file — always judged. `<<<`: the next
+            # word is a here-STRING (data; its substitutions were lifted out and are judged).
+            # `<<`: the next word is a heredoc delimiter (bodies are handled before tokenising).
+            state["redirect"] = "skip" if w.startswith("<<") else True
+            if w.startswith("<<<"):
+                state["herestring"] = True
+            elif w.startswith("<<"):
+                state["heredoc"] = True            # a heredoc program is visible and judged
+            continue
+        if state["redirect"] == "skip":
+            state["redirect"] = False
+            continue
+        if state["redirect"]:                # a redirection target: always judged
+            state["redirect"] = False
+            emit(w, uglob)
+            continue
+        head, spec = state["head"], state["spec"]
+        if head is None:
+            name, eq, val = w.partition("=")
+            if eq and name.isidentifier():                 # an assignment
+                # Reaches nothing by itself. A LITERAL path value is judged (a command it prefixes
+                # may read it: `CFG=/x tool`). A value an expansion decides makes the name unknown
+                # (unenumerated wherever it is used as a path), and is unenumerated at once if a
+                # command follows in this simple command and receives it in its environment.
+                try:
+                    _word_value(val)
+                    literal = True
+                except _Unenumerated:
+                    literal = False
+                if name not in _NONPATH_ASSIGNMENTS:
+                    if literal:
+                        emit(val, uglob)
+                    elif state["env_expansion"] is None:
+                        state["env_expansion"] = name
+                if (literal and name in bindable and idx < main_len and bind["paren"] == 0
+                        and bind["kw"] == 0 and bind["prev_sep"] == ";"
+                        and _is_bindable_literal(val, uglob)):
+                    # Bound only if the NEXT token ends the statement (`;`, newline, `&&`):
+                    # a word next makes this a prefix assignment, which binds nothing here.
+                    bind["pending"] = (name, _word_value(val))
+                continue
+            base = os.path.basename(w)
+            if base in _STDIN_ARGV:
+                found.unenum.append(f"argv built from stdin (`{base}`)")
+            if base in _HEREDOC_WRAPPERS or w.isdigit() or re.fullmatch(r"\d+[smhd]?", w) \
+                    or (w.startswith("-") and len(w) > 1):
+                continue                                   # wrapper, its options and durations
+            if _expansion_spans(w):
+                found.unenum.append("an expansion used as the program")
+            if state["env_expansion"] is not None:
+                found.unenum.append(f"an expansion handed to `{base}` in "
+                                    f"${state['env_expansion']}")
+            state["head"], state["spec"] = base, _CMD_SPECS.get(base, {})
+            if "/" in w or w.startswith("."):
+                emit(w, uglob)                             # a program run by path is a reach
+            if base in ("export", "local", "declare", "typeset", "readonly"):
+                state["spec"] = {"assign_args": "export" if base == "export" else "local"}
+            if base == "popd":
+                found.dirs_unknown = "`popd`"
+            continue
+        # ---- an argument of `head` ----
+        if (len(seg_words) >= 3 and seg_words[-2] == "-c" and not _HEREDOC_SHELL.match(head)
+                and _HEREDOC_SHELL.match(os.path.basename(seg_words[-3]))):
+            code(w)                         # `find … -exec sh -c '…'`, `docker exec c bash -c '…'`
+            continue
+        if state["dirpending"]:
+            state["dirpending"] = False
+            chdir(w, uglob)
+            emit(w, uglob)
+            continue
+        if state["pending"] is not None:
+            opt, state["pending"] = state["pending"], None
+            if opt in spec.get("code_opts", ()):
+                code(w)
+                continue
+            if (opt in spec.get("delim_opts", ()) or opt in spec.get("pattern_opts", ())
+                    or opt in spec.get("string_opts", ())) and not uglob:
+                if opt in spec.get("pattern_opts", ()):
+                    state["pattern_given"] = True
+                continue
+            if opt == "-c" and _HEREDOC_SHELL.match(head):
+                code(w)
+                continue
+            if opt in ("-c", "-e") and _CODE_ARG_HEADS.match(head):
+                for lit in _code_path_literals(w.replace(_DQ_REF, "").replace(_LIT_DOLLAR, "$")):
+                    emit(lit, False)
+                continue
+            emit(w, uglob)
+            continue
+        if w == "--" and not state["opts_done"]:
+            state["opts_done"] = True
+            continue
+        if w.startswith("-") and len(w) > 1 and not state["opts_done"]:
+            name, eq, val = w.partition("=")
+            if head in _DIR_OPT_HEADS:
+                if w in ("-C", "--directory"):
+                    state["dirpending"] = True
+                    continue
+                if name == "--directory" and eq:
+                    chdir(val, uglob)
+                    emit(val, uglob)
+                    continue
+                if w.startswith("-C") and len(w) > 2:
+                    chdir(w[2:], uglob)
+                    emit(w[2:], uglob)
+                    continue
+            takes = (spec.get("delim_opts", set()) | spec.get("pattern_opts", set())
+                     | spec.get("string_opts", set()) | spec.get("file_opts", set())
+                     | spec.get("value_opts", set()) | spec.get("code_opts", set()))
+            if eq:
+                if name in spec.get("code_opts", ()):
+                    code(val)
+                    continue
+                if name in spec.get("pattern_opts", ()):
+                    state["pattern_given"] = True
+                if uglob or not (name in spec.get("delim_opts", ())
+                                 or name in spec.get("pattern_opts", ())
+                                 or name in spec.get("string_opts", ())):
+                    emit(val, uglob)
+                continue
+            if (_HEREDOC_SHELL.match(head) or _CODE_ARG_HEADS.match(head)) and not w.startswith("--") \
+                    and re.fullmatch(r"-[A-Za-z]*[ce][A-Za-z]*", w) \
+                    and ("c" in w[1:] or (_CODE_ARG_HEADS.match(head) and "e" in w[1:])):
+                # A clustered code option (`bash -lc`, `sh -ec`, `perl -ne`, Codex 20536 P1-4):
+                # the next word is the program, whatever letters ride with it.
+                state["pending"] = "-c" if "c" in w[1:] else "-e"
+                state["code_opt"] = True
+                continue
+            if w in takes or (w == "-c" and (_HEREDOC_SHELL.match(head)
+                                             or _CODE_ARG_HEADS.match(head))) \
+                    or (w == "-e" and _CODE_ARG_HEADS.match(head)):
+                state["pending"] = w
+                if w in ("-c", "-e"):
+                    state["code_opt"] = True
+                continue
+            if not w.startswith("--") and len(w) > 2 and w[:2] in takes:
+                # attached short-option value: `-d/`, `-F:`, `-e/x/`, `-fFILE`
+                if w[:2] in spec.get("code_opts", ()):
+                    code(w[2:])
+                    continue
+                if w[:2] in spec.get("pattern_opts", ()):
+                    state["pattern_given"] = True
+                if uglob or not (w[:2] in spec.get("delim_opts", ())
+                                 or w[:2] in spec.get("pattern_opts", ())
+                                 or w[:2] in spec.get("string_opts", ())):
+                    emit(w[2:], uglob)
+                continue
+            m = _ATTACHED_OPT.match(w)
+            if m:
+                emit(m.group(1), uglob)                    # `-I/usr/include`, `-C/elsewhere`
+            continue
+        state["positional"] += 1
+        if state["positional"] == 1 and _HEREDOC_INTERPRETER.match(head) and not state["code_opt"]:
+            # The program: a script file (judged as a path below), or stdin / a descriptor.
+            if w == "-" or w.startswith(("/dev/fd/", "/dev/stdin", "/proc/self/fd/")):
+                state["stdin_prog"] = True
+            else:
+                state["script_arg"] = True
+        if head in ("cd", "pushd") and state["positional"] == 1:
+            state["chdir_seen"] = True
+            chdir(w, uglob)
+            emit(w, uglob)                                 # where it goes is a reach too
+            continue
+        if head == "read" and w.isidentifier():
+            continue                                       # a variable name, not a path
+        if spec.get("assign_args"):
+            name, eq, val = w.partition("=")
+            if eq and name.isidentifier():                 # `export D=/x` — as an assignment
+                try:
+                    _word_value(val)
+                    literal = True
+                except _Unenumerated:
+                    literal = False
+                if name not in _NONPATH_ASSIGNMENTS:
+                    if literal:
+                        emit(val, uglob)
+                    elif spec["assign_args"] == "export":
+                        found.unenum.append(f"an expansion exported in ${name}")
+                continue
+        mode = spec.get("positional")
+        if mode == "code":
+            code(w)                                        # `eval "…"`, `watch '…'`
+            continue
+        # An UNQUOTED glob is expanded by the shell BEFORE the command sees its arguments, so no
+        # (command, position) exception can make it a string or a pattern: `tr /x/* y` and
+        # `grep /x/*` read /x (Codex review 17029c). Exceptions apply to glob-free words only.
+        if mode in ("strings", "strings_noglob") and not uglob:
+            continue
+        if spec.get("pattern_first") and state["positional"] == 1 and not state["pattern_given"] \
+                and not uglob:
+            continue
+        name, eq, val = w.partition("=")
+        if eq and name.isidentifier():                     # `dd if=/x`, `make DESTDIR=/x`
+            emit(val, uglob)
+            continue
+        emit(w, uglob)
+    new_segment()
+    return out
+
+
+def _dir_bases(dirs, cwd: str):
+    """Every directory a relative path may resolve under after the command's directory changes:
+    each literal `cd` / `-C` target, a relative one composed under every base known before it
+    (`cd a && cd b` reaches cwd/a/b). Over-approximates the shell's scoping (`(cd x)` leaks here),
+    which only adds judgments. None when there are more than `_MAX_DIR_BASES`."""
+    bases = []
+    for d in dirs:
+        if d.startswith("/"):
+            new = [os.path.normpath(d)]
+        else:
+            new = [os.path.normpath(os.path.join(b, d)) for b in [cwd] + bases]
+        for n in new:
+            if n not in bases:
+                bases.append(n)
+        if len(bases) > _MAX_DIR_BASES:
+            return None
+    return bases
+
+
+def _is_reach(path: str) -> bool:
+    """Whether an absolute spelling plausibly names a filesystem object: it exists, or its
+    nearest existing ancestor is below `/`. `/` itself is a reach (`find /`). A spelling whose
+    only existing ancestor is the root — a sed address `/^#/d`, a regex, prose — is not."""
+    if path == "/":
+        return True
+    p = path
+    for _ in range(40):
+        if os.path.lexists(p):
+            return p != "/" or path == "/"
+        parent = os.path.dirname(p)
+        if parent == p:
+            return False
+        p = parent
+    return False
+
+
+def _glob_probe(path: str) -> str:
+    """The path a glob is judged as: its literal directory plus a `*` child, so a glob reaches
+    only what a RECURSIVE grant (or temp/home) covers — an exact grant on one file under the
+    directory does not authorise `dir/*`."""
+    comps = path.split("/")
+    for i, c in enumerate(comps):
+        if _GLOB_CHARS.search(c):
+            base = "/".join(comps[:i]) or "/"
+            return base.rstrip("/") + "/*"
+    return path
+
+
+def _outside_reach_refused(resolved: str, scopes, workspace: str, cwd: Optional[str], egress,
+                           home_markers) -> Optional[tuple]:
+    """Judge one absolute candidate exactly like a Read path (`path_in_scope`: temp roots, the
+    member's home markers, `path:` grants by realpath, the workspace's segment rule) — and,
+    when a symlink is on the way, judge where it LANDS as well. Returns None when the reach is
+    in scope, else `(offending, refused_path)`."""
+    if _device_sink(resolved):
+        return None
+    prof = HarnessProfile(member_id="", identity_path="", home_markers=tuple(home_markers or ()))
+    lexical = os.path.normpath(resolved).replace("\\", "/")
+    target = os.path.realpath(lexical).replace("\\", "/")
+    if target != lexical:
+        low = target.lower()
+        hidden = next((f for f in egress if f in low), None)
+        if hidden is not None:
+            return target, target
+    if not path_in_scope(lexical, scopes, workspace, prof, cwd):
+        return _elide(lexical), lexical
+    if target != lexical and not _device_sink(target) and not path_in_scope(target, scopes,
+                                                                            workspace, prof, cwd):
+        return _elide(target), target
+    return None
+
+
 def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = None,
-                        forbidden=None):
+                        forbidden=None, home_markers=None):
     """Returns (ok, offending_token, resolved_path).
+
+    OUTSIDE THE WORKSPACE (2026-10-05, dp: "yes on gate gap, let's fix it"). Until this pass the
+    check judged only tokens UNDER the workspace, so `cat /abs/path/outside` passed on every seat
+    while a Read of the same path was refused `mrh.path` — measured live the same day, a session
+    listed and read a mail client's profile directory on a Windows mount through the shell. Pass 3
+    judges every absolute spelling (and every relative escape) that lands outside the workspace by
+    the SAME rule as a Read path — temp roots, the member's home markers, `path:` grants by
+    realpath — plus the POSIX device sinks, which are law. `home_markers` comes from the
+    caller's HarnessProfile; `evaluate` passes it. Heredoc bodies fed to a non-interpreter are
+    data and are not judged (see `_strip_data_heredocs`).
 
     `forbidden` is the egress list applied to a symlink's RESOLVED target, on every absolute workspace
     token and before any grant check (#953, #1191 review); None means `_default_forbidden()`.
@@ -1025,9 +2281,27 @@ def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = N
 
     Residual, documented and accepted: relative traversal that never names a path (`grep -r .`)
     escapes string parsing entirely — the engine sandbox, not this check, is the fs boundary."""
+    # The workspace is NORMALISED before anything compares against it. Spelled with `.` / `..`
+    # (a caller's REPO.parent, a configured path), an inside path normalised against it looked
+    # like a traversal OUT and was judged by the outside rule — under a temp-root workspace that
+    # admitted the workspace's own ungranted repos (found by the staged contract run, 2026-10-10;
+    # main refused every traversal, so this is a regression 01e68a1c introduced, not main's).
+    workspace = os.path.normpath(workspace.replace("\\", "/")).replace("\\", "/")
     ws = workspace.rstrip("/")
     repo_scopes, _ = _scope_parts(scopes, workspace)
     egress = _default_forbidden() if forbidden is None else forbidden
+    # The two once-only lifts (see UNENUMERATED_TARGET): present only in a trial scope the
+    # orchestrator builds for an act whose one-time approval it holds.
+    scopes = list(scopes)
+    lift_unenum = "path:" + UNENUMERATED_TARGET in scopes
+    lift_overflow = "path:" + OVERFLOW_TARGET in scopes
+    # A home spelling is expanded from the gate's HOME below; a command that REASSIGNS HOME
+    # (`HOME=/x; cat ~/y`) makes that expansion a guess, so it is unenumerated instead.
+    if not lift_unenum and _HOME_REASSIGNED.search(cmd) and _HOME_WORD.search(cmd):
+        return False, f"{_UNMODELLED_PREFIX}a home spelling after HOME is reassigned>", UNENUMERATED_TARGET
+    # Pass 0 — the shell's home spellings, expanded before anything reads the text, so a
+    # workspace path spelled `~/…` or `$HOME/…` meets pass 1 like its literal spelling does.
+    cmd = _expand_home_words(cmd)
     for after in cmd.split(workspace)[1:]:
         # Resolve the whole token before reading a segment off it (kimi #940 B7). Taking the
         # head lexically let `cat <ws>/repo-a/../repo-b/secret` pass on `repo-a` while
@@ -1036,7 +2310,15 @@ def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = N
         tok = re.split(r"""[\s"'`);&|<>]""", after.lstrip("/"), 1)[0]
         resolved = os.path.normpath(f"{ws}/{tok}").replace("\\", "/")
         if resolved != ws and not resolved.startswith(ws + "/"):
-            return False, (tok or "<workspace root>"), resolved   # traversed out of the workspace
+            # Traversed out of the workspace: judged WHERE IT LANDS, by the outside rule (pass 3),
+            # so a grant the operator makes for the landing path is honoured however it is
+            # spelled. Before 2026-10-05 this refused unconditionally, which made a granted
+            # outside path unreachable through a `<ws>/../…` spelling — a grant that could never
+            # be spent, re-escalating forever.
+            refused = _outside_reach_refused(resolved, scopes, workspace, cwd, egress, home_markers)
+            if refused is None:
+                continue
+            return False, (tok or "<workspace root>"), refused[1]
         # EGRESS FIRST, for every token: a symlink must not launder a forbidden target past a grant.
         hidden = _symlink_target_forbidden(resolved, egress)
         if hidden is not None:
@@ -1059,6 +2341,7 @@ def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = N
     bases = [cwd] + [f"{ws}/{s}" for s in repo_scopes]
     oos_names = {r for r in _all_repos(workspace) if r not in repo_scopes}
     probes = 0
+    seen2 = set()
     for raw in re.split(r"""[\s;|&<>()'"`]+""", cmd):
         for tok in raw.split("="):
             tok = tok.strip()
@@ -1069,8 +2352,16 @@ def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = N
                 continue
             if "/" not in tok and tok in MEMBER_ADDRESSES:
                 continue
-            if probes >= 40:
-                break                 # bound fs probing under the engine's hook clamp
+            if tok in seen2:
+                continue                      # a repeated spelling is judged once
+            seen2.add(tok)
+            if probes >= SCOPE_JUDGE_BUDGET:
+                # FAIL CLOSED (Codex review of #1232, P1-3): an unjudged token is not an
+                # allowed one. The old bound `break`-ed and returned allow for everything after.
+                # Escalable as the act (OVERFLOW_TARGET): a one-time approval of it lifts this.
+                if lift_overflow:
+                    break
+                return False, _INCOMPLETE, OVERFLOW_TARGET
             probes += 1
             comps = tok.split("/")
             k = 0
@@ -1097,6 +2388,96 @@ def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = N
                     break
             if not in_scope_vote and oos_vote:
                 return False, oos_vote, oos_path
+
+    # Pass 3 — OUTSIDE the workspace (2026-10-05). Every absolute spelling, and every relative
+    # escape, that lands outside the workspace is judged like a Read path. Data heredoc bodies
+    # are removed first; the bound keeps filesystem probing inside the engine's hook clamp.
+    judged = 0
+    seen3 = set()
+    found = _Found()
+    try:
+        candidates = _outside_candidates(_strip_data_heredocs(cmd), cwd, found=found)
+    except _Unmodelled as why:
+        # Shell the lexer cannot read is UNENUMERATED: a scope request for the act, never a skip
+        # (Codex re-review of #1232; dp, 2026-10-10). The reason travels in the refusal.
+        if lift_unenum:
+            return True, None, None
+        return False, f"{_UNMODELLED_PREFIX}{why}>", UNENUMERATED_TARGET
+    rels = [(s_, g_) for s_, k_, g_ in candidates if k_ == "rel"]
+    if found.dirs_unknown and rels:
+        found.unenum.append(f"a relative path after {found.dirs_unknown}")
+    dir_bases = _dir_bases(found.dirs, cwd) if rels else []
+    if dir_bases is None:
+        found.unenum.append(f"more than {_MAX_DIR_BASES} directory changes")
+        dir_bases = []
+    # A relative path after a directory change is ALSO judged where it lands under it, strictly
+    # (the Read rule, inside the workspace too): `cd /tmp && cat ../etc/x` reaches /etc/x.
+    candidates = list(candidates) + [
+        (os.path.normpath(os.path.join(b, s_)).replace("\\", "/"), "dir", g_)
+        for b in dir_bases for s_, g_ in rels]
+    for spelling, kind, globbed in candidates:
+        if (spelling, kind, globbed) in seen3:
+            continue                          # a repeated spelling is judged once
+        seen3.add((spelling, kind, globbed))
+        if judged >= SCOPE_JUDGE_BUDGET:
+            # FAIL CLOSED (Codex review of #1232, P1-3): past the budget the classification is
+            # INCOMPLETE, and incomplete is a refusal — never an allow of the unjudged rest.
+            if lift_overflow:
+                break
+            return False, _INCOMPLETE, OVERFLOW_TARGET
+        if kind == "dir":
+            probe = _glob_probe(spelling) if globbed else spelling
+            if _device_sink(spelling) or not _is_reach(probe.rstrip("*").rstrip("/") or "/"
+                                                       if globbed else probe):
+                continue
+            judged += 1
+            refused = _outside_reach_refused(probe, scopes, workspace, cwd, egress, home_markers)
+            if refused is not None:
+                return (False,) + refused
+            continue
+        if kind == "abs":
+            cand = os.path.normpath(spelling).replace("\\", "/")
+            if cand == ws or cand.startswith(ws + "/"):
+                continue                      # inside: passes 1 and 2 own it
+            # Only an UNQUOTED glob expands; a quoted `*` is a literal character of the name.
+            probe = _glob_probe(cand) if globbed else cand
+            if _device_sink(cand) or not _is_reach(probe.rstrip("*").rstrip("/") or "/"
+                                                   if globbed else probe):
+                continue
+            judged += 1
+            refused = _outside_reach_refused(probe, scopes, workspace, cwd, egress, home_markers)
+            if refused is not None:
+                return (False,) + refused
+            continue
+        # A relative spelling, voted like pass 2 over its plausible bases (the event cwd plus
+        # every granted repo root): it is refused only when an interpretation that EXISTS lands
+        # outside the workspace un-granted and no existing interpretation is in scope.
+        in_scope, refused = False, None
+        for base in bases:
+            cand = os.path.normpath(os.path.join(base, spelling)).replace("\\", "/")
+            probe = _glob_probe(cand) if globbed else cand
+            if not _is_reach(probe.rstrip("*").rstrip("/") or "/"):
+                continue
+            if not os.path.lexists(os.path.dirname(probe.rstrip("*").rstrip("/")) or "/"):
+                continue
+            if cand == ws or cand.startswith(ws + "/"):
+                seg = cand[len(ws):].lstrip("/").split("/", 1)[0]
+                if seg and (seg in repo_scopes or _within_path_grant(cand, scopes, workspace)):
+                    in_scope = True
+                    break
+                continue                      # an inside interpretation: pass 2's to refuse
+            judged += 1
+            r = _outside_reach_refused(probe, scopes, workspace, cwd, egress, home_markers)
+            if r is None:
+                in_scope = True
+                break
+            refused = refused or r
+        if refused is not None and not in_scope:
+            return (False,) + refused
+    # Every literal candidate passed. What could not be enumerated is a scope REQUEST for the act
+    # (never a silent allow): a blanket refusal, load-bearing, priced in the PR's measurement.
+    if found.unenum and not lift_unenum:
+        return False, f"{_UNMODELLED_PREFIX}{found.unenum[0]}>", UNENUMERATED_TARGET
     return True, None, None
 
 
@@ -1260,21 +2641,41 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
                 "mrh.path",
                 f"'{event.tool}' targets '{_elide(p)}' outside your granted scope: {where} "
                 f"(granted: {'+'.join(scopes)}){hint}",
+                target=os.path.normpath(os.path.expanduser(absolute)).replace("\\", "/"),
             )
     if event.command is not None:
         ok, offending, refused = command_scope_reach(event.command, scopes, ws, event.cwd,
-                                                     forbidden=forbidden)
+                                                     forbidden=forbidden,
+                                                     home_markers=profile.home_markers)
         if not ok:
             # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
             # debugging blind (Codex live session, 2026-07-23). The exact-grant hint is
             # judged on the path the checker actually refused — carried out of the check,
             # not rebuilt from the display token, which has the right repo and the wrong
             # depth (GPT review of #1003).
-            hint = _exact_grant_hint(refused, scopes, ws) if refused else ""
+            unpriceable = bool(refused) and refused.startswith(UNPRICEABLE_PREFIX)
+            hint = _exact_grant_hint(refused, scopes, ws) if refused and not unpriceable else ""
+            wsn = ws.replace("\\", "/").rstrip("/")
+            outside = bool(refused) and not unpriceable and not (refused == wsn or
+                                                                  refused.startswith(wsn + "/"))
+            if offending == _INCOMPLETE:
+                what = (f"the command names more than {SCOPE_JUDGE_BUDGET} distinct paths, so it "
+                        f"could not be judged completely, and an incompletely judged command is "
+                        f"refused — split it, or the act can be approved once as written")
+            elif offending and offending.startswith(_UNMODELLED_PREFIX):
+                what = (f"the gate cannot enumerate what it reaches "
+                        f"({offending[len(_UNMODELLED_PREFIX):-1]}): nothing an expansion produces is "
+                        f"modelled, so this act can only be approved ONCE, as written — or rewritten "
+                        f"with every path spelled out literally")
+            elif outside:
+                what = f"'{offending}' is outside the workspace and no grant reaches it"
+            else:
+                what = f"'{offending}' is not granted"
             return _deny(
                 "mrh.command",
-                f"'{event.tool}' command reaches outside your granted scope: '{offending}' "
-                f"is not granted (granted: {'+'.join(scopes)}){hint}",
+                f"'{event.tool}' command reaches outside your granted scope: {what} "
+                f"(granted: {'+'.join(scopes)}){hint}",
+                target=refused or "",
             )
 
     return ALLOW
