@@ -2775,6 +2775,10 @@ async fn scope_list_requests(State(state): State<SharedState>) -> impl IntoRespo
                 "recursive": r.recursive,
                 "invited_peers": r.ext.invited_peers,
                 "peer_basis": r.ext.peer_basis,
+                // #1287 part 2: what a surface may offer, from the decide endpoint's own source.
+                "enumerable": !crate::server::state::is_unpriceable_scope_path(&r.path),
+                "allowed_decisions": crate::server::state::scope_allowed_decisions(
+                    &r.path, r.ext.gate.is_some()),
             })
         })
         .collect();
@@ -2945,27 +2949,29 @@ pub(crate) async fn scope_decide_as(
     }
     let (plugin_id, path, ask) = (req.plugin_id.clone(), req.path.clone(), req.reason.clone());
     let gate_origin = req.ext.gate.clone();
-    // An UNENUMERATED act (dp, 2026-10-10, #1232 narrowed): the gate could not enumerate what it
-    // reaches, so the request names the act, not a path. ONCE (that act, exactly) or refuse —
-    // a session or standing grant would have to name a path nobody knows.
-    if granted && !once && crate::server::state::is_unpriceable_scope_path(&path) {
+    // WHICH KINDS this request accepts comes from `scope_allowed_decisions` — the same function
+    // every operator surface reads its offer from (`allowed_decisions` on the snapshot, the
+    // request listing and the ledger), so a button the UI renders is one this check admits
+    // (#1287 part 2: dp clicked a plain grant on an unenumerated request and learnt the rule
+    // from this error).
+    let kind = crate::server::state::scope_decision_kind(granted, once, standing);
+    let allowed = crate::server::state::scope_allowed_decisions(&path, gate_origin.is_some());
+    if !allowed.contains(&kind) {
+        let error = if kind == "once" {
+            "a one-time approval binds to the act the gate refused, and this request was filed by \
+             the member — it names no act. Grant it for the session or standing instead"
+        } else {
+            // An UNENUMERATED act (dp, 2026-10-10, #1232 narrowed): the gate could not
+            // enumerate what it reaches, so the request names the act, not a path. ONCE (that
+            // act, exactly) or refuse — a session or standing grant would have to name a path
+            // nobody knows.
+            "the gate could not enumerate what this act reaches (an expansion decides it), so \
+             there is no path a session or standing grant could name: approve it ONCE (this \
+             act, exactly) or refuse it"
+        };
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "the gate could not enumerate what this act reaches (an expansion \
-                          decides it), so there is no path a session or standing grant could \
-                          name: approve it ONCE (this act, exactly) or refuse it"
-            })),
-        );
-    }
-    if once && gate_origin.is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "a one-time approval binds to the act the gate refused, and this request \
-                          was filed by the member — it names no act. Grant it for the session or \
-                          standing instead"
-            })),
+            Json(serde_json::json!({"error": error, "kind": kind, "allowed_decisions": allowed})),
         );
     }
     // The breadth, validated against the ASKED path: equal, or an ancestor at a separator.
@@ -11467,6 +11473,92 @@ mod disposition_tests {
         let plain = rows.iter().find(|r| r["path"] == "/srv/plain.txt").expect("listed");
         assert_eq!(unenum["once_only"], true, "{unenum}");
         assert_eq!(plain["once_only"], false, "{plain}");
+    }
+
+    /// #1287 part 2 CONTRACT: for every request shape, the decisions the surfaces are TOLD they
+    /// may offer (`allowed_decisions` on the dashboard snapshot, the request listing and the
+    /// governance ledger) are EXACTLY the decisions the decide endpoint accepts — every listed
+    /// kind is admitted, every unlisted kind is refused. dp clicked a plain grant on
+    /// scope-1981a1b1f6e5 (unenumerated) and learnt the rule from the error; this pins that the
+    /// offer and the check read one source.
+    #[tokio::test]
+    async fn scope_allowed_decisions_are_exactly_what_decide_accepts() {
+        const KINDS: [&str; 4] = ["once", "session", "standing", "refuse"];
+        // BREADTH is a separate axis from the kind: a glob reach is offered recursive breadths
+        // only (scopeBreadthOptions), so its session/standing ruling is sent recursive.
+        let body_for = |id: &str, kind: &str, glob: bool| match kind {
+            "once" => serde_json::json!({"request_id": id, "granted": true, "reason": "r", "once": true}),
+            "session" => serde_json::json!({"request_id": id, "granted": true, "reason": "r", "recursive": glob}),
+            "standing" => serde_json::json!({"request_id": id, "granted": true, "reason": "r",
+                                             "standing": true, "recursive": glob}),
+            _ => serde_json::json!({"request_id": id, "granted": false}),
+        };
+        let unenum_act = "for f in a b; do cat $f; done";
+        let overflow_act = "cat /srv/a /srv/b /srv/c";
+        // (shape, path, gate-opened?, the kinds it must accept)
+        let shapes: Vec<(&str, String, bool, Vec<&str>)> = vec![
+            ("gate, a path", "/srv/plain.txt".into(), true, vec!["once", "session", "standing", "refuse"]),
+            ("gate, a glob dir", "/srv/logs/*".into(), true, vec!["once", "session", "standing", "refuse"]),
+            ("gate, unenumerated",
+             format!("hestia:unpriceable:unenumerated#{}", &digest_of(unenum_act)[..16]), true,
+             vec!["once", "refuse"]),
+            ("gate, overflow",
+             format!("hestia:unpriceable:overflow#{}", &digest_of(overflow_act)[..16]), true,
+             vec!["once", "refuse"]),
+            ("member-filed, a path", "/x/member.txt".into(), false, vec!["session", "standing", "refuse"]),
+        ];
+        for (shape, path, gate, expect) in &shapes {
+            for kind in KINDS {
+                let (_dir, state) = test_state().await;
+                let id = if *gate {
+                    let act = if path.contains("unenumerated") { unenum_act }
+                              else if path.contains("overflow") { overflow_act }
+                              else { "cat it" };
+                    let o = claim(&state, "codex", path, act, false).await;
+                    assert_eq!(o["verdict"], "opened", "{shape}: {o}");
+                    o["request_id"].as_str().unwrap().to_string()
+                } else {
+                    let now = crate::server::gate_escalation::now_secs();
+                    let mut req = live_req("scope-member-1", path, now);
+                    req.granted = None; req.decided_by = None; req.decided_at = None;
+                    req.decision_reason = None;
+                    state.lock().await.scope_requests.insert("scope-member-1".into(), req);
+                    "scope-member-1".to_string()
+                };
+                // What each surface is TOLD.
+                let snap = state.lock().await.dashboard_snapshot(10).pending_scope_requests;
+                let row = snap.iter().find(|r| r["request_id"] == id.as_str()).expect("on the snapshot");
+                let listed = {
+                    let resp = scope_list_requests(State(state.clone())).await.into_response();
+                    let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+                    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+                    v["requests"].as_array().unwrap().iter()
+                        .find(|r| r["request_id"] == id.as_str()).cloned().expect("listed")
+                };
+                let offered: Vec<String> = serde_json::from_value(row["allowed_decisions"].clone()).unwrap();
+                assert_eq!(&offered, expect, "{shape}: snapshot offer");
+                assert_eq!(listed["allowed_decisions"], row["allowed_decisions"], "{shape}: listing agrees");
+                assert_eq!(row["enumerable"], !path.starts_with("hestia:unpriceable:"), "{shape}");
+                assert_eq!(listed["enumerable"], row["enumerable"], "{shape}");
+                if *gate {
+                    // The ledger reads the same two inputs off the chain row.
+                    let rows = crate::server::governance_ledger::project(
+                        &state.lock().await.recent_chain(50),
+                        crate::server::gate_escalation::now_secs());
+                    let lrow = rows.iter().find(|r| r.id == id).expect("on the ledger");
+                    assert_eq!(&lrow.allowed_decisions, expect, "{shape}: ledger offer");
+                }
+                // What the endpoint ACCEPTS.
+                let (code, out) = decide(&state, body_for(&id, kind, path.ends_with("/*"))).await;
+                if expect.contains(&kind) {
+                    assert_eq!(code, StatusCode::OK, "{shape}: {kind} is offered, so it must land: {out}");
+                } else {
+                    assert_eq!(code, StatusCode::BAD_REQUEST, "{shape}: {kind} is not offered: {out}");
+                    assert_eq!(out["allowed_decisions"], row["allowed_decisions"],
+                               "{shape}: the refusal names the same set the surface was told");
+                }
+            }
+        }
     }
 
     /// A refusal is not reopened by re-issuing inside its window, and a member-filed ask has no

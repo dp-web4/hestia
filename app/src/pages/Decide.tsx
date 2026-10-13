@@ -3,8 +3,11 @@ import { decideGateEscalation, getDashboard, operatorStatus, ruleScopeRequest } 
 import type { OperatorStatus, PendingEscalation, PendingScopeRequest, WriteEffect } from "../lib/types";
 import {
   DURATION_LABEL,
+  SCOPE_ONCE_ONLY_WHY,
   scopeBreadthOptions,
   scopeDurations,
+  scopeEnumerable,
+  scopeOnceOnly,
   scopeRulingOpts,
   scopeAwaitsOperator,
   type ScopeDuration,
@@ -164,7 +167,9 @@ function ScopeRequestCard({
   const [reason, setReason] = useState("");
   // DURATION and BREADTH, chosen at decide time (spec decide-scope-request, 2026-10-05).
   const durations = scopeDurations(req);
-  // An act the gate could not enumerate (once_only) offers only "this act once".
+  // #1287 part 2: the card offers exactly what the decide endpoint accepts. An act the gate
+  // could not enumerate accepts "this act once" and a refusal — nothing else is rendered.
+  const onceOnly = scopeOnceOnly(req);
   const [duration, setDuration] = useState<ScopeDuration>(
     durations.includes("session") ? "session" : (durations[0] ?? "once"),
   );
@@ -185,7 +190,7 @@ function ScopeRequestCard({
         req.request_id,
         granted,
         reason || null,
-        scopeRulingOpts(req, granted, duration, breadths[breadthIdx]),
+        scopeRulingOpts(req, granted, onceOnly ? "once" : duration, breadths[breadthIdx]),
       );
       if (out.outcome === "already_decided") {
         onDecided(req.request_id, "already ruled elsewhere");
@@ -216,7 +221,7 @@ function ScopeRequestCard({
         <dt>path</dt>
         {/* Exactly one path. The asker cannot request recursion; only the ruler can grant it.
             An act the gate could not enumerate names no path (dp, 2026-10-10). */}
-        {req.once_only ? (
+        {!scopeEnumerable(req) ? (
           <dd data-scope-once-only>
             no path: the gate cannot enumerate what this act reaches — approve it once, as
             written, or refuse
@@ -260,6 +265,12 @@ function ScopeRequestCard({
 
       {err && <div className="error-banner">{err}</div>}
 
+      {signedIn && onceOnly && (
+        <p className="muted" data-scope-once-why>
+          {SCOPE_ONCE_ONLY_WHY}
+        </p>
+      )}
+
       {signedIn ? (
         <div className="decide-actions">
           <label>
@@ -275,39 +286,46 @@ function ScopeRequestCard({
               placeholder="what they should know about this ruling"
             />
           </label>
-          <label>
-            duration{" "}
-            <select
-              aria-label="duration"
-              value={duration}
-              onChange={(e) => setDuration(e.target.value as ScopeDuration)}
-            >
-              {durations.map((d) => (
-                <option key={d} value={d}>
-                  {DURATION_LABEL[d]}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            reach{" "}
-            {/* Each option IS the path the grant will reach from. A one-time approval has none. */}
-            <select
-              aria-label="reach"
-              value={breadthIdx}
-              disabled={duration === "once"}
-              onChange={(e) => setBreadthIdx(Number(e.target.value))}
-            >
-              {breadths.map((b, i) => (
-                <option key={b.label} value={i}>
-                  {b.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <button disabled={busy} onClick={() => rule(true)}>
-            {override ? "Override: grant" : "Grant"}
-          </button>
+          {!onceOnly && (
+            <>
+              <label>
+                duration{" "}
+                <select
+                  aria-label="duration"
+                  value={duration}
+                  onChange={(e) => setDuration(e.target.value as ScopeDuration)}
+                >
+                  {durations.map((d) => (
+                    <option key={d} value={d}>
+                      {DURATION_LABEL[d]}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                reach{" "}
+                {/* Each option IS the path the grant will reach from. A one-time approval has none. */}
+                <select
+                  aria-label="reach"
+                  value={breadthIdx}
+                  disabled={duration === "once"}
+                  onChange={(e) => setBreadthIdx(Number(e.target.value))}
+                >
+                  {breadths.map((b, i) => (
+                    <option key={b.label} value={i}>
+                      {b.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </>
+          )}
+          {/* Only a ruling the decide endpoint accepts is rendered (#1287 part 2). */}
+          {durations.length > 0 && (
+            <button disabled={busy} onClick={() => rule(true)}>
+              {override ? `Override: ${onceOnly ? "approve once" : "grant"}` : onceOnly ? "Approve once" : "Grant"}
+            </button>
+          )}
           <button disabled={busy} onClick={() => rule(false)}>
             {override ? "Override: refuse" : "Refuse"}
           </button>
